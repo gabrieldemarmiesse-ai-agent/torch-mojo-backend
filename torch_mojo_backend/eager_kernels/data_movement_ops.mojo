@@ -30,8 +30,14 @@ from std.python._cpython import PyObjectPtr, Py_ssize_t
 from op_utils import (
     GS_THREADS,
     MAX_RANK,
+    _LLC_BYTES,
+    _bw_blocks,
+    _MAX_GRID_Y,
+    _T2D_ROWS,
     _enqueue_cached,
     _gs_blocks,
+    _t2d_tile,
+    _transpose2d_kernel,
     _make_ptr,
     _parallel_for,
     _parallel_for_dt,
@@ -103,6 +109,54 @@ def _permute_copy_kernel[
         i += gstride
 
 
+# A permutation whose innermost extent is contiguous in *both* operands
+# (`s3 == 1`) is not a transpose at all: it is a gather of `d3`-element runs.
+# nanoGPT's `view(B, T, nh, hs).transpose(1, 2)` is exactly that, and it is the
+# most common permutation an attention block issues. The generic kernel above
+# copies one element per thread, so a BF16 lane uses 2 bytes of a 16-byte access
+# and pays three integer divisions for them; here consecutive lanes take
+# consecutive *vectors* of the contiguous destination, so the stores are wide and
+# contiguous, the loads are whole runs, and the three divisions are amortized
+# over a whole vector.
+def _run_gather_kernel[
+    dtype: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1: Int,
+    d2: Int,
+    spv: Int,
+    s0: Int,
+    s1: Int,
+    s2: Int,
+    slots: Int,
+):
+    """`out[i0,i1,i2,i3] = in[i0*s0 + i1*s1 + i2*s2 + i3]`, VEC elements a time.
+
+    `spv` is the number of VEC-wide vectors in one run (`d3 // VEC`) and `slots`
+    the number of vectors in the whole copy; the caller has checked that every
+    stride and the run length are multiples of VEC and that both base addresses
+    are vector-aligned.
+    """
+    comptime ALIGN = min(16, VEC * size_of[dtype]())
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while j < slots:
+        var off = j % spv
+        var run = j // spv
+        var i2 = run % d2
+        var rest = run // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        out_ptr.store[width=VEC, alignment=ALIGN](
+            j * VEC,
+            in_ptr.load[width=VEC, alignment=ALIGN](
+                i0 * s0 + i1 * s1 + i2 * s2 + off * VEC
+            ),
+        )
+        j += gstride
+
+
 @always_inline
 def _permute_copy[
     dtype: DType
@@ -141,6 +195,98 @@ def _permute_copy[
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
         comptime if has_accelerator():
+            # The innermost extent contiguous in both operands: gather runs, in
+            # the widest vector the runtime extents, strides and addresses admit.
+            # Every candidate width is a compile-time regime; which one runs is a
+            # runtime decision, and when none fits the copy declines to the
+            # general element-at-a-time kernel below, which masks every extent.
+            @always_inline
+            @parameter
+            def _try_run_gather[VEC: Int]() raises -> Bool:
+                comptime ALIGN = min(16, VEC * size_of[dtype]())
+                if (
+                    d3 % VEC != 0
+                    or s0 % VEC != 0
+                    or s1 % VEC != 0
+                    or s2 % VEC != 0
+                    or out_addr % ALIGN != 0
+                    or in_addr % ALIGN != 0
+                ):
+                    return False
+                var slots = total // VEC
+                _enqueue_cached[_run_gather_kernel[dtype, VEC]](
+                    ctx,
+                    String(t"dm_rungather_{dtype}_v{VEC}"),
+                    _gs_blocks(slots),
+                    1,
+                    1,
+                    GS_THREADS,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    d1,
+                    d2,
+                    d3 // VEC,
+                    s0,
+                    s1,
+                    s2,
+                    slots,
+                )
+                return True
+
+            comptime V32 = 32 // size_of[dtype]()
+            comptime V16 = 16 // size_of[dtype]()
+            comptime V8 = 8 // size_of[dtype]()
+            if s3 == 1 and d3 > 1 and total >= 1024:
+                if _try_run_gather[V32]():
+                    return
+                comptime if V16 < V32:
+                    if _try_run_gather[V16]():
+                        return
+                comptime if V8 < V16:
+                    if _try_run_gather[V8]():
+                        return
+
+            # A batched transpose of the innermost two dims is by far the most
+            # common permutation -- the eager SDPA backward does four per layer --
+            # and the generic kernel below reads one element per thread down a
+            # column, so it never reaches a useful fraction of bandwidth. When the
+            # permutation is exactly that, hand it to the tiled LDS transpose,
+            # which stages a TILE x TILE block through shared memory so both the
+            # reads and the writes are contiguous.
+            #
+            # `s2 == 1` says the output's row index walks the source contiguously,
+            # i.e. source columns are output rows; `s3 >= d2` says the output's
+            # column index steps by the source's row pitch. The leading pair
+            # collapses into one batch axis only if its two strides are uniform,
+            # hence `s0 == d1 * s1`.
+            comptime TILE = _t2d_tile[dtype]()
+            var batch = d0 * d1
+            if (
+                d2 > 1
+                and d3 > 1
+                and total >= 1024
+                and s2 == 1
+                and s3 >= d2
+                and (d0 == 1 or s0 == d1 * s1)
+                and (batch == 1 or s1 >= d3 * s3)
+            ):
+                _enqueue_cached[_transpose2d_kernel[dtype]](
+                    ctx,
+                    String(t"transpose2d_{dtype}"),
+                    (d3 + TILE - 1) // TILE,
+                    min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
+                    min(batch, _MAX_GRID_Y),
+                    TILE * _T2D_ROWS,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    d2,
+                    d3,
+                    s3,
+                    batch,
+                    d2 * d3,
+                    s1 if batch > 1 else 0,
+                )
+                return
             _enqueue_cached[_permute_copy_kernel[dtype]](
                 ctx,
                 String(t"dm_permute_{dtype}"),
@@ -903,7 +1049,67 @@ def _where_select_go(
 
 # ---------------------------------------------------------------------------
 # Elementwise dtype cast between contiguous buffers of the same shape.
+#
+# A cast is pure bandwidth, so the only thing that matters is how many bytes a
+# lane moves. This used to go through `elementwise` with `simd_width=1`: a
+# BF16 store used 2 bytes of a 16-byte access, and every element paid its own
+# address arithmetic and loop iteration. That sustained 3.3-3.7 TB/s of the
+# ~4.1 TB/s a streaming copy gets on gfx942; one VEC-wide slot per thread with
+# the grid sized to cover the slots exactly reaches 4.0-4.4, and going through
+# `_enqueue_cached` also drops `elementwise`'s per-call `compile_function`.
+#
+# VEC is a compile-time regime and which one runs is a runtime decision: the
+# widest whose access is naturally aligned for BOTH operands, down to 1. That
+# check has to be on the addresses themselves -- a tensor can start at any
+# element offset inside its storage (`x[1:]`), and the `alignment` parameter
+# `elementwise` passes its body is the vector width, not a promise about the
+# base pointer. An element count that is not a multiple of VEC leaves at most
+# VEC-1 elements over, which the first VEC-1 threads finish one at a time.
 # ---------------------------------------------------------------------------
+
+# Grid geometry is `_bw_blocks` in op_utils, which carries the measurements.
+comptime CAST_THREADS = GS_THREADS
+
+
+def _cast_vec_kernel[
+    src: DType, dst: DType, VEC: Int
+](
+    out_ptr: UnsafePointer[Scalar[dst], MutAnyOrigin],
+    in_ptr: UnsafePointer[Scalar[src], ImmutAnyOrigin],
+    nvec: Int,
+    size: Int,
+):
+    """`out[i] = cast(in[i])` for `size` elements, VEC of them per thread."""
+    comptime IALIGN = min(16, VEC * size_of[src]())
+    comptime OALIGN = min(16, VEC * size_of[dst]())
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var j = tid
+    while j < nvec:
+        var v = in_ptr.load[width=VEC, alignment=IALIGN](j * VEC)
+        comptime if dst == DType.bool:
+            # An `i1` vector is not a storable value. Torch's bool is one byte
+            # holding 0 or 1, so build those bytes and store them.
+            out_ptr.bitcast[Scalar[DType.uint8]]().store[
+                width=VEC, alignment=OALIGN
+            ](
+                j * VEC,
+                v.ne(SIMD[src, VEC](0)).select(
+                    SIMD[DType.uint8, VEC](1), SIMD[DType.uint8, VEC](0)
+                ),
+            )
+        else:
+            out_ptr.store[width=VEC, alignment=OALIGN](j * VEC, v.cast[dst]())
+        j += gstride
+    # The tail is at most VEC-1 elements and the grid is never narrower than
+    # one CAST_THREADS-wide block, so the leading threads cover all of it.
+    var t = nvec * VEC + tid
+    if t < size:
+        var a = in_ptr[t]
+        comptime if dst == DType.bool:
+            out_ptr[t] = Scalar[dst](a != Scalar[src](0))
+        else:
+            out_ptr[t] = a.cast[dst]()
 
 
 @always_inline
@@ -912,19 +1118,83 @@ def _cast[
 ](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
     var out_ptr = _make_ptr[dst](out_addr)
     var in_ptr = _make_ptr[src](in_addr)
+    if size == 0:
+        return
 
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var a = in_ptr[i]
-        comptime if dst == DType.bool:
-            out_ptr[i] = Scalar[dst](a != Scalar[src](0))
-        else:
-            out_ptr[i] = a.cast[dst]()
+    if ctx.api() == "cpu":
 
-    _parallel_for[func](size, ctx)
+        @always_inline
+        @parameter
+        @__copy_capture(out_ptr, in_ptr)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var a = in_ptr[i]
+            comptime if dst == DType.bool:
+                out_ptr[i] = Scalar[dst](a != Scalar[src](0))
+            else:
+                out_ptr[i] = a.cast[dst]()
+
+        elementwise[func, simd_width=1](Coord(size), ctx)
+        return
+
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
+    else:
+
+        @always_inline
+        @parameter
+        def _try_cast[VEC: Int]() raises -> Bool:
+            comptime IALIGN = min(16, VEC * size_of[src]())
+            comptime OALIGN = min(16, VEC * size_of[dst]())
+            if in_addr % IALIGN != 0 or out_addr % OALIGN != 0:
+                return False
+            var nvec = size // VEC
+            # One 16-byte access per thread on the wider operand. At the widest
+            # VEC that is one slot per thread and the grid covers the slots
+            # exactly; a narrower VEC (taken only when the addresses are not
+            # vector-aligned) gets proportionally more slots per thread instead
+            # of a proportionally larger grid, which measured 49.8 us against
+            # 112 us for one 4-byte element per thread on [48, 1024, 768].
+            comptime SLOTS = max(
+                1, 16 // (VEC * max(size_of[src](), size_of[dst]()))
+            )
+            _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
+                ctx,
+                String(t"dm_cast_{src}_{dst}_v{VEC}"),
+                _bw_blocks(
+                    nvec,
+                    SLOTS,
+                    SLOTS == 1
+                    and size * (size_of[src]() + size_of[dst]()) <= _LLC_BYTES,
+                    ctx,
+                ),
+                1,
+                1,
+                CAST_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                in_ptr.as_unsafe_any_origin().as_immutable(),
+                nvec,
+                size,
+            )
+            return True
+
+        # 16 bytes per lane on the wider operand; the narrower one moves half
+        # of that. Wider than 16 measured no better on either nanoGPT shape.
+        comptime WIDEST = 16 // max(size_of[src](), size_of[dst]())
+        comptime if WIDEST >= 16:
+            if _try_cast[16]():
+                return
+        comptime if WIDEST >= 8:
+            if _try_cast[8]():
+                return
+        comptime if WIDEST >= 4:
+            if _try_cast[4]():
+                return
+        comptime if WIDEST >= 2:
+            if _try_cast[2]():
+                return
+        # VEC=1 needs no alignment, so this always launches.
+        _ = _try_cast[1]()
 
 
 # The dtypes fast cast supports on either end. Both the src and dst
