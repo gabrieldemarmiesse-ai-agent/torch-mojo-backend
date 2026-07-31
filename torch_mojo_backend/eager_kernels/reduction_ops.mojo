@@ -36,7 +36,12 @@ from std.memory.unsafe import bitcast
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys._assembly import inlined_assembly
-from std.sys.info import has_accelerator, is_nvidia_gpu, size_of
+from std.sys.info import (
+    has_apple_gpu_accelerator,
+    has_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
@@ -1571,7 +1576,15 @@ def _log_softmax_spec_go(a_o: PyObjectPtr) raises -> PyObjectPtr:
     var nbytes = a.numel * a.itemsize
     var buf = ctx.enqueue_create_buffer[DType.uint8](max(nbytes, 1))
     var addr = Int(buf.unsafe_ptr())
-    if a.contig:
+    # The row kernel's scalar head/tail corrects per-row phase but assumes a
+    # 16-byte-aligned base: its vector loads claim that alignment. A sliced
+    # (contiguous, base-misaligned) input silently violates the claim — the
+    # MI300X path tolerates it, Metal returns wrong lanes — so Apple routes
+    # misaligned bases through the aligned scratch copy below.
+    var base_aligned = True
+    comptime if has_apple_gpu_accelerator():
+        base_aligned = a.ptr % 16 == 0
+    if a.contig and base_aligned:
         comptime for dt in FLOAT_DTYPES:
             if a.dtype == dt:
                 _log_softmax_rows[dt](addr, a.ptr, rows, cols, ctx)

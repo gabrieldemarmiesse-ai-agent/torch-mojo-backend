@@ -3974,15 +3974,18 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     assert [path.name for path in aten_fast._BF16_SOURCE_PATHS] == [
         "bf16_matmul_ops.mojo",
         "bf16_gemm_v3_kernels.mojo",
+        "bf16_gemm_tn_v4_kernels.mojo",
         "bf16_gemm_kernels.mojo",
     ]
-    bridge_path, v3_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
+    bridge_path, v3_path, tn_v4_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
     bridge_source = bridge_path.read_text()
     v3_source = v3_path.read_text()
+    tn_v4_source = tn_v4_path.read_text()
     fallback_source = fallback_path.read_text()
 
     assert "from bf16_gemm_v3_kernels import" in bridge_source
     assert "from bf16_gemm_kernels import (" in v3_source
+    assert "from bf16_gemm_tn_v4_kernels import" in v3_source
     for kernel_name in (
         "nanogpt_bf16_gemm_v3_nn_ws_m64n128_tma_s3",
         "nanogpt_bf16_gemm_v3_nn_ws_m128n256_tma_s3",
@@ -4016,7 +4019,7 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert scratch_only not in v3_source
 
-    for source in (bridge_source, v3_source, fallback_source):
+    for source in (bridge_source, v3_source, tn_v4_source, fallback_source):
         for forbidden in (
             ".synchronize(",
             "devicecontext(",
@@ -6347,8 +6350,10 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     original_causal_bmm = aten_fast._try_sdpa_causal_bmm
     original_transpose_b_bmm = aten_fast._fast_aten_bmm_transpose_b
     original_fused_backward = aten_fast.fast_sdpa_dropout_softmax_backward
+    original_fused_route = aten_fast.fast_sdpa_backward
     original_materialize = TorchMojoTensor._materialize_contiguous
     materialized_shapes = []
+    fused_route_handled = []
 
     def spy_bmm(*args):
         calls["bmm"] += 1
@@ -6372,6 +6377,11 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
         calls["fused_backward"] += 1
         return original_fused_backward(*args)
 
+    def spy_fused_route(*args, **kwargs):
+        result = original_fused_route(*args, **kwargs)
+        fused_route_handled.append(result is not aten_fast.NOT_HANDLED)
+        return result
+
     def spy_materialize(self):
         materialized_shapes.append(tuple(self._shape))
         return original_materialize(self)
@@ -6382,6 +6392,7 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     monkeypatch.setattr(
         aten_fast, "fast_sdpa_dropout_softmax_backward", spy_fused_backward
     )
+    monkeypatch.setattr(aten_fast, "fast_sdpa_backward", spy_fused_route)
     monkeypatch.setattr(TorchMojoTensor, "_materialize_contiguous", spy_materialize)
 
     actual_inputs = [
@@ -6398,11 +6409,16 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     calls.update(bmm=0, transpose_b_bmm=0, fused_backward=0)
     actual_output.backward(grad_output.to(mojo_gpu))
 
-    assert calls == {
-        "bmm": expected_bmm,
-        "transpose_b_bmm": expected_transpose_b_bmm,
-        "fused_backward": expected_fused_backward,
-    }
+    if fused_route_handled == [True]:
+        # The Apple fused route replaces every composed branch outright; its
+        # own launches respect the same dependency pruning by construction.
+        assert calls == {"bmm": 0, "transpose_b_bmm": 0, "fused_backward": 0}
+    else:
+        assert calls == {
+            "bmm": expected_bmm,
+            "transpose_b_bmm": expected_transpose_b_bmm,
+            "fused_backward": expected_fused_backward,
+        }
     # Neither the old P^T nor dScores^T (both SxL) may be materialized.
     assert (batch * heads, key_length, query_length) not in materialized_shapes
     for name, actual, reference in zip(
