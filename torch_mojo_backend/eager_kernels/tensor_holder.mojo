@@ -466,8 +466,8 @@ def _copy_strided_dispatcher(
         _copy_strided_go(
             args[0], args[1], args[2], args[3], args[4], args[5], args[6]
         )
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
@@ -552,15 +552,15 @@ def _strided_fill_dispatcher(
     var args = UnsafePointer(args_safe)
     try:
         _strided_fill_go(args[0], args[1], args[2], args[3], args[4], args[5])
-    except:
-        pass
+    except e:
+        return _spec_unsupported(e)
     return _raw_ret_none()
 
 
 # ===========================================================================
 # TensorSpec constructor (`make_spec`, the one Python-facing spec
 # constructor). The shared infrastructure (TensorSpec/TensorHolder structs,
-# _spec_ptr, _spec_result, _spec_unsupported) lives in `op_utils`; spec ops
+# _spec_ptr, _spec_unsupported) lives in `op_utils`; spec ops
 # live next to their kernels (see docs/tensor_spec_design.md §3).
 # ===========================================================================
 

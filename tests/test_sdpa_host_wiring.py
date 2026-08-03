@@ -50,7 +50,9 @@ def _query_gradient_context(has_dropout: bool) -> SimpleNamespace:
 
 
 def test_sdpa_backward_bridge_is_lazy_registered() -> None:
-    assert "sdpa_backward_ops" in eager_kernels._MOJO_MODULES
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    assert aten_fast._SdpaBackwardExtension.MOJO_FILE.name == "sdpa_backward_ops.mojo"
 
 
 def test_missing_sdpa_kernel_module_returns_not_handled_before_device_work(
@@ -80,10 +82,12 @@ def test_missing_sdpa_kernel_module_returns_not_handled_before_device_work(
         (tmp_path / "missing_fable_kernel.mojo",),
     )
 
-    def forbidden_import(_name: str):
+    def forbidden_load(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("absent SDPA kernel triggered lazy Mojo compilation")
 
-    monkeypatch.setattr(eager_kernels, "_import_mojo_module", forbidden_import)
+    monkeypatch.setattr(
+        eager_kernels.MOJO_EXTENSION_LOADER, "load_canonical", forbidden_load
+    )
     result = aten_fast.fast_sdpa_dropout_softmax_backward(
         probabilities, grad, None, object(), 0.5
     )
@@ -120,6 +124,7 @@ def test_sdpa_query_gradient_prefers_fused_dropout_softmax_backward(
 
     fake_fast = SimpleNamespace(
         NOT_HANDLED=not_handled,
+        fast_sdpa_backward=lambda *_args: not_handled,
         _fast_aten_bmm_transpose_b=probability_gradient,
         fast_sdpa_dropout_softmax_backward=fused,
         fast_aten_bmm=query_gradient,
@@ -188,6 +193,7 @@ def test_sdpa_fused_not_handled_preserves_decomposition_order(
 
     fake_fast = SimpleNamespace(
         NOT_HANDLED=not_handled,
+        fast_sdpa_backward=lambda *_args: not_handled,
         _fast_aten_bmm_transpose_b=probability_gradient,
         fast_sdpa_dropout_softmax_backward=lambda *_args: not_handled,
         fast_aten_native_dropout_backward=dropout,
@@ -260,6 +266,7 @@ def test_sdpa_value_only_gradient_skips_fused_score_gradient(
 
     fake_fast = SimpleNamespace(
         NOT_HANDLED=not_handled,
+        fast_sdpa_backward=lambda *_args: not_handled,
         fast_aten_native_dropout_backward=dropout,
         fast_aten_transpose=transpose,
         fast_aten_bmm=bmm,

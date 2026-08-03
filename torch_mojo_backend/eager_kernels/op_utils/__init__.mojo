@@ -11,11 +11,17 @@ from std.builtin.device_passable import DevicePassable
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import barrier, block_dim, block_idx, grid_dim, thread_idx
 from std.gpu.host import DeviceBuffer, DeviceContext
-from std.math import ceildiv
+from std.math import ceildiv, sqrt
 from std.memory import OpaquePointer, alloc, stack_allocation
 from std.python import Python, PythonObject
-from std.python._cpython import PyObjectPtr
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.python._cpython import PyObjectPtr, Py_ssize_t
+from std.sys import llvm_intrinsic
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils import IndexList
 from std.utils.coord import Coord
 
@@ -25,6 +31,64 @@ from std.utils.coord import Coord
 # runtime dtype, which unrolls into the same `if dtype == ...` chain without
 # repeating the call site once per dtype.
 comptime FLOAT_DTYPES = [DType.float32, DType.float16, DType.bfloat16]
+
+
+# ===========================================================================
+# Correctly rounded square root
+# ===========================================================================
+#
+# `std.math.sqrt` is not IEEE-754 on NVIDIA. Its NVIDIA arm routes every float
+# dtype through `_sqrt_nvvm`, i.e. `llvm.nvvm.sqrt.approx.ftz.f`
+# (`mojo/stdlib/std/math/math.mojo`), and that is a property of the stdlib,
+# not of any fast-math flag we could turn off. PTX documents `sqrt.approx` at
+# up to 2 ulp, and `.ftz` flushes denormals to zero on input AND output, so a
+# value whose true root is denormal comes back as exactly 0. Neither is a
+# precision preference: a zeroed AdamW denominator is a wrong answer, and a
+# 1-2 ulp drift means no eager op that returns a square root can be compared
+# bit-for-bit against ATen on CPU or CUDA.
+#
+# `llvm.sqrt` lowers to `sqrt.rn.f32` / `sqrt.rn.f64` on NVPTX -- correctly
+# rounded and denormal preserving -- so the override is a plain intrinsic
+# swap; no inline PTX is needed. Every other target already reaches the right
+# instruction through `std.math.sqrt` itself, which is why the fast path stays
+# gated on `is_nvidia_gpu()`: AMD expands `llvm.sqrt` to `v_sqrt_f32` plus the
+# denormal rescale and the +-1 ulp fma correction (verified in the emitted
+# gfx942 assembly), and Apple uses `llvm.air.sqrt`.
+@always_inline
+def ieee_sqrt[
+    dtype: DType, width: SIMDSize, //
+](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """Elementwise square root that is correctly rounded on every backend.
+
+    Use this, not `std.math.sqrt`, wherever the root reaches a user-visible
+    result. `std.math.sqrt` remains the right call only where the value feeds
+    a heuristic that never leaves the kernel.
+
+    Parameters:
+        dtype: Element type of the input and output vector.
+        width: SIMD width of the input and output vector.
+
+    Args:
+        x: Vector to take the square root of.
+
+    Returns:
+        The elementwise square root of `x`.
+    """
+    comptime if is_nvidia_gpu() and dtype.is_floating_point():
+        comptime if dtype in (DType.float16, DType.bfloat16):
+            # Widening is exact, and f32 carries at least 2p+2 bits for both
+            # 16-bit formats (24 >= 2*11+2 for f16, 24 >= 2*8+2 for bf16), so
+            # rounding a correctly rounded f32 root back down is itself
+            # correctly rounded -- the classic no-double-rounding bound.
+            return llvm_intrinsic[
+                "llvm.sqrt", SIMD[DType.float32, width], has_side_effect=False
+            ](x.cast[DType.float32]()).cast[dtype]()
+        else:
+            return llvm_intrinsic[
+                "llvm.sqrt", SIMD[dtype, width], has_side_effect=False
+            ](x)
+    else:
+        return sqrt(x)
 
 
 @always_inline
@@ -310,8 +374,9 @@ def _raw_tuple_len(t: PyObjectPtr) -> Int:
 # silent memory corruption.
 #
 # Spec ops (see docs/tensor_spec_design.md) do the whole op prologue in one
-# boundary call: input checks, geometry, output alloc, kernel launch, and
-# return `(holder, out_spec, shape_tuple, data_ptr)` via `_spec_result`.
+# boundary call: input checks, geometry, and the kernel launch. The output is
+# always allocated by Python and handed in as a trailing spec, so a spec op
+# writes into it and returns None — there is no allocating return ABI.
 # Errors are REAL: dispatchers catch Mojo errors and return
 # `_spec_unsupported(e)`, which raises NotImplementedError into Python;
 # the Python callers treat that as "take the classic path".
@@ -424,6 +489,36 @@ struct TensorSpec(Movable, Writable):
 
 
 @always_inline
+def _check_into_sized(
+    a: TensorSpec, dst: TensorSpec, expected_numel: Int, expected_dtype: DType
+) raises:
+    """Validate an Into-ABI output whose element count the op computes.
+
+    Reductions and shape-changing ops pass the count they derived (rows,
+    m*n, ...); same-shape ops go through ``_check_into``.
+    (``dst``, not ``out``: that name is Mojo's result-argument keyword.)
+    """
+    if (
+        dst.numel != expected_numel
+        or not dst.contig
+        or dst.ctx_ptr != a.ctx_ptr
+    ):
+        raise Error("mojo spec into: output buffer mismatch")
+    if dst.dtype != expected_dtype:
+        raise Error("mojo spec into: output dtype mismatch")
+
+
+@always_inline
+def _check_into(a: TensorSpec, dst: TensorSpec, expected_dtype: DType) raises:
+    """Validate an Into-ABI output against its input's buffer geometry.
+
+    The shared form of every bridge's preallocated-output check: same element
+    count, contiguous, same device, and exactly the dtype Python inferred.
+    """
+    _check_into_sized(a, dst, a.numel, expected_dtype)
+
+
+@always_inline
 def _spec_ptr(o: PyObjectPtr) -> UnsafePointer[TensorSpec, MutAnyOrigin]:
     """The TensorSpec behind a borrowed spec argument — a pure pointer cast.
 
@@ -448,6 +543,442 @@ def _spec_unsupported(e: Error) -> PyObjectPtr:
     return PyObjectPtr()
 
 
+# ===========================================================================
+# Arity-generic METH_FASTCALL dispatchers
+# ===========================================================================
+#
+# Every spec entry point shares one skeleton: check the argument count, hand
+# the raw PyObjectPtr arguments to a `_go` function (which does its own
+# conversion and validation), return None, and translate any Error into
+# Python's NotImplementedError. Only the arity and the target differ, so the
+# target is a compile-time function parameter — the same idiom
+# `_enqueue_cached` uses — and one dispatcher per observed arity replaces the
+# per-op copies. `what` names the op family in the arity error.
+
+
+def _spec_dispatcher2[
+    go: def(PyObjectPtr, PyObjectPtr) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 2:
+            raise Error(what, " expects exactly 2 arguments")
+        go(args[0], args[1])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher3[
+    go: def(PyObjectPtr, PyObjectPtr, PyObjectPtr) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 3:
+            raise Error(what, " expects exactly 3 arguments")
+        go(args[0], args[1], args[2])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher4[
+    go: def(
+        PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 4:
+            raise Error(what, " expects exactly 4 arguments")
+        go(args[0], args[1], args[2], args[3])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher5[
+    go: def(
+        PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr, PyObjectPtr
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 5:
+            raise Error(what, " expects exactly 5 arguments")
+        go(args[0], args[1], args[2], args[3], args[4])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher6[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 6:
+            raise Error(what, " expects exactly 6 arguments")
+        go(args[0], args[1], args[2], args[3], args[4], args[5])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher7[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 7:
+            raise Error(what, " expects exactly 7 arguments")
+        go(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher8[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 8:
+            raise Error(what, " expects exactly 8 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher9[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 9:
+            raise Error(what, " expects exactly 9 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher10[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 10:
+            raise Error(what, " expects exactly 10 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher11[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 11:
+            raise Error(what, " expects exactly 11 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher12[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 12:
+            raise Error(what, " expects exactly 12 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[11],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher13[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 13:
+            raise Error(what, " expects exactly 13 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[11],
+            args[12],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
+def _spec_dispatcher15[
+    go: def(
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+        PyObjectPtr,
+    ) raises thin -> None,
+    what: StaticString = "spec op",
+](
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        if nargs != 15:
+            raise Error(what, " expects exactly 15 arguments")
+        go(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            args[6],
+            args[7],
+            args[8],
+            args[9],
+            args[10],
+            args[11],
+            args[12],
+            args[13],
+            args[14],
+        )
+        return _raw_ret_none()
+    except e:
+        return _spec_unsupported(e)
+
+
 @always_inline
 def _row_major8(shape: IndexList[MAX_RANK], rank: Int) -> IndexList[MAX_RANK]:
     """Row-major element strides over the trailing `rank` slots (leading 0s)."""
@@ -458,100 +989,6 @@ def _row_major8(shape: IndexList[MAX_RANK], rank: Int) -> IndexList[MAX_RANK]:
         strides[i] = acc
         acc *= shape[i]
     return strides
-
-
-@always_inline
-def _spec_group(
-    var buf: DeviceBuffer[DType.uint8],
-    addr: Int,
-    nbytes: Int,
-    rank: Int,
-    shape: IndexList[MAX_RANK],
-    dtype: DType,
-    itemsize: Int,
-    numel: Int,
-    ctx_ptr: Int,
-) raises -> PythonObject:
-    """One (holder, out_spec, shape_tuple, data_ptr) group for a fresh
-    contiguous output — everything Python needs to mint the torch wrapper."""
-    var spec_obj = PythonObject(
-        alloc=TensorSpec(
-            ptr=addr,
-            rank=rank,
-            shape=shape,
-            strides=_row_major8(shape, rank),
-            offset=0,
-            dtype=dtype,
-            itemsize=itemsize,
-            numel=numel,
-            contig=True,
-            ctx_ptr=ctx_ptr,
-        )
-    )
-    var holder_obj = PythonObject(alloc=TensorHolder(buf=buf^, nbytes=nbytes))
-    ref cpy = Python().cpython()
-    var shape_tuple = cpy.PyTuple_New(rank)
-    for i in range(rank):
-        _ = cpy.PyTuple_SetItem(
-            shape_tuple, i, cpy.PyLong_FromSsize_t(shape[MAX_RANK - rank + i])
-        )
-    return Python.tuple(
-        holder_obj^,
-        spec_obj^,
-        PythonObject(from_owned=shape_tuple),
-        PythonObject(addr),
-    )
-
-
-@always_inline
-def _spec_result(
-    var buf: DeviceBuffer[DType.uint8],
-    addr: Int,
-    nbytes: Int,
-    rank: Int,
-    shape: IndexList[MAX_RANK],
-    dtype: DType,
-    itemsize: Int,
-    numel: Int,
-    ctx_ptr: Int,
-) raises -> PyObjectPtr:
-    """Single-output spec-op result: one (holder, spec, shape, ptr) tuple."""
-    var group = _spec_group(
-        buf^, addr, nbytes, rank, shape, dtype, itemsize, numel, ctx_ptr
-    )
-    return group^.steal_data()
-
-
-@always_inline
-def _spec_result2(
-    var buf1: DeviceBuffer[DType.uint8],
-    addr1: Int,
-    nbytes1: Int,
-    rank1: Int,
-    shape1: IndexList[MAX_RANK],
-    dtype1: DType,
-    itemsize1: Int,
-    numel1: Int,
-    var buf2: DeviceBuffer[DType.uint8],
-    addr2: Int,
-    nbytes2: Int,
-    rank2: Int,
-    shape2: IndexList[MAX_RANK],
-    dtype2: DType,
-    itemsize2: Int,
-    numel2: Int,
-    ctx_ptr: Int,
-) raises -> PyObjectPtr:
-    """Two-output spec-op result: ((holder, spec, shape, ptr) x 2) in ONE
-    tuple, so multi-output ops stay one boundary call."""
-    var g1 = _spec_group(
-        buf1^, addr1, nbytes1, rank1, shape1, dtype1, itemsize1, numel1, ctx_ptr
-    )
-    var g2 = _spec_group(
-        buf2^, addr2, nbytes2, rank2, shape2, dtype2, itemsize2, numel2, ctx_ptr
-    )
-    var result = Python.tuple(g1^, g2^)
-    return result^.steal_data()
 
 
 @always_inline
@@ -1022,21 +1459,17 @@ def _reduce_spec_geom(
     mut cols: Int,
     mut out_rank: Int,
     mut oshape: IndexList[MAX_RANK],
-    mut pshape: IndexList[MAX_RANK],
-    mut pstrides: IndexList[MAX_RANK],
-    mut needs_copy: Bool,
 ) raises:
-    """Geometry for a reduction spec op over arbitrary (sorted, normalized)
-    reduce dims — Python only parses the dim spec.
+    """Geometry for a reduction spec op over trailing reduce dims of a
+    contiguous operand — Python parses the dim spec AND pre-materializes.
 
-    (pshape, pstrides) is the permuted logical layout — kept dims ascending,
-    then reduce dims ascending, trailing-aligned — i.e. the layout the
-    Python classic path used to build with permute+materialize. When the
-    input is contiguous with trailing reduce dims (the hot path) it is
-    already exactly that layout and `needs_copy` stays False; otherwise the
-    caller materializes it via `_scratch_copy` inside the call. The output
-    shape is leading-padded for `out_rank`: keepdim puts 1s at the original
-    reduce positions; otherwise the kept dims pack the trailing slots.
+    Any other layout raises: the Python routes permute+materialize through
+    the queued strided copy (aten_fast._reduce_ready_operand), so the
+    transient is allocated by `_alloc` — metered by the run-ahead budget
+    and covered by the allocation retry — instead of by an invisible
+    Mojo-side scratch buffer. The output shape is leading-padded for
+    `out_rank`: keepdim puts 1s at the original reduce positions;
+    otherwise the kept dims pack the trailing slots.
     """
     var n = _raw_tuple_len(rdims_t)
     if n > a.rank:
@@ -1048,28 +1481,25 @@ def _reduce_spec_geom(
             raise Error("mojo spec reduce: reduce dim out of range")
         is_red[MAX_RANK - a.rank + d] = 1
 
-    pshape = IndexList[MAX_RANK](1)
-    pstrides = IndexList[MAX_RANK](0)
-    var w = MAX_RANK - a.rank
-    rows = 1
-    for i in range(MAX_RANK - a.rank, MAX_RANK):
-        if is_red[i] == 0:
-            pshape[w] = a.shape[i]
-            pstrides[w] = a.strides[i]
-            rows *= a.shape[i]
-            w += 1
-    cols = 1
-    for i in range(MAX_RANK - a.rank, MAX_RANK):
-        if is_red[i] == 1:
-            pshape[w] = a.shape[i]
-            pstrides[w] = a.strides[i]
-            cols *= a.shape[i]
-            w += 1
-
-    needs_copy = not a.contig
+    if not a.contig:
+        raise Error(
+            "mojo spec reduce: operand must be contiguous (Python"
+            " pre-materializes)"
+        )
     for k in range(n):
         if _raw_tuple_int(rdims_t, k) != a.rank - n + k:
-            needs_copy = True
+            raise Error(
+                "mojo spec reduce: reduce dims must be trailing (Python"
+                " pre-materializes)"
+            )
+
+    rows = 1
+    cols = 1
+    for i in range(MAX_RANK - a.rank, MAX_RANK):
+        if is_red[i] == 0:
+            rows *= a.shape[i]
+        else:
+            cols *= a.shape[i]
 
     oshape = IndexList[MAX_RANK](1)
     if _raw_int(keepdim_o) != 0:
