@@ -114,9 +114,13 @@ Ask a subagent to explore the directory `../modular/max` to find:
 ### Step 6: Implement the Operation
 Write the ATen operation implementation in `aten_functions.py` just below the signature comment:
 
-**Important**: The implementation must support **both execution modes**:
-- **Graph Mode**: Works with `TensorValue` (symbolic tensors)
-- **Eager Mode**: Works with `MaxEagerTensor` (actual tensors)
+**Important**: `aten_functions.py` serves the **torch.compile backend only**
+(the mojo-device eager mode has its own fast implementations — see Step 7).
+The implementation must still accept both value types the compile backend can
+feed it:
+- `TensorValue` (symbolic tensors, real graph building)
+- `MaxEagerTensor` (MAX's eager interpreter — the test suite runs with
+  `MAX_USE_EAGER_INTERPRETER=1`)
 
 Use the type hint `MaxTensor = TensorValue | MaxEagerTensor` for tensor parameters.
 
@@ -131,17 +135,40 @@ def aten__log_softmax(
 ```
 
 ### Step 7: Register for Eager Mode Execution
-Add the operation to `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`:
+Eager mode has **no graph fallback**: every op is either bound to a fast
+implementation (Mojo kernels over raw pointers) or raises
+`NotImplementedError`. (The old `wrap_for_mojo_device` wrapper no longer
+exists.) Two places are involved:
 
-You'll likely need to write mojo code, even if it's only to import `from nn import ...`. If a fully dynamic function to handle the aten op is not available in the modular repo, write it yourself.
+1. Write the fast implementation `fast_aten_<op>` in
+   `torch_mojo_backend/eager_kernels/aten_fast.py`. It receives
+   `TorchMojoTensor`s (a Mojo `TensorHolder` ownership token plus `_ptr` /
+   `_shape` / `_strides` / `_offset` / `_dtype` / `_device`) and runs one or
+   a few kernel calls from an `eager_kernels/<family>/` extension. View ops
+   are zero-copy wrapper math (no kernel at all). Return the `NOT_HANDLED`
+   sentinel to decline inputs you don't handle — the registration turns it
+   into an actionable `NotImplementedError`.
+2. Bind it in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py`, in
+   alphabetical order within the file:
+
+   ```python
+   _register_fast("aten::<op>", "fast_aten_<op>")
+   ```
+
+   Related helpers: `_out_variant(...)` wraps a functional fast impl as an
+   `out=` variant; `_register_foreach_inplace(...)` covers `_foreach_*_`
+   ops; operations requiring custom device handling (like
+   `aten::_copy_from`) use `@register_aten_op("aten::<op>")` on a
+   hand-written function directly.
+
+If the op needs a new Mojo kernel, add it to the matching
+`eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
+one specialization per (OP, DTYPE) on first use and caches it in
+`__mojocache__`). You may import kernels from the modular repo inside the
+`.mojo` file (`from nn import ...`) only if they don't call
+CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
+available in the modular repo, write the kernel yourself.
 If you have access to multiple gpus, the aten function should work on all those gpus.
-
-Place the registration in alphabetical order within the file. The `wrap_for_mojo_device` wrapper automatically:
-- Converts `TorchMojoTensor` inputs to `MaxEagerTensor`
-- Executes the operation
-- Converts results back to `TorchMojoTensor`
-
-**Note**: For operations requiring custom device handling (like `aten::_copy_from`), you can implement a custom function directly instead of using `wrap_for_mojo_device`.
 
 ### Step 8: Re-run Tests
 Run the unit tests again and verify they pass:
@@ -161,10 +188,12 @@ uvx pre-commit run --all-files
 
 **Do not run the whole test suite** as it takes too long. Only run tests for the specific operation you added.
 
-### Summary: Two-Part Implementation
-When adding an operation, you need to update **two files**:
-1. **`aten_functions.py`**: Core implementation (works for both modes)
-2. **`mojo_device_aten_ops.py`**: Registration for eager mode execution
+### Summary: Implementation Checklist
+When adding an operation, you typically update **three places**:
+1. **`aten_functions.py`**: torch.compile backend implementation (MAX ops composition)
+2. **`eager_kernels/aten_fast.py`**: fast eager implementation over
+   `TorchMojoTensor` (plus a Mojo kernel in `eager_kernels/<family>/` when needed)
+3. **`mojo_device_aten_ops.py`**: the `_register_fast(...)` binding for eager mode
 
 This ensures the operation works in both `torch.compile()` and on the `mojo` device.
 
@@ -247,3 +276,28 @@ bill of health.
 When a tuning constant was measured on one architecture, say so where it is
 defined, the way `LSM_BLOCKS_PER_CU` and `LSM_L2_BUDGET` do. The next agent
 needs to know which numbers are portable and which were fitted to one card.
+
+
+## Optimizing a kernel
+
+When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
+- Unit tests for the kernels (outside the main test suite), the unit tests should acquire the flock `/tmp/gpu_lock_{gpu_id}.lock`.
+- A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The benchmark should use a flock in /tmp/gpu_lock_{gpu_id}.lock to avoid using the gpu at the same time as other benchmarks. `ncu` or rocprof or equivalent should be given to the agent.
+- The harness should only measure the total gpu time, not the wall time as the wall time can be worked on later on.
+- The harness should also include reference numbers, so roofline estimate, and the performance of stock pytorch on the same input shapes (device time too, not wall time).
+- The scope of the agent should be as limited as possible, for example, if writing a gemm, the agent should only take care of the TN variant, or NT but not all variants. It should only focus on one dtype. (if multiple dtypes are needed, we'll do the dance Agent A, Agent B for dtype1 and then Agent A Agent B for dtype2, etc..., with a bit of luck for dtype2, agent A can reuse the code of dtype1 and just change the dtype, which will be easy to integrate later by agent B by parametrizing the code).
+- The agent should write the kernel outside the codebase, but the agent can import code from it, or import code from the modular repo. This is to avoid having the agent work on integrating the kernel into the codebase, the agent should only focus on the kernel itself. 
+- The performance work is done when 1) The kernel is within 2% of the stock pytorch performance on the same input shapes AND 2) The kernel is within 20% of the roofline estimate.
+
+A small agent A2 should be used for a quick code review, notably just check that the kernel respects the rules of the eager mode and the tests are passing. No need for a very smart model here.
+
+When subagent A is done, a subagent B should start to integrate the kernel into the codebase. The subagent B should first:
+- Add those harness tests in the ` tests/test_eager_kernels.py` file.
+- Add benchmarks for the `benchmarks/` directory.  `ncu` or rocprof or equivalent should be given to the agent.
+- Export the ptx/asm of the kernel into a temporary directory.
+- Then integrate the kernel into the codebase, make sure the tests are passing and the benchmarks are as good as before. The subagent B can also generate the ptx/asm of its implementation to help, even if it doesn't need to match exactly the ptx/asm of the agent A kernel. The subagent B should take the decision to either use metaprogramming to adapt a kernel already in the codebase to perform the work of the new kernel given some specific parameter, or to write new code. Duplication should be avoided if possible so if the agent find out that some function/piece of code is already used in the codebase, the agent should perform a refactoring to reuse this code.
+- The agent B should not degrade the performance of existing kernels, dtypes, shapes, other gpus, etc...
+
+When subagent B is done, a subagent C should do a code review of B and run benchmarks to make sure that the performance has not regressed for other dtypes, shapes, similar kernels, other gpus etc... Cross-compilation can be used to check that the assembly/ptx didn't change much. But worst case scenario, other gpus are available to run benchmarks through ssh.
+
+When agents A, B and C are all done, all the temporary files of agent A should be removed and a commit should be made.
