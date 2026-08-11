@@ -26,19 +26,18 @@ physical row-major (K, M) and loaded directly into an MN-major shared tile,
 which is the column-major A representation accepted by SM90 WGMMA.
 """
 
-from std.gpu import (
-    MAX_THREADS_PER_BLOCK_METADATA,
-    barrier,
-    block_idx,
-    thread_idx,
-)
-from std.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.gpu.host.nvidia.tma import (
-    TensorMapSwizzle,
-    create_tma_descriptor,
+from max.gpu.sync import barrier
+from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, thread_idx
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
+from max.gpu.compute.mma import (
+    wgmma_async,
+    wgmma_commit_group_sync,
+    wgmma_fence_aligned,
+    wgmma_wait_group_sync,
 )
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from std.gpu.memory import AddressSpace
+from std.memory import AddressSpace
 from std.memory import stack_allocation
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
@@ -323,11 +322,17 @@ def _v4_tn_splitk_m128n256_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
     ws: _V4_F32_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
-    chunk_tiles: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8](
         a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
     )
@@ -350,11 +355,17 @@ def _v4_nt_splitk_m128n256_s4(
     ],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
     ws: _V4_F32_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
-    chunk_tiles: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, True](
         a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
     )
@@ -372,11 +383,17 @@ def _v4_nn_splitk_m128n256_s4(
     ],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
     ws: _V4_F32_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
-    chunk_tiles: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, False](
         a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
     )
@@ -392,11 +409,17 @@ def _v4_tt_splitk_m128n256_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
     ws: _V4_F32_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
-    chunk_tiles: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    chunk_tiles_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, True, True](
         a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
     )
@@ -412,10 +435,15 @@ def _v4_tn_direct_m128n192_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     _v4_tn_ws_body[192, 4, False, 8](
         a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
     )
@@ -434,10 +462,15 @@ def _v4_tn_direct_m128n192_s3g16(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     _v4_tn_ws_body[192, 3, False, 16](
         a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
     )
@@ -461,10 +494,15 @@ def _v4_tt_direct_m128n64_s4(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
     output: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     _v4_tn_ws_body[64, 4, False, 8, True, True](
         a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
     )
@@ -483,10 +521,15 @@ def _v4_tt_direct_m64n128_s3(
     a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
     b_tma: TMATensorTile[_V4_BF16, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
     output: _V4_PTR,
-    m: Int,
-    n: Int,
-    k: Int,
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var m = Int(m_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
     _v4_tn_ws_body[128, 3, False, 8, True, True, 64, 1](
         a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
     )
@@ -508,9 +551,13 @@ comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 def _v4_tn_splitk_reduce(
     output: _V4_PTR,
     ws: _V4_F32_PTR,
-    count: Int,
-    splits: Int,
+    count_arg: Int64,
+    splits_arg: Int64,
 ):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var count = Int(count_arg)
+    var splits = Int(splits_arg)
     var base = Int(block_idx.x) * _V4_RED_SPAN + Int(thread_idx.x) * 4
     if base + (_V4_RED_GROUPS - 1) * _V4_RED_THREADS * 4 + 4 <= count:
         # Fast path: all four chains fully in range.
@@ -660,10 +707,10 @@ def _v4_enqueue_splitk_m128n256[
             _v4_make_a_tma(a, m, k, ctx),
             _v4_make_b_mn_tma[256](b, n, k, ctx),
             ws_ptr,
-            m,
-            n,
-            k,
-            chunk_tiles,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
         )
@@ -672,10 +719,10 @@ def _v4_enqueue_splitk_m128n256[
             _v4_make_a_row_tma(a, m, k, ctx),
             _v4_make_b_kmaj_tma[256](b, n, k, ctx),
             ws_ptr,
-            m,
-            n,
-            k,
-            chunk_tiles,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
         )
@@ -684,10 +731,10 @@ def _v4_enqueue_splitk_m128n256[
             _v4_make_a_row_tma(a, m, k, ctx),
             _v4_make_b_mn_tma[256](b, n, k, ctx),
             ws_ptr,
-            m,
-            n,
-            k,
-            chunk_tiles,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
         )
@@ -696,18 +743,18 @@ def _v4_enqueue_splitk_m128n256[
             _v4_make_a_tma(a, m, k, ctx),
             _v4_make_b_kmaj_tma[256](b, n, k, ctx),
             ws_ptr,
-            m,
-            n,
-            k,
-            chunk_tiles,
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
         )
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
         ws_ptr,
-        count,
-        splits,
+        Int64(count),
+        Int64(splits),
         grid_dim=((count + _V4_RED_SPAN - 1) // _V4_RED_SPAN,),
         block_dim=(_V4_RED_THREADS,),
     )
@@ -746,9 +793,9 @@ def _v4_enqueue_direct_m128n192(
             a_tma,
             b_tma,
             output,
-            m,
-            n,
-            k,
+            Int64(m),
+            Int64(n),
+            Int64(k),
             grid_dim=(grid_x,),
             block_dim=(_V4_THREADS,),
         )
@@ -757,9 +804,9 @@ def _v4_enqueue_direct_m128n192(
             a_tma,
             b_tma,
             output,
-            m,
-            n,
-            k,
+            Int64(m),
+            Int64(n),
+            Int64(k),
             grid_dim=(grid_x,),
             block_dim=(_V4_THREADS,),
         )
@@ -779,9 +826,9 @@ def _v4_enqueue_tt_direct_m128n64(
         _v4_make_a_tma(a, m, k, ctx),
         _v4_make_b_kmaj_tma[64](b, n, k, ctx),
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V4_THREADS,),
     )
@@ -801,9 +848,9 @@ def _v4_enqueue_tt_direct_m64n128(
         _v4_make_a_tma[64](a, m, k, ctx),
         _v4_make_b_kmaj_tma[128](b, n, k, ctx),
         output,
-        m,
-        n,
-        k,
+        Int64(m),
+        Int64(n),
+        Int64(k),
         grid_dim=(grid_x,),
         block_dim=(256,),
     )
