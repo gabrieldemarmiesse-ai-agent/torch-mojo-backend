@@ -855,6 +855,60 @@ def mojo_device_normal_(
     return self
 
 
+@register_aten_op("aten::uniform_")
+def mojo_device_uniform_(
+    self: TorchMojoTensor, from_: float = 0.0, to: float = 1.0, generator=None
+) -> TorchMojoTensor:
+    if generator is not None:
+        raise _unsupported("aten::uniform_ (generator)", (self,))
+    cpu = torch.empty(
+        self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)
+    ).uniform_(from_, to)
+    staged = TorchMojoTensor._from_cpu(cpu, self._device)
+    _copy_into_tensor(self, staged)
+    return self
+
+
+@register_aten_op("aten::random_")
+def mojo_device_random_(self: TorchMojoTensor, generator=None) -> TorchMojoTensor:
+    if generator is not None:
+        raise _unsupported("aten::random_ (generator)", (self,))
+    cpu = torch.empty(
+        self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)
+    ).random_()
+    staged = TorchMojoTensor._from_cpu(cpu, self._device)
+    _copy_into_tensor(self, staged)
+    return self
+
+
+@register_aten_op("aten::random_.to")
+def mojo_device_random__to(
+    self: TorchMojoTensor, to: int, generator=None
+) -> TorchMojoTensor:
+    if generator is not None:
+        raise _unsupported("aten::random_.to (generator)", (self,))
+    cpu = torch.empty(self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)).random_(
+        to
+    )
+    staged = TorchMojoTensor._from_cpu(cpu, self._device)
+    _copy_into_tensor(self, staged)
+    return self
+
+
+@register_aten_op("aten::random_.from")
+def mojo_device_random__from(
+    self: TorchMojoTensor, from_: int, to: int | None = None, generator=None
+) -> TorchMojoTensor:
+    if generator is not None:
+        raise _unsupported("aten::random_.from (generator)", (self,))
+    cpu = torch.empty(self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)).random_(
+        from_, to
+    )
+    staged = TorchMojoTensor._from_cpu(cpu, self._device)
+    _copy_into_tensor(self, staged)
+    return self
+
+
 # ----------------------------------------------------------------------------------
 # In-place ops with custom plumbing
 # ----------------------------------------------------------------------------------

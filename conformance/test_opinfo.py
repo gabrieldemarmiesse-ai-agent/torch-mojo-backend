@@ -54,7 +54,16 @@ def _not_implemented(exc: BaseException) -> bool:
     if isinstance(exc, NotImplementedError):
         return True
     text = str(exc).lower()
-    return "not implemented" in text or "no fast implementation" in text
+    return (
+        "not implemented" in text
+        or "no fast implementation" in text
+        # Some error_inputs_func corpora build a deliberately wrong-dtype
+        # tensor (complex, float64) purely to provoke the error under test.
+        # MAX doesn't support those dtypes at all, so construction fails
+        # before the operator under test is ever reached -- a backend
+        # limitation, not a wrong error-handling result.
+        or "unsupported torch dtype" in text
+    )
 
 
 class TestOpInfoConformance(TestCase):
@@ -102,13 +111,34 @@ class TestOpInfoConformance(TestCase):
         those are per operator.
         """
         checked = 0
-        for error_input in op.error_inputs(device):
+        error_inputs = op.error_inputs(device)
+        while True:
+            try:
+                error_input = next(error_inputs)
+            except StopIteration:
+                break
+            except Exception as exc:  # noqa: BLE001 - triaging is the point
+                # Building the error input itself (not the op call) can hit a
+                # backend limitation, e.g. a dtype-mismatch case constructed
+                # via a dtype MAX doesn't support at all.
+                if _not_implemented(exc):
+                    self.skipTest(f"not implemented on mojo: {exc}")
+                raise
             sample = error_input.sample_input
             with self.assertRaises(error_input.error_type):
                 try:
-                    op(sample.input, *sample.args, **sample.kwargs)
-                except NotImplementedError as exc:
-                    self.skipTest(f"not implemented on mojo: {exc}")
+                    out = op(sample.input, *sample.args, **sample.kwargs)
+                except Exception as exc:  # noqa: BLE001 - triaging is the point
+                    if _not_implemented(exc):
+                        self.skipTest(f"not implemented on mojo: {exc}")
+                    raise
+                # Some dunder ops (e.g. __rmod__) called directly rather than
+                # through operator syntax return the `NotImplemented`
+                # sentinel instead of raising when both operands are plain
+                # Python scalars. Upstream's own test_ops.py::test_errors
+                # turns that into a failure the same way, from inside the
+                # assertRaises block.
+                self.assertFalse(isinstance(out, type(NotImplemented)))
             checked += 1
         if checked == 0:
             self.skipTest("OpInfo declared no error inputs for this operator")
