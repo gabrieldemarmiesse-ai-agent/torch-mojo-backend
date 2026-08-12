@@ -57,6 +57,44 @@ def _not_implemented(exc: BaseException) -> bool:
     return "not implemented" in text or "no fast implementation" in text
 
 
+def _harness_cannot_construct(exc: BaseException) -> bool:
+    """True when the harness's build-on-CPU-then-move strategy created a
+    call the operator's own contract forbids on every backend, not just
+    ours -- e.g. tensor_split's indices/sections argument must stay on
+    CPU; moving it because it happens to be a Tensor is a property of
+    "move every tensor found in the sample" being simpler than knowing
+    each op's per-argument device rules, not a mojo bug.
+    """
+    return "but it's on" in str(exc) and "to be on cpu" in str(exc)
+
+
+def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | None:
+    """OpInfo already flags operators whose output is legitimately allowed
+    to differ across devices -- uninitialized memory for the `empty`
+    family, a per-device RNG stream for `dropout` -- by skipping
+    `TestCommon.test_compare_cpu`, upstream's own CPU-vs-other-device
+    consistency test. `test_matches_cpu` is the same kind of comparison,
+    so it honors the same skip instead of hand-maintaining a duplicate
+    list that would drift from upstream's.
+    """
+    for skip in op.skips:
+        if skip.test_name != "test_compare_cpu":
+            continue
+        if skip.cls_name not in (None, "TestCommon"):
+            continue
+        if skip.device_type not in (None, "privateuse1"):
+            continue
+        if skip.dtypes is not None and dtype not in skip.dtypes:
+            continue
+        if not skip.active_if:
+            continue
+        return (
+            "OpInfo skips TestCommon.test_compare_cpu for this op "
+            "(output not expected to match across devices)"
+        )
+    return None
+
+
 class TestOpInfoConformance(TestCase):
     """One test per (operator, dtype), driven entirely by OpInfo metadata."""
 
@@ -71,6 +109,9 @@ class TestOpInfoConformance(TestCase):
         which is a property of the harness, not of the operator.  Moving also
         makes both legs read bit-identical inputs.
         """
+        skip_reason = _cross_device_comparison_skip_reason(op, dtype)
+        if skip_reason is not None:
+            self.skipTest(skip_reason)
         checked = 0
         for sample in op.sample_inputs("cpu", dtype, requires_grad=False):
             moved = sample.transform(
@@ -79,7 +120,7 @@ class TestOpInfoConformance(TestCase):
             try:
                 actual = op(moved.input, *moved.args, **moved.kwargs)
             except Exception as exc:  # noqa: BLE001 - triaging is the point
-                if _not_implemented(exc):
+                if _not_implemented(exc) or _harness_cannot_construct(exc):
                     self.skipTest(f"not implemented on mojo: {exc}")
                 raise
             expected = op(sample.input, *sample.args, **sample.kwargs)
