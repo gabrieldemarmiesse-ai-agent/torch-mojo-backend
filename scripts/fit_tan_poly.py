@@ -79,7 +79,9 @@ def validate(
         poly = np.float32(0.0)
         for c in reversed(coeffs_lo_first):
             poly = poly * z + np.float32(c)
-        tan_r = np.float32(np.float64(r) + np.float64(r) * np.float64(z) * np.float64(poly))
+        tan_r = np.float32(
+            np.float64(r) + np.float64(r) * np.float64(z) * np.float64(poly)
+        )
         return np.float32(-1.0 / np.float64(tan_r)) if int(k) % 2 else tan_r
 
     rng = np.random.default_rng(0)
