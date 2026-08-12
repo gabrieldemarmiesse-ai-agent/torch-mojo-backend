@@ -41,6 +41,7 @@ from std.math import (
     sinh,
     tanh,
 )
+from std.math.polynomial import polynomial_evaluate
 from std.python import PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
@@ -413,8 +414,50 @@ def _float_unary[
     comptime if op_code == UOP_SQRT:
         res = ieee_sqrt(a)
     comptime if op_code == UOP_TAN:
-        # tan(x) = sin(x)/cos(x); std.math.tan is libm/CPU-only.
-        res = sin(a) / cos(a)
+        comptime if dtype == DType.float32:
+            # Not sin(x)/cos(x): on GPU both use a fixed ~1e-6-absolute-error
+            # hardware approx instruction (PTX sin/cos.approx.ftz.f32), and
+            # dividing two such values right where cos(x) is small (near a
+            # pole, x ~ pi/2 + k*pi) turns that fixed absolute error into a
+            # large *relative* error in tan -- randn inputs land in that
+            # band often enough to fail conformance (8.8% of a 20x20 sample).
+            #
+            # Reduce x to the nearest multiple of pi/2 (Cody-Waite, exact in
+            # float32 for any |k| this op will realistically see) so the
+            # residual r is always in [-pi/4, pi/4], away from every pole,
+            # then evaluate tan(r) with a dedicated minimax polynomial (fit
+            # against a float64 reference; <2e-7 relative error in float32
+            # arithmetic over the whole reduced range -- see
+            # scripts/fit_tan_poly.py). Near a pole the residual r is itself
+            # small and well-conditioned, so -1/tan(r) reproduces the
+            # blow-up without ever dividing two independently-rounded
+            # hardware trig results against each other.
+            var af = a.cast[DType.float32]()
+            comptime PIO2_HI = Float32(1.5703125)
+            comptime PIO2_LO = Float32(0.00048382679233327506)
+            comptime INV_PIO2 = Float32(0.63661977236758134308)
+
+            var k = floor(af.fma(INV_PIO2, 0.5))
+            var r = (af - k * PIO2_HI) - k * PIO2_LO
+            var z = r * r
+            var poly = polynomial_evaluate[
+                [
+                    Float32(0.33333312008738518),
+                    0.13334750477592851,
+                    0.053745989665389061,
+                    0.023242133948206902,
+                    0.0050118292279914021,
+                    0.0082744075469672680,
+                ],
+            ](z)
+            var tan_r = r + r * z * poly
+            var is_odd = (k.cast[DType.int32]() & 1).cast[DType.bool]()
+            res = is_odd.select(-1 / tan_r, tan_r).cast[dtype]()
+        else:
+            # std.math.tan is libm/CPU-only; float64 sin/cos never take the
+            # GPU-approx path above (see `cos`/`sin`'s NVIDIA branches,
+            # float32-only), so this composition is already accurate here.
+            res = sin(a) / cos(a)
     comptime if op_code == UOP_GELU_NONE:
         # 0.5 * x * (1 + erf(x / sqrt(2)))
         comptime inv_sqrt2 = 0.70710678118654752440
