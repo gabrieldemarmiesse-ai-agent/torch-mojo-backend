@@ -91,6 +91,15 @@ def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | N
     `test_compare_cpu` makes, just against a different accelerator, so it
     honors the same verdict instead of hand-maintaining a duplicate list of
     "known-divergent" ops that would drift out of sync with upstream's own.
+
+    Not every `test_compare_cpu` skip upstream carries is this principled --
+    e.g. `nn.functional.conv3d` skips it unconditionally with only "break
+    slow tests" as a comment, not a documented semantic split. Honoring
+    those too trades a small amount of value-comparison coverage for the
+    same reason: a hand-picked subset would itself be a drift-prone list,
+    and re-deriving "principled vs. merely convenient" from a skip that
+    carries no machine-readable reason is not something this function can
+    do reliably.
     """
     for skip in op.skips:
         # op.skips is not guaranteed to be homogeneous: some OpInfo entries
@@ -103,6 +112,12 @@ def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | N
         if skip.device_type not in (None, "privateuse1"):
             continue
         if skip.dtypes is not None and dtype not in skip.dtypes:
+            continue
+        if callable(skip.active_if):
+            # DecorateInfo.is_active() would call this with the concrete
+            # test's param_kwargs, which we don't have here; treating a
+            # callable as unconditionally active (its truthiness, not its
+            # result) would be wrong, so decline it rather than guess.
             continue
         if not skip.active_if:
             continue
@@ -138,8 +153,10 @@ class TestOpInfoConformance(TestCase):
                 )
                 actual = op(moved.input, *moved.args, **moved.kwargs)
             except Exception as exc:  # noqa: BLE001 - triaging is the point
-                if _not_implemented(exc) or _harness_cannot_construct(exc):
+                if _not_implemented(exc):
                     self.skipTest(f"not implemented on mojo: {exc}")
+                if _harness_cannot_construct(exc):
+                    self.skipTest(f"harness cannot construct this call on mojo: {exc}")
                 raise
             expected = op(sample.input, *sample.args, **sample.kwargs)
             # assertEqual carries the OpInfo precisionOverride for this dtype
