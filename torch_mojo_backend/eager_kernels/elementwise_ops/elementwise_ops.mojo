@@ -425,13 +425,18 @@ def _float_unary[
             # Reduce x to the nearest multiple of pi/2 (Cody-Waite, exact in
             # float32 for any |k| this op will realistically see) so the
             # residual r is always in [-pi/4, pi/4], away from every pole,
-            # then evaluate tan(r) with a dedicated minimax polynomial (fit
-            # against a float64 reference; <2e-7 relative error in float32
-            # arithmetic over the whole reduced range -- see
-            # scripts/fit_tan_poly.py). Near a pole the residual r is itself
-            # small and well-conditioned, so -1/tan(r) reproduces the
-            # blow-up without ever dividing two independently-rounded
-            # hardware trig results against each other.
+            # then evaluate tan(r) with a dedicated least-squares polynomial
+            # fit (fit against a float64 reference; <2e-7 relative error in
+            # float32 arithmetic over the polynomial's own domain -- see
+            # `validate_polynomial` in scripts/fit_tan_poly.py). Near a pole
+            # the residual r is itself small and well-conditioned, so
+            # -1/tan(r) reproduces the blow-up without ever dividing two
+            # independently-rounded hardware trig results against each
+            # other -- though for x within ~0.05 rad of an exact pole, the
+            # end-to-end relative error can still exceed torch.testing's
+            # default float32 rtol; that is inherent to representing tan's
+            # unbounded derivative there in finite precision, not specific
+            # to this polynomial (see `validate` in the same script).
             var af = a.cast[DType.float32]()
             comptime PIO2_HI = Float32(1.5703125)
             comptime PIO2_LO = Float32(0.00048382679233327506)
@@ -454,9 +459,14 @@ def _float_unary[
             var is_odd = (k.cast[DType.int32]() & 1).cast[DType.bool]()
             res = is_odd.select(-1 / tan_r, tan_r).cast[dtype]()
         else:
-            # std.math.tan is libm/CPU-only; float64 sin/cos never take the
-            # GPU-approx path above (see `cos`/`sin`'s NVIDIA branches,
-            # float32-only), so this composition is already accurate here.
+            # Unchanged: std.math.tan is libm/CPU-only, so this composition
+            # was already here before the float32 branch above. float64
+            # never reaches this GPU-approx-instruction problem in the
+            # first place -- `_unary_elementwise`'s GPU dispatch (below)
+            # rejects float64 outright ("float64 is not supported on
+            # GPU"), so this branch only ever runs on CPU, where `sin`/`cos`
+            # already use accurate LLVM intrinsics, not the approx PTX
+            # instructions. Not otherwise verified or in scope here.
             res = sin(a) / cos(a)
     comptime if op_code == UOP_GELU_NONE:
         # 0.5 * x * (1 + erf(x / sqrt(2)))
