@@ -25,6 +25,7 @@ from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
+from std.memory import bitcast
 from std.python import PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
@@ -153,6 +154,141 @@ def _add_f32_bf16_contig(
 
 
 @always_inline
+def _fmod_bf16_exact_scalar(
+    x: Scalar[DType.float32], y: Scalar[DType.float32]
+) -> Scalar[DType.float32]:
+    """Correctly-rounded float32 `fmod(x, y)` (sign of `x`, C semantics),
+    via bit-exact integer long division on the mantissa (ported from
+    fdlibm/musl's `e_fmodf`).
+
+    Needed specifically for bfloat16 remainder: bf16 shares fp32's 8-bit
+    exponent field, so a bf16 divisor near that format's smallest normal
+    value (~1.18e-38, e.g. the value `make_tensor(..., exclude_zero=True)`
+    substitutes for an exact-zero draw) can put `x / y` outside fp32's
+    range even though the true remainder -- bounded by `|y|` -- always
+    fits. The textbook `x - trunc(x / y) * y` decomposition (what `%`
+    uses below for every other float width) forms that out-of-range
+    quotient explicitly and overflows to +/-inf; worse, even where the
+    quotient itself does not overflow, multiplying it back by `y` in
+    float32 to recover `x` loses exactly the low bits the remainder lives
+    in, since float32 has only 24 mantissa bits total. This function
+    never forms `x / y`: it aligns `y`'s mantissa to `x`'s exponent one
+    bit at a time and subtracts, which is exact at every step.
+
+    fp16 does not need this: its exponent field is only 5 bits, so the
+    worst-case ratio between two fp16 values stays far inside fp32's
+    range and the simple decomposition is already exact enough.
+    """
+    var ix_bits = bitcast[DType.uint32, 1](x)
+    var iy_bits = bitcast[DType.uint32, 1](y)
+    var sx = ix_bits & UInt32(0x80000000)
+    var ix = ix_bits & UInt32(0x7FFFFFFF)
+    var iy = iy_bits & UInt32(0x7FFFFFFF)
+
+    # NaN/Inf/zero-divisor: match torch's fmod-based remainder, which
+    # relies on IEEE fmod semantics (NaN out) for these inputs.
+    if iy == UInt32(0) or ix >= UInt32(0x7F800000) or iy > UInt32(0x7F800000):
+        return bitcast[DType.float32, 1](UInt32(0x7FC00000))
+    if ix < iy:
+        return x
+    if ix == iy:
+        return bitcast[DType.float32, 1](sx)
+
+    # Normalize into 24-bit mantissas (implicit leading bit set) plus
+    # unbiased exponents; subnormal inputs are normalized by hand since
+    # their exponent field is already zero. bf16-sourced subnormals are
+    # not reachable from realistic inputs, but this keeps the function
+    # correct (not just non-crashing) if one ever appears.
+    var hx = ix
+    var hy = iy
+    var ix_exp: Int32
+    if hx < UInt32(0x00800000):
+        var e: Int32 = -126
+        while hx < UInt32(0x00800000):
+            hx = hx << UInt32(1)
+            e -= 1
+        ix_exp = e
+    else:
+        ix_exp = Int32(hx >> UInt32(23)) - Int32(127)
+        hx = (hx & UInt32(0x007FFFFF)) | UInt32(0x00800000)
+
+    var iy_exp: Int32
+    if hy < UInt32(0x00800000):
+        var e2: Int32 = -126
+        while hy < UInt32(0x00800000):
+            hy = hy << UInt32(1)
+            e2 -= 1
+        iy_exp = e2
+    else:
+        iy_exp = Int32(hy >> UInt32(23)) - Int32(127)
+        hy = (hy & UInt32(0x007FFFFF)) | UInt32(0x00800000)
+
+    # Bit-serial restoring division: one compare/subtract/double per
+    # exponent of gap between x and y (up to ~260 for bf16's full normal
+    # + subnormal range), each step exact since hx/hy are plain 32-bit
+    # integers. This is a data-dependent runtime loop, not a hot-path
+    # kernel -- see the docstring above for why the fp32 shortcut can't
+    # replace it.
+    var n = ix_exp - iy_exp
+    var steps = Int(n)
+    var k = 0
+    while k < steps:
+        if hx >= hy:
+            var hz = hx - hy
+            if hz == UInt32(0):
+                return bitcast[DType.float32, 1](sx)
+            hx = hz << UInt32(1)
+        else:
+            hx = hx << UInt32(1)
+        k += 1
+    if hx >= hy:
+        hx = hx - hy
+    if hx == UInt32(0):
+        return bitcast[DType.float32, 1](sx)
+
+    # Re-normalize the remainder mantissa and reassemble the float32,
+    # handling a subnormal result explicitly.
+    while hx < UInt32(0x00800000):
+        hx = hx << UInt32(1)
+        iy_exp -= 1
+
+    var result_bits: UInt32
+    if iy_exp >= -126:
+        result_bits = (
+            ((hx - UInt32(0x00800000)) & UInt32(0x007FFFFF))
+            | (UInt32(Int(iy_exp) + 127) << UInt32(23))
+            | sx
+        )
+    else:
+        var shift = -126 - iy_exp
+        if shift >= 24:
+            result_bits = sx
+        else:
+            hx = hx >> UInt32(Int(shift))
+            result_bits = (hx & UInt32(0x007FFFFF)) | sx
+    return bitcast[DType.float32, 1](result_bits)
+
+
+@always_inline
+def _remainder_bf16_exact[
+    width: Int
+](a: SIMD[DType.float32, width], b: SIMD[DType.float32, width]) -> SIMD[
+    DType.float32, width
+]:
+    """Python/torch `%` (sign of the divisor) on top of the bit-exact fmod
+    above, mirroring the sign-fixup every other dtype already gets from
+    Mojo's own `%` operator. `_fmod_bf16_exact_scalar` is inherently
+    scalar (it manipulates one float32 bit pattern), so this just calls
+    it once per lane -- a compile-time-unrolled loop of 1 for the Scalar
+    caller in `_bin_bcast_body`."""
+    var fmod_val = SIMD[DType.float32, width]()
+    comptime for lane in range(width):
+        fmod_val[lane] = _fmod_bf16_exact_scalar(a[lane], b[lane])
+    var mask = (b.lt(0) ^ a.lt(0)) & fmod_val.ne(0)
+    return fmod_val + mask.select(b, SIMD[DType.float32, width](0))
+
+
+@always_inline
 def _bin_bcast_body[
     dtype: DType, op_code: Int
 ](
@@ -186,9 +322,26 @@ def _bin_bcast_body[
         comptime if not dtype.is_floating_point():
             out_ptr[i] = a ^ b
     comptime if op_code == BOP_REMAINDER:
-        # Mojo's `%` follows the divisor's sign (Python/torch
-        # semantics) for both signed integers and floats.
-        out_ptr[i] = a % b
+        # Mojo's `%` follows the divisor's sign (Python/torch semantics)
+        # for both signed integers and floats, but for bfloat16 it also
+        # runs the whole trunc/multiply/subtract decomposition at bf16's
+        # 8-bit-mantissa precision, which can round the quotient across
+        # an integer boundary or -- when the divisor is near bf16's
+        # smallest normal value -- overflow outright even though the
+        # true remainder is always finite and bounded by |b|. Route bf16
+        # through the bit-exact fp32 fmod above; fp16's narrower exponent
+        # range never hits that overflow, so a plain fp32 promotion
+        # (still needed to avoid the boundary-rounding issue) suffices.
+        comptime if dtype == DType.bfloat16:
+            out_ptr[i] = _remainder_bf16_exact[1](
+                a.cast[DType.float32](), b.cast[DType.float32]()
+            ).cast[dtype]()
+        elif dtype == DType.float16:
+            out_ptr[i] = (
+                a.cast[DType.float32]() % b.cast[DType.float32]()
+            ).cast[dtype]()
+        else:
+            out_ptr[i] = a % b
     comptime if op_code == BOP_FLOORDIV:
         # `//` = floor(a / b), matching torch.floor_divide for
         # both float and integer dtypes.
@@ -284,6 +437,16 @@ def _bin_vec_op[
         comptime if not dtype.is_floating_point():
             return a ^ b
     comptime if op_code == BOP_REMAINDER:
+        # See _bin_bcast_body for why bf16 needs the bit-exact fp32 fmod
+        # and fp16 just needs the fp32 promotion.
+        comptime if dtype == DType.bfloat16:
+            return _remainder_bf16_exact[width](
+                a.cast[DType.float32](), b.cast[DType.float32]()
+            ).cast[dtype]()
+        elif dtype == DType.float16:
+            return (a.cast[DType.float32]() % b.cast[DType.float32]()).cast[
+                dtype
+            ]()
         return a % b
     comptime if op_code == BOP_FLOORDIV:
         return a // b
