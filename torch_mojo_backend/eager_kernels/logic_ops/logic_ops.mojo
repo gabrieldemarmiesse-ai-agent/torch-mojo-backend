@@ -153,31 +153,39 @@ def _add_f32_bf16_contig(
         raise Error("mixed FP32/BF16 add requires an accelerator build")
 
 
-@always_inline
-def _fmod_bf16_exact_scalar(
+def _fmod_narrow_float_exact_scalar(
     x: Scalar[DType.float32], y: Scalar[DType.float32]
 ) -> Scalar[DType.float32]:
     """Correctly-rounded float32 `fmod(x, y)` (sign of `x`, C semantics),
     via bit-exact integer long division on the mantissa (ported from
     fdlibm/musl's `e_fmodf`).
 
-    Needed specifically for bfloat16 remainder: bf16 shares fp32's 8-bit
-    exponent field, so a bf16 divisor near that format's smallest normal
-    value (~1.18e-38, e.g. the value `make_tensor(..., exclude_zero=True)`
-    substitutes for an exact-zero draw) can put `x / y` outside fp32's
-    range even though the true remainder -- bounded by `|y|` -- always
-    fits. The textbook `x - trunc(x / y) * y` decomposition (what `%`
-    uses below for every other float width) forms that out-of-range
-    quotient explicitly and overflows to +/-inf; worse, even where the
-    quotient itself does not overflow, multiplying it back by `y` in
-    float32 to recover `x` loses exactly the low bits the remainder lives
-    in, since float32 has only 24 mantissa bits total. This function
-    never forms `x / y`: it aligns `y`'s mantissa to `x`'s exponent one
-    bit at a time and subtracts, which is exact at every step.
+    Needed for bfloat16 *and* float16 remainder, for two separate reasons
+    that both trace back to the textbook `x - trunc(x / y) * y`
+    decomposition (what `%` uses below for every other float width)
+    forming the quotient `x / y` explicitly:
 
-    fp16 does not need this: its exponent field is only 5 bits, so the
-    worst-case ratio between two fp16 values stays far inside fp32's
-    range and the simple decomposition is already exact enough.
+    - bf16 shares fp32's 8-bit exponent field, so a bf16 divisor near
+      that format's smallest normal value (~1.18e-38, e.g. the value
+      `make_tensor(..., exclude_zero=True)` substitutes for an
+      exact-zero draw) can put `x / y` outside fp32's range even though
+      the true remainder -- bounded by `|y|` -- always fits, and the
+      decomposition overflows to +/-inf.
+    - float32 only has 24 mantissa bits total, so even where the
+      quotient itself does not overflow, multiplying it back by `y` in
+      float32 to recover `x` loses exactly the low bits the remainder
+      lives in whenever `|x / y|` exceeds ~2^24. fp16's own dynamic
+      range reaches that on its own (e.g. 23456.0 / 0.0009937... ~=
+      2.36e7 > 2^24), so fp16 needs this too, not just bf16 -- a
+      narrower exponent field only rules out the first (overflow)
+      failure mode, not this second (precision) one.
+
+    This function never forms `x / y`: it aligns `y`'s mantissa to `x`'s
+    exponent one bit at a time and subtracts, which is exact at every
+    step. It is not marked `@always_inline`: the data-dependent loop
+    below makes it too large a body to force-inline at every SIMD lane
+    without risking register pressure in the surrounding kernel; the
+    compiler is left to decide.
     """
     var ix_bits = bitcast[DType.uint32, 1](x)
     var iy_bits = bitcast[DType.uint32, 1](y)
@@ -226,9 +234,11 @@ def _fmod_bf16_exact_scalar(
     # Bit-serial restoring division: one compare/subtract/double per
     # exponent of gap between x and y (up to ~260 for bf16's full normal
     # + subnormal range), each step exact since hx/hy are plain 32-bit
-    # integers. This is a data-dependent runtime loop, not a hot-path
-    # kernel -- see the docstring above for why the fp32 shortcut can't
-    # replace it.
+    # integers. This is a data-dependent runtime loop; the trip count is
+    # usually small (operands of similar magnitude), but nothing here
+    # guarantees the "small bookkeeping tensor" shapes this file was
+    # originally written for -- see the docstring above for why the fp32
+    # shortcut can't replace it regardless of tensor size.
     var n = ix_exp - iy_exp
     var steps = Int(n)
     var k = 0
@@ -260,6 +270,15 @@ def _fmod_bf16_exact_scalar(
             | sx
         )
     else:
+        # The remainder itself underflows fp32's normal range (true
+        # mathematical value < ~1.18e-38): shift into a subnormal fp32
+        # result. This truncates rather than rounds to nearest, so it
+        # can be off by up to one fp32-subnormal ULP from the true
+        # correctly-rounded fmod (matching fdlibm/musl's own fmodf,
+        # which does the same). Not fixed: the dropped precision here
+        # (fp32 subnormal, down to ~1.4e-45) is far finer than bf16's
+        # own subnormal step (~9.18e-41) or fp16's (~5.96e-8), so it
+        # never survives the final `.cast[dtype]()` back to bf16/fp16.
         var shift = -126 - iy_exp
         if shift >= 24:
             result_bits = sx
@@ -270,20 +289,21 @@ def _fmod_bf16_exact_scalar(
 
 
 @always_inline
-def _remainder_bf16_exact[
+def _remainder_narrow_float_exact[
     width: Int
 ](a: SIMD[DType.float32, width], b: SIMD[DType.float32, width]) -> SIMD[
     DType.float32, width
 ]:
     """Python/torch `%` (sign of the divisor) on top of the bit-exact fmod
     above, mirroring the sign-fixup every other dtype already gets from
-    Mojo's own `%` operator. `_fmod_bf16_exact_scalar` is inherently
-    scalar (it manipulates one float32 bit pattern), so this just calls
-    it once per lane -- a compile-time-unrolled loop of 1 for the Scalar
-    caller in `_bin_bcast_body`."""
+    Mojo's own `%` operator. Used for bf16 and fp16 operands (already
+    cast up to float32 by the caller). `_fmod_narrow_float_exact_scalar`
+    is inherently scalar (it manipulates one float32 bit pattern), so
+    this just calls it once per lane -- a compile-time-unrolled loop of
+    1 for the Scalar caller in `_bin_bcast_body`."""
     var fmod_val = SIMD[DType.float32, width]()
     comptime for lane in range(width):
-        fmod_val[lane] = _fmod_bf16_exact_scalar(a[lane], b[lane])
+        fmod_val[lane] = _fmod_narrow_float_exact_scalar(a[lane], b[lane])
     var mask = (b.lt(0) ^ a.lt(0)) & fmod_val.ne(0)
     return fmod_val + mask.select(b, SIMD[DType.float32, width](0))
 
@@ -323,22 +343,19 @@ def _bin_bcast_body[
             out_ptr[i] = a ^ b
     comptime if op_code == BOP_REMAINDER:
         # Mojo's `%` follows the divisor's sign (Python/torch semantics)
-        # for both signed integers and floats, but for bfloat16 it also
-        # runs the whole trunc/multiply/subtract decomposition at bf16's
-        # 8-bit-mantissa precision, which can round the quotient across
-        # an integer boundary or -- when the divisor is near bf16's
-        # smallest normal value -- overflow outright even though the
-        # true remainder is always finite and bounded by |b|. Route bf16
-        # through the bit-exact fp32 fmod above; fp16's narrower exponent
-        # range never hits that overflow, so a plain fp32 promotion
-        # (still needed to avoid the boundary-rounding issue) suffices.
-        comptime if dtype == DType.bfloat16:
-            out_ptr[i] = _remainder_bf16_exact[1](
+        # for both signed integers and floats, but for narrow floats
+        # (bf16, fp16) it also runs the whole trunc/multiply/subtract
+        # decomposition at the operand's own precision, which is not
+        # exact whenever |a / b| exceeds what that width's mantissa (or,
+        # after promoting to fp32, fp32's 24-bit mantissa) can represent
+        # -- rounding the quotient across an integer boundary, or losing
+        # the remainder's low bits outright, or (for bf16 specifically,
+        # whose exponent field is as wide as fp32's) overflowing to
+        # +/-inf when the divisor is near bf16's smallest normal value.
+        # Route both through the bit-exact fp32 fmod above.
+        comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+            out_ptr[i] = _remainder_narrow_float_exact[1](
                 a.cast[DType.float32](), b.cast[DType.float32]()
-            ).cast[dtype]()
-        elif dtype == DType.float16:
-            out_ptr[i] = (
-                a.cast[DType.float32]() % b.cast[DType.float32]()
             ).cast[dtype]()
         else:
             out_ptr[i] = a % b
@@ -437,17 +454,14 @@ def _bin_vec_op[
         comptime if not dtype.is_floating_point():
             return a ^ b
     comptime if op_code == BOP_REMAINDER:
-        # See _bin_bcast_body for why bf16 needs the bit-exact fp32 fmod
-        # and fp16 just needs the fp32 promotion.
-        comptime if dtype == DType.bfloat16:
-            return _remainder_bf16_exact[width](
+        # See _bin_bcast_body: bf16 and fp16 both need the bit-exact fp32
+        # fmod, not just a plain fp32 promotion.
+        comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+            return _remainder_narrow_float_exact[width](
                 a.cast[DType.float32](), b.cast[DType.float32]()
             ).cast[dtype]()
-        elif dtype == DType.float16:
-            return (a.cast[DType.float32]() % b.cast[DType.float32]()).cast[
-                dtype
-            ]()
-        return a % b
+        else:
+            return a % b
     comptime if op_code == BOP_FLOORDIV:
         return a // b
     comptime if op_code == BOP_POW:
