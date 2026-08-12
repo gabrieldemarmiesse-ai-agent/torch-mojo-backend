@@ -125,20 +125,33 @@ class TestOpInfoConformance(TestCase):
                     self.skipTest(f"not implemented on mojo: {exc}")
                 raise
             sample = error_input.sample_input
-            with self.assertRaises(error_input.error_type):
-                try:
-                    out = op(sample.input, *sample.args, **sample.kwargs)
-                except Exception as exc:  # noqa: BLE001 - triaging is the point
-                    if _not_implemented(exc):
-                        self.skipTest(f"not implemented on mojo: {exc}")
+            # `self.skipTest(...)` must not be reachable from inside a
+            # `with self.assertRaises(error_input.error_type):` block: a
+            # sufficiently broad error_type (plain `Exception`, which every
+            # `unittest.SkipTest` also is) would catch it as if it were the
+            # expected exception, silently turning a real skip into a false
+            # pass. So classify the raised/returned outcome first, and only
+            # reach for assertRaises afterwards, scoped to the one check
+            # that needs its swallow-on-match behavior (see below).
+            try:
+                out = op(sample.input, *sample.args, **sample.kwargs)
+            except Exception as exc:  # noqa: BLE001 - triaging is the point
+                if _not_implemented(exc):
+                    self.skipTest(f"not implemented on mojo: {exc}")
+                if not isinstance(exc, error_input.error_type):
                     raise
-                # Some dunder ops (e.g. __rmod__) called directly rather than
-                # through operator syntax return the `NotImplemented`
-                # sentinel instead of raising when both operands are plain
-                # Python scalars. Upstream's own test_ops.py::test_errors
-                # turns that into a failure the same way, from inside the
-                # assertRaises block.
-                self.assertFalse(isinstance(out, type(NotImplemented)))
+            else:
+                # Some dunder ops (e.g. __rmod__) called directly, rather
+                # than through operator syntax, correctly decline by
+                # returning the `NotImplemented` sentinel instead of raising.
+                # Upstream's own test_ops.py::test_errors accepts exactly
+                # that outcome, via this identical assertFalse nested inside
+                # `assertRaises(error_type)`: nesting it only here (not
+                # around the skipTest above, which the original bug did)
+                # still fails for real on a mismatch or on a call that
+                # returned an ordinary value without raising anything.
+                with self.assertRaises(error_input.error_type):
+                    self.assertFalse(isinstance(out, type(NotImplemented)))
             checked += 1
         if checked == 0:
             self.skipTest("OpInfo declared no error inputs for this operator")

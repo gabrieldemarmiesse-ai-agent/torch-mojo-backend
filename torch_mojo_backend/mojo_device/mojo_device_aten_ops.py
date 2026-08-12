@@ -855,58 +855,60 @@ def mojo_device_normal_(
     return self
 
 
-@register_aten_op("aten::uniform_")
-def mojo_device_uniform_(
-    self: TorchMojoTensor, from_: float = 0.0, to: float = 1.0, generator=None
+def _fill_via_cpu_rng(
+    self: TorchMojoTensor,
+    generator: torch.Generator | None,
+    op_name: str,
+    fill: Callable[[torch.Tensor], torch.Tensor],
 ) -> TorchMojoTensor:
+    """Draw on the CPU (MAX has no on-device RNG state to seed/checkpoint
+    the way torch.Generator expects) and stage the result across."""
     if generator is not None:
-        raise _unsupported("aten::uniform_ (generator)", (self,))
-    cpu = torch.empty(
-        self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)
-    ).uniform_(from_, to)
+        raise _unsupported(f"{op_name} (generator)", (self,))
+    cpu = fill(torch.empty(self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)))
     staged = TorchMojoTensor._from_cpu(cpu, self._device)
     _copy_into_tensor(self, staged)
     return self
+
+
+@register_aten_op("aten::uniform_")
+def mojo_device_uniform_(
+    self: TorchMojoTensor,
+    from_: float = 0.0,
+    to: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> TorchMojoTensor:
+    return _fill_via_cpu_rng(
+        self, generator, "aten::uniform_", lambda t: t.uniform_(from_, to)
+    )
 
 
 @register_aten_op("aten::random_")
-def mojo_device_random_(self: TorchMojoTensor, generator=None) -> TorchMojoTensor:
-    if generator is not None:
-        raise _unsupported("aten::random_ (generator)", (self,))
-    cpu = torch.empty(
-        self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)
-    ).random_()
-    staged = TorchMojoTensor._from_cpu(cpu, self._device)
-    _copy_into_tensor(self, staged)
-    return self
+def mojo_device_random_(
+    self: TorchMojoTensor, generator: torch.Generator | None = None
+) -> TorchMojoTensor:
+    return _fill_via_cpu_rng(self, generator, "aten::random_", lambda t: t.random_())
 
 
 @register_aten_op("aten::random_.to")
 def mojo_device_random__to(
-    self: TorchMojoTensor, to: int, generator=None
+    self: TorchMojoTensor, to: int, generator: torch.Generator | None = None
 ) -> TorchMojoTensor:
-    if generator is not None:
-        raise _unsupported("aten::random_.to (generator)", (self,))
-    cpu = torch.empty(self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)).random_(
-        to
+    return _fill_via_cpu_rng(
+        self, generator, "aten::random_.to", lambda t: t.random_(to)
     )
-    staged = TorchMojoTensor._from_cpu(cpu, self._device)
-    _copy_into_tensor(self, staged)
-    return self
 
 
 @register_aten_op("aten::random_.from")
 def mojo_device_random__from(
-    self: TorchMojoTensor, from_: int, to: int | None = None, generator=None
+    self: TorchMojoTensor,
+    from_: int,
+    to: int | None = None,
+    generator: torch.Generator | None = None,
 ) -> TorchMojoTensor:
-    if generator is not None:
-        raise _unsupported("aten::random_.from (generator)", (self,))
-    cpu = torch.empty(self._shape, dtype=max_dtype_to_torch_dtype(self._dtype)).random_(
-        from_, to
+    return _fill_via_cpu_rng(
+        self, generator, "aten::random_.from", lambda t: t.random_(from_, to)
     )
-    staged = TorchMojoTensor._from_cpu(cpu, self._device)
-    _copy_into_tensor(self, staged)
-    return self
 
 
 # ----------------------------------------------------------------------------------

@@ -3284,7 +3284,7 @@ def _masked_fill_operands(input, mask, value):
                 "masked_fill_ only supports a 0-dimensional value tensor, "
                 f"but got tensor with {len(val._shape)} dimension(s)."
             )
-        if val._dtype != a._dtype or val._device != a._device or val._numel != 1:
+        if val._dtype != a._dtype or val._device != a._device:
             return None
     elif isinstance(value, int | float):
         if isinstance(value, bool):
