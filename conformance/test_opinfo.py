@@ -114,10 +114,10 @@ class TestOpInfoConformance(TestCase):
             self.skipTest(skip_reason)
         checked = 0
         for sample in op.sample_inputs("cpu", dtype, requires_grad=False):
-            moved = sample.transform(
-                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x
-            )
             try:
+                moved = sample.transform(
+                    lambda x: x.to(device) if isinstance(x, torch.Tensor) else x
+                )
                 actual = op(moved.input, *moved.args, **moved.kwargs)
             except Exception as exc:  # noqa: BLE001 - triaging is the point
                 if _not_implemented(exc) or _harness_cannot_construct(exc):
