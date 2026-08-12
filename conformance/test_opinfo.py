@@ -69,13 +69,28 @@ def _harness_cannot_construct(exc: BaseException) -> bool:
 
 
 def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | None:
-    """OpInfo already flags operators whose output is legitimately allowed
-    to differ across devices -- uninitialized memory for the `empty`
-    family, a per-device RNG stream for `dropout` -- by skipping
-    `TestCommon.test_compare_cpu`, upstream's own CPU-vs-other-device
-    consistency test. `test_matches_cpu` is the same kind of comparison,
-    so it honors the same skip instead of hand-maintaining a duplicate
-    list that would drift from upstream's.
+    """None, or why `test_matches_cpu` should not compare this op's output.
+
+    OpInfo already flags operators whose output is legitimately allowed to
+    differ across devices by skipping `TestCommon.test_compare_cpu`,
+    upstream's own CPU-vs-other-device consistency test: uninitialized
+    memory for the `empty` family, a per-device RNG stream for `dropout`
+    and `multi_head_attention_forward`. `native_batch_norm` is a sharper
+    case: with `training=False` ATen's CPU kernel returns
+    `save_mean`/`save_invstd` as empty `(0,)` tensors
+    (`aten/src/ATen/native/Normalization.cpp`, `batch_norm_cpu`), while its
+    CUDA kernel always returns them populated with `running_mean` and
+    `rsqrt(running_var + eps)` (`aten/src/ATen/native/cuda/Normalization.cu`,
+    `batch_norm_cuda_out`) -- required by `native_batch_norm_backward` so a
+    frozen (eval-mode) BatchNorm still produces gradients. Upstream has
+    known about this CPU/CUDA split since 2022 (pytorch/pytorch#85960) and,
+    rather than pick a side, encodes it as an unconditional
+    `DecorateInfo(expectedFailure, 'TestCommon', 'test_compare_cpu')` on the
+    op's own OpInfo entry: CPU and an accelerator are not required to agree
+    here. `test_matches_cpu` is the same comparison upstream's
+    `test_compare_cpu` makes, just against a different accelerator, so it
+    honors the same verdict instead of hand-maintaining a duplicate list of
+    "known-divergent" ops that would drift out of sync with upstream's own.
     """
     for skip in op.skips:
         if skip.test_name != "test_compare_cpu":
