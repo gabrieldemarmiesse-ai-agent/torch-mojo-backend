@@ -93,7 +93,10 @@ def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | N
     "known-divergent" ops that would drift out of sync with upstream's own.
     """
     for skip in op.skips:
-        if skip.test_name != "test_compare_cpu":
+        # op.skips is not guaranteed to be homogeneous: some OpInfo entries
+        # (e.g. linalg.solve_triangular) mix in a bare decorator function
+        # (skipCPUIfNoLapack) alongside proper DecorateInfo instances.
+        if getattr(skip, "test_name", None) != "test_compare_cpu":
             continue
         if skip.cls_name not in (None, "TestCommon"):
             continue
