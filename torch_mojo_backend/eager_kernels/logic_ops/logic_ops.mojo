@@ -194,9 +194,14 @@ def _bin_bcast_body[
         # float and integer dtypes. bf16/fp16 need the division itself
         # done at fp32: computed directly in their own 8/11-bit mantissa,
         # the quotient can round onto the wrong side of an integer
-        # boundary before the floor, which torch's own CPU kernel avoids
-        # by upcasting these dtypes to fp32 first (`div_floor_floating`
-        # in c10/util/generic_math.h, called on the upcast operands).
+        # boundary before the floor -- e.g. a true quotient of 5.985
+        # rounds to 6.0 in bf16, giving floor_divide = 6 instead of 5.
+        # torch's floor_divide algorithm (`div_floor_floating` in
+        # c10/util/generic_math.h) is more involved than a plain
+        # divide-then-floor, but empirically (verified directly against
+        # torch.floor_divide on real bf16/fp16 tensors, including this
+        # exact boundary case) computing it at fp32 and narrowing once at
+        # the end reproduces its bf16/fp16 output.
         comptime if dtype == DType.float16 or dtype == DType.bfloat16:
             out_ptr[i] = (
                 a.cast[DType.float32]() // b.cast[DType.float32]()
@@ -298,12 +303,13 @@ def _bin_vec_op[
     comptime if op_code == BOP_FLOORDIV:
         # See _bin_bcast_body: bf16/fp16 need the fp32 promotion to avoid
         # rounding the quotient across an integer boundary before the
-        # floor, matching torch's own upcast-before-divide CPU kernel.
+        # floor, matching torch's own bf16/fp16 floor_divide output.
         comptime if dtype == DType.float16 or dtype == DType.bfloat16:
             return (a.cast[DType.float32]() // b.cast[DType.float32]()).cast[
                 dtype
             ]()
-        return a // b
+        else:
+            return a // b
     comptime if op_code == BOP_POW:
         comptime if dtype == DType.float16 or dtype == DType.bfloat16:
             return pow(a.cast[DType.float32](), b.cast[DType.float32]()).cast[
