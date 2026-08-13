@@ -54,7 +54,7 @@ from op_utils import (
     _raw_ret_none,
     _raw_tuple_int,
     _raw_tuple_len,
-    _runtime_sm_count,
+    _device_sm_count,
     _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
@@ -1994,7 +1994,7 @@ def _repeat_seg_blocks(nseg: Int, nout: Int) -> Int:
     one with parallelism there.
 
     The caller hands over to it when this count cannot put a block on every
-    SM. That floor is a property of the device (`_runtime_sm_count`), not a
+    SM. That floor is a property of the device (`_device_sm_count`), not a
     tuned number, and the two regimes are three orders of magnitude apart:
     8192x64 r(1,16), which wants the segment kernel, has 512 blocks here
     against the pathological case's 1.
@@ -2283,7 +2283,7 @@ def _repeat_tiled[
     var cout = ecols * r1
     var nout = erows * ncopies  # output rows, copies folded in
     var wide = ecols * size_of[dtype]() >= SEG_MIN_BYTES
-    var sm_count = _runtime_sm_count(ctx)
+    var sm_count = _device_sm_count(ctx)
 
     @always_inline
     @parameter
