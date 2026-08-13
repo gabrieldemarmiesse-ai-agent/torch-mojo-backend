@@ -5045,7 +5045,7 @@ def test_tf32_module_is_available_for_lazy_import():
 def test_bf16_module_is_available_for_lazy_import():
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    assert aten_fast._Gemm16MatmulExtension.MOJO_FILE.name == "bf16_matmul_ops.mojo"
+    assert aten_fast._Gemm16MatmulExtension.MOJO_FILE.name == "gemm16_matmul_ops.mojo"
 
 
 def test_bf16_v3_source_dependency_and_kernel_contract():
@@ -5053,10 +5053,10 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     from torch_mojo_backend.eager_kernels import aten_fast
 
     assert [path.name for path in aten_fast._GEMM16_SOURCE_PATHS] == [
-        "bf16_matmul_ops.mojo",
-        "bf16_gemm_v3_kernels.mojo",
-        "bf16_gemm_tn_v4_kernels.mojo",
-        "bf16_gemm_kernels.mojo",
+        "gemm16_matmul_ops.mojo",
+        "gemm16_v3_kernels.mojo",
+        "gemm16_tn_v4_kernels.mojo",
+        "gemm16_kernels.mojo",
     ]
     bridge_path, v3_path, tn_v4_path, fallback_path = aten_fast._GEMM16_SOURCE_PATHS
     bridge_source = bridge_path.read_text()
@@ -5064,9 +5064,9 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     tn_v4_source = tn_v4_path.read_text()
     fallback_source = fallback_path.read_text()
 
-    assert "from bf16_gemm_v3_kernels import" in bridge_source
-    assert "from bf16_gemm_kernels import (" in v3_source
-    assert "from bf16_gemm_tn_v4_kernels import" in v3_source
+    assert "from gemm16_v3_kernels import" in bridge_source
+    assert "from gemm16_kernels import (" in v3_source
+    assert "from gemm16_tn_v4_kernels import" in v3_source
     # Kernel names carry the dtype the build was specialized for, so the
     # literal in the source is the tag interpolation, not "bf16".  A user
     # profiling a float16 model must read "f16_gemm_..." there.
@@ -5745,7 +5745,7 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
     monkeypatch.setattr(aten_fast, "_ctx_ptr", context_ptr)
     _replace_defined_native_calls(
         monkeypatch,
-        {("bf16_matmul_ops.mojo", "Bf16GemmBF16"): lambda *args: calls.append(args)},
+        {("gemm16_matmul_ops.mojo", "Gemm16"): lambda *args: calls.append(args)},
     )
 
     try:
@@ -5805,7 +5805,7 @@ def test_bf16_gemm_no_bias_uses_ignored_output_pointer(monkeypatch):
     monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda actual_device: 7007)
     _replace_defined_native_calls(
         monkeypatch,
-        {("bf16_matmul_ops.mojo", "Bf16GemmBF16"): lambda *args: calls.append(args)},
+        {("gemm16_matmul_ops.mojo", "Gemm16"): lambda *args: calls.append(args)},
     )
 
     assert aten_fast._try_gemm16_mm(lhs, rhs) is output
@@ -5874,10 +5874,7 @@ def test_gemm16_float16_every_entry_point_launches_the_bridge(
     m, n, k, batch = 64, 96, 128, 3
     calls = _spy_defined_native_calls(
         monkeypatch,
-        {
-            ("bf16_matmul_ops.mojo", "Bf16GemmBF16"),
-            ("bf16_matmul_ops.mojo", "Bf16BmmBF16"),
-        },
+        {("gemm16_matmul_ops.mojo", "Gemm16"), ("gemm16_matmul_ops.mojo", "Bmm16")},
     )
 
     def half(*shape: int) -> torch.Tensor:
@@ -5886,28 +5883,28 @@ def test_gemm16_float16_every_entry_point_launches_the_bridge(
     if op == "mm":
         a, b = half(m, k), half(k, n)
         actual, expected = torch.mm(a, b), a.cpu().float() @ b.cpu().float()
-        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+        launched = ("gemm16_matmul_ops.mojo", "Gemm16")
     elif op == "addmm":
         a, b, c = half(m, k), half(k, n), half(n)
         actual = torch.addmm(c, a, b)
         expected = c.cpu().float() + a.cpu().float() @ b.cpu().float()
-        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+        launched = ("gemm16_matmul_ops.mojo", "Gemm16")
     elif op == "linear":
         x, w, c = half(2, m, k), half(n, k), half(n)
         actual = torch.nn.functional.linear(x, w, c)
         expected = torch.nn.functional.linear(
             x.cpu().float(), w.cpu().float(), c.cpu().float()
         )
-        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+        launched = ("gemm16_matmul_ops.mojo", "Gemm16")
     elif op == "bmm":
         a, b = half(batch, m, k), half(batch, k, n)
         actual, expected = torch.bmm(a, b), torch.bmm(a.cpu().float(), b.cpu().float())
-        launched = ("bf16_matmul_ops.mojo", "Bf16BmmBF16")
+        launched = ("gemm16_matmul_ops.mojo", "Bmm16")
     else:
         a, b = half(batch, m, k), half(batch, n, k)
         actual = aten_fast._fast_aten_bmm_transpose_b(a, b)
         expected = torch.bmm(a.cpu().float(), b.cpu().float().transpose(1, 2))
-        launched = ("bf16_matmul_ops.mojo", "Bf16BmmBF16")
+        launched = ("gemm16_matmul_ops.mojo", "Bmm16")
 
     assert actual.dtype == torch.float16
     assert len(calls[launched]) == 1, f"{op} did not reach the 16-bit GEMM bridge"
@@ -5925,18 +5922,18 @@ def test_gemm16_float16_and_bfloat16_are_separate_specializations(
     from torch_mojo_backend.eager_kernels import aten_fast
 
     calls = _spy_defined_native_calls(
-        monkeypatch, {("bf16_matmul_ops.mojo", "Bf16GemmBF16")}
+        monkeypatch, {("gemm16_matmul_ops.mojo", "Gemm16")}
     )
     half_a = torch.randn(64, 128).to(torch.float16).to(mojo_h100)
     half_b = torch.randn(128, 96).to(torch.float16).to(mojo_h100)
     brain_b = torch.randn(128, 96).to(torch.bfloat16).to(mojo_h100)
 
     assert aten_fast._try_gemm16_mm(half_a, brain_b) is None
-    assert not calls[("bf16_matmul_ops.mojo", "Bf16GemmBF16")]
+    assert not calls[("gemm16_matmul_ops.mojo", "Gemm16")]
 
     assert aten_fast._try_gemm16_mm(half_a, half_b) is not None
     assert aten_fast._try_gemm16_mm(half_a.bfloat16(), brain_b) is not None
-    assert len(calls[("bf16_matmul_ops.mojo", "Bf16GemmBF16")]) == 2
+    assert len(calls[("gemm16_matmul_ops.mojo", "Gemm16")]) == 2
 
 
 def test_gemm16_float16_linear_backward_matches_fp32_reference(
@@ -6196,7 +6193,7 @@ def test_bf16_bmm_host_bridge_padded_layouts_offsets_and_logical_transpose(
     monkeypatch.setattr(aten_fast, "_ctx_ptr", context_ptr)
     _replace_defined_native_calls(
         monkeypatch,
-        {("bf16_matmul_ops.mojo", "Bf16BmmBF16"): lambda *args: calls.append(args)},
+        {("gemm16_matmul_ops.mojo", "Bmm16"): lambda *args: calls.append(args)},
     )
 
     out = aten_fast._try_gemm16_bmm(lhs, rhs, transpose_b=transpose_b)

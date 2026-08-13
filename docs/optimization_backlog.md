@@ -840,7 +840,7 @@ temporary** — **DONE** (`NormSpec`)
   AGENTS.md describes: identical device assembly, different launch geometry.
 * **What the optimized version looks like.** Query the device's last-level cache
   size at launch — MAX exposes device attributes, and
-  `bf16_gemm_v3_kernels.mojo:1701` already calls `ctx.get_attribute(...)` — or at
+  `gemm16_v3_kernels.mojo:1701` already calls `ctx.get_attribute(...)` — or at
   minimum re-fit per architecture behind a `comptime if` and record each sweep
   next to it.
 * **Expected win.** **UNMEASURED** off gfx942.
@@ -1397,7 +1397,7 @@ fallback runs. This is the answer to "which GPUs run an unoptimized path".
 * **What the optimized version looks like.** Derive from device attributes where
   one exists — `ctx.default_device_info.sm_count`
   (`op_utils/__init__.mojo:179`) and `ctx.get_attribute(DeviceAttribute...)`
-  (`bf16_gemm_v3_kernels.mojo:1701`) are both already used in this tree — and
+  (`gemm16_v3_kernels.mojo:1701`) are both already used in this tree — and
   where a constant must stay fixed, state the card and the sweep next to it.
 * **Expected win.** **UNMEASURED** on every card except the one each was fitted
   on.
@@ -1425,7 +1425,7 @@ Stated explicitly so nobody reads this document as complete.
   the entry-point and gating level.** Its kernel bodies —
   `fa4_fwd_kernel.mojo`, `fa4_bwd_kernel.mojo`, `fa4_wgmma_f16.mojo` — were not
   reviewed for optimization opportunities.
-* **`bf16_matmul_ops/` (~7 kLOC across five files) was read only at the dispatch
+* **`gemm16_matmul_ops/` (~7 kLOC across five files) was read only at the dispatch
   level.** The v3/v4 kernel bodies and their tile-selection heuristics were not
   reviewed. `optimization_journal.md` is the authority there and states the
   gfx942 GEMM core is close to exhausted.

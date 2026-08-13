@@ -77,7 +77,7 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from bf16_gemm_kernels import _pick_regime
+from gemm16_kernels import _pick_regime
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _V4_DT = _GEMM16_DT
@@ -102,7 +102,7 @@ comptime _V4_PROD_TMA_STORE = True
 # One (64 x BN x BK) slab of WGMMA work per consumer warp group through the
 # raw descriptor path, fence to fence.  TensorCoreAsync has no col-major A
 # mode, so operand majorness is expressed with COL_A / KMAJ_B exactly like
-# the non-persistent shared body in bf16_gemm_tn_v4_kernels.mojo (which
+# the non-persistent shared body in gemm16_tn_v4_kernels.mojo (which
 # calls this helper too): canonical descriptor layouts follow each
 # operand's majorness and the stride formulas are majorness-generic (they
 # mirror TensorCoreAsync.wgmma).  The second consumer warp group advances
@@ -176,7 +176,7 @@ def _v4_mma_tile[
 # Kernel-symbol layout tag for the persistent body: col_a selects the TN
 # (wgrad) instantiation, col_a + kmaj_b the TT one, plain NN (dgrad)
 # otherwise.  (kmaj_b alone would be NT, which has its own dedicated
-# persistent kernel in bf16_gemm_nt_v4_kernels.mojo and is never
+# persistent kernel in gemm16_nt_v4_kernels.mojo and is never
 # instantiated here.)
 @always_inline
 def _v4_persistent_layout_tag[col_a: Bool, kmaj_b: Bool]() -> StaticString:
@@ -718,7 +718,7 @@ def _v4_enqueue_nn_persistent[
     )
 
 
-def maybe_enqueue_bf16_gemm_nn_v4(
+def maybe_enqueue_gemm16_nn_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
@@ -813,7 +813,7 @@ def maybe_enqueue_bf16_gemm_nn_v4(
                     # alternatives below it on the ladder:
                     #
                     # 1. The 64x64 s64 route at the bottom of the ladder
-                    #    (bf16_gemm_kernels.mojo).  Its own dispatcher
+                    #    (gemm16_kernels.mojo).  Its own dispatcher
                     #    engages it exactly when _pick_regime returns the
                     #    64x64 regime, so the same call is the coverage
                     #    condition here and the two cannot drift apart.  A
@@ -886,7 +886,7 @@ def maybe_enqueue_bf16_gemm_nn_v4(
     return False
 
 
-def maybe_enqueue_bf16_gemm_tn_v4_persistent[
+def maybe_enqueue_gemm16_tn_v4_persistent[
     kmaj_b: Bool = False, any_wave: Bool = False, ragged_n: Bool = False
 ](
     output: _V4_PTR,
@@ -900,7 +900,7 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent[
     """Route a multi-wave TN (wgrad) GEMM -- or, with kmaj_b, a TT one --
     to the persistent clustered v4 body in its col-major-A mode.
 
-    Called by the TN and TT dispatchers in bf16_gemm_tn_v4_kernels.mojo
+    Called by the TN and TT dispatchers in gemm16_tn_v4_kernels.mojo
     AFTER their split-K attempt (deep-K underfilled outputs stay on split-K)
     and BEFORE the remaining one-CTA-per-tile routes.  By default it engages
     only when the 128x256 tiling of the output is strictly multi-wave on the
@@ -912,7 +912,7 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent[
     narrow-tile / v3 routes, which beat the persistent body there.  The TT
     dispatcher passes any_wave=True because it makes its own wave decision
     (its 128x64 small-tile kernel beats this body on every single-wave
-    shape measured; see try_enqueue_bf16_gemm_tt_v4), and ragged_n=True so
+    shape measured; see try_enqueue_gemm16_gemm_tt_v4), and ragged_n=True so
     n % 256 != 0 multi-wave shapes (n % 64 == 0, guaranteed by its gate)
     reach the body's n-clip instantiation instead of falling off to the far
     slower one-CTA-per-tile grid.  The TN dispatcher calls twice: once with
@@ -923,7 +923,7 @@ def maybe_enqueue_bf16_gemm_tn_v4_persistent[
 
     Precondition: m % 128 == 0, k % 64 == 0, and n % 256 == 0 unless
     ragged_n (then n % 64 == 0).  Both callers
-    (try_enqueue_bf16_gemm_tn_v4 / _tt_v4) gate m % 128 == 0 before calling,
+    (try_enqueue_gemm16_gemm_tn_v4 / _tt_v4) gate m % 128 == 0 before calling,
     so the kernel body's ragged-m clip path (TMA read clamp + store clip) is
     unreachable and untested on these routes.
     Returns False when the caller must fall back."""

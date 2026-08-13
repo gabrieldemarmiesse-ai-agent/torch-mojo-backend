@@ -587,7 +587,7 @@ def _v4c_enqueue_nt_persistent[
     )
 
 
-def maybe_enqueue_bf16_gemm_nt_v4(
+def maybe_enqueue_gemm16_nt_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,

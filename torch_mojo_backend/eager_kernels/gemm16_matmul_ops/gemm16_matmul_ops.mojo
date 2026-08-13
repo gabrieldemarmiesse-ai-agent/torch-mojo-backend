@@ -21,7 +21,7 @@ from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
-from bf16_gemm_v3_kernels import enqueue_bf16_bmm, enqueue_bf16_gemm
+from gemm16_v3_kernels import enqueue_gemm16_bmm, enqueue_gemm16_gemm
 from gemm16_dtype import _GEMM16_DT
 from op_utils import (
     _make_ptr,
@@ -58,7 +58,7 @@ def _bf16_gemm_go(
         _raw_int(bias_ptr_obj)
     ).as_unsafe_any_origin()
     var ctx = _raw_ctx(device_context_ptr)
-    enqueue_bf16_gemm(
+    enqueue_gemm16_gemm(
         output,
         a,
         b,
@@ -94,7 +94,7 @@ def _bf16_bmm_go(
     var a = _make_ptr[_GEMM16_DT](_raw_int(a_ptr_obj)).as_unsafe_any_origin()
     var b = _make_ptr[_GEMM16_DT](_raw_int(b_ptr_obj)).as_unsafe_any_origin()
     var ctx = _raw_ctx(device_context_ptr)
-    enqueue_bf16_bmm(
+    enqueue_gemm16_bmm(
         output,
         a,
         b,
@@ -112,13 +112,13 @@ def _bf16_bmm_go(
 
 
 @export
-def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
+def PyInit_gemm16_matmul_ops() abi("C") -> PythonObject:
     try:
-        var b = PythonModuleBuilder("bf16_matmul_ops")
-        comptime if _op_on["Bf16BmmBF16"]():
+        var b = PythonModuleBuilder("gemm16_matmul_ops")
+        comptime if _op_on["Bmm16"]():
             _register_call(
                 b,
-                _spec_dispatcher13[_bf16_bmm_go, "Bf16BmmBF16"],
+                _spec_dispatcher13[_bf16_bmm_go, "Bmm16"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
@@ -126,10 +126,10 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
                     " 16-bit tensor-core strided BMM"
                 ),
             )
-        comptime if _op_on["Bf16GemmBF16"]():
+        comptime if _op_on["Gemm16"]():
             _register_call(
                 b,
-                _spec_dispatcher11[_bf16_gemm_go, "Bf16GemmBF16"],
+                _spec_dispatcher11[_bf16_gemm_go, "Gemm16"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
                     " transpose_b, has_bias, context_ptr); 16-bit tensor-core"
@@ -138,4 +138,4 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
             )
         return b.finalize()
     except e:
-        abort(t"failed to create bf16_matmul_ops python module: {e}")
+        abort(t"failed to create gemm16_matmul_ops python module: {e}")

@@ -3795,14 +3795,14 @@ recorded pre-existing state; unrelated to this work.
 
 Two things worth recording for the next agent:
 
-* `bf16_matmul_ops` and `tf32_matmul_ops` DO NOT COMPILE on this machine, at
-  HEAD, with or without this change: `bf16_gemm_kernels.mojo` calls
+* `gemm16_matmul_ops` and `tf32_matmul_ops` DO NOT COMPILE on this machine, at
+  HEAD, with or without this change: `gemm16_kernels.mojo` calls
   `mma(a=8xbfloat16, b=4xbfloat16, c=4xfloat32)`, which is the NVIDIA
   `m16n8k16` shape and has no gfx942 implementation. `_resolve_bf16_bridge`
   already degrades gracefully ("without compiling a known-incomplete module"),
   and no cached `.so` for either module exists for any source hash. Any edit
   under `eager_kernels/` invalidates the cache, so a loop that imports all of
-  `_MOJO_MODULES` will die on `bf16_matmul_ops`; skip those two.
+  `_MOJO_MODULES` will die on `gemm16_matmul_ops`; skip those two.
 * `pytest -n 8` on this file fails 42 tests with `hipErrorOutOfMemory`, because
   each worker's MAX `DeviceContext` reserves a 172 GB pool. Run this file
   serially; it takes 4.5 s.
@@ -3857,7 +3857,7 @@ cost ~5 us/layer even when the body never reads them, scaling with wave count
 against keeping them unread at 517.9). Worth confirming independently before
 treating as settled.
 
-Operational notes for anyone re-measuring here: `bf16_matmul_ops` and
+Operational notes for anyone re-measuring here: `gemm16_matmul_ops` and
 `tf32_matmul_ops` do not compile at HEAD (an NVIDIA `m16n8k16` MMA shape with no
 gfx942 path; `_resolve_bf16_bridge` degrades gracefully, but a loop importing all
 of `_MOJO_MODULES` dies there). And `pytest -n 8` on `test_eager_kernels.py`
@@ -5308,9 +5308,9 @@ Not chased further -- it needs a fresh profile, not a kernel change.
 | `tests/test_eager_kernels.py`, serial | 645 passed, 93 skipped, 1 failed | see below |
 | `matmul_ops` | untouched by this pass | untouched |
 
-`bf16_matmul_ops` does not compile on this toolchain
+`gemm16_matmul_ops` does not compile on this toolchain
 (`no valid implementation of mma for a=8xbfloat16, b=4xbfloat16, c=4xfloat32` in
-`bf16_gemm_kernels.mojo`); it has never been in this cache and is the
+`gemm16_kernels.mojo`); it has never been in this cache and is the
 pre-existing `test_bf16_v3_source_dependency_and_kernel_contract` failure. It is
 not affected by this pass.
 

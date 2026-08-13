@@ -1828,7 +1828,7 @@ def _enqueue_gemm_splitk(
     raise Error("bf16 gemm split-K: no kernel instantiated for this tile")
 
 
-def enqueue_bf16_gemm(
+def enqueue_gemm16_gemm(
     output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_DT], MutAnyOrigin],
@@ -1987,7 +1987,7 @@ def enqueue_bf16_gemm(
                             )
 
 
-def enqueue_bf16_bmm(
+def enqueue_gemm16_bmm(
     output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_DT], MutAnyOrigin],

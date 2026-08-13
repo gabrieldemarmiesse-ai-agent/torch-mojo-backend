@@ -39,16 +39,16 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from bf16_gemm_kernels import (
-    enqueue_bf16_bmm as _enqueue_accepted_bf16_bmm,
-    enqueue_bf16_gemm as _enqueue_accepted_bf16_gemm,
+from gemm16_kernels import (
+    enqueue_gemm16_bmm as _enqueue_accepted_bf16_bmm,
+    enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
-from bf16_gemm_nn_v4_kernels import maybe_enqueue_bf16_gemm_nn_v4
-from bf16_gemm_nt_v4_kernels import maybe_enqueue_bf16_gemm_nt_v4
-from bf16_gemm_tn_v4_kernels import (
-    try_enqueue_bf16_gemm_splitk_rm_v4,
-    try_enqueue_bf16_gemm_tn_v4,
-    try_enqueue_bf16_gemm_tt_v4,
+from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
+from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
+from gemm16_tn_v4_kernels import (
+    try_enqueue_gemm16_gemm_splitk_rm_v4,
+    try_enqueue_gemm16_gemm_tn_v4,
+    try_enqueue_gemm16_gemm_tt_v4,
 )
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
@@ -1384,7 +1384,7 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     )
 
 
-def enqueue_bf16_gemm(
+def enqueue_gemm16_gemm(
     output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
@@ -1398,7 +1398,7 @@ def enqueue_bf16_gemm(
     ctx: DeviceContext,
 ) raises:
     # NT (forward linear) route: persistent clustered v4 kernel with TMA
-    # multicast and TMA-store epilogue (bf16_gemm_nt_v4_kernels.mojo).  The
+    # multicast and TMA-store epilogue (gemm16_nt_v4_kernels.mojo).  The
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
@@ -1407,10 +1407,12 @@ def enqueue_bf16_gemm(
         # SMs resident but cannot parallelize over K, so an output with few
         # macro-tiles and a deep reduction leaves most of the GPU idle.
         # The helper gates itself on that regime (see
-        # bf16_gemm_tn_v4_kernels.mojo) and returns False otherwise.
-        if try_enqueue_bf16_gemm_splitk_rm_v4[True](output, a, b, m, n, k, ctx):
+        # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
+        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+            output, a, b, m, n, k, ctx
+        ):
             return
-        if maybe_enqueue_bf16_gemm_nt_v4(output, a, b, m, n, k, ctx):
+        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
@@ -1423,7 +1425,7 @@ def enqueue_bf16_gemm(
             if cc_major == 9 and cc_minor == 0:
                 # NN dgrad route (v4): persistent warp-specialized kernel
                 # with 2-CTA-cluster B multicast and a TMA-store epilogue
-                # (bf16_gemm_nn_v4_kernels.mojo).  It gates itself on the
+                # (gemm16_nn_v4_kernels.mojo).  It gates itself on the
                 # aligned NN regime (n % 64 == 0, k % 64 == 0; m may be
                 # ragged, and n % 256 != 0 selects the ragged_n _nclip
                 # instantiation) and declines only shapes a smaller route
@@ -1439,11 +1441,11 @@ def enqueue_bf16_gemm(
                 # leaves most SMs idle.  The helper gates itself on that
                 # regime.
                 if not transpose_a and not transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_splitk_rm_v4[False](
+                    if try_enqueue_gemm16_gemm_splitk_rm_v4[False](
                         output, a, b, m, n, k, ctx
                     ):
                         return
-                if maybe_enqueue_bf16_gemm_nn_v4(
+                if maybe_enqueue_gemm16_nn_v4(
                     output,
                     a,
                     b,
@@ -1458,24 +1460,28 @@ def enqueue_bf16_gemm(
                     return
                 # V4 TN (wgrad) route: split-K and narrow-tile kernels for
                 # the deep-K, underfilled-output regime (huge K, small m*n;
-                # see bf16_gemm_tn_v4_kernels.mojo).  The dispatcher checks
+                # see gemm16_tn_v4_kernels.mojo).  The dispatcher checks
                 # its own alignment/regime gates and returns False whenever
                 # it declines, so every existing TN path below remains the
                 # fallback.
                 if transpose_a and not transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_tn_v4(output, a, b, m, n, k, ctx):
+                    if try_enqueue_gemm16_gemm_tn_v4(
+                        output, a, b, m, n, k, ctx
+                    ):
                         return
                 # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
                 # instantiations of the shared warp-specialized body
                 # (split-K, persistent, direct; see
-                # bf16_gemm_tn_v4_kernels.mojo), so a TT mm writes C
+                # gemm16_tn_v4_kernels.mojo), so a TT mm writes C
                 # directly into the caller's contiguous row-major (m, n)
                 # buffer -- the same strides CUDA torch returns.  The
                 # dispatcher gates its own aligned regime and returns False
                 # otherwise, in which case the all-layout v2 fallback below
                 # serves the call.
                 if transpose_a and transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_tt_v4(output, a, b, m, n, k, ctx):
+                    if try_enqueue_gemm16_gemm_tt_v4(
+                        output, a, b, m, n, k, ctx
+                    ):
                         return
                 # A 64x128 tile preserves the prior aligned-NN coverage and
                 # increases available CTAs when the 128x256 grid would be
@@ -1727,7 +1733,7 @@ def enqueue_bf16_gemm(
     )
 
 
-def enqueue_bf16_bmm(
+def enqueue_gemm16_bmm(
     output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],

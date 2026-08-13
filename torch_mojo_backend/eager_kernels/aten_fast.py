@@ -39,9 +39,6 @@ from torch_mojo_backend.eager_kernels.activation_backward_ops import (
 from torch_mojo_backend.eager_kernels.activation_forward_ops import (
     ActivationForwardExtension as _ActivationForwardExtension,
 )
-from torch_mojo_backend.eager_kernels.bf16_matmul_ops import (
-    Gemm16MatmulExtension as _Gemm16MatmulExtension,
-)
 from torch_mojo_backend.eager_kernels.conv_ops import ConvExtension as _ConvExtension
 from torch_mojo_backend.eager_kernels.data_movement_ops import (
     DataMovementExtension as _DataMovementExtension,
@@ -57,6 +54,9 @@ from torch_mojo_backend.eager_kernels.embedding_backward_ops import (
 )
 from torch_mojo_backend.eager_kernels.flash_attention_ops import (
     FlashAttentionExtension as _FlashAttentionExtension,
+)
+from torch_mojo_backend.eager_kernels.gemm16_matmul_ops import (
+    Gemm16MatmulExtension as _Gemm16MatmulExtension,
 )
 from torch_mojo_backend.eager_kernels.logic_ops import LogicExtension as _LogicExtension
 from torch_mojo_backend.eager_kernels.loss_ops import LossExtension as _LossExtension
@@ -167,18 +167,21 @@ _SDPA_BACKWARD_SOURCE_PATHS = (
 # closure would otherwise launch a predictably failing compile before an
 # ordinary eager matmul.
 #
-# The directory and its files still carry the `bf16_` prefix they were born
-# with; the family now serves float16 as well, selected at compile time by
-# DTYPE_ARG_0 (bf16_matmul_ops/gemm16_dtype.mojo).  The names were left alone
-# on purpose: the entry module's stem is how scripts/compare_kernel_asm.py
-# pairs kernels across two trees, and renaming it in the same change that
-# parametrized the dtype would have made the bfloat16 byte-invariance check
-# unverifiable.  A rename is a separate, mechanical follow-up.
+# The family serves both 16-bit float dtypes, selected at compile time by
+# DTYPE_ARG_0 (gemm16_matmul_ops/gemm16_dtype.mojo), hence `gemm16` rather
+# than a dtype in the name.  The `bf16_` prefix it was born with survived one
+# commit past the parametrization on purpose -- the entry module's stem is how
+# scripts/compare_kernel_asm.py pairs kernels across two trees, so renaming it
+# in the same change would have made the bfloat16 byte-invariance check
+# unverifiable.  The kernel names CUPTI prints keep a real dtype token
+# (`{_GEMM16_TAG}_gemm_...` -> `f16_gemm_...` / `bf16_gemm_...`): a profile
+# must say which dtype actually ran, which is the one place the distinction
+# still belongs.
 _GEMM16_SOURCE_PATHS = (
     eager_kernels._PACKAGE_DIR / _Gemm16MatmulExtension.MOJO_FILE,
-    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_v3_kernels.mojo",
-    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_tn_v4_kernels.mojo",
-    eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "gemm16_matmul_ops/gemm16_v3_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "gemm16_matmul_ops/gemm16_tn_v4_kernels.mojo",
+    eager_kernels._PACKAGE_DIR / "gemm16_matmul_ops/gemm16_kernels.mojo",
 )
 
 # The dtypes that family serves.  bfloat16 and float16 are one and the same to
@@ -7460,7 +7463,7 @@ def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     out = _alloc(logical_output_shape, lhs._dtype, lhs._device)
     _call_mojo(
         _Gemm16MatmulExtension,
-        "Bf16GemmBF16",
+        "Gemm16",
         (
             out._ptr,
             lhs._ptr,
@@ -7603,7 +7606,7 @@ def _try_gemm16_bmm(a, b, *, transpose_b=False):
     out = _alloc((batch, m, n), lhs._dtype, lhs._device)
     _call_mojo(
         _Gemm16MatmulExtension,
-        "Bf16BmmBF16",
+        "Bmm16",
         (
             out._ptr,
             lhs._ptr,

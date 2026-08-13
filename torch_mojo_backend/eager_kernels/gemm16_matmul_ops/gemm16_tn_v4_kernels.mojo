@@ -52,9 +52,9 @@ from layout import Layout, LayoutTensor
 from layout.tensor_core_async import tile_layout_k_major, tile_layout_mn_major
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from bf16_gemm_nn_v4_kernels import (
+from gemm16_nn_v4_kernels import (
     _v4_mma_tile,
-    maybe_enqueue_bf16_gemm_tn_v4_persistent,
+    maybe_enqueue_gemm16_tn_v4_persistent,
 )
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
@@ -276,7 +276,7 @@ def _v4_tn_ws_body[
                     alignment=128,
                 ](b_pipeline.ptr + stage * BN * _V4_BK)
                 # Majorness-generic raw WGMMA slab, shared with the
-                # persistent body in bf16_gemm_nn_v4_kernels.mojo.
+                # persistent body in gemm16_nn_v4_kernels.mojo.
                 _v4_mma_tile[BN, COL_A, KMAJ_B, A_LAYOUT, B_LAYOUT](
                     a_tile.ptr, b_tile.ptr, accum, warp_group_idx
                 )
@@ -866,7 +866,7 @@ def _v4_enqueue_tt_direct_m64n128(
 # Regime dispatch.  Returns True when a v4 kernel handled the call.
 # Caller guarantees: TN (transpose_a and not transpose_b), no bias.
 # ============================================================================
-def try_enqueue_bf16_gemm_tn_v4(
+def try_enqueue_gemm16_gemm_tn_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
@@ -930,7 +930,7 @@ def try_enqueue_bf16_gemm_tn_v4(
     # in its col-major-A mode.  Gated inside the helper; it declines
     # single-wave and unaligned shapes, which fall through to the
     # narrow-tile / v3 routes below.
-    if maybe_enqueue_bf16_gemm_tn_v4_persistent(output, a, b, m, n, k, ctx):
+    if maybe_enqueue_gemm16_tn_v4_persistent(output, a, b, m, n, k, ctx):
         return True
 
     # Same rung for n % 256 != 0 (n % 64 == 0, gated in the helper): the
@@ -950,7 +950,7 @@ def try_enqueue_bf16_gemm_tn_v4(
     # persistent body's per-tile rate would only tie).  Single-wave
     # ragged shapes therefore keep the narrow-tile / v3 routes below.
     if n % 256 != 0:
-        if maybe_enqueue_bf16_gemm_tn_v4_persistent[False, False, True](
+        if maybe_enqueue_gemm16_tn_v4_persistent[False, False, True](
             output, a, b, m, n, k, ctx
         ):
             return True
@@ -996,7 +996,7 @@ def try_enqueue_bf16_gemm_tn_v4(
 # and m == 128.  Everything declined falls back to the v2 all-layout
 # dispatcher.
 # ============================================================================
-def try_enqueue_bf16_gemm_tt_v4(
+def try_enqueue_gemm16_gemm_tt_v4(
     output: _V4_PTR,
     a: _V4_PTR,
     b: _V4_PTR,
@@ -1107,7 +1107,7 @@ def try_enqueue_bf16_gemm_tt_v4(
     #     (152.6 vs 146.7) -- a zero-sum trade across the transposed pair,
     #     and both cells stay within 2% of stock PyTorch.
     if not small_covers and m % 256 == 0:
-        if maybe_enqueue_bf16_gemm_tn_v4_persistent[True, True, True](
+        if maybe_enqueue_gemm16_tn_v4_persistent[True, True, True](
             output, a, b, m, n, k, ctx
         ):
             return True
@@ -1172,7 +1172,7 @@ comptime _V4_SPLITK_RM_DEEP_TILES = 64  # k BK-tiles; H100 PCIe fit
 comptime _V4_SPLITK_RM_COVERED_MIN_SPLITS = 4  # H100 PCIe fit
 
 
-def try_enqueue_bf16_gemm_splitk_rm_v4[
+def try_enqueue_gemm16_gemm_splitk_rm_v4[
     KMAJ_B: Bool
 ](
     output: _V4_PTR,
