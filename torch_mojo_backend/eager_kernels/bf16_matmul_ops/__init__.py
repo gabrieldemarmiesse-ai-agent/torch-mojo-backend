@@ -1,3 +1,3 @@
-from .bf16_matmul_ops import BF16MatmulExtension
+from .bf16_matmul_ops import Gemm16MatmulExtension
 
-__all__ = ["BF16MatmulExtension"]
+__all__ = ["Gemm16MatmulExtension"]

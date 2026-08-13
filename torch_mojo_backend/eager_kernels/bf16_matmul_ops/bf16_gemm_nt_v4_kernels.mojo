@@ -1,4 +1,4 @@
-"""Persistent warp-specialized H100 BF16 NT GEMM (v4).
+"""Persistent warp-specialized H100 16-bit NT GEMM (v4).
 
 Targets the forward-linear layout C[m,n] = A[m,k] @ B[n,k]^T on SM90.
 
@@ -28,6 +28,11 @@ Improvements over the v3 NT kernel (`_v3_nt_ws_m128n256_tma_s3`):
 The kernel is fully dynamic in m, n, k (runtime dispatch, no hardcoded
 model dimensions).  Partial edge tiles are handled by TMA out-of-bounds
 clipping on both loads (zero-fill) and stores (write suppression).
+
+The operand dtype is bfloat16 or float16, chosen at compile time by
+`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the 2-byte operand width, not of the exponent
+layout, so one source serves both.
 """
 
 from max.gpu.sync import barrier
@@ -57,10 +62,11 @@ from layout.tensor_core_async import (
     warpgroup_fence,
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
+from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
-comptime _V4_BF16 = DType.bfloat16
+comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_BF16], MutAnyOrigin]
+comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 
 comptime _V4_BM = 128
@@ -69,28 +75,26 @@ comptime _V4_THREADS = 384
 comptime _V4_CONSUMERS = 2
 # Consumer warp group owns a 64-row half of the 128-row output tile.
 comptime _V4_WG_ROWS = _V4_BM // _V4_CONSUMERS
-# TMA store box: 64 rows x 64 bf16 columns (128B swizzle span).
+# TMA store box: 64 rows x 64 16-bit columns (128B swizzle span).
 comptime _V4_C_BOX_N = 64
 comptime _V4_C_BOX_ELEMS = _V4_WG_ROWS * _V4_C_BOX_N
 comptime _V4_CLUSTER = 2
 comptime _V4_CLUSTER_SHAPE = StaticTuple[Int32, 3](Int32(_V4_CLUSTER), 1, 1)
 
 comptime _V4_A_LAYOUT = tile_layout_k_major[
-    _V4_BF16, _V4_BM, _V4_BK, _V4_SWIZZLE
+    _V4_DT, _V4_BM, _V4_BK, _V4_SWIZZLE
 ]()
 comptime _V4_A_TMA = TMATensorTile[
-    _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
 ]
 
 
 def _v4_b_layout[bn: Int]() -> Layout:
-    return tile_layout_k_major[_V4_BF16, bn, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_k_major[_V4_DT, bn, _V4_BK, _V4_SWIZZLE]()
 
 
 def _v4_b_half_layout[bn: Int]() -> Layout:
-    return tile_layout_k_major[
-        _V4_BF16, bn // _V4_CLUSTER, _V4_BK, _V4_SWIZZLE
-    ]()
+    return tile_layout_k_major[_V4_DT, bn // _V4_CLUSTER, _V4_BK, _V4_SWIZZLE]()
 
 
 @always_inline
@@ -98,7 +102,7 @@ def _v4_store_accum_stmatrix[
     bn: Int
 ](
     wg_half: UnsafePointer[
-        Scalar[_V4_BF16], MutAnyOrigin, address_space=AddressSpace.SHARED
+        Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     accum: LayoutTensor[
         _V4_F32,
@@ -133,31 +137,40 @@ def _v4_store_accum_stmatrix[
         )
         var data = SIMD[DType.float32, 4](
             bitcast[DType.float32, 1](
-                SIMD[_V4_BF16, 2](
-                    accum.ptr[8 * t].cast[_V4_BF16](),
-                    accum.ptr[8 * t + 1].cast[_V4_BF16](),
+                SIMD[_V4_DT, 2](
+                    accum.ptr[8 * t].cast[_V4_DT](),
+                    accum.ptr[8 * t + 1].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
-                SIMD[_V4_BF16, 2](
-                    accum.ptr[8 * t + 2].cast[_V4_BF16](),
-                    accum.ptr[8 * t + 3].cast[_V4_BF16](),
+                SIMD[_V4_DT, 2](
+                    accum.ptr[8 * t + 2].cast[_V4_DT](),
+                    accum.ptr[8 * t + 3].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
-                SIMD[_V4_BF16, 2](
-                    accum.ptr[8 * t + 4].cast[_V4_BF16](),
-                    accum.ptr[8 * t + 5].cast[_V4_BF16](),
+                SIMD[_V4_DT, 2](
+                    accum.ptr[8 * t + 4].cast[_V4_DT](),
+                    accum.ptr[8 * t + 5].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
-                SIMD[_V4_BF16, 2](
-                    accum.ptr[8 * t + 6].cast[_V4_BF16](),
-                    accum.ptr[8 * t + 7].cast[_V4_BF16](),
+                SIMD[_V4_DT, 2](
+                    accum.ptr[8 * t + 6].cast[_V4_DT](),
+                    accum.ptr[8 * t + 7].cast[_V4_DT](),
                 )
             ),
         )
         st_matrix[simd_width=4](wg_half + off, data)
+
+
+@always_inline
+def _v4c_nt_defer_tag[defer_release: Bool]() -> StaticString:
+    """Name suffix for the deferred-release pipeline variant."""
+    comptime if defer_release:
+        return "_dr"
+    else:
+        return ""
 
 
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
@@ -167,18 +180,25 @@ def _v4_store_accum_stmatrix[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS)),
     `nvvm.cluster_dim`=_V4_CLUSTER_SHAPE,
 )
+# Without an explicit name this kernel reaches CUPTI, Nsight and
+# torch.profiler as its Mojo mangling -- module path, encoded parameters and
+# a 16-hex hash that moves on any refactor -- which is both unreadable and,
+# once this family serves float16 too, wrong about the dtype.
+@__name(
+    t"{_GEMM16_TAG}_gemm_nt_v4_persistent_m{_V4_BM}n{bn}_s{stages}g{raster_h}{_v4c_nt_defer_tag[defer_release]()}"
+)
 def _v4c_nt_persistent[
     bn: Int, stages: Int, raster_h: Int, defer_release: Bool = False
 ](
     a_tma: _V4_A_TMA,
     b_tma: TMATensorTile[
-        _V4_BF16,
+        _V4_DT,
         2,
         Index(bn // _V4_CLUSTER, _V4_BK),
         Index(bn // _V4_CLUSTER, _V4_BK),
     ],
     c_tma: TMATensorTile[
-        _V4_BF16, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
+        _V4_DT, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
     ],
     m_arg: Int64,
     n_arg: Int64,
@@ -206,14 +226,14 @@ def _v4c_nt_persistent[
     comptime TMA_BYTES = (_V4_BM + bn) * _V4_BK * 2
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             Layout.row_major(stages, _V4_BM * _V4_BK),
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             Layout.row_major(stages, bn * _V4_BK),
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -223,7 +243,7 @@ def _v4c_nt_persistent[
         # as consecutive 64x64 boxes in the canonical 128B-swizzled TMA
         # layout expected by the C descriptor.
         var c_staging = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             Layout.row_major(_V4_CONSUMERS, _V4_WG_ROWS * bn),
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -310,7 +330,7 @@ def _v4c_nt_persistent[
                         empty_barriers[stage].wait(phase)
                         full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
                         var a_tile = LayoutTensor[
-                            _V4_BF16,
+                            _V4_DT,
                             _V4_A_LAYOUT,
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
@@ -321,7 +341,7 @@ def _v4c_nt_persistent[
                         if can_multicast:
                             # Load our half of B, multicast to both CTAs.
                             var b_half = LayoutTensor[
-                                _V4_BF16,
+                                _V4_DT,
                                 B_HALF_LAYOUT,
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
@@ -341,7 +361,7 @@ def _v4c_nt_persistent[
                             # Divergent pair: load the full B tile privately.
                             comptime for half in range(_V4_CLUSTER):
                                 var b_half = LayoutTensor[
-                                    _V4_BF16,
+                                    _V4_DT,
                                     B_HALF_LAYOUT,
                                     MutAnyOrigin,
                                     address_space=AddressSpace.SHARED,
@@ -369,8 +389,8 @@ def _v4c_nt_persistent[
             ].stack_allocation()
             comptime wgmma = TensorCoreAsync[
                 _V4_F32,
-                _V4_BF16,
-                _V4_BF16,
+                _V4_DT,
+                _V4_DT,
                 Index(64, bn, 16),
                 a_swizzle=_V4_SWIZZLE,
                 b_swizzle=_V4_SWIZZLE,
@@ -401,14 +421,14 @@ def _v4c_nt_persistent[
                     var phase = UInt32((gkt // stages) % 2)
                     full_barriers[stage].wait(phase)
                     var a_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         _V4_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * _V4_BM * _V4_BK)
                     var b_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -477,7 +497,7 @@ def _v4c_nt_persistent[
                 named_barrier[Int32(128)](Int32(warp_group_idx))
                 if warp_group_thread_idx == 0:
                     var c_store = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         Layout.row_major(_V4_WG_ROWS, bn),
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -510,7 +530,7 @@ def _v4c_enqueue_nt_persistent[
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -521,7 +541,7 @@ def _v4c_enqueue_nt_persistent[
         IndexList[2](k, 1),
         IndexList[2](_V4_BM, _V4_BK),
     )
-    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -532,7 +552,7 @@ def _v4c_enqueue_nt_persistent[
         IndexList[2](k, 1),
         IndexList[2](bn // _V4_CLUSTER, _V4_BK),
     )
-    var c_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var c_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             output.address_space_cast[AddressSpace.GENERIC](),
@@ -545,13 +565,13 @@ def _v4c_enqueue_nt_persistent[
     )
     var a_tma = _V4_A_TMA(a_desc)
     var b_tma = TMATensorTile[
-        _V4_BF16,
+        _V4_DT,
         2,
         Index(bn // _V4_CLUSTER, _V4_BK),
         Index(bn // _V4_CLUSTER, _V4_BK),
     ](b_desc)
     var c_tma = TMATensorTile[
-        _V4_BF16, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
+        _V4_DT, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
     ](c_desc)
     ctx.enqueue_function[
         _v4c_nt_persistent[bn, stages, raster_h, defer_release]

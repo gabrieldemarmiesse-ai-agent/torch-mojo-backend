@@ -1,4 +1,4 @@
-"""Persistent clustered H100 BF16 NN GEMM (dgrad) kernels — v4.
+"""Persistent clustered H100 16-bit NN GEMM (dgrad) kernels — v4.
 
 C[m, n] = A[m, k] @ B[k, n] with both operands row-major.
 
@@ -29,6 +29,11 @@ stores; n % BN != 0 selects the ragged_n `_nclip` instantiation, which
 clips the trailing partial column of tiles the same way); everything else
 must be routed to the existing v3 dispatcher by the caller
 (`maybe_enqueue_...` returns False in that case).
+
+The operand dtype is bfloat16 or float16, chosen at compile time by
+`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the 2-byte operand width, not of the exponent
+layout, so one source serves both.
 """
 
 from std.gpu import (
@@ -73,10 +78,11 @@ from layout.tensor_core_async import (
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from bf16_gemm_kernels import _pick_regime
+from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
-comptime _V4_BF16 = DType.bfloat16
+comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_BF16], MutAnyOrigin]
+comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_BK = 64
 # Macro-rows per rasterization group: consecutive work indices cover
 # _V4_GROUP macro rows before advancing one BN column, keeping the in-flight
@@ -110,10 +116,10 @@ def _v4_mma_tile[
     B_LAYOUT: Layout,
 ](
     a_smem: UnsafePointer[
-        Scalar[_V4_BF16], MutAnyOrigin, address_space=AddressSpace.SHARED
+        Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     b_smem: UnsafePointer[
-        Scalar[_V4_BF16], MutAnyOrigin, address_space=AddressSpace.SHARED
+        Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     accum: LayoutTensor[
         _V4_F32,
@@ -125,11 +131,9 @@ def _v4_mma_tile[
 ):
     comptime CFRAG = 64 * BN // 128
     comptime a_canonical_layout = tile_to_descriptor[
-        _V4_BF16, A_LAYOUT, not COL_A
+        _V4_DT, A_LAYOUT, not COL_A
     ]()
-    comptime b_canonical_layout = tile_to_descriptor[
-        _V4_BF16, B_LAYOUT, KMAJ_B
-    ]()
+    comptime b_canonical_layout = tile_to_descriptor[_V4_DT, B_LAYOUT, KMAJ_B]()
     comptime a_shape00 = a_canonical_layout[0].shape[0].value()
     comptime a_stride01 = a_canonical_layout[0].stride[1].value()
     comptime a_stride11 = a_canonical_layout[1].stride[1].value()
@@ -154,8 +158,8 @@ def _v4_mma_tile[
             64,
             BN,
             16,
-            a_type=_V4_BF16,
-            b_type=_V4_BF16,
+            a_type=_V4_DT,
+            b_type=_V4_DT,
             layout_a="col" if COL_A else "row",
             layout_b="col" if KMAJ_B else "row",
         ](
@@ -214,7 +218,7 @@ def _v4_persistent_ragged_tag[ragged_n: Bool]() -> StaticString:
 # ragged tag does the same for the n-clip TT instantiation while keeping
 # every exact-n symbol byte-identical to its pre-existing name.
 @__name(
-    t"bf16_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent{_v4_persistent_ragged_tag[ragged_n]()}"
+    t"{_GEMM16_TAG}_gemm_{_v4_persistent_layout_tag[col_a, kmaj_b]()}_v4_persistent{_v4_persistent_ragged_tag[ragged_n]()}"
 )
 def _v4_nn_persistent_ws[
     stages: Int,
@@ -254,9 +258,9 @@ def _v4_nn_persistent_ws[
         _V4_BK, 64
     ),
 ](
-    a_tma: TMATensorTile[_V4_BF16, 2, a_tile_shape, a_desc_shape],
-    b_tma: TMATensorTile[_V4_BF16, 2, b_tile_shape, b_desc_shape],
-    c_tma: TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)],
+    a_tma: TMATensorTile[_V4_DT, 2, a_tile_shape, a_desc_shape],
+    b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
+    c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -269,14 +273,12 @@ def _v4_nn_persistent_ws[
     var k = Int(k_arg)
     comptime if _is_sm_9x():
         comptime A_LAYOUT = tile_layout_mn_major[
-            _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
-        ]() if col_a else tile_layout_k_major[
-            _V4_BF16, bm, _V4_BK, _V4_SWIZZLE
-        ]()
+            _V4_DT, bm, _V4_BK, _V4_SWIZZLE
+        ]() if col_a else tile_layout_k_major[_V4_DT, bm, _V4_BK, _V4_SWIZZLE]()
         comptime B_LAYOUT = tile_layout_k_major[
-            _V4_BF16, bn, _V4_BK, _V4_SWIZZLE
+            _V4_DT, bn, _V4_BK, _V4_SWIZZLE
         ]() if kmaj_b else tile_layout_mn_major[
-            _V4_BF16, bn, _V4_BK, _V4_SWIZZLE
+            _V4_DT, bn, _V4_BK, _V4_SWIZZLE
         ]()
         # For both majornesses a 64-row chunk of the bn-row tile is one
         # contiguous 64 * BK block at offset chunk * 64 * BK (BK = 64 bf16 is
@@ -284,21 +286,21 @@ def _v4_nn_persistent_ws[
         # stack of 8-row atoms; the NT kernel's half-tile multicast relies on
         # the same decomposition).
         comptime B_CHUNK_LAYOUT = tile_layout_k_major[
-            _V4_BF16, 64, _V4_BK, _V4_SWIZZLE
+            _V4_DT, 64, _V4_BK, _V4_SWIZZLE
         ]() if kmaj_b else tile_layout_mn_major[
-            _V4_BF16, 64, _V4_BK, _V4_SWIZZLE
+            _V4_DT, 64, _V4_BK, _V4_SWIZZLE
         ]()
         comptime A_PIPE_LAYOUT = Layout.row_major(stages, bm * _V4_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(stages, bn * _V4_BK)
         var a_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -308,7 +310,7 @@ def _v4_nn_persistent_ws[
         # 64 elements, bn // 64 chunks).  A dummy allocation when disabled.
         comptime C_SMEM_ELEMS = bm * bn if tma_store else 512
         var c_smem = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             Layout.row_major(1, C_SMEM_ELEMS),
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -391,7 +393,7 @@ def _v4_nn_persistent_ws[
                         empty_barriers[stage].wait(phase)
                         full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
                         var a_tile = LayoutTensor[
-                            _V4_BF16,
+                            _V4_DT,
                             A_LAYOUT,
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
@@ -418,7 +420,7 @@ def _v4_nn_persistent_ws[
                         var cend = (rank + 1) * B_CHUNKS // cluster_m
                         while cc < cend:
                             var b_chunk = LayoutTensor[
-                                _V4_BF16,
+                                _V4_DT,
                                 B_CHUNK_LAYOUT,
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
@@ -479,8 +481,8 @@ def _v4_nn_persistent_ws[
             ].stack_allocation()
             comptime wgmma = TensorCoreAsync[
                 _V4_F32,
-                _V4_BF16,
-                _V4_BF16,
+                _V4_DT,
+                _V4_DT,
                 Index(64, bn, 16),
                 a_swizzle=_V4_SWIZZLE,
                 b_swizzle=_V4_SWIZZLE,
@@ -505,14 +507,14 @@ def _v4_nn_persistent_ws[
                     var phase = UInt32((gt // stages) % 2)
                     full_barriers[stage].wait(phase)
                     var a_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * bm * _V4_BK)
                     var b_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -563,9 +565,9 @@ def _v4_nn_persistent_ws[
                             (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                         )
                         var col = base_col + (q // 2) * 8
-                        var pair = SIMD[_V4_BF16, 2](
-                            accum.ptr[e].cast[_V4_BF16](),
-                            accum.ptr[e + 1].cast[_V4_BF16](),
+                        var pair = SIMD[_V4_DT, 2](
+                            accum.ptr[e].cast[_V4_DT](),
+                            accum.ptr[e + 1].cast[_V4_DT](),
                         )
                         # 128B-swizzled staging layout: 16B units within
                         # each 64-element row are XORed with (row % 8).
@@ -582,7 +584,7 @@ def _v4_nn_persistent_ws[
                     if warp_group_idx == 1 and warp_group_thread_idx == 0:
                         comptime for chunk in range(bn // 64):
                             var c_chunk = LayoutTensor[
-                                _V4_BF16,
+                                _V4_DT,
                                 Layout.row_major(bm, 64),
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
@@ -597,9 +599,9 @@ def _v4_nn_persistent_ws[
                             (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                         )
                         var col = base_col + (q // 2) * 8
-                        var pair = SIMD[_V4_BF16, 2](
-                            accum.ptr[e].cast[_V4_BF16](),
-                            accum.ptr[e + 1].cast[_V4_BF16](),
+                        var pair = SIMD[_V4_DT, 2](
+                            accum.ptr[e].cast[_V4_DT](),
+                            accum.ptr[e + 1].cast[_V4_DT](),
                         )
                         if m0 + row < m and n0 + col + 1 < n:
                             output.store[alignment=4](
@@ -646,7 +648,7 @@ def _v4_enqueue_nn_persistent[
     comptime B_TILE = Index(64, _V4_BK) if kmaj_b else Index(_V4_BK, 64)
     var a_dim0 = k if col_a else m
     var a_dim1 = m if col_a else k
-    var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -659,7 +661,7 @@ def _v4_enqueue_nn_persistent[
     )
     var b_dim0 = n if kmaj_b else k
     var b_dim1 = k if kmaj_b else n
-    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -670,7 +672,7 @@ def _v4_enqueue_nn_persistent[
         IndexList[2](b_dim1, 1),
         IndexList[2](B_TILE[0], B_TILE[1]),
     )
-    var c_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var c_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             output.address_space_cast[AddressSpace.GENERIC](),
@@ -681,9 +683,9 @@ def _v4_enqueue_nn_persistent[
         IndexList[2](n, 1),
         IndexList[2](bm, 64),
     )
-    var a_tma = TMATensorTile[_V4_BF16, 2, A_TILE, A_DESC](a_desc)
-    var b_tma = TMATensorTile[_V4_BF16, 2, B_TILE, B_TILE](b_desc)
-    var c_tma = TMATensorTile[_V4_BF16, 2, Index(bm, 64), Index(bm, 64)](c_desc)
+    var a_tma = TMATensorTile[_V4_DT, 2, A_TILE, A_DESC](a_desc)
+    var b_tma = TMATensorTile[_V4_DT, 2, B_TILE, B_TILE](b_desc)
+    var c_tma = TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)](c_desc)
     var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
     var blocks_n = n // bn
     comptime if ragged_n:

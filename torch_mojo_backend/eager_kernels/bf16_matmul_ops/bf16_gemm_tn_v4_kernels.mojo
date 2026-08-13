@@ -1,4 +1,4 @@
-"""V4 H100 BF16 TN (wgrad) GEMM kernels: split-K and narrow-tile variants.
+"""V4 H100 16-bit TN (wgrad) GEMM kernels: split-K and narrow-tile variants.
 
 The nanogpt wgrad family C[m,n] = A[k,m]^T @ B[k,n] has a huge reduction
 dimension (K = tokens = 32768) and small outputs (m,n in the hundreds to a
@@ -24,6 +24,11 @@ Two remedies, both dispatched by regime (no model dims hardcoded):
 Both kernels reuse the v3 warp-specialized TMA + WGMMA structure: A is
 physical row-major (K, M) and loaded directly into an MN-major shared tile,
 which is the column-major A representation accepted by SM90 WGMMA.
+
+The operand dtype is bfloat16 or float16, chosen at compile time by
+`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the 2-byte operand width, not of the exponent
+layout, so one source serves both.
 """
 
 from max.gpu.sync import barrier
@@ -51,11 +56,12 @@ from bf16_gemm_nn_v4_kernels import (
     _v4_mma_tile,
     maybe_enqueue_bf16_gemm_tn_v4_persistent,
 )
+from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 
-comptime _V4_BF16 = DType.bfloat16
+comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_BF16], MutAnyOrigin]
+comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_F32_PTR = UnsafePointer[Scalar[_V4_F32], MutAnyOrigin]
 comptime _V4_BM = 128
 comptime _V4_BK = 64
@@ -82,14 +88,14 @@ comptime _V4_MAX_WS_BYTES = 256 * 1024 * 1024
 # would be equally fast but hand back a column-major C).
 def _v4_a_smem_layout[COL_A: Bool, BM: Int = _V4_BM]() -> Layout:
     comptime if COL_A:
-        return tile_layout_mn_major[_V4_BF16, BM, _V4_BK, _V4_SWIZZLE]()
-    return tile_layout_k_major[_V4_BF16, BM, _V4_BK, _V4_SWIZZLE]()
+        return tile_layout_mn_major[_V4_DT, BM, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_k_major[_V4_DT, BM, _V4_BK, _V4_SWIZZLE]()
 
 
 def _v4_b_smem_layout[BN: Int, KMAJ_B: Bool]() -> Layout:
     comptime if KMAJ_B:
-        return tile_layout_k_major[_V4_BF16, BN, _V4_BK, _V4_SWIZZLE]()
-    return tile_layout_mn_major[_V4_BF16, BN, _V4_BK, _V4_SWIZZLE]()
+        return tile_layout_k_major[_V4_DT, BN, _V4_BK, _V4_SWIZZLE]()
+    return tile_layout_mn_major[_V4_DT, BN, _V4_BK, _V4_SWIZZLE]()
 
 
 # ============================================================================
@@ -123,8 +129,8 @@ def _v4_tn_ws_body[
     BM: Int = _V4_BM,
     CONSUMERS: Int = _V4_CONSUMERS,
 ](
-    a_tma: TMATensorTile[_V4_BF16, 2, a_tile, a_desc],
-    b_tma: TMATensorTile[_V4_BF16, 2, b_tile, b_desc],
+    a_tma: TMATensorTile[_V4_DT, 2, a_tile, a_desc],
+    b_tma: TMATensorTile[_V4_DT, 2, b_tile, b_desc],
     output: _V4_PTR,
     ws: _V4_F32_PTR,
     m: Int,
@@ -139,14 +145,14 @@ def _v4_tn_ws_body[
         comptime B_PIPE_LAYOUT = Layout.row_major(STAGES, BN * _V4_BK)
 
         var a_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V4_BF16,
+            _V4_DT,
             B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -215,14 +221,14 @@ def _v4_tn_ws_body[
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
 
                     var a_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * BM * _V4_BK)
                     var b_tile = LayoutTensor[
-                        _V4_BF16,
+                        _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -256,14 +262,14 @@ def _v4_tn_ws_body[
                 var phase = UInt32((it // STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V4_BF16,
+                    _V4_DT,
                     A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * BM * _V4_BK)
                 var b_tile = LayoutTensor[
-                    _V4_BF16,
+                    _V4_DT,
                     B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -299,9 +305,9 @@ def _v4_tn_ws_body[
                     var e = q * 2
                     var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                     var col = base_col + (q // 2) * 8
-                    var pair = SIMD[_V4_BF16, 2](
-                        accum.ptr[e].cast[_V4_BF16](),
-                        accum.ptr[e + 1].cast[_V4_BF16](),
+                    var pair = SIMD[_V4_DT, 2](
+                        accum.ptr[e].cast[_V4_DT](),
+                        accum.ptr[e + 1].cast[_V4_DT](),
                     )
                     if m0 + row < m and n0 + col + 1 < n:
                         output.store[alignment=4](
@@ -317,10 +323,10 @@ def _v4_tn_ws_body[
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_tn_v4_splitk_m128n256_s4")
+@__name(t"{_GEMM16_TAG}_gemm_tn_v4_splitk_m128n256_s4")
 def _v4_tn_splitk_m128n256_s4(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
     ws: _V4_F32_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -334,7 +340,7 @@ def _v4_tn_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
     )
 
 
@@ -348,12 +354,12 @@ def _v4_tn_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_nt_v4_splitk_m128n256_s4")
+@__name(t"{_GEMM16_TAG}_gemm_nt_v4_splitk_m128n256_s4")
 def _v4_nt_splitk_m128n256_s4(
     a_tma: TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
     ],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
     ws: _V4_F32_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -367,7 +373,7 @@ def _v4_nt_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
     )
 
 
@@ -376,12 +382,12 @@ def _v4_nt_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_nn_v4_splitk_m128n256_s4")
+@__name(t"{_GEMM16_TAG}_gemm_nn_v4_splitk_m128n256_s4")
 def _v4_nn_splitk_m128n256_s4(
     a_tma: TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
     ],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 256), Index(_V4_BK, 64)],
     ws: _V4_F32_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -395,7 +401,7 @@ def _v4_nn_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, False](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
     )
 
 
@@ -404,10 +410,10 @@ def _v4_nn_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_tt_v4_splitk_m128n256_s4")
+@__name(t"{_GEMM16_TAG}_gemm_tt_v4_splitk_m128n256_s4")
 def _v4_tt_splitk_m128n256_s4(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(256, _V4_BK), Index(256, _V4_BK)],
     ws: _V4_F32_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -421,7 +427,7 @@ def _v4_tt_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, True, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_BF16]](), ws, m, n, k, chunk_tiles
+        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
     )
 
 
@@ -430,10 +436,10 @@ def _v4_tt_splitk_m128n256_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_tn_v4_direct_m128n192_s4")
+@__name(t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s4")
 def _v4_tn_direct_m128n192_s4(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -457,10 +463,10 @@ def _v4_tn_direct_m128n192_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_tn_v4_direct_m128n192_s3g16")
+@__name(t"{_GEMM16_TAG}_gemm_tn_v4_direct_m128n192_s3g16")
 def _v4_tn_direct_m128n192_s3g16(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -489,10 +495,10 @@ def _v4_tn_direct_m128n192_s3g16(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_THREADS))
 )
-@__name("bf16_gemm_tt_v4_direct_m128n64_s4")
+@__name(t"{_GEMM16_TAG}_gemm_tt_v4_direct_m128n64_s4")
 def _v4_tt_direct_m128n64_s4(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, _V4_BM), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(64, _V4_BK), Index(64, _V4_BK)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -516,10 +522,10 @@ def _v4_tt_direct_m128n64_s4(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(256))
 )
-@__name("bf16_gemm_tt_v4_direct_m64n128_s3")
+@__name(t"{_GEMM16_TAG}_gemm_tt_v4_direct_m64n128_s3")
 def _v4_tt_direct_m64n128_s3(
-    a_tma: TMATensorTile[_V4_BF16, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
-    b_tma: TMATensorTile[_V4_BF16, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
+    a_tma: TMATensorTile[_V4_DT, 2, Index(_V4_BK, 64), Index(_V4_BK, 64)],
+    b_tma: TMATensorTile[_V4_DT, 2, Index(128, _V4_BK), Index(128, _V4_BK)],
     output: _V4_PTR,
     m_arg: Int64,
     n_arg: Int64,
@@ -547,7 +553,7 @@ comptime _V4_RED_SPAN = _V4_RED_THREADS * _V4_RED_GROUPS * 4
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V4_RED_THREADS))
 )
-@__name("bf16_gemm_tn_v4_splitk_reduce")
+@__name(t"{_GEMM16_TAG}_gemm_tn_v4_splitk_reduce")
 def _v4_tn_splitk_reduce(
     output: _V4_PTR,
     ws: _V4_F32_PTR,
@@ -574,7 +580,7 @@ def _v4_tn_splitk_reduce(
                 )
         comptime for g in range(_V4_RED_GROUPS):
             output.store[alignment=8](
-                base + g * _V4_RED_THREADS * 4, acc[g].cast[_V4_BF16]()
+                base + g * _V4_RED_THREADS * 4, acc[g].cast[_V4_DT]()
             )
     else:
         comptime for g in range(_V4_RED_GROUPS):
@@ -583,13 +589,13 @@ def _v4_tn_splitk_reduce(
                 var acc4 = ws.load[width=4, alignment=16](i)
                 for s in range(1, splits):
                     acc4 += ws.load[width=4, alignment=16](s * count + i)
-                output.store[alignment=8](i, acc4.cast[_V4_BF16]())
+                output.store[alignment=8](i, acc4.cast[_V4_DT]())
             else:
                 while i < count:
                     var acc1 = ws[i]
                     for s in range(1, splits):
                         acc1 += ws[s * count + i]
-                    output[i] = acc1.cast[_V4_BF16]()
+                    output[i] = acc1.cast[_V4_DT]()
                     i += 1
 
 
@@ -599,9 +605,9 @@ def _v4_tn_splitk_reduce(
 def _v4_make_a_tma[
     BM: Int = _V4_BM
 ](a: _V4_PTR, m: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
-    _V4_BF16, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)
+    _V4_DT, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)
 ]:
-    var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -612,7 +618,7 @@ def _v4_make_a_tma[
         IndexList[2](m, 1),
         IndexList[2](_V4_BK, 64),
     )
-    return TMATensorTile[_V4_BF16, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)](
+    return TMATensorTile[_V4_DT, 2, Index(_V4_BK, BM), Index(_V4_BK, 64)](
         a_desc
     )
 
@@ -622,9 +628,9 @@ def _v4_make_a_tma[
 def _v4_make_a_row_tma(
     a: _V4_PTR, m: Int, k: Int, ctx: DeviceContext
 ) raises -> TMATensorTile[
-    _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+    _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
 ]:
-    var a_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -636,7 +642,7 @@ def _v4_make_a_row_tma(
         IndexList[2](_V4_BM, _V4_BK),
     )
     return TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
+        _V4_DT, 2, Index(_V4_BM, _V4_BK), Index(_V4_BM, _V4_BK)
     ](a_desc)
 
 
@@ -644,9 +650,9 @@ def _v4_make_a_row_tma(
 def _v4_make_b_mn_tma[
     BN: Int
 ](b: _V4_PTR, n: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
-    _V4_BF16, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)
+    _V4_DT, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)
 ]:
-    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -657,7 +663,7 @@ def _v4_make_b_mn_tma[
         IndexList[2](n, 1),
         IndexList[2](_V4_BK, 64),
     )
-    return TMATensorTile[_V4_BF16, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)](
+    return TMATensorTile[_V4_DT, 2, Index(_V4_BK, BN), Index(_V4_BK, 64)](
         b_desc
     )
 
@@ -666,9 +672,9 @@ def _v4_make_b_mn_tma[
 def _v4_make_b_kmaj_tma[
     BN: Int
 ](b: _V4_PTR, n: Int, k: Int, ctx: DeviceContext) raises -> TMATensorTile[
-    _V4_BF16, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)
+    _V4_DT, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)
 ]:
-    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -679,7 +685,7 @@ def _v4_make_b_kmaj_tma[
         IndexList[2](k, 1),
         IndexList[2](BN, _V4_BK),
     )
-    return TMATensorTile[_V4_BF16, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)](
+    return TMATensorTile[_V4_DT, 2, Index(BN, _V4_BK), Index(BN, _V4_BK)](
         b_desc
     )
 
@@ -774,7 +780,7 @@ def _v4_enqueue_direct_m128n192(
     ctx: DeviceContext,
 ) raises:
     var a_tma = _v4_make_a_tma(a, m, k, ctx)
-    var b_desc = create_tma_descriptor[_V4_BF16, 2, _V4_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -785,9 +791,9 @@ def _v4_enqueue_direct_m128n192(
         IndexList[2](n, 1),
         IndexList[2](_V4_BK, 64),
     )
-    var b_tma = TMATensorTile[
-        _V4_BF16, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)
-    ](b_desc)
+    var b_tma = TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)](
+        b_desc
+    )
     if multi_wave:
         ctx.enqueue_function[_v4_tn_direct_m128n192_s3g16](
             a_tma,

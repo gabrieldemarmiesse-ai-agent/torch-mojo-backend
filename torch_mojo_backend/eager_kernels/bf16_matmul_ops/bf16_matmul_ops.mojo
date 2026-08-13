@@ -1,10 +1,19 @@
 # ===----------------------------------------------------------------------=== #
-# Thin eager-mode bridge for the BF16 GEMM and BMM paths.
+# Thin eager-mode bridge for the 16-bit tensor-core GEMM and BMM paths.
 #
 # Device-kernel bodies and dynamic fallback routing live in the internal v3
 # module imported below. This Python-visible module only unpacks the runtime
 # pointer/layout ABI and enqueues on the caller's DeviceContext. It performs no
 # allocation, host read, or synchronization.
+#
+# The family serves bfloat16 AND float16 from one source: `_GEMM16_DT`
+# (gemm16_dtype.mojo) resolves the operand dtype from the DTYPE_ARG_0 define,
+# so the loader's existing per-dtype specialization is the whole mechanism and
+# nothing dtype-dependent travels at runtime. The module, its files and its OP
+# names still spell `bf16` for one reason worth writing down: the entry
+# module's stem is how scripts/compare_kernel_asm.py pairs kernels across two
+# trees, and renaming it in the same change that parametrized the dtype would
+# have made the bfloat16 byte-invariance check unverifiable.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -13,6 +22,7 @@ from std.python.bindings import PythonModuleBuilder
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 
 from bf16_gemm_v3_kernels import enqueue_bf16_bmm, enqueue_bf16_gemm
+from gemm16_dtype import _GEMM16_DT
 from op_utils import (
     _make_ptr,
     _raw_ctx,
@@ -39,16 +49,12 @@ def _bf16_gemm_go(
     has_bias_obj: PyObjectPtr,
     device_context_ptr: PyObjectPtr,
 ) raises:
-    var output = _make_ptr[DType.bfloat16](
+    var output = _make_ptr[_GEMM16_DT](
         _raw_int(output_ptr_obj)
     ).as_unsafe_any_origin()
-    var a = _make_ptr[DType.bfloat16](
-        _raw_int(a_ptr_obj)
-    ).as_unsafe_any_origin()
-    var b = _make_ptr[DType.bfloat16](
-        _raw_int(b_ptr_obj)
-    ).as_unsafe_any_origin()
-    var bias = _make_ptr[DType.bfloat16](
+    var a = _make_ptr[_GEMM16_DT](_raw_int(a_ptr_obj)).as_unsafe_any_origin()
+    var b = _make_ptr[_GEMM16_DT](_raw_int(b_ptr_obj)).as_unsafe_any_origin()
+    var bias = _make_ptr[_GEMM16_DT](
         _raw_int(bias_ptr_obj)
     ).as_unsafe_any_origin()
     var ctx = _raw_ctx(device_context_ptr)
@@ -82,15 +88,11 @@ def _bf16_bmm_go(
     transpose_b_obj: PyObjectPtr,
     device_context_ptr: PyObjectPtr,
 ) raises:
-    var output = _make_ptr[DType.bfloat16](
+    var output = _make_ptr[_GEMM16_DT](
         _raw_int(output_ptr_obj)
     ).as_unsafe_any_origin()
-    var a = _make_ptr[DType.bfloat16](
-        _raw_int(a_ptr_obj)
-    ).as_unsafe_any_origin()
-    var b = _make_ptr[DType.bfloat16](
-        _raw_int(b_ptr_obj)
-    ).as_unsafe_any_origin()
+    var a = _make_ptr[_GEMM16_DT](_raw_int(a_ptr_obj)).as_unsafe_any_origin()
+    var b = _make_ptr[_GEMM16_DT](_raw_int(b_ptr_obj)).as_unsafe_any_origin()
     var ctx = _raw_ctx(device_context_ptr)
     enqueue_bf16_bmm(
         output,
@@ -121,7 +123,7 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
                     "(output_ptr, a_ptr, b_ptr, batch_count, m, n, k,"
                     " output_batch_stride, a_batch_stride, b_batch_stride,"
                     " transpose_a, transpose_b, context_ptr); opt-in"
-                    " BF16 strided BMM"
+                    " 16-bit tensor-core strided BMM"
                 ),
             )
         comptime if _op_on["Bf16GemmBF16"]():
@@ -130,7 +132,8 @@ def PyInit_bf16_matmul_ops() abi("C") -> PythonObject:
                 _spec_dispatcher11[_bf16_gemm_go, "Bf16GemmBF16"],
                 docstring=(
                     "(output_ptr, a_ptr, b_ptr, bias_ptr, m, n, k, transpose_a,"
-                    " transpose_b, has_bias, context_ptr); BF16 2-D GEMM"
+                    " transpose_b, has_bias, context_ptr); 16-bit tensor-core"
+                    " 2-D GEMM"
                 ),
             )
         return b.finalize()

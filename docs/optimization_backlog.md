@@ -157,7 +157,7 @@ different kind of item.
 * **Current implementation.** `fast_aten_linear_backward` forms the weight
   gradient as `mm(transpose(grad, 0, 1), input)`. The transpose is a zero-copy
   view, so `mm` receives a non-contiguous A. Three bridges are tried:
-  `_try_bf16_gemm` (`:6861` — bf16 only, and it *does* accept a physically
+  `_try_gemm16_mm` (`:6861` — bf16/f16 only, and it *does* accept a physically
   transposed 2-D operand via `_tf32_dense_2d_layout`), `_try_tf32_gemm` (`:6935`,
   off at default precision — see [G3](#g3)), and `_try_spec_matmul`. For fp32 all
   three decline and the backstop materializes A.
@@ -294,8 +294,8 @@ different kind of item.
 **Bridge decline conditions that push a whole GEMM onto the slow path**
 
 * **What.** `fast_aten_addmm`, `aten_fast.py:7220`; bias validation in
-  `_try_bf16_gemm` / `_try_tf32_gemm`, `aten_fast.py:6893` and `:6975`; the
-  rank>2 contiguity requirement in `_try_bf16_linear` / `_try_tf32_linear`,
+  `_try_gemm16_mm` / `_try_tf32_gemm`, `aten_fast.py:6893` and `:6975`; the
+  rank>2 contiguity requirement in `_try_gemm16_linear` / `_try_tf32_linear`,
   `aten_fast.py:7150` and `:7188`.
 * **Current implementation.** `addmm` declines the fused-bias bridges entirely
   unless `beta == 1 and alpha == 1`. The bridges require the bias to be a

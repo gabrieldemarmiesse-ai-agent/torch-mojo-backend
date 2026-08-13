@@ -40,7 +40,7 @@ from torch_mojo_backend.eager_kernels.activation_forward_ops import (
     ActivationForwardExtension as _ActivationForwardExtension,
 )
 from torch_mojo_backend.eager_kernels.bf16_matmul_ops import (
-    BF16MatmulExtension as _Bf16MatmulExtension,
+    Gemm16MatmulExtension as _Gemm16MatmulExtension,
 )
 from torch_mojo_backend.eager_kernels.conv_ops import ConvExtension as _ConvExtension
 from torch_mojo_backend.eager_kernels.data_movement_ops import (
@@ -162,15 +162,31 @@ _SDPA_BACKWARD_SOURCE_PATHS = (
     eager_kernels._PACKAGE_DIR / "sdpa_backward_ops/sdpa_backward_gemm_kernels.mojo",
 )
 
-# Keep the optional BF16 bridge dormant until the bridge, optimized dispatcher,
-# and accepted fallback all exist. A partial dependency closure would otherwise
-# launch a predictably failing compile before an ordinary eager matmul.
-_BF16_SOURCE_PATHS = (
-    eager_kernels._PACKAGE_DIR / _Bf16MatmulExtension.MOJO_FILE,
+# Keep the optional 16-bit tensor-core bridge dormant until the bridge,
+# optimized dispatcher, and accepted fallback all exist. A partial dependency
+# closure would otherwise launch a predictably failing compile before an
+# ordinary eager matmul.
+#
+# The directory and its files still carry the `bf16_` prefix they were born
+# with; the family now serves float16 as well, selected at compile time by
+# DTYPE_ARG_0 (bf16_matmul_ops/gemm16_dtype.mojo).  The names were left alone
+# on purpose: the entry module's stem is how scripts/compare_kernel_asm.py
+# pairs kernels across two trees, and renaming it in the same change that
+# parametrized the dtype would have made the bfloat16 byte-invariance check
+# unverifiable.  A rename is a separate, mechanical follow-up.
+_GEMM16_SOURCE_PATHS = (
+    eager_kernels._PACKAGE_DIR / _Gemm16MatmulExtension.MOJO_FILE,
     eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_v3_kernels.mojo",
     eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_tn_v4_kernels.mojo",
     eager_kernels._PACKAGE_DIR / "bf16_matmul_ops/bf16_gemm_kernels.mojo",
 )
+
+# The dtypes that family serves.  bfloat16 and float16 are one and the same to
+# Hopper's tensor cores -- same operand width, same WGMMA tile shapes, same
+# FP32 accumulator, only the operand-type token of the instruction differs --
+# so every tile size, pipeline depth and TMA descriptor carries over unchanged
+# and the loader simply compiles the sources once per dtype.
+_GEMM16_DTYPES = (DType.bfloat16, DType.float16)
 
 # The TF32 host route is useful before the separately profiled Fable kernel is
 # installed, but the thin bridge imports that kernel unconditionally.  Avoid a
@@ -207,9 +223,9 @@ def _bridge_available(name: str, paths: tuple[_OptionalSource, ...]) -> bool:
     return available
 
 
-def _bf16_bridge_available() -> bool:
-    """Whether the optional BF16 bridge and all of its sources are present."""
-    return _bridge_available("bf16", _BF16_SOURCE_PATHS)
+def _gemm16_bridge_available() -> bool:
+    """Whether the 16-bit tensor-core bridge and all its sources are present."""
+    return _bridge_available("gemm16", _GEMM16_SOURCE_PATHS)
 
 
 def _tf32_bridge_available() -> bool:
@@ -5934,7 +5950,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
         # the 44% of tiles it removes buy nothing (895.05 -> 901.77 us,
         # against 488.42 us for a dense half-width control with the same
         # live-tile count). See optimization_journal.md, experiment AA.
-        scores = _try_bf16_bmm(q3, k3, transpose_b=True)
+        scores = _try_gemm16_bmm(q3, k3, transpose_b=True)
         if scores is None:
             scores = _try_tf32_bmm(q3, k3, transpose_b=True)
         if scores is None:
@@ -6078,7 +6094,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
             # any consumer.
             out = _try_sdpa_causal_bmm(effective_probs, v3, False, SDPA_CAUSAL_A_ROWS)
         if out is None:
-            out = _try_bf16_bmm(effective_probs, v3)
+            out = _try_gemm16_bmm(effective_probs, v3)
         if out is None:
             out = _try_tf32_bmm(effective_probs, v3)
         if out is None:
@@ -7386,12 +7402,13 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     return physical_transpose, batch_stride
 
 
-def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
-    """Enqueue the dense H100 BF16 GEMM, or return ``None``.
+def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
+    """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
-    The bridge consumes and produces BF16 while the accepted device kernel
-    accumulates in FP32.  This host helper only validates metadata, resolves
-    the optional bridge before allocation, and launches it without a retry.
+    The bridge consumes and produces the operand dtype (bfloat16 or float16;
+    see ``_GEMM16_DTYPES``) while the device kernel accumulates in FP32.  This
+    host helper only validates metadata, resolves the optional bridge before
+    allocation, and launches it without a retry.
     """
     lhs = _t(a)
     rhs = _t(b)
@@ -7400,8 +7417,8 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         lhs is None
         or rhs is None
         or (bias is not None and bias_tensor is None)
-        or lhs._dtype != DType.bfloat16
-        or rhs._dtype != DType.bfloat16
+        or lhs._dtype not in _GEMM16_DTYPES
+        or rhs._dtype != lhs._dtype
         or lhs._device != rhs._device
         or lhs._device.label != "gpu"
         or lhs._device.api != "cuda"
@@ -7420,7 +7437,7 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         return None
     if bias_tensor is not None and (
         bias_tensor._device != lhs._device
-        or bias_tensor._dtype != DType.bfloat16
+        or bias_tensor._dtype != lhs._dtype
         or tuple(bias_tensor._shape) != (n,)
         or not bias_tensor._is_contiguous
     ):
@@ -7433,16 +7450,16 @@ def _try_bf16_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         or math.prod(logical_output_shape) != m * n
     ):
         return None
-    if not _bf16_bridge_available():
+    if not _gemm16_bridge_available():
         return None
     # TT (both flags set below) is launched directly, not operand-swapped
     # into NN: the extension's TT routes compute C straight into this
     # contiguous row-major buffer, so `.stride()` matches what CUDA torch
     # returns for the identical call (a swapped NN kernel would hand back a
     # column-major C).
-    out = _alloc(logical_output_shape, DType.bfloat16, lhs._device)
+    out = _alloc(logical_output_shape, lhs._dtype, lhs._device)
     _call_mojo(
-        _Bf16MatmulExtension,
+        _Gemm16MatmulExtension,
         "Bf16GemmBF16",
         (
             out._ptr,
@@ -7550,15 +7567,16 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     return out
 
 
-def _try_bf16_bmm(a, b, *, transpose_b=False):
-    """Enqueue dense H100 BF16 BMM over packed or padded batches."""
+def _try_gemm16_bmm(a, b, *, transpose_b=False):
+    """Enqueue the dense H100 16-bit tensor-core BMM over packed or padded
+    batches, or return ``None`` (dtypes: ``_GEMM16_DTYPES``)."""
     lhs = _t(a)
     rhs = _t(b)
     if (
         lhs is None
         or rhs is None
-        or lhs._dtype != DType.bfloat16
-        or rhs._dtype != DType.bfloat16
+        or lhs._dtype not in _GEMM16_DTYPES
+        or rhs._dtype != lhs._dtype
         or lhs._device != rhs._device
         or lhs._device.label != "gpu"
         or lhs._device.api != "cuda"
@@ -7580,11 +7598,11 @@ def _try_bf16_bmm(a, b, *, transpose_b=False):
     lhs_transposed, lhs_batch_stride = lhs_layout
     rhs_transposed, rhs_batch_stride = rhs_layout
     output_batch_stride = m * n
-    if not _bf16_bridge_available():
+    if not _gemm16_bridge_available():
         return None
-    out = _alloc((batch, m, n), DType.bfloat16, lhs._device)
+    out = _alloc((batch, m, n), lhs._dtype, lhs._device)
     _call_mojo(
-        _Bf16MatmulExtension,
+        _Gemm16MatmulExtension,
         "Bf16BmmBF16",
         (
             out._ptr,
@@ -7676,8 +7694,8 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
     return out
 
 
-def _try_bf16_linear(input, weight, bias=None):
-    """Route a dense rank >= 2 BF16 projection through GEMM without copies."""
+def _try_gemm16_linear(input, weight, bias=None):
+    """Route a dense rank >= 2 16-bit projection through GEMM without copies."""
     a = _t(input)
     w = _t(weight)
     if (
@@ -7701,7 +7719,7 @@ def _try_bf16_linear(input, weight, bias=None):
             a._offset,
             contiguous=True,
         )
-    return _try_bf16_gemm(
+    return _try_gemm16_mm(
         matrix, weight, bias, transpose_b=True, output_shape=output_shape
     )
 
@@ -7745,7 +7763,7 @@ def _try_tf32_linear(input, weight, bias=None):
 
 
 def fast_aten_mm(x, y):
-    out = _try_bf16_gemm(x, y)
+    out = _try_gemm16_mm(x, y)
     if out is not None:
         return out
     out = _try_tf32_gemm(x, y)
@@ -7758,7 +7776,7 @@ def fast_aten_mm(x, y):
 def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
-        out = _try_bf16_gemm(mat1, mat2, input)
+        out = _try_gemm16_mm(mat1, mat2, input)
         if out is not None:
             return out
         out = _try_tf32_gemm(mat1, mat2, input)
@@ -7774,7 +7792,7 @@ def fast_aten_linear(input, weight, bias=None):
     # Keep linear as a concrete backend op alongside fast_aten_linear_backward.
     # The GEMM kernel reads B transposed for free, so the weight is never
     # materialized in transposed layout.
-    out = _try_bf16_linear(input, weight, bias)
+    out = _try_gemm16_linear(input, weight, bias)
     if out is not None:
         return out
     out = _try_tf32_linear(input, weight, bias)
@@ -7926,7 +7944,7 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
 
 
 def fast_aten_bmm(input, mat2):
-    out = _try_bf16_bmm(input, mat2)
+    out = _try_gemm16_bmm(input, mat2)
     if out is not None:
         return out
     out = _try_tf32_bmm(input, mat2)
@@ -7943,7 +7961,7 @@ def _fast_aten_bmm_transpose_b(input, mat2):
     ``BmmSpec`` passes the logical RHS-transpose flag directly to the existing
     GEMM kernel while both physical operands remain dense row-major tensors.
     """
-    out = _try_bf16_bmm(input, mat2, transpose_b=True)
+    out = _try_gemm16_bmm(input, mat2, transpose_b=True)
     if out is not None:
         return out
     out = _try_tf32_bmm(input, mat2, transpose_b=True)

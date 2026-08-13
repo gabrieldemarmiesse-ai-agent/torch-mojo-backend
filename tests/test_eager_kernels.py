@@ -5045,20 +5045,20 @@ def test_tf32_module_is_available_for_lazy_import():
 def test_bf16_module_is_available_for_lazy_import():
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    assert aten_fast._Bf16MatmulExtension.MOJO_FILE.name == "bf16_matmul_ops.mojo"
+    assert aten_fast._Gemm16MatmulExtension.MOJO_FILE.name == "bf16_matmul_ops.mojo"
 
 
 def test_bf16_v3_source_dependency_and_kernel_contract():
     """The lazy bridge includes v3 while v2 remains its explicit fallback."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    assert [path.name for path in aten_fast._BF16_SOURCE_PATHS] == [
+    assert [path.name for path in aten_fast._GEMM16_SOURCE_PATHS] == [
         "bf16_matmul_ops.mojo",
         "bf16_gemm_v3_kernels.mojo",
         "bf16_gemm_tn_v4_kernels.mojo",
         "bf16_gemm_kernels.mojo",
     ]
-    bridge_path, v3_path, tn_v4_path, fallback_path = aten_fast._BF16_SOURCE_PATHS
+    bridge_path, v3_path, tn_v4_path, fallback_path = aten_fast._GEMM16_SOURCE_PATHS
     bridge_source = bridge_path.read_text()
     v3_source = v3_path.read_text()
     tn_v4_source = tn_v4_path.read_text()
@@ -5067,14 +5067,18 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     assert "from bf16_gemm_v3_kernels import" in bridge_source
     assert "from bf16_gemm_kernels import (" in v3_source
     assert "from bf16_gemm_tn_v4_kernels import" in v3_source
+    # Kernel names carry the dtype the build was specialized for, so the
+    # literal in the source is the tag interpolation, not "bf16".  A user
+    # profiling a float16 model must read "f16_gemm_..." there.
+    assert "from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG" in v3_source
     for kernel_name in (
-        "bf16_gemm_v3_nn_ws_m64n128_tma_s3",
-        "bf16_gemm_v3_nn_ws_m128n256_tma_s3",
-        "bf16_gemm_v3_nt_ws_m128n256_tma_s3",
-        "bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3",
-        "bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3",
+        "gemm_v3_nn_ws_m64n128_tma_s3",
+        "gemm_v3_nn_ws_m128n256_tma_s3",
+        "gemm_v3_nt_ws_m128n256_tma_s3",
+        "gemm_v3_tn_ws_m64n128_tma_col_a_s3",
+        "gemm_v3_tn_ws_m128n256_tma_col_a_s3",
     ):
-        assert f'@__name("{kernel_name}")' in v3_source
+        assert f'@__name(t"{{_GEMM16_TAG}}_{kernel_name}")' in v3_source
 
     for helper_name in (
         "_v3_enqueue_nn_ws_m64n128_tma_s3",
@@ -5082,9 +5086,11 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert v3_source.count(f"{helper_name}(") == 2
 
-    nt_kernel_start = v3_source.index('@__name("bf16_gemm_v3_nt_ws_m128n256_tma_s3")')
+    nt_kernel_start = v3_source.index(
+        '@__name(t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3")'
+    )
     nt_kernel_end = v3_source.index(
-        '@__name("bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")'
+        '@__name(t"{_GEMM16_TAG}_gemm_v3_tn_ws_m64n128_tma_col_a_s3")'
     )
     nt_source = v3_source[nt_kernel_start:nt_kernel_end]
     assert "b_tma.prefetch_descriptor()\n        barrier()" in nt_source
@@ -5139,14 +5145,14 @@ def test_bf16_unavailable_bridge_falls_back_before_allocation(
     monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda _device: 1)
     monkeypatch.setattr(
         aten_fast,
-        "_BF16_SOURCE_PATHS",
+        "_GEMM16_SOURCE_PATHS",
         (SimpleNamespace(is_file=lambda: failure_mode != "missing_source"),),
     )
 
     def call():
         if operation == "gemm":
-            return aten_fast._try_bf16_gemm(tensor((3, 4)), tensor((4, 5)))
-        return aten_fast._try_bf16_bmm(tensor((2, 3, 4)), tensor((2, 4, 5)))
+            return aten_fast._try_gemm16_mm(tensor((3, 4)), tensor((4, 5)))
+        return aten_fast._try_gemm16_bmm(tensor((2, 3, 4)), tensor((2, 4, 5)))
 
     if failure_mode == "missing_source":
         monkeypatch.setattr(aten_fast, "_alloc", fail_allocation)
@@ -5206,9 +5212,9 @@ def test_bf16_matmul_family_precedes_tf32_and_tensorspec(monkeypatch):
     def fail_later_route(*_args, **_kwargs):
         raise AssertionError("BF16-routed matmul reached TF32 or TensorSpec")
 
-    monkeypatch.setattr(aten_fast, "_try_bf16_gemm", try_gemm)
-    monkeypatch.setattr(aten_fast, "_try_bf16_linear", try_linear)
-    monkeypatch.setattr(aten_fast, "_try_bf16_bmm", try_bmm)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_linear", try_linear)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_bmm", try_bmm)
     monkeypatch.setattr(aten_fast, "_try_tf32_gemm", fail_later_route)
     monkeypatch.setattr(aten_fast, "_try_tf32_linear", fail_later_route)
     monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
@@ -5322,9 +5328,9 @@ def test_tf32_matmul_family_prefers_opt_in_routes(monkeypatch):
     def fail_spec(*_args, **_kwargs):
         raise AssertionError("TF32-routed matmul reached the TensorSpec fallback")
 
-    monkeypatch.setattr(aten_fast, "_try_bf16_gemm", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(aten_fast, "_try_bf16_linear", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(aten_fast, "_try_bf16_bmm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_bmm", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_try_tf32_gemm", try_gemm)
     monkeypatch.setattr(aten_fast, "_try_tf32_linear", try_linear)
     monkeypatch.setattr(aten_fast, "_try_tf32_bmm", try_bmm)
@@ -5368,9 +5374,9 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     monkeypatch.setattr(
         aten_fast.torch, "get_float32_matmul_precision", lambda: "highest"
     )
-    monkeypatch.setattr(aten_fast, "_try_bf16_gemm", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(aten_fast, "_try_bf16_linear", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(aten_fast, "_try_bf16_bmm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_bmm", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_t", fail_tensor_inspection)
     monkeypatch.setattr(aten_fast, "_try_spec_matmul", spec)
 
@@ -5438,7 +5444,7 @@ def test_tf32_addmm_scalars_retain_existing_not_handled_contract(monkeypatch):
 
     calls = []
     monkeypatch.setattr(
-        aten_fast, "_try_bf16_gemm", lambda *args, **kwargs: calls.append("bf16")
+        aten_fast, "_try_gemm16_mm", lambda *args, **kwargs: calls.append("gemm16")
     )
     monkeypatch.setattr(
         aten_fast, "_try_tf32_gemm", lambda *args, **kwargs: calls.append("tf32")
@@ -5513,7 +5519,7 @@ def test_tf32_linear_noncontiguous_batch_retains_tensorspec_path(monkeypatch):
     monkeypatch.setattr(aten_fast.torch, "get_float32_matmul_precision", lambda: "high")
     monkeypatch.setattr(aten_fast, "_t", as_tensor)
     monkeypatch.setattr(aten_fast, "_view_of", fail_tf32_work)
-    monkeypatch.setattr(aten_fast, "_try_bf16_linear", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_try_tf32_gemm", fail_tf32_work)
     monkeypatch.setattr(
         aten_fast, "_try_spec_matmul", lambda name, tensors, transpose_b: fallback
@@ -5606,7 +5612,7 @@ def test_sdpa_forward_tf32_bmm_routing_preserves_raw_fallback(
     monkeypatch.setattr(aten_fast, "_tc", lambda value: value)
     monkeypatch.setattr(aten_fast, "_alloc", alloc)
     monkeypatch.setattr(aten_fast, "_view_of", view_of)
-    monkeypatch.setattr(aten_fast, "_try_bf16_bmm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_bmm", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_try_tf32_bmm", try_tf32)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda _device: 1234)
     monkeypatch.setattr(aten_fast, "fast_aten_native_dropout", native_dropout)
@@ -5743,7 +5749,7 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
     )
 
     try:
-        out = aten_fast._try_bf16_gemm(
+        out = aten_fast._try_gemm16_mm(
             lhs, rhs, bias, transpose_b=transpose_b, output_shape=(2, 3, n)
         )
     finally:
@@ -5802,10 +5808,177 @@ def test_bf16_gemm_no_bias_uses_ignored_output_pointer(monkeypatch):
         {("bf16_matmul_ops.mojo", "Bf16GemmBF16"): lambda *args: calls.append(args)},
     )
 
-    assert aten_fast._try_bf16_gemm(lhs, rhs) is output
+    assert aten_fast._try_gemm16_mm(lhs, rhs) is output
     assert len(calls) == 1
     assert calls[0][3] == output._ptr
     assert calls[0][9] == 0
+
+
+# The 16-bit tensor-core GEMM family serves bfloat16 and float16 from one
+# source, specialized at compile time by DTYPE_ARG_0.  These tests pin the
+# float16 half of that contract: the same routes, the same regime dispatch and
+# the same FP32 accumulation, at every layout the family claims.
+_GEMM16_LAYOUTS = ("NN", "NT", "TN", "TT")
+
+
+def _gemm16_operands(
+    layout: str, m: int, n: int, k: int, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A (M,K) and B (K,N) as dense views with the requested physical layout."""
+
+    def view(rows: int, cols: int, transposed: bool) -> torch.Tensor:
+        host = torch.randn(cols, rows) if transposed else torch.randn(rows, cols)
+        moved = host.to(dtype).to(device)
+        return moved.t() if transposed else moved
+
+    return view(m, k, layout[0] == "T"), view(k, n, layout[1] == "T")
+
+
+@pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
+def test_gemm16_float16_mm_matches_fp32_reference_on_every_layout(
+    mojo_h100: torch.device, layout: str
+) -> None:
+    """float16 reaches the tensor-core family, not the generic tiled GEMM.
+
+    The tolerance is the point of the assertion: the kernels accumulate in
+    FP32, so a 333-deep contraction stays near 1e-3 relative.  A kernel that
+    accumulated in float16 instead would miss it by an order of magnitude.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k = 357, 789, 333  # awkward on purpose: exercises the edge tiles
+    a, b = _gemm16_operands(layout, m, n, k, torch.float16, mojo_h100)
+
+    out = aten_fast._try_gemm16_mm(a, b)
+    assert out is not None, "float16 declined by the tensor-core GEMM family"
+    assert out.dtype == torch.float16
+    assert tuple(out.shape) == (m, n)
+    assert out.stride() == (n, 1)
+
+    expected = a.cpu().float() @ b.cpu().float()
+    # atol covers the two error floors of a k=333 contraction of ~N(0,1)
+    # operands (|result| ~ 18): the FP32 partial sums reordered against the
+    # CPU reference (~2e-5) and the final round to float16 (half an ulp,
+    # ~8e-3).  Both are ~20x below what accumulating in float16 would give,
+    # which is what this bound is here to reject.
+    torch.testing.assert_close(out.cpu().float(), expected, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.parametrize("op", ["mm", "addmm", "linear", "bmm", "bmm_transpose_b"])
+def test_gemm16_float16_every_entry_point_launches_the_bridge(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """mm / addmm / linear / bmm all route float16 through the same bridge."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    m, n, k, batch = 64, 96, 128, 3
+    calls = _spy_defined_native_calls(
+        monkeypatch,
+        {
+            ("bf16_matmul_ops.mojo", "Bf16GemmBF16"),
+            ("bf16_matmul_ops.mojo", "Bf16BmmBF16"),
+        },
+    )
+
+    def half(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape).to(torch.float16).to(mojo_h100)
+
+    if op == "mm":
+        a, b = half(m, k), half(k, n)
+        actual, expected = torch.mm(a, b), a.cpu().float() @ b.cpu().float()
+        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+    elif op == "addmm":
+        a, b, c = half(m, k), half(k, n), half(n)
+        actual = torch.addmm(c, a, b)
+        expected = c.cpu().float() + a.cpu().float() @ b.cpu().float()
+        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+    elif op == "linear":
+        x, w, c = half(2, m, k), half(n, k), half(n)
+        actual = torch.nn.functional.linear(x, w, c)
+        expected = torch.nn.functional.linear(
+            x.cpu().float(), w.cpu().float(), c.cpu().float()
+        )
+        launched = ("bf16_matmul_ops.mojo", "Bf16GemmBF16")
+    elif op == "bmm":
+        a, b = half(batch, m, k), half(batch, k, n)
+        actual, expected = torch.bmm(a, b), torch.bmm(a.cpu().float(), b.cpu().float())
+        launched = ("bf16_matmul_ops.mojo", "Bf16BmmBF16")
+    else:
+        a, b = half(batch, m, k), half(batch, n, k)
+        actual = aten_fast._fast_aten_bmm_transpose_b(a, b)
+        expected = torch.bmm(a.cpu().float(), b.cpu().float().transpose(1, 2))
+        launched = ("bf16_matmul_ops.mojo", "Bf16BmmBF16")
+
+    assert actual.dtype == torch.float16
+    assert len(calls[launched]) == 1, f"{op} did not reach the 16-bit GEMM bridge"
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-3)
+
+
+def test_gemm16_float16_and_bfloat16_are_separate_specializations(
+    mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One source, one .so per dtype: the define travels, the kernel does not.
+
+    Mixing the two dtypes in one call must decline rather than reinterpret the
+    operand bits, which have different exponent widths.
+    """
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    calls = _spy_defined_native_calls(
+        monkeypatch, {("bf16_matmul_ops.mojo", "Bf16GemmBF16")}
+    )
+    half_a = torch.randn(64, 128).to(torch.float16).to(mojo_h100)
+    half_b = torch.randn(128, 96).to(torch.float16).to(mojo_h100)
+    brain_b = torch.randn(128, 96).to(torch.bfloat16).to(mojo_h100)
+
+    assert aten_fast._try_gemm16_mm(half_a, brain_b) is None
+    assert not calls[("bf16_matmul_ops.mojo", "Bf16GemmBF16")]
+
+    assert aten_fast._try_gemm16_mm(half_a, half_b) is not None
+    assert aten_fast._try_gemm16_mm(half_a.bfloat16(), brain_b) is not None
+    assert len(calls[("bf16_matmul_ops.mojo", "Bf16GemmBF16")]) == 2
+
+
+def test_gemm16_float16_linear_backward_matches_fp32_reference(
+    mojo_h100: torch.device,
+) -> None:
+    """linear_backward's dgrad/wgrad pair is the NN and TN route in float16."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    rows, in_features, out_features = 128, 192, 96
+
+    def half(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape).to(torch.float16)
+
+    host_input = half(rows, in_features)
+    host_weight = half(out_features, in_features)
+    host_grad = half(rows, out_features)
+
+    grad_input, grad_weight, grad_bias = aten_fast.fast_aten_linear_backward(
+        host_input.to(mojo_h100),
+        host_grad.to(mojo_h100),
+        host_weight.to(mojo_h100),
+        [True, True, True],
+    )
+    assert grad_input is not aten_fast.NOT_HANDLED
+    assert grad_input.dtype == torch.float16
+    assert grad_weight.dtype == torch.float16
+
+    torch.testing.assert_close(
+        grad_input.cpu().float(),
+        host_grad.float() @ host_weight.float(),
+        atol=2e-2,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        grad_weight.cpu().float(),
+        host_grad.float().t() @ host_input.float(),
+        atol=2e-2,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        grad_bias.cpu().float(), host_grad.float().sum(0), atol=2e-2, rtol=2e-3
+    )
 
 
 @pytest.mark.parametrize(
@@ -5901,7 +6074,7 @@ def test_bf16_gemm_rejects_invalid_metadata_before_resolve_or_allocation(
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
-    assert aten_fast._try_bf16_gemm(lhs, rhs, bias, output_shape=output_shape) is None
+    assert aten_fast._try_gemm16_mm(lhs, rhs, bias, output_shape=output_shape) is None
 
 
 def test_bf16_linear_flattens_contiguous_gpt_input_without_precision_query(monkeypatch):
@@ -5937,9 +6110,9 @@ def test_bf16_linear_flattens_contiguous_gpt_input_without_precision_query(monke
     )
     monkeypatch.setattr(aten_fast, "_t", as_tensor)
     monkeypatch.setattr(aten_fast, "_view_of", view_of)
-    monkeypatch.setattr(aten_fast, "_try_bf16_gemm", try_gemm)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
 
-    assert aten_fast._try_bf16_linear(input, weight, bias) is result
+    assert aten_fast._try_gemm16_linear(input, weight, bias) is result
     assert view_calls == [((input_metadata, (24, 8), (8, 1), 7), {"contiguous": True})]
     assert gemm_calls == [
         (
@@ -6026,7 +6199,7 @@ def test_bf16_bmm_host_bridge_padded_layouts_offsets_and_logical_transpose(
         {("bf16_matmul_ops.mojo", "Bf16BmmBF16"): lambda *args: calls.append(args)},
     )
 
-    out = aten_fast._try_bf16_bmm(lhs, rhs, transpose_b=transpose_b)
+    out = aten_fast._try_gemm16_bmm(lhs, rhs, transpose_b=transpose_b)
 
     assert out is not None
     assert out._shape == (batch, m, n)
@@ -6120,7 +6293,7 @@ def test_bf16_bmm_rejects_invalid_metadata_before_resolve_or_allocation(
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
-    assert aten_fast._try_bf16_bmm(lhs, rhs) is None
+    assert aten_fast._try_gemm16_bmm(lhs, rhs) is None
 
 
 @pytest.mark.parametrize("operation", ["gemm", "bmm"])
@@ -6159,9 +6332,9 @@ def test_bf16_bridge_error_propagates_without_retry(monkeypatch, operation):
 
     with pytest.raises(RuntimeError, match="synthetic BF16 enqueue failure"):
         if operation == "gemm":
-            aten_fast._try_bf16_gemm(tensor((6, 5), 1000), tensor((5, 7), 2000))
+            aten_fast._try_gemm16_mm(tensor((6, 5), 1000), tensor((5, 7), 2000))
         else:
-            aten_fast._try_bf16_bmm(tensor((2, 6, 5), 1000), tensor((2, 5, 7), 2000))
+            aten_fast._try_gemm16_bmm(tensor((2, 6, 5), 1000), tensor((2, 5, 7), 2000))
 
     assert len(allocations) == 1
     assert len(bridge_calls) == 1
@@ -6204,17 +6377,17 @@ def test_bf16_helpers_reject_cross_device_before_resolve_or_allocation(
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
     if invalid_case == "gemm_rhs":
-        result = aten_fast._try_bf16_gemm(
+        result = aten_fast._try_gemm16_mm(
             tensor((3, 4), devices[0]), tensor((4, 5), devices[1])
         )
     elif invalid_case == "gemm_bias":
-        result = aten_fast._try_bf16_gemm(
+        result = aten_fast._try_gemm16_mm(
             tensor((3, 4), devices[0]),
             tensor((4, 5), devices[0]),
             tensor((5,), devices[1]),
         )
     else:
-        result = aten_fast._try_bf16_bmm(
+        result = aten_fast._try_gemm16_bmm(
             tensor((2, 3, 4), devices[0]), tensor((2, 4, 5), devices[1])
         )
     assert result is None
@@ -6648,7 +6821,9 @@ def _require_real_bf16_gemm_sources():
     """Skip before lazy import while an optional BF16 source is absent."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    missing = [path.name for path in aten_fast._BF16_SOURCE_PATHS if not path.is_file()]
+    missing = [
+        path.name for path in aten_fast._GEMM16_SOURCE_PATHS if not path.is_file()
+    ]
     if missing:
         pytest.skip(f"real BF16 GEMM sources are not installed: {', '.join(missing)}")
 
@@ -7012,10 +7187,10 @@ def test_bf16_real_linear_forward_backward_uses_three_gemm_routes(
     mojo_bias = bias.to(mojo_h100).requires_grad_()
     mojo_grad_output = grad_output.to(mojo_h100)
     gemm_calls = []
-    original_try_bf16_gemm = aten_fast._try_bf16_gemm
+    original_try_gemm16_mm = aten_fast._try_gemm16_mm
 
-    def record_bf16_gemm(*args, **kwargs):
-        result = original_try_bf16_gemm(*args, **kwargs)
+    def record_gemm16_mm(*args, **kwargs):
+        result = original_try_gemm16_mm(*args, **kwargs)
         assert result is not None
         gemm_calls.append((tuple(args[0]._shape), tuple(args[1]._shape), kwargs))
         return result
@@ -7023,7 +7198,7 @@ def test_bf16_real_linear_forward_backward_uses_three_gemm_routes(
     def fail_later_route(*_args, **_kwargs):
         raise AssertionError("eligible BF16 linear GEMM reached TF32 or TensorSpec")
 
-    monkeypatch.setattr(aten_fast, "_try_bf16_gemm", record_bf16_gemm)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", record_gemm16_mm)
     monkeypatch.setattr(aten_fast, "_try_tf32_gemm", fail_later_route)
     monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
     actual_output = torch.nn.functional.linear(mojo_input, mojo_weight, mojo_bias)
