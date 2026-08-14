@@ -95,33 +95,15 @@ def ieee_sqrt[
         return sqrt(x)
 
 
-# ===========================================================================
-# Tangent
-# ===========================================================================
+# Tangent: CPU -> libm; float32 on GPU -> the polynomial below; anything
+# else -> sin(x) / cos(x).
 #
-# There is no one call that computes a tangent on every backend, so this
-# routes on the compilation target and the dtype:
-#
-#   * CPU -> `std.math.tan`, i.e. libm. It is accurate, and it is only
-#     reachable here: `_call_libm` `comptime assert`s a non-GPU target, so a
-#     GPU kernel that calls `std.math.tan` fails to compile rather than
-#     falling back to anything.
-#   * float32 on GPU -> the argument-reduced polynomial below.
-#   * anything else -> `sin(x) / cos(x)`, the obvious composition.
-#
-# `sin / cos` is *not* good enough for the float32 GPU case, which is why the
-# polynomial exists: on NVIDIA both factors lower to a fixed
-# ~1e-6-absolute-error hardware approx instruction (PTX `sin.approx.ftz.f32` /
-# `cos.approx.ftz.f32`), and dividing two such values right where cos(x) is
-# small (near a pole, x ~ pi/2 + k*pi) turns that fixed absolute error into a
-# large *relative* error in the quotient -- randn inputs land in that band
-# often enough to fail conformance (8.8% of a 20x20 sample).
-#
-# That argument is NVIDIA's; AMD and Apple reach `sin`/`cos` through
-# `llvm.sin` / `llvm.air.sin` instead, which are not the approx instruction.
-# The float32 GPU route is still the polynomial on every backend, both because
-# it is what those backends already ran and because it needs no per-vendor
-# claim about how accurate their `sin`/`cos` are.
+# float32 GPU needs the polynomial because on NVIDIA `sin`/`cos` lower to a
+# fixed ~1e-6-absolute-error approx instruction, and dividing them near a pole
+# (cos(x) ~ 0) turns that into a large relative error -- 8.8% of a 20x20 randn
+# sample failed conformance. AMD and Apple do not use that instruction, but
+# take the polynomial too: it is what they already ran, and it needs no
+# per-vendor accuracy claim.
 @always_inline
 def custom_tan[
     dtype: DType, width: SIMDSize, //, *, exact: Bool = True
