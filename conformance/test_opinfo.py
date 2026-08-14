@@ -9,8 +9,10 @@ What comes from OpInfo rather than from us:
 * which of a sample's tensors belong on the device and which ATen requires on
   the CPU, read back from where the sample generator itself puts them when it
   targets a device (`_opinfo_placements`);
-* the dtypes each operator is expected to support, per `op.dtypesIfCUDA` —
-  the accelerator set, not the CPU one;
+* the dtypes each operator is expected to support, per `op.supported_dtypes()`
+  — which for an out-of-tree backend resolves to `op.dtypes`, the CPU set,
+  since `dtypesIf` is keyed by backend name and no OpInfo declares one for
+  "mojo";
 * the accuracy bar: `op.precisionOverride` when the operator declares one,
   otherwise `torch.testing.assert_close`'s dtype defaults, applied through
   `TestCase.assertEqual`.  We never invent a tolerance;
@@ -18,15 +20,24 @@ What comes from OpInfo rather than from us:
   RAISE, and the exception type and message it requires.
 
 An operator we have not implemented raises NotImplementedError from the
-dispatch layer.  That is reported as a distinct outcome (skip with a
-"not implemented" reason), never as a pass and never as a wrong answer,
-because the point of this suite is to tell those three apart.
+dispatch layer, and that is a FAILURE here like any wrong answer, unless the
+case is listed in `known_unsupported.py`.  Absence is declared there, node by
+node, never read off the exception: an implementation that could excuse itself
+by the exception it raised would erase the difference between "absent" and
+"broken", which is the whole point of this suite.  A declared case still runs
+and must still fail (reported xfail); when it starts passing the suite fails
+and says which entry to delete.
 """
 
 from __future__ import annotations
 
+import functools
+import unittest
+from collections.abc import Callable
 from typing import Any
 
+import known_unsupported
+import pytest
 import torch
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
@@ -52,21 +63,54 @@ def _to_cpu(value: Any) -> Any:
     return value
 
 
-def _not_implemented(exc: BaseException) -> bool:
-    """True when the backend declined the op rather than got it wrong."""
-    if isinstance(exc, NotImplementedError):
-        return True
-    text = str(exc).lower()
-    return (
-        "not implemented" in text
-        or "no fast implementation" in text
-        # Some error_inputs_func corpora build a deliberately wrong-dtype
-        # tensor (complex, float64) purely to provoke the error under test.
-        # MAX doesn't support those dtypes at all, so construction fails
-        # before the operator under test is ever reached -- a backend
-        # limitation, not a wrong error-handling result.
-        or "unsupported torch dtype" in text
+def _run_declared_unsupported(reason: str, run: Callable[[], None]) -> None:
+    """Run a case `known_unsupported.py` declares cannot pass, and hold it to it.
+
+    xfail-strict semantics, and the strictness is the entire reason a
+    declaration is safe.  A list that goes on muting a case after the case
+    starts working would be worse than the exception-sniffing it replaces: a
+    permanent mute nobody is ever told to remove.  So the case runs exactly as
+    an undeclared one does, any failure is reported as an expected one, and a
+    PASS is turned into a loud failure naming the entry to delete.
+
+    A skip is not a failure and is not converted into one: a case the harness
+    itself declined to compare (no sample inputs for this dtype, or OpInfo
+    saying the output may legitimately differ across devices) never ran, so it
+    is evidence neither for nor against the declaration.
+    """
+    try:
+        run()
+    except unittest.SkipTest:
+        raise
+    except Exception:  # noqa: BLE001 - any failure is the declared outcome
+        pytest.xfail(reason)
+    raise AssertionError(
+        f"This case is {reason}, and it now PASSES. Delete that entry: "
+        "support is the ABSENCE of an entry, and a declaration that outlives "
+        "the gap it describes silently mutes a working case."
     )
+
+
+def _declining_rather_than_rejecting(
+    exc: BaseException, required: type[BaseException] | tuple[type[BaseException], ...]
+) -> bool:
+    """Whether `exc` is us declining the operator, not us rejecting the input.
+
+    `NotImplementedError` IS a `RuntimeError` subclass, and `RuntimeError` is
+    what most `error_inputs_func` corpora declare (`Exception`, which matches
+    anything, is the second most common).  So an operator we never implemented
+    satisfies `assertRaises` by not existing, and `test_errors_match` would
+    credit "correctly rejects this malformed call" to an operator that rejects
+    every call there is -- the false pass this suite is least able to afford,
+    since the entire point of the test is that silently accepting a bad call is
+    worse than not running it.  Declining is therefore never the required
+    rejection, unless NotImplementedError is what OpInfo asked for (nothing in
+    op_db does today, but the rule should not depend on that).
+    """
+    if not isinstance(exc, NotImplementedError):
+        return False
+    demanded = required if isinstance(required, tuple) else (required,)
+    return not any(issubclass(kind, NotImplementedError) for kind in demanded)
 
 
 def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
@@ -247,10 +291,25 @@ class TestOpInfoConformance(TestCase):
         reads back where the operator's own sample generator puts each tensor
         when it targets a device, so arguments ATen requires on the CPU stay
         there instead of being moved and rejected.
+
+        Whether this operator and dtype are expected to work at all is read
+        from `known_unsupported.py` BEFORE anything runs, so the operator never
+        gets the chance to launder its own failure into a skip.
         """
         skip_reason = _cross_device_comparison_skip_reason(op, dtype)
         if skip_reason is not None:
             self.skipTest(skip_reason)
+        run = functools.partial(self._compare_with_cpu, device, dtype, op)
+        reason = known_unsupported.declared_unsupported(
+            "test_matches_cpu", op.formatted_name, dtype
+        )
+        if reason is None:
+            run()
+        else:
+            _run_declared_unsupported(reason, run)
+
+    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: Any) -> None:
+        """One `test_matches_cpu` case: every sample, device leg vs CPU leg."""
         placements = _opinfo_placements(op, dtype)
         checked = 0
         for index, sample in enumerate(
@@ -259,13 +318,8 @@ class TestOpInfoConformance(TestCase):
             placement = None
             if placements is not None and index < len(placements):
                 placement = placements[index]
-            try:
-                moved = _to_device(sample, device, placement)
-                actual = op(moved.input, *moved.args, **moved.kwargs)
-            except Exception as exc:  # noqa: BLE001 - triaging is the point
-                if _not_implemented(exc):
-                    self.skipTest(f"not implemented on mojo: {exc}")
-                raise
+            moved = _to_device(sample, device, placement)
+            actual = op(moved.input, *moved.args, **moved.kwargs)
             expected = op(sample.input, *sample.args, **sample.kwargs)
             # assertEqual carries the OpInfo precisionOverride for this dtype
             # when the operator declares one; otherwise assert_close defaults.
@@ -284,23 +338,30 @@ class TestOpInfoConformance(TestCase):
         A backend that silently accepts a malformed call is a worse failure
         than one that cannot run it at all, and only OpInfo knows which calls
         those are per operator.
+
+        An operator that cannot even be reached -- because we do not implement
+        it, or because the error input is built out of a dtype the device does
+        not have -- is declared in `known_unsupported.py` under this test's own
+        name, and read before anything runs.  The two tests are listed
+        separately because they ask different questions: an operator can be
+        absent from one and present in the other, and one dtype's error corpus
+        can be unbuildable while its samples run.
         """
+        run = functools.partial(self._check_error_inputs, device, op)
+        reason = known_unsupported.declared_unsupported(
+            "test_errors_match", op.formatted_name, dtype
+        )
+        if reason is None:
+            run()
+        else:
+            _run_declared_unsupported(reason, run)
+
+    def _check_error_inputs(self, device: str, op: Any) -> None:
+        """One `test_errors_match` case: every error input OpInfo declares."""
         checked = 0
-        error_inputs = op.error_inputs(device)
-        while True:
-            try:
-                error_input = next(error_inputs)
-            except StopIteration:
-                break
-            except Exception as exc:  # noqa: BLE001 - triaging is the point
-                # Building the error input itself (not the op call) can hit a
-                # backend limitation, e.g. a dtype-mismatch case constructed
-                # via a dtype MAX doesn't support at all.
-                if _not_implemented(exc):
-                    self.skipTest(f"not implemented on mojo: {exc}")
-                raise
+        for error_input in op.error_inputs(device):
             sample = error_input.sample_input
-            # `self.skipTest(...)` must not be reachable from inside a
+            # Nothing that raises `unittest.SkipTest` may run inside a
             # `with self.assertRaises(error_input.error_type):` block: a
             # sufficiently broad error_type (plain `Exception`, which every
             # `unittest.SkipTest` also is) would catch it as if it were the
@@ -311,8 +372,8 @@ class TestOpInfoConformance(TestCase):
             try:
                 out = op(sample.input, *sample.args, **sample.kwargs)
             except Exception as exc:  # noqa: BLE001 - triaging is the point
-                if _not_implemented(exc):
-                    self.skipTest(f"not implemented on mojo: {exc}")
+                if _declining_rather_than_rejecting(exc, error_input.error_type):
+                    raise
                 if not isinstance(exc, error_input.error_type):
                     raise
             else:
