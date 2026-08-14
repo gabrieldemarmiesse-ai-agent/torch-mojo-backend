@@ -102,6 +102,19 @@ comptime FEW_MAX_CHUNK = 65_536
 comptime FEW_DESC_CAP = 64
 
 
+# The family roster, and the two sub-families whose members reach the SAME
+# entry point and differ only in the code they pass it: mul/add/div all go to
+# `enqueue_foreach_scalar_f32`, addcmul/addcdiv both go to
+# `enqueue_foreach_addc_f32`. `_FEW_SOLO` is everything with a signature of
+# its own. Splitting the roster this way is what lets the Apple dispatch be a
+# `comptime for` over each sub-family plus one arm per solo op, and lets
+# `_few_metal_covered` be computed from the very same lists the arms are
+# written from, so the two cannot drift apart.
+comptime _FEW_SCALAR_FAMILY = [FEW_MUL, FEW_ADD, FEW_DIV]
+comptime _FEW_ADDC_FAMILY = [FEW_ADDCMUL, FEW_ADDCDIV]
+comptime _FEW_SOLO = [FEW_MUL_TENSOR, FEW_LERP, FEW_SQRT]
+
+
 @always_inline
 def _few_addrs[op: Int]() -> Int:
     """Device addresses one metadata record carries for `op`."""
@@ -109,8 +122,15 @@ def _few_addrs[op: Int]() -> Int:
         return 2
     elif op == FEW_ADDCMUL or op == FEW_ADDCDIV:
         return 3
-    else:
+    elif (
+        op == FEW_MUL or op == FEW_ADD or op == FEW_DIV or op == FEW_MUL_TENSOR
+    ):
         return 1
+    else:
+        # Not a fallthrough default: an op with no entry here would otherwise
+        # get a plausible-looking arity and mispack its metadata in silence.
+        comptime assert False, "no metadata arity for this foreach op"
+        return 0
 
 
 @always_inline
@@ -151,8 +171,63 @@ def _few_label[op: Int]() -> StaticString:
         return "addcmul"
     elif op == FEW_ADDCDIV:
         return "addcdiv"
-    else:
+    elif op == FEW_SQRT:
         return "sqrt"
+    else:
+        # A wrong name here would be printed to users by CUPTI/Nsight and would
+        # name the wrong algorithm, so this is a build error, not a default.
+        comptime assert False, "no kernel-name fragment for this foreach op"
+        return "unknown"
+
+
+@always_inline
+def _few_metal_covered[op: Int]() -> Bool:
+    """Whether `_foreach_ew_enqueue_apple` has an arm that launches `op`.
+
+    Computed from the same three rosters the arms are generated from, so it
+    answers the question that matters -- "will this op actually launch?" --
+    rather than restating a list by hand.
+    """
+    comptime for candidate in _FEW_SCALAR_FAMILY:
+        comptime if op == candidate:
+            return True
+    comptime for candidate in _FEW_ADDC_FAMILY:
+        comptime if op == candidate:
+            return True
+    comptime for candidate in _FEW_SOLO:
+        comptime if op == candidate:
+            return True
+    return False
+
+
+@always_inline
+def _few_scalar_family_code[op: Int]() -> Int:
+    """The `FES_*` code the shared scalar entry point takes for `op`.
+
+    `FEW_*` and `FES_*` are separate namespaces that happen to agree
+    numerically today; map them rather than depending on that.
+    """
+    comptime if op == FEW_MUL:
+        return FES_MUL
+    elif op == FEW_ADD:
+        return FES_ADD
+    elif op == FEW_DIV:
+        return FES_DIV
+    else:
+        comptime assert False, "not a foreach scalar-family op"
+        return FES_MUL
+
+
+@always_inline
+def _few_addc_family_code[op: Int]() -> Int:
+    """The `FEA_*` code the shared addc entry point takes for `op`."""
+    comptime if op == FEW_ADDCMUL:
+        return FEA_ADDCMUL
+    elif op == FEW_ADDCDIV:
+        return FEA_ADDCDIV
+    else:
+        comptime assert False, "not a foreach addc-family op"
+        return FEA_ADDCMUL
 
 
 struct ForeachEwDesc(
@@ -249,7 +324,7 @@ def _few_element[
             result = finish - one_minus_weight * difference
         else:
             result = a + weight * difference
-    else:
+    elif op == FEW_ADDCMUL or op == FEW_ADDCDIV:
         var b = b_ptr.load[width=width, alignment=alignment](index).cast[
             DType.float32
         ]()
@@ -260,6 +335,10 @@ def _few_element[
             result = a + scalar * (b * c)
         else:
             result = a + scalar * (b / c)
+    else:
+        # No default arithmetic: an op with no arm here would otherwise write
+        # back its own input, or another op's answer, without a diagnostic.
+        comptime assert False, "no element math for this foreach op"
     out_ptr.store[width=width, alignment=alignment](index, result.cast[dtype]())
 
 
@@ -472,34 +551,39 @@ def _foreach_ew_enqueue_apple[
             comptime if _few_addrs[op]() >= 3:
                 _few_backfill(third_addrs, used_slots)
 
-            comptime if op == FEW_MUL:
-                enqueue_foreach_scalar_f32[FES_MUL](
-                    first_addrs,
-                    chunk_ends,
-                    numels,
-                    group_scalars,
-                    group_chunks,
-                    ctx,
-                )
-            elif op == FEW_ADD:
-                enqueue_foreach_scalar_f32[FES_ADD](
-                    first_addrs,
-                    chunk_ends,
-                    numels,
-                    group_scalars,
-                    group_chunks,
-                    ctx,
-                )
-            elif op == FEW_DIV:
-                enqueue_foreach_scalar_f32[FES_DIV](
-                    first_addrs,
-                    chunk_ends,
-                    numels,
-                    group_scalars,
-                    group_chunks,
-                    ctx,
-                )
-            elif op == FEW_MUL_TENSOR:
+            # One arm per sub-family, plus one per solo op. `launched` is a
+            # compile-time constant (every assignment sits in a `comptime if`),
+            # so for a covered op the guard below folds away entirely.
+            var launched = False
+            comptime for candidate in _FEW_SCALAR_FAMILY:
+                comptime if op == candidate:
+                    enqueue_foreach_scalar_f32[
+                        _few_scalar_family_code[candidate]()
+                    ](
+                        first_addrs,
+                        chunk_ends,
+                        numels,
+                        group_scalars,
+                        group_chunks,
+                        ctx,
+                    )
+                    launched = True
+            comptime for candidate in _FEW_ADDC_FAMILY:
+                comptime if op == candidate:
+                    enqueue_foreach_addc_f32[
+                        _few_addc_family_code[candidate]()
+                    ](
+                        first_addrs,
+                        second_addrs,
+                        third_addrs,
+                        chunk_ends,
+                        numels,
+                        group_scalars,
+                        group_chunks,
+                        ctx,
+                    )
+                    launched = True
+            comptime if op == FEW_MUL_TENSOR:
                 enqueue_foreach_mul_tensor_f32(
                     first_addrs,
                     chunk_ends,
@@ -508,7 +592,8 @@ def _foreach_ew_enqueue_apple[
                     group_chunks,
                     ctx,
                 )
-            elif op == FEW_LERP:
+                launched = True
+            comptime if op == FEW_LERP:
                 enqueue_foreach_lerp_f32(
                     first_addrs,
                     second_addrs,
@@ -520,29 +605,8 @@ def _foreach_ew_enqueue_apple[
                     group_chunks,
                     ctx,
                 )
-            elif op == FEW_ADDCMUL:
-                enqueue_foreach_addc_f32[FEA_ADDCMUL](
-                    first_addrs,
-                    second_addrs,
-                    third_addrs,
-                    chunk_ends,
-                    numels,
-                    group_scalars,
-                    group_chunks,
-                    ctx,
-                )
-            elif op == FEW_ADDCDIV:
-                enqueue_foreach_addc_f32[FEA_ADDCDIV](
-                    first_addrs,
-                    second_addrs,
-                    third_addrs,
-                    chunk_ends,
-                    numels,
-                    group_scalars,
-                    group_chunks,
-                    ctx,
-                )
-            else:
+                launched = True
+            comptime if op == FEW_SQRT:
                 enqueue_foreach_sqrt_f32(
                     first_addrs,
                     second_addrs,
@@ -550,6 +614,17 @@ def _foreach_ew_enqueue_apple[
                     numels,
                     group_chunks,
                     ctx,
+                )
+                launched = True
+            if not launched:
+                # Unreachable once `_few_metal_covered` holds, and compiled
+                # away with it. It stays because the failure it catches -- an
+                # op whose arm went missing -- is otherwise a mutating op that
+                # silently does nothing at all.
+                raise Error(
+                    "mojo foreach ",
+                    _few_label[op](),
+                    ": no Apple launch for this op",
                 )
 
 
@@ -567,6 +642,13 @@ def foreach_ew_enqueue[
     low_branch: Int,
     ctx: DeviceContext,
 ) raises:
+    # Checked on EVERY target, not just Apple: the Apple arms are the half of
+    # the family that no CI machine here can run, so an op added without one
+    # has to fail the build wherever it is first compiled rather than turn into
+    # a mutating op that silently does nothing on a Mac.
+    comptime assert _few_metal_covered[
+        op
+    ](), "this foreach op has no arm in _foreach_ew_enqueue_apple"
     if desc_count <= 0 or total_chunks <= 0:
         return
     comptime if has_apple_gpu_accelerator():
