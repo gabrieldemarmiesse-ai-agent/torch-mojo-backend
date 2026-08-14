@@ -488,7 +488,7 @@ different kind of item.
   (`attn_mask is None` inside the eligibility conjunction); the autograd node
   raises explicitly at `mojo_device_autograd.py:271-275`.
 * **Current implementation.** `aten::scaled_dot_product_attention` is registered
-  for the mojo device (`mojo_device_aten_ops.py:1182`), which suppresses
+  for the mojo device (`mojo_device_aten_ops.py`), which suppresses
   PyTorch's own composite decomposition, and then declines any masked call —
   producing a `NotImplementedError` rather than a slow path.
 * **Why it is not optimal.** Padded-batch inference and most HuggingFace encoder
@@ -538,7 +538,7 @@ different kind of item.
   pointer as `Scalar[DType.float32]`.
 * **Current implementation.** fp16/bf16 LayerNorm forward succeeds; its backward
   returns `NOT_HANDLED`, and the registration
-  (`mojo_device_aten_ops.py:1160`) turns that into a raise.
+  (`mojo_device_aten_ops.py`) turns that into a raise.
 * **Why it is not optimal.** Under bf16 autocast this is invisible (autocast runs
   LayerNorm in fp32), which is why nanoGPT never hit it. A model trained in pure
   bf16 — increasingly the norm — cannot run its backward at all.
@@ -921,7 +921,7 @@ temporary** — **DONE** (`NormSpec`)
 
 * **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
   and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is, at `:1096`).
+  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
 * **Current implementation.** conv1d (rank-3 input), conv3d and transposed
   convolutions all return `NOT_HANDLED` → raise. There is no eager conv backward.
 * **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
@@ -943,7 +943,7 @@ temporary** — **DONE** (`NormSpec`)
   at `:5203`). `aten::max_pool2d_with_indices_backward` and
   `aten::avg_pool2d_backward` are unregistered;
   `aten::_adaptive_avg_pool2d_backward` is explicitly `_register_missing`
-  (`mojo_device_aten_ops.py:1222`).
+  (`mojo_device_aten_ops.py`).
 * **Current implementation.** Forward-only, floor-mode-only, rank-4-only.
 * **Why it is not optimal.** `ceil_mode=True` appears in common torchvision
   configurations; the missing backwards are the third blocker for vision
@@ -993,7 +993,7 @@ temporary** — **DONE** (`NormSpec`)
   added by journal Change 45. `_foreach_norm` (`:329`) and `_foreach_mul_.Tensor`
   (`:512`) are device-general but fp32-only.
 * **Current implementation.** On CUDA and ROCm those five decline, and
-  `_register_foreach_inplace` (`mojo_device_aten_ops.py:947`) redispatches to
+  `_register_foreach_inplace` (`mojo_device/aten_ops/foreach.py`) redispatches to
   ATen's generic decomposition — one launch per tensor.
 * **Why it is not optimal.** `torch.optim.AdamW(foreach=True)` — PyTorch's
   default when `fused` is not requested — uses exactly `_foreach_mul_`,

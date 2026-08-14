@@ -227,11 +227,20 @@ exists.) Two places are involved:
    _register_fast("aten::<op>", "fast_aten_<op>")
    ```
 
-   Related helpers: `_out_variant(...)` wraps a functional fast impl as an
-   `out=` variant; `_register_foreach_inplace(...)` covers `_foreach_*_`
-   ops; operations requiring custom device handling (like
-   `aten::_copy_from`) use `@register_aten_op("aten::<op>")` on a
-   hand-written function directly.
+   That file is only the registration list — one line per aten name, kept
+   alphabetical. Related shorthands: `_register_out(...)` wraps a functional
+   fast impl as an `out=` variant; `_register_foreach_inplace(...)` covers
+   `_foreach_*_` ops; `_register_missing(...)` registers an explicit raiser.
+
+   An op needing real Python code of its own (custom device handling like
+   `aten::_copy_from`, a forward-time autograd preflight, ...) gets a
+   function in the matching `mojo_device/aten_ops/` module — `transfer`,
+   `factories`, `autograd_preflight`, `inplace`, `rng`, `reductions`,
+   `foreach`, `blas`, with the shared plumbing (`_fast`, `_unsupported`,
+   `_copy_into_tensor`, `_out_variant`) in `aten_ops/support.py`. The
+   registration list then imports it and calls
+   `register_aten_op("aten::<op>")(<fn>)`. Do not register from inside
+   `aten_ops/`: every binding stays visible in the one list.
 
 If the op needs a new Mojo kernel, add it to the matching
 `eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
