@@ -54,6 +54,7 @@ from op_utils import (
     _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
+    custom_remainder,
 )
 
 from variant_gates import (
@@ -297,9 +298,11 @@ def _bin_vec_op[
             comptime if not dtype.is_floating_point():
                 return (a ^ b).cast[out_dtype]()
         comptime if op_code == BOP_REMAINDER:
-            # Mojo's `%` follows the divisor's sign (Python/torch semantics)
-            # for both signed integers and floats.
-            return (a % b).cast[out_dtype]()
+            # NOT Mojo's `%`: that one has the right (divisor's) sign, but
+            # loses the answer outright on bf16/fp16 operands.
+            # `op_utils.custom_remainder` routes those two through a bit-exact
+            # fp32 fmod and explains why.
+            return custom_remainder(a, b).cast[out_dtype]()
         comptime if op_code == BOP_FLOORDIV:
             # `//` = floor(a / b), matching torch.floor_divide for both
             # float and integer dtypes. bf16/fp16 need the division itself
