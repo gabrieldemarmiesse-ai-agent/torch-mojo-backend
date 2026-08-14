@@ -1,15 +1,20 @@
-"""Fixed-arity batched FP32 foreach elementwise kernels.
+"""Fixed-arity batched FP32 foreach elementwise kernels: the APPLE half.
 
-Metal only translates pointer-typed kernel *arguments* into valid GPU
-addresses; a raw address smuggled as data (a descriptor struct or an Int)
-reads back zeros. The CUDA-style descriptor-batch multi-tensor kernel is
-therefore impossible on Apple GPUs, and per-tensor launches are dispatch
-bound for optimizer-sized tensor lists. These kernels take a fixed arity of
-FOREACH_EW_SLOTS real pointer arguments per tensor list plus plain-Int
-per-slot chunk offsets/lengths (non-pointer data passes fine), so one
-launch covers up to FOREACH_EW_SLOTS tensors, grid-strided over the
-concatenation of their fixed-size chunks. Unused slots repeat a valid
-pointer with length zero and are never dereferenced.
+Every op here is also served by the single descriptor-batched body in
+`foreach_batched_kernels`, which is the route on CUDA and ROCm and the one to
+change when the element math changes. These exist because Metal cannot take
+that route: Metal only translates pointer-typed kernel *arguments* into valid
+GPU addresses, and a raw address smuggled as data (a descriptor struct or an
+Int) reads back zeros — while per-tensor launches are dispatch bound for
+optimizer-sized tensor lists.
+
+So each kernel here takes a fixed arity of FOREACH_EW_SLOTS real pointer
+arguments per tensor list plus plain-Int per-slot chunk offsets/lengths
+(non-pointer data passes fine), and one launch covers up to FOREACH_EW_SLOTS
+tensors, grid-strided over the concatenation of their fixed-size chunks.
+Unused slots repeat a valid pointer with length zero and are never
+dereferenced. `foreach_ew_enqueue` does the regrouping from the shared
+descriptors.
 
 Element math deliberately mirrors the scalar eager kernels these ops fall
 back to (`elementwise_ops`/`logic_ops`), keeping the batched path
@@ -202,6 +207,44 @@ def _foreach_scalar_kernel[
         comptime if op_code == FES_DIV:
             value = value / scalar
         values[index] = value
+        index += FOREACH_EW_THREADS
+
+
+def _foreach_mul_tensor_kernel(
+    p0: _MutPtr,
+    p1: _MutPtr,
+    p2: _MutPtr,
+    p3: _MutPtr,
+    p4: _MutPtr,
+    p5: _MutPtr,
+    p6: _MutPtr,
+    p7: _MutPtr,
+    scalar_ptr: _ImmutPtr,
+    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
+    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+):
+    """In-place x = x * scalar[0], the scalar a 0-d device tensor.
+
+    `aten::_foreach_mul_.Tensor`; element math matches the `mul_.Tensor`
+    sequential fallback.
+    """
+    var scalar = scalar_ptr[0]
+    var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
+    var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
+    var values = _pick_mut(slot, p0, p1, p2, p3, p4, p5, p6, p7)
+
+    var index = begin + Int(thread_idx.x) * _VEC
+    var stride = FOREACH_EW_THREADS * _VEC
+    while index + _VEC <= end:
+        var value = values.load[width=_VEC, alignment=4](index)
+        values.store[width=_VEC, alignment=4](index, value * scalar)
+        index += stride
+
+    # The chunk size is divisible by _VEC, so only a tensor's last chunk can
+    # need this scalar tail.
+    index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
+    while index < end:
+        values[index] = values[index] * scalar
         index += FOREACH_EW_THREADS
 
 
@@ -457,6 +500,38 @@ def enqueue_foreach_scalar_f32[
             chunk_ends,
             numels,
             scalars,
+        )
+    else:
+        raise Error("no GPU accelerator available at compile time")
+
+
+def enqueue_foreach_mul_tensor_f32(
+    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
+    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    scalar_addr: Int,
+    total_chunks: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if has_accelerator():
+        _enqueue_cached[_foreach_mul_tensor_kernel](
+            ctx,
+            String("FOREACH_EW_MUL_TENSOR_F32_V1"),
+            total_chunks,
+            1,
+            1,
+            FOREACH_EW_THREADS,
+            _addr_ptr(addrs[0]),
+            _addr_ptr(addrs[1]),
+            _addr_ptr(addrs[2]),
+            _addr_ptr(addrs[3]),
+            _addr_ptr(addrs[4]),
+            _addr_ptr(addrs[5]),
+            _addr_ptr(addrs[6]),
+            _addr_ptr(addrs[7]),
+            _addr_ptr(scalar_addr).as_immutable(),
+            chunk_ends,
+            numels,
         )
     else:
         raise Error("no GPU accelerator available at compile time")

@@ -2258,7 +2258,7 @@ def test_fast_foreach_add_scalar_matches_adamw_step_counters(mojo_gpu, monkeypat
     be entered once per call, not once per tensor.
     """
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_add_.Scalar")
-    target = ("elementwise_ops.mojo", "ForeachAddScalar")
+    target = ("optimizer_ops.mojo", "ForeachAdd")
     native_calls = _spy_defined_native_calls(monkeypatch, {target})
     steps = [torch.zeros((), dtype=torch.float32).to(mojo_gpu) for _ in range(75)]
     for _ in range(3):
