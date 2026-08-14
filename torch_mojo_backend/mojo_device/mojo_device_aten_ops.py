@@ -15,6 +15,7 @@ import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
 import torch_mojo_backend.is_running_tests
+from torch_mojo_backend.mojo_device import cuda_peer
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
     _copy_strided_into,
@@ -212,6 +213,49 @@ def _out_variant(op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast
 # ----------------------------------------------------------------------------------
 
 
+def _upload_on_device(src: torch.Tensor, dest_ptr: int, dest_device) -> bool:
+    """Copy a foreign CUDA tensor straight into `dest_ptr`, or return False.
+
+    Both allocations are device memory in one process, so when they sit on the
+    same physical GPU the bytes never need to visit the host -- 0.75 ms rather
+    than 386 ms for 537 MB on an H100 PCIe.  `cuda_peer` decides sameness from
+    the pointers rather than from device ordinals, so this stays correct on a
+    multi-GPU box where the two runtimes may not enumerate alike.
+
+    Three synchronizations are load-bearing and none is optional:
+
+    * the queue drain, because a pending queued write to the destination would
+      otherwise land AFTER this copy and silently overwrite it;
+    * the CUDA synchronize, because this runtime knows nothing about torch's
+      stream and would otherwise read bytes CUDA has not written yet;
+    * the mojo synchronize, because torch's caching allocator may hand the
+      source block to another tensor the moment this call returns, while the
+      copy is still in flight.
+    """
+    if src.device.type != "cuda" or not src.is_contiguous():
+        return False
+    # The mojo side must be NVIDIA too: `api` is "cuda" only there, and the
+    # whole route speaks the CUDA driver API.  Anything else falls through to
+    # the host bounce, which is correct everywhere and merely slower.
+    if getattr(dest_device, "api", None) != "cuda":
+        return False
+    nbytes = src.numel() * src.element_size()
+    if nbytes == 0:
+        return True
+    if not cuda_peer.same_physical_device(src.data_ptr(), dest_ptr):
+        return False
+    from torch_mojo_backend import eager_kernels
+    from torch_mojo_backend.mojo_device import deferred_compile
+
+    deferred_compile.drain()
+    torch.cuda.synchronize()
+    eager_kernels.tensor_holder.copy_d2d(
+        eager_kernels._ctx_ptr(dest_device), dest_ptr, src.data_ptr(), nbytes
+    )
+    torch.mojo.synchronize()
+    return True
+
+
 @register_aten_op("aten::_copy_from")
 def mojo_device__copy_from(self, dest, non_blocking: bool = False):
     src_is_mojo = isinstance(self, TorchMojoTensor)
@@ -239,6 +283,15 @@ def mojo_device__copy_from(self, dest, non_blocking: bool = False):
         torch_dtype = max_dtype_to_torch_dtype(dest._dtype)
         if cpu.dtype != torch_dtype:
             cpu = cpu.to(torch_dtype)
+        if cpu.device.type != "cpu":
+            # Same trap as _to_copy: the source only has to be non-mojo, and
+            # copy_from_host below reads data_ptr() as host memory.  Try the
+            # on-device route first; otherwise bounce through the host, after
+            # the cast and before the broadcast materializes anything.
+            if tuple(cpu.shape) == tuple(dest._shape) and dest._is_contiguous:
+                if _upload_on_device(cpu.contiguous(), dest._ptr, dest._device):
+                    return dest
+            cpu = cpu.cpu()
         if tuple(cpu.shape) != tuple(dest._shape):
             cpu = cpu.broadcast_to(dest._shape)
         cpu = cpu.contiguous()
@@ -284,10 +337,23 @@ def mojo_device__to_copy(
 ):
     aten_fast = _fast()
     if not isinstance(tensor, TorchMojoTensor):
-        # CPU tensor moving onto mojo_device (optionally casting on host).
+        # Any non-mojo tensor moving onto mojo_device (optionally casting
+        # first).  "Not mojo" is not "on the host": with a GPU torch installed
+        # this branch also takes `x.cuda().to("mojo")`, and _from_cpu passes
+        # data_ptr() to alloc_from_host, which reads it as HOST memory -- so a
+        # CUDA pointer segfaulted the process instead of raising.  Cast before
+        # the bounce: on a downcast that shrinks the transfer.
         t = tensor.detach()
         if dtype is not None and t.dtype != dtype:
             t = t.to(dtype)
+        if t.device.type != "cpu":
+            max_device = find_equivalent_max_device(device)
+            staged = TorchMojoTensor._alloc(
+                tuple(t.shape), torch_dtype_to_max(t.dtype), max_device
+            )
+            if _upload_on_device(t.contiguous(), staged._ptr, staged._device):
+                return staged
+            t = t.cpu()
         return TorchMojoTensor._from_cpu(
             t, find_equivalent_max_device(device), non_blocking=non_blocking
         )
@@ -1137,6 +1203,32 @@ def mojo_device__foreach_sqrt(self):
     if result is aten_fast.NOT_HANDLED:
         return torch.ops.aten._foreach_sqrt.default.redispatch(
             _COMPOSITE_EXPLICIT_AUTOGRAD, self
+        )
+    return result
+
+
+@register_aten_op("aten::addr")
+def mojo_device_addr(
+    self: torch.Tensor,
+    vec1: torch.Tensor,
+    vec2: torch.Tensor,
+    beta: int | float = 1,
+    alpha: int | float = 1,
+) -> torch.Tensor:
+    """Fused beta*self + alpha*outer(vec1, vec2) in one kernel launch that
+    reproduces CPU's own addr_kernel op order and per-op rounding exactly
+    (see `fast_aten_addr`'s docstring for why: absent this, ATen's own
+    CompositeExplicitAutograd fallback for backends without a native addr
+    kernel composes outer/scale/add in a different multiplication order
+    than the native CPU/CUDA kernel, which drifts enough to fail OpInfo
+    conformance for fp16/bf16). Anything the fast path declines (self not
+    broadcastable to exactly (len(vec1), len(vec2)), mixed dtypes, ...)
+    redispatches to that same composite fallback, unchanged."""
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_addr(self, vec1, vec2, beta, alpha)
+    if result is aten_fast.NOT_HANDLED:
+        return torch.ops.aten.addr.default.redispatch(
+            _COMPOSITE_EXPLICIT_AUTOGRAD, self, vec1, vec2, beta=beta, alpha=alpha
         )
     return result
 
