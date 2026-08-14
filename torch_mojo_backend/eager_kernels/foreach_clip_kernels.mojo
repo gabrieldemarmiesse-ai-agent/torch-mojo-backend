@@ -25,9 +25,11 @@ from foreach_clip_contract import (
 from foreach_elementwise_kernels import (
     FOREACH_EW_CHUNK,
     FOREACH_EW_SLOTS,
+    _SlotInts,
     _pick_immut,
     _pick_mut,
     _slot_begin,
+    _slot_ints,
 )
 from op_utils import _enqueue_cached, ieee_sqrt
 
@@ -149,12 +151,12 @@ def _norm_partials_batched_apple(
     v5: _ImmutPtr,
     v6: _ImmutPtr,
     v7: _ImmutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
 ):
     comptime assert FOREACH_CHUNK_ELEMENTS == FOREACH_EW_CHUNK
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
-    var end = min(begin + FOREACH_CHUNK_ELEMENTS, numels[slot])
+    var end = min(begin + FOREACH_CHUNK_ELEMENTS, Int(numels[slot]))
     var values = _pick_immut(slot, v0, v1, v2, v3, v4, v5, v6, v7)
     var accum = SIMD[DType.float32, _VEC](0.0)
     var index = begin + Int(thread_idx.x) * _VEC
@@ -190,7 +192,7 @@ def _norm_finalize_batched_apple(
     o6: _MutPtr,
     o7: _MutPtr,
     partials_ptr: _ImmutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
     used_slots_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -201,10 +203,10 @@ def _norm_finalize_batched_apple(
         return
     var first_chunk = 0
     if slot != 0:
-        first_chunk = chunk_ends[slot - 1]
+        first_chunk = Int(chunk_ends[slot - 1])
     var accum = Float32(0.0)
     for chunk in range(
-        first_chunk + Int(thread_idx.x), chunk_ends[slot], FOREACH_THREADS
+        first_chunk + Int(thread_idx.x), Int(chunk_ends[slot]), FOREACH_THREADS
     ):
         accum += partials_ptr[chunk]
     var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
@@ -345,8 +347,8 @@ def enqueue_foreach_l2_norm_f32(
                     _ptr(in_addrs[5]).as_unsafe_any_origin().as_immutable(),
                     _ptr(in_addrs[6]).as_unsafe_any_origin().as_immutable(),
                     _ptr(in_addrs[7]).as_unsafe_any_origin().as_immutable(),
-                    chunk_ends,
-                    numels,
+                    _slot_ints(chunk_ends),
+                    _slot_ints(numels),
                 )
             _enqueue_cached[_norm_finalize_batched_apple](
                 ctx,
@@ -364,7 +366,7 @@ def enqueue_foreach_l2_norm_f32(
                 _ptr(out_addrs[6]).as_unsafe_any_origin(),
                 _ptr(out_addrs[7]).as_unsafe_any_origin(),
                 partials.as_immutable(),
-                chunk_ends,
+                _slot_ints(chunk_ends),
                 Int64(used_slots),
             )
     else:
