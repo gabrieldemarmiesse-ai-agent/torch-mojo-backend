@@ -73,6 +73,9 @@ from torch_mojo_backend.eager_kernels.normalization_forward_ops import (
 from torch_mojo_backend.eager_kernels.optimizer_ops import (
     OptimizerExtension as _OptimizerExtension,
 )
+from torch_mojo_backend.eager_kernels.random_ops import (
+    RandomExtension as _RandomExtension,
+)
 from torch_mojo_backend.eager_kernels.reduction_ops import (
     ReductionExtension as _ReductionExtension,
 )
@@ -4714,6 +4717,141 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
             keepalive=(grad_input, grad, keep),
         )
     return grad_input
+
+
+# Dtypes `aten::uniform_` is defined for, minus complex (unsupported
+# device-wide): ATen dispatches it over the floating-point types plus the two
+# 16-bit floats (`uniform_impl_` in aten/src/ATen/native/DistributionTemplates.h).
+_UNIFORM_DTYPES = _FLOAT_DTYPES + (DType.float64,)
+
+# ATen bounds-checks both endpoints against the OUTPUT dtype's representable
+# range before it draws anything (`check_uniform_bounds`), so the limits are
+# per dtype and come from torch itself rather than a table of ours.
+_UNIFORM_LIMITS = {
+    dtype: (torch.finfo(torch_dtype).min, torch.finfo(torch_dtype).max, name)
+    for dtype, torch_dtype, name in (
+        (DType.float32, torch.float32, "float32"),
+        (DType.float16, torch.float16, "float16"),
+        (DType.bfloat16, torch.bfloat16, "bfloat16"),
+        (DType.float64, torch.float64, "float64"),
+    )
+}
+
+
+def _uniform_number(value: float) -> str:
+    """A float the way ATen's error messages print it (`3`, not `3.0`)."""
+    return f"{value:g}"
+
+
+def fast_aten_uniform_(
+    self: TorchMojoTensor,
+    from_: float = 0.0,
+    to: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> object:
+    """In-place `uniform_` generated ON THE DEVICE, from the device's own
+    Philox stream.
+
+    Nothing round-trips through the host: `_reserve_philox_state` reserves the
+    exact counter interval this call will consume (one counter per Philox
+    group, `ceil(numel * words_per_element / 4)` of them) without reading a
+    tensor or synchronizing the queue, and the kernel derives every value from
+    `(seed, base_offset, index)` alone. So the draw is asynchronous like any
+    other kernel, `torch.mojo.manual_seed_all` reproduces it, and
+    `get_rng_state` / `set_rng_state` checkpoint it -- which is the whole
+    reason for generating on the device rather than staging a host draw
+    across.
+
+    Only the device's DEFAULT generator is supported. That is not a shortcut:
+    a `torch.Generator(device="mojo")` cannot be built from pure Python at all
+    (pytorch e337bdbd435, 2026-08-14 -- `torch/csrc/acc/Module.cpp`'s
+    `PythonHooks::getNewGenerator` has no `PYBIND11_OVERRIDE` and the pybind
+    class does not bind it, carrying a standing "TODO(qihqi): these is not
+    supported from python yet"), and the only alternative,
+    `REGISTER_GENERATOR_PRIVATEUSE1`, needs a compiled C++ extension -- which
+    this backend deliberately does not have -- and is itself marked
+    "TODO(FFFrog): Preserved for BC and will be removed in the future" in
+    `aten/src/ATen/detail/PrivateUse1HooksInterface.h`. So an explicit
+    generator is refused rather than silently ignored.
+    """
+    if self._dtype not in _UNIFORM_DTYPES:
+        return NOT_HANDLED
+    if self._dtype == DType.float64 and self._device.api == "metal":
+        return NOT_HANDLED
+    if not isinstance(from_, int | float) or not isinstance(to, int | float):
+        return NOT_HANDLED
+    from_ = float(from_)
+    to = float(to)
+
+    # ATen's own checks, in ATen's order, so a malformed call is rejected the
+    # same way here (DistributionTemplates.h, `uniform_impl_`). The clamp that
+    # follows them upstream cannot change a value these checks accepted, so it
+    # is not repeated.
+    lowest, highest, dtype_name = _UNIFORM_LIMITS[self._dtype]
+    for value, name in ((from_, "from"), (to, "to")):
+        if not (value >= lowest and value <= highest):
+            raise RuntimeError(f"{name} is out of bounds for {dtype_name}")
+    if not from_ <= to:
+        raise RuntimeError(
+            "uniform_ expects to return a [from, to) range, but found from="
+            f"{_uniform_number(from_)} > to={_uniform_number(to)}"
+        )
+    if not (to - from_) <= highest:
+        raise RuntimeError(
+            f"uniform_ expects to-from <= std::numeric_limits<{dtype_name}>"
+            f"::max(), but found to={_uniform_number(to)} and from="
+            f"{_uniform_number(from_)} which result in to-from to exceed the "
+            "limit"
+        )
+    if generator is not None:
+        raise NotImplementedError(
+            "aten::uniform_ on the mojo device draws from the device's default "
+            "generator; an explicit generator= is not supported (a "
+            'torch.Generator(device="mojo") cannot be constructed from Python '
+            "in the first place). Seed the device generator instead: "
+            "torch.mojo.manual_seed_all(seed), or torch.manual_seed(seed), "
+            "and checkpoint it with torch.mojo.get_rng_state() / "
+            "torch.mojo.set_rng_state(state)."
+        )
+    if self._numel == 0:
+        return self
+
+    # A strided destination is generated into fresh contiguous storage and
+    # copied back through the ordinary strided copy: the values a tensor
+    # receives then depend only on its logical (row-major) index, never on its
+    # layout, which is what keeps a draw reproducible across views.
+    target = (
+        self if self._is_contiguous else _alloc(self._shape, self._dtype, self._device)
+    )
+    # float64 needs 53 mantissa bits, i.e. two of Philox's four 32-bit words
+    # per element; every other dtype takes one word (uniform_kernels.mojo).
+    words = 2 if self._dtype == DType.float64 else 1
+    seed, base_offset = _reserve_philox_state(
+        self._torch_device, (self._numel * words + 3) // 4
+    )
+    word_mask = (1 << 32) - 1
+    _call_mojo(
+        _RandomExtension,
+        "UniformFill",
+        (
+            target._ptr,
+            from_,
+            to,
+            target._numel,
+            target._dtype.value,
+            seed & word_mask,
+            (seed >> 32) & word_mask,
+            base_offset & word_mask,
+            (base_offset >> 32) & word_mask,
+            _ctx_ptr(target._device),
+        ),
+        arg_dtypes=(),
+        output_dtypes=(target._dtype,),
+        keepalive=(target,),
+    )
+    if target is not self:
+        _copy_into(self, target)
+    return self
 
 
 def _layer_norm_stats_to_input_dtype(
