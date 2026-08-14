@@ -1,13 +1,14 @@
 """PrivateUse1 device-module, transfer, and RNG runtime contracts."""
 
 import gc
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 
-from torch_mojo_backend import register_mojo_devices
+from torch_mojo_backend import get_accelerators, register_mojo_devices
 from torch_mojo_backend.mojo_device import torch_mojo_tensor as mojo_tensor_module
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
@@ -249,3 +250,60 @@ def test_torch_fork_rng_restores_mojo_counter(mojo_device):
     with torch.random.fork_rng(devices=[index], device_type="mojo"):
         assert _reserve_philox_state(device, 33) == (91, 0)
     torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+
+
+def test_registration_prewarms_the_first_device_tensor_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first device tensor must not pay one-time runtime setup inline.
+
+    `torch.tensor(..., device="mojo")` used to block for ~0.7s warm (2.4s+ on a
+    cold cache) while every *operation* build was already backgrounded. Profiling
+    put 0.711 of 0.721s inside a single native call, `tensor_holder.alloc_from_host`
+    -- one-time runtime and pinned-host staging setup, not compilation. The
+    registration hook does that work on a background thread instead.
+
+    Asserted through observable state rather than timing, so this cannot flake on
+    a loaded machine: the holder module ends up loaded without the test having
+    created a tensor.
+    """
+    from torch_mojo_backend import eager_kernels
+    from torch_mojo_backend.eager_kernels import call_queue
+    from torch_mojo_backend.mojo_device import register
+
+    if not get_accelerators():
+        pytest.skip("prewarm targets an accelerator")
+
+    # The prewarm is deliberately skipped when the kernel queue is off, which is
+    # the default under the test suite -- force it on for this test only.
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_KERNEL_QUEUE", "1")
+    call_queue.refresh()
+    assert call_queue.enabled()
+
+    register._start_tensor_holder_prewarm()
+    for _ in range(600):  # up to 60s on a cold cache, which builds the extension
+        if eager_kernels._TENSOR_HOLDER:
+            break
+        time.sleep(0.1)
+    assert eager_kernels._TENSOR_HOLDER, "prewarm thread never loaded the holder"
+
+
+def test_prewarm_is_skipped_when_the_kernel_queue_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` means every build blocks at its call
+    site, for debugging. Prewarming would move one off its call site and make the
+    kill switch a partial lie, so it must not start a thread at all."""
+    import threading
+
+    from torch_mojo_backend.eager_kernels import call_queue
+    from torch_mojo_backend.mojo_device import register
+
+    monkeypatch.setenv("TORCH_MOJO_BACKEND_KERNEL_QUEUE", "0")
+    call_queue.refresh()
+    assert not call_queue.enabled()
+
+    before = {t.name for t in threading.enumerate()}
+    register._start_tensor_holder_prewarm()
+    after = {t.name for t in threading.enumerate()}
+    assert not [n for n in after - before if "prewarm" in n]

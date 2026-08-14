@@ -1,7 +1,11 @@
+import threading
 from functools import wraps
 
 import torch
 
+from .. import eager_kernels
+from ..eager_kernels import call_queue
+from ..torch_compile_backend.utils import get_accelerators
 from .mojo_device_aten_ops import _aten_ops_registry
 
 _registered = False
@@ -214,6 +218,70 @@ def _keep_mojo_kernels_out_of_fake_tensor_construction():
     FakeTensor.__new__ = staticmethod(fake_new_without_mojo_kernels)
 
 
+def _start_tensor_holder_prewarm() -> None:
+    """Start building the TensorHolder extension now, off the calling thread.
+
+    Creating the first device tensor reaches `eager_kernels.tensor_holder`,
+    whose module-level `__getattr__` builds and dlopens the extension
+    SYNCHRONOUSLY on the calling thread. That is a one-time cost (~2.4s on an
+    H100 box, cold cache) but it lands squarely on the user's first
+    `torch.tensor(..., device="mojo")`, while every *operation* build is
+    already handed to the background pool and returns immediately. The stall
+    is therefore not inherent to creating a tensor -- the second and third
+    tensors are instant -- it is the extension build being on the critical
+    path of whoever touches it first.
+
+    Nothing about that build needs the caller, so it starts here. This
+    function is the point where a program declares it intends to use the
+    device, which is why the prewarm lives here and NOT at import time:
+    importing the package must keep compiling nothing, since torch.compile-only
+    users never touch the eager kernels and should not pay for them.
+
+    Daemon thread, and the exception is swallowed on purpose:
+    `_ensure_tensor_holder` caches a failure and re-raises it at the real call
+    site, so a broken build still surfaces there, with the traceback the user
+    can act on, instead of being reported twice or lost in a thread.
+    """
+    if not call_queue.enabled():
+        # Kill switch (TORCH_MOJO_BACKEND_KERNEL_QUEUE=0) means "every build
+        # blocks inline at its call site" for debugging. Prewarming would move
+        # this one off its call site and make the knob a partial lie.
+        return
+
+    def _build() -> None:
+        try:
+            eager_kernels._ensure_tensor_holder()
+        except BaseException:
+            pass
+        try:
+            # Second one-time cost on the same critical path, and the bigger
+            # one once the extension is cached. Profiling the first
+            # `torch.tensor(..., device="mojo")` with the holder already loaded
+            # put 0.711 of its 0.721s inside ONE native call --
+            # `tensor_holder.alloc_from_host` -- with the second tensor at
+            # 0.000s. So it is one-time setup behind that entry point (device
+            # context plus the pinned-host staging path), not the extension
+            # build and not compilation.
+            #
+            # It has to be `_from_cpu`, i.e. `alloc_from_host`: prewarming with
+            # a plain `alloc` did NOT remove the stall, because the two entry
+            # points do not share the setup. Warm the path the user's first
+            # statement actually takes, with the smallest tensor there is.
+            from .torch_mojo_tensor import TorchMojoTensor
+
+            probe = torch.zeros(1)
+            for device in get_accelerators():
+                # Unreferenced on return, so the holder frees it immediately
+                # and this leaves only the initialized runtime behind.
+                TorchMojoTensor._from_cpu(probe, device)
+        except BaseException:
+            pass
+
+    threading.Thread(
+        target=_build, name="tmb-tensor-holder-prewarm", daemon=True
+    ).start()
+
+
 def register_mojo_devices():
     """Enable the mojo device globally and register all aten ops"""
     from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
@@ -271,5 +339,7 @@ def register_mojo_devices():
     from .apple_optimizations import register_apple_optimizations
 
     register_apple_optimizations()
+
+    _start_tensor_holder_prewarm()
 
     _registered = True
