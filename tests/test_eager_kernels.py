@@ -178,6 +178,35 @@ def test_fallback_int_div(mojo_device):
     torch.testing.assert_close(result, x / y, check_dtype=False)
 
 
+def test_fast_remainder_bfloat16_near_zero_divisor(mojo_device):
+    """Regression test: a bf16 divisor near that format's smallest normal
+    value (~1.18e-38 -- what OpInfo's exclude_zero substitutes for an
+    exact-zero draw) used to send the naive trunc/multiply/subtract
+    decomposition's quotient to +/-inf, even though the true remainder is
+    always finite and bounded by |divisor|. -7.4375 and 91.0 both overflow
+    a raw bf16 division by the tiny divisor (verified directly); the
+    other two entries are ordinary values so this also covers the mixed
+    case a broadcast triggers in practice."""
+    x = torch.tensor([0.4922, -7.4375, 2.3125, 91.0], dtype=torch.bfloat16)
+    y = torch.tensor([1.0, 1.0, 1.0, 1.1754943508222875e-38], dtype=torch.bfloat16)
+    result = torch.remainder(x.to(mojo_device), y.to(mojo_device)).cpu()
+    torch.testing.assert_close(result, torch.remainder(x, y))
+    result_rmod = (y.to(mojo_device) % x.to(mojo_device)).cpu()
+    torch.testing.assert_close(result_rmod, y % x)
+
+
+def test_fast_remainder_float16_large_ratio(mojo_device):
+    """Regression test: fp16's dynamic range alone (no divisor anywhere
+    near a boundary) can push |a / b| past float32's 24-bit mantissa,
+    e.g. 23456.0 / 0.0009937... ~= 2.36e7 > 2^24. Promoting to fp32
+    without the bit-exact fmod used to lose the remainder's low bits
+    entirely, rounding a true 0.0004178 down to exactly 0."""
+    x = torch.tensor([23456.0], dtype=torch.float16)
+    y = torch.tensor([0.0009937286376953125], dtype=torch.float16)
+    result = torch.remainder(x.to(mojo_device), y.to(mojo_device)).cpu()
+    torch.testing.assert_close(result, torch.remainder(x, y))
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fast_floor_divide_narrow_float_boundary(mojo_device, dtype):
     """Regression test for an off-by-one bug: computing floor(a / b) at
