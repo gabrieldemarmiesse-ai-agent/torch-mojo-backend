@@ -302,8 +302,27 @@ def _bin_vec_op[
             return (a % b).cast[out_dtype]()
         comptime if op_code == BOP_FLOORDIV:
             # `//` = floor(a / b), matching torch.floor_divide for both
-            # float and integer dtypes.
-            return (a // b).cast[out_dtype]()
+            # float and integer dtypes. bf16/fp16 need the division itself
+            # done at fp32: computed directly in their own 8/11-bit mantissa,
+            # the quotient can round onto the wrong side of an integer
+            # boundary before the floor -- e.g. a true quotient of 5.985
+            # rounds to 6.0 in bf16, giving floor_divide = 6 instead of 5.
+            # torch's floor_divide algorithm (`div_floor_floating` in
+            # c10/util/generic_math.h) is more involved than a plain
+            # divide-then-floor, but empirically (verified directly against
+            # torch.floor_divide on real bf16/fp16 tensors, including this
+            # exact boundary case) computing it at fp32 and narrowing once at
+            # the end reproduces its bf16/fp16 output.
+            #
+            # One body serves every kernel in this family now, so this lives
+            # in one place; before the vectorization refactor the same fix had
+            # to be written twice, in the scalar body and its SIMD twin.
+            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+                return (
+                    a.cast[DType.float32]() // b.cast[DType.float32]()
+                ).cast[out_dtype]()
+            else:
+                return (a // b).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher); accumulate halves in
             # float32 to match torch's numerics.

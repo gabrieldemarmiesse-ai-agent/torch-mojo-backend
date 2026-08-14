@@ -88,6 +88,7 @@ from op_utils import (
     _spec_dispatcher3,
     _spec_ptr,
     _spec_unsupported,
+    custom_tan,
     ieee_sqrt,
 )
 
@@ -320,10 +321,11 @@ def _bin_go[
 #   * every other opcode is float-only (`_float_unary` below): half-precision
 #     inputs are promoted to float32, computed, and cast back — matching
 #     torch's numerics and keeping the polynomial math accurate.
-# Two of the composed ops deserve a note: `tan` and `asinh` are built from
-# sin/cos and log/sqrt rather than the std.math primitives, because those
-# lower to libm (`_call_libm`) which `comptime assert`s CPU-only and would
-# refuse to compile for the GPU target.
+# Two of the ops deserve a note: `tan` and `asinh` cannot call the std.math
+# primitive of the same name, because those lower to libm (`_call_libm`) which
+# `comptime assert`s CPU-only and would refuse to compile for the GPU target.
+# `asinh` is composed from log/sqrt right here; `tan` goes through
+# `op_utils.custom_tan`, which routes per target and dtype.
 # ---------------------------------------------------------------------------
 
 comptime UOP_RELU = 0
@@ -414,8 +416,9 @@ def _float_unary[
     comptime if op_code == UOP_SQRT:
         res = ieee_sqrt(a)
     comptime if op_code == UOP_TAN:
-        # tan(x) = sin(x)/cos(x); std.math.tan is libm/CPU-only.
-        res = sin(a) / cos(a)
+        # `custom_tan` picks libm, the argument-reduced polynomial or
+        # `sin / cos` from the compilation target and `dtype` on its own.
+        res = custom_tan(a)
     comptime if op_code == UOP_GELU_NONE:
         # 0.5 * x * (1 + erf(x / sqrt(2)))
         comptime inv_sqrt2 = 0.70710678118654752440
