@@ -12,7 +12,8 @@ from std.ffi import _get_global_or_null, external_call
 from max.gpu.sync import barrier
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
-from std.math import ceildiv, sqrt
+from std.math import ceildiv, cos, floor, sin, sqrt, tan
+from std.math.polynomial import polynomial_evaluate
 from std.memory import OpaquePointer, alloc, bitcast, stack_allocation
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
@@ -20,6 +21,7 @@ from std.sys import llvm_intrinsic
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
+    is_gpu,
     is_nvidia_gpu,
     simd_width_of,
     size_of,
@@ -91,6 +93,86 @@ def ieee_sqrt[
             ](x)
     else:
         return sqrt(x)
+
+
+# Tangent: CPU -> libm; float32 on GPU -> the polynomial below; anything
+# else -> sin(x) / cos(x).
+#
+# float32 GPU needs the polynomial because on NVIDIA `sin`/`cos` lower to a
+# fixed ~1e-6-absolute-error approx instruction, and dividing them near a pole
+# (cos(x) ~ 0) turns that into a large relative error -- 8.8% of a 20x20 randn
+# sample failed conformance. AMD and Apple do not use that instruction, but
+# take the polynomial too: it is what they already ran, and it needs no
+# per-vendor accuracy claim.
+@always_inline
+def custom_tan[
+    dtype: DType, width: SIMDSize, //, *, exact: Bool = True
+](x: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """Elementwise tangent that keeps its relative accuracy on every backend.
+
+    Use this, not `std.math.tan` (which refuses to compile for a GPU target)
+    and not a hand-written `sin / cos` (which loses relative accuracy near the
+    poles on NVIDIA).
+
+    Parameters:
+        dtype: Element type of the input and output vector.
+        width: SIMD width of the input and output vector.
+        exact: Whether float32 on GPU takes the argument-reduced polynomial
+            path. Passing `False` asks for the raw hardware approximation
+            instead -- two instructions and a divide, but wrong by a large
+            relative factor near every pole -- and is only appropriate where
+            the tangent feeds a heuristic that never leaves the kernel. Every
+            other target/dtype combination ignores it: there is no cheaper
+            route to drop to.
+
+    Args:
+        x: Vector to take the tangent of, in radians.
+
+    Returns:
+        The elementwise tangent of `x`.
+    """
+    comptime if not is_gpu():
+        # `sin`/`cos` here would be the accurate LLVM intrinsics rather than
+        # the approx PTX instructions, so neither GPU route below buys
+        # anything over libm's own tangent.
+        return tan(x)
+    elif exact and dtype == DType.float32:
+        # Reduce x to the nearest multiple of pi/2 (Cody-Waite, exact in
+        # float32 for any |k| this op will realistically see) so the residual
+        # r is always in [-pi/4, pi/4], away from every pole, then evaluate
+        # tan(r) with a dedicated least-squares polynomial fit (fit against a
+        # float64 reference; <2e-7 relative error in float32 arithmetic over
+        # the polynomial's own domain). Near a pole the residual r is itself
+        # small and well-conditioned, so -1/tan(r) reproduces the blow-up
+        # without ever dividing two independently-rounded hardware trig
+        # results against each other -- though for x within ~0.05 rad of an
+        # exact pole, the end-to-end relative error can still exceed
+        # torch.testing's default float32 rtol; that is inherent to
+        # representing tan's unbounded derivative there in finite precision,
+        # not specific to this polynomial.
+        var af = x.cast[DType.float32]()
+        comptime PIO2_HI = Float32(1.5703125)
+        comptime PIO2_LO = Float32(0.00048382679233327506)
+        comptime INV_PIO2 = Float32(0.63661977236758134308)
+
+        var k = floor(af.fma(INV_PIO2, 0.5))
+        var r = (af - k * PIO2_HI) - k * PIO2_LO
+        var z = r * r
+        var poly = polynomial_evaluate[
+            [
+                Float32(0.33333312008738518),
+                0.13334750477592851,
+                0.053745989665389061,
+                0.023242133948206902,
+                0.0050118292279914021,
+                0.0082744075469672680,
+            ],
+        ](z)
+        var tan_r = r + r * z * poly
+        var is_odd = (k.cast[DType.int32]() & 1).cast[DType.bool]()
+        return is_odd.select(-1 / tan_r, tan_r).cast[dtype]()
+    else:
+        return sin(x) / cos(x)
 
 
 @always_inline

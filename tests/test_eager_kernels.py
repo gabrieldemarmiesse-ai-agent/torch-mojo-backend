@@ -178,6 +178,19 @@ def test_fallback_int_div(mojo_device):
     torch.testing.assert_close(result, x / y, check_dtype=False)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fast_floor_divide_narrow_float_boundary(mojo_device, dtype):
+    """Regression test for an off-by-one bug: computing floor(a / b) at
+    bf16/fp16's own precision can round the quotient across an integer
+    boundary before the floor is applied. E.g. -6.3125 / -1.0546875 has a
+    true quotient of ~5.985, which used to round to 6.0 in bf16 before the
+    floor, giving floor_divide = 6 instead of the correct 5."""
+    x = torch.tensor([-6.3125, 91.0, 2.3125, -5.2812, 357.0], dtype=dtype)
+    y = torch.tensor([-1.0546875, 3.375, 8.5, 1.0547, 6.789], dtype=dtype)
+    result = torch.floor_divide(x.to(mojo_device), y.to(mojo_device)).cpu()
+    torch.testing.assert_close(result, torch.floor_divide(x, y))
+
+
 @pytest.mark.parametrize("shape", [(0,), (1,), (7,), (0, 5)])
 def test_edge_case_shapes(mojo_device, shape):
     x = torch.randn(*shape)

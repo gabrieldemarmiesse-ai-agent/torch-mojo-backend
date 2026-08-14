@@ -6,6 +6,9 @@ Simply use [`torch.compile`](https://docs.pytorch.org/tutorials/intermediate/tor
 
 ```bash
 pip install torch-mojo-backend
+
+# or, with uv:
+uv add torch-mojo-backend
 ```
 
 ## Quick Start
