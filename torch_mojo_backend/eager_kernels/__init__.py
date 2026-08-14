@@ -429,10 +429,15 @@ _BUILD_NOTICE_SHOWN = False
 
 
 def _trace(message: str) -> None:
-    """Timestamped build tracing, on by default; TORCH_MOJO_BACKEND_TRACE=0
-    silences it."""
+    """Build tracing, on by default; TORCH_MOJO_BACKEND_TRACE=0 silences it.
+
+    No timestamp: a raw `t=<monotonic>` told a reader nothing on its own --
+    it is an arbitrary process-relative float, and answering "how long did
+    this take" meant subtracting two of them by hand. The `built` line now
+    carries the duration directly.
+    """
     if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
-        sys.stderr.write(f"[TRACE] {message} t={time.monotonic():.2f}\n")
+        sys.stderr.write(f"[TRACE] {message}\n")
 
 
 def _announce_build() -> None:
@@ -465,15 +470,27 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if out.is_file():
             return out
-        scope = "full" if defines is None else dict(defines).get("OP", "defined")
+        # An ungated build gets named as what it is rather than as
+        # "<stem>.full". `full` is this loader's tag for "no -D gates", but
+        # read in a trace line `tensor_holder.full` looks exactly like a
+        # kernel specialization for `aten.full` -- so the one build that is
+        # pure infrastructure was the one that read like a mystery kernel.
+        # Gated builds keep `<stem>.<OP>`, where the suffix really is the
+        # operation being specialized.
+        label = (
+            f"{src.stem} extension"
+            if defines is None
+            else f"{src.stem}.{dict(defines).get('OP', 'defined')}"
+        )
         _announce_build()
-        _trace(f"building {src.stem}.{scope}")
+        _trace(f"building {label}")
         # Build to a temp path and rename into place: `mojo build -o` writes
         # the output non-atomically, and the fast-path existence check above
         # runs WITHOUT the lock — a reader must never see a partial .so.
         # The temp name keeps the .so suffix (mojo normalizes others) and a
         # leading dot so no cache scan ever picks it up.
         tmp = out.with_name(f".tmp{os.getpid()}.{out.name}")
+        started = time.monotonic()
         try:
             proc = subprocess.run(
                 _extension_cmd(src, defines, tmp),
@@ -481,7 +498,7 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                 text=True,
                 env=_build_env(),
             )
-            _trace(f"built {src.stem}.{scope}")
+            _trace(f"built {label} in {time.monotonic() - started:.2f}s")
             if proc.returncode != 0:
                 raise ImportError(
                     f"mojo build failed for {src.stem} "
