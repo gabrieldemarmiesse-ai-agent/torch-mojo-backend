@@ -1,4 +1,4 @@
-"""Candidate H100 BF16 GEMM/BMM built on mma.sync m16n8k16 tensor cores.
+"""Candidate H100 16-bit GEMM/BMM built on mma.sync m16n8k16 tensor cores.
 
 Four shared-memory tile regimes (128x128x32, 128x64x32, 64x128x32, 64x64x32)
 serve every runtime shape, layout, and batch; the host picks per launch from
@@ -40,6 +40,11 @@ grid-strides past the 2_147_483_647 physical grid.x cap, grid.z
 grid-strides batches, both loops advance via remaining-distance tests
 that cannot wrap, and the host raises before enqueue if any launch or
 addressing product cannot fit in machine Int.
+
+The operand dtype is bfloat16 or float16, chosen at compile time by
+`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the 2-byte operand width, not of the exponent
+layout, so one source serves both.
 """
 
 from std.collections import InlineArray
@@ -49,6 +54,7 @@ from max.gpu.compute.mma import mma
 from max.gpu.host import DeviceAttribute, DeviceContext
 from std.memory import AddressSpace
 from std.memory import stack_allocation
+from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _BM = 128
 comptime _BN = 128
@@ -58,9 +64,9 @@ comptime _STAGE_A = _BM * _LDS
 comptime _STAGE_B = _BN * _LDS
 comptime _THREADS = 256
 comptime _GROUP_M = 8
-comptime _BF16 = DType.bfloat16
+comptime _DT = _GEMM16_DT
 comptime _F32 = DType.float32
-comptime _Ptr = UnsafePointer[Scalar[_BF16], MutAnyOrigin]
+comptime _Ptr = UnsafePointer[Scalar[_DT], MutAnyOrigin]
 comptime _F32Ptr = UnsafePointer[Scalar[_F32], MutAnyOrigin]
 comptime _I32_MAX = 2_147_483_647
 comptime _I64_MAX = 9_223_372_036_854_775_807
@@ -77,7 +83,7 @@ def _g2r_kc[
     kdim: Int32,
     tid: Int32,
     fast: Int32,
-    mut regs: InlineArray[SIMD[_BF16, 8], CH],
+    mut regs: InlineArray[SIMD[_DT, 8], CH],
 ):
     # K-contiguous operand: element (r, kk) lives at src[r * kdim + kk].
     # Quad q takes row (4q % 64) + q // 16 so the paired quads of one shared
@@ -91,7 +97,7 @@ def _g2r_kc[
         var kc = (tid % 4) * 8
         var gr = row0 + r
         var gk = k0 + kc
-        var v = SIMD[_BF16, 8]()
+        var v = SIMD[_DT, 8]()
 
         @parameter
         if FAST:
@@ -137,7 +143,7 @@ def _g2r_mc[
     kdim: Int32,
     tid: Int32,
     fast: Int32,
-    mut regs: InlineArray[SIMD[_BF16, 8], CH],
+    mut regs: InlineArray[SIMD[_DT, 8], CH],
 ):
     # Row-contiguous operand: element (r, kk) lives at src[kk * rows + r].
     #
@@ -164,7 +170,7 @@ def _g2r_mc[
             rc = (item // _BK) * 8
         var gk = k0 + kr
         var gr = row0 + rc
-        var v = SIMD[_BF16, 8]()
+        var v = SIMD[_DT, 8]()
 
         @parameter
         if FAST:
@@ -296,15 +302,15 @@ def _mma_tile_impl[
     var cpair: Int32 = 0
 
     var smem_a = stack_allocation[
-        2 * STAGE_A, _BF16, alignment=16, address_space=AddressSpace.SHARED
+        2 * STAGE_A, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
     var smem_b = stack_allocation[
-        2 * STAGE_B, _BF16, alignment=16, address_space=AddressSpace.SHARED
+        2 * STAGE_B, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
 
     var acc = InlineArray[SIMD[_F32, 4], 2 * NT](fill=SIMD[_F32, 4]())
-    var va = InlineArray[SIMD[_BF16, 8], ACH](fill=SIMD[_BF16, 8]())
-    var vb = InlineArray[SIMD[_BF16, 8], BCH](fill=SIMD[_BF16, 8]())
+    var va = InlineArray[SIMD[_DT, 8], ACH](fill=SIMD[_DT, 8]())
+    var vb = InlineArray[SIMD[_DT, 8], BCH](fill=SIMD[_DT, 8]())
 
     # QKMAJ: in the guarded small-tile regime, m/n-contiguous operands use
     # the quad load mapping (see _g2r_mc) plus k-major staging with one 16B
@@ -435,7 +441,7 @@ def _mma_tile_impl[
         @parameter
         for ks in range(2):
             var kb = Int32(ks * 16) + 2 * tg
-            var afr = InlineArray[SIMD[_BF16, 8], 2](fill=SIMD[_BF16, 8]())
+            var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
             @parameter
             for mt in range(2):
@@ -444,7 +450,7 @@ def _mma_tile_impl[
                 @parameter
                 if TA and (FASTK or QKMAJ):
                     var c0 = Int(base_a + kb * Int32(LDA_K) + row)
-                    afr[mt] = SIMD[_BF16, 8](
+                    afr[mt] = SIMD[_DT, 8](
                         smem_a[c0],
                         smem_a[c0 + LDA_K],
                         smem_a[c0 + 8],
@@ -472,7 +478,7 @@ def _mma_tile_impl[
             @parameter
             for nt in range(NT):
                 var nr = wn + Int32(nt * 8) + g
-                var bfr = SIMD[_BF16, 4]()
+                var bfr = SIMD[_DT, 4]()
 
                 @parameter
                 if TB or not (FASTK or QKMAJ):
@@ -485,7 +491,7 @@ def _mma_tile_impl[
                     bfr = b01.join(b23)
                 else:
                     var d0 = Int(base_b + kb * Int32(LDB_K) + nr)
-                    bfr = SIMD[_BF16, 4](
+                    bfr = SIMD[_DT, 4](
                         smem_b[d0],
                         smem_b[d0 + LDB_K],
                         smem_b[d0 + 8 * LDB_K],
@@ -584,10 +590,10 @@ def _mma_tile_impl[
                         var row = row0 + Int32(h * 8)
                         if row < mi:
                             var base_idx = Int(row) * n + Int(col)
-                            var v0 = (frag[2 * h] + add0).cast[_BF16]()
+                            var v0 = (frag[2 * h] + add0).cast[_DT]()
                             if cpair != 0 and col + 1 < ni:
-                                var pair = SIMD[_BF16, 2](
-                                    v0, (frag[2 * h + 1] + add1).cast[_BF16]()
+                                var pair = SIMD[_DT, 2](
+                                    v0, (frag[2 * h + 1] + add1).cast[_DT]()
                                 )
                                 cp.store[alignment=4](base_idx, pair)
                             else:
@@ -595,7 +601,7 @@ def _mma_tile_impl[
                                 if col + 1 < ni:
                                     cp[base_idx + 1] = (
                                         frag[2 * h + 1] + add1
-                                    ).cast[_BF16]()
+                                    ).cast[_DT]()
 
     @parameter
     @always_inline
@@ -676,7 +682,7 @@ def _gemm_fastk_tag[FASTK: Bool]() -> StaticString:
 # once) and the FASTK builds take the one-batch-per-grid.z body, so BATCHED is
 # exactly the complement of FASTK here.
 @__name(
-    t"bf16_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}{_gemm_fastk_tag[FASTK]()}"
+    t"{_GEMM16_TAG}_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}{_gemm_fastk_tag[FASTK]()}"
 )
 def _gemm_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool
@@ -734,7 +740,7 @@ def _gemm_entry[
 # 64x64 regimes only (the ones _pick_regime can select for a small grid with
 # both extents above 64); narrow-extent shapes keep their existing routes.
 @__name(
-    t"bf16_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}_splitk"
+    t"{_GEMM16_TAG}_gemm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}_splitk"
 )
 def _gemm_splitk_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int
@@ -762,7 +768,7 @@ def _gemm_splitk_entry[
     # `output`/`bias` are unread under SPLITK; the workspace and `a` stand in
     # as dummies the same way BMM reuses `a` for its unread bias pointer.
     _mma_tile_impl[TA, TB, BM, BN, False, False, SPLITK=True](
-        ws.bitcast[Scalar[_BF16]](),
+        ws.bitcast[Scalar[_DT]](),
         a,
         b,
         a,
@@ -798,7 +804,7 @@ comptime _SPLITK_RED_THREADS = 256
 comptime _SPLITK_RED_GROUPS = 1
 
 
-@__name(t"bf16_gemm_splitk_reduce{_gemm_regime_tag[BM, BN]()}")
+@__name(t"{_GEMM16_TAG}_gemm_splitk_reduce{_gemm_regime_tag[BM, BN]()}")
 def _gemm_splitk_reduce[
     BM: Int, BN: Int
 ](
@@ -872,13 +878,13 @@ def _gemm_splitk_reduce[
                         acc4[e] += bias[col0 + e].cast[_F32]()
             var obase = row * n + col0
             if col0 + 4 <= n:
-                output.store[alignment=2](obase, acc4.cast[_BF16]())
+                output.store[alignment=2](obase, acc4.cast[_DT]())
             else:
 
                 @parameter
                 for e in range(4):
                     if col0 + e < n:
-                        output[obase + e] = acc4[e].cast[_BF16]()
+                        output[obase + e] = acc4[e].cast[_DT]()
 
 
 @always_inline
@@ -919,7 +925,7 @@ def _bmm_fastk_tag[FASTK: Bool]() -> StaticString:
 # one batch per grid.z block, so it never runs the kernel's batch loop, while
 # a guarded launch grid-strides batches through it.
 @__name(
-    t"bf16_bmm_{_bmm_layout_tag[TA, TB]()}{_bmm_regime_tag[BM, BN]()}{_bmm_fastk_tag[FASTK]()}"
+    t"{_GEMM16_TAG}_bmm_{_bmm_layout_tag[TA, TB]()}{_bmm_regime_tag[BM, BN]()}{_bmm_fastk_tag[FASTK]()}"
 )
 def _bmm_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool
@@ -984,7 +990,7 @@ def _g2r_kc_wide(
     kdim: Int,
     tid: Int,
     fast: Int,
-    mut regs: InlineArray[SIMD[_BF16, 8], 2],
+    mut regs: InlineArray[SIMD[_DT, 8], 2],
 ):
     # Full-width copy of the accepted-v1 K-contiguous staging: element
     # (r, kk) lives at src[r * kdim + kk]. Every coordinate and flat offset
@@ -996,7 +1002,7 @@ def _g2r_kc_wide(
         var kc = (tid % 4) * 8
         var gr = row0 + r
         var gk = k0 + kc
-        var v = SIMD[_BF16, 8]()
+        var v = SIMD[_DT, 8]()
         if fast != 0:
             # fast proves 16B base alignment and kdim % 8 == 0, so each
             # 8-wide chunk is aligned and entirely in or out of bounds.
@@ -1025,7 +1031,7 @@ def _g2r_mc_wide(
     kdim: Int,
     tid: Int,
     fast: Int,
-    mut regs: InlineArray[SIMD[_BF16, 8], 2],
+    mut regs: InlineArray[SIMD[_DT, 8], 2],
 ):
     # Full-width copy of the accepted-v1 row-contiguous staging: element
     # (r, kk) lives at src[kk * rows + r].
@@ -1036,7 +1042,7 @@ def _g2r_mc_wide(
         var rc = (item // _BK) * 8
         var gk = k0 + kr
         var gr = row0 + rc
-        var v = SIMD[_BF16, 8]()
+        var v = SIMD[_DT, 8]()
         if fast != 0:
             # fast proves 16B base alignment and rows % 8 == 0.
             if gk < kdim and gr < rows:
@@ -1115,15 +1121,15 @@ def _mma_tile_wide[
     var cpair = 0
 
     var smem_a = stack_allocation[
-        2 * _STAGE_A, _BF16, alignment=16, address_space=AddressSpace.SHARED
+        2 * _STAGE_A, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
     var smem_b = stack_allocation[
-        2 * _STAGE_B, _BF16, alignment=16, address_space=AddressSpace.SHARED
+        2 * _STAGE_B, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
 
     var acc = InlineArray[SIMD[_F32, 4], 16](fill=SIMD[_F32, 4]())
-    var va = InlineArray[SIMD[_BF16, 8], 2](fill=SIMD[_BF16, 8]())
-    var vb = InlineArray[SIMD[_BF16, 8], 2](fill=SIMD[_BF16, 8]())
+    var va = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
+    var vb = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
     @parameter
     @always_inline
@@ -1197,7 +1203,7 @@ def _mma_tile_wide[
         @parameter
         for ks in range(2):
             var kb = ks * 16 + 2 * tg
-            var afr = InlineArray[SIMD[_BF16, 8], 2](fill=SIMD[_BF16, 8]())
+            var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
             @parameter
             for mt in range(2):
@@ -1297,11 +1303,11 @@ def _mma_tile_wide[
                             var row = row0 + h * 8
                             if row < m:
                                 var base_idx = row * n + col
-                                var v0 = (frag[2 * h] + add0).cast[_BF16]()
+                                var v0 = (frag[2 * h] + add0).cast[_DT]()
                                 if cpair != 0 and col + 1 < n:
-                                    var pair = SIMD[_BF16, 2](
+                                    var pair = SIMD[_DT, 2](
                                         v0,
-                                        (frag[2 * h + 1] + add1).cast[_BF16](),
+                                        (frag[2 * h + 1] + add1).cast[_DT](),
                                     )
                                     cp.store[alignment=4](base_idx, pair)
                                 else:
@@ -1309,7 +1315,7 @@ def _mma_tile_wide[
                                     if col + 1 < n:
                                         cp[base_idx + 1] = (
                                             frag[2 * h + 1] + add1
-                                        ).cast[_BF16]()
+                                        ).cast[_DT]()
 
             # Overflow-safe batch advance: compare the remaining distance
             # first so bz + gdz is never formed past the final batch.
@@ -1333,7 +1339,7 @@ def _wide_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
         return "nt" if TB else "nn"
 
 
-@__name(t"bf16_gemm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"{_GEMM16_TAG}_gemm_{_wide_layout_tag[TA, TB]()}_wide")
 def _gemm_wide[
     TA: Bool, TB: Bool
 ](
@@ -1379,7 +1385,7 @@ def _gemm_wide[
     )
 
 
-@__name(t"bf16_bmm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"{_GEMM16_TAG}_bmm_{_wide_layout_tag[TA, TB]()}_wide")
 def _bmm_wide[
     TA: Bool, TB: Bool
 ](
@@ -1822,11 +1828,11 @@ def _enqueue_gemm_splitk(
     raise Error("bf16 gemm split-K: no kernel instantiated for this tile")
 
 
-def enqueue_bf16_gemm(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+def enqueue_gemm16_gemm(
+    output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    bias: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -1981,10 +1987,10 @@ def enqueue_bf16_gemm(
                             )
 
 
-def enqueue_bf16_bmm(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+def enqueue_gemm16_bmm(
+    output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_DT], MutAnyOrigin],
     batch_count: Int,
     m: Int,
     n: Int,

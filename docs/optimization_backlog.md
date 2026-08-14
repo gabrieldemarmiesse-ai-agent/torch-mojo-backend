@@ -157,7 +157,7 @@ different kind of item.
 * **Current implementation.** `fast_aten_linear_backward` forms the weight
   gradient as `mm(transpose(grad, 0, 1), input)`. The transpose is a zero-copy
   view, so `mm` receives a non-contiguous A. Three bridges are tried:
-  `_try_bf16_gemm` (`:6861` — bf16 only, and it *does* accept a physically
+  `_try_gemm16_mm` (`:6861` — bf16/f16 only, and it *does* accept a physically
   transposed 2-D operand via `_tf32_dense_2d_layout`), `_try_tf32_gemm` (`:6935`,
   off at default precision — see [G3](#g3)), and `_try_spec_matmul`. For fp32 all
   three decline and the backstop materializes A.
@@ -294,8 +294,8 @@ different kind of item.
 **Bridge decline conditions that push a whole GEMM onto the slow path**
 
 * **What.** `fast_aten_addmm`, `aten_fast.py:7220`; bias validation in
-  `_try_bf16_gemm` / `_try_tf32_gemm`, `aten_fast.py:6893` and `:6975`; the
-  rank>2 contiguity requirement in `_try_bf16_linear` / `_try_tf32_linear`,
+  `_try_gemm16_mm` / `_try_tf32_gemm`, `aten_fast.py:6893` and `:6975`; the
+  rank>2 contiguity requirement in `_try_gemm16_linear` / `_try_tf32_linear`,
   `aten_fast.py:7150` and `:7188`.
 * **Current implementation.** `addmm` declines the fused-bias bridges entirely
   unless `beta == 1 and alpha == 1`. The bridges require the bias to be a
@@ -840,7 +840,7 @@ temporary** — **DONE** (`NormSpec`)
   AGENTS.md describes: identical device assembly, different launch geometry.
 * **What the optimized version looks like.** Query the device's last-level cache
   size at launch — MAX exposes device attributes, and
-  `bf16_gemm_v3_kernels.mojo:1701` already calls `ctx.get_attribute(...)` — or at
+  `gemm16_v3_kernels.mojo:1701` already calls `ctx.get_attribute(...)` — or at
   minimum re-fit per architecture behind a `comptime if` and record each sweep
   next to it.
 * **Expected win.** **UNMEASURED** off gfx942.
@@ -1397,7 +1397,7 @@ fallback runs. This is the answer to "which GPUs run an unoptimized path".
 * **What the optimized version looks like.** Derive from device attributes where
   one exists — `ctx.default_device_info.sm_count`
   (`op_utils/__init__.mojo:179`) and `ctx.get_attribute(DeviceAttribute...)`
-  (`bf16_gemm_v3_kernels.mojo:1701`) are both already used in this tree — and
+  (`gemm16_v3_kernels.mojo:1701`) are both already used in this tree — and
   where a constant must stay fixed, state the card and the sweep next to it.
 * **Expected win.** **UNMEASURED** on every card except the one each was fitted
   on.
@@ -1425,7 +1425,7 @@ Stated explicitly so nobody reads this document as complete.
   the entry-point and gating level.** Its kernel bodies —
   `fa4_fwd_kernel.mojo`, `fa4_bwd_kernel.mojo`, `fa4_wgmma_f16.mojo` — were not
   reviewed for optimization opportunities.
-* **`bf16_matmul_ops/` (~7 kLOC across five files) was read only at the dispatch
+* **`gemm16_matmul_ops/` (~7 kLOC across five files) was read only at the dispatch
   level.** The v3/v4 kernel bodies and their tile-selection heuristics were not
   reviewed. `optimization_journal.md` is the authority there and states the
   gfx942 GEMM core is close to exhausted.

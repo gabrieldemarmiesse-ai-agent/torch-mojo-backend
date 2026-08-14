@@ -1,7 +1,12 @@
-"""Dynamically routed H100 BF16 GEMM kernels.
+"""Dynamically routed H100 16-bit tensor-core GEMM kernels.
 
 The accepted-v2 implementation remains the fallback for every regime not
 handled by the optimized NN, NT, and TN routes in this module.
+
+The operand dtype is bfloat16 or float16, chosen at compile time by
+`_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
+here is a function of the 2-byte operand width, not of the exponent
+layout, so one source serves both.
 """
 
 from max.gpu.sync import barrier
@@ -34,22 +39,23 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from bf16_gemm_kernels import (
-    enqueue_bf16_bmm as _enqueue_accepted_bf16_bmm,
-    enqueue_bf16_gemm as _enqueue_accepted_bf16_gemm,
+from gemm16_kernels import (
+    enqueue_gemm16_bmm as _enqueue_accepted_bf16_bmm,
+    enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
-from bf16_gemm_nn_v4_kernels import maybe_enqueue_bf16_gemm_nn_v4
-from bf16_gemm_nt_v4_kernels import maybe_enqueue_bf16_gemm_nt_v4
-from bf16_gemm_tn_v4_kernels import (
-    try_enqueue_bf16_gemm_splitk_rm_v4,
-    try_enqueue_bf16_gemm_tn_v4,
-    try_enqueue_bf16_gemm_tt_v4,
+from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
+from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
+from gemm16_tn_v4_kernels import (
+    try_enqueue_gemm16_gemm_splitk_rm_v4,
+    try_enqueue_gemm16_gemm_tn_v4,
+    try_enqueue_gemm16_gemm_tt_v4,
 )
+from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 
-comptime _V3_BF16 = DType.bfloat16
+comptime _V3_DT = _GEMM16_DT
 comptime _V3_F32 = DType.float32
-comptime _V3_PTR = UnsafePointer[Scalar[_V3_BF16], MutAnyOrigin]
+comptime _V3_PTR = UnsafePointer[Scalar[_V3_DT], MutAnyOrigin]
 comptime _V3_BM = 64
 comptime _V3_BN = 128
 comptime _V3_BK = 64
@@ -62,19 +68,19 @@ comptime _V3_NN_THREADS = 384
 comptime _V3_NN_CONSUMERS = 2
 comptime _V3_NN_WGMMA_SHAPE = Index(64, 256, 16)
 comptime _V3_NN_A_LAYOUT = tile_layout_k_major[
-    _V3_BF16, _V3_NN_BM, _V3_NN_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NN_BM, _V3_NN_BK, _V3_SWIZZLE
 ]()
 comptime _V3_NN_B_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_NN_BN, _V3_NN_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NN_BN, _V3_NN_BK, _V3_SWIZZLE
 ]()
 comptime _V3_NN_A_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NN_BM, _V3_NN_BK),
     Index(_V3_NN_BM, _V3_NN_BK),
 ]
 comptime _V3_NN_B_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NN_BK, _V3_NN_BN),
     Index(_V3_NN_BK, 64),
@@ -93,19 +99,19 @@ comptime _V3_NN_SMALL_THREADS = 256
 comptime _V3_NN_SMALL_CONSUMERS = 1
 comptime _V3_NN_SMALL_WGMMA_SHAPE = Index(64, 128, 16)
 comptime _V3_NN_SMALL_A_LAYOUT = tile_layout_k_major[
-    _V3_BF16, _V3_NN_SMALL_BM, _V3_NN_SMALL_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NN_SMALL_BM, _V3_NN_SMALL_BK, _V3_SWIZZLE
 ]()
 comptime _V3_NN_SMALL_B_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_NN_SMALL_BN, _V3_NN_SMALL_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NN_SMALL_BN, _V3_NN_SMALL_BK, _V3_SWIZZLE
 ]()
 comptime _V3_NN_SMALL_A_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NN_SMALL_BM, _V3_NN_SMALL_BK),
     Index(_V3_NN_SMALL_BM, _V3_NN_SMALL_BK),
 ]
 comptime _V3_NN_SMALL_B_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NN_SMALL_BK, _V3_NN_SMALL_BN),
     Index(_V3_NN_SMALL_BK, 64),
@@ -124,19 +130,19 @@ comptime _V3_NT_THREADS = 384
 comptime _V3_NT_CONSUMERS = 2
 comptime _V3_NT_WGMMA_SHAPE = Index(64, 256, 16)
 comptime _V3_NT_A_LAYOUT = tile_layout_k_major[
-    _V3_BF16, _V3_NT_BM, _V3_NT_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NT_BM, _V3_NT_BK, _V3_SWIZZLE
 ]()
 comptime _V3_B_K_LAYOUT = tile_layout_k_major[
-    _V3_BF16, _V3_NT_BN, _V3_NT_BK, _V3_SWIZZLE
+    _V3_DT, _V3_NT_BN, _V3_NT_BK, _V3_SWIZZLE
 ]()
 comptime _V3_NT_A_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NT_BM, _V3_NT_BK),
     Index(_V3_NT_BM, _V3_NT_BK),
 ]
 comptime _V3_B_K_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_NT_BN, _V3_NT_BK),
     Index(_V3_NT_BN, _V3_NT_BK),
@@ -155,19 +161,19 @@ comptime _V3_TN_WS_THREADS = 384
 comptime _V3_TN_WS_CONSUMERS = 2
 comptime _V3_TN_WS_WGMMA_SHAPE = Index(64, 256, 16)
 comptime _V3_TN_WS_A_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_TN_WS_BM, _V3_TN_WS_BK, _V3_SWIZZLE
+    _V3_DT, _V3_TN_WS_BM, _V3_TN_WS_BK, _V3_SWIZZLE
 ]()
 comptime _V3_TN_WS_B_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_TN_WS_BN, _V3_TN_WS_BK, _V3_SWIZZLE
+    _V3_DT, _V3_TN_WS_BN, _V3_TN_WS_BK, _V3_SWIZZLE
 ]()
 comptime _V3_TN_WS_A_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_TN_WS_BK, _V3_TN_WS_BM),
     Index(_V3_TN_WS_BK, 64),
 ]
 comptime _V3_TN_WS_B_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_TN_WS_BK, _V3_TN_WS_BN),
     Index(_V3_TN_WS_BK, 64),
@@ -186,19 +192,19 @@ comptime _V3_TN_SMALL_THREADS = 256
 comptime _V3_TN_SMALL_CONSUMERS = 1
 comptime _V3_TN_SMALL_WGMMA_SHAPE = Index(64, 128, 16)
 comptime _V3_TN_SMALL_A_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_TN_SMALL_BM, _V3_TN_SMALL_BK, _V3_SWIZZLE
+    _V3_DT, _V3_TN_SMALL_BM, _V3_TN_SMALL_BK, _V3_SWIZZLE
 ]()
 comptime _V3_TN_SMALL_B_LAYOUT = tile_layout_mn_major[
-    _V3_BF16, _V3_TN_SMALL_BN, _V3_TN_SMALL_BK, _V3_SWIZZLE
+    _V3_DT, _V3_TN_SMALL_BN, _V3_TN_SMALL_BK, _V3_SWIZZLE
 ]()
 comptime _V3_TN_SMALL_A_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_TN_SMALL_BK, _V3_TN_SMALL_BM),
     Index(_V3_TN_SMALL_BK, 64),
 ]
 comptime _V3_TN_SMALL_B_TMA = TMATensorTile[
-    _V3_BF16,
+    _V3_DT,
     2,
     Index(_V3_TN_SMALL_BK, _V3_TN_SMALL_BN),
     Index(_V3_TN_SMALL_BK, 64),
@@ -216,7 +222,7 @@ comptime _V3_TN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NN_THREADS))
 )
-@__name("bf16_gemm_v3_nn_ws_m128n256_tma_s3")
+@__name(t"{_GEMM16_TAG}_gemm_v3_nn_ws_m128n256_tma_s3")
 def _v3_nn_ws_m128n256_tma_s3(
     a_tma: _V3_NN_A_TMA,
     b_tma: _V3_NN_B_TMA,
@@ -232,14 +238,14 @@ def _v3_nn_ws_m128n256_tma_s3(
     var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NN_A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NN_B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -298,14 +304,14 @@ def _v3_nn_ws_m128n256_tma_s3(
                     empty_barriers[stage].wait(phase)
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
                     var a_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_NN_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * _V3_NN_BM * _V3_NN_BK)
                     var b_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_NN_B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -326,8 +332,8 @@ def _v3_nn_ws_m128n256_tma_s3(
             _ = accum.fill(0.0)
             comptime wgmma = TensorCoreAsync[
                 _V3_F32,
-                _V3_BF16,
-                _V3_BF16,
+                _V3_DT,
+                _V3_DT,
                 _V3_NN_WGMMA_SHAPE,
                 a_swizzle=_V3_SWIZZLE,
                 b_swizzle=_V3_SWIZZLE,
@@ -340,14 +346,14 @@ def _v3_nn_ws_m128n256_tma_s3(
                 var phase = UInt32((tile // _V3_NN_STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_NN_A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * _V3_NN_BM * _V3_NN_BK)
                 var b_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_NN_B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -374,9 +380,9 @@ def _v3_nn_ws_m128n256_tma_s3(
                 var e = q * 2
                 var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
-                var pair = SIMD[_V3_BF16, 2](
-                    accum.ptr[e].cast[_V3_BF16](),
-                    accum.ptr[e + 1].cast[_V3_BF16](),
+                var pair = SIMD[_V3_DT, 2](
+                    accum.ptr[e].cast[_V3_DT](),
+                    accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
                     output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
@@ -392,7 +398,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -403,7 +409,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         IndexList[2](k, 1),
         IndexList[2](_V3_NN_BM, _V3_NN_BK),
     )
-    var b_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -435,7 +441,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         Int32(_V3_NN_SMALL_THREADS)
     )
 )
-@__name("bf16_gemm_v3_nn_ws_m64n128_tma_s3")
+@__name(t"{_GEMM16_TAG}_gemm_v3_nn_ws_m64n128_tma_s3")
 def _v3_nn_ws_m64n128_tma_s3(
     a_tma: _V3_NN_SMALL_A_TMA,
     b_tma: _V3_NN_SMALL_B_TMA,
@@ -451,14 +457,14 @@ def _v3_nn_ws_m64n128_tma_s3(
     var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NN_SMALL_A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NN_SMALL_B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -516,7 +522,7 @@ def _v3_nn_ws_m64n128_tma_s3(
                     empty_barriers[stage].wait(phase)
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
                     var a_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_NN_SMALL_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -526,7 +532,7 @@ def _v3_nn_ws_m64n128_tma_s3(
                         + stage * _V3_NN_SMALL_BM * _V3_NN_SMALL_BK
                     )
                     var b_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_NN_SMALL_B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -550,8 +556,8 @@ def _v3_nn_ws_m64n128_tma_s3(
             _ = accum.fill(0.0)
             comptime wgmma = TensorCoreAsync[
                 _V3_F32,
-                _V3_BF16,
-                _V3_BF16,
+                _V3_DT,
+                _V3_DT,
                 _V3_NN_SMALL_WGMMA_SHAPE,
                 a_swizzle=_V3_SWIZZLE,
                 b_swizzle=_V3_SWIZZLE,
@@ -564,14 +570,14 @@ def _v3_nn_ws_m64n128_tma_s3(
                 var phase = UInt32((tile // _V3_NN_SMALL_STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_NN_SMALL_A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * _V3_NN_SMALL_BM * _V3_NN_SMALL_BK)
                 var b_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_NN_SMALL_B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -598,9 +604,9 @@ def _v3_nn_ws_m64n128_tma_s3(
                 var e = q * 2
                 var row = base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
-                var pair = SIMD[_V3_BF16, 2](
-                    accum.ptr[e].cast[_V3_BF16](),
-                    accum.ptr[e + 1].cast[_V3_BF16](),
+                var pair = SIMD[_V3_DT, 2](
+                    accum.ptr[e].cast[_V3_DT](),
+                    accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
                     output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
@@ -616,7 +622,7 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -627,7 +633,7 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
         IndexList[2](k, 1),
         IndexList[2](_V3_NN_SMALL_BM, _V3_NN_SMALL_BK),
     )
-    var b_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -657,7 +663,7 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(_V3_NT_THREADS))
 )
-@__name("bf16_gemm_v3_nt_ws_m128n256_tma_s3")
+@__name(t"{_GEMM16_TAG}_gemm_v3_nt_ws_m128n256_tma_s3")
 def _v3_nt_ws_m128n256_tma_s3(
     a_tma: _V3_NT_A_TMA,
     b_tma: _V3_B_K_TMA,
@@ -673,14 +679,14 @@ def _v3_nt_ws_m128n256_tma_s3(
     var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NT_A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_NT_B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -737,14 +743,14 @@ def _v3_nt_ws_m128n256_tma_s3(
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
 
                     var a_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_NT_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * _V3_NT_BM * _V3_NT_BK)
                     var b_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_B_K_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -765,8 +771,8 @@ def _v3_nt_ws_m128n256_tma_s3(
             _ = accum.fill(0.0)
             comptime wgmma = TensorCoreAsync[
                 _V3_F32,
-                _V3_BF16,
-                _V3_BF16,
+                _V3_DT,
+                _V3_DT,
                 _V3_NT_WGMMA_SHAPE,
                 a_swizzle=_V3_SWIZZLE,
                 b_swizzle=_V3_SWIZZLE,
@@ -779,14 +785,14 @@ def _v3_nt_ws_m128n256_tma_s3(
                 var phase = UInt32((tile // _V3_NT_STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_NT_A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * _V3_NT_BM * _V3_NT_BK)
                 var b_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_B_K_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -813,9 +819,9 @@ def _v3_nt_ws_m128n256_tma_s3(
                 var e = q * 2
                 var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
-                var pair = SIMD[_V3_BF16, 2](
-                    accum.ptr[e].cast[_V3_BF16](),
-                    accum.ptr[e + 1].cast[_V3_BF16](),
+                var pair = SIMD[_V3_DT, 2](
+                    accum.ptr[e].cast[_V3_DT](),
+                    accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
                     output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
@@ -831,7 +837,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -842,7 +848,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         IndexList[2](k, 1),
         IndexList[2](_V3_NT_BM, _V3_NT_BK),
     )
-    var b_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -874,7 +880,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         Int32(_V3_TN_SMALL_THREADS)
     )
 )
-@__name("bf16_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
+@__name(t"{_GEMM16_TAG}_gemm_v3_tn_ws_m64n128_tma_col_a_s3")
 def _v3_tn_ws_m64n128_tma_col_a_s3(
     a_tma: _V3_TN_SMALL_A_TMA,
     b_tma: _V3_TN_SMALL_B_TMA,
@@ -890,14 +896,14 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
     var k = Int(k_arg)
     comptime if _is_sm_9x():
         var a_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_TN_SMALL_A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_TN_SMALL_B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -958,7 +964,7 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                     empty_barriers[stage].wait(phase)
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
                     var a_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_TN_SMALL_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -968,7 +974,7 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                         + stage * _V3_TN_SMALL_BM * _V3_TN_SMALL_BK
                     )
                     var b_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_TN_SMALL_B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -991,10 +997,10 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
             ].stack_allocation()
             _ = accum.fill(0.0)
             comptime a_canonical_layout = tile_to_descriptor[
-                _V3_BF16, _V3_TN_SMALL_A_LAYOUT, False
+                _V3_DT, _V3_TN_SMALL_A_LAYOUT, False
             ]()
             comptime b_canonical_layout = tile_to_descriptor[
-                _V3_BF16, _V3_TN_SMALL_B_LAYOUT, False
+                _V3_DT, _V3_TN_SMALL_B_LAYOUT, False
             ]()
             comptime a_stride11 = a_canonical_layout[1].stride[1].value()
             comptime b_stride11 = b_canonical_layout[1].stride[1].value()
@@ -1010,14 +1016,14 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                 var phase = UInt32((tile // _V3_TN_SMALL_STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_TN_SMALL_A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * _V3_TN_SMALL_BM * _V3_TN_SMALL_BK)
                 var b_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_TN_SMALL_B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -1040,8 +1046,8 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                         64,
                         _V3_TN_SMALL_BN,
                         16,
-                        a_type=_V3_BF16,
-                        b_type=_V3_BF16,
+                        a_type=_V3_DT,
+                        b_type=_V3_DT,
                         layout_a="col",
                         layout_b="row",
                     ](
@@ -1066,9 +1072,9 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
                 var e = q * 2
                 var row = base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
-                var pair = SIMD[_V3_BF16, 2](
-                    accum.ptr[e].cast[_V3_BF16](),
-                    accum.ptr[e + 1].cast[_V3_BF16](),
+                var pair = SIMD[_V3_DT, 2](
+                    accum.ptr[e].cast[_V3_DT](),
+                    accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
                     output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
@@ -1084,7 +1090,7 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -1095,7 +1101,7 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         IndexList[2](m, 1),
         IndexList[2](_V3_TN_SMALL_BK, 64),
     )
-    var b_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -1127,7 +1133,7 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         Int32(_V3_TN_WS_THREADS)
     )
 )
-@__name("bf16_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
+@__name(t"{_GEMM16_TAG}_gemm_v3_tn_ws_m128n256_tma_col_a_s3")
 def _v3_tn_ws_m128n256_tma_col_a_s3(
     a_tma: _V3_TN_WS_A_TMA,
     b_tma: _V3_TN_WS_B_TMA,
@@ -1147,14 +1153,14 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
         # column-major A representation accepted by SM90 WGMMA.  This avoids
         # the explicit shared-memory transpose used by the fallback TN path.
         var a_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_TN_WS_A_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
         ].stack_allocation()
         var b_pipeline = LayoutTensor[
-            _V3_BF16,
+            _V3_DT,
             _V3_TN_WS_B_PIPE_LAYOUT,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
@@ -1214,14 +1220,14 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
                     full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
 
                     var a_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_TN_WS_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
                     ](a_pipeline.ptr + stage * _V3_TN_WS_BM * _V3_TN_WS_BK)
                     var b_tile = LayoutTensor[
-                        _V3_BF16,
+                        _V3_DT,
                         _V3_TN_WS_B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
@@ -1245,10 +1251,10 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
             # and row-major B modes.  The second consumer advances by one
             # 64-row WGMMA tile within the shared A tile.
             comptime a_canonical_layout = tile_to_descriptor[
-                _V3_BF16, _V3_TN_WS_A_LAYOUT, False
+                _V3_DT, _V3_TN_WS_A_LAYOUT, False
             ]()
             comptime b_canonical_layout = tile_to_descriptor[
-                _V3_BF16, _V3_TN_WS_B_LAYOUT, False
+                _V3_DT, _V3_TN_WS_B_LAYOUT, False
             ]()
             comptime a_shape00 = a_canonical_layout[0].shape[0].value()
             comptime a_stride01 = a_canonical_layout[0].stride[1].value()
@@ -1267,14 +1273,14 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
                 var phase = UInt32((tile // _V3_TN_WS_STAGES) % 2)
                 full_barriers[stage].wait(phase)
                 var a_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_TN_WS_A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
                 ](a_pipeline.ptr + stage * _V3_TN_WS_BM * _V3_TN_WS_BK)
                 var b_tile = LayoutTensor[
-                    _V3_BF16,
+                    _V3_DT,
                     _V3_TN_WS_B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
@@ -1298,8 +1304,8 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
                         64,
                         _V3_TN_WS_BN,
                         16,
-                        a_type=_V3_BF16,
-                        b_type=_V3_BF16,
+                        a_type=_V3_DT,
+                        b_type=_V3_DT,
                         layout_a="col",
                         layout_b="row",
                     ](
@@ -1324,9 +1330,9 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
                 var e = q * 2
                 var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
-                var pair = SIMD[_V3_BF16, 2](
-                    accum.ptr[e].cast[_V3_BF16](),
-                    accum.ptr[e + 1].cast[_V3_BF16](),
+                var pair = SIMD[_V3_DT, 2](
+                    accum.ptr[e].cast[_V3_DT](),
+                    accum.ptr[e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
                     output.store[alignment=4]((m0 + row) * n + n0 + col, pair)
@@ -1342,7 +1348,7 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
-    var a_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var a_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             a.address_space_cast[AddressSpace.GENERIC](),
@@ -1353,7 +1359,7 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
         IndexList[2](m, 1),
         IndexList[2](_V3_TN_WS_BK, 64),
     )
-    var b_desc = create_tma_descriptor[_V3_BF16, 2, _V3_SWIZZLE](
+    var b_desc = create_tma_descriptor[_V3_DT, 2, _V3_SWIZZLE](
         DeviceBuffer(
             ctx,
             b.address_space_cast[AddressSpace.GENERIC](),
@@ -1378,11 +1384,11 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     )
 
 
-def enqueue_bf16_gemm(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+def enqueue_gemm16_gemm(
+    output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    bias: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -1392,7 +1398,7 @@ def enqueue_bf16_gemm(
     ctx: DeviceContext,
 ) raises:
     # NT (forward linear) route: persistent clustered v4 kernel with TMA
-    # multicast and TMA-store epilogue (bf16_gemm_nt_v4_kernels.mojo).  The
+    # multicast and TMA-store epilogue (gemm16_nt_v4_kernels.mojo).  The
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
@@ -1401,10 +1407,12 @@ def enqueue_bf16_gemm(
         # SMs resident but cannot parallelize over K, so an output with few
         # macro-tiles and a deep reduction leaves most of the GPU idle.
         # The helper gates itself on that regime (see
-        # bf16_gemm_tn_v4_kernels.mojo) and returns False otherwise.
-        if try_enqueue_bf16_gemm_splitk_rm_v4[True](output, a, b, m, n, k, ctx):
+        # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
+        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+            output, a, b, m, n, k, ctx
+        ):
             return
-        if maybe_enqueue_bf16_gemm_nt_v4(output, a, b, m, n, k, ctx):
+        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
             return
     comptime if _has_sm_9x():
         if ctx.api() == "cuda":
@@ -1417,7 +1425,7 @@ def enqueue_bf16_gemm(
             if cc_major == 9 and cc_minor == 0:
                 # NN dgrad route (v4): persistent warp-specialized kernel
                 # with 2-CTA-cluster B multicast and a TMA-store epilogue
-                # (bf16_gemm_nn_v4_kernels.mojo).  It gates itself on the
+                # (gemm16_nn_v4_kernels.mojo).  It gates itself on the
                 # aligned NN regime (n % 64 == 0, k % 64 == 0; m may be
                 # ragged, and n % 256 != 0 selects the ragged_n _nclip
                 # instantiation) and declines only shapes a smaller route
@@ -1433,11 +1441,11 @@ def enqueue_bf16_gemm(
                 # leaves most SMs idle.  The helper gates itself on that
                 # regime.
                 if not transpose_a and not transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_splitk_rm_v4[False](
+                    if try_enqueue_gemm16_gemm_splitk_rm_v4[False](
                         output, a, b, m, n, k, ctx
                     ):
                         return
-                if maybe_enqueue_bf16_gemm_nn_v4(
+                if maybe_enqueue_gemm16_nn_v4(
                     output,
                     a,
                     b,
@@ -1452,24 +1460,28 @@ def enqueue_bf16_gemm(
                     return
                 # V4 TN (wgrad) route: split-K and narrow-tile kernels for
                 # the deep-K, underfilled-output regime (huge K, small m*n;
-                # see bf16_gemm_tn_v4_kernels.mojo).  The dispatcher checks
+                # see gemm16_tn_v4_kernels.mojo).  The dispatcher checks
                 # its own alignment/regime gates and returns False whenever
                 # it declines, so every existing TN path below remains the
                 # fallback.
                 if transpose_a and not transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_tn_v4(output, a, b, m, n, k, ctx):
+                    if try_enqueue_gemm16_gemm_tn_v4(
+                        output, a, b, m, n, k, ctx
+                    ):
                         return
                 # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
                 # instantiations of the shared warp-specialized body
                 # (split-K, persistent, direct; see
-                # bf16_gemm_tn_v4_kernels.mojo), so a TT mm writes C
+                # gemm16_tn_v4_kernels.mojo), so a TT mm writes C
                 # directly into the caller's contiguous row-major (m, n)
                 # buffer -- the same strides CUDA torch returns.  The
                 # dispatcher gates its own aligned regime and returns False
                 # otherwise, in which case the all-layout v2 fallback below
                 # serves the call.
                 if transpose_a and transpose_b and not has_bias:
-                    if try_enqueue_bf16_gemm_tt_v4(output, a, b, m, n, k, ctx):
+                    if try_enqueue_gemm16_gemm_tt_v4(
+                        output, a, b, m, n, k, ctx
+                    ):
                         return
                 # A 64x128 tile preserves the prior aligned-NN coverage and
                 # increases available CTAs when the 128x256 grid would be
@@ -1721,10 +1733,10 @@ def enqueue_bf16_gemm(
     )
 
 
-def enqueue_bf16_bmm(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+def enqueue_gemm16_bmm(
+    output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     batch_count: Int,
     m: Int,
     n: Int,
