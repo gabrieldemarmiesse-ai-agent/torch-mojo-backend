@@ -6,6 +6,9 @@ What comes from OpInfo rather than from us:
 * the sample inputs (`sample_inputs_func`) and, with `--reference-inputs`, the
   larger `reference_inputs_func` corpus of awkward shapes, non-contiguous
   layouts, broadcasts and scalar overloads;
+* which of a sample's tensors belong on the device and which ATen requires on
+  the CPU, read back from where the sample generator itself puts them when it
+  targets a device (`_opinfo_placements`);
 * the dtypes each operator is expected to support, per `op.dtypesIfCUDA` —
   the accelerator set, not the CPU one;
 * the accuracy bar: `op.precisionOverride` when the operator declares one,
@@ -57,15 +60,104 @@ def _not_implemented(exc: BaseException) -> bool:
     return "not implemented" in text or "no fast implementation" in text
 
 
-def _harness_cannot_construct(exc: BaseException) -> bool:
-    """True when the harness's build-on-CPU-then-move strategy created a
-    call the operator's own contract forbids on every backend, not just
-    ours -- e.g. tensor_split's indices/sections argument must stay on
-    CPU; moving it because it happens to be a Tensor is a property of
-    "move every tensor found in the sample" being simpler than knowing
-    each op's per-argument device rules, not a mojo bug.
+def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
+    """Shape, dtype and device of every tensor in `sample`, in the order
+    `SampleInput.transform` visits them.
+
+    `transform` is also what moves the sample to the device below, so walking
+    with it is what makes two walks line up position by position.
     """
-    return "but it's on" in str(exc) and "to be on cpu" in str(exc)
+    specs: list[tuple[torch.Size, torch.dtype, torch.device]] = []
+
+    def record(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            specs.append((value.shape, value.dtype, value.device))
+        return value
+
+    sample.transform(record)
+    return specs
+
+
+def _opinfo_placements(
+    op: Any, dtype: torch.dtype
+) -> list[list[tuple[torch.Size, torch.dtype, torch.device]]] | None:
+    """Where OpInfo itself puts each sample-input tensor when it builds this
+    operator's samples for a device -- one entry per tensor, per sample.
+
+    Not every tensor in a sample is data.  Some are metadata that ATen
+    requires on the CPU whatever device the operand lives on:
+    `tensor_split`'s `tensor_indices_or_sections` is checked outright
+    (`aten/src/ATen/native/TensorShape.cpp`, `tensor_split`), and `narrow`'s
+    `start`, `logsumexp`'s `dim` and advanced indexing's index tensors are
+    conventionally left there too.  `sample_inputs_func` already encodes this,
+    by building such arguments with a plain `torch.tensor(...)` while the
+    operand goes through `make_tensor(device=device)`.  So asking a generator
+    to target a device and reading back where each tensor landed IS the
+    per-argument device rule, straight from OpInfo -- no table of ours to
+    maintain and, crucially, nothing to learn from an exception after the
+    fact.  Moving every tensor found in a sample and then recognising ATen's
+    complaint by its wording was the previous answer here; it reported a
+    harness artifact as an operator skip, and silently became a spurious
+    failure the moment upstream reworded the message.
+
+    The device asked for is `meta`: it allocates nothing and runs no kernel,
+    so it cannot fail for the reason samples are built on the CPU in the first
+    place (a backend missing an op that `make_tensor` reaches), and it does
+    not need the backend under test to exist at all.  Only `.device` is read
+    from the result.
+
+    None means the placement is not observable and the caller should move
+    everything, as this harness always did: the generator raised on meta
+    (data-dependent construction -- `nonzero`, `bincount`, `searchsorted` and
+    ~100 others), or yielded a different number of samples there (`sort`,
+    `argsort` and `to` branch on the device), so position no longer identifies
+    an argument.
+    """
+    rng_state = torch.get_rng_state()
+    try:
+        samples = list(op.sample_inputs("meta", dtype, requires_grad=False))
+    except Exception:  # noqa: BLE001 - any failure here just means "unobservable"
+        return None
+    finally:
+        # Meta construction fills nothing, so today no generator draws from the
+        # default RNG here (checked across op_db: sample values are byte-identical
+        # with and without this probe).  Rewind anyway: one generator hardcoding a
+        # `torch.randn(...)` would otherwise shift every later sample's values and
+        # quietly move tolerance-borderline comparisons suite-wide, for a probe
+        # whose only output is a device.
+        torch.set_rng_state(rng_state)
+    return [_tensor_specs(sample) for sample in samples]
+
+
+def _to_device(
+    sample: Any,
+    device: str,
+    placement: list[tuple[torch.Size, torch.dtype, torch.device]] | None,
+) -> Any:
+    """`sample`, built on the CPU, with every tensor moved to `device` except
+    the ones `placement` says OpInfo keeps on the CPU.
+
+    `placement` is only trusted when its tensors line up with this sample's
+    one for one, same shapes and same dtypes; otherwise the two builds
+    diverged and position does not identify an argument, so everything moves.
+    """
+    if placement is not None:
+        specs = _tensor_specs(sample)
+        if [s[:2] for s in specs] != [p[:2] for p in placement]:
+            placement = None
+    keep_on_cpu = (
+        iter([p[2].type == "cpu" for p in placement]) if placement is not None else None
+    )
+
+    def move(value: Any) -> Any:
+        # transform() also visits torch.dtype values, which have no device.
+        if not isinstance(value, torch.Tensor):
+            return value
+        if keep_on_cpu is not None and next(keep_on_cpu):
+            return value
+        return value.to(device)
+
+    return sample.transform(move)
 
 
 def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | None:
@@ -141,22 +233,29 @@ class TestOpInfoConformance(TestCase):
         construction and reports as if the operator under test were broken --
         which is a property of the harness, not of the operator.  Moving also
         makes both legs read bit-identical inputs.
+
+        Which tensors to move is OpInfo's call, not ours: `_opinfo_placements`
+        reads back where the operator's own sample generator puts each tensor
+        when it targets a device, so arguments ATen requires on the CPU stay
+        there instead of being moved and rejected.
         """
         skip_reason = _cross_device_comparison_skip_reason(op, dtype)
         if skip_reason is not None:
             self.skipTest(skip_reason)
+        placements = _opinfo_placements(op, dtype)
         checked = 0
-        for sample in op.sample_inputs("cpu", dtype, requires_grad=False):
+        for index, sample in enumerate(
+            op.sample_inputs("cpu", dtype, requires_grad=False)
+        ):
+            placement = None
+            if placements is not None and index < len(placements):
+                placement = placements[index]
             try:
-                moved = sample.transform(
-                    lambda x: x.to(device) if isinstance(x, torch.Tensor) else x
-                )
+                moved = _to_device(sample, device, placement)
                 actual = op(moved.input, *moved.args, **moved.kwargs)
             except Exception as exc:  # noqa: BLE001 - triaging is the point
                 if _not_implemented(exc):
                     self.skipTest(f"not implemented on mojo: {exc}")
-                if _harness_cannot_construct(exc):
-                    self.skipTest(f"harness cannot construct this call on mojo: {exc}")
                 raise
             expected = op(sample.input, *sample.args, **sample.kwargs)
             # assertEqual carries the OpInfo precisionOverride for this dtype
