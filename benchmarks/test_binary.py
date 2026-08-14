@@ -277,7 +277,14 @@ def test_floor_divide(
         )
 
 
-@pytest.mark.parametrize("dtype_id", ("f32",))
+# The one op whose narrow-float dtypes are a SEPARATE kernel regime, so both
+# are benchmarked: bf16 and fp16 do not take Mojo's `%` at all.  `%` forms the
+# quotient explicitly and loses the answer on both (see
+# op_utils.custom_remainder), so they run a bit-exact per-lane fp32 fmod
+# instead, and it costs about 3x the device time of `%` here -- on operands in
+# (0.05, 0.95), i.e. the BENIGN regime, where the exactness is never needed.
+# f32 alone would report none of that: its kernels are byte-identical to `%`.
+@pytest.mark.parametrize("dtype_id", ("bf16", "f16", "f32"))
 @pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_remainder(
