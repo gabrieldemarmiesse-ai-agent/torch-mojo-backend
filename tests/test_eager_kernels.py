@@ -7997,6 +7997,189 @@ def test_bf16_real_bmm_batched_tn_wgmma_route(
     _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
 
 
+# ---------------------------------------------------------------------------
+# Batched NN wgmma route (gemm16_bmm_v5_kernels.mojo). Unlike TN's per-item
+# loop above, NN batches the WHOLE launch in one call: a persistent work list
+# spans every batch item's tiles, addressed by rank-3 TMA descriptors that
+# carry the batch dimension and clip ragged m/n/k per item, so a small
+# per-item grid (attention, conv-shaped BMM) still fills the machine instead
+# of underfilling once per loop iteration. Cases below walk
+# `try_enqueue_bmm16_nn_batched`'s dispatch ladder: aligned direct-TMA,
+# ragged m/n/k, the forced big-tile regime, padded (non-packed) batch
+# strides, and the row-repack route (row stride/batch stride not a multiple
+# of 8 elements) with its scalar-C epilogue -- plus a broadcast A operand
+# (batch stride 0, the conv im2col shape) and an alignment-driven fallback,
+# each in their own test below.
+# ---------------------------------------------------------------------------
+
+
+def test_tf32_dense_batched_layout_accepts_broadcast_stride_zero():
+    """Batch stride 0 (a broadcast/expanded operand, e.g. conv's shared
+    weight matrix or an `expand()`ed bmm argument) classifies as valid with
+    the batch stride passed through unchanged, for both physical layouts.
+    Genuine overlap (a stride strictly between 0 and matrix_elements) is
+    still rejected -- only exact broadcast is a first-class case."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    h100 = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
+
+    def tensor(shape, strides):
+        return SimpleNamespace(
+            _shape=tuple(shape),
+            _strides=tuple(strides),
+            _dtype=aten_fast.DType.bfloat16,
+            _device=h100,
+        )
+
+    row_major = tensor((4, 7, 9), (0, 9, 1))
+    assert aten_fast._tf32_dense_batched_layout(row_major) == (False, 0)
+
+    transposed = tensor((4, 7, 9), (0, 1, 7))
+    assert aten_fast._tf32_dense_batched_layout(transposed) == (True, 0)
+
+    overlapping = tensor((4, 7, 9), (62, 9, 1))  # matrix_elements = 63
+    assert aten_fast._tf32_dense_batched_layout(overlapping) is None
+
+    non_broadcast_still_dense = tensor((4, 7, 9), (63, 9, 1))
+    assert aten_fast._tf32_dense_batched_layout(non_broadcast_still_dense) == (
+        False,
+        63,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "batch", "gap_a", "gap_b"),
+    [
+        (64, 64, 64, 3, 0, 0),  # minimal aligned direct-TMA
+        (100, 200, 104, 2, 0, 0),  # ragged m, n, k (per-item TMA clip)
+        (300, 520, 128, 2, 0, 0),  # forced big-tile regime (m >= 256)
+        (70, 96, 64, 2, 64, 128),  # padded (non-packed) batch strides
+        (77, 89, 100, 2, 0, 0),  # fully unaligned: repack route + scalar-C
+        (64, 71, 64, 2, 0, 0),  # odd n only: B repack + scalar C
+        (64, 72, 65, 2, 0, 0),  # odd k only: A repack, TMA-store C
+        (357, 789, 333, 8, 0, 0),  # awkward/odd dims (documented 1.09-1.11x)
+    ],
+    ids=[
+        "aligned_min",
+        "ragged_mnk",
+        "big_tile",
+        "padded_batch_strides",
+        "unaligned_repack_scalar_c",
+        "oddn_repack",
+        "oddk_repack",
+        "awkward_odd_dims",
+    ],
+)
+def test_bf16_real_bmm_batched_nn_v5_route(
+    mojo_h100, monkeypatch, m, n, k, batch, gap_a, gap_b, dtype
+):
+    """The batched NN route matches every other BMM layout's correctness
+    across its whole dispatch ladder (gemm16_bmm_v5_kernels.mojo's
+    `_b5_dispatch`): direct TMA, ragged-edge clipping, the big-tile
+    instantiation, padded batch strides, and the row-repack path an odd n or
+    k forces. Shapes mirror the reconciled harness table (see the PR body
+    for the measured ratios vs cuBLAS)."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260816)
+    lhs, mojo_lhs = _bf16_dense_batched_pair(
+        generator, (batch, m, k), False, gap_a, 1, mojo_h100, dtype
+    )
+    rhs, mojo_rhs = _bf16_dense_batched_pair(
+        generator, (batch, k, n), False, gap_b, 2, mojo_h100, dtype
+    )
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible 16-bit NN BMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "batch"),
+    [
+        (64, 128, 64, 4),  # broadcast A, direct TMA route
+        (64, 89, 100, 3),  # broadcast A through the repack route (odd n/k)
+        (64, 3136, 576, 2),  # conv-im2col-shaped: wide n
+    ],
+    ids=["bcastA_aligned", "bcastA_repack", "bcastA_conv_shaped"],
+)
+def test_bf16_real_bmm_batched_nn_v5_broadcast_a(
+    mojo_h100, monkeypatch, m, n, k, batch, dtype
+):
+    """A broadcast (`expand()`ed, batch stride 0) A operand -- the shape
+    conv's im2col GEMM produces, one shared weight matrix reused for every
+    sample -- is a first-class input to the v5 route, not a decline: this
+    used to be exactly the routing gap `_tf32_dense_batched_layout` produced
+    for `fast_aten_bmm` (see that function's docstring; conv itself reaches
+    the bridge through its own call site, not this classifier)."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260816)
+    a2d = torch.randn(m, k, generator=generator).to(dtype)
+    lhs = a2d.unsqueeze(0).expand(batch, m, k)
+    mojo_a2d = a2d.to(mojo_h100)
+    mojo_lhs = aten_fast._view_of(mojo_a2d, (batch, m, k), (0, k, 1), 0)
+    rhs, mojo_rhs = _bf16_dense_batched_pair(
+        generator, (batch, k, n), False, 0, 2, mojo_h100, dtype
+    )
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError(
+            "eligible 16-bit broadcast-A NN BMM reached TF32 or TensorSpec"
+        )
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_bf16_real_bmm_batched_nn_v5_declines_on_misaligned_base_pointer(
+    mojo_h100, monkeypatch, dtype
+):
+    """The v5 route's own runtime gate (`Int(a) % 16 != 0` etc. in
+    `try_enqueue_bmm16_nn_batched`) checks the ACTUAL base pointer, not just
+    the strides the host already validated -- a 1-element offset keeps every
+    stride a multiple of 8 (the host-side repack gate would see this as
+    TMA-eligible) while still breaking 16-byte pointer alignment. This must
+    fall back to a still-correct route (the pre-wgmma accepted BMM kernel),
+    not corrupt output or raise."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    generator = torch.Generator().manual_seed(20260816)
+    batch, m, n, k = 2, 64, 128, 64
+    lhs, mojo_lhs = _bf16_dense_batched_pair(
+        generator, (batch, m, k), False, 0, 1, mojo_h100, dtype
+    )
+    rhs, mojo_rhs = _bf16_dense_batched_pair(
+        generator, (batch, k, n), False, 0, 2, mojo_h100, dtype
+    )
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible 16-bit NN BMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
+
+
 def test_bf16_real_linear_forward_backward_uses_three_gemm_routes(
     mojo_h100, monkeypatch
 ):

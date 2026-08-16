@@ -7736,11 +7736,22 @@ def _tf32_dense_2d_layout(tensor: MojoTensorLike) -> bool | None:
 
 
 def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | None:
-    """Classify dense matrices separated by a non-overlapping batch stride.
+    """Classify dense matrices separated by a non-overlapping batch stride, or
+    a broadcast operand (batch stride 0 -- one dense matrix shared by every
+    batch item, as `expand()` or a stride-0 `unsqueeze` produces, e.g. conv's
+    im2col weight or a broadcast ``bmm`` argument).  The boolean is the
+    physical per-matrix transpose flag and the integer is the runtime batch
+    stride in elements: either a genuine non-overlapping stride, or 0.
+    Padding between matrices is valid; arbitrary inner strides and any other
+    overlapping batch stride (0 < batch_stride < matrix_elements) are not.
 
-    The boolean is the physical per-matrix transpose flag and the integer is
-    the runtime batch stride in elements.  Padding between matrices is valid;
-    arbitrary inner strides, broadcasts, and overlapping batches are not.
+    Zero is unambiguous to accept here: the kernels this classification feeds
+    already special-case it as "broadcast", never as "dense with a zero
+    stride" -- `_opt_bmm_address_proof`'s `a_bstride > 0` guards (the pre-wgmma
+    accepted BMM/TF32 kernels) and `gemm16_bmm_v5_kernels.mojo`'s
+    `a_mul`/`b_mul` coordinate multiplier both read a zero batch stride as
+    "readdress the same single matrix for every item," which is exactly what
+    an expanded/broadcast operand's shape (batch > 1, stride 0) means.
     """
     if len(tensor._shape) != 3:
         return None
@@ -7755,7 +7766,9 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     else:
         return None
     matrix_elements = rows * cols
-    if min(batch, rows, cols) <= 0 or batch_stride < matrix_elements:
+    if min(batch, rows, cols) <= 0:
+        return None
+    if batch_stride != 0 and batch_stride < matrix_elements:
         return None
     return physical_transpose, batch_stride
 
