@@ -6479,7 +6479,7 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
     return out4, probs4
 
 
-def _fa4_bf16_d64_causal_inputs(
+def _fa4_16bit_d64_causal_inputs(
     query,
     key,
     value,
@@ -6489,7 +6489,16 @@ def _fa4_bf16_d64_causal_inputs(
     scale=None,
     enable_gqa=False,
 ):
-    """Return eligible public BHTD inputs without doing any device work."""
+    """Return eligible public BHTD inputs (bf16 or f16) without doing any
+    device work.
+
+    bf16 and f16 are the same width on Hopper's tensor cores -- same WGMMA
+    tile shapes, same f32 accumulator -- so both share this eligibility
+    gate and the launch cache below; f16 only needs its own RS wgmma
+    emitter because the stdlib's register-operand overload is hardcoded
+    bf16 (see ``fa4_wgmma_f16.mojo``). Q/K/V must all share one dtype from
+    this set -- no bf16/f16 mixing.
+    """
     q = _t(query)
     k = _t(key)
     v = _t(value)
@@ -6507,9 +6516,9 @@ def _fa4_bf16_d64_causal_inputs(
         or q._device != v._device
         or q._device.api != "cuda"
         or q._device.architecture_name != "sm_90a"
-        or q._dtype != DType.bfloat16
-        or k._dtype != DType.bfloat16
-        or v._dtype != DType.bfloat16
+        or q._dtype not in (DType.bfloat16, DType.float16)
+        or k._dtype != q._dtype
+        or v._dtype != q._dtype
         or len(q._shape) != 4
         or tuple(q._shape) != tuple(k._shape)
         or tuple(q._shape) != tuple(v._shape)
@@ -6533,12 +6542,14 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
     The pointer is already adjusted to logical ``[0, 0, 0, 0]`` and strides
     are element strides.  Keep this predicate in lockstep with the defensive
     validation in the Mojo bridge so an unsupported view is materialized
-    before any FA4 launch is selected.
+    before any FA4 launch is selected.  bf16 and f16 are both 2-byte types,
+    so the same byte-alignment math (16-byte-multiple strides) applies to
+    either.
     """
     if (
         tensor is None
-        or tensor._dtype != DType.bfloat16
-        or tensor._itemsize != DType.bfloat16.size_in_bytes
+        or tensor._dtype not in (DType.bfloat16, DType.float16)
+        or tensor._itemsize != tensor._dtype.size_in_bytes
         or len(tensor._shape) != 4
         or len(tensor._strides) != 4
     ):
@@ -6589,7 +6600,7 @@ def _fa4_prepare_qkv_bridge(q_native, k_native, v_native):
     return qkv, False
 
 
-def fast_fa4_bf16_d64_causal_forward(
+def fast_fa4_16bit_d64_causal_forward(
     query,
     key,
     value,
@@ -6599,12 +6610,13 @@ def fast_fa4_bf16_d64_causal_forward(
     scale=None,
     enable_gqa=False,
 ):
-    """Run vendored FA4 and return output/LSE plus saved physical inputs.
+    """Run vendored FA4 (bf16 or f16) and return output/LSE plus saved
+    physical inputs.
 
     Loading the bridge happens before materialization or allocation, so a
     packaging/compiler error cannot leave unnecessary device work queued.
     """
-    inputs = _fa4_bf16_d64_causal_inputs(
+    inputs = _fa4_16bit_d64_causal_inputs(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
     if inputs is None:
@@ -6614,6 +6626,7 @@ def fast_fa4_bf16_d64_causal_forward(
 
     fa4_ops = load_fa4_ops()
     q, k, v = inputs
+    qkv_dtype = q._dtype
     q_native = _fa4_native_bthd(q)
     k_native = _fa4_native_bthd(k)
     v_native = _fa4_native_bthd(v)
@@ -6626,12 +6639,17 @@ def fast_fa4_bf16_d64_causal_forward(
 
     batch, heads, seqlen, head_dim = q._shape
     physical_shape = (batch, seqlen, heads, head_dim)
-    out_native = _alloc(physical_shape, DType.bfloat16, q._device)
+    out_native = _alloc(physical_shape, qkv_dtype, q._device)
     logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if use_strided_qkv:
+        forward_fn = (
+            fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv
+            if qkv_dtype == DType.bfloat16
+            else fa4_ops.flash_attention_fwd_f16_d64_causal_strided_qkv
+        )
         _device_call(
-            fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv,
+            forward_fn,
             q_native._ptr,
             *q_native._strides,
             k_native._ptr,
@@ -6648,8 +6666,13 @@ def fast_fa4_bf16_d64_causal_forward(
             keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     else:
+        forward_fn = (
+            fa4_ops.flash_attention_fwd_bf16_d64_causal
+            if qkv_dtype == DType.bfloat16
+            else fa4_ops.flash_attention_fwd_f16_d64_causal
+        )
         _device_call(
-            fa4_ops.flash_attention_fwd_bf16_d64_causal,
+            forward_fn,
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -6668,14 +6691,16 @@ def fast_fa4_bf16_d64_causal_forward(
     return output, logsumexp, q_native, k_native, v_native
 
 
-def fast_fa4_bf16_d64_causal_backward(
+def fast_fa4_16bit_d64_causal_backward(
     q_native, k_native, v_native, output, logsumexp, grad_output, scale
 ):
-    """Enqueue FA4 preprocess/main/convert and return public BHTD grads."""
+    """Enqueue FA4 preprocess/main/convert and return public BHTD grads
+    (bf16 or f16, matching Q/K/V's shared dtype)."""
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
 
     fa4_ops = load_fa4_ops()
     batch, seqlen, heads, head_dim = q_native._shape
+    qkv_dtype = q_native._dtype
     prepared = _fa4_prepare_qkv_bridge(q_native, k_native, v_native)
     if prepared is None:
         return NOT_HANDLED
@@ -6693,9 +6718,9 @@ def fast_fa4_bf16_d64_causal_backward(
         return NOT_HANDLED
 
     physical_shape = (batch, seqlen, heads, head_dim)
-    dq_native = _alloc(physical_shape, DType.bfloat16, q_native._device)
-    dk_native = _alloc(physical_shape, DType.bfloat16, q_native._device)
-    dv_native = _alloc(physical_shape, DType.bfloat16, q_native._device)
+    dq_native = _alloc(physical_shape, qkv_dtype, q_native._device)
+    dk_native = _alloc(physical_shape, qkv_dtype, q_native._device)
+    dv_native = _alloc(physical_shape, qkv_dtype, q_native._device)
     seqlen_padded = ((seqlen + 127) // 128) * 128
     stats_shape = (batch, heads, seqlen_padded)
     dpsum = _alloc(stats_shape, DType.float32, q_native._device)
@@ -6704,8 +6729,13 @@ def fast_fa4_bf16_d64_causal_backward(
         (batch * heads * seqlen_padded * head_dim,), DType.float32, q_native._device
     )
     if use_strided_qkv:
+        backward_fn = (
+            fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv
+            if qkv_dtype == DType.bfloat16
+            else fa4_ops.flash_attention_bwd_f16_d64_causal_strided_qkv
+        )
         _device_call(
-            fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv,
+            backward_fn,
             q_native._ptr,
             *q_native._strides,
             k_native._ptr,
@@ -6742,8 +6772,13 @@ def fast_fa4_bf16_d64_causal_backward(
             ),
         )
     else:
+        backward_fn = (
+            fa4_ops.flash_attention_bwd_bf16_d64_causal
+            if qkv_dtype == DType.bfloat16
+            else fa4_ops.flash_attention_bwd_f16_d64_causal
+        )
         _device_call(
-            fa4_ops.flash_attention_bwd_bf16_d64_causal,
+            backward_fn,
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -7087,7 +7122,7 @@ def fast_aten__scaled_dot_product_flash_attention(
 ):
     if dropout_p != 0.0 or return_debug_mask:
         return NOT_HANDLED
-    result = fast_fa4_bf16_d64_causal_forward(
+    result = fast_fa4_16bit_d64_causal_forward(
         query, key, value, None, 0.0, is_causal, scale, False
     )
     if result is NOT_HANDLED:
@@ -7131,8 +7166,8 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
     *,
     scale=None,
 ):
-    """Dense lower-op autograd bridge for the vendored BF16 FA4 kernel."""
-    inputs = _fa4_bf16_d64_causal_inputs(
+    """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel."""
+    inputs = _fa4_16bit_d64_causal_inputs(
         query, key, value, None, dropout_p, is_causal, scale, False
     )
     grad = _t(grad_out)
@@ -7149,13 +7184,13 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
         or max_k != seqlen
         or grad is None
         or grad._device != q._device
-        or grad._dtype != DType.bfloat16
+        or grad._dtype != q._dtype
         or tuple(grad._shape) != tuple(q._shape)
         or (
             output is not None
             and (
                 output._device != q._device
-                or output._dtype != DType.bfloat16
+                or output._dtype != q._dtype
                 or tuple(output._shape) != tuple(q._shape)
             )
         )
@@ -7163,6 +7198,7 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
             lse is not None
             and (
                 lse._device != q._device
+                # LSE is always float32 regardless of Q/K/V's dtype.
                 or lse._dtype != DType.float32
                 or tuple(lse._shape) != (batch, heads, seqlen)
             )
@@ -7177,7 +7213,7 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
         # payload. Recompute this direct lower-op forward so backward never
         # reads an inaccessible pointer. The high-level SDPA custom autograd
         # path retains its payload and does not take this compatibility path.
-        recomputed = fast_fa4_bf16_d64_causal_forward(
+        recomputed = fast_fa4_16bit_d64_causal_forward(
             q, k, v, None, 0.0, True, scale, False
         )
         if recomputed is NOT_HANDLED:
@@ -7198,7 +7234,7 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
     if lse is None:
         return NOT_HANDLED
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(q._shape[-1])
-    return fast_fa4_bf16_d64_causal_backward(
+    return fast_fa4_16bit_d64_causal_backward(
         q_native, k_native, v_native, output, lse, grad, scale_value
     )
 
@@ -8396,7 +8432,7 @@ def fast_aten_scaled_dot_product_attention(
         out, _ = result
         return out
 
-    fa4_result = fast_fa4_bf16_d64_causal_forward(
+    fa4_result = fast_fa4_16bit_d64_causal_forward(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
     if fa4_result is not NOT_HANDLED:

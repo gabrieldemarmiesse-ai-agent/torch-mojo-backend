@@ -61,6 +61,55 @@ def flash_attention_fwd_bf16_d64_causal(
     return PythonObject(None)
 
 
+def flash_attention_fwd_f16_d64_causal(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Same dense d64 causal forward as the bf16 entry point above, only the
+    comptime ``dtype`` differs. The f16 RS (register-A) wgmma emitters live
+    in ``fa4_wgmma_f16.mojo`` and are selected inside the shared kernel by
+    ``comptime if dtype == DType.float16`` -- bf16 keeps the stdlib path
+    byte-identical."""
+    var q_addr = Int(py=args[0])
+    var k_addr = Int(py=args[1])
+    var v_addr = Int(py=args[2])
+    var out_addr = Int(py=args[3])
+    var lse_addr = Int(py=args[4])
+    var batch = Int(py=args[5])
+    var seqlen = Int(py=args[6])
+    var nheads = Int(py=args[7])
+    var softmax_scale = Float32(py=args[8])
+    var ctx_addr = Int(py=args[9])
+
+    if batch <= 0 or seqlen <= 0 or nheads <= 0:
+        return PythonObject(None)
+
+    launch_fwd_fa4[
+        DType.float16,
+        64,
+        False,
+        True,
+        1,
+        False,
+        False,
+        False,
+        0,
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        out_addr,
+        lse_addr,
+        0,
+        ctx_addr,
+    )
+    return PythonObject(None)
+
+
 def flash_attention_bwd_bf16_d64_causal(
     mut py_self: PythonObject,
     mut args: PythonObject,
@@ -137,6 +186,85 @@ def flash_attention_bwd_bf16_d64_causal(
     return PythonObject(None)
 
 
+def flash_attention_bwd_f16_d64_causal(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Same dense d64 causal backward as the bf16 entry point above, only
+    the comptime ``dtype`` differs (see ``flash_attention_fwd_f16_d64_causal``
+    for the f16 RS wgmma note)."""
+    var q_addr = Int(py=args[0])
+    var k_addr = Int(py=args[1])
+    var v_addr = Int(py=args[2])
+    var out_addr = Int(py=args[3])
+    var dout_addr = Int(py=args[4])
+    var lse_addr = Int(py=args[5])
+    var dq_addr = Int(py=args[6])
+    var dk_addr = Int(py=args[7])
+    var dv_addr = Int(py=args[8])
+    var dpsum_addr = Int(py=args[9])
+    var lse_log2_addr = Int(py=args[10])
+    var dq_accum_addr = Int(py=args[11])
+    var batch = Int(py=args[12])
+    var seqlen = Int(py=args[13])
+    var nheads = Int(py=args[14])
+    var softmax_scale = Float32(py=args[15])
+    var ctx_addr = Int(py=args[16])
+
+    if batch <= 0 or seqlen <= 0 or nheads <= 0:
+        return PythonObject(None)
+
+    launch_bwd_preprocess[
+        DType.float16, 64, False, True, 1, False
+    ](
+        batch,
+        seqlen,
+        nheads,
+        out_addr,
+        dout_addr,
+        lse_addr,
+        dpsum_addr,
+        lse_log2_addr,
+        dq_accum_addr,
+        0,
+        0,
+        0,
+        ctx_addr,
+    )
+    launch_bwd_main[
+        DType.float16, 64, False, True, 1, False, False, 0
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        dout_addr,
+        dk_addr,
+        dv_addr,
+        lse_log2_addr,
+        dpsum_addr,
+        dq_accum_addr,
+        0,
+        ctx_addr,
+    )
+    launch_bwd_convert[
+        DType.float16, 64, False, True, 1, False
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        dq_accum_addr,
+        dq_addr,
+        0,
+        ctx_addr,
+    )
+    return PythonObject(None)
+
+
 def _check_strided_qkv_layout(
     name: StaticString,
     addr: Int,
@@ -150,7 +278,9 @@ def _check_strided_qkv_layout(
     """Reject any Q/K/V layout outside the strict zero-copy regime.
 
     Runs BEFORE any descriptor is created or kernel enqueued so a
-    violation never partially launches. Strides are in bf16 ELEMENTS.
+    violation never partially launches. Strides are in Q/K/V dtype
+    ELEMENTS (bf16 or f16 -- shared by both entry-point families since
+    both are 2-byte types with identical 16-byte-multiple math).
     """
     if b_stride <= 0 or s_stride <= 0 or h_stride <= 0 or d_stride <= 0:
         raise Error(
@@ -337,6 +467,105 @@ def flash_attention_fwd_bf16_d64_causal_strided_qkv(
     return PythonObject(None)
 
 
+def flash_attention_fwd_f16_d64_causal_strided_qkv(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Same zero-copy strided fwd as the bf16 entry point above (see its
+    docstring for the layout contract), only the comptime ``dtype`` differs.
+    """
+    var q_addr = Int(py=args[0])
+    var q_b_stride = Int(py=args[1])
+    var q_s_stride = Int(py=args[2])
+    var q_h_stride = Int(py=args[3])
+    var q_d_stride = Int(py=args[4])
+    var k_addr = Int(py=args[5])
+    var k_b_stride = Int(py=args[6])
+    var k_s_stride = Int(py=args[7])
+    var k_h_stride = Int(py=args[8])
+    var k_d_stride = Int(py=args[9])
+    var v_addr = Int(py=args[10])
+    var v_b_stride = Int(py=args[11])
+    var v_s_stride = Int(py=args[12])
+    var v_h_stride = Int(py=args[13])
+    var v_d_stride = Int(py=args[14])
+    var out_addr = Int(py=args[15])
+    var lse_addr = Int(py=args[16])
+    var batch = Int(py=args[17])
+    var seqlen = Int(py=args[18])
+    var nheads = Int(py=args[19])
+    var softmax_scale = Float32(py=args[20])
+    var ctx_addr = Int(py=args[21])
+
+    _check_strided_qkv_args(batch, seqlen, nheads)
+    _check_strided_qkv_layout(
+        "q",
+        q_addr,
+        q_b_stride,
+        q_s_stride,
+        q_h_stride,
+        q_d_stride,
+        seqlen,
+        nheads,
+    )
+    _check_strided_qkv_layout(
+        "k",
+        k_addr,
+        k_b_stride,
+        k_s_stride,
+        k_h_stride,
+        k_d_stride,
+        seqlen,
+        nheads,
+    )
+    _check_strided_qkv_layout(
+        "v",
+        v_addr,
+        v_b_stride,
+        v_s_stride,
+        v_h_stride,
+        v_d_stride,
+        seqlen,
+        nheads,
+    )
+
+    launch_fwd_fa4[
+        DType.float16,
+        64,
+        False,
+        True,
+        1,
+        False,
+        False,
+        False,
+        0,
+        strided_qkv=True,
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        out_addr,
+        lse_addr,
+        0,
+        ctx_addr,
+        q_b_stride=q_b_stride,
+        q_s_stride=q_s_stride,
+        q_h_stride=q_h_stride,
+        q_d_stride=q_d_stride,
+        k_s_stride=k_s_stride,
+        k_h_stride=k_h_stride,
+        k_d_stride=k_d_stride,
+        v_s_stride=v_s_stride,
+        v_h_stride=v_h_stride,
+        v_d_stride=v_d_stride,
+    )
+    return PythonObject(None)
+
+
 def flash_attention_bwd_bf16_d64_causal_strided_qkv(
     mut py_self: PythonObject,
     mut args: PythonObject,
@@ -477,6 +706,145 @@ def flash_attention_bwd_bf16_d64_causal_strided_qkv(
     return PythonObject(None)
 
 
+def flash_attention_bwd_f16_d64_causal_strided_qkv(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Same zero-copy strided bwd as the bf16 entry point above (see its
+    docstring for the layout contract), only the comptime ``dtype`` differs.
+    """
+    var q_addr = Int(py=args[0])
+    var q_b_stride = Int(py=args[1])
+    var q_s_stride = Int(py=args[2])
+    var q_h_stride = Int(py=args[3])
+    var q_d_stride = Int(py=args[4])
+    var k_addr = Int(py=args[5])
+    var k_b_stride = Int(py=args[6])
+    var k_s_stride = Int(py=args[7])
+    var k_h_stride = Int(py=args[8])
+    var k_d_stride = Int(py=args[9])
+    var v_addr = Int(py=args[10])
+    var v_b_stride = Int(py=args[11])
+    var v_s_stride = Int(py=args[12])
+    var v_h_stride = Int(py=args[13])
+    var v_d_stride = Int(py=args[14])
+    var out_addr = Int(py=args[15])
+    var dout_addr = Int(py=args[16])
+    var lse_addr = Int(py=args[17])
+    var dq_addr = Int(py=args[18])
+    var dk_addr = Int(py=args[19])
+    var dv_addr = Int(py=args[20])
+    var dpsum_addr = Int(py=args[21])
+    var lse_log2_addr = Int(py=args[22])
+    var dq_accum_addr = Int(py=args[23])
+    var batch = Int(py=args[24])
+    var seqlen = Int(py=args[25])
+    var nheads = Int(py=args[26])
+    var softmax_scale = Float32(py=args[27])
+    var ctx_addr = Int(py=args[28])
+
+    # The whole layout contract is validated up front so preprocess
+    # never launches for an unsupported layout.
+    _check_strided_qkv_args(batch, seqlen, nheads)
+    _check_strided_qkv_layout(
+        "q",
+        q_addr,
+        q_b_stride,
+        q_s_stride,
+        q_h_stride,
+        q_d_stride,
+        seqlen,
+        nheads,
+    )
+    _check_strided_qkv_layout(
+        "k",
+        k_addr,
+        k_b_stride,
+        k_s_stride,
+        k_h_stride,
+        k_d_stride,
+        seqlen,
+        nheads,
+    )
+    _check_strided_qkv_layout(
+        "v",
+        v_addr,
+        v_b_stride,
+        v_s_stride,
+        v_h_stride,
+        v_d_stride,
+        seqlen,
+        nheads,
+    )
+
+    launch_bwd_preprocess[
+        DType.float16, 64, False, True, 1, False
+    ](
+        batch,
+        seqlen,
+        nheads,
+        out_addr,
+        dout_addr,
+        lse_addr,
+        dpsum_addr,
+        lse_log2_addr,
+        dq_accum_addr,
+        0,
+        0,
+        0,
+        ctx_addr,
+    )
+    launch_bwd_main[
+        DType.float16,
+        64,
+        False,
+        True,
+        1,
+        False,
+        False,
+        0,
+        strided_qkv=True,
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        dout_addr,
+        dk_addr,
+        dv_addr,
+        lse_log2_addr,
+        dpsum_addr,
+        dq_accum_addr,
+        0,
+        ctx_addr,
+        q_s_stride=q_s_stride,
+        q_h_stride=q_h_stride,
+        q_d_stride=q_d_stride,
+        k_s_stride=k_s_stride,
+        k_h_stride=k_h_stride,
+        k_d_stride=k_d_stride,
+        v_s_stride=v_s_stride,
+        v_h_stride=v_h_stride,
+        v_d_stride=v_d_stride,
+    )
+    launch_bwd_convert[
+        DType.float16, 64, False, True, 1, False
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        dq_accum_addr,
+        dq_addr,
+        0,
+        ctx_addr,
+    )
+    return PythonObject(None)
+
+
 @export
 def PyInit_fa4_ops() abi("C") -> PythonObject:
     try:
@@ -484,14 +852,26 @@ def PyInit_fa4_ops() abi("C") -> PythonObject:
         module.def_py_function[flash_attention_fwd_bf16_d64_causal](
             "flash_attention_fwd_bf16_d64_causal"
         )
+        module.def_py_function[flash_attention_fwd_f16_d64_causal](
+            "flash_attention_fwd_f16_d64_causal"
+        )
         module.def_py_function[flash_attention_bwd_bf16_d64_causal](
             "flash_attention_bwd_bf16_d64_causal"
+        )
+        module.def_py_function[flash_attention_bwd_f16_d64_causal](
+            "flash_attention_bwd_f16_d64_causal"
         )
         module.def_py_function[flash_attention_fwd_bf16_d64_causal_strided_qkv](
             "flash_attention_fwd_bf16_d64_causal_strided_qkv"
         )
+        module.def_py_function[flash_attention_fwd_f16_d64_causal_strided_qkv](
+            "flash_attention_fwd_f16_d64_causal_strided_qkv"
+        )
         module.def_py_function[flash_attention_bwd_bf16_d64_causal_strided_qkv](
             "flash_attention_bwd_bf16_d64_causal_strided_qkv"
+        )
+        module.def_py_function[flash_attention_bwd_f16_d64_causal_strided_qkv](
+            "flash_attention_bwd_f16_d64_causal_strided_qkv"
         )
         return module.finalize()
     except error:
