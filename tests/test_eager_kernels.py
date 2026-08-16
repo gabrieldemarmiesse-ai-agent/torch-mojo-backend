@@ -5997,6 +5997,9 @@ def test_bf16_matmul_family_precedes_tf32_and_tensorspec(monkeypatch):
     monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
 
     assert aten_fast.fast_aten_mm(lhs, rhs) is gemm_result
+    # `lhs`/`rhs` are plain placeholders, not TorchMojoTensors, so
+    # _gemm16_alignment_favors_split (which inspects real shapes) always
+    # declines here and addmm takes its single bias-fused call, same as mm.
     assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is gemm_result
     assert aten_fast.fast_aten_linear(lhs, weight, bias) is linear_result
     assert aten_fast.fast_aten_bmm(lhs, rhs) is bmm_result
@@ -6005,6 +6008,98 @@ def test_bf16_matmul_family_precedes_tf32_and_tensorspec(monkeypatch):
     assert gemm_calls == [((lhs, rhs), {}), ((lhs, rhs, bias), {})]
     assert linear_calls == [((lhs, weight, bias), {})]
     assert bmm_calls == [((lhs, rhs), {}), ((lhs, rhs), {"transpose_b": True})]
+
+
+def test_gemm16_alignment_favors_split_helper(monkeypatch):
+    """The cheap pre-check gemm16's bias split relies on: every v3/v4
+    tensor-core route needs m, n, and k each a multiple of 64, so a shape
+    missing that can never benefit from splitting the mm from the bias."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+
+    def tensor(shape):
+        return SimpleNamespace(_shape=tuple(shape))
+
+    assert aten_fast._gemm16_alignment_favors_split(
+        tensor((128, 128)), tensor((128, 128))
+    )
+    # S5's exact shape (357x789x333): none of m, n, k is a multiple of 64.
+    assert not aten_fast._gemm16_alignment_favors_split(
+        tensor((357, 333)), tensor((333, 789))
+    )
+    # k mismatch between lhs and rhs.
+    assert not aten_fast._gemm16_alignment_favors_split(
+        tensor((128, 128)), tensor((64, 128))
+    )
+    # transpose_b reinterprets which rhs dim is k vs n.
+    assert aten_fast._gemm16_alignment_favors_split(
+        tensor((128, 128)), tensor((128, 128)), transpose_b=True
+    )
+    assert not aten_fast._gemm16_alignment_favors_split(tensor((3, 4)), tensor((4, 5)))
+
+
+def test_addmm_skips_split_for_misaligned_shapes(monkeypatch):
+    """A misaligned shape (S5's 357x789x333 regime) must take the single
+    bias-fused gemm16 call directly rather than paying for a wasted
+    bias-free mm plus a separate add: gemm16 always falls to the same
+    "accepted" kernel either way, so the split only adds a kernel launch
+    with no benefit.  Regression guard for the ~5us-per-launch tax that
+    turned this exact shape's f16 addmm from an already-good <1.0x ratio
+    into a 1.25-1.65x regression before this gate existed."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    def tensor(shape):
+        return SimpleNamespace(_shape=tuple(shape))
+
+    lhs, rhs, bias = tensor((357, 333)), tensor((333, 789)), object()
+    fused_result = object()
+    fused_calls = []
+
+    def try_gemm(*args, **kwargs):
+        fused_calls.append((args, kwargs))
+        return fused_result
+
+    def fail_add(*_args, **_kwargs):
+        raise AssertionError("misaligned addmm should never try the bias-free split")
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", fail_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is fused_result
+    assert fused_calls == [((lhs, rhs, bias), {})]
+
+
+def test_addmm_tries_split_for_aligned_shapes(monkeypatch):
+    """A 64-aligned addmm shape (unlike S5) does try the bias-free mm plus
+    a separate add first, since it could plausibly reach a fast gemm16
+    route -- see _gemm16_alignment_favors_split."""
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    def tensor(shape):
+        return SimpleNamespace(_shape=tuple(shape))
+
+    lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), object()
+    mm_result, biased_result = object(), object()
+    gemm_calls = []
+    add_calls = []
+
+    def try_gemm(*args, **kwargs):
+        gemm_calls.append((args, kwargs))
+        return mm_result
+
+    def try_add(*args, **kwargs):
+        add_calls.append((args, kwargs))
+        return biased_result
+
+    monkeypatch.setattr(aten_fast, "_t", lambda value: value)
+    monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
+    monkeypatch.setattr(aten_fast, "fast_aten_add", try_add)
+
+    assert aten_fast.fast_aten_addmm(bias, lhs, rhs) is biased_result
+    assert gemm_calls == [((lhs, rhs), {})]
+    assert add_calls == [((mm_result, bias), {})]
 
 
 @pytest.mark.parametrize("operation", ["gemm", "bmm"])
@@ -6124,7 +6219,11 @@ def test_tf32_matmul_family_prefers_opt_in_routes(monkeypatch):
 
 
 def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
-    """Strict FP32 rejects TF32 before inspecting operands, then uses SIMT."""
+    """Strict FP32 declines TF32 without importing its extension, then uses
+    SIMT. (gemm16's own cheap alignment pre-check -- see
+    _gemm16_alignment_favors_split -- does inspect operand shapes via `_t`
+    even here; that's a deliberate, cheap `isinstance` check, not the
+    expensive TF32-extension import this test actually guards.)"""
     from torch_mojo_backend import eager_kernels
     from torch_mojo_backend.eager_kernels import aten_fast
 
@@ -6132,9 +6231,6 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     fallback = object()
     spec_calls = []
     tf32_import_calls = []
-
-    def fail_tensor_inspection(*_args, **_kwargs):
-        raise AssertionError("strict FP32 inspected a TF32 operand")
 
     def fail_tf32_import(*_args: object, **_kwargs: object) -> ModuleType:
         tf32_import_calls.append("tf32_matmul_ops")
@@ -6153,7 +6249,6 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     monkeypatch.setattr(aten_fast, "_try_gemm16_mm", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(aten_fast, "_try_gemm16_bmm", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(aten_fast, "_t", fail_tensor_inspection)
     monkeypatch.setattr(aten_fast, "_try_spec_matmul", spec)
 
     assert aten_fast.fast_aten_mm(lhs, rhs) is fallback
@@ -6865,7 +6960,14 @@ def test_bf16_linear_flattens_contiguous_gpt_input_without_precision_query(monke
     gemm_calls = []
 
     def as_tensor(value):
-        return {input: input_metadata, weight: weight_metadata}.get(value)
+        # `is` comparisons, not a dict keyed by `value`: matrix_view (passed
+        # to _gemm16_alignment_favors_split too) is an unhashable
+        # SimpleNamespace.
+        if value is input:
+            return input_metadata
+        if value is weight:
+            return weight_metadata
+        return None
 
     def view_of(*args, **kwargs):
         view_calls.append((args, kwargs))
@@ -6885,6 +6987,9 @@ def test_bf16_linear_flattens_contiguous_gpt_input_without_precision_query(monke
     monkeypatch.setattr(aten_fast, "_view_of", view_of)
     monkeypatch.setattr(aten_fast, "_try_gemm16_mm", try_gemm)
 
+    # matrix_view/weight are SimpleNamespaces `_t` doesn't resolve to a real
+    # tensor, so _gemm16_alignment_favors_split declines and linear takes
+    # its single bias-fused call, same as before this fix.
     assert aten_fast._try_gemm16_linear(input, weight, bias) is result
     assert view_calls == [((input_metadata, (24, 8), (8, 1), 7), {"contiguous": True})]
     assert gemm_calls == [
@@ -7904,6 +8009,120 @@ def test_bf16_real_gemm_extension_handles_tails_offsets_and_all_layouts(
         torch.set_float32_matmul_precision(old_precision)
 
     _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
+
+
+# float32 never reaches gemm16 (bf16/f16 only), so its addmm bias goes
+# through the pre-existing TF32/TensorSpec routes this fix does not touch.
+# Those routes already decline a 0-d or 1-element bias (a pre-existing gap,
+# confirmed present on upstream/main before this change too) -- out of
+# scope here, so float32 only exercises the (n,) row vector shape that path
+# already supported, as a plain no-regression check.
+_ADDMM_BROADCAST_CASES = [
+    (dtype, bias_kind)
+    for dtype in (torch.bfloat16, torch.float16)
+    for bias_kind in ("scalar", "scalar_expandable", "row_vector")
+] + [(torch.float32, "row_vector")]
+_ADDMM_BROADCAST_IDS = [
+    f"{dtype}".rsplit(".", 1)[-1] + f"-{bias_kind}"
+    for dtype, bias_kind in _ADDMM_BROADCAST_CASES
+]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "bias_kind"), _ADDMM_BROADCAST_CASES, ids=_ADDMM_BROADCAST_IDS
+)
+@pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
+def test_addmm_bias_broadcast_shapes_stay_correct(
+    mojo_h100, monkeypatch, layout, dtype, bias_kind
+):
+    """Every bias shape aten::addmm broadcasts -- a 0-d scalar, a 1-element
+    expandable vector, and the usual (n,) row vector -- stays correct on
+    every physical layout, for bf16/f16.  These dtypes additionally reach
+    the gemm16 tensor-core fast path rather than falling back to the slower
+    bias-fused "accepted" kernel or TensorSpec: see fast_aten_addmm, which
+    computes the bias-free mm on the fast path and adds the bias with the
+    general broadcasting elementwise add (wider than the fused kernel's
+    exact-(n,)-shape gate).
+    """
+    is_gemm16_dtype = dtype in (torch.bfloat16, torch.float16)
+    if is_gemm16_dtype:
+        _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    # 64-aligned in every dim: _gemm16_alignment_favors_split must consider
+    # this shape worth splitting into a bias-free mm plus a separate add.
+    m, n, k = 128, 128, 128
+    a, b = _gemm16_operands(layout, m, n, k, dtype, mojo_h100)
+    bias_shape = {"scalar": (), "scalar_expandable": (1,), "row_vector": (n,)}[
+        bias_kind
+    ]
+    host_bias = torch.randn(bias_shape, dtype=dtype)
+    mojo_bias = host_bias.to(mojo_h100)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible gemm16 addmm reached TF32 or TensorSpec")
+
+    if is_gemm16_dtype:
+        # float32 legitimately needs the TF32/TensorSpec routes below gemm16
+        # (gemm16 only serves bf16/f16), so only bf16/f16 assert they never
+        # reach them.
+        monkeypatch.setattr(aten_fast, "_try_tf32_gemm", fail_later_route)
+        monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+
+    actual = torch.addmm(mojo_bias, a, b)
+    expected = (a.cpu().float() @ b.cpu().float() + host_bias.float()).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_addmm_alpha_beta_scaling_declines_explicitly(mojo_h100, dtype):
+    """alpha/beta != 1 isn't implemented by the fast eager path -- it must
+    decline loudly (NotImplementedError) rather than silently dropping the
+    scaling, on every dtype the gemm16 dispatch fix touches (see the
+    ``beta == 1 and alpha == 1`` gate in fast_aten_addmm, unchanged by this
+    fix)."""
+    a = torch.randn(8, 6, dtype=dtype)
+    b = torch.randn(6, 5, dtype=dtype)
+    bias = torch.randn(5, dtype=dtype)
+    with pytest.raises(NotImplementedError, match="aten::addmm"):
+        torch.addmm(
+            bias.to(mojo_h100), a.to(mojo_h100), b.to(mojo_h100), alpha=2.0, beta=0.5
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("bias_kind", ["scalar", "scalar_expandable", "row_vector"])
+def test_linear_bias_broadcast_shapes_use_gemm16_fast_path(
+    mojo_h100, monkeypatch, dtype, bias_kind
+):
+    """F.linear's bias broadcasts the same way addmm's does; every shape
+    stays on the gemm16 fast path -- see _try_gemm16_linear."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    # 64-aligned in every dim: _gemm16_alignment_favors_split must consider
+    # this shape worth splitting into a bias-free mm plus a separate add.
+    m, in_features, out_features = 128, 128, 128
+    x = torch.randn(m, in_features, dtype=dtype)
+    w = torch.randn(out_features, in_features, dtype=dtype)
+    bias_shape = {
+        "scalar": (),
+        "scalar_expandable": (1,),
+        "row_vector": (out_features,),
+    }[bias_kind]
+    host_bias = torch.randn(bias_shape, dtype=dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible gemm16 linear reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_linear", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+
+    actual = torch.nn.functional.linear(
+        x.to(mojo_h100), w.to(mojo_h100), host_bias.to(mojo_h100)
+    )
+    expected = (x.float() @ w.float().t() + host_bias.float()).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize("lhs_transposed", [False, True])
