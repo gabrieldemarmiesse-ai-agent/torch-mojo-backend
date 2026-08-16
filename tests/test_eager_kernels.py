@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 from max.driver import CPU
+from torch.testing._internal.common_methods_invocations import op_db
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
 
@@ -515,6 +516,58 @@ def test_fast_stack_uses_the_batched_cat(mojo_gpu, dim):
     torch.testing.assert_close(
         torch.stack(device, dim).cpu(), torch.stack(host, dim), rtol=0, atol=0
     )
+
+
+def test_fast_cat_narrow_copy_dst_cpu_alignment_regression(mojo_device):
+    """Regression for a segfault (SIGSEGV) in the CPU fallback of
+    `NarrowCopyDst` (the per-input path `fast_aten_cat` takes when the
+    batched `CatN` kernel is unavailable, i.e. on a `mojo` device with no
+    accelerator -- see `first._device.api != "cpu"` in `fast_aten_cat`).
+
+    Root cause: a CPU-only "func4" fast path in `_narrow_copy_dst`
+    (data_movement_ops.mojo) vectorized 4 elements per store whenever
+    `copy_len`, `dst_stride` and `dst_offset` were all multiples of 4, using
+    `elementwise[..., simd_width=1]`. That primitive does not guarantee
+    calling back exactly `Coord(outer * copy_len // 4)` times with no
+    overrun, and was observed writing one extra width-4 store past `out`'s
+    allocation. Harmless while it lands in heap slack, it corrupts a live
+    allocation once the heap is packed tightly enough. The fix removes the
+    CPU fast path entirely and always stores one element at a time there;
+    the accelerator fast path (a real GPU kernel launch, not this CPU
+    `elementwise` call) is untouched.
+
+    First reproduced via
+    `conformance/test_opinfo.py::TestOpInfoConformancePRIVATEUSE1::test_matches_cpu_stack_mojo_int64`
+    (exit 139), which iterates every `stack` OpInfo sample for int64 in one
+    process. The overrun is real regardless of what runs around it -- it
+    always writes past `out`'s allocation -- but whether that lands in
+    unused heap space or corrupts something live depends on the process's
+    whole allocation history, not just this test's own few small tensors: a
+    hand-picked repro of only the "suspicious" (copy_len, dst_stride,
+    offset) case, or even this same OpInfo replay run standalone outside
+    `instantiate_device_type_tests`' class-wide setup, did not reliably
+    crash, while running it through that real machinery (however lightly,
+    e.g. via plain `unittest`, no pytest needed) did every time. So this is
+    the exact OpInfo sample sequence that overran and corrupted a real
+    allocation -- a faithful repro of the trigger conditions and a real
+    correctness check (`assert_close`, not just "did not crash") -- even
+    though a from-scratch process running only this function is not
+    guaranteed to reproduce the crash exit code if the bug ever regresses.
+    """
+    op = next(
+        candidate
+        for candidate in op_db
+        if candidate.formatted_name == "stack" and candidate.variant_test_name == ""
+    )
+    checked = 0
+    for sample in op.sample_inputs("cpu", torch.int64):
+        host = sample.input
+        device = [tensor.to(mojo_device) for tensor in host]
+        actual = torch.stack(device, *sample.args, **sample.kwargs).cpu()
+        expected = torch.stack(host, *sample.args, **sample.kwargs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        checked += 1
+    assert checked > 0
 
 
 def _repeat_fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
