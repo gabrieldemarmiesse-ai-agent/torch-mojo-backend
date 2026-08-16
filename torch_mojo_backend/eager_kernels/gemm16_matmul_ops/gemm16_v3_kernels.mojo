@@ -43,6 +43,7 @@ from gemm16_kernels import (
     enqueue_gemm16_bmm as _enqueue_accepted_bf16_bmm,
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
+from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
 from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
 from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
 from gemm16_tn_v4_kernels import (
@@ -1790,6 +1791,35 @@ def enqueue_gemm16_bmm(
     # The per-batch retry on a False is a defensive correctness net, not an
     # expected path: same-shape batches only diverge if a batch stride
     # breaks 16B alignment partway through.
+    #
+    # NN batched route: unlike TN above, this is a single launch over the
+    # WHOLE batch (gemm16_bmm_v5_kernels.mojo) rather than a per-item loop --
+    # a persistent work list spanning every batch item's tiles, addressed by
+    # rank-3 TMA descriptors that carry the batch dimension (and clip ragged
+    # m/n/k per item). Looping the mm-level NN ladder the way TN does was
+    # tried and measured worse on every shape (small per-item grids -- e.g.
+    # attention's batch of narrow-n matrices, or conv's im2col batch --
+    # underfill the GPU independently on each loop iteration); see
+    # gemm16_bmm_v5_kernels.mojo's module docstring. `a_bs == 0` (a
+    # broadcast/expanded A, e.g. conv's shared per-sample weight matrix)
+    # is a first-class input here, not a special case: the caller passes it
+    # straight through, unlike `_tf32_dense_batched_layout` on the aten_fast
+    # side which used to reject it (see that function's history).
+    if not transpose_a and not transpose_b:
+        if try_enqueue_bmm16_nn_batched(
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            ctx,
+        ):
+            return
     if transpose_a and not transpose_b:
         comptime if _has_sm_9x():
             if ctx.api() == "cuda":
