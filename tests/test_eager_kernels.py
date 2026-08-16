@@ -1840,12 +1840,12 @@ def test_fast_native_dropout_rng_state_replays_exactly(mojo_gpu):
     torch.testing.assert_close(torch.mojo.get_rng_state(input.device), advanced)
 
 
-def _dropout_rng_state(seed: int, counter: int) -> torch.Tensor:
+def _philox_rng_state(seed: int, counter: int) -> torch.Tensor:
     encoded = seed.to_bytes(8, "little") + counter.to_bytes(8, "little")
     return torch.tensor(list(encoded), dtype=torch.uint8)
 
 
-def _decode_dropout_rng_state(state: torch.Tensor) -> tuple[int, int]:
+def _decode_philox_rng_state(state: torch.Tensor) -> tuple[int, int]:
     encoded = bytes(state.reshape(-1).tolist())
     return int.from_bytes(encoded[:8], "little"), int.from_bytes(encoded[8:], "little")
 
@@ -1861,7 +1861,7 @@ def test_fast_native_dropout_reserves_exact_full_width_interval(mojo_gpu, monkey
     input = torch.arange(9, dtype=torch.float32).to(mojo_gpu)
     seed = (1 << 63) + 0x1234_5678
     counter = (1 << 63) + 0x9ABC_DEF0
-    torch.mojo.set_rng_state(_dropout_rng_state(seed, counter), input.device)
+    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), input.device)
 
     output, mask = aten_fast.fast_aten_native_dropout(input, 0.0, True)
 
@@ -1878,7 +1878,7 @@ def test_fast_native_dropout_reserves_exact_full_width_interval(mojo_gpu, monkey
         counter & 0xFFFF_FFFF,
         counter >> 32,
     )
-    assert _decode_dropout_rng_state(torch.mojo.get_rng_state(input.device)) == (
+    assert _decode_philox_rng_state(torch.mojo.get_rng_state(input.device)) == (
         seed,
         counter + 3,
     )
@@ -1896,11 +1896,11 @@ def test_fast_native_dropout_reservation_wrap_does_not_mutate_state(
     )
     input = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
     seed = (1 << 64) - 1
-    torch.mojo.set_rng_state(_dropout_rng_state(seed, (1 << 64) - 2), input.device)
+    torch.mojo.set_rng_state(_philox_rng_state(seed, (1 << 64) - 2), input.device)
 
     aten_fast.fast_aten_native_dropout(input, 0.0, True)
     endpoint = torch.mojo.get_rng_state(input.device)
-    assert _decode_dropout_rng_state(endpoint) == (seed, (1 << 64) - 1)
+    assert _decode_philox_rng_state(endpoint) == (seed, (1 << 64) - 1)
     assert len(calls) == 1
 
     with pytest.raises(OverflowError, match="wrap uint64"):
@@ -2050,6 +2050,270 @@ def test_fast_nn_dropout_training_backward(mojo_gpu):
     assert input.grad is not None
     assert torch.isfinite(output.cpu()).all()
     assert torch.isfinite(input.grad.cpu()).all()
+
+
+UNIFORM_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.float64]
+
+
+@pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
+@pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-100.0, 100.0), (1.0, 2.0)])
+def test_fast_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
+    """Half-open [from, to) on a large sample, plus the first two moments."""
+    torch.mojo.manual_seed_all(20260814)
+    drawn = torch.empty(200_000, dtype=dtype, device=mojo_device).uniform_(low, high)
+    host = drawn.cpu().double()
+
+    assert host.min().item() >= low
+    assert host.max().item() < high
+    span = high - low
+    assert abs(host.mean().item() - (low + high) / 2) < 0.01 * span
+    assert abs(host.var().item() - span * span / 12) < 0.02 * span * span
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fast_uniform_narrow_dtype_never_reaches_to(mojo_device, dtype):
+    """The endpoint fold, which only a narrow output dtype exercises.
+
+    A draw above 1 - 2**-9 rounds to exactly 1.0 in bfloat16 (one in ~512;
+    measured 407 of 200k with torch's own generator), so without the fold this
+    sample would contain values equal to `to`. Every folded draw lands on
+    `from` instead, and `from` is otherwise unreachable here: only an exact
+    zero word produces it, with probability 2**-24 per element.
+    """
+    torch.mojo.manual_seed_all(20260814)
+    host = (
+        torch.empty(200_000, dtype=dtype, device=mojo_device)
+        .uniform_(0.0, 1.0)
+        .cpu()
+        .double()
+    )
+
+    assert host.max().item() < 1.0
+    assert int((host == 0.0).sum()) > 20
+
+
+@pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
+def test_fast_uniform_from_equals_to_is_constant(mojo_gpu, dtype):
+    drawn = torch.empty(37, dtype=dtype, device=mojo_gpu).uniform_(2.5, 2.5)
+    assert torch.equal(drawn.cpu(), torch.full((37,), 2.5, dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    ("numel", "dtype", "counters"),
+    [
+        (8, torch.float32, 2),
+        # Not a multiple of the group: the ragged group consumes its whole
+        # counter, so the next draw starts past it and cannot overlap.
+        (7, torch.float32, 2),
+        (1, torch.bfloat16, 1),
+        # float64 spends two of the four words per element.
+        (8, torch.float64, 4),
+        (7, torch.float64, 4),
+    ],
+)
+def test_fast_uniform_reserves_one_counter_per_philox_group(
+    mojo_gpu, monkeypatch, numel, dtype, counters
+):
+    """The exact interval reserved, and the full-width words handed to Mojo."""
+    calls = []
+    _replace_defined_native_calls(
+        monkeypatch,
+        {("random_ops.mojo", "UniformFill"): lambda *args: calls.append(args)},
+    )
+    drawn = torch.empty(numel, dtype=dtype, device=mojo_gpu)
+    seed = (1 << 63) + 0x1234_5678
+    counter = (1 << 63) + 0x9ABC_DEF0
+    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), drawn.device)
+
+    drawn.uniform_(-1.0, 3.0)
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[1:4] == (-1.0, 3.0, numel)
+    assert args[5:9] == (
+        seed & 0xFFFF_FFFF,
+        seed >> 32,
+        counter & 0xFFFF_FFFF,
+        counter >> 32,
+    )
+    assert _decode_philox_rng_state(torch.mojo.get_rng_state(drawn.device)) == (
+        seed,
+        counter + counters,
+    )
+
+
+def test_fast_uniform_adjacent_draws_are_independent(mojo_gpu):
+    """Two draws in a row must not share a single value of the stream.
+
+    A reservation that rounded the ragged group down, or one that forgot to
+    advance at all, shows up here and nowhere else: exact float32 collisions
+    between two 8192-element draws are otherwise ~1 in 2**24 per element.
+    """
+    torch.mojo.manual_seed_all(20260814)
+    first = torch.empty(8192, device=mojo_gpu).uniform_().cpu()
+    second = torch.empty(8192, device=mojo_gpu).uniform_().cpu()
+
+    assert int((first == second).sum()) == 0
+    centered_first = first - first.mean()
+    centered_second = second - second.mean()
+    correlation = (centered_first * centered_second).sum() / (
+        centered_first.norm() * centered_second.norm()
+    )
+    assert abs(correlation.item()) < 0.05
+
+
+def test_fast_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
+    """A ragged draw leaves the stream exactly two counters further on."""
+    torch.mojo.manual_seed_all(20260814)
+    state = torch.mojo.get_rng_state(mojo_gpu)
+    seed, counter = _decode_philox_rng_state(state)
+
+    first = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+
+    torch.mojo.set_rng_state(_philox_rng_state(seed, counter + 2), mojo_gpu)
+    replayed_second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    assert torch.equal(second, replayed_second)
+    assert not torch.equal(first, second)
+
+
+def test_fast_uniform_is_reproducible_under_manual_seed(mojo_device):
+    torch.mojo.manual_seed_all(4242)
+    first = torch.empty(1023, device=mojo_device).uniform_(-2.0, 5.0).cpu()
+    torch.mojo.manual_seed_all(4242)
+    second = torch.empty(1023, device=mojo_device).uniform_(-2.0, 5.0).cpu()
+
+    assert torch.equal(first, second)
+
+
+def test_fast_uniform_rng_state_round_trips(mojo_device):
+    torch.mojo.manual_seed_all((1 << 63) + 0x54321)
+    initial = torch.mojo.get_rng_state(mojo_device)
+    first = torch.empty(1025, device=mojo_device).uniform_().cpu()
+    advanced = torch.mojo.get_rng_state(mojo_device)
+    assert not torch.equal(initial, advanced)
+
+    torch.mojo.set_rng_state(initial, mojo_device)
+    replayed = torch.empty(1025, device=mojo_device).uniform_().cpu()
+
+    assert torch.equal(first, replayed)
+    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_device), advanced)
+
+
+def test_fast_uniform_wide_and_scalar_store_paths_agree(mojo_gpu):
+    """An offset base declines the vector store; the values must not change.
+
+    `x[1:]` starts one float32 in, so the 16-byte store is unavailable and the
+    scalar kernel runs instead. Both kernels index the stream the same way, so
+    the same reservation has to produce the same values.
+    """
+    torch.mojo.manual_seed_all(20260814)
+    state = torch.mojo.get_rng_state(mojo_gpu)
+    aligned = torch.zeros(8, device=mojo_gpu)
+    aligned.uniform_(-1.0, 1.0)
+
+    torch.mojo.set_rng_state(state, mojo_gpu)
+    storage = torch.zeros(9, device=mojo_gpu)
+    offset_view = storage[1:]
+    assert offset_view._ptr % 16 != 0
+    offset_view.uniform_(-1.0, 1.0)
+
+    host = storage.cpu()
+    assert torch.equal(host[1:], aligned.cpu())
+    assert host[0].item() == 0.0
+
+
+def test_fast_uniform_strided_destination_matches_contiguous(mojo_gpu):
+    """A view's values depend on its logical index, never on its layout."""
+    torch.mojo.manual_seed_all(20260814)
+    state = torch.mojo.get_rng_state(mojo_gpu)
+    contiguous = torch.empty(4, 4, device=mojo_gpu).uniform_(10.0, 11.0)
+
+    torch.mojo.set_rng_state(state, mojo_gpu)
+    storage = torch.zeros(4, 8, device=mojo_gpu)
+    view = storage[:, ::2]
+    assert not view.is_contiguous()
+    view.uniform_(10.0, 11.0)
+
+    host = storage.cpu()
+    assert torch.equal(host[:, ::2], contiguous.cpu())
+    assert host[:, 1::2].abs().max().item() == 0.0
+
+
+def test_fast_uniform_empty_does_not_advance_rng(mojo_gpu):
+    drawn = torch.empty(0, 5, device=mojo_gpu)
+    torch.mojo.manual_seed_all(20260814)
+    before = torch.mojo.get_rng_state(drawn.device)
+
+    assert drawn.uniform_() is drawn
+    torch.testing.assert_close(torch.mojo.get_rng_state(drawn.device), before)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "low", "high", "message"),
+    [
+        (torch.float32, 3.0, -1.0, r"\[from, to\) range, but found from=3 > to=-1"),
+        (torch.float32, 3, -1, r"\[from, to\) range, but found from=3 > to=-1"),
+        (torch.float16, -1e9, 1.0, "from is out of bounds for float16"),
+        (torch.float16, 0.0, 1e9, "to is out of bounds for float16"),
+        (torch.float32, -3e38, 3e38, "which result in to-from to exceed the limit"),
+    ],
+)
+def test_fast_uniform_rejects_bad_bounds(mojo_gpu, dtype, low, high, message):
+    """ATen's own checks, including on an empty tensor (ATen checks first)."""
+    torch.mojo.manual_seed_all(20260814)
+    before = torch.mojo.get_rng_state(mojo_gpu)
+    for numel in (10, 0):
+        drawn = torch.empty(numel, dtype=dtype, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match=message):
+            drawn.uniform_(low, high)
+    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_gpu), before)
+
+
+def test_fast_uniform_refuses_an_explicit_generator(mojo_gpu):
+    torch.mojo.manual_seed_all(20260814)
+    before = torch.mojo.get_rng_state(mojo_gpu)
+    drawn = torch.empty(4, device=mojo_gpu)
+
+    with pytest.raises(NotImplementedError, match="explicit generator"):
+        drawn.uniform_(0.0, 1.0, generator=torch.Generator())
+    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_gpu), before)
+
+
+def test_fast_uniform_declines_integer_dtypes(mojo_gpu):
+    drawn = torch.zeros(4, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="aten::uniform_"):
+        drawn.uniform_(0.0, 1.0)
+
+
+def test_fast_uniform_initializes_a_module_like_nn_init(mojo_gpu):
+    """The way a user actually reaches this op."""
+    layer = torch.nn.Linear(64, 32).to(mojo_gpu)
+    torch.nn.init.uniform_(layer.weight, -0.125, 0.125)
+    host = layer.weight.detach().cpu()
+
+    assert host.min().item() >= -0.125
+    assert host.max().item() < 0.125
+    assert host.std().item() > 0.05
+
+
+def test_fast_uniform_carries_torch_rand_on_device(mojo_gpu):
+    """`torch.rand` needs no registration of its own: ATen's own
+    CompositeExplicitAutograd `rand` is `empty` plus `uniform_`, so it lands on
+    this kernel. `torch.manual_seed` reaches the device generator through
+    `torch.mojo.manual_seed_all`, which is what makes it reproducible."""
+    torch.manual_seed(20260814)
+    first = torch.rand(1000, device=mojo_gpu)
+    like = torch.rand_like(first)
+    torch.manual_seed(20260814)
+    replayed = torch.rand(1000, device=mojo_gpu)
+
+    assert first.device.type == "mojo"
+    assert torch.equal(first.cpu(), replayed.cpu())
+    assert not torch.equal(first.cpu(), like.cpu())
+    host = first.cpu()
+    assert host.min().item() >= 0.0
+    assert host.max().item() < 1.0
 
 
 def test_fast_lerp_scalar_out_and_inplace_alias(mojo_gpu):
@@ -8771,14 +9035,14 @@ def test_fast_sdpa_dropout_reserves_exact_probability_interval(mojo_gpu, dropout
     value = torch.randn(batch, heads, key_length, head_dim).to(mojo_gpu)
     seed = (1 << 63) + 0x1234
     counter = (1 << 63) + 0x5678
-    torch.mojo.set_rng_state(_dropout_rng_state(seed, counter), query.device)
+    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), query.device)
 
     output = torch.nn.functional.scaled_dot_product_attention(
         query, key, value, dropout_p=dropout_p, is_causal=True
     )
     probability_elements = batch * heads * query_length * key_length
     expected_increment = (probability_elements + 3) // 4 if 0.0 < dropout_p < 1.0 else 0
-    assert _decode_dropout_rng_state(torch.mojo.get_rng_state(query.device)) == (
+    assert _decode_philox_rng_state(torch.mojo.get_rng_state(query.device)) == (
         seed,
         counter + expected_increment,
     )
