@@ -3291,7 +3291,9 @@ def fast_aten_where(condition, input, other):
 def _masked_fill_operands(input, mask, value):
     """Resolve (in_t, mask_t, value_t, meta) for masked_fill, or None.
 
-    `value` may be a Python scalar or a 1-element tensor of input's dtype.
+    `value` may be a Python scalar or a 0-dimensional tensor of input's
+    dtype (matching aten, a tensor `value` with any other rank raises
+    RuntimeError rather than being declined as unhandled).
     The output shape must equal input's shape (mask broadcasts up to input).
     """
     a = _t(input)
@@ -3300,10 +3302,13 @@ def _masked_fill_operands(input, mask, value):
         return None
     val = _t(value)
     if val is not None:
-        if val._dtype != a._dtype or val._device != a._device or val._numel != 1:
-            return None
         if len(val._shape) > 0:
-            val = _view_of(val, (), (), val._offset)
+            raise RuntimeError(
+                "masked_fill_ only supports a 0-dimensional value tensor, "
+                f"but got tensor with {len(val._shape)} dimension(s)."
+            )
+        if val._dtype != a._dtype or val._device != a._device:
+            return None
     elif isinstance(value, int | float):
         if isinstance(value, bool):
             value = int(value)

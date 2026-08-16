@@ -15,6 +15,18 @@ NVIDIA H100 PCIe, torch 2.11.0+cu130, `conformance/test_opinfo.py`.
 | failed | 220 |
 | xfail / error | 2 |
 
+Those totals are that sweep on that commit; several of the fixes below have
+landed since, and §2 and §3 in particular no longer reproduce and need
+re-triaging. The **outcome vocabulary has changed too**: what a node cannot do
+is now declared in `known_unsupported.py` and reported as xfail, so "absent"
+reads as xfail, and "skipped" means only that the harness declined to compare
+(no sample inputs for the dtype, or OpInfo saying the output may legitimately
+differ across devices). Same hardware and torch build, the same 2786 nodes now
+give **973 passed / 1561 xfailed / 237 skipped / 15 failed**, the 15 being
+value mismatches in `addr`, `bmm`, `log_softmax`, `masked.log_softmax`,
+`nn.functional.batch_norm`, `nn.functional.conv2d`,
+`nn.functional.instance_norm`, `pow` and `__rpow__`.
+
 ## 1. Segfault: any CUDA tensor moved to the mojo device
 
 **This killed the run at 93%**, on `test_matches_cpu_to_mojo_bfloat16`.
@@ -79,11 +91,20 @@ findings; they need an allowlist that asserts shape/dtype/device only.
 ## Reproducing
 
 ```bash
-uv run pytest conformance/                       # everything (~40 min)
+uv run pytest conformance/                       # everything (~40 min cold, ~1 min warm with -n 15)
 uv run pytest conformance/ -k "test_errors_match"  # just the error-input conformance
 uv run pytest conformance/ -k "bmm"                # one operator
 ```
 
-The suite skips an unimplemented operator with its reason rather than failing
-it, so the failure list stays the list of things that are *wrong* rather than
-merely *absent*.
+The failure list is the list of things that are *wrong* rather than merely
+*absent*, and what is absent is written down: `known_unsupported.py` declares
+it node by node, per accelerator, and `test_opinfo.py` reads that BEFORE
+running the case. A declared case is still run and must still fail (xfail); it
+fails the suite the moment it starts passing, which is what forces the entry to
+be deleted when support lands. An operator raising NotImplementedError without
+an entry is a failure — nothing an implementation raises can excuse itself.
+
+```bash
+# after landing an operator (or when a card differs), re-derive the entries
+uv run python conformance/regenerate_known_unsupported.py --write -k "<operator>"
+```
