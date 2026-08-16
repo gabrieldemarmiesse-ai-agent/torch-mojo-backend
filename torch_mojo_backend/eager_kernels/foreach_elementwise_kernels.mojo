@@ -1,15 +1,21 @@
-"""Fixed-arity batched FP32 foreach elementwise kernels.
+"""Fixed-arity batched FP32 foreach elementwise kernels: the APPLE half.
 
-Metal only translates pointer-typed kernel *arguments* into valid GPU
-addresses; a raw address smuggled as data (a descriptor struct or an Int)
-reads back zeros. The CUDA-style descriptor-batch multi-tensor kernel is
-therefore impossible on Apple GPUs, and per-tensor launches are dispatch
-bound for optimizer-sized tensor lists. These kernels take a fixed arity of
-FOREACH_EW_SLOTS real pointer arguments per tensor list plus plain-Int
-per-slot chunk offsets/lengths (non-pointer data passes fine), so one
+Every op here is also served by the single descriptor-batched body in
+`foreach_batched_kernels`, which is the route on CUDA and ROCm and the one to
+change when the element math changes. These exist because Metal cannot take
+that route: Metal only translates pointer-typed kernel *arguments* into valid
+GPU addresses, and a raw address smuggled as data (a descriptor struct or an
+Int) reads back zeros — while per-tensor launches are dispatch bound for
+optimizer-sized tensor lists.
+
+So each kernel here takes a fixed arity of FOREACH_EW_SLOTS real pointer
+arguments per tensor list plus per-slot chunk offsets/lengths as plain data
+(non-pointer data passes fine, in fixed-width form — see `_SlotInts`), and one
 launch covers up to FOREACH_EW_SLOTS tensors, grid-strided over the
-concatenation of their fixed-size chunks. Unused slots repeat a valid
-pointer with length zero and are never dereferenced.
+concatenation of their fixed-size chunks.
+Unused slots repeat a valid pointer with length zero and are never
+dereferenced. `foreach_ew_enqueue` does the regrouping from the shared
+descriptors.
 
 Element math deliberately mirrors the scalar eager kernels these ops fall
 back to (`elementwise_ops`/`logic_ops`), keeping the batched path
@@ -40,12 +46,28 @@ comptime FEA_ADDCDIV = 1
 comptime _MutPtr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
 comptime _ImmutPtr = UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
 
+# Per-slot chunk offsets and lengths as they cross the launch ABI. `Int` is
+# not device-passable (its width differs between host and device, and Metal's
+# device `Int` is not the host's), and an `InlineArray` encodes element-wise,
+# so the array element type has to be fixed-width too. Kernels convert back
+# to `Int` at the use site and all index math stays in `Int`.
+comptime _SlotInts = InlineArray[Int64, FOREACH_EW_SLOTS]
+
 
 @always_inline
 def _addr_ptr(addr: Int) -> _MutPtr:
     return UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=addr
     ).as_unsafe_any_origin()
+
+
+@always_inline
+def _slot_ints(values: InlineArray[Int, FOREACH_EW_SLOTS]) -> _SlotInts:
+    """Widen a host-side per-slot `Int` array to the launch ABI type."""
+    var widened = _SlotInts(fill=Int64(0))
+    for slot in range(FOREACH_EW_SLOTS):
+        widened[slot] = Int64(values[slot])
+    return widened^
 
 
 @always_inline
@@ -68,20 +90,18 @@ def _no_fuse[
 
 
 @always_inline
-def _slot_begin(
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS], chunk: Int
-) -> Tuple[Int, Int]:
+def _slot_begin(chunk_ends: _SlotInts, chunk: Int) -> Tuple[Int, Int]:
     """(slot, element offset in that slot's tensor) for a global chunk id.
 
     Empty slots occupy zero chunks (their chunk_end repeats the previous
     one), so the scan naturally steps over them.
     """
     var slot = 0
-    while slot + 1 < FOREACH_EW_SLOTS and chunk >= chunk_ends[slot]:
+    while slot + 1 < FOREACH_EW_SLOTS and chunk >= Int(chunk_ends[slot]):
         slot += 1
     var first_chunk = 0
     if slot != 0:
-        first_chunk = chunk_ends[slot - 1]
+        first_chunk = Int(chunk_ends[slot - 1])
     return slot, (chunk - first_chunk) * FOREACH_EW_CHUNK
 
 
@@ -163,8 +183,8 @@ def _foreach_scalar_kernel[
     p5: _MutPtr,
     p6: _MutPtr,
     p7: _MutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
     scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
 ):
     """In-place x = x (op) scalar[slot], one scalar per slot.
@@ -173,7 +193,7 @@ def _foreach_scalar_kernel[
     binary kernel (`a / b`) element math exactly.
     """
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
-    var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
     var values = _pick_mut(slot, p0, p1, p2, p3, p4, p5, p6, p7)
     var scalar = scalars[slot]
 
@@ -205,6 +225,44 @@ def _foreach_scalar_kernel[
         index += FOREACH_EW_THREADS
 
 
+def _foreach_mul_tensor_kernel(
+    p0: _MutPtr,
+    p1: _MutPtr,
+    p2: _MutPtr,
+    p3: _MutPtr,
+    p4: _MutPtr,
+    p5: _MutPtr,
+    p6: _MutPtr,
+    p7: _MutPtr,
+    scalar_ptr: _ImmutPtr,
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
+):
+    """In-place x = x * scalar[0], the scalar a 0-d device tensor.
+
+    `aten::_foreach_mul_.Tensor`; element math matches the `mul_.Tensor`
+    sequential fallback.
+    """
+    var scalar = scalar_ptr[0]
+    var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
+    var values = _pick_mut(slot, p0, p1, p2, p3, p4, p5, p6, p7)
+
+    var index = begin + Int(thread_idx.x) * _VEC
+    var stride = FOREACH_EW_THREADS * _VEC
+    while index + _VEC <= end:
+        var value = values.load[width=_VEC, alignment=4](index)
+        values.store[width=_VEC, alignment=4](index, value * scalar)
+        index += stride
+
+    # The chunk size is divisible by _VEC, so only a tensor's last chunk can
+    # need this scalar tail.
+    index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
+    while index < end:
+        values[index] = values[index] * scalar
+        index += FOREACH_EW_THREADS
+
+
 def _foreach_lerp_kernel(
     a0: _MutPtr,
     a1: _MutPtr,
@@ -222,8 +280,8 @@ def _foreach_lerp_kernel(
     e5: _ImmutPtr,
     e6: _ImmutPtr,
     e7: _ImmutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
     weight: Float32,
     one_minus_weight: Float32,
     low_branch_arg: Int64,
@@ -238,7 +296,7 @@ def _foreach_lerp_kernel(
     # the launch ABI as Int64 and index math stays in Int.
     var low_branch = Int(low_branch_arg)
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
-    var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
     var self_values = _pick_mut(slot, a0, a1, a2, a3, a4, a5, a6, a7)
     var end_values = _pick_immut(slot, e0, e1, e2, e3, e4, e5, e6, e7)
 
@@ -293,8 +351,8 @@ def _foreach_addc_kernel[
     c5: _ImmutPtr,
     c6: _ImmutPtr,
     c7: _ImmutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
     scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
 ):
     """In-place self = self + value[slot] * (t1 * t2) or (t1 / t2).
@@ -302,7 +360,7 @@ def _foreach_addc_kernel[
     Matches `logic_ops._ternary_bcast` element math exactly.
     """
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
-    var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
     var self_values = _pick_mut(slot, a0, a1, a2, a3, a4, a5, a6, a7)
     var first_values = _pick_immut(slot, b0, b1, b2, b3, b4, b5, b6, b7)
     var second_values = _pick_immut(slot, c0, c1, c2, c3, c4, c5, c6, c7)
@@ -351,12 +409,12 @@ def _foreach_sqrt_kernel(
     o5: _MutPtr,
     o6: _MutPtr,
     o7: _MutPtr,
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: _SlotInts,
+    numels: _SlotInts,
 ):
     """Out-of-place out = sqrt(in), matching `elementwise_ops` UOP_SQRT."""
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
-    var end = min(begin + FOREACH_EW_CHUNK, numels[slot])
+    var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
     var in_values = _pick_immut(slot, i0, i1, i2, i3, i4, i5, i6, i7)
     var out_values = _pick_mut(slot, o0, o1, o2, o3, o4, o5, o6, o7)
 
@@ -454,9 +512,41 @@ def enqueue_foreach_scalar_f32[
             _addr_ptr(addrs[5]),
             _addr_ptr(addrs[6]),
             _addr_ptr(addrs[7]),
-            chunk_ends,
-            numels,
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
             scalars,
+        )
+    else:
+        raise Error("no GPU accelerator available at compile time")
+
+
+def enqueue_foreach_mul_tensor_f32(
+    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
+    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
+    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    scalar_addr: Int,
+    total_chunks: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if has_accelerator():
+        _enqueue_cached[_foreach_mul_tensor_kernel](
+            ctx,
+            String("FOREACH_EW_MUL_TENSOR_F32_V1"),
+            total_chunks,
+            1,
+            1,
+            FOREACH_EW_THREADS,
+            _addr_ptr(addrs[0]),
+            _addr_ptr(addrs[1]),
+            _addr_ptr(addrs[2]),
+            _addr_ptr(addrs[3]),
+            _addr_ptr(addrs[4]),
+            _addr_ptr(addrs[5]),
+            _addr_ptr(addrs[6]),
+            _addr_ptr(addrs[7]),
+            _addr_ptr(scalar_addr).as_immutable(),
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
         )
     else:
         raise Error("no GPU accelerator available at compile time")
@@ -497,8 +587,8 @@ def enqueue_foreach_lerp_f32(
             _addr_ptr(end_addrs[5]).as_immutable(),
             _addr_ptr(end_addrs[6]).as_immutable(),
             _addr_ptr(end_addrs[7]).as_immutable(),
-            chunk_ends,
-            numels,
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
             weight,
             one_minus_weight,
             Int64(low_branch),
@@ -551,8 +641,8 @@ def enqueue_foreach_addc_f32[
             _addr_ptr(second_addrs[5]).as_immutable(),
             _addr_ptr(second_addrs[6]).as_immutable(),
             _addr_ptr(second_addrs[7]).as_immutable(),
-            chunk_ends,
-            numels,
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
             scalars,
         )
     else:
@@ -591,8 +681,8 @@ def enqueue_foreach_sqrt_f32(
             _addr_ptr(out_addrs[5]),
             _addr_ptr(out_addrs[6]),
             _addr_ptr(out_addrs[7]),
-            chunk_ends,
-            numels,
+            _slot_ints(chunk_ends),
+            _slot_ints(numels),
         )
     else:
         raise Error("no GPU accelerator available at compile time")

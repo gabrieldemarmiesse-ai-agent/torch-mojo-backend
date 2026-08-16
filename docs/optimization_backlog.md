@@ -49,7 +49,7 @@ different kind of item.
 | [D1](#d1) | The hot rank≤4 materialize path lacks the 16-byte vectorized transpose the rank≤8 path already has | Data movement | Medium (2.1–2.4 → 3.57 TB/s on the transposes, gfx942-measured) | **Low** (port an existing kernel) | — |
 | [P1](#p1) | Warm-path regression from the variant loader: 101 ms/step vs 60 ms on `main` | Compile pipeline | **High** — the largest single eager regression currently on record | Medium | — |
 | [R1](#r1) | ~~Non-trailing reductions materialize a whole permuted copy of the input~~ **DONE**: one accumulator-parametrized skeleton over (outer, reduce, inner), strided-axis kernel for every scalar reduction | Reductions | Medium | Medium | — |
-| [O2](#o2) | Five `_foreach_*` batched kernels are Metal-only; CUDA/ROCm fall back to one launch per tensor | Optimizer | Medium (non-fused `AdamW(foreach=True)`) | Low–Medium | — |
+| [O2](#o2) | ~~Five `_foreach_*` batched kernels are Metal-only; CUDA/ROCm fall back to one launch per tensor~~ **DONE**: one descriptor-batched kernel body for the whole elementwise family, chunk size sized from the device | Optimizer | Medium (non-fused `AdamW(foreach=True)`) | Low–Medium | — |
 | [C2](#c2) | Grouped convolution issues `N × groups` GEMM launches from a Python loop | Conv | Medium for depthwise/grouped nets | Medium | — |
 | [C1](#c1) | Convolution is im2col + GEMM with a full `(N, C·kh·kw, out_h·out_w)` temporary | Conv | Medium (memory-bound at large spatial) | High | no conv benchmark exists |
 | [N1](#n1) | LayerNorm backward is fp32-only and GPU-only; the forward accepts fp16/bf16 | Normalization | Medium (blocks pure-bf16 training) | Medium | — |
@@ -488,7 +488,7 @@ different kind of item.
   (`attn_mask is None` inside the eligibility conjunction); the autograd node
   raises explicitly at `mojo_device_autograd.py:271-275`.
 * **Current implementation.** `aten::scaled_dot_product_attention` is registered
-  for the mojo device (`mojo_device_aten_ops.py:1182`), which suppresses
+  for the mojo device (`mojo_device_aten_ops.py`), which suppresses
   PyTorch's own composite decomposition, and then declines any masked call —
   producing a `NotImplementedError` rather than a slow path.
 * **Why it is not optimal.** Padded-batch inference and most HuggingFace encoder
@@ -538,7 +538,7 @@ different kind of item.
   pointer as `Scalar[DType.float32]`.
 * **Current implementation.** fp16/bf16 LayerNorm forward succeeds; its backward
   returns `NOT_HANDLED`, and the registration
-  (`mojo_device_aten_ops.py:1160`) turns that into a raise.
+  (`mojo_device_aten_ops.py`) turns that into a raise.
 * **Why it is not optimal.** Under bf16 autocast this is invisible (autocast runs
   LayerNorm in fp32), which is why nanoGPT never hit it. A model trained in pure
   bf16 — increasingly the norm — cannot run its backward at all.
@@ -921,7 +921,7 @@ temporary** — **DONE** (`NormSpec`)
 
 * **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
   and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is, at `:1096`).
+  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
 * **Current implementation.** conv1d (rank-3 input), conv3d and transposed
   convolutions all return `NOT_HANDLED` → raise. There is no eager conv backward.
 * **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
@@ -943,7 +943,7 @@ temporary** — **DONE** (`NormSpec`)
   at `:5203`). `aten::max_pool2d_with_indices_backward` and
   `aten::avg_pool2d_backward` are unregistered;
   `aten::_adaptive_avg_pool2d_backward` is explicitly `_register_missing`
-  (`mojo_device_aten_ops.py:1222`).
+  (`mojo_device_aten_ops.py`).
 * **Current implementation.** Forward-only, floor-mode-only, rank-4-only.
 * **Why it is not optimal.** `ceil_mode=True` appears in common torchvision
   configurations; the missing backwards are the third blocker for vision
@@ -969,7 +969,7 @@ temporary** — **DONE** (`NormSpec`)
 * **Why it is not optimal.** Two gaps. (a) Mixed-precision training with bf16
   *master* weights (no fp32 copy) cannot use the fused optimizer. (b) The failure
   mode is a `RuntimeError` rather than `NOT_HANDLED`, so PyTorch cannot fall back
-  to its own foreach path — and that path is itself crippled by [O2](#o2).
+  to its own foreach path (which is now the fast one, see [O2](#o2)).
 * **What the optimized version looks like.** A per-tensor dtype field in the
   descriptor record — the ABI already carries a "homogeneous" flag slot, so the
   heterogeneous encoding was anticipated — with fp32 accumulation inside the
@@ -993,7 +993,7 @@ temporary** — **DONE** (`NormSpec`)
   added by journal Change 45. `_foreach_norm` (`:329`) and `_foreach_mul_.Tensor`
   (`:512`) are device-general but fp32-only.
 * **Current implementation.** On CUDA and ROCm those five decline, and
-  `_register_foreach_inplace` (`mojo_device_aten_ops.py:947`) redispatches to
+  `_register_foreach_inplace` (`mojo_device/aten_ops/foreach.py`) redispatches to
   ATen's generic decomposition — one launch per tensor.
 * **Why it is not optimal.** `torch.optim.AdamW(foreach=True)` — PyTorch's
   default when `fused` is not requested — uses exactly `_foreach_mul_`,
@@ -1010,6 +1010,50 @@ temporary** — **DONE** (`NormSpec`)
 * **How to measure it.** `bench_nanogpt_train.py` with the optimizer configured
   `fused=False, foreach=True`, plus `compare_nanogpt_train_kernels.py`'s
   optimizer group.
+
+**Five batched `_foreach_*` kernels are Metal-only** — **DONE** (one
+descriptor-batched body for the whole family)
+
+* **What it was.** `_foreach_metal_f32` returned `None` unless
+  `device.api == "metal"`, so `_foreach_mul_.Scalar`,
+  `_foreach_div_.ScalarList`, `_foreach_lerp_.Scalar`,
+  `_foreach_addcmul_.Scalar`, `_foreach_addcdiv_.ScalarList` and
+  `_foreach_sqrt` all declined on CUDA and ROCm and
+  `_register_foreach_inplace` redispatched to ATen's decomposition — one
+  launch per tensor. Only `_foreach_add_.Scalar` and `_foreach_mul_.Tensor`
+  had device-general descriptor kernels of their own.
+* **What replaced it.** `foreach_batched_kernels.mojo`: ONE kernel body,
+  comptime-parametrized by dtype and by op (mul/add/div by a per-tensor host
+  scalar, multiply by a 0-d device scalar, lerp, addcmul, addcdiv, sqrt),
+  reached through one bridge `_foreach_ew_go[op]` and one Python launch
+  helper. The six separate bridges it replaced (`ForeachScalarOp`,
+  `ForeachLerpScalar`, `ForeachAddcOp`, `ForeachSqrt`, `ForeachMulTensor` and
+  `elementwise_ops`' `ForeachAddScalar`) are gone, as is the hand-tuned
+  `foreach_mul_tensor_f32_aligned_streaming_ilp8_t128_v8`. Apple regroups the
+  same descriptors into the fixed-arity Metal launches, which is the only
+  part that ever needed to be Metal-specific.
+* **The Metal gate was not the whole cost.** The chunk size was fixed at
+  65_536 elements, which put the 4x1_048_576 list on 64 blocks and the
+  16x65_536 list on 16 — on 114 SMs. It is now a runtime launch argument
+  derived from the element count and the runtime SM count, which is where
+  most of the win came from: `_foreach_add_.Scalar` and
+  `_foreach_mul_.Tensor` already had a single-launch descriptor path and
+  still went from 1.85/1.94 to 0.84/0.81.
+* **Measured** (H100 PCIe, `benchmarks/test_foreach.py`, ours/stock device
+  time, 4x1_048_576 then 16x65_536): `_foreach_mul_.Scalar` 1.76/4.31 ->
+  0.84/0.39, `_foreach_add_.Scalar` 1.85/1.95 -> 0.84/0.39,
+  `_foreach_div_.ScalarList` 1.19/2.88 -> 0.59/0.29, `_foreach_lerp_.Scalar`
+  4.55/6.88 -> 0.85/0.44, `_foreach_addcmul_.Scalar` 2.43/4.55 ->
+  0.84/0.44, `_foreach_addcdiv_.ScalarList` 2.36/3.36 -> 0.81/0.35,
+  `_foreach_mul_.Tensor` 1.94/2.04 -> 0.81/0.37, `_foreach_sqrt`
+  1.05/1.57 -> 0.53/0.30. (The four `.Scalar`/`.ScalarList` "before" numbers
+  are freshly measured; the recorded baselines for `_foreach_mul_.Scalar`
+  (8.03/6.91) and `_foreach_div_.ScalarList` (5.24/4.43) could not be
+  reproduced at the commit that held them.)
+* **What is still open.** mul/add take every float dtype; div, lerp, addc*,
+  sqrt and mul.Tensor are still fp32-only, because the sequential kernels
+  they have to stay bit-compatible with do not all widen to fp32 the same
+  way. Lists longer than `FEW_DESC_CAP` (64) still pay one launch per 64.
 
 ### O3
 **`clip_grad_norm_` is fp32-only end to end**
@@ -1361,7 +1405,7 @@ fallback runs. This is the answer to "which GPUs run an unoptimized path".
 | Fused softmax+dropout forward | `metal` + fp32 | `aten_fast.py:5581` | separate softmax + dropout |
 | Fused 3-way `cat` | `metal` | `aten_fast.py:3621` | 3 `NarrowCopyDst` launches |
 | `fast_aten_add` spec-bypass fast path | `metal` | `aten_fast.py:2364` | spec path |
-| Five batched `_foreach_*` ops | `metal` | `aten_fast.py:611` | ATen sequential redispatch ([O2](#o2)) |
+| Foreach elementwise family, fixed-arity 8-slot ABI | `has_apple_gpu_accelerator()` | `foreach_batched_kernels.mojo` (`foreach_ew_enqueue`) | the descriptor-batched kernel (same body, same descriptors) |
 | Apple vectorized D2D copy | `has_apple_gpu_accelerator()` | `tensor_holder.mojo:326` | `enqueue_copy_from` |
 | Apple permute rows4 / rowloop | `has_apple_gpu_accelerator()` | `data_movement_ops.mojo:321` | generic gather ladder |
 | Apple fused AdamW variant | `has_apple_gpu_accelerator()` | `optimizer_kernels.mojo:339` | generic fused AdamW |

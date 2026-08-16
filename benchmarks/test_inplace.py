@@ -32,6 +32,7 @@ COVERS: dict[str, str] = {
     "aten::fill_.Scalar": "test_fill_",
     "aten::masked_fill_.Scalar": "test_masked_fill_[Scalar]",
     "aten::masked_fill_.Tensor": "test_masked_fill_[Tensor]",
+    "aten::uniform_": "test_uniform_",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -91,6 +92,28 @@ def test_fill_(
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
         lambda: x_ref.fill_(0.5), lambda: x_our.fill_(0.5), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("uniform_")
+def test_uniform_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    """A generated fill: same write traffic as fill_, plus the generator.
+
+    Both legs draw from their own device's default generator (there is no
+    portable way to hand one backend the other's stream, and the values are
+    not compared here anyway) -- what is measured is the cost of producing
+    and storing them.
+    """
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.uniform_(-1.0, 1.0),
+        lambda: x_our.uniform_(-1.0, 1.0),
+        flops=float(x_ref.numel()),
     )
 
 
