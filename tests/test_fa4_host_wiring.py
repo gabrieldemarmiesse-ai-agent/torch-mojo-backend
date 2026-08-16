@@ -735,6 +735,112 @@ def test_direct_flash_backward_materializes_strided_logsumexp(
     assert backward_calls[0][4] is contiguous_lse
 
 
+def test_fa4_saved_variable_recompute_rederives_natives_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the SavedVariable-recompute fallback (``out``/
+    ``logsumexp`` unpacked as bare tensors without their Python payload).
+
+    Before this fix, the recompute branch trusted the *natives* returned by
+    the inner ``fast_fa4_16bit_d64_causal_forward`` recompute call. Now that
+    the BHSD-eligible fast path returns the untouched PUBLIC q/k/v as those
+    same tuple slots (see ``fast_fa4_16bit_d64_causal_forward``), blindly
+    reusing them here would feed BHSD-shaped tensors into the BTHD-only bwd
+    kernel ABI. This test simulates exactly that: the mocked recompute
+    returns the public q/k/v unchanged (mirroring the BHSD fast path's
+    contract), and asserts the backward bridge is handed independently
+    rederived BTHD natives instead -- never the recompute's raw tuple
+    elements.
+    """
+    device = _device()
+    shape = (2, 4, 128, 64)
+    query, key, value = (
+        _tensor(name, shape=shape, device=device, ptr=ptr)
+        for name, ptr in zip(("q", "k", "v"), (0x1000, 0x2000, 0x3000), strict=True)
+    )
+    grad = _tensor("grad", shape=shape, device=device, ptr=0x4000)
+    recomputed_output = _tensor(
+        "recomputed_output", shape=shape, device=device, ptr=0x5000
+    )
+    recomputed_lse = _tensor(
+        "recomputed_lse",
+        shape=(2, 4, 128),
+        dtype=aten_fast.DType.float32,
+        device=device,
+        ptr=0x6000,
+    )
+    bthd_native = {
+        tensor.name: _tensor(
+            f"{tensor.name}_bthd_native",
+            shape=(2, 128, 4, 64),
+            device=device,
+            ptr=tensor._ptr,
+        )
+        for tensor in (query, key, value)
+    }
+    native_calls = []
+    backward_calls = []
+
+    monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
+    monkeypatch.setattr(
+        aten_fast, "_fa4_16bit_d64_causal_inputs", lambda *args: (query, key, value)
+    )
+
+    def fake_recompute(q, k, v, *_args):
+        # Mirrors the real BHSD fast path's contract: the "natives" slots
+        # are the untouched PUBLIC q/k/v, not BTHD-shaped tensors.
+        assert (q, k, v) == (query, key, value)
+        return recomputed_output, recomputed_lse, q, k, v
+
+    monkeypatch.setattr(aten_fast, "fast_fa4_16bit_d64_causal_forward", fake_recompute)
+
+    def fake_native_bthd(tensor):
+        native_calls.append(tensor)
+        return bthd_native[tensor.name]
+
+    monkeypatch.setattr(aten_fast, "_fa4_native_bthd", fake_native_bthd)
+    monkeypatch.setattr(aten_fast, "_tc", lambda tensor: tensor)
+    monkeypatch.setattr(
+        aten_fast,
+        "fast_fa4_16bit_d64_causal_backward",
+        lambda *args: backward_calls.append(args) or "gradients",
+    )
+
+    result = aten_fast.fast_aten__scaled_dot_product_flash_attention_backward(
+        grad,
+        query,
+        key,
+        value,
+        None,  # out: unpacked as a bare tensor, triggers the recompute path
+        None,  # logsumexp: ditto
+        None,
+        None,
+        128,
+        128,
+        0.0,
+        True,
+        None,
+        None,
+        scale=0.125,
+    )
+
+    assert result == "gradients"
+    # Every one of q/k/v must have been independently rederived...
+    assert native_calls == [query, key, value]
+    assert len(backward_calls) == 1
+    q_native, k_native, v_native = backward_calls[0][:3]
+    # ...and the backward call must have received those rederived BTHD
+    # natives, never the recompute's raw (public-shaped) return values. This
+    # is the exact bug the fix closes: pre-fix, q_native/k_native/v_native
+    # here would have been `query`/`key`/`value` themselves.
+    assert (q_native, k_native, v_native) == (
+        bthd_native["q"],
+        bthd_native["k"],
+        bthd_native["v"],
+    )
+    assert q_native is not query and k_native is not key and v_native is not value
+
+
 def test_fa4_combined_backward_bridge_allocates_exact_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
