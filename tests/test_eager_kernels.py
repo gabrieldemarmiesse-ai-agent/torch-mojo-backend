@@ -1413,6 +1413,228 @@ def test_fast_var_strided_axis_skips_materialization(mojo_gpu, monkeypatch):
     assert native_calls[target][0][0][1] == (0,)
 
 
+# ---------------------------------------------------------------------------
+# cumsum: INNER (trailing/stride-1 dim, block.prefix_sum-cooperating blocks,
+# with a 3-pass workspace scan once there are too few independent lines to
+# fill the device) and OUTER (dim=0 on a contiguous rank-2 tensor, one
+# thread per independent column, no cooperation needed) -- see
+# torch_mojo_backend/eager_kernels/nn_ops/cumsum_kernels.mojo for the
+# kernels and nn_ops.mojo's `_cumsum_spec_into_go` for the dispatch. Both
+# families are CUDA-only (gated by `_device.api == "cuda"` in
+# `fast_aten_cumsum`): non-CUDA devices, including the `mojo:cpu` test
+# device, keep exactly the int64/int32/float32-trailing-dim-only surface
+# `main` had before this file, through a portable (but unoptimized)
+# `_parallel_for`-based kernel -- see `test_fast_cumsum_...non_cuda...`
+# below.
+#
+# Shapes are chosen to land deliberately on both sides of the regime split
+# (INNER "many independent lines" vs. the long-line workspace path, which
+# is picked below `sm_count * FILL_WAVES` independent lines -- read at
+# runtime, so a handful of rows lands in the workspace regime on any real
+# datacenter GPU without hardcoding a specific SM count).
+# ---------------------------------------------------------------------------
+
+# (shape, dim) -- covers INNER many-lines, INNER workspace (few long lines),
+# OUTER many-lines and OUTER narrow, plus edge cases (single element/line/
+# column, an exact multiple of a tile size vs. one off it, and the awkward
+# 357x789 shape AGENTS.md's benchmark-harness notes ask every kernel to
+# include).
+_CUMSUM_SHAPES = [
+    ((4096, 4096), 1),  # INNER, many lines
+    ((4096, 4096), 0),  # OUTER, many lines
+    ((357, 789), 1),  # INNER, awkward extents
+    ((357, 789), 0),  # OUTER, awkward extents
+    ((1, 200_000), 1),  # INNER, workspace (one very long line)
+    ((8, 100_003), 1),  # INNER, workspace (few long lines, off-by-one)
+    ((4, 1024 * 5), 1),  # INNER, workspace, exact tile multiple
+    ((200_003, 4), 0),  # OUTER, narrow (few columns, many rows)
+    ((1, 4096), 1),  # single line
+    ((500, 1), 1),  # single column, INNER framing
+    ((1, 4096), 0),  # single row, OUTER framing
+    ((4096, 1), 0),  # single column, OUTER framing
+    ((1, 1), 1),  # single element
+    ((500, 256), 1),  # exact tile multiple (256 threads)
+    ((500, 257), 1),  # one past a tile multiple
+]
+
+
+@pytest.mark.parametrize("shape,dim", _CUMSUM_SHAPES)
+def test_fast_cumsum_shapes_match_cpu(mojo_gpu, shape, dim):
+    # Compared against a float64 reference computed from the SAME float32
+    # input, not CPU's own float32 cumsum: two float32 accumulations done in
+    # a different order (ours: one thread per line/column, strictly
+    # sequential; CPU's: whatever order aten's own reduction takes) round
+    # differently at every step and can legitimately disagree, without
+    # either being wrong -- this tolerance measures the fast kernel's OWN
+    # float32 accumulation error, the same idiom
+    # test_fast_var_split_regimes_match_cpu above uses. A random walk this
+    # long (up to 200,003 steps for the narrow-outer shape) crosses near
+    # zero somewhere, where a purely RELATIVE tolerance is meaningless (a
+    # ~1e-3 absolute difference against an expected value of 6e-4 is a
+    # "250000%" relative error despite being an entirely unremarkable fp32
+    # accumulation error at that depth) -- atol carries the bound there;
+    # rtol matters for the large-magnitude tail. Seeded for reproducibility
+    # (swept seeds 0-7 across every shape here to size this bound with
+    # margin, not picked to make one run pass).
+    torch.manual_seed(0)
+    x = torch.randn(shape)
+    result = torch.cumsum(x.to(mojo_gpu), dim=dim).cpu().double()
+    expected = torch.cumsum(x.double(), dim=dim)
+    torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-2)
+
+
+# Measured worst relative error (against an fp64 reference, moderate
+# accumulation depths up to 4096 elements -- see the PR description for the
+# full sweep): bf16 up to ~0.39%, float16 up to ~0.90% (float16's narrower
+# mantissa loses more on the OUTER kernel's longer per-thread serial
+# accumulation). 3% is roughly a 3-4x margin over that measured worst case
+# -- tightened from an ungrounded 6% bound used during kernel development
+# (the fast kernels accumulate bf16/f16 in float32 internally, matching
+# stock torch's own cumsum accumulation, so the error floor here is the
+# INPUT's bf16/f16 quantization compounding over the scan, not anything the
+# kernel design adds).
+_CUMSUM_LOWP_RTOL = 3e-2
+_CUMSUM_LOWP_ATOL = 3e-2
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize("shape,dim", [((4096, 4096), 1), ((4096, 4096), 0)])
+def test_fast_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
+    """Dtype sweep on the INNER 'many lines' and OUTER regimes."""
+    torch.manual_seed(0)
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    result = torch.cumsum(x.to(mojo_gpu), dim=dim)
+    expected = torch.cumsum(x, dim=dim)
+    assert result.dtype == expected.dtype
+    if dtype.is_floating_point:
+        torch.testing.assert_close(
+            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+        )
+    else:
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize("shape,dim", [((4, 5120), 1), ((8, 100_003), 1)])
+def test_fast_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
+    """A2 follow-up: the long-line 3-pass workspace path was only ever
+    correctness-tested in float32 before integration -- this covers
+    bf16/f16/i32/i64 through the SAME regime (few rows, so `enqueue_
+    cumsum_rows_workspace` is what actually runs, not the many-lines
+    kernel)."""
+    torch.manual_seed(0)
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    result = torch.cumsum(x.to(mojo_gpu), dim=dim)
+    expected = torch.cumsum(x, dim=dim)
+    assert result.dtype == expected.dtype
+    if dtype.is_floating_point:
+        torch.testing.assert_close(
+            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+        )
+    else:
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dim", [-1, -2])
+def test_fast_cumsum_negative_dim(mojo_gpu, dim):
+    torch.manual_seed(0)
+    x = torch.randn(64, 4096)
+    result = torch.cumsum(x.to(mojo_gpu), dim=dim).cpu().double()
+    expected = torch.cumsum(x.double(), dim=dim)
+    torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-2)
+
+
+def test_fast_cumsum_dtype_kwarg_casts_before_accumulating(mojo_gpu):
+    """torch casts the input to `dtype` first, then accumulates in it --
+    verified against stock torch directly (not just a claim): an int64
+    input with dtype=torch.float32 upcasts before scanning, and a float32
+    input with dtype=torch.int32 TRUNCATES before scanning (not the other
+    way around, i.e. not sum-then-cast)."""
+    x = torch.arange(1, 9, dtype=torch.int64).reshape(2, 4)
+    result = torch.cumsum(x.to(mojo_gpu), dim=1, dtype=torch.float32)
+    expected = torch.cumsum(x, dim=1, dtype=torch.float32)
+    assert result.dtype == torch.float32
+    torch.testing.assert_close(result.cpu(), expected)
+
+    y = torch.tensor([[1.7, 2.7, 3.7, 0.2]])
+    result = torch.cumsum(y.to(mojo_gpu), dim=1, dtype=torch.int32)
+    expected = torch.cumsum(y, dim=1, dtype=torch.int32)
+    assert result.dtype == torch.int32
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.bool])
+def test_fast_cumsum_integer_promotes_to_int64(mojo_gpu, dtype):
+    """No dtype= kwarg: torch promotes every integer/bool cumsum to int64
+    (same rule fast_aten_sum already applies) -- verified directly against
+    stock torch, not assumed. int8/int16 are NOT covered here: promoting
+    them needs a cast through `_CAST_DTYPES`, which does not include those
+    two dtypes -- a pre-existing gap `fast_aten_sum` has for the same
+    reason (verified: `torch.sum` on an int8 mojo tensor also declines),
+    not something specific to or fixed by this file."""
+    if dtype == torch.bool:
+        x = torch.randint(0, 2, (8, 16), dtype=torch.bool)
+    else:
+        x = torch.randint(0, 20, (8, 16), dtype=dtype)
+    result = torch.cumsum(x.to(mojo_gpu), dim=1)
+    expected = torch.cumsum(x, dim=1)
+    assert result.dtype == torch.int64 == expected.dtype
+    torch.testing.assert_close(result.cpu(), expected)
+
+
+def test_fast_cumsum_noncontiguous_input_materializes_correctly(mojo_gpu):
+    """A non-contiguous operand is NOT declined here: `fast_aten_cumsum`
+    materializes it (`a._contig()`) before the boundary call, same as
+    `_try_spec_unary` already did for this op pre-integration -- so the
+    result must be numerically correct, not just non-crashing."""
+    torch.manual_seed(0)
+    x = torch.randn(64, 128).t()  # transpose of a contiguous tensor
+    assert not x.is_contiguous()
+    result = torch.cumsum(x.to(mojo_gpu), dim=1).cpu().double()
+    expected = torch.cumsum(x.double(), dim=1)
+    torch.testing.assert_close(result, expected, rtol=2e-3, atol=1e-2)
+
+
+def test_fast_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
+    """rank>=3 non-trailing dims are out of this kernel family's scope and
+    must raise (eager has no graph fallback), not silently compute the
+    wrong axis."""
+    x = torch.randn(4, 5, 6).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.cumsum(x, dim=1)
+
+
+def test_fast_cumsum_new_dtype_and_dim_decline_on_non_cuda_device():
+    """dim=0 and bf16/f16 route through the new, CUDA-only fast kernels
+    (`is_cuda` gate in `fast_aten_cumsum`) -- on a non-CUDA device, the
+    `mojo:cpu` test device used here (no real GPU required, unlike AMD/Apple
+    which this repo has no way to exercise in CI), these must decline
+    exactly as they did on `main` before this file existed, not silently run
+    an unmeasured kernel. int64/int32/float32 on the trailing dim is
+    unaffected -- same portable `_parallel_for` kernel as always.
+    """
+    mojo_cpu = f"mojo:{len(get_accelerators()) - 1}"
+    x32 = torch.randn(8, 16)
+    with pytest.raises(NotImplementedError):
+        torch.cumsum(x32.to(mojo_cpu), dim=0)
+    xbf16 = torch.randn(8, 16).to(torch.bfloat16)
+    with pytest.raises(NotImplementedError):
+        torch.cumsum(xbf16.to(mojo_cpu), dim=1)
+    # The pre-existing surface still works on that same device.
+    result = torch.cumsum(x32.to(mojo_cpu), dim=1)
+    torch.testing.assert_close(result.cpu(), torch.cumsum(x32, dim=1))
+
+
 def test_fast_native_layer_norm_bf16_gpu_preserves_generic_path(mojo_gpu):
     input = torch.randn(3, 65).bfloat16()
     weight = torch.randn(65).bfloat16()
