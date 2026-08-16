@@ -719,7 +719,100 @@ TABLE_NAMES: dict[str, str] = {
 #         # The tensor-core route this needs is gated on sm_90a.
 #         "test_matches_cpu": {"nn_functional_scaled_dot_product_attention": ()},
 #     },
-_ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {}
+#
+# "cpu" is a machine with no accelerator at all -- CI's ubuntu-latest
+# runners. Kernels still run there (MAX has a CPU target), so this is a real
+# measurement, not a stub: some ops raise on this path where they would not
+# on a GPU (declared below under "test_matches_cpu"), and some
+# error_inputs_func cases that provoke a GPU-only failure mode on
+# BASE_ACCELERATOR instead run to completion here, so their base declaration
+# is overridden to the empty tuple (declared below under "test_errors_match").
+# Measured with `regenerate_known_unsupported.py -n 15 --records ...`; see
+# that script's docstring for why `--write` refuses off BASE_ACCELERATOR and
+# a delta has to be hand-derived from the printed diff instead.
+#
+# Not declared here: test_matches_cpu_stack_mojo_int64 segfaults (SIGSEGV,
+# exit 139) on this path, reproducibly and standalone. A declared entry
+# cannot excuse it -- a declared case still calls the operator and only
+# excuses an EXCEPTION it raises; a segfault never raises one, it takes the
+# whole process down before any Python `except` runs. That is a real bug in
+# the stack/cat path for int64 with no accelerator present, out of scope for
+# this table, and it will keep failing (or crashing whatever process runs
+# it, CI shard included) until fixed at the kernel level.
+_ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
+    "cpu": {
+        "test_matches_cpu": {
+            "__rpow__": ("float32", "int64"),
+            "bmm": ("float32", "int64"),
+            "floor_divide": ("bfloat16",),
+            "log_softmax": ("float32", "bfloat16", "float16"),
+            "masked_log_softmax": ("float32", "bfloat16", "float16"),
+            "native_dropout_backward": (
+                "float32",
+                "bfloat16",
+                "float16",
+                "int64",
+                "bool",
+            ),
+            "nn_functional_batch_norm": ("float32", "bfloat16", "float16"),
+            "nn_functional_conv2d": ("bfloat16", "float16", "int64"),
+            "nn_functional_instance_norm": ("float32", "bfloat16", "float16"),
+            "pow": ("float32", "int64"),
+        },
+        "test_errors_match": {
+            "_chunk_cat": (),
+            "diag_embed": (),
+            "diagonal": (),
+            "diagonal_copy": (),
+            "diff": (),
+            "dsplit": (),
+            "fft_fft": (),
+            "fft_fft2": (),
+            "fft_fftn": (),
+            "fft_hfft2": (),
+            "fft_hfftn": (),
+            "fft_ifft": (),
+            "fft_ifft2": (),
+            "fft_ifftn": (),
+            "fft_ihfft": (),
+            "fft_ihfft2": (),
+            "fft_ihfftn": (),
+            "fft_irfft2": (),
+            "fft_irfftn": (),
+            "fft_rfft": (),
+            "fft_rfft2": (),
+            "fft_rfftn": (),
+            "fliplr": (),
+            "flipud": (),
+            "hsplit": (),
+            "isclose": (),
+            "item": (),
+            "linalg_cross": (),
+            "linalg_diagonal": (),
+            "movedim": (),
+            "narrow_copy": (),
+            "nn_functional_adaptive_avg_pool1d": (),
+            "nn_functional_adaptive_avg_pool2d": (),
+            "nn_functional_adaptive_avg_pool3d": (),
+            "nn_functional_adaptive_max_pool1d": (),
+            "nn_functional_group_norm": (),
+            "nn_functional_hardtanh": (),
+            "nn_functional_hinge_embedding_loss": (),
+            "nn_functional_l1_loss": (),
+            "nn_functional_margin_ranking_loss": (),
+            "nn_functional_prelu": (),
+            "nn_functional_rms_norm": (),
+            "nn_functional_rrelu": (),
+            "nn_functional_softshrink": (),
+            "rot90": (),
+            "scatter_add": (),
+            "sum_to_size": (),
+            "uniform": (),
+            "view_copy": (),
+            "vsplit": (),
+        },
+    }
+}
 
 
 def dtype_token(dtype: torch.dtype) -> str:
