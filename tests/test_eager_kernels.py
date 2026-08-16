@@ -7493,15 +7493,21 @@ def _bf16_dense_matrix_pair(generator, shape, transposed, offset, mojo_h100):
     return host, device
 
 
-def _bf16_dense_batched_pair(generator, shape, transposed, gap, offset, mojo_h100):
-    """Create stored-BF16 dense matrices separated by runtime batch padding."""
+def _bf16_dense_batched_pair(
+    generator, shape, transposed, gap, offset, mojo_h100, dtype=torch.bfloat16
+):
+    """Create stored 16-bit dense matrices separated by a runtime batch
+    stride. ``gap`` > 0 pads consecutive batch items apart, i.e. a
+    non-contiguous (non-packed) batch stride rather than ``rows * cols``.
+    ``dtype`` defaults to bfloat16; pass ``torch.float16`` for the other
+    16-bit route."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
     batch, rows, cols = shape
     matrix_elements = rows * cols
     batch_stride = matrix_elements + gap
     storage_elements = offset + (batch - 1) * batch_stride + matrix_elements + 4
-    storage = torch.randn(storage_elements, generator=generator).to(torch.bfloat16)
+    storage = torch.randn(storage_elements, generator=generator).to(dtype)
     strides = (batch_stride, 1, rows) if transposed else (batch_stride, cols, 1)
     host = torch.as_strided(storage, shape, strides, offset)
     device = aten_fast._view_of(storage.to(mojo_h100), shape, strides, offset)
@@ -7511,6 +7517,14 @@ def _bf16_dense_batched_pair(generator, shape, transposed, gap, offset, mojo_h10
 def _assert_bf16_fp32_accumulation_close(actual, expected):
     """Compare BF16 outputs after an explicit one-round FP32 oracle."""
     assert actual.dtype == expected.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.02)
+
+
+def _assert_gemm16_fp32_accumulation_close(actual, expected, dtype):
+    """Compare 16-bit (bf16 or f16) GEMM outputs after a one-round FP32
+    oracle. f16 has one more mantissa bit than bf16, so the bound
+    ``_assert_bf16_fp32_accumulation_close`` uses stays safe for it too."""
+    assert actual.dtype == expected.dtype == dtype
     torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.02)
 
 
@@ -7803,6 +7817,62 @@ def test_bf16_real_bmm_extension_handles_all_layouts_offsets_and_padded_batches(
         actual = torch.bmm(mojo_lhs, mojo_rhs)
 
     _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
+
+
+# ---------------------------------------------------------------------------
+# Batched TN wgmma route: TN previously had no batched tensor-core kernel at
+# all (see enqueue_gemm16_bmm's module comment) and fell all the way back to
+# the pre-wgmma accepted-v2 kernel that also serves NN/NT/TT above -- the
+# worst-served of the four there. It now loops the mm-level TN wgmma ladder
+# (_try_enqueue_gemm16_tn_route) once per batch item instead. The three
+# aligned shapes below were profiler-verified (CUPTI on H100) to land on the
+# v3 small-tile, v3 large-tile, and v4 split-K TN routes respectively; the
+# awkward shape stays on today's accepted-v2 kernel, unchanged. NN/NT/TT are
+# included at the same shapes to pin that their dispatch (and thus their
+# performance) is untouched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "batch"),
+    [
+        (128, 256, 256, 3),  # v3 TN small-tile occupancy regime
+        (1152, 1024, 64, 2),  # v3 TN large-tile occupancy regime
+        (128, 256, 4096, 2),  # v4 TN split-K (deep-K, underfilled output)
+        (357, 789, 333, 5),  # awkward/odd dims: every wgmma route declines
+    ],
+    ids=["tn_small_tile", "tn_large_tile", "tn_splitk", "awkward_odd_dims"],
+)
+@pytest.mark.parametrize("layout", ["NN", "NT", "TN", "TT"])
+def test_bf16_real_bmm_batched_tn_wgmma_route(
+    mojo_h100, monkeypatch, layout, m, n, k, batch, dtype
+):
+    """The strided-batch TN loop matches every other BMM layout's
+    correctness at wgmma-triggering scale, batch > 1, non-contiguous
+    (padded, not back-to-back) batch strides, and both 16-bit dtypes."""
+    _require_real_bf16_gemm_sources()
+    from torch_mojo_backend.eager_kernels import aten_fast
+
+    lhs_transposed = layout[0] == "T"
+    rhs_transposed = layout[1] == "T"
+    generator = torch.Generator().manual_seed(20260816)
+    lhs, mojo_lhs = _bf16_dense_batched_pair(
+        generator, (batch, m, k), lhs_transposed, 5, 1, mojo_h100, dtype
+    )
+    rhs, mojo_rhs = _bf16_dense_batched_pair(
+        generator, (batch, k, n), rhs_transposed, 7, 2, mojo_h100, dtype
+    )
+    expected = torch.bmm(lhs.float(), rhs.float()).to(dtype)
+
+    def fail_later_route(*_args, **_kwargs):
+        raise AssertionError("eligible 16-bit BMM reached TF32 or TensorSpec")
+
+    monkeypatch.setattr(aten_fast, "_try_tf32_bmm", fail_later_route)
+    monkeypatch.setattr(aten_fast, "_try_spec_matmul", fail_later_route)
+    actual = torch.bmm(mojo_lhs, mojo_rhs)
+
+    _assert_gemm16_fp32_accumulation_close(actual.cpu(), expected, dtype)
 
 
 def test_bf16_real_linear_forward_backward_uses_three_gemm_routes(
