@@ -73,6 +73,9 @@ from torch_mojo_backend.eager_kernels.normalization_forward_ops import (
 from torch_mojo_backend.eager_kernels.optimizer_ops import (
     OptimizerExtension as _OptimizerExtension,
 )
+from torch_mojo_backend.eager_kernels.random_ops import (
+    RandomExtension as _RandomExtension,
+)
 from torch_mojo_backend.eager_kernels.reduction_ops import (
     ReductionExtension as _ReductionExtension,
 )
@@ -332,16 +335,23 @@ _ARG_DIRECT_MIN_INNER = 16
 _FUSED_ADAMW_RECORD_FIELDS = 7
 _FOREACH_CHUNK_ELEMENTS = 65_536
 _FOREACH_NORM_RECORD_FIELDS = 3
-_FOREACH_MUL_RECORD_FIELDS = 2
-_FOREACH_ADD_RECORD_FIELDS = 2
 
-# Opcodes of the batched foreach elementwise bridge (must match
-# foreach_elementwise_kernels.mojo).
-_FOREACH_EW_MUL = 0
-_FOREACH_EW_ADD = 1
-_FOREACH_EW_DIV = 2
-_FOREACH_EW_ADDCMUL = 0
-_FOREACH_EW_ADDCDIV = 1
+# Entry names of the batched foreach elementwise family. Each is one
+# specialized build of the single kernel body in foreach_batched_kernels.mojo,
+# so this list is also the list of ops that body serves.
+_FOREACH_MUL = "ForeachMul"
+_FOREACH_ADD = "ForeachAdd"
+_FOREACH_DIV = "ForeachDiv"
+_FOREACH_MUL_TENSOR = "ForeachMulTensor"
+_FOREACH_LERP = "ForeachLerp"
+_FOREACH_ADDCMUL = "ForeachAddcmul"
+_FOREACH_ADDCDIV = "ForeachAddcdiv"
+_FOREACH_SQRT = "ForeachSqrt"
+
+# Dtypes of a list whose sequential per-tensor kernel already computes in FP32
+# and narrows back (`elementwise_ops._scalar_elementwise`), so one batched
+# launch over the concatenation is bit-identical to it.
+_FOREACH_WIDENING_DTYPES = _FLOAT_DTYPES
 
 # ATen Scalar arguments as they arrive at a PrivateUse1 registration.
 AtenScalar = int | float | bool | complex
@@ -632,111 +642,6 @@ def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
     return "partial"
 
 
-def _fast__foreach_add__scalar_generic(self, scalar):
-    """One launch for `t += scalar` over a whole homogeneous float tensor list.
-
-    Without this ATen runs the CompositeExplicitAutograd fallback, a sequential
-    `add_.Scalar` per element of the list. nanoGPT's fused AdamW bumps 75
-    one-element step counters per step, so that is 75 launches to add 75 floats.
-    Anything this cannot serve -- a mixed dtype, a non-float dtype, a strided
-    tensor, a list whose members alias -- returns ``NOT_HANDLED`` and keeps that
-    fallback, which is also what defines the semantics being matched.
-    """
-    if len(self) == 0:
-        return NOT_HANDLED
-    if isinstance(scalar, bool) or not isinstance(scalar, int | float):
-        return NOT_HANDLED
-    tensors = [_t(tensor) for tensor in self]
-    if any(tensor is None for tensor in tensors):
-        return NOT_HANDLED
-    device = tensors[0]._device
-    dtype = tensors[0]._dtype
-    if (
-        device.api == "cpu"
-        or dtype not in _FLOAT_DTYPES
-        or any(
-            tensor._device != device
-            or tensor._dtype != dtype
-            or not tensor._is_contiguous
-            for tensor in tensors
-        )
-        # Duplicated or aliasing entries have to be applied once each, in
-        # order; one grid over the concatenation would race instead.
-        or _foreach_tensors_overlap(tensors)
-    ):
-        return NOT_HANDLED
-
-    metadata = tuple(
-        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
-    )
-    if len(metadata) != len(tensors) * _FOREACH_ADD_RECORD_FIELDS:
-        raise AssertionError("invalid foreach add metadata packing")
-    _call_mojo(
-        _ElementwiseExtension,
-        "ForeachAddScalar",
-        (metadata, float(scalar), dtype.value, _ctx_ptr(device)),
-        arg_dtypes=(dtype,),
-        output_dtypes=(dtype,),
-        flags={"INPLACE": True},
-        keepalive=(tensors,),
-    )
-    return None
-
-
-def fast_aten__foreach_mul__tensor(self, other):
-    """Fast homogeneous FP32 in-place multiply by a device scalar tensor."""
-    if len(self) == 0:
-        raise RuntimeError("Tensor list must have at least one tensor.")
-    scalar = _t(other)
-    tensors = [_t(tensor) for tensor in self]
-    if scalar is None or any(tensor is None for tensor in tensors):
-        return NOT_HANDLED
-    device = tensors[0]._device
-    if scalar._shape == ():
-        overlap_kinds = [
-            _foreach_scalar_overlap_kind(tensor, scalar) for tensor in tensors
-        ]
-        if "partial" in overlap_kinds:
-            raise RuntimeError(
-                "unsupported operation: some elements of the input tensor and "
-                "the written-to tensor refer to a single memory location. "
-                "Please clone() the tensor before performing the operation."
-            )
-        if "full" in overlap_kinds:
-            return NOT_HANDLED
-    if (
-        device.api == "cpu"
-        or scalar._device != device
-        or scalar._dtype != DType.float32
-        or scalar._shape != ()
-        or not scalar._is_contiguous
-        or any(
-            tensor._device != device
-            or tensor._dtype != DType.float32
-            or not tensor._is_contiguous
-            for tensor in tensors
-        )
-        or _foreach_tensors_overlap(tensors)
-    ):
-        return NOT_HANDLED
-
-    metadata = tuple(
-        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
-    )
-    if len(metadata) != len(tensors) * _FOREACH_MUL_RECORD_FIELDS:
-        raise AssertionError("invalid foreach multiply metadata packing")
-    _call_mojo(
-        _OptimizerExtension,
-        "ForeachMulTensor",
-        (metadata, scalar._ptr, _ctx_ptr(device)),
-        arg_dtypes=(DType.float32, DType.float32),
-        output_dtypes=(DType.float32,),
-        flags={"INPLACE": True},
-        keepalive=(scalar,),
-    )
-    return None
-
-
 def _foreach_scalar_value(scalar: AtenScalar) -> float | None:
     """A python float for an ATen Scalar, or None when it disqualifies."""
     if isinstance(scalar, bool) or not isinstance(scalar, int | float):
@@ -758,15 +663,21 @@ def _foreach_scalar_values(
     return values
 
 
-def _foreach_metal_f32(
-    *lists: Sequence[torch.Tensor],
-) -> list[list[TorchMojoTensor]] | None:
-    """Unwrap parallel TensorLists for the batched Metal foreach kernels.
+def _foreach_lists(
+    *lists: Sequence[torch.Tensor], dtypes: tuple[DType, ...] = (DType.float32,)
+) -> tuple[list[list[TorchMojoTensor]], DType] | None:
+    """Unwrap parallel TensorLists for the batched foreach kernels.
 
-    Qualifies only homogeneous lists: every entry a contiguous float32
-    TorchMojoTensor on one shared Metal device, with corresponding entries
-    of all lists shaped identically (the batched kernels are elementwise
-    and never broadcast). Returns None otherwise so callers fall back.
+    Qualifies only homogeneous lists: every entry a contiguous
+    TorchMojoTensor of one accepted dtype on one shared accelerator, with
+    corresponding entries of all lists shaped identically (the batched
+    kernels are elementwise and never broadcast). Returns None otherwise, so
+    the caller falls back to ATen's sequential per-tensor decomposition --
+    which is also what defines the semantics being matched.
+
+    Apple GPUs reach the fixed-arity Metal kernels inside the Mojo bridge
+    (`foreach_batched_kernels`), which exist for float32 only, so anything
+    else there falls back too.
     """
     count = len(lists[0])
     if count == 0:
@@ -783,18 +694,21 @@ def _foreach_metal_f32(
             wrapped.append(mojo_tensor)
         unwrapped.append(wrapped)
     device = unwrapped[0][0]._device
-    if device.api != "metal":
+    dtype = unwrapped[0][0]._dtype
+    if device.api == "cpu" or dtype not in dtypes:
+        return None
+    if device.api == "metal" and dtype != DType.float32:
         return None
     for tensors in unwrapped:
         for index, tensor in enumerate(tensors):
             if (
                 tensor._device != device
-                or tensor._dtype != DType.float32
+                or tensor._dtype != dtype
                 or not tensor._is_contiguous
                 or tensor._shape != unwrapped[0][index]._shape
             ):
                 return None
-    return unwrapped
+    return unwrapped, dtype
 
 
 def _foreach_mutation_hazard(
@@ -840,70 +754,134 @@ def _foreach_mutation_hazard(
     return False
 
 
-def _foreach_scalar_inplace(
-    self: Sequence[torch.Tensor], values: Sequence[float], op_code: int
-) -> object:
-    """Shared launch path of the in-place foreach mul/add/div fast ops."""
-    lists = _foreach_metal_f32(self)
-    if lists is None:
-        return NOT_HANDLED
-    (tensors,) = lists
-    if _foreach_mutation_hazard(tensors, ()):
-        return NOT_HANDLED
+def _foreach_launch(
+    entry: str,
+    lists: Sequence[Sequence[TorchMojoTensor]],
+    dtype: DType,
+    *,
+    scalars: Sequence[float] = (),
+    aux: tuple[int, ...] = (),
+    keepalive: tuple[object, ...] = (),
+) -> None:
+    """One launch of the batched foreach family for a whole TensorList.
+
+    `lists` are the parallel operand lists in the order the Mojo bridge
+    expects them (the mutated list first; for sqrt, input then output). They
+    are flattened into one metadata tuple of `addresses..., numel` per
+    tensor. `scalars` is one host scalar per tensor where the op takes one,
+    and `aux` carries the remaining integers (a device scalar's address, a
+    branch selector).
+    """
+    device = lists[0][0]._device
     metadata = tuple(
-        value for tensor in tensors for value in (tensor._ptr, tensor._numel)
+        value
+        for operands in zip(*lists, strict=True)
+        for value in (*(tensor._ptr for tensor in operands), operands[0]._numel)
     )
     _call_mojo(
         _OptimizerExtension,
-        "ForeachScalarOp",
-        (op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)),
-        arg_dtypes=(DType.float32,),
-        output_dtypes=(DType.float32,),
-        flags={"INPLACE": True, "OP_CODE": op_code},
-        keepalive=(tensors,),
+        entry,
+        (metadata, tuple(scalars), aux, dtype.value, _ctx_ptr(device)),
+        arg_dtypes=(dtype,) * len(lists),
+        output_dtypes=(dtype,),
+        keepalive=(*(list(tensors) for tensors in lists), *keepalive),
     )
+
+
+def fast_aten__foreach_mul__tensor(self, other):
+    """Batched in-place multiply of a whole list by one 0-d device tensor."""
+    if len(self) == 0:
+        raise RuntimeError("Tensor list must have at least one tensor.")
+    scalar = _t(other)
+    if scalar is None or scalar._shape != () or not scalar._is_contiguous:
+        return NOT_HANDLED
+    tensors = [_t(tensor) for tensor in self]
+    if any(tensor is None for tensor in tensors):
+        return NOT_HANDLED
+    overlap_kinds = [_foreach_scalar_overlap_kind(tensor, scalar) for tensor in tensors]
+    if "partial" in overlap_kinds:
+        raise RuntimeError(
+            "unsupported operation: some elements of the input tensor and "
+            "the written-to tensor refer to a single memory location. "
+            "Please clone() the tensor before performing the operation."
+        )
+    if "full" in overlap_kinds:
+        return NOT_HANDLED
+    unwrapped = _foreach_lists(self)
+    if unwrapped is None:
+        return NOT_HANDLED
+    lists, dtype = unwrapped
+    if scalar._device != lists[0][0]._device or scalar._dtype != dtype:
+        return NOT_HANDLED
+    if _foreach_mutation_hazard(lists[0], ()):
+        return NOT_HANDLED
+    _foreach_launch(
+        _FOREACH_MUL_TENSOR, lists, dtype, aux=(scalar._ptr,), keepalive=(scalar,)
+    )
+    return None
+
+
+def _foreach_scalar_inplace(
+    entry: str,
+    self: Sequence[torch.Tensor],
+    values: Sequence[float],
+    dtypes: tuple[DType, ...] = (DType.float32,),
+) -> object:
+    """Shared launch path of the in-place foreach mul/add/div fast ops."""
+    unwrapped = _foreach_lists(self, dtypes=dtypes)
+    if unwrapped is None:
+        return NOT_HANDLED
+    lists, dtype = unwrapped
+    if _foreach_mutation_hazard(lists[0], ()):
+        return NOT_HANDLED
+    _foreach_launch(entry, lists, dtype, scalars=values)
     return None
 
 
 def fast_aten__foreach_mul__scalar(
     self: Sequence[torch.Tensor], scalar: AtenScalar
 ) -> object:
-    """Batched homogeneous FP32 in-place multiply by one host scalar."""
+    """Batched homogeneous in-place multiply by one host scalar."""
     value = _foreach_scalar_value(scalar)
     if value is None:
         return NOT_HANDLED
-    return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_MUL)
-
-
-def _fast__foreach_add__scalar_metal(
-    self: Sequence[torch.Tensor], scalar: AtenScalar
-) -> object:
-    """Batched homogeneous FP32 in-place add of one host scalar."""
-    value = _foreach_scalar_value(scalar)
-    if value is None:
-        return NOT_HANDLED
-    return _foreach_scalar_inplace(self, [value] * len(self), _FOREACH_EW_ADD)
+    return _foreach_scalar_inplace(
+        _FOREACH_MUL, self, [value] * len(self), _FOREACH_WIDENING_DTYPES
+    )
 
 
 def fast_aten__foreach_add__scalar(
     self: Sequence[torch.Tensor], scalar: AtenScalar
 ) -> object:
-    """Batched in-place `t += scalar`: Metal 8-slot path first, then the
-    generic single-launch path (measured on gfx942), else NOT_HANDLED."""
-    result = _fast__foreach_add__scalar_metal(self, scalar)
-    if result is NOT_HANDLED:
-        result = _fast__foreach_add__scalar_generic(self, scalar)
-    return result
+    """Batched homogeneous in-place add of one host scalar.
+
+    Without this ATen runs the CompositeExplicitAutograd fallback, a
+    sequential `add_.Scalar` per element of the list: nanoGPT's fused AdamW
+    bumps 75 one-element step counters per step and would pay 75 launches to
+    add 75 floats.
+    """
+    value = _foreach_scalar_value(scalar)
+    if value is None:
+        return NOT_HANDLED
+    return _foreach_scalar_inplace(
+        _FOREACH_ADD, self, [value] * len(self), _FOREACH_WIDENING_DTYPES
+    )
 
 
 def fast_aten__foreach_div__scalarlist(
     self: Sequence[torch.Tensor], scalars: Sequence[AtenScalar]
 ) -> object:
-    """Batched homogeneous FP32 in-place divide by one scalar per tensor."""
+    """Batched homogeneous FP32 in-place divide by one scalar per tensor.
+
+    FP32 only, unlike mul/add: the per-tensor `div_.Scalar` this replaces
+    divides in the operand dtype (`logic_ops._bin_vec_op`), so widening a
+    half/bfloat16 list to FP32 here would not be the bit-identical result the
+    fallback produces.
+    """
     values = _foreach_scalar_values(scalars, len(self))
     if values is None:
         return NOT_HANDLED
-    return _foreach_scalar_inplace(self, values, _FOREACH_EW_DIV)
+    return _foreach_scalar_inplace(_FOREACH_DIV, self, values)
 
 
 def fast_aten__foreach_lerp__scalar(
@@ -917,11 +895,11 @@ def fast_aten__foreach_lerp__scalar(
     """
     if isinstance(weight, bool) or not isinstance(weight, int | float):
         return NOT_HANDLED
-    lists = _foreach_metal_f32(self, tensors1)
-    if lists is None:
+    unwrapped = _foreach_lists(self, tensors1)
+    if unwrapped is None:
         return NOT_HANDLED
-    tensors, ends = lists
-    if _foreach_mutation_hazard(tensors, (ends,)):
+    lists, dtype = unwrapped
+    if _foreach_mutation_hazard(lists[0], (lists[1],)):
         return NOT_HANDLED
     try:
         narrowed_weight = struct.unpack("=f", struct.pack("=f", weight))[0]
@@ -930,57 +908,31 @@ def fast_aten__foreach_lerp__scalar(
             "value cannot be converted to type float without overflow"
         ) from exc
     one_minus_weight = struct.unpack("=f", struct.pack("=f", 1.0 - narrowed_weight))[0]
-    metadata = tuple(
-        value
-        for tensor, end in zip(tensors, ends, strict=True)
-        for value in (tensor._ptr, end._ptr, tensor._numel)
-    )
-    _call_mojo(
-        _OptimizerExtension,
-        "ForeachLerpScalar",
-        (
-            metadata,
-            narrowed_weight,
-            one_minus_weight,
-            int(abs(narrowed_weight) < 0.5),
-            _ctx_ptr(tensors[0]._device),
-        ),
-        arg_dtypes=(DType.float32, DType.float32),
-        output_dtypes=(DType.float32,),
-        flags={"INPLACE": True, "SMALL_WEIGHT": abs(narrowed_weight) < 0.5},
-        keepalive=(tensors, ends),
+    _foreach_launch(
+        _FOREACH_LERP,
+        lists,
+        dtype,
+        scalars=(narrowed_weight, one_minus_weight),
+        aux=(int(abs(narrowed_weight) < 0.5),),
     )
     return None
 
 
 def _foreach_addc_inplace(
+    entry: str,
     self: Sequence[torch.Tensor],
     tensor1: Sequence[torch.Tensor],
     tensor2: Sequence[torch.Tensor],
     values: Sequence[float],
-    op_code: int,
 ) -> object:
     """Shared launch path of the in-place foreach addcmul/addcdiv fast ops."""
-    lists = _foreach_metal_f32(self, tensor1, tensor2)
-    if lists is None:
+    unwrapped = _foreach_lists(self, tensor1, tensor2)
+    if unwrapped is None:
         return NOT_HANDLED
-    tensors, firsts, seconds = lists
-    if _foreach_mutation_hazard(tensors, (firsts, seconds)):
+    lists, dtype = unwrapped
+    if _foreach_mutation_hazard(lists[0], (lists[1], lists[2])):
         return NOT_HANDLED
-    metadata = tuple(
-        value
-        for tensor, first, second in zip(tensors, firsts, seconds, strict=True)
-        for value in (tensor._ptr, first._ptr, second._ptr, tensor._numel)
-    )
-    _call_mojo(
-        _OptimizerExtension,
-        "ForeachAddcOp",
-        (op_code, metadata, tuple(values), _ctx_ptr(tensors[0]._device)),
-        arg_dtypes=(DType.float32, DType.float32, DType.float32),
-        output_dtypes=(DType.float32,),
-        flags={"INPLACE": True, "OP_CODE": op_code},
-        keepalive=(tensors, firsts, seconds),
-    )
+    _foreach_launch(entry, lists, dtype, scalars=values)
     return None
 
 
@@ -995,7 +947,7 @@ def fast_aten__foreach_addcmul__scalar(
     if scalar is None:
         return NOT_HANDLED
     return _foreach_addc_inplace(
-        self, tensor1, tensor2, [scalar] * len(self), _FOREACH_EW_ADDCMUL
+        _FOREACH_ADDCMUL, self, tensor1, tensor2, [scalar] * len(self)
     )
 
 
@@ -1009,31 +961,17 @@ def fast_aten__foreach_addcdiv__scalarlist(
     values = _foreach_scalar_values(scalars, len(self))
     if values is None:
         return NOT_HANDLED
-    return _foreach_addc_inplace(self, tensor1, tensor2, values, _FOREACH_EW_ADDCDIV)
+    return _foreach_addc_inplace(_FOREACH_ADDCDIV, self, tensor1, tensor2, values)
 
 
 def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
     """Batched homogeneous FP32 out-of-place elementwise square roots."""
-    lists = _foreach_metal_f32(self)
-    if lists is None:
+    unwrapped = _foreach_lists(self)
+    if unwrapped is None:
         return NOT_HANDLED
-    (tensors,) = lists
-    outputs = [
-        _alloc(tensor._shape, DType.float32, tensor._device) for tensor in tensors
-    ]
-    metadata = tuple(
-        value
-        for tensor, output in zip(tensors, outputs, strict=True)
-        for value in (tensor._ptr, output._ptr, tensor._numel)
-    )
-    _call_mojo(
-        _OptimizerExtension,
-        "ForeachSqrt",
-        (metadata, _ctx_ptr(tensors[0]._device)),
-        arg_dtypes=(DType.float32,),
-        output_dtypes=(DType.float32,),
-        keepalive=(tensors, outputs),
-    )
+    (tensors,), dtype = unwrapped
+    outputs = [_alloc(tensor._shape, dtype, tensor._device) for tensor in tensors]
+    _foreach_launch(_FOREACH_SQRT, (tensors, outputs), dtype)
     return outputs
 
 
@@ -4714,6 +4652,141 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
             keepalive=(grad_input, grad, keep),
         )
     return grad_input
+
+
+# Dtypes `aten::uniform_` is defined for, minus complex (unsupported
+# device-wide): ATen dispatches it over the floating-point types plus the two
+# 16-bit floats (`uniform_impl_` in aten/src/ATen/native/DistributionTemplates.h).
+_UNIFORM_DTYPES = _FLOAT_DTYPES + (DType.float64,)
+
+# ATen bounds-checks both endpoints against the OUTPUT dtype's representable
+# range before it draws anything (`check_uniform_bounds`), so the limits are
+# per dtype and come from torch itself rather than a table of ours.
+_UNIFORM_LIMITS = {
+    dtype: (torch.finfo(torch_dtype).min, torch.finfo(torch_dtype).max, name)
+    for dtype, torch_dtype, name in (
+        (DType.float32, torch.float32, "float32"),
+        (DType.float16, torch.float16, "float16"),
+        (DType.bfloat16, torch.bfloat16, "bfloat16"),
+        (DType.float64, torch.float64, "float64"),
+    )
+}
+
+
+def _uniform_number(value: float) -> str:
+    """A float the way ATen's error messages print it (`3`, not `3.0`)."""
+    return f"{value:g}"
+
+
+def fast_aten_uniform_(
+    self: TorchMojoTensor,
+    from_: float = 0.0,
+    to: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> object:
+    """In-place `uniform_` generated ON THE DEVICE, from the device's own
+    Philox stream.
+
+    Nothing round-trips through the host: `_reserve_philox_state` reserves the
+    exact counter interval this call will consume (one counter per Philox
+    group, `ceil(numel * words_per_element / 4)` of them) without reading a
+    tensor or synchronizing the queue, and the kernel derives every value from
+    `(seed, base_offset, index)` alone. So the draw is asynchronous like any
+    other kernel, `torch.mojo.manual_seed_all` reproduces it, and
+    `get_rng_state` / `set_rng_state` checkpoint it -- which is the whole
+    reason for generating on the device rather than staging a host draw
+    across.
+
+    Only the device's DEFAULT generator is supported. That is not a shortcut:
+    a `torch.Generator(device="mojo")` cannot be built from pure Python at all
+    (pytorch e337bdbd435, 2026-08-14 -- `torch/csrc/acc/Module.cpp`'s
+    `PythonHooks::getNewGenerator` has no `PYBIND11_OVERRIDE` and the pybind
+    class does not bind it, carrying a standing "TODO(qihqi): these is not
+    supported from python yet"), and the only alternative,
+    `REGISTER_GENERATOR_PRIVATEUSE1`, needs a compiled C++ extension -- which
+    this backend deliberately does not have -- and is itself marked
+    "TODO(FFFrog): Preserved for BC and will be removed in the future" in
+    `aten/src/ATen/detail/PrivateUse1HooksInterface.h`. So an explicit
+    generator is refused rather than silently ignored.
+    """
+    if self._dtype not in _UNIFORM_DTYPES:
+        return NOT_HANDLED
+    if self._dtype == DType.float64 and self._device.api == "metal":
+        return NOT_HANDLED
+    if not isinstance(from_, int | float) or not isinstance(to, int | float):
+        return NOT_HANDLED
+    from_ = float(from_)
+    to = float(to)
+
+    # ATen's own checks, in ATen's order, so a malformed call is rejected the
+    # same way here (DistributionTemplates.h, `uniform_impl_`). The clamp that
+    # follows them upstream cannot change a value these checks accepted, so it
+    # is not repeated.
+    lowest, highest, dtype_name = _UNIFORM_LIMITS[self._dtype]
+    for value, name in ((from_, "from"), (to, "to")):
+        if not (value >= lowest and value <= highest):
+            raise RuntimeError(f"{name} is out of bounds for {dtype_name}")
+    if not from_ <= to:
+        raise RuntimeError(
+            "uniform_ expects to return a [from, to) range, but found from="
+            f"{_uniform_number(from_)} > to={_uniform_number(to)}"
+        )
+    if not (to - from_) <= highest:
+        raise RuntimeError(
+            f"uniform_ expects to-from <= std::numeric_limits<{dtype_name}>"
+            f"::max(), but found to={_uniform_number(to)} and from="
+            f"{_uniform_number(from_)} which result in to-from to exceed the "
+            "limit"
+        )
+    if generator is not None:
+        raise NotImplementedError(
+            "aten::uniform_ on the mojo device draws from the device's default "
+            "generator; an explicit generator= is not supported (a "
+            'torch.Generator(device="mojo") cannot be constructed from Python '
+            "in the first place). Seed the device generator instead: "
+            "torch.mojo.manual_seed_all(seed), or torch.manual_seed(seed), "
+            "and checkpoint it with torch.mojo.get_rng_state() / "
+            "torch.mojo.set_rng_state(state)."
+        )
+    if self._numel == 0:
+        return self
+
+    # A strided destination is generated into fresh contiguous storage and
+    # copied back through the ordinary strided copy: the values a tensor
+    # receives then depend only on its logical (row-major) index, never on its
+    # layout, which is what keeps a draw reproducible across views.
+    target = (
+        self if self._is_contiguous else _alloc(self._shape, self._dtype, self._device)
+    )
+    # float64 needs 53 mantissa bits, i.e. two of Philox's four 32-bit words
+    # per element; every other dtype takes one word (uniform_kernels.mojo).
+    words = 2 if self._dtype == DType.float64 else 1
+    seed, base_offset = _reserve_philox_state(
+        self._torch_device, (self._numel * words + 3) // 4
+    )
+    word_mask = (1 << 32) - 1
+    _call_mojo(
+        _RandomExtension,
+        "UniformFill",
+        (
+            target._ptr,
+            from_,
+            to,
+            target._numel,
+            target._dtype.value,
+            seed & word_mask,
+            (seed >> 32) & word_mask,
+            base_offset & word_mask,
+            (base_offset >> 32) & word_mask,
+            _ctx_ptr(target._device),
+        ),
+        arg_dtypes=(),
+        output_dtypes=(target._dtype,),
+        keepalive=(target,),
+    )
+    if target is not self:
+        _copy_into(self, target)
+    return self
 
 
 def _layer_norm_stats_to_input_dtype(

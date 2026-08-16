@@ -531,6 +531,106 @@ _FOREACH_BATCHED_OPS = [
 ]
 
 
+def _misaligned_foreach_lists(
+    device: str, *, stagger: bool = False
+) -> list[list[torch.Tensor]]:
+    """The same three lists, but every tensor an offset view.
+
+    A device allocation is 16-byte aligned, so a misaligned base can only come
+    from a contiguous OFFSET view -- which the fast path accepts and the
+    batched kernel therefore has to handle: each chunk peels up to three
+    elements to reach a 16-byte boundary before its vectorized body, and no
+    length here is a multiple of the four-element vector step, so every last
+    chunk also ends in a scalar tail.
+
+    With `stagger` the parallel lists start at DIFFERENT residues, which no
+    single peel can align: the kernel has to fall back to its scalar path for
+    the multi-operand ops (lerp, addcmul, addcdiv).
+    """
+    lengths = (1, 6, 17, 4099, 65_539)
+    shifts = [index % 3 + 1 for index in range(len(lengths))]
+
+    def group(
+        scale: float, base: float, bump: int, positive: bool = False
+    ) -> list[torch.Tensor]:
+        tensors = []
+        for index, length in enumerate(lengths):
+            shift = shifts[index] + bump
+            whole = (
+                torch.arange(length + shift, dtype=torch.float32)
+                .mul(scale)
+                .add(base + index * 0.01)
+            )
+            if positive:
+                whole = whole.abs().add(0.5)
+            # Slice AFTER the arithmetic: every operation would otherwise
+            # allocate a fresh, 16-byte-aligned result and lose the offset
+            # this fixture exists to produce.
+            tensors.append(whole.to(device)[shift:])
+        return tensors
+
+    return [
+        group(0.003, -0.4, 0),
+        group(-0.0007, 0.3, 1 if stagger else 0),
+        group(0.0002, 0.55, 2 if stagger else 0, positive=True),
+    ]
+
+
+@pytest.mark.parametrize("stagger", (False, True), ids=["aligned", "staggered"])
+@pytest.mark.parametrize(("op_name", "apply"), _FOREACH_BATCHED_OPS)
+def test_batched_foreach_misaligned_views_match_cpu(
+    mojo_gpu: str, call_checker: CallChecker, op_name: str, apply, stagger: bool
+):
+    """Offset views, awkward lengths, and mismatched operand alignments."""
+    _watch_eager_op(call_checker, op_name)
+    cpu_lists = _misaligned_foreach_lists("cpu", stagger=stagger)
+    mojo_lists = _misaligned_foreach_lists(mojo_gpu, stagger=stagger)
+    assert any(tensor._ptr % 16 for tensor in mojo_lists[0])
+    apply(*cpu_lists)
+    apply(*mojo_lists)
+    for expected, actual in zip(cpu_lists[0], mojo_lists[0], strict=True):
+        torch.testing.assert_close(actual.cpu(), expected, rtol=2e-6, atol=2e-7)
+
+
+def test_batched_foreach_mixed_dtype_list_falls_back(
+    mojo_gpu: str, call_checker: CallChecker
+):
+    """A two-dtype list is not one launch, and still gets ATen's answer.
+
+    One batched launch is compiled for exactly one dtype, so a mixed list has
+    to reach the sequential per-tensor decomposition instead.
+    """
+    _watch_eager_op(call_checker, "aten::_foreach_mul_.Scalar")
+    mixed = [
+        torch.tensor([1.5, -2.0]).to(mojo_gpu),
+        torch.tensor([1.5, -2.0], dtype=torch.bfloat16).to(mojo_gpu),
+    ]
+    torch._foreach_mul_(mixed, 2.0)
+    torch.testing.assert_close(
+        mixed[0].cpu(), torch.tensor([3.0, -4.0]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        mixed[1].cpu(), torch.tensor([3.0, -4.0], dtype=torch.bfloat16), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
+def test_batched_foreach_mul_scalar_reduced_precision(mojo_gpu: str, dtype):
+    """Half and bfloat16 lists take the batched path and widen like ATen.
+
+    The per-tensor `mul_.Scalar` this replaces computes in FP32 and narrows
+    once, so the batched launch has to land on the same bits -- not merely
+    close.
+    """
+    host = [torch.linspace(-3.0, 4.0, length).to(dtype) for length in (7, 65_539, 1)]
+    device = [tensor.to(mojo_gpu) for tensor in host]
+    torch._foreach_mul_(device, 0.998)
+    for expected, actual in zip(host, device, strict=True):
+        torch.testing.assert_close(
+            actual.cpu(), (expected.float() * 0.998).to(dtype), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize(("op_name", "apply"), _FOREACH_BATCHED_OPS)
 def test_batched_foreach_elementwise_matches_cpu(
     mojo_gpu: str, call_checker: CallChecker, op_name: str, apply
@@ -573,6 +673,23 @@ def test_batched_foreach_sqrt_matches_cpu(mojo_gpu: str, call_checker: CallCheck
     for original, actual_out in zip(mojo_inputs, actual, strict=True):
         if original.numel() > 0:
             assert actual_out._ptr != original._ptr
+
+
+def test_batched_foreach_sqrt_misaligned_input_matches_cpu(mojo_gpu: str):
+    """Offset-view inputs, freshly aligned outputs: no peel can align both.
+
+    Every other member of the family writes where it reads, so this is the one
+    op whose operands can disagree on alignment in ordinary use, and the
+    element-at-a-time route the kernel then takes has to be exact too.
+    """
+    cpu_inputs = _misaligned_foreach_lists("cpu")[2]
+    mojo_inputs = _misaligned_foreach_lists(mojo_gpu)[2]
+    assert any(tensor._ptr % 16 for tensor in mojo_inputs)
+    expected = [tensor.double().sqrt().to(tensor.dtype) for tensor in cpu_inputs]
+    for expected_out, actual_out in zip(
+        expected, torch._foreach_sqrt(mojo_inputs), strict=True
+    ):
+        torch.testing.assert_close(actual_out.cpu(), expected_out, rtol=0, atol=0)
 
 
 def test_batched_foreach_falls_back_for_non_f32(
