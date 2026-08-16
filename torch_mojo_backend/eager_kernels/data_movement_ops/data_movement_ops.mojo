@@ -1200,24 +1200,20 @@ def _narrow_copy_dst[
         else:
             raise Error("no GPU accelerator available at compile time")
 
-    if copy_len % 4 == 0 and dst_stride % 4 == 0 and dst_offset % 4 == 0:
-        comptime vec_align = 4 * size_of[dtype]()
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func4[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value()) * 4
-            var o = i // copy_len
-            var j = i % copy_len
-            var v = in_ptr.load[width=4, alignment=vec_align](i)
-            out_ptr.store[width=4, alignment=vec_align](
-                o * dst_stride + dst_offset + j, v
-            )
-
-        elementwise[func4, simd_width=1](Coord(outer * copy_len // 4), ctx)
-        return
-
+    # No CPU-side "func4" fast path here (there was one, briefly): CPU
+    # `elementwise[..., simd_width=1]` does not guarantee exactly
+    # `Coord(outer * copy_len // 4)` calls to the callback with no overrun --
+    # observed writing one extra width-4 store (4 elements) past `out`'s
+    # allocation on this host. Silent when it lands in slack space, a
+    # segfault when it does not: reproduced deterministically via
+    # `test_matches_cpu_stack_mojo_int64`, which concatenates several small
+    # int64 tensors back to back so a later allocation lands where an
+    # earlier call's overrun wrote. The accelerator path above is untouched
+    # -- its "float4" fast path launches a real GPU kernel
+    # (`_narrow_copy_dst_kernel2d` / `kernel4`) with its own explicit
+    # grid/thread bounds, not this CPU `elementwise` call, so it does not
+    # share this bug. One scalar store per element is what CPU gets until
+    # the overrun is root-caused inside `elementwise` itself.
     @always_inline
     @parameter
     @__copy_capture(out_ptr, in_ptr)

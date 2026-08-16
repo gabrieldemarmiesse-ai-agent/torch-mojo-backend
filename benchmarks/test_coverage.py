@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bench_lib import baselines
+
 from conftest import KEY_DUMP_ENV
 
 BENCH_DIR = Path(__file__).resolve().parent
