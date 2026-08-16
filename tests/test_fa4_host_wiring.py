@@ -1,4 +1,4 @@
-"""Host-only contracts for the vendored H100 BF16 FA4 integration."""
+"""Host-only contracts for the vendored H100 FA4 integration (bf16 and f16)."""
 
 import math
 from pathlib import Path
@@ -80,7 +80,7 @@ def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
         }
         kwargs.update(overrides)
         assert (
-            aten_fast.fast_fa4_bf16_d64_causal_forward(query, key, value, **kwargs)
+            aten_fast.fast_fa4_16bit_d64_causal_forward(query, key, value, **kwargs)
             is aten_fast.NOT_HANDLED
         )
 
@@ -141,7 +141,7 @@ def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
         ),
     )
 
-    result = aten_fast.fast_fa4_bf16_d64_causal_forward(
+    result = aten_fast.fast_fa4_16bit_d64_causal_forward(
         *public, is_causal=True, scale=0.125
     )
     output, logsumexp, q_native, k_native, v_native = result
@@ -169,6 +169,120 @@ def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
     ]
 
 
+def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """f16 Q/K/V select the f16 bridge symbol and f16 output allocation.
+
+    Mirrors ``test_fa4_forward_bridge_uses_dynamic_bthd_allocations`` above,
+    only with f16 inputs: the bf16 bridge symbol must not be touched.
+    """
+    import torch_mojo_backend.eager_flash_attention as package
+
+    device = _device()
+    public = [
+        _tensor(
+            name,
+            shape=(3, 12, 256, 64),
+            device=device,
+            ptr=ptr,
+            dtype=aten_fast.DType.float16,
+        )
+        for name, ptr in zip(("q", "k", "v"), (10, 20, 30), strict=True)
+    ]
+    native = {
+        tensor.name: _tensor(
+            f"{tensor.name}_native",
+            shape=(3, 256, 12, 64),
+            device=device,
+            ptr=tensor._ptr + 100,
+            dtype=aten_fast.DType.float16,
+        )
+        for tensor in public
+    }
+    allocations = []
+    bridge_calls = []
+
+    def alloc(shape, dtype, actual_device):
+        result = _tensor(
+            f"alloc{len(allocations)}",
+            shape=shape,
+            dtype=dtype,
+            device=actual_device,
+            ptr=1000 + len(allocations),
+        )
+        allocations.append(result)
+        return result
+
+    def transpose(tensor, dim0, dim1):
+        assert (dim0, dim1) == (1, 2)
+        shape = list(tensor._shape)
+        shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
+        return _tensor(
+            "output", shape, dtype=tensor._dtype, device=device, ptr=tensor._ptr
+        )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("f16 inputs reached the bf16 bridge symbol")
+
+    monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
+    monkeypatch.setattr(
+        aten_fast, "_fa4_native_bthd", lambda tensor: native[tensor.name]
+    )
+    monkeypatch.setattr(aten_fast, "_alloc", alloc)
+    monkeypatch.setattr(aten_fast, "fast_aten_transpose", transpose)
+    monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda actual_device: 9090)
+    monkeypatch.setattr(
+        package,
+        "load_fa4_ops",
+        lambda: SimpleNamespace(
+            flash_attention_fwd_bf16_d64_causal=forbidden,
+            flash_attention_fwd_f16_d64_causal=lambda *args: bridge_calls.append(args),
+        ),
+    )
+
+    result = aten_fast.fast_fa4_16bit_d64_causal_forward(
+        *public, is_causal=True, scale=0.125
+    )
+    output, logsumexp, q_native, k_native, v_native = result
+
+    assert output._shape == (3, 12, 256, 64)
+    assert output._dtype == aten_fast.DType.float16
+    assert logsumexp._shape == (3, 12, 256)
+    assert (q_native, k_native, v_native) == tuple(native[name] for name in "qkv")
+    assert [(item._shape, item._dtype) for item in allocations] == [
+        ((3, 256, 12, 64), aten_fast.DType.float16),
+        ((3, 12, 256), aten_fast.DType.float32),
+    ]
+    assert bridge_calls == [
+        (
+            110,
+            120,
+            130,
+            allocations[0]._ptr,
+            allocations[1]._ptr,
+            3,
+            256,
+            12,
+            0.125,
+            9090,
+        )
+    ]
+
+
+def test_fa4_rejects_mixed_bf16_f16_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Q/K/V must share one dtype from {bf16, f16} -- mixing is not eligible."""
+    monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
+    device = _device()
+    q = _tensor("q", dtype=aten_fast.DType.bfloat16, device=device)
+    k = _tensor("k", dtype=aten_fast.DType.float16, device=device)
+    v = _tensor("v", dtype=aten_fast.DType.bfloat16, device=device)
+    assert (
+        aten_fast._fa4_16bit_d64_causal_inputs(q, k, v, None, 0.0, True, None, False)
+        is None
+    )
+
+
 def test_fa4_strided_layout_contract_is_strict() -> None:
     shape = (2, 256, 12, 64)
     token_stride = 3 * shape[2] * shape[3]
@@ -177,6 +291,16 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
         "q_native", shape=shape, ptr=0x1000, strides=strides, contiguous=False
     )
     assert aten_fast._fa4_strided_bthd_layout(eligible)
+    # f16 is the same 2-byte width as bf16, so the same layout is eligible.
+    eligible_f16 = _tensor(
+        "q_native_f16",
+        shape=shape,
+        ptr=0x1000,
+        strides=strides,
+        contiguous=False,
+        dtype=aten_fast.DType.float16,
+    )
+    assert aten_fast._fa4_strided_bthd_layout(eligible_f16)
 
     invalid = []
     for updates in (
@@ -188,6 +312,7 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
         {"_strides": (strides[0] + 8, strides[1], 64, 1)},
         {"_strides": (strides[0], strides[1], 64, 2)},
         {"_strides": (strides[0], strides[1] + 2, 64, 1)},
+        {"_dtype": aten_fast.DType.float32, "_itemsize": 4},
     ):
         candidate = SimpleNamespace(**vars(eligible))
         for name, value in updates.items():
@@ -267,7 +392,9 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     )
 
     output, logsumexp, q_native, k_native, v_native = (
-        aten_fast.fast_fa4_bf16_d64_causal_forward(*public, is_causal=True, scale=0.125)
+        aten_fast.fast_fa4_16bit_d64_causal_forward(
+            *public, is_causal=True, scale=0.125
+        )
     )
 
     physical_strides = (batch_stride, token_stride, head_dim, 1)
@@ -362,7 +489,7 @@ def test_fa4_unsupported_public_layout_copies_and_uses_contiguous_fallback(
         ),
     )
 
-    result = aten_fast.fast_fa4_bf16_d64_causal_forward(
+    result = aten_fast.fast_fa4_16bit_d64_causal_forward(
         *public, is_causal=True, scale=0.125
     )
 
@@ -393,7 +520,7 @@ def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
     monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
     monkeypatch.setattr(
         aten_fast,
-        "fast_fa4_bf16_d64_causal_forward",
+        "fast_fa4_16bit_d64_causal_forward",
         lambda *_args: (output, logsumexp, *physical),
     )
 
@@ -476,7 +603,7 @@ def test_direct_flash_backward_materializes_strided_logsumexp(
     monkeypatch.setattr(aten_fast, "_tc", make_contiguous)
     monkeypatch.setattr(
         aten_fast,
-        "fast_fa4_bf16_d64_causal_backward",
+        "fast_fa4_16bit_d64_causal_backward",
         lambda *args: backward_calls.append(args) or "gradients",
     )
 
@@ -561,7 +688,7 @@ def test_fa4_combined_backward_bridge_allocates_exact_scratch(
         ),
     )
 
-    gradients = aten_fast.fast_fa4_bf16_d64_causal_backward(
+    gradients = aten_fast.fast_fa4_16bit_d64_causal_backward(
         q_native, k_native, v_native, output, logsumexp, grad_output, 0.125
     )
 
@@ -689,7 +816,7 @@ def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
         ),
     )
 
-    gradients = aten_fast.fast_fa4_bf16_d64_causal_backward(
+    gradients = aten_fast.fast_fa4_16bit_d64_causal_backward(
         q_native, k_native, v_native, output, logsumexp, grad_output, 0.125
     )
 
@@ -750,7 +877,7 @@ def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("an eligible FA4 call built a custom autograd node")
 
-    monkeypatch.setattr(aten_fast, "_fa4_bf16_d64_causal_inputs", eligible)
+    monkeypatch.setattr(aten_fast, "_fa4_16bit_d64_causal_inputs", eligible)
     monkeypatch.setattr(
         torch.ops.aten._scaled_dot_product_flash_attention, "default", flash
     )

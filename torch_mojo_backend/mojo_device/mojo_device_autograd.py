@@ -583,7 +583,7 @@ def _scaled_dot_product_attention_autograd(
     # for the generic math/dropout fallback, which has no native backward op.
     if (
         needs_backward
-        and aten_fast._fa4_bf16_d64_causal_inputs(
+        and aten_fast._fa4_16bit_d64_causal_inputs(
             query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
         )
         is not None

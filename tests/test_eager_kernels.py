@@ -8278,15 +8278,27 @@ def test_fast_sdpa(mojo_gpu, is_causal, kv_len, dtype):
     torch.testing.assert_close(dev, ref, atol=1e-2, rtol=1e-2)
 
 
-def test_fa4_bf16_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch):
-    """The cached H100 path stays dynamic for nanoGPT's gapped QKV views."""
+_FA4_DTYPE_SUFFIX = {torch.bfloat16: "bf16", torch.float16: "f16"}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fa4_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch, dtype):
+    """The cached H100 path stays dynamic for nanoGPT's gapped QKV views.
+
+    bf16 and f16 share the same kernel family (the f16 RS wgmma emitter is a
+    vendored gap-filler for the stdlib's bf16-only register-operand overload,
+    see ``fa4_wgmma_f16.mojo``), so both dtypes are exercised here.
+    """
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
     from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 
     module = load_fa4_ops()
     calls = {"forward": 0, "backward": 0}
-    original_forward = module.flash_attention_fwd_bf16_d64_causal_strided_qkv
-    original_backward = module.flash_attention_bwd_bf16_d64_causal_strided_qkv
+    suffix = _FA4_DTYPE_SUFFIX[dtype]
+    forward_name = f"flash_attention_fwd_{suffix}_d64_causal_strided_qkv"
+    backward_name = f"flash_attention_bwd_{suffix}_d64_causal_strided_qkv"
+    original_forward = getattr(module, forward_name)
+    original_backward = getattr(module, backward_name)
 
     def forward_spy(*args):
         calls["forward"] += 1
@@ -8296,12 +8308,8 @@ def test_fa4_bf16_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch):
         calls["backward"] += 1
         return original_backward(*args)
 
-    monkeypatch.setattr(
-        module, "flash_attention_fwd_bf16_d64_causal_strided_qkv", forward_spy
-    )
-    monkeypatch.setattr(
-        module, "flash_attention_bwd_bf16_d64_causal_strided_qkv", backward_spy
-    )
+    monkeypatch.setattr(module, forward_name, forward_spy)
+    monkeypatch.setattr(module, backward_name, backward_spy)
 
     head_dim = 64
     for seed, batch, seqlen, heads in ((20260718, 1, 128, 4), (20260719, 2, 256, 8)):
@@ -8312,10 +8320,10 @@ def test_fa4_bf16_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch):
                 batch, seqlen, 3 * width, generator=generator, dtype=torch.float32
             )
             * 0.25
-        ).to(torch.bfloat16)
+        ).to(dtype)
         grad_output = torch.randn(
             batch, heads, seqlen, head_dim, generator=generator, dtype=torch.float32
-        ).to(torch.bfloat16)
+        ).to(dtype)
 
         def qkv_views(fused):
             return tuple(
@@ -8350,7 +8358,7 @@ def test_fa4_bf16_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch):
             "ScaledDotProductFlashAttentionBackward0"
         )
         assert backward_counter.call_count == calls_before
-        assert actual_output.dtype == torch.bfloat16
+        assert actual_output.dtype == dtype
         assert not actual_output._is_contiguous
         assert actual_output.transpose(1, 2)._is_contiguous
         actual_output.backward(grad_output.to(mojo_h100))
@@ -8368,13 +8376,13 @@ def test_fa4_bf16_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch):
     assert calls == {"forward": 2, "backward": 2}
 
 
-def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype):
     """The low-level flash op must not substitute zero backward metadata."""
     generator = torch.Generator().manual_seed(20260721)
     shape = (1, 4, 128, 64)
     query, key, value = (
-        (torch.randn(shape, generator=generator) * 0.25).to(torch.bfloat16)
-        for _ in range(3)
+        (torch.randn(shape, generator=generator) * 0.25).to(dtype) for _ in range(3)
     )
     mojo_inputs = [
         tensor.to(mojo_h100).requires_grad_() for tensor in (query, key, value)
@@ -8403,9 +8411,9 @@ def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100):
     assert (max_q, max_k) == (128, 128)
     assert rng.dtype == torch.uint64 and tuple(rng.shape) == (2,)
     assert offset.dtype == torch.uint64 and tuple(offset.shape) == ()
-    assert debug.dtype == torch.bfloat16 and debug.numel() == 0
+    assert debug.dtype == dtype and debug.numel() == 0
 
-    grad_output = torch.randn(shape, generator=generator).to(torch.bfloat16)
+    grad_output = torch.randn(shape, generator=generator).to(dtype)
     expected_output.backward(grad_output.float())
     output.backward(grad_output.to(mojo_h100))
     for actual, expected in zip(mojo_inputs, reference_inputs, strict=True):
