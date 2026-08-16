@@ -488,7 +488,7 @@ different kind of item.
   (`attn_mask is None` inside the eligibility conjunction); the autograd node
   raises explicitly at `mojo_device_autograd.py:271-275`.
 * **Current implementation.** `aten::scaled_dot_product_attention` is registered
-  for the mojo device (`mojo_device_aten_ops.py:1182`), which suppresses
+  for the mojo device (`mojo_device_aten_ops.py`), which suppresses
   PyTorch's own composite decomposition, and then declines any masked call —
   producing a `NotImplementedError` rather than a slow path.
 * **Why it is not optimal.** Padded-batch inference and most HuggingFace encoder
@@ -538,7 +538,7 @@ different kind of item.
   pointer as `Scalar[DType.float32]`.
 * **Current implementation.** fp16/bf16 LayerNorm forward succeeds; its backward
   returns `NOT_HANDLED`, and the registration
-  (`mojo_device_aten_ops.py:1160`) turns that into a raise.
+  (`mojo_device_aten_ops.py`) turns that into a raise.
 * **Why it is not optimal.** Under bf16 autocast this is invisible (autocast runs
   LayerNorm in fp32), which is why nanoGPT never hit it. A model trained in pure
   bf16 — increasingly the norm — cannot run its backward at all.
@@ -921,7 +921,7 @@ temporary** — **DONE** (`NormSpec`)
 
 * **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
   and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is, at `:1096`).
+  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
 * **Current implementation.** conv1d (rank-3 input), conv3d and transposed
   convolutions all return `NOT_HANDLED` → raise. There is no eager conv backward.
 * **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
@@ -943,7 +943,7 @@ temporary** — **DONE** (`NormSpec`)
   at `:5203`). `aten::max_pool2d_with_indices_backward` and
   `aten::avg_pool2d_backward` are unregistered;
   `aten::_adaptive_avg_pool2d_backward` is explicitly `_register_missing`
-  (`mojo_device_aten_ops.py:1222`).
+  (`mojo_device_aten_ops.py`).
 * **Current implementation.** Forward-only, floor-mode-only, rank-4-only.
 * **Why it is not optimal.** `ceil_mode=True` appears in common torchvision
   configurations; the missing backwards are the third blocker for vision
@@ -979,6 +979,38 @@ temporary** — **DONE** (`NormSpec`)
   `bench_nanogpt_train.py` with a bf16-parameter variant.
 
 ### O2
+**Five batched `_foreach_*` kernels are Metal-only**
+
+* **What.** `_foreach_metal_f32`, `aten_fast.py:586` — returns `None` unless
+  `device.api == "metal"` (`:611`). Its callers:
+  `fast_aten__foreach_mul__scalar` (`:692`),
+  `fast_aten__foreach_div__scalarlist` (`:723`),
+  `fast_aten__foreach_lerp__scalar` (`:733`),
+  `fast_aten__foreach_addcmul__scalar` (`:809`),
+  `fast_aten__foreach_addcdiv__scalarlist` (`:824`) — all via
+  `_foreach_scalar_inplace` (`:668`). Only `fast_aten__foreach_add__scalar`
+  (`:712`) has a generic route (`_fast__foreach_add__scalar_generic`, `:462`),
+  added by journal Change 45. `_foreach_norm` (`:329`) and `_foreach_mul_.Tensor`
+  (`:512`) are device-general but fp32-only.
+* **Current implementation.** On CUDA and ROCm those five decline, and
+  `_register_foreach_inplace` (`mojo_device/aten_ops/foreach.py`) redispatches to
+  ATen's generic decomposition — one launch per tensor.
+* **Why it is not optimal.** `torch.optim.AdamW(foreach=True)` — PyTorch's
+  default when `fused` is not requested — uses exactly `_foreach_mul_`,
+  `_foreach_addcmul_`, `_foreach_addcdiv_`, `_foreach_div_` and `_foreach_lerp_`.
+  For nanoGPT's 75 parameter tensors that is ~375 launches per step instead of
+  five. The journal priced the analogous case: `_foreach_add_.Scalar` was 76
+  launches / 379 µs against ROCm's 10.4 µs, and Change 45 collapsed it to one.
+* **What the optimized version looks like.** Replace the Metal gate with "GPU +
+  contiguous + homogeneous fp32". The `ForeachScalarOp` kernel
+  (`optimizer_ops/optimizer_ops.mojo`) already takes a runtime descriptor array;
+  what is Metal-specific is the 8-slot batching, not the operation.
+* **Expected win.** By analogy with Change 45, ~370 µs/step on gfx942 — **that is
+  an analogy, not a measurement of these five ops**.
+* **How to measure it.** `bench_nanogpt_train.py` with the optimizer configured
+  `fused=False, foreach=True`, plus `compare_nanogpt_train_kernels.py`'s
+  optimizer group.
+
 **Five batched `_foreach_*` kernels are Metal-only** — **DONE** (one
 descriptor-batched body for the whole family)
 

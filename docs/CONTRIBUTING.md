@@ -67,7 +67,7 @@ The project supports PyTorch operations in **two execution modes**:
 
 When implementing operations, you must:
 - Implement in `torch_mojo_backend/aten_functions.py` (works for both modes)
-- Register in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py` (enables eager mode)
+- Register in `torch_mojo_backend/mojo_device/mojo_device_aten_ops.py` (enables eager mode; hand-written eager impls live in `mojo_device/aten_ops/`)
 
 ## Development Workflow
 
@@ -145,7 +145,7 @@ Write a fast implementation `fast_aten_cat` in `torch_mojo_backend/eager_kernels
 _register_fast("aten::cat", "fast_aten_cat")
 ```
 
-Place in alphabetical order. Ops needing custom device handling use `@register_aten_op("aten::<op>")` on a hand-written function directly; `_out_variant(...)` wraps a functional fast impl as an `out=` variant.
+Place in alphabetical order — that file is only the registration list. An op needing real Python code of its own (custom device handling, a forward-time autograd preflight, ...) gets a function in the matching `torch_mojo_backend/mojo_device/aten_ops/` module (`transfer`, `factories`, `autograd_preflight`, `inplace`, `rng`, `reductions`, `foreach`, `blas`; shared plumbing in `aten_ops/support.py`), which the list imports and passes to `register_aten_op("aten::<op>")(...)`. `_register_out(...)` wraps a functional fast impl as an `out=` variant.
 
 ### Step 8: Verify Implementation
 
