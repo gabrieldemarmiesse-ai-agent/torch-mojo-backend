@@ -36,6 +36,9 @@ from op_utils import (
     _BW_MAX_BLOCKS,
     _LLC_BYTES,
     _bw_blocks,
+    _bw_flat_blocks,
+    _fill_bits,
+    _fill_bits_dtype,
     _MAX_GRID_Y,
     _T2D_ROWS,
     _enqueue_cached,
@@ -1303,11 +1306,155 @@ def _narrow_copy_dst_go(
 # strides (0 on broadcast dims), so scalar operands are 1-element buffers
 # with all-zero strides. A pure selection copy — kernels are specialized on
 # element byte-size, not dtype.
+#
+# Tiered like logic_ops' binary dispatch (`_binary_bcast`/`_bin_flat_vec_kernel`):
+# a flat-vec tier for the common case -- cond flat-contiguous over the
+# output's extent, and each of a/b either flat-contiguous too or a single
+# broadcast element (e.g. masked_fill's 0-d value tensor) -- skips the rank-4
+# coordinate decomposition entirely (no integer division at all) and
+# vector-loads/stores 16 bytes per thread; a general strided fallback covers
+# anything else (a genuinely broadcasting mask, a non-contiguous operand, an
+# unaligned view). Both go through `_enqueue_cached`, never the stdlib
+# `elementwise` GPU dispatcher used previously: its per-call
+# `compile_function` plus the six-division coordinate chain run on every
+# element made this kernel 4-5x slower than stock PyTorch on a 357x789 case
+# that should cost single-digit microseconds (see `_cast_vec_kernel`'s
+# comment above for the same fix, applied earlier to CastSpec).
 # ---------------------------------------------------------------------------
 
 
+@__name(t"where_flat_vec_{dtype}")
+def _where_flat_vec_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+    a_bcast_arg: Int64,
+    b_bcast_arg: Int64,
+):
+    """16-byte-vectorized select for the no-broadcast, all-contiguous case:
+    `cond` is flat over the output's extent (the launcher falls back to the
+    strided kernel on the rare shape where it is not), and each of `a`/`b`
+    is either flat too or a single broadcast element (`a_bcast`/`b_bcast`,
+    e.g. a 0-d scalar operand), read once and splatted. Mirrors
+    `_bin_flat_vec_kernel` in logic_ops.mojo.
+    """
+    comptime VW = 16 // size_of[dtype]()
+    comptime vec_align = VW * size_of[dtype]()
+    comptime cond_align = VW  # bool is 1 byte; matches the launcher's gate
+    var total = Int(total_arg)
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var nvec = total // VW
+
+    @always_inline
+    @parameter
+    def pass_over[a_b: Bool, b_b: Bool]():
+        var a_splat = SIMD[dtype, VW](a_ptr[0]) if a_b else SIMD[dtype, VW](0)
+        var b_splat = SIMD[dtype, VW](b_ptr[0]) if b_b else SIMD[dtype, VW](0)
+        var c = tid
+        while c < nvec:
+            var i = c * VW
+            var cond = cond_ptr.load[width=VW, alignment=cond_align](i)
+            var a = a_splat if a_b else a_ptr.load[
+                width=VW, alignment=vec_align
+            ](i)
+            var b = b_splat if b_b else b_ptr.load[
+                width=VW, alignment=vec_align
+            ](i)
+            out_ptr.store[width=VW, alignment=vec_align](i, cond.select(a, b))
+            c += gstride
+        var tail = total - nvec * VW
+        if tid < tail:
+            var i = nvec * VW + tid
+            var a1 = a_splat[0] if a_b else a_ptr[i]
+            var b1 = b_splat[0] if b_b else b_ptr[i]
+            out_ptr[i] = a1 if cond_ptr[i] else b1
+
+    # The splat flags are loop-invariant, so each arm is INSTANTIATED rather
+    # than branched on per iteration (see `_bin_flat_vec_kernel`'s note on
+    # the measured cost of a per-iteration uniform branch).
+    if a_bcast_arg != 0:
+        if b_bcast_arg != 0:
+            pass_over[True, True]()
+        else:
+            pass_over[True, False]()
+    elif b_bcast_arg != 0:
+        pass_over[False, True]()
+    else:
+        pass_over[False, False]()
+
+
+@__name(t"where_strided_{dtype}")
+def _where_bcast_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    cs0_arg: Int64,
+    cs1_arg: Int64,
+    cs2_arg: Int64,
+    cs3_arg: Int64,
+    a_s0_arg: Int64,
+    a_s1_arg: Int64,
+    a_s2_arg: Int64,
+    a_s3_arg: Int64,
+    b_s0_arg: Int64,
+    b_s1_arg: Int64,
+    b_s2_arg: Int64,
+    b_s3_arg: Int64,
+    total_arg: Int64,
+):
+    """Fully general arm: any broadcast strides, one element per thread.
+
+    Pays six integer divisions/moduli per element, so the launcher reaches
+    it only when the flat-vec tier's layout does not apply -- a genuinely
+    broadcasting mask/operand, or a non-16-byte-aligned view.
+    """
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var cs0 = Int(cs0_arg)
+    var cs1 = Int(cs1_arg)
+    var cs2 = Int(cs2_arg)
+    var cs3 = Int(cs3_arg)
+    var a_s0 = Int(a_s0_arg)
+    var a_s1 = Int(a_s1_arg)
+    var a_s2 = Int(a_s2_arg)
+    var a_s3 = Int(a_s3_arg)
+    var b_s0 = Int(b_s0_arg)
+    var b_s1 = Int(b_s1_arg)
+    var b_s2 = Int(b_s2_arg)
+    var b_s3 = Int(b_s3_arg)
+    var total = Int(total_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
+        var abase = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
+        var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
+        out_ptr[i] = a_ptr[abase] if cond_ptr[cbase] else b_ptr[bbase]
+        i += gstride
+
+
 @always_inline
-def _where_select[
+def _where_bcast[
     dtype: DType
 ](
     out_addr: Int,
@@ -1332,102 +1479,467 @@ def _where_select[
     total: Int,
     ctx: DeviceContext,
 ) raises:
+    if total == 0:
+        return
     var out_ptr = _make_ptr[dtype](out_addr)
     var cond_ptr = _make_ptr[DType.bool](cond_addr)
     var a_ptr = _make_ptr[dtype](a_addr)
     var b_ptr = _make_ptr[dtype](b_addr)
 
-    # Chunk-of-4 kernel: one thread selects 4 consecutive output elements,
-    # so the div/mod coordinate chain (the cost that dominates the scalar
-    # version — 6 integer divisions per element) runs once per chunk, and
-    # last-dim strides of 1/0 use vector loads / splats.
-    var vec_ok = (
-        (cs3 == 0 or cs3 == 1)
-        and (a_s3 == 0 or a_s3 == 1)
-        and (b_s3 == 0 or b_s3 == 1)
-        and d3 >= 4
-    )
+    if ctx.api() == "cpu":
 
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, cond_ptr, a_ptr, b_ptr)
-    def func4[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value()) * 4
-        var i3 = i % d3
-        var rest = i // d3
-        var i2 = rest % d2
-        rest = rest // d2
-        var i1 = rest % d1
-        var i0 = rest // d1
-        if i3 + 4 <= d3 and i + 4 <= total:
+        @always_inline
+        @parameter
+        @__copy_capture(out_ptr, cond_ptr, a_ptr, b_ptr)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var i3 = i % d3
+            var rest = i // d3
+            var i2 = rest % d2
+            rest = rest // d2
+            var i1 = rest % d1
+            var i0 = rest // d1
             var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
             var abase = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
             var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-            var cond: SIMD[DType.bool, 4]
-            if cs3 == 1:
-                cond = cond_ptr.load[width=4](cbase)
-            else:
-                cond = SIMD[DType.bool, 4](cond_ptr[cbase])
-            var av: SIMD[dtype, 4]
-            if a_s3 == 1:
-                av = a_ptr.load[width=4](abase)
-            else:
-                av = SIMD[dtype, 4](a_ptr[abase])
-            var bv: SIMD[dtype, 4]
-            if b_s3 == 1:
-                bv = b_ptr.load[width=4](bbase)
-            else:
-                bv = SIMD[dtype, 4](b_ptr[bbase])
-            out_ptr.store(i, cond.select(av, bv))
+            out_ptr[i] = a_ptr[abase] if cond_ptr[cbase] else b_ptr[bbase]
+
+        elementwise[func, simd_width=1](Coord(total), ctx)
+        return
+
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        raise Error("float64 is not supported on Apple GPU")
+    else:
+        comptime if not has_accelerator():
+            raise Error("no GPU accelerator available at compile time")
         else:
-            # Chunk crosses a row boundary (or the end): per-element math.
-            for u in range(4):
-                var j = i + u
-                if j >= total:
-                    return
-                var j3 = j % d3
-                var jrest = j // d3
-                var j2 = jrest % d2
-                jrest = jrest // d2
-                var j1 = jrest % d1
-                var j0 = jrest // d1
-                if cond_ptr[j0 * cs0 + j1 * cs1 + j2 * cs2 + j3 * cs3]:
-                    out_ptr[j] = a_ptr[
-                        j0 * a_s0 + j1 * a_s1 + j2 * a_s2 + j3 * a_s3
-                    ]
-                else:
-                    out_ptr[j] = b_ptr[
-                        j0 * b_s0 + j1 * b_s1 + j2 * b_s2 + j3 * b_s3
-                    ]
+            comptime VW = 16 // size_of[dtype]()
+            var d0 = total // max(1, d1 * d2 * d3)
+            var cont3 = d3
+            var cont2 = d2 * d3
+            var cont1 = d1 * d2 * d3
+            # An operand whose every stride is 0 is a single element -- what
+            # masked_fill's 0-d value tensor looks like. The flat kernel
+            # reads it once and splats it, so it neither breaks the flat
+            # layout nor needs 16B alignment.
+            var a_scalar = a_s0 == 0 and a_s1 == 0 and a_s2 == 0 and a_s3 == 0
+            var b_scalar = b_s0 == 0 and b_s1 == 0 and b_s2 == 0 and b_s3 == 0
+            var cond_flat = (
+                (cs3 == 1 or d3 == 1)
+                and (cs2 == cont3 or d2 == 1)
+                and (cs1 == cont2 or d1 == 1)
+                and (cs0 == cont1 or d0 == 1)
+            )
+            var a_flat = a_scalar or (
+                (a_s3 == 1 or d3 == 1)
+                and (a_s2 == cont3 or d2 == 1)
+                and (a_s1 == cont2 or d1 == 1)
+                and (a_s0 == cont1 or d0 == 1)
+            )
+            var b_flat = b_scalar or (
+                (b_s3 == 1 or d3 == 1)
+                and (b_s2 == cont3 or d2 == 1)
+                and (b_s1 == cont2 or d1 == 1)
+                and (b_s0 == cont1 or d0 == 1)
+            )
+            var aligned = (
+                out_addr % 16 == 0
+                and cond_addr % VW == 0
+                and (a_scalar or a_addr % 16 == 0)
+                and (b_scalar or b_addr % 16 == 0)
+            )
+            if aligned and cond_flat and a_flat and b_flat:
+                # Bytes actually moved: a splatted operand reads one element
+                # for the whole launch, so it does not count toward the
+                # residency decision (see `_bw_flat_blocks`).
+                var traffic = total * (
+                    1  # cond: one byte per element, always read
+                    + (0 if a_scalar else size_of[dtype]())
+                    + (0 if b_scalar else size_of[dtype]())
+                    + size_of[dtype]()
+                )
+                var slots = max(1, total // VW)
+                _enqueue_cached[_where_flat_vec_kernel[dtype]](
+                    ctx,
+                    String(t"dm_where_fv_{dtype}"),
+                    _bw_flat_blocks(slots, traffic),
+                    1,
+                    1,
+                    GS_THREADS,
+                    out_ptr.as_unsafe_any_origin(),
+                    cond_ptr.as_unsafe_any_origin().as_immutable(),
+                    a_ptr.as_unsafe_any_origin().as_immutable(),
+                    b_ptr.as_unsafe_any_origin().as_immutable(),
+                    Int64(total),
+                    Int64(a_scalar),
+                    Int64(b_scalar),
+                )
+                return
+
+            _enqueue_cached[_where_bcast_kernel[dtype]](
+                ctx,
+                String(t"dm_where_bc_{dtype}"),
+                _gs_blocks(total),
+                1,
+                1,
+                GS_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                cond_ptr.as_unsafe_any_origin().as_immutable(),
+                a_ptr.as_unsafe_any_origin().as_immutable(),
+                b_ptr.as_unsafe_any_origin().as_immutable(),
+                Int64(d1),
+                Int64(d2),
+                Int64(d3),
+                Int64(cs0),
+                Int64(cs1),
+                Int64(cs2),
+                Int64(cs3),
+                Int64(a_s0),
+                Int64(a_s1),
+                Int64(a_s2),
+                Int64(a_s3),
+                Int64(b_s0),
+                Int64(b_s1),
+                Int64(b_s2),
+                Int64(b_s3),
+                Int64(total),
+            )
+
+
+# ---------------------------------------------------------------------------
+# MaskedFillScalar: out[i] = cond[i] ? value : b[i], where `value` is a
+# plain scalar baked into the kernel launch -- no device buffer, no separate
+# materialization launch. Serves masked_fill(_).Scalar specifically:
+# masked_fill(_).Tensor and where.self keep going through WhereSelect, whose
+# `a` operand is already a real device tensor, so there is nothing to save
+# there. Before this existed, the Scalar overload materialized `value` into
+# a 0-d device tensor through the Fill kernel first (`_scalar_tensor_0d` in
+# aten_fast.py) and then ran WhereSelect -- a second full kernel launch to
+# move one repeated constant that this kernel now carries as an argument.
+#
+# Shares WhereSelect's rank-4 strided convention and flat-vec/strided
+# tiering, and (like FillSpec) its element-WIDTH dispatch: `value` is
+# narrowed to the real dtype and reinterpreted as same-width bits exactly
+# once, on the host, via `_fill_bits` -- the kernels below never see a
+# floating-point value, only bits to move, so float16/bfloat16 share one
+# uint16 instantiation and so on.
+# ---------------------------------------------------------------------------
+
+
+@__name(t"masked_fill_scalar_flat_vec_{dtype}")
+def _masked_fill_scalar_flat_vec_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Scalar[dtype],
+    total_arg: Int64,
+    b_bcast_arg: Int64,
+):
+    """`_where_flat_vec_kernel` with `a` fixed to an immediate."""
+    comptime VW = 16 // size_of[dtype]()
+    comptime vec_align = VW * size_of[dtype]()
+    comptime cond_align = VW
+    var total = Int(total_arg)
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    var nvec = total // VW
+    var a_splat = SIMD[dtype, VW](value)
 
     @always_inline
     @parameter
-    @__copy_capture(out_ptr, cond_ptr, a_ptr, b_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
+    def pass_over[b_b: Bool]():
+        var b_splat = SIMD[dtype, VW](b_ptr[0]) if b_b else SIMD[dtype, VW](0)
+        var c = tid
+        while c < nvec:
+            var i = c * VW
+            var cond = cond_ptr.load[width=VW, alignment=cond_align](i)
+            var b = b_splat if b_b else b_ptr.load[
+                width=VW, alignment=vec_align
+            ](i)
+            out_ptr.store[width=VW, alignment=vec_align](
+                i, cond.select(a_splat, b)
+            )
+            c += gstride
+        var tail = total - nvec * VW
+        if tid < tail:
+            var i = nvec * VW + tid
+            var b1 = b_splat[0] if b_b else b_ptr[i]
+            out_ptr[i] = value if cond_ptr[i] else b1
+
+    if b_bcast_arg != 0:
+        pass_over[True]()
+    else:
+        pass_over[False]()
+
+
+@__name(t"masked_fill_scalar_strided_{dtype}")
+def _masked_fill_scalar_bcast_kernel[
+    dtype: DType
+](
+    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Scalar[dtype],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    cs0_arg: Int64,
+    cs1_arg: Int64,
+    cs2_arg: Int64,
+    cs3_arg: Int64,
+    b_s0_arg: Int64,
+    b_s1_arg: Int64,
+    b_s2_arg: Int64,
+    b_s3_arg: Int64,
+    total_arg: Int64,
+):
+    """`_where_bcast_kernel` with `a` fixed to an immediate."""
+    var d1 = Int(d1_arg)
+    var d2 = Int(d2_arg)
+    var d3 = Int(d3_arg)
+    var cs0 = Int(cs0_arg)
+    var cs1 = Int(cs1_arg)
+    var cs2 = Int(cs2_arg)
+    var cs3 = Int(cs3_arg)
+    var b_s0 = Int(b_s0_arg)
+    var b_s1 = Int(b_s1_arg)
+    var b_s2 = Int(b_s2_arg)
+    var b_s3 = Int(b_s3_arg)
+    var total = Int(total_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
         var i3 = i % d3
         var rest = i // d3
         var i2 = rest % d2
         rest = rest // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        if cond_ptr[i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3]:
-            out_ptr[i] = a_ptr[i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3]
-        else:
-            out_ptr[i] = b_ptr[i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3]
+        var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
+        var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
+        out_ptr[i] = value if cond_ptr[cbase] else b_ptr[bbase]
+        i += gstride
 
-    if vec_ok:
-        _parallel_for[func4]((total + 3) // 4, ctx)
+
+@always_inline
+def _masked_fill_scalar_bcast[
+    dtype: DType
+](
+    out_addr: Int,
+    cond_addr: Int,
+    b_addr: Int,
+    value: Scalar[dtype],
+    d1: Int,
+    d2: Int,
+    d3: Int,
+    cs0: Int,
+    cs1: Int,
+    cs2: Int,
+    cs3: Int,
+    b_s0: Int,
+    b_s1: Int,
+    b_s2: Int,
+    b_s3: Int,
+    total: Int,
+    ctx: DeviceContext,
+) raises:
+    """Same tiering as `_where_bcast`, minus the `a` operand entirely: an
+    element-WIDTH dtype (`_fill_bits_dtype`'s uintN), never the real one --
+    the caller has already narrowed `value` to it."""
+    if total == 0:
+        return
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var cond_ptr = _make_ptr[DType.bool](cond_addr)
+    var b_ptr = _make_ptr[dtype](b_addr)
+
+    if ctx.api() == "cpu":
+
+        @always_inline
+        @parameter
+        @__copy_capture(out_ptr, cond_ptr, b_ptr, value)
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            var i3 = i % d3
+            var rest = i // d3
+            var i2 = rest % d2
+            rest = rest // d2
+            var i1 = rest % d1
+            var i0 = rest // d1
+            var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
+            var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
+            out_ptr[i] = value if cond_ptr[cbase] else b_ptr[bbase]
+
+        elementwise[func, simd_width=1](Coord(total), ctx)
+        return
+
+    comptime if not has_accelerator():
+        raise Error("no GPU accelerator available at compile time")
     else:
-        _parallel_for[func](total, ctx)
+        comptime VW = 16 // size_of[dtype]()
+        var d0 = total // max(1, d1 * d2 * d3)
+        var cont3 = d3
+        var cont2 = d2 * d3
+        var cont1 = d1 * d2 * d3
+        var b_scalar = b_s0 == 0 and b_s1 == 0 and b_s2 == 0 and b_s3 == 0
+        var cond_flat = (
+            (cs3 == 1 or d3 == 1)
+            and (cs2 == cont3 or d2 == 1)
+            and (cs1 == cont2 or d1 == 1)
+            and (cs0 == cont1 or d0 == 1)
+        )
+        var b_flat = b_scalar or (
+            (b_s3 == 1 or d3 == 1)
+            and (b_s2 == cont3 or d2 == 1)
+            and (b_s1 == cont2 or d1 == 1)
+            and (b_s0 == cont1 or d0 == 1)
+        )
+        var aligned = (
+            out_addr % 16 == 0
+            and cond_addr % VW == 0
+            and (b_scalar or b_addr % 16 == 0)
+        )
+        if aligned and cond_flat and b_flat:
+            var traffic = total * (
+                1 + (0 if b_scalar else size_of[dtype]()) + size_of[dtype]()
+            )
+            var slots = max(1, total // VW)
+            _enqueue_cached[_masked_fill_scalar_flat_vec_kernel[dtype]](
+                ctx,
+                String(t"dm_mfs_fv_{dtype}"),
+                _bw_flat_blocks(slots, traffic),
+                1,
+                1,
+                GS_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                cond_ptr.as_unsafe_any_origin().as_immutable(),
+                b_ptr.as_unsafe_any_origin().as_immutable(),
+                value,
+                Int64(total),
+                Int64(b_scalar),
+            )
+            return
+
+        _enqueue_cached[_masked_fill_scalar_bcast_kernel[dtype]](
+            ctx,
+            String(t"dm_mfs_bc_{dtype}"),
+            _gs_blocks(total),
+            1,
+            1,
+            GS_THREADS,
+            out_ptr.as_unsafe_any_origin(),
+            cond_ptr.as_unsafe_any_origin().as_immutable(),
+            b_ptr.as_unsafe_any_origin().as_immutable(),
+            value,
+            Int64(d1),
+            Int64(d2),
+            Int64(d3),
+            Int64(cs0),
+            Int64(cs1),
+            Int64(cs2),
+            Int64(cs3),
+            Int64(b_s0),
+            Int64(b_s1),
+            Int64(b_s2),
+            Int64(b_s3),
+            Int64(total),
+        )
+
+
+# `value` crosses the WIDTH-dispatch boundary as bits (`_fill_bits_dtype`),
+# so this dispatcher is parametrized on the REAL dtype only to narrow the
+# incoming Float64 correctly (float32 vs. its same-width int32/uint32 read
+# very different bit patterns from the same numeric value) -- exactly the
+# split `_fill`/`_fill_contig` already use for the plain Fill kernel.
+# Scoped to the float dtypes masked_fill's fast eager path targets
+# (`_FLOAT_DTYPES` in aten_fast.py); any other dtype's Scalar overload keeps
+# going through the slower materialize-then-WhereSelect route in Python.
+comptime _MASKED_FILL_SCALAR_DTYPES = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+]
+
+
+def _masked_fill_scalar_go(
+    out_ptr: PyObjectPtr,
+    cond_ptr: PyObjectPtr,
+    b_ptr: PyObjectPtr,
+    params: PyObjectPtr,  # (d0..d3, cs0..cs3, bs0..bs3)
+    value: PyObjectPtr,
+    dtype_o: PyObjectPtr,
+    ctx_ptr: PyObjectPtr,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var cond_addr = _raw_int(cond_ptr)
+    var b_addr = _raw_int(b_ptr)
+    var d0 = _raw_tuple_int(params, 0)
+    var d1 = _raw_tuple_int(params, 1)
+    var d2 = _raw_tuple_int(params, 2)
+    var d3 = _raw_tuple_int(params, 3)
+    var cs0 = _raw_tuple_int(params, 4)
+    var cs1 = _raw_tuple_int(params, 5)
+    var cs2 = _raw_tuple_int(params, 6)
+    var cs3 = _raw_tuple_int(params, 7)
+    var b_s0 = _raw_tuple_int(params, 8)
+    var b_s1 = _raw_tuple_int(params, 9)
+    var b_s2 = _raw_tuple_int(params, 10)
+    var b_s3 = _raw_tuple_int(params, 11)
+    var value_v = _raw_f64(value)
+    var dtype_val = _raw_dtype_int(dtype_o)
+    var total = d0 * d1 * d2 * d3
+    var ctx = _raw_ctx(ctx_ptr)
+
+    @always_inline
+    @parameter
+    def run[dt: DType]() raises:
+        comptime BITS = _fill_bits_dtype[dt]()
+        _masked_fill_scalar_bcast[BITS](
+            out_addr,
+            cond_addr,
+            b_addr,
+            _fill_bits[dt, BITS](value_v),
+            d1,
+            d2,
+            d3,
+            cs0,
+            cs1,
+            cs2,
+            cs3,
+            b_s0,
+            b_s1,
+            b_s2,
+            b_s3,
+            total,
+            ctx,
+        )
+
+    # arg_dtypes on the Python side is (cond.dtype, b.dtype) -- index 0 is
+    # always bool (the mask), so the real dtype the kernel specializes on is
+    # index 1, matching `_launch_masked_fill_scalar`'s `arg_dtypes=(cond,
+    # b)` ordering (and `_where_select_go`'s own `_dtype_arg_width_on[1,
+    # ...]`, gated the same way for the same reason).
+    var handled = False
+    comptime for dt in _MASKED_FILL_SCALAR_DTYPES:
+        comptime if _dtype_arg_on[1, dt]():
+            if dtype_val == dt:
+                run[dt]()
+                handled = True
+    if not handled:
+        raise Error(
+            "unsupported dtype for fast masked_fill scalar: "
+            + String(dtype_val)
+        )
 
 
 @always_inline
 def _dtype_size(dtype: DType) raises -> Int:
     """Element size in bytes for WhereSelect's `dtype` arg.
 
-    `_where_select` is a pure bit-move (SIMD select, no arithmetic), so it
-    only needs to be specialized per byte-size, not per exact dtype.
+    `_where_bcast` (and its flat-vec/strided kernels) is a pure bit-move
+    (SIMD select, no arithmetic), so it only needs to be specialized per
+    byte-size, not per exact dtype.
     """
     if dtype == DType.float32 or dtype == DType.int32 or dtype == DType.uint32:
         return 4
@@ -1482,7 +1994,7 @@ def _where_select_go(
     comptime if _dtype_arg_width_on[1, 32]():
         if size != 4:
             raise Error("where specialization/dtype mismatch")
-        _where_select[DType.uint32](
+        _where_bcast[DType.uint32](
             out_addr,
             cond_addr,
             a_addr,
@@ -1508,7 +2020,7 @@ def _where_select_go(
     elif _dtype_arg_width_on[1, 16]():
         if size != 2:
             raise Error("where specialization/dtype mismatch")
-        _where_select[DType.uint16](
+        _where_bcast[DType.uint16](
             out_addr,
             cond_addr,
             a_addr,
@@ -1534,7 +2046,7 @@ def _where_select_go(
     elif _dtype_arg_width_on[1, 64]():
         if size != 8:
             raise Error("where specialization/dtype mismatch")
-        _where_select[DType.uint64](
+        _where_bcast[DType.uint64](
             out_addr,
             cond_addr,
             a_addr,
@@ -1560,7 +2072,7 @@ def _where_select_go(
     elif _dtype_arg_width_on[1, 8]():
         if size != 1:
             raise Error("where specialization/dtype mismatch")
-        _where_select[DType.uint8](
+        _where_bcast[DType.uint8](
             out_addr,
             cond_addr,
             a_addr,
@@ -2802,6 +3314,21 @@ def _where_select_dispatcher(
     return _raw_ret_none()
 
 
+def _masked_fill_scalar_dispatcher(
+    py_self: PyObjectPtr,
+    args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
+    nargs: Py_ssize_t,
+) abi("C") -> PyObjectPtr:
+    var args = UnsafePointer(args_safe)
+    try:
+        _masked_fill_scalar_go(
+            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+        )
+    except e:
+        return _spec_unsupported(e)
+    return _raw_ret_none()
+
+
 def _tile_copy_dispatcher(
     py_self: PyObjectPtr,
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
@@ -2997,6 +3524,16 @@ def PyInit_data_movement_ops() abi("C") -> PythonObject:
                 b,
                 _where_select_dispatcher,
                 docstring="out = cond ? a : b (broadcast strides, any dtype)",
+            )
+        comptime if _op_on["MaskedFillScalar"]():
+            _register_call(
+                b,
+                _masked_fill_scalar_dispatcher,
+                docstring=(
+                    "out = cond ? value : b (value baked into the launch, no"
+                    " device buffer; masked_fill(_).Scalar fast path, float"
+                    " dtypes only)"
+                ),
             )
         comptime if _op_on["TileCopy"]():
             _register_call(

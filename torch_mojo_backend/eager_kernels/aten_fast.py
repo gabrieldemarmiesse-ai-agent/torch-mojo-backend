@@ -2393,6 +2393,41 @@ def _launch_where_bcast(
     )
 
 
+def _launch_masked_fill_scalar(
+    out: TorchMojoTensor,
+    cond: TorchMojoTensor,
+    b: TorchMojoTensor,
+    value: float,
+    meta: tuple[list[int], list[int], list[list[int]]],
+    dtype: DType,
+) -> None:
+    """masked_fill(_).Scalar's fast path: `value` is baked into the launch
+    as an argument, never materialized into a device buffer first (that
+    used to cost a whole extra Fill kernel launch -- see MaskedFillScalar's
+    docstring in data_movement_ops.mojo). Only `_MASKED_FILL_SCALAR_DTYPES`
+    (the float dtypes) are wired to this; every other dtype's Scalar
+    overload still goes through `_launch_where_bcast` below."""
+    out_shape, dims, strides = meta
+    cond_strides, b_strides = strides
+    params = tuple(dims) + tuple(cond_strides) + tuple(b_strides)
+    _call_mojo(
+        _DataMovementExtension,
+        "MaskedFillScalar",
+        (
+            out._ptr,
+            cond._ptr,
+            b._ptr,
+            params,
+            value,
+            dtype.value,
+            _ctx_ptr(out._device),
+        ),
+        arg_dtypes=(cond._dtype, b._dtype),
+        output_dtypes=(out._dtype,),
+        keepalive=(out, cond, b),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Elementwise ops
 # ---------------------------------------------------------------------------
@@ -3288,6 +3323,34 @@ def fast_aten_where(condition, input, other):
     return out
 
 
+def _masked_fill_scalar_operands(input, mask, value):
+    """Resolve (in_t, mask_t, value: float, meta) for masked_fill's
+    immediate-scalar fast path, or None.
+
+    Only takes a plain Python scalar `value` (never a 0-d tensor -- that
+    goes through `_masked_fill_operands`/`_launch_where_bcast` instead,
+    since it already has a real device pointer) against one of the float
+    dtypes `MaskedFillScalar` supports (`_FLOAT_DTYPES`; matches
+    `_MASKED_FILL_SCALAR_DTYPES` in data_movement_ops.mojo). Anything else
+    -- a Tensor value, an int/bool tensor, a value that doesn't embed
+    losslessly -- declines here and falls back to the slower
+    materialize-then-WhereSelect path below.
+    """
+    a = _t(input)
+    m = _t(mask)
+    if a is None or m is None or m._dtype != DType.bool or m._device != a._device:
+        return None
+    if a._dtype not in _FLOAT_DTYPES:
+        return None
+    fval = _scalar_embed(value, a._dtype)
+    if fval is None:
+        return None
+    meta = _bcast_meta(m, a)
+    if meta is None or tuple(meta[0]) != tuple(a._shape):
+        return None
+    return a, m, fval, meta
+
+
 def _masked_fill_operands(input, mask, value):
     """Resolve (in_t, mask_t, value_t, meta) for masked_fill, or None.
 
@@ -3332,6 +3395,13 @@ def _masked_fill_operands(input, mask, value):
 
 
 def fast_aten_masked_fill(input, mask, value):
+    scalar_resolved = _masked_fill_scalar_operands(input, mask, value)
+    if scalar_resolved is not None:
+        a, m, fval, meta = scalar_resolved
+        out = _alloc(a._shape, a._dtype, a._device)
+        if out._numel > 0:
+            _launch_masked_fill_scalar(out, m, a, fval, meta, a._dtype)
+        return out
     resolved = _masked_fill_operands(input, mask, value)
     if resolved is None:
         return NOT_HANDLED
@@ -3344,6 +3414,20 @@ def fast_aten_masked_fill(input, mask, value):
 
 def fast_aten_masked_fill_(input, mask, value):
     """In-place masked fill into input. Returns None when unavailable."""
+    scalar_resolved = _masked_fill_scalar_operands(input, mask, value)
+    if scalar_resolved is not None:
+        a, m, fval, meta = scalar_resolved
+        if a._numel > 0:
+            if a._is_contiguous:
+                # Writing out == a is safe: each element reads and writes
+                # the same index (a's strides are the output layout).
+                _launch_masked_fill_scalar(a, m, a, fval, meta, a._dtype)
+            else:
+                result = fast_aten_masked_fill(input, mask, value)
+                if result is NOT_HANDLED:
+                    return None
+                _copy_into(a, result)
+        return input
     resolved = _masked_fill_operands(input, mask, value)
     if resolved is None:
         return None

@@ -4784,6 +4784,128 @@ def test_fast_bitwise_scalar_operand_match_cpu(mojo_gpu):
             assert torch.equal(op(device, 21).cpu(), op(values, 21)), f"{op}, n={n}"
 
 
+# masked_fill / where.self: the WhereSelect flat-vec tier (`_where_bcast` in
+# data_movement_ops.mojo) and the MaskedFillScalar immediate-value fast path
+# (masked_fill(_).Scalar only -- see `_masked_fill_scalar_operands` in
+# aten_fast.py). Both were 4-6x slower than stock on the tiny A_357x789
+# benchmark shape before those tiers existed: the old code went through the
+# stdlib `elementwise` GPU dispatcher (per-call `compile_function`, plus a
+# six-division rank-4 coordinate decomposition per element even for a fully
+# contiguous, non-broadcasting case), and masked_fill's Scalar overload paid
+# a second full kernel launch (a Fill kernel) just to materialize its value
+# into a 0-d device tensor before WhereSelect could read it.
+_WHERE_FAMILY_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
+
+
+def _where_family_operands(
+    n: int, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministic (input, other, mask): mask true on ~1/3 of elements."""
+    left = (torch.arange(n, dtype=torch.float32) % 97 - 48.0).to(dtype)
+    right = (torch.arange(n, dtype=torch.float32) % 61 - 30.0).to(dtype)
+    mask = (torch.arange(n) % 3) == 0
+    return left, right, mask
+
+
+@pytest.mark.parametrize("dtype", _WHERE_FAMILY_DTYPES)
+@pytest.mark.parametrize("n", _MASK_SIZES)
+def test_fast_masked_fill_scalar_vector_width_boundaries_match_cpu(mojo_gpu, n, dtype):
+    """The MaskedFillScalar immediate-value kernel's vector width and ragged
+    tail, functional and in-place: `value` never touches device memory for
+    this overload (see `_masked_fill_scalar_operands`)."""
+    x, _other, mask = _where_family_operands(n, dtype)
+    x_dev, mask_dev = x.to(mojo_gpu), mask.to(mojo_gpu)
+
+    expected = x.masked_fill(mask, -1.5)
+    actual = x_dev.masked_fill(mask_dev, -1.5).cpu()
+    torch.testing.assert_close(actual, expected)
+
+    expected_ip = x.clone()
+    expected_ip.masked_fill_(mask, 2.25)
+    actual_ip = x_dev.clone()
+    actual_ip.masked_fill_(mask_dev, 2.25)
+    torch.testing.assert_close(actual_ip.cpu(), expected_ip)
+
+
+@pytest.mark.parametrize("dtype", _WHERE_FAMILY_DTYPES)
+def test_fast_masked_fill_tensor_value_0d_matches_cpu(mojo_gpu, dtype):
+    """masked_fill's Tensor overload: `value` is a real 0-d device tensor, a
+    stride-0 broadcast operand for the WhereSelect flat-vec kernel (not an
+    immediate) -- exercised across the same vector-width/tail sizes."""
+    for n in _MASK_SIZES:
+        x, _other, mask = _where_family_operands(n, dtype)
+        value = torch.tensor(3.25, dtype=dtype)
+        x_dev, mask_dev = x.to(mojo_gpu), mask.to(mojo_gpu)
+        value_dev = value.to(mojo_gpu)
+
+        expected = x.masked_fill(mask, value)
+        actual = x_dev.masked_fill(mask_dev, value_dev).cpu()
+        torch.testing.assert_close(actual, expected)
+
+        expected_ip = x.clone()
+        expected_ip.masked_fill_(mask, value)
+        actual_ip = x_dev.clone()
+        actual_ip.masked_fill_(mask_dev, value_dev)
+        torch.testing.assert_close(actual_ip.cpu(), expected_ip)
+
+
+@pytest.mark.parametrize("dtype", _WHERE_FAMILY_DTYPES)
+def test_fast_where_self_vector_width_boundaries_match_cpu(mojo_gpu, dtype):
+    for n in _MASK_SIZES:
+        left, right, mask = _where_family_operands(n, dtype)
+        actual = torch.where(
+            mask.to(mojo_gpu), left.to(mojo_gpu), right.to(mojo_gpu)
+        ).cpu()
+        torch.testing.assert_close(actual, torch.where(mask, left, right))
+
+
+@pytest.mark.parametrize("dtype", _WHERE_FAMILY_DTYPES)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_fast_masked_fill_broadcast_mask_matches_cpu(mojo_gpu, dtype, inplace):
+    """A mask that broadcasts up to the input (leading-dim broadcast) is a
+    genuinely strided case for both the Scalar and Tensor overloads: it must
+    fall back off the flat-vec tier (`cond_flat` is false) and still be
+    correct."""
+    x = (
+        (torch.arange(3 * 4 * 5, dtype=torch.float32) % 23 - 11.0)
+        .to(dtype)
+        .reshape(3, 4, 5)
+    )
+    mask = (torch.arange(4 * 5) % 4 == 0).reshape(4, 5)
+    x_dev, mask_dev = x.to(mojo_gpu), mask.to(mojo_gpu)
+
+    for value in (7.0, torch.tensor(7.0, dtype=dtype)):
+        value_dev = value.to(mojo_gpu) if isinstance(value, torch.Tensor) else value
+        if inplace:
+            expected = x.clone()
+            expected.masked_fill_(mask, value)
+            actual = x_dev.clone()
+            actual.masked_fill_(mask_dev, value_dev)
+            actual = actual.cpu()
+        else:
+            expected = x.masked_fill(mask, value)
+            actual = x_dev.masked_fill(mask_dev, value_dev).cpu()
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", _WHERE_FAMILY_DTYPES)
+def test_fast_masked_fill_noncontiguous_input_matches_cpu(mojo_gpu, dtype):
+    """A transposed (non-contiguous) input must fail the flat-vec alignment
+    gate and take the strided fallback, not silently corrupt. Built by
+    transposing ON DEVICE, not via `.to()`: a cross-device copy is free to
+    re-materialize its destination contiguously regardless of the source
+    layout."""
+    x = (torch.arange(60, dtype=torch.float32) % 41 - 20.0).to(dtype).reshape(6, 10)
+    mask = (torch.arange(60) % 5 == 0).reshape(6, 10)
+    x_dev_t = x.to(mojo_gpu).t()
+    mask_dev_t = mask.to(mojo_gpu).t()
+    assert not x_dev_t.is_contiguous()
+
+    expected = x.t().masked_fill(mask.t(), -3.0)
+    actual = x_dev_t.masked_fill(mask_dev_t, -3.0).cpu()
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("op_name", ["logical_not", "bitwise_not", "isnan"])
 def test_fast_unary_mask_vector_tail_match_cpu(mojo_gpu, op_name):
     """The flat vectorized unary skeleton: same tail and alignment rules, and
