@@ -7676,6 +7676,40 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     return physical_transpose, batch_stride
 
 
+def _gemm16_alignment_favors_split(a, b, *, transpose_b: bool = False) -> bool:
+    """Conservative pre-check: could gemm16 possibly route this shape through
+    a v3/v4 tensor-core route (aligned or split-K), regardless of bias?
+
+    Every such route (gemm16_v3_kernels.mojo, gemm16_nn/nt/tn_v4_kernels.mojo)
+    requires m, n, and k to each be a multiple of at least 64 -- the smallest
+    tile any of them uses. When that fails, gemm16 always falls to the
+    "accepted" mma.sync kernel either way (with or without a bias), so
+    computing the mm separately from the bias only pays for an extra
+    elementwise-add kernel launch (device time on the order of 5us) with no
+    upside. That is exactly what regressed the tiny, deliberately-awkward
+    357x789x333 shape (S5) from an already-good sub-1.0x ratio to 1.25-1.65x
+    when this split was tried unconditionally: none of m=357, n=789, k=333
+    is a multiple of 64, so both the split mm and the original fused-bias
+    call were always going to land on the identical accepted-kernel path,
+    and only the split paid for a second launch.
+
+    A conservative "yes" here costs nothing beyond that same one extra
+    launch on a shape that turns out to still use the accepted kernel for
+    some other (rarer) reason; it never affects correctness, only which of
+    two already-correct paths a caller tries first.
+    """
+    lhs = _t(a)
+    rhs = _t(b)
+    if lhs is None or rhs is None or len(lhs._shape) != 2 or len(rhs._shape) != 2:
+        return False
+    m, k = lhs._shape
+    rhs_k = rhs._shape[1] if transpose_b else rhs._shape[0]
+    n = rhs._shape[0] if transpose_b else rhs._shape[1]
+    if rhs_k != k:
+        return False
+    return m % 64 == 0 and n % 64 == 0 and k % 64 == 0
+
+
 def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
@@ -7969,7 +8003,18 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
 
 
 def _try_gemm16_linear(input, weight, bias=None):
-    """Route a dense rank >= 2 16-bit projection through GEMM without copies."""
+    """Route a dense rank >= 2 16-bit projection through GEMM without copies.
+
+    Every gemm16 tensor-core route (the v3/v4 warp-specialized, TMA, and
+    split-K kernels in gemm16_v3_kernels.mojo) declines outright whenever a
+    bias is present, so a fused-bias call here would silently fall back to
+    the far slower "accepted" mma.sync kernel -- measured 3.6-7.4x slower
+    than stock PyTorch on deep-K shapes, versus ~1.3x for the identical
+    unbiased mm.  Compute the bias-free mm on the fast path instead and add
+    the bias afterward with the existing broadcasting elementwise add: the
+    same mm-then-add composition `aten_addmm` already uses for the
+    torch.compile backend, and microseconds next to the GEMM itself.
+    """
     a = _t(input)
     w = _t(weight)
     if (
@@ -7993,6 +8038,22 @@ def _try_gemm16_linear(input, weight, bias=None):
             a._offset,
             contiguous=True,
         )
+    if bias is None:
+        return _try_gemm16_mm(
+            matrix, weight, transpose_b=True, output_shape=output_shape
+        )
+    if _gemm16_alignment_favors_split(matrix, weight, transpose_b=True):
+        mm_out = _try_gemm16_mm(
+            matrix, weight, transpose_b=True, output_shape=output_shape
+        )
+        if mm_out is not None:
+            biased = fast_aten_add(mm_out, bias)
+            if biased is not NOT_HANDLED:
+                return biased
+    # Either the shape can never reach a fast route regardless of bias (see
+    # _gemm16_alignment_favors_split), or the fast add declined for this
+    # bias: the bias-fused kernel is at worst identical, and never drops
+    # the bias silently.
     return _try_gemm16_mm(
         matrix, weight, bias, transpose_b=True, output_shape=output_shape
     )
@@ -8050,6 +8111,22 @@ def fast_aten_mm(x, y):
 def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
+        # See _try_gemm16_linear: every gemm16 tensor-core route declines
+        # outright whenever a bias is present, so calling it WITH the bias
+        # would silently fall back to the much slower "accepted" mma.sync
+        # kernel.  When the shape could plausibly reach a fast route (see
+        # _gemm16_alignment_favors_split), compute the bias-free mm on the
+        # fast path and add the bias with the existing broadcasting
+        # elementwise add instead.
+        if _gemm16_alignment_favors_split(mat1, mat2):
+            mm_out = _try_gemm16_mm(mat1, mat2)
+            if mm_out is not None:
+                biased = fast_aten_add(mm_out, input)
+                if biased is not NOT_HANDLED:
+                    return biased
+        # Either the shape can never reach a fast route regardless of bias,
+        # or the fast add declined for this bias: the bias-fused kernel is
+        # at worst identical, and never drops the bias silently.
         out = _try_gemm16_mm(mat1, mat2, input)
         if out is not None:
             return out
