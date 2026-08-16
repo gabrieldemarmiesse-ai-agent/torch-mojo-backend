@@ -566,6 +566,142 @@ def flash_attention_fwd_f16_d64_causal_strided_qkv(
     return PythonObject(None)
 
 
+def _check_bhsd_args(
+    batch: Int,
+    seqlen: Int,
+    nheads: Int,
+    q_addr: Int,
+    k_addr: Int,
+    v_addr: Int,
+    out_addr: Int,
+) raises:
+    """Defensive validation for the BHSD-native forward entry points.
+
+    The Python bridge (``_fa4_bhsd_layout`` in ``aten_fast.py``) has
+    already gated on public (B, H, S, D) contiguity and 16-byte
+    base-pointer alignment before selecting this path -- TMA descriptor
+    creation over the plane-viewed (B*H, S, D) layout requires exactly
+    that. Re-check here (same spirit as ``_check_strided_qkv_layout``
+    for the strided ABI) so a caller that bypasses the Python gate
+    cannot slip an unaligned or degenerate view past descriptor
+    creation.
+    """
+    if batch <= 0 or seqlen <= 0 or nheads <= 0:
+        raise Error(
+            "fa4 bhsd: batch, seqlen and nheads must be positive, got (",
+            batch,
+            ", ",
+            seqlen,
+            ", ",
+            nheads,
+            ")",
+        )
+    if (
+        q_addr % 16 != 0
+        or k_addr % 16 != 0
+        or v_addr % 16 != 0
+        or out_addr % 16 != 0
+    ):
+        raise Error(
+            "fa4 bhsd: q/k/v/out base addresses must be 16-byte aligned"
+        )
+
+
+def flash_attention_fwd_bf16_d64_causal_bhsd(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Dense causal d64 fwd, BHSD-native: Q/K/V/O TMA descriptors address
+    the PUBLIC contiguous (B, H, S, D) layout directly (viewed as
+    (B*H, S, D) planes), skipping the BTHD materialization the dense
+    entry point above requires. See fa4_fwd_kernel.mojo/fa4_fwd_launch.mojo
+    ``bhsd``/``bhsd_qkv`` comptime params."""
+    var q_addr = Int(py=args[0])
+    var k_addr = Int(py=args[1])
+    var v_addr = Int(py=args[2])
+    var out_addr = Int(py=args[3])
+    var lse_addr = Int(py=args[4])
+    var batch = Int(py=args[5])
+    var seqlen = Int(py=args[6])
+    var nheads = Int(py=args[7])
+    var softmax_scale = Float32(py=args[8])
+    var ctx_addr = Int(py=args[9])
+
+    _check_bhsd_args(batch, seqlen, nheads, q_addr, k_addr, v_addr, out_addr)
+
+    launch_fwd_fa4[
+        DType.bfloat16,
+        64,
+        False,
+        True,
+        1,
+        False,
+        False,
+        False,
+        0,
+        bhsd_qkv=True,
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        out_addr,
+        lse_addr,
+        0,
+        ctx_addr,
+    )
+    return PythonObject(None)
+
+
+def flash_attention_fwd_f16_d64_causal_bhsd(
+    mut py_self: PythonObject,
+    mut args: PythonObject,
+) raises -> PythonObject:
+    """Same BHSD-native dense causal d64 fwd as the bf16 entry point
+    above, only the comptime ``dtype`` differs."""
+    var q_addr = Int(py=args[0])
+    var k_addr = Int(py=args[1])
+    var v_addr = Int(py=args[2])
+    var out_addr = Int(py=args[3])
+    var lse_addr = Int(py=args[4])
+    var batch = Int(py=args[5])
+    var seqlen = Int(py=args[6])
+    var nheads = Int(py=args[7])
+    var softmax_scale = Float32(py=args[8])
+    var ctx_addr = Int(py=args[9])
+
+    _check_bhsd_args(batch, seqlen, nheads, q_addr, k_addr, v_addr, out_addr)
+
+    launch_fwd_fa4[
+        DType.float16,
+        64,
+        False,
+        True,
+        1,
+        False,
+        False,
+        False,
+        0,
+        bhsd_qkv=True,
+    ](
+        batch,
+        seqlen,
+        nheads,
+        softmax_scale,
+        q_addr,
+        k_addr,
+        v_addr,
+        out_addr,
+        lse_addr,
+        0,
+        ctx_addr,
+    )
+    return PythonObject(None)
+
+
 def flash_attention_bwd_bf16_d64_causal_strided_qkv(
     mut py_self: PythonObject,
     mut args: PythonObject,
@@ -866,6 +1002,12 @@ def PyInit_fa4_ops() abi("C") -> PythonObject:
         )
         module.def_py_function[flash_attention_fwd_f16_d64_causal_strided_qkv](
             "flash_attention_fwd_f16_d64_causal_strided_qkv"
+        )
+        module.def_py_function[flash_attention_fwd_bf16_d64_causal_bhsd](
+            "flash_attention_fwd_bf16_d64_causal_bhsd"
+        )
+        module.def_py_function[flash_attention_fwd_f16_d64_causal_bhsd](
+            "flash_attention_fwd_f16_d64_causal_bhsd"
         )
         module.def_py_function[flash_attention_bwd_bf16_d64_causal_strided_qkv](
             "flash_attention_bwd_bf16_d64_causal_strided_qkv"

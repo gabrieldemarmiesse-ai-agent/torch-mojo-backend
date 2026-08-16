@@ -6575,6 +6575,27 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
     )
 
 
+def _fa4_bhsd_layout(tensor) -> bool:
+    """Whether the PUBLIC (B, H, S, D) tensor is eligible for the
+    BHSD-native TMA path -- no BTHD materialization needed at all.
+
+    TMA descriptor creation over the (B*H, S, D) plane view requires the
+    exact row-major (B, H, S, D) contiguity the aten op naturally
+    produces, plus a 16-byte-aligned base pointer. A sliced/offset view
+    can be fully contiguous yet still violate the latter, so both are
+    checked here -- mirroring the alignment requirement
+    ``_fa4_strided_bthd_layout`` enforces for the strided BTHD ABI.
+    """
+    return (
+        tensor is not None
+        and tensor._dtype in (DType.bfloat16, DType.float16)
+        and tensor._itemsize == tensor._dtype.size_in_bytes
+        and len(tensor._shape) == 4
+        and tensor._is_contiguous
+        and tensor._ptr % 16 == 0
+    )
+
+
 def _fa4_native_bthd(tensor):
     """Expose public BHTD storage as FA4-native BTHD, copying if required."""
     physical = fast_aten_transpose(tensor, 1, 2)
@@ -6627,6 +6648,42 @@ def fast_fa4_16bit_d64_causal_forward(
     fa4_ops = load_fa4_ops()
     q, k, v = inputs
     qkv_dtype = q._dtype
+    batch, heads, seqlen, head_dim = q._shape
+    if _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v):
+        # PUBLIC contiguous (B, H, S, D), 16-byte-aligned base pointers:
+        # TMA descriptors address this layout directly (viewed as
+        # (B*H, S, D) planes), so no BTHD materialization
+        # (fast_aten_transpose + copy, ~3 gather copies removed) is
+        # needed for Q/K/V, and the output is allocated in this same
+        # contiguous layout and returned as-is (no transpose-back
+        # either). "q_native"/"k_native"/"v_native" below is just
+        # ``q``/``k``/``v`` themselves -- they are what the kernel
+        # actually consumed, matching what the strided/dense branches
+        # return for their own materialized forms.
+        out_native = _alloc((batch, heads, seqlen, head_dim), qkv_dtype, q._device)
+        logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
+        scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+        forward_fn = (
+            fa4_ops.flash_attention_fwd_bf16_d64_causal_bhsd
+            if qkv_dtype == DType.bfloat16
+            else fa4_ops.flash_attention_fwd_f16_d64_causal_bhsd
+        )
+        _device_call(
+            forward_fn,
+            q._ptr,
+            k._ptr,
+            v._ptr,
+            out_native._ptr,
+            logsumexp._ptr,
+            batch,
+            seqlen,
+            heads,
+            scale_value,
+            _ctx_ptr(q._device),
+            keepalive=(q, k, v, out_native, logsumexp),
+        )
+        return out_native, logsumexp, q, k, v
+
     q_native = _fa4_native_bthd(q)
     k_native = _fa4_native_bthd(k)
     v_native = _fa4_native_bthd(v)
@@ -6637,7 +6694,6 @@ def fast_fa4_16bit_d64_causal_forward(
         return NOT_HANDLED
     (q_native, k_native, v_native), use_strided_qkv = prepared
 
-    batch, heads, seqlen, head_dim = q._shape
     physical_shape = (batch, seqlen, heads, head_dim)
     out_native = _alloc(physical_shape, qkv_dtype, q._device)
     logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
@@ -7218,15 +7274,20 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
         )
         if recomputed is NOT_HANDLED:
             return NOT_HANDLED
-        recomputed_output, recomputed_lse, q_native, k_native, v_native = recomputed
+        recomputed_output, recomputed_lse, _, _, _ = recomputed
         output = recomputed_output
         lse = recomputed_lse
-    else:
-        q_native = _fa4_native_bthd(q)
-        k_native = _fa4_native_bthd(k)
-        v_native = _fa4_native_bthd(v)
-        if q_native is None or k_native is None or v_native is None:
-            return NOT_HANDLED
+    # Always re-materialize Q/K/V natives from the public tensors rather than
+    # trusting forward's returned "natives": the BHSD-eligible fast path
+    # above returns the PUBLIC q/k/v untouched (that's the whole point --
+    # no BTHD copy), which is the wrong shape/layout for the bwd kernels'
+    # BTHD-only ABI, so backward must derive its own regardless of which
+    # forward path (if any) ran above.
+    q_native = _fa4_native_bthd(q)
+    k_native = _fa4_native_bthd(k)
+    v_native = _fa4_native_bthd(v)
+    if q_native is None or k_native is None or v_native is None:
+        return NOT_HANDLED
     # The lower ATen backward accepts arbitrary shape-compatible views, while
     # FA4 consumes LSE as contiguous (B, H, S).  Keep the generated/high-level
     # path zero-copy and materialize only a genuinely strided direct caller.

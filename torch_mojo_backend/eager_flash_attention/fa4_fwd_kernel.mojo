@@ -103,6 +103,7 @@ def fwd_fa4_kernel[
     window: Bool = False,
     window_unaligned: Bool = False,
     softcap_x1000: Int = 0,
+    bhsd: Bool = False,
 ](
     q_tma: TMATensorTile[dtype, qo_rank, q_tile_shape, q_desc_shape],
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
@@ -116,6 +117,16 @@ def fwd_fa4_kernel[
     sched_num_hb_q_arg: Int64,
     sched_residual_arg: Int64,
 ):
+    # BHSD-native mode: Q/K/V/O descriptors address the PUBLIC
+    # contiguous (B, H, S, D) layout viewed as (B*H, S, D) — planes are
+    # the TMA outer dim and S its own dim, so BM=192 tail tiles
+    # zero-fill on load and clamp on store at every plane edge. No BTHD
+    # materialization (FA3's scheme: the head stride is just another
+    # gmem stride). Dense only in v1.
+    comptime if bhsd:
+        comptime assert qo_rank == 3 and not varlen and not window, (
+            "bhsd v1 is the dense (non-varlen, non-window) path"
+        )
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var seq_len = Int(seq_len_arg)
@@ -329,7 +340,14 @@ def fwd_fa4_kernel[
         warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
         if thread_idx.x == 0:
             mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
-            comptime if qo_rank == 4:
+            comptime if bhsd:
+                # (B*H, S, D) planes; S its own dim -> tail zero-fill.
+                q_tma.async_copy_3d(
+                    q_smem,
+                    mbar_q[0],
+                    (0, m_block * BM, b_idx * nheads + h_idx),
+                )
+            elif qo_rank == 4:
                 # Dense hdim64: S is its own TMA dim (BM=192 does not
                 # divide the seqlen envelope; OOB tail rows zero-fill
                 # here and the store-side clamps).
@@ -360,7 +378,15 @@ def fwd_fa4_kernel[
             var wrap: Int = 0
             var row: Int
             var row_step: Int = BN
-            comptime if window:
+            # BHSD: kv rows are plane-local (the plane is a TMA coord).
+            var kv_plane: Int = 0
+            comptime if bhsd:
+                kv_plane = (
+                    b_idx * (nheads // gqa_ratio) + h_idx // gqa_ratio
+                )
+            comptime if bhsd:
+                row = 0
+            elif window:
                 comptime if varlen:
                     row = vl_k_base + first_kv * BN
                 else:
@@ -383,9 +409,12 @@ def fwd_fa4_kernel[
                     alignment=128,
                 ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
                 full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                k_tma.async_copy_3d(
-                    k_st, full[slot], (0, h_idx // gqa_ratio, row)
-                )
+                comptime if bhsd:
+                    k_tma.async_copy_3d(k_st, full[slot], (0, row, kv_plane))
+                else:
+                    k_tma.async_copy_3d(
+                        k_st, full[slot], (0, h_idx // gqa_ratio, row)
+                    )
 
                 empty[slot + 1].wait(phase)
                 var v_st = LayoutTensor[
@@ -396,9 +425,14 @@ def fwd_fa4_kernel[
                     alignment=128,
                 ]((kv_smem_base + (slot + 1) * kv_slot_size).as_unsafe_any_origin())
                 full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                v_tma.async_copy_3d(
-                    v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
-                )
+                comptime if bhsd:
+                    v_tma.async_copy_3d(
+                        v_st, full[slot + 1], (0, row, kv_plane)
+                    )
+                else:
+                    v_tma.async_copy_3d(
+                        v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
+                    )
 
                 row += row_step
                 slot += 2
@@ -864,8 +898,9 @@ def fwd_fa4_kernel[
     # Dense hdim64 (BM=192): the last m-tile is partial whenever
     # seq_len % BM != 0 — rank-4 TMA clamps the O store, but the LSE
     # writes still need the row predicate (vl_rows doubles as the
-    # valid-row count for both paths).
-    comptime if qo_rank == 4:
+    # valid-row count for both paths). BHSD's rank-3 (planes, S, D)
+    # store clamps at the plane's S edge the same way.
+    comptime if qo_rank == 4 or bhsd:
         vl_rows = seq_len - m_block * BM
 
     var full_tile_store: Bool = True
@@ -970,7 +1005,7 @@ def fwd_fa4_kernel[
             # Varlen: rows past the sequence's end belong to the NEXT
             # sequence's packed LSE rows — predicate them off.
             var lse_ok: Bool = True
-            comptime if varlen or qo_rank == 4:
+            comptime if varlen or qo_rank == 4 or bhsd:
                 lse_ok = r < vl_rows
             if lse_ok:
                 (lse_ptr + lse_row_base + r)[0] = (
@@ -989,7 +1024,13 @@ def fwd_fa4_kernel[
             address_space=AddressSpace.SHARED,
             alignment=128,
         ]((smem_base).as_unsafe_any_origin())
-        comptime if qo_rank == 4:
+        comptime if bhsd:
+            # (B*H, S, D) planes: the partial tail clamps at the
+            # plane's S edge in hardware.
+            o_tma.async_store_3d(
+                o_st, (0, m_block * BM, b_idx * nheads + h_idx)
+            )
+        elif qo_rank == 4:
             # S its own dim: the partial tail tile clamps in hardware.
             o_tma.async_store_4d(
                 o_st, (0, h_idx, m_block * BM, b_idx)

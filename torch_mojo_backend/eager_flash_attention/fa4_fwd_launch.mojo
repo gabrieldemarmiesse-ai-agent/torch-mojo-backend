@@ -54,6 +54,7 @@ def launch_fwd_fa4[
     window_unaligned: Bool = False,
     softcap_x1000: Int = 0,
     strided_qkv: Bool = False,
+    bhsd_qkv: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -134,6 +135,104 @@ def launch_fwd_fa4[
         kFa4BlockM(head_dim), 1, head_dim
     )
     comptime kv_smem_shape = IndexList[3](kFa4BlockN, 1, head_dim)
+
+    comptime if bhsd_qkv:
+        comptime assert (
+            head_dim == 64
+            and causal
+            and not varlen
+            and not window
+            and softcap_x1000 == 0
+            and not strided_qkv
+        ), "bhsd_qkv v1 supports only the dense causal d64 path"
+        # PUBLIC-layout consumption (the fix for the 30-45% gather-copy
+        # overhead): Q/K/V/O are the contiguous (B, H, S, D) tensors the
+        # ATen op provides, viewed as (B*H, S, D). Planes are the TMA
+        # outer dim and S its OWN dim, so BM=192 tail tiles zero-fill
+        # on load and clamp on store at every plane's S edge — no BTHD
+        # materialization, no next-plane clobber. This is FA3's scheme
+        # (head stride is just another gmem stride).
+        comptime q_smem_shape_b = IndexList[3](
+            1, kFa4BlockM(head_dim), head_dim
+        )
+        comptime kv_smem_shape_b = IndexList[3](1, kFa4BlockN, head_dim)
+        var planes_q: Int = batch_int * nheads_int
+        var planes_kv: Int = batch_int * (nheads_int // gqa_ratio)
+        var q_tma_b = create_split_tma[
+            q_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, q_ptr, planes_q, seqlen_int)
+        var k_tma_b = create_split_tma[
+            kv_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, k_ptr, planes_kv, seqlen_int)
+        var v_tma_b = create_split_tma[
+            kv_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, v_ptr, planes_kv, seqlen_int)
+        var o_imm_ptr_b = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+            unsafe_from_address=o_addr
+        )
+        var o_tma_b = create_split_tma[
+            q_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, o_imm_ptr_b, planes_q, seqlen_int)
+        comptime kernel_inst_b = fwd_fa4_kernel[
+            dtype,
+            head_dim,
+            3,
+            type_of(q_tma_b).tile_shape,
+            type_of(q_tma_b).desc_shape,
+            type_of(k_tma_b).tile_shape,
+            type_of(k_tma_b).desc_shape,
+            type_of(o_tma_b).tile_shape,
+            type_of(o_tma_b).desc_shape,
+            causal,
+            gqa_ratio,
+            False,
+            False,
+            False,
+            0,
+            bhsd=True,
+        ]
+        # Same LPT scheduler as the dense causal rank-4 path.
+        var num_m_b: Int = ceildiv(
+            seqlen_int, Int(kFa4BlockM(head_dim))
+        )
+        var size_one_kv_head_b: Int = (
+            seqlen_int * 2 * head_dim * size_of[dtype]()
+        )
+        var l2_ratio_b: Int = (50 * 1024 * 1024) // size_one_kv_head_b
+        var sched_swizzle_b: Int = 1
+        while sched_swizzle_b * 2 <= l2_ratio_b:
+            sched_swizzle_b *= 2
+        var num_hb_b: Int = nheads_int * batch_int
+        var sched_num_hb_q_b: Int = num_hb_b // sched_swizzle_b
+        var sched_residual_b: Int = max(num_hb_b % sched_swizzle_b, 1)
+        enqueue_fa4_cached[
+            kernel_inst_b,
+            use_external_stream=use_external_stream,
+            dump_asm=_dump_ptx_path(),
+        ](
+            ctx,
+            ctx_handle_addr,
+            stream_opaque,
+            String(
+                t"fwd_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"
+            ),
+            (num_m_b * num_hb_b, 1, 1),
+            kFa4NThreads(head_dim),
+            smem_bytes,
+            FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(smem_bytes)),
+            q_tma_b,
+            k_tma_b,
+            v_tma_b,
+            o_tma_b,
+            lse_ptr,
+            Int64(seqlen_int),
+            softmax_scale,
+            Int64(nheads_int),
+            Int64(sched_swizzle_b),
+            Int64(sched_num_hb_q_b),
+            Int64(sched_residual_b),
+        )
+        return
 
     # Varlen: one flat descriptor over the packed (total_tokens, H, D)
     # arrays; the kernel supplies per-sequence row offsets at copy

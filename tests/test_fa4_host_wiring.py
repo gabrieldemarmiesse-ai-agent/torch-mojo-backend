@@ -423,15 +423,24 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     ]
 
 
-def test_fa4_unsupported_public_layout_copies_and_uses_contiguous_fallback(
+def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A public (B, H, S, D) tensor that is fully contiguous but whose base
+    pointer is NOT 16-byte aligned (e.g. a sliced/offset view into a larger
+    buffer) must be rejected by ``_fa4_bhsd_layout`` and fall back to the
+    existing BTHD-materialize-and-copy path -- TMA descriptor creation for
+    the BHSD-native path requires 16-byte alignment and a misaligned base
+    pointer violates that even though the tensor is otherwise eligible.
+    """
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
+    # +2 bytes (one bf16/f16 element) off a 16-byte-aligned address: still
+    # fully contiguous, but ptr % 16 != 0.
     public = tuple(
         _tensor(name, shape=(2, 12, 256, 64), device=device, ptr=ptr)
-        for name, ptr in zip("qkv", (0x1000, 0x2000, 0x3000), strict=True)
+        for name, ptr in zip("qkv", (0x1002, 0x2002, 0x3002), strict=True)
     )
     copied = []
     old_calls = []
@@ -497,6 +506,102 @@ def test_fa4_unsupported_public_layout_copies_and_uses_contiguous_fallback(
     assert [tensor.name for tensor in copied] == ["q", "k", "v"]
     assert len(old_calls) == 1
     assert old_calls[0][:3] == (0x5000, 0x6000, 0x7000)
+
+
+def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_qkv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public (B, H, S, D) tensor that is fully contiguous AND 16-byte
+    aligned skips BTHD materialization entirely: no transpose, no copy, and
+    the output is allocated directly in the (B, H, S, D) layout and
+    returned as-is."""
+    import torch_mojo_backend.eager_flash_attention as package
+
+    device = _device()
+    public = tuple(
+        _tensor(name, shape=(3, 12, 256, 64), device=device, ptr=ptr)
+        for name, ptr in zip("qkv", (0x1000, 0x2000, 0x3000), strict=True)
+    )
+    allocations = []
+    bridge_calls = []
+
+    def alloc(shape, dtype, actual_device):
+        result = _tensor(
+            f"alloc{len(allocations)}",
+            shape=shape,
+            dtype=dtype,
+            device=actual_device,
+            ptr=0x9000 + len(allocations) * 0x1000,
+        )
+        allocations.append(result)
+        return result
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError(
+            "aligned contiguous public QKV reached a copy or a non-bhsd bridge"
+        )
+
+    monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
+    monkeypatch.setattr(aten_fast, "_fa4_native_bthd", forbidden)
+    monkeypatch.setattr(aten_fast, "_tc", forbidden)
+    monkeypatch.setattr(aten_fast, "fast_aten_transpose", forbidden)
+    monkeypatch.setattr(aten_fast, "_alloc", alloc)
+    monkeypatch.setattr(aten_fast, "_ctx_ptr", lambda actual_device: 5050)
+    monkeypatch.setattr(
+        package,
+        "load_fa4_ops",
+        lambda: SimpleNamespace(
+            flash_attention_fwd_bf16_d64_causal=forbidden,
+            flash_attention_fwd_bf16_d64_causal_strided_qkv=forbidden,
+            flash_attention_fwd_bf16_d64_causal_bhsd=lambda *args: bridge_calls.append(
+                args
+            ),
+        ),
+    )
+
+    result = aten_fast.fast_fa4_16bit_d64_causal_forward(
+        *public, is_causal=True, scale=0.125
+    )
+    output, logsumexp, q_native, k_native, v_native = result
+
+    assert output is allocations[0]
+    assert output._shape == (3, 12, 256, 64)
+    assert logsumexp._shape == (3, 12, 256)
+    assert (q_native, k_native, v_native) == public
+    assert bridge_calls == [
+        (
+            0x1000,
+            0x2000,
+            0x3000,
+            allocations[0]._ptr,
+            allocations[1]._ptr,
+            3,
+            256,
+            12,
+            0.125,
+            5050,
+        )
+    ]
+
+
+def test_fa4_bhsd_layout_requires_contiguity_and_16_byte_alignment() -> None:
+    base = _tensor("q", shape=(3, 12, 256, 64), ptr=0x1000)
+    assert aten_fast._fa4_bhsd_layout(base)
+
+    misaligned = SimpleNamespace(**vars(base))
+    misaligned._ptr = base._ptr + 2
+    assert not aten_fast._fa4_bhsd_layout(misaligned)
+
+    non_contiguous = SimpleNamespace(**vars(base))
+    non_contiguous._is_contiguous = False
+    assert not aten_fast._fa4_bhsd_layout(non_contiguous)
+
+    wrong_dtype = SimpleNamespace(**vars(base))
+    wrong_dtype._dtype = aten_fast.DType.float32
+    wrong_dtype._itemsize = 4
+    assert not aten_fast._fa4_bhsd_layout(wrong_dtype)
+
+    assert not aten_fast._fa4_bhsd_layout(None)
 
 
 def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
@@ -900,13 +1005,16 @@ def test_vendored_fa4_sources_have_no_torch_cuda_or_internal_sync() -> None:
     assert "torch.cuda" not in sources
     assert "ctx.synchronize()" not in sources
 
-    # All five launches share compiled code by specialization and raw context
-    # identity.  B/S/H, pointers, descriptors, and launch grids stay runtime
-    # values, so changing model or batch shapes does not force recompilation.
+    # All six launches -- dense fwd, strided_qkv fwd, and BHSD-native fwd in
+    # fa4_fwd_launch.mojo, plus bwd preprocess/main/convert in
+    # fa4_bwd_launch.mojo -- share compiled code by specialization and raw
+    # context identity.  B/S/H, pointers, descriptors, and launch grids stay
+    # runtime values, so changing model or batch shapes does not force
+    # recompilation.
     launchers = (
         source_by_name["fa4_fwd_launch.mojo"] + source_by_name["fa4_bwd_launch.mojo"]
     )
     cache = source_by_name["fa4_launch_cache.mojo"]
-    assert launchers.count("enqueue_fa4_cached[") == 5
+    assert launchers.count("enqueue_fa4_cached[") == 6
     assert ".compile_function[" not in launchers
     assert "_CTX{context_identity}" in cache

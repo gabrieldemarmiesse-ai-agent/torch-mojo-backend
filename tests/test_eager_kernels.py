@@ -8493,6 +8493,146 @@ def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype):
         )
 
 
+# (batch, heads, seqlen): S residues mod BM=192 reachable under the FA4
+# seqlen % 128 == 0 eligibility gate -- ported from agent A's pure-Mojo fwd
+# harness (test_fa4_fwd.mojo in /scratch/fa4-fwd-harness), which validates the
+# same shapes' numerics against an fp64 host reference on sampled rows plus a
+# bitwise BTHD-vs-BHSD leg comparison. Skips harness shape (1, 16, 4096): a
+# full fp32 CPU SDPA reference there allocates a ~1 GB causal score matrix,
+# which the pure-Mojo harness already covers far more cheaply.
+_FA4_BHSD_TAIL_SHAPES = (
+    (1, 1, 128),  # single m-block, single plane
+    (1, 1, 256),  # tail 64
+    (2, 3, 384),  # exact 2*BM
+    (1, 2, 640),  # tail 64, 4 kv tiles + LPT
+    (5, 7, 896),  # tail 128, odd plane count
+    (3, 5, 1152),  # exact 6*BM (awkward B/H)
+    (2, 4, 1024),  # tail 64, LPT swizzle > 1
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("batch,heads,seqlen", _FA4_BHSD_TAIL_SHAPES)
+def test_fa4_bhsd_native_forward_backward_matches_reference(
+    mojo_h100, monkeypatch, batch, heads, seqlen, dtype
+):
+    """Public contiguous, 16-byte-aligned (B, H, S, D) Q/K/V take the
+    BHSD-native TMA path (no BTHD gather-copy materialization) across every
+    BM=192 tail-residue class reachable under seqlen % 128 == 0."""
+    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
+
+    module = load_fa4_ops()
+    suffix = _FA4_DTYPE_SUFFIX[dtype]
+    bhsd_name = f"flash_attention_fwd_{suffix}_d64_causal_bhsd"
+    original_bhsd = getattr(module, bhsd_name)
+    calls = {"count": 0}
+
+    def bhsd_spy(*args):
+        calls["count"] += 1
+        return original_bhsd(*args)
+
+    monkeypatch.setattr(module, bhsd_name, bhsd_spy)
+
+    head_dim = 64
+    generator = torch.Generator().manual_seed(20260816 + seqlen)
+    query, key, value = (
+        (torch.randn(batch, heads, seqlen, head_dim, generator=generator) * 0.25).to(
+            dtype
+        )
+        for _ in range(3)
+    )
+    grad_output = torch.randn(batch, heads, seqlen, head_dim, generator=generator).to(
+        dtype
+    )
+
+    reference_inputs = [
+        tensor.float().detach().requires_grad_() for tensor in (query, key, value)
+    ]
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=True
+    )
+    reference_output.backward(grad_output.float())
+
+    mojo_inputs = [
+        tensor.to(mojo_h100).detach().requires_grad_() for tensor in (query, key, value)
+    ]
+    for tensor in mojo_inputs:
+        assert tensor._is_contiguous
+        assert tensor._ptr % 16 == 0
+
+    actual_output = torch.nn.functional.scaled_dot_product_attention(
+        *mojo_inputs, dropout_p=0.0, is_causal=True
+    )
+    assert calls["count"] == 1
+    actual_output.backward(grad_output.to(mojo_h100))
+
+    torch.testing.assert_close(
+        actual_output.cpu().float(), reference_output, atol=2e-2, rtol=2e-2
+    )
+    for actual, reference in zip(mojo_inputs, reference_inputs, strict=True):
+        assert actual.grad is not None
+        torch.testing.assert_close(
+            actual.grad.cpu().float(), reference.grad, atol=5e-2, rtol=5e-2
+        )
+
+
+def test_fa4_bhsd_gate_rejects_misaligned_offset_view(mojo_h100, monkeypatch):
+    """A public (B, H, S, D) tensor that is a genuine offset slice of a
+    larger buffer is fully contiguous but its base pointer is not 16-byte
+    aligned -- ``_fa4_bhsd_layout`` must reject it (TMA descriptor creation
+    needs 16-byte-aligned base addresses) and fall back to the existing
+    BTHD-materialize-and-copy path. Still produces correct output."""
+    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
+
+    module = load_fa4_ops()
+    calls = {"bhsd": 0, "dense": 0}
+    original_bhsd = module.flash_attention_fwd_bf16_d64_causal_bhsd
+    original_dense = module.flash_attention_fwd_bf16_d64_causal
+
+    def bhsd_spy(*args):
+        calls["bhsd"] += 1
+        return original_bhsd(*args)
+
+    def dense_spy(*args):
+        calls["dense"] += 1
+        return original_dense(*args)
+
+    monkeypatch.setattr(module, "flash_attention_fwd_bf16_d64_causal_bhsd", bhsd_spy)
+    monkeypatch.setattr(module, "flash_attention_fwd_bf16_d64_causal", dense_spy)
+
+    batch, heads, seqlen, head_dim = 1, 4, 128, 64
+    numel = batch * heads * seqlen * head_dim
+    generator = torch.Generator().manual_seed(20260816)
+
+    def offset_qkv() -> torch.Tensor:
+        # One extra element (2 bytes) ahead of a fresh allocation: the
+        # [1:] slice is still fully contiguous once viewed, but its base
+        # pointer is no longer a multiple of 16.
+        host = (
+            torch.randn(numel + 1, generator=generator, dtype=torch.float32) * 0.25
+        ).to(torch.bfloat16)
+        view = host.to(mojo_h100)[1:].view(batch, heads, seqlen, head_dim)
+        assert view._is_contiguous
+        assert view._ptr % 16 != 0
+        return view
+
+    query, key, value = (offset_qkv() for _ in range(3))
+
+    reference_inputs = [tensor.detach().cpu().float() for tensor in (query, key, value)]
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=True
+    )
+
+    actual_output = torch.nn.functional.scaled_dot_product_attention(
+        query, key, value, dropout_p=0.0, is_causal=True
+    )
+
+    assert calls == {"bhsd": 0, "dense": 1}
+    torch.testing.assert_close(
+        actual_output.cpu().float(), reference_output, atol=2e-2, rtol=2e-2
+    )
+
+
 @pytest.mark.parametrize("mutated", ["query", "output"])
 def test_fa4_autograd_rejects_saved_tensor_mutation(mojo_h100, mutated):
     """The physical FA4 copies must not bypass PyTorch version checks."""
