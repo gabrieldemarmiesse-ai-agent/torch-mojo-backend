@@ -1384,6 +1384,115 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     )
 
 
+# ============================================================================
+# Single-matrix TN route, factored out of enqueue_gemm16_gemm's ladder below
+# so a batched TN BMM (see enqueue_gemm16_bmm) can loop this exact sequence
+# once per batch item instead of falling all the way back to the pre-wgmma
+# accepted BMM kernel. Caller guarantees TN (transpose_a, not transpose_b)
+# and no bias; every gate and tile choice here is unchanged from the ladder
+# it was pulled out of. Returns True when a route enqueued; False declines
+# with no side effect (no partial launch), so the caller's own fallback
+# stays correct.
+# ============================================================================
+def _try_enqueue_gemm16_tn_route(
+    output: _V3_PTR,
+    a: _V3_PTR,
+    b: _V3_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    # V4 TN (wgrad) route: split-K and narrow-tile kernels for the deep-K,
+    # underfilled-output regime (huge K, small m*n; see
+    # gemm16_tn_v4_kernels.mojo). The dispatcher checks its own
+    # alignment/regime gates and returns False whenever it declines, so
+    # every route below remains the fallback.
+    if try_enqueue_gemm16_gemm_tn_v4(output, a, b, m, n, k, ctx):
+        return True
+    # Underfilled aligned TN regime. A smaller 64x128 output tile exposes
+    # four times as many CTAs and uses half the consumer warp groups per
+    # CTA. Dispatch is based on severe underfill relative to the current
+    # GPU's SM count, not model dimensions.
+    if (
+        m >= _V3_TN_SMALL_BM
+        and n >= _V3_TN_SMALL_BN
+        and k >= _V3_TN_SMALL_BK
+        and m % _V3_TN_SMALL_BM == 0
+        and n % _V3_TN_SMALL_BN == 0
+        and k % _V3_TN_SMALL_BK == 0
+        and Int(output) % 16 == 0
+        and Int(a) % 16 == 0
+        and Int(b) % 16 == 0
+        and m <= 2_147_483_647
+        and n <= 2_147_483_647
+        and k <= 2_147_483_647
+        and k <= 9_223_372_036_854_775_807 // m
+        and k <= 9_223_372_036_854_775_807 // n
+        and n <= 9_223_372_036_854_775_807 // m
+    ):
+        var large_blocks_m = m // _V3_TN_WS_BM
+        var large_blocks_n = n // _V3_TN_WS_BN
+        var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        var use_small_tile = (
+            m % _V3_TN_WS_BM != 0
+            or n % _V3_TN_WS_BN != 0
+            or large_blocks_m * large_blocks_n * 4 < sm_count
+        )
+        if use_small_tile:
+            var blocks_m = m // _V3_TN_SMALL_BM
+            var blocks_n = n // _V3_TN_SMALL_BN
+            var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+            if (
+                blocks_m > 0
+                and blocks_n > 0
+                and max_grid_x > 0
+                and blocks_m <= max_grid_x // blocks_n
+            ):
+                var grid_x = blocks_m * blocks_n
+                if grid_x > 0:
+                    _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
+                        output, a, b, m, n, k, grid_x, ctx
+                    )
+                    return True
+    # Large aligned TN regime. Both operands are physical row-major (k, mn);
+    # TMA writes directly into MN-major shared tiles and WGMMA consumes A in
+    # its column-major mode.
+    if (
+        m >= _V3_TN_WS_BM
+        and n >= _V3_TN_WS_BN
+        and k >= _V3_TN_WS_BK
+        and m % _V3_TN_WS_BM == 0
+        and n % _V3_TN_WS_BN == 0
+        and k % _V3_TN_WS_BK == 0
+        and Int(output) % 16 == 0
+        and Int(a) % 16 == 0
+        and Int(b) % 16 == 0
+        and m <= 2_147_483_647
+        and n <= 2_147_483_647
+        and k <= 2_147_483_647
+        and k <= 9_223_372_036_854_775_807 // m
+        and k <= 9_223_372_036_854_775_807 // n
+        and n <= 9_223_372_036_854_775_807 // m
+    ):
+        var blocks_m = m // _V3_TN_WS_BM
+        var blocks_n = n // _V3_TN_WS_BN
+        var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+        if (
+            blocks_m > 0
+            and blocks_n > 0
+            and max_grid_x > 0
+            and blocks_m <= max_grid_x // blocks_n
+        ):
+            var grid_x = blocks_m * blocks_n
+            if grid_x > 0:
+                _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
+                    output, a, b, m, n, k, grid_x, ctx
+                )
+                return True
+    return False
+
+
 def enqueue_gemm16_gemm(
     output: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
     a: UnsafePointer[Scalar[_V3_DT], MutAnyOrigin],
@@ -1458,16 +1567,13 @@ def enqueue_gemm16_gemm(
                     ctx,
                 ):
                     return
-                # V4 TN (wgrad) route: split-K and narrow-tile kernels for
-                # the deep-K, underfilled-output regime (huge K, small m*n;
-                # see gemm16_tn_v4_kernels.mojo).  The dispatcher checks
-                # its own alignment/regime gates and returns False whenever
-                # it declines, so every existing TN path below remains the
-                # fallback.
+                # TN (wgrad) route ladder: split-K/narrow-tile v4, then the
+                # underfilled small-tile and large-tile v3 wgmma kernels
+                # (gemm16_tn_v4_kernels.mojo, this file). Factored into
+                # _try_enqueue_gemm16_tn_route so enqueue_gemm16_bmm below can
+                # loop the identical single-matrix ladder once per batch item.
                 if transpose_a and not transpose_b and not has_bias:
-                    if try_enqueue_gemm16_gemm_tn_v4(
-                        output, a, b, m, n, k, ctx
-                    ):
+                    if _try_enqueue_gemm16_tn_route(output, a, b, m, n, k, ctx):
                         return
                 # V4 TT route: the (COL_A, KMAJ_B) = (True, True)
                 # instantiations of the shared warp-specialized body
@@ -1626,98 +1732,11 @@ def enqueue_gemm16_gemm(
                                 output, a, b, m, n, k, grid_x, ctx
                             )
                             return
-                # Underfilled aligned TN regime.  A smaller 64x128 output tile
-                # exposes four times as many CTAs and uses half the consumer
-                # warp groups per CTA.  Dispatch is based on severe underfill
-                # relative to the current GPU's SM count, not model dimensions.
-                if (
-                    transpose_a
-                    and not transpose_b
-                    and not has_bias
-                    and m >= _V3_TN_SMALL_BM
-                    and n >= _V3_TN_SMALL_BN
-                    and k >= _V3_TN_SMALL_BK
-                    and m % _V3_TN_SMALL_BM == 0
-                    and n % _V3_TN_SMALL_BN == 0
-                    and k % _V3_TN_SMALL_BK == 0
-                    and Int(output) % 16 == 0
-                    and Int(a) % 16 == 0
-                    and Int(b) % 16 == 0
-                    and m <= 2_147_483_647
-                    and n <= 2_147_483_647
-                    and k <= 2_147_483_647
-                    and k <= 9_223_372_036_854_775_807 // m
-                    and k <= 9_223_372_036_854_775_807 // n
-                    and n <= 9_223_372_036_854_775_807 // m
-                ):
-                    var large_blocks_m = m // _V3_TN_WS_BM
-                    var large_blocks_n = n // _V3_TN_WS_BN
-                    var sm_count = ctx.get_attribute(
-                        DeviceAttribute.MULTIPROCESSOR_COUNT
-                    )
-                    var use_small_tile = (
-                        m % _V3_TN_WS_BM != 0
-                        or n % _V3_TN_WS_BN != 0
-                        or large_blocks_m * large_blocks_n * 4 < sm_count
-                    )
-                    if use_small_tile:
-                        var blocks_m = m // _V3_TN_SMALL_BM
-                        var blocks_n = n // _V3_TN_SMALL_BN
-                        var max_grid_x = ctx.get_attribute(
-                            DeviceAttribute.MAX_GRID_DIM_X
-                        )
-                        if (
-                            blocks_m > 0
-                            and blocks_n > 0
-                            and max_grid_x > 0
-                            and blocks_m <= max_grid_x // blocks_n
-                        ):
-                            var grid_x = blocks_m * blocks_n
-                            if grid_x > 0:
-                                _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
-                                    output, a, b, m, n, k, grid_x, ctx
-                                )
-                                return
-                # Large aligned TN regime.  Both operands are physical
-                # row-major (k, mn); TMA writes directly into MN-major shared
-                # tiles and WGMMA consumes A in its column-major mode.
-                if (
-                    transpose_a
-                    and not transpose_b
-                    and not has_bias
-                    and m >= _V3_TN_WS_BM
-                    and n >= _V3_TN_WS_BN
-                    and k >= _V3_TN_WS_BK
-                    and m % _V3_TN_WS_BM == 0
-                    and n % _V3_TN_WS_BN == 0
-                    and k % _V3_TN_WS_BK == 0
-                    and Int(output) % 16 == 0
-                    and Int(a) % 16 == 0
-                    and Int(b) % 16 == 0
-                    and m <= 2_147_483_647
-                    and n <= 2_147_483_647
-                    and k <= 2_147_483_647
-                    and k <= 9_223_372_036_854_775_807 // m
-                    and k <= 9_223_372_036_854_775_807 // n
-                    and n <= 9_223_372_036_854_775_807 // m
-                ):
-                    var blocks_m = m // _V3_TN_WS_BM
-                    var blocks_n = n // _V3_TN_WS_BN
-                    var max_grid_x = ctx.get_attribute(
-                        DeviceAttribute.MAX_GRID_DIM_X
-                    )
-                    if (
-                        blocks_m > 0
-                        and blocks_n > 0
-                        and max_grid_x > 0
-                        and blocks_m <= max_grid_x // blocks_n
-                    ):
-                        var grid_x = blocks_m * blocks_n
-                        if grid_x > 0:
-                            _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
-                                output, a, b, m, n, k, grid_x, ctx
-                            )
-                            return
+                # The remaining TN regimes (underfilled small-tile and large
+                # aligned) are tried above via _try_enqueue_gemm16_tn_route,
+                # right after the v4 split-K/narrow-tile route: same gates,
+                # same tile choices, same order, just shared with the batched
+                # BMM loop below instead of duplicated here.
     _enqueue_accepted_bf16_gemm(
         output,
         a,
@@ -1748,6 +1767,55 @@ def enqueue_gemm16_bmm(
     transpose_b: Bool,
     ctx: DeviceContext,
 ) raises:
+    # TN strided-batch loop over the mm-level wgmma ladder. There is no
+    # batched (grid.z) wgmma TN kernel: every BMM layout, including TN,
+    # reaches only the pre-wgmma accepted kernel below today, and TN is the
+    # worst-served layout there (~1.7x the NN/NT/TT siblings sharing that
+    # same kernel, ~6-7x cuBLAS overall) because that kernel predates the
+    # tensor-core-async / TMA work the mm-level TN route already has.
+    #
+    # This loops _try_enqueue_gemm16_tn_route -- the exact single-matrix TN
+    # ladder `enqueue_gemm16_gemm` uses -- once per batch item, the same way
+    # a caller doing `batch_count` independent `torch.mm` calls would. Every
+    # gate that ladder checks (alignment, m/n/k divisibility, SM-count-based
+    # tile and split-K choice) depends only on (m, n, k, sm_count) and
+    # operand alignment, which are identical across batch items by
+    # construction (one m/n/k triple and one batch stride for the whole
+    # call) -- so batch item 0's routing decision predicts every other
+    # item's, and this only commits to the loop once batch 0 actually fires.
+    # Declining (e.g. an odd shape, or a small per-matrix problem the v3/v4
+    # routes were never tuned to fill a wave with alone -- attention-shaped
+    # BMM, many small matrices, is exactly the case the grid.z-packed
+    # kernel below is tuned for) falls through to today's unchanged path.
+    # The per-batch retry on a False is a defensive correctness net, not an
+    # expected path: same-shape batches only diverge if a batch stride
+    # breaks 16B alignment partway through.
+    if transpose_a and not transpose_b:
+        comptime if _has_sm_9x():
+            if ctx.api() == "cuda":
+                var cc_major = ctx.get_attribute(
+                    DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
+                )
+                var cc_minor = ctx.get_attribute(
+                    DeviceAttribute.COMPUTE_CAPABILITY_MINOR
+                )
+                if (
+                    cc_major == 9
+                    and cc_minor == 0
+                    and batch_count > 0
+                    and _try_enqueue_gemm16_tn_route(output, a, b, m, n, k, ctx)
+                ):
+                    for bidx in range(1, batch_count):
+                        var oo = output + bidx * output_batch_stride
+                        var ao = a + bidx * a_batch_stride
+                        var bo = b + bidx * b_batch_stride
+                        if not _try_enqueue_gemm16_tn_route(
+                            oo, ao, bo, m, n, k, ctx
+                        ):
+                            _enqueue_accepted_bf16_gemm(
+                                oo, ao, bo, oo, m, n, k, True, False, False, ctx
+                            )
+                    return
     _enqueue_accepted_bf16_bmm(
         output,
         a,
