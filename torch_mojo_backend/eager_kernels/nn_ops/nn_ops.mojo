@@ -51,6 +51,15 @@ from std.utils.static_tuple import StaticTuple
 from max.algorithm import elementwise
 
 from argreduce_kernels import _argreduce_spec_into
+from cumsum_kernels import (
+    CUMSUM_DTYPES,
+    FILL_WAVES,
+    _acc_dtype,
+    cumsum_workspace_lines,
+    enqueue_cumsum_cols,
+    enqueue_cumsum_rows,
+    enqueue_cumsum_rows_workspace,
+)
 from reduce_skeleton import (
     AllOp,
     AnyOp,
@@ -70,6 +79,7 @@ from op_utils import (
     MAX_RANK,
     _check_into,
     _check_into_sized,
+    _device_sm_count,
     _enqueue_cached,
     _make_ptr,
     _parallel_for,
@@ -82,6 +92,7 @@ from op_utils import (
     _raw_tuple_int,
     _reduce_spec_geom,
     _spec_dispatcher2,
+    _spec_dispatcher3,
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_dispatcher7,
@@ -1934,16 +1945,40 @@ def _any_bool_go(
 
 
 # ---------------------------------------------------------------------------
-# Row-wise cumulative sum along the last dim: input viewed as (rows, cols).
-# One sequential task per row — used on the small int tensors of the
-# generation loop (position ids from attention-mask cumsum).
+# Cumulative sum, INNER (trailing dim, any rank) or OUTER (dim=0, rank 2)
+# family — see cumsum_kernels.mojo for the fast, NVIDIA-measured kernels
+# (one block cooperating over a "line" via block.prefix_sum for INNER, one
+# thread per independent column for OUTER, plus a 3-pass workspace scan for
+# the few-very-long-lines regime).
+#
+# `_cumsum_rows_portable`/`_cumsum_cols_portable` below are a DIFFERENT,
+# simpler thing: a plain one-task-per-line serial accumulate through
+# `_parallel_for`, which is what's used for
+#   (a) true CPU (`ctx.api() == "cpu"`, e.g. the `mojo:cpu` test device —
+#       there is no warp coalescing to lose in the first place, and this is
+#       what the small int tensors of the generation loop, position ids
+#       from attention-mask cumsum, hit today), and
+#   (b) any GPU `ctx.api()` is not `"cuda"` for (AMD, Apple): `block.
+#       prefix_sum`/`block.sum` are portable MAX primitives and this whole
+#       kernel family DOES cross-compile for gfx942 (verified with
+#       scripts/compare_kernel_asm.py), but it was only ever MEASURED on
+#       NVIDIA (H100) — see the PR that added this file. Per AGENTS.md's
+#       "To check a kernel change against a GPU you do not have", an
+#       unmeasured architecture gets the change gated off, not shipped on
+#       faith, so non-CUDA GPUs keep running the exact naive kernel `main`
+#       ran for cumsum before this file existed (dispatch matches at the
+#       Python layer too — see `fast_aten_cumsum`'s `is_cuda` gate).
+#       `_parallel_for` itself already knows how to target a non-CPU
+#       device (`elementwise[..., target="gpu"]`), so this same function
+#       serves both (a) and (b) — "portable", not "CPU-only".
 # ---------------------------------------------------------------------------
 
 
 @always_inline
-def _cumsum_rows[
+def _cumsum_rows_portable[
     dtype: DType
 ](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
+    comptime acc = _acc_dtype[dtype]()
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
@@ -1953,12 +1988,113 @@ def _cumsum_rows[
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var r = Int(idx[0].value())
         var base = r * cols
-        var total = Scalar[dtype](0)
+        var total = Scalar[acc](0)
         for j in range(cols):
-            total += in_ptr[base + j]
-            out_ptr[base + j] = total
+            total += in_ptr[base + j].cast[acc]()
+            out_ptr[base + j] = total.cast[dtype]()
 
     _parallel_for[func](rows, ctx)
+
+
+@always_inline
+def _cumsum_cols_portable[
+    dtype: DType
+](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
+    """Portable (CPU or non-CUDA GPU) fallback for dim=0: one parallel task
+    per column. Unlike `_cumsum_rows_portable`, this has no naive-kernel
+    precedent on `main` (dim=0 simply raised NotImplementedError there).
+    `fast_aten_cumsum` currently only ever reaches dim=0 on a CUDA device
+    (its own `is_cuda` gate declines dim=0 elsewhere, matching "keep AMD on
+    its current path"), so on today's dispatch this body only runs for the
+    `mojo:cpu` test device; it stays a real, tested implementation (not a
+    stub) so that gate can be loosened later without a new kernel."""
+    comptime acc = _acc_dtype[dtype]()
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr)
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var c = Int(idx[0].value())
+        var total = Scalar[acc](0)
+        var i = 0
+        while i < rows:
+            var addr = i * cols + c
+            total += in_ptr[addr].cast[acc]()
+            out_ptr[addr] = total.cast[dtype]()
+            i += 1
+
+    _parallel_for[func](cols, ctx)
+
+
+@always_inline
+def _cumsum_inner_into[
+    dtype: DType
+](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
+    """INNER family entry: dim is the trailing (stride-1) axis.
+
+    The fast `block.prefix_sum`-based kernels below are NVIDIA-only by
+    measurement, not by portability (`block.prefix_sum`/`block.sum` cross-
+    compile fine for AMD -- verified with scripts/compare_kernel_asm.py,
+    --accelerator gfx942). `ctx.api() == "cuda"` gates them off on anything
+    else, same as `_device.api == "cuda"` gates `fast_aten_cumsum`'s own
+    dim/dtype widening in aten_fast.py -- see that gate's comment for why.
+    """
+    if ctx.api() == "cuda":
+        comptime if has_accelerator():
+            var gout = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+            var gin = (
+                _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
+            )
+            # sm_count_floor: below this many independent lines, one block
+            # per line cannot fill the device — see FILL_WAVES in
+            # cumsum_kernels.mojo. Read at runtime (not the compile-time
+            # `default_device_info` table) because two cards of the same
+            # architecture can differ here (H100 PCIe: 114 SMs, H100 SXM:
+            # 132 — the table reports 132 for both).
+            var sm_count_floor = _device_sm_count(ctx) * FILL_WAVES
+            if rows >= sm_count_floor:
+                enqueue_cumsum_rows[dtype](ctx, gout, gin, rows, cols)
+            else:
+                comptime acc = _acc_dtype[dtype]()
+                var ws_n = max(1, cumsum_workspace_lines[dtype](rows, cols))
+                var ws = ctx.enqueue_create_buffer[acc](ws_n)
+                enqueue_cumsum_rows_workspace[dtype](
+                    ctx,
+                    gout,
+                    gin,
+                    rows,
+                    cols,
+                    ws.unsafe_ptr().as_unsafe_any_origin(),
+                )
+                # Keep the workspace alive until its free is enqueued after
+                # the finish kernel (stream-ordered, matches the GEMM
+                # split-K workspace pattern in matmul_ops.mojo).
+                _ = ws^
+        else:
+            raise Error("no GPU accelerator available at compile time")
+    else:
+        _cumsum_rows_portable[dtype](out_addr, in_addr, rows, cols, ctx)
+
+
+@always_inline
+def _cumsum_outer_into[
+    dtype: DType
+](out_addr: Int, in_addr: Int, rows: Int, cols: Int, ctx: DeviceContext) raises:
+    """OUTER family entry: dim=0 on a contiguous rank-2 tensor. Same
+    CUDA-only fast-path gate as `_cumsum_inner_into` above."""
+    if ctx.api() == "cuda":
+        comptime if has_accelerator():
+            var gout = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+            var gin = (
+                _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
+            )
+            enqueue_cumsum_cols[dtype](ctx, gout, gin, rows, cols)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+    else:
+        _cumsum_cols_portable[dtype](out_addr, in_addr, rows, cols, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -2656,12 +2792,6 @@ def _any_bool_dispatcher(
     return _raw_ret_none()
 
 
-comptime SPEC_CUMSUM_DTYPES: List[DType] = [
-    DType.int64,
-    DType.int32,
-    DType.float32,
-]
-
 comptime SPEC_MAXROWS_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
@@ -2686,31 +2816,50 @@ def _argmax_spec_into_go(
     _argreduce_spec_into[SPEC_MAXROWS_DTYPES, False](a, out, rdims_t, a.ctx())
 
 
-def _cumsum_spec_into_go(a_o: PyObjectPtr, out_o: PyObjectPtr) raises:
-    """Cumulative sum over the trailing dim; full-shape output."""
+def _cumsum_spec_into_go(
+    a_o: PyObjectPtr, dim_o: PyObjectPtr, out_o: PyObjectPtr
+) raises:
+    """Cumulative sum over the trailing dim (any rank) or dim=0 of a rank-2
+    tensor; full-shape output. Python (`fast_aten_cumsum`) normalizes the
+    dim and pre-materializes non-contiguous/other-dim inputs, but this
+    boundary re-validates rather than trusting the caller, matching every
+    other spec bridge in this file."""
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[SPEC_CUMSUM_DTYPES](a.dtype):
+    if not _dtype_supported[CUMSUM_DTYPES](a.dtype):
         raise Error("mojo spec cumsum: unsupported dtype ", a.dtype)
     if a.rank < 1 or a.numel == 0:
         raise Error("mojo spec cumsum: empty or rank-0 input")
-
-    var cols = a.shape[MAX_RANK - 1]
-    var rows = a.numel // cols
-    var ctx = a.ctx()
-    var nbytes = a.numel * a.itemsize
-    _ = nbytes
-    _check_into(a, out, a.dtype)
-    var addr = out.ptr
-    if a.contig:
-        comptime for dt in [DType.int64, DType.int32, DType.float32]:
-            comptime if _dtype_arg_on[0, dt]():
-                if a.dtype == dt:
-                    _cumsum_rows[dt](addr, a.ptr, rows, cols, ctx)
-    else:
+    var dim = _raw_int(dim_o)
+    if dim < 0 or dim >= a.rank:
+        raise Error("mojo spec cumsum: dim out of range")
+    if not a.contig:
         raise Error(
             "mojo spec cumsum: input must be contiguous"
             " (Python pre-materializes)"
+        )
+    _check_into(a, out, a.dtype)
+    var addr = out.ptr
+    var ctx = a.ctx()
+
+    if dim == a.rank - 1:
+        var cols = a.shape[MAX_RANK - 1]
+        var rows = a.numel // cols
+        comptime for dt in CUMSUM_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _cumsum_inner_into[dt](addr, a.ptr, rows, cols, ctx)
+    elif dim == 0 and a.rank == 2:
+        var rows = a.dim(0)
+        var cols = a.dim(1)
+        comptime for dt in CUMSUM_DTYPES:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _cumsum_outer_into[dt](addr, a.ptr, rows, cols, ctx)
+    else:
+        raise Error(
+            "mojo spec cumsum: dim must be the trailing dim, or dim=0 on a"
+            " rank-2 tensor"
         )
 
 
@@ -2942,8 +3091,11 @@ def PyInit_nn_ops() abi("C") -> PythonObject:
         comptime if _op_on["CumsumSpec"]():
             _register_call(
                 b,
-                _spec_dispatcher2[_cumsum_spec_into_go, "CumsumSpec"],
-                docstring="(a_spec, out_spec); trailing dim",
+                _spec_dispatcher3[_cumsum_spec_into_go, "CumsumSpec"],
+                docstring=(
+                    "(a_spec, dim, out_spec); trailing dim, or dim=0 on a"
+                    " rank-2 tensor"
+                ),
             )
         comptime if _op_on["BatchNormSpec"]():
             _register_call(

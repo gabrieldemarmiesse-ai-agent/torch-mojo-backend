@@ -1261,6 +1261,45 @@ class _CastSpecExtension(
         return (_spec_of(tensor), dtype.value, _spec_of(out))
 
 
+class _CumsumSpecExtension(
+    eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
+):
+    """cumsum's dim-threaded spec op — same shape as `_CastSpecExtension`
+    (one extra scalar arg alongside the tensor), except the extra arg is a
+    dim rather than a dtype, so it plays no part in `make_defines`/
+    `make_canonical_defines`: two different dims of the same input/output
+    dtype compile to the exact same Mojo variant (dim is a plain runtime
+    int read via `_raw_int` at the boundary, not a compile-time define)."""
+
+    MOJO_FILE: ClassVar[Path] = _NNExtension.MOJO_FILE
+
+    @classmethod
+    def make_defines(
+        cls, tensor: MojoTensorLike, dim: int
+    ) -> dict[str, bool | int | str]:
+        return {"OP": "CumsumSpec", "DTYPE_ARG_0": tensor._dtype.name}
+
+    @classmethod
+    def make_canonical_defines(
+        cls, tensor: MojoTensorLike, dim: int
+    ) -> "eager_kernels.CanonicalDefines":
+        return eager_kernels._canonical_call_defines(
+            "CumsumSpec", (tensor._dtype,), (tensor._dtype,), ()
+        )
+
+    @classmethod
+    def expected_output_specs(
+        cls, tensor: MojoTensorLike, dim: int
+    ) -> _TensorOutputSpec:
+        return _TensorOutputSpec(tuple(tensor._shape), tensor._dtype, tensor._device)
+
+    @classmethod
+    def extension_args(
+        cls, out: TorchMojoTensor, tensor: MojoTensorLike, dim: int
+    ) -> tuple[object, ...]:
+        return (_spec_of(tensor), dim, _spec_of(out))
+
+
 class _BinarySpecExtension(
     eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
 ):
@@ -1860,6 +1899,24 @@ def _try_spec_min_dim(
     return outputs
 
 
+def _try_spec_cumsum(a: TorchMojoTensor, dim: int) -> TorchMojoTensor | None:
+    """cumsum through CumsumSpec (dim-threaded), or None.
+
+    Not queue-eligible yet (mirrors `_try_spec_unary`'s old CumsumSpec
+    branch: "constraints not mirrored" — CumsumSpec is not registered in
+    the call-queue's static rule tables), so every call drains and runs
+    synchronously. `a` must already be contiguous; the caller materializes
+    non-contiguous inputs first.
+    """
+    try:
+        return _submit_prepared_into(
+            _CumsumSpecExtension.prepare(a, dim), force_sync=True
+        )
+    except Exception as exc:
+        _raise_if_device_oom(exc)
+        return None
+
+
 def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
     """Contiguous unary through a spec op, or None.
 
@@ -1887,7 +1944,7 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
     elif spec_fn_name in ("LogSoftmaxSpec", "SoftmaxSpec"):
         ok = a._dtype in _SPEC_FLOAT_DTYPES and len(a._shape) >= 1 and a._numel > 0
     else:
-        ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync
+        ok = False  # any other spec_fn_name: constraints not mirrored, stay sync
     try:
         return _submit_prepared_into(
             _UNARY_SPEC_EXTENSIONS[module_name].prepare(
@@ -5783,18 +5840,76 @@ def fast_aten_nll_loss_backward_grad_input(
     return grad_input
 
 
+# What CumsumSpec's kernels are compiled for (nn_ops/cumsum_kernels.mojo's
+# CUMSUM_DTYPES) -- narrower than _CAST_DTYPES (no uint8/bool: torch never
+# needs cumsum's *own* dtype to be one of those, only promoted FROM one).
+_CUMSUM_DTYPES = (
+    DType.float32,
+    DType.bfloat16,
+    DType.float16,
+    DType.int32,
+    DType.int64,
+)
+# What `main` supported before this file's CUDA-only fast kernels: bf16/f16
+# need the new block.prefix_sum-based kernels, which are unmeasured on
+# non-CUDA GPUs (see the `is_cuda` gate in fast_aten_cumsum below).
+_CUMSUM_DTYPES_LEGACY = (DType.float32, DType.int32, DType.int64)
+
+
 def fast_aten_cumsum(input, dim, *, dtype=None):
-    a = _t(input) if dtype is None else None
-    if (
-        a is None
-        or a._numel == 0
-        or a._dtype not in (DType.int64, DType.int32, DType.float32)
-    ):
+    a = _t(input)
+    if a is None or a._numel == 0:
+        return NOT_HANDLED
+    # The fast nn_ops/cumsum_kernels.mojo family (block.prefix_sum INNER,
+    # workspace long-line route, OUTER dim=0) was only ever MEASURED on
+    # NVIDIA (H100) -- it cross-compiles for AMD (block.prefix_sum/block.sum
+    # are portable MAX primitives, verified with
+    # scripts/compare_kernel_asm.py --accelerator gfx942) but per AGENTS.md's
+    # "To check a kernel change against a GPU you do not have", an unmeasured
+    # architecture does not get shipped on faith. Anything that is not a CUDA
+    # device gets EXACTLY today's `main` behavior: int64/int32/float32,
+    # trailing dim only -- the nn_ops.mojo Mojo-side dispatch mirrors this
+    # (`ctx.api() == "cuda"` gates the same fast kernels off there too).
+    is_cuda = a._device.api == "cuda"
+    allowed_dtypes = _CUMSUM_DTYPES if is_cuda else _CUMSUM_DTYPES_LEGACY
+    if dtype is not None:
+        # torch casts the input to `dtype` first, then accumulates in it
+        # (verified: dtype=int32 on a float input truncates before summing,
+        # not the other way around) -- same cast-then-op convention as
+        # fast_aten_sum/fast_aten_mean above.
+        target = _torch_dtype_to_max(dtype)
+        if target is None or target not in allowed_dtypes:
+            return NOT_HANDLED
+        if a._dtype != target:
+            if a._dtype not in _CAST_DTYPES or target not in _CAST_DTYPES:
+                return NOT_HANDLED
+            a = _cast_tensor(a, target)
+    elif not a._dtype.is_float():
+        # No dtype= kwarg: torch promotes bool/sub-int64 integer cumsum to
+        # int64 (verified: int8/int16/int32/uint8/bool all cumsum to int64;
+        # same rule fast_aten_sum applies above).
+        if a._dtype != DType.int64:
+            if a._dtype not in _CAST_DTYPES:
+                return NOT_HANDLED
+            a = _cast_tensor(a, DType.int64)
+    if a._dtype not in allowed_dtypes:
         return NOT_HANDLED
     rank = len(a._shape)
-    if not isinstance(dim, int) or rank == 0 or dim % rank != rank - 1:
+    if not isinstance(dim, int) or rank == 0:
         return NOT_HANDLED
-    result = _try_spec_unary("CumsumSpec", a, module_name="nn_ops")
+    dim = dim % rank
+    # INNER (trailing dim, any rank) or OUTER (dim=0, rank 2 only, CUDA
+    # only) -- see cumsum_kernels.mojo. Everything else (rank>=3
+    # non-trailing dims, dim=0 on a non-CUDA device, non-contiguous strides
+    # not fixed by `_contig()` below) is out of this kernel family's scope
+    # and declines, same as every unsupported input: NOT_HANDLED here
+    # becomes an actionable NotImplementedError (eager has no graph
+    # fallback to fall back to).
+    if dim != rank - 1 and not (is_cuda and rank == 2 and dim == 0):
+        return NOT_HANDLED
+    if not a._is_contiguous:
+        a = a._contig()
+    result = _try_spec_cumsum(a, dim)
     return result if result is not None else NOT_HANDLED
 
 

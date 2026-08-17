@@ -6446,11 +6446,30 @@ document.addEventListener("DOMContentLoaded", boot);
         },
         "cumsum": {
           "dtypes": {
-            "f32": {
+            "bf16": {
               "shapes": {
+                "S_4096x4096_d0": {
+                  "layouts": {
+                    "contig": 0.985
+                  }
+                },
                 "S_4096x4096_d1": {
                   "layouts": {
-                    "contig": 7.081
+                    "contig": 0.375
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S_4096x4096_d0": {
+                  "layouts": {
+                    "contig": 1.011
+                  }
+                },
+                "S_4096x4096_d1": {
+                  "layouts": {
+                    "contig": 0.466
                   }
                 }
               }
