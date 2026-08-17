@@ -6687,6 +6687,8 @@ def _fa4_16bit_d64_causal_inputs(
     is_causal=False,
     scale=None,
     enable_gqa=False,
+    *,
+    allow_any_seqlen: bool = False,
 ):
     """Return eligible public BHTD inputs (bf16 or f16) without doing any
     device work.
@@ -6696,7 +6698,22 @@ def _fa4_16bit_d64_causal_inputs(
     gate and the launch cache below; f16 only needs its own RS wgmma
     emitter because the stdlib's register-operand overload is hardcoded
     bf16 (see ``fa4_wgmma_f16.mojo``). Q/K/V must all share one dtype from
-    this set -- no bf16/f16 mixing.
+    this set -- no bf16/f16 mixing. ``head_dim`` is a compile-time regime,
+    not a free runtime dimension (AGENTS.md rule 4): only 64 (GPT-2-class)
+    and 128 (Llama-class) have an instantiated kernel + exported Mojo
+    symbol (``fa4_ops.mojo``); any other head_dim declines here and falls
+    to the math decomposition.
+
+    ``allow_any_seqlen`` lifts the ``seqlen % 128 == 0`` restriction down
+    to ``seqlen > 0``. Default ``False`` keeps every existing caller's
+    contract byte-identical -- in particular the two backward-adjacent call
+    sites (the autograd wrapper's ``needs_backward`` dispatch decision and
+    the flash backward op's own eligibility check), where the bwd tile
+    machinery has never been proven to handle a partial last tile and a
+    wrong answer there would be a silently wrong gradient. Only
+    ``fast_fa4_16bit_d64_causal_forward`` passes ``True``, and only for
+    inputs it goes on to route through the BHSD-native path -- see the
+    per-route check there.
     """
     q = _t(query)
     k = _t(key)
@@ -6724,7 +6741,8 @@ def _fa4_16bit_d64_causal_inputs(
     ):
         return None
     batch, heads, seqlen, head_dim = q._shape
-    if batch <= 0 or heads <= 0 or seqlen <= 0 or seqlen % 128 != 0 or head_dim != 64:
+    seqlen_ok = seqlen > 0 and (allow_any_seqlen or seqlen % 128 == 0)
+    if batch <= 0 or heads <= 0 or not seqlen_ok or head_dim not in (64, 128):
         return None
     if scale is not None and (
         not isinstance(scale, int | float)
@@ -6760,17 +6778,38 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
         or seqlen <= 0
         or heads <= 0
         or seqlen % 128 != 0
-        or head_dim != 64
+        or head_dim not in (64, 128)
         or min(b_stride, s_stride, h_stride, d_stride) <= 0
         or d_stride != 1
-        or h_stride != 64
-        or s_stride < heads * 64
+        or h_stride != head_dim
+        or s_stride < heads * head_dim
         or b_stride != seqlen * s_stride
         or tensor._ptr % 16 != 0
     ):
         return False
     return all(
         stride * tensor._itemsize % 16 == 0 for stride in (b_stride, s_stride, h_stride)
+    )
+
+
+def _fa4_bhsd_layout(tensor) -> bool:
+    """Whether the PUBLIC (B, H, S, D) tensor is eligible for the
+    BHSD-native TMA path -- no BTHD materialization needed at all.
+
+    TMA descriptor creation over the (B*H, S, D) plane view requires the
+    exact row-major (B, H, S, D) contiguity the aten op naturally
+    produces, plus a 16-byte-aligned base pointer. A sliced/offset view
+    can be fully contiguous yet still violate the latter, so both are
+    checked here -- mirroring the alignment requirement
+    ``_fa4_strided_bthd_layout`` enforces for the strided BTHD ABI.
+    """
+    return (
+        tensor is not None
+        and tensor._dtype in (DType.bfloat16, DType.float16)
+        and tensor._itemsize == tensor._dtype.size_in_bytes
+        and len(tensor._shape) == 4
+        and tensor._is_contiguous
+        and tensor._ptr % 16 == 0
     )
 
 
@@ -6799,6 +6838,26 @@ def _fa4_prepare_qkv_bridge(q_native, k_native, v_native):
     return qkv, False
 
 
+def _fa4_symbol(
+    fa4_ops: object, direction: str, dtype: DType, head_dim: int, variant: str = ""
+) -> object:
+    """Resolve one FA4 Mojo-exported entry point by name.
+
+    Mirrors the ``flash_attention_{direction}_{bf16,f16}_d{64,128}_causal{variant}``
+    naming convention ``PyInit_fa4_ops`` registers (``fa4_ops.mojo``) --
+    allocation and symbol selection are both derived from ``head_dim`` at
+    the call site rather than hardcoded, so d64 and d128 share every
+    dispatcher below (``variant`` is ``""`` for the dense entry point,
+    ``"_strided_qkv"`` or ``"_bhsd"`` for the zero-copy ones). ``fa4_ops``
+    is typed ``object`` rather than ``ModuleType``: host-only tests pass a
+    ``SimpleNamespace`` double here instead of the real compiled extension
+    module.
+    """
+    dtype_suffix = "bf16" if dtype == DType.bfloat16 else "f16"
+    name = f"flash_attention_{direction}_{dtype_suffix}_d{head_dim}_causal{variant}"
+    return getattr(fa4_ops, name)
+
+
 def fast_fa4_16bit_d64_causal_forward(
     query,
     key,
@@ -6809,14 +6868,30 @@ def fast_fa4_16bit_d64_causal_forward(
     scale=None,
     enable_gqa=False,
 ):
-    """Run vendored FA4 (bf16 or f16) and return output/LSE plus saved
-    physical inputs.
+    """Run vendored FA4 (bf16 or f16, head_dim 64 or 128) and return
+    output/LSE plus saved physical inputs.
 
     Loading the bridge happens before materialization or allocation, so a
     packaging/compiler error cannot leave unnecessary device work queued.
+
+    Seqlen eligibility is per-route (PR #391 review thread): the BHSD-native
+    descriptor path zero-fills/clamps a partial last tile at both d64 and
+    d128 (proven by ``test_fa4_bhsd_d64_direct_partial_tail_block`` and the
+    d128 sibling), so it accepts any ``seqlen >= 1``. The legacy strided-BTHD
+    and dense-copy routes below predate that tail machinery and may assume
+    full BM/BN tiles, so they still require ``seqlen % 128 == 0`` until
+    someone proves otherwise for them specifically.
     """
     inputs = _fa4_16bit_d64_causal_inputs(
-        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa,
+        allow_any_seqlen=True,
     )
     if inputs is None:
         return NOT_HANDLED
@@ -6826,6 +6901,45 @@ def fast_fa4_16bit_d64_causal_forward(
     fa4_ops = load_fa4_ops()
     q, k, v = inputs
     qkv_dtype = q._dtype
+    batch, heads, seqlen, head_dim = q._shape
+    bhsd_eligible = _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v)
+    if seqlen % 128 != 0 and not bhsd_eligible:
+        # Partial tiles are unproven outside the BHSD-native path (see the
+        # docstring above) -- decline rather than risk the untested legacy
+        # tail behavior. A caller that needs this seqlen on a non-BHSD
+        # layout falls back to the math decomposition.
+        return NOT_HANDLED
+    if bhsd_eligible:
+        # PUBLIC contiguous (B, H, S, D), 16-byte-aligned base pointers:
+        # TMA descriptors address this layout directly (viewed as
+        # (B*H, S, D) planes), so no BTHD materialization
+        # (fast_aten_transpose + copy, ~3 gather copies removed) is
+        # needed for Q/K/V, and the output is allocated in this same
+        # contiguous layout and returned as-is (no transpose-back
+        # either). "q_native"/"k_native"/"v_native" below is just
+        # ``q``/``k``/``v`` themselves -- they are what the kernel
+        # actually consumed, matching what the strided/dense branches
+        # return for their own materialized forms.
+        out_native = _alloc((batch, heads, seqlen, head_dim), qkv_dtype, q._device)
+        logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
+        scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_bhsd")
+        _device_call(
+            forward_fn,
+            q._ptr,
+            k._ptr,
+            v._ptr,
+            out_native._ptr,
+            logsumexp._ptr,
+            batch,
+            seqlen,
+            heads,
+            scale_value,
+            _ctx_ptr(q._device),
+            keepalive=(q, k, v, out_native, logsumexp),
+        )
+        return out_native, logsumexp, q, k, v
+
     q_native = _fa4_native_bthd(q)
     k_native = _fa4_native_bthd(k)
     v_native = _fa4_native_bthd(v)
@@ -6836,17 +6950,12 @@ def fast_fa4_16bit_d64_causal_forward(
         return NOT_HANDLED
     (q_native, k_native, v_native), use_strided_qkv = prepared
 
-    batch, heads, seqlen, head_dim = q._shape
     physical_shape = (batch, seqlen, heads, head_dim)
     out_native = _alloc(physical_shape, qkv_dtype, q._device)
     logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if use_strided_qkv:
-        forward_fn = (
-            fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_fwd_f16_d64_causal_strided_qkv
-        )
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_strided_qkv")
         _device_call(
             forward_fn,
             q_native._ptr,
@@ -6865,11 +6974,7 @@ def fast_fa4_16bit_d64_causal_forward(
             keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     else:
-        forward_fn = (
-            fa4_ops.flash_attention_fwd_bf16_d64_causal
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_fwd_f16_d64_causal
-        )
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim)
         _device_call(
             forward_fn,
             q_native._ptr,
@@ -6928,11 +7033,7 @@ def fast_fa4_16bit_d64_causal_backward(
         (batch * heads * seqlen_padded * head_dim,), DType.float32, q_native._device
     )
     if use_strided_qkv:
-        backward_fn = (
-            fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_bwd_f16_d64_causal_strided_qkv
-        )
+        backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim, "_strided_qkv")
         _device_call(
             backward_fn,
             q_native._ptr,
@@ -6971,11 +7072,7 @@ def fast_fa4_16bit_d64_causal_backward(
             ),
         )
     else:
-        backward_fn = (
-            fa4_ops.flash_attention_bwd_bf16_d64_causal
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_bwd_f16_d64_causal
-        )
+        backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim)
         _device_call(
             backward_fn,
             q_native._ptr,
@@ -7365,7 +7462,16 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
     *,
     scale=None,
 ):
-    """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel."""
+    """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel.
+
+    Deliberately omits ``allow_any_seqlen=True``: this is the actual bwd
+    tile machinery, unproven on a partial last tile, so it declines an odd
+    seqlen here regardless of how forward was reached (a direct call to the
+    lower ``aten::_scaled_dot_product_flash_attention`` op with grad-needing
+    inputs and an odd seqlen makes it this far -- forward tolerates it via
+    BHSD, but backward must not, so this raises NotImplementedError rather
+    than silently mishandling the tail).
+    """
     inputs = _fa4_16bit_d64_causal_inputs(
         query, key, value, None, dropout_p, is_causal, scale, False
     )
@@ -7417,15 +7523,20 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
         )
         if recomputed is NOT_HANDLED:
             return NOT_HANDLED
-        recomputed_output, recomputed_lse, q_native, k_native, v_native = recomputed
+        recomputed_output, recomputed_lse, _, _, _ = recomputed
         output = recomputed_output
         lse = recomputed_lse
-    else:
-        q_native = _fa4_native_bthd(q)
-        k_native = _fa4_native_bthd(k)
-        v_native = _fa4_native_bthd(v)
-        if q_native is None or k_native is None or v_native is None:
-            return NOT_HANDLED
+    # Always re-materialize Q/K/V natives from the public tensors rather than
+    # trusting forward's returned "natives": the BHSD-eligible fast path
+    # above returns the PUBLIC q/k/v untouched (that's the whole point --
+    # no BTHD copy), which is the wrong shape/layout for the bwd kernels'
+    # BTHD-only ABI, so backward must derive its own regardless of which
+    # forward path (if any) ran above.
+    q_native = _fa4_native_bthd(q)
+    k_native = _fa4_native_bthd(k)
+    v_native = _fa4_native_bthd(v)
+    if q_native is None or k_native is None or v_native is None:
+        return NOT_HANDLED
     # The lower ATen backward accepts arbitrary shape-compatible views, while
     # FA4 consumes LSE as contiguous (B, H, S).  Keep the generated/high-level
     # path zero-copy and materialize only a genuinely strided direct caller.

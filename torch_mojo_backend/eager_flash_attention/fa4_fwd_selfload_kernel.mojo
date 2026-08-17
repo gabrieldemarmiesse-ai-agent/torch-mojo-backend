@@ -1,31 +1,60 @@
-"""FA4-target flash-attention forward kernel (sm_90a, Hopper).
+# ============================================================================
+# PHASE 2c: self-loading single-warpgroup CTA, d64 dense-causal BHSD ONLY.
+# A NEW module (not a replacement): fa4_fwd_kernel.mojo (phase 2b) still
+# serves head_dim=128 and, below the wave-gate threshold in fa4_ops.mojo,
+# the few-wave d64 shapes too. See NOTES.md "Phase 2c" for the merge
+# options this module deliberately did not take (see item 1 of agent A's
+# handoff there: a shared-body `self_load: Bool` comptime parameter is
+# possible but was not done here, to keep every phase-2b instantiation
+# byte-identical without re-running the full asm-diff obligation that
+# merge would owe).
+# ============================================================================
+"""FA4-target flash-attention forward kernel (sm_90a, Hopper) -- the
+self-loading single-warpgroup CTA (phase 2c).
 
-v4: warp-specialized like FA4 — 1 producer warpgroup (WG0, thread 0
-issues all TMA loads) + 2 MMA warpgroups, 384 threads. K/V tiles
-live in a single 6-slot smem ring (slot(K_n) = 2n%6, slot(V_n) =
-(2n+1)%6) guarded by full/empty mbarrier pairs:
+The CTA is ONE warpgroup of 128 threads that issues its own TMA loads --
+no producer warpgroup. That is what buys a THIRD CTA per SM: at the
+phase-2b kernel's 256 threads, `nvvm.minctasm`=3 hands ptxas a static
+budget of 65536/(3*256) = 80 registers per thread and it refuses to
+compile (setmaxnreg moves registers BETWEEN warps, it does not lift the
+CTA's static allocation); at 128 threads the budget is 65536/(3*128) =
+170 -> 168, and ptxas settles at 154, so registers AND smem (4 ring
+stages: 8 KiB Q + 4*16 KiB = 72 KiB, 3*72 <= 227 KiB) both allow 3.
+
+K/V tiles live in a 4-slot smem ring (slot(K_n) = 2n%4, slot(V_n) =
+(2n+1)%4) guarded by `full` mbarriers only:
 
     full[i].init(1)     -> flipped by TMA expect_bytes completion
-    empty[i].init(256)  -> flipped when every MMA thread arrives
 
-The MMA warpgroups run FA4's intra-warpgroup overlap schedule (from
+The empty[] barriers are GONE. The warpgroup that reads a slot is the
+one that refills it, so program order plus `wgmma.wait_group` already
+orders the refill after the read: a warp's wait_group returns only once
+the whole warpgroup's group has retired, i.e. after every warp's share
+of that wgmma has finished reading smem. Refills are issued exactly at
+the two points where that proof lands -- after `wait_group[1]` (K of the
+trip just consumed) and after `wait_group[0]` (V) -- so the prefetch
+distance is a constant STAGES/2 = 2 tiles. See the PREFETCH invariant
+comment below, next to its definition, before touching STAGES or the
+refill call sites.
+
+The MMA warpgroup runs FA4's intra-warpgroup overlap schedule (from
 `flash_attn/cute/flash_fwd_sm90.py::mma_one_n_block_intrawg_overlap`):
 
     wait full K(n+1); commit QK(n+1) -> s_reg        (no wait)
     wait full V(n);   commit PV(n):  p_reg x V -> o_reg
-    wait_group(1)   # QK(n+1) retired -> arrive empty[K(n+1)]
+    wait_group(1)   # QK(n+1) retired -> refill K's slot (was: arrive empty[K(n+1)])
     softmax(n+1)    # overlaps PV(n) on the tensor core
-    wait_group(0)   # PV(n) retired   -> arrive empty[V(n)]
+    wait_group(0)   # PV(n) retired   -> refill V's slot (was: arrive empty[V(n)])
     pack P(n+1) bf16; rescale o_reg
 
-No block-wide barriers in the loop (v3's main stall). Single S /
-single P register buffer keeps the consumer register count near
-FA4's 168/thread; producer deallocates to 24 regs via setmaxnreg.
+No block-wide barriers in the loop (v3's main stall). Single S / single P
+register buffer keeps the register count near FA4's target; there is no
+producer warpgroup left to deallocate registers for via setmaxnreg.
 
 The exp2 uses the scaled-domain trick: rowmax is kept premultiplied
 by softmax_scale*log2(e) so P = exp2(fma(s, scale_log2, -m)).
 
-Grid: (ceildiv(seqlen, BM), nheads, batch). Block: 384 threads.
+Grid: (ceildiv(seqlen, BM), nheads, batch). Block: 128 threads.
 
 P c-frag -> a-frag mapping: with num_m_mmas=1 per warpgroup the QK
 c-fragment element order (16 col-chunks x [top0 top1 bot0 bot1]) is
@@ -43,7 +72,6 @@ from max.gpu.sync import barrier
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, lane_id, thread_idx, warp_id
 import std.gpu.primitives.warp as warp
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
-from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory, fence_async_view_proxy
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier, named_barrier_arrive
@@ -64,14 +92,13 @@ from layout.tensor_core_async import (
 from fa4_wgmma_f16 import wgmma_rs_f16_m64n128, wgmma_rs_f16_m64n64
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
-from fa4_fwd_common import (
+from fa4_fwd_selfload_common import (
     kFa4NThreads,
     kFa4BlockM,
     kFa4BlockN,
     kFa4NMmaWarpgroups,
     kFa4KVStages,
-    kFa4ProducerRegs,
-    kFa4ConsumerRegs,
+    kFa4CtasPerSm,
 )
 
 comptime WGMMA_M: Int = 64
@@ -82,15 +109,13 @@ comptime WGMMA_K: Int = 16
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
         Int32(kFa4NThreads(head_dim))
     ),
-    `nvvm.minctasm`=SIMDLength(
-        2 if kFa4NMmaWarpgroups(head_dim) == 1 else 1
-    ),
+    `nvvm.minctasm`=SIMDLength(kFa4CtasPerSm(head_dim)),
 )
 @__llvm_arg_metadata(q_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(k_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(v_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(o_tma, `nvvm.grid_constant`)
-def fwd_fa4_kernel[
+def fwd_fa4_selfload_kernel[
     dtype: DType,
     head_dim: Int,
     qo_rank: Int,
@@ -137,21 +162,77 @@ def fwd_fa4_kernel[
     var sched_swizzle = Int(sched_swizzle_arg)
     var sched_num_hb_q = Int(sched_num_hb_q_arg)
     var sched_residual = Int(sched_residual_arg)
+    # SCOPE GUARD: this body has no producer warpgroup and assumes one
+    # 128-thread MMA warpgroup per CTA. head_dim=128 needs BM=BN=128 with
+    # TWO warpgroups and 224 KiB of smem (1 CTA/SM) -- it must keep the
+    # phase-2b kernel (fa4_fwd_kernel.mojo); instantiating this one at
+    # d128 would compute only 64 of its 128 rows.
+    comptime assert head_dim == 64, (
+        "self-load geometry is d64-only (d128 keeps the phase-2b kernel)"
+    )
     comptime BM: Int = kFa4BlockM(head_dim)
     comptime BN: Int = kFa4BlockN
     comptime D: Int = head_dim
     comptime NWG: Int = kFa4NMmaWarpgroups(head_dim)
     comptime STAGES: Int = kFa4KVStages
-    comptime NUM_PRODUCER_REGS: Int = kFa4ProducerRegs(head_dim)
-    comptime NUM_CONSUMER_REGS: Int = kFa4ConsumerRegs(head_dim)
+    # PREFETCH INVARIANT -- READ BEFORE CHANGING STAGES OR THE REFILL
+    # CALL SITES. This kernel deleted the empty[] mbarriers that the
+    # phase-2b producer/consumer split used to prove a slot's smem read
+    # had retired before the next TMA refill into that same slot. The
+    # substitute proof is: the warpgroup that CONSUMES a slot (via
+    # wgmma) is the same warpgroup that REFILLS it, so program order
+    # plus `wgmma.wait_group` orders "read done" before "refill issued"
+    # -- wait_group returns only once every warp's share of that wgmma
+    # group has retired, which requires the smem read to be complete.
+    # That proof holds ONLY as long as the refill targets the SAME slot
+    # the just-retired wgmma just read, i.e. PREFETCH (the ring depth in
+    # tile-pairs, STAGES/2) must be >= 1: the tile issued after
+    # wait_group(k) is trip `it + PREFETCH`, whose slot is
+    # `(2*(it+PREFETCH)) % STAGES == (2*it) % STAGES` exactly when
+    # `2*PREFETCH % STAGES == 0`, i.e. PREFETCH == STAGES/2. Widening
+    # STAGES without moving PREFETCH by the same STAGES/2 relationship
+    # (or moving PREFETCH without moving the `issue_k`/`issue_v` call
+    # sites' `it + PREFETCH` / `pf < kv_trips` offsets to match) breaks
+    # the slot arithmetic silently: the refill would target a slot a
+    # DIFFERENT in-flight tile still owns, which is a write-after-read
+    # race with no barrier left to catch it -- Mojo's `wgmma.wait_group`
+    # is not annotated with an LLVM memory clobber, so nothing but this
+    # invariant (and the PTX-ordering regression test that checks it,
+    # tests/test_fa4_selfload_ptx_ordering.py) stops a future toolchain
+    # from reordering a refill's `cp.async.bulk.tensor` ahead of the
+    # `wgmma.wait_group` that proves the slot is free. Failure mode if
+    # violated: silent corruption (wrong output, no error, no crash) --
+    # see tests/test_fa4_selfload_soak.py, ported from the phase-2c
+    # harness's soak_v7.mojo, which stresses exactly this window with
+    # back-to-back launches and no inter-launch sync.
+    #
+    # The "consumer refills its own slot after its own retirement proof"
+    # pattern is the same one warp-specialized GEMM mainloops use for
+    # their smem-read retirement, not something invented for this
+    # kernel: CUTLASS's SM90 TMA+GMMA mainloop retires a pipeline stage
+    # with the consumer's own `wait` before the producer may reuse that
+    # stage's smem (cutlass/gemm/collective/sm90_mma_tma_gmma_ss.hpp,
+    # `PipelineTmaAsync` release/acquire pair around lines 493-497 of
+    # that file); FlashAttention-3's own sm90 warp-specialized mainloop
+    # documents the identical rule at the point it advances its KV
+    # pipeline (mainloop_fwd_sm90_tma_gmma_ws.hpp:1142); and the
+    # modular repo's own SM90 dense GEMM mainloop relies on the same
+    # wgmma-wait-then-release proof to retire a shared-memory read
+    # before the next refill into that stage
+    # (max/kernels/src/linalg/matmul/gpu/sm90/matmul_kernels.mojo,
+    # lines 1554-1577) -- the ISA reference for `wgmma.wait_group.sync`
+    # states only that prior wgmma ops complete; it does not by itself
+    # say anything about a paired smem consumer/producer schedule being
+    # safe, so those three call sites (not the ISA text alone) are what
+    # back the claim that this pattern is correct.
+    comptime PREFETCH: Int = STAGES // 2
     comptime accum_type: DType = DType.float32
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
     # Tree-shaped row reductions (phase 2b), scoped to the geometry they
-    # were profiled on: the d64 tile (BM=64, ONE MMA warpgroup, 232 regs,
-    # 2 CTAs/SM), where `wait` (fixed-latency dependency) was the top ncu
-    # stall. On the d128 tile (BM=BN=128, two warpgroups, 240 regs, 1
-    # CTA/SM) they measured NEUTRAL -- 1.036 vs an A/A control of 1.038
-    # at B8 H12 S1024 -- so d128 keeps a4e8462's codegen (and its exact
+    # were profiled on: the d64 tile (BM=64, ONE MMA warpgroup, 2/3
+    # CTAs/SM), where `wait` (fixed-latency dependency) was the top ncu
+    # stall. On the d128 tile (BM=BN=128, two warpgroups, 1 CTA/SM) they
+    # measured NEUTRAL, so d128 keeps a4e8462's codegen (and its exact
     # rowsum summation order) rather than taking an unproven change.
     # Ungating is safe if a later measurement wants one code path.
     comptime TREE_REDUCE: Bool = kFa4NMmaWarpgroups(head_dim) == 1
@@ -192,17 +273,10 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=8,
     ]()
-    var empty = stack_allocation[
-        STAGES,
-        SharedMemBarrier,
-        address_space=AddressSpace.SHARED,
-        alignment=8,
-    ]()
     if thread_idx.x == 0:
         mbar_q[0].init()
         comptime for s in range(STAGES):
             full[s].init(1)
-            empty[s].init(Int32(NWG * 128))
     barrier()
 
     var m_block: Int
@@ -338,130 +412,104 @@ def fwd_fa4_kernel[
     comptime if varlen and not causal:
         vl_kv_tail = vl_seqlen_k - (num_kv_blocks - 1) * BN
 
-    # shfl-broadcast warpgroup index (the bwd's tid-widening trap:
-    # ptxas's tid-uniformity rule only matches 32-bit shr.u32, and
-    # LLVM re-widens any 32-bit extract; the convergent shfl is
-    # opaque to LLVM and a recognized broadcast to ptxas — without
-    # it every wg-derived descriptor offset costs R2UR per HGMMA).
-    var wgid: Int = Int(
-        warp.broadcast(Int32(Int(thread_idx.x) >> 7))
-    )
+    # ================= single warpgroup, self-loading =================
+    # No producer warpgroup: this warpgroup issues its own TMA loads
+    # (thread 0) at the points where `wgmma.wait_group` proves the
+    # slot's reader has retired. Program order then replaces the empty[]
+    # barriers entirely (see the PREFETCH invariant comment above).
+    var wg: Int = 0
 
-    if wgid == 0:
-        # ================= producer =================
-        warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
-        if thread_idx.x == 0:
-            mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
-            comptime if bhsd:
-                # (B*H, S, D) planes; S its own dim -> tail zero-fill.
-                q_tma.async_copy_3d(
-                    q_smem,
-                    mbar_q[0],
-                    (0, m_block * BM, b_idx * nheads + h_idx),
-                )
-            elif qo_rank == 4:
-                # Dense hdim64: S is its own TMA dim (BM=192 does not
-                # divide the seqlen envelope; OOB tail rows zero-fill
-                # here and the store-side clamps).
-                q_tma.async_copy_4d(
-                    q_smem,
-                    mbar_q[0],
-                    (0, h_idx, m_block * BM, b_idx),
-                )
-            elif varlen:
-                q_tma.async_copy_3d(
-                    q_smem, mbar_q[0], (0, h_idx, vl_q_base + m_block * BM)
-                )
-            else:
-                q_tma.async_copy_3d(
-                    q_smem,
-                    mbar_q[0],
-                    (0, h_idx, b_idx * seq_len + m_block * BM),
-                )
-            # Incremental ring state: K(n) in slot 2n%6, V(n) in
-            # (2n+1)%6; the empty-barrier phase flips every 3 tiles.
-            # Varlen non-causal walks the kv tiles in REVERSE so the
-            # sequence's ragged-tail (boundary) tile is processed in
-            # the consumer PROLOGUE — its column mask then never
-            # touches the steady loop (FA4's design: the hot loop
-            # stays mask-free; online softmax is order-independent).
-            var slot: Int = 0
-            var phase: UInt32 = 0
-            var wrap: Int = 0
-            var row: Int
-            var row_step: Int = BN
-            # BHSD: kv rows are plane-local (the plane is a TMA coord).
-            var kv_plane: Int = 0
-            comptime if bhsd:
-                kv_plane = (
-                    b_idx * (nheads // gqa_ratio) + h_idx // gqa_ratio
-                )
-            comptime if bhsd:
-                row = 0
-            elif window:
-                comptime if varlen:
-                    row = vl_k_base + first_kv * BN
-                else:
-                    row = b_idx * seq_len + first_kv * BN
-            elif varlen:
-                comptime if causal:
-                    row = vl_k_base
-                else:
-                    row = vl_k_base + (num_kv_blocks - 1) * BN
-                    row_step = -BN
-            else:
-                row = b_idx * seq_len
-            for _ in range(kv_trips):
-                empty[slot].wait(phase)
-                var k_st = LayoutTensor[
-                    dtype,
-                    k_smem_layout,
-                    MutAnyOrigin,
-                    address_space=AddressSpace.SHARED,
-                    alignment=128,
-                ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
-                full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                comptime if bhsd:
-                    k_tma.async_copy_3d(k_st, full[slot], (0, row, kv_plane))
-                else:
-                    k_tma.async_copy_3d(
-                        k_st, full[slot], (0, h_idx // gqa_ratio, row)
-                    )
+    # kv row of trip n is row0 + n * row_step (the same trip numbering
+    # the consumer loop uses; window starts at first_kv, varlen
+    # non-causal walks backwards).
+    var kv_row0: Int
+    var kv_row_step: Int = BN
+    var kv_plane: Int = 0
+    comptime if bhsd:
+        kv_plane = b_idx * (nheads // gqa_ratio) + h_idx // gqa_ratio
+        kv_row0 = 0
+    elif window:
+        comptime if varlen:
+            kv_row0 = vl_k_base + first_kv * BN
+        else:
+            kv_row0 = b_idx * seq_len + first_kv * BN
+    elif varlen:
+        comptime if causal:
+            kv_row0 = vl_k_base
+        else:
+            kv_row0 = vl_k_base + (num_kv_blocks - 1) * BN
+            kv_row_step = -BN
+    else:
+        kv_row0 = b_idx * seq_len
 
-                empty[slot + 1].wait(phase)
-                var v_st = LayoutTensor[
-                    dtype,
-                    v_smem_layout,
-                    MutAnyOrigin,
-                    address_space=AddressSpace.SHARED,
-                    alignment=128,
-                ]((kv_smem_base + (slot + 1) * kv_slot_size).as_unsafe_any_origin())
-                full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                comptime if bhsd:
-                    v_tma.async_copy_3d(
-                        v_st, full[slot + 1], (0, row, kv_plane)
-                    )
-                else:
-                    v_tma.async_copy_3d(
-                        v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
-                    )
+    @parameter
+    @always_inline
+    def issue_k(n: Int, slot: Int):
+        """TMA K(n) into `slot` (thread 0 only, caller-guarded)."""
+        var k_st = LayoutTensor[
+            dtype,
+            k_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=128,
+        ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
+        full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+        var row: Int = kv_row0 + n * kv_row_step
+        comptime if bhsd:
+            k_tma.async_copy_3d(k_st, full[slot], (0, row, kv_plane))
+        else:
+            k_tma.async_copy_3d(
+                k_st, full[slot], (0, h_idx // gqa_ratio, row)
+            )
 
-                row += row_step
-                slot += 2
-                wrap += 1
-                if wrap == STAGES // 2:
-                    wrap = 0
-                    slot = 0
-                    phase ^= 1
-        return
+    @parameter
+    @always_inline
+    def issue_v(n: Int, slot: Int):
+        """TMA V(n) into `slot` (thread 0 only, caller-guarded)."""
+        var v_st = LayoutTensor[
+            dtype,
+            v_smem_layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=128,
+        ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
+        full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+        var row: Int = kv_row0 + n * kv_row_step
+        comptime if bhsd:
+            v_tma.async_copy_3d(v_st, full[slot], (0, row, kv_plane))
+        else:
+            v_tma.async_copy_3d(
+                v_st, full[slot], (0, h_idx // gqa_ratio, row)
+            )
 
-    # ================= MMA warpgroups =================
-    warpgroup_reg_alloc[NUM_CONSUMER_REGS]()
-    var wg: Int = wgid - 1
-
-    # Unblock the producer's first ring cycle.
-    comptime for s in range(STAGES):
-        _ = empty[s].arrive()
+    # Prologue issues: Q plus PREFETCH whole tile-pairs (the ring holds
+    # exactly PREFETCH pairs).
+    if thread_idx.x == 0:
+        mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
+        comptime if bhsd:
+            q_tma.async_copy_3d(
+                q_smem,
+                mbar_q[0],
+                (0, m_block * BM, b_idx * nheads + h_idx),
+            )
+        elif qo_rank == 4:
+            q_tma.async_copy_4d(
+                q_smem, mbar_q[0], (0, h_idx, m_block * BM, b_idx)
+            )
+        elif varlen:
+            q_tma.async_copy_3d(
+                q_smem, mbar_q[0], (0, h_idx, vl_q_base + m_block * BM)
+            )
+        else:
+            q_tma.async_copy_3d(
+                q_smem,
+                mbar_q[0],
+                (0, h_idx, b_idx * seq_len + m_block * BM),
+            )
+        comptime for pf in range(PREFETCH):
+            if pf < kv_trips:
+                issue_k(pf, (2 * pf) % STAGES)
+                issue_v(pf, (2 * pf + 1) % STAGES)
 
     # Scheduler-pingpong barrier participant count: each barrier id
     # is waited by ONE warpgroup (128) and armed by its predecessor
@@ -699,12 +747,11 @@ def fwd_fa4_kernel[
                     # under INT32_MAX - 8 (~2.1e9): unreachable at any
                     # physical shape this kernel is built for (it would
                     # need a multi-billion-token packed varlen batch),
-                    # but it is new exposure vs the old code above,
-                    # which compared in 64-bit `Int` and had no such
-                    # ceiling. Guarded explicitly rather than left
-                    # implicit; off by default like every other
-                    # debug_assert (`-D ASSERT=all` or a debug build
-                    # turns it on).
+                    # but it is new exposure vs a 64-bit compare, which
+                    # has no such ceiling. Guarded explicitly rather
+                    # than left implicit; off by default like every
+                    # other debug_assert (`-D ASSERT=all` or a debug
+                    # build turns it on).
                     var mask_thr0_wide: Int = (
                         mask_row_lo - mask_col_lo - causal_mask_d
                     )
@@ -712,8 +759,9 @@ def fwd_fa4_kernel[
                         mask_thr0_wide <= Int(Int32.MAX_FINITE) - 8
                         and mask_thr0_wide >= Int(Int32.MIN_FINITE),
                         (
-                            "fa4 fwd: causal mask threshold overflows"
-                            " int32 (seqlen/vl_offs too large): "
+                            "fa4 fwd (self-load): causal mask threshold"
+                            " overflows int32 (seqlen/vl_offs too"
+                            " large): "
                         ),
                         mask_thr0_wide,
                     )
@@ -871,7 +919,12 @@ def fwd_fa4_kernel[
     wgmma_qk.commit_group()
     wgmma_qk.wait_group()
     warpgroup_fence(s_reg)
-    _ = empty[0].arrive()
+    # K(0)'s slot (0) is free: refill it with K(PREFETCH). 2*PREFETCH
+    # == STAGES, so that tile's slot IS slot 0 (see the PREFETCH
+    # invariant comment above).
+    if thread_idx.x == 0:
+        if PREFETCH < kv_trips:
+            issue_k(PREFETCH, 0)
 
     # rowmax starts at -inf -> scale_old==0, rowsum init. For causal,
     # m_block 0's single tile IS the diagonal (BM==BN) or may sit in
@@ -914,9 +967,9 @@ def fwd_fa4_kernel[
     comptime if window_unaligned:
         win_mask_d += BN
 
-    # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots and
-    # empty-barrier phases track incrementally (no div/mod per iter):
-    # K(t): slot 2t%6, V(t): (2t+1)%6, phase flips every 3 tiles.
+    # ---- Main loop: QK(n+1) + PV(n) per iteration. Ring slots track
+    # incrementally (no div/mod per iter): K(t): slot 2t%STAGES,
+    # V(t): (2t+1)%STAGES, phase flips every STAGES//2 tiles.
     var k_slot: Int = 2  # K(1)
     var k_phase: UInt32 = 0
     var k_wrap: Int = 1
@@ -952,7 +1005,13 @@ def fwd_fa4_kernel[
         # QK(n+1) retired (PV(n) still running on the tensor core).
         wgmma_qk.wait_group[1]()
         warpgroup_fence(s_reg)
-        _ = empty[k_slot].arrive()
+        # QK(it+1) has retired for the whole warpgroup -> K(it+1)'s slot
+        # is free for the tile PREFETCH trips later (same slot; see the
+        # PREFETCH invariant comment above).
+        if thread_idx.x == 0:
+            var k_next: Int = it + 1 + PREFETCH
+            if k_next < kv_trips:
+                issue_k(k_next, k_slot)
 
         # Softmax of S(n+1) overlaps PV(n). For causal the last
         # tile (BM==BN: n+1 == num_kv_blocks-1 == m_block is THE
@@ -985,7 +1044,10 @@ def fwd_fa4_kernel[
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()
         warpgroup_fence(o_reg)
-        _ = empty[v_slot].arrive()
+        if thread_idx.x == 0:
+            var v_next: Int = it + PREFETCH
+            if v_next < kv_trips:
+                issue_v(v_next, v_slot)
         pack_p()  # P(n+1)
         rescale_o()
 
@@ -1160,10 +1222,11 @@ def fwd_fa4_kernel[
                 ).cast[DType.float32]()
 
     fence_async_view_proxy()
-    # Producer warpgroup may have exited -> consumer-only barrier.
-    # (id NWG+1: ids 1..NWG are the scheduler pingpong barriers.)
+    # No producer warpgroup exists in this kernel -> a plain
+    # whole-CTA barrier (id NWG+1: ids 1..NWG are the scheduler
+    # pingpong barriers) suffices before the O store reads smem.
     named_barrier[Int32(NWG * 128)](Int32(NWG + 1))
-    if full_tile_store and thread_idx.x == 128:
+    if full_tile_store and thread_idx.x == 0:
         var o_st = LayoutTensor[
             dtype,
             q_smem_layout,

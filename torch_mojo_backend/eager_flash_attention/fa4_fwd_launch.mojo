@@ -10,7 +10,7 @@ function's PTX is written to <path> at first-call JIT time via
 kernel module name.
 """
 
-from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
 from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
@@ -54,6 +54,7 @@ def launch_fwd_fa4[
     window_unaligned: Bool = False,
     softcap_x1000: Int = 0,
     strided_qkv: Bool = False,
+    bhsd_qkv: Bool = False,
 ](
     batch_int: Int,
     seqlen_int: Int,
@@ -83,17 +84,18 @@ def launch_fwd_fa4[
     v_d_stride: Int = 1,
 ) raises:
     # Strided Q/K/V (zero-copy fused-QKV views) is scoped to the
-    # dense d64 causal path in this port; the caller validates the
-    # layout contract (d_stride==1, b_stride==S*s_stride, 16 B-
-    # aligned strides) before this launcher runs.
+    # dense causal path in this port (d64 or d128); the caller
+    # validates the layout contract (d_stride==1, b_stride==S*s_stride,
+    # 16 B-aligned strides, h_stride==head_dim) before this launcher
+    # runs.
     comptime assert (not strided_qkv) or (
-        head_dim == 64
+        (head_dim == 64 or head_dim == 128)
         and causal
         and not varlen
         and not window
         and gqa_ratio == 1
         and softcap_x1000 == 0
-    ), "strided_qkv supports only dense d64 (no varlen/window/gqa/softcap)"
+    ), "strided_qkv supports only dense d64/d128 (no varlen/window/gqa/softcap)"
     var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
@@ -134,6 +136,127 @@ def launch_fwd_fa4[
         kFa4BlockM(head_dim), 1, head_dim
     )
     comptime kv_smem_shape = IndexList[3](kFa4BlockN, 1, head_dim)
+
+    comptime if bhsd_qkv:
+        comptime assert (
+            (head_dim == 64 or head_dim == 128)
+            and causal
+            and not varlen
+            and not window
+            and softcap_x1000 == 0
+            and not strided_qkv
+        ), "bhsd_qkv v1 supports only the dense causal d64/d128 path"
+        # PUBLIC-layout consumption (the fix for the 30-45% gather-copy
+        # overhead): Q/K/V/O are the contiguous (B, H, S, D) tensors the
+        # ATen op provides, viewed as (B*H, S, D). Planes are the TMA
+        # outer dim and S its OWN dim, so BM=192 tail tiles zero-fill
+        # on load and clamp on store at every plane's S edge — no BTHD
+        # materialization, no next-plane clobber. This is FA3's scheme
+        # (head stride is just another gmem stride).
+        comptime q_smem_shape_b = IndexList[3](
+            1, kFa4BlockM(head_dim), head_dim
+        )
+        comptime kv_smem_shape_b = IndexList[3](1, kFa4BlockN, head_dim)
+        var planes_q: Int = batch_int * nheads_int
+        var planes_kv: Int = batch_int * (nheads_int // gqa_ratio)
+        var q_tma_b = create_split_tma[
+            q_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, q_ptr, planes_q, seqlen_int)
+        var k_tma_b = create_split_tma[
+            kv_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, k_ptr, planes_kv, seqlen_int)
+        var v_tma_b = create_split_tma[
+            kv_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, v_ptr, planes_kv, seqlen_int)
+        var o_imm_ptr_b = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+            unsafe_from_address=o_addr
+        )
+        var o_tma_b = create_split_tma[
+            q_smem_shape_b, gmem_shape, swizzle_mode=swizzle
+        ](ctx, o_imm_ptr_b, planes_q, seqlen_int)
+        comptime kernel_inst_b = fwd_fa4_kernel[
+            dtype,
+            head_dim,
+            3,
+            type_of(q_tma_b).tile_shape,
+            type_of(q_tma_b).desc_shape,
+            type_of(k_tma_b).tile_shape,
+            type_of(k_tma_b).desc_shape,
+            type_of(o_tma_b).tile_shape,
+            type_of(o_tma_b).desc_shape,
+            causal,
+            gqa_ratio,
+            False,
+            False,
+            False,
+            0,
+            bhsd=True,
+        ]
+        # Same LPT scheduler as the dense causal rank-4 path.
+        var num_m_b: Int = ceildiv(
+            seqlen_int, Int(kFa4BlockM(head_dim))
+        )
+        var size_one_kv_head_b: Int = (
+            seqlen_int * 2 * head_dim * size_of[dtype]()
+        )
+        # Work order, wave-dispatched (measured on d64; middle group
+        # sizes lose BOTH ways — see the phase-2 harness NOTES.md):
+        # - MANY waves (>= ~12): swizzle group 1 — each plane's whole
+        #   m-sweep is consecutive, so the CTAs in flight walk a few
+        #   planes' K/V phase-aligned (L2-resident, many readers per
+        #   tile): P1 -8%, P3 -3%. The 50MB-budget order (128 planes
+        #   at the SAME m in flight) shares nothing concurrently:
+        #   L2 hit 50%, 1.7x DRAM re-reads, long_scoreboard top stall.
+        # - FEW waves: keep the global-LPT order (all planes sweep m
+        #   together, heavy tiles first) — the tail is all light
+        #   tiles, which dominates short grids (group 1 here cost P0
+        #   8% in stragglers).
+        var sm_count_b: Int = ctx.get_attribute(
+            DeviceAttribute.MULTIPROCESSOR_COUNT
+        )
+        var ctas_per_sm_b: Int = 2 if head_dim == 64 else 1
+        var waves_b: Int = (num_m_b * nheads_int * batch_int) // (
+            ctas_per_sm_b * sm_count_b
+        )
+        var l2_ratio_b: Int = (50 * 1024 * 1024) // size_one_kv_head_b
+        var sched_swizzle_b: Int
+        if waves_b >= 12:
+            sched_swizzle_b = 1
+        else:
+            sched_swizzle_b = 1
+            while sched_swizzle_b * 2 <= l2_ratio_b:
+                sched_swizzle_b *= 2
+        var num_hb_b: Int = nheads_int * batch_int
+        var sched_num_hb_q_b: Int = num_hb_b // sched_swizzle_b
+        var sched_residual_b: Int = max(num_hb_b % sched_swizzle_b, 1)
+        enqueue_fa4_cached[
+            kernel_inst_b,
+            use_external_stream=use_external_stream,
+            dump_asm=_dump_ptx_path(),
+        ](
+            ctx,
+            ctx_handle_addr,
+            stream_opaque,
+            String(
+                t"fwd_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"
+            ),
+            (num_m_b * num_hb_b, 1, 1),
+            kFa4NThreads(head_dim),
+            smem_bytes,
+            FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(smem_bytes)),
+            q_tma_b,
+            k_tma_b,
+            v_tma_b,
+            o_tma_b,
+            lse_ptr,
+            Int64(seqlen_int),
+            softmax_scale,
+            Int64(nheads_int),
+            Int64(sched_swizzle_b),
+            Int64(sched_num_hb_q_b),
+            Int64(sched_residual_b),
+        )
+        return
 
     # Varlen: one flat descriptor over the packed (total_tokens, H, D)
     # arrays; the kernel supplies per-sequence row offsets at copy
@@ -300,9 +423,30 @@ def launch_fwd_fa4[
         )
         return
 
-    var q_tma = create_split_tma[
-        q_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, q_ptr, rows, nheads_int)
+    # QO_RANK == 3 (head_dim != 64, i.e. the d128 dense/strided path):
+    # BM == BN == 128 here, so the seqlen % 128 == 0 eligibility gate
+    # already makes every m-tile a full tile -- no rank-4 tail
+    # descriptor is needed the way d64's BM=192 requires. Q mirrors
+    # K/V's existing strided-vs-plain choice above; O always stays
+    # the dense contiguous descriptor (strided_qkv only broadens Q/K/V).
+    var q_tma: SplitLastDimTMATensorTile[dtype, q_smem_shape, swizzle]
+    comptime if strided_qkv:
+        q_tma = create_split_tma_3d_strided[
+            q_smem_shape, swizzle_mode=swizzle
+        ](
+            ctx,
+            q_ptr,
+            rows,
+            nheads_int,
+            head_dim,
+            q_s_stride,
+            q_h_stride,
+            q_d_stride,
+        )
+    else:
+        q_tma = create_split_tma[
+            q_smem_shape, gmem_shape, swizzle_mode=swizzle
+        ](ctx, q_ptr, rows, nheads_int)
     var o_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, o_imm_ptr, rows, nheads_int)
