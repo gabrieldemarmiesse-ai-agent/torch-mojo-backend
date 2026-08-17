@@ -269,8 +269,6 @@ def _searchsorted_tensor_dtype(left: DType, right: DType) -> DType:
 
 def _searchsorted_scalar_dtype(boundary_dtype: DType, value: Scalar) -> DType:
     """Wrapped-number promotion used by ATen's Scalar overloads."""
-    if isinstance(value, Dim):
-        return boundary_dtype
     promoted = torch.result_type(
         torch.empty((), dtype=max_dtype_to_torch(boundary_dtype)), value
     )
@@ -359,10 +357,12 @@ def _searchsorted_impl(
             raise RuntimeError(
                 "torch.searchsorted(): sorter must be a tensor of long dtype"
             )
-        sorted_sequence = F.gather_nd(
-            sorted_sequence,
-            F.unsqueeze(sorter, axis=-1),
-            batch_dims=len(sorted_sequence.shape) - 1,
+        # MAX graphs cannot validate data-dependent sorter bounds before a
+        # gather_nd. Passing unchecked indices through silently returned wrong
+        # answers for out-of-range sorters, so decline the graph sorter path.
+        raise NotImplementedError(
+            "searchsorted sorter is not supported by the MAX graph backend "
+            "because sorter bounds cannot be validated"
         )
 
     if sorted_sequence.dtype != common_dtype:
@@ -385,8 +385,30 @@ def _searchsorted_impl(
         else F.greater_equal(sorted_sequence, values)
     )
     count_mask = F.logical_not(comparison)
-    counts = _reduce_sum(F.cast(count_mask, dtype=output_dtype), axis=-1)
-    return F.squeeze(counts, axis=-1)
+    if common_dtype.is_float():
+        # For a sorted numeric prefix followed by NaNs, ATen's
+        # !(boundary >/>= value) search skips the NaN tail only when the
+        # numeric insertion point reaches it. A plain count treats every NaN
+        # as an advance for every value, so exclude them from the numeric
+        # count and remap that terminal insertion point to the full size.
+        boundary_is_nan = F.is_nan(sorted_sequence)
+        boundary_is_numeric = F.logical_not(boundary_is_nan)
+        count_mask = F.logical_and(count_mask, boundary_is_numeric)
+        numeric_boundary_count = _reduce_sum(
+            F.cast(boundary_is_numeric, dtype=DType.int32), axis=-1
+        )
+        total_boundary_count = numeric_boundary_count + _reduce_sum(
+            F.cast(boundary_is_nan, dtype=DType.int32), axis=-1
+        )
+    # MAX has no binary-search primitive, so this graph composition necessarily
+    # materializes the broadcast N x K mask. Accumulate it as int32 to halve
+    # peak memory versus an int64 mask, then cast only the reduced result.
+    counts = _reduce_sum(F.cast(count_mask, dtype=DType.int32), axis=-1)
+    if common_dtype.is_float():
+        counts = F.where(
+            F.equal(counts, numeric_boundary_count), total_boundary_count, counts
+        )
+    return F.squeeze(F.cast(counts, dtype=output_dtype), axis=-1)
 
 
 @map_to(aten.floordiv)

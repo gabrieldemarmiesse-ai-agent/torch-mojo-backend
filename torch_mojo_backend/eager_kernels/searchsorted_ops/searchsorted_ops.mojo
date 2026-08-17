@@ -22,7 +22,6 @@ from std.python._cpython import PyObjectPtr
 from std.python.bindings import PythonModuleBuilder
 from std.sys.info import has_accelerator
 from std.utils.coord import Coord
-from std.utils.numerics import isnan
 from std.utils.static_tuple import StaticTuple
 
 from op_utils import (
@@ -34,7 +33,6 @@ from op_utils import (
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _raw_ret_none,
     _spec_dispatcher13,
     _spec_unsupported,
 )
@@ -57,8 +55,23 @@ comptime OUTPUT_DTYPES = [DType.int32, DType.int64]
 
 
 @always_inline
+def _should_advance[
+    dtype: DType, right: Bool
+](boundary: SIMD[dtype, 1], value: SIMD[dtype, 1]) -> Bool:
+    # Match ATen's negated comparison exactly.  Besides using one compare,
+    # this is what makes a NaN in either operand advance the search.
+    comptime if right:
+        return not boundary.gt(value)[0]
+    else:
+        return not boundary.ge(value)[0]
+
+
+@always_inline
 def _binary_search_position[
-    dtype: DType
+    dtype: DType,
+    boundaries_are_1d: Bool,
+    has_sorter: Bool,
+    right: Bool,
 ](
     boundaries: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
     values: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -66,29 +79,23 @@ def _binary_search_position[
     value_index: Int,
     boundary_size: Int,
     values_per_batch: Int,
-    boundaries_are_1d: Bool,
-    has_sorter: Bool,
-    right: Bool,
 ) -> Int:
     var boundary_base = 0
-    if not boundaries_are_1d:
+    comptime if not boundaries_are_1d:
         boundary_base = (value_index // values_per_batch) * boundary_size
 
     var value = SIMD[dtype, 1](values[value_index])
-    var value_is_nan = isnan(value)
     var low = 0
     var high = boundary_size
     while low < high:
         var mid = low + ((high - low) >> 1)
         var boundary_index = mid
-        if has_sorter:
+        comptime if has_sorter:
             boundary_index = Int(sorter[boundary_base + mid])
         var boundary = SIMD[dtype, 1](
             boundaries[boundary_base + boundary_index]
         )
-        var advance = (
-            value_is_nan | (boundary.le(value) if right else boundary.lt(value))
-        )[0]
+        var advance = _should_advance[dtype, right](boundary, value)
         # Conditional expressions lower to selects: the data-dependent update
         # is branchless even though every lane takes a different search path.
         low = mid + 1 if advance else low
@@ -96,12 +103,18 @@ def _binary_search_position[
     return low
 
 
-@__name(t"binary_search_global_{dtype}_{out_dtype}_t{GS_THREADS}")
+@__name(
+    t"binary_search_global_{dtype}_{out_dtype}_d1{boundaries_are_1d}_s{has_sorter}_r{right}_t{GS_THREADS}"
+)
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
 )
 def _binary_search_kernel[
-    dtype: DType, out_dtype: DType
+    dtype: DType,
+    out_dtype: DType,
+    boundaries_are_1d: Bool,
+    has_sorter: Bool,
+    right: Bool,
 ](
     out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
     boundaries: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
@@ -110,36 +123,35 @@ def _binary_search_kernel[
     num_values_arg: Int64,
     boundary_size_arg: Int64,
     values_per_batch_arg: Int64,
-    boundaries_are_1d_arg: Int64,
-    has_sorter_arg: Int64,
-    right_arg: Int64,
 ):
     var num_values = Int(num_values_arg)
     var boundary_size = Int(boundary_size_arg)
     var values_per_batch = Int(values_per_batch_arg)
-    var boundaries_are_1d = Bool(boundaries_are_1d_arg)
-    var has_sorter = Bool(has_sorter_arg)
-    var right = Bool(right_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * Int(block_dim.x)
     while i < num_values:
-        out_ptr[i] = _binary_search_position[dtype](
+        out_ptr[i] = _binary_search_position[
+            dtype, boundaries_are_1d, has_sorter, right
+        ](
             boundaries,
             values,
             sorter,
             i,
             boundary_size,
             values_per_batch,
-            boundaries_are_1d,
-            has_sorter,
-            right,
-        ).cast[out_dtype]()
+        ).cast[
+            out_dtype
+        ]()
         i += stride
 
 
 @always_inline
 def _searchsorted[
-    dtype: DType, out_dtype: DType
+    dtype: DType,
+    out_dtype: DType,
+    boundaries_are_1d: Bool,
+    has_sorter: Bool,
+    right: Bool,
 ](
     out_addr: Int,
     boundaries_addr: Int,
@@ -148,9 +160,6 @@ def _searchsorted[
     num_values: Int,
     boundary_size: Int,
     values_per_batch: Int,
-    boundaries_are_1d: Bool,
-    has_sorter: Bool,
-    right: Bool,
     ctx: DeviceContext,
 ) raises:
     var out = _make_ptr[out_dtype](out_addr).as_unsafe_any_origin()
@@ -177,23 +186,21 @@ def _searchsorted[
             sorter,
             boundary_size,
             values_per_batch,
-            boundaries_are_1d,
-            has_sorter,
-            right,
         )
         def func[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            out[i] = _binary_search_position[dtype](
+            out[i] = _binary_search_position[
+                dtype, boundaries_are_1d, has_sorter, right
+            ](
                 boundaries,
                 values,
                 sorter,
                 i,
                 boundary_size,
                 values_per_batch,
-                boundaries_are_1d,
-                has_sorter,
-                right,
-            ).cast[out_dtype]()
+            ).cast[
+                out_dtype
+            ]()
 
         _parallel_for[func](num_values, ctx)
         return
@@ -201,9 +208,15 @@ def _searchsorted[
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
-        _enqueue_cached[_binary_search_kernel[dtype, out_dtype]](
+        _enqueue_cached[
+            _binary_search_kernel[
+                dtype, out_dtype, boundaries_are_1d, has_sorter, right
+            ]
+        ](
             ctx,
-            String(t"binary_search_{dtype}_{out_dtype}"),
+            String(
+                t"binary_search_{dtype}_{out_dtype}_d1{boundaries_are_1d}_s{has_sorter}_r{right}"
+            ),
             _gs_blocks(num_values),
             1,
             1,
@@ -215,10 +228,58 @@ def _searchsorted[
             Int64(num_values),
             Int64(boundary_size),
             Int64(values_per_batch),
-            Int64(boundaries_are_1d),
-            Int64(has_sorter),
-            Int64(right),
         )
+
+
+@always_inline
+def _dispatch_searchsorted[
+    dtype: DType, out_dtype: DType
+](
+    out_addr: Int,
+    boundaries_addr: Int,
+    values_addr: Int,
+    sorter_addr: Int,
+    num_values: Int,
+    boundary_size: Int,
+    values_per_batch: Int,
+    boundaries_are_1d: Bool,
+    has_sorter: Bool,
+    right: Bool,
+    ctx: DeviceContext,
+) raises:
+    @always_inline
+    @parameter
+    def _run[d1: Bool, sorter: Bool, upper: Bool]() raises:
+        _searchsorted[dtype, out_dtype, d1, sorter, upper](
+            out_addr,
+            boundaries_addr,
+            values_addr,
+            sorter_addr,
+            num_values,
+            boundary_size,
+            values_per_batch,
+            ctx,
+        )
+
+    if boundaries_are_1d:
+        if has_sorter:
+            if right:
+                _run[True, True, True]()
+            else:
+                _run[True, True, False]()
+        elif right:
+            _run[True, False, True]()
+        else:
+            _run[True, False, False]()
+    elif has_sorter:
+        if right:
+            _run[False, True, True]()
+        else:
+            _run[False, True, False]()
+    elif right:
+        _run[False, False, True]()
+    else:
+        _run[False, False, False]()
 
 
 def _searchsorted_go(
@@ -240,12 +301,12 @@ def _searchsorted_go(
     var out_dtype = _raw_dtype_int(out_dtype_obj)
     var handled = False
     comptime for dt in SEARCH_DTYPES:
-        comptime if _dtype_arg_on[0, dt]() and _dtype_arg_on[1, dt]():
+        comptime if _dtype_arg_on[0, dt]():
             if dtype == dt:
                 comptime for odt in OUTPUT_DTYPES:
                     comptime if _dtype_out_on[0, odt]():
                         if out_dtype == odt:
-                            _searchsorted[dt, odt](
+                            _dispatch_searchsorted[dt, odt](
                                 _raw_int(out_obj),
                                 _raw_int(boundaries_obj),
                                 _raw_int(values_obj),

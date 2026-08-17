@@ -3128,6 +3128,9 @@ _SEARCHSORTED_DTYPES = (
     DType.int32,
     DType.int64,
 )
+# float64, int16, and uint8 are deliberately declined until their kernels are
+# supported.  Scalar integers with magnitude above 2**53 are also declined so
+# wrapped-number promotion cannot silently lose precision.
 
 
 def _searchsorted_tensor_dtype(left: DType, right: DType) -> DType | None:
@@ -3330,7 +3333,7 @@ def _fast_searchsorted(
             out_dtype.value,
             _ctx_ptr(input_tensor._device),
         ),
-        arg_dtypes=(common_dtype, common_dtype),
+        arg_dtypes=(common_dtype,),
         output_dtypes=(out_dtype,),
         keepalive=tuple(
             tensor
