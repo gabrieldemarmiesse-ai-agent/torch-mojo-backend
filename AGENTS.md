@@ -382,6 +382,12 @@ remaining gap is physics or engineering; it never decides whether the work is
 done. A kernel inside 10% of PyTorch is finished even at 50% of roofline,
 because PyTorch itself is often nowhere near roofline.
 
+**Model selection for kernel agents**: use Opus 5 for hard kernels (new
+mainloops, schedule work, wgmma/TMA/MFMA pipelines, anything
+memory-ordering-sensitive) and Sonnet 5 for easy kernels and mechanical work
+(gate widening, dispatch wiring, parametrizing an existing kernel,
+integration, conflict fixes). Never use Fable 5 for agents.
+
 When optimizing a kernel, you should make a harness for a subagent A to work on. The harness should include:
 - Unit tests for the kernels (outside the main test suite), the unit tests should acquire the flock `/tmp/gpu_lock_{gpu_id}.lock`.
 - A benchmark script in pure mojo, that measures the performance of the kernel on different input shapes (no more than 6), requiring at least one non-round/awkward shape (e.g. 357×789). The benchmark should lock the GPU frequency if possible. The benchmark should use a flock in /tmp/gpu_lock_{gpu_id}.lock to avoid using the gpu at the same time as other benchmarks. `ncu` or rocprof or equivalent should be given to the agent.
