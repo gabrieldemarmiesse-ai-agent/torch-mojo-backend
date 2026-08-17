@@ -1111,16 +1111,19 @@ def test_vendored_fa4_sources_have_no_torch_cuda_or_internal_sync() -> None:
     assert "torch.cuda" not in sources
     assert "ctx.synchronize()" not in sources
 
-    # All six launches -- dense fwd, strided_qkv fwd, and BHSD-native fwd in
-    # fa4_fwd_launch.mojo, plus bwd preprocess/main/convert in
+    # All seven launches -- dense fwd, strided_qkv fwd, and BHSD-native fwd
+    # in fa4_fwd_launch.mojo, the phase-2c self-loading BHSD-native fwd in
+    # fa4_fwd_selfload_launch.mojo, plus bwd preprocess/main/convert in
     # fa4_bwd_launch.mojo -- share compiled code by specialization and raw
     # context identity.  B/S/H, pointers, descriptors, and launch grids stay
     # runtime values, so changing model or batch shapes does not force
     # recompilation.
     launchers = (
-        source_by_name["fa4_fwd_launch.mojo"] + source_by_name["fa4_bwd_launch.mojo"]
+        source_by_name["fa4_fwd_launch.mojo"]
+        + source_by_name["fa4_fwd_selfload_launch.mojo"]
+        + source_by_name["fa4_bwd_launch.mojo"]
     )
     cache = source_by_name["fa4_launch_cache.mojo"]
-    assert launchers.count("enqueue_fa4_cached[") == 6
+    assert launchers.count("enqueue_fa4_cached[") == 7
     assert ".compile_function[" not in launchers
     assert "_CTX{context_identity}" in cache

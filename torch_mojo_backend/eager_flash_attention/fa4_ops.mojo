@@ -5,16 +5,57 @@ asynchronous; synchronization belongs at explicit consumer/benchmark
 boundaries, never between forward or backward component kernels.
 """
 
+from std.math import ceildiv
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 
+from max.gpu.host import DeviceAttribute, DeviceContext
+from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
+
 from fa4_fwd_launch import launch_fwd_fa4
+from fa4_fwd_selfload_launch import launch_fwd_fa4_selfload
+from fa4_fwd_selfload_common import kFa4BlockM as kFa4SelfloadBlockM
+from fa4_fwd_selfload_common import kFa4CtasPerSm as kFa4SelfloadCtasPerSm
 from fa4_bwd_launch import (
     launch_bwd_preprocess,
     launch_bwd_main,
     launch_bwd_convert,
 )
+
+# PHASE 2c wave-gate threshold (NOTES.md, /scratch/fa4-fwd-harness-2c,
+# "Phase 2c" section 5): the self-loading (3 CTAs/SM) bhsd route beats
+# the phase-2b (2 CTAs/SM) geometry once there is enough parallel work
+# to fill a third CTA everywhere; below it, the shallower 4-stage ring
+# and the missing dedicated producer warpgroup are pure cost with
+# nothing to hide behind. Measured waves at this divisor: P0/P1/P2/P3 at
+# 4.5/17/3.0/23 all clear the bar; P4/P5 at 0.8/0.2 both regress (5-9%)
+# but stay under 1.10x cuDNN either way, so the gate is not delicate.
+# FITTED ON H100 PCIe (114 SMs) -- re-derive on other cards; nothing
+# here is architecture-specific in principle, but the threshold was
+# never measured off Hopper.
+comptime _FA4_SELFLOAD_MIN_WAVES: Int = 2
+
+
+def _fa4_bhsd_selfload_waves(
+    batch: Int, seqlen: Int, nheads: Int, ctx_handle_addr: Int
+) raises -> Int:
+    """Runtime wave count for the self-loading (3 CTAs/SM) bhsd route.
+
+    Deliberately its OWN computation, not shared with
+    ``launch_fwd_fa4``'s internal L2-swizzle wave count (which keeps
+    dividing by ITS OWN 2-CTAs/SM occupancy): conflating the two would
+    move the phase-2b ">= 12 waves" swizzle-group threshold for shapes
+    that stay on the phase-2b geometry, an unmeasured combination this
+    gate must not create (NOTES.md "Phase 2c" handoff item 4).
+    """
+    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
+        unsafe_from_address=ctx_handle_addr
+    )
+    var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
+    var sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var num_m = ceildiv(seqlen, kFa4SelfloadBlockM(64))
+    return (num_m * nheads * batch) // (kFa4SelfloadCtasPerSm(64) * sm_count)
 
 
 def flash_attention_fwd_bf16_d64_causal(
@@ -630,7 +671,14 @@ def flash_attention_fwd_bf16_d64_causal_bhsd(
     the PUBLIC contiguous (B, H, S, D) layout directly (viewed as
     (B*H, S, D) planes), skipping the BTHD materialization the dense
     entry point above requires. See fa4_fwd_kernel.mojo/fa4_fwd_launch.mojo
-    ``bhsd``/``bhsd_qkv`` comptime params."""
+    ``bhsd``/``bhsd_qkv`` comptime params.
+
+    Runtime-gated (phase 2c, ``_fa4_bhsd_selfload_waves``) between two
+    d64 geometries: the self-loading single-warpgroup, 3-CTAs/SM kernel
+    (``fa4_fwd_selfload_launch.mojo``) once there is enough parallel work
+    to fill a third CTA everywhere, else the phase-2b 2-CTAs/SM producer/
+    consumer kernel this bridge always used before. See
+    ``_FA4_SELFLOAD_MIN_WAVES`` above for the threshold and its source."""
     var q_addr = Int(py=args[0])
     var k_addr = Int(py=args[1])
     var v_addr = Int(py=args[2])
@@ -644,30 +692,55 @@ def flash_attention_fwd_bf16_d64_causal_bhsd(
 
     _check_bhsd_args(batch, seqlen, nheads, q_addr, k_addr, v_addr, out_addr)
 
-    launch_fwd_fa4[
-        DType.bfloat16,
-        64,
-        False,
-        True,
-        1,
-        False,
-        False,
-        False,
-        0,
-        bhsd_qkv=True,
-    ](
-        batch,
-        seqlen,
-        nheads,
-        softmax_scale,
-        q_addr,
-        k_addr,
-        v_addr,
-        out_addr,
-        lse_addr,
-        0,
-        ctx_addr,
-    )
+    if (
+        _fa4_bhsd_selfload_waves(batch, seqlen, nheads, ctx_addr)
+        >= _FA4_SELFLOAD_MIN_WAVES
+    ):
+        launch_fwd_fa4_selfload[
+            DType.bfloat16,
+            64,
+            False,
+            True,
+            1,
+            0,
+        ](
+            batch,
+            seqlen,
+            nheads,
+            softmax_scale,
+            q_addr,
+            k_addr,
+            v_addr,
+            out_addr,
+            lse_addr,
+            0,
+            ctx_addr,
+        )
+    else:
+        launch_fwd_fa4[
+            DType.bfloat16,
+            64,
+            False,
+            True,
+            1,
+            False,
+            False,
+            False,
+            0,
+            bhsd_qkv=True,
+        ](
+            batch,
+            seqlen,
+            nheads,
+            softmax_scale,
+            q_addr,
+            k_addr,
+            v_addr,
+            out_addr,
+            lse_addr,
+            0,
+            ctx_addr,
+        )
     return PythonObject(None)
 
 
@@ -676,7 +749,8 @@ def flash_attention_fwd_f16_d64_causal_bhsd(
     mut args: PythonObject,
 ) raises -> PythonObject:
     """Same BHSD-native dense causal d64 fwd as the bf16 entry point
-    above, only the comptime ``dtype`` differs."""
+    above, only the comptime ``dtype`` differs (including the phase-2c
+    self-load/phase-2b wave gate)."""
     var q_addr = Int(py=args[0])
     var k_addr = Int(py=args[1])
     var v_addr = Int(py=args[2])
@@ -690,30 +764,55 @@ def flash_attention_fwd_f16_d64_causal_bhsd(
 
     _check_bhsd_args(batch, seqlen, nheads, q_addr, k_addr, v_addr, out_addr)
 
-    launch_fwd_fa4[
-        DType.float16,
-        64,
-        False,
-        True,
-        1,
-        False,
-        False,
-        False,
-        0,
-        bhsd_qkv=True,
-    ](
-        batch,
-        seqlen,
-        nheads,
-        softmax_scale,
-        q_addr,
-        k_addr,
-        v_addr,
-        out_addr,
-        lse_addr,
-        0,
-        ctx_addr,
-    )
+    if (
+        _fa4_bhsd_selfload_waves(batch, seqlen, nheads, ctx_addr)
+        >= _FA4_SELFLOAD_MIN_WAVES
+    ):
+        launch_fwd_fa4_selfload[
+            DType.float16,
+            64,
+            False,
+            True,
+            1,
+            0,
+        ](
+            batch,
+            seqlen,
+            nheads,
+            softmax_scale,
+            q_addr,
+            k_addr,
+            v_addr,
+            out_addr,
+            lse_addr,
+            0,
+            ctx_addr,
+        )
+    else:
+        launch_fwd_fa4[
+            DType.float16,
+            64,
+            False,
+            True,
+            1,
+            False,
+            False,
+            False,
+            0,
+            bhsd_qkv=True,
+        ](
+            batch,
+            seqlen,
+            nheads,
+            softmax_scale,
+            q_addr,
+            k_addr,
+            v_addr,
+            out_addr,
+            lse_addr,
+            0,
+            ctx_addr,
+        )
     return PythonObject(None)
 
 
