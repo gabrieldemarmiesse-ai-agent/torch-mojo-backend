@@ -8361,10 +8361,12 @@ def test_fa4_causal_gapped_qkv_forward_backward(
     bf16 and f16 share the same kernel family (the f16 RS wgmma emitter is a
     vendored gap-filler for the stdlib's bf16-only register-operand overload,
     see ``fa4_wgmma_f16.mojo``), so both dtypes are exercised here. head_dim
-    64 (GPT-2-class, BM=192, 3 MMA warpgroups) and 128 (Llama-class, BM=128,
-    2 MMA warpgroups) are two distinct comptime tile configs (see
-    ``fa4_fwd_common.mojo``/``fa4_bwd_common.mojo``), not one kernel with a
-    runtime dimension -- both get their own cached launch here.
+    64 (GPT-2-class, BM=64, 1 MMA warpgroup, 2 CTAs/SM -- phase 2b's
+    causal-tile-quantization fix, see ``fa4_fwd_common.mojo``) and 128
+    (Llama-class, BM=128, 2 MMA warpgroups, unchanged) are two distinct
+    comptime tile configs (see ``fa4_fwd_common.mojo``/``fa4_bwd_common.mojo``),
+    not one kernel with a runtime dimension -- both get their own cached
+    launch here.
     """
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
     from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
@@ -8500,7 +8502,7 @@ def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype, head_dim
         )
 
 
-# (batch, heads, seqlen): S residues mod BM=192 reachable under the FA4
+# (batch, heads, seqlen): S residues mod BM reachable under the FA4
 # seqlen % 128 == 0 eligibility gate -- ported from agent A's pure-Mojo fwd
 # harness (test_fa4_fwd.mojo in /scratch/fa4-fwd-harness), which validates the
 # same shapes' numerics against an fp64 host reference on sampled rows plus a
@@ -8510,14 +8512,25 @@ def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype, head_dim
 # BM is 128 (kFa4BlockM), which the seqlen % 128 == 0 gate always divides
 # evenly -- no partial m-tile is reachable there, but the same shape set
 # still stresses multi-plane LPT scheduling at the second tile config.
+#
+# NOTE (phase 2b, BM=64 at d64): the per-shape "tail N" comments below were
+# written for the pre-phase-2b BM=192 tile, where seqlen % 128 == 0 still
+# left a partial last m-block most of the time. 128 is a multiple of the new
+# BM=64, so under this SAME seqlen % 128 == 0 gate every d64 block below is
+# now a FULL 64-row block -- these shapes now only exercise multi-block/LPT
+# scheduling at d64, not a partial tail. The genuine BM=64 partial-tail path
+# (zero-fill load, store clamp, partial-row LSE predicate) needs seqlen NOT
+# a multiple of 128, which the production eligibility gate never routes to
+# FA4 -- see _FA4_BHSD_D64_TAIL_SHAPES below, which calls the bhsd bridge
+# directly to reach it anyway.
 _FA4_BHSD_TAIL_SHAPES = (
     (1, 1, 128),  # single m-block, single plane
-    (1, 1, 256),  # tail 64 at d64
-    (2, 3, 384),  # exact 2*BM at d64
-    (1, 2, 640),  # tail 64 at d64, 4 kv tiles + LPT
-    (5, 7, 896),  # tail 128 at d64, odd plane count
-    (3, 5, 1152),  # exact 6*BM at d64 (awkward B/H)
-    (2, 4, 1024),  # tail 64 at d64, LPT swizzle > 1
+    (1, 1, 256),  # 2 full BM=64 blocks at d64 (was: tail 64 at BM=192)
+    (2, 3, 384),  # exact 2*BM at d128 / 6 full blocks at d64
+    (1, 2, 640),  # 10 full BM=64 blocks at d64, 4 kv tiles + LPT
+    (5, 7, 896),  # 14 full BM=64 blocks at d64, odd plane count
+    (3, 5, 1152),  # exact 6*BM at d128 / 18 full blocks at d64 (awkward B/H)
+    (2, 4, 1024),  # 16 full BM=64 blocks at d64, LPT swizzle > 1
 )
 
 
@@ -8585,6 +8598,90 @@ def test_fa4_bhsd_native_forward_backward_matches_reference(
         torch.testing.assert_close(
             actual.grad.cpu().float(), reference.grad, atol=5e-2, rtol=5e-2
         )
+
+
+# (batch, heads, seqlen): genuine BM=64 partial-tail shapes at d64 -- ported
+# from agent A's phase-2b harness (test_fa4_fwd.mojo). None divides evenly
+# by 128, so the public seqlen % 128 == 0 eligibility gate would decline
+# every one of them and route to a different backend entirely, never
+# reaching FA4 -- these call the compiled bhsd bridge function directly
+# (bypassing the Python gate, the same bridge fast_fa4_16bit_d64_causal_forward
+# calls) so the new BM=64 tail machinery (zero-fill load past seq_len, store
+# clamp, the partial-row LSE predicate, and the causal boundary predicate
+# for a warpgroup entirely past seq_len) is exercised by the permanent suite
+# at all.
+_FA4_BHSD_D64_TAIL_SHAPES = (
+    (2, 3, 65),  # ceil(65/64) = 2 m-blocks; last block has ONE valid row
+    (2, 3, 127),  # ceil(127/64) = 2 m-blocks; last block has 63/64 valid rows
+    (2, 3, 193),  # ceil(193/64) = 4 m-blocks; last block has ONE valid row,
+    #                deeper into the KV walk than the 65 case
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize("batch,heads,seqlen", _FA4_BHSD_D64_TAIL_SHAPES)
+def test_fa4_bhsd_d64_direct_partial_tail_block(mojo_h100, batch, heads, seqlen, dtype):
+    """BM=64 partial last m-block, called directly past the %128 gate.
+
+    Production never routes these seqlens to FA4 (``_fa4_16bit_d64_causal_inputs``
+    requires seqlen % 128 == 0), so this calls
+    ``flash_attention_fwd_{bf16,f16}_d64_causal_bhsd`` the same way
+    ``fast_fa4_16bit_d64_causal_forward`` does internally, with hand-built
+    Q/K/V/out/LSE device buffers, to reach the BM=64 tail path the phase-2b
+    harness measured but the public eligibility gate would otherwise hide
+    from the permanent suite entirely.
+    """
+    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
+    from torch_mojo_backend.eager_kernels.aten_fast import _ctx_ptr
+
+    module = load_fa4_ops()
+    suffix = _FA4_DTYPE_SUFFIX[dtype]
+    forward_fn = getattr(module, f"flash_attention_fwd_{suffix}_d64_causal_bhsd")
+
+    head_dim = 64
+    generator = torch.Generator().manual_seed(20260817 + seqlen)
+    query, key, value = (
+        (torch.randn(batch, heads, seqlen, head_dim, generator=generator) * 0.25).to(
+            dtype
+        )
+        for _ in range(3)
+    )
+    reference_inputs = [tensor.float() for tensor in (query, key, value)]
+    reference_output = torch.nn.functional.scaled_dot_product_attention(
+        *reference_inputs, dropout_p=0.0, is_causal=True
+    )
+
+    q, k, v = (tensor.to(mojo_h100) for tensor in (query, key, value))
+    for tensor in (q, k, v):
+        assert tensor._is_contiguous
+        assert tensor._ptr % 16 == 0
+    out = torch.empty(batch, heads, seqlen, head_dim, dtype=dtype, device=mojo_h100)
+    logsumexp = torch.empty(batch, heads, seqlen, dtype=torch.float32, device=mojo_h100)
+    assert out._ptr % 16 == 0
+    scale = 1.0 / math.sqrt(head_dim)
+
+    result = forward_fn(
+        q._ptr,
+        k._ptr,
+        v._ptr,
+        out._ptr,
+        logsumexp._ptr,
+        batch,
+        seqlen,
+        heads,
+        scale,
+        _ctx_ptr(q._device),
+    )
+    assert result is None
+
+    torch.testing.assert_close(
+        out.cpu().float(), reference_output, atol=2e-2, rtol=2e-2
+    )
+
+    expected_lse = reference_inputs[0] @ reference_inputs[1].transpose(-2, -1) * scale
+    causal_mask = torch.ones(seqlen, seqlen, dtype=torch.bool).tril()
+    expected_lse = expected_lse.masked_fill(~causal_mask, float("-inf")).logsumexp(-1)
+    torch.testing.assert_close(logsumexp.cpu(), expected_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])

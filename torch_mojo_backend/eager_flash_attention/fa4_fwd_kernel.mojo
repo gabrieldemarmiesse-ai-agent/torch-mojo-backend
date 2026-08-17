@@ -81,7 +81,10 @@ comptime WGMMA_K: Int = 16
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
         Int32(kFa4NThreads(head_dim))
-    )
+    ),
+    `nvvm.minctasm`=SIMDLength(
+        2 if kFa4NMmaWarpgroups(head_dim) == 1 else 1
+    ),
 )
 @__llvm_arg_metadata(q_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(k_tma, `nvvm.grid_constant`)
@@ -143,6 +146,15 @@ def fwd_fa4_kernel[
     comptime NUM_CONSUMER_REGS: Int = kFa4ConsumerRegs(head_dim)
     comptime accum_type: DType = DType.float32
     comptime swizzle: TensorMapSwizzle = TensorMapSwizzle.SWIZZLE_128B
+    # Tree-shaped row reductions (phase 2b), scoped to the geometry they
+    # were profiled on: the d64 tile (BM=64, ONE MMA warpgroup, 232 regs,
+    # 2 CTAs/SM), where `wait` (fixed-latency dependency) was the top ncu
+    # stall. On the d128 tile (BM=BN=128, two warpgroups, 240 regs, 1
+    # CTA/SM) they measured NEUTRAL -- 1.036 vs an A/A control of 1.038
+    # at B8 H12 S1024 -- so d128 keeps a4e8462's codegen (and its exact
+    # rowsum summation order) rather than taking an unproven change.
+    # Ungating is safe if a later measurement wants one code path.
+    comptime TREE_REDUCE: Bool = kFa4NMmaWarpgroups(head_dim) == 1
 
     comptime q_smem_layout = tile_layout_k_major[
         dtype, BM, D, swizzle_mode=swizzle
@@ -437,7 +449,7 @@ def fwd_fa4_kernel[
                 row += row_step
                 slot += 2
                 wrap += 1
-                if wrap == 3:
+                if wrap == STAGES // 2:
                     wrap = 0
                     slot = 0
                     phase ^= 1
@@ -461,8 +473,15 @@ def fwd_fa4_kernel[
     # warpgroup arrives at the *other* one's barrier after committing
     # its GEMM pair, so issue phases alternate and each warpgroup's
     # softmax overlaps the other's GEMMs. WG0 self-arms its barrier.
-    if wg == 0:
-        named_barrier_arrive[Int32(SCHED_BAR_N)](Int32(1))
+    # At NWG == 1 the pingpong ring degenerates to a SELF ring: the
+    # warpgroup's wait on barrier 1 is satisfied by its own arrive from
+    # the previous trip, so it orders nothing (the K/V mbarriers carry
+    # every real dependency) while costing two BAR ops and a ~30-cycle
+    # barrier latency per kv tile -- `barrier` was 0.51 warps/issue in
+    # the ncu profile. Comptime-drop it; NWG >= 2 keeps FA4's schedule.
+    comptime if NWG > 1:
+        if wg == 0:
+            named_barrier_arrive[Int32(SCHED_BAR_N)](Int32(1))
 
     var wgmma_qk = TensorCoreAsync[
         accum_type,
@@ -658,14 +677,76 @@ def fwd_fa4_kernel[
                 # cross-attention offset shifts the diagonal off the
                 # n == m tile and the band may straddle two tiles.)
                 if mask_diag:
-                    comptime for c in range(c_frag_size_qk):
-                        comptime col_base: Int = (c // 4) * 8 + (c & 1)
-                        comptime row_off: Int = 8 if (c % 4) >= 2 else 0
-                        if (
-                            col_base + mask_col_lo + causal_mask_d
-                            > mask_row_lo + row_off
-                        ):
-                            s_reg.ptr[c] = neg_inf
+                    # 32-BIT THRESHOLDS, hoisted out of the 64-element
+                    # unrolled body. Mojo's Int is 64-bit, so
+                    # `col + mask_col_lo + causal_mask_d > row + off`
+                    # reached SASS as a 64-bit compare -- TWO ISETPs
+                    # (ISETP.GT.U32.AND + ISETP.GT.AND.EX) per element,
+                    # 128 of the masked tile's 192 mask instructions.
+                    # Rearranged, the per-element test is
+                    # `col_base > row + off - mask_col_lo - mask_d`
+                    # whose right-hand side is loop-invariant: two
+                    # Int32 registers and one ISETP per element.
+                    #
+                    # INT32 RANGE ASSUMPTION: mask_row_lo (tile-local,
+                    # < BM <= 192) and mask_col_lo (< 8) are always
+                    # small, but causal_mask_d carries -vl_offs for
+                    # varlen causal -- the cumulative token offset of
+                    # this sequence within its packed batch -- and is
+                    # otherwise O(seqlen) for dense/window causal. The
+                    # Int32() truncation below is exact only while
+                    # |mask_row_lo - mask_col_lo - causal_mask_d| stays
+                    # under INT32_MAX - 8 (~2.1e9): unreachable at any
+                    # physical shape this kernel is built for (it would
+                    # need a multi-billion-token packed varlen batch),
+                    # but it is new exposure vs the old code above,
+                    # which compared in 64-bit `Int` and had no such
+                    # ceiling. Guarded explicitly rather than left
+                    # implicit; off by default like every other
+                    # debug_assert (`-D ASSERT=all` or a debug build
+                    # turns it on).
+                    var mask_thr0_wide: Int = (
+                        mask_row_lo - mask_col_lo - causal_mask_d
+                    )
+                    debug_assert(
+                        mask_thr0_wide <= Int(Int32.MAX_FINITE) - 8
+                        and mask_thr0_wide >= Int(Int32.MIN_FINITE),
+                        (
+                            "fa4 fwd: causal mask threshold overflows"
+                            " int32 (seqlen/vl_offs too large): "
+                        ),
+                        mask_thr0_wide,
+                    )
+                    var mask_thr0: Int32 = Int32(mask_thr0_wide)
+                    var mask_thr1: Int32 = mask_thr0 + 8
+                    # COLUMN-GROUP SKIP: the c-fragment's column
+                    # col_base = (c//4)*8 + (c&1) is monotone in c, so
+                    # the mask is a SUFFIX in c and whole quarters of
+                    # the fragment can be skipped with one compare. The
+                    # causal band is 65 columns wide inside a 128-column
+                    # tile, so on the diagonal tile a bit under half the
+                    # fragment is below the boundary for every thread.
+                    # The test uses mask_thr0 (<= mask_thr1) so it is
+                    # conservative for both rows, and the threads of a
+                    # warp share a row block, so the branch is nearly
+                    # warp-uniform.
+                    comptime GROUPS: Int = 4
+                    comptime GSZ: Int = c_frag_size_qk // GROUPS
+                    comptime for g in range(GROUPS):
+                        comptime col_max: Int32 = Int32(
+                            ((g * GSZ + GSZ - 1) // 4) * 8 + 1
+                        )
+                        if col_max > mask_thr0:
+                            comptime for cc in range(GSZ):
+                                comptime c: Int = g * GSZ + cc
+                                comptime col_base: Int32 = Int32(
+                                    (c // 4) * 8 + (c & 1)
+                                )
+                                comptime hi_row: Bool = (c % 4) >= 2
+                                if col_base > (
+                                    mask_thr1 if hi_row else mask_thr0
+                                ):
+                                    s_reg.ptr[c] = neg_inf
         comptime if window:
             # Leading window edge (prologue tile only): cols before
             # row - left are outside the window.
@@ -684,14 +765,41 @@ def fwd_fa4_kernel[
                     comptime col_base: Int = (c // 4) * 8 + (c & 1)
                     if col_base + mask_col_lo >= vl_kv_tail:
                         s_reg.ptr[c] = neg_inf
+        # TREE-SHAPED row reductions. The natural
+        # `local_max[row] = max(local_max[row], s_reg[c])` sweep is two
+        # 32-deep dependent chains (~4-cycle FMNMX latency each = ~128
+        # cycles of pure latency for 64 issue slots); `wait` was the
+        # top stall in the ncu profile. Four partial accumulators per
+        # row turn it into eight 8-deep chains plus a 2-level combine.
+        # Same instruction count, ~1/3 the exposed latency, and max is
+        # associative/commutative so the result is bit-identical.
+        comptime RED_WAYS: Int = 4
         var local_max = stack_allocation[
             rows_per_thread, Scalar[accum_type]
         ]()
-        comptime for i in range(rows_per_thread):
-            local_max[i] = neg_inf
-        comptime for c in range(c_frag_size_qk):
-            comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-            local_max[row_idx] = max(local_max[row_idx], s_reg.ptr[c])
+        comptime if TREE_REDUCE:
+            var part_max = stack_allocation[
+                rows_per_thread * RED_WAYS, Scalar[accum_type]
+            ]()
+            comptime for i in range(rows_per_thread * RED_WAYS):
+                part_max[i] = neg_inf
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                comptime part: Int = (c // 4) % RED_WAYS
+                part_max[row_idx * RED_WAYS + part] = max(
+                    part_max[row_idx * RED_WAYS + part], s_reg.ptr[c]
+                )
+            comptime for i in range(rows_per_thread):
+                local_max[i] = max(
+                    max(part_max[i * RED_WAYS], part_max[i * RED_WAYS + 1]),
+                    max(part_max[i * RED_WAYS + 2], part_max[i * RED_WAYS + 3]),
+                )
+        else:
+            comptime for i in range(rows_per_thread):
+                local_max[i] = neg_inf
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                local_max[row_idx] = max(local_max[row_idx], s_reg.ptr[c])
         comptime for i in range(rows_per_thread):
             local_max[i] = warp.lane_group_max[num_lanes=4](local_max[i])
             var rmax_new: Scalar[accum_type] = max(
@@ -703,15 +811,39 @@ def fwd_fa4_kernel[
         var local_sum = stack_allocation[
             rows_per_thread, Scalar[accum_type]
         ]()
-        comptime for i in range(rows_per_thread):
-            local_sum[i] = Scalar[accum_type](0)
-        comptime for c in range(c_frag_size_qk):
-            comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-            var p: Scalar[accum_type] = exp2(
-                s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
-            )
-            s_reg.ptr[c] = p
-            local_sum[row_idx] += p
+        comptime if TREE_REDUCE:
+            var part_sum = stack_allocation[
+                rows_per_thread * RED_WAYS, Scalar[accum_type]
+            ]()
+            comptime for i in range(rows_per_thread * RED_WAYS):
+                part_sum[i] = Scalar[accum_type](0)
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                comptime part: Int = (c // 4) % RED_WAYS
+                var p: Scalar[accum_type] = exp2(
+                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                )
+                s_reg.ptr[c] = p
+                part_sum[row_idx * RED_WAYS + part] += p
+            # Pairwise combine (the ONLY numeric difference vs the
+            # a4e8462 kernel: f32 addition is not associative, so rowsum
+            # can differ in the last ulp -- tree summation of
+            # non-negative exp2 outputs is the better-conditioned order,
+            # and the fp64 reference check bounds it).
+            comptime for i in range(rows_per_thread):
+                local_sum[i] = (
+                    part_sum[i * RED_WAYS] + part_sum[i * RED_WAYS + 1]
+                ) + (part_sum[i * RED_WAYS + 2] + part_sum[i * RED_WAYS + 3])
+        else:
+            comptime for i in range(rows_per_thread):
+                local_sum[i] = Scalar[accum_type](0)
+            comptime for c in range(c_frag_size_qk):
+                comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
+                var p: Scalar[accum_type] = exp2(
+                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                )
+                s_reg.ptr[c] = p
+                local_sum[row_idx] += p
         comptime for i in range(rows_per_thread):
             rowsum[i] = rowsum[i] * scale_old[i] + local_sum[i]
 
@@ -752,13 +884,24 @@ def fwd_fa4_kernel[
         comptime if BM == BN and not varlen:
             prologue_diag = kv_trips == 1
         else:
-            prologue_diag = kv_trips <= 2
             causal_mask_d = -m_block * BM
             comptime if varlen:
                 causal_mask_d -= vl_offs
             comptime if window:
                 # The prologue tile is first_kv, not 0.
                 causal_mask_d += first_kv * BN
+            comptime if varlen or window:
+                prologue_diag = kv_trips <= 2
+            else:
+                # EXACT diagonal test (dense causal): a tile needs the
+                # mask iff its last column can exceed this warpgroup's
+                # first row, n*BN + BN-1 > m*BM + wg*WGMMA_M, i.e.
+                # causal_mask_d + BN-1 > wg*WGMMA_M. The old "last two
+                # tiles of the trip range" rule is a strict superset:
+                # at BM=64/BN=128 the 64-row band's diagonal spans 65
+                # columns and always lands in ONE tile, so it made 42%
+                # of all tiles run the mask arm where 22% need it.
+                prologue_diag = causal_mask_d + (BN - 1) > wg * WGMMA_M
     softmax_block(prologue_diag, True)
     pack_p()  # P(0)
     # The window leading edge can straddle into the FIRST loop tile
@@ -784,7 +927,8 @@ def fwd_fa4_kernel[
     for it in range(kv_trips - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
         full[k_slot].wait(k_phase)
-        named_barrier[Int32(SCHED_BAR_N)](Int32(1 + wg))
+        comptime if NWG > 1:
+            named_barrier[Int32(SCHED_BAR_N)](Int32(1 + wg))
         warpgroup_fence(s_reg)
         wgmma_qk.arrive()
         wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -800,7 +944,7 @@ def fwd_fa4_kernel[
         # Arrive at the SUCCESSOR's sync barrier: ring W0->W1->...->W0.
         comptime if NWG == 2:
             named_barrier_arrive[Int32(SCHED_BAR_N)](Int32(2 - wg))
-        else:
+        elif NWG > 2:
             named_barrier_arrive[Int32(SCHED_BAR_N)](
                 Int32(wg + 2 if wg < NWG - 1 else 1)
             )
@@ -819,13 +963,16 @@ def fwd_fa4_kernel[
             comptime if BM == BN and not varlen:
                 loop_diag = it == kv_trips - 2
             else:
-                loop_diag = it >= kv_trips - 3
                 causal_mask_d = (it + 1) * BN - m_block * BM
                 comptime if varlen:
                     causal_mask_d -= vl_offs
                 comptime if window:
                     # Loop trip it processes tile first_kv + it + 1.
                     causal_mask_d += first_kv * BN
+                comptime if varlen or window:
+                    loop_diag = it >= kv_trips - 3
+                else:
+                    loop_diag = causal_mask_d + (BN - 1) > wg * WGMMA_M
         # Window, unaligned left only: the first loop tile can hold
         # leading-edge columns (win_mask_d was advanced after the
         # prologue). Aligned variants pass a comptime False so the
@@ -844,13 +991,13 @@ def fwd_fa4_kernel[
 
         k_slot += 2
         k_wrap += 1
-        if k_wrap == 3:
+        if k_wrap == STAGES // 2:
             k_wrap = 0
             k_slot = 0
             k_phase ^= 1
         v_slot += 2
         v_wrap += 1
-        if v_wrap == 3:
+        if v_wrap == STAGES // 2:
             v_wrap = 0
             v_slot = 1
             v_phase ^= 1

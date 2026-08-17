@@ -10,7 +10,7 @@ function's PTX is written to <path> at first-call JIT time via
 kernel module name.
 """
 
-from max.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
 from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
@@ -199,10 +199,33 @@ def launch_fwd_fa4[
         var size_one_kv_head_b: Int = (
             seqlen_int * 2 * head_dim * size_of[dtype]()
         )
+        # Work order, wave-dispatched (measured on d64; middle group
+        # sizes lose BOTH ways — see the phase-2 harness NOTES.md):
+        # - MANY waves (>= ~12): swizzle group 1 — each plane's whole
+        #   m-sweep is consecutive, so the CTAs in flight walk a few
+        #   planes' K/V phase-aligned (L2-resident, many readers per
+        #   tile): P1 -8%, P3 -3%. The 50MB-budget order (128 planes
+        #   at the SAME m in flight) shares nothing concurrently:
+        #   L2 hit 50%, 1.7x DRAM re-reads, long_scoreboard top stall.
+        # - FEW waves: keep the global-LPT order (all planes sweep m
+        #   together, heavy tiles first) — the tail is all light
+        #   tiles, which dominates short grids (group 1 here cost P0
+        #   8% in stragglers).
+        var sm_count_b: Int = ctx.get_attribute(
+            DeviceAttribute.MULTIPROCESSOR_COUNT
+        )
+        var ctas_per_sm_b: Int = 2 if head_dim == 64 else 1
+        var waves_b: Int = (num_m_b * nheads_int * batch_int) // (
+            ctas_per_sm_b * sm_count_b
+        )
         var l2_ratio_b: Int = (50 * 1024 * 1024) // size_one_kv_head_b
-        var sched_swizzle_b: Int = 1
-        while sched_swizzle_b * 2 <= l2_ratio_b:
-            sched_swizzle_b *= 2
+        var sched_swizzle_b: Int
+        if waves_b >= 12:
+            sched_swizzle_b = 1
+        else:
+            sched_swizzle_b = 1
+            while sched_swizzle_b * 2 <= l2_ratio_b:
+                sched_swizzle_b *= 2
         var num_hb_b: Int = nheads_int * batch_int
         var sched_num_hb_q_b: Int = num_hb_b // sched_swizzle_b
         var sched_residual_b: Int = max(num_hb_b % sched_swizzle_b, 1)
