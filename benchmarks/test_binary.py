@@ -32,6 +32,14 @@ SHAPES: dict[str, tuple[int, ...]] = {
 # later simplification that collapses the two arms into one would pass the
 # whole suite while costing 68% right here.
 COMPARE_SHAPES: dict[str, tuple[int, ...]] = SHAPES | {"E_2048x2048": (2048, 2048)}
+BUCKETIZE_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
+    "V1048576_K1024": ((1048576,), 1024),
+    "A357x789_K257": ((357, 789), 257),
+}
+SEARCHSORTED_SHAPES: dict[str, tuple[int, int, int]] = {
+    "B4096x256_K1024": (4096, 256, 1024),
+    "A357x789_K257": (357, 789, 257),
+}
 
 ARITH_OPS = {
     "add.Tensor": torch.add,
@@ -88,6 +96,14 @@ COVERS: dict[str, str] = (
         "aten::masked_fill.Scalar": "test_masked_fill[Scalar]",
         "aten::masked_fill.Tensor": "test_masked_fill[Tensor]",
         "aten::isin.Tensor_Tensor": "test_isin",
+        "aten::bucketize.Tensor": "test_bucketize",
+        "aten::bucketize.Scalar": (
+            "test_bucketize (same binary-search kernel, scalar input plumbing)"
+        ),
+        "aten::searchsorted.Tensor": "test_searchsorted",
+        "aten::searchsorted.Scalar": (
+            "test_searchsorted (same binary-search kernel, scalar input plumbing)"
+        ),
     }
 )
 
@@ -104,6 +120,50 @@ def _pair(
     b_shape = (shape[-1],) if layout == "bcast" else shape
     b_ref, b_our = both(unit_interval(b_shape, dtype), hw, mojo)
     return a_ref, b_ref, a_our, b_our
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", BUCKETIZE_SHAPES)
+@pytest.mark.bench_op("bucketize.Tensor")
+def test_bucketize(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    value_shape, boundary_size = BUCKETIZE_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    values_ref, values_our = both(
+        torch.rand(value_shape, dtype=dtype) * 8 - 4, hw, mojo_device
+    )
+    boundaries_ref, boundaries_our = both(
+        torch.linspace(-4, 4, boundary_size, dtype=dtype), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.bucketize(values_ref, boundaries_ref),
+        lambda: torch.bucketize(values_our, boundaries_our),
+        flops=float(values_ref.numel() * boundary_size.bit_length()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SEARCHSORTED_SHAPES)
+@pytest.mark.bench_op("searchsorted.Tensor")
+def test_searchsorted(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+) -> None:
+    rows, values_per_row, boundary_size = SEARCHSORTED_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    boundaries = (
+        torch.linspace(-4, 4, boundary_size, dtype=dtype)
+        .expand(rows, boundary_size)
+        .contiguous()
+    )
+    values = torch.rand(rows, values_per_row, dtype=dtype) * 8 - 4
+    boundaries_ref, boundaries_our = both(boundaries, hw, mojo_device)
+    values_ref, values_our = both(values, hw, mojo_device)
+    bench.run(
+        lambda: torch.searchsorted(boundaries_ref, values_ref),
+        lambda: torch.searchsorted(boundaries_our, values_our),
+        flops=float(values_ref.numel() * boundary_size.bit_length()),
+    )
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))

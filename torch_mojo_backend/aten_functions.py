@@ -20,6 +20,7 @@ import torch
 from max.dtype import DType
 from max.experimental import functional as F
 from max.experimental.random import gaussian as max_gaussian
+from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
 from max.graph import Dim, StaticDim
 from max.graph.type import DeviceRef
@@ -249,6 +250,143 @@ def type_promotion(x, y):
         y = F.cast(y, dtype=float_dtype)
 
     return x, y
+
+
+_SEARCHSORTED_DTYPES = (
+    DType.float32,
+    DType.bfloat16,
+    DType.float16,
+    DType.int32,
+    DType.int64,
+)
+
+
+def _searchsorted_tensor_dtype(left: DType, right: DType) -> DType:
+    """PyTorch's result-type promotion for two comparison tensors."""
+    promoted = torch.promote_types(max_dtype_to_torch(left), max_dtype_to_torch(right))
+    return torch_dtype_to_max(promoted)
+
+
+def _searchsorted_scalar_dtype(boundary_dtype: DType, value: Scalar) -> DType:
+    """Wrapped-number promotion used by ATen's Scalar overloads."""
+    if isinstance(value, Dim):
+        return boundary_dtype
+    promoted = torch.result_type(
+        torch.empty((), dtype=max_dtype_to_torch(boundary_dtype)), value
+    )
+    return torch_dtype_to_max(promoted)
+
+
+def _searchsorted_impl(
+    sorted_sequence: MaxTensor,
+    values: MaxTensor | Scalar,
+    out_int32: bool,
+    right: bool,
+    side: str | None,
+    sorter: MaxTensor | None,
+) -> MaxTensor:
+    """MAX graph composition shared by searchsorted and bucketize."""
+    if side is not None:
+        if side not in ("left", "right"):
+            raise RuntimeError(
+                "torch.searchsorted(): side can only be 'left' or 'right' but "
+                f"got {side}"
+            )
+        if right and side != "right":
+            raise RuntimeError(
+                "torch.searchsorted(): side and right can't be set to opposites, "
+                f"got side of {side} while right was True"
+            )
+        right = side == "right"
+
+    if len(sorted_sequence.shape) == 0:
+        raise RuntimeError(
+            "torch.searchsorted(): boundaries tensor should have positive "
+            "dimension, but got 0 dimension"
+        )
+
+    scalar_values = isinstance(values, int | float | Dim)
+    if scalar_values:
+        if len(sorted_sequence.shape) != 1:
+            raise RuntimeError(
+                "torch.searchsorted(): input value can be a scalar only when "
+                "boundaries tensor dimension is 1"
+            )
+        if isinstance(values, Dim):
+            raise NotImplementedError(
+                "symbolic scalar values are not supported by searchsorted"
+            )
+        common_dtype = _searchsorted_scalar_dtype(sorted_sequence.dtype, values)
+        values = F.constant(values, dtype=common_dtype, device=sorted_sequence.device)
+    else:
+        if values.device != sorted_sequence.device:
+            raise RuntimeError(
+                "torch.searchsorted(): boundaries and input value tensors "
+                "should have same device type"
+            )
+        if len(values.shape) == 0 and len(sorted_sequence.shape) != 1:
+            raise RuntimeError(
+                "torch.searchsorted(): input value can be a scalar only when "
+                "boundaries tensor dimension is 1"
+            )
+        if len(sorted_sequence.shape) != 1 and (
+            len(values.shape) != len(sorted_sequence.shape)
+            or tuple(values.shape[:-1]) != tuple(sorted_sequence.shape[:-1])
+        ):
+            raise RuntimeError(
+                "torch.searchsorted(): boundaries tensor should be 1 dimension "
+                "or the first N-1 dimensions of boundaries tensor and input "
+                "value tensor must match"
+            )
+        common_dtype = _searchsorted_tensor_dtype(sorted_sequence.dtype, values.dtype)
+
+    if common_dtype not in _SEARCHSORTED_DTYPES:
+        raise NotImplementedError(
+            f"searchsorted comparison dtype {common_dtype} is not supported"
+        )
+
+    if sorter is not None:
+        if sorter.device != sorted_sequence.device:
+            raise RuntimeError(
+                "torch.searchsorted(): sorter and boundary tensors should have "
+                "same device type"
+            )
+        if tuple(sorter.shape) != tuple(sorted_sequence.shape):
+            raise RuntimeError(
+                "torch.searchsorted(): boundary and sorter must have the same size"
+            )
+        if sorter.dtype != DType.int64:
+            raise RuntimeError(
+                "torch.searchsorted(): sorter must be a tensor of long dtype"
+            )
+        sorted_sequence = F.gather_nd(
+            sorted_sequence,
+            F.unsqueeze(sorter, axis=-1),
+            batch_dims=len(sorted_sequence.shape) - 1,
+        )
+
+    if sorted_sequence.dtype != common_dtype:
+        sorted_sequence = F.cast(sorted_sequence, dtype=common_dtype)
+    if values.dtype != common_dtype:
+        values = F.cast(values, dtype=common_dtype)
+
+    output_dtype = DType.int32 if out_int32 else DType.int64
+    boundary_size = sorted_sequence.shape[-1]
+    if isinstance(boundary_size, StaticDim) and int(boundary_size) == 0:
+        zero = F.constant(0, dtype=output_dtype, device=values.device)
+        return F.broadcast_to(zero, values.shape)
+
+    values = F.unsqueeze(values, axis=-1)
+    if len(sorted_sequence.shape) != 1:
+        sorted_sequence = F.unsqueeze(sorted_sequence, axis=-2)
+    comparison = (
+        F.greater(sorted_sequence, values)
+        if right
+        else F.greater_equal(sorted_sequence, values)
+    )
+    count_mask = F.logical_not(comparison)
+    counts = _reduce_sum(F.cast(count_mask, dtype=output_dtype), axis=-1)
+    return F.squeeze(counts, axis=-1)
 
 
 @map_to(aten.floordiv)
@@ -1426,6 +1564,26 @@ def aten_bmm(input: MaxTensor, mat2: MaxTensor) -> MaxTensor:
     """
     # MAX's matmul handles batch dimensions automatically through broadcasting
     return F.matmul(input, mat2)
+
+
+# aten::bucketize.Tensor(Tensor self, Tensor boundaries, *, bool out_int32=False, bool right=False) -> Tensor
+# aten::bucketize.Scalar(Scalar self, Tensor boundaries, *, bool out_int32=False, bool right=False) -> Tensor
+@map_to(aten.bucketize)
+def aten_bucketize(
+    input: MaxTensor | Scalar,
+    boundaries: MaxTensor,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+) -> MaxTensor:
+    if len(boundaries.shape) != 1:
+        raise RuntimeError(
+            "boundaries tensor must be 1 dimension, but got "
+            f"dim({len(boundaries.shape)})"
+        )
+    return _searchsorted_impl(
+        boundaries, input, out_int32=out_int32, right=right, side=None, sorter=None
+    )
 
 
 # cat(Tensor[] tensors, int dim=0) -> Tensor
@@ -3126,6 +3284,28 @@ def aten_scatter_value(
 
 # scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
 # scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
+
+
+# aten::searchsorted.Tensor(Tensor sorted_sequence, Tensor self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None) -> Tensor
+# aten::searchsorted.Scalar(Tensor sorted_sequence, Scalar self, *, bool out_int32=False, bool right=False, str? side=None, Tensor? sorter=None) -> Tensor
+@map_to(aten.searchsorted)
+def aten_searchsorted(
+    sorted_sequence: MaxTensor,
+    input: MaxTensor | Scalar,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+    side: str | None = None,
+    sorter: MaxTensor | None = None,
+) -> MaxTensor:
+    return _searchsorted_impl(
+        sorted_sequence,
+        input,
+        out_int32=out_int32,
+        right=right,
+        side=side,
+        sorter=sorter,
+    )
 
 
 # select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)
