@@ -6488,6 +6488,8 @@ def _fa4_16bit_d64_causal_inputs(
     is_causal=False,
     scale=None,
     enable_gqa=False,
+    *,
+    allow_any_seqlen: bool = False,
 ):
     """Return eligible public BHTD inputs (bf16 or f16) without doing any
     device work.
@@ -6502,6 +6504,17 @@ def _fa4_16bit_d64_causal_inputs(
     and 128 (Llama-class) have an instantiated kernel + exported Mojo
     symbol (``fa4_ops.mojo``); any other head_dim declines here and falls
     to the math decomposition.
+
+    ``allow_any_seqlen`` lifts the ``seqlen % 128 == 0`` restriction down
+    to ``seqlen > 0``. Default ``False`` keeps every existing caller's
+    contract byte-identical -- in particular the two backward-adjacent call
+    sites (the autograd wrapper's ``needs_backward`` dispatch decision and
+    the flash backward op's own eligibility check), where the bwd tile
+    machinery has never been proven to handle a partial last tile and a
+    wrong answer there would be a silently wrong gradient. Only
+    ``fast_fa4_16bit_d64_causal_forward`` passes ``True``, and only for
+    inputs it goes on to route through the BHSD-native path -- see the
+    per-route check there.
     """
     q = _t(query)
     k = _t(key)
@@ -6529,13 +6542,8 @@ def _fa4_16bit_d64_causal_inputs(
     ):
         return None
     batch, heads, seqlen, head_dim = q._shape
-    if (
-        batch <= 0
-        or heads <= 0
-        or seqlen <= 0
-        or seqlen % 128 != 0
-        or head_dim not in (64, 128)
-    ):
+    seqlen_ok = seqlen > 0 and (allow_any_seqlen or seqlen % 128 == 0)
+    if batch <= 0 or heads <= 0 or not seqlen_ok or head_dim not in (64, 128):
         return None
     if scale is not None and (
         not isinstance(scale, int | float)
@@ -6666,9 +6674,25 @@ def fast_fa4_16bit_d64_causal_forward(
 
     Loading the bridge happens before materialization or allocation, so a
     packaging/compiler error cannot leave unnecessary device work queued.
+
+    Seqlen eligibility is per-route (PR #391 review thread): the BHSD-native
+    descriptor path zero-fills/clamps a partial last tile at both d64 and
+    d128 (proven by ``test_fa4_bhsd_d64_direct_partial_tail_block`` and the
+    d128 sibling), so it accepts any ``seqlen >= 1``. The legacy strided-BTHD
+    and dense-copy routes below predate that tail machinery and may assume
+    full BM/BN tiles, so they still require ``seqlen % 128 == 0`` until
+    someone proves otherwise for them specifically.
     """
     inputs = _fa4_16bit_d64_causal_inputs(
-        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa,
+        allow_any_seqlen=True,
     )
     if inputs is None:
         return NOT_HANDLED
@@ -6679,7 +6703,14 @@ def fast_fa4_16bit_d64_causal_forward(
     q, k, v = inputs
     qkv_dtype = q._dtype
     batch, heads, seqlen, head_dim = q._shape
-    if _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v):
+    bhsd_eligible = _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v)
+    if seqlen % 128 != 0 and not bhsd_eligible:
+        # Partial tiles are unproven outside the BHSD-native path (see the
+        # docstring above) -- decline rather than risk the untested legacy
+        # tail behavior. A caller that needs this seqlen on a non-BHSD
+        # layout falls back to the math decomposition.
+        return NOT_HANDLED
+    if bhsd_eligible:
         # PUBLIC contiguous (B, H, S, D), 16-byte-aligned base pointers:
         # TMA descriptors address this layout directly (viewed as
         # (B*H, S, D) planes), so no BTHD materialization
@@ -7232,7 +7263,16 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
     *,
     scale=None,
 ):
-    """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel."""
+    """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel.
+
+    Deliberately omits ``allow_any_seqlen=True``: this is the actual bwd
+    tile machinery, unproven on a partial last tile, so it declines an odd
+    seqlen here regardless of how forward was reached (a direct call to the
+    lower ``aten::_scaled_dot_product_flash_attention`` op with grad-needing
+    inputs and an odd seqlen makes it this far -- forward tolerates it via
+    BHSD, but backward must not, so this raises NotImplementedError rather
+    than silently mishandling the tail).
+    """
     inputs = _fa4_16bit_d64_causal_inputs(
         query, key, value, None, dropout_p, is_causal, scale, False
     )

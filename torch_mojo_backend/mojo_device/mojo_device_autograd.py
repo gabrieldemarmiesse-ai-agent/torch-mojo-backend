@@ -581,6 +581,13 @@ def _scaled_dot_product_attention_autograd(
     # and backward pair. Dispatch through it so generated autograd owns the
     # saves, version checks, and backward call; retain the custom Function only
     # for the generic math/dropout fallback, which has no native backward op.
+    #
+    # This call intentionally omits allow_any_seqlen=True: the bwd tile
+    # machinery has never been proven to handle a partial last tile (only
+    # the BHSD-native forward has), so when a backward pass is coming this
+    # gate must still require seqlen % 128 == 0. An odd seqlen with grad
+    # needed simply falls through to the math-decomposition Function below
+    # instead of the native flash op pair.
     if (
         needs_backward
         and aten_fast._fa4_16bit_d64_causal_inputs(
