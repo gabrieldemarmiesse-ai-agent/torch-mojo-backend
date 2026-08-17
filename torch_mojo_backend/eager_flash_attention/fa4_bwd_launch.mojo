@@ -215,17 +215,19 @@ def launch_bwd_main[
     v_d_stride: Int = 1,
 ) raises:
     # Strided Q/K/V (zero-copy fused-QKV views) is scoped to the
-    # dense d64 path in this port; the caller validates the layout
-    # contract (d_stride==1, b_stride==S*s_stride, 16 B-aligned
-    # strides) before this launcher runs.
+    # dense path in this port (d64 or d128); the caller validates the
+    # layout contract (d_stride==1, b_stride==S*s_stride, 16 B-aligned
+    # strides, h_stride==head_dim) before this launcher runs. Q/K/V
+    # descriptor construction below is already head_dim-generic (no
+    # rank-4 tail-tile branch the way the fwd launcher needs).
     comptime assert (not strided_qkv) or (
-        head_dim == 64
+        (head_dim == 64 or head_dim == 128)
         and causal
         and not varlen
         and not window
         and gqa_ratio == 1
         and softcap_x1000 == 0
-    ), "strided_qkv supports only dense d64 MHA"
+    ), "strided_qkv supports only dense d64/d128 MHA"
     var ctx = _ctx_and_stream(ctx_handle_addr)
     var stream_opaque = OpaquePointer[MutAnyOrigin](
         unsafe_from_address=stream_handle_addr

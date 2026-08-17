@@ -408,23 +408,36 @@ different kind of item.
 ### A2
 **FA4's eligibility gate is extremely narrow**
 
-* **What.** `_fa4_bf16_d64_causal_inputs`, `aten_fast.py:5737-5781`.
-* **Current implementation.** bf16 only, `head_dim == 64` exactly,
+* **Update (head_dim=128, this PR).** `head_dim` is now a compile-time
+  regime with 64 (GPT-2-class) and 128 (Llama-class) both instantiated and
+  gated in: `_fa4_16bit_d64_causal_inputs` / `_fa4_strided_bthd_layout` /
+  `_fa4_symbol` (`aten_fast.py`) derive dtype+head_dim symbol selection at
+  the call site, and `fa4_ops.mojo` exports
+  `flash_attention_{fwd,bwd}_{bf16,f16}_d128_causal{,_strided_qkv,_bhsd}`
+  alongside the pre-existing d64 family (BM/warpgroup-count/register-budget
+  constants were already head_dim-parametric in `fa4_fwd_common.mojo` /
+  `fa4_bwd_common.mojo` before this landed). GQA and non-multiple-of-128
+  sequences are still open below.
+* **What.** `_fa4_16bit_d64_causal_inputs`, `aten_fast.py:6482` (the name
+  predates f16/d128 support and is now imprecise, kept for call-site
+  stability).
+* **Current implementation.** bf16 or f16, `head_dim in (64, 128)`,
   `seqlen % 128 == 0`, `is_causal is True` (identity, not truthiness), no
   dropout, no mask, no GQA, `sm_90a`.
-* **Why it is not optimal.** GPT-2 (`head_dim = 64`) fits; Llama-class models
-  with `head_dim = 128`, anything with GQA, and any non-multiple-of-128 sequence
-  do not, and fall all the way to [A1](#a1).
-* **What the optimized version looks like.** `head_dim` as a compile-time regime
-  with a runtime chooser (64 / 128 / 256), a masked tail for
+* **Why it is not optimal.** GPT-2 (`head_dim = 64`) and Llama-class
+  (`head_dim = 128`) models now fit; anything with GQA, any other head_dim,
+  and any non-multiple-of-128 sequence still fall all the way to [A1](#a1).
+* **What the optimized version looks like.** A masked tail for
   `seqlen % 128 != 0`, and a GQA arm that indexes the KV head instead of
   materializing a repeat. These are compile-time *regimes* selected at runtime,
   which is what AGENTS.md rule 4 asks for — not hardcoded shapes.
-* **Expected win.** **UNMEASURED.** Bounded above by the [A1](#a1) ratio for the
-  shapes it would newly claim.
-* **How to measure it.** `tests/test_fa4_host_wiring.py` covers the gate itself;
-  for timing, `bench_gpt2_batch.py` and a `head_dim = 128` variant of
-  `bench_nanogpt_train.py`.
+* **Expected win.** head_dim=128: measured, see `benchmarks/baselines.html`
+  (`B1H16S4096D128`). GQA / ragged-seqlen: **UNMEASURED**, bounded above by
+  the [A1](#a1) ratio for the shapes they would newly claim.
+* **How to measure it.** `tests/test_fa4_host_wiring.py` and
+  `tests/test_eager_kernels.py` (`test_fa4_*[...-d128]`) cover the gate
+  itself; for timing, `benchmarks/test_attention.py -k D128` and a
+  `head_dim = 128` variant of `bench_nanogpt_train.py`.
 
 ### A3
 **The fused SDPA backward is Apple-only**
@@ -1397,7 +1410,7 @@ fallback runs. This is the answer to "which GPUs run an unoptimized path".
 | Copy-free transposed-A GEMM (`_tn_mfma_route`) | `amdgpu:gfx942` + bf16 | `matmul_ops.mojo:6857-6867` | Python-side copy ([G1](#g1)) |
 | Apple simdgroup GEMM (NN/NT/TN) | `has_apple_gpu_accelerator()` | `matmul_ops.mojo:4056`, `:6416` region | SIMT FFMA tiles (the source says 3–15x behind torch MPS) |
 | Apple transposed-A spec route | `has_apple_gpu_accelerator()` | `matmul_ops.mojo:6755` | copy |
-| FA4 flash attention (fwd + bwd) | `cuda` + `sm_90a` + bf16 + d64 + causal + `seq % 128 == 0` | `aten_fast.py:5763-5774` | math decomposition ([A1](#a1)) |
+| FA4 flash attention (fwd + bwd) | `cuda` + `sm_90a` + bf16/f16 + d64/d128 + causal + `seq % 128 == 0` | `aten_fast.py:6482` | math decomposition ([A1](#a1)) |
 | Fused flash attention (fwd + bwd) | `hip` + `gfx942` | `aten_fast.py:6096-6097` | math decomposition ([A1](#a1)) |
 | Causal batched GEMM (`_try_sdpa_causal_bmm`) | `gfx942` | `aten_fast.py:5448` | dense BMM |
 | Causal BMM (`BmmCausalF32`) | Apple | `matmul_ops.mojo:6321`, raise at `:6369` | dense BMM |

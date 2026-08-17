@@ -8351,13 +8351,20 @@ def test_fast_sdpa(mojo_gpu, is_causal, kv_len, dtype):
 _FA4_DTYPE_SUFFIX = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
 
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
-def test_fa4_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch, dtype):
+def test_fa4_causal_gapped_qkv_forward_backward(
+    mojo_h100, monkeypatch, dtype, head_dim
+):
     """The cached H100 path stays dynamic for nanoGPT's gapped QKV views.
 
     bf16 and f16 share the same kernel family (the f16 RS wgmma emitter is a
     vendored gap-filler for the stdlib's bf16-only register-operand overload,
-    see ``fa4_wgmma_f16.mojo``), so both dtypes are exercised here.
+    see ``fa4_wgmma_f16.mojo``), so both dtypes are exercised here. head_dim
+    64 (GPT-2-class, BM=192, 3 MMA warpgroups) and 128 (Llama-class, BM=128,
+    2 MMA warpgroups) are two distinct comptime tile configs (see
+    ``fa4_fwd_common.mojo``/``fa4_bwd_common.mojo``), not one kernel with a
+    runtime dimension -- both get their own cached launch here.
     """
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
     from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
@@ -8365,8 +8372,8 @@ def test_fa4_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch, dtype):
     module = load_fa4_ops()
     calls = {"forward": 0, "backward": 0}
     suffix = _FA4_DTYPE_SUFFIX[dtype]
-    forward_name = f"flash_attention_fwd_{suffix}_d64_causal_strided_qkv"
-    backward_name = f"flash_attention_bwd_{suffix}_d64_causal_strided_qkv"
+    forward_name = f"flash_attention_fwd_{suffix}_d{head_dim}_causal_strided_qkv"
+    backward_name = f"flash_attention_bwd_{suffix}_d{head_dim}_causal_strided_qkv"
     original_forward = getattr(module, forward_name)
     original_backward = getattr(module, backward_name)
 
@@ -8381,7 +8388,6 @@ def test_fa4_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch, dtype):
     monkeypatch.setattr(module, forward_name, forward_spy)
     monkeypatch.setattr(module, backward_name, backward_spy)
 
-    head_dim = 64
     for seed, batch, seqlen, heads in ((20260718, 1, 128, 4), (20260719, 2, 256, 8)):
         width = heads * head_dim
         generator = torch.Generator().manual_seed(seed)
@@ -8446,11 +8452,12 @@ def test_fa4_causal_gapped_qkv_forward_backward(mojo_h100, monkeypatch, dtype):
     assert calls == {"forward": 2, "backward": 2}
 
 
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
-def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype):
+def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype, head_dim):
     """The low-level flash op must not substitute zero backward metadata."""
     generator = torch.Generator().manual_seed(20260721)
-    shape = (1, 4, 128, 64)
+    shape = (1, 4, 128, head_dim)
     query, key, value = (
         (torch.randn(shape, generator=generator) * 0.25).to(dtype) for _ in range(3)
     )
@@ -8499,31 +8506,36 @@ def test_fa4_direct_flash_aten_returns_real_logsumexp(mojo_h100, dtype):
 # same shapes' numerics against an fp64 host reference on sampled rows plus a
 # bitwise BTHD-vs-BHSD leg comparison. Skips harness shape (1, 16, 4096): a
 # full fp32 CPU SDPA reference there allocates a ~1 GB causal score matrix,
-# which the pure-Mojo harness already covers far more cheaply.
+# which the pure-Mojo harness already covers far more cheaply. head_dim=128's
+# BM is 128 (kFa4BlockM), which the seqlen % 128 == 0 gate always divides
+# evenly -- no partial m-tile is reachable there, but the same shape set
+# still stresses multi-plane LPT scheduling at the second tile config.
 _FA4_BHSD_TAIL_SHAPES = (
     (1, 1, 128),  # single m-block, single plane
-    (1, 1, 256),  # tail 64
-    (2, 3, 384),  # exact 2*BM
-    (1, 2, 640),  # tail 64, 4 kv tiles + LPT
-    (5, 7, 896),  # tail 128, odd plane count
-    (3, 5, 1152),  # exact 6*BM (awkward B/H)
-    (2, 4, 1024),  # tail 64, LPT swizzle > 1
+    (1, 1, 256),  # tail 64 at d64
+    (2, 3, 384),  # exact 2*BM at d64
+    (1, 2, 640),  # tail 64 at d64, 4 kv tiles + LPT
+    (5, 7, 896),  # tail 128 at d64, odd plane count
+    (3, 5, 1152),  # exact 6*BM at d64 (awkward B/H)
+    (2, 4, 1024),  # tail 64 at d64, LPT swizzle > 1
 )
 
 
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("batch,heads,seqlen", _FA4_BHSD_TAIL_SHAPES)
 def test_fa4_bhsd_native_forward_backward_matches_reference(
-    mojo_h100, monkeypatch, batch, heads, seqlen, dtype
+    mojo_h100, monkeypatch, batch, heads, seqlen, dtype, head_dim
 ):
     """Public contiguous, 16-byte-aligned (B, H, S, D) Q/K/V take the
     BHSD-native TMA path (no BTHD gather-copy materialization) across every
-    BM=192 tail-residue class reachable under seqlen % 128 == 0."""
+    BM=192 tail-residue class reachable under seqlen % 128 == 0, for both
+    the d64 and d128 tile configs."""
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
 
     module = load_fa4_ops()
     suffix = _FA4_DTYPE_SUFFIX[dtype]
-    bhsd_name = f"flash_attention_fwd_{suffix}_d64_causal_bhsd"
+    bhsd_name = f"flash_attention_fwd_{suffix}_d{head_dim}_causal_bhsd"
     original_bhsd = getattr(module, bhsd_name)
     calls = {"count": 0}
 
@@ -8533,7 +8545,6 @@ def test_fa4_bhsd_native_forward_backward_matches_reference(
 
     monkeypatch.setattr(module, bhsd_name, bhsd_spy)
 
-    head_dim = 64
     generator = torch.Generator().manual_seed(20260816 + seqlen)
     query, key, value = (
         (torch.randn(batch, heads, seqlen, head_dim, generator=generator) * 0.25).to(
@@ -8576,18 +8587,23 @@ def test_fa4_bhsd_native_forward_backward_matches_reference(
         )
 
 
-def test_fa4_bhsd_gate_rejects_misaligned_offset_view(mojo_h100, monkeypatch):
+@pytest.mark.parametrize("head_dim", [64, 128], ids=["d64", "d128"])
+def test_fa4_bhsd_gate_rejects_misaligned_offset_view(mojo_h100, monkeypatch, head_dim):
     """A public (B, H, S, D) tensor that is a genuine offset slice of a
     larger buffer is fully contiguous but its base pointer is not 16-byte
     aligned -- ``_fa4_bhsd_layout`` must reject it (TMA descriptor creation
     needs 16-byte-aligned base addresses) and fall back to the existing
-    BTHD-materialize-and-copy path. Still produces correct output."""
+    BTHD-materialize-and-copy path. Still produces correct output. A 2-byte
+    (one bf16 element) offset breaks 16-byte alignment independently of
+    head_dim, so this is exercised at both tile configs."""
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
 
     module = load_fa4_ops()
     calls = {"bhsd": 0, "dense": 0}
-    original_bhsd = module.flash_attention_fwd_bf16_d64_causal_bhsd
-    original_dense = module.flash_attention_fwd_bf16_d64_causal
+    bhsd_name = f"flash_attention_fwd_bf16_d{head_dim}_causal_bhsd"
+    dense_name = f"flash_attention_fwd_bf16_d{head_dim}_causal"
+    original_bhsd = getattr(module, bhsd_name)
+    original_dense = getattr(module, dense_name)
 
     def bhsd_spy(*args):
         calls["bhsd"] += 1
@@ -8597,10 +8613,10 @@ def test_fa4_bhsd_gate_rejects_misaligned_offset_view(mojo_h100, monkeypatch):
         calls["dense"] += 1
         return original_dense(*args)
 
-    monkeypatch.setattr(module, "flash_attention_fwd_bf16_d64_causal_bhsd", bhsd_spy)
-    monkeypatch.setattr(module, "flash_attention_fwd_bf16_d64_causal", dense_spy)
+    monkeypatch.setattr(module, bhsd_name, bhsd_spy)
+    monkeypatch.setattr(module, dense_name, dense_spy)
 
-    batch, heads, seqlen, head_dim = 1, 4, 128, 64
+    batch, heads, seqlen = 1, 4, 128
     numel = batch * heads * seqlen * head_dim
     generator = torch.Generator().manual_seed(20260816)
 

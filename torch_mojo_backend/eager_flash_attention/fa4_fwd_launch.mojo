@@ -84,17 +84,18 @@ def launch_fwd_fa4[
     v_d_stride: Int = 1,
 ) raises:
     # Strided Q/K/V (zero-copy fused-QKV views) is scoped to the
-    # dense d64 causal path in this port; the caller validates the
-    # layout contract (d_stride==1, b_stride==S*s_stride, 16 B-
-    # aligned strides) before this launcher runs.
+    # dense causal path in this port (d64 or d128); the caller
+    # validates the layout contract (d_stride==1, b_stride==S*s_stride,
+    # 16 B-aligned strides, h_stride==head_dim) before this launcher
+    # runs.
     comptime assert (not strided_qkv) or (
-        head_dim == 64
+        (head_dim == 64 or head_dim == 128)
         and causal
         and not varlen
         and not window
         and gqa_ratio == 1
         and softcap_x1000 == 0
-    ), "strided_qkv supports only dense d64 (no varlen/window/gqa/softcap)"
+    ), "strided_qkv supports only dense d64/d128 (no varlen/window/gqa/softcap)"
     var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
@@ -138,13 +139,13 @@ def launch_fwd_fa4[
 
     comptime if bhsd_qkv:
         comptime assert (
-            head_dim == 64
+            (head_dim == 64 or head_dim == 128)
             and causal
             and not varlen
             and not window
             and softcap_x1000 == 0
             and not strided_qkv
-        ), "bhsd_qkv v1 supports only the dense causal d64 path"
+        ), "bhsd_qkv v1 supports only the dense causal d64/d128 path"
         # PUBLIC-layout consumption (the fix for the 30-45% gather-copy
         # overhead): Q/K/V/O are the contiguous (B, H, S, D) tensors the
         # ATen op provides, viewed as (B*H, S, D). Planes are the TMA
@@ -399,9 +400,30 @@ def launch_fwd_fa4[
         )
         return
 
-    var q_tma = create_split_tma[
-        q_smem_shape, gmem_shape, swizzle_mode=swizzle
-    ](ctx, q_ptr, rows, nheads_int)
+    # QO_RANK == 3 (head_dim != 64, i.e. the d128 dense/strided path):
+    # BM == BN == 128 here, so the seqlen % 128 == 0 eligibility gate
+    # already makes every m-tile a full tile -- no rank-4 tail
+    # descriptor is needed the way d64's BM=192 requires. Q mirrors
+    # K/V's existing strided-vs-plain choice above; O always stays
+    # the dense contiguous descriptor (strided_qkv only broadens Q/K/V).
+    var q_tma: SplitLastDimTMATensorTile[dtype, q_smem_shape, swizzle]
+    comptime if strided_qkv:
+        q_tma = create_split_tma_3d_strided[
+            q_smem_shape, swizzle_mode=swizzle
+        ](
+            ctx,
+            q_ptr,
+            rows,
+            nheads_int,
+            head_dim,
+            q_s_stride,
+            q_h_stride,
+            q_d_stride,
+        )
+    else:
+        q_tma = create_split_tma[
+            q_smem_shape, gmem_shape, swizzle_mode=swizzle
+        ](ctx, q_ptr, rows, nheads_int)
     var o_tma = create_split_tma[
         q_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, o_imm_ptr, rows, nheads_int)

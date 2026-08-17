@@ -6497,7 +6497,11 @@ def _fa4_16bit_d64_causal_inputs(
     gate and the launch cache below; f16 only needs its own RS wgmma
     emitter because the stdlib's register-operand overload is hardcoded
     bf16 (see ``fa4_wgmma_f16.mojo``). Q/K/V must all share one dtype from
-    this set -- no bf16/f16 mixing.
+    this set -- no bf16/f16 mixing. ``head_dim`` is a compile-time regime,
+    not a free runtime dimension (AGENTS.md rule 4): only 64 (GPT-2-class)
+    and 128 (Llama-class) have an instantiated kernel + exported Mojo
+    symbol (``fa4_ops.mojo``); any other head_dim declines here and falls
+    to the math decomposition.
     """
     q = _t(query)
     k = _t(key)
@@ -6525,7 +6529,13 @@ def _fa4_16bit_d64_causal_inputs(
     ):
         return None
     batch, heads, seqlen, head_dim = q._shape
-    if batch <= 0 or heads <= 0 or seqlen <= 0 or seqlen % 128 != 0 or head_dim != 64:
+    if (
+        batch <= 0
+        or heads <= 0
+        or seqlen <= 0
+        or seqlen % 128 != 0
+        or head_dim not in (64, 128)
+    ):
         return None
     if scale is not None and (
         not isinstance(scale, int | float)
@@ -6561,11 +6571,11 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
         or seqlen <= 0
         or heads <= 0
         or seqlen % 128 != 0
-        or head_dim != 64
+        or head_dim not in (64, 128)
         or min(b_stride, s_stride, h_stride, d_stride) <= 0
         or d_stride != 1
-        or h_stride != 64
-        or s_stride < heads * 64
+        or h_stride != head_dim
+        or s_stride < heads * head_dim
         or b_stride != seqlen * s_stride
         or tensor._ptr % 16 != 0
     ):
@@ -6621,6 +6631,26 @@ def _fa4_prepare_qkv_bridge(q_native, k_native, v_native):
     return qkv, False
 
 
+def _fa4_symbol(
+    fa4_ops: object, direction: str, dtype: DType, head_dim: int, variant: str = ""
+) -> object:
+    """Resolve one FA4 Mojo-exported entry point by name.
+
+    Mirrors the ``flash_attention_{direction}_{bf16,f16}_d{64,128}_causal{variant}``
+    naming convention ``PyInit_fa4_ops`` registers (``fa4_ops.mojo``) --
+    allocation and symbol selection are both derived from ``head_dim`` at
+    the call site rather than hardcoded, so d64 and d128 share every
+    dispatcher below (``variant`` is ``""`` for the dense entry point,
+    ``"_strided_qkv"`` or ``"_bhsd"`` for the zero-copy ones). ``fa4_ops``
+    is typed ``object`` rather than ``ModuleType``: host-only tests pass a
+    ``SimpleNamespace`` double here instead of the real compiled extension
+    module.
+    """
+    dtype_suffix = "bf16" if dtype == DType.bfloat16 else "f16"
+    name = f"flash_attention_{direction}_{dtype_suffix}_d{head_dim}_causal{variant}"
+    return getattr(fa4_ops, name)
+
+
 def fast_fa4_16bit_d64_causal_forward(
     query,
     key,
@@ -6631,8 +6661,8 @@ def fast_fa4_16bit_d64_causal_forward(
     scale=None,
     enable_gqa=False,
 ):
-    """Run vendored FA4 (bf16 or f16) and return output/LSE plus saved
-    physical inputs.
+    """Run vendored FA4 (bf16 or f16, head_dim 64 or 128) and return
+    output/LSE plus saved physical inputs.
 
     Loading the bridge happens before materialization or allocation, so a
     packaging/compiler error cannot leave unnecessary device work queued.
@@ -6663,11 +6693,7 @@ def fast_fa4_16bit_d64_causal_forward(
         out_native = _alloc((batch, heads, seqlen, head_dim), qkv_dtype, q._device)
         logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
         scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
-        forward_fn = (
-            fa4_ops.flash_attention_fwd_bf16_d64_causal_bhsd
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_fwd_f16_d64_causal_bhsd
-        )
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_bhsd")
         _device_call(
             forward_fn,
             q._ptr,
@@ -6699,11 +6725,7 @@ def fast_fa4_16bit_d64_causal_forward(
     logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if use_strided_qkv:
-        forward_fn = (
-            fa4_ops.flash_attention_fwd_bf16_d64_causal_strided_qkv
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_fwd_f16_d64_causal_strided_qkv
-        )
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_strided_qkv")
         _device_call(
             forward_fn,
             q_native._ptr,
@@ -6722,11 +6744,7 @@ def fast_fa4_16bit_d64_causal_forward(
             keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     else:
-        forward_fn = (
-            fa4_ops.flash_attention_fwd_bf16_d64_causal
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_fwd_f16_d64_causal
-        )
+        forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim)
         _device_call(
             forward_fn,
             q_native._ptr,
@@ -6785,11 +6803,7 @@ def fast_fa4_16bit_d64_causal_backward(
         (batch * heads * seqlen_padded * head_dim,), DType.float32, q_native._device
     )
     if use_strided_qkv:
-        backward_fn = (
-            fa4_ops.flash_attention_bwd_bf16_d64_causal_strided_qkv
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_bwd_f16_d64_causal_strided_qkv
-        )
+        backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim, "_strided_qkv")
         _device_call(
             backward_fn,
             q_native._ptr,
@@ -6828,11 +6842,7 @@ def fast_fa4_16bit_d64_causal_backward(
             ),
         )
     else:
-        backward_fn = (
-            fa4_ops.flash_attention_bwd_bf16_d64_causal
-            if qkv_dtype == DType.bfloat16
-            else fa4_ops.flash_attention_bwd_f16_d64_causal
-        )
+        backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim)
         _device_call(
             backward_fn,
             q_native._ptr,
