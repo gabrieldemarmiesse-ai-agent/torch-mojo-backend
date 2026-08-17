@@ -8615,6 +8615,14 @@ _FA4_BHSD_D64_TAIL_SHAPES = (
     (2, 3, 127),  # ceil(127/64) = 2 m-blocks; last block has 63/64 valid rows
     (2, 3, 193),  # ceil(193/64) = 4 m-blocks; last block has ONE valid row,
     #                deeper into the KV walk than the 65 case
+    # The three shapes above stay under one wave, so the bridge's wave gate
+    # routes them to the v2b kernel -- its tail/clamp logic gets exercised,
+    # but the SELFLOAD kernel carries its own copy of that logic and
+    # selfload+partial-tail is reachable through the bridge (nothing below
+    # the Python gate enforces seqlen % 128). batch*heads here is large
+    # enough to cross the >=2-waves-at-3-CTAs/SM gate on any H100:
+    # 16*12*ceil(193/64) = 768 CTAs >= 2*3*132.
+    (16, 12, 193),
 )
 
 
