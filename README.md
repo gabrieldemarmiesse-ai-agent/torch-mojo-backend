@@ -20,6 +20,12 @@ Concretely, the backend provides two things:
 
 You can see our benchmarks for the supported ops [here](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/benchmarks/baselines.html). It can give you an idea of where we're fast and where we're not. We recently tried running nanogpt eager mode on H100, MI300X and Apple M4 on 2.5B tokens, with torch autocast, and we got the same loss curve as stock PyTorch, while being ~2% faster.
 
+We don't support yet:
+* Using `torch.compile` with the mojo device, only the cuda device is supported for now. 
+* DDP to train on multiple gpus or nodes.
+* Many GPUs (prefer H100, MI300X and Apple M4)
+* Many ops
+
 ## Installation
 
 ```bash
