@@ -27,7 +27,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from apple_gpu_clock_lock import STATE_VALUES, locked_template_path
+from current_bench.apple_gpu_clock_lock import STATE_VALUES, locked_template_path
 
 
 def main() -> int:

@@ -38,7 +38,7 @@ import torch
 from tabulate import tabulate
 from torch.profiler import ProfilerActivity, profile
 
-from bench_nanogpt_train import (
+from current_bench.bench_nanogpt_train import (
     DEFAULT_NANOGPT_PATH,
     DTYPES,
     GRAD_CLIP,
