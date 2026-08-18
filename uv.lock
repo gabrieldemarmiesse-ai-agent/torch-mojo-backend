@@ -2384,11 +2384,12 @@ wheels = [
 
 [[package]]
 name = "torch-mojo-backend"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "beartype" },
     { name = "max" },
+    { name = "mojo" },
     { name = "tabulate" },
     { name = "torch" },
 ]
@@ -2428,7 +2429,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beartype", specifier = ">=0.17.0" },
-    { name = "max", specifier = ">=26.5" },
+    { name = "max", specifier = "==26.5" },
+    { name = "mojo", specifier = "==1.0" },
     { name = "tabulate" },
     { name = "torch", specifier = ">=2.10" },
 ]

@@ -4,15 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "torch-mojo-backend"
-version = "0.2.0"
+version = "0.3.0"
 description = "A PyTorch backend powered by Mojo kernels and Modular's MAX framework"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    # 26.5 is the first stable MAX on PyPI (it ships mojo 1.0); the kernels use
-    # its API, so an older one cannot compile them.
-    "max>=26.5",
+    "mojo==1.0",
+    "max==26.5",
     "tabulate",
     "torch>=2.10",
     "beartype>=0.17.0",

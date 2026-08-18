@@ -25,6 +25,7 @@ We don't support yet:
 * DDP to train on multiple gpus or nodes.
 * Many GPUs (prefer H100, MI300X and Apple M4)
 * Many ops
+* Other mojo versions than 1.0
 
 ## Installation
 
