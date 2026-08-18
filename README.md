@@ -13,7 +13,7 @@ Concretely, the backend provides two things:
 
 ## Warning:
 
-- This project is experimental and should not be used for any serious work. It is currently a proof of concept and its goal is to show what's possible.*
+- This project is experimental and should not be used for any serious work. It is currently a proof of concept and its goal is to show what's possible.
 - We currently only support a limited set of operations and this was mostly tested on H100, MI300X and Apple M4.
 - Due to the high number of operations to implement, the repository make heavy use of AI agents, and it can be seen in the code. While the kernels are very high performance,
   you might find them quite verbose.
@@ -64,6 +64,13 @@ d = (a + b - c) * 8 / 16
 print(d.cpu())
 ```
 
+Ops are compiled on the fly, and compilation doesn't stop your code, as long as you don't request a host-device sync.
+Torch-mojo-backend uses this optimization to compile multiple ops in the background at the same time. E.g. all the 
+ops needed to perform `(a + b - c) * 8 / 16` will be sent to a compiler process pool to be compiled in parallel.
+A cache is on disk to make sure we don't recompile when the user restarts the process.
+You can look at [this animation](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/kernel_call_queue_animation.html) to understand better how it works.
+
+We guarantee that changing the shapes or the values of the tensors will not trigger a recompilation.
 
 ### Torch compile
 
@@ -92,6 +99,9 @@ a = torch.tensor([1.0, 2.0, 3.0]).to("cuda")
 b = torch.tensor([4.0, 5.0, 6.0]).to("cuda")
 print(simple_math(a, b))
 ```
+
+See [this animation](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/torch_compile_backend_animation.html)
+which shows what happens under the hood to convert a dynamo graph to a MAX graph.
 
 ### Training
 
