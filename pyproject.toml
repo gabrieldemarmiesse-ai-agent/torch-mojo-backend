@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "torch-mojo-backend"
-version = "0.3.0"
+version = "0.3.1"
 description = "A PyTorch backend powered by Mojo kernels and Modular's MAX framework"
 readme = "README.md"
 license = { file = "LICENSE" }
