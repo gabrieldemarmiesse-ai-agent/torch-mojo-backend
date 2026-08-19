@@ -6101,7 +6101,14 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
     ):
         assert scratch_only not in v3_source
 
+    def _code_only(source: str) -> str:
+        # The vendor-library ban is about imports and calls, not prose: a
+        # comment saying a kernel was benchmarked against cuBLAS must not
+        # trip it (it did once, via #392's tuning notes).
+        return "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+
     for source in (bridge_source, v3_source, tn_v4_source, fallback_source):
+        code = _code_only(source).lower()
         for forbidden in (
             ".synchronize(",
             "devicecontext(",
@@ -6111,7 +6118,7 @@ def test_bf16_v3_source_dependency_and_kernel_contract():
             "rocblas",
             "triton",
         ):
-            assert forbidden not in source.lower()
+            assert forbidden not in code
 
 
 @pytest.mark.parametrize("operation", ["gemm", "bmm"])
