@@ -96,6 +96,7 @@ comptime BOP_XOR = 8
 comptime BOP_REMAINDER = 9
 comptime BOP_FLOORDIV = 10
 comptime BOP_POW = 11
+comptime BOP_TRUNCDIV = 12
 
 comptime COP_EQ = 0
 comptime COP_NE = 1
@@ -157,6 +158,8 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "floor_divide"
         comptime if op_code == BOP_POW:
             return "pow"
+        comptime if op_code == BOP_TRUNCDIV:
+            return "trunc_divide"
     return "binop"
 
 
@@ -326,6 +329,43 @@ def _bin_vec_op[
                 ).cast[out_dtype]()
             else:
                 return (a // b).cast[out_dtype]()
+        comptime if op_code == BOP_TRUNCDIV:
+            # `torch.div(..., rounding_mode="trunc")`: the quotient rounded
+            # toward zero (C-style integer division), for both float and
+            # integer dtypes. Differs from BOP_FLOORDIV exactly when the
+            # true quotient is negative and inexact -- floor rounds down
+            # (away from zero), trunc rounds toward zero.
+            comptime if dtype.is_floating_point():
+                # UNLIKE BOP_FLOORDIV, deliberately NOT widened to fp32 for
+                # bf16/fp16: torch's own tensor-tensor trunc kernel
+                # (`div_trunc_kernel` in aten/src/ATen/native/cpu/
+                # BinaryOpsKernel.cpp) computes `std::trunc(a / b)` at the
+                # operand's OWN precision for the general tensor/tensor case
+                # -- only its separate is-scalar fast path upcasts to
+                # opmath_t, and that fast path is not reachable from here
+                # (a Python scalar operand already arrives pre-rounded into
+                # a same-dtype broadcast tensor, see `_scalar_embed`). So
+                # matching torch means reproducing its rounding here too:
+                # verified directly against torch.div(..., rounding_mode=
+                # "trunc") on real bf16 tensors that -6.3125 / -1.0546875
+                # (true quotient ~5.985) rounds to 6.0 in bf16 *before*
+                # truncation, same as torch -- not the fp32-computed 5.0
+                # BOP_FLOORDIV's comment calls "correct".
+                return (a / b).__trunc__().cast[out_dtype]()
+            else:
+                # Correct Mojo's floor division (`//`, already zero-safe --
+                # see BOP_FLOORDIV) toward zero. Floor and trunc agree
+                # unless the operands have opposite signs and the division
+                # is inexact, in which case floor landed one step further
+                # from zero than trunc; `r` here has floor's sign
+                # convention (the divisor's sign, or zero) so `r != 0` is
+                # exactly the "inexact" test.
+                var q = a // b
+                var r = a - q * b
+                var zero = SIMD[dtype, width](0)
+                var opposite_signs = a.lt(zero) ^ b.lt(zero)
+                var needs_adjust = opposite_signs & r.ne(zero)
+                return needs_adjust.select(q + 1, q).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher); accumulate halves in
             # float32 to match torch's numerics.
@@ -1766,6 +1806,15 @@ def PyInit_logic_ops() abi("C") -> PythonObject:
                     "a binary spec op",
                 ],
                 docstring="(a_spec, b_spec, out_spec); //",
+            )
+        comptime if _op_on["TruncDivSpec"]():
+            _register_call(
+                b,
+                _spec_dispatcher3[
+                    _binary_spec_into_go[BOP_TRUNCDIV, False],
+                    "a binary spec op",
+                ],
+                docstring="(a_spec, b_spec, out_spec); trunc(a / b)",
             )
         comptime if _op_on["BitwiseAndSpec"]():
             _register_call(

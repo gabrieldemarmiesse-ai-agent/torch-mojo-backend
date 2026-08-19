@@ -112,6 +112,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::addcdiv.out": _OUT,
     "aten::addcmul.out": _OUT,
     "aten::div.out": _OUT,
+    "aten::div.out_mode": _OUT,
     "aten::mul.out": _OUT,
     "aten::mean.out": _OUT,
     "aten::sub.out": _OUT,

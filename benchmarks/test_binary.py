@@ -75,6 +75,8 @@ COVERS: dict[str, str] = (
         "aten::floor_divide": "test_floor_divide[Tensor]",
         "aten::floor_divide.Scalar": "test_floor_divide[Scalar]",
         "aten::floordiv": "test_floor_divide (same fast impl, alias entry)",
+        "aten::div.Tensor_mode": "test_div_trunc_mode (rounding_mode='trunc'; "
+        "the 'floor' sub-case shares FloorDivSpec with test_floor_divide above)",
         "aten::remainder.Tensor": "test_remainder[Tensor]",
         "aten::remainder.Scalar": "test_remainder[Scalar]",
         "aten::remainder.Scalar_Tensor": (
@@ -273,6 +275,37 @@ def test_floor_divide(
         bench.run(
             lambda: torch.floor_divide(a_ref, b_ref),
             lambda: torch.floor_divide(a_our, b_our),
+            flops=float(a_ref.numel()),
+        )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+def test_div_trunc_mode(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+) -> None:
+    """`torch.div(..., rounding_mode="trunc")` -- aten::div.Tensor_mode /
+    div.Scalar_mode, a separate kernel (TruncDivSpec) from floor_divide's
+    FloorDivSpec above despite the shared `div.Tensor_mode` overload for the
+    floor case, so it gets its own regime here rather than piggybacking on
+    test_floor_divide."""
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    if layout == "Scalar":
+        bench.run(
+            lambda: torch.div(a_ref, 0.25, rounding_mode="trunc"),
+            lambda: torch.div(a_our, 0.25, rounding_mode="trunc"),
+            flops=float(a_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.div(a_ref, b_ref, rounding_mode="trunc"),
+            lambda: torch.div(a_our, b_our, rounding_mode="trunc"),
             flops=float(a_ref.numel()),
         )
 

@@ -1589,6 +1589,59 @@ def test_aten_ceil_scalar_tensor(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
+)
+def test_aten_div_rounding_mode_tensor(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, rounding_mode: str
+):
+    """aten::div.Tensor_mode: floor/trunc rounding, incl. the sign
+    combinations where the two modes disagree (only when the true quotient
+    is negative and inexact)."""
+    call_checker.register(aten_functions.aten_div)
+
+    def fn(x, y):
+        return torch.div(x, y, rounding_mode=rounding_mode)
+
+    x = torch.tensor([7, -7, 7, -7, 8, -8, 6, -6], dtype=dtype)
+    y = torch.tensor([2, 2, -2, -2, 3, 3, -3, -3], dtype=dtype)
+    check_outputs(fn, conf, [x, y])
+
+
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+def test_aten_div_rounding_mode_scalar(
+    conf: Conf, call_checker: CallChecker, rounding_mode: str
+):
+    """aten::div.Scalar_mode (a negative Python-scalar divisor)."""
+    call_checker.register(aten_functions.aten_div)
+
+    def fn(x):
+        return torch.div(x, -3, rounding_mode=rounding_mode)
+
+    x = torch.tensor([7, -7, 8, -8, 9, -9], dtype=torch.int64)
+    check_outputs(fn, conf, [x])
+
+
+def test_aten_div_rounding_mode_floor_trunc_disagree(
+    conf: Conf, call_checker: CallChecker
+):
+    """Documents (and pins) the actual semantic difference: floor and trunc
+    only disagree when the operands have opposite signs and the division is
+    inexact -- a naive implementation that aliases one mode to the other
+    would still pass same-sign cases."""
+    call_checker.register(aten_functions.aten_div)
+
+    def fn(x, y):
+        return torch.div(x, y, rounding_mode="floor"), torch.div(
+            x, y, rounding_mode="trunc"
+        )
+
+    x = torch.tensor([-7, 7], dtype=torch.int64)
+    y = torch.tensor([2, -2], dtype=torch.int64)
+    check_outputs(fn, conf, [x, y])
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_aten_gelu_backward_basic(conf: Conf, dtype: torch.dtype, approximate: str):
