@@ -8,7 +8,7 @@ from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
 from torch.ops import aten
 
-from torch_mojo_backend import aten_functions
+from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
@@ -2416,6 +2416,359 @@ def test_aten_pow_tensor_tensor_single_element(conf: Conf):
     base = torch.tensor([2.0], dtype=torch.float32)
     exponent = torch.tensor([3.0], dtype=torch.float32)
     check_outputs(fn, conf, [base, exponent])
+
+
+@pytest.mark.parametrize(("right", "out_int32"), [(False, False), (True, True)])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+def test_aten_bucketize_tensor(
+    mojo_device: str,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    right: bool,
+    out_int32: bool,
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_bucketize)
+
+    def fn(values: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
+        return aten.bucketize.Tensor(
+            values, boundaries, right=right, out_int32=out_int32
+        )
+
+    boundaries = torch.tensor([-5, -1, 0, 2, 2, 9], dtype=dtype)
+    values = torch.tensor([[-6, -1, 1], [2, 8, 10]], dtype=dtype)
+    check_outputs(fn, Conf(mojo_device, False), [values, boundaries])
+
+
+@pytest.mark.parametrize(("side", "out_int32"), [("left", True), ("right", False)])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+def test_aten_searchsorted_batched(
+    mojo_device: str,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    side: str,
+    out_int32: bool,
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    def fn(boundaries: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        return aten.searchsorted.Tensor(
+            boundaries, values, side=side, out_int32=out_int32
+        )
+
+    boundaries = torch.tensor([[-3, 0, 0, 7], [1, 4, 8, 12]], dtype=dtype)
+    values = torch.tensor([[-4, 0, 6], [1, 9, 20]], dtype=dtype)
+    check_outputs(fn, Conf(mojo_device, False), [boundaries, values])
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+def test_aten_searchsorted_sorter(
+    mojo_device: str, call_checker: CallChecker, dtype: torch.dtype
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    def fn(
+        boundaries: torch.Tensor, values: torch.Tensor, sorter: torch.Tensor
+    ) -> torch.Tensor:
+        return aten.searchsorted.Tensor(boundaries, values, sorter=sorter)
+
+    boundaries = torch.tensor([[30, 10, 20], [6, -2, 3]], dtype=dtype)
+    sorter = torch.tensor([[1, 2, 0], [1, 2, 0]], dtype=torch.int64)
+    values = torch.tensor([[5, 10, 25, 35], [-3, 2, 6, 8]], dtype=dtype)
+    check_outputs(fn, Conf(mojo_device, False), [boundaries, values, sorter])
+
+
+@pytest.mark.parametrize(
+    ("boundary_dtype", "value_dtype"),
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.int64, torch.float16),
+        (torch.int32, torch.int64),
+    ],
+)
+def test_aten_searchsorted_dtype_promotion(
+    mojo_device: str,
+    call_checker: CallChecker,
+    boundary_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+) -> None:
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    def fn(boundaries: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        return aten.searchsorted.Tensor(boundaries, values, right=True)
+
+    boundaries = torch.tensor([-5, 0, 2, 9], dtype=boundary_dtype)
+    values = torch.tensor([-6, 0, 1, 10], dtype=value_dtype)
+    check_outputs(fn, Conf(mojo_device, False), [boundaries, values])
+
+
+@pytest.mark.parametrize("out_int32", [False, True])
+def test_aten_searchsorted_and_bucketize_scalar_overloads(
+    conf: Conf, call_checker: CallChecker, out_int32: bool
+) -> None:
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(boundaries: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Scalar(
+                boundaries, 2.0, side="right", out_int32=out_int32
+            ),
+            aten.bucketize.Scalar(float("nan"), boundaries, out_int32=out_int32),
+        )
+
+    boundaries = torch.tensor(
+        [float("-inf"), 0, 2, 2, float("inf")], dtype=torch.float32
+    )
+    check_outputs(fn, conf, [boundaries])
+
+
+@pytest.mark.parametrize("right", [False, True])
+def test_aten_searchsorted_and_bucketize_empty_edges(
+    conf: Conf, call_checker: CallChecker, right: bool
+) -> None:
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(
+        empty_boundaries: torch.Tensor,
+        values: torch.Tensor,
+        batched_boundaries: torch.Tensor,
+        batched_values: torch.Tensor,
+        nonempty_boundaries: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Tensor(empty_boundaries, values, right=right),
+            aten.bucketize.Tensor(values, empty_boundaries, right=right),
+            aten.searchsorted.Tensor(batched_boundaries, batched_values, right=right),
+            aten.bucketize.Tensor(values[:0], nonempty_boundaries, right=right),
+        )
+
+    empty_boundaries = torch.empty(0)
+    values = torch.tensor([float("-inf"), 0.0, float("inf"), float("nan")])
+    batched_boundaries = torch.empty(2, 0)
+    batched_values = torch.randn(2, 3)
+    nonempty_boundaries = torch.tensor([0.0, 1.0])
+    check_outputs(
+        fn,
+        conf,
+        [
+            empty_boundaries,
+            values,
+            batched_boundaries,
+            batched_values,
+            nonempty_boundaries,
+        ],
+    )
+
+
+def test_aten_searchsorted_and_bucketize_eager_cpu_and_gpu(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    register_mojo_devices()
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(
+        boundaries: torch.Tensor, values: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Tensor(boundaries, values, right=True),
+            aten.bucketize.Tensor(values, boundaries, out_int32=True),
+        )
+
+    boundaries = torch.tensor([-4.0, 0.0, 3.0, 8.0])
+    values = torch.tensor([[float("-inf"), 0.0, 4.0, float("inf"), float("nan")]])
+    check_outputs(fn, Conf(mojo_device, False), [boundaries, values])
+
+
+@pytest.mark.parametrize("right", [False, True])
+def test_aten_searchsorted_and_bucketize_nan_boundaries_eager(
+    mojo_device: str, call_checker: CallChecker, right: bool
+) -> None:
+    register_mojo_devices()
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(
+        boundaries: torch.Tensor, values: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Tensor(boundaries, values, right=right),
+            aten.bucketize.Tensor(values, boundaries, right=right),
+        )
+
+    boundaries = torch.tensor([1.0, 2.0, float("nan")])
+    values = torch.tensor([0.5, 1.5, 3.0, float("nan")])
+    check_outputs(fn, Conf(mojo_device, False), [boundaries, values])
+
+
+@pytest.mark.parametrize("out_int32", [False, True])
+def test_aten_searchsorted_and_bucketize_out_variants(
+    mojo_device: str, call_checker: CallChecker, out_int32: bool
+) -> None:
+    register_mojo_devices()
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+    dtype = torch.int32 if out_int32 else torch.int64
+    boundaries = torch.tensor([1.0, 2.0, 4.0]).to(mojo_device)
+    values = torch.tensor([0.5, 2.0, 3.0, 5.0]).to(mojo_device)
+    tensor_out = torch.empty(0, dtype=dtype, device=mojo_device)
+    scalar_out = torch.empty((), dtype=dtype, device=mojo_device)
+
+    expected_tensor = torch.tensor([0, 1, 2, 3], dtype=dtype)
+    expected_scalar = torch.tensor(2, dtype=dtype)
+    assert (
+        aten.searchsorted.Tensor_out(
+            boundaries, values, out_int32=out_int32, out=tensor_out
+        )
+        is tensor_out
+    )
+    torch.testing.assert_close(tensor_out.cpu(), expected_tensor)
+    assert (
+        aten.searchsorted.Scalar_out(
+            boundaries, 3.0, out_int32=out_int32, out=scalar_out
+        )
+        is scalar_out
+    )
+    torch.testing.assert_close(scalar_out.cpu(), expected_scalar)
+
+    tensor_out = torch.empty(0, dtype=dtype, device=mojo_device)
+    scalar_out = torch.empty((), dtype=dtype, device=mojo_device)
+    assert (
+        aten.bucketize.Tensor_out(
+            values, boundaries, out_int32=out_int32, out=tensor_out
+        )
+        is tensor_out
+    )
+    torch.testing.assert_close(tensor_out.cpu(), expected_tensor)
+    assert (
+        aten.bucketize.Scalar_out(3.0, boundaries, out_int32=out_int32, out=scalar_out)
+        is scalar_out
+    )
+    torch.testing.assert_close(scalar_out.cpu(), expected_scalar)
+
+
+def test_aten_searchsorted_and_bucketize_errors(
+    mojo_device: str, call_checker: CallChecker
+) -> None:
+    register_mojo_devices()
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+    boundaries = torch.tensor([1.0, 3.0, 7.0]).to(mojo_device)
+    values = torch.tensor([0.0, 4.0]).to(mojo_device)
+
+    with pytest.raises(RuntimeError, match="side can only be 'left' or 'right'"):
+        aten.searchsorted.Tensor(boundaries, values, side="middle")
+    with pytest.raises(RuntimeError, match="side and right can't be set to opposites"):
+        aten.searchsorted.Tensor(boundaries, values, right=True, side="left")
+    with pytest.raises(RuntimeError, match="sorter must be a tensor of long dtype"):
+        aten.searchsorted.Tensor(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1, 2], dtype=torch.int32).to(mojo_device),
+        )
+    with pytest.raises(RuntimeError, match="sorter index out of range"):
+        aten.searchsorted.Tensor(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device),
+        )
+    with pytest.raises(RuntimeError, match="should have same device type"):
+        aten.searchsorted.Tensor(boundaries, torch.tensor([0.0, 4.0]))
+    with pytest.raises(
+        RuntimeError, match="sorter and boundary tensors should have same device type"
+    ):
+        aten.searchsorted.Tensor(
+            boundaries, values, sorter=torch.tensor([0, 1, 2], dtype=torch.int64)
+        )
+    with pytest.raises(RuntimeError, match="boundaries tensor must be 1 dimension"):
+        aten.bucketize.Tensor(values, boundaries.unsqueeze(0))
+
+
+def test_aten_searchsorted_and_bucketize_compile_backend(
+    call_checker: CallChecker,
+) -> None:
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(
+        batched_boundaries: torch.Tensor,
+        batched_values: torch.Tensor,
+        boundaries: torch.Tensor,
+        values: torch.Tensor,
+        empty_boundaries: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Tensor(batched_boundaries, batched_values, side="right"),
+            aten.bucketize.Tensor(values, boundaries, out_int32=True),
+            aten.searchsorted.Scalar(boundaries, 2.0, side="left"),
+            aten.bucketize.Scalar(float("nan"), boundaries, right=True),
+            aten.searchsorted.Tensor(empty_boundaries, values),
+        )
+
+    batched_boundaries = torch.tensor([[10.0, 20.0, 30.0], [-2.0, 3.0, 6.0]])
+    batched_values = torch.tensor([[5.0, 10.0, 25.0], [-3.0, 2.0, 8.0]])
+    boundaries = torch.tensor([-2.0, 0.0, 4.0, 9.0])
+    values = torch.tensor([float("-inf"), 0.0, 5.0, float("inf"), float("nan")])
+    empty_boundaries = torch.empty(0)
+    check_outputs(
+        fn,
+        Conf("cpu", True),
+        [batched_boundaries, batched_values, boundaries, values, empty_boundaries],
+    )
+
+
+@pytest.mark.parametrize("right", [False, True])
+def test_aten_searchsorted_and_bucketize_nan_boundaries_compile_backend(
+    call_checker: CallChecker, right: bool
+) -> None:
+    call_checker.register(
+        aten_functions.aten_searchsorted, aten_functions.aten_bucketize
+    )
+
+    def fn(
+        boundaries: torch.Tensor, values: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            aten.searchsorted.Tensor(boundaries, values, right=right),
+            aten.bucketize.Tensor(values, boundaries, right=right),
+        )
+
+    boundaries = torch.tensor([1.0, 2.0, float("nan")])
+    values = torch.tensor([0.5, 1.5, 3.0, float("nan")])
+    check_outputs(fn, Conf("cpu", True), [boundaries, values])
+
+
+def test_aten_searchsorted_compile_backend_declines_unchecked_sorter() -> None:
+    def fn(
+        boundaries: torch.Tensor, values: torch.Tensor, sorter: torch.Tensor
+    ) -> torch.Tensor:
+        return aten.searchsorted.Tensor(boundaries, values, sorter=sorter)
+
+    boundaries = torch.tensor([1.0, 2.0, 3.0])
+    values = torch.tensor([0.5])
+    out_of_range_sorter = torch.tensor([0, 1, 9], dtype=torch.int64)
+    with pytest.raises(
+        BackendCompilerFailed, match="sorter bounds cannot be validated"
+    ):
+        torch.compile(fn, backend=mojo_backend)(boundaries, values, out_of_range_sorter)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

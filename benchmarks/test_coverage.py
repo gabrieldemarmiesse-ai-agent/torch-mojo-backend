@@ -111,6 +111,8 @@ SKIPPED_OPS: dict[str, str] = {
     # -- out-variant plumbing --------------------------------------------
     "aten::addcdiv.out": _OUT,
     "aten::addcmul.out": _OUT,
+    "aten::bucketize.Scalar_out": _OUT,
+    "aten::bucketize.Tensor_out": _OUT,
     "aten::div.out": _OUT,
     "aten::div.out_mode": _OUT,
     "aten::mul.out": _OUT,
@@ -120,6 +122,8 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::lerp.Scalar_out": _OUT,
     "aten::isin.Tensor_Tensor_out": _OUT,
     "aten::min.dim_min": _OUT,
+    "aten::searchsorted.Scalar_out": _OUT,
+    "aten::searchsorted.Tensor_out": _OUT,
     # -- not implemented --------------------------------------------------
     "aten::_adaptive_avg_pool2d_backward": (
         "registered as an explicit raiser (_register_missing): no fast impl "

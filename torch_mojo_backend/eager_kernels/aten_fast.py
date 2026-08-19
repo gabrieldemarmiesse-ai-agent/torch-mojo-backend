@@ -30,6 +30,7 @@ from typing import ClassVar, Protocol, runtime_checkable
 import torch
 from max.driver import Device
 from max.dtype import DType
+from max.experimental.torch import max_dtype_to_torch
 
 from torch_mojo_backend import eager_kernels, is_running_tests
 from torch_mojo_backend.eager_kernels import call_queue as _call_queue
@@ -81,6 +82,9 @@ from torch_mojo_backend.eager_kernels.reduction_ops import (
 )
 from torch_mojo_backend.eager_kernels.sdpa_backward_ops import (
     SDPABackwardExtension as _SdpaBackwardExtension,
+)
+from torch_mojo_backend.eager_kernels.searchsorted_ops import (
+    SearchsortedExtension as _SearchsortedExtension,
 )
 from torch_mojo_backend.eager_kernels.softmax_backward_ops import (
     SoftmaxBackwardExtension as _SoftmaxBackwardExtension,
@@ -3124,6 +3128,278 @@ def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False
             keepalive=(out, el, te),
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Searchsorted / bucketize: one binary search per value, shared by CPU/GPU.
+# ---------------------------------------------------------------------------
+
+
+_SEARCHSORTED_DTYPES = (
+    DType.float32,
+    DType.bfloat16,
+    DType.float16,
+    DType.int32,
+    DType.int64,
+)
+# float64, int16, and uint8 are deliberately declined until their kernels are
+# supported.  Scalar integers with magnitude above 2**53 are also declined so
+# wrapped-number promotion cannot silently lose precision.
+
+
+def _searchsorted_tensor_dtype(left: DType, right: DType) -> DType | None:
+    """PyTorch's result-type promotion, restricted to kernel dtypes."""
+    try:
+        promoted = torch.promote_types(
+            max_dtype_to_torch(left), max_dtype_to_torch(right)
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    result = _torch_dtype_to_max(promoted)
+    return result if result in _SEARCHSORTED_DTYPES else None
+
+
+def _searchsorted_scalar_dtype(
+    boundary_dtype: DType, value: AtenScalar
+) -> DType | None:
+    """ATen wrapped-number promotion for a Python scalar search value."""
+    try:
+        promoted = torch.result_type(
+            torch.empty((), dtype=max_dtype_to_torch(boundary_dtype)), value
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return None
+    result = _torch_dtype_to_max(promoted)
+    return result if result in _SEARCHSORTED_DTYPES else None
+
+
+def _searchsorted_sorter_in_range(
+    sorter: TorchMojoTensor, boundary_size: int
+) -> bool | None:
+    """Validate sorter values like ATen (a deliberate device sync)."""
+    if sorter._numel == 0:
+        return True
+    minimum = fast_aten_min(sorter)
+    maximum = fast_aten_max(sorter)
+    if minimum is NOT_HANDLED or maximum is NOT_HANDLED:
+        return None
+    min_value = fast_aten__local_scalar_dense(minimum)
+    max_value = fast_aten__local_scalar_dense(maximum)
+    if min_value is NOT_HANDLED or max_value is NOT_HANDLED:
+        return None
+    return int(min_value) >= 0 and int(max_value) < boundary_size
+
+
+def _fast_searchsorted(
+    sorted_sequence: torch.Tensor,
+    values: torch.Tensor | AtenScalar,
+    *,
+    out_int32: bool,
+    right: bool,
+    side: str | None,
+    sorter: torch.Tensor | None,
+) -> TorchMojoTensor | object:
+    boundaries = _t(sorted_sequence)
+    if boundaries is None:
+        if _t(values) is not None:
+            raise RuntimeError(
+                "torch.searchsorted(): boundaries and input value tensors "
+                "should have same device type"
+            )
+        return NOT_HANDLED
+
+    if side is not None:
+        if side not in ("left", "right"):
+            raise RuntimeError(
+                "torch.searchsorted(): side can only be 'left' or 'right' but "
+                f"got {side}"
+            )
+        if right and side != "right":
+            raise RuntimeError(
+                "torch.searchsorted(): side and right can't be set to opposites, "
+                f"got side of {side} while right was True"
+            )
+        right = side == "right"
+
+    input_tensor = _t(values)
+    if isinstance(values, torch.Tensor) and input_tensor is None:
+        raise RuntimeError(
+            "torch.searchsorted(): boundaries and input value tensors should "
+            "have same device type"
+        )
+    scalar_value = input_tensor is None
+    if not scalar_value and input_tensor._device != boundaries._device:
+        raise RuntimeError(
+            "torch.searchsorted(): boundaries and input value tensors should "
+            "have same device type"
+        )
+
+    sorter_tensor = _t(sorter) if sorter is not None else None
+    if sorter is not None:
+        if sorter_tensor is None:
+            if isinstance(sorter, torch.Tensor):
+                raise RuntimeError(
+                    "torch.searchsorted(): sorter and boundary tensors should "
+                    "have same device type"
+                )
+            return NOT_HANDLED
+        if sorter_tensor._device != boundaries._device:
+            raise RuntimeError(
+                "torch.searchsorted(): sorter and boundary tensors should have "
+                "same device type"
+            )
+        if tuple(sorter_tensor._shape) != tuple(boundaries._shape):
+            raise RuntimeError(
+                "torch.searchsorted(): boundary and sorter must have the same size"
+            )
+        if sorter_tensor._dtype != DType.int64:
+            raise RuntimeError(
+                "torch.searchsorted(): sorter must be a tensor of long dtype"
+            )
+        if len(boundaries._shape) > 0:
+            in_range = _searchsorted_sorter_in_range(
+                sorter_tensor, boundaries._shape[-1]
+            )
+            if in_range is None:
+                return NOT_HANDLED
+            if not in_range:
+                raise RuntimeError("torch.searchsorted(): sorter index out of range")
+
+    if scalar_value:
+        if not isinstance(values, int | float | bool | complex):
+            return NOT_HANDLED
+        if isinstance(values, int) and abs(values) > _MAX_EXACT_INT:
+            return NOT_HANDLED
+        if len(boundaries._shape) != 1:
+            raise RuntimeError(
+                "torch.searchsorted(): input value can be a scalar only when "
+                "boundaries tensor dimension is 1"
+            )
+    if len(boundaries._shape) == 0:
+        raise RuntimeError(
+            "torch.searchsorted(): boundaries tensor should have positive "
+            "dimension, but got 0 dimension"
+        )
+    if not scalar_value:
+        if len(input_tensor._shape) == 0 and len(boundaries._shape) != 1:
+            raise RuntimeError(
+                "torch.searchsorted(): input value can be a scalar only when "
+                "boundaries tensor dimension is 1"
+            )
+        if len(boundaries._shape) != 1 and (
+            len(input_tensor._shape) != len(boundaries._shape)
+            or tuple(input_tensor._shape[:-1]) != tuple(boundaries._shape[:-1])
+        ):
+            raise RuntimeError(
+                "torch.searchsorted(): boundaries tensor should be 1 dimension "
+                "or the first N-1 dimensions of boundaries tensor and input "
+                "value tensor must match"
+            )
+
+    boundary_size = boundaries._shape[-1]
+    if out_int32 and boundary_size >= 2**31 - 1:
+        raise RuntimeError(
+            "torch.searchsorted(): the size of boundaries' last dimension "
+            f"should be less than {2**31 - 1}, but we got {boundary_size}"
+        )
+
+    if scalar_value:
+        common_dtype = _searchsorted_scalar_dtype(boundaries._dtype, values)
+        if common_dtype is None:
+            return NOT_HANDLED
+        input_tensor = _scalar_tensor_0d(values, common_dtype, boundaries._device)
+    else:
+        common_dtype = _searchsorted_tensor_dtype(
+            boundaries._dtype, input_tensor._dtype
+        )
+        if common_dtype is None:
+            return NOT_HANDLED
+        if input_tensor._dtype != common_dtype:
+            input_tensor = _cast_tensor(input_tensor, common_dtype)
+
+    if boundaries._dtype != common_dtype:
+        boundaries = _cast_tensor(boundaries, common_dtype)
+
+    boundaries = _tc(boundaries)
+    input_tensor = _tc(input_tensor)
+    sorter_tensor = _tc(sorter_tensor) if sorter_tensor is not None else None
+    out_dtype = DType.int32 if out_int32 else DType.int64
+    out = _alloc(input_tensor._shape, out_dtype, input_tensor._device)
+    if out._numel == 0:
+        return out
+
+    values_per_batch = input_tensor._shape[-1] if input_tensor._shape else 1
+    _call_mojo(
+        _SearchsortedExtension,
+        "Searchsorted",
+        (
+            out._ptr,
+            boundaries._ptr,
+            input_tensor._ptr,
+            sorter_tensor._ptr if sorter_tensor is not None else 0,
+            input_tensor._numel,
+            boundary_size,
+            values_per_batch,
+            1 if len(boundaries._shape) == 1 else 0,
+            1 if sorter_tensor is not None else 0,
+            1 if right else 0,
+            common_dtype.value,
+            out_dtype.value,
+            _ctx_ptr(input_tensor._device),
+        ),
+        arg_dtypes=(common_dtype,),
+        output_dtypes=(out_dtype,),
+        keepalive=tuple(
+            tensor
+            for tensor in (out, boundaries, input_tensor, sorter_tensor)
+            if tensor is not None
+        ),
+    )
+    return out
+
+
+def fast_aten_bucketize(
+    input: torch.Tensor | AtenScalar,
+    boundaries: torch.Tensor,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+) -> TorchMojoTensor | object:
+    boundary_tensor = _t(boundaries)
+    if boundary_tensor is None:
+        if _t(input) is not None:
+            raise RuntimeError(
+                "torch.searchsorted(): boundaries and input value tensors "
+                "should have same device type"
+            )
+        return NOT_HANDLED
+    if len(boundary_tensor._shape) != 1:
+        raise RuntimeError(
+            "boundaries tensor must be 1 dimension, but got "
+            f"dim({len(boundary_tensor._shape)})"
+        )
+    return _fast_searchsorted(
+        boundary_tensor, input, out_int32=out_int32, right=right, side=None, sorter=None
+    )
+
+
+def fast_aten_searchsorted(
+    sorted_sequence: torch.Tensor,
+    input: torch.Tensor | AtenScalar,
+    *,
+    out_int32: bool = False,
+    right: bool = False,
+    side: str | None = None,
+    sorter: torch.Tensor | None = None,
+) -> TorchMojoTensor | object:
+    return _fast_searchsorted(
+        sorted_sequence,
+        input,
+        out_int32=out_int32,
+        right=right,
+        side=side,
+        sorter=sorter,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -238,6 +238,10 @@ _register_fast("aten::bitwise_or.Tensor", "fast_aten_bitwise_or")
 _register_fast("aten::bitwise_xor.Scalar", "fast_aten_bitwise_xor")
 _register_fast("aten::bitwise_xor.Tensor", "fast_aten_bitwise_xor")
 _register_fast("aten::bmm", "fast_aten_bmm")
+_register_fast("aten::bucketize.Scalar", "fast_aten_bucketize")
+_register_out("aten::bucketize.Scalar_out", "fast_aten_bucketize", dtype_policy="exact")
+_register_fast("aten::bucketize.Tensor", "fast_aten_bucketize")
+_register_out("aten::bucketize.Tensor_out", "fast_aten_bucketize", dtype_policy="exact")
 _register_fast("aten::cat", "fast_aten_cat")
 _register_fast("aten::ceil", "fast_aten_ceil")
 _register_fast("aten::clamp", "fast_aten_clamp")
@@ -363,6 +367,14 @@ _register_fast(
 )
 register_aten_op("aten::scatter.src")(mojo_device_scatter_src)
 _register_fast("aten::scatter.value", "fast_aten_scatter_value")
+_register_fast("aten::searchsorted.Scalar", "fast_aten_searchsorted")
+_register_out(
+    "aten::searchsorted.Scalar_out", "fast_aten_searchsorted", dtype_policy="exact"
+)
+_register_fast("aten::searchsorted.Tensor", "fast_aten_searchsorted")
+_register_out(
+    "aten::searchsorted.Tensor_out", "fast_aten_searchsorted", dtype_policy="exact"
+)
 _register_fast("aten::select_scatter", "fast_aten_select_scatter")
 _register_fast("aten::select.int", "fast_aten_select")
 register_aten_op("aten::sigmoid")(mojo_device_sigmoid)
