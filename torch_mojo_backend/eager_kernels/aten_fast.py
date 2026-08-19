@@ -9148,8 +9148,8 @@ def _try_tf32_gemm(
     declines, keeps the SM80-class ``mma.m16n8k8`` route in ``tf32_matmul_ops``.
 
     This helper owns only host validation/allocation and the raw bridge call;
-    the Fable-owned module owns every device-kernel body.  Unsupported layouts
-    and strict FP32 retain the existing pure-Mojo SIMT path.
+    the Mojo module owns every device-kernel body.  Unsupported layouts and
+    strict FP32 retain the existing pure-Mojo SIMT path.
     """
     # This gate is a numerics decision, not a capability one: TF32 drops
     # mantissa bits, and "highest" (PyTorch's default) is the user asking for
