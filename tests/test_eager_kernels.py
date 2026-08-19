@@ -1,5 +1,6 @@
 """Tests for the Mojo-extension fast path used by mojo eager mode."""
 
+import functools
 import math
 import weakref
 from pathlib import Path
@@ -866,6 +867,175 @@ def test_fast_batch_norm_training_refuses_autograd_in_the_forward(mojo_gpu):
         )
 
 
+# Every op here has a fast forward and no runnable native backward. Reaching
+# the backward node aborts the process (exit 134, "terminate called without an
+# active exception", no traceback), so each is refused from the forward
+# instead; the table pairs the call with the backward op its message must name.
+# One case per op, so a preflight that regresses names itself in the failing
+# node id -- and can be re-run alone, which matters here: a broken preflight
+# does not fail this test, it kills the pytest process.
+_UNARY_AUTOGRAD_PREFLIGHT_CASES = [
+    ("relu", (4, 8), torch.relu, "aten::threshold_backward"),
+    ("tanh", (4, 8), torch.tanh, "aten::tanh_backward"),
+    ("sigmoid", (4, 8), torch.sigmoid, "aten::sigmoid_backward"),
+    (
+        "softmax",
+        (4, 8),
+        functools.partial(torch.softmax, dim=-1),
+        "aten::_softmax_backward_data",
+    ),
+    (
+        "_softmax",
+        (4, 8),
+        functools.partial(torch.ops.aten._softmax, dim=-1, half_to_float=False),
+        "aten::_softmax_backward_data",
+    ),
+    ("cumsum", (4, 5), functools.partial(torch.cumsum, dim=-1), "aten::flip"),
+    (
+        "avg_pool2d",
+        (2, 3, 8, 8),
+        functools.partial(torch.nn.functional.avg_pool2d, kernel_size=2),
+        "aten::avg_pool2d_backward",
+    ),
+    (
+        "max_pool2d",
+        (2, 3, 8, 8),
+        functools.partial(torch.nn.functional.max_pool2d, kernel_size=2),
+        "aten::max_pool2d_with_indices_backward",
+    ),
+    (
+        "adaptive_avg_pool2d",
+        (2, 3, 8, 8),
+        functools.partial(torch.nn.functional.adaptive_avg_pool2d, output_size=(2, 2)),
+        "aten::_adaptive_avg_pool2d_backward",
+    ),
+    (
+        "upsample_bilinear2d",
+        (2, 3, 4, 4),
+        functools.partial(
+            torch.nn.functional.interpolate, scale_factor=2, mode="bilinear"
+        ),
+        "aten::upsample_bilinear2d_backward",
+    ),
+]
+
+
+def _preflight_input(
+    shape: tuple[int, ...], device: str, seed: int = 20260819
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The same values on the host and on the device, for an A/B comparison."""
+    host = torch.randn(*shape, generator=torch.Generator().manual_seed(seed))
+    return host, host.to(device)
+
+
+@pytest.mark.parametrize(
+    ("shape", "call", "backward_op"),
+    [case[1:] for case in _UNARY_AUTOGRAD_PREFLIGHT_CASES],
+    ids=[case[0] for case in _UNARY_AUTOGRAD_PREFLIGHT_CASES],
+)
+def test_autograd_preflight_refuses_unrunnable_backward_in_the_forward(
+    mojo_gpu, shape, call, backward_op
+):
+    """A grad-requiring call must raise here, not abort in the engine later."""
+    _, device_input = _preflight_input(shape, mojo_gpu)
+    device_input.requires_grad_()
+    with pytest.raises(NotImplementedError, match=backward_op):
+        call(device_input)
+
+
+@pytest.mark.parametrize(
+    ("shape", "call", "backward_op"),
+    [case[1:] for case in _UNARY_AUTOGRAD_PREFLIGHT_CASES],
+    ids=[case[0] for case in _UNARY_AUTOGRAD_PREFLIGHT_CASES],
+)
+def test_autograd_preflight_leaves_the_gradless_forward_working(
+    mojo_gpu, shape, call, backward_op
+):
+    """The preflight must not cost the forward: no grad wanted, no refusal.
+
+    Both halves matter -- a grad-free call, and a grad-requiring call under
+    `torch.no_grad()`, which is the workaround the refusal message advertises.
+    """
+    host_input, device_input = _preflight_input(shape, mojo_gpu)
+    expected = call(host_input)
+
+    torch.testing.assert_close(call(device_input).cpu(), expected, atol=1e-5, rtol=1e-5)
+    with torch.no_grad():
+        grad_wanted = device_input.detach().requires_grad_()
+        torch.testing.assert_close(
+            call(grad_wanted).cpu(), expected, atol=1e-5, rtol=1e-5
+        )
+
+
+def test_autograd_preflight_refuses_relu_inplace_in_the_forward(mojo_gpu):
+    """`nn.ReLU(inplace=True)` records the same node the functional form does.
+
+    The operand has to be a non-leaf: an in-place write to a leaf that requires
+    grad is rejected by PyTorch before this backend is consulted.
+    """
+    _, device_input = _preflight_input((4, 8), mojo_gpu)
+    device_input.requires_grad_()
+    with torch.no_grad():
+        torch.relu_(device_input.detach().clone())
+    non_leaf = device_input * 1.0
+    with pytest.raises(NotImplementedError, match="aten::threshold_backward"):
+        torch.relu_(non_leaf)
+
+
+def test_autograd_preflight_refuses_advanced_indexing_in_the_forward(mojo_gpu):
+    """`index.Tensor`'s backward scatters through `_index_put_impl_`."""
+    host_input, device_input = _preflight_input((4, 5), mojo_gpu)
+    index = torch.tensor([0, 2], device=mojo_gpu)
+    torch.testing.assert_close(device_input[index].cpu(), host_input[[0, 2]])
+    device_input.requires_grad_()
+    with pytest.raises(NotImplementedError, match="aten::_index_put_impl_"):
+        device_input[index]
+
+
+def test_autograd_preflight_refuses_scatter_src_only_for_the_src_gradient(mojo_gpu):
+    """Only `src`'s gradient needs `gather`; a self-only call still runs.
+
+    The `self` gradient is a scatter of zeros, which this backend can run, so
+    preflighting on "any operand requires grad" would refuse a working call.
+    """
+    host_input, device_input = _preflight_input((4, 5), mojo_gpu)
+    host_src, device_src = _preflight_input((4, 1), mojo_gpu, seed=7)
+    index = torch.zeros(4, 1, dtype=torch.long, device=mojo_gpu)
+
+    expected = host_input.scatter(1, torch.zeros(4, 1, dtype=torch.long), host_src)
+    torch.testing.assert_close(
+        device_input.scatter(1, index, device_src).cpu(), expected
+    )
+    # self-only: still allowed, and the node it records is runnable.
+    device_input.requires_grad_()
+    device_input.scatter(1, index, device_src).sum().backward()
+    assert device_input.grad is not None
+
+    with pytest.raises(NotImplementedError, match="aten::gather"):
+        device_input.detach().scatter(1, index, device_src.requires_grad_())
+
+
+def test_autograd_preflight_refuses_efficient_attention_in_the_forward(mojo_gpu):
+    """The low-level efficient-attention op, reached only by a direct call.
+
+    `F.scaled_dot_product_attention` goes through this backend's own Python
+    autograd Function, whose backward raises normally; this op is what a
+    caller reaching past that hits.
+    """
+    _, query = _preflight_input((1, 2, 4, 8), mojo_gpu)
+    with torch.no_grad():
+        torch.ops.aten._scaled_dot_product_efficient_attention(
+            query, query, query, None, False
+        )
+    query.requires_grad_()
+    with pytest.raises(
+        NotImplementedError, match="_scaled_dot_product_efficient_attention_backward"
+    ):
+        torch.ops.aten._scaled_dot_product_efficient_attention(
+            query, query, query, None, False
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("cols", [7, 789, 1024, 4096, 20000])
 def test_fast_layer_norm_row_widths(mojo_gpu, dtype, cols):
@@ -975,6 +1145,48 @@ def test_fast_group_norm_matches_torch(mojo_gpu, dtype, n, c, hxw, groups):
     )
     for got, want in zip(actual[1:], expected[1:], strict=True):
         torch.testing.assert_close(got.cpu(), want, atol=1e-3, rtol=1e-3)
+
+
+def test_fast_group_norm_refuses_autograd_in_the_forward(mojo_gpu):
+    """A grad-requiring group norm must fail at the FORWARD.
+
+    `aten::native_group_norm_backward` is not implemented here, and a raise
+    from inside the autograd engine aborts the process on this backend instead
+    of propagating, so the refusal cannot wait for NativeGroupNormBackward0.
+    Unlike batch norm there is no `training` flag to key on: every
+    grad-requiring call is refused, and only turning grad off gets the forward.
+    """
+    host_input, device_input = _preflight_input((2, 4, 6, 6), mojo_gpu)
+    host_weight, device_weight = _preflight_input((4,), mojo_gpu, seed=11)
+    host_bias, device_bias = _preflight_input((4,), mojo_gpu, seed=13)
+
+    expected = torch.nn.functional.group_norm(host_input, 2, host_weight, host_bias)
+    torch.testing.assert_close(
+        torch.nn.functional.group_norm(
+            device_input, 2, device_weight, device_bias
+        ).cpu(),
+        expected,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    # Any one of the three operands wanting a gradient is enough to refuse:
+    # the engine would come back for the same unrunnable node either way.
+    for which in range(3):
+        operands = [device_input.detach(), device_weight.detach(), device_bias.detach()]
+        operands[which] = operands[which].requires_grad_()
+        with pytest.raises(NotImplementedError, match="native_group_norm_backward"):
+            torch.nn.functional.group_norm(operands[0], 2, operands[1], operands[2])
+
+    with torch.no_grad():
+        torch.testing.assert_close(
+            torch.nn.functional.group_norm(
+                device_input.detach().requires_grad_(), 2, device_weight, device_bias
+            ).cpu(),
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 def test_fast_group_norm_without_affine(mojo_gpu):
@@ -9083,6 +9295,51 @@ def test_fast_conv2d_batched_falls_back_correctly(mojo_gpu):
     dev = torch.nn.functional.conv2d(x.to(mojo_gpu), w.to(mojo_gpu), padding=1).cpu()
     ref = torch.nn.functional.conv2d(x, w, padding=1)
     torch.testing.assert_close(dev, ref, atol=5e-2, rtol=5e-2)
+
+
+def test_fast_conv2d_refuses_autograd_in_the_forward(mojo_gpu):
+    """A grad-requiring conv must fail at the FORWARD.
+
+    `aten::convolution_backward` is not implemented here, and a raise from
+    inside the autograd engine aborts the process on this backend (exit 134,
+    no traceback) instead of propagating, so the refusal cannot wait for
+    ConvolutionBackward0. A conv weight normally requires grad, so this refuses
+    conv training outright -- the alternative was a dead process -- while
+    inference under `torch.no_grad()` is untouched.
+    """
+    host_input, device_input = _preflight_input((2, 3, 8, 8), mojo_gpu)
+    host_weight, device_weight = _preflight_input((4, 3, 3, 3), mojo_gpu, seed=11)
+    host_bias, device_bias = _preflight_input((4,), mojo_gpu, seed=13)
+
+    expected = torch.nn.functional.conv2d(host_input, host_weight, host_bias, padding=1)
+    torch.testing.assert_close(
+        torch.nn.functional.conv2d(
+            device_input, device_weight, device_bias, padding=1
+        ).cpu(),
+        expected,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+    # The weight-only case is the one every training model actually hits.
+    for which in range(3):
+        operands = [device_input.detach(), device_weight.detach(), device_bias.detach()]
+        operands[which] = operands[which].requires_grad_()
+        with pytest.raises(NotImplementedError, match="convolution_backward"):
+            torch.nn.functional.conv2d(operands[0], operands[1], operands[2], padding=1)
+
+    with torch.no_grad():
+        torch.testing.assert_close(
+            torch.nn.functional.conv2d(
+                device_input.detach().requires_grad_(),
+                device_weight,
+                device_bias,
+                padding=1,
+            ).cpu(),
+            expected,
+            atol=5e-2,
+            rtol=5e-2,
+        )
 
 
 @pytest.mark.parametrize("is_causal", [True, False])

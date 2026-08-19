@@ -9,11 +9,205 @@ forward, where it still has a traceback naming the op. Each function's
 docstring spells out its own case.
 """
 
+from collections.abc import Callable, Sequence
+
 import torch
 
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
-from .support import _fast, _unsupported
+from .support import _eager_impl, _fast, _refuse_unsupported_backward, _unsupported
+
+# Most of these ops have no autograd escape other than turning grad off: their
+# parameters legitimately require grad during training, so unlike batch norm
+# (whose `training=False` forward records a node nobody runs) there is no mode
+# that keeps training working. `.eval()` specifically does NOT help — it leaves
+# grad mode on and the parameters still require grad — and saying otherwise has
+# sent users chasing a workaround that cannot exist.
+_GRAD_OFF_ONLY = (
+    "The forward itself is supported: run it under torch.no_grad() or "
+    "torch.inference_mode(). Module .eval() alone does not help here, because "
+    "it leaves grad mode enabled and the parameters still require grad; "
+    "training through this op needs the backward kernel itself."
+)
+
+
+def _preflight_unsupported_backward(
+    op_name: str,
+    fast_name: str,
+    backward_op: str,
+    grad_operands: Sequence[int],
+    workaround: str = _GRAD_OFF_ONLY,
+) -> Callable[..., TorchMojoTensor | tuple[TorchMojoTensor, ...]]:
+    """`aten_fast.<fast_name>`, fronted by the forward-time autograd refusal.
+
+    One entry per op whose whole native backward is missing, which is the
+    common case and needs no reasoning beyond "which operands' gradients would
+    require it": `grad_operands` are positions in the ATen schema, so an op
+    whose backward only needs the missing kernel for one operand (scatter's
+    `src`, say) refuses only that. Ops needing more than a position list get a
+    hand-written function further down.
+    """
+    dispatch = _eager_impl(fast_name, op_name)
+
+    def preflighted(
+        *args: object, **kwargs: object
+    ) -> TorchMojoTensor | tuple[TorchMojoTensor, ...]:
+        operands = [
+            args[index]
+            for index in grad_operands
+            if index < len(args) and isinstance(args[index], torch.Tensor)
+        ]
+        if len(operands) < len(grad_operands):
+            # The PrivateUse1 boxed kernel passes every positional schema
+            # argument positionally, so this is unreachable today. If some call
+            # shape ever moves one into kwargs, checking every keyword tensor
+            # over-refuses at worst; skipping the check aborts the process.
+            operands += [
+                value for value in kwargs.values() if isinstance(value, torch.Tensor)
+            ]
+        _refuse_unsupported_backward(op_name, backward_op, tuple(operands), workaround)
+        return dispatch(*args, **kwargs)
+
+    preflighted.__name__ = "mojo_device_" + op_name.removeprefix("aten::").replace(
+        ".", "_"
+    )
+    preflighted.__qualname__ = preflighted.__name__
+    return preflighted
+
+
+# ---------------------------------------------------------------------------
+# Ops whose entire native backward is unsupported: one table entry each.
+# Alphabetical by aten name. `backward_op` names what the engine would actually
+# have failed on, which for a few of these is an ordinary forward op the
+# generated backward composes (cumsum needs `flip`, scatter needs `gather`,
+# advanced indexing needs `_index_put_impl_`) rather than a `*_backward` op.
+# ---------------------------------------------------------------------------
+
+mojo_device__adaptive_avg_pool2d = _preflight_unsupported_backward(
+    "aten::_adaptive_avg_pool2d",
+    "fast_aten__adaptive_avg_pool2d",
+    "aten::_adaptive_avg_pool2d_backward",
+    grad_operands=(0,),
+)
+
+mojo_device__scaled_dot_product_efficient_attention = _preflight_unsupported_backward(
+    "aten::_scaled_dot_product_efficient_attention",
+    "fast_aten__scaled_dot_product_efficient_attention",
+    "aten::_scaled_dot_product_efficient_attention_backward",
+    grad_operands=(0, 1, 2, 3),
+)
+
+mojo_device__softmax = _preflight_unsupported_backward(
+    "aten::_softmax",
+    "fast_aten__softmax",
+    "aten::_softmax_backward_data",
+    grad_operands=(0,),
+)
+
+mojo_device_avg_pool2d = _preflight_unsupported_backward(
+    "aten::avg_pool2d",
+    "fast_aten_avg_pool2d",
+    "aten::avg_pool2d_backward",
+    grad_operands=(0,),
+)
+
+mojo_device_cumsum = _preflight_unsupported_backward(
+    "aten::cumsum", "fast_aten_cumsum", "aten::flip", grad_operands=(0,)
+)
+
+mojo_device_index = _preflight_unsupported_backward(
+    "aten::index.Tensor",
+    "fast_aten_index",
+    "aten::_index_put_impl_",
+    grad_operands=(0,),
+)
+
+mojo_device_max_pool2d_with_indices = _preflight_unsupported_backward(
+    "aten::max_pool2d_with_indices",
+    "fast_aten_max_pool2d_with_indices",
+    "aten::max_pool2d_with_indices_backward",
+    grad_operands=(0,),
+)
+
+mojo_device_relu = _preflight_unsupported_backward(
+    "aten::relu", "fast_aten_relu", "aten::threshold_backward", grad_operands=(0,)
+)
+
+# Only the `src` gradient goes through `gather`; the `self` gradient is a
+# scatter of zeros, which runs, so a self-only call must not be refused.
+mojo_device_scatter_src = _preflight_unsupported_backward(
+    "aten::scatter.src", "fast_aten_scatter_src", "aten::gather", grad_operands=(3,)
+)
+
+mojo_device_sigmoid = _preflight_unsupported_backward(
+    "aten::sigmoid", "fast_aten_sigmoid", "aten::sigmoid_backward", grad_operands=(0,)
+)
+
+mojo_device_tanh = _preflight_unsupported_backward(
+    "aten::tanh", "fast_aten_tanh", "aten::tanh_backward", grad_operands=(0,)
+)
+
+mojo_device_upsample_bilinear2d = _preflight_unsupported_backward(
+    "aten::upsample_bilinear2d",
+    "fast_aten_upsample_bilinear2d",
+    "aten::upsample_bilinear2d_backward",
+    grad_operands=(0,),
+)
+
+
+# ---------------------------------------------------------------------------
+# Ops whose preflight needs op-specific reasoning. Alphabetical.
+# ---------------------------------------------------------------------------
+
+
+def mojo_device_convolution(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+) -> TorchMojoTensor:
+    """Convolution with a forward-time preflight of its native autograd node.
+
+    The forward exists here; `aten::convolution_backward` does not (it needs
+    the im2col-transpose GEMM pair). Recording ConvolutionBackward0 anyway
+    would move the failure into the autograd engine, where an exception aborts
+    the process instead of raising — the unwind hazard
+    `_refuse_unsupported_backward` documents — so a call whose gradient the
+    engine would come back for is refused here, from the forward, with a
+    traceback that names the op.
+
+    Unlike batch norm this has no training-mode escape: a conv weight normally
+    requires grad, so in practice this refuses every conv in a training model,
+    and the honest message is that the backward kernel is missing rather than
+    that some flag is set wrong. Inference is unaffected under
+    `torch.no_grad()` / `torch.inference_mode()`.
+    """
+    _refuse_unsupported_backward(
+        "aten::convolution",
+        "aten::convolution_backward",
+        (input, weight, bias),
+        _GRAD_OFF_ONLY,
+    )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_convolution(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    )
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported("aten::convolution", (input, weight, bias))
+    return result
 
 
 def mojo_device_embedding(
@@ -217,4 +411,77 @@ def mojo_device_native_batch_norm(
         raise _unsupported(
             "aten::native_batch_norm", (input, weight, bias, running_mean, running_var)
         )
+    return result
+
+
+def mojo_device_native_group_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor]:
+    """Group norm with a forward-time preflight of its native autograd node.
+
+    The forward exists here; `aten::native_group_norm_backward` does not (it
+    needs the per-group reduction statistics). Recording
+    NativeGroupNormBackward0 anyway would move the failure into the autograd
+    engine, where an exception aborts the process instead of raising, so the
+    call is refused from the forward as `mojo_device_native_batch_norm` above
+    refuses its training case.
+
+    Group norm has no `training` flag to key on, so unlike batch norm every
+    grad-requiring call is refused; inference is unaffected under
+    `torch.no_grad()` / `torch.inference_mode()`.
+    """
+    _refuse_unsupported_backward(
+        "aten::native_group_norm",
+        "aten::native_group_norm_backward",
+        (input, weight, bias),
+        _GRAD_OFF_ONLY,
+    )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_native_group_norm(
+        input, weight, bias, N, C, HxW, group, eps
+    )
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported("aten::native_group_norm", (input, weight, bias))
+    return result
+
+
+def mojo_device_softmax(
+    self: torch.Tensor, dim: int, dtype: torch.dtype | None = None
+) -> TorchMojoTensor:
+    """`aten::softmax.int`, refused when a gradient would silently go missing.
+
+    This one fails differently from its neighbours, and worse. `softmax.int` is
+    CompositeImplicitAutograd upstream, so registering a PrivateUse1 kernel for
+    it (worth it: the kernel is a fused softmax) takes it out of reach of the
+    decomposition autograd would otherwise differentiate. Autograd then falls
+    back to `autograd_not_implemented_fallback`, which does not abort and does
+    not raise — it warns and produces **no gradient at all**, leaving
+    `x.grad is None` after `backward()` and training silently stuck.
+
+    `aten::_softmax_backward_data` has no kernel here either, so there is no
+    gradient to be had by any route; refusing beats returning a model that
+    trains on zeros. Raised from the forward, same as the aborting ops around
+    it, so the traceback names the op.
+    """
+    if torch.is_grad_enabled() and self.requires_grad:
+        raise NotImplementedError(
+            "aten::softmax.int has no gradient in mojo eager mode, and unlike "
+            "the ops around it would not have failed: autograd cannot see "
+            "through the fused kernel registered for this op, so backward() "
+            "would leave .grad as None and train on nothing "
+            f"(input {tuple(self.shape)} {self.dtype} on {self.device}). "
+            "aten::_softmax_backward_data has no kernel here either, so no "
+            "route produces one. " + _GRAD_OFF_ONLY
+        )
+    aten_fast = _fast()
+    result = aten_fast.fast_aten_softmax(self, dim, dtype)
+    if result is aten_fast.NOT_HANDLED:
+        raise _unsupported("aten::softmax.int", (self,))
     return result

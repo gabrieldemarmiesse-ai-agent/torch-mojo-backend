@@ -2,7 +2,12 @@
 
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
-from .support import _copy_into_tensor, _fast, _unsupported
+from .support import (
+    _copy_into_tensor,
+    _fast,
+    _refuse_unsupported_backward,
+    _unsupported,
+)
 
 
 def mojo_device_add_(
@@ -41,6 +46,18 @@ def mojo_device_mul_(self: TorchMojoTensor, other) -> TorchMojoTensor:
 
 
 def mojo_device_relu_(self: TorchMojoTensor) -> TorchMojoTensor:
+    # `nn.ReLU(inplace=True)` records the same ReluBackward0 as the functional
+    # form, and `aten::threshold_backward` has no kernel here, so the refusal
+    # has to happen in the forward for the reason
+    # `_refuse_unsupported_backward` documents. A leaf would already have been
+    # rejected by ADInplaceOrView; a non-leaf reaches this.
+    _refuse_unsupported_backward(
+        "aten::relu_",
+        "aten::threshold_backward",
+        (self,),
+        "The forward itself is supported: run it under torch.no_grad() or "
+        "torch.inference_mode().",
+    )
     aten_fast = _fast()
     result = aten_fast.fast_aten_relu(self)
     if result is aten_fast.NOT_HANDLED:

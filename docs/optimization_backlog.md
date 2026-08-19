@@ -580,7 +580,9 @@ forward now exists)**
   `mojo_device_native_batch_norm` refuses a training call whose inputs require
   grad IN THE FORWARD — a raise from inside the autograd engine aborts the
   process on this backend rather than raising. GroupNorm likewise has a fused
-  forward and no backward.
+  forward and no backward, and `mojo_device_native_group_norm` now refuses a
+  grad-requiring call in the forward for the same reason — with no `training`
+  flag to key on, that means every such call.
 * **Why it is not optimal.** ResNet / VGG / DenseNet *training* on the mojo
   device is still blocked — now by the missing backward rather than the
   missing forward; the `demo_scripts/` vision examples are inference-only for
@@ -936,7 +938,11 @@ temporary** — **DONE** (`NormSpec`)
   and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
   registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
 * **Current implementation.** conv1d (rank-3 input), conv3d and transposed
-  convolutions all return `NOT_HANDLED` → raise. There is no eager conv backward.
+  convolutions all return `NOT_HANDLED` → raise. There is no eager conv
+  backward, so `mojo_device_convolution` refuses any conv whose operands
+  require grad in the FORWARD (see [N2](#n2) for why it cannot wait for the
+  backward node). A conv weight normally requires grad, so that is every conv
+  in a training model; inference under `torch.no_grad()` is unaffected.
 * **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
   `(N, C, 1, L)` with a `(1, kw)` kernel. The missing backward blocks all vision
   training together with [N2](#n2) and [C4](#c4).
@@ -957,7 +963,10 @@ temporary** — **DONE** (`NormSpec`)
   `aten::avg_pool2d_backward` are unregistered;
   `aten::_adaptive_avg_pool2d_backward` is explicitly `_register_missing`
   (`mojo_device_aten_ops.py`).
-* **Current implementation.** Forward-only, floor-mode-only, rank-4-only.
+* **Current implementation.** Forward-only, floor-mode-only, rank-4-only. All
+  three pooling forwards refuse a grad-requiring call in the FORWARD (see
+  [N2](#n2)); `_register_missing` on the backward was not enough, because that
+  raise still happens inside the autograd node and aborts the process.
 * **Why it is not optimal.** `ceil_mode=True` appears in common torchvision
   configurations; the missing backwards are the third blocker for vision
   training.

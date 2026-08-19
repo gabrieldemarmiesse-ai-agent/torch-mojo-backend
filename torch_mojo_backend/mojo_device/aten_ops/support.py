@@ -64,6 +64,43 @@ def _unsupported(op_name: str, args=(), kwargs=None) -> NotImplementedError:
     )
 
 
+def _refuse_unsupported_backward(
+    op_name: str,
+    backward_op: str,
+    operands: tuple[torch.Tensor | None, ...],
+    workaround: str,
+) -> None:
+    """Refuse, from the forward, a call whose autograd node we cannot run.
+
+    An exception raised while the autograd engine runs a *native* backward node
+    does not propagate on this backend. The engine restores streams through
+    PyTorch's noexcept Python device guard, and that Python round-trip failing
+    during unwind reaches std::terminate: "terminate called without an active
+    exception", exit 134, no traceback and no Python exception at all. So an op
+    whose native backward is missing has to refuse before the node is recorded,
+    which means here, in ordinary forward-pass Python code.
+
+    `requires_grad` on any listed operand is the widest mask the engine could
+    ask the node for; callers pass only the operands whose gradient actually
+    needs the missing op.
+    """
+    if not torch.is_grad_enabled():
+        return
+    needs_grad = [
+        operand for operand in operands if operand is not None and operand.requires_grad
+    ]
+    if not needs_grad:
+        return
+    first = needs_grad[0]
+    raise NotImplementedError(
+        f"{op_name} would record an autograd node whose backward needs "
+        f"{backward_op}, which mojo eager mode does not implement (operand "
+        f"{tuple(first.shape)} {first.dtype} on {first.device}). {workaround} "
+        "Raised from the forward on purpose: raised from the backward node "
+        "instead, this aborts the process without a traceback."
+    )
+
+
 def _eager_impl(fast_name: str, op_name: str) -> Callable:
     """Bind an op to its aten_fast implementation; raise on NOT_HANDLED."""
     fast_fn: Callable | None = None
