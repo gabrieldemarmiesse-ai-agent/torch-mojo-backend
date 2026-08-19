@@ -221,6 +221,79 @@ def test_fast_floor_divide_narrow_float_boundary(mojo_device, dtype):
     torch.testing.assert_close(result, torch.floor_divide(x, y))
 
 
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int32, torch.int64, torch.uint8]
+)
+def test_fast_div_rounding_mode_signs(mojo_device, dtype, rounding_mode):
+    """aten::div.Tensor_mode / div.out_mode: every sign combination of a
+    non-exact division, for both float and integer dtypes. floor and trunc
+    only diverge when the operands have opposite signs and the true
+    quotient is inexact -- unsigned has no such case, included as the
+    "always agree" control."""
+    if dtype == torch.uint8:
+        x = torch.tensor([7, 1, 200, 5], dtype=dtype)
+        y = torch.tensor([2, 3, 7, 5], dtype=dtype)
+    else:
+        x = torch.tensor([7, -7, 7, -7, 8, -8, 6, -6], dtype=dtype)
+        y = torch.tensor([2, 2, -2, -2, 3, 3, -3, -3], dtype=dtype)
+    dev = torch.div(
+        x.to(mojo_device), y.to(mojo_device), rounding_mode=rounding_mode
+    ).cpu()
+    ref = torch.div(x, y, rounding_mode=rounding_mode)
+    torch.testing.assert_close(dev, ref)
+
+
+def test_fast_div_rounding_mode_floor_trunc_disagree(mojo_device):
+    """Pin the actual semantic difference between the two modes: a naive
+    implementation that aliases trunc to floor (or vice versa) would still
+    pass a same-sign-only test suite."""
+    x = torch.tensor([-7, 7], dtype=torch.int64).to(mojo_device)
+    y = torch.tensor([2, -2], dtype=torch.int64).to(mojo_device)
+    floor_dev = torch.div(x, y, rounding_mode="floor").cpu()
+    trunc_dev = torch.div(x, y, rounding_mode="trunc").cpu()
+    assert not torch.equal(floor_dev, trunc_dev)
+    torch.testing.assert_close(floor_dev, torch.tensor([-4, -4], dtype=torch.int64))
+    torch.testing.assert_close(trunc_dev, torch.tensor([-3, -3], dtype=torch.int64))
+
+
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+def test_fast_div_rounding_mode_scalar(mojo_device, rounding_mode):
+    """aten::div.Scalar_mode, routed through the same Tensor_mode kernel: a
+    negative Python-scalar divisor against mixed-sign int operands."""
+    x = torch.tensor([7, -7, 8, -8, 9, -9], dtype=torch.int32)
+    dev = torch.div(x.to(mojo_device), -2, rounding_mode=rounding_mode).cpu()
+    ref = torch.div(x, -2, rounding_mode=rounding_mode)
+    torch.testing.assert_close(dev, ref)
+
+
+def test_fast_div_rounding_mode_out(mojo_device):
+    """aten::div.out_mode."""
+    x = torch.tensor([7, -7, 8, -8], dtype=torch.int32).to(mojo_device)
+    y = torch.tensor([2, 2, -3, -3], dtype=torch.int32).to(mojo_device)
+    out = torch.empty_like(x)
+    torch.div(x, y, rounding_mode="trunc", out=out)
+    ref = torch.div(x.cpu(), y.cpu(), rounding_mode="trunc")
+    torch.testing.assert_close(out.cpu(), ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fast_div_trunc_mode_narrow_float_boundary(mojo_device, dtype):
+    """Same operands as test_fast_floor_divide_narrow_float_boundary's
+    boundary regression, but pinning the OPPOSITE fix for trunc mode:
+    unlike floor_divide, torch's own tensor-tensor trunc kernel does not
+    upcast bf16/fp16 to fp32 (see BOP_TRUNCDIV's comment in logic_ops.mojo),
+    so a quotient of ~5.985 rounding to 6.0 in bf16 *before* truncation,
+    giving 6 rather than the mathematically exact 5, is torch's actual
+    output here and must be reproduced exactly, not "corrected"."""
+    x = torch.tensor([-6.3125, 91.0, 2.3125, -5.2812, 357.0], dtype=dtype)
+    y = torch.tensor([-1.0546875, 3.375, 8.5, 1.0547, 6.789], dtype=dtype)
+    result = torch.div(
+        x.to(mojo_device), y.to(mojo_device), rounding_mode="trunc"
+    ).cpu()
+    torch.testing.assert_close(result, torch.div(x, y, rounding_mode="trunc"))
+
+
 @pytest.mark.parametrize("shape", [(0,), (1,), (7,), (0, 5)])
 def test_edge_case_shapes(mojo_device, shape):
     x = torch.randn(*shape)

@@ -2667,9 +2667,23 @@ def fast_aten_mul_(input, other):
     return input
 
 
+# div.Tensor_mode/div.Scalar_mode's `rounding_mode` kwarg: "floor" keeps
+# torch.floor_divide's own semantics (division then floor, divisor's sign
+# convention) and "trunc" divides then truncates the quotient toward zero
+# (C-style integer division). Both keep the operands' own (promoted) dtype
+# -- unlike plain (`rounding_mode=None`) division below, which always
+# promotes to float -- so both route to the same broadcast-strided kernel
+# family FloorDivSpec/TruncDivSpec, shared with `aten::floor_divide`.
+_DIV_ROUNDING_MODE_SPECS = {"floor": "FloorDivSpec", "trunc": "TruncDivSpec"}
+
+
 def fast_aten_div(input, other, *, rounding_mode=None):
     if rounding_mode is not None:
-        return NOT_HANDLED
+        spec_name = _DIV_ROUNDING_MODE_SPECS.get(rounding_mode)
+        if spec_name is None:
+            return NOT_HANDLED
+        result = _try_spec_binary(spec_name, input, other)
+        return result if result is not None else NOT_HANDLED
     a = _t(input)
     if a is not None and a._dtype in _FLOAT_DTYPES:
         result = _try_spec_binary("DivSpec", input, other)
