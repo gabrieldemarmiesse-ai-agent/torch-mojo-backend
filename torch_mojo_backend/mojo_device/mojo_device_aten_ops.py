@@ -21,9 +21,24 @@ import torch_mojo_backend.is_running_tests
 
 from .aten_ops import foreach
 from .aten_ops.autograd_preflight import (
+    mojo_device__adaptive_avg_pool2d,
+    mojo_device__scaled_dot_product_efficient_attention,
+    mojo_device__softmax,
+    mojo_device_avg_pool2d,
+    mojo_device_convolution,
+    mojo_device_cumsum,
     mojo_device_embedding,
+    mojo_device_index,
     mojo_device_linear,
+    mojo_device_max_pool2d_with_indices,
     mojo_device_native_batch_norm,
+    mojo_device_native_group_norm,
+    mojo_device_relu,
+    mojo_device_scatter_src,
+    mojo_device_sigmoid,
+    mojo_device_softmax,
+    mojo_device_tanh,
+    mojo_device_upsample_bilinear2d,
 )
 from .aten_ops.blas import mojo_device_addr
 from .aten_ops.factories import (
@@ -135,7 +150,7 @@ def _register_missing(op_name: str) -> None:
 #   register_aten_op(...)(fn)   -> a hand-written impl from aten_ops/
 # ----------------------------------------------------------------------------------
 
-_register_fast("aten::_adaptive_avg_pool2d", "fast_aten__adaptive_avg_pool2d")
+register_aten_op("aten::_adaptive_avg_pool2d")(mojo_device__adaptive_avg_pool2d)
 _register_missing("aten::_adaptive_avg_pool2d_backward")
 register_aten_op("aten::_copy_from")(mojo_device__copy_from)
 _register_foreach_inplace(
@@ -174,9 +189,8 @@ _register_fast(
     "aten::_scaled_dot_product_attention_math",
     "fast_aten__scaled_dot_product_attention_math",
 )
-_register_fast(
-    "aten::_scaled_dot_product_efficient_attention",
-    "fast_aten__scaled_dot_product_efficient_attention",
+register_aten_op("aten::_scaled_dot_product_efficient_attention")(
+    mojo_device__scaled_dot_product_efficient_attention
 )
 _register_fast(
     "aten::_scaled_dot_product_flash_attention",
@@ -186,7 +200,7 @@ _register_fast(
     "aten::_scaled_dot_product_flash_attention_backward",
     "fast_aten__scaled_dot_product_flash_attention_backward",
 )
-_register_fast("aten::_softmax", "fast_aten__softmax")
+register_aten_op("aten::_softmax")(mojo_device__softmax)
 register_aten_op("aten::_to_copy")(mojo_device__to_copy)
 _register_fast("aten::_unsafe_view", "fast_aten__unsafe_view")
 _register_fast("aten::abs", "fast_aten_abs")
@@ -215,7 +229,7 @@ _register_fast("aten::argmax", "fast_aten_argmax")
 _register_fast("aten::argmin", "fast_aten_argmin")
 _register_fast("aten::asinh", "fast_aten_asinh")
 _register_fast("aten::atanh", "fast_aten_atanh")
-_register_fast("aten::avg_pool2d", "fast_aten_avg_pool2d")
+register_aten_op("aten::avg_pool2d")(mojo_device_avg_pool2d)
 _register_fast("aten::bitwise_and.Scalar", "fast_aten_bitwise_and")
 _register_fast("aten::bitwise_and.Tensor", "fast_aten_bitwise_and")
 _register_fast("aten::bitwise_not", "fast_aten_bitwise_not")
@@ -228,10 +242,10 @@ _register_fast("aten::cat", "fast_aten_cat")
 _register_fast("aten::ceil", "fast_aten_ceil")
 _register_fast("aten::clamp", "fast_aten_clamp")
 _register_fast("aten::clone", "fast_aten_clone")
-_register_fast("aten::convolution", "fast_aten_convolution")
+register_aten_op("aten::convolution")(mojo_device_convolution)
 _register_fast("aten::cos", "fast_aten_cos")
 _register_fast("aten::cosh", "fast_aten_cosh")
-_register_fast("aten::cumsum", "fast_aten_cumsum")
+register_aten_op("aten::cumsum")(mojo_device_cumsum)
 _register_fast("aten::detach", "fast_aten_detach")
 _register_out("aten::div.out", "fast_aten_div")
 _register_fast("aten::div.Tensor", "fast_aten_div")
@@ -264,7 +278,7 @@ _register_fast("aten::gelu_backward", "fast_aten_gelu_backward")
 _register_fast("aten::gt", "fast_aten_gt")
 _register_fast("aten::gt.Scalar", "fast_aten_gt")
 _register_fast("aten::gt.Tensor", "fast_aten_gt")
-_register_fast("aten::index.Tensor", "fast_aten_index")
+register_aten_op("aten::index.Tensor")(mojo_device_index)
 _register_fast("aten::isin.Tensor_Tensor", "fast_aten_isin")
 _register_out("aten::isin.Tensor_Tensor_out", "fast_aten_isin", dtype_policy="exact")
 _register_fast("aten::isnan", "fast_aten_isnan")
@@ -291,7 +305,7 @@ register_aten_op("aten::masked_fill_.Tensor")(mojo_device_masked_fill_)
 _register_fast("aten::masked_fill.Scalar", "fast_aten_masked_fill")
 _register_fast("aten::masked_fill.Tensor", "fast_aten_masked_fill")
 _register_fast("aten::max", "fast_aten_max")
-_register_fast("aten::max_pool2d_with_indices", "fast_aten_max_pool2d_with_indices")
+register_aten_op("aten::max_pool2d_with_indices")(mojo_device_max_pool2d_with_indices)
 _register_fast("aten::maximum", "fast_aten_maximum")
 _register_fast("aten::mean", "fast_aten_mean")
 # Registering the base name only covers the default overload; mean.dim would
@@ -309,7 +323,7 @@ _register_fast("aten::mul.Tensor", "fast_aten_mul")
 register_aten_op("aten::native_batch_norm")(mojo_device_native_batch_norm)
 _register_fast("aten::native_dropout", "fast_aten_native_dropout")
 _register_fast("aten::native_dropout_backward", "fast_aten_native_dropout_backward")
-_register_fast("aten::native_group_norm", "fast_aten_native_group_norm")
+register_aten_op("aten::native_group_norm")(mojo_device_native_group_norm)
 _register_fast("aten::native_layer_norm", "fast_aten_native_layer_norm")
 _register_fast(
     "aten::native_layer_norm_backward", "fast_aten_native_layer_norm_backward"
@@ -334,7 +348,7 @@ _register_fast("aten::permute", "fast_aten_permute")
 _register_fast("aten::pow.Tensor_Scalar", "fast_aten_pow")
 _register_fast("aten::pow.Tensor_Tensor", "fast_aten_pow_tensor_tensor")
 _register_fast("aten::reciprocal", "fast_aten_reciprocal")
-_register_fast("aten::relu", "fast_aten_relu")
+register_aten_op("aten::relu")(mojo_device_relu)
 register_aten_op("aten::relu_")(mojo_device_relu_)
 _register_fast("aten::remainder.Scalar", "fast_aten_remainder")
 _register_fast("aten::remainder.Scalar_Tensor", "fast_aten_remainder")
@@ -345,17 +359,17 @@ register_aten_op("aten::scalar_tensor")(mojo_device_scalar_tensor)
 _register_fast(
     "aten::scaled_dot_product_attention", "fast_aten_scaled_dot_product_attention"
 )
-_register_fast("aten::scatter.src", "fast_aten_scatter_src")
+register_aten_op("aten::scatter.src")(mojo_device_scatter_src)
 _register_fast("aten::scatter.value", "fast_aten_scatter_value")
 _register_fast("aten::select_scatter", "fast_aten_select_scatter")
 _register_fast("aten::select.int", "fast_aten_select")
-_register_fast("aten::sigmoid", "fast_aten_sigmoid")
+register_aten_op("aten::sigmoid")(mojo_device_sigmoid)
 _register_fast("aten::sign", "fast_aten_sign")
 _register_fast("aten::silu", "fast_aten_silu")
 _register_fast("aten::sin", "fast_aten_sin")
 _register_fast("aten::sinh", "fast_aten_sinh")
 _register_fast("aten::slice.Tensor", "fast_aten_slice")
-_register_fast("aten::softmax.int", "fast_aten_softmax")
+register_aten_op("aten::softmax.int")(mojo_device_softmax)
 _register_fast("aten::split_with_sizes", "fast_aten_split_with_sizes")
 _register_fast("aten::split.Tensor", "fast_aten_split")
 _register_fast("aten::sqrt", "fast_aten_sqrt")
@@ -366,14 +380,14 @@ _register_fast("aten::sub.Tensor", "fast_aten_sub")
 _register_fast("aten::sum.dim_IntList", "fast_aten_sum")
 _register_fast("aten::t", "fast_aten_t")
 _register_fast("aten::tan", "fast_aten_tan")
-_register_fast("aten::tanh", "fast_aten_tanh")
+register_aten_op("aten::tanh")(mojo_device_tanh)
 _register_fast("aten::transpose.int", "fast_aten_transpose")
 _register_fast("aten::tril", "fast_aten_tril")
 _register_fast("aten::triu", "fast_aten_triu")
 _register_fast("aten::unbind.int", "fast_aten_unbind")
 _register_fast("aten::uniform_", "fast_aten_uniform_")
 _register_fast("aten::unsqueeze", "fast_aten_unsqueeze")
-_register_fast("aten::upsample_bilinear2d", "fast_aten_upsample_bilinear2d")
+register_aten_op("aten::upsample_bilinear2d")(mojo_device_upsample_bilinear2d)
 _register_fast("aten::var.correction", "fast_aten_var")
 _register_fast("aten::view", "fast_aten_view")
 _register_fast("aten::where.self", "fast_aten_where")
