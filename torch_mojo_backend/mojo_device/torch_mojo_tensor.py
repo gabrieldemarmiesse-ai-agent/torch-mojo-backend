@@ -60,6 +60,59 @@ _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 _WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
 
 
+class _HolderOwner:
+    """Shared owner of one device allocation, fencing its stream-ordered free.
+
+    MAX frees a buffer stream-ordered on its OWNING stream only; a reader on
+    another stream races the pool's reuse of the block (measured — see
+    channels.record_use). Cross-stream users record an event per foreign
+    stream here; the destructor enqueues waits for those events on the
+    owning stream BEFORE the holder's release enqueues behind them, so the
+    free is ordered after every foreign reader with no host sync. Tensors
+    and views share one owner per allocation (_make wraps exactly once).
+    The single-stream hot path pays only the None check in __del__.
+    """
+
+    __slots__ = ("_holder", "_events", "_owner_stream")
+
+    def __init__(self, holder: object) -> None:
+        self._holder = holder
+        self._events = None  # {foreign stream handle: newest CudaEvent}
+        self._owner_stream = 0
+
+    def data_ptr(self) -> int:
+        return self._holder.data_ptr()
+
+    def get_nbytes(self) -> int:
+        return self._holder.get_nbytes()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(object.__getattribute__(self, "_holder"), name)
+
+    def record_foreign_use(
+        self, stream_handle: int, event: object, owner_stream_handle: int
+    ) -> None:
+        if self._events is None:
+            self._events = {}
+        self._owner_stream = owner_stream_handle
+        superseded = self._events.get(stream_handle)
+        self._events[stream_handle] = event
+        if superseded is not None:
+            # A later event on the same stream dominates the earlier one.
+            superseded.destroy()
+
+    def __del__(self) -> None:
+        events = self._events
+        if not events:
+            return
+        try:
+            for event in events.values():
+                event.enqueue_wait(self._owner_stream)
+                event.destroy()
+        except Exception:
+            pass  # interpreter teardown: the driver context is going away too
+
+
 def _ctx_ptr(device):
     # Rebinds this module-level name to the real (cached) implementation on
     # first use, so the lazy import costs one call, not one per call.
@@ -349,6 +402,8 @@ class TorchMojoTensor(torch.Tensor):
     def _make(
         cls, holder, ptr, shape, strides, offset, dtype, device, contiguous=None
     ) -> "TorchMojoTensor":
+        if not isinstance(holder, _HolderOwner):
+            holder = _HolderOwner(holder)
         shape = tuple(shape)
         strides = tuple(strides)
         res = torch.Tensor._make_wrapper_subclass(

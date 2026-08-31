@@ -103,3 +103,54 @@ def test_event_semantics(mojo_gpu: str):
     untimed.record(stream)
     with pytest.raises(RuntimeError):
         untimed.elapsed_time(end)
+
+
+def test_record_use_fences_free_against_channel_reader(mojo_gpu: str):
+    """MAX frees a buffer stream-ordered on the owning stream only, so a
+    channel reader races the pool's reuse unless the allocation is recorded
+    with channels.record_use before its last reference drops. This asserts
+    the fenced path: reuse still happens, corruption never does."""
+    import ctypes
+
+    from torch_mojo_backend.mojo_device import deferred_compile
+    from torch_mojo_backend.mojo_device.channels import get_channel, record_use
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+        find_equivalent_max_device,
+    )
+
+    device = find_equivalent_max_device(torch.device("mojo", 0))
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuMemcpyDtoDAsync_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    channel = get_channel(device, "lifetime-test")
+    default_handle = device.default_stream.native_stream_handle
+    n = 8 * 1024 * 1024
+    copies = 4
+
+    reused_any = False
+    for _ in range(10):
+        source = torch.full((n,), 1.0, device=mojo_gpu)
+        sink = torch.empty((copies * n,), device=mojo_gpu)
+        deferred_compile.drain()
+        channel.wait_default_stream()
+        source_ptr = source._ptr
+        for k in range(copies):
+            rc = lib.cuMemcpyDtoDAsync_v2(
+                sink._ptr + k * n * 4, source_ptr, n * 4, channel.handle
+            )
+            assert rc == 0
+        record_use(source._holder, channel, default_handle)
+        del source  # free is now fenced behind the channel's copies
+        overwriter = torch.full((n,), 2.0, device=mojo_gpu)
+        deferred_compile.drain()
+        reused_any = reused_any or overwriter._ptr == source_ptr
+        channel.synchronize()
+        torch.mojo.synchronize()
+        assert int((sink.cpu() != 1.0).sum().item()) == 0
+        del overwriter, sink
+    # If the pool never reused the block the test proved nothing — flag it.
+    assert reused_any, "allocator never reused the freed block; test inconclusive"

@@ -129,6 +129,13 @@ class CudaEvent:
     def synchronize(self) -> None:
         _check("cuEventSynchronize", _driver().cuEventSynchronize(self._handle))
 
+    def enqueue_wait(self, stream_handle: int) -> None:
+        """Order subsequent work on `stream_handle` after this event."""
+        _check(
+            "cuStreamWaitEvent",
+            _driver().cuStreamWaitEvent(stream_handle, self._handle, 0),
+        )
+
     def destroy(self) -> None:
         if self._handle is not None:
             # The driver defers the actual release until captured work
@@ -239,3 +246,19 @@ def get_channel(device: max.driver.Device, name: str) -> Channel:
 def default_channel(device: max.driver.Device) -> Channel:
     """The channel view of the device's default stream."""
     return get_channel(device, "default")
+
+
+def record_use(holder: object, channel: Channel, owner_stream_handle: int) -> None:
+    """Order `holder`'s eventual free after channel work enqueued so far.
+
+    The record_stream analog for this backend. MAX frees a buffer
+    stream-ordered on its OWNING stream only — a reader on another stream
+    races the pool's reuse (measured 40/40: see the free-race stress test) —
+    so any tensor a channel reads or writes must be recorded here before its
+    last reference may drop. The holder's destructor then enqueues waits for
+    the recorded events on the owning stream ahead of the release, ordering
+    the free after every foreign reader with no host synchronization.
+    """
+    holder.record_foreign_use(
+        channel.handle, channel.record_event(), owner_stream_handle
+    )

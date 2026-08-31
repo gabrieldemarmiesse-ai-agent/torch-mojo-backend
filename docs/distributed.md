@@ -70,8 +70,11 @@ before anything touches CUDA or enumerates MAX devices.
   watcher thread once the collective's end event fires on the device. DDP
   keeps enqueuing backward compute while bucket allreduces fly; the
   end-of-backward `future.wait()` blocks only for the un-overlappable tail.
-  References to every tensor a collective touches are held until its end
-  event fires, which keeps MAX's default-stream-ordered frees safe.
+  Every tensor a collective touches is fenced with `channels.record_use`
+  (the backend's `record_stream` analog): its eventual stream-ordered free
+  is ordered after the collective on the device, because MAX does not fence
+  frees across streams by itself (measured; see the memory note in
+  `mojo_device/channels.py`).
   `TORCH_MOJO_BACKEND_COMM_STREAM=0` pins collectives to the default stream
   instead (simplest ordering, zero overlap) — also the automatic path for
   collectives needing default-stream copies after the NCCL call. Both paths

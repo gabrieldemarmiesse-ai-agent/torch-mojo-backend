@@ -18,8 +18,9 @@ Design (see docs/distributed.md for the full story):
   end event fires on the device. DDP's Reducer therefore keeps enqueuing
   backward compute on the default stream while bucket allreduces fly on the
   channel, and its end-of-backward ``future.wait()`` blocks only for the
-  un-overlappable tail. Tensor references are held until the end event
-  fires, which keeps the default-stream-ordered frees of MAX buffers safe.
+  un-overlappable tail. Every tensor a channel collective touches is fenced
+  via channels.record_use, which orders its eventual stream-ordered free
+  after the collective (MAX does not fence frees across streams itself).
   ``TORCH_MOJO_BACKEND_COMM_STREAM=0`` falls back to enqueuing on the
   default stream itself (ordering free, zero overlap) — also the automatic
   path for collectives that need default-stream copies AFTER the collective
@@ -154,9 +155,9 @@ class _CommCompletionWorker:
 
     One daemon thread per process group. Jobs arrive in enqueue order, and
     events on one channel complete in enqueue order too, so futures resolve
-    FIFO. The keepalive tuple pins every tensor the collective reads or
-    writes until the event fires — that is what makes the default-stream-
-    ordered frees of MAX buffers safe while NCCL runs on a side channel.
+    FIFO. Buffer lifetime is NOT this worker's job: every tensor a channel
+    collective touches is fenced via channels.record_use, which orders its
+    eventual free after the collective on the device side.
     Polling (short spin, then 200 µs sleeps) instead of a blocking event
     wait keeps ``abort()`` able to unstick the thread when a communicator
     dies mid-collective.
@@ -169,11 +170,7 @@ class _CommCompletionWorker:
         self.aborted = False
 
     def submit(
-        self,
-        event: object,
-        future: torch.futures.Future,
-        result: list[torch.Tensor],
-        keepalive: tuple,
+        self, event: object, future: torch.futures.Future, result: list[torch.Tensor]
     ) -> None:
         with self._lock:
             if self._thread is None:
@@ -181,7 +178,7 @@ class _CommCompletionWorker:
                     target=self._run, name="mojo-comm-completion", daemon=True
                 )
                 self._thread.start()
-        self._jobs.put((event, future, result, keepalive))
+        self._jobs.put((event, future, result))
 
     def shutdown(self) -> None:
         with self._lock:
@@ -196,7 +193,7 @@ class _CommCompletionWorker:
             job = self._jobs.get()
             if job is None:
                 return
-            event, future, result, keepalive = job
+            event, future, result = job
             try:
                 spin_until = time.monotonic() + 0.001
                 while not event.query():
@@ -215,7 +212,7 @@ class _CommCompletionWorker:
                 traceback.print_exc()
             finally:
                 event.destroy()
-                del event, future, result, keepalive
+                del event, future, result
 
 
 class MojoProcessGroup(dist.ProcessGroup):
@@ -328,7 +325,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         self,
         index: int,
         result: list[torch.Tensor],
-        keepalive: tuple,
+        fenced: tuple,
         enqueue: Callable[[int], None],
     ) -> Work | None:
         """Run ``enqueue(stream_handle)`` on the comm channel, overlapped.
@@ -339,17 +336,24 @@ class MojoProcessGroup(dist.ProcessGroup):
         the NCCL call (no copy-back into non-contiguous outputs) may come
         here, because nothing makes the default stream wait for the channel;
         completion is signaled host-side through the Work's future instead.
+
+        ``fenced`` lists every tensor the collective reads or writes: their
+        allocations are recorded against the channel (channels.record_use),
+        which orders each one's eventual stream-ordered free after this
+        collective — MAX does not fence frees across streams by itself.
         """
         if not self._comm_stream_enabled:
             return None
-        from torch_mojo_backend.mojo_device.channels import get_channel
+        from torch_mojo_backend.mojo_device.channels import get_channel, record_use
 
         channel = get_channel(self._max_devices[index], "nccl")
         self._drained()  # producers must be ON the stream before we fence it
         channel.wait_default_stream()
         enqueue(channel.handle)
+        for tensor in fenced:
+            record_use(tensor._holder, channel, self._streams[index])
         future = torch.futures.Future()  # no devices= — see module docstring
-        self._completion.submit(channel.record_event(), future, result, keepalive)
+        self._completion.submit(channel.record_event(), future, result)
         return _create_work_from_future(future)
 
     def _fence_default(self, index: int) -> None:
