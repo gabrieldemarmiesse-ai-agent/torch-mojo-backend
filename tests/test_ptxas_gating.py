@@ -6,12 +6,17 @@ and lifts the cap in CUDA 13. It enforces that at assembly time inside
 on a machine whose `MODULAR_NVPTX_COMPILER_PATH` names an older assembler the
 matmul extensions do not merely lose their fast routes, they stop importing,
 and the loader has no run-time fallback to soften that
-(docs/kernel_call_queue.md). `PTXAS_BIG_SMEM` compiles those routes out
-instead, leaving the ones that already fit.
+(docs/kernel_call_queue.md). `PTXAS_BIG_SMEM` tells the Mojo side which
+assembler it is being built for, and the kernels whose tiles do not fit take
+them from the dynamic (`extern`) shared window instead, which was never
+subject to that cap — so every fast route is compiled and reachable under
+either assembler.
 
 Two properties matter and are tested separately: the probe must answer for
-the assembler that will actually be used, and the gate must leave a correct
-kernel behind for every shape the removed routes used to claim.
+the assembler that will actually be used, and every regime must still reach
+a kernel — the routes that remain behind an ordinary architecture gate need
+a fallback outside it, and the ones that switched allocation must serve the
+same shapes in both regimes (the end-to-end worker at the bottom).
 """
 
 from __future__ import annotations
@@ -128,7 +133,7 @@ def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
     assert eager_kernels.big_static_smem_flags() == {"PTXAS_BIG_SMEM": 1}
 
 
-def test_assembler_capped_at_48kib_compiles_the_big_routes_out(
+def test_assembler_capped_at_48kib_sends_no_define(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The CUDA 12.x case: the control leg passes, the big one does not.
@@ -201,9 +206,14 @@ def test_only_the_two_families_with_big_smem_routes_send_the_define() -> None:
         for path in _KERNEL_DIR.rglob("*.mojo")
         if "_big_static_smem_on" in path.read_text()
     }
+    # One reader per file that owns an allocation decision. The gemm16 family
+    # shares `_v4_dyn_smem_tile` (declared in the NN v4 file, imported by the
+    # NT/TN v4 and v3 files), so those importers are not readers themselves;
+    # the v5 BMM file decides per instantiation and so reads the gate itself.
     assert readers == {
         "variant_gates.mojo",
-        "gemm16_matmul_ops/gemm16_v3_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_nn_v4_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_bmm_v5_kernels.mojo",
         "matmul_ops/tn_f32_gemm_kernels.mojo",
     }
 
@@ -243,12 +253,15 @@ class _StubTensor:
 
 
 def test_gated_routes_leave_an_unconditional_fallback_behind() -> None:
-    """The gate removes routes; something must still serve their shapes.
+    """Gated routes exist; something must still serve their shapes.
 
-    Structural, because the alternative is a build on an old assembler that
-    enqueues nothing and returns a buffer of garbage. For the 16-bit GEMMs
-    the survivor is the mma.sync ladder, for fp32 the 64x64 TN core, and in
-    both files that call has to sit *outside* every `comptime if`.
+    Structural, because the alternative is a build that enqueues nothing and
+    returns a buffer of garbage. The 16-bit fast routes no longer depend on
+    the assembler — their tiles move to dynamic shared memory instead of
+    being compiled out — but they are still architecture-gated (`comptime if
+    _has_sm_9x()`) and shape-gated, so an sm_80 build, a biased GEMM or an
+    unaligned shape reaches nothing above the mma.sync ladder. That call has
+    to sit *outside* every `comptime if`.
     """
     v3 = (_KERNEL_DIR / "gemm16_matmul_ops" / "gemm16_v3_kernels.mojo").read_text()
     for fallback in ("_enqueue_accepted_bf16_gemm(", "_enqueue_accepted_bf16_bmm("):
@@ -256,9 +269,25 @@ def test_gated_routes_leave_an_unconditional_fallback_behind() -> None:
         # itself; anything deeper is nested inside a branch.
         assert f"\n    {fallback}" in v3, fallback
 
-    tn = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_kernels.mojo").read_text()
-    assert "comptime if not _big_static_smem_on():\n        use_t128 = False" in tn
-    assert "\n    if not use_t128:\n        _tn_core_launch[64, 64," in tn
+
+def test_fp32_tn_routes_serve_every_regime_instead_of_gating_out() -> None:
+    """fp32 TN took the other fix: dynamic shared memory, not a fallback.
+
+    Unlike the 16-bit GEMMs above, the 128x128 TN cores' tiles moved to
+    `external_memory` on an assembler that cannot take their static
+    allocation (tn_f32_gemm_core.mojo), so `use_t128` in
+    tn_f32_gemm_kernels.mojo is plain shape-based selection again -- no
+    `_big_static_smem_on()` override, no gate around the 128x128 launches,
+    and the 64x64 core sits behind an ordinary `else:` next to them rather
+    than an unconditional fallback call outside a `comptime if`.
+    """
+    tn_kernels = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_kernels.mojo").read_text()
+    assert "use_t128 = False" not in tn_kernels
+    assert "\n    else:\n        _tn_core_launch[64, 64," in tn_kernels
+
+    tn_core = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_core.mojo").read_text()
+    assert "external_memory" in tn_core
+    assert "comptime if STATIC_SMEM:" in tn_core
 
 
 @pytest.fixture(scope="module")
@@ -275,7 +304,7 @@ def sm90_mojo_gpu() -> None:
 # key: flipping the environment variable inside a live session would leave
 # extensions already built under the other answer.
 _FALLBACK_WORKER = '''
-"""Exercise every route the >48 KiB gate removes, against a CPU reference."""
+"""Exercise every route the >48 KiB gate re-allocates, against a CPU reference."""
 
 import sys
 
@@ -374,12 +403,15 @@ sys.exit(0)
 def test_gated_build_still_computes_the_right_answers(
     sm90_mojo_gpu: None, tmp_path: Path
 ) -> None:
-    """End to end with the fast routes compiled out: mm, bmm, linear and
-    SDPA must still match a CPU reference.
+    """End to end with the define absent: mm, bmm, linear and SDPA must
+    still match a CPU reference.
 
-    This is the only check that the surviving routes actually *cover* the
-    shapes the removed ones claimed. It compiles two extension families the
-    first time it runs on a machine.
+    That build is not the one CI usually exercises -- every >48 KiB kernel
+    in it stages its tiles in dynamic shared memory instead of static, with
+    a different launch (`shared_mem_bytes` plus the opt-in attribute) and
+    every tile at a different address -- so this is the check that the
+    regime an old assembler forces still computes the same numbers. It
+    compiles two extension families the first time it runs on a machine.
     """
     worker = tmp_path / "ptxas_fallback_worker.py"
     worker.write_text(_FALLBACK_WORKER)

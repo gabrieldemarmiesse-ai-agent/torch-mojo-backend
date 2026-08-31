@@ -2091,11 +2091,12 @@ class _MatmulSpecExtension(
     def _flag_items(cls, transpose_b: int) -> tuple[tuple[str, bool | int | str], ...]:
         """The non-dtype defines, in the one place both builders below read.
 
-        `PTXAS_BIG_SMEM` compiles the 128x128 fp32 TN tiles (>48 KiB of
-        static shared memory) in or out; the 64x64 core serves their shapes
-        without it. The two `make_*_defines` hooks must agree exactly — one
-        keys the cache, the other the compile line — so neither spells the
-        flag set itself.
+        `PTXAS_BIG_SMEM` says whether the active assembler takes >48 KiB of
+        *static* shared memory, which decides how the 128x128 fp32 TN tiles
+        are allocated (static, or carved from `external_memory`); the same
+        kernels are built either way. The two `make_*_defines` hooks must
+        agree exactly — one keys the cache, the other the compile line — so
+        neither spells the flag set itself.
         """
         return (
             ("TRANSPOSE_B", bool(transpose_b)),
@@ -8443,10 +8444,11 @@ def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
         # The WGMMA/TMA routes this family reaches for first need more than
-        # 48 KiB of static shared memory, which not every ptxas will
-        # assemble; the flag compiles them out where it cannot, leaving the
-        # mma.sync ladder that serves the same shapes. See
-        # `eager_kernels.big_static_smem_flags`.
+        # 48 KiB of shared memory per CTA, which not every ptxas will
+        # assemble as a *static* allocation; the flag tells those kernels
+        # which assembler they are built for, and they carve the tiles from
+        # the dynamic (extern) window where a static one would be refused.
+        # Same routes either way. See `eager_kernels.big_static_smem_flags`.
         flags={
             "TRANSPOSE_B": bool(transpose_b),
             "HAS_BIAS": bias_tensor is not None,
@@ -8595,8 +8597,9 @@ def _try_gemm16_bmm(a, b, *, transpose_b=False):
         ),
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
-        # Same >48 KiB static-smem gate as the Gemm16 call above: the batched
-        # WGMMA ladder is compiled out where ptxas will not take it.
+        # Same >48 KiB static-smem flag as the Gemm16 call above: the batched
+        # WGMMA ladder's tiles move to the dynamic shared window where ptxas
+        # will not take them as a static allocation.
         flags={
             "TRANSPOSE_B": bool(transpose_b),
             **eager_kernels.big_static_smem_flags(),

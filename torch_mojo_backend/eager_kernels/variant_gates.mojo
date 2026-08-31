@@ -26,18 +26,28 @@ def _big_static_smem_on() -> Bool:
     ptxas caps a kernel's static (non-opt-in) `.shared` at 0xc000 bytes on
     every sm_90 part up to CUDA 12.8 and lifts the cap in CUDA 13, and it
     fails the whole `mojo build` rather than the one over-limit kernel — so a
-    route that needs a bigger tile has to be compiled out, not merely left
-    unselected, wherever the active assembler is the older one. Python probes
-    that assembler once per process and passes `PTXAS_BIG_SMEM=1` only when
-    it accepts the larger allocation (`_ptxas_supports_big_static_smem` in
-    eager_kernels/__init__.py); the define is absent otherwise, so the
-    default below gates the big routes off exactly like every other gate in
-    this file treats a define nobody sent.
+    kernel whose tiles exceed that has to be allocated differently, not
+    merely left unselected, wherever the active assembler is the older one.
+    Python probes that assembler once per process and passes
+    `PTXAS_BIG_SMEM=1` only when it accepts the larger allocation
+    (`_ptxas_supports_big_static_smem` in eager_kernels/__init__.py); the
+    define is absent otherwise, so the default below reads False exactly like
+    every other gate in this file treats a define nobody sent.
 
-    A route behind this gate must therefore never be the only one able to
-    serve a shape: its `else` has to reach an existing kernel that fits in
-    48 KiB, which for the 16-bit GEMMs is the mma.sync ladder in
-    gemm16_kernels.mojo and for fp32 is the 64x64 TN core.
+    False does NOT mean "drop the route". Every kernel reading this gate
+    takes its big tiles from the dynamic (`extern`) shared window instead,
+    which the cap never applied to: opted into per launch with
+    MAX_DYNAMIC_SHARED_SIZE_BYTES and sized by `shared_mem_bytes`, the scheme
+    eager_flash_attention has always used. The same routes are therefore
+    compiled and reachable under either assembler, and with the define
+    present the emitted device code is byte-for-byte what it was before this
+    gate existed. Small allocations (mbarriers, and any tile already under
+    the cap) stay static in both regimes — the dynamic window is not free,
+    its base sits past the static allocations rounded up to its alignment.
+
+    A kernel that instead *were* gated out by this flag would have to leave
+    another kernel able to serve its shapes; nothing in the tree does that
+    today.
     """
     comptime if _PTXAS_BIG_SMEM == "1":
         return True

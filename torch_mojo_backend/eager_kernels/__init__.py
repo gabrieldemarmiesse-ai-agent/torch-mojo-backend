@@ -471,12 +471,14 @@ def _ptxas_assembles(compiler: str, size: int) -> bool:
 def _ptxas_supports_big_static_smem() -> bool:
     """Whether the active PTX assembler accepts >48 KiB of *static* shared memory.
 
-    Answering False compiles the sm_90 WGMMA/TMA GEMM routes out of the build
+    Answering False makes the sm_90 WGMMA/TMA GEMM kernels stage their big
+    operand tiles in *dynamic* (`extern`) shared memory instead of static
     (see `_big_static_smem_on` in variant_gates.mojo): ptxas fails the whole
     `mojo build`, not the one over-limit kernel, so an extension carrying such
     a kernel is not slow on an old assembler, it is unimportable — and this
     loader deliberately has no run-time fallback (docs/kernel_call_queue.md).
-    The routes that stay serve every shape those ones did, more slowly.
+    The dynamic window has never been capped that way, so the same routes are
+    compiled and reachable either way; only the allocation changes.
 
     The answer is a property of the assembler, so it is probed rather than
     guessed from a version string:
@@ -492,8 +494,8 @@ def _ptxas_supports_big_static_smem() -> bool:
 
     Only NVIDIA is affected. AMD and Apple builds never consult
     `MODULAR_NVPTX_COMPILER_PATH`, so they take the True branch above and
-    nothing about them changes; the routes gated on this flag are in any case
-    already behind an sm_9x comptime check.
+    nothing about them changes; the kernels that read this flag are in any
+    case already behind an sm_9x comptime check.
     """
     override = os.environ.get(_PTXAS_BIG_SMEM_ENV)
     if override in ("0", "1"):

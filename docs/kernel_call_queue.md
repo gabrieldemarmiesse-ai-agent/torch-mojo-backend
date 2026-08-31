@@ -119,11 +119,14 @@ one over-limit kernel fails the whole `.so`, so on an older assembler the
 matmul families would not be slow, they would be unimportable. Python probes
 the assembler `MODULAR_NVPTX_COMPILER_PATH` names (`big_static_smem_flags`,
 `_ptxas_supports_big_static_smem`) and sends `PTXAS_BIG_SMEM=1` only when it
-takes the larger allocation. Absent, the `_big_static_smem_on()` gate compiles
-the wgmma/TMA GEMM routes out and the smaller routes that already serve those
-shapes take over. With no such variable set, MAX assembles in-process with the
-compiler it ships and the define is always sent, so a default install compiles
-exactly what it always did. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
+takes the larger allocation. Absent, the `_big_static_smem_on()` gate switches
+the wgmma/TMA GEMM kernels' operand tiles from a static allocation to the
+dynamic (`extern`) shared window, which that cap never applied to — the same
+kernels, the same routes, opted in per launch with
+`MAX_DYNAMIC_SHARED_SIZE_BYTES` the way `eager_flash_attention` always has.
+With no such variable set, MAX assembles in-process with the compiler it ships
+and the define is always sent, so a default install compiles exactly what it
+always did, byte for byte. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
 overrides the probe.
 
 Builds are protected by a per-identity file lock (`flock`) and written to a
