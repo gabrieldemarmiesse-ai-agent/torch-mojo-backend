@@ -2088,14 +2088,29 @@ class _MatmulSpecExtension(
     MOJO_FILE: ClassVar[Path] = _MatmulExtension.MOJO_FILE
 
     @classmethod
+    def _flag_items(cls, transpose_b: int) -> tuple[tuple[str, bool | int | str], ...]:
+        """The non-dtype defines, in the one place both builders below read.
+
+        `PTXAS_BIG_SMEM` compiles the 128x128 fp32 TN tiles (>48 KiB of
+        static shared memory) in or out; the 64x64 core serves their shapes
+        without it. The two `make_*_defines` hooks must agree exactly — one
+        keys the cache, the other the compile line — so neither spells the
+        flag set itself.
+        """
+        return (
+            ("TRANSPOSE_B", bool(transpose_b)),
+            *eager_kernels.big_static_smem_flags().items(),
+        )
+
+    @classmethod
     def make_defines(
         cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
     ) -> dict[str, bool | int | str]:
-        defines = {
+        defines: dict[str, bool | int | str] = {
             "OP": op,
             "DTYPE_OUT": tensors[0]._dtype.name,
-            "TRANSPOSE_B": bool(transpose_b),
         }
+        defines.update(cls._flag_items(transpose_b))
         defines.update(
             (f"DTYPE_ARG_{index}", tensor._dtype.name)
             for index, tensor in enumerate(tensors)
@@ -2110,7 +2125,7 @@ class _MatmulSpecExtension(
             op,
             tuple(t._dtype for t in tensors),
             (tensors[0]._dtype,),
-            (("TRANSPOSE_B", bool(transpose_b)),),
+            cls._flag_items(transpose_b),
         )
 
     @classmethod
@@ -4013,6 +4028,35 @@ def fast_aten_expand(tensor, sizes, *, implicit=False):
             else:
                 return NOT_HANDLED
     return _view_of(t, new_shape, new_strides, t._offset)
+
+
+def fast_aten_as_strided(tensor, size, stride, storage_offset=None):
+    """Zero-copy relayout over the tensor's storage (the holder allocation).
+
+    ``storage_offset`` is absolute in elements from the storage start, which
+    for this backend is the allocation start — the same convention
+    ``_view_of`` uses. DDP's Reducer builds its gradient bucket views with
+    this op (reducer.cpp initialize_bucket_views).
+    """
+    t = _t(tensor)
+    if t is None:
+        return NOT_HANDLED
+    size = tuple(size)
+    stride = tuple(stride)
+    if len(size) != len(stride) or any(s < 0 for s in size):
+        return NOT_HANDLED
+    if any(s < 0 for s in stride):
+        return NOT_HANDLED  # negative strides need flip support; decline
+    offset = t._offset if storage_offset is None else storage_offset
+    if offset < 0:
+        return NOT_HANDLED
+    # Refuse views that could reach past the allocation: as_strided is the
+    # one view op whose arguments are unconstrained by the input's own shape.
+    if all(size):
+        last = offset + sum((n - 1) * st for n, st in zip(size, stride))
+        if (last + 1) * t._itemsize > t._holder.get_nbytes():
+            return NOT_HANDLED
+    return _view_of(t, size, stride, offset)
 
 
 def fast_aten_slice(input, dim=0, start=None, end=None, step=1):
@@ -8398,7 +8442,16 @@ def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
         arg_dtypes=(lhs._dtype, rhs._dtype)
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
-        flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
+        # The WGMMA/TMA routes this family reaches for first need more than
+        # 48 KiB of static shared memory, which not every ptxas will
+        # assemble; the flag compiles them out where it cannot, leaving the
+        # mma.sync ladder that serves the same shapes. See
+        # `eager_kernels.big_static_smem_flags`.
+        flags={
+            "TRANSPOSE_B": bool(transpose_b),
+            "HAS_BIAS": bias_tensor is not None,
+            **eager_kernels.big_static_smem_flags(),
+        },
         keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
@@ -8542,7 +8595,12 @@ def _try_gemm16_bmm(a, b, *, transpose_b=False):
         ),
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
-        flags={"TRANSPOSE_B": bool(transpose_b)},
+        # Same >48 KiB static-smem gate as the Gemm16 call above: the batched
+        # WGMMA ladder is compiled out where ptxas will not take it.
+        flags={
+            "TRANSPOSE_B": bool(transpose_b),
+            **eager_kernels.big_static_smem_flags(),
+        },
         keepalive=(out, lhs, rhs),
     )
     return out

@@ -730,9 +730,26 @@ def use_local_rank_gpu() -> None:
     one visible GPU per rank, ``mojo``/``mojo:0`` is always the right device,
     the phantom ``privateuseone:0`` TensorImpl index is always truthful, and
     each process binds a single CUDA context.
+
+    SLURM (and other launchers) often pre-set CUDA_VISIBLE_DEVICES to the
+    whole allocation ("0,1,...,7"); in that case each rank keeps only its
+    LOCAL_RANK-th entry. A single already-pinned entry is left alone.
     """
     local_rank = os.environ.get("LOCAL_RANK")
-    if local_rank is None or "CUDA_VISIBLE_DEVICES" in os.environ:
+    if local_rank is None:
         return
-    os.environ["CUDA_VISIBLE_DEVICES"] = local_rank
-    os.environ.setdefault("HIP_VISIBLE_DEVICES", local_rank)
+    rank_index = int(local_rank)
+    for var in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        visible = os.environ.get(var)
+        if visible is None:
+            os.environ[var] = local_rank
+            continue
+        entries = [entry for entry in visible.split(",") if entry]
+        if len(entries) <= 1:
+            continue  # already pinned (or nothing to slice)
+        if rank_index >= len(entries):
+            raise RuntimeError(
+                f"LOCAL_RANK={rank_index} but {var}={visible!r} lists only "
+                f"{len(entries)} devices"
+            )
+        os.environ[var] = entries[rank_index]

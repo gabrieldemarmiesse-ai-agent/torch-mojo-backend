@@ -20,10 +20,15 @@ forward, backward, clip_grad_norm_, AdamW, zero_grad — under bf16 autocast.
 
 import os
 
-# One GPU per torchrun worker, decided before anything initializes CUDA/MAX.
-if "LOCAL_RANK" in os.environ and "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
-    os.environ.setdefault("HIP_VISIBLE_DEVICES", os.environ["LOCAL_RANK"])
+# One GPU per torchrun worker, decided before anything initializes CUDA/MAX
+# (slices a SLURM-style "0,1,...,7" CUDA_VISIBLE_DEVICES by LOCAL_RANK).
+# Optional so --device cuda works as a baseline in a stock-torch venv.
+try:
+    from torch_mojo_backend.distributed import use_local_rank_gpu
+
+    use_local_rank_gpu()
+except ImportError:
+    pass
 
 import argparse
 import datetime
@@ -36,8 +41,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-from torch_mojo_backend import register_mojo_devices
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +98,8 @@ def main() -> None:
     device = args.device
 
     if device == "mojo":
+        from torch_mojo_backend import register_mojo_devices
+
         register_mojo_devices()
         backend = "mojo"
     else:
@@ -162,7 +167,8 @@ def main() -> None:
                     _, loss = model(x, y)
                 total += loss.item()
         model.train()
-        mean = torch.tensor([total / args.eval_iters])
+        # On the device so the NCCL cuda baseline can reduce it too.
+        mean = torch.tensor([total / args.eval_iters]).to(device)
         dist.all_reduce(mean, op=dist.ReduceOp.AVG)
         return mean.item()
 
@@ -170,7 +176,9 @@ def main() -> None:
     t_start = time.perf_counter()
     t_window = t_start
     for step in range(1, args.max_iters + 1):
-        x, y = get_batch(train_data, args.batch_size, args.block_size, device, generator)
+        x, y = get_batch(
+            train_data, args.batch_size, args.block_size, device, generator
+        )
         with autocast:
             _, loss = ddp_model(x, y)
         loss.backward()

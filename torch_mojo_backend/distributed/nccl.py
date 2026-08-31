@@ -51,6 +51,12 @@ NCCL_UNIQUE_ID_BYTES = 128
 _NCCL_LIB_ENV = "TORCH_MOJO_BACKEND_NCCL_LIB"
 
 
+class NcclUniqueId(ctypes.Structure):
+    """nccl.h: typedef struct { char internal[128]; } ncclUniqueId."""
+
+    _fields_ = [("internal", ctypes.c_char * NCCL_UNIQUE_ID_BYTES)]
+
+
 class NcclError(RuntimeError):
     """An NCCL call returned a non-success ncclResult_t."""
 
@@ -100,12 +106,14 @@ def _libnccl() -> ctypes.CDLL:
     lib.ncclGetErrorString.restype = ctypes.c_char_p
     lib.ncclGetErrorString.argtypes = [ctypes.c_int]
     lib.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    lib.ncclGetUniqueId.argtypes = [ctypes.c_char_p]
-    # ncclUniqueId is passed BY VALUE (a 128-byte struct) to ncclCommInitRank.
+    lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(NcclUniqueId)]
+    # ncclUniqueId is passed BY VALUE — it must be a ctypes.Structure here: a
+    # bare (c_char * 128) array argtype decays to a pointer like a C array,
+    # shifting every following argument (NCCL then sees a garbage rank).
     lib.ncclCommInitRank.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.c_int,
-        ctypes.c_char * NCCL_UNIQUE_ID_BYTES,
+        NcclUniqueId,
         ctypes.c_int,
     ]
     lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
@@ -173,9 +181,10 @@ def nccl_version() -> int:
 
 def get_unique_id() -> bytes:
     """Generate the 128-byte communicator id (rank 0 only; share via the store)."""
-    buf = ctypes.create_string_buffer(NCCL_UNIQUE_ID_BYTES)
-    _check("ncclGetUniqueId", _libnccl().ncclGetUniqueId(buf))
-    return buf.raw
+    uid = NcclUniqueId()
+    _check("ncclGetUniqueId", _libnccl().ncclGetUniqueId(ctypes.byref(uid)))
+    # Not uid.internal: ctypes truncates c_char-array fields at the first NUL.
+    return ctypes.string_at(ctypes.byref(uid), NCCL_UNIQUE_ID_BYTES)
 
 
 class NcclComm:
@@ -190,7 +199,7 @@ class NcclComm:
         """Collective, blocking: every rank of the clique must call concurrently."""
         if len(unique_id) != NCCL_UNIQUE_ID_BYTES:
             raise ValueError(f"unique_id must be {NCCL_UNIQUE_ID_BYTES} bytes")
-        uid = (ctypes.c_char * NCCL_UNIQUE_ID_BYTES).from_buffer_copy(unique_id)
+        uid = NcclUniqueId.from_buffer_copy(unique_id)
         handle = ctypes.c_void_p(0)
         _check(
             "ncclCommInitRank",

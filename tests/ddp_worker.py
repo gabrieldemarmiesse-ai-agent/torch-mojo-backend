@@ -8,10 +8,10 @@ without a GPU: everything device-touching happens inside main().
 import os
 import sys
 
-if "LOCAL_RANK" in os.environ and "CUDA_VISIBLE_DEVICES" not in os.environ:
-    # One GPU per rank, decided before anything can initialize CUDA/MAX.
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
-    os.environ.setdefault("HIP_VISIBLE_DEVICES", os.environ["LOCAL_RANK"])
+# One GPU per rank, decided before anything can initialize CUDA/MAX.
+from torch_mojo_backend.distributed import use_local_rank_gpu
+
+use_local_rank_gpu()
 
 import datetime
 
@@ -29,7 +29,9 @@ class ElemwiseNet(torch.nn.Module):
         self.b = torch.nn.Parameter(torch.randn(width))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x * self.w + self.b).relu()
+        # gelu, not relu: relu's backward (threshold_backward) is not
+        # implemented in mojo eager mode; gelu_backward is.
+        return torch.nn.functional.gelu(x * self.w + self.b)
 
 
 def _check(failures: list[str], name: str, ok: bool) -> None:
@@ -76,7 +78,9 @@ def run_collectives(failures: list[str]) -> None:
     src = torch.arange(world * 3, dtype=torch.float32, device="mojo")
     out = torch.zeros(3, device="mojo")
     dist.reduce_scatter_tensor(out, src)
-    exp = torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3] * world
+    exp = (
+        torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3] * world
+    )
     _check(failures, "reduce_scatter_tensor", (out.cpu() == exp).all().item())
 
     objs: list[object] = [None] * world
@@ -97,7 +101,9 @@ def run_collectives(failures: list[str]) -> None:
             dist.recv(r, (rank - 1) % world)
             dist.send(s, (rank + 1) % world)
         _check(
-            failures, "send_recv_ring", (r.cpu() == float((rank - 1) % world)).all().item()
+            failures,
+            "send_recv_ring",
+            (r.cpu() == float((rank - 1) % world)).all().item(),
         )
 
     dist.barrier()
@@ -142,7 +148,9 @@ def run_ddp_parity(failures: list[str]) -> None:
         failures,
         "ddp.step_parity",
         torch.allclose(ddp.module.w.detach().cpu(), reference.w.detach(), atol=1e-5)
-        and torch.allclose(ddp.module.b.detach().cpu(), reference.b.detach(), atol=1e-5),
+        and torch.allclose(
+            ddp.module.b.detach().cpu(), reference.b.detach(), atol=1e-5
+        ),
     )
     dist.barrier()
 
