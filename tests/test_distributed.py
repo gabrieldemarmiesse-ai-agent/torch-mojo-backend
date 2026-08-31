@@ -33,10 +33,7 @@ def test_backend_name_registered():
 
 def test_nccl_dtype_and_op_maps():
     from torch_mojo_backend.distributed import nccl
-    from torch_mojo_backend.distributed.process_group import (
-        _nccl_dtype,
-        _nccl_red_op,
-    )
+    from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
 
     assert _nccl_dtype(torch.bfloat16) == nccl.NCCL_BFLOAT16 == 9
     assert _nccl_dtype(torch.float32) == nccl.NCCL_FLOAT32 == 7
@@ -72,9 +69,12 @@ def test_cpu_collectives_through_gloo_delegation():
         dist.destroy_process_group()
 
 
-def _run_torchrun(nproc: int, mode: str) -> None:
+def _run_torchrun(
+    nproc: int, mode: str, extra_env: dict[str, str] | None = None
+) -> None:
     env = dict(os.environ)
     env.pop("CUDA_VISIBLE_DEVICES", None)  # the worker pins per-rank visibility
+    env.update(extra_env or {})
     result = subprocess.run(
         [
             sys.executable,
@@ -98,8 +98,9 @@ def _run_torchrun(nproc: int, mode: str) -> None:
         )
 
 
+@pytest.mark.parametrize("comm_stream", ["1", "0"], ids=["channel", "same-stream"])
 @pytest.mark.parametrize("mode", ["collectives", "ddp_parity"])
-def test_two_rank_nccl(mode: str):
+def test_two_rank_nccl(mode: str, comm_stream: str):
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
-    _run_torchrun(2, mode)
+    _run_torchrun(2, mode, {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream})

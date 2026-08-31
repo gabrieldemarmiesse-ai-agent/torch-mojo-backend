@@ -63,13 +63,22 @@ before anything touches CUDA or enumerates MAX devices.
 
 ## Design notes
 
-- **One stream.** NCCL is enqueued on the same MAX default stream every mojo
-  kernel, transfer, and stream-ordered free rides
-  (`DeviceStream.native_stream_handle`). Ordering against compute is
-  therefore free, with one obligation: the host-side kernel-call queue is
-  drained before every collective so producers are actually on the stream
-  (`docs/kernel_call_queue.md`). Comm/compute overlap on a side stream is a
-  possible future optimization; it would also need event-ordered frees.
+- **A comm channel overlaps compute.** Collectives run on a dedicated side
+  CUDA stream per device (a "channel", `mojo_device/channels.py`): the
+  channel waits on a default-stream event so every producer kernel comes
+  first, the collective is enqueued, and the Work's future completes from a
+  watcher thread once the collective's end event fires on the device. DDP
+  keeps enqueuing backward compute while bucket allreduces fly; the
+  end-of-backward `future.wait()` blocks only for the un-overlappable tail.
+  References to every tensor a collective touches are held until its end
+  event fires, which keeps MAX's default-stream-ordered frees safe.
+  `TORCH_MOJO_BACKEND_COMM_STREAM=0` pins collectives to the default stream
+  instead (simplest ordering, zero overlap) — also the automatic path for
+  collectives needing default-stream copies after the NCCL call. Both paths
+  drain the host-side kernel-call queue first so producers are actually on
+  a stream (`docs/kernel_call_queue.md`). One contract carried over from
+  stock torch: `wait()` an async collective before reading its result —
+  including before exporting it through DLPack.
 - **Work objects** wrap completed `torch.futures.Future`s (no `devices=` —
   the PrivateUse1 device guard is a stub, and a device-typed future would
   do out-of-bounds bookkeeping for index ≥ 1). `wait()` is a host no-op by

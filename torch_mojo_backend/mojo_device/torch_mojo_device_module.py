@@ -197,3 +197,16 @@ def synchronize(device: "int | str | torch.device | None" = None) -> None:
 
 def get_amp_supported_dtype():
     return [torch.float16, torch.bfloat16]  # TODO change
+
+
+# Streams ("channels"): real torch.Stream/torch.Event support, dispatched
+# here by register_mojo_devices() because the generic classes' C++ guard is
+# a stub for Python PrivateUse1 backends. See mojo_device/streams.py.
+from torch_mojo_backend.mojo_device.streams import (  # noqa: E402
+    Event as Event,
+)
+from torch_mojo_backend.mojo_device.streams import Stream as Stream
+from torch_mojo_backend.mojo_device.streams import current_stream as current_stream
+from torch_mojo_backend.mojo_device.streams import default_stream as default_stream
+from torch_mojo_backend.mojo_device.streams import set_stream as set_stream
+from torch_mojo_backend.mojo_device.streams import stream as stream

@@ -10,13 +10,23 @@ Design (see docs/distributed.md for the full story):
   empty). Every override dispatches on the tensor's device type and delegates
   CPU tensors to a private ``ProcessGroupGloo``.
 
-- NCCL runs on the SAME CUDA stream as all mojo compute (the MAX device's
-  default stream, obtained via ``DeviceStream.native_stream_handle``). That
-  makes ordering free: mojo kernels, NCCL kernels, and the stream-ordered
-  frees of MAX buffers all ride one FIFO stream, so no events, no host syncs,
-  and no keep-alives are needed for correctness. The one obligation is to
-  **drain the host-side kernel-call queue first**: a queued-but-unlaunched
-  producer kernel is invisible to the stream (docs/kernel_call_queue.md).
+- NCCL collectives run on a dedicated comm CHANNEL (a second CUDA stream per
+  device, ``mojo_device/channels.py``) so communication overlaps compute:
+  the channel first waits on a default-stream event (so every producer
+  kernel is ordered before the collective), the collective is enqueued, and
+  the Work's future is completed by a watcher thread once the collective's
+  end event fires on the device. DDP's Reducer therefore keeps enqueuing
+  backward compute on the default stream while bucket allreduces fly on the
+  channel, and its end-of-backward ``future.wait()`` blocks only for the
+  un-overlappable tail. Tensor references are held until the end event
+  fires, which keeps the default-stream-ordered frees of MAX buffers safe.
+  ``TORCH_MOJO_BACKEND_COMM_STREAM=0`` falls back to enqueuing on the
+  default stream itself (ordering free, zero overlap) — also the automatic
+  path for collectives that need default-stream copies AFTER the collective
+  (non-contiguous outputs, list-form allgather/reduce_scatter,
+  gather/scatter/alltoall staging). Both paths share one obligation:
+  **drain the host-side kernel-call queue first** — a queued-but-unlaunched
+  producer kernel is invisible to any stream (docs/kernel_call_queue.md).
 
 - Work objects wrap an already-completed ``torch.futures.Future`` holding the
   output tensors. Never pass ``devices=`` to that Future: with a device list
@@ -38,8 +48,10 @@ One process drives exactly one GPU (torchrun layout). Set
 
 import datetime
 import os
+import queue
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 
@@ -137,6 +149,75 @@ def _loud(fn: Callable) -> Callable:
     return wrapper
 
 
+class _CommCompletionWorker:
+    """Completes collective futures once their device-side end event fires.
+
+    One daemon thread per process group. Jobs arrive in enqueue order, and
+    events on one channel complete in enqueue order too, so futures resolve
+    FIFO. The keepalive tuple pins every tensor the collective reads or
+    writes until the event fires — that is what makes the default-stream-
+    ordered frees of MAX buffers safe while NCCL runs on a side channel.
+    Polling (short spin, then 200 µs sleeps) instead of a blocking event
+    wait keeps ``abort()`` able to unstick the thread when a communicator
+    dies mid-collective.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.aborted = False
+
+    def submit(
+        self,
+        event: object,
+        future: torch.futures.Future,
+        result: list[torch.Tensor],
+        keepalive: tuple,
+    ) -> None:
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="mojo-comm-completion", daemon=True
+                )
+                self._thread.start()
+        self._jobs.put((event, future, result, keepalive))
+
+    def shutdown(self) -> None:
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        if thread is not None:
+            self._jobs.put(None)
+            thread.join(timeout=30)
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            event, future, result, keepalive = job
+            try:
+                spin_until = time.monotonic() + 0.001
+                while not event.query():
+                    if self.aborted:
+                        raise RuntimeError(
+                            "communicator aborted while a collective was in flight"
+                        )
+                    if time.monotonic() > spin_until:
+                        time.sleep(0.0002)
+                future.set_result(result)
+            except Exception as e:
+                try:
+                    future.set_exception(e)
+                except Exception:
+                    pass
+                traceback.print_exc()
+            finally:
+                event.destroy()
+                del event, future, result, keepalive
+
+
 class MojoProcessGroup(dist.ProcessGroup):
     """NCCL-backed process group for ``mojo`` tensors, gloo for CPU tensors."""
 
@@ -158,9 +239,17 @@ class MojoProcessGroup(dist.ProcessGroup):
         # rank reaches it in the same order because collectives are SPMD).
         self._comms: dict[int, nccl.NcclComm] = {}
         self._streams: dict[int, int] = {}
+        self._max_devices: dict[int, object] = {}
         self._comm_seq = 0
         self._comm_lock = threading.Lock()
         self._device_current = threading.local()
+        # Comm channel (side CUDA stream) for compute/communication overlap;
+        # TORCH_MOJO_BACKEND_COMM_STREAM=0 pins collectives to the default
+        # stream instead (no overlap, simplest possible ordering).
+        self._comm_stream_enabled = (
+            os.environ.get("TORCH_MOJO_BACKEND_COMM_STREAM", "1") != "0"
+        )
+        self._completion = _CommCompletionWorker()
         # Private CPU backend: torch will not compose gloo around a Python PG
         # (see module docstring), so CPU tensors are our job too.
         self._gloo = dist.ProcessGroupGloo(
@@ -184,14 +273,21 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._group_name = name
 
     def shutdown(self) -> None:
+        # Let in-flight channel collectives complete before tearing down the
+        # communicators they run on.
+        self._completion.shutdown()
         for comm in self._comms.values():
             comm.destroy()
         self._comms.clear()
 
     def abort(self) -> None:
+        # Flag first so the completion worker errors out its pending futures
+        # instead of waiting forever on events an aborted comm never fires.
+        self._completion.aborted = True
         for comm in self._comms.values():
             comm.abort()
         self._comms.clear()
+        self._completion.shutdown()
 
     def _ensure_device_current(self, ordinal: int) -> None:
         # NCCL resolves the target GPU from the thread-current CUDA context,
@@ -201,8 +297,8 @@ class MojoProcessGroup(dist.ProcessGroup):
             nccl.set_current_cuda_device(ordinal)
             self._device_current.ordinal = ordinal
 
-    def _device_state(self, tensor: torch.Tensor) -> tuple[nccl.NcclComm, int]:
-        """The (communicator, raw CUstream) serving this mojo tensor's GPU."""
+    def _device_state(self, tensor: torch.Tensor) -> tuple[nccl.NcclComm, int, int]:
+        """(communicator, default-stream CUstream, device index) for a tensor."""
         from torch_mojo_backend.mojo_device import cuda_peer
         from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
             find_equivalent_max_device,
@@ -224,8 +320,53 @@ class MojoProcessGroup(dist.ProcessGroup):
                 comm = self._init_comm(index, ordinal)
                 self._comms[index] = comm
                 max_device = find_equivalent_max_device(torch.device("mojo", index))
+                self._max_devices[index] = max_device
                 self._streams[index] = max_device.default_stream.native_stream_handle
-        return comm, self._streams[index]
+        return comm, self._streams[index], index
+
+    def _channel_work(
+        self,
+        index: int,
+        result: list[torch.Tensor],
+        keepalive: tuple,
+        enqueue: Callable[[int], None],
+    ) -> Work | None:
+        """Run ``enqueue(stream_handle)`` on the comm channel, overlapped.
+
+        Returns None when the channel path is unavailable — the caller then
+        runs the same ``enqueue`` on the default stream. Eligibility is the
+        caller's job: only collectives needing NO default-stream work after
+        the NCCL call (no copy-back into non-contiguous outputs) may come
+        here, because nothing makes the default stream wait for the channel;
+        completion is signaled host-side through the Work's future instead.
+        """
+        if not self._comm_stream_enabled:
+            return None
+        from torch_mojo_backend.mojo_device.channels import get_channel
+
+        channel = get_channel(self._max_devices[index], "nccl")
+        self._drained()  # producers must be ON the stream before we fence it
+        channel.wait_default_stream()
+        enqueue(channel.handle)
+        future = torch.futures.Future()  # no devices= — see module docstring
+        self._completion.submit(channel.record_event(), future, result, keepalive)
+        return _create_work_from_future(future)
+
+    def _fence_default(self, index: int) -> None:
+        """Drain, and order the default stream after the comm channel.
+
+        NCCL requires every rank to EXECUTE a communicator's operations in
+        issue order. When channel-path and default-stream-path collectives
+        mix, this fence keeps device execution order equal to issue order:
+        a default-stream collective never starts before earlier channel
+        collectives. (The reverse direction is ``wait_default_stream`` in
+        ``_channel_work``.)
+        """
+        self._drained()
+        if self._comm_stream_enabled and index in self._max_devices:
+            from torch_mojo_backend.mojo_device.channels import get_channel
+
+            get_channel(self._max_devices[index], "nccl").make_default_stream_wait()
 
     def _init_comm(self, index: int, ordinal: int) -> nccl.NcclComm:
         key = f"nccl-uid-{self._comm_seq}"
@@ -279,17 +420,25 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._one_per_rank(tensors)
         tensor = tensors[0]
         op = _nccl_red_op(opts.reduceOp)
-        comm, stream = self._device_state(tensor)
+        comm, stream, index = self._device_state(tensor)
         staged = self._dense(tensor)
-        self._drained()
-        comm.all_reduce(
-            staged._ptr,
-            staged._ptr,
-            staged.numel(),
-            _nccl_dtype(staged.dtype),
-            op,
-            stream,
-        )
+
+        def enqueue(handle: int) -> None:
+            comm.all_reduce(
+                staged._ptr,
+                staged._ptr,
+                staged.numel(),
+                _nccl_dtype(staged.dtype),
+                op,
+                handle,
+            )
+
+        if staged is tensor:
+            work = self._channel_work(index, tensors, (tensor,), enqueue)
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if staged is not tensor:
             tensor.copy_(staged)
         return _completed_work(tensors)
@@ -303,13 +452,23 @@ class MojoProcessGroup(dist.ProcessGroup):
         if self._is_cpu(tensors[0]):
             return self._gloo.allreduce_coalesced(tensors, opts)
         op = _nccl_red_op(opts.reduceOp)
-        comm, stream = self._device_state(tensors[0])
+        comm, stream, index = self._device_state(tensors[0])
         staged = [self._dense(t) for t in tensors]
-        self._drained()
-        nccl.group_start()
-        for s in staged:
-            comm.all_reduce(s._ptr, s._ptr, s.numel(), _nccl_dtype(s.dtype), op, stream)
-        nccl.group_end()
+
+        def enqueue(handle: int) -> None:
+            nccl.group_start()
+            for s in staged:
+                comm.all_reduce(
+                    s._ptr, s._ptr, s.numel(), _nccl_dtype(s.dtype), op, handle
+                )
+            nccl.group_end()
+
+        if all(s is t for s, t in zip(staged, tensors)):
+            work = self._channel_work(index, tensors, tuple(tensors), enqueue)
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         for original, s in zip(tensors, staged):
             if s is not original:
                 original.copy_(s)
@@ -323,17 +482,26 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.broadcast(tensors, opts)
         self._one_per_rank(tensors)
         tensor = tensors[0]
-        comm, stream = self._device_state(tensor)
+        comm, stream, index = self._device_state(tensor)
         staged = self._dense(tensor)
-        self._drained()
-        comm.broadcast(
-            staged._ptr,
-            staged._ptr,
-            staged.numel(),
-            _nccl_dtype(staged.dtype),
-            int(opts.rootRank),
-            stream,
-        )
+        root = int(opts.rootRank)
+
+        def enqueue(handle: int) -> None:
+            comm.broadcast(
+                staged._ptr,
+                staged._ptr,
+                staged.numel(),
+                _nccl_dtype(staged.dtype),
+                root,
+                handle,
+            )
+
+        if staged is tensor:
+            work = self._channel_work(index, tensors, (tensor,), enqueue)
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if staged is not tensor:
             tensor.copy_(staged)
         return _completed_work(tensors)
@@ -346,18 +514,28 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.reduce(tensors, opts)
         self._one_per_rank(tensors)
         tensor = tensors[0]
-        comm, stream = self._device_state(tensor)
+        comm, stream, index = self._device_state(tensor)
         staged = self._dense(tensor)
-        self._drained()
-        comm.reduce(
-            staged._ptr,
-            staged._ptr,
-            staged.numel(),
-            _nccl_dtype(staged.dtype),
-            _nccl_red_op(opts.reduceOp),
-            int(opts.rootRank),
-            stream,
-        )
+        op = _nccl_red_op(opts.reduceOp)
+        root = int(opts.rootRank)
+
+        def enqueue(handle: int) -> None:
+            comm.reduce(
+                staged._ptr,
+                staged._ptr,
+                staged.numel(),
+                _nccl_dtype(staged.dtype),
+                op,
+                root,
+                handle,
+            )
+
+        if staged is tensor:
+            work = self._channel_work(index, tensors, (tensor,), enqueue)
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if staged is not tensor:
             tensor.copy_(staged)
         return _completed_work(tensors)
@@ -377,8 +555,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         flat = torch.empty(
             self.size() * source.numel(), dtype=source.dtype, device=source.device
         )
-        comm, stream = self._device_state(source)
-        self._drained()
+        comm, stream, index = self._device_state(source)
+        self._fence_default(index)
         comm.all_gather(
             source._ptr, flat._ptr, source.numel(), _nccl_dtype(source.dtype), stream
         )
@@ -400,11 +578,28 @@ class MojoProcessGroup(dist.ProcessGroup):
         if output_tensor.numel() != source.numel() * self.size():
             raise ValueError("all_gather_into_tensor output has the wrong size")
         dest = self._dense(output_tensor)
-        comm, stream = self._device_state(source)
-        self._drained()
-        comm.all_gather(
-            source._ptr, dest._ptr, source.numel(), _nccl_dtype(source.dtype), stream
-        )
+        comm, stream, index = self._device_state(source)
+
+        def enqueue(handle: int) -> None:
+            comm.all_gather(
+                source._ptr,
+                dest._ptr,
+                source.numel(),
+                _nccl_dtype(source.dtype),
+                handle,
+            )
+
+        if dest is output_tensor:
+            # A staged (pre-copied) SOURCE is fine on the channel path: the
+            # copy rides the default stream before the fence. Only post-
+            # collective copy-backs disqualify.
+            work = self._channel_work(
+                index, [output_tensor], (source, output_tensor), enqueue
+            )
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if dest is not output_tensor:
             output_tensor.copy_(dest)
         return _completed_work([output_tensor])
@@ -420,20 +615,30 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.allgather_into_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
-        comm, stream = self._device_state(input_tensors[0])
+        comm, stream, index = self._device_state(input_tensors[0])
         staged_in = [self._dense(t) for t in input_tensors]
         staged_out = [self._dense(t) for t in output_tensors]
-        self._drained()
-        nccl.group_start()
-        for source, dest in zip(staged_in, staged_out):
-            comm.all_gather(
-                source._ptr,
-                dest._ptr,
-                source.numel(),
-                _nccl_dtype(source.dtype),
-                stream,
+
+        def enqueue(handle: int) -> None:
+            nccl.group_start()
+            for source, dest in zip(staged_in, staged_out):
+                comm.all_gather(
+                    source._ptr,
+                    dest._ptr,
+                    source.numel(),
+                    _nccl_dtype(source.dtype),
+                    handle,
+                )
+            nccl.group_end()
+
+        if all(s is t for s, t in zip(staged_out, output_tensors)):
+            work = self._channel_work(
+                index, output_tensors, (*staged_in, *output_tensors), enqueue
             )
-        nccl.group_end()
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         for original, s in zip(output_tensors, staged_out):
             if s is not original:
                 original.copy_(s)
@@ -459,8 +664,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         for peer, chunk in enumerate(inputs):
             flat.narrow(0, peer * count, count).copy_(chunk.reshape(-1))
         dest = self._dense(output)
-        comm, stream = self._device_state(dest)
-        self._drained()
+        comm, stream, index = self._device_state(dest)
+        self._fence_default(index)
         comm.reduce_scatter(
             flat._ptr,
             dest._ptr,
@@ -486,16 +691,27 @@ class MojoProcessGroup(dist.ProcessGroup):
         dest = self._dense(output_tensor)
         if source.numel() != dest.numel() * self.size():
             raise ValueError("reduce_scatter_tensor input has the wrong size")
-        comm, stream = self._device_state(dest)
-        self._drained()
-        comm.reduce_scatter(
-            source._ptr,
-            dest._ptr,
-            dest.numel(),
-            _nccl_dtype(dest.dtype),
-            _nccl_red_op(opts.reduceOp),
-            stream,
-        )
+        comm, stream, index = self._device_state(dest)
+        op = _nccl_red_op(opts.reduceOp)
+
+        def enqueue(handle: int) -> None:
+            comm.reduce_scatter(
+                source._ptr,
+                dest._ptr,
+                dest.numel(),
+                _nccl_dtype(dest.dtype),
+                op,
+                handle,
+            )
+
+        if dest is output_tensor:
+            work = self._channel_work(
+                index, [output_tensor], (source, output_tensor), enqueue
+            )
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if dest is not output_tensor:
             output_tensor.copy_(dest)
         return _completed_work([output_tensor])
@@ -511,22 +727,32 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.reduce_scatter_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
-        comm, stream = self._device_state(output_tensors[0])
+        comm, stream, index = self._device_state(output_tensors[0])
         op = _nccl_red_op(opts.reduceOp)
         staged_in = [self._dense(t) for t in input_tensors]
         staged_out = [self._dense(t) for t in output_tensors]
-        self._drained()
-        nccl.group_start()
-        for source, dest in zip(staged_in, staged_out):
-            comm.reduce_scatter(
-                source._ptr,
-                dest._ptr,
-                dest.numel(),
-                _nccl_dtype(dest.dtype),
-                op,
-                stream,
+
+        def enqueue(handle: int) -> None:
+            nccl.group_start()
+            for source, dest in zip(staged_in, staged_out):
+                comm.reduce_scatter(
+                    source._ptr,
+                    dest._ptr,
+                    dest.numel(),
+                    _nccl_dtype(dest.dtype),
+                    op,
+                    handle,
+                )
+            nccl.group_end()
+
+        if all(s is t for s, t in zip(staged_out, output_tensors)):
+            work = self._channel_work(
+                index, output_tensors, (*staged_in, *output_tensors), enqueue
             )
-        nccl.group_end()
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         for original, s in zip(output_tensors, staged_out):
             if s is not original:
                 original.copy_(s)
@@ -554,8 +780,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         if not output_split_sizes:
             output_split_sizes = [dest.shape[0] // world] * world
         dtype = _nccl_dtype(source.dtype)
-        comm, stream = self._device_state(source)
-        self._drained()
+        comm, stream, index = self._device_state(source)
+        self._fence_default(index)
         nccl.group_start()
         send_offset = 0
         recv_offset = 0
@@ -585,10 +811,10 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(output_tensors[0]):
             return self._gloo.alltoall(output_tensors, input_tensors, opts)
-        comm, stream = self._device_state(input_tensors[0])
+        comm, stream, index = self._device_state(input_tensors[0])
         staged_in = [self._dense(t) for t in input_tensors]
         staged_out = [self._dense(t) for t in output_tensors]
-        self._drained()
+        self._fence_default(index)
         nccl.group_start()
         for peer in range(self.size()):
             source = staged_in[peer]
@@ -615,7 +841,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         root = int(opts.rootRank)
         source = self._dense(input_tensors[0])
         dtype = _nccl_dtype(source.dtype)
-        comm, stream = self._device_state(source)
+        comm, stream, index = self._device_state(source)
         result: list[torch.Tensor] = []
         if self.rank() == root:
             outputs = output_tensors[0]
@@ -623,7 +849,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             # self-send: same convention as ProcessGroupNCCL.
             outputs[root].copy_(source.view(outputs[root].shape))
             staged_out = [self._dense(t) for t in outputs]
-            self._drained()
+            self._fence_default(index)
             nccl.group_start()
             for peer, dest in enumerate(staged_out):
                 if peer != root:
@@ -634,7 +860,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                     original.copy_(s)
             result = outputs
         else:
-            self._drained()
+            self._fence_default(index)
             nccl.group_start()
             comm.send(source._ptr, source.numel(), dtype, root, stream)
             nccl.group_end()
@@ -652,18 +878,18 @@ class MojoProcessGroup(dist.ProcessGroup):
         root = int(opts.rootRank)
         dest = self._dense(output_tensors[0])
         dtype = _nccl_dtype(dest.dtype)
-        comm, stream = self._device_state(dest)
+        comm, stream, index = self._device_state(dest)
         if self.rank() == root:
             sources = [self._dense(t) for t in input_tensors[0]]
             output_tensors[0].copy_(sources[root].view(output_tensors[0].shape))
-            self._drained()
+            self._fence_default(index)
             nccl.group_start()
             for peer, source in enumerate(sources):
                 if peer != root:
                     comm.send(source._ptr, source.numel(), dtype, peer, stream)
             nccl.group_end()
         else:
-            self._drained()
+            self._fence_default(index)
             nccl.group_start()
             comm.recv(dest._ptr, dest.numel(), dtype, root, stream)
             nccl.group_end()
@@ -677,11 +903,18 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.send(tensors, dst_rank, tag)
         self._one_per_rank(tensors)
         source = self._dense(tensors[0])
-        comm, stream = self._device_state(source)
-        self._drained()
-        comm.send(
-            source._ptr, source.numel(), _nccl_dtype(source.dtype), dst_rank, stream
-        )
+        comm, stream, index = self._device_state(source)
+
+        def enqueue(handle: int) -> None:
+            comm.send(
+                source._ptr, source.numel(), _nccl_dtype(source.dtype), dst_rank, handle
+            )
+
+        work = self._channel_work(index, tensors, (source,), enqueue)
+        if work is not None:
+            return work
+        self._fence_default(index)
+        enqueue(stream)
         return _completed_work(tensors)
 
     @_loud
@@ -691,9 +924,19 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._one_per_rank(tensors)
         tensor = tensors[0]
         dest = self._dense(tensor)
-        comm, stream = self._device_state(dest)
-        self._drained()
-        comm.recv(dest._ptr, dest.numel(), _nccl_dtype(dest.dtype), src_rank, stream)
+        comm, stream, index = self._device_state(dest)
+
+        def enqueue(handle: int) -> None:
+            comm.recv(
+                dest._ptr, dest.numel(), _nccl_dtype(dest.dtype), src_rank, handle
+            )
+
+        if dest is tensor:
+            work = self._channel_work(index, tensors, (tensor,), enqueue)
+            if work is not None:
+                return work
+        self._fence_default(index)
+        enqueue(stream)
         if dest is not tensor:
             tensor.copy_(dest)
         return _completed_work(tensors)
@@ -702,9 +945,16 @@ class MojoProcessGroup(dist.ProcessGroup):
     def barrier(self, opts: BarrierOptions = BarrierOptions()) -> Work:
         # Complete this rank's device work first, then rendezvous over gloo.
         # This gives barrier() the "everything before me is done everywhere"
-        # meaning users expect from the CUDA backend.
+        # meaning users expect from the CUDA backend. The comm channel is a
+        # separate stream, so torch.mojo.synchronize() alone would not cover
+        # in-flight collectives.
         if self._comms:
             torch.mojo.synchronize()
+            if self._comm_stream_enabled:
+                from torch_mojo_backend.mojo_device.channels import get_channel
+
+                for max_device in self._max_devices.values():
+                    get_channel(max_device, "nccl").synchronize()
         return self._gloo.barrier(opts)
 
     def _one_per_rank(self, tensors: list[torch.Tensor]) -> None:
