@@ -302,6 +302,17 @@ def type_promotion(
     return x, y
 
 
+def _scale_operand(
+    other: MaxTensor | int | float, alpha: Scalar
+) -> MaxTensor | int | float:
+    """`other * alpha` for add/sub's `alpha`; `other` is a Python number for
+    the Scalar overloads."""
+    if isinstance(other, TensorValue | MaxEagerTensor):
+        return aten_mul(other, alpha)
+    assert not isinstance(alpha, Dim)  # a number times a Dim was never supported
+    return other * alpha
+
+
 _SEARCHSORTED_DTYPES = (
     DType.float32,
     DType.bfloat16,
@@ -1170,11 +1181,11 @@ def aten_add(
     promoted_input, promoted_other = type_promotion(input, other)
     # input is always a genuine Tensor per both ATen overloads, and
     # type_promotion only ever replaces a Dim operand or casts a tensor's
-    # dtype -- never turns a MaxTensor into a plain Scalar.
+    # dtype -- never turns a MaxTensor into a plain Scalar. `other` may stay
+    # a Python number (the Scalar overload).
     assert isinstance(promoted_input, TensorValue | MaxEagerTensor)
-    assert isinstance(promoted_other, TensorValue | MaxEagerTensor)
     if alpha != 1:
-        promoted_other = aten_mul(promoted_other, alpha)
+        promoted_other = _scale_operand(promoted_other, alpha)
     return promoted_input + promoted_other
 
 
@@ -3488,10 +3499,11 @@ def aten_select_scatter(
 
     # Handle negative index
     dim_size = input.shape[dim]
-    assert isinstance(dim_size, StaticDim), (
-        f"select_scatter requires a static size for dim {dim}, got {dim_size!r}"
-    )
     if index < 0:
+        assert isinstance(dim_size, StaticDim), (
+            f"a negative select_scatter index needs a static size for dim {dim}, "
+            f"got {dim_size!r}"
+        )
         index = index + dim_size.dim
 
     # Step 1: Create a range tensor for the dimension to build the mask
@@ -3503,7 +3515,7 @@ def aten_select_scatter(
 
     # Step 3: Reshape mask to have correct broadcasting shape
     # All dimensions except 'dim' should be 1
-    mask_shape = [StaticDim(1)] * len(input.shape)
+    mask_shape = [Dim(1)] * len(input.shape)
     mask_shape[dim] = dim_size
     mask = F.reshape(mask_1d, mask_shape)
 
@@ -3627,16 +3639,16 @@ def aten_squeeze(input: MaxTensor, dim: int | list[int]) -> MaxTensor:
 # sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 @map_to(aten.sub)
 def aten_sub(
-    input: MaxTensor, other: MaxTensor | Scalar, alpha: Scalar = 1
+    input: MaxTensor | int | float, other: MaxTensor | Scalar, alpha: Scalar = 1
 ) -> MaxTensor:
     promoted_input, other = type_promotion(input, other)
-    # input is always a genuine Tensor per both ATen overloads; type_promotion
-    # only ever replaces a Dim operand or casts a tensor's dtype.
-    assert isinstance(promoted_input, TensorValue | MaxEagerTensor)
     if alpha != 1:
-        assert isinstance(other, TensorValue | MaxEagerTensor)
-        other = aten_mul(other, alpha)
-    return promoted_input - other
+        other = _scale_operand(other, alpha)
+    result = promoted_input - other
+    # At least one operand is a tensor (rsub decomposes to a number minus
+    # a tensor, hence the widened `input`).
+    assert isinstance(result, TensorValue | MaxEagerTensor)
+    return result
 
 
 # sum.dim_IntList(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
