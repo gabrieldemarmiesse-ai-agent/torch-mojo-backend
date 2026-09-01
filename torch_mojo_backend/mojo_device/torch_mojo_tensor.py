@@ -59,6 +59,10 @@ _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 # the public ``device`` property continue to carry the real Mojo device.
 _WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
 
+# Captured at import: `sys` module globals may already be torn down when a
+# late __del__ runs.
+_is_finalizing = sys.is_finalizing
+
 
 class _HolderOwner:
     """Shared owner of one device allocation, fencing its stream-ordered free.
@@ -75,7 +79,7 @@ class _HolderOwner:
     def __init__(self, holder: object) -> None:
         self._holder = holder
         self._events = None  # {foreign stream ctx ptr: newest FenceEvent}
-        self._owner_ctx = 0
+        self._owner_ctx = None
         self._wait = None
 
     def data_ptr(self) -> int:
@@ -83,9 +87,6 @@ class _HolderOwner:
 
     def get_nbytes(self) -> int:
         return self._holder.get_nbytes()
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(object.__getattribute__(self, "_holder"), name)
 
     def record_foreign_use(
         self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
@@ -100,15 +101,10 @@ class _HolderOwner:
 
     def __del__(self) -> None:
         events = self._events
-        if not events:
+        if not events or _is_finalizing():
             return
-        try:
-            wait = self._wait
-            owner_ctx = self._owner_ctx
-            for event in events.values():
-                wait(owner_ctx, event)
-        except Exception:
-            pass  # interpreter teardown: the device context is going away too
+        for event in events.values():
+            self._wait(self._owner_ctx, event)
 
 
 def _ctx_ptr(device):
