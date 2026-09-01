@@ -409,62 +409,131 @@ def _build_env() -> dict[str, str]:
     }
 
 
-# A ptxas capability probe, not a kernel: one entry whose only body is a
-# store/load through a static `.shared` array of `__SIZE__` bytes. ptxas
-# rejects an entry function whose *static* shared memory exceeds 48 KiB
-# (0xc000) up to and including CUDA 12.8, and accepts it from CUDA 13 on;
-# the check happens before any device exists, so the probe assembles to
-# /dev/null and nothing is ever launched. `%tid.x` in and a global store out
-# keep the array live so the assembler cannot elide it. `.version 8.5` is the
-# ISA the Mojo toolchain emits for sm_90a (ptxas 12.6+ accepts it), so a
-# probe that assembles proves nothing about ISA support that the real build
-# does not already assume.
-_PTXAS_PROBE_PTX = """\
-.version 8.5
-.target sm_90a
-.address_size 64
-
-.shared .align 16 .b8 probe_shared_buffer[__SIZE__];
-
-.visible .entry probe_static_shared(
-\t.param .u64 .ptr .align 4 probe_static_shared_param_0
-)
-{
-\t.reg .b32 \t%r<4>;
-\t.reg .b64 \t%rd<4>;
-
-\tld.param.u64 \t%rd1, [probe_static_shared_param_0];
-\tcvta.to.global.u64 \t%rd2, %rd1;
-\tmov.u32 \t%r1, %tid.x;
-\tmov.u32 \t%r2, probe_shared_buffer;
-\tst.shared.u32 \t[%r2], %r1;
-\tbar.sync \t0;
-\tld.shared.u32 \t%r3, [%r2];
-\tst.global.u32 \t[%rd2], %r3;
-\tret;
-}
-"""
+# A ptxas capability probe, not a kernel: `ptxas_probe.mojo` declares one GPU
+# entry with a *static* `.shared` array of `PROBE_SIZE` bytes (a `-D` define)
+# and is built with `mojo build`, the same toolchain and (`_build_env`)
+# environment real extensions use, rather than by handing synthetic PTX to a
+# guessed assembler binary. ptxas rejects a static `.shared` allocation over
+# 48 KiB (0xc000) up to and including CUDA 12.8, and accepts it from CUDA 13
+# on; `mojo build` surfaces that as a nonzero exit and nothing is ever
+# launched.
+#
+# `mojo build` only shells out to the assembler `MODULAR_NVPTX_COMPILER_PATH`
+# names when it auto-detects a real, physically attached accelerator to build
+# for (confirmed empirically: passing an explicit `--target-accelerator`, or
+# building with none attached at all, both make it defer to PTX-only
+# embedding for later JIT and never touch that env var). `_ptxas_assembles`
+# therefore builds the same way `_extension_cmd` does -- no accelerator
+# override -- which also means the probe is only ever reachable in practice
+# where it matters: `big_static_smem_flags()` is only consulted while
+# building a real GEMM/BMM extension for an actual mojo device, which
+# requires an accelerator to exist in the first place.
+_PTXAS_PROBE_SOURCE = _PACKAGE_DIR / "ptxas_probe.mojo"
 
 # The static-shared ceiling every ptxas enforces without an opt-in, and the
 # smallest request above it. 49152 must assemble everywhere: it is the
 # control leg that tells a real ceiling apart from a probe that failed for
-# an unrelated reason (an sm_90a-unaware assembler, a sandboxed exec).
+# an unrelated reason (a sandboxed exec, a missing binary).
 _PTXAS_PROBE_SIZES = (131072, 49152)
 
 _PTXAS_BIG_SMEM_ENV = "TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM"
 
 
-def _ptxas_assembles(compiler: str, size: int) -> bool:
-    """Whether `compiler` assembles the probe with `size` bytes of static smem."""
+def _ptxas_assembles(size: int) -> bool:
+    """Whether `mojo build` compiles the probe kernel with `size` bytes of
+    static smem, under the active `MODULAR_NVPTX_COMPILER_PATH` (inherited
+    from `os.environ` through `_build_env`, exactly like a real build)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        source = Path(tmpdir) / f"probe_{size}.ptx"
-        source.write_text(_PTXAS_PROBE_PTX.replace("__SIZE__", str(size)))
+        out = Path(tmpdir) / "probe.so"
         proc = subprocess.run(
-            [compiler, "-arch=sm_90a", str(source), "-o", os.devnull],
+            [
+                str(_find_mojo()),
+                "build",
+                str(_PTXAS_PROBE_SOURCE),
+                "--emit",
+                "shared-lib",
+                "-D",
+                f"PROBE_SIZE={size}",
+                "-o",
+                str(out),
+            ],
             capture_output=True,
             text=True,
+            env=_build_env(),
         )
     return proc.returncode == 0
+
+
+def _ptxas_probe_cache_path(compiler: str) -> Path:
+    """On-disk verdict location for one (toolchain, compiler-binary) pair.
+
+    `_TOOLCHAIN_IDENTITY` covers the mojo/max package versions and host ABI;
+    the compiler path plus its file's size+mtime cover the actual binary
+    `MODULAR_NVPTX_COMPILER_PATH` names, so pointing it at a different
+    install invalidates the entry -- the realistic way an assembler changes.
+    A path that cannot be stat'd (does not exist, no permission) still gets
+    a stable key -- probing it is cheap since `mojo build` fails immediately,
+    and the answer does not depend on a fingerprint that does not exist.
+
+    This can only invalidate what it can see. `mojo build` keeps its own
+    persistent compilation cache under `MODULAR_HOME`, and empirically (see
+    tests/test_ptxas_gating.py) that cache is keyed on the compiler *path
+    string*, not on the bytes at that path -- a ptxas binary replaced in
+    place at a path `mojo` has already built against can still answer from
+    its stale cache even in a brand new process. Nothing at this layer can
+    see that; it is a property of the toolchain, not of this probe.
+    """
+    try:
+        info = os.stat(compiler)
+        fingerprint = f"{info.st_size}:{info.st_mtime_ns}"
+    except OSError:
+        fingerprint = "unavailable"
+    key = "|".join((_TOOLCHAIN_IDENTITY.decode(), compiler, fingerprint))
+    digest = hashlib.sha256(key.encode()).hexdigest()[:24]
+    return _CACHE_DIR / f"ptxas_big_smem.{digest}.json"
+
+
+def _read_ptxas_probe_cache(path: Path) -> bool | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    verdict = data.get("supports_big_static_smem")
+    return verdict if isinstance(verdict, bool) else None
+
+
+def _write_ptxas_probe_cache(path: Path, verdict: bool) -> None:
+    """Best-effort: a write failure just costs the next process a re-probe."""
+    tmp = path.with_name(f".tmp{os.getpid()}.{path.name}")
+    try:
+        _CACHE_DIR.mkdir(exist_ok=True)
+        tmp.write_text(json.dumps({"supports_big_static_smem": verdict}))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _probe_ptxas_big_static_smem(compiler: str) -> bool:
+    """Run both probe legs and apply the broken-vs-capped fallback rule."""
+    big, control = _PTXAS_PROBE_SIZES
+    if _ptxas_assembles(big):
+        return True
+    # The big leg failed. Only a passing control leg makes that a statement
+    # about the ceiling; if even 48 KiB fails, the probe itself is broken and
+    # gating the fast kernels out on that evidence would be a silent,
+    # permanent slowdown. Keep today's behaviour and say so.
+    if _ptxas_assembles(control):
+        return False
+    sys.stderr.write(
+        f"torch-mojo-backend: {compiler!r} (MODULAR_NVPTX_COMPILER_PATH) "
+        "failed to build both probe kernels via `mojo build`, so its static "
+        "shared-memory limit could not be determined; assuming it accepts "
+        f"the large-shared-memory kernels. Set {_PTXAS_BIG_SMEM_ENV}=0 if "
+        "builds fail with 'uses too much shared data'.\n"
+    )
+    return True
 
 
 @functools.cache
@@ -478,17 +547,23 @@ def _ptxas_supports_big_static_smem() -> bool:
     loader deliberately has no run-time fallback (docs/kernel_call_queue.md).
     The routes that stay serve every shape those ones did, more slowly.
 
-    The answer is a property of the assembler, so it is probed rather than
-    guessed from a version string:
+    The answer is a property of the assembler, so it is asked by actually
+    building `ptxas_probe.mojo` with `mojo build` rather than guessed from a
+    version string:
 
     * `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1` overrides everything, for
-      tests and for a machine whose probe is wrong.
+      tests and for a machine whose probe is wrong. It short-circuits before
+      either the build or the disk cache below.
     * With `MODULAR_NVPTX_COMPILER_PATH` unset, MAX assembles PTX in-process
       with the PTX compiler it ships (CUDA 13 today, which accepts big static
       smem) and there is no external binary to interrogate: answer True, so
       the default install compiles exactly the kernels it always did.
     * Otherwise that env var names the `ptxas` MAX will hand the PTX to, and
-      it is the one binary whose limits matter. Assemble the probe with it.
+      it is the one binary whose limits matter. A `mojo build` of the probe
+      costs real seconds, so the verdict is memoized on disk under
+      `_CACHE_DIR`, keyed by toolchain identity plus the compiler binary's
+      path and size+mtime fingerprint (`_ptxas_probe_cache_path`); this
+      `functools.cache` is only the in-process layer on top of that file.
 
     Only NVIDIA is affected. AMD and Apple builds never consult
     `MODULAR_NVPTX_COMPILER_PATH`, so they take the True branch above and
@@ -501,31 +576,13 @@ def _ptxas_supports_big_static_smem() -> bool:
     compiler = os.environ.get("MODULAR_NVPTX_COMPILER_PATH")
     if not compiler:
         return True
-    big, control = _PTXAS_PROBE_SIZES
-    try:
-        if _ptxas_assembles(compiler, big):
-            return True
-        # The big probe failed. Only a passing control leg makes that a
-        # statement about the ceiling; if even 48 KiB fails, the probe itself
-        # is broken and gating the fast kernels out on that evidence would be
-        # a silent, permanent slowdown. Keep today's behaviour and say so.
-        if _ptxas_assembles(compiler, control):
-            return False
-    except OSError as exc:
-        sys.stderr.write(
-            f"torch-mojo-backend: could not run {compiler!r} to probe its "
-            f"static shared-memory limit ({exc}); assuming it accepts the "
-            f"large-shared-memory kernels. Set {_PTXAS_BIG_SMEM_ENV}=0 if "
-            "builds fail with 'uses too much shared data'.\n"
-        )
-        return True
-    sys.stderr.write(
-        f"torch-mojo-backend: {compiler!r} failed to assemble both probes, so "
-        "its static shared-memory limit could not be determined; assuming it "
-        f"accepts the large-shared-memory kernels. Set {_PTXAS_BIG_SMEM_ENV}=0 "
-        "if builds fail with 'uses too much shared data'.\n"
-    )
-    return True
+    cache_path = _ptxas_probe_cache_path(compiler)
+    cached = _read_ptxas_probe_cache(cache_path)
+    if cached is not None:
+        return cached
+    verdict = _probe_ptxas_big_static_smem(compiler)
+    _write_ptxas_probe_cache(cache_path, verdict)
+    return verdict
 
 
 def big_static_smem_flags() -> dict[str, DefineValue]:

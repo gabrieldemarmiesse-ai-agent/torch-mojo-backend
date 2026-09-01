@@ -9,6 +9,15 @@ and the loader has no run-time fallback to soften that
 (docs/kernel_call_queue.md). `PTXAS_BIG_SMEM` compiles those routes out
 instead, leaving the ones that already fit.
 
+The probe itself works by actually building `ptxas_probe.mojo` with
+`mojo build` (see eager_kernels._ptxas_assembles): the fakes below stand in
+for the assembler that build shells out to, not for a compiler this test
+invokes directly. `mojo build` only shells out to it when auto-detecting a
+real, physically attached accelerator, so tests that need at least one leg to
+genuinely reach the fake are gated on `real_accelerator`; the two tests where
+both legs fail regardless of *why* (missing binary, no attached accelerator)
+are not.
+
 Two properties matter and are tested separately: the probe must answer for
 the assembler that will actually be used, and the gate must leave a correct
 kernel behind for every shape the removed routes used to claim.
@@ -25,6 +34,7 @@ from typing import ClassVar
 
 import pytest
 from max.dtype import DType
+from max.driver import accelerator_count
 
 from torch_mojo_backend import eager_kernels, get_accelerators
 
@@ -40,26 +50,54 @@ _BIG, _CONTROL = eager_kernels._PTXAS_PROBE_SIZES
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache() -> Iterator[None]:
-    """The probe is process-cached; every test here sets up its own answer."""
+    """The probe is process-cached; every test here sets up its own answer.
+
+    Only the in-process `functools.cache` layer: the on-disk verdict cache is
+    keyed by the fake assembler's own path plus its file's size+mtime
+    (`_ptxas_probe_cache_path`), and every test here builds its fake under
+    pytest's per-test `tmp_path`, so distinct tests never share an entry.
+    """
     eager_kernels._ptxas_supports_big_static_smem.cache_clear()
     yield
     eager_kernels._ptxas_supports_big_static_smem.cache_clear()
 
 
-def _fake_ptxas(tmp_path: Path, *, ceiling: int | None, exit_code: int = 1) -> str:
-    """A stand-in `ptxas` that accepts static shared memory up to `ceiling`.
+@pytest.fixture(scope="module")
+def real_accelerator() -> None:
+    """`mojo build` shells out to `MODULAR_NVPTX_COMPILER_PATH` only when it
+    auto-detects a real, physically attached accelerator to build for
+    (verified empirically: an explicit `--target-accelerator`, or none
+    attached at all, both make it defer to PTX-only embedding and never
+    touch that env var — see eager_kernels._ptxas_assembles). A test that
+    needs the fake to actually be reached and accept a leg needs one.
 
-    It reads the `.shared` request out of the probe PTX the way the real one
-    does, so a probe that stopped emitting a shared array (and therefore
-    stopped testing anything) fails here instead of silently passing.
-    `ceiling=None` refuses everything, standing in for an assembler that
-    cannot answer the question at all.
+    `get_accelerators()` always appends a CPU pseudo-device (so `mojo:0`
+    resolves somewhere even without one), so its list is truthy either way;
+    `accelerator_count()` is the actual "is a real accelerator attached?"
+    primitive it and `sm90_mojo_gpu` are both built from.
+    """
+    if accelerator_count() == 0:
+        pytest.skip("the build-based ptxas probe needs a real accelerator")
+
+
+def _fake_ptxas(tmp_path: Path, *, ceiling: int | None, exit_code: int = 1) -> str:
+    """A stand-in assembler `mojo build` shells out to, accepting static
+    shared memory up to `ceiling`.
+
+    It reads the `.shared` request out of the PTX `mojo build` hands it the
+    way the real ptxas does, so a probe kernel that stopped declaring a
+    shared array (and therefore stopped testing anything) fails here instead
+    of silently passing. `ceiling=None` refuses everything, standing in for
+    an assembler that cannot answer the question at all. It also writes the
+    `-o` output path on success, matching a real assembler closely enough
+    that a future `mojo build` which starts checking for it still works.
     """
     script = tmp_path / "fake_ptxas"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import re, sys\n"
-        "source = [a for a in sys.argv[1:] if a.endswith('.ptx')]\n"
+        "args = sys.argv[1:]\n"
+        "source = [a for a in args if a.endswith('.ptx')]\n"
         "if not source:\n"
         "    sys.exit(2)\n"
         "text = open(source[0]).read()\n"
@@ -71,6 +109,8 @@ def _fake_ptxas(tmp_path: Path, *, ceiling: int | None, exit_code: int = 1) -> s
         "if ceiling is None or max(sizes) > ceiling:\n"
         "    sys.stderr.write('ptxas error   : uses too much shared data\\n')\n"
         f"    sys.exit({exit_code})\n"
+        "if '-o' in args:\n"
+        "    open(args[args.index('-o') + 1], 'wb').close()\n"
         "sys.exit(0)\n"
     )
     script.chmod(0o755)
@@ -117,7 +157,7 @@ def test_env_override_beats_the_probe(
 
 
 def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
     monkeypatch.setenv(
@@ -129,7 +169,7 @@ def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
 
 
 def test_assembler_capped_at_48kib_compiles_the_big_routes_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The CUDA 12.x case: the control leg passes, the big one does not.
 
@@ -169,22 +209,73 @@ def test_assembler_that_cannot_be_run_is_not_evidence_of_a_cap(
     assert eager_kernels._PTXAS_BIG_SMEM_ENV in capsys.readouterr().err
 
 
-def test_probe_ptx_declares_more_than_the_ceiling_and_uses_it() -> None:
+def test_disk_cache_reprobes_only_when_the_assembler_fingerprint_changes(
+    real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A warm process must read the on-disk verdict, not rebuild, unless the
+    binary `MODULAR_NVPTX_COMPILER_PATH` names actually changed.
+
+    The "changed" leg uses a second, distinct path rather than overwriting
+    the first path's file in place: `mojo build` turns out to keep its own
+    persistent compilation cache (under `MODULAR_HOME`, confirmed to survive
+    across separate processes) keyed on the compiler *path string*, not on
+    the bytes at that path, so replacing a binary in place while `mojo`
+    itself has already cached an answer for that exact path is not something
+    this probe -- or any caller of `mojo build` -- can observe. A distinct
+    install path (a different CUDA toolkit directory, the realistic trigger
+    for "the assembler changed") is exactly the case the size+mtime
+    fingerprint has to catch, and it is what this test exercises.
+    """
+    monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
+    path = _fake_ptxas(tmp_path, ceiling=_BIG)
+    monkeypatch.setenv("MODULAR_NVPTX_COMPILER_PATH", path)
+
+    assert eager_kernels._ptxas_supports_big_static_smem() is True
+    cache_file = eager_kernels._ptxas_probe_cache_path(path)
+    assert cache_file.is_file()
+
+    # A fresh functools.cache (a new process, in effect) with the same
+    # fingerprint must read the disk verdict and never call mojo build again.
+    eager_kernels._ptxas_supports_big_static_smem.cache_clear()
+    calls: list[int] = []
+    real_ptxas_assembles = eager_kernels._ptxas_assembles
+    monkeypatch.setattr(
+        eager_kernels,
+        "_ptxas_assembles",
+        lambda size: calls.append(size) or real_ptxas_assembles(size),
+    )
+    assert eager_kernels._ptxas_supports_big_static_smem() is True
+    assert calls == []
+
+    # A different assembler at a different path is a different fingerprint
+    # (different path string alone already changes the cache key; a fresh
+    # binary's distinct size/mtime is the part this test is really after),
+    # which must force a fresh probe with the new, correct answer.
+    eager_kernels._ptxas_supports_big_static_smem.cache_clear()
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_path = _fake_ptxas(other_dir, ceiling=_CONTROL)
+    monkeypatch.setenv("MODULAR_NVPTX_COMPILER_PATH", other_path)
+    assert eager_kernels._ptxas_probe_cache_path(other_path) != cache_file
+    assert eager_kernels._ptxas_supports_big_static_smem() is False
+    assert calls, "a changed fingerprint must not be served from the stale entry"
+
+
+def test_probe_source_declares_more_than_the_ceiling_and_uses_it() -> None:
     """Guard rails on the probe source itself.
 
-    Assembling PTX that declares no shared memory, or whose array the
-    assembler can prove dead, would answer True everywhere — a probe that
-    always passes is worse than no probe, because it looks like evidence.
+    A kernel whose shared buffer the compiler can prove dead would assemble
+    everywhere regardless of size — a probe that always passes is worse than
+    no probe, because it looks like evidence.
     """
-    text = eager_kernels._PTXAS_PROBE_PTX
+    text = eager_kernels._PTXAS_PROBE_SOURCE.read_text()
     assert _BIG > _CONTROL == 49152
-    assert ".shared .align 16 .b8 probe_shared_buffer[__SIZE__];" in text
-    # Written, read back, and stored to a caller-visible pointer: nothing in
-    # that chain is removable.
-    assert "st.shared.u32" in text
-    assert "ld.shared.u32" in text
-    assert "st.global.u32" in text
-    assert ".target sm_90a" in text
+    assert "address_space=AddressSpace.SHARED" in text
+    assert "stack_allocation[" in text
+    # Written, barrier-synced, read back, and stored to a caller-visible
+    # pointer: nothing in that chain is provably dead.
+    assert "barrier()" in text
+    assert "out_ptr[0]" in text
 
 
 def test_only_the_two_families_with_big_smem_routes_send_the_define() -> None:
