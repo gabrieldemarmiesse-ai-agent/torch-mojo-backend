@@ -1200,3 +1200,21 @@ def test_vector_norm_with_an_accumulation_dtype(mojo_gpu_available, dtype):
     got = torch.linalg.vector_norm(cpu.to("mojo:0"), 2.0, dtype=torch.float32)
     assert got.dtype == torch.float32
     torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_library_attributes_do_not_clobber_the_payload(mojo_gpu_available):
+    """A mojo Parameter IS the wrapper object, so torch's own bookkeeping
+    attributes land in the payload's namespace.
+    ``FlatParameter._init_metadata`` writes ``_strides``/``_shapes``/
+    ``_numels``; none of those may disturb the layout metadata."""
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    tensor = torch.arange(8, dtype=torch.float32, device="mojo:0")
+    strides = tensor._mojo_strides
+    tensor._strides = ((1,), (1,))
+    tensor._shapes = (torch.Size([4]), torch.Size([4]))
+    tensor._numels = (4, 4)
+    assert tensor._mojo_strides == strides
+    first, second = torch.split(tensor, [4, 4])
+    assert second.cpu().tolist() == [4.0, 5.0, 6.0, 7.0]
+    assert first.cpu().tolist() == [0.0, 1.0, 2.0, 3.0]

@@ -472,7 +472,7 @@ def test_spec_descriptor_canonical_defines_match_make_defines() -> None:
     class _FakePayload:
         _dtype: DType
         _shape: tuple[int, ...] = (2, 3)
-        _strides: tuple[int, ...] = (3, 1)
+        _mojo_strides: tuple[int, ...] = (3, 1)
         _device: object = field(default_factory=lambda: cpu)
 
     a = _FakePayload(DType.float32)
