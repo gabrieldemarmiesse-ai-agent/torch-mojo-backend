@@ -14,6 +14,11 @@ dependencies = [
     "max==26.5",
     "tabulate",
     "torch>=2.10",
+    # NCCL for the mojo-device distributed backend (torch_mojo_backend/distributed).
+    # The cu12 build: libnccl.so.2 statically links cudart and dlopens libcuda
+    # itself, so it runs on any CUDA-12-capable driver (>= r525) regardless of
+    # which CUDA version torch was built for.
+    "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
 ]
 
 [project.urls]
@@ -96,6 +101,13 @@ exclude = [
 
 [tool.uv]
 python-preference = "only-managed"
+override-dependencies = [
+    # torch's PyPI wheel pins nvidia-nccl-cu13, which needs an r580+ driver and
+    # installs to the same site-packages path (nvidia/nccl/) as the
+    # nvidia-nccl-cu12 wheel our distributed backend drives directly. Exclude
+    # it; the cu12 wheel satisfies torch's optional libnccl preload too.
+    "nvidia-nccl-cu13; sys_platform == 'never'",
+]
 
 [tool.ruff.format]
 line-ending = "lf"
