@@ -1218,3 +1218,29 @@ def test_library_attributes_do_not_clobber_the_payload(mojo_gpu_available):
     first, second = torch.split(tensor, [4, 4])
     assert second.cpu().tolist() == [4.0, 5.0, 6.0, 7.0]
     assert first.cpu().tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_data_assignment_moves_the_payload(mojo_gpu_available):
+    """``x.data = y`` has to move the allocation, not just TensorImpl metadata.
+
+    The C++ setter shallow-copies the TensorImpl and stops; for this
+    storage-less wrapper that left every kernel reading the OLD buffer with
+    no error at all. FSDP1 swaps a flat parameter between its sharded and
+    unsharded buffers with exactly this assignment.
+    """
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    destination = torch.zeros(8, device="mojo:0")
+    source = torch.arange(8, dtype=torch.float32, device="mojo:0") + 100
+    destination.data = source
+    assert destination.cpu().tolist() == source.cpu().tolist()
+
+    # A strided view at a non-zero offset must survive intact: FSDP hands
+    # every original parameter a slice of the flat parameter this way.
+    base = torch.arange(16, dtype=torch.float32, device="mojo:0")
+    view = base[4:12].reshape(2, 4)
+    holder = torch.zeros(1, device="mojo:0")
+    holder.data = view
+    assert tuple(holder.shape) == (2, 4)
+    assert holder.stride() == view.stride()
+    assert holder.cpu().tolist() == [[4.0, 5.0, 6.0, 7.0], [8.0, 9.0, 10.0, 11.0]]

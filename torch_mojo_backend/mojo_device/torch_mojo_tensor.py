@@ -617,6 +617,36 @@ class TorchMojoTensor(torch.Tensor):
             return self._torch_device
         return super().device
 
+    def _set_data(self, value: torch.Tensor) -> None:
+        """``tensor.data = other`` for a wrapper whose payload is in Python.
+
+        The C++ setter reaches ``Variable::set_data``, which shallow-copies
+        the *TensorImpl* metadata and stops there. For an ordinary backend
+        that moves the storage pointer too and is the whole story; here the
+        allocation lives in this object's ``_holder``/``_ptr``, so the C++
+        path left every kernel reading the old buffer — silently, with no
+        error and wrong numbers. (FSDP1 swaps a flat parameter between its
+        sharded and unsharded buffers with exactly this assignment on every
+        unshard and reshard.) Move the payload as well.
+        """
+        if (
+            isinstance(value, TorchMojoTensor)
+            and hasattr(self, "_holder")
+            and hasattr(value, "_holder")
+        ):
+            if value._device != self._device:
+                raise RuntimeError(
+                    "tensor.data = other requires both tensors on the same mojo "
+                    f"device (got {self.device} and {value.device})"
+                )
+            _rebind_payload_exact(self, value)
+            return
+        torch._C.TensorBase.data.__set__(self, value)
+
+    # Only the setter is overridden; reads keep going straight to the C++
+    # getset descriptor so nothing about `x.data` changes for dynamo.
+    data = property(torch._C.TensorBase.data.__get__, _set_data)
+
     __torch_function__ = torch._C._disabled_torch_function_impl
 
 
@@ -662,6 +692,59 @@ class _PermuteCopyExtension(
         )
 
 
+_CPU_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.CPU)
+
+_PAYLOAD_ATTRIBUTES = (
+    "_holder",
+    "_ptr",
+    "_shape",
+    "_mojo_strides",
+    "_offset",
+    "_dtype",
+    "_itemsize",
+    "_numel",
+    "_device",
+    "_torch_device",
+    "_is_contiguous",
+)
+
+
+def _resize_tensorimpl(dst: TorchMojoTensor, shape) -> None:
+    """Set dst's TensorImpl sizes (and grow its placeholder storage)."""
+    torch.ops.aten.resize_.default.redispatch(
+        _CPU_KEYSET, dst, shape, memory_format=None
+    )
+
+
+def _as_strided_tensorimpl(dst: TorchMojoTensor, shape, strides, offset: int) -> None:
+    """State dst's TensorImpl layout exactly. Metadata only, no data moved."""
+    torch.ops.aten.as_strided_.default.redispatch(
+        _CPU_KEYSET, dst, shape, strides, offset
+    )
+
+
+def _move_payload_attributes(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+    for name in _PAYLOAD_ATTRIBUTES:
+        setattr(dst, name, getattr(src, name))
+    # Any cached spec describes the old allocation or layout. Rebuild it on
+    # the next spec operation instead of retaining stale pointer metadata.
+    dst.__dict__.pop("_spec", None)
+
+
+def _storage_extent(tensor: TorchMojoTensor) -> int:
+    """Elements from the allocation start that `tensor`'s layout reaches."""
+    if not all(tensor._shape):
+        return tensor._offset
+    return (
+        tensor._offset
+        + 1
+        + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor._shape, tensor._mojo_strides)
+        )
+    )
+
+
 def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     """Move ``src``'s eager payload into ``dst`` without changing identity.
 
@@ -678,29 +761,40 @@ def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     to retain the original TensorImpl, then move the authoritative Mojo
     payload. No CPU tensor data is allocated or read.
     """
-    torch.ops.aten.resize_.default.redispatch(
-        torch._C.DispatchKeySet(torch._C.DispatchKey.CPU),
-        dst,
-        src._shape,
-        memory_format=None,
-    )
-    for name in (
-        "_holder",
-        "_ptr",
-        "_shape",
-        "_mojo_strides",
-        "_offset",
-        "_dtype",
-        "_itemsize",
-        "_numel",
-        "_device",
-        "_torch_device",
-        "_is_contiguous",
-    ):
-        setattr(dst, name, getattr(src, name))
-    # Any cached spec describes the old allocation or layout. Rebuild it on
-    # the next spec operation instead of retaining stale pointer metadata.
-    dst.__dict__.pop("_spec", None)
+    _resize_tensorimpl(dst, src._shape)
+    _move_payload_attributes(dst, src)
+
+
+def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+    """``_rebind_payload`` that also reproduces src's strides and offset.
+
+    ``_rebind_payload`` moves the payload and resizes the TensorImpl, but
+    ``resize_`` can only give contiguous strides at the offset the
+    destination already had. That is enough for an ``out=`` kernel, and not
+    enough for ``set_`` / ``tensor.data = view``, where the source is
+    routinely a strided view at a non-zero offset (FSDP1 hands every
+    original parameter a slice of the flat parameter this way). ``as_strided_``
+    is a metadata-only composite kernel — it calls ``setStrided`` and touches
+    no data — so redispatching it below this backend's Python kernels states
+    the layout exactly.
+
+    ``setStrided`` does bounds-check the layout against the wrapper's
+    placeholder storage, which was sized for whatever the destination used to
+    hold, so the resize that precedes it asks for the source's full extent
+    rather than its element count. Nothing is allocated either way: the
+    placeholder storage is on the Meta allocator and only its recorded byte
+    count moves.
+    """
+    if src._mojo_strides == _row_major_strides(src._shape) and src._offset == 0:
+        _rebind_payload(dst, src)
+        return
+    # Rewind to offset zero before growing: `resize_` sizes the storage from
+    # the offset the destination already has, which after an earlier exact
+    # rebind need not be zero and need not be large enough.
+    _as_strided_tensorimpl(dst, (0,), (1,), 0)
+    _resize_tensorimpl(dst, (_storage_extent(src),))
+    _move_payload_attributes(dst, src)
+    _as_strided_tensorimpl(dst, src._shape, src._mojo_strides, src._offset)
 
 
 def _resize_payload(dst: TorchMojoTensor, shape) -> None:
