@@ -67,6 +67,7 @@ _OUT = (
 SKIPPED_OPS: dict[str, str] = {
     # -- views ------------------------------------------------------------
     "aten::alias": _VIEW,
+    "aten::as_strided": _VIEW,
     "aten::detach": _VIEW,
     "aten::view": _VIEW,
     "aten::_unsafe_view": _VIEW,

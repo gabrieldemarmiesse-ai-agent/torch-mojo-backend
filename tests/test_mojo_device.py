@@ -1244,3 +1244,25 @@ def test_data_assignment_moves_the_payload(mojo_gpu_available):
     assert tuple(holder.shape) == (2, 4)
     assert holder.stride() == view.stride()
     assert holder.cpu().tolist() == [[4.0, 5.0, 6.0, 7.0], [8.0, 9.0, 10.0, 11.0]]
+
+
+def test_as_strided_zero_copy_view(mojo_gpu_available):
+    """A strided view at an offset, and the allocation-bounds refusal.
+
+    as_strided is the one view op whose arguments are unconstrained by the
+    input's own shape, so the backend must bound-check against the real
+    allocation rather than trust the caller (DDP's Reducer builds gradient
+    bucket views with it).
+    """
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    cpu = torch.arange(24, dtype=torch.float32)
+    dev = cpu.to("mojo:0")
+    view = torch.as_strided(dev, (3, 4), (8, 2), 1)
+    assert torch.equal(view.cpu(), torch.as_strided(cpu, (3, 4), (8, 2), 1))
+    # Zero-copy: writes through the base are visible in the view.
+    dev.add_(1.0)
+    assert torch.equal(view.cpu(), torch.as_strided(cpu + 1, (3, 4), (8, 2), 1))
+    # A layout that would reach past the allocation must be refused.
+    with pytest.raises(NotImplementedError):
+        torch.as_strided(dev, (5, 4), (8, 2), 1)
