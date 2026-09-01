@@ -35,6 +35,7 @@ process), so it is always built complete and never escalated — which also
 means direct references to its functions stay valid forever.
 """
 
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
@@ -460,6 +461,25 @@ def _announce_build() -> None:
     )
 
 
+def _flock_or_none(lock: object) -> bool:
+    """Take the build lock; False when this filesystem cannot lock at all.
+
+    The lock only DEDUPES concurrent identical builds — correctness never
+    depends on it, because every builder writes a per-pid temp file and
+    installs it with an atomic os.replace. On NFS home directories without a
+    lock manager, flock raises ENOLCK (seen with 8 torchrun ranks sharing one
+    __mojocache__ over NFS); building redundantly is the right fallback.
+    """
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return True
+    except OSError as e:
+        if e.errno in (errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP):
+            _trace(f"build lock unavailable ({e}); building without dedupe")
+            return False
+        raise
+
+
 def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
     """Compile one immutable defined extension and return its cache path."""
     out = _extension_path(src, defines)
@@ -467,7 +487,7 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         return out
     _CACHE_DIR.mkdir(exist_ok=True)
     with open(_CACHE_DIR / f".{out.stem}.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock_or_none(lock)
         if out.is_file():
             return out
         # An ungated build gets named as what it is rather than as
