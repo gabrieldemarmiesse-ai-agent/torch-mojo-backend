@@ -59,6 +59,53 @@ _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 # the public ``device`` property continue to carry the real Mojo device.
 _WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
 
+# Captured at import: `sys` module globals may already be torn down when a
+# late __del__ runs.
+_is_finalizing = sys.is_finalizing
+
+
+class _HolderOwner:
+    """Shared owner of one device allocation, fencing its stream-ordered free.
+
+    MAX frees a buffer stream-ordered on its OWNING stream only, so a reader
+    on another stream races the pool's reuse (measured — see
+    device_streams.record_use). ``_wait`` caches
+    ``tensor_holder.fence_event_wait`` at record time because ``__del__`` can
+    run during interpreter shutdown, when module globals are already cleared.
+    """
+
+    __slots__ = ("_holder", "_events", "_owner_ctx", "_wait")
+
+    def __init__(self, holder: object) -> None:
+        self._holder = holder
+        self._events = None  # {foreign stream ctx ptr: newest FenceEvent}
+        self._owner_ctx = None
+        self._wait = None
+
+    def data_ptr(self) -> int:
+        return self._holder.data_ptr()
+
+    def get_nbytes(self) -> int:
+        return self._holder.get_nbytes()
+
+    def record_foreign_use(
+        self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
+    ) -> None:
+        if self._events is None:
+            self._events = {}
+            self._wait = _holder_mod().fence_event_wait
+        self._owner_ctx = owner_ctx_ptr
+        # A later event on the same stream dominates the earlier one; the
+        # replaced event is released when this rebinding drops it.
+        self._events[stream_ctx_ptr] = event
+
+    def __del__(self) -> None:
+        events = self._events
+        if not events or _is_finalizing():
+            return
+        for event in events.values():
+            self._wait(self._owner_ctx, event)
+
 
 def _ctx_ptr(device):
     # Rebinds this module-level name to the real (cached) implementation on
@@ -357,6 +404,8 @@ class TorchMojoTensor(torch.Tensor):
     def _make(
         cls, holder, ptr, shape, strides, offset, dtype, device, contiguous=None
     ) -> "TorchMojoTensor":
+        if not isinstance(holder, _HolderOwner):
+            holder = _HolderOwner(holder)
         shape = tuple(shape)
         strides = tuple(strides)
         res = torch.Tensor._make_wrapper_subclass(

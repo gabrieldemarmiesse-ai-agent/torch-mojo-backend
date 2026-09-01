@@ -22,7 +22,7 @@
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, DeviceEvent, HostBuffer
 from std.memory import memcpy
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
@@ -404,6 +404,51 @@ def read_scalar(
 
 
 # ---------------------------------------------------------------------------
+# Fence events: the one primitive Python's `max.driver` lacks — enqueue a
+# wait on stream B for an event recorded at a point in time on stream A,
+# arbitrarily later (at destructor time). Python's `wait_for(stream)` waits
+# on the other stream's current TAIL instead, which over-fences; Mojo has
+# the real thing. `FenceEvent` owns the MAX `DeviceEvent` via the CPython
+# refcount (no bare pointers cross the ABI); streams are addressed by their
+# per-stream `DeviceContext` pointer. Dropping a FenceEvent right after
+# enqueuing its waits is safe: the driver defers destruction until the
+# captured work completes.
+# ---------------------------------------------------------------------------
+
+
+struct FenceEvent(Movable, Writable):
+    """Owns one MAX `DeviceEvent` for as long as Python holds this object."""
+
+    var event: DeviceEvent
+
+    def __init__(out self, event: DeviceEvent):
+        self.event = event
+
+    def write_to(self, mut writer: Some[Writer]):
+        # DeviceEvent is not Writable, so the reflection-derived default
+        # cannot be used for either of these.
+        writer.write("FenceEvent()")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("FenceEvent()")
+
+
+def fence_event_record(stream_ctx_ptr: PythonObject) raises -> PythonObject:
+    """Create an event and record it on `stream_ctx_ptr`'s stream."""
+    var ctx = _get_ctx(stream_ctx_ptr)
+    var event = ctx.create_event()
+    ctx.stream().record_event(event)
+    return PythonObject(alloc=FenceEvent(event^))
+
+
+def fence_event_wait(stream_ctx_ptr: PythonObject, event: PythonObject) raises:
+    """Order later work on `stream_ctx_ptr`'s stream after `event`."""
+    _get_ctx(stream_ctx_ptr).stream().enqueue_wait_for(
+        event.downcast_value_ptr[FenceEvent]()[].event
+    )
+
+
+# ---------------------------------------------------------------------------
 # CopyStrided: dst[coords] = src[coords] over an arbitrary-rank-<=8 index
 # space, with independent element strides on both sides (0-stride broadcast
 # reads included). This is the shared materialize primitive: .contiguous(),
@@ -655,6 +700,9 @@ def PyInit_tensor_holder() abi("C") -> PythonObject:
         )
         m.def_function[synchronize]("synchronize")
         m.def_function[read_scalar]("read_scalar")
+        _ = m.add_type[FenceEvent]("FenceEvent")
+        m.def_function[fence_event_record]("fence_event_record")
+        m.def_function[fence_event_wait]("fence_event_wait")
         m.def_py_c_function(
             _copy_strided_dispatcher,
             "CopyStrided",
