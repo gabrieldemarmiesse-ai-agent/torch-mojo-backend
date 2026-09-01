@@ -222,6 +222,34 @@ def test_fast_floor_divide_narrow_float_boundary(mojo_device, dtype):
     torch.testing.assert_close(result, torch.floor_divide(x, y))
 
 
+def test_fast_floor_divide_subnormal_quotient_underflow(mojo_device):
+    """Regression test for a CPU-only bug distinct from the boundary-rounding
+    one above: `a` sits exactly at float32's smallest NORMAL magnitude
+    (2**-126, itself exactly representable in bf16 -- not subnormal), and
+    dividing it by an O(1) `b` produces a true quotient that underflows into
+    float32's subnormal range. The CPU `elementwise` codegen this kernel's
+    CPU dispatch goes through was observed to flush that subnormal quotient
+    to zero (a bare scalar `mojo run` of the same fp32 division does NOT
+    flush -- this is specific to that compiled CPU path), giving floor(0) =
+    0 instead of the correct -1. float64's subnormal threshold (~2**-1074)
+    is nowhere near reachable from a bf16 operand, so the CPU dispatch
+    widens to float64 instead of float32 for this op (`cpu_floordiv_f64` in
+    logic_ops.mojo's `_bin_vec_op`); GPU device kernels are unaffected and
+    stay on float32. bf16-only: fp16's own normal range bottoms out at
+    2**-14, far above float32's subnormal cliff (~2**-149), so an fp16
+    operand can never reach this failure mode through the same fp32
+    upcast. Exact values from a fresh OpInfo conformance failure:
+    `conformance/test_opinfo.py::test_matches_cpu_div_floor_rounding_mojo_bfloat16`,
+    sample 5, index (3, 6, 2)."""
+    dtype = torch.bfloat16
+    x = torch.tensor([2.0**-126], dtype=dtype)
+    y = torch.tensor([-4.71875], dtype=dtype)
+    result = torch.floor_divide(x.to(mojo_device), y.to(mojo_device)).cpu()
+    ref = torch.floor_divide(x, y)
+    torch.testing.assert_close(result, ref)
+    torch.testing.assert_close(ref, torch.tensor([-1.0], dtype=dtype))
+
+
 @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float64, torch.int32, torch.int64, torch.uint8]
