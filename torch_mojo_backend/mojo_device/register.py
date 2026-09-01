@@ -53,6 +53,98 @@ def _install_torch_accelerator_synchronize(torch_mojo_device_module):
     torch.accelerator.synchronize = synchronize
 
 
+def _install_torch_accelerator_stream_api(torch_mojo_device_module):
+    """Route torch.accelerator.current_stream/set_stream to mojo streams.
+
+    Same reason as the synchronize patch above: the Python PrivateUse1
+    guard's stream hooks are stubs (every torch.Stream it mints is a silent
+    no-op object), so the generic accelerator entry points would otherwise
+    hand back streams that do nothing.
+    """
+    original_current_stream = torch.accelerator.current_stream
+    if getattr(original_current_stream, "_torch_mojo_backend", False):
+        return
+    mojo_device = torch.device("mojo")
+
+    @wraps(original_current_stream)
+    def current_stream(device=None):
+        if torch.accelerator.current_accelerator() != mojo_device:
+            return original_current_stream(device)
+        return torch_mojo_device_module.current_stream(device)
+
+    current_stream._torch_mojo_backend = True
+    torch.accelerator.current_stream = current_stream
+
+    original_set_stream = torch.accelerator.set_stream
+
+    @wraps(original_set_stream)
+    def set_stream(stream):
+        from torch_mojo_backend.mojo_device.streams import Stream as MojoStream
+
+        if isinstance(stream, MojoStream):
+            return torch_mojo_device_module.set_stream(stream)
+        return original_set_stream(stream)
+
+    set_stream._torch_mojo_backend = True
+    torch.accelerator.set_stream = set_stream
+
+
+def _install_torch_stream_event_dispatch():
+    """Dispatch torch.Stream/torch.Event on mojo devices to real classes.
+
+    Construction through the original classes reaches the stub C++ guard and
+    yields inert objects, so a metaclass routes mojo devices to
+    mojo_device/streams.py while delegating everything else (and the
+    explicit ``stream_id=``/``device_type=`` reconstruction overload) to the
+    originals. ``isinstance`` accepts both families in both directions.
+    """
+    if getattr(torch.Stream, "_torch_mojo_backend", False):
+        return
+    from torch_mojo_backend.mojo_device import streams as mojo_streams
+
+    original_stream = torch.Stream
+    original_event = torch.Event
+
+    def _wants_mojo(args, kwargs):
+        device = kwargs.get("device", args[0] if args else None)
+        if device is None or isinstance(device, int):
+            accelerator = torch.accelerator.current_accelerator()
+            return accelerator is not None and accelerator.type == "mojo"
+        try:
+            return torch.device(device).type == "mojo"
+        except (TypeError, RuntimeError, ValueError):
+            return False
+
+    class _StreamMeta(type):
+        def __call__(cls, *args, **kwargs):
+            if "stream_id" in kwargs or "device_type" in kwargs:
+                return original_stream(*args, **kwargs)
+            if _wants_mojo(args, kwargs):
+                return mojo_streams.Stream(*args, **kwargs)
+            return original_stream(*args, **kwargs)
+
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, (original_stream, mojo_streams.Stream))
+
+    class Stream(metaclass=_StreamMeta):
+        _torch_mojo_backend = True
+
+    class _EventMeta(type):
+        def __call__(cls, *args, **kwargs):
+            if _wants_mojo(args, kwargs):
+                return mojo_streams.Event(*args, **kwargs)
+            return original_event(*args, **kwargs)
+
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, (original_event, mojo_streams.Event))
+
+    class Event(metaclass=_EventMeta):
+        _torch_mojo_backend = True
+
+    torch.Stream = Stream
+    torch.Event = Event
+
+
 def _declare_mojo_tensor_as_plain_tensor():
     """Add TorchMojoTensor to torch's HANDLED_TYPES allowlists.
 
@@ -236,6 +328,8 @@ def register_mojo_devices():
         "mojo", backend_module=torch_mojo_device_module
     )
     _install_torch_accelerator_synchronize(torch_mojo_device_module)
+    _install_torch_accelerator_stream_api(torch_mojo_device_module)
+    _install_torch_stream_event_dispatch()
 
     # PyTorch deliberately uses exact-type checks before selecting foreach
     # optimizers. TorchMojoTensor is a transparent PrivateUse1 wrapper, so
