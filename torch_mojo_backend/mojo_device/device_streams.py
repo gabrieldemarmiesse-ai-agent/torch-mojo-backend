@@ -50,7 +50,12 @@ def default_stream_ctx_ptr(device: max.driver.Device) -> int:
 
 
 class Stream:
-    """One extra device stream, orderable against the device's default."""
+    """One extra device stream, orderable against the device's default.
+
+    Infra-level, like c10::Stream: no current-stream state, so no
+    ``with stream:`` — the torch-facing ``torch.mojo.Stream`` wrapper adds
+    that (follow-up streams PR), the way torch.cuda.Stream does over c10.
+    """
 
     def __init__(
         self, device: max.driver.Device, name: str, wrap_default: bool = False
