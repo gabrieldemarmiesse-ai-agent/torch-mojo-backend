@@ -48,10 +48,20 @@ from max.gpu.compute.mma import (
     wgmma_fence_aligned,
     wgmma_wait_group_sync,
 )
-from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from std.collections import OptionalReg
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from max.gpu.memory import fence_async_view_proxy, fence_mbarrier_init
+from max.gpu.memory import (
+    external_memory,
+    fence_async_view_proxy,
+    fence_mbarrier_init,
+)
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
 from max.gpu.primitives import (
@@ -60,6 +70,7 @@ from max.gpu.primitives import (
     cluster_sync_relaxed,
 )
 from std.memory import stack_allocation
+from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
@@ -79,6 +90,7 @@ from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_kernels import _pick_regime
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from variant_gates import _big_static_smem_on
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
@@ -97,6 +109,135 @@ comptime _V4_PROD_BM = 128
 comptime _V4_PROD_BN = 256
 comptime _V4_PROD_CONSUMERS = 2
 comptime _V4_PROD_TMA_STORE = True
+
+
+# ============================================================================
+# Operand/staging tiles: static shared memory where the assembler takes them,
+# one dynamic (extern) slab where it does not.
+#
+# Every tile the v4 bodies stage -- the A and B operand pipelines and the C
+# tile of the TMA-store epilogues -- runs from 72 KiB to 208 KiB per CTA,
+# far past the 49152-byte cap ptxas puts on a kernel's *static* `.shared`
+# before CUDA 13, and ptxas fails the whole `mojo build` on the first kernel
+# over the line rather than the one kernel.  Dynamic shared memory is not
+# capped that way: it is opted into per function with
+# MAX_DYNAMIC_SHARED_SIZE_BYTES and sized by the launch's `shared_mem_bytes`,
+# which is how eager_flash_attention has always fitted its own ~200 KiB slabs
+# under every assembler (fa4_fwd_kernel.mojo / fa4_fwd_launch.mojo).
+#
+# `_big_static_smem_on()` -- the loader's once-per-process ptxas probe, see
+# variant_gates.mojo -- picks between the two:
+#
+#   - define present: the pre-existing `.stack_allocation()` and a launch with
+#     no shared-memory arguments (both helpers below hand back `None`, which
+#     is what the launch defaults to), so the emitted device code and the
+#     launch are what they were before this file grew a second regime.
+#   - define absent: one extern slab per CTA carved into the same tiles, at
+#     the same sizes, in the same order, with the same alignments; the launch
+#     passes the slab total and the opt-in attribute.
+#
+# The mbarriers stay static in both regimes: tens of bytes, nowhere near the
+# cap, and leaving them alone keeps the cluster arrive/wait addressing exactly
+# as it was.  The carve is entirely compile-time, so every CTA of a cluster
+# still sees each tile at one shared offset -- what TMA multicast into a peer
+# CTA and `arrive_cluster` require, and what the static allocations gave.
+#
+# The slab base is aligned to the largest alignment any tile asks for (the C
+# staging tile's 1024) so that one `external_memory` declaration serves every
+# call site; every offset passed below is a multiple of its tile's own
+# alignment, so a dynamic tile is aligned exactly like the static one it
+# replaces.  The padding this costs (at most 1 KiB, ptxas rounding the
+# barriers up to the slab's alignment) leaves the biggest of these kernels at
+# 214016 bytes, inside sm_90's 232448-byte per-block maximum and still one CTA
+# per SM, which is what the 213040-byte static build already got.
+comptime _V4_DYN_SMEM_ALIGN = 1024
+
+
+@always_inline
+def _v4_dyn_smem_tile[
+    layout: Layout, align: Int, offset: Int
+]() -> LayoutTensor[
+    _V4_DT,
+    layout,
+    MutAnyOrigin,
+    address_space=AddressSpace.SHARED,
+    alignment=align,
+]:
+    """One shared tile of `layout`, `offset` elements into the CTA's slab."""
+    # A dynamic tile must land on the same alignment as the static one it
+    # replaces, which is only true when its byte offset is a multiple of
+    # `align` -- the slab base already carries `_V4_DYN_SMEM_ALIGN`.  For a
+    # 1024-aligned tile that IS the 128B-swizzle atom (8 rows x 128 B): an
+    # epilogue that stages C by hand at a tile-RELATIVE row and lets the TMA
+    # store de-swizzle by ADDRESS agrees with itself only on an atom
+    # boundary, and a 128-byte-aligned carve was measured to scramble every
+    # TMA-store case while leaving the mainloop exact (see the same finding
+    # recorded in gemm16_bmm_v5_kernels.mojo).  Every carve in this family
+    # satisfies this today; the assert is what catches the geometry that
+    # would not, instead of a silently wrong result.
+    comptime assert (
+        offset * size_of[Scalar[_V4_DT]]()
+    ) % align == 0, "dynamic smem carve offset is not aligned like the tile"
+    comptime if _big_static_smem_on():
+        return LayoutTensor[
+            _V4_DT,
+            layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=align,
+        ].stack_allocation()
+    else:
+        return LayoutTensor[
+            _V4_DT,
+            layout,
+            MutAnyOrigin,
+            address_space=AddressSpace.SHARED,
+            alignment=align,
+        ](
+            (
+                external_memory[
+                    Scalar[_V4_DT],
+                    address_space=AddressSpace.SHARED,
+                    alignment=_V4_DYN_SMEM_ALIGN,
+                ]()
+                + offset
+            ).as_unsafe_any_origin()
+        )
+
+
+# Shared bytes one persistent CTA carves out of its slab: both operand
+# pipelines plus the C staging tile, in the order `_v4_nn_persistent_ws`
+# carves them.  The kernel asserts at compile time that this equals the end
+# of its own last carving, so the launch size and the carve cannot drift.
+@always_inline
+def _v4_persistent_smem_bytes[
+    stages: Int, bm: Int, bn: Int, tma_store: Bool
+]() -> Int:
+    return (stages * (bm + bn) * _V4_BK + (bm * bn if tma_store else 512)) * 2
+
+
+@always_inline
+def _v4_dyn_smem_arg[dyn_bytes: Int]() -> OptionalReg[Int]:
+    """`shared_mem_bytes` for a kernel whose tiles are carved from the slab.
+
+    `None` in the static regime: the launch then reads exactly as it did
+    before, with the kernel's whole shared footprint declared statically.
+    """
+    comptime if _big_static_smem_on():
+        return OptionalReg[Int](None)
+    else:
+        return OptionalReg[Int](dyn_bytes)
+
+
+@always_inline
+def _v4_dyn_smem_attr[dyn_bytes: Int]() -> OptionalReg[FuncAttribute]:
+    """The opt-in above sm_90's 48 KiB default dynamic-shared allowance."""
+    comptime if _big_static_smem_on():
+        return OptionalReg[FuncAttribute](None)
+    else:
+        return OptionalReg[FuncAttribute](
+            FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(dyn_bytes))
+        )
 
 
 # One (64 x BN x BK) slab of WGMMA work per consumer warp group through the
@@ -292,30 +433,26 @@ def _v4_nn_persistent_ws[
         ]()
         comptime A_PIPE_LAYOUT = Layout.row_major(stages, bm * _V4_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(stages, bn * _V4_BK)
-        var a_pipeline = LayoutTensor[
-            _V4_DT,
-            A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V4_DT,
-            B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or three carvings of one extern slab in the same
+        # order at the same alignments -- see `_v4_dyn_smem_tile`.
+        var a_pipeline = _v4_dyn_smem_tile[A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            B_PIPE_LAYOUT, 128, stages * bm * _V4_BK
+        ]()
         # C staging tile for the TMA-store epilogue (swizzled 128B rows of
         # 64 elements, bn // 64 chunks).  A dummy allocation when disabled.
         comptime C_SMEM_ELEMS = bm * bn if tma_store else 512
-        var c_smem = LayoutTensor[
-            _V4_DT,
-            Layout.row_major(1, C_SMEM_ELEMS),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=1024,
-        ].stack_allocation()
+        comptime C_SMEM_OFFSET = stages * (bm + bn) * _V4_BK
+        var c_smem = _v4_dyn_smem_tile[
+            Layout.row_major(1, C_SMEM_ELEMS), 1024, C_SMEM_OFFSET
+        ]()
+        # The C tile is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
+            == (C_SMEM_OFFSET + C_SMEM_ELEMS) * 2
+        ), "persistent-body smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -693,6 +830,7 @@ def _v4_enqueue_nn_persistent[
     var total_works = macro_rows * blocks_n
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
+    comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
     ctx.enqueue_function[
         _v4_nn_persistent_ws[
             stages,
@@ -715,6 +853,8 @@ def _v4_enqueue_nn_persistent[
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(128 * (consumers + 1),),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 

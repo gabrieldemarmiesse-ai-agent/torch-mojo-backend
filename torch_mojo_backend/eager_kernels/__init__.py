@@ -505,9 +505,10 @@ def _ptxas_supports_big_static_smem() -> bool:
     """Whether the active PTX assembler accepts >48 KiB of *static* shared memory.
 
     ptxas caps static `.shared` at 48 KiB through CUDA 12.8 and fails the
-    whole `mojo build` on one over-limit kernel, so the sm_90 wgmma/TMA GEMM
-    routes must be compiled out (`_big_static_smem_on` in variant_gates.mojo),
-    not merely left unselected; the smaller routes serve the same shapes.
+    whole `mojo build` on one over-limit kernel. Answering False makes the
+    sm_90 wgmma/TMA GEMM kernels stage their big tiles in dynamic (`extern`)
+    shared memory instead (`_big_static_smem_on` in variant_gates.mojo); the
+    same routes are compiled either way.
 
     `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1` overrides the probe. With
     `MODULAR_NVPTX_COMPILER_PATH` unset, MAX assembles with the CUDA 13

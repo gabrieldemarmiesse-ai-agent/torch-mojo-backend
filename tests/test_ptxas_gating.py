@@ -115,7 +115,7 @@ def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
     assert eager_kernels.big_static_smem_flags() == {"PTXAS_BIG_SMEM": 1}
 
 
-def test_assembler_capped_at_48kib_compiles_the_big_routes_out(
+def test_assembler_capped_at_48kib_sends_no_define(
     real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     """The CUDA 12.x case: the control leg passes, the big one does not."""
@@ -213,9 +213,14 @@ def test_only_the_two_families_with_big_smem_routes_send_the_define():
         for path in _KERNEL_DIR.rglob("*.mojo")
         if "_big_static_smem_on" in path.read_text()
     }
+    # One reader per file that owns an allocation decision. The gemm16 family
+    # shares `_v4_dyn_smem_tile` (declared in the NN v4 file, imported by the
+    # NT/TN v4 and v3 files), so those importers are not readers themselves;
+    # the v5 BMM file decides per instantiation and so reads the gate itself.
     assert readers == {
         "variant_gates.mojo",
-        "gemm16_matmul_ops/gemm16_v3_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_nn_v4_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_bmm_v5_kernels.mojo",
         "matmul_ops/tn_f32_gemm_kernels.mojo",
     }
 
@@ -252,16 +257,33 @@ class _StubTensor:
 
 
 def test_gated_routes_leave_an_unconditional_fallback_behind():
-    """The fallback call must sit outside every `comptime if`, or a gated
-    build enqueues nothing for those shapes."""
+    """The mma.sync fallback must sit outside every `comptime if`: the fast
+    routes are still sm_9x- and shape-gated, and a build reaching none of
+    them must not enqueue nothing."""
     v3 = (_KERNEL_DIR / "gemm16_matmul_ops" / "gemm16_v3_kernels.mojo").read_text()
     for fallback in ("_enqueue_accepted_bf16_gemm(", "_enqueue_accepted_bf16_bmm("):
         # Column 4 is the function body; deeper is nested inside a branch.
         assert f"\n    {fallback}" in v3, fallback
 
-    tn = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_kernels.mojo").read_text()
-    assert "comptime if not _big_static_smem_on():\n        use_t128 = False" in tn
-    assert "\n    if not use_t128:\n        _tn_core_launch[64, 64," in tn
+
+def test_fp32_tn_routes_serve_every_regime_instead_of_gating_out():
+    """fp32 TN took the other fix: dynamic shared memory, not a fallback.
+
+    Unlike the 16-bit GEMMs above, the 128x128 TN cores' tiles moved to
+    `external_memory` on an assembler that cannot take their static
+    allocation (tn_f32_gemm_core.mojo), so `use_t128` in
+    tn_f32_gemm_kernels.mojo is plain shape-based selection again -- no
+    `_big_static_smem_on()` override, no gate around the 128x128 launches,
+    and the 64x64 core sits behind an ordinary `else:` next to them rather
+    than an unconditional fallback call outside a `comptime if`.
+    """
+    tn_kernels = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_kernels.mojo").read_text()
+    assert "use_t128 = False" not in tn_kernels
+    assert "\n    else:\n        _tn_core_launch[64, 64," in tn_kernels
+
+    tn_core = (_KERNEL_DIR / "matmul_ops" / "tn_f32_gemm_core.mojo").read_text()
+    assert "external_memory" in tn_core
+    assert "comptime if STATIC_SMEM:" in tn_core
 
 
 @pytest.fixture(scope="module")
@@ -276,7 +298,7 @@ def sm90_mojo_gpu():
 # Out of process: the gate is answered once per process and the loader
 # memoizes every specialization key, so the env var cannot be flipped live.
 _FALLBACK_WORKER = '''
-"""Exercise every shape the >48 KiB gate removes a route for, against CPU."""
+"""Exercise every route the >48 KiB gate re-allocates, against a CPU reference."""
 
 import sys
 
@@ -368,8 +390,9 @@ sys.exit(0)
 def test_gated_build_still_computes_the_right_answers(
     sm90_mojo_gpu: None, tmp_path: Path
 ):
-    """With the fast routes compiled out, mm/bmm/linear/SDPA still match CPU.
-    Compiles two extension families on first run."""
+    """With the define absent, mm/bmm/linear/SDPA still match CPU: the >48 KiB
+    kernels run with their tiles in dynamic shared memory, a build CI does not
+    otherwise exercise. Compiles two extension families on first run."""
     worker = tmp_path / "ptxas_fallback_worker.py"
     worker.write_text(_FALLBACK_WORKER)
     env = dict(os.environ)

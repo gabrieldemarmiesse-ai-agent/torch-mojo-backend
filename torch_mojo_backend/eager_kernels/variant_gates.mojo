@@ -24,9 +24,11 @@ def _big_static_smem_on() -> Bool:
     """Whether this build may contain kernels using >48 KiB of *static* smem.
 
     Sent as `PTXAS_BIG_SMEM=1` only when the assembler accepts that much
-    (`_ptxas_supports_big_static_smem` in eager_kernels/__init__.py). A
-    route behind this gate must never be the only one serving a shape: its
-    fallback has to fit in 48 KiB.
+    (`_ptxas_supports_big_static_smem` in eager_kernels/__init__.py). False
+    does not drop a route: kernels reading this gate carve their big tiles
+    from the dynamic (`extern`) shared window instead, which the cap never
+    applied to. Small allocations stay static in both regimes; the dynamic
+    window's base sits past them.
     """
     comptime if _PTXAS_BIG_SMEM == "1":
         return True

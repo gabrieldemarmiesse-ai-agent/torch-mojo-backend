@@ -63,6 +63,11 @@ from layout.tensor_core_async import (
 )
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from gemm16_nn_v4_kernels import (
+    _v4_dyn_smem_arg,
+    _v4_dyn_smem_attr,
+    _v4_dyn_smem_tile,
+)
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
@@ -95,6 +100,19 @@ def _v4_b_layout[bn: Int]() -> Layout:
 
 def _v4_b_half_layout[bn: Int]() -> Layout:
     return tile_layout_k_major[_V4_DT, bn // _V4_CLUSTER, _V4_BK, _V4_SWIZZLE]()
+
+
+# Shared bytes one persistent NT CTA carves out of its slab: both operand
+# pipelines plus the two consumer warp groups' C staging slices, in the order
+# the kernel carves them.  The kernel asserts at compile time that this
+# equals the end of its own last carving, so the launch size and the carve
+# cannot drift.  Zero in the static regime -- `_v4_dyn_smem_arg` drops it
+# there (gemm16_nn_v4_kernels.mojo).
+@always_inline
+def _v4c_nt_smem_bytes[bn: Int, stages: Int]() -> Int:
+    return (
+        stages * (_V4_BM + bn) * _V4_BK + _V4_CONSUMERS * _V4_WG_ROWS * bn
+    ) * 2
 
 
 @always_inline
@@ -225,30 +243,34 @@ def _v4c_nt_persistent[
     comptime CFRAG = 64 * bn // 128
     comptime TMA_BYTES = (_V4_BM + bn) * _V4_BK * 2
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V4_DT,
-            Layout.row_major(stages, _V4_BM * _V4_BK),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V4_DT,
+        # Static allocations, or three carvings of one extern slab in the same
+        # order at the same alignment -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        var a_pipeline = _v4_dyn_smem_tile[
+            Layout.row_major(stages, _V4_BM * _V4_BK), 128, 0
+        ]()
+        var b_pipeline = _v4_dyn_smem_tile[
             Layout.row_major(stages, bn * _V4_BK),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+            128,
+            stages * _V4_BM * _V4_BK,
+        ]()
         # One 64 x bn bf16 staging slice per consumer warp group, arranged
         # as consecutive 64x64 boxes in the canonical 128B-swizzled TMA
         # layout expected by the C descriptor.
-        var c_staging = LayoutTensor[
-            _V4_DT,
+        comptime C_STAGING_ELEMS = _V4_CONSUMERS * _V4_WG_ROWS * bn
+        comptime C_STAGING_OFFSET = stages * (_V4_BM + bn) * _V4_BK
+        var c_staging = _v4_dyn_smem_tile[
             Layout.row_major(_V4_CONSUMERS, _V4_WG_ROWS * bn),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+            128,
+            C_STAGING_OFFSET,
+        ]()
+        # The staging tile is the last carving, so its end IS the slab size
+        # the launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4c_nt_smem_bytes[bn, stages]()
+            == (C_STAGING_OFFSET + C_STAGING_ELEMS) * 2
+        ), "NT persistent smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -573,6 +595,7 @@ def _v4c_enqueue_nt_persistent[
     var c_tma = TMATensorTile[
         _V4_DT, 2, Index(_V4_WG_ROWS, bn), Index(_V4_WG_ROWS, _V4_C_BOX_N)
     ](c_desc)
+    comptime DYN_SMEM = _v4c_nt_smem_bytes[bn, stages]()
     ctx.enqueue_function[
         _v4c_nt_persistent[bn, stages, raster_h, defer_release]
     ](
@@ -584,6 +607,8 @@ def _v4c_enqueue_nt_persistent[
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V4_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 

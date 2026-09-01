@@ -3,7 +3,8 @@
 Each function here is registered in `mojo_device_aten_ops.py` (through
 `_eager_impl`). Tensors are `TorchMojoTensor`s: a Mojo `TensorHolder`
 ownership token plus Python-side layout metadata (`_ptr`, `_shape`,
-`_mojo_strides` in elements, `_offset`, `_dtype`, `_device`, `_is_contiguous`).
+`_mojo_strides` in elements, `_offset`, `_dtype`, `_device`,
+`_is_contiguous`).
 An op runs as one or a few Mojo kernel calls — no graph building, no MLIR
 passes, no interpreter, and *no graph fallback*: when a function returns
 the `NOT_HANDLED` sentinel, the registration raises `NotImplementedError`

@@ -51,16 +51,28 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
+from std.builtin.device_passable import DevicePassable
+from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
-from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from std.memory import AddressSpace
 from std.math import ceildiv
-from std.memory import stack_allocation
+from std.memory import alloc, stack_allocation
 from std.sys.info import _has_sm_9x
 
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
 from op_utils import _enqueue_cached, _make_ptr
-from tn_f32_gemm_core import _tn_core_kernel, _tn_split_kernel
+from tn_f32_gemm_core import (
+    _tn_core_kernel,
+    _tn_core_smem_bytes,
+    _tn_split_kernel,
+    _tn_split_smem_bytes,
+)
 from variant_gates import _big_static_smem_on
 
 
@@ -146,6 +158,70 @@ def _tn_ksplit_reduce_wide_kernel(
 
 
 @always_inline
+def _enqueue_cached_smem3d[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+    *Ts: DevicePassable,
+](
+    ctx: DeviceContext,
+    key: String,
+    gx: Int,
+    gy: Int,
+    gz: Int,
+    threads: Int,
+    smem_bytes: Int,
+    *args: *Ts,
+) raises:
+    """`op_utils._enqueue_cached`, 3D grid, with a
+    `MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in baked into the cached
+    `DeviceFunction` -- the 3D-grid twin of
+    `softmax_backward_ops.softmax_backward_kernels._enqueue_cached_smem`
+    (kept local rather than shared: that helper is keyed for a caller
+    serving many different `smem_bytes` per process, which the 128x128 TN
+    cores never do -- `smem_bytes` is a comptime constant of `func` here, so
+    one process only ever asks this helper for one value per `key`).
+
+    Only ever called with `func` an `_tn_core_kernel`/`_tn_split_kernel`
+    instantiated with `STATIC_SMEM=False` (see tn_f32_gemm_core.mojo): the
+    kernel stages its tiles from `external_memory`, sized at launch by
+    `smem_bytes` here.
+    """
+    var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
+    comptime FuncT = type_of(ctx.compile_function[func]())
+
+    if global_ptr := _get_global_or_null(name):
+        var fptr = global_ptr.value().bitcast[FuncT]()
+        ctx.enqueue_function(
+            fptr[],
+            *args,
+            grid_dim=(gx, gy, gz),
+            block_dim=(threads,),
+            shared_mem_bytes=smem_bytes,
+        )
+        return
+
+    var compiled = ctx.compile_function[func](
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+            UInt32(smem_bytes)
+        )
+    )
+    var fptr = alloc[FuncT](1)
+    fptr.init_pointee_move(compiled^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name),
+        fptr.bitcast[NoneType](),
+    )
+    ctx.enqueue_function(
+        fptr[],
+        *args,
+        grid_dim=(gx, gy, gz),
+        block_dim=(threads,),
+        shared_mem_bytes=smem_bytes,
+    )
+
+
+@always_inline
 def _tn_core_launch[
     BM: Int,
     BN: Int,
@@ -179,6 +255,13 @@ def _tn_core_launch[
     a[(kt+kk)*m + bm+cm] — coalesced along m, no transpose, no copy.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 32
+    # STATIC_SMEM picked from this instantiation's OWN byte count, same as
+    # the kernel itself computes (`_tn_core_smem_bytes` — the single source
+    # both sides read, see tn_f32_gemm_core.mojo): the 64x64 core (32768 B)
+    # is always True and never touches `_enqueue_cached_smem3d` below; only
+    # the 128x128 core (65536 B) depends on `_big_static_smem_on()`.
+    comptime SMEM_BYTES = _tn_core_smem_bytes[BM, BN, BK, STAGES]()
+    comptime STATIC_SMEM = SMEM_BYTES <= 49152 or _big_static_smem_on()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     var a = (
         _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
@@ -187,78 +270,276 @@ def _tn_core_launch[
         _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
     )
 
-    if va4 and vb4:
-        _enqueue_cached[
-            _tn_core_kernel[BM, BN, BK, WM, WN, LR, 4, 4, STAGES, MINB, PUMP]
-        ](
-            ctx,
-            String(t"tn_c_{BM}x{BN}x{BK}l{LR}_v44_s{STAGES}_mb{MINB}_p{PUMP}"),
-            gx,
-            gy,
-            gz,
-            THREADS,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif va4:
-        _enqueue_cached[
-            _tn_core_kernel[BM, BN, BK, WM, WN, LR, 4, 1, STAGES, MINB, PUMP]
-        ](
-            ctx,
-            String(t"tn_c_{BM}x{BN}x{BK}l{LR}_v41_s{STAGES}_mb{MINB}_p{PUMP}"),
-            gx,
-            gy,
-            gz,
-            THREADS,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif vb4:
-        _enqueue_cached[
-            _tn_core_kernel[BM, BN, BK, WM, WN, LR, 1, 4, STAGES, MINB, PUMP]
-        ](
-            ctx,
-            String(t"tn_c_{BM}x{BN}x{BK}l{LR}_v14_s{STAGES}_mb{MINB}_p{PUMP}"),
-            gx,
-            gy,
-            gz,
-            THREADS,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
+    comptime if STATIC_SMEM:
+        if va4 and vb4:
+            _enqueue_cached[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    4,
+                    4,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v44_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif va4:
+            _enqueue_cached[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    4,
+                    1,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v41_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif vb4:
+            _enqueue_cached[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    1,
+                    4,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v14_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        else:
+            _enqueue_cached[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    1,
+                    1,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v11_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
     else:
-        _enqueue_cached[
-            _tn_core_kernel[BM, BN, BK, WM, WN, LR, 1, 1, STAGES, MINB, PUMP]
-        ](
-            ctx,
-            String(t"tn_c_{BM}x{BN}x{BK}l{LR}_v11_s{STAGES}_mb{MINB}_p{PUMP}"),
-            gx,
-            gy,
-            gz,
-            THREADS,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
+        if va4 and vb4:
+            _enqueue_cached_smem3d[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    4,
+                    4,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v44_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif va4:
+            _enqueue_cached_smem3d[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    4,
+                    1,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v41_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif vb4:
+            _enqueue_cached_smem3d[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    1,
+                    4,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v14_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        else:
+            _enqueue_cached_smem3d[
+                _tn_core_kernel[
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    LR,
+                    1,
+                    1,
+                    STAGES,
+                    MINB,
+                    STATIC_SMEM,
+                    PUMP,
+                ]
+            ](
+                ctx,
+                String(
+                    t"tn_c_{BM}x{BN}x{BK}l{LR}_v11_s{STAGES}_mb{MINB}_p{PUMP}"
+                ),
+                gx,
+                gy,
+                gz,
+                THREADS,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
 
 
 @always_inline
@@ -286,6 +567,11 @@ def _tn_split_launch[
 ) raises:
     """Launch the warp-group split core (256 threads) with VEC_A/VEC_B
     picked by the caller's alignment gates."""
+    # This kernel is only ever instantiated at BM=BN=128, so it always
+    # crosses the 49152 B static-.shared ceiling on the older assembler --
+    # see tn_f32_gemm_core.mojo for the full rationale.
+    comptime SMEM_BYTES = _tn_split_smem_bytes[BM, BN, BK, STAGES]()
+    comptime STATIC_SMEM = SMEM_BYTES <= 49152 or _big_static_smem_on()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     var a = (
         _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
@@ -294,70 +580,172 @@ def _tn_split_launch[
         _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
     )
 
-    if va4 and vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 4, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v44_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif va4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 1, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v41_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
-    elif vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 4, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v14_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
+    comptime if STATIC_SMEM:
+        if va4 and vb4:
+            _enqueue_cached[
+                _tn_split_kernel[
+                    BM, BN, BK, 4, 4, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v44_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif va4:
+            _enqueue_cached[
+                _tn_split_kernel[
+                    BM, BN, BK, 4, 1, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v41_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif vb4:
+            _enqueue_cached[
+                _tn_split_kernel[
+                    BM, BN, BK, 1, 4, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v14_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        else:
+            _enqueue_cached[
+                _tn_split_kernel[
+                    BM, BN, BK, 1, 1, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v11_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
     else:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 1, STAGES, LR, SERP]](
-            ctx,
-            String(t"tn_s_{BM}x{BN}x{BK}_v11_s{STAGES}_l{LR}_z{SERP}"),
-            gx,
-            gy,
-            gz,
-            256,
-            c,
-            a,
-            b,
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(ksplits),
-        )
+        if va4 and vb4:
+            _enqueue_cached_smem3d[
+                _tn_split_kernel[
+                    BM, BN, BK, 4, 4, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v44_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif va4:
+            _enqueue_cached_smem3d[
+                _tn_split_kernel[
+                    BM, BN, BK, 4, 1, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v41_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        elif vb4:
+            _enqueue_cached_smem3d[
+                _tn_split_kernel[
+                    BM, BN, BK, 1, 4, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v14_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
+        else:
+            _enqueue_cached_smem3d[
+                _tn_split_kernel[
+                    BM, BN, BK, 1, 1, STAGES, STATIC_SMEM, LR, SERP
+                ]
+            ](
+                ctx,
+                String(t"tn_s_{BM}x{BN}x{BK}_v11_s{STAGES}_l{LR}_z{SERP}"),
+                gx,
+                gy,
+                gz,
+                256,
+                SMEM_BYTES,
+                c,
+                a,
+                b,
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(ksplits),
+            )
 
 
 def _pick_ksplits_wave(base: Int, m: Int, n: Int, k: Int, wave: Int) -> Int:
@@ -458,12 +846,18 @@ def try_enqueue_tn_f32_gemm(
     var va4 = m % 4 == 0 and a_addr % 16 == 0
     var vb4 = n % 4 == 0 and b_addr % 16 == 0
 
+    # Both 128x128 cores stage their tiles in shared memory that used to be
+    # static only — 0x10000 bytes for the quadrant core, up to 0x20000 for
+    # the warp-group split core — and ptxas caps a kernel's *static*
+    # `.shared` at 0xc000 bytes before CUDA 13, failing the whole
+    # `mojo build`. `_tn_core_launch`/`_tn_split_launch` now carve those
+    # tiles from `external_memory` instead whenever a build's assembler
+    # cannot take the static allocation (`_big_static_smem_on()` in
+    # variant_gates.mojo), so both cores build and run identically to the
+    # CUDA-13 case on the older assembler too — see the STATIC_SMEM comment
+    # on `_tn_core_kernel` in tn_f32_gemm_core.mojo. `use_t128` is therefore
+    # plain shape-based selection again, same as before that gate existed.
     var use_t128 = m >= 96 and n >= 96
-    # The 128x128 cores use 64-128 KiB of static smem, over ptxas's 48 KiB
-    # cap before CUDA 13; the `comptime if` below keeps them out of such a
-    # build and the 64x64 core (correct for any m, n, k >= 1) serves instead.
-    comptime if not _big_static_smem_on():
-        use_t128 = False
     var use_split = use_t128 and va4 and vb4
 
     var gx: Int
@@ -504,48 +898,13 @@ def try_enqueue_tn_f32_gemm(
         ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
         c_target = Int(ws.value().unsafe_ptr())
 
-    # `comptime if`, not a runtime `if`: a runtime branch would still
-    # elaborate the parametric launch and emit the over-limit kernel.
-    comptime if _big_static_smem_on():
-        if use_split:
-            # Deep splits mean short per-group chains (kchunk <= ~2 x
-            # KCHUNK_MIN_T128 slabs); STAGES=2's one-slab prologue amortizes
-            # better there (interleaved A/B on 128x128x131072 ks=114: s2
-            # 0.157 ms vs s4 0.158-0.159 ms). Long chains keep STAGES=4.
-            if ksplits > SPLITK_GENERIC_CAP:
-                _tn_split_launch[128, 128, 16, 2](
-                    ctx,
-                    gx,
-                    gy,
-                    ksplits,
-                    c_target,
-                    a_addr,
-                    b_addr,
-                    m,
-                    n,
-                    k,
-                    ksplits,
-                    va4,
-                    vb4,
-                )
-            else:
-                _tn_split_launch[128, 128, 16, 4](
-                    ctx,
-                    gx,
-                    gy,
-                    ksplits,
-                    c_target,
-                    a_addr,
-                    b_addr,
-                    m,
-                    n,
-                    k,
-                    ksplits,
-                    va4,
-                    vb4,
-                )
-        elif use_t128:
-            _tn_core_launch[128, 128, 16, 32, 64, 4, 4, 2](
+    if use_split:
+        # Deep splits mean short per-group chains (kchunk <= ~2 x
+        # KCHUNK_MIN_T128 slabs); STAGES=2's one-slab prologue amortizes
+        # better there (interleaved A/B on 128x128x131072 ks=114: s2
+        # 0.157 ms vs s4 0.158-0.159 ms). Long chains keep STAGES=4.
+        if ksplits > SPLITK_GENERIC_CAP:
+            _tn_split_launch[128, 128, 16, 2](
                 ctx,
                 gx,
                 gy,
@@ -560,7 +919,39 @@ def try_enqueue_tn_f32_gemm(
                 va4,
                 vb4,
             )
-    if not use_t128:
+        else:
+            _tn_split_launch[128, 128, 16, 4](
+                ctx,
+                gx,
+                gy,
+                ksplits,
+                c_target,
+                a_addr,
+                b_addr,
+                m,
+                n,
+                k,
+                ksplits,
+                va4,
+                vb4,
+            )
+    elif use_t128:
+        _tn_core_launch[128, 128, 16, 32, 64, 4, 4, 2](
+            ctx,
+            gx,
+            gy,
+            ksplits,
+            c_target,
+            a_addr,
+            b_addr,
+            m,
+            n,
+            k,
+            ksplits,
+            va4,
+            vb4,
+        )
+    else:
         _tn_core_launch[64, 64, 16, 16, 32, 4, 4, 4](
             ctx,
             gx,

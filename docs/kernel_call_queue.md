@@ -118,8 +118,9 @@ one over-limit kernel fails the whole `.so`. `_ptxas_supports_big_static_smem`
 (eager_kernels/__init__.py) builds `ptxas_probe.mojo` once per (toolchain,
 `MODULAR_NVPTX_COMPILER_PATH` binary) to find out, and sends `PTXAS_BIG_SMEM=1`
 only when the assembler accepts it; otherwise `_big_static_smem_on()` in
-variant_gates.mojo compiles the wgmma/TMA GEMM routes out and the smaller
-routes serve their shapes. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
+variant_gates.mojo makes the wgmma/TMA GEMM kernels take their tiles from the
+dynamic (`extern`) shared window, which the cap never applied to, so the same
+routes are compiled either way. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
 overrides the probe.
 
 Builds are protected by a per-identity file lock (`flock`) and written to a

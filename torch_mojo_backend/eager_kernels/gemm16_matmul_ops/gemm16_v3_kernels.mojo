@@ -44,15 +44,20 @@ from gemm16_kernels import (
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
 from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
-from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
+from gemm16_nn_v4_kernels import (
+    _v4_dyn_smem_arg,
+    _v4_dyn_smem_attr,
+    _v4_dyn_smem_tile,
+    maybe_enqueue_gemm16_nn_v4,
+)
 from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
 from gemm16_tn_v4_kernels import (
+    _v4_ws_smem_bytes,
     try_enqueue_gemm16_gemm_splitk_rm_v4,
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
 )
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
-from variant_gates import _big_static_smem_on
 
 
 comptime _V3_DT = _GEMM16_DT
@@ -219,6 +224,40 @@ comptime _V3_TN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 )
 
 
+# ============================================================================
+# Where the operand pipelines live.
+#
+# Each of the five warp-specialized kernels below stages one A and one B
+# pipeline in shared memory: 72 KiB for the 64x128 tiles, 144 KiB for the
+# 128x256 ones, against the 48 KiB ceiling ptxas puts on a kernel's *static*
+# `.shared` before CUDA 13 -- and it fails the whole `mojo build` on the first
+# kernel over the line, not just that kernel.  So under such an assembler the
+# tiles come from the dynamic (`extern`) shared window instead, which was
+# never capped that way: it is opted into per launch with
+# MAX_DYNAMIC_SHARED_SIZE_BYTES and sized by `shared_mem_bytes`, the scheme
+# eager_flash_attention has always used for its own ~200 KiB slabs.
+#
+# The choice is `_v4_dyn_smem_tile`'s, one compile-time branch on the loader's
+# once-per-process ptxas probe; see the design comment above it in
+# gemm16_nn_v4_kernels.mojo, which the whole gemm16 family shares.  With the
+# probe's define present each kernel below allocates and launches exactly as
+# it did before this file grew a second regime; without it, one extern slab
+# per CTA is carved into the same two tiles, at the same sizes, in the same
+# order, each still 128-byte aligned (the slab base carries the family's
+# 1024, so every tile offset here -- a whole number of 16 KiB TMA boxes --
+# lands on a 128B-swizzle atom as well as on 128 bytes).
+#
+# These kernels have no C staging tile -- the epilogue writes accumulator
+# registers straight to global, so nothing here re-derives a swizzle from a
+# tile-relative row the way a TMA-store epilogue does -- and the carve is
+# therefore A pipeline then B pipeline and nothing else, which is the layout
+# `_v4_ws_smem_bytes` already sizes for the identically-shaped v4 TN bodies.
+# Every kernel asserts at compile time that its own last carving ends where
+# that size says it should.  The mbarriers stay static in both regimes: two
+# arrays of three 8-byte barriers, 48 bytes, never threatened the cap.
+# ============================================================================
+
+
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
@@ -239,20 +278,20 @@ def _v3_nn_ws_m128n256_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or two carvings of one extern slab in the same
+        # order at the same alignment -- see the comment above this kernel.
+        comptime B_PIPE_OFFSET = _V3_NN_STAGES * _V3_NN_BM * _V3_NN_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NN_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NN_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_NN_STAGES, _V3_NN_BM, _V3_NN_BN]()
+            == (B_PIPE_OFFSET + _V3_NN_STAGES * _V3_NN_BN * _V3_NN_BK) * 2
+        ), "v3 NN 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NN_STAGES,
             SharedMemBarrier,
@@ -424,6 +463,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NN_A_TMA(a_desc)
     var b_tma = _V3_NN_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[_V3_NN_STAGES, _V3_NN_BM, _V3_NN_BN]()
     ctx.enqueue_function[_v3_nn_ws_m128n256_tma_s3](
         a_tma,
         b_tma,
@@ -433,6 +473,8 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -458,20 +500,28 @@ def _v3_nn_ws_m64n128_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_SMALL_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_SMALL_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or two carvings of one extern slab in the same
+        # order at the same alignment -- see the comment above this kernel.
+        comptime B_PIPE_OFFSET = (
+            _V3_NN_SMALL_STAGES * _V3_NN_SMALL_BM * _V3_NN_SMALL_BK
+        )
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NN_SMALL_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NN_SMALL_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[
+                _V3_NN_SMALL_STAGES, _V3_NN_SMALL_BM, _V3_NN_SMALL_BN
+            ]()
+            == (
+                B_PIPE_OFFSET
+                + _V3_NN_SMALL_STAGES * _V3_NN_SMALL_BN * _V3_NN_SMALL_BK
+            )
+            * 2
+        ), "v3 NN 64x128 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NN_SMALL_STAGES,
             SharedMemBarrier,
@@ -648,6 +698,9 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
     )
     var a_tma = _V3_NN_SMALL_A_TMA(a_desc)
     var b_tma = _V3_NN_SMALL_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_NN_SMALL_STAGES, _V3_NN_SMALL_BM, _V3_NN_SMALL_BN
+    ]()
     ctx.enqueue_function[_v3_nn_ws_m64n128_tma_s3](
         a_tma,
         b_tma,
@@ -657,6 +710,8 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_SMALL_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -680,20 +735,20 @@ def _v3_nt_ws_m128n256_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NT_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NT_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or two carvings of one extern slab in the same
+        # order at the same alignment -- see the comment above this kernel.
+        comptime B_PIPE_OFFSET = _V3_NT_STAGES * _V3_NT_BM * _V3_NT_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NT_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NT_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_NT_STAGES, _V3_NT_BM, _V3_NT_BN]()
+            == (B_PIPE_OFFSET + _V3_NT_STAGES * _V3_NT_BN * _V3_NT_BK) * 2
+        ), "v3 NT 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NT_STAGES,
             SharedMemBarrier,
@@ -863,6 +918,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NT_A_TMA(a_desc)
     var b_tma = _V3_B_K_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[_V3_NT_STAGES, _V3_NT_BM, _V3_NT_BN]()
     ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3](
         a_tma,
         b_tma,
@@ -872,6 +928,8 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NT_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -897,20 +955,28 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_SMALL_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_SMALL_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or two carvings of one extern slab in the same
+        # order at the same alignment -- see the comment above this kernel.
+        comptime B_PIPE_OFFSET = (
+            _V3_TN_SMALL_STAGES * _V3_TN_SMALL_BM * _V3_TN_SMALL_BK
+        )
+        var a_pipeline = _v4_dyn_smem_tile[_V3_TN_SMALL_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_TN_SMALL_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[
+                _V3_TN_SMALL_STAGES, _V3_TN_SMALL_BM, _V3_TN_SMALL_BN
+            ]()
+            == (
+                B_PIPE_OFFSET
+                + _V3_TN_SMALL_STAGES * _V3_TN_SMALL_BN * _V3_TN_SMALL_BK
+            )
+            * 2
+        ), "v3 TN 64x128 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_TN_SMALL_STAGES,
             SharedMemBarrier,
@@ -1116,6 +1182,9 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
     )
     var a_tma = _V3_TN_SMALL_A_TMA(a_desc)
     var b_tma = _V3_TN_SMALL_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_TN_SMALL_STAGES, _V3_TN_SMALL_BM, _V3_TN_SMALL_BN
+    ]()
     ctx.enqueue_function[_v3_tn_ws_m64n128_tma_col_a_s3](
         a_tma,
         b_tma,
@@ -1125,6 +1194,8 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_SMALL_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -1154,20 +1225,21 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
         # directly into an MN-major shared layout, which is exactly the
         # column-major A representation accepted by SM90 WGMMA.  This avoids
         # the explicit shared-memory transpose used by the fallback TN path.
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_WS_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_WS_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Static allocations, or two carvings of one extern slab in the same
+        # order at the same alignment -- see the comment above this kernel.
+        comptime B_PIPE_OFFSET = _V3_TN_WS_STAGES * _V3_TN_WS_BM * _V3_TN_WS_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_TN_WS_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_TN_WS_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_TN_WS_STAGES, _V3_TN_WS_BM, _V3_TN_WS_BN]()
+            == (B_PIPE_OFFSET + _V3_TN_WS_STAGES * _V3_TN_WS_BN * _V3_TN_WS_BK)
+            * 2
+        ), "v3 TN 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_TN_WS_STAGES,
             SharedMemBarrier,
@@ -1374,6 +1446,9 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     )
     var a_tma = _V3_TN_WS_A_TMA(a_desc)
     var b_tma = _V3_TN_WS_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_TN_WS_STAGES, _V3_TN_WS_BM, _V3_TN_WS_BN
+    ]()
     ctx.enqueue_function[_v3_tn_ws_m128n256_tma_col_a_s3](
         a_tma,
         b_tma,
@@ -1383,6 +1458,8 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_WS_THREADS,),
+        shared_mem_bytes=_v4_dyn_smem_arg[DYN_SMEM](),
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -1513,23 +1590,22 @@ def enqueue_gemm16_gemm(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    # The wgmma/TMA routes (v4 and the v3 kernels below) use 72-208 KiB of
-    # static smem; `_big_static_smem_on()` compiles them out where ptxas
-    # rejects that, and `_enqueue_accepted_bf16_gemm` serves their shapes.
-    comptime if _big_static_smem_on():
-        if not transpose_a and transpose_b and not has_bias:
-            # Deep-K split-K route first: the persistent kernel below keeps
-            # all SMs resident but cannot parallelize over K, so an output
-            # with few macro-tiles and a deep reduction leaves most of the
-            # GPU idle. The helper gates itself on that regime (see
-            # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
-            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-                output, a, b, m, n, k, ctx
-            ):
-                return
-            if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
-                return
-    comptime if _has_sm_9x() and _big_static_smem_on():
+    # Under a pre-CUDA-13 ptxas the wgmma/TMA kernels here take their tiles
+    # from the dynamic shared window (see gemm16_nn_v4_kernels.mojo), so
+    # every route below is compiled under either assembler.
+    if not transpose_a and transpose_b and not has_bias:
+        # Deep-K split-K route first: the persistent kernel below keeps all
+        # SMs resident but cannot parallelize over K, so an output with few
+        # macro-tiles and a deep reduction leaves most of the GPU idle.
+        # The helper gates itself on that regime (see
+        # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
+        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+            output, a, b, m, n, k, ctx
+        ):
+            return
+        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
+            return
+    comptime if _has_sm_9x():
         if ctx.api() == "cuda":
             var cc_major = ctx.get_attribute(
                 DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
@@ -1811,26 +1887,24 @@ def enqueue_gemm16_bmm(
     # straight through, unlike `_tf32_dense_batched_layout` on the aten_fast
     # side which used to reject it (see that function's history).
     #
-    # Both wgmma/TMA routes are compiled out where ptxas rejects their static
-    # smem (see enqueue_gemm16_gemm); `_enqueue_accepted_bf16_bmm` remains.
-    comptime if _big_static_smem_on():
-        if not transpose_a and not transpose_b:
-            if try_enqueue_bmm16_nn_batched(
-                output,
-                a,
-                b,
-                batch_count,
-                m,
-                n,
-                k,
-                output_batch_stride,
-                a_batch_stride,
-                b_batch_stride,
-                ctx,
-            ):
-                return
+    # Both routes are compiled under either ptxas (see enqueue_gemm16_gemm).
+    if not transpose_a and not transpose_b:
+        if try_enqueue_bmm16_nn_batched(
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            ctx,
+        ):
+            return
     if transpose_a and not transpose_b:
-        comptime if _has_sm_9x() and _big_static_smem_on():
+        comptime if _has_sm_9x():
             if ctx.api() == "cuda":
                 var cc_major = ctx.get_attribute(
                     DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
