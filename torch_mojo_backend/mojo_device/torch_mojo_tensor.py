@@ -180,7 +180,15 @@ class MojoTensorLike(Protocol):
     """
 
     _shape: tuple[int, ...]
-    _strides: tuple[int, ...]
+    # Namespaced on purpose. PyTorch library code assigns its own bookkeeping
+    # onto parameter objects, and because a mojo Parameter *is* the wrapper
+    # instance (nn.Parameter.__new__ takes the custom-tensor path and returns
+    # `data.detach()`), such a write lands directly in this payload. FSDP1's
+    # `FlatParameter._init_metadata` sets `_strides` to the per-parameter
+    # stride list, which silently replaced the layout strides here and made
+    # every later view op read a list of tuples. Keep payload names that torch
+    # could plausibly reuse under a `_mojo_` prefix.
+    _mojo_strides: tuple[int, ...]
     _dtype: DType
     _device: object
 
@@ -316,7 +324,7 @@ class TorchMojoTensor(torch.Tensor):
       ownership mechanism, and the last drop enqueues the stream-ordered
       free (see docs/strided_owning_tensors_design.md).
     - Layout metadata as plain Python attributes (`_ptr`, `_shape`,
-      `_strides` in elements, `_offset` in elements from the allocation
+      `_mojo_strides` in elements, `_offset` in elements from the allocation
       start, `_dtype` as a max DType, `_numel`, `_itemsize`, `_device`,
       `_is_contiguous`).
 
@@ -364,7 +372,7 @@ class TorchMojoTensor(torch.Tensor):
         res._holder = holder
         res._ptr = ptr
         res._shape = shape
-        res._strides = strides
+        res._mojo_strides = strides
         res._offset = offset
         res._dtype = dtype
         res._itemsize = dtype.size_in_bytes
@@ -648,7 +656,7 @@ class _PermuteCopyExtension(
             out._ptr,
             tensor._ptr,
             (1,) * pad + tuple(tensor._shape),
-            (0,) * pad + tuple(tensor._strides),
+            (0,) * pad + tuple(tensor._mojo_strides),
             tensor._dtype.size_in_bytes,
             _ctx_ptr(tensor._device),
         )
@@ -680,7 +688,7 @@ def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         "_holder",
         "_ptr",
         "_shape",
-        "_strides",
+        "_mojo_strides",
         "_offset",
         "_dtype",
         "_itemsize",
@@ -742,8 +750,8 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         dst._ptr,
         src._ptr,
         _pad8(dst._shape, 1),
-        _pad8(dst._strides, 0),
-        _pad8(src._strides, 0),
+        _pad8(dst._mojo_strides, 0),
+        _pad8(src._mojo_strides, 0),
         dst._itemsize,
         _ctx_ptr(dst._device),
     )
@@ -766,8 +774,8 @@ def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         dst._ptr,
         src._ptr,
         _pad8(dst._shape, 1),
-        _pad8(dst._strides, 0),
-        _pad8(src._strides, 0),
+        _pad8(dst._mojo_strides, 0),
+        _pad8(src._mojo_strides, 0),
         dst._itemsize,
         _ctx_ptr(dst._device),
     )

@@ -74,7 +74,7 @@ class _SavedMojoPayload:
         self.holder = None if _saved_tensor_hooks_active() else tensor._holder
         self.ptr = tensor._ptr
         self.shape = tensor._shape
-        self.strides = tensor._strides
+        self.strides = tensor._mojo_strides
         self.offset = tensor._offset
         self.dtype = tensor._dtype
         self.itemsize = tensor._itemsize
@@ -127,7 +127,7 @@ class _SavedMojoPayload:
             "_holder",
             "_ptr",
             "_shape",
-            "_strides",
+            "_mojo_strides",
             "_offset",
             "_dtype",
             "_itemsize",

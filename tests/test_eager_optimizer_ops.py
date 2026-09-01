@@ -195,8 +195,8 @@ def test_fused_adamw_accepts_contiguous_singleton_stride_variants(
     cpu_groups = groups("cpu")
     mojo_groups = groups(mojo_gpu)
     parameter, gradient = mojo_groups[0][0], mojo_groups[1][0]
-    assert parameter._strides == (1, 1)
-    assert gradient._strides == (1, 2)
+    assert parameter._mojo_strides == (1, 1)
+    assert gradient._mojo_strides == (1, 2)
     assert parameter._is_contiguous and gradient._is_contiguous
     kwargs = {
         "lr": 0.01,
