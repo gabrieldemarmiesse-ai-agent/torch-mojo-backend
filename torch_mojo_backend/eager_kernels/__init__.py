@@ -50,11 +50,11 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import ClassVar, Generic, TypeVar
+from typing import IO, ClassVar, Generic, TypeVar, cast
 
 from max import driver
 from max.dtype import DType
@@ -461,7 +461,7 @@ def _announce_build() -> None:
     )
 
 
-def _flock_or_none(lock: object) -> bool:
+def _flock_or_none(lock: IO[str]) -> bool:
     """Take the build lock; False when this filesystem cannot lock at all.
 
     The lock only DEDUPES concurrent identical builds — correctness never
@@ -547,6 +547,8 @@ def _load_extension(module_name: str, so_path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         module_name, str(so_path), loader=loader
     )
+    # An explicit loader= makes spec_from_file_location always succeed.
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
@@ -829,7 +831,11 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         spec. Descriptors with several outputs override this with the same
         allocation their ``call_extension`` performs.
         """
-        return _allocate_single_output(output_specs)  # type: ignore[return-value]
+        # _ExtensionResult is this descriptor's declared result type, which
+        # the base class can't itself prove _allocate_single_output's object
+        # return satisfies -- only single-output descriptors use this default,
+        # and for those _ExtensionResult is concretely torch.Tensor.
+        return cast(_ExtensionResult, _allocate_single_output(output_specs))
 
     @classmethod
     def prepare(
@@ -843,19 +849,24 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
         return PreparedExtensionCall(cls, defines, output_specs, args)
 
 
-def _allocate_single_output(spec: object) -> object:
+def _bootstrap_allocate_single_output(spec: object) -> object:
     """``output_specs._allocate_output_spec``, resolved on first use.
 
     ``output_specs`` imports this package, so it cannot be imported at module
-    scope here; rebinding the global on the first allocation leaves the
-    steady state at one plain lookup (the same trick as ``output_specs``'s
-    own ``_alloc``).
+    scope here; rebinding the `_allocate_single_output` global on the first
+    allocation leaves the steady state at one plain lookup (the same trick
+    as ``output_specs``'s own ``_alloc``). `_allocate_single_output` is a
+    plain variable (not `def`-bound) so this rebind type-checks against its
+    declared `Callable[[object], object]` type.
     """
     global _allocate_single_output
     from torch_mojo_backend.eager_kernels.output_specs import _allocate_output_spec
 
-    _allocate_single_output = _allocate_output_spec
-    return _allocate_output_spec(spec)
+    _allocate_single_output = cast("Callable[[object], object]", _allocate_output_spec)
+    return _allocate_single_output(spec)
+
+
+_allocate_single_output: Callable[[object], object] = _bootstrap_allocate_single_output
 
 
 class MojoFileExtension(MojoExtension[object, object]):

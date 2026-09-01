@@ -267,6 +267,8 @@ class _MiniAttentionBlock(torch.nn.Module):
     """Attention + MLP block exercising embeddings, layernorm, views,
     transposes, masked softmax and matmuls in one compiled graph."""
 
+    mask: torch.Tensor
+
     def __init__(self, vocab=64, n_embd=32, n_head=4, block_size=16):
         super().__init__()
         self.tok = torch.nn.Embedding(vocab, n_embd)

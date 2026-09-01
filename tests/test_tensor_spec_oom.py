@@ -58,7 +58,7 @@ def test_tensor_spec_fallbacks_propagate_device_oom(
         _mojo_file: Path, _defines: eager_kernels.CanonicalDefines
     ) -> ModuleType:
         module = ModuleType("oom_test_extension")
-        module.call = raise_allocator_oom
+        setattr(module, "call", raise_allocator_oom)
         return module
 
     def fake_allocate_output(
@@ -123,7 +123,7 @@ def test_tensor_spec_unsupported_metadata_still_uses_fallback(
         _mojo_file: Path, _defines: eager_kernels.CanonicalDefines
     ) -> ModuleType:
         module = ModuleType("unsupported_test_extension")
-        module.call = raise_unsupported
+        setattr(module, "call", raise_unsupported)
         return module
 
     def fake_allocate_output(

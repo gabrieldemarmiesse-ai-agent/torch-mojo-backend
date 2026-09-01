@@ -31,6 +31,9 @@ def mojo_device_min_dim_min(
     """Out-variant of torch.min along a dim: writes values into `min` and
     int64 indices into `min_indices` (resizing via payload rebind when the
     pre-allocated shapes don't match, like the other out-variants)."""
+    assert min is not None and min_indices is not None, (
+        "the out= dispatcher always supplies both output tensors"
+    )
     aten_fast = _fast()
     result = aten_fast.fast_aten_min_dim(input, dim, keepdim)
     if result is aten_fast.NOT_HANDLED:

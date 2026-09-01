@@ -29,6 +29,9 @@ TORCH_MOJO_BACKEND_VERBOSE=1 uv run pytest tests/test_compiler.py
 uv run ruff check .
 uv run ruff format .
 
+# Run the static type checker (must exit 0)
+uv run ty check
+
 # Or use pre-commit for all checks
 uvx pre-commit run --all-files
 ```
@@ -37,7 +40,9 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 
 
 ## Development Notes
-- **Code Quality**: Uses Ruff for linting/formatting with Python 3.11+ target and pyupgrade rules
+- **Code Quality**: Uses Ruff for linting/formatting with Python 3.11+ target and
+  pyupgrade rules, plus flake8-annotations (`ANN`) to require type hints; Astral's
+  `ty` (`uv run ty check`) statically checks those hints — see "Type hints" below
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
@@ -298,19 +303,39 @@ Use `: object` only when no other option is possible. Prefer precise types,
 unions, `Protocol`s (e.g. `MojoTensorLike` for payload-level helpers), or a
 `TypeVar` for pass-through functions.
 
-These hints are enforced at runtime by beartype, but only while running the
-unit tests: `tests/conftest.py` sets `TORCH_MOJO_BACKEND_BEARTYPE=1`, and
-production imports leave it off so no wrapper frames are added to hot paths.
-Set the variable explicitly to enable or disable checking in other contexts.
+These hints are enforced statically by Astral's `ty` type checker
+(`uv run ty check`), which must exit 0. Suppressing a diagnostic (per-rule
+or per-path in `[tool.ty]` in pyproject.toml) is a last resort for
+demonstrable `ty` false positives or third-party stub gaps (torch/max
+untyped surfaces), each needing a one-line reason — prefer a real, precise
+type over widening to `Any`/`object`.
+
+`ty` infers unannotated parameters and returns as `Unknown` and raises no
+diagnostic on their misuse, so a function with no hints at all is invisible
+to it. Ruff's `ANN` rules (`uv run ruff check`) are the backstop that catches
+a missing annotation in the first place; `ty` then checks that the
+annotation is correct. `tests/` and `current_bench/` are exempt from `ANN`
+(per-file-ignores in pyproject.toml): tests/ predates the rule by ~5k
+gaps, mostly pytest fixture params, and current_bench/ is ad hoc GPU
+profiling scratch, not shipped code. `ty` itself still checks whatever code
+in those two paths happens to already be annotated; only `current_bench/`
+and the untracked `deeplink/` are excluded from `ty` entirely.
+
+On a box with an active conda environment, run `ty` through `uv run`
+(`uv run ty check`), not the bare `ty` binary: `CONDA_PREFIX` makes ty's
+site-packages discovery fail outright when set to a non-standard conda
+layout. `[tool.ty.environment] python = ".venv"` in pyproject.toml pins the
+venv explicitly so this doesn't bite even outside `uv run`.
 
 ## To find the correct type hints for a function
 It may be hard to find the correct type hints for a function. What you should do in this case is:
 1) Add an obviously wrong type hint, for example datetime.timezone in an aten function.
-2) Run an existing unit test that calls this function.
-3) Beartype will throw an error and give the name of the type being actually passed to the function.
-4) Replace the type hint by the type given by beartype.
-5) Run the unit test again to check that it works.
-6) Run the whole test suite to verify that the type hint shouldn't be wider.
+2) Run `uv run ty check` (whole repo, or `uv run ty check path/to/file.py`).
+3) `ty` reports the inferred type of the value actually flowing into that
+   argument in its diagnostic.
+4) Replace the type hint with the type `ty` reported.
+5) Run `uv run ty check` again to confirm the diagnostic is gone.
+6) Run the relevant unit test(s) to check the annotation matches runtime behavior.
 
 ## Rules about the eager mode
 

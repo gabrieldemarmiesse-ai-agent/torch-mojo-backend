@@ -21,12 +21,14 @@ import weakref
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
 
-from torch_mojo_backend import eager_kernels, get_accelerators
+from torch_mojo_backend import TorchMojoTensor, eager_kernels, get_accelerators
 from torch_mojo_backend.eager_kernels import aten_fast, call_queue
+from torch_mojo_backend.eager_kernels.output_specs import _TensorOutputSpec
 from torch_mojo_backend.mojo_device import torch_mojo_device_module
 
 
@@ -78,12 +80,15 @@ class _StalledBuild:
         self._unit = unit
         self._module = unit.module
         unit.module = None
-        unit.request_async = self._request  # type: ignore[method-assign]
+        unit.request_async = self._request  # ty: ignore[invalid-assignment]
         self._job = _FakeJob(self)
 
     @classmethod
     def for_call(
-        cls, prepared: eager_kernels.PreparedExtensionCall[object, object]
+        cls,
+        prepared: eager_kernels.PreparedExtensionCall[
+            _TensorOutputSpec, TorchMojoTensor
+        ],
     ) -> "_StalledBuild":
         return cls(
             eager_kernels.MOJO_EXTENSION_LOADER.unit_canonical(
@@ -147,7 +152,7 @@ class _StalledUnits:
 
 def _prepare_add(
     lhs: object, rhs: object
-) -> eager_kernels.PreparedExtensionCall[object, object]:
+) -> eager_kernels.PreparedExtensionCall[_TensorOutputSpec, TorchMojoTensor]:
     return aten_fast._BinarySpecExtension.prepare(
         "AddSpec", lhs, rhs, aten_fast.DType.float32
     )
@@ -183,7 +188,7 @@ class _FakeUnit:
         error: BaseException | None = None,
         build_error: BaseException | None = None,
     ) -> None:
-        self.extension: object = _FakeExtension(log, error)
+        self.extension: _FakeExtension = _FakeExtension(log, error)
         self.ext: object | None = self.extension if ready else None
         self.build_error = build_error
         self.builds = 0
@@ -199,6 +204,12 @@ class _FakeUnit:
 
     def ready(self) -> None:
         self.ext = self.extension
+
+
+def _q(unit: _FakeUnit) -> call_queue._QueueUnit:
+    """`_FakeUnit` implements `_QueueUnit` structurally, but `.ext` holds a
+    `_FakeExtension` stand-in rather than a real compiled module."""
+    return cast(call_queue._QueueUnit, unit)
 
 
 class _Buffer:
@@ -224,9 +235,9 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     buffer = _Buffer()
     retained = weakref.ref(buffer)
 
-    call_queue.kernel_call_into(first, ("first",), ())
-    call_queue.kernel_call_into(failing, ("failing",), ())
-    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    call_queue.kernel_call_into(_q(first), ("first",), ())
+    call_queue.kernel_call_into(_q(failing), ("failing",), ())
+    call_queue.kernel_call_into(_q(successor), ("successor",), (buffer,))
     del buffer
     assert call_queue.active()
     assert retained() is not None  # the queued item retains its operands
@@ -249,7 +260,7 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     call_queue.drain()  # the episode is over: a clean, silent no-op
     assert log == ["first", "failing"]
 
-    call_queue.kernel_call_into(_FakeUnit(log, ready=True), ("after",), ())
+    call_queue.kernel_call_into(_q(_FakeUnit(log, ready=True)), ("after",), ())
     assert log == ["first", "failing", "after"]
 
 
@@ -264,8 +275,8 @@ def test_build_failure_behind_a_queued_launch_surfaces_from_drain(
 
     buffer = _Buffer()
     retained = weakref.ref(buffer)
-    call_queue.kernel_call_into(doomed, ("doomed",), ())
-    call_queue.kernel_call_into(successor, ("successor",), (buffer,))
+    call_queue.kernel_call_into(_q(doomed), ("doomed",), ())
+    call_queue.kernel_call_into(_q(successor), ("successor",), (buffer,))
     del buffer
 
     with pytest.raises(ImportError, match="mojo build failed"):
@@ -287,7 +298,7 @@ def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -
     )
     unit = _FakeUnit(log, error=oom)
 
-    call_queue.kernel_call_into(unit, ("oom",), ())
+    call_queue.kernel_call_into(_q(unit), ("oom",), ())
     unit.ready()
     call_queue.pump()
 
@@ -310,14 +321,14 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
     log: list[str] = []
 
     warm = _FakeUnit(log, ready=True)
-    call_queue.kernel_call_into(warm, ("warm",), ())  # runs inline on this thread
+    call_queue.kernel_call_into(_q(warm), ("warm",), ())  # runs inline on this thread
     assert log == ["warm"]
     assert syncs == []  # first device work of the episode: no switch yet
 
     first = _FakeUnit(log)
     second = _FakeUnit(log)
-    call_queue.kernel_call_into(first, ("first",), ())
-    call_queue.kernel_call_into(second, ("second",), ())
+    call_queue.kernel_call_into(_q(first), ("first",), ())
+    call_queue.kernel_call_into(_q(second), ("second",), ())
     first.ready()
     second.ready()
 
@@ -361,11 +372,11 @@ def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -
             log.append(f"{label}:exit")
 
     reentrant = _FakeUnit(log)
-    reentrant.extension = _ReentrantExtension()  # type: ignore[assignment]
+    reentrant.extension = _ReentrantExtension()  # ty: ignore[invalid-assignment]
     follower = _FakeUnit(log)
 
-    call_queue.kernel_call_into(reentrant, ("first",), (buffer,))
-    call_queue.kernel_call_into(follower, ("second",), (follower_buffer,))
+    call_queue.kernel_call_into(_q(reentrant), ("first",), (buffer,))
+    call_queue.kernel_call_into(_q(follower), ("second",), (follower_buffer,))
     del buffer, follower_buffer
     reentrant.ready()
     follower.ready()
@@ -384,7 +395,7 @@ def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
     producer = _FakeUnit(log)
     retained = weakref.ref(buffer := _Buffer())
 
-    call_queue.kernel_call_into(producer, ("producer",), ())
+    call_queue.kernel_call_into(_q(producer), ("producer",), ())
     call_queue.external_call(log.append, ("consumer",), (buffer,))
     del buffer
     assert log == []
@@ -410,11 +421,13 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
     log: list[str] = []
     retained = weakref.ref(out := _Buffer())
 
-    call_queue.kernel_call_into(_FakeUnit(log), ("cold",), (out,))
+    call_queue.kernel_call_into(_q(_FakeUnit(log)), ("cold",), (out,))
     del out
 
     assert retained() is not None  # only the queued item holds it now
-    call_queue._QUEUE[0][0].ready()
+    queued_unit = call_queue._QUEUE[0][0]
+    assert isinstance(queued_unit, _FakeUnit)
+    queued_unit.ready()
     call_queue.drain()
     assert log == ["cold"]
     assert retained() is None  # released right after its launch
@@ -455,8 +468,10 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
     # OOM once -> drain (launches the queued item), sync, retry succeeds.
     holder = _FlakyHolder([oom])
     monkeypatch.setattr(torch_mojo_tensor, "_holder_mod", lambda: holder)
-    call_queue.kernel_call_into(_FakeUnit(log), ("pending",), ())
-    call_queue._QUEUE[0][0].ready()
+    call_queue.kernel_call_into(_q(_FakeUnit(log)), ("pending",), ())
+    queued_unit = call_queue._QUEUE[0][0]
+    assert isinstance(queued_unit, _FakeUnit)
+    queued_unit.ready()
     result = torch_mojo_tensor._alloc_with_recovery(device, 4096)
     assert result[1] == 0x1000
     assert holder.calls == 2
@@ -546,7 +561,7 @@ def test_retention_budget_bounds_cold_run_ahead(
     for index, unit in enumerate(units):
         buf = _Payload()
         retained.append(weakref.ref(buf))
-        call_queue.kernel_call_into(unit, (f"cold{index}",), (buf,))
+        call_queue.kernel_call_into(_q(unit), (f"cold{index}",), (buf,))
         del buf
         if index < 3:
             # At or under budget: still queued, still retained, not blocked.
@@ -576,8 +591,8 @@ def test_retention_budget_holds_launch_errors_for_the_next_drain(
     log: list[str] = []
     failure = RuntimeError("exact variant rejected its arguments")
     failing = _FakeUnit(log, error=failure)
-    call_queue.kernel_call_into(failing, ("failing",), (_Payload(),))
-    call_queue.kernel_call_into(_FakeUnit(log), ("successor",), (_Payload(),))
+    call_queue.kernel_call_into(_q(failing), ("failing",), (_Payload(),))
+    call_queue.kernel_call_into(_q(_FakeUnit(log)), ("successor",), (_Payload(),))
 
     assert log == ["failing"]  # the budget drain launched and failed it
     assert not call_queue.active()  # rule 5 dropped the successor
@@ -942,14 +957,16 @@ def test_queued_sdpa_backward_matches_cpu(mojo_gpu, forced_queue, monkeypatch):
     q, k, v = (torch.randn(shape, generator=generator) for _ in range(3))
     grad = torch.randn(shape, generator=generator)
 
-    def run(device: str) -> tuple[torch.Tensor, ...]:
+    def run(device: str) -> tuple[torch.Tensor | None, ...]:
         # detach().clone() first: `.to("cpu")` of a CPU tensor is the tensor
         # itself, and marking the shared original as a leaf that requires
         # grad would make the device copy a non-leaf.
-        tensors = [t.detach().clone().to(device).requires_grad_() for t in (q, k, v)]
-        out = torch.nn.functional.scaled_dot_product_attention(*tensors)
+        t_q, t_k, t_v = (
+            t.detach().clone().to(device).requires_grad_() for t in (q, k, v)
+        )
+        out = torch.nn.functional.scaled_dot_product_attention(t_q, t_k, t_v)
         out.backward(grad.to(device))
-        return (out.detach(), *(tensor.grad for tensor in tensors))
+        return (out.detach(), t_q.grad, t_k.grad, t_v.grad)
 
     expected = run("cpu")
     run(mojo_gpu)  # warm every specialization the stalled region will use

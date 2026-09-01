@@ -31,7 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bench_lib import baselines
 
-from conftest import KEY_DUMP_ENV
+# conftest is resolved via the sys.path.insert above (this script also runs
+# standalone, not just under pytest's conftest auto-discovery); ty's module
+# resolver doesn't follow that runtime path manipulation. (A real fix is
+# `environment.root = ["benchmarks"]` in [tool.ty], mirroring the sys.path
+# insert -- left for a repo-wide config change rather than a local workaround.)
+from conftest import KEY_DUMP_ENV  # ty: ignore[unresolved-import]
 
 BENCH_DIR = Path(__file__).resolve().parent
 

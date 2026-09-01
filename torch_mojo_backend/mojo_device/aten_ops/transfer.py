@@ -1,9 +1,12 @@
 """Data transfer: H2D / D2H / D2D and dtype/device copies."""
 
+from typing import Protocol, cast, runtime_checkable
+
+import max.driver
 import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
-from torch_mojo_backend.mojo_device import cuda_peer
+from torch_mojo_backend.mojo_device import cuda_peer, torch_mojo_device_module
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
     _copy_strided_into,
@@ -14,7 +17,23 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
 from .support import _copy_into_tensor, _fast, max_dtype_to_torch_dtype
 
 
-def _upload_on_device(src: torch.Tensor, dest_ptr: int, dest_device) -> bool:
+@runtime_checkable
+class _TensorHolderModule(Protocol):
+    """The Mojo `tensor_holder` extension's Python-callable surface this
+    module needs -- it's a compiled-on-first-use native module (no stubs
+    possible), reached via `eager_kernels`' PEP 562 `__getattr__`."""
+
+    def copy_d2d(
+        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
+    ) -> None: ...
+    def copy_from_host(
+        self, ctx_ptr: int, dev_ptr: int, host_ptr: int, nbytes: int
+    ) -> object: ...
+
+
+def _upload_on_device(
+    src: torch.Tensor, dest_ptr: int, dest_device: max.driver.Device
+) -> bool:
     """Copy a foreign CUDA tensor straight into `dest_ptr`, or return False.
 
     Both allocations are device memory in one process, so when they sit on the
@@ -50,14 +69,17 @@ def _upload_on_device(src: torch.Tensor, dest_ptr: int, dest_device) -> bool:
 
     deferred_compile.drain()
     torch.cuda.synchronize()
-    eager_kernels.tensor_holder.copy_d2d(
+    holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
+    holder.copy_d2d(
         eager_kernels._ctx_ptr(dest_device), dest_ptr, src.data_ptr(), nbytes
     )
-    torch.mojo.synchronize()
+    torch_mojo_device_module.synchronize()
     return True
 
 
-def mojo_device__copy_from(self, dest, non_blocking: bool = False):
+def mojo_device__copy_from(
+    self: torch.Tensor, dest: torch.Tensor, non_blocking: bool = False
+) -> torch.Tensor:
     src_is_mojo = isinstance(self, TorchMojoTensor)
     dest_is_mojo = isinstance(dest, TorchMojoTensor)
 
@@ -99,7 +121,8 @@ def mojo_device__copy_from(self, dest, non_blocking: bool = False):
             if dest._numel > 0:
                 from torch_mojo_backend import eager_kernels
 
-                transfer_owner = eager_kernels.tensor_holder.copy_from_host(
+                holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
+                transfer_owner = holder.copy_from_host(
                     eager_kernels._ctx_ptr(dest._device),
                     dest._ptr,
                     cpu.data_ptr(),
@@ -119,7 +142,7 @@ def mojo_device__copy_from(self, dest, non_blocking: bool = False):
 
 
 def mojo_device__to_copy(
-    tensor,
+    tensor: torch.Tensor,
     *,
     dtype: torch.dtype | None = None,
     layout: torch.layout | None = None,
@@ -127,7 +150,7 @@ def mojo_device__to_copy(
     pin_memory: bool | None = None,
     non_blocking: bool = False,
     memory_format: torch.memory_format | None = None,
-):
+) -> torch.Tensor:
     aten_fast = _fast()
     if not isinstance(tensor, TorchMojoTensor):
         # Any non-mojo tensor moving onto mojo_device (optionally casting
@@ -136,6 +159,7 @@ def mojo_device__to_copy(
         # data_ptr() to alloc_from_host, which reads it as HOST memory -- so a
         # CUDA pointer segfaulted the process instead of raising.  Cast before
         # the bounce: on a downcast that shrinks the transfer.
+        assert device is not None, "moving onto mojo_device always names a device"
         t = tensor.detach()
         if dtype is not None and t.dtype != dtype:
             t = t.to(dtype)

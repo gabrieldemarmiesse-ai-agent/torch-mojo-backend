@@ -51,4 +51,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture(scope="session")
 def mojo_available() -> bool:
-    return bool(getattr(torch, "mojo", None) and torch.mojo.is_available())
+    # torch.mojo is installed at runtime by register_mojo_devices()
+    # (_setup_privateuseone_for_python_backend), not a real torch stub module.
+    return bool(
+        getattr(torch, "mojo", None) and torch.mojo.is_available()  # ty: ignore[unresolved-attribute]
+    )

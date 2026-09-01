@@ -7,18 +7,22 @@ while normalization and NLL run in FP32. Unlisted operations fall through.
 """
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
 
 _registered = False
-_fallback_library = None
-_aten_library = None
+_fallback_library: torch.library.Library | None = None
+_aten_library: torch.library.Library | None = None
 
-_AUTOCAST_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.AutocastPrivateUse1)
+# torch/_C/__init__.pyi's DispatchKey stub lists PrivateUse1, AutogradPrivateUse1
+# etc. but omits AutocastPrivateUse1, even though it exists at runtime.
+_AUTOCAST_KEYSET = torch._C.DispatchKeySet(
+    torch._C.DispatchKey.AutocastPrivateUse1  # ty: ignore[unresolved-attribute]
+)
 
 
-def _cast_mojo_floating(value, dtype):
+def _cast_mojo_floating(value: object, dtype: torch.dtype) -> object:
     """Recursively cast eligible Mojo floating tensors, leaving metadata alone."""
     if isinstance(value, torch.Tensor):
         if (
@@ -38,25 +42,29 @@ def _cast_mojo_floating(value, dtype):
     return value
 
 
-def _policy_wrapper(op, dtype_getter):
+def _policy_wrapper(
+    op: torch._ops.OpOverload, dtype_getter: Callable[[], torch.dtype]
+) -> Callable[..., object]:
     @functools.wraps(op)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: object, **kwargs: object) -> object:
         # Casts themselves must redispatch below AutocastPrivateUse1, otherwise
         # their internal _to_copy calls would re-enter this policy layer.
         with torch._C._ExcludeDispatchKeyGuard(_AUTOCAST_KEYSET):
             dtype = dtype_getter()
-            return op(
-                *_cast_mojo_floating(args, dtype), **_cast_mojo_floating(kwargs, dtype)
-            )
+            cast_args = _cast_mojo_floating(args, dtype)
+            cast_kwargs = _cast_mojo_floating(kwargs, dtype)
+            assert isinstance(cast_args, tuple)
+            assert isinstance(cast_kwargs, dict)
+            return op(*cast_args, **cast_kwargs)
 
     return wrapper
 
 
-def _lower_precision_wrapper(op):
+def _lower_precision_wrapper(op: torch._ops.OpOverload) -> Callable[..., object]:
     return _policy_wrapper(op, lambda: torch.get_autocast_dtype("mojo"))
 
 
-def _fp32_wrapper(op):
+def _fp32_wrapper(op: torch._ops.OpOverload) -> Callable[..., object]:
     return _policy_wrapper(op, lambda: torch.float32)
 
 

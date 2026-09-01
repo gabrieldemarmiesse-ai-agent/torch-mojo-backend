@@ -474,8 +474,8 @@ def rebuild(path: Path = BASELINES_PATH) -> None:
     raw = json.loads(block)
     if isinstance(raw, dict) and raw.get("format") in (3, 4):
         stripped = _without_legacy_aggregates(raw)
-        raw = {
-            "configs": _transposed(stripped.get("configs", {})),
-            "format": FORMAT_VERSION,
-        }
+        # Parsed JSON, shape guaranteed by the format-3/4 contract this
+        # migration handles, not something isinstance can verify past "dict".
+        configs = typing.cast("dict[str, dict]", stripped.get("configs", {}))
+        raw = {"configs": _transposed(configs), "format": FORMAT_VERSION}
     write(_parse(raw, path), path)

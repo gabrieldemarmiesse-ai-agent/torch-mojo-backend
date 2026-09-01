@@ -1,5 +1,6 @@
 import io
 from pathlib import Path
+from typing import TypedDict
 from unittest.mock import patch
 
 import numpy as np
@@ -8,7 +9,11 @@ import torch
 import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
-from torch.ops import aten
+
+# torch.ops is a `_Ops` instance registered into sys.modules at runtime
+# (torch/_ops.py), not a real package on disk, so no static resolver can
+# see `torch/ops/__init__.py` or `torch/ops.py`.
+from torch.ops import aten  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend
 import torch_mojo_backend.torch_compile_backend.compiler
@@ -36,7 +41,12 @@ from .conftest import require_cuda_autograd
 # the tolerance. atol=2e-2 is ~1.3x the measured worst case and still ~50x
 # below the O(1) error an actually wrong matmul produces on N(0, 1) data.
 # CPU keeps assert_close's exact fp32 defaults.
-def matmul_tolerance(device: str) -> dict[str, float]:
+class _Tolerance(TypedDict, total=False):
+    rtol: float
+    atol: float
+
+
+def matmul_tolerance(device: str) -> _Tolerance:
     if device == "cpu":
         return {}
     return {"rtol": 1e-2, "atol": 2e-2}
@@ -761,6 +771,7 @@ def test_decomposition_overload(monkeypatch):
 
     # it's normally decomposed. We check that it's not the case since we
     # implemented it ourselves.
+    assert input_gm is not None
     assert aten.t.default in [node.target for node in input_gm.graph.nodes]
 
 
@@ -795,6 +806,7 @@ def test_decomposition_overload_packet(monkeypatch):
 
     # it's normally decomposed. We check that it's not the case since we
     # implemented it ourselves.
+    assert input_gm is not None
     assert aten.transpose.int in [node.target for node in input_gm.graph.nodes]
 
 
@@ -829,6 +841,7 @@ def test_mojo_custom_op(device: str):
     def more_complexe_graph(x: torch.Tensor):
         x = x + 8
         y = my_torch_grayscale(x)
+        assert isinstance(y, torch.Tensor)
         y = y - 16
         return y
 
@@ -860,7 +873,10 @@ def test_mojo_custom_op(device: str):
 def allocate_outputs_grayscale_multi(
     pic: torch.Tensor, noise: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return tuple(pic.new_empty(noise.shape, dtype=torch.float32) for _ in range(2))
+    return (
+        pic.new_empty(noise.shape, dtype=torch.float32),
+        pic.new_empty(noise.shape, dtype=torch.float32),
+    )
 
 
 def grayscale_multi_eager(

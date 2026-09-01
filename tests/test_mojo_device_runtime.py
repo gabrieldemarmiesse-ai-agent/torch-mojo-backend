@@ -3,11 +3,14 @@
 import gc
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from typing import cast
 
+import max.driver
 import pytest
 import torch
 
-from torch_mojo_backend import register_mojo_devices
+from torch_mojo_backend import TorchMojoTensor, register_mojo_devices
+from torch_mojo_backend.mojo_device import torch_mojo_device_module
 from torch_mojo_backend.mojo_device import torch_mojo_tensor as mojo_tensor_module
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
@@ -34,20 +37,20 @@ def test_mojo_is_the_default_torch_accelerator():
 
 def test_torch_accelerator_synchronize_uses_mojo_device_module(monkeypatch):
     calls = []
-    original_synchronize = torch.mojo.synchronize
-    original_device = torch.mojo.current_device()
+    original_synchronize = torch_mojo_device_module.synchronize
+    original_device = torch_mojo_device_module.current_device()
 
     def recording_synchronize(device=None):
         calls.append(device)
         return original_synchronize(device)
 
-    monkeypatch.setattr(torch.mojo, "synchronize", recording_synchronize)
+    monkeypatch.setattr(torch_mojo_device_module, "synchronize", recording_synchronize)
     try:
         torch.accelerator.synchronize()
         torch.accelerator.synchronize("mojo")
         torch.accelerator.synchronize(0)
     finally:
-        torch.mojo.set_device(original_device)
+        torch_mojo_device_module.set_device(original_device)
 
     assert calls == [original_device, original_device, 0]
     with pytest.raises(ValueError, match="doesn't match the current accelerator mojo"):
@@ -58,17 +61,19 @@ def test_indexless_mojo_device_uses_current_device():
     accelerators = get_ordered_accelerators()
     if len(accelerators) < 2:
         pytest.skip("requires two Mojo devices, including the MAX CPU device")
-    original_index = torch.mojo.current_device()
+    original_index = torch_mojo_device_module.current_device()
     alternate_index = (original_index + 1) % len(accelerators)
     try:
-        torch.mojo.set_device(alternate_index)
+        torch_mojo_device_module.set_device(alternate_index)
         assert (
             find_equivalent_max_device(torch.device("mojo"))
             == accelerators[alternate_index]
         )
-        assert torch.empty(1, device="mojo")._device == accelerators[alternate_index]
+        empty_tensor = torch.empty(1, device="mojo")
+        assert isinstance(empty_tensor, TorchMojoTensor)
+        assert empty_tensor._device == accelerators[alternate_index]
     finally:
-        torch.mojo.set_device(original_index)
+        torch_mojo_device_module.set_device(original_index)
 
 
 def test_non_blocking_cpu_to_mojo_transfers(mojo_device):
@@ -86,6 +91,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
     source = torch.arange(1 << 20, dtype=torch.int32)
     expected = source.clone()
     uploaded = source.to(mojo_device, non_blocking=True)
+    assert isinstance(uploaded, TorchMojoTensor)
     del source
     for _ in range(8):
         torch.empty_like(expected).fill_(-1)
@@ -98,6 +104,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
 def test_non_blocking_mojo_to_cpu_transfer(mojo_device):
     expected = torch.arange(1 << 16, dtype=torch.float32)
     source = expected.to(mojo_device)
+    assert isinstance(source, TorchMojoTensor)
     downloaded = source.to("cpu", non_blocking=True)
 
     torch.accelerator.synchronize(mojo_device)
@@ -126,7 +133,9 @@ def test_transfer_query_failure_retains_new_dma_owner(direction):
         def __init__(self):
             self.default_stream = FakeStream()
 
-    device = FakeDevice()
+    # _PENDING_H2D/_PENDING_D2H are keyed structurally (only default_stream is
+    # read); cast the host-contract stand-in to the declared key type.
+    device = cast(max.driver.Device, FakeDevice())
     old_owner = object()
     new_owner = object()
     if direction == "h2d":
@@ -170,7 +179,7 @@ def test_transfer_record_and_sync_failure_retains_owner(direction):
         def __init__(self):
             self.default_stream = FailingStream()
 
-    device = FakeDevice()
+    device = cast(max.driver.Device, FakeDevice())
     owner = Owner()
     owner_ref = weakref.ref(owner)
     try:
@@ -190,40 +199,46 @@ def test_transfer_record_and_sync_failure_retains_owner(direction):
 def test_mojo_rng_state_exact_replay_and_high_bit_seed(mojo_device):
     device = torch.device(mojo_device)
     seed = (1 << 63) + 0x12345
-    torch.mojo.manual_seed_all(seed)
-    initial = torch.mojo.get_rng_state(device)
+    torch_mojo_device_module.manual_seed_all(seed)
+    initial = torch_mojo_device_module.get_rng_state(device)
     assert initial.dtype == torch.uint8
     assert initial.shape == (16,)
 
     assert _reserve_philox_state(device, 17) == (seed, 0)
-    advanced = torch.mojo.get_rng_state(device)
-    torch.mojo.set_rng_state(initial, device)
+    advanced = torch_mojo_device_module.get_rng_state(device)
+    torch_mojo_device_module.set_rng_state(initial, device)
     assert _reserve_philox_state(device, 17) == (seed, 0)
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), advanced)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), advanced)
 
 
 def test_mojo_rng_state_is_per_device():
-    if torch.mojo.device_count() < 2:
+    if torch_mojo_device_module.device_count() < 2:
         pytest.skip("requires two Mojo devices")
     first = torch.device("mojo:0")
     second = torch.device("mojo:1")
-    torch.mojo.manual_seed_all(20260718)
-    second_before = torch.mojo.get_rng_state(second)
+    torch_mojo_device_module.manual_seed_all(20260718)
+    second_before = torch_mojo_device_module.get_rng_state(second)
     assert _reserve_philox_state(first, 257) == (20260718, 0)
-    torch.testing.assert_close(torch.mojo.get_rng_state(second), second_before)
+    torch.testing.assert_close(
+        torch_mojo_device_module.get_rng_state(second), second_before
+    )
 
 
 def test_mojo_rng_state_rejects_malformed_state(mojo_device):
     device = torch.device(mojo_device)
     with pytest.raises(ValueError, match="16-element uint8"):
-        torch.mojo.set_rng_state(torch.zeros(16, dtype=torch.int64), device)
+        torch_mojo_device_module.set_rng_state(
+            torch.zeros(16, dtype=torch.int64), device
+        )
     with pytest.raises(ValueError, match="16-element uint8"):
-        torch.mojo.set_rng_state(torch.zeros(15, dtype=torch.uint8), device)
+        torch_mojo_device_module.set_rng_state(
+            torch.zeros(15, dtype=torch.uint8), device
+        )
 
 
 def test_mojo_rng_reservations_are_atomic_and_reject_wrap(mojo_device):
     device = torch.device(mojo_device)
-    torch.mojo.manual_seed_all(20260718)
+    torch_mojo_device_module.manual_seed_all(20260718)
     reservations = 256
     with ThreadPoolExecutor(max_workers=16) as pool:
         bases = list(
@@ -234,18 +249,24 @@ def test_mojo_rng_reservations_are_atomic_and_reject_wrap(mojo_device):
     seed = (1 << 63) + 7
     counter = (1 << 64) - 1
     encoded = seed.to_bytes(8, "little") + counter.to_bytes(8, "little")
-    torch.mojo.set_rng_state(torch.tensor(list(encoded), dtype=torch.uint8), device)
-    before = torch.mojo.get_rng_state(device)
+    torch_mojo_device_module.set_rng_state(
+        torch.tensor(list(encoded), dtype=torch.uint8), device
+    )
+    before = torch_mojo_device_module.get_rng_state(device)
     with pytest.raises(OverflowError, match="would wrap"):
         _reserve_philox_state(device, 1)
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), before)
 
 
 def test_torch_fork_rng_restores_mojo_counter(mojo_device):
     device = torch.device(mojo_device)
-    index = torch.mojo.current_device() if device.index is None else device.index
-    torch.mojo.manual_seed_all(91)
-    before = torch.mojo.get_rng_state(device)
+    index = (
+        torch_mojo_device_module.current_device()
+        if device.index is None
+        else device.index
+    )
+    torch_mojo_device_module.manual_seed_all(91)
+    before = torch_mojo_device_module.get_rng_state(device)
     with torch.random.fork_rng(devices=[index], device_type="mojo"):
         assert _reserve_philox_state(device, 33) == (91, 0)
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), before)

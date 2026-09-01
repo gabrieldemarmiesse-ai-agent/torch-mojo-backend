@@ -1,5 +1,6 @@
 import math
 import os
+from typing import Any, Protocol
 
 import torch
 import torch.nn as nn
@@ -12,8 +13,35 @@ os.environ["TORCH_MOJO_BACKEND_PROFILE"] = "1"
 os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "0"
 
 
+class GPTConfig:
+    attn_pdrop: float = 0.1
+    embd_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+
+    def __init__(
+        self,
+        vocab_size: int,
+        block_size: int,
+        n_layer: int,
+        n_head: int,
+        n_embd: int,
+        **kwargs: object,
+    ) -> None:
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    # register_buffer (unlike a direct `self.bias = ...` assignment) doesn't
+    # give the type checker anything to infer the attribute's type from.
+    bias: torch.Tensor
+
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -33,7 +61,7 @@ class CausalSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
 
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -53,13 +81,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=True)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=True)
         self.dropout = nn.Dropout(config.resid_pdrop)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.gelu(x)
         x = self.c_proj(x)
@@ -68,41 +96,34 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 
-class GPTConfig:
-    attn_pdrop = 0.1
-    embd_pdrop = 0.1
-    resid_pdrop = 0.1
-
-    def __init__(self, vocab_size, block_size, **kwargs):
-        self.vocab_size = vocab_size
-        self.block_size = block_size
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
 class GPT2(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
+        # Local typed refs so the weight tie below (and the class-level
+        # declarations further down) don't have to go through ModuleDict's
+        # attribute access, which nn.Module.__getattr__ types as Tensor | Module
+        # (it doesn't know the dict's keys statically).
+        wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wte=wte,
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.embd_pdrop),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -111,7 +132,7 @@ class GPT2(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.transformer.wte.weight = self.lm_head.weight
+        wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -120,7 +141,7 @@ class GPT2(nn.Module):
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -129,7 +150,9 @@ class GPT2(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
+    def from_pretrained(
+        cls, model_type: str, override_args: dict[str, Any] | None = None
+    ) -> "GPT2":
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         override_args = override_args or {}
         assert all(k == "dropout" for k in override_args)
@@ -183,9 +206,15 @@ class GPT2(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        decay = set()
-        no_decay = set()
+    def configure_optimizers(
+        self,
+        weight_decay: float,
+        learning_rate: float,
+        betas: tuple[float, float],
+        device_type: str,
+    ) -> torch.optim.Optimizer:
+        decay: set[str] = set()
+        no_decay: set[str] = set()
         whitelist_weight_modules = (torch.nn.Linear,)
         blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
         for mn, m in self.named_modules():
@@ -222,7 +251,9 @@ class GPT2(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(
+        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         device = idx.device
         b, t = idx.shape
         assert t <= self.config.block_size, (
@@ -230,12 +261,17 @@ class GPT2(nn.Module):
         )
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        # ModuleDict.__getitem__ is typed as -> Module (unlike attribute
+        # access, which nn.Module.__getattr__ types as the generic Tensor |
+        # Module since it doesn't know the dict's keys statically).
+        h_blocks = self.transformer["h"]
+        assert isinstance(h_blocks, nn.ModuleList)
+        tok_emb = self.transformer["wte"](idx)
+        pos_emb = self.transformer["wpe"](pos)
+        x = self.transformer["drop"](tok_emb + pos_emb)
+        for block in h_blocks:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer["ln_f"](x)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -249,7 +285,13 @@ class GPT2(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
         for _ in range(max_new_tokens):
             idx_cond = (
                 idx
@@ -268,7 +310,12 @@ class GPT2(nn.Module):
         return idx
 
 
-def load_tokenizer():
+class Tokenizer(Protocol):
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, tokens: list[int]) -> str: ...
+
+
+def load_tokenizer() -> Tokenizer:
     try:
         import tiktoken
 
@@ -278,21 +325,21 @@ def load_tokenizer():
         print("tiktoken not found, using simple character-level tokenizer")
 
         class SimpleTokenizer:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.vocab = {chr(i): i for i in range(256)}
                 self.vocab.update({"<|endoftext|>": 50256})
                 self.inv_vocab = {v: k for k, v in self.vocab.items()}
 
-            def encode(self, text):
+            def encode(self, text: str) -> list[int]:
                 return [self.vocab.get(c, 50256) for c in text]
 
-            def decode(self, tokens):
+            def decode(self, tokens: list[int]) -> str:
                 return "".join([self.inv_vocab.get(t, "<unk>") for t in tokens])
 
         return SimpleTokenizer()
 
 
-def main():
+def main() -> None:
     device = "cuda" if len(list(get_accelerators())) >= 2 else "cpu"
     print(f"Using device: {device}")
 
@@ -330,7 +377,12 @@ def main():
     )
 
     @torch.no_grad()
-    def generate_with_compiled_step(idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate_with_compiled_step(
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
         for _ in range(max_new_tokens):
             idx_cond = (
                 idx
@@ -366,7 +418,7 @@ def main():
     print("\n" + "=" * 50)
     print("Testing completed successfully!")
     print("=" * 50)
-    print(torch._dynamo.utils.compile_times())
+    print(torch._dynamo.utils.compile_times("str"))
 
 
 if __name__ == "__main__":

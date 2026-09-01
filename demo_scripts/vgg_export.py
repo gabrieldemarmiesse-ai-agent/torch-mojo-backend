@@ -7,7 +7,10 @@ import torch
 from max.driver import Accelerator
 from max.graph import DeviceRef
 from PIL import Image
-from torchvision import models, transforms
+
+# torchvision is a demo-only extra, not a project dependency (pip install it
+# yourself to run this script).
+from torchvision import models, transforms  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend.torch_compile_backend.exporter import export_to_max_graph
 
@@ -17,7 +20,7 @@ model.eval()
 dummy_input = torch.randn(1, 3, 224, 224)
 max_model = export_to_max_graph(model, (dummy_input,), force_device=DeviceRef.GPU(0))
 
-dummy_input_max_gpu = max.driver.Tensor.from_numpy(
+dummy_input_max_gpu = max.driver.Buffer.from_numpy(
     np.random.randn(1, 3, 224, 224).astype(np.float32)
 ).to(Accelerator(0))
 print(max_model(dummy_input_max_gpu))
@@ -37,7 +40,7 @@ preprocess = transforms.Compose(
 )
 
 
-def load_image(image_path_or_url):
+def load_image(image_path_or_url: str) -> Image.Image:
     if image_path_or_url.startswith("http"):
         response = requests.get(image_path_or_url)
         image = Image.open(BytesIO(response.content))
@@ -50,19 +53,19 @@ def load_image(image_path_or_url):
     return image
 
 
-def load_imagenet_labels():
+def load_imagenet_labels() -> list[str]:
     url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
     response = requests.get(url)
     labels = response.text.strip().split("\n")
     return labels
 
 
-def predict_image(image_path_or_url, top_k=5):
+def predict_image(image_path_or_url: str, top_k: int = 5) -> None:
     image = load_image(image_path_or_url)
 
     input_tensor = preprocess(image)
     input_batch = input_tensor.unsqueeze(0)  # Add batch dimension
-    input_batch = max.driver.Tensor.from_dlpack(input_batch).to(Accelerator(0))
+    input_batch = max.driver.Buffer.from_dlpack(input_batch).to(Accelerator(0))
     output = max_model(input_batch)
 
     output = torch.tensor(output[0].to_numpy())
@@ -75,7 +78,7 @@ def predict_image(image_path_or_url, top_k=5):
 
     print("Top Predictions: (boxer should come first)")
     for i in range(top_k):
-        class_idx = top_class[i].item()
+        class_idx = int(top_class[i].item())
         prob = top_prob[i].item()
         label = labels[class_idx]
         print(f"{i + 1:2d}. {label:30s} ({prob:.3f})")

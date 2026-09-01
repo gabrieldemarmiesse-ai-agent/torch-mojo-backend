@@ -66,7 +66,11 @@ from torch_mojo_backend.is_running_tests import IS_RUNNING_TESTS
 class _BuildJob(Protocol):
     """The background build of one specialization."""
 
-    def wait(self) -> None: ...
+    # Both call sites use this purely for the blocking side effect (and the
+    # exception it raises on build failure) and discard the return value,
+    # so implementations are free to return whatever they like (e.g.
+    # _AsyncLoadJob.wait() returns the loaded module).
+    def wait(self) -> object: ...
 
 
 @runtime_checkable
@@ -75,7 +79,11 @@ class _QueueUnit(Protocol):
     the loaded native module once its build lands (None while building),
     and `request_async()` starts or joins that build."""
 
-    ext: ModuleType | None
+    # A property (read-only), not a plain attribute: `_DefinedUnit.ext` is
+    # itself a read-only @property, and a Protocol's plain-attribute member
+    # requires write-compatibility a read-only property can't offer.
+    @property
+    def ext(self) -> ModuleType | None: ...
 
     def request_async(self) -> _BuildJob: ...
 
@@ -283,9 +291,11 @@ def _order_queue_launch_locked() -> None:
 def _exec(item: _QueueItem) -> None:
     unit, fn, args, _enqueuer, _keepalive, _nbytes = item
     if unit is None:
-        fn(*args)  # type: ignore[misc]  # exactly one of unit/fn is set
+        assert fn is not None  # exactly one of unit/fn is set
+        fn(*args)
         return
-    unit.ext.call(*args)  # type: ignore[union-attr]  # readiness checked by caller
+    assert unit.ext is not None  # readiness checked by caller
+    unit.ext.call(*args)
 
 
 def _pop_locked() -> _QueueItem:

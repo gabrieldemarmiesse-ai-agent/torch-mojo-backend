@@ -34,7 +34,6 @@ from __future__ import annotations
 import functools
 import unittest
 from collections.abc import Callable
-from typing import Any
 
 import known_unsupported
 import pytest
@@ -45,6 +44,7 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.opinfo.core import OpInfo, SampleInput
 
 # The dtypes worth exercising on an accelerator backend.  Deliberately not the
 # full OpInfo set: float64 is absent on some GPUs we target and complex is not
@@ -53,7 +53,7 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 _DTYPES = (torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.bool)
 
 
-def _to_cpu(value: Any) -> Any:
+def _to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
     if isinstance(value, list | tuple):
@@ -113,7 +113,9 @@ def _declining_rather_than_rejecting(
     return not any(issubclass(kind, NotImplementedError) for kind in demanded)
 
 
-def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
+def _tensor_specs(
+    sample: SampleInput,
+) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
     """Shape, dtype and device of every tensor in `sample`, in the order
     `SampleInput.transform` visits them.
 
@@ -122,7 +124,7 @@ def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.devi
     """
     specs: list[tuple[torch.Size, torch.dtype, torch.device]] = []
 
-    def record(value: Any) -> Any:
+    def record(value: object) -> object:
         if isinstance(value, torch.Tensor):
             specs.append((value.shape, value.dtype, value.device))
         return value
@@ -132,7 +134,7 @@ def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.devi
 
 
 def _opinfo_placements(
-    op: Any, dtype: torch.dtype
+    op: OpInfo, dtype: torch.dtype
 ) -> list[list[tuple[torch.Size, torch.dtype, torch.device]]] | None:
     """Where OpInfo itself puts each sample-input tensor when it builds this
     operator's samples for a device -- one entry per tensor, per sample.
@@ -183,10 +185,10 @@ def _opinfo_placements(
 
 
 def _to_device(
-    sample: Any,
+    sample: SampleInput,
     device: str,
     placement: list[tuple[torch.Size, torch.dtype, torch.device]] | None,
-) -> Any:
+) -> SampleInput:
     """`sample`, built on the CPU, with every tensor moved to `device` except
     the ones `placement` says OpInfo keeps on the CPU.
 
@@ -202,7 +204,7 @@ def _to_device(
         iter([p[2].type == "cpu" for p in placement]) if placement is not None else None
     )
 
-    def move(value: Any) -> Any:
+    def move(value: object) -> object:
         # transform() also visits torch.dtype values, which have no device.
         if not isinstance(value, torch.Tensor):
             return value
@@ -213,7 +215,7 @@ def _to_device(
     return sample.transform(move)
 
 
-def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | None:
+def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str | None:
     """None, or why `test_matches_cpu` should not compare this op's output.
 
     OpInfo already flags operators whose output is legitimately allowed to
@@ -277,7 +279,7 @@ class TestOpInfoConformance(TestCase):
     """One test per (operator, dtype), driven entirely by OpInfo metadata."""
 
     @ops(op_db, allowed_dtypes=_DTYPES)
-    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
         """Same operator, same inputs, mojo vs CPU, at OpInfo's own tolerance.
 
         Samples are built on the CPU and moved, never built on the device.
@@ -308,7 +310,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
         """One `test_matches_cpu` case: every sample, device leg vs CPU leg."""
         placements = _opinfo_placements(op, dtype)
         checked = 0
@@ -332,7 +334,7 @@ class TestOpInfoConformance(TestCase):
         [op for op in op_db if op.error_inputs_func is not None],
         allowed_dtypes=(torch.float32,),
     )
-    def test_errors_match(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def test_errors_match(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
         """The inputs PyTorch says must raise, must raise here too.
 
         A backend that silently accepts a malformed call is a worse failure
@@ -356,7 +358,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _check_error_inputs(self, device: str, op: Any) -> None:
+    def _check_error_inputs(self, device: str, op: OpInfo) -> None:
         """One `test_errors_match` case: every error input OpInfo declares."""
         checked = 0
         for error_input in op.error_inputs(device):

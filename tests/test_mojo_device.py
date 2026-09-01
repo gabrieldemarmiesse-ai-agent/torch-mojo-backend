@@ -6,11 +6,14 @@ import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import cast
 
+import max.driver
 import pytest
 import torch
 
 from torch_mojo_backend import TorchMojoTensor, mojo_backend, register_mojo_devices
+from torch_mojo_backend.mojo_device import torch_mojo_device_module
 from torch_mojo_backend.mojo_device import torch_mojo_tensor as mojo_tensor_module
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
@@ -38,14 +41,14 @@ def test_mojo_is_the_default_torch_accelerator():
 
 def test_torch_accelerator_synchronize_uses_mojo_device_module(monkeypatch):
     calls = []
-    original_synchronize = torch.mojo.synchronize
-    original_device = torch.mojo.current_device()
+    original_synchronize = torch_mojo_device_module.synchronize
+    original_device = torch_mojo_device_module.current_device()
 
     def recording_synchronize(device=None):
         calls.append(device)
         return original_synchronize(device)
 
-    monkeypatch.setattr(torch.mojo, "synchronize", recording_synchronize)
+    monkeypatch.setattr(torch_mojo_device_module, "synchronize", recording_synchronize)
 
     try:
         torch.accelerator.synchronize()
@@ -53,10 +56,10 @@ def test_torch_accelerator_synchronize_uses_mojo_device_module(monkeypatch):
         torch.accelerator.synchronize(0)
 
         if torch.accelerator.device_count() > 1:
-            torch.mojo.set_device(1)
+            torch_mojo_device_module.set_device(1)
             torch.accelerator.synchronize()
     finally:
-        torch.mojo.set_device(original_device)
+        torch_mojo_device_module.set_device(original_device)
 
     assert calls[:3] == [original_device, original_device, 0]
     if torch.accelerator.device_count() > 1:
@@ -145,20 +148,22 @@ def test_indexless_mojo_device_uses_and_restores_current_device():
     if len(accelerators) < 2:
         pytest.skip("requires two Mojo devices, including the MAX CPU device")
 
-    original_index = torch.mojo.current_device()
+    original_index = torch_mojo_device_module.current_device()
     alternate_index = (original_index + 1) % len(accelerators)
     try:
-        torch.mojo.set_device(alternate_index)
+        torch_mojo_device_module.set_device(alternate_index)
 
         assert (
             find_equivalent_max_device(torch.device("mojo"))
             == accelerators[alternate_index]
         )
-        assert torch.empty(1, device="mojo")._device == accelerators[alternate_index]
+        empty_tensor = torch.empty(1, device="mojo")
+        assert isinstance(empty_tensor, TorchMojoTensor)
+        assert empty_tensor._device == accelerators[alternate_index]
     finally:
-        torch.mojo.set_device(original_index)
+        torch_mojo_device_module.set_device(original_index)
 
-    assert torch.mojo.current_device() == original_index
+    assert torch_mojo_device_module.current_device() == original_index
     assert (
         find_equivalent_max_device(torch.device("mojo")) == accelerators[original_index]
     )
@@ -210,6 +215,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
     source = torch.arange(1 << 20, dtype=torch.int32)
     expected = source.clone()
     uploaded = source.to(mojo_device, non_blocking=True)
+    assert isinstance(uploaded, TorchMojoTensor)
     if uploaded._device.label == "gpu":
         assert uploaded._device in _PENDING_H2D
 
@@ -227,10 +233,12 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
 def test_synchronized_transfers_reap_completed_cpu_sources(mojo_device):
     """Later blocking H2D/D2H operations release completed async sources."""
     first = torch.arange(4096).to(mojo_device, non_blocking=True)
+    assert isinstance(first, TorchMojoTensor)
     torch.zeros(4096).to(mojo_device)
     assert first._device not in _PENDING_H2D
 
     second = torch.arange(4096).to(mojo_device, non_blocking=True)
+    assert isinstance(second, TorchMojoTensor)
     torch.testing.assert_close(second.cpu(), torch.arange(4096))
     assert second._device not in _PENDING_H2D
 
@@ -243,14 +251,14 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
 
     a = torch.randn(4096, 4096).to(mojo_device)
     b = torch.randn(4096, 4096).to(mojo_device)
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
 
     # Establish a conservative duration for the work placed ahead of H2D.
     _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     started = time.perf_counter()
     _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     matmul_seconds = time.perf_counter() - started
 
     delayed = a @ b
@@ -259,7 +267,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     upload_return_seconds = time.perf_counter() - started
 
     assert upload_return_seconds < matmul_seconds * 0.5
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     torch.testing.assert_close(uploaded.cpu(), torch.arange(4096))
     assert delayed.shape == (4096, 4096)
 
@@ -274,7 +282,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     large_upload_return_seconds = time.perf_counter() - started
 
     assert large_upload_return_seconds < matmul_seconds * 0.5
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     torch.testing.assert_close(large_uploaded.cpu(), source)
     assert delayed.shape == (4096, 4096)
 
@@ -282,8 +290,9 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     # CPU source must stay alive while both operations wait behind prior work.
     destination_storage = torch.empty((elements, 2), device=mojo_device)
     destination = destination_storage[:, 1]
+    assert isinstance(destination, TorchMojoTensor)
     destination.copy_(torch.zeros(elements), non_blocking=True)
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
 
     expected = source.clone()
     # The staged strided path has a few milliseconds of legitimate host-side
@@ -293,7 +302,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     started = time.perf_counter()
     for _ in range(queue_repeats):
         _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     queued_matmul_seconds = time.perf_counter() - started
 
     delayed = [a @ b for _ in range(queue_repeats)]
@@ -307,7 +316,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     for _ in range(8):
         torch.empty_like(expected).fill_(-1)
 
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     assert destination._device not in _PENDING_H2D
     torch.testing.assert_close(destination.cpu(), expected)
     assert all(result.shape == (4096, 4096) for result in delayed)
@@ -329,13 +338,13 @@ def test_non_blocking_mojo_to_cpu_does_not_drain_prior_gpu_work(mojo_device):
 
     # Warm the pinned-host allocation and DLPack adoption paths before timing.
     _ = source.to("cpu", non_blocking=True)
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
 
     queue_repeats = 8
     started = time.perf_counter()
     for _ in range(queue_repeats):
         _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     queued_matmul_seconds = time.perf_counter() - started
 
     delayed = [a @ b for _ in range(queue_repeats)]
@@ -346,7 +355,7 @@ def test_non_blocking_mojo_to_cpu_does_not_drain_prior_gpu_work(mojo_device):
     assert download_return_seconds < queued_matmul_seconds * 0.5
     assert max_device in pending_d2h
 
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     assert max_device not in pending_d2h
     torch.testing.assert_close(downloaded, expected)
     assert all(result.shape == (4096, 4096) for result in delayed)
@@ -366,7 +375,7 @@ def test_non_blocking_strided_d2h_survives_source_destruction(mojo_device):
     assert isinstance(retained, tuple) and len(retained) == 2
 
     del source, storage
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     torch.testing.assert_close(downloaded, expected)
     assert max_device not in mojo_tensor_module._PENDING_D2H
 
@@ -382,7 +391,7 @@ def test_non_blocking_d2h_survives_destination_destruction(mojo_device):
     a = torch.randn(4096, 4096).to(mojo_device)
     b = torch.randn(4096, 4096).to(mojo_device)
     source = torch.arange(1 << 20, dtype=torch.float32).to(mojo_device)
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
 
     delayed = [a @ b for _ in range(8)]
     exports_before = len(dlpack._live_exports)
@@ -398,7 +407,7 @@ def test_non_blocking_d2h_survives_destination_destruction(mojo_device):
     assert len(dlpack._live_exports) == exports_before
     assert max_device in mojo_tensor_module._PENDING_D2H
 
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     assert max_device not in mojo_tensor_module._PENDING_D2H
     assert all(result.shape == (4096, 4096) for result in delayed)
 
@@ -447,7 +456,10 @@ def test_transfer_query_failure_retains_new_dma_owner(direction):
         def __init__(self):
             self.default_stream = FakeStream()
 
-    device = FakeDevice()
+    fake_device = FakeDevice()
+    # _PENDING_H2D/_PENDING_D2H are keyed structurally (only default_stream is
+    # read); cast the host-contract stand-in to the declared key type.
+    device = cast(max.driver.Device, fake_device)
     old_owner = object()
     new_owner = object()
     if direction == "h2d":
@@ -471,7 +483,7 @@ def test_transfer_query_failure_retains_new_dma_owner(direction):
             record()
         assert list(pending[device]) == [
             (pending[device][0][0], old_owner),
-            (device.default_stream.current, new_owner),
+            (fake_device.default_stream.current, new_owner),
         ]
     finally:
         with lock:
@@ -496,7 +508,7 @@ def test_transfer_record_and_sync_failure_retains_owner(direction):
         def __init__(self):
             self.default_stream = FailingStream()
 
-    device = FakeDevice()
+    device = cast(max.driver.Device, FakeDevice())
     owner = Owner()
     owner_ref = weakref.ref(owner)
     try:
@@ -538,11 +550,11 @@ def test_same_device_d2d_does_not_drain_prior_gpu_work(mojo_device):
     contiguous_destination.copy_(contiguous_source)
     strided_destination.copy_(strided_source)
     _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
 
     started = time.perf_counter()
     _ = a @ b
-    torch.mojo.synchronize(mojo_device)
+    torch_mojo_device_module.synchronize(mojo_device)
     matmul_seconds = time.perf_counter() - started
 
     for layout, destination, source in (
@@ -555,7 +567,7 @@ def test_same_device_d2d_does_not_drain_prior_gpu_work(mojo_device):
         copy_return_seconds = time.perf_counter() - started
 
         assert copy_return_seconds < matmul_seconds * 0.5, layout
-        torch.mojo.synchronize(mojo_device)
+        torch_mojo_device_module.synchronize(mojo_device)
         torch.testing.assert_close(destination.cpu(), expected)
         assert delayed.shape == (4096, 4096)
 
@@ -564,57 +576,67 @@ def test_mojo_rng_state_exact_replay_and_high_bit_seed(mojo_device):
     """Public RNG snapshots exactly replay per-device Philox reservations."""
     device = torch.device(mojo_device)
     seed = (1 << 63) + 0x12345
-    torch.mojo.manual_seed_all(seed)
+    torch_mojo_device_module.manual_seed_all(seed)
 
-    initial = torch.mojo.get_rng_state(device)
+    initial = torch_mojo_device_module.get_rng_state(device)
     assert initial.dtype == torch.uint8
     assert initial.shape == (16,)
 
     assert _reserve_philox_state(device, 17) == (seed, 0)
-    advanced = torch.mojo.get_rng_state(device)
+    advanced = torch_mojo_device_module.get_rng_state(device)
     assert not torch.equal(advanced, initial)
 
-    torch.mojo.set_rng_state(initial, device)
+    torch_mojo_device_module.set_rng_state(initial, device)
     assert _reserve_philox_state(device, 17) == (seed, 0)
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), advanced)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), advanced)
 
 
 def test_mojo_rng_state_is_per_device():
     """Consuming one Mojo device's counter does not advance another device."""
-    if torch.mojo.device_count() < 2:
+    if torch_mojo_device_module.device_count() < 2:
         pytest.skip("requires two Mojo devices, including the MAX CPU device")
 
     first = torch.device("mojo:0")
     second = torch.device("mojo:1")
-    torch.mojo.manual_seed_all(20260718)
-    second_before = torch.mojo.get_rng_state(second)
+    torch_mojo_device_module.manual_seed_all(20260718)
+    second_before = torch_mojo_device_module.get_rng_state(second)
 
     assert _reserve_philox_state(first, 257) == (20260718, 0)
-    torch.testing.assert_close(torch.mojo.get_rng_state(second), second_before)
+    torch.testing.assert_close(
+        torch_mojo_device_module.get_rng_state(second), second_before
+    )
     assert _reserve_philox_state(second, 1) == (20260718, 0)
 
 
 def test_mojo_rng_state_rejects_malformed_state(mojo_device):
     device = torch.device(mojo_device)
     with pytest.raises(ValueError, match="16-element uint8"):
-        torch.mojo.set_rng_state(torch.zeros(16, dtype=torch.int64), device)
+        torch_mojo_device_module.set_rng_state(
+            torch.zeros(16, dtype=torch.int64), device
+        )
     with pytest.raises(ValueError, match="16-element uint8"):
-        torch.mojo.set_rng_state(torch.zeros(15, dtype=torch.uint8), device)
+        torch_mojo_device_module.set_rng_state(
+            torch.zeros(15, dtype=torch.uint8), device
+        )
 
 
 def test_mojo_rng_seed_bounds_do_not_mutate_state(mojo_device):
     device = torch.device(mojo_device)
-    torch.mojo.manual_seed_all(20260718)
-    before = torch.mojo.get_rng_state(device)
+    torch_mojo_device_module.manual_seed_all(20260718)
+    before = torch_mojo_device_module.get_rng_state(device)
 
     for invalid_seed in (1 << 64, -(1 << 63) - 1):
         with pytest.raises(ValueError, match="Overflow"):
-            torch.mojo.manual_seed_all(invalid_seed)
-        torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+            torch_mojo_device_module.manual_seed_all(invalid_seed)
+        torch.testing.assert_close(
+            torch_mojo_device_module.get_rng_state(device), before
+        )
 
         with pytest.raises(ValueError, match="Overflow"):
             torch.manual_seed(invalid_seed)
-        torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+        torch.testing.assert_close(
+            torch_mojo_device_module.get_rng_state(device), before
+        )
         # A CUDA-enabled PyTorch queues manual_seed_all() until its first CUDA
         # initialization.  The custom-device validation above then raises, so
         # replace that deferred invalid callback before another test initializes
@@ -625,17 +647,17 @@ def test_mojo_rng_seed_bounds_do_not_mutate_state(mojo_device):
 
 def test_mojo_rng_state_accepts_reshaped_byte_tensor(mojo_device):
     device = torch.device(mojo_device)
-    torch.mojo.manual_seed_all((1 << 63) + 20260718)
-    initial = torch.mojo.get_rng_state(device)
+    torch_mojo_device_module.manual_seed_all((1 << 63) + 20260718)
+    initial = torch_mojo_device_module.get_rng_state(device)
     _reserve_philox_state(device, 37)
 
-    torch.mojo.set_rng_state(initial.reshape(4, 4), device)
+    torch_mojo_device_module.set_rng_state(initial.reshape(4, 4), device)
     assert _reserve_philox_state(device, 37) == ((1 << 63) + 20260718, 0)
 
 
 def test_mojo_rng_reservations_are_atomic_and_reject_wrap(mojo_device):
     device = torch.device(mojo_device)
-    torch.mojo.manual_seed_all(20260718)
+    torch_mojo_device_module.manual_seed_all(20260718)
 
     reservations = 512
     with ThreadPoolExecutor(max_workers=16) as pool:
@@ -647,25 +669,31 @@ def test_mojo_rng_reservations_are_atomic_and_reject_wrap(mojo_device):
     seed = (1 << 63) + 7
     counter = (1 << 64) - 1
     encoded = seed.to_bytes(8, "little") + counter.to_bytes(8, "little")
-    torch.mojo.set_rng_state(torch.tensor(list(encoded), dtype=torch.uint8), device)
-    before = torch.mojo.get_rng_state(device)
+    torch_mojo_device_module.set_rng_state(
+        torch.tensor(list(encoded), dtype=torch.uint8), device
+    )
+    before = torch_mojo_device_module.get_rng_state(device)
 
     with pytest.raises(OverflowError, match="would wrap"):
         _reserve_philox_state(device, 1)
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), before)
 
 
 def test_torch_fork_rng_restores_mojo_counter(mojo_device):
     device = torch.device(mojo_device)
-    index = torch.mojo.current_device() if device.index is None else device.index
-    torch.mojo.manual_seed_all(91)
-    before = torch.mojo.get_rng_state(device)
+    index = (
+        torch_mojo_device_module.current_device()
+        if device.index is None
+        else device.index
+    )
+    torch_mojo_device_module.manual_seed_all(91)
+    before = torch_mojo_device_module.get_rng_state(device)
 
     with torch.random.fork_rng(devices=[index], device_type="mojo"):
         assert _reserve_philox_state(device, 33) == (91, 0)
-        assert not torch.equal(torch.mojo.get_rng_state(device), before)
+        assert not torch.equal(torch_mojo_device_module.get_rng_state(device), before)
 
-    torch.testing.assert_close(torch.mojo.get_rng_state(device), before)
+    torch.testing.assert_close(torch_mojo_device_module.get_rng_state(device), before)
 
 
 def test_dtype_preservation(mojo_device):
@@ -716,8 +744,12 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
     module.to(mojo_device)
 
     assert module.embedding.weight is module.projection.weight
-    assert module.embedding.weight._holder is module.projection.weight._holder
-    assert module.embedding.weight._ptr == module.projection.weight._ptr
+    embedding_weight = module.embedding.weight
+    projection_weight = module.projection.weight
+    assert isinstance(embedding_weight, TorchMojoTensor)
+    assert isinstance(projection_weight, TorchMojoTensor)
+    assert embedding_weight._holder is projection_weight._holder
+    assert embedding_weight._ptr == projection_weight._ptr
     assert len(list(module.parameters())) == 1
 
 
@@ -766,7 +798,7 @@ def test_mojo_adamw_step_matches_cpu(mojo_gpu_available, foreach):
         cpu_optimizer.step()
         mojo_optimizer.step()
 
-    torch.mojo.synchronize(mojo_gpu)
+    torch_mojo_device_module.synchronize(mojo_gpu)
     torch.testing.assert_close(mojo_parameter.cpu(), cpu_parameter)
     cpu_state = cpu_optimizer.state[cpu_parameter]
     mojo_state = mojo_optimizer.state[mojo_parameter]
@@ -810,7 +842,7 @@ def test_mojo_checkpoint_resumes_through_portable_cpu_state(mojo_gpu_available):
     for parameter in resumed_model.parameters():
         parameter.grad = torch.ones_like(parameter)
     resumed_optimizer.step()
-    torch.mojo.synchronize(mojo_gpu)
+    torch_mojo_device_module.synchronize(mojo_gpu)
     assert all(
         torch.isfinite(parameter.cpu()).all()
         for parameter in resumed_model.parameters()
@@ -845,10 +877,12 @@ def test_mojo_clip_grad_norm_matches_cpu(mojo_gpu_available, foreach):
         cpu_parameters, 1.25, foreach=foreach
     )
     actual_norm = torch.nn.utils.clip_grad_norm_(mojo_parameters, 1.25, foreach=foreach)
-    torch.mojo.synchronize(mojo_gpu)
+    torch_mojo_device_module.synchronize(mojo_gpu)
 
     torch.testing.assert_close(actual_norm.cpu(), expected_norm)
     for actual, expected in zip(mojo_parameters, cpu_parameters, strict=True):
+        # Both grads were assigned above.
+        assert actual.grad is not None
         torch.testing.assert_close(actual.grad.cpu(), expected.grad)
 
 
@@ -1135,6 +1169,7 @@ def test_copy_into_mojo_from_another_backend(mojo_gpu):
 def test_from_cpu_rejects_a_device_source(mojo_gpu):
     """The guard behind both call sites: a message, never a fault."""
     on_device = torch.zeros(4, device=mojo_gpu)
+    assert isinstance(on_device, TorchMojoTensor)
     with pytest.raises(RuntimeError, match="requires a CPU source"):
         TorchMojoTensor._from_cpu(on_device, on_device._device)
 
@@ -1154,16 +1189,16 @@ def test_same_gpu_transfer_skips_the_host(mojo_gpu):
 
     big = torch.randn(1 << 26, device="cuda")  # 256 MB
     big.to(mojo_gpu)
-    torch.mojo.synchronize()
+    torch_mojo_device_module.synchronize()
 
     start = time.perf_counter()
     moved = big.to(mojo_gpu)
-    torch.mojo.synchronize()
+    torch_mojo_device_module.synchronize()
     on_device = time.perf_counter() - start
 
     start = time.perf_counter()
     bounced = big.cpu().to(mojo_gpu)
-    torch.mojo.synchronize()
+    torch_mojo_device_module.synchronize()
     through_host = time.perf_counter() - start
 
     assert torch.equal(moved.cpu(), bounced.cpu())
@@ -1183,7 +1218,8 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     from torch_mojo_backend.mojo_device import cuda_peer
 
     on_mojo = torch.zeros(8, device=mojo_gpu)
-    torch.mojo.synchronize()
+    assert isinstance(on_mojo, TorchMojoTensor)
+    torch_mojo_device_module.synchronize()
     assert cuda_peer.device_ordinal(on_mojo._ptr) is not None
     assert cuda_peer.device_ordinal(0) is None
     assert cuda_peer.device_ordinal(torch.zeros(8).data_ptr()) is None
@@ -1210,10 +1246,15 @@ def test_library_attributes_do_not_clobber_the_payload(mojo_gpu_available):
     if not mojo_gpu_available:
         pytest.skip("requires a MAX GPU")
     tensor = torch.arange(8, dtype=torch.float32, device="mojo:0")
+    assert isinstance(tensor, TorchMojoTensor)
     strides = tensor._mojo_strides
-    tensor._strides = ((1,), (1,))
-    tensor._shapes = (torch.Size([4]), torch.Size([4]))
-    tensor._numels = (4, 4)
+    # Simulates FSDP1 writing its own bookkeeping onto the wrapper instance;
+    # these names are deliberately not part of TorchMojoTensor's declared
+    # payload, so setattr (not a plain attribute assignment) is the honest
+    # way to write them.
+    setattr(tensor, "_strides", ((1,), (1,)))
+    setattr(tensor, "_shapes", (torch.Size([4]), torch.Size([4])))
+    setattr(tensor, "_numels", (4, 4))
     assert tensor._mojo_strides == strides
     first, second = torch.split(tensor, [4, 4])
     assert second.cpu().tolist() == [4.0, 5.0, 6.0, 7.0]

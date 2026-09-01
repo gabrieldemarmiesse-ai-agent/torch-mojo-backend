@@ -1,10 +1,11 @@
 import time
 import traceback
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import max.driver
 import max.graph.value
@@ -64,10 +65,10 @@ def global_max_objects() -> GlobalMaxObjects:
     return _global_max_objects
 
 
-def gather_stats_on_graph(gm: torch.fx.GraphModule):
+def gather_stats_on_graph(gm: torch.fx.GraphModule) -> None:
     # count the number of times we see each function.
     # print and sort alphabetically.
-    function_counts = {}
+    function_counts: dict[str, int] = {}
     for node in gm.graph.nodes:
         if node.op == "call_function" or node.op == "call_method":
             name = get_fully_qualified_name(node.target)
@@ -80,13 +81,13 @@ def gather_stats_on_graph(gm: torch.fx.GraphModule):
 
 
 class TensorsBook:
-    def __init__(self):
+    def __init__(self) -> None:
         self.tensors: dict[str, Any] = {}
 
-    def __setitem__(self, name: str, tensor):
+    def __setitem__(self, name: str, tensor: object) -> None:
         self.tensors[name] = tensor
 
-    def convert_to_max(self, something):
+    def convert_to_max(self, something: object) -> object:
         if isinstance(something, torch.fx.Node):
             input_tensor = self.tensors[something.name]
             if isinstance(input_tensor, NotImplementedError):
@@ -129,7 +130,7 @@ class TensorsBook:
         raise ValueError(f"Unsupported type when reading the graph: {type(something)}")
 
 
-def fetch_attr(gm: torch.fx.GraphModule, target: str):
+def fetch_attr(gm: torch.fx.GraphModule, target: str) -> object:
     """Fetch an attribute from the Module hierarchy of self.gm.
     Args:
         target (str): The fully-qualified name of the attribute to fetch
@@ -156,7 +157,7 @@ class _GraphFactory:
         self,
         replace_inputs: dict[str, torch.Tensor] = {},
         force_device: DeviceRef | None = None,
-    ):
+    ) -> None:
         """Creates the MAX graph according to the input fx graph.
 
         Create a new instance for each new graph to be created.
@@ -185,7 +186,7 @@ class _GraphFactory:
         self.replace_inputs = replace_inputs
         self.force_device = force_device
 
-    def initialize_graph(self):
+    def initialize_graph(self) -> None:
         if self.graph is not None:
             raise RuntimeError("Graph has already been initialized.")
 
@@ -215,7 +216,7 @@ class _GraphFactory:
         # torch_device_to_max_device also handles the eager "mojo" device.
         return torch_device_to_max_device(tensor.device)
 
-    def handle_placeholder(self, node: torch.fx.Node):
+    def handle_placeholder(self, node: torch.fx.Node) -> None:
         if node.name in self.replace_inputs:
             # We short-circuit this input and use a constant instead.
             # We still have to place it in the graph inputs list because
@@ -254,7 +255,7 @@ class _GraphFactory:
             )
             self.names_to_input_idx[node.name] = len(self.graph_inputs) - 1
 
-    def handle_call_function(self, node_idx: int, node: torch.fx.Node):
+    def handle_call_function(self, node_idx: int, node: torch.fx.Node) -> None:
         func_args = [self.tensor_book.convert_to_max(x) for x in node.args]
         func_kwargs = {
             k: self.tensor_book.convert_to_max(v) for k, v in node.kwargs.items()
@@ -269,17 +270,20 @@ class _GraphFactory:
             func_to_execute = MAPPING_TORCH_ATEN_TO_MOJO[normalized_name]
             # without hidden keys
             input_tensors = [v for k, v in func_kwargs.items() if not k.startswith("_")]
+            # AutoFunctionalizedV2's `_all_bases` kwarg is the list of mutated
+            # tensor arguments (torch._higher_order_ops.auto_functionalize).
+            all_bases = func_kwargs["_all_bases"]
+            assert isinstance(all_bases, list)
             # We pray the gods that the order is correct here
             # because we only work with positional arguments
-            self.tensor_book[node.name] = func_to_execute(
-                *func_kwargs["_all_bases"], *input_tensors
-            )
+            self.tensor_book[node.name] = func_to_execute(*all_bases, *input_tensors)
             return
         key = node.target
 
         # TODO: refactor this
         if (
-            key not in MAPPING_TORCH_ATEN_TO_MOJO
+            isinstance(key, torch._ops.OpOverload)
+            and key not in MAPPING_TORCH_ATEN_TO_MOJO
             and key.overloadpacket in MAPPING_TORCH_ATEN_TO_MOJO
         ):
             key = key.overloadpacket
@@ -308,8 +312,11 @@ class _GraphFactory:
 
         self.tensor_book[node.name] = func_output
 
-    def handle_get_attr(self, node: torch.fx.Node):
-        attr_value = fetch_attr(node.graph.owning_module, node.target)
+    def handle_get_attr(self, node: torch.fx.Node) -> None:
+        owning_module = node.graph.owning_module
+        assert owning_module is not None
+        assert isinstance(node.target, str)
+        attr_value = fetch_attr(owning_module, node.target)
         if isinstance(attr_value, torch.Tensor):
             # A tensor constant embedded in the graph (e.g. dynamo's
             # lift_fresh of a torch.tensor(...) created inside the traced
@@ -341,14 +348,28 @@ class _GraphFactory:
         because MAX assumes that if your ouput is a Dim(), then you want a max tensor
         as output, not a simple python int.
         """
-        output_tensors = []
+        # create_graph always calls initialize_graph (which sets self.graph)
+        # before any node reaches handle_output.
+        assert self.graph is not None
+        # Elements are whatever convert_to_max returns for a graph-output
+        # leaf: in practice always a previously-converted MAX value (the
+        # Dim branch below is split out separately) -- narrowed with a
+        # single cast at the `graph.output` call below rather than
+        # scattering isinstance checks convert_to_max's broad return
+        # doesn't support per-branch.
+        output_tensors: list[object] = []
 
         # None outputs can be required. So we remember here if
         # we want an output tensor (and we reccord the tensor position)
         # or if we want None.
         output_blueprint: list[tuple[OutputBlueprintKind, int | None]] = []
 
-        for x in node.args[0]:
+        # An "output" fx node's args[0] is the traced function's actual
+        # return value structure, always a list/tuple of Nodes/constants
+        # (aot_autograd graphs always produce a flat tuple).
+        output_args = node.args[0]
+        assert isinstance(output_args, list | tuple)
+        for x in output_args:
             converted = self.tensor_book.convert_to_max(x)
             if converted is None:
                 output_blueprint.append((OutputBlueprintKind.NONE, None))
@@ -363,7 +384,12 @@ class _GraphFactory:
                 )
                 output_tensors.append(converted)
         # Store the none indices for runtime handling
-        self.graph.output(*output_tensors)
+        self.graph.output(
+            *cast(
+                "list[max.graph.value.Value | max.graph.value.TensorValueLike]",
+                output_tensors,
+            )
+        )
         self.graph.__exit__(None, None, None)
         self._graph_open = False
         return output_blueprint
@@ -400,10 +426,15 @@ class _GraphFactory:
                 self.graph.__exit__(None, None, None)
                 self._graph_open = False
             raise
+        # handle_output (which ran to set output_blueprint above) asserts
+        # self.graph is set.
+        assert self.graph is not None
         return self.graph, output_blueprint
 
 
-def _graph_uses_mojo_device(gm: torch.fx.GraphModule, example_inputs: list) -> bool:
+def _graph_uses_mojo_device(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> bool:
     """Whether this graph computes on the eager "mojo" device.
 
     Checked at compile time (inputs may be fake tensors; factory-only graphs
@@ -453,7 +484,12 @@ def _dim_buffer_to_cpu_tensor(buffer: max.driver.Buffer) -> torch.Tensor:
 
 
 class BaseMaxCompiler:
-    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list, mode=None):
+    def __init__(
+        self,
+        gm: torch.fx.GraphModule,
+        example_inputs: list[object],
+        mode: str | None = None,
+    ) -> None:
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
         if profiling_enabled():
@@ -483,17 +519,19 @@ class BaseMaxCompiler:
     def reconstruct_from_blueprint(
         self, max_ouptputs: list[torch.Tensor]
     ) -> list[torch.Tensor | int | float | None]:
-        result = []
+        result: list[torch.Tensor | int | float | None] = []
         for kind, index in self.output_blueprint:
             if kind is OutputBlueprintKind.NONE:
                 result.append(None)
             elif kind is OutputBlueprintKind.TENSOR:
+                assert index is not None
                 result.append(max_ouptputs[index])
             elif kind is OutputBlueprintKind.DIM:
+                assert index is not None
                 result.append(max_ouptputs[index].item())
         return result
 
-    def __call__(self, *args) -> list[torch.Tensor | int | float | None]:
+    def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
@@ -539,7 +577,7 @@ class BaseMaxCompiler:
 # (catches storage reallocation, e.g. `param.data = ...`), evicted when the
 # tensor dies. Buffers alias the tensor memory, so in-place updates
 # (optimizer steps) are seen without invalidation.
-_buffer_cache: dict[int, tuple] = {}
+_buffer_cache: dict[int, tuple[max.driver.Buffer, int, weakref.finalize]] = {}
 
 
 def _evict_buffer(tensor_id: int) -> None:
@@ -553,7 +591,7 @@ def _data_ptr_of(t: torch.Tensor) -> int:
     return t.data_ptr()
 
 
-def _cached_buffer_for(t: torch.Tensor):
+def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     if not t.is_contiguous():
         # A MAX Buffer is dense row-major, and the graph input type only
         # carries a shape, so a strided input has to be materialized. The
@@ -574,24 +612,28 @@ def _cached_buffer_for(t: torch.Tensor):
     return buffer
 
 
-def boxed_func(*args, **kwargs):
-    return make_boxed_func(BaseMaxCompiler(*args, **kwargs).__call__)
+def boxed_func(
+    gm: torch.fx.GraphModule, example_inputs: list[object], mode: str | None = None
+) -> Callable[[list[Any]], Any]:
+    return make_boxed_func(BaseMaxCompiler(gm, example_inputs, mode).__call__)
 
 
 class mojo_backend:
-    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list):
+    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]) -> None:
         self.func_to_execute = aot_autograd(
             fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE
         )(gm, example_inputs)
 
-    def __call__(self, *args) -> list[torch.Tensor | int | float | None]:
+    def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         result = self.func_to_execute(*args)
         if isinstance(result, tuple):
             return list(result)
         return result
 
 
-def dummy_compiler(gm: torch.fx.GraphModule, example_inputs: list):
+def dummy_compiler(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> Callable[[list[Any]], Any]:
     return make_boxed_func(gm.forward)
 
 
@@ -610,8 +652,17 @@ dummy_backend = aot_autograd(fw_compiler=dummy_compiler)
 #   which can take advantage of MAX's automatic kernel fusion.
 def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
     if t.device.type == "cuda":
+        # Deferred: torch_mojo_tensor imports this module (get_ordered_accelerators
+        # -> compiler.get_accelerators), so importing it back at module scope
+        # would cycle.
+        from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+            find_equivalent_max_device,
+        )
+
         stream = torch.cuda.current_stream(t.device).cuda_stream
-        device = torch_device_to_max_device(t.device)
+        # _from_dlpack wants a concrete driver Device, not the graph-building
+        # DeviceRef torch_device_to_max_device returns.
+        device = find_equivalent_max_device(t.device)
         data = t.__dlpack__()
         try:
             return max.driver.Buffer._from_dlpack(data, device, stream)

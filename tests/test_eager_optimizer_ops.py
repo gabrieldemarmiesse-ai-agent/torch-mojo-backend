@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from torch_mojo_backend import TorchMojoTensor
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
@@ -350,6 +351,7 @@ def test_sub_out_supports_optimizer_step_rollback(
 ):
     _watch_eager_op(call_checker, "aten::sub.out")
     step = torch.tensor(4.0, device=mojo_gpu)
+    assert isinstance(step, TorchMojoTensor)
     found_inf = torch.tensor(1.0, device=mojo_gpu)
     holder, ptr = step._holder, step._ptr
 
@@ -445,10 +447,12 @@ def test_fused_adamw_optimizer_found_inf_rolls_back_step(
     mojo_optimizer = torch.optim.AdamW([mojo_parameter], lr=0.01, fused=True)
     cpu_parameter.grad = gradient.clone()
     mojo_parameter.grad = gradient.to(mojo_gpu)
-    cpu_optimizer.grad_scale = torch.tensor(2.0)
-    cpu_optimizer.found_inf = torch.tensor(1.0)
-    mojo_optimizer.grad_scale = torch.tensor(2.0, device=mojo_gpu)
-    mojo_optimizer.found_inf = torch.tensor(1.0, device=mojo_gpu)
+    # grad_scale/found_inf are an internal GradScaler contract the fused
+    # optimizers read via getattr; torch's own AdamW stub doesn't declare them.
+    setattr(cpu_optimizer, "grad_scale", torch.tensor(2.0))
+    setattr(cpu_optimizer, "found_inf", torch.tensor(1.0))
+    setattr(mojo_optimizer, "grad_scale", torch.tensor(2.0, device=mojo_gpu))
+    setattr(mojo_optimizer, "found_inf", torch.tensor(1.0, device=mojo_gpu))
 
     cpu_optimizer.step()
     mojo_optimizer.step()
@@ -458,8 +462,8 @@ def test_fused_adamw_optimizer_found_inf_rolls_back_step(
     assert mojo_state["step"].dtype == torch.float32
     assert mojo_state["step"].item() == 0
 
-    cpu_optimizer.found_inf.fill_(0.0)
-    mojo_optimizer.found_inf.fill_(0.0)
+    getattr(cpu_optimizer, "found_inf").fill_(0.0)
+    getattr(mojo_optimizer, "found_inf").fill_(0.0)
     cpu_optimizer.step()
     mojo_optimizer.step()
     torch.testing.assert_close(
@@ -585,7 +589,10 @@ def test_batched_foreach_misaligned_views_match_cpu(
     _watch_eager_op(call_checker, op_name)
     cpu_lists = _misaligned_foreach_lists("cpu", stagger=stagger)
     mojo_lists = _misaligned_foreach_lists(mojo_gpu, stagger=stagger)
-    assert any(tensor._ptr % 16 for tensor in mojo_lists[0])
+    assert any(
+        isinstance(tensor, TorchMojoTensor) and tensor._ptr % 16
+        for tensor in mojo_lists[0]
+    )
     apply(*cpu_lists)
     apply(*mojo_lists)
     for expected, actual in zip(cpu_lists[0], mojo_lists[0], strict=True):
@@ -671,6 +678,8 @@ def test_batched_foreach_sqrt_matches_cpu(mojo_gpu: str, call_checker: CallCheck
         # eager kernels call `ieee_sqrt` from op_utils instead.
         torch.testing.assert_close(actual_out.cpu(), expected_out, rtol=0, atol=0)
     for original, actual_out in zip(mojo_inputs, actual, strict=True):
+        assert isinstance(original, TorchMojoTensor)
+        assert isinstance(actual_out, TorchMojoTensor)
         if original.numel() > 0:
             assert actual_out._ptr != original._ptr
 
@@ -684,7 +693,10 @@ def test_batched_foreach_sqrt_misaligned_input_matches_cpu(mojo_gpu: str):
     """
     cpu_inputs = _misaligned_foreach_lists("cpu")[2]
     mojo_inputs = _misaligned_foreach_lists(mojo_gpu)[2]
-    assert any(tensor._ptr % 16 for tensor in mojo_inputs)
+    assert any(
+        isinstance(tensor, TorchMojoTensor) and tensor._ptr % 16
+        for tensor in mojo_inputs
+    )
     expected = [tensor.double().sqrt().to(tensor.dtype) for tensor in cpu_inputs]
     for expected_out, actual_out in zip(
         expected, torch._foreach_sqrt(mojo_inputs), strict=True
@@ -742,6 +754,7 @@ def test_lerp_scalar_out_supports_strided_self_alias(
 
     device_base = base.to(mojo_gpu)
     device_self = device_base[:, 1::2]
+    assert isinstance(device_self, TorchMojoTensor)
     device_end = end.to(mojo_gpu)
     assert not device_self._is_contiguous
     assert not device_self.is_contiguous()
@@ -830,12 +843,14 @@ def test_optimizer_out_ops_resize_public_shape_metadata(
     _watch_eager_op(call_checker, op_name)
     out = torch.empty(0, dtype=torch.float32, device=mojo_gpu)
     marker = object()
-    out.user_marker = marker
+    # Arbitrary user attribute, unrelated to the tensor's own payload; setattr
+    # keeps this honest instead of pretending Tensor declares `user_marker`.
+    setattr(out, "user_marker", marker)
     version = out._version
     returned = invoke(out)
 
     assert returned is out
-    assert out.user_marker is marker
+    assert getattr(out, "user_marker") is marker
     assert out._version == version + 1
     assert tuple(out._shape) == tuple(expected.shape)
     torch.testing.assert_close(out.cpu(), expected)
@@ -858,6 +873,7 @@ def test_linalg_vector_norm_out_strided_and_empty(
         base = torch.linspace(-3.0, 4.0, 35).reshape(5, 7)
         input = base.t()
         device_input = base.to(mojo_gpu).t()
+        assert isinstance(device_input, TorchMojoTensor)
         dim = [1]
         keepdim = True
         assert not device_input._is_contiguous
@@ -869,6 +885,7 @@ def test_linalg_vector_norm_out_strided_and_empty(
 
     expected = torch.linalg.vector_norm(input, 2, dim, keepdim)
     out = torch.empty_like(expected, device=mojo_gpu)
+    assert isinstance(out, TorchMojoTensor)
     holder, ptr = out._holder, out._ptr
     returned = torch.ops.aten.linalg_vector_norm.out(
         device_input, 2, dim, keepdim, dtype=None, out=out
@@ -887,6 +904,7 @@ def test_mul_tensor_inplace_preserves_strided_alias(
 
     base = torch.arange(12, dtype=torch.float32).to(mojo_gpu)
     view = base[::2]
+    assert isinstance(view, TorchMojoTensor)
     observer = base.view(3, 4)
     coefficient = torch.tensor(0.25, dtype=torch.float32).to(mojo_gpu)
     expected = torch.arange(12, dtype=torch.float32)
@@ -910,7 +928,9 @@ def test_mul_out_resize_preserves_existing_storage_alias(
     _watch_eager_op(call_checker, "aten::mul.out")
 
     base = torch.arange(8, dtype=torch.float32).to(mojo_gpu)
+    assert isinstance(base, TorchMojoTensor)
     out = base[storage_offset:storage_offset]
+    assert isinstance(out, TorchMojoTensor)
     lhs = torch.tensor([2.0, 3.0], device=mojo_gpu)
     rhs = torch.tensor([5.0, 7.0], device=mojo_gpu)
     holder = base._holder

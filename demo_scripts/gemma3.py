@@ -1,6 +1,8 @@
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
+from typing import TypedDict, cast
 
 import torch
 import torch.nn as nn
@@ -18,8 +20,26 @@ os.environ["TORCH_MOJO_BACKEND_DEBUG_GRAPH"] = "0"
 USE_INSTRUCT_MODEL = True
 
 
+class GemmaConfig(TypedDict):
+    vocab_size: int
+    context_length: int
+    emb_dim: int
+    n_heads: int
+    n_layers: int
+    hidden_dim: int
+    head_dim: int
+    qk_norm: bool
+    n_kv_groups: int
+    rope_local_base: float
+    rope_base: float
+    sliding_window: int
+    layer_types: list[str]
+    dtype: torch.dtype
+    query_pre_attn_scalar: int
+
+
 class FeedForward(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg: GemmaConfig) -> None:
         super().__init__()
         self.fc1 = nn.Linear(
             cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False
@@ -31,7 +51,7 @@ class FeedForward(nn.Module):
             cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc1 = self.fc1(x)
         x_fc2 = self.fc2(x)
         x = nn.functional.gelu(x_fc1, approximate="tanh") * x_fc2
@@ -39,14 +59,14 @@ class FeedForward(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, emb_dim, eps=1e-6, bias=False):
+    def __init__(self, emb_dim: int, eps: float = 1e-6, bias: bool = False) -> None:
         super().__init__()
         self.eps = eps
         # Gemma3 stores zero-centered weights and uses (1 + weight) during forward
         self.scale = nn.Parameter(torch.zeros(emb_dim))
         self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Match HF Gemma3: compute norm in float32, then scale by (1 + w)
         input_dtype = x.dtype
         x_f = x.float()
@@ -61,8 +81,11 @@ class RMSNorm(nn.Module):
 
 
 def compute_rope_params(
-    head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32
-):
+    head_dim: int,
+    theta_base: float = 10_000,
+    context_length: int = 4096,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
     # Compute the inverse frequencies
@@ -92,7 +115,7 @@ def compute_rope_params(
     return cos, sin
 
 
-def apply_rope(x, cos, sin):
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # x: (batch_size, num_heads, seq_len, head_dim)
     batch_size, num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
@@ -116,14 +139,14 @@ def apply_rope(x, cos, sin):
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self,
-        d_in,
-        num_heads,
-        num_kv_groups,
-        head_dim=None,
-        qk_norm=False,
-        query_pre_attn_scalar=None,
-        dtype=None,
-    ):
+        d_in: int,
+        num_heads: int,
+        num_kv_groups: int,
+        head_dim: int | None = None,
+        qk_norm: bool = False,
+        query_pre_attn_scalar: float | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         assert num_heads % num_kv_groups == 0, (
             "num_heads must be divisible by num_kv_groups"
@@ -161,7 +184,9 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.scaling = (head_dim) ** -0.5
 
-    def forward(self, x, mask, cos, sin):
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
         b, num_tokens, _ = x.shape
 
         # Apply projections
@@ -209,7 +234,7 @@ class GroupedQueryAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg, attn_type):
+    def __init__(self, cfg: GemmaConfig, attn_type: str) -> None:
         super().__init__()
         self.attn_type = attn_type
 
@@ -229,8 +254,15 @@ class TransformerBlock(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(cfg["emb_dim"], eps=1e-6)
 
     def forward(
-        self, x, mask_global, mask_local, cos_global, sin_global, cos_local, sin_local
-    ):
+        self,
+        x: torch.Tensor,
+        mask_global: torch.Tensor,
+        mask_local: torch.Tensor,
+        cos_global: torch.Tensor,
+        sin_global: torch.Tensor,
+        cos_local: torch.Tensor,
+        sin_local: torch.Tensor,
+    ) -> torch.Tensor:
         # Shortcut connection for attention block
         shortcut = x
         x = self.input_layernorm(x)
@@ -258,7 +290,14 @@ class TransformerBlock(nn.Module):
 
 
 class Gemma3Model(nn.Module):
-    def __init__(self, cfg):
+    # register_buffer (unlike a direct `self.x = ...` assignment) doesn't give
+    # the type checker anything to infer these attributes' types from.
+    cos_local: torch.Tensor
+    sin_local: torch.Tensor
+    cos_global: torch.Tensor
+    sin_global: torch.Tensor
+
+    def __init__(self, cfg: GemmaConfig) -> None:
         super().__init__()
         assert (
             cfg["layer_types"] is not None
@@ -298,7 +337,9 @@ class Gemma3Model(nn.Module):
         self.register_buffer("cos_global", cos_global, persistent=False)
         self.register_buffer("sin_global", sin_global, persistent=False)
 
-    def _create_masks(self, seq_len, device):
+    def _create_masks(
+        self, seq_len: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
 
         # mask_global (future is masked: j > i)
@@ -343,7 +384,7 @@ class Gemma3Model(nn.Module):
         mask_local = mask_global | far_past
         return mask_global, mask_local
 
-    def forward(self, input_ids):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Forward pass
         b, seq_len = input_ids.shape
         x = self.tok_emb(input_ids) * (self.cfg["emb_dim"] ** 0.5)
@@ -365,7 +406,7 @@ class Gemma3Model(nn.Module):
         return logits
 
 
-GEMMA3_CONFIG_270M = {
+GEMMA3_CONFIG_270M: GemmaConfig = {
     "vocab_size": 262_144,
     "context_length": 32_768,
     "emb_dim": 640,
@@ -418,7 +459,9 @@ total_params_normalized = total_params - model.tok_emb.weight.numel()
 print(f"\nTotal number of unique parameters: {total_params_normalized:,}")
 
 
-def model_memory_size(model, input_dtype=torch.float32):
+def model_memory_size(
+    model: nn.Module, input_dtype: torch.dtype = torch.float32
+) -> float:
     total_params = 0
     total_grads = 0
     for param in model.parameters():
@@ -460,8 +503,12 @@ else:
 model.to(device)
 
 
-def load_weights_into_gemma(model, param_config, params):
-    def assign(left, right, tensor_name="unknown"):
+def load_weights_into_gemma(
+    model: Gemma3Model, param_config: GemmaConfig, params: dict[str, torch.Tensor]
+) -> None:
+    def assign(
+        left: torch.Tensor, right: torch.Tensor, tensor_name: str = "unknown"
+    ) -> nn.Parameter:
         if left.shape != right.shape:
             raise ValueError(
                 f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}"
@@ -482,8 +529,14 @@ def load_weights_into_gemma(model, param_config, params):
 
     # Iterate over transformer layers
     for l in range(param_config["n_layers"]):
+        # ModuleList.__getitem__ is typed as -> Module; narrow to the
+        # concrete type actually stored (Gemma3Model.__init__ only ever
+        # puts TransformerBlocks in `blocks`).
         block = model.blocks[l]
+        assert isinstance(block, TransformerBlock)
         att = block.att
+        assert att.q_norm is not None
+        assert att.k_norm is not None
         # Attention projections
         att.W_query.weight = assign(
             att.W_query.weight,
@@ -610,7 +663,7 @@ from tokenizers import Tokenizer
 
 
 class GemmaTokenizer:
-    def __init__(self, tokenizer_file_path: str):
+    def __init__(self, tokenizer_file_path: str) -> None:
         tok_file = Path(tokenizer_file_path)
         self._tok = Tokenizer.from_file(str(tok_file))
         # Attempt to identify EOS and padding tokens
@@ -625,7 +678,7 @@ class GemmaTokenizer:
         return self._tok.decode(ids, skip_special_tokens=False)
 
 
-def apply_chat_template(user_text):
+def apply_chat_template(user_text: str) -> str:
     return f"<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
 
 
@@ -648,10 +701,18 @@ prompt = apply_chat_template("Give me a short introduction to large language mod
 input_token_ids = tokenizer.encode(prompt)
 
 
-model = torch.compile(model, backend=mojo_backend)
+# torch.compile's stub returns a generic Callable here, but the
+# OptimizedModule it actually returns is still an nn.Module (.eval() and
+# calling it both still work).
+model = cast(nn.Module, torch.compile(model, backend=mojo_backend))
 
 
-def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
+def generate_text_basic_stream(
+    model: nn.Module,
+    token_ids: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_id: int | None = None,
+) -> Iterator[torch.Tensor]:
     model.eval()
     with torch.no_grad():
         for _ in range(max_new_tokens):

@@ -13,7 +13,7 @@ imports ``aten_fast``.
 """
 
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Protocol, TypeVar, cast
 
 import torch
 from max.driver import Device
@@ -35,20 +35,33 @@ class _TensorOutputSpec:
     device: Device
 
 
-def _alloc(shape: tuple[int, ...], dtype: DType, device: Device) -> torch.Tensor:
+class _AllocFn(Protocol):
+    def __call__(
+        self, shape: tuple[int, ...], dtype: DType, device: Device
+    ) -> torch.Tensor: ...
+
+
+def _bootstrap_alloc(
+    shape: tuple[int, ...], dtype: DType, device: Device
+) -> torch.Tensor:
     """``TorchMojoTensor._alloc``, resolved on first use.
 
     ``mojo_device`` imports ``eager_kernels``, never the other way round, so
-    the allocator cannot be imported at module scope. Rebinding this global on
-    the first call keeps that direction intact and leaves the steady state at
-    one plain attribute lookup (the same trick as ``_ctx_ptr``). Tensors are
-    typed ``torch.Tensor`` here for the same import-direction reason.
+    the allocator cannot be imported at module scope. Rebinding the `_alloc`
+    global on the first call keeps that direction intact and leaves the
+    steady state at one plain attribute lookup (the same trick as
+    ``_ctx_ptr``). Tensors are typed ``torch.Tensor`` here for the same
+    import-direction reason. `_alloc` is a plain variable (not `def`-bound)
+    so this rebind type-checks against its declared `_AllocFn` type.
     """
     global _alloc
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
-    _alloc = TorchMojoTensor._alloc
+    _alloc = cast(_AllocFn, TorchMojoTensor._alloc)
     return _alloc(shape, dtype, device)
+
+
+_alloc: _AllocFn = _bootstrap_alloc
 
 
 def _allocate_output_spec(spec: _TensorOutputSpec) -> torch.Tensor:

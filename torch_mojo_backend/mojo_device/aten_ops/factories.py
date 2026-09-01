@@ -1,7 +1,9 @@
 """Tensor factories: empty/new_*/full/ones/zeros/scalar_tensor/arange."""
 
 import math
+from collections.abc import Sequence
 
+import max.driver as max_driver
 import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
@@ -14,51 +16,85 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
 from .support import _copy_into_tensor, _fast, _unsupported, max_dtype_to_torch_dtype
 
 
+def _require_device(device: torch.device | None) -> torch.device:
+    """The dispatcher always resolves a factory op's device before calling
+    into this PrivateUse1 registration; `None` here would already be a
+    crash inside `find_equivalent_max_device`, just with a worse message."""
+    assert device is not None, "expected a resolved mojo device from the dispatcher"
+    return device
+
+
 def mojo_device_empty_memory_format(
-    size, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
+    size: Sequence[int],
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TorchMojoTensor:
     dtype = torch.get_default_dtype() if dtype is None else dtype
     return TorchMojoTensor._alloc(
-        tuple(size), torch_dtype_to_max(dtype), find_equivalent_max_device(device)
+        tuple(size),
+        torch_dtype_to_max(dtype),
+        find_equivalent_max_device(_require_device(device)),
     )
 
 
 def empty_strided(
-    size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
+    size: Sequence[int],
+    stride: Sequence[int],
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     # The requested strides are ignored: allocation is always contiguous
     # (matching the previous behavior; our metadata is self-consistent).
     dtype = torch.get_default_dtype() if dtype is None else dtype
     return TorchMojoTensor._alloc(
-        tuple(size), torch_dtype_to_max(dtype), find_equivalent_max_device(device)
+        tuple(size),
+        torch_dtype_to_max(dtype),
+        find_equivalent_max_device(_require_device(device)),
     )
 
 
 def mojo_device_empty_permuted(
-    size, physical_layout, *, dtype=None, layout=None, device=None, pin_memory=None
+    size: Sequence[int],
+    physical_layout: Sequence[int],
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     # Uninitialized memory: a contiguous allocation of `size` is valid.
     dtype = torch.get_default_dtype() if dtype is None else dtype
     return TorchMojoTensor._alloc(
-        tuple(size), torch_dtype_to_max(dtype), find_equivalent_max_device(device)
+        tuple(size),
+        torch_dtype_to_max(dtype),
+        find_equivalent_max_device(_require_device(device)),
     )
 
 
 def mojo_device_empty_like(
     self: TorchMojoTensor,
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
-    memory_format=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     mojo_device = self._device if device is None else find_equivalent_max_device(device)
     return TorchMojoTensor._alloc(self._shape, max_dtype, mojo_device)
 
 
-def _new_factory_device(self: TorchMojoTensor, device):
+def _new_factory_device(
+    self: TorchMojoTensor, device: torch.device | None
+) -> max_driver.Device:
     """Target MAX device for a `new_*` factory. torch passes `self`'s device
     (whose torch-side index is the phantom 0) when the caller doesn't
     override it, so default to `self`'s real MAX device; only an explicit
@@ -73,12 +109,12 @@ def _new_factory_device(self: TorchMojoTensor, device):
 
 def mojo_device_new_empty(
     self: TorchMojoTensor,
-    size,
+    size: Sequence[int],
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     return TorchMojoTensor._alloc(
@@ -88,12 +124,12 @@ def mojo_device_new_empty(
 
 def mojo_device_new_zeros(
     self: TorchMojoTensor,
-    size,
+    size: Sequence[int],
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     result = _fast().fast_filled(size, 0, max_dtype, _new_factory_device(self, device))
@@ -104,12 +140,12 @@ def mojo_device_new_zeros(
 
 def mojo_device_new_ones(
     self: TorchMojoTensor,
-    size,
+    size: Sequence[int],
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     result = _fast().fast_filled(size, 1, max_dtype, _new_factory_device(self, device))
@@ -120,13 +156,13 @@ def mojo_device_new_ones(
 
 def mojo_device_new_full(
     self: TorchMojoTensor,
-    size,
-    fill_value,
+    size: Sequence[int],
+    fill_value: bool | int | float,
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     result = _fast().fast_filled(
@@ -137,14 +173,19 @@ def mojo_device_new_full(
     return result
 
 
-def _fast_filled_tensor(size, value, dtype, device):
+def _fast_filled_tensor(
+    size: Sequence[int],
+    value: bool | int | float,
+    dtype: torch.dtype,
+    device: torch.device | None,
+) -> TorchMojoTensor:
     """Filled-tensor factory (alloc + Fill), or raises."""
     try:
         max_dtype = torch_dtype_to_max(dtype)
     except (KeyError, ValueError):
         raise _unsupported("aten::full (dtype)", (dtype,)) from None
     result = _fast().fast_filled(
-        size, value, max_dtype, find_equivalent_max_device(device)
+        size, value, max_dtype, find_equivalent_max_device(_require_device(device))
     )
     if result is None:
         raise _unsupported("aten::full", (size, value, dtype))
@@ -152,7 +193,13 @@ def _fast_filled_tensor(size, value, dtype, device):
 
 
 def mojo_device_full(
-    size, fill_value, *, dtype=None, layout=None, device=None, pin_memory=None
+    size: Sequence[int],
+    fill_value: bool | int | float,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     if dtype is not None:
         resolved = dtype
@@ -167,13 +214,13 @@ def mojo_device_full(
 
 def mojo_device_full_like(
     self: TorchMojoTensor,
-    fill_value,
+    fill_value: bool | int | float,
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
-    memory_format=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TorchMojoTensor:
     max_dtype = self._dtype if dtype is None else torch_dtype_to_max(dtype)
     mojo_device = self._device if device is None else find_equivalent_max_device(device)
@@ -184,7 +231,12 @@ def mojo_device_full_like(
 
 
 def mojo_device_ones(
-    size, *, dtype=None, layout=None, device=None, pin_memory=None
+    size: Sequence[int],
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     resolved = torch.get_default_dtype() if dtype is None else dtype
     return _fast_filled_tensor(size, 1, resolved, device)
@@ -193,17 +245,22 @@ def mojo_device_ones(
 def mojo_device_ones_like(
     self: TorchMojoTensor,
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
-    memory_format=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TorchMojoTensor:
     return mojo_device_full_like(self, 1, dtype=dtype, device=device)
 
 
 def mojo_device_zeros(
-    size, *, dtype=None, layout=None, device=None, pin_memory=None
+    size: Sequence[int],
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     resolved = torch.get_default_dtype() if dtype is None else dtype
     return _fast_filled_tensor(size, 0, resolved, device)
@@ -212,28 +269,43 @@ def mojo_device_zeros(
 def mojo_device_zeros_like(
     self: TorchMojoTensor,
     *,
-    dtype=None,
-    layout=None,
-    device=None,
-    pin_memory=None,
-    memory_format=None,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+    memory_format: torch.memory_format | None = None,
 ) -> TorchMojoTensor:
     return mojo_device_full_like(self, 0, dtype=dtype, device=device)
 
 
 def mojo_device_scalar_tensor(
-    s, dtype=None, layout=None, device=None, pin_memory=None
+    s: bool | int | float,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     resolved = torch.float32 if dtype is None else dtype
     return _fast_filled_tensor((), s, resolved, device)
 
 
-def _host_arange_tensor(start, end, step, dtype: torch.dtype | None) -> torch.Tensor:
+def _host_arange_tensor(
+    start: bool | int | float,
+    end: bool | int | float,
+    step: bool | int | float,
+    dtype: torch.dtype | None,
+) -> torch.Tensor:
     """torch.arange built on the host (exact torch semantics)."""
     return torch.arange(start, end, step, dtype=dtype)
 
 
-def _device_arange(start, end, step, dtype: torch.dtype | None, device):
+def _device_arange(
+    start: bool | int | float,
+    end: bool | int | float,
+    step: bool | int | float,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+) -> TorchMojoTensor | None:
     """torch.arange computed by a device kernel, or None to use the host
     path. HF generation loops call torch.arange(..., device=...) every
     step; the host path costs a blocking H2D copy (full queue drain) per
@@ -261,7 +333,11 @@ def _device_arange(start, end, step, dtype: torch.dtype | None, device):
     else:
         numel = max(0, math.ceil((float(end) - float(start)) / float(step)))
     return _fast().fast_arange(
-        numel, start, step, max_dtype, find_equivalent_max_device(device)
+        numel,
+        start,
+        step,
+        max_dtype,
+        find_equivalent_max_device(_require_device(device)),
     )
 
 
@@ -271,7 +347,14 @@ _MAX_EXACT_F64_INT = 2**53
 
 
 def mojo_device_arange(
-    start, end=None, step=1, *, dtype=None, layout=None, device=None, pin_memory=None
+    start: bool | int | float,
+    end: bool | int | float | None = None,
+    step: bool | int | float = 1,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
 ) -> TorchMojoTensor:
     if end is None:
         start, end = 0, start
@@ -280,10 +363,18 @@ def mojo_device_arange(
         return result
     # Build on the host with exact torch semantics, then one H2D copy.
     cpu = _host_arange_tensor(start, end, step, dtype)
-    return TorchMojoTensor._from_cpu(cpu, find_equivalent_max_device(device))
+    return TorchMojoTensor._from_cpu(
+        cpu, find_equivalent_max_device(_require_device(device))
+    )
 
 
-def mojo_device_arange_start_out(start, end, step=1, *, out) -> TorchMojoTensor:
+def mojo_device_arange_start_out(
+    start: bool | int | float,
+    end: bool | int | float,
+    step: bool | int | float = 1,
+    *,
+    out: TorchMojoTensor,
+) -> TorchMojoTensor:
     # torch.arange(start, end, step, device=...) dispatches to the out
     # variant with a pre-allocated `out` of the right size and dtype.
     torch_dtype = max_dtype_to_torch_dtype(out._dtype)

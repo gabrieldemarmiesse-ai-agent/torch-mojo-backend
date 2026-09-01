@@ -1,22 +1,37 @@
+import inspect
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol, cast
 
 import max.graph.ops as max_ops
 import torch
+from max.dtype import DType
 from max.experimental.torch import CustomOpLibrary
-from max.graph import TensorType
+from max.graph import TensorType, TensorValue
 
 import torch_mojo_backend
 import torch_mojo_backend.torch_compile_backend.compiler
 
 
+class _SignedTorchOp(Protocol):
+    """A callable carrying the `__signature__` `torch.library.custom_op`
+    introspects; `functools`-style wrapping can't express the extra
+    attribute, so the callable this wraps is cast to this structural type."""
+
+    __signature__: inspect.Signature
+
+    def __call__(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> None: ...
+
+
 def make_torch_op_from_mojo(
     path_to_kernels: Path, mojo_custom_op_str: str, allocate_outputs_fn: Callable
-):
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]]:
     ops = CustomOpLibrary(path_to_kernels)
     mojo_custom_op = ops.__getattr__(mojo_custom_op_str)
 
-    def compiler_fn(*args, **kwargs):
+    def compiler_fn(
+        *args: TensorValue, **kwargs: bool | int | str | DType
+    ) -> tuple[object, ...]:
         # We split args into outputs and inputs
         # We assume outputs are first
         out_args = args[: mojo_custom_op.num_outputs]
@@ -38,10 +53,13 @@ def make_torch_op_from_mojo(
 
     torch_mojo_backend.torch_compile_backend.compiler._global_max_objects = None
 
-    def mojo_custom_op_with_signature(*args, **kwargs):
-        return mojo_custom_op(*args, **kwargs)
+    def mojo_custom_op_with_signature(
+        *args: torch.Tensor, **kwargs: torch.Tensor
+    ) -> None:
+        mojo_custom_op(*args, **kwargs)
 
-    mojo_custom_op_with_signature.__signature__ = mojo_custom_op.torch_signature
+    signed_op = cast(_SignedTorchOp, mojo_custom_op_with_signature)
+    signed_op.__signature__ = mojo_custom_op.torch_signature
 
     torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels.append(
         path_to_kernels
@@ -57,10 +75,13 @@ def make_torch_op_from_mojo(
 
     torch_custom_op = torch.library.custom_op(
         f"{path_to_kernels.name}::{mojo_custom_op_str}", mutates_args=mutates_args
-    )(mojo_custom_op_with_signature)
+    )(signed_op)
 
-    def fn(*args, **kwargs):
+    def fn(
+        *args: object, **kwargs: object
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]:
         output_tensors = allocate_outputs_fn(*args, **kwargs)
+        single_output: bool
         if isinstance(output_tensors, torch.Tensor):
             output_tensors = (output_tensors,)
             single_output = True

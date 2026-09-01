@@ -25,7 +25,8 @@ from pathlib import Path
 
 import pytest
 import torch
-from bench_lib.check import Bench, bench_key, update_mode
+from _pytest.terminal import TerminalReporter
+from bench_lib.check import BENCH_NOTES_KEY, Bench, bench_key, update_mode
 from bench_lib.hw import Hardware, detect
 
 # Set to a path to make collection write every benchmark node's baseline
@@ -109,9 +110,11 @@ def bench(
 
 
 def pytest_terminal_summary(
-    terminalreporter, exitstatus: int, config: pytest.Config
+    terminalreporter: TerminalReporter,
+    exitstatus: pytest.ExitCode,
+    config: pytest.Config,
 ) -> None:
-    notes = getattr(config, "_bench_notes", [])
+    notes = config.stash.get(BENCH_NOTES_KEY, [])
     if not notes:
         return
     terminalreporter.section("benchmark baselines")

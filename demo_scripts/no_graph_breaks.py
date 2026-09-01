@@ -27,8 +27,12 @@ my_torch_grayscale = make_torch_op_from_mojo(
 
 def simple_graph(img: torch.Tensor) -> torch.Tensor:
     img = img - 1
-    img = my_torch_grayscale(img)
-    img = img + 1
+    grayscale = my_torch_grayscale(img)
+    # allocate_outputs_grayscale always allocates a single Tensor, so this
+    # particular custom op never takes the tuple/list branch of
+    # make_torch_op_from_mojo's general return type.
+    assert isinstance(grayscale, torch.Tensor)
+    img = grayscale + 1
     return img
 
 

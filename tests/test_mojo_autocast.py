@@ -25,8 +25,9 @@ def mojo_h100():
 
 
 def test_mojo_autocast_fallback_and_required_policies_are_registered() -> None:
+    # Exists at runtime; missing from torch's own DispatchKey stub.
     assert torch._C._dispatch_has_backend_fallback(
-        torch._C.DispatchKey.AutocastPrivateUse1
+        getattr(torch._C.DispatchKey, "AutocastPrivateUse1")
     )
     for name in (
         "addmm",

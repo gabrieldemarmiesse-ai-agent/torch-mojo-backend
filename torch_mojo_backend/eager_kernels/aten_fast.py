@@ -23,9 +23,9 @@ backend keeps using `aten_functions` directly.
 import math
 import struct
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Final, Protocol, cast, runtime_checkable
 
 import torch
 from max.driver import Device
@@ -96,7 +96,9 @@ from torch_mojo_backend.eager_kernels.tf32_matmul_ops import (
 _VariantFlag = bool | int | str
 
 
-def _device_call(fn: object, *args: object, keepalive: tuple[object, ...]) -> object:
+def _device_call(
+    fn: Callable[..., object], *args: object, keepalive: tuple[object, ...]
+) -> object:
     """Launch an ungated device call (tensor_holder / fa4): when the call
     queue is active it must hold its FIFO position behind queued producers
     of its inputs; otherwise call directly. `keepalive` names the tensors
@@ -153,10 +155,51 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     _resize_payload,
     _row_major_strides,
 )
+from torch_mojo_backend.types import CountedCallable
+
+
+@runtime_checkable
+class _TensorHolderModule(Protocol):
+    """The subset of the JIT-compiled `tensor_holder` Mojo extension this
+    file calls directly. The module itself has no stubs (its source is
+    Mojo, not Python); every member here is a raw PythonObject-in,
+    PythonObject-out native call, so `object` is the honest signature."""
+
+    def make_spec(self, *args: object) -> object: ...
+    def copy_d2d(self, *args: object) -> object: ...
+    def StridedFill(self, *args: object) -> object: ...
+    def read_scalar(self, *args: object) -> object: ...
+
+
+@runtime_checkable
+class _HolderObject(Protocol):
+    """TorchMojoTensor._holder's real type: the Mojo `TensorHolder` a
+    tensor_holder.alloc() call returns. Declared `object` on TorchMojoTensor
+    (no Python stub for a Mojo class); get_nbytes is its one member used
+    outside torch_mojo_tensor.py."""
+
+    def get_nbytes(self) -> int: ...
+
+
+def _tensor_holder() -> _TensorHolderModule:
+    """`eager_kernels.tensor_holder`, typed.
+
+    `eager_kernels.__getattr__` resolves and caches it lazily so importing
+    this module never triggers a Mojo kernel compile; that resolution
+    happens on this call, same as the bare attribute access it replaces.
+    """
+    return cast(_TensorHolderModule, eager_kernels.tensor_holder)
+
+
+class _NotHandled:
+    """Sentinel: this fast path declines the input; caller falls through."""
+
+    __slots__ = ()
+
 
 # Returned when the inputs don't qualify; the registration then raises
 # NotImplementedError naming the op (there is no fallback anymore).
-NOT_HANDLED = object()
+NOT_HANDLED: Final[_NotHandled] = _NotHandled()
 
 # The host/autograd route is landed before Fable's separately validated kernel
 # port.  Do not ask mojo.importer to compile the thin bridge until every source
@@ -361,12 +404,12 @@ _FOREACH_WIDENING_DTYPES = _FLOAT_DTYPES
 AtenScalar = int | float | bool | complex
 
 
-def _t(x) -> TorchMojoTensor | None:
+def _t(x: object) -> TorchMojoTensor | None:
     """x as a TorchMojoTensor (any layout), or None."""
     return x if isinstance(x, TorchMojoTensor) else None
 
 
-def _tc(x) -> TorchMojoTensor | None:
+def _tc(x: object) -> TorchMojoTensor | None:
     """x as a *contiguous* TorchMojoTensor (materializing views), or None."""
     if isinstance(x, TorchMojoTensor):
         return x if x._is_contiguous else x._materialize_contiguous()
@@ -512,7 +555,9 @@ def _reduce_keepdim_shape(
     return _view_of(result, shape, _row_major_strides(shape), result._offset)
 
 
-def fast_aten__foreach_norm(self, ord=2, dtype=None):
+def fast_aten__foreach_norm(
+    self: Sequence[torch.Tensor], ord: AtenScalar = 2, dtype: torch.dtype | None = None
+) -> list[TorchMojoTensor] | _NotHandled:
     """Fast homogeneous FP32 L2 norms with one independent scalar output.
 
     The Mojo bridge batches runtime descriptors and uses an ordinary eager
@@ -529,9 +574,10 @@ def fast_aten__foreach_norm(self, ord=2, dtype=None):
     ):
         return NOT_HANDLED
 
-    tensors = [_t(tensor) for tensor in self]
-    if any(tensor is None for tensor in tensors):
+    unwrapped_tensors = [_t(tensor) for tensor in self]
+    if any(tensor is None for tensor in unwrapped_tensors):
         return NOT_HANDLED
+    tensors = cast(list[TorchMojoTensor], unwrapped_tensors)
     device = tensors[0]._device
     if device.api == "cpu" or any(
         tensor._device != device
@@ -565,7 +611,9 @@ def fast_aten__foreach_norm(self, ord=2, dtype=None):
     return outputs
 
 
-def foreach_norm_sequential_fallback(self, ord=2, dtype=None):
+def foreach_norm_sequential_fallback(
+    self: Sequence[torch.Tensor], ord: AtenScalar = 2, dtype: torch.dtype | None = None
+) -> list[TorchMojoTensor] | _NotHandled:
     """Device-index-correct L2 fallback using existing scalar eager ops.
 
     ATen's generic foreach decomposition synthesizes functional norm outputs
@@ -580,20 +628,23 @@ def foreach_norm_sequential_fallback(self, ord=2, dtype=None):
         or dtype not in (None, torch.float32)
     ):
         return NOT_HANDLED
-    tensors = [_t(tensor) for tensor in self]
-    if any(tensor is None or tensor._dtype != DType.float32 for tensor in tensors):
+    unwrapped = [_t(tensor) for tensor in self]
+    if any(tensor is None or tensor._dtype != DType.float32 for tensor in unwrapped):
         return NOT_HANDLED
+    tensors = cast(list[TorchMojoTensor], unwrapped)
 
-    outputs = []
+    outputs: list[TorchMojoTensor] = []
     for tensor in tensors:
         output = fast_aten_linalg_vector_norm(tensor, ord, None, False, dtype=None)
-        if output is NOT_HANDLED:
+        # isinstance, not `is`: ty doesn't narrow identity checks against a
+        # custom singleton instance the way it does for `is None`.
+        if isinstance(output, _NotHandled):
             return NOT_HANDLED
         outputs.append(output)
     return outputs
 
 
-def _foreach_tensors_overlap(tensors) -> bool:
+def _foreach_tensors_overlap(tensors: Sequence[TorchMojoTensor]) -> bool:
     """Whether contiguous mutable tensor byte intervals overlap."""
     intervals = sorted(
         (tensor._ptr, tensor._ptr + tensor._numel * tensor._itemsize)
@@ -606,7 +657,7 @@ def _foreach_tensors_overlap(tensors) -> bool:
     )
 
 
-def _is_non_overlapping_and_dense(shape, strides) -> bool:
+def _is_non_overlapping_and_dense(shape: Sequence[int], strides: Sequence[int]) -> bool:
     """Match TensorImpl's sorted-stride dense-layout classification."""
     required_stride = 1
     dimensions = sorted(
@@ -619,7 +670,9 @@ def _is_non_overlapping_and_dense(shape, strides) -> bool:
     return True
 
 
-def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
+def _foreach_scalar_overlap_kind(
+    tensor: TorchMojoTensor, scalar: TorchMojoTensor
+) -> str:
     """Classify scalar overlap as none, full, or forbidden partial overlap.
 
     PyTorch reports overlap as ``TooHard`` for non-dense layouts, so those
@@ -792,16 +845,19 @@ def _foreach_launch(
     )
 
 
-def fast_aten__foreach_mul__tensor(self, other):
+def fast_aten__foreach_mul__tensor(
+    self: Sequence[torch.Tensor], other: torch.Tensor
+) -> None | _NotHandled:
     """Batched in-place multiply of a whole list by one 0-d device tensor."""
     if len(self) == 0:
         raise RuntimeError("Tensor list must have at least one tensor.")
     scalar = _t(other)
     if scalar is None or scalar._shape != () or not scalar._is_contiguous:
         return NOT_HANDLED
-    tensors = [_t(tensor) for tensor in self]
-    if any(tensor is None for tensor in tensors):
+    unwrapped_tensors = [_t(tensor) for tensor in self]
+    if any(tensor is None for tensor in unwrapped_tensors):
         return NOT_HANDLED
+    tensors = cast(list[TorchMojoTensor], unwrapped_tensors)
     overlap_kinds = [_foreach_scalar_overlap_kind(tensor, scalar) for tensor in tensors]
     if "partial" in overlap_kinds:
         raise RuntimeError(
@@ -830,7 +886,7 @@ def _foreach_scalar_inplace(
     self: Sequence[torch.Tensor],
     values: Sequence[float],
     dtypes: tuple[DType, ...] = (DType.float32,),
-) -> object:
+) -> None | _NotHandled:
     """Shared launch path of the in-place foreach mul/add/div fast ops."""
     unwrapped = _foreach_lists(self, dtypes=dtypes)
     if unwrapped is None:
@@ -844,7 +900,7 @@ def _foreach_scalar_inplace(
 
 def fast_aten__foreach_mul__scalar(
     self: Sequence[torch.Tensor], scalar: AtenScalar
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous in-place multiply by one host scalar."""
     value = _foreach_scalar_value(scalar)
     if value is None:
@@ -856,7 +912,7 @@ def fast_aten__foreach_mul__scalar(
 
 def fast_aten__foreach_add__scalar(
     self: Sequence[torch.Tensor], scalar: AtenScalar
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous in-place add of one host scalar.
 
     Without this ATen runs the CompositeExplicitAutograd fallback, a
@@ -874,7 +930,7 @@ def fast_aten__foreach_add__scalar(
 
 def fast_aten__foreach_div__scalarlist(
     self: Sequence[torch.Tensor], scalars: Sequence[AtenScalar]
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous FP32 in-place divide by one scalar per tensor.
 
     FP32 only, unlike mul/add: the per-tensor `div_.Scalar` this replaces
@@ -890,7 +946,7 @@ def fast_aten__foreach_div__scalarlist(
 
 def fast_aten__foreach_lerp__scalar(
     self: Sequence[torch.Tensor], tensors1: Sequence[torch.Tensor], weight: AtenScalar
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous FP32 in-place scalar lerp toward `tensors1`.
 
     Mirrors `fast_aten_lerp`: the weight is narrowed to float32 first and
@@ -928,7 +984,7 @@ def _foreach_addc_inplace(
     tensor1: Sequence[torch.Tensor],
     tensor2: Sequence[torch.Tensor],
     values: Sequence[float],
-) -> object:
+) -> None | _NotHandled:
     """Shared launch path of the in-place foreach addcmul/addcdiv fast ops."""
     unwrapped = _foreach_lists(self, tensor1, tensor2)
     if unwrapped is None:
@@ -945,7 +1001,7 @@ def fast_aten__foreach_addcmul__scalar(
     tensor1: Sequence[torch.Tensor],
     tensor2: Sequence[torch.Tensor],
     value: AtenScalar = 1,
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous FP32 in-place self += value * (t1 * t2)."""
     scalar = _foreach_scalar_value(value)
     if scalar is None:
@@ -960,7 +1016,7 @@ def fast_aten__foreach_addcdiv__scalarlist(
     tensor1: Sequence[torch.Tensor],
     tensor2: Sequence[torch.Tensor],
     scalars: Sequence[AtenScalar],
-) -> object:
+) -> None | _NotHandled:
     """Batched homogeneous FP32 in-place self += s[i] * (t1 / t2)."""
     values = _foreach_scalar_values(scalars, len(self))
     if values is None:
@@ -968,7 +1024,9 @@ def fast_aten__foreach_addcdiv__scalarlist(
     return _foreach_addc_inplace(_FOREACH_ADDCDIV, self, tensor1, tensor2, values)
 
 
-def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
+def fast_aten__foreach_sqrt(
+    self: Sequence[torch.Tensor],
+) -> list[TorchMojoTensor] | _NotHandled:
     """Batched homogeneous FP32 out-of-place elementwise square roots."""
     unwrapped = _foreach_lists(self)
     if unwrapped is None:
@@ -979,7 +1037,9 @@ def fast_aten__foreach_sqrt(self: Sequence[torch.Tensor]) -> object:
     return outputs
 
 
-def _fused_adamw_scalar_tensor(value, name, device):
+def _fused_adamw_scalar_tensor(
+    value: torch.Tensor | None, name: str, device: Device
+) -> int:
     """Validate an optional read-only scalar and return its device pointer."""
     if value is None:
         return 0
@@ -999,23 +1059,23 @@ def _fused_adamw_scalar_tensor(value, name, device):
 
 
 def fast_aten__fused_adamw(
-    parameters,
-    grads,
-    exp_avgs,
-    exp_avg_sqs,
-    max_exp_avg_sqs,
-    state_steps,
+    parameters: Sequence[torch.Tensor],
+    grads: Sequence[torch.Tensor],
+    exp_avgs: Sequence[torch.Tensor],
+    exp_avg_sqs: Sequence[torch.Tensor],
+    max_exp_avg_sqs: Sequence[torch.Tensor],
+    state_steps: Sequence[torch.Tensor],
     *,
-    lr,
-    beta1,
-    beta2,
-    weight_decay,
-    eps,
-    amsgrad,
-    maximize,
-    grad_scale=None,
-    found_inf=None,
-):
+    lr: torch.Tensor | float | int,
+    beta1: float,
+    beta2: float,
+    weight_decay: float,
+    eps: float,
+    amsgrad: bool,
+    maximize: bool,
+    grad_scale: torch.Tensor | None = None,
+    found_inf: torch.Tensor | None = None,
+) -> None | _NotHandled:
     """Runtime-dynamic, allocation-free fused FP32 AdamW TensorList route.
 
     Validation deliberately completes for every tensor before the first
@@ -1103,17 +1163,19 @@ def fast_aten__fused_adamw(
 
     grad_scale_ptr = _fused_adamw_scalar_tensor(grad_scale, "grad_scale", device)
     found_inf_ptr = _fused_adamw_scalar_tensor(found_inf, "found_inf", device)
+    # The validation loop above already confirmed every entry (including
+    # max_exp_avg_sqs when amsgrad) is a TorchMojoTensor.
     metadata = tuple(
         value
         for index in range(tensor_count)
         for value in (
-            parameters[index]._ptr,
-            grads[index]._ptr,
-            exp_avgs[index]._ptr,
-            exp_avg_sqs[index]._ptr,
-            max_exp_avg_sqs[index]._ptr if amsgrad else 0,
-            state_steps[index]._ptr,
-            parameters[index]._numel,
+            cast(TorchMojoTensor, parameters[index])._ptr,
+            cast(TorchMojoTensor, grads[index])._ptr,
+            cast(TorchMojoTensor, exp_avgs[index])._ptr,
+            cast(TorchMojoTensor, exp_avg_sqs[index])._ptr,
+            cast(TorchMojoTensor, max_exp_avg_sqs[index])._ptr if amsgrad else 0,
+            cast(TorchMojoTensor, state_steps[index])._ptr,
+            cast(TorchMojoTensor, parameters[index])._numel,
         )
     )
     if len(metadata) != tensor_count * _FUSED_ADAMW_RECORD_FIELDS:
@@ -1174,11 +1236,26 @@ def fast_aten__fused_adamw(
 # ---------------------------------------------------------------------------
 
 
-def _spec_of(t):
-    """t's cached Mojo TensorSpec, built on first use."""
+# MojoTensorLike._device is `object` (mutable Protocol members are checked
+# invariantly, so even TorchMojoTensor's own concrete `Device` doesn't
+# satisfy the Protocol for that one member) -- every real call site here
+# passes either a TorchMojoTensor or a MojoTensorLike-typed operand.
+_SpecTensor = TorchMojoTensor | MojoTensorLike
+
+
+def _spec_of(mojo_tensor: _SpecTensor) -> object:
+    """t's cached Mojo TensorSpec, built on first use.
+
+    Every extension_args/make_defines call site here types its operand as
+    the structural MojoTensorLike (payload-only, testable with stand-ins),
+    but the cache itself is a TorchMojoTensor-specific implementation detail
+    (`__dict__`-backed, not part of the Protocol) -- real callers are always
+    the concrete class.
+    """
+    t = cast(TorchMojoTensor, mojo_tensor)
     spec = t.__dict__.get("_spec")
     if spec is None:
-        spec = eager_kernels.tensor_holder.make_spec(
+        spec = _tensor_holder().make_spec(
             t._ptr,
             len(t._shape),
             _pad8(t._shape, 1),
@@ -1190,8 +1267,16 @@ def _spec_of(t):
             1 if t._is_contiguous else 0,
             _ctx_ptr(t._device),
         )
-        t._spec = spec
+        # Same __dict__-backed cache _move_payload_attributes pops on rebind;
+        # _spec isn't a declared TorchMojoTensor attribute.
+        t.__dict__["_spec"] = spec
     return spec
+
+
+def _device_of(mojo_tensor: _SpecTensor) -> Device:
+    """MojoTensorLike._device is `object` for host-contract test doubles;
+    real operands are always a TorchMojoTensor with a concrete Device."""
+    return cast(Device, mojo_tensor._device)
 
 
 class _FillSpecExtension(
@@ -1256,7 +1341,7 @@ class _CastSpecExtension(
     def expected_output_specs(
         cls, tensor: MojoTensorLike, dtype: DType
     ) -> _TensorOutputSpec:
-        return _TensorOutputSpec(tuple(tensor._shape), dtype, tensor._device)
+        return _TensorOutputSpec(tuple(tensor._shape), dtype, _device_of(tensor))
 
     @classmethod
     def extension_args(
@@ -1295,7 +1380,9 @@ class _CumsumSpecExtension(
     def expected_output_specs(
         cls, tensor: MojoTensorLike, dim: int
     ) -> _TensorOutputSpec:
-        return _TensorOutputSpec(tuple(tensor._shape), tensor._dtype, tensor._device)
+        return _TensorOutputSpec(
+            tuple(tensor._shape), tensor._dtype, _device_of(tensor)
+        )
 
     @classmethod
     def extension_args(
@@ -1338,7 +1425,7 @@ class _BinarySpecExtension(
             # Equal shapes dominate (residual adds, grad accumulation) and
             # torch.broadcast_shapes costs ~7 µs per call.
             lhs_shape = tuple(torch.broadcast_shapes(lhs_shape, rhs_shape))
-        return _TensorOutputSpec(lhs_shape, out_dtype, lhs._device)
+        return _TensorOutputSpec(lhs_shape, out_dtype, _device_of(lhs))
 
     @classmethod
     def extension_args(
@@ -1377,7 +1464,7 @@ class _UnarySpecExtension(
     def expected_output_specs(
         cls, op: str, tensor: MojoTensorLike, out_dtype: DType
     ) -> _TensorOutputSpec:
-        return _TensorOutputSpec(tuple(tensor._shape), out_dtype, tensor._device)
+        return _TensorOutputSpec(tuple(tensor._shape), out_dtype, _device_of(tensor))
 
     @classmethod
     def extension_args(
@@ -1483,6 +1570,7 @@ def _try_spec_binary_into(
     if a is not None and b is not None and a._device != b._device:
         return None
     anchor_t = a if a is not None else b
+    assert anchor_t is not None
     device = anchor_t._device
     dtype = anchor_t._dtype
 
@@ -1492,6 +1580,8 @@ def _try_spec_binary_into(
                 return None
             a = _tc(a)
             b = _tc(b)
+            # a/b were already TorchMojoTensor; _tc only materializes.
+            assert a is not None and b is not None
         promotion = _binary_promotion(a._dtype, b._dtype)
         if promotion is None:
             return None
@@ -1516,6 +1606,7 @@ def _try_spec_binary_into(
         else:
             a = fill
 
+    assert a is not None and b is not None
     kdtype = DType.uint8 if dtype == DType.bool else dtype
     if kdtype not in _SPEC_INTO_DTYPES:
         return None
@@ -1548,7 +1639,9 @@ def _try_spec_binary_into(
     )
 
 
-def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
+def _try_spec_binary(
+    spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None = None
+) -> TorchMojoTensor | None:
     """Broadcast binary through a logic_ops spec op, or None.
 
     Python keeps what Python must do — scalar embedding, torch's promotion
@@ -1576,6 +1669,8 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
         if len(a._shape) > 4 or len(b._shape) > 4:
             a = _tc(a)
             b = _tc(b)
+            # a/b were already TorchMojoTensor; _tc only materializes.
+            assert a is not None and b is not None
         promotion = _binary_promotion(a._dtype, b._dtype)
         if promotion is None:
             return None
@@ -1643,7 +1738,7 @@ def _try_spec_binary(spec_fn_name, lhs, rhs, out_dtype=None):
     return result
 
 
-def _try_spec_add_f32_bf16(lhs, rhs):
+def _try_spec_add_f32_bf16(lhs: object, rhs: object) -> TorchMojoTensor | None:
     """One-launch contiguous FP32 + BF16 -> FP32 add, or None.
 
     The general binary promotion path materializes its lower-precision input.
@@ -1724,18 +1819,6 @@ _SPEC_REDUCE_INTO = {
 }
 
 
-def _reduced_shape(shape: tuple, rdims: object, keepdim: bool) -> tuple:
-    rd = set(rdims)
-    out = []
-    for i, s in enumerate(shape):
-        if i in rd:
-            if keepdim:
-                out.append(1)
-        else:
-            out.append(s)
-    return tuple(out)
-
-
 class _ReductionSpecExtension(
     eager_kernels.MojoExtension[_TensorOutputSpec, TorchMojoTensor]
 ):
@@ -1780,7 +1863,7 @@ class _ReductionSpecExtension(
         out_dtype: DType,
     ) -> _TensorOutputSpec:
         shape = _reduced_shape(tuple(tensor._shape), rdims, keepdim)
-        return _TensorOutputSpec(shape, out_dtype, tensor._device)
+        return _TensorOutputSpec(shape, out_dtype, _device_of(tensor))
 
     @classmethod
     def extension_args(
@@ -1843,18 +1926,18 @@ class _MinDimSpecExtension(
     ) -> tuple[_TensorOutputSpec, _TensorOutputSpec]:
         shape = _reduced_shape(tuple(tensor._shape), (dim,), keepdim)
         return (
-            _TensorOutputSpec(shape, tensor._dtype, tensor._device),
-            _TensorOutputSpec(shape, DType.int64, tensor._device),
+            _TensorOutputSpec(shape, tensor._dtype, _device_of(tensor)),
+            _TensorOutputSpec(shape, DType.int64, _device_of(tensor)),
         )
 
     @classmethod
     def allocate_outputs(
         cls, output_specs: tuple[_TensorOutputSpec, _TensorOutputSpec]
     ) -> tuple[TorchMojoTensor, TorchMojoTensor]:
-        return (
-            _allocate_output_spec(output_specs[0]),
-            _allocate_output_spec(output_specs[1]),
-        )
+        out0 = _allocate_output_spec(output_specs[0])
+        out1 = _allocate_output_spec(output_specs[1])
+        assert isinstance(out0, TorchMojoTensor) and isinstance(out1, TorchMojoTensor)
+        return (out0, out1)
 
     @classmethod
     def extension_args(
@@ -1921,7 +2004,12 @@ def _try_spec_cumsum(a: TorchMojoTensor, dim: int) -> TorchMojoTensor | None:
         return None
 
 
-def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_ops"):
+def _try_spec_unary(
+    spec_fn_name: str,
+    x: object,
+    out_dtype: DType | None = None,
+    module_name: str = "elementwise_ops",
+) -> TorchMojoTensor | None:
     """Contiguous unary through a spec op, or None.
 
     `out_dtype` overrides the wrapper dtype for the bool-output ops
@@ -1962,8 +2050,14 @@ def _try_spec_unary(spec_fn_name, x, out_dtype=None, module_name="elementwise_op
 
 
 def _try_spec_reduce(
-    spec_fn_name, a, rdims, keepdim, *extra, out_dtype=None, module_name="reduction_ops"
-):
+    spec_fn_name: str,
+    a: TorchMojoTensor,
+    rdims: Sequence[int],
+    keepdim: bool,
+    *extra: object,
+    out_dtype: DType | None = None,
+    module_name: str = "reduction_ops",
+) -> TorchMojoTensor | None:
     """Trailing-dims reduction through a spec op, or None. `a` is already a
     TorchMojoTensor (dtype promotion happened upstream); the spec op raises
     on non-trailing dims / strided input and the classic path takes over."""
@@ -2120,7 +2214,9 @@ class _MatmulSpecExtension(
         shape = _spec_matmul_out_shape(op, list(tensors), transpose_b)
         if shape is None:
             raise ValueError("matmul metadata is not eligible for the spec path")
-        return _TensorOutputSpec(tuple(shape), tensors[0]._dtype, tensors[0]._device)
+        return _TensorOutputSpec(
+            tuple(shape), tensors[0]._dtype, _device_of(tensors[0])
+        )
 
     @classmethod
     def extension_args(
@@ -2134,8 +2230,8 @@ class _MatmulSpecExtension(
 
 
 def _submit_spec_matmul(
-    spec_fn_name: str, ts: tuple[MojoTensorLike, ...], transpose_b: int
-) -> torch.Tensor | None:
+    spec_fn_name: str, ts: tuple[_SpecTensor, ...], transpose_b: int
+) -> TorchMojoTensor | None:
     """One matmul spec launch over already-typed operands, or None.
 
     Declines (ineligible metadata, a Mojo-side refusal) come back as None; a
@@ -2152,7 +2248,9 @@ def _submit_spec_matmul(
         return None
 
 
-def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
+def _try_spec_matmul(
+    spec_fn_name: str, tensors: tuple[torch.Tensor, ...], transpose_b: int
+) -> TorchMojoTensor | None:
     """Matmul-family spec op over already-typed operands, or None.
 
     Strided operands are passed through: `_matmul_spec_operands_launch` reads
@@ -2165,10 +2263,14 @@ def _try_spec_matmul(spec_fn_name, tensors, transpose_b):
     ts = tuple(_t(x) for x in tensors)
     if any(t is None for t in ts):
         return None
-    return _submit_spec_matmul(spec_fn_name, ts, transpose_b)
+    return _submit_spec_matmul(
+        spec_fn_name, cast(tuple[TorchMojoTensor, ...], ts), transpose_b
+    )
 
 
-def _try_spec_scalar(spec_fn_name, x, scalar):
+def _try_spec_scalar(
+    spec_fn_name: str, x: object, scalar: object
+) -> TorchMojoTensor | None:
     """Contiguous tensor-with-float-scalar through a spec op, or None."""
     if not isinstance(scalar, int | float) or isinstance(scalar, bool):
         return None
@@ -2193,7 +2295,7 @@ def _try_spec_scalar(spec_fn_name, x, scalar):
     return out
 
 
-def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
+def _try_spec_scalar_inplace(spec_fn_name: str, x: object, scalar: object) -> bool:
     """`x op= scalar` in place through a spec op. True when it ran.
 
     The functional spec plus `_copy_into` costs an allocation and a
@@ -2221,7 +2323,9 @@ def _try_spec_scalar_inplace(spec_fn_name: str, x, scalar) -> bool:
     return True
 
 
-def _try_spec_int_scalar(spec_fn_name, x, scalar):
+def _try_spec_int_scalar(
+    spec_fn_name: str, x: object, scalar: object
+) -> TorchMojoTensor | None:
     """Contiguous tensor-with-int-scalar through a spec op, or None."""
     if not isinstance(scalar, int) or isinstance(scalar, bool):
         return None
@@ -2246,8 +2350,8 @@ def _try_spec_int_scalar(spec_fn_name, x, scalar):
     return out
 
 
-def _on_gpu(t: MojoTensorLike) -> bool:
-    return t._device.label == "gpu"
+def _on_gpu(t: _SpecTensor) -> bool:
+    return _device_of(t).label == "gpu"
 
 
 def _alert_not_deterministic(caller: str) -> None:
@@ -2279,7 +2383,7 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         return
     if dst._is_contiguous and src._is_contiguous:
         _device_call(
-            eager_kernels.tensor_holder.copy_d2d,
+            _tensor_holder().copy_d2d,
             _ctx_ptr(dst._device),
             dst._ptr,
             src._ptr,
@@ -2290,13 +2394,13 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
         _copy_strided_into(dst, src)
 
 
-def _valid_nll_out(tensor, dtype, device) -> bool:
+def _valid_nll_out(tensor: object, dtype: DType, device: Device) -> bool:
     """Whether an NLL out= tensor may be written or resized in place."""
     out = _t(tensor)
     return out is not None and out._dtype == dtype and out._device == device
 
 
-def _prepare_nll_out(out: TorchMojoTensor, shape):
+def _prepare_nll_out(out: TorchMojoTensor, shape: Sequence[int]) -> TorchMojoTensor:
     """Return a contiguous NLL kernel destination for ``out``.
 
     Validation is deliberately separate: callers validate every input and
@@ -2328,7 +2432,11 @@ def _prepare_nll_out(out: TorchMojoTensor, shape):
 # ---------------------------------------------------------------------------
 
 
-def _bcast_meta(*tensors):
+# (out_shape, dims4, [strides4 per tensor])
+_BcastMeta = tuple[list[int], list[int], list[list[int]]]
+
+
+def _bcast_meta(*tensors: TorchMojoTensor) -> _BcastMeta | None:
     """Broadcast metadata (rank <= 4) from the tensors' real strides.
 
     Returns (out_shape, dims4, [strides4 per tensor]) or None when the
@@ -2362,7 +2470,9 @@ def _bcast_meta(*tensors):
     return out, dims, all_strides
 
 
-def _scalar_tensor_0d(value, dtype, device) -> TorchMojoTensor:
+def _scalar_tensor_0d(
+    value: int | float, dtype: DType, device: Device
+) -> TorchMojoTensor:
     """A 0-d tensor holding `value`, for stride-0 broadcast operands."""
     return _submit_prepared_into(
         _FillSpecExtension.prepare((), float(value), dtype, device)
@@ -2380,7 +2490,9 @@ def _cast_tensor(x: TorchMojoTensor, dtype: DType) -> TorchMojoTensor:
     return _submit_prepared_into(_CastSpecExtension.prepare(t, dtype))
 
 
-def _promoted_pair(a: TorchMojoTensor, b: TorchMojoTensor):
+def _promoted_pair(
+    a: TorchMojoTensor, b: TorchMojoTensor
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
     """Same-dtype tensor pair following torch's promotion, or None.
 
     Only the promotions the generation loops hit: bool combined with any
@@ -2401,7 +2513,7 @@ def _promoted_pair(a: TorchMojoTensor, b: TorchMojoTensor):
     return None
 
 
-def _scalar_embed(value, dtype: DType) -> float | None:
+def _scalar_embed(value: object, dtype: DType) -> float | None:
     """`value` validated for lossless embedding into `dtype`, as a float,
     or None."""
     if not isinstance(value, int | float):
@@ -2421,7 +2533,9 @@ def _scalar_embed(value, dtype: DType) -> float | None:
     return float(value)
 
 
-def _resolve_scalar(value, dtype: DType, device) -> TorchMojoTensor | None:
+def _resolve_scalar(
+    value: object, dtype: DType, device: Device
+) -> TorchMojoTensor | None:
     """A 0-d stride-0 tensor holding a Python scalar in `dtype`, or None
     when the value doesn't embed losslessly."""
     v = _scalar_embed(value, dtype)
@@ -2494,7 +2608,9 @@ def _launch_masked_fill_scalar(
 # ---------------------------------------------------------------------------
 
 
-def _scaled_operand(other, alpha):
+def _scaled_operand(
+    other: object, alpha: int | float
+) -> TorchMojoTensor | float | None:
     """other * alpha as a tensor, for add/sub with alpha != 1, or None."""
     b = _t(other)
     if b is None:
@@ -2507,7 +2623,9 @@ def _scaled_operand(other, alpha):
     return scaled
 
 
-def fast_aten_add(input, other, alpha=1):
+def fast_aten_add(
+    input: torch.Tensor, other: object, alpha: int | float = 1
+) -> TorchMojoTensor | _NotHandled:
     if alpha != 1:
         other = _scaled_operand(other, alpha)
         if other is None:
@@ -2527,7 +2645,9 @@ def fast_aten_add(input, other, alpha=1):
 _fast_aten_add_default = fast_aten_add
 
 
-def fast_aten_add_apple(input, other, alpha=1):
+def fast_aten_add_apple(
+    input: torch.Tensor, other: object, alpha: int | float = 1
+) -> TorchMojoTensor | _NotHandled:
     """Metal specialization for equal-shape contiguous tensor addition."""
     a = _t(input)
     b = _t(other)
@@ -2565,7 +2685,9 @@ def fast_aten_add_apple(input, other, alpha=1):
     return _fast_aten_add_default(input, other, alpha)
 
 
-def fast_aten_add_(input, other, alpha=1):
+def fast_aten_add_(
+    input: torch.Tensor, other: object, alpha: int | float = 1
+) -> torch.Tensor | None:
     """In-place add into input. Returns None when unavailable."""
     dst = _t(input)
     if dst is None:
@@ -2614,7 +2736,7 @@ def fast_aten_add_(input, other, alpha=1):
     # General path: functional result, then a (strided-safe) copy back.
     result = fast_aten_add(input, other, alpha)
     if (
-        result is NOT_HANDLED
+        not isinstance(result, TorchMojoTensor)
         or result._shape != dst._shape
         or result._dtype != dst._dtype
     ):
@@ -2623,7 +2745,9 @@ def fast_aten_add_(input, other, alpha=1):
     return input
 
 
-def fast_aten_sub(input, other, alpha=1):
+def fast_aten_sub(
+    input: torch.Tensor, other: object, alpha: int | float = 1
+) -> TorchMojoTensor | _NotHandled:
     if alpha != 1:
         other = _scaled_operand(other, alpha)
         if other is None:
@@ -2641,7 +2765,7 @@ def fast_aten_sub(input, other, alpha=1):
     return NOT_HANDLED
 
 
-def fast_aten_mul(input, other):
+def fast_aten_mul(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_scalar("MulScalarSpec", input, other)
     if result is None:
         result = _try_spec_int_scalar("MulScalarIntSpec", input, other)
@@ -2652,7 +2776,7 @@ def fast_aten_mul(input, other):
     return NOT_HANDLED
 
 
-def fast_aten_mul_(input, other):
+def fast_aten_mul_(input: torch.Tensor, other: object) -> torch.Tensor | None:
     """In-place multiply used by the foreach gradient-clipping slow path."""
     dst = _t(input)
     if dst is None:
@@ -2661,7 +2785,7 @@ def fast_aten_mul_(input, other):
         return input
     result = fast_aten_mul(input, other)
     if (
-        result is NOT_HANDLED
+        not isinstance(result, TorchMojoTensor)
         or result._shape != dst._shape
         or result._dtype != dst._dtype
         or result._device != dst._device
@@ -2681,7 +2805,9 @@ def fast_aten_mul_(input, other):
 _DIV_ROUNDING_MODE_SPECS = {"floor": "FloorDivSpec", "trunc": "TruncDivSpec"}
 
 
-def fast_aten_div(input, other, *, rounding_mode=None):
+def fast_aten_div(
+    input: torch.Tensor, other: object, *, rounding_mode: str | None = None
+) -> TorchMojoTensor | _NotHandled:
     if rounding_mode is not None:
         spec_name = _DIV_ROUNDING_MODE_SPECS.get(rounding_mode)
         if spec_name is None:
@@ -2714,7 +2840,9 @@ def fast_aten_div(input, other, *, rounding_mode=None):
     return NOT_HANDLED
 
 
-def fast_aten_lerp(self, end, weight):
+def fast_aten_lerp(
+    self: torch.Tensor, end: torch.Tensor, weight: AtenScalar
+) -> TorchMojoTensor | _NotHandled:
     """FP32 scalar lerp composed from the existing asynchronous fast ops.
 
     Match ATen's numerically stable branch from ``native/Lerp.h``.  Keeping
@@ -2758,7 +2886,9 @@ def fast_aten_lerp(self, end, weight):
     return fast_aten_sub(finish, difference, alpha=one_minus_weight)
 
 
-def fast_aten_fill_scalar(input, value):
+def fast_aten_fill_scalar(
+    input: torch.Tensor, value: object
+) -> TorchMojoTensor | _NotHandled:
     """Functional fill: new tensor, same shape/dtype, all elements = value."""
     # ``bool`` is a Python ``int`` subclass and ATen accepts it for every
     # scalar-fill dtype (most importantly for mutating saved bool masks).
@@ -2771,7 +2901,7 @@ def fast_aten_fill_scalar(input, value):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_fill__scalar(input, value):
+def fast_aten_fill__scalar(input: torch.Tensor, value: object) -> torch.Tensor | None:
     """In-place fill of input (any strides). Returns None when unavailable."""
     if not isinstance(value, int | float):
         return None
@@ -2782,7 +2912,7 @@ def fast_aten_fill__scalar(input, value):
         return None
     if a._numel > 0:
         _device_call(
-            eager_kernels.tensor_holder.StridedFill,
+            _tensor_holder().StridedFill,
             a._ptr,
             float(value),
             _pad8(a._shape, 1),
@@ -2794,29 +2924,29 @@ def fast_aten_fill__scalar(input, value):
     return input
 
 
-def fast_aten_maximum(x, y):
+def fast_aten_maximum(x: torch.Tensor, y: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("MaximumSpec", x, y)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_minimum(x, y):
+def fast_aten_minimum(x: torch.Tensor, y: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("MinimumSpec", x, y)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_relu(tensor):
+def fast_aten_relu(tensor: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("ReluSpec", tensor)
 
 
-def fast_aten_exp(input):
+def fast_aten_exp(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("ExpSpec", input)
 
 
-def fast_aten_tanh(x):
+def fast_aten_tanh(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("TanhSpec", x)
 
 
-def fast_aten_pow(x, y):
+def fast_aten_pow(x: torch.Tensor, y: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_scalar("PowScalarSpec", x, y)
     return result if result is not None else NOT_HANDLED
 
@@ -2831,7 +2961,7 @@ def fast_aten_pow(x, y):
 # ---------------------------------------------------------------------------
 
 
-def _unary_spec_op(spec, x):
+def _unary_spec_op(spec: str, x: object) -> TorchMojoTensor | _NotHandled:
     """Float-only unary with no classic fallback: the spec entry provably
     covers the classic gate (_FLOAT_DTYPES, strided via Mojo-side
     temporaries), so the classic chain was deleted (design doc §2.4)."""
@@ -2839,19 +2969,19 @@ def _unary_spec_op(spec, x):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_abs(x):
+def fast_aten_abs(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("AbsSpec", x)
 
 
-def fast_aten_neg(x):
+def fast_aten_neg(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("NegSpec", x)
 
 
-def fast_aten_sign(x):
+def fast_aten_sign(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SignSpec", x)
 
 
-def _int_unary_identity(x):
+def _int_unary_identity(x: torch.Tensor) -> TorchMojoTensor | None:
     """ceil/floor on integer tensors is the identity in torch; return a copy."""
     a = _t(x)
     if a is not None and a._dtype in _BITWISE_DTYPES and a._dtype != DType.bool:
@@ -2859,85 +2989,87 @@ def _int_unary_identity(x):
     return None
 
 
-def fast_aten_ceil(x):
+def fast_aten_ceil(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     result = _int_unary_identity(x)
     if result is not None:
         return result
     return _unary_spec_op("CeilSpec", x)
 
 
-def fast_aten_floor(x):
+def fast_aten_floor(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     result = _int_unary_identity(x)
     if result is not None:
         return result
     return _unary_spec_op("FloorSpec", x)
 
 
-def fast_aten_acos(x):
+def fast_aten_acos(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("AcosSpec", x)
 
 
-def fast_aten_asinh(x):
+def fast_aten_asinh(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("AsinhSpec", x)
 
 
-def fast_aten_atanh(x):
+def fast_aten_atanh(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("AtanhSpec", x)
 
 
-def fast_aten_cos(x):
+def fast_aten_cos(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("CosSpec", x)
 
 
-def fast_aten_cosh(x):
+def fast_aten_cosh(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("CoshSpec", x)
 
 
-def fast_aten_erf(x):
+def fast_aten_erf(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("ErfSpec", x)
 
 
-def fast_aten_log(x):
+def fast_aten_log(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("LogSpec", x)
 
 
-def fast_aten_log1p(x):
+def fast_aten_log1p(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("Log1pSpec", x)
 
 
-def fast_aten_reciprocal(x):
+def fast_aten_reciprocal(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("ReciprocalSpec", x)
 
 
-def fast_aten_rsqrt(x):
+def fast_aten_rsqrt(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("RsqrtSpec", x)
 
 
-def fast_aten_sigmoid(x):
+def fast_aten_sigmoid(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SigmoidSpec", x)
 
 
-def fast_aten_silu(x):
+def fast_aten_silu(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SiluSpec", x)
 
 
-def fast_aten_sin(x):
+def fast_aten_sin(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SinSpec", x)
 
 
-def fast_aten_sinh(x):
+def fast_aten_sinh(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SinhSpec", x)
 
 
-def fast_aten_sqrt(x):
+def fast_aten_sqrt(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("SqrtSpec", x)
 
 
-def fast_aten_tan(x):
+def fast_aten_tan(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     return _unary_spec_op("TanSpec", x)
 
 
-def fast_aten_gelu(input, approximate="none"):
+def fast_aten_gelu(
+    input: torch.Tensor, approximate: str = "none"
+) -> TorchMojoTensor | _NotHandled:
     if approximate == "none":
         spec = "GeluNoneSpec"
     elif approximate == "tanh":
@@ -2968,7 +3100,9 @@ def fast_aten_gelu(input, approximate="none"):
     return _unary_spec_op(spec, input)
 
 
-def fast_aten_gelu_backward(grad_output, self, *, approximate="none"):
+def fast_aten_gelu_backward(
+    grad_output: torch.Tensor, self: torch.Tensor, *, approximate: str = "none"
+) -> TorchMojoTensor | _NotHandled:
     """Float32/BFloat16 GPU GELU backward through Fable-owned Mojo kernels."""
     grad = _t(grad_output)
     input = _t(self)
@@ -2987,6 +3121,8 @@ def fast_aten_gelu_backward(grad_output, self, *, approximate="none"):
 
     grad = _tc(grad)
     input = _tc(input)
+    # grad/input were already TorchMojoTensor; _tc only materializes.
+    assert grad is not None and input is not None
     out = _alloc(input._shape, dtype, input._device)
     if out._numel > 0:
         op = "GeluBackwardBF16" if dtype == DType.bfloat16 else "GeluBackwardF32"
@@ -3009,12 +3145,12 @@ def fast_aten_gelu_backward(grad_output, self, *, approximate="none"):
     return out
 
 
-def fast_aten_isnan(x):
+def fast_aten_isnan(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_unary("IsNanSpec", x, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_logical_not(x):
+def fast_aten_logical_not(x: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_unary("LogicalNotSpec", x, DType.bool)
     return result if result is not None else NOT_HANDLED
 
@@ -3026,52 +3162,58 @@ def fast_aten_logical_not(x):
 # ---------------------------------------------------------------------------
 
 
-def fast_aten_eq(input, other):
+def fast_aten_eq(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("EqSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_ne(input, other):
+def fast_aten_ne(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("NeSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_lt(input, other):
+def fast_aten_lt(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("LtSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_le(input, other):
+def fast_aten_le(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("LeSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_gt(input, other):
+def fast_aten_gt(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("GtSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_ge(input, other):
+def fast_aten_ge(input: torch.Tensor, other: object) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("GeSpec", input, other, DType.bool)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_bitwise_and(input, other):
+def fast_aten_bitwise_and(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("BitwiseAndSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_bitwise_or(input, other):
+def fast_aten_bitwise_or(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("BitwiseOrSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_bitwise_xor(input, other):
+def fast_aten_bitwise_xor(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("BitwiseXorSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_bitwise_not(input):
+def fast_aten_bitwise_not(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     if a is None or a._dtype not in _BITWISE_DTYPES:
         return NOT_HANDLED
@@ -3092,7 +3234,13 @@ def fast_aten_bitwise_not(input):
     return out
 
 
-def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False):
+def fast_aten_isin(
+    elements: torch.Tensor,
+    test_elements: torch.Tensor,
+    *,
+    assume_unique: bool = False,
+    invert: bool = False,
+) -> TorchMojoTensor | _NotHandled:
     del assume_unique
     el = _tc(elements)
     te = _tc(test_elements)
@@ -3106,7 +3254,8 @@ def fast_aten_isin(elements, test_elements, *, assume_unique=False, invert=False
         return NOT_HANDLED
     if el._numel > 0 and te._numel == 0:
         # x in {} is always False (True under invert).
-        return fast_filled(el._shape, 1.0 if invert else 0.0, DType.bool, el._device)
+        filled = fast_filled(el._shape, 1.0 if invert else 0.0, DType.bool, el._device)
+        return filled if filled is not None else NOT_HANDLED
     out = _alloc(el._shape, DType.bool, el._device)
     if el._numel > 0:
         _call_mojo(
@@ -3183,9 +3332,13 @@ def _searchsorted_sorter_in_range(
     maximum = fast_aten_max(sorter)
     if minimum is NOT_HANDLED or maximum is NOT_HANDLED:
         return None
+    if not isinstance(minimum, TorchMojoTensor) or not isinstance(
+        maximum, TorchMojoTensor
+    ):
+        return None
     min_value = fast_aten__local_scalar_dense(minimum)
     max_value = fast_aten__local_scalar_dense(maximum)
-    if min_value is NOT_HANDLED or max_value is NOT_HANDLED:
+    if not isinstance(min_value, int | float) or not isinstance(max_value, int | float):
         return None
     return int(min_value) >= 0 and int(max_value) < boundary_size
 
@@ -3304,6 +3457,9 @@ def _fast_searchsorted(
         )
 
     if scalar_value:
+        # A complex scalar cannot be embedded (float() on it raises); decline.
+        if not isinstance(values, int | float):
+            return NOT_HANDLED
         common_dtype = _searchsorted_scalar_dtype(boundaries._dtype, values)
         if common_dtype is None:
             return NOT_HANDLED
@@ -3322,6 +3478,7 @@ def _fast_searchsorted(
 
     boundaries = _tc(boundaries)
     input_tensor = _tc(input_tensor)
+    assert boundaries is not None and input_tensor is not None
     sorter_tensor = _tc(sorter_tensor) if sorter_tensor is not None else None
     out_dtype = DType.int32 if out_int32 else DType.int64
     out = _alloc(input_tensor._shape, out_dtype, input_tensor._device)
@@ -3410,19 +3567,25 @@ def fast_aten_searchsorted(
 # ---------------------------------------------------------------------------
 
 
-def fast_aten_remainder(input, other):
+def fast_aten_remainder(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     # Divisor-signed remainder (Python/torch `%`), float and int dtypes.
     result = _try_spec_binary("RemainderSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_floor_divide(input, other):
+def fast_aten_floor_divide(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     # floor(input / other), float and int dtypes.
     result = _try_spec_binary("FloorDivSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_pow_tensor_tensor(input, exponent):
+def fast_aten_pow_tensor_tensor(
+    input: torch.Tensor, exponent: object
+) -> TorchMojoTensor | _NotHandled:
     # Float-only (the kernel raises on ints, which would leave the output
     # unwritten); gate here so unsupported dtypes fall through cleanly.
     a = _t(input)
@@ -3432,7 +3595,9 @@ def fast_aten_pow_tensor_tensor(input, exponent):
     return result if result is not None else NOT_HANDLED
 
 
-def _try_logical(spec_fn_name, input, other):
+def _try_logical(
+    spec_fn_name: str, input: object, other: object
+) -> TorchMojoTensor | None:
     """Mixed-dtype logical_and / logical_xor: reduce each operand to bool
     (the nonzero test) spec-to-spec via CastSpec, then the bool spec path
     (uint8 dispatch). Same-dtype pairs already went through the spec
@@ -3454,33 +3619,40 @@ def _try_logical(spec_fn_name, input, other):
         return None
 
 
-def fast_aten_logical_and(input, other):
+def fast_aten_logical_and(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("LogicalAndSpec", input, other, DType.bool)
     if result is None:
         result = _try_logical("LogicalAndSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_logical_xor(input, other):
+def fast_aten_logical_xor(
+    input: torch.Tensor, other: object
+) -> TorchMojoTensor | _NotHandled:
     result = _try_spec_binary("LogicalXorSpec", input, other, DType.bool)
     if result is None:
         result = _try_logical("LogicalXorSpec", input, other)
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_clamp(input, min=None, max=None):
+def fast_aten_clamp(
+    input: torch.Tensor, min: object = None, max: object = None
+) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     if a is None or a._dtype not in _BCAST_DTYPES:
         return NOT_HANDLED
     if min is None and max is None:
         return NOT_HANDLED
-    for bound in (min, max):
-        if bound is not None and not isinstance(bound, int | float):
-            return NOT_HANDLED
+    if min is not None and not isinstance(min, int | float):
+        return NOT_HANDLED
+    if max is not None and not isinstance(max, int | float):
+        return NOT_HANDLED
     has_min = min is not None
     has_max = max is not None
-    lo = float(min) if has_min else 0.0
-    hi = float(max) if has_max else 0.0
+    lo = float(min) if min is not None else 0.0
+    hi = float(max) if max is not None else 0.0
     out = _alloc(a._shape, a._dtype, a._device)
     if out._numel > 0:
         _call_mojo(
@@ -3505,7 +3677,14 @@ def fast_aten_clamp(input, min=None, max=None):
     return out
 
 
-def _try_addc(kernel_name, self, tensor1, tensor2, value, allow_int):
+def _try_addc(
+    kernel_name: str,
+    self: torch.Tensor,
+    tensor1: torch.Tensor,
+    tensor2: torch.Tensor,
+    value: object,
+    allow_int: bool,
+) -> TorchMojoTensor | _NotHandled:
     a = _t(self)
     b = _t(tensor1)
     c = _t(tensor2)
@@ -3557,11 +3736,15 @@ def _try_addc(kernel_name, self, tensor1, tensor2, value, allow_int):
     return out
 
 
-def fast_aten_addcmul(self, tensor1, tensor2, value=1):
+def fast_aten_addcmul(
+    self: torch.Tensor, tensor1: torch.Tensor, tensor2: torch.Tensor, value: object = 1
+) -> TorchMojoTensor | _NotHandled:
     return _try_addc("AddcmulBcast", self, tensor1, tensor2, value, True)
 
 
-def fast_aten_addcdiv(self, tensor1, tensor2, value=1):
+def fast_aten_addcdiv(
+    self: torch.Tensor, tensor1: torch.Tensor, tensor2: torch.Tensor, value: object = 1
+) -> TorchMojoTensor | _NotHandled:
     return _try_addc("AddcdivBcast", self, tensor1, tensor2, value, False)
 
 
@@ -3571,7 +3754,7 @@ def fast_aten_addr(
     vec2: object,
     beta: int | float = 1,
     alpha: int | float = 1,
-) -> object:
+) -> TorchMojoTensor | _NotHandled:
     """beta*self + alpha*outer(vec1, vec2), fused into one kernel launch
     that reproduces CPU's own addr_kernel op order and per-op rounding
     exactly (see the comment above `_addr_bcast` in logic_ops.mojo for why
@@ -3631,7 +3814,9 @@ def fast_aten_addr(
     return out
 
 
-def _binary_operands(input, other):
+def _binary_operands(
+    input: object, other: object
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
     """Resolve (lhs, rhs) TorchMojoTensors with equal dtypes for the ternary
     broadcast kernels (where / masked_fill). Either operand may be a Python
     scalar (which becomes a 0-d stride-0 tensor of the tensor operand's
@@ -3651,7 +3836,9 @@ def _binary_operands(input, other):
     return None
 
 
-def fast_aten_where(condition, input, other):
+def fast_aten_where(
+    condition: torch.Tensor, input: object, other: object
+) -> TorchMojoTensor | _NotHandled:
     cond = _t(condition)
     if cond is None or cond._dtype != DType.bool:
         return NOT_HANDLED
@@ -3670,7 +3857,9 @@ def fast_aten_where(condition, input, other):
     return out
 
 
-def _masked_fill_scalar_operands(input, mask, value):
+def _masked_fill_scalar_operands(
+    input: torch.Tensor, mask: torch.Tensor, value: object
+) -> tuple[TorchMojoTensor, TorchMojoTensor, float, _BcastMeta] | None:
     """Resolve (in_t, mask_t, value: float, meta) for masked_fill's
     immediate-scalar fast path, or None.
 
@@ -3698,7 +3887,9 @@ def _masked_fill_scalar_operands(input, mask, value):
     return a, m, fval, meta
 
 
-def _masked_fill_operands(input, mask, value):
+def _masked_fill_operands(
+    input: torch.Tensor, mask: torch.Tensor, value: object
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor, _BcastMeta] | None:
     """Resolve (in_t, mask_t, value_t, meta) for masked_fill, or None.
 
     `value` may be a Python scalar or a 0-dimensional tensor of input's
@@ -3741,7 +3932,9 @@ def _masked_fill_operands(input, mask, value):
     return a, m, val, meta
 
 
-def fast_aten_masked_fill(input, mask, value):
+def fast_aten_masked_fill(
+    input: torch.Tensor, mask: torch.Tensor, value: object
+) -> TorchMojoTensor | _NotHandled:
     scalar_resolved = _masked_fill_scalar_operands(input, mask, value)
     if scalar_resolved is not None:
         a, m, fval, meta = scalar_resolved
@@ -3759,7 +3952,9 @@ def fast_aten_masked_fill(input, mask, value):
     return out
 
 
-def fast_aten_masked_fill_(input, mask, value):
+def fast_aten_masked_fill_(
+    input: torch.Tensor, mask: torch.Tensor, value: object
+) -> torch.Tensor | None:
     """In-place masked fill into input. Returns None when unavailable."""
     scalar_resolved = _masked_fill_scalar_operands(input, mask, value)
     if scalar_resolved is not None:
@@ -3771,7 +3966,7 @@ def fast_aten_masked_fill_(input, mask, value):
                 _launch_masked_fill_scalar(a, m, a, fval, meta, a._dtype)
             else:
                 result = fast_aten_masked_fill(input, mask, value)
-                if result is NOT_HANDLED:
+                if not isinstance(result, TorchMojoTensor):
                     return None
                 _copy_into(a, result)
         return input
@@ -3786,7 +3981,7 @@ def fast_aten_masked_fill_(input, mask, value):
             _launch_where_bcast(a, (m, val, a), meta, a._dtype)
         else:
             result = fast_aten_masked_fill(input, mask, value)
-            if result is NOT_HANDLED:
+            if not isinstance(result, TorchMojoTensor):
                 return None
             _copy_into(a, result)
     return input
@@ -3798,7 +3993,7 @@ def fast_aten_masked_fill_(input, mask, value):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_sizes(shape, numel: int) -> list[int] | None:
+def _resolve_sizes(shape: Sequence[int], numel: int) -> list[int] | None:
     # Single pass; view is the hottest op in transformer forwards.
     prod = 1
     neg = -1
@@ -3820,7 +4015,9 @@ def _resolve_sizes(shape, numel: int) -> list[int] | None:
     return sizes
 
 
-def _compute_view_strides(old_shape, old_strides, new_shape):
+def _compute_view_strides(
+    old_shape: Sequence[int], old_strides: Sequence[int], new_shape: Sequence[int]
+) -> tuple[int, ...] | None:
     """Port of ATen's computeStride: strides for viewing `old` as
     `new_shape` without a copy, or None when impossible."""
     if len(old_shape) == 0:
@@ -3859,11 +4056,14 @@ def _compute_view_strides(old_shape, old_strides, new_shape):
     return tuple(new_strides)
 
 
-def _fast_view(tensor, shape):
+def _fast_view(
+    tensor: torch.Tensor, shape: Sequence[object]
+) -> TorchMojoTensor | _NotHandled:
     if len(shape) == 1 and isinstance(shape[0], list | tuple):
         shape = shape[0]
     if not all(isinstance(s, int) for s in shape):
         return NOT_HANDLED
+    shape = cast(Sequence[int], shape)
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
@@ -3881,15 +4081,21 @@ def _fast_view(tensor, shape):
     return _view_of(t, sizes, new_strides, t._offset)
 
 
-def fast_aten_view(tensor, *shape):
+def fast_aten_view(
+    tensor: torch.Tensor, *shape: object
+) -> TorchMojoTensor | _NotHandled:
     return _fast_view(tensor, shape)
 
 
-def fast_aten__unsafe_view(tensor, *shape):
+def fast_aten__unsafe_view(
+    tensor: torch.Tensor, *shape: object
+) -> TorchMojoTensor | _NotHandled:
     return _fast_view(tensor, shape)
 
 
-def fast_aten_unsqueeze(tensor, dim):
+def fast_aten_unsqueeze(
+    tensor: torch.Tensor, dim: int
+) -> TorchMojoTensor | _NotHandled:
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
@@ -3904,7 +4110,9 @@ def fast_aten_unsqueeze(tensor, dim):
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
-def fast_aten_squeeze_dim(tensor, dim):
+def fast_aten_squeeze_dim(
+    tensor: torch.Tensor, dim: int
+) -> TorchMojoTensor | _NotHandled:
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
@@ -3919,7 +4127,7 @@ def fast_aten_squeeze_dim(tensor, dim):
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
-def fast_aten_alias(tensor):
+def fast_aten_alias(tensor: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     t = _t(tensor)
     if t is None:
         return NOT_HANDLED
@@ -3942,22 +4150,25 @@ def fast_aten_alias(tensor):
 fast_aten_detach = fast_aten_alias
 
 
-def fast_aten_permute(input, dims):
+def fast_aten_permute(
+    input: torch.Tensor, dims: object
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dims, list | tuple):
         return NOT_HANDLED
     rank = len(t._shape)
     if len(dims) != rank:
         return NOT_HANDLED
-    perm = [d % rank if -rank <= d < rank else None for d in dims]
-    if None in perm or len(set(perm)) != rank:
+    unchecked_perm = [d % rank if -rank <= d < rank else None for d in dims]
+    if None in unchecked_perm or len(set(unchecked_perm)) != rank:
         return NOT_HANDLED
+    perm = cast(list[int], unchecked_perm)
     new_shape = tuple(t._shape[p] for p in perm)
     new_strides = tuple(t._mojo_strides[p] for p in perm)
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
-def fast_aten_t(input):
+def fast_aten_t(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or len(t._shape) > 2:
         return NOT_HANDLED
@@ -3966,7 +4177,9 @@ def fast_aten_t(input):
     return fast_aten_transpose(input, 0, 1)
 
 
-def fast_aten_transpose(input, dim0, dim1):
+def fast_aten_transpose(
+    input: torch.Tensor, dim0: object, dim1: object
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dim0, int) or not isinstance(dim1, int):
         return NOT_HANDLED
@@ -3984,7 +4197,9 @@ def fast_aten_transpose(input, dim0, dim1):
     return _view_of(t, shape, strides, t._offset)
 
 
-def fast_aten_expand(tensor, sizes, *, implicit=False):
+def fast_aten_expand(
+    tensor: torch.Tensor, sizes: object, *, implicit: bool = False
+) -> TorchMojoTensor | _NotHandled:
     t = _t(tensor)
     if t is None or not isinstance(sizes, list | tuple):
         return NOT_HANDLED
@@ -4015,7 +4230,12 @@ def fast_aten_expand(tensor, sizes, *, implicit=False):
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
-def fast_aten_as_strided(tensor, size, stride, storage_offset=None):
+def fast_aten_as_strided(
+    tensor: torch.Tensor,
+    size: Sequence[int],
+    stride: Sequence[int],
+    storage_offset: int | None = None,
+) -> TorchMojoTensor | _NotHandled:
     """Zero-copy relayout over the tensor's storage (the holder allocation).
 
     ``storage_offset`` is absolute in elements from the storage start, which
@@ -4039,12 +4259,18 @@ def fast_aten_as_strided(tensor, size, stride, storage_offset=None):
     # one view op whose arguments are unconstrained by the input's own shape.
     if all(size):
         last = offset + sum((n - 1) * st for n, st in zip(size, stride))
-        if (last + 1) * t._itemsize > t._holder.get_nbytes():
+        if (last + 1) * t._itemsize > cast(_HolderObject, t._holder).get_nbytes():
             return NOT_HANDLED
     return _view_of(t, size, stride, offset)
 
 
-def fast_aten_slice(input, dim=0, start=None, end=None, step=1):
+def fast_aten_slice(
+    input: torch.Tensor,
+    dim: object = 0,
+    start: object = None,
+    end: object = None,
+    step: object = 1,
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dim, int) or not isinstance(step, int) or step < 1:
         return NOT_HANDLED
@@ -4075,7 +4301,9 @@ def fast_aten_slice(input, dim=0, start=None, end=None, step=1):
     return _view_of(t, new_shape, new_strides, new_offset)
 
 
-def fast_aten_select(input, dim, index):
+def fast_aten_select(
+    input: torch.Tensor, dim: object, index: object
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dim, int) or not isinstance(index, int):
         return NOT_HANDLED
@@ -4094,7 +4322,9 @@ def fast_aten_select(input, dim, index):
     return _view_of(t, new_shape, new_strides, new_offset)
 
 
-def fast_aten_split(input, split_size, dim=0):
+def fast_aten_split(
+    input: torch.Tensor, split_size: int | Sequence[int], dim: object = 0
+) -> list[TorchMojoTensor] | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dim, int):
         return NOT_HANDLED
@@ -4123,16 +4353,22 @@ def fast_aten_split(input, split_size, dim=0):
     for length in lengths:
         results.append(fast_aten_slice(t, dim, offset, offset + length))
         offset += length
-    if any(r is NOT_HANDLED for r in results):
+    # isinstance, not `is`: ty doesn't narrow identity checks against a custom
+    # singleton, and a generator's per-element check can't narrow the list.
+    if any(isinstance(r, _NotHandled) for r in results):
         return NOT_HANDLED
-    return results
+    return cast(list[TorchMojoTensor], results)
 
 
-def fast_aten_split_with_sizes(input, split_sizes, dim=0):
+def fast_aten_split_with_sizes(
+    input: torch.Tensor, split_sizes: Sequence[int], dim: int = 0
+) -> list[TorchMojoTensor] | _NotHandled:
     return fast_aten_split(input, list(split_sizes), dim)
 
 
-def fast_aten_unbind(input, dim=0):
+def fast_aten_unbind(
+    input: torch.Tensor, dim: object = 0
+) -> list[TorchMojoTensor] | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(dim, int):
         return NOT_HANDLED
@@ -4141,12 +4377,14 @@ def fast_aten_unbind(input, dim=0):
         return NOT_HANDLED
     dim %= rank
     results = [fast_aten_select(t, dim, i) for i in range(t._shape[dim])]
-    if any(r is NOT_HANDLED for r in results):
+    if any(isinstance(r, _NotHandled) for r in results):
         return NOT_HANDLED
-    return results
+    return cast(list[TorchMojoTensor], results)
 
 
-def fast_aten_clone(input, *, memory_format=None):
+def fast_aten_clone(
+    input: torch.Tensor, *, memory_format: object = None
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None:
         return NOT_HANDLED
@@ -4173,7 +4411,7 @@ def fast_aten_clone(input, *, memory_format=None):
 _VECTOR_BYTES = 16
 
 
-def _is_legacy_empty(t) -> bool:
+def _is_legacy_empty(t: torch.Tensor) -> bool:
     x = _t(t)
     return x is not None and len(x._shape) == 1 and x._numel == 0
 
@@ -4205,21 +4443,23 @@ def _cat_vector_width(
     return width
 
 
-def fast_aten_cat(tensors, dim=0):
+def fast_aten_cat(
+    tensors: Sequence[torch.Tensor], dim: object = 0
+) -> TorchMojoTensor | _NotHandled:
     # PyTorch's cat skips legacy "empty" (1-D, size-0) tensors, e.g.
     # uninitialized KV-caches.
     real = [x for x in tensors if not _is_legacy_empty(x)]
     if not real or not isinstance(dim, int):
         return NOT_HANDLED
-    ins = [_t(x) for x in real]
-    first = ins[0]
+    unwrapped_ins = [_t(x) for x in real]
+    first = unwrapped_ins[0]
     if first is None or first._dtype not in _COPYABLE_DTYPES:
         return NOT_HANDLED
     rank = len(first._shape)
     if rank == 0 or not -rank <= dim < rank or rank > _MAX_RANK:
         return NOT_HANDLED
     dim %= rank
-    for b in ins:
+    for b in unwrapped_ins:
         if (
             b is None
             or b._dtype != first._dtype
@@ -4228,6 +4468,7 @@ def fast_aten_cat(tensors, dim=0):
             or any(i != dim and b._shape[i] != first._shape[i] for i in range(rank))
         ):
             return NOT_HANDLED
+    ins = cast(list[TorchMojoTensor], unwrapped_ins)
     out_shape = list(first._shape)
     out_shape[dim] = sum(b._shape[dim] for b in ins)
     inner = math.prod(out_shape[dim + 1 :])
@@ -4352,7 +4593,7 @@ def _try_stack_scalars(
     return out
 
 
-def fast_aten_stack(tensors, dim=0):
+def fast_aten_stack(tensors: object, dim: object = 0) -> TorchMojoTensor | _NotHandled:
     # stack = unsqueeze each input at `dim`, then concatenate along `dim`.
     # Both helpers normalize `dim` against the SAME (rank + 1) base, so a raw
     # (possibly negative) `dim` stays consistent between them.
@@ -4363,10 +4604,10 @@ def fast_aten_stack(tensors, dim=0):
     scalar_stack = _try_stack_scalars(tensors, dim)
     if scalar_stack is not None:
         return scalar_stack
-    unsqueezed = []
+    unsqueezed: list[torch.Tensor] = []
     for x in tensors:
         u = fast_aten_unsqueeze(x, dim)
-        if u is NOT_HANDLED:
+        if not isinstance(u, TorchMojoTensor):
             return NOT_HANDLED
         unsqueezed.append(u)
     return fast_aten_cat(unsqueezed, dim)
@@ -4412,7 +4653,9 @@ def _repeat_tile_plan(
     return rows, cols, r1, ncopies
 
 
-def fast_aten_repeat(input, repeats):
+def fast_aten_repeat(
+    input: torch.Tensor, repeats: object
+) -> TorchMojoTensor | _NotHandled:
     t = _tc(input)
     if t is None or t._dtype not in _COPYABLE_DTYPES:
         return NOT_HANDLED
@@ -4475,7 +4718,9 @@ def fast_aten_repeat(input, repeats):
     return out
 
 
-def _fast_triangular(input, diagonal, upper):
+def _fast_triangular(
+    input: torch.Tensor, diagonal: object, upper: int
+) -> TorchMojoTensor | _NotHandled:
     if not isinstance(diagonal, int):
         return NOT_HANDLED
     t = _tc(input)
@@ -4510,15 +4755,21 @@ def _fast_triangular(input, diagonal, upper):
     return out
 
 
-def fast_aten_tril(input, diagonal=0):
+def fast_aten_tril(
+    input: torch.Tensor, diagonal: object = 0
+) -> TorchMojoTensor | _NotHandled:
     return _fast_triangular(input, diagonal, 0)
 
 
-def fast_aten_triu(input, diagonal=0):
+def fast_aten_triu(
+    input: torch.Tensor, diagonal: object = 0
+) -> TorchMojoTensor | _NotHandled:
     return _fast_triangular(input, diagonal, 1)
 
 
-def fast_aten_index(input, indices):
+def fast_aten_index(
+    input: torch.Tensor, indices: object
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None or not isinstance(indices, list | tuple):
         return NOT_HANDLED
@@ -4536,6 +4787,7 @@ def fast_aten_index(input, indices):
         if src is None or src._dtype not in _COPYABLE_DTYPES or len(src._shape) < 1:
             return NOT_HANDLED
         idx_c = _tc(idx)
+        assert idx_c is not None
         row_len = 1
         for s in src._shape[1:]:
             row_len *= s
@@ -4565,16 +4817,27 @@ def fast_aten_index(input, indices):
     if idx._dtype == DType.bool:
         # Boolean mask: data-dependent output shape -> host bounce (syncs).
         cpu_self = t._to_cpu_tensor()
-        cpu_indices = tuple(
-            slice(None) if x is None else _t(x)._to_cpu_tensor() for x in indices
-        )
-        result = cpu_self[cpu_indices]
+        cpu_index_entries = []
+        for x in indices:
+            if x is None:
+                cpu_index_entries.append(slice(None))
+                continue
+            x_mojo = _t(x)
+            assert x_mojo is not None
+            cpu_index_entries.append(x_mojo._to_cpu_tensor())
+        result = cpu_self[tuple(cpu_index_entries)]
         return TorchMojoTensor._from_cpu(result, t._device)
 
     return NOT_HANDLED
 
 
-def _fast_scatter(input, dim, index, src, value):
+def _fast_scatter(
+    input: torch.Tensor,
+    dim: object,
+    index: torch.Tensor,
+    src: torch.Tensor | None,
+    value: object,
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     idx = _t(index)
     if a is None or idx is None or not isinstance(dim, int):
@@ -4594,6 +4857,7 @@ def _fast_scatter(input, dim, index, src, value):
 
     out = a._materialize_contiguous()  # clone(self)
     idx_c = _tc(idx)
+    assert idx_c is not None
 
     is_value = 0
     value_f = 0.0
@@ -4658,15 +4922,21 @@ def _fast_scatter(input, dim, index, src, value):
     return out
 
 
-def fast_aten_scatter_src(input, dim, index, src):
+def fast_aten_scatter_src(
+    input: torch.Tensor, dim: object, index: torch.Tensor, src: torch.Tensor
+) -> TorchMojoTensor | _NotHandled:
     return _fast_scatter(input, dim, index, src, None)
 
 
-def fast_aten_scatter_value(input, dim, index, value):
+def fast_aten_scatter_value(
+    input: torch.Tensor, dim: object, index: torch.Tensor, value: object
+) -> TorchMojoTensor | _NotHandled:
     return _fast_scatter(input, dim, index, None, value)
 
 
-def fast_aten_select_scatter(input, src, dim, index):
+def fast_aten_select_scatter(
+    input: torch.Tensor, src: torch.Tensor, dim: object, index: object
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     s = _t(src)
     if a is None or s is None or not isinstance(dim, int) or not isinstance(index, int):
@@ -4674,22 +4944,22 @@ def fast_aten_select_scatter(input, src, dim, index):
     if s._device != a._device:
         return NOT_HANDLED
     out = fast_aten_clone(a)
-    if out is NOT_HANDLED:
+    if not isinstance(out, TorchMojoTensor):
         return NOT_HANDLED
     view = fast_aten_select(out, dim, index)
-    if view is NOT_HANDLED:
+    if not isinstance(view, TorchMojoTensor):
         return NOT_HANDLED
     if s._dtype != out._dtype:
         s = _cast_tensor(s, out._dtype)
     if tuple(s._shape) != tuple(view._shape):
         s = fast_aten_expand(s, view._shape)
-        if s is NOT_HANDLED:
+        if not isinstance(s, TorchMojoTensor):
             return NOT_HANDLED
     _copy_into(view, s)
     return out
 
 
-def fast_aten_nonzero(input):
+def fast_aten_nonzero(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if t is None:
         return NOT_HANDLED
@@ -4728,8 +4998,8 @@ def _bn_geometry(
 
 
 def _bn_inference_saved_stats(
-    running_mean: object, running_var: object, eps: object
-) -> tuple[object, object] | None:
+    running_mean: object, running_var: object, eps: float
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
     """`(save_mean, save_invstd)` for an inference batch norm, or None.
 
     These are NOT empty in PyTorch.  `batch_norm_cuda_out` resizes `save_mean`
@@ -4744,8 +5014,13 @@ def _bn_inference_saved_stats(
     if mean_t is None or var_t is None:
         return None
     save_mean = fast_aten_clone(mean_t)
-    save_invstd = fast_aten_rsqrt(fast_aten_add(var_t, float(eps)))
-    if save_mean is NOT_HANDLED or save_invstd is NOT_HANDLED:
+    shifted_var = fast_aten_add(var_t, float(eps))
+    if not isinstance(shifted_var, TorchMojoTensor):
+        return None
+    save_invstd = fast_aten_rsqrt(shifted_var)
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if isinstance(save_mean, _NotHandled) or isinstance(save_invstd, _NotHandled):
         return None
     return save_mean, save_invstd
 
@@ -4756,8 +5031,8 @@ def _fast_batch_norm_inference_gpu(
     bias: object,
     running_mean: object,
     running_var: object,
-    eps: object,
-) -> object:
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Vectorized GPU inference batch norm, or NOT_HANDLED.
 
     Torch feeds float32 running statistics to a half/bfloat16 input (that is
@@ -4772,10 +5047,22 @@ def _fast_batch_norm_inference_gpu(
         _t(bias),
     )
     geom = _bn_geometry(a, (mean_t, var_t, gamma_t, beta_t))
-    if geom is None or mean_t._dtype != var_t._dtype or gamma_t._dtype != beta_t._dtype:
+    if geom is None:
+        return NOT_HANDLED
+    # _bn_geometry returned a geometry, so every parameter is a mojo tensor.
+    assert (
+        mean_t is not None
+        and var_t is not None
+        and gamma_t is not None
+        and beta_t is not None
+    )
+    if mean_t._dtype != var_t._dtype or gamma_t._dtype != beta_t._dtype:
         return NOT_HANDLED
     channels, inner, planes = geom
-    a = _tc(a)
+    contiguous_a = _tc(a)
+    # a was already TorchMojoTensor; _tc only materializes.
+    assert contiguous_a is not None
+    a = contiguous_a
     out = _alloc(a._shape, a._dtype, a._device)
     # The kernel emits the saved statistics itself: see _bn_inference_saved_stats
     # for why they must not be empty, and the kernel docstring for why doing it
@@ -4817,9 +5104,9 @@ def _fast_batch_norm_training(
     bias: object,
     running_mean: object,
     running_var: object,
-    momentum: object,
-    eps: object,
-) -> object:
+    momentum: float,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """`aten::native_batch_norm` with `training=True` on the GPU.
 
     The per-channel statistics reduce `{0, 2, 3}` of an NCHW tensor — an axis
@@ -4847,7 +5134,7 @@ def _fast_batch_norm_training(
     geom = _bn_geometry(a, present)
     if geom is None:
         return NOT_HANDLED
-    if has_running and mean_t._dtype != var_t._dtype:
+    if mean_t is not None and var_t is not None and mean_t._dtype != var_t._dtype:
         return NOT_HANDLED
     if gamma_t is not None and beta_t is not None and gamma_t._dtype != beta_t._dtype:
         return NOT_HANDLED
@@ -4859,9 +5146,10 @@ def _fast_batch_norm_training(
         return NOT_HANDLED
     # The saved statistics are float32 whatever the input dtype is (ATen's
     # `at::acc_type`), and the second one is the inverse standard deviation.
-    stat_dtype = mean_t._dtype if has_running else DType.float32
+    stat_dtype = mean_t._dtype if mean_t is not None else DType.float32
     param_dtype = gamma_t._dtype if gamma_t is not None else a._dtype
     a = _tc(a)
+    assert a is not None
     out = _alloc(a._shape, a._dtype, a._device)
     save_mean = _alloc((channels,), DType.float32, a._device)
     save_invstd = _alloc((channels,), DType.float32, a._device)
@@ -4875,8 +5163,8 @@ def _fast_batch_norm_training(
             a._ptr,
             gamma_t._ptr if gamma_t is not None else 0,
             beta_t._ptr if beta_t is not None else 0,
-            mean_t._ptr if has_running else 0,
-            var_t._ptr if has_running else 0,
+            mean_t._ptr if mean_t is not None else 0,
+            var_t._ptr if var_t is not None else 0,
             (
                 float(eps),
                 float(momentum),
@@ -4901,29 +5189,40 @@ def _fast_batch_norm_training(
     return out, save_mean, save_invstd
 
 
-def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, eps):
+def _fast_batch_norm_inference(
+    input: torch.Tensor,
+    weight: object,
+    bias: object,
+    running_mean: object,
+    running_var: object,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     a = _t(input)
     if a is not None and _on_gpu(a) and a._dtype in _FLOAT_DTYPES:
         result = _fast_batch_norm_inference_gpu(
             a, weight, bias, running_mean, running_var, eps
         )
-        if result is not NOT_HANDLED:
+        # isinstance, not `is`: ty doesn't narrow identity checks against a
+        # custom singleton instance the way it does for `is None`.
+        if not isinstance(result, _NotHandled):
             return result
-    stats = [_t(x) for x in (running_mean, running_var, weight, bias)]
+    unwrapped_stats = [_t(x) for x in (running_mean, running_var, weight, bias)]
     if (
         a is not None
-        and all(stat is not None for stat in stats)
+        and all(stat is not None for stat in unwrapped_stats)
         and a._dtype in _FLOAT_DTYPES
         and len(a._shape) >= 2
         and a._numel > 0
         and a._is_contiguous
         and all(
-            stat._device == a._device
+            stat is not None
+            and stat._device == a._device
             and stat._dtype == a._dtype
             and stat._is_contiguous
-            for stat in stats
+            for stat in unwrapped_stats
         )
     ):
+        stats = cast(list[TorchMojoTensor], unwrapped_stats)
         out = _alloc(a._shape, a._dtype, a._device)
         _call_mojo(
             _NNExtension,
@@ -4949,10 +5248,10 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
         return NOT_HANDLED
     if a._numel == 0:
         return NOT_HANDLED
-    params = [_tc(x) for x in (running_mean, running_var, weight, bias)]
-    if any(p is None or p._dtype != a._dtype for p in params):
+    unwrapped_params = [_tc(x) for x in (running_mean, running_var, weight, bias)]
+    if any(p is None or p._dtype != a._dtype for p in unwrapped_params):
         return NOT_HANDLED
-    mean_t, var_t, gamma_t, beta_t = params
+    mean_t, var_t, gamma_t, beta_t = cast(list[TorchMojoTensor], unwrapped_params)
     channels = a._shape[1]
     inner = math.prod(a._shape[2:])
     out = _alloc(a._shape, a._dtype, a._device)
@@ -4987,8 +5286,15 @@ def _fast_batch_norm_inference(input, weight, bias, running_mean, running_var, e
 
 
 def fast_aten_native_batch_norm(
-    input, weight, bias, running_mean, running_var, training, momentum, eps
-):
+    input: torch.Tensor,
+    weight: object,
+    bias: object,
+    running_mean: object,
+    running_var: object,
+    training: bool,
+    momentum: float,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     if not training:
         return _fast_batch_norm_inference(
             input, weight, bias, running_mean, running_var, eps
@@ -4999,14 +5305,22 @@ def fast_aten_native_batch_norm(
 
 
 def fast_aten__native_batch_norm_legit_no_training(
-    input, weight, bias, running_mean, running_var, momentum, eps
-):
+    input: torch.Tensor,
+    weight: object,
+    bias: object,
+    running_mean: object,
+    running_var: object,
+    momentum: float,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     return _fast_batch_norm_inference(
         input, weight, bias, running_mean, running_var, eps
     )
 
 
-def fast_aten_native_dropout(input, p, train):
+def fast_aten_native_dropout(
+    input: torch.Tensor, p: object, train: bool | None
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Contiguous float32 GPU native dropout with host-owned RNG state.
 
     The Fable-owned Mojo kernel is stateless: this host path atomically
@@ -5029,7 +5343,9 @@ def fast_aten_native_dropout(input, p, train):
     if train is False:
         output = fast_aten_clone(a)
         mask = fast_filled(a._shape, True, DType.bool, a._device)
-        if output is NOT_HANDLED or mask is None:
+        # isinstance, not `is`: ty doesn't narrow identity checks against a
+        # custom singleton instance the way it does for `is None`.
+        if isinstance(output, _NotHandled) or mask is None:
             return NOT_HANDLED
         return output, mask
 
@@ -5059,6 +5375,7 @@ def fast_aten_native_dropout(input, p, train):
     # Validate and allocate before changing generator state.  No operation
     # after the reservation reads the host or synchronizes the device queue.
     a = _tc(a)
+    assert a is not None
     output = _alloc(a._shape, DType.float32, a._device)
     mask = _alloc(a._shape, DType.bool, a._device)
     seed, base_offset = _reserve_philox_state(a._torch_device, (a._numel + 3) // 4)
@@ -5085,7 +5402,9 @@ def fast_aten_native_dropout(input, p, train):
     return output, mask
 
 
-def fast_aten_native_dropout_backward(grad_output, mask, scale):
+def fast_aten_native_dropout_backward(
+    grad_output: torch.Tensor, mask: torch.Tensor, scale: object
+) -> TorchMojoTensor | _NotHandled:
     """Float32 GPU native-dropout backward through the saved bool mask."""
     grad = _t(grad_output)
     keep = _t(mask)
@@ -5103,6 +5422,7 @@ def fast_aten_native_dropout_backward(grad_output, mask, scale):
 
     grad = _tc(grad)
     keep = _tc(keep)
+    assert grad is not None and keep is not None
     grad_input = _alloc(grad._shape, DType.float32, grad._device)
     if grad._numel > 0:
         _call_mojo(
@@ -5152,7 +5472,7 @@ def fast_aten_uniform_(
     from_: float = 0.0,
     to: float = 1.0,
     generator: torch.Generator | None = None,
-) -> object:
+) -> TorchMojoTensor | _NotHandled:
     """In-place `uniform_` generated ON THE DEVICE, from the device's own
     Philox stream.
 
@@ -5259,8 +5579,8 @@ def fast_aten_uniform_(
 
 
 def _layer_norm_stats_to_input_dtype(
-    mean: MojoTensorLike, rstd: MojoTensorLike, input_dtype: DType
-) -> tuple[MojoTensorLike, MojoTensorLike]:
+    mean: _SpecTensor, rstd: _SpecTensor, input_dtype: DType
+) -> tuple[_SpecTensor, _SpecTensor]:
     """`(mean, rstd)` as ATen returns them: same dtype as the input.
 
     ATen's CPU `layer_norm` accumulates in `opmath_type` (float for a
@@ -5275,10 +5595,19 @@ def _layer_norm_stats_to_input_dtype(
     """
     if input_dtype == DType.float32:
         return mean, rstd
-    return _cast_tensor(mean, input_dtype), _cast_tensor(rstd, input_dtype)
+    return (
+        _cast_tensor(cast(TorchMojoTensor, mean), input_dtype),
+        _cast_tensor(cast(TorchMojoTensor, rstd), input_dtype),
+    )
 
 
-def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
+def fast_aten_native_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> tuple[TorchMojoTensor, _SpecTensor, _SpecTensor] | _NotHandled:
     a = _t(input)
     normalized_shape = tuple(normalized_shape)
     k = len(normalized_shape)
@@ -5321,10 +5650,13 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
     # cross-device or wrong-shape call cannot enqueue partial work.
     eps_value = float(eps)
     a = _tc(a)
+    assert a is not None
     if weight is not None:
         gamma = _tc(gamma)
+        assert gamma is not None
     if bias is not None:
         beta = _tc(beta)
+        assert beta is not None
     # Not spec-converted: the classic prologue here is already thin, and
     # building three (holder, spec, shape, ptr) result groups measurably
     # costs more than the removed Python work (+4us/call measured A/B on
@@ -5354,8 +5686,8 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
                 mean._ptr,
                 rstd._ptr,
                 a._ptr,
-                gamma._ptr if weight is not None else 0,
-                beta._ptr if bias is not None else 0,
+                gamma._ptr if gamma is not None else 0,
+                beta._ptr if beta is not None else 0,
                 rows,
                 cols,
                 eps_value,
@@ -5382,6 +5714,7 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
         gamma = fast_filled((cols,), 1.0, a._dtype, a._device)
     if bias is None:
         beta = fast_filled((cols,), 0.0, a._dtype, a._device)
+    assert gamma is not None and beta is not None
     _call_mojo(
         _NNExtension,
         "LayerNorm",
@@ -5405,7 +5738,17 @@ def fast_aten_native_layer_norm(input, normalized_shape, weight, bias, eps):
 
 
 def fast_aten_native_layer_norm_backward(
-    grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+    grad_out: torch.Tensor,
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    output_mask: Sequence[bool],
+) -> (
+    tuple[TorchMojoTensor | None, TorchMojoTensor | None, TorchMojoTensor | None]
+    | _NotHandled
 ):
     """Direct eager LayerNorm backward for the pure-Mojo f32 GPU kernels.
 
@@ -5496,6 +5839,12 @@ def fast_aten_native_layer_norm_backward(
     a = _tc(a)
     saved_mean = _tc(saved_mean)
     saved_rstd = _tc(saved_rstd)
+    assert (
+        grad is not None
+        and a is not None
+        and saved_mean is not None
+        and saved_rstd is not None
+    )
     # The affine-parameter reductions do not consume weight.  Materialize it
     # only for the grad-input kernel, which needs gamma in the dx formula.
     gamma = _tc(gamma) if gamma is not None and mask[0] else None
@@ -5555,7 +5904,10 @@ def fast_aten_native_layer_norm_backward(
 # ---------------------------------------------------------------------------
 
 
-def _torch_dtype_to_max(dtype):
+def _torch_dtype_to_max(dtype: object) -> DType | None:
+    # `object`: the autograd doubles-based tests probe this with non-dtypes.
+    if not isinstance(dtype, torch.dtype):
+        return None
     from max.experimental.torch.torch import torch_dtype_to_max
 
     try:
@@ -5564,7 +5916,7 @@ def _torch_dtype_to_max(dtype):
         return None
 
 
-def _norm_reduce_dims(dim, rank, empty_is_all):
+def _norm_reduce_dims(dim: object, rank: int, empty_is_all: bool) -> list[int] | None:
     """Sorted unique normalized reduce dims, or None if the spec is invalid.
 
     `dim=None` always reduces every dim. An empty dim list reduces every dim
@@ -5596,7 +5948,9 @@ def _norm_reduce_dims(dim, rank, empty_is_all):
     return sorted(out)
 
 
-def _reduced_shape(shape, reduce_dims, keepdim):
+def _reduced_shape(
+    shape: Sequence[int], reduce_dims: Sequence[int], keepdim: bool
+) -> tuple[int, ...]:
     """The reduction output shape (keepdim already applied)."""
     rset = set(reduce_dims)
     if keepdim:
@@ -5604,7 +5958,13 @@ def _reduced_shape(shape, reduce_dims, keepdim):
     return tuple(s for i, s in enumerate(shape) if i not in rset)
 
 
-def fast_aten_mean(input, dim=None, keepdim=False, *, dtype=None):
+def fast_aten_mean(
+    input: torch.Tensor,
+    dim: object = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None:
         return NOT_HANDLED
@@ -5626,7 +5986,13 @@ def fast_aten_mean(input, dim=None, keepdim=False, *, dtype=None):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_sum(input, dim=None, keepdim=False, *, dtype=None):
+def fast_aten_sum(
+    input: torch.Tensor,
+    dim: object = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None:
         return NOT_HANDLED
@@ -5661,7 +6027,14 @@ def fast_aten_sum(input, dim=None, keepdim=False, *, dtype=None):
     return NOT_HANDLED
 
 
-def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=None):
+def fast_aten_linalg_vector_norm(
+    self: torch.Tensor,
+    ord: object = 2,
+    dim: object = None,
+    keepdim: object = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> TorchMojoTensor | _NotHandled:
     """L2 norm in ONE pass: sum of squares with the root folded into the
     accumulator's finalize (reduction_ops' NormSpec / NormL2Op).
 
@@ -5700,7 +6073,9 @@ def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=
     return result if result is not None else NOT_HANDLED
 
 
-def _amax_amin(input, dim, keepdim, spec_name):
+def _amax_amin(
+    input: torch.Tensor, dim: object, keepdim: bool, spec_name: str
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None or a._dtype not in _ROW_REDUCE_DTYPES:
         return NOT_HANDLED
@@ -5712,15 +6087,19 @@ def _amax_amin(input, dim, keepdim, spec_name):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_amax(input, dim=(), keepdim=False):
+def fast_aten_amax(
+    input: torch.Tensor, dim: object = (), keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _amax_amin(input, dim, keepdim, "AmaxSpec")
 
 
-def fast_aten_amin(input, dim=(), keepdim=False):
+def fast_aten_amin(
+    input: torch.Tensor, dim: object = (), keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _amax_amin(input, dim, keepdim, "AminSpec")
 
 
-def fast_aten_min(input):
+def fast_aten_min(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     # Values-only full reduction: aten::min(Tensor) -> Tensor.
     t = _t(input)
     if t is None:
@@ -5729,7 +6108,9 @@ def fast_aten_min(input):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_min_dim(input, dim, keepdim=False):
+def fast_aten_min_dim(
+    input: torch.Tensor, dim: object, keepdim: object = False
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """aten::min.dim -> (values, indices) along `dim` (first-min-wins)."""
     a = _t(input)
     if a is None or a._dtype not in _ROW_REDUCE_DTYPES or not isinstance(dim, int):
@@ -5742,7 +6123,9 @@ def fast_aten_min_dim(input, dim, keepdim=False):
     return result if result is not None else NOT_HANDLED
 
 
-def _argreduce(input, dim, keepdim, is_min):
+def _argreduce(
+    input: torch.Tensor, dim: object, keepdim: bool, is_min: bool
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None or a._numel == 0 or a._dtype not in _ROW_REDUCE_DTYPES:
         return NOT_HANDLED
@@ -5761,15 +6144,21 @@ def _argreduce(input, dim, keepdim, is_min):
     return NOT_HANDLED
 
 
-def fast_aten_argmax(input, dim=None, keepdim=False):
+def fast_aten_argmax(
+    input: torch.Tensor, dim: object = None, keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _argreduce(input, dim, keepdim, is_min=False)
 
 
-def fast_aten_argmin(input, dim=None, keepdim=False):
+def fast_aten_argmin(
+    input: torch.Tensor, dim: object = None, keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _argreduce(input, dim, keepdim, is_min=True)
 
 
-def fast_aten_max(input, *args, **kwargs):
+def fast_aten_max(
+    input: torch.Tensor, *args: object, **kwargs: object
+) -> TorchMojoTensor | _NotHandled:
     # Only the values-only overload max(Tensor) -> Tensor.
     if args or kwargs:
         return NOT_HANDLED
@@ -5782,7 +6171,13 @@ def fast_aten_max(input, *args, **kwargs):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_var(input, dim=None, *, correction=1, keepdim=False):
+def fast_aten_var(
+    input: torch.Tensor,
+    dim: object = None,
+    *,
+    correction: object = 1,
+    keepdim: bool = False,
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None or a._dtype not in _FLOAT_DTYPES:
         return NOT_HANDLED
@@ -5798,7 +6193,9 @@ def fast_aten_var(input, dim=None, *, correction=1, keepdim=False):
     return result if result is not None else NOT_HANDLED
 
 
-def _any_all(input, dim, keepdim, is_all):
+def _any_all(
+    input: torch.Tensor, dim: object, keepdim: bool, is_all: bool
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None or a._dtype not in _ANYALL_DTYPES:
         return NOT_HANDLED
@@ -5806,6 +6203,7 @@ def _any_all(input, dim, keepdim, is_all):
     # Fast full-reduce bool path (the existing single-block AllBool/AnyBool).
     if dim is None and not keepdim and a._dtype == DType.bool:
         c = _tc(a)
+        assert c is not None
         if 0 < c._numel < (1 << 22):
             out = _alloc((), DType.bool, a._device)
             _call_mojo(
@@ -5826,15 +6224,21 @@ def _any_all(input, dim, keepdim, is_all):
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_all(input, dim=None, keepdim=False):
+def fast_aten_all(
+    input: torch.Tensor, dim: object = None, keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _any_all(input, dim, keepdim, is_all=True)
 
 
-def fast_aten_any(input, dim=None, keepdim=False):
+def fast_aten_any(
+    input: torch.Tensor, dim: object = None, keepdim: bool = False
+) -> TorchMojoTensor | _NotHandled:
     return _any_all(input, dim, keepdim, is_all=False)
 
 
-def fast_aten__log_softmax(input, dim, half_to_float=False):
+def fast_aten__log_softmax(
+    input: torch.Tensor, dim: object, half_to_float: bool = False
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if (
         t is None
@@ -5853,7 +6257,8 @@ def fast_aten__log_softmax(input, dim, half_to_float=False):
     if rank == 0:
         if dim not in (-1, 0):
             return NOT_HANDLED
-        return fast_filled((), 0.0, t._dtype, t._device)
+        filled = fast_filled((), 0.0, t._dtype, t._device)
+        return filled if filled is not None else NOT_HANDLED
     if not -rank <= dim < rank:
         return NOT_HANDLED
     dim %= rank
@@ -5862,8 +6267,10 @@ def fast_aten__log_softmax(input, dim, half_to_float=False):
         # transposes are zero-copy, the inner one materializes once.
         # (t is already fp32 here if half_to_float was set, so pass False.)
         swapped = fast_aten_transpose(t, dim, rank - 1)
+        if not isinstance(swapped, TorchMojoTensor):
+            return NOT_HANDLED
         result = fast_aten__log_softmax(swapped, rank - 1, False)
-        if result is NOT_HANDLED:
+        if not isinstance(result, TorchMojoTensor):
             return NOT_HANDLED
         return fast_aten_transpose(result, dim, rank - 1)
     result = _try_spec_unary("LogSoftmaxSpec", t, module_name="reduction_ops")
@@ -5872,7 +6279,7 @@ def fast_aten__log_softmax(input, dim, half_to_float=False):
 
 def fast_aten__log_softmax_backward_data(
     grad_output: object, output: object, dim: int, input_dtype: object
-) -> object:
+) -> TorchMojoTensor | _NotHandled:
     # `object` params: besides real (TorchMojoTensor, torch.dtype) calls, the
     # composed path's lifetime contract is regression-tested with duck-typed
     # doubles (tests/test_autograd_memory_lifetime.py).
@@ -5974,10 +6381,13 @@ def fast_aten__log_softmax_backward_data(
             grad._shape[dim],
             math.prod(grad._shape[dim + 1 :]),
         )
-        work_grad = fast_aten_view(work_grad, flat_shape)
-        work_output = fast_aten_view(work_output, flat_shape)
-        if work_grad is NOT_HANDLED or work_output is NOT_HANDLED:
+        viewed_grad = fast_aten_view(work_grad, flat_shape)
+        viewed_output = fast_aten_view(work_output, flat_shape)
+        if not isinstance(viewed_grad, TorchMojoTensor) or not isinstance(
+            viewed_output, TorchMojoTensor
+        ):
             return NOT_HANDLED
+        work_grad, work_output = viewed_grad, viewed_output
         work_dim = 1
         restore_shape = grad._shape
 
@@ -5992,15 +6402,16 @@ def fast_aten__log_softmax_backward_data(
             summed = _cast_tensor(summed, DType.float32)
 
     if summed is None:
-        summed = fast_aten_sum(work_grad, dim=[work_dim], keepdim=True)
-        if summed is NOT_HANDLED:
+        summed_result = fast_aten_sum(work_grad, dim=[work_dim], keepdim=True)
+        if not isinstance(summed_result, TorchMojoTensor):
             return NOT_HANDLED
+        summed = summed_result
     probabilities = fast_aten_exp(work_output)
-    if probabilities is NOT_HANDLED:
+    if not isinstance(probabilities, TorchMojoTensor):
         return NOT_HANDLED
 
     grad_input = fast_aten_addcmul(work_grad, probabilities, summed, value=-1.0)
-    if grad_input is NOT_HANDLED:
+    if not isinstance(grad_input, TorchMojoTensor):
         return NOT_HANDLED
 
     # The launches above have captured their inputs on this device stream.
@@ -6008,15 +6419,22 @@ def fast_aten__log_softmax_backward_data(
     # allocator can recycle them without introducing a host synchronization.
     del probabilities, summed
     if restore_shape is not None:
-        grad_input = fast_aten_view(grad_input, restore_shape)
-        if grad_input is NOT_HANDLED:
+        restored = fast_aten_view(grad_input, restore_shape)
+        if not isinstance(restored, TorchMojoTensor):
             return NOT_HANDLED
+        grad_input = restored
     if grad_input._dtype != target_dtype:
         grad_input = _cast_tensor(grad_input, target_dtype)
     return grad_input
 
 
-def _nll_loss_inputs(self, target, weight, reduction, ignore_index):
+def _nll_loss_inputs(
+    self: torch.Tensor,
+    target: torch.Tensor,
+    weight: object,
+    reduction: object,
+    ignore_index: object,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, int, int] | None:
     """Validate the f32/i64 two-dimensional NLL kernel contract.
 
     This stays enqueue-only, so it cannot inspect target values on the host.
@@ -6054,12 +6472,21 @@ def _nll_loss_inputs(self, target, weight, reduction, ignore_index):
 
 
 def fast_aten_nll_loss_forward_output(
-    self, target, weight, reduction, ignore_index, *, output, total_weight
-):
+    self: torch.Tensor,
+    target: torch.Tensor,
+    weight: object,
+    reduction: object,
+    ignore_index: object,
+    *,
+    output: TorchMojoTensor,
+    total_weight: TorchMojoTensor,
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Direct out= NLL forward for the pure-Mojo f32 GPU kernel."""
     inputs = _nll_loss_inputs(self, target, weight, reduction, ignore_index)
     if inputs is None:
         return NOT_HANDLED
+    # _nll_loss_inputs validated both as ints.
+    assert isinstance(reduction, int) and isinstance(ignore_index, int)
     log_probs, labels, rows, classes = inputs
     if (
         output is total_weight
@@ -6081,6 +6508,7 @@ def fast_aten_nll_loss_forward_output(
             fast_aten_fill__scalar(write_output, math.nan if reduction == 1 else 0.0)
     else:
         labels_c = _tc(labels)
+        assert labels_c is not None
         _call_mojo(
             _LossExtension,
             "NllLossForwardF32",
@@ -6109,20 +6537,22 @@ def fast_aten_nll_loss_forward_output(
 
 
 def fast_aten_nll_loss_backward_grad_input(
-    grad_output,
-    self,
-    target,
-    weight,
-    reduction,
-    ignore_index,
-    total_weight,
+    grad_output: torch.Tensor,
+    self: torch.Tensor,
+    target: torch.Tensor,
+    weight: object,
+    reduction: object,
+    ignore_index: object,
+    total_weight: torch.Tensor,
     *,
-    grad_input,
-):
+    grad_input: TorchMojoTensor,
+) -> TorchMojoTensor | _NotHandled:
     """Direct out= NLL backward for the pure-Mojo f32 GPU kernel."""
     inputs = _nll_loss_inputs(self, target, weight, reduction, ignore_index)
     if inputs is None:
         return NOT_HANDLED
+    # _nll_loss_inputs validated both as ints.
+    assert isinstance(reduction, int) and isinstance(ignore_index, int)
     log_probs, labels, rows, classes = inputs
     grad = _t(grad_output)
     weight_sum = _t(total_weight)
@@ -6148,8 +6578,10 @@ def fast_aten_nll_loss_backward_grad_input(
     write_grad_input = _prepare_nll_out(grad_input, log_probs._shape)
     if rows != 0:
         labels_c = _tc(labels)
+        assert labels_c is not None
         grad_c = _tc(grad)
         weight_sum_c = _tc(weight_sum)
+        assert grad_c is not None and weight_sum_c is not None
         _call_mojo(
             _LossExtension,
             "NllLossBackwardF32",
@@ -6191,7 +6623,9 @@ _CUMSUM_DTYPES = (
 _CUMSUM_DTYPES_LEGACY = (DType.float32, DType.int32, DType.int64)
 
 
-def fast_aten_cumsum(input, dim, *, dtype=None):
+def fast_aten_cumsum(
+    input: torch.Tensor, dim: object, *, dtype: torch.dtype | None = None
+) -> TorchMojoTensor | _NotHandled:
     a = _t(input)
     if a is None or a._numel == 0:
         return NOT_HANDLED
@@ -6253,7 +6687,7 @@ def fast_aten_cumsum(input, dim, *, dtype=None):
 # ---------------------------------------------------------------------------
 
 
-def _pair(x) -> tuple[int, int] | None:
+def _pair(x: object) -> tuple[int, int] | None:
     if isinstance(x, int):
         return (x, x)
     if (
@@ -6268,8 +6702,13 @@ def _pair(x) -> tuple[int, int] | None:
 
 
 def fast_aten_max_pool2d_with_indices(
-    input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False
-):
+    input: torch.Tensor,
+    kernel_size: object,
+    stride: object = None,
+    padding: object = 0,
+    dilation: object = 1,
+    ceil_mode: bool = False,
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     a = _tc(input)
     kernel = _pair(kernel_size)
     strides = _pair(stride) if stride not in (None, []) else kernel
@@ -6281,7 +6720,10 @@ def fast_aten_max_pool2d_with_indices(
         and a._dtype in _FLOAT_DTYPES
         and len(a._shape) == 4
         and not ceil_mode
-        and None not in (kernel, strides, pads, dils)
+        and kernel is not None
+        and strides is not None
+        and pads is not None
+        and dils is not None
     ):
         n, c, in_h, in_w = a._shape
         kh, kw = kernel
@@ -6319,14 +6761,14 @@ def fast_aten_max_pool2d_with_indices(
 
 
 def fast_aten_avg_pool2d(
-    input,
-    kernel_size,
-    stride=None,
-    padding=0,
-    ceil_mode=False,
-    count_include_pad=True,
-    divisor_override=None,
-):
+    input: torch.Tensor,
+    kernel_size: object,
+    stride: object = None,
+    padding: object = 0,
+    ceil_mode: bool = False,
+    count_include_pad: bool = True,
+    divisor_override: object = None,
+) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     kernel = _pair(kernel_size)
     strides = _pair(stride) if stride not in (None, []) else kernel
@@ -6337,7 +6779,9 @@ def fast_aten_avg_pool2d(
         and a._dtype in _FLOAT_DTYPES
         and len(a._shape) == 4
         and not ceil_mode
-        and None not in (kernel, strides, pads)
+        and kernel is not None
+        and strides is not None
+        and pads is not None
         and (
             divisor_override is None
             or (isinstance(divisor_override, int) and divisor_override != 0)
@@ -6388,7 +6832,9 @@ def fast_aten_avg_pool2d(
     return NOT_HANDLED
 
 
-def fast_aten__adaptive_avg_pool2d(input, output_size):
+def fast_aten__adaptive_avg_pool2d(
+    input: torch.Tensor, output_size: object
+) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     osize = _pair(output_size)
     if (
@@ -6420,7 +6866,16 @@ def fast_aten__adaptive_avg_pool2d(input, output_size):
     return NOT_HANDLED
 
 
-def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
+def fast_aten_native_group_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    N: int,
+    C: object,
+    HxW: int,
+    group: object,
+    eps: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     a = _tc(input)
     if (
         a is not None
@@ -6490,6 +6945,7 @@ def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
             gamma = fast_filled((C,), 1.0, a._dtype, a._device)
         if beta is None:
             beta = fast_filled((C,), 0.0, a._dtype, a._device)
+        assert gamma is not None and beta is not None
         _call_mojo(
             _NNExtension,
             "GroupNorm",
@@ -6513,7 +6969,9 @@ def fast_aten_native_group_norm(input, weight, bias, N, C, HxW, group, eps):
     return NOT_HANDLED
 
 
-def _area_pixel_scale(in_size, out_size, align_corners, scale):
+def _area_pixel_scale(
+    in_size: int, out_size: int, align_corners: bool, scale: float | None
+) -> float:
     """torch area_pixel_compute_scale for one axis."""
     if align_corners:
         return (in_size - 1) / (out_size - 1) if out_size > 1 else 0.0
@@ -6523,8 +6981,12 @@ def _area_pixel_scale(in_size, out_size, align_corners, scale):
 
 
 def fast_aten_upsample_bilinear2d(
-    input, output_size, align_corners, scales_h=None, scales_w=None
-):
+    input: torch.Tensor,
+    output_size: object,
+    align_corners: bool,
+    scales_h: float | None = None,
+    scales_w: float | None = None,
+) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     osize = _pair(output_size)
     if (
@@ -6576,8 +7038,8 @@ SDPA_CAUSAL_B_COLS = 3
 
 
 def _try_sdpa_causal_bmm(
-    a: MojoTensorLike, b: MojoTensorLike, transpose_b: bool, causal_mode: int
-) -> object:
+    a: TorchMojoTensor, b: TorchMojoTensor, transpose_b: bool, causal_mode: int
+) -> TorchMojoTensor | None:
     """Batched GEMM that skips the contraction indices a causal mask kills.
 
     ``a`` is ``(batch, m, k)`` and ``b`` is ``(batch, n, k)`` when
@@ -6619,7 +7081,7 @@ def _try_sdpa_causal_bmm(
         or not mode_supported
     ):
         return None
-    out = _alloc((batch, m, n), a._dtype, a._device)
+    out = _alloc((batch, m, n), a._dtype, _device_of(a))
     _call_mojo(
         _MatmulExtension,
         "CausalBmm",
@@ -6629,7 +7091,7 @@ def _try_sdpa_causal_bmm(
             b._ptr,
             (batch, m, n, k, int(bool(transpose_b)), int(causal_mode)),
             a._dtype.value,
-            _ctx_ptr(a._device),
+            _ctx_ptr(_device_of(a)),
         ),
         arg_dtypes=(a._dtype, b._dtype),
         output_dtypes=(out._dtype,),
@@ -6639,7 +7101,14 @@ def _try_sdpa_causal_bmm(
     return out
 
 
-def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout_p):
+def _sdpa_math_forward_with_dropout(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+    dropout_p: object,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor | None] | _NotHandled:
     """Decomposed SDPA returning output, pre-dropout probabilities, and mask.
 
     Dropout is deliberately composed between softmax and the value BMM.  The
@@ -6675,6 +7144,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     q = _tc(q)
     k = _tc(k)
     v = _tc(v)
+    assert q is not None and k is not None and v is not None
     b, h, q_len, head_dim = q._shape
     kv_len = k._shape[2]
     scale_val = scale if scale is not None else 1.0 / math.sqrt(head_dim)
@@ -6829,15 +7299,17 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
         # remain nonfinite instead of being overwritten by zeros.  The mask
         # is still saved so backward applies the same mask/scale arithmetic,
         # and neither path reserves RNG state at this endpoint.
-        effective_probs = fast_aten_mul(probs, 0.0)
+        zeroed_probs = fast_aten_mul(probs, 0.0)
         dropout_mask = fast_filled(probs._shape, False, DType.bool, probs._device)
-        if effective_probs is NOT_HANDLED or dropout_mask is None:
+        if not isinstance(zeroed_probs, TorchMojoTensor) or dropout_mask is None:
             return NOT_HANDLED
+        effective_probs = zeroed_probs
     elif dropout_p > 0.0:
         dropout_result = fast_aten_native_dropout(probs, dropout_p, True)
-        if dropout_result is NOT_HANDLED:
+        if not isinstance(dropout_result, tuple):
             return NOT_HANDLED
         effective_probs, dropout_mask = dropout_result
+        assert isinstance(effective_probs, TorchMojoTensor)
         del dropout_result
 
     if metal_causal:
@@ -6887,6 +7359,7 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
                 flags={"TRANSPOSE_B": False},
                 keepalive=(out, effective_probs, v),
             )
+        assert isinstance(out, TorchMojoTensor)
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
     # mask, avoiding one persistent f32 (B,H,L,S) allocation per layer.
     del effective_probs
@@ -6911,7 +7384,14 @@ def _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, dropout
     return out4, probs4, mask4
 
 
-def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
+def _sdpa_masked_math_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Decomposed SDPA with an explicit attention mask -> ``(output, probs)``.
 
     ATen turns the mask into an additive bias on the *already scaled* scores: a
@@ -6958,6 +7438,7 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
     q = _tc(q)
     k = _tc(k)
     v = _tc(v)
+    assert q is not None and k is not None and v is not None
     q3_shape = (b * h, q_len, head_dim)
     kv3_shape = (b * h, kv_len, head_dim)
     q3 = _view_of(q, q3_shape, _row_major_strides(q3_shape), q._offset, contiguous=True)
@@ -6968,7 +7449,7 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
         v, kv3_shape, _row_major_strides(kv3_shape), v._offset, contiguous=True
     )
     scores3 = _fast_aten_bmm_transpose_b(q3, k3)
-    if scores3 is NOT_HANDLED:
+    if not isinstance(scores3, TorchMojoTensor):
         return NOT_HANDLED
     score_shape = (b, h, q_len, kv_len)
     scores4 = _view_of(
@@ -6977,14 +7458,14 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     scaled = fast_aten_mul(scores4, scale_val)
     del scores3, scores4
-    if scaled is NOT_HANDLED:
+    if not isinstance(scaled, TorchMojoTensor):
         return NOT_HANDLED
     if mask._dtype == DType.bool:
         biased = fast_aten_where(mask, scaled, float("-inf"))
     else:
         biased = fast_aten_add(scaled, mask)
     del scaled
-    if biased is NOT_HANDLED:
+    if not isinstance(biased, TorchMojoTensor):
         return NOT_HANDLED
     # A mask that broadcasts to anything other than the score matrix is not a
     # valid SDPA mask; the elementwise kernels would silently expand instead.
@@ -6992,7 +7473,7 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
         return NOT_HANDLED
     probs4 = fast_aten__softmax(biased, -1, False)
     del biased
-    if probs4 is NOT_HANDLED or not probs4._is_contiguous:
+    if not isinstance(probs4, TorchMojoTensor) or not probs4._is_contiguous:
         return NOT_HANDLED
     probs3_shape = (b * h, q_len, kv_len)
     probs3 = _view_of(
@@ -7004,7 +7485,7 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
     )
     out3 = fast_aten_bmm(probs3, v3)
     del probs3, q3, k3, v3
-    if out3 is NOT_HANDLED:
+    if not isinstance(out3, TorchMojoTensor):
         return NOT_HANDLED
     out_shape = (b, h, q_len, head_dim)
     out4 = _view_of(
@@ -7014,17 +7495,17 @@ def _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale):
 
 
 def _fa4_16bit_d64_causal_inputs(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
     *,
     allow_any_seqlen: bool = False,
-):
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | None:
     """Return eligible public BHTD inputs (bf16 or f16) without doing any
     device work.
 
@@ -7088,7 +7569,7 @@ def _fa4_16bit_d64_causal_inputs(
     return q, k, v
 
 
-def _fa4_strided_bthd_layout(tensor) -> bool:
+def _fa4_strided_bthd_layout(tensor: TorchMojoTensor) -> bool:
     """Whether a physical BTHD view is safe for FA4's strided TMA ABI.
 
     The pointer is already adjusted to logical ``[0, 0, 0, 0]`` and strides
@@ -7127,7 +7608,7 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
     )
 
 
-def _fa4_bhsd_layout(tensor) -> bool:
+def _fa4_bhsd_layout(tensor: TorchMojoTensor) -> bool:
     """Whether the PUBLIC (B, H, S, D) tensor is eligible for the
     BHSD-native TMA path -- no BTHD materialization needed at all.
 
@@ -7148,17 +7629,19 @@ def _fa4_bhsd_layout(tensor) -> bool:
     )
 
 
-def _fa4_native_bthd(tensor):
+def _fa4_native_bthd(tensor: torch.Tensor) -> TorchMojoTensor | None:
     """Expose public BHTD storage as FA4-native BTHD, copying if required."""
     physical = fast_aten_transpose(tensor, 1, 2)
-    if physical is NOT_HANDLED:
+    if not isinstance(physical, TorchMojoTensor):
         return None
     if _fa4_strided_bthd_layout(physical):
         return physical
     return _tc(physical)
 
 
-def _fa4_prepare_qkv_bridge(q_native, k_native, v_native):
+def _fa4_prepare_qkv_bridge(
+    q_native: TorchMojoTensor, k_native: TorchMojoTensor, v_native: TorchMojoTensor
+) -> tuple[tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor], bool] | None:
     """Return prepared Q/K/V plus whether their strided ABI is required."""
     qkv = (q_native, k_native, v_native)
     needs_strided_bridge = any(not tensor._is_contiguous for tensor in qkv)
@@ -7167,15 +7650,18 @@ def _fa4_prepare_qkv_bridge(q_native, k_native, v_native):
     if needs_strided_bridge:
         # Defensive path for callers of the private backward helper.  Normal
         # forward preparation has already copied every unsupported view.
-        qkv = tuple(_tc(tensor) for tensor in qkv)
-        if any(tensor is None for tensor in qkv):
+        materialized = tuple(_tc(tensor) for tensor in qkv)
+        if any(tensor is None for tensor in materialized):
             return None
+        qkv = cast(
+            "tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor]", materialized
+        )
     return qkv, False
 
 
 def _fa4_symbol(
     fa4_ops: object, direction: str, dtype: DType, head_dim: int, variant: str = ""
-) -> object:
+) -> Callable[..., object]:
     """Resolve one FA4 Mojo-exported entry point by name.
 
     Mirrors the ``flash_attention_{direction}_{bf16,f16}_d{64,128}_causal{variant}``
@@ -7194,14 +7680,23 @@ def _fa4_symbol(
 
 
 def fast_fa4_16bit_d64_causal_forward(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> (
+    tuple[
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+    ]
+    | _NotHandled
 ):
     """Run vendored FA4 (bf16 or f16, head_dim 64 or 128) and return
     output/LSE plus saved physical inputs.
@@ -7234,7 +7729,13 @@ def fast_fa4_16bit_d64_causal_forward(
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
 
     fa4_ops = load_fa4_ops()
+    assert isinstance(inputs, tuple)
     q, k, v = inputs
+    assert (
+        isinstance(q, TorchMojoTensor)
+        and isinstance(k, TorchMojoTensor)
+        and isinstance(v, TorchMojoTensor)
+    )
     qkv_dtype = q._dtype
     batch, heads, seqlen, head_dim = q._shape
     bhsd_eligible = _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v)
@@ -7325,14 +7826,22 @@ def fast_fa4_16bit_d64_causal_forward(
             keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     output = fast_aten_transpose(out_native, 1, 2)
-    if output is NOT_HANDLED:
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if isinstance(output, _NotHandled):
         raise RuntimeError("FA4 output could not be exposed as a BHTD view")
     return output, logsumexp, q_native, k_native, v_native
 
 
 def fast_fa4_16bit_d64_causal_backward(
-    q_native, k_native, v_native, output, logsumexp, grad_output, scale
-):
+    q_native: TorchMojoTensor,
+    k_native: TorchMojoTensor,
+    v_native: TorchMojoTensor,
+    output: torch.Tensor,
+    logsumexp: TorchMojoTensor,
+    grad_output: torch.Tensor,
+    scale: float,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Enqueue FA4 preprocess/main/convert and return public BHTD grads
     (bf16 or f16, matching Q/K/V's shared dtype)."""
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
@@ -7448,7 +7957,13 @@ def fast_fa4_16bit_d64_causal_backward(
     grad_query = fast_aten_transpose(dq_native, 1, 2)
     grad_key = fast_aten_transpose(dk_native, 1, 2)
     grad_value = fast_aten_transpose(dv_native, 1, 2)
-    if any(grad is NOT_HANDLED for grad in (grad_query, grad_key, grad_value)):
+    # isinstance (not `is`, which ty won't narrow here) on each name directly
+    # (not a generator, which can't narrow the names it closes over either).
+    if (
+        isinstance(grad_query, _NotHandled)
+        or isinstance(grad_key, _NotHandled)
+        or isinstance(grad_value, _NotHandled)
+    ):
         raise RuntimeError("FA4 gradients could not be exposed as BHTD views")
     return grad_query, grad_key, grad_value
 
@@ -7465,7 +7980,7 @@ def fast_fa4_16bit_d64_causal_backward(
 _FUSED_FA_MAX_HEAD_DIM = 256
 
 
-def _fa_strides(t: MojoTensorLike) -> tuple[int, int, int]:
+def _fa_strides(t: _SpecTensor) -> tuple[int, int, int]:
     """``t``'s (batch, head, seq) element strides for the fused kernels.
 
     The head_dim stride is not passed: it must be 1, and ``_fused_fa_inputs`` is
@@ -7505,8 +8020,15 @@ def _alloc_bthd(
 
 
 def _fused_fa_inputs(
-    query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
-):
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    dropout_p: object,
+    is_causal: bool,
+    scale: float | None,
+    enable_gqa: bool,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | None:
     """Eligible BHTD inputs for the fused gfx942 kernels, or None.
 
     The kernels read Q, K and V through their own (batch, head, seq) strides, so
@@ -7576,14 +8098,23 @@ def _fused_fa_inputs(
 
 
 def fast_fused_flash_attention_forward(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> (
+    tuple[
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+    ]
+    | _NotHandled
 ):
     """Fused forward returning ``(output, lse, q, k, v)``, or NOT_HANDLED.
 
@@ -7600,9 +8131,14 @@ def fast_fused_flash_attention_forward(
     eligible = _fused_fa_inputs(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
-    if eligible is None:
+    if not isinstance(eligible, tuple):
         return NOT_HANDLED
     q, k, v = eligible
+    assert (
+        isinstance(q, TorchMojoTensor)
+        and isinstance(k, TorchMojoTensor)
+        and isinstance(v, TorchMojoTensor)
+    )
     batch, heads, seq_q, head_dim = q._shape
     seq_kv = k._shape[2]
     scale_val = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
@@ -7633,8 +8169,15 @@ def fast_fused_flash_attention_forward(
 
 
 def fast_fused_flash_attention_backward(
-    grad_output, query, key, value, output, lse, is_causal, scale
-):
+    grad_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Fused backward returning ``(dq, dk, dv)``, or NOT_HANDLED.
 
     ``query``/``key``/``value``/``output``/``lse`` must be exactly what the
@@ -7709,54 +8252,73 @@ def fast_fused_flash_attention_backward(
     return grad_query, grad_key, grad_value
 
 
-def _sdpa_math_forward(query, key, value, is_causal, scale):
+def _sdpa_math_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Dropout-free compatibility wrapper returning ``(output, probs)``."""
     result = _sdpa_math_forward_with_dropout(query, key, value, is_causal, scale, 0.0)
-    if result is NOT_HANDLED:
+    if not isinstance(result, tuple):
         return NOT_HANDLED
     output, probabilities, _ = result
     return output, probabilities
 
 
 def fast_aten__scaled_dot_product_attention_math(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    dropout_mask=None,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    dropout_mask: torch.Tensor | None = None,
     *,
-    scale=None,
-    enable_gqa=False,
-):
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     if dropout_p != 0.0 or dropout_mask is not None or enable_gqa:
         return NOT_HANDLED
     if attn_mask is not None:
         return _sdpa_masked_math_forward(query, key, value, attn_mask, is_causal, scale)
     result = _sdpa_math_forward(query, key, value, is_causal, scale)
-    if result is NOT_HANDLED:
+    if not isinstance(result, tuple):
         return NOT_HANDLED
     out, probs = result
     return out, probs
 
 
 def fast_aten__scaled_dot_product_flash_attention(
-    query,
-    key,
-    value,
-    dropout_p=0.0,
-    is_causal=False,
-    return_debug_mask=False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    return_debug_mask: bool = False,
     *,
-    scale=None,
+    scale: float | None = None,
+) -> (
+    tuple[
+        TorchMojoTensor,
+        TorchMojoTensor,
+        None,
+        None,
+        int,
+        int,
+        TorchMojoTensor,
+        TorchMojoTensor,
+        TorchMojoTensor,
+    ]
+    | _NotHandled
 ):
     if dropout_p != 0.0 or return_debug_mask:
         return NOT_HANDLED
     result = fast_fa4_16bit_d64_causal_forward(
         query, key, value, None, 0.0, is_causal, scale, False
     )
-    if result is NOT_HANDLED:
+    if not isinstance(result, tuple):
         return NOT_HANDLED
     out, logsumexp, q_native, k_native, v_native = result
     # This direct ATen forward does not own the autograd saves used by the
@@ -7765,8 +8327,11 @@ def fast_aten__scaled_dot_product_flash_attention(
     # order instead of retaining three full activations.
     del q_native, k_native, v_native
     q = _t(query)
+    k = _t(key)
+    # The forward above succeeded, so both are mojo tensors.
+    assert q is not None and k is not None
     sq = q._shape[2]
-    sk = _t(key)._shape[2]
+    sk = k._shape[2]
     dev = q._device
     # Dense CUDA returns undefined cumulative-sequence tensors, uint64 RNG
     # state/offset tensors, and an empty debug mask when dropout/debugging are
@@ -7780,23 +8345,23 @@ def fast_aten__scaled_dot_product_flash_attention(
 
 
 def fast_aten__scaled_dot_product_flash_attention_backward(
-    grad_out,
-    query,
-    key,
-    value,
-    out,
-    logsumexp,
-    cum_seq_q,
-    cum_seq_k,
-    max_q,
-    max_k,
-    dropout_p,
-    is_causal,
-    philox_seed,
-    philox_offset,
+    grad_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    logsumexp: torch.Tensor,
+    cum_seq_q: torch.Tensor | None,
+    cum_seq_k: torch.Tensor | None,
+    max_q: object,
+    max_k: object,
+    dropout_p: float,
+    is_causal: bool,
+    philox_seed: torch.Tensor,
+    philox_offset: torch.Tensor,
     *,
-    scale=None,
-):
+    scale: float | None = None,
+) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Dense lower-op autograd bridge for the vendored bf16/f16 FA4 kernel.
 
     Deliberately omits ``allow_any_seqlen=True``: this is the actual bwd
@@ -7856,7 +8421,7 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
         recomputed = fast_fa4_16bit_d64_causal_forward(
             q, k, v, None, 0.0, True, scale, False
         )
-        if recomputed is NOT_HANDLED:
+        if not isinstance(recomputed, tuple):
             return NOT_HANDLED
         recomputed_output, recomputed_lse, _, _, _ = recomputed
         output = recomputed_output
@@ -7885,24 +8450,36 @@ def fast_aten__scaled_dot_product_flash_attention_backward(
 
 
 def fast_aten__scaled_dot_product_efficient_attention(
-    query,
-    key,
-    value,
-    attn_bias,
-    compute_log_sumexp,
-    dropout_p=0.0,
-    is_causal=False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor | None,
+    compute_log_sumexp: bool,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
     *,
-    scale=None,
+    scale: float | None = None,
+) -> (
+    tuple[
+        TorchMojoTensor,
+        TorchMojoTensor | None,
+        TorchMojoTensor | None,
+        TorchMojoTensor | None,
+    ]
+    | _NotHandled
 ):
     if dropout_p != 0.0 or attn_bias is not None:
         return NOT_HANDLED
     out = fast_aten_scaled_dot_product_attention(
         query, key, value, None, 0.0, is_causal, scale, False
     )
-    if out is NOT_HANDLED:
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if isinstance(out, _NotHandled):
         return NOT_HANDLED
     q = _t(query)
+    # The SDPA call above succeeded, so query is a mojo tensor.
+    assert q is not None
     b, h, sq, _ = q._shape
     dev = q._device
     lse_len = sq if compute_log_sumexp else 0
@@ -7920,7 +8497,7 @@ def fast_sdpa_dropout_softmax_backward(
     score_scale: object,
     is_causal: bool = False,
     query_length: int = 0,
-) -> object:
+) -> TorchMojoTensor | _NotHandled:
     """Fuse SDPA dropout backward, softmax backward, and score scaling.
 
     The helper owns public-tensor validation, ordinary output allocation, and
@@ -7960,7 +8537,7 @@ def fast_sdpa_dropout_softmax_backward(
         return NOT_HANDLED
 
     has_mask = mask is not None
-    if has_mask and (
+    if mask is not None and (
         mask._device != probs._device
         or mask._dtype != DType.bool
         or tuple(mask._shape) != tuple(probs._shape)
@@ -7979,13 +8556,19 @@ def fast_sdpa_dropout_softmax_backward(
     # In the no-dropout path the scale is semantically dead.  Canonicalizing
     # it also keeps nonnumeric or nonfinite caller metadata away from the raw
     # Float64 bridge without rejecting an otherwise valid operation.
-    bridge_dropout_scale = float(dropout_scale) if has_mask else 1.0
+    bridge_dropout_scale = (
+        float(dropout_scale)
+        if mask is not None and isinstance(dropout_scale, int | float)
+        else 1.0
+    )
     bridge_score_scale = float(score_scale)
 
     probs = _tc(probs)
     grad = _tc(grad)
-    if has_mask:
+    assert probs is not None and grad is not None
+    if mask is not None:
         mask = _tc(mask)
+        assert mask is not None
     out = _alloc(probs._shape, probs._dtype, probs._device)
     if out._numel == 0:
         return out
@@ -7999,7 +8582,7 @@ def fast_sdpa_dropout_softmax_backward(
             out._ptr,
             probs._ptr,
             grad._ptr,
-            mask._ptr if has_mask else 0,
+            mask._ptr if mask is not None else 0,
             rows,
             cols,
             int(query_length) if is_causal else 0,
@@ -8010,7 +8593,8 @@ def fast_sdpa_dropout_softmax_backward(
             probs._dtype.value,
             _ctx_ptr(probs._device),
         ),
-        arg_dtypes=(probs._dtype, grad._dtype) + ((mask._dtype,) if has_mask else ()),
+        arg_dtypes=(probs._dtype, grad._dtype)
+        + ((mask._dtype,) if mask is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
         keepalive=(out, probs, grad, mask),
@@ -8072,7 +8656,7 @@ def fast_sdpa_backward(
     ):
         return NOT_HANDLED
     has_mask = mask is not None
-    if has_mask and (
+    if mask is not None and (
         mask._device != probs._device
         or mask._dtype != DType.bool
         or tuple(mask._shape) != tuple(probs._shape)
@@ -8117,12 +8701,18 @@ def fast_sdpa_backward(
     if not _sdpa_backward_bridge_available():
         return NOT_HANDLED
 
-    bridge_dropout_scale = float(dropout_scale) if has_mask else 1.0
+    bridge_dropout_scale = (
+        float(dropout_scale)
+        if mask is not None and isinstance(dropout_scale, int | float)
+        else 1.0
+    )
     causal = 1 if is_causal else 0
     probs = _tc(probs)
     grad = _tc(grad)
-    if has_mask:
+    assert probs is not None and grad is not None
+    if mask is not None:
         mask = _tc(mask)
+        assert mask is not None
     device = probs._device
     ctx = _ctx_ptr(device)
     dt = DType.float32.value
@@ -8137,13 +8727,13 @@ def fast_sdpa_backward(
                 grad_value._ptr,
                 probs._ptr,
                 grad._ptr,
-                mask._ptr if has_mask else 0,
+                mask._ptr if mask is not None else 0,
                 (batch_heads, kv_len, head_dim, q_len, int(has_mask), causal),
                 bridge_dropout_scale,
                 ctx,
             ),
             arg_dtypes=(probs._dtype, grad._dtype)
-            + ((mask._dtype,) if has_mask else ()),
+            + ((mask._dtype,) if mask is not None else ()),
             output_dtypes=(grad_value._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
             keepalive=(grad_value, probs, grad, mask),
@@ -8153,6 +8743,7 @@ def fast_sdpa_backward(
     grad_key = None
     if need_query or need_key:
         v = _tc(_t(value))
+        assert v is not None
         grad_probs = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
         if causal:
             _call_mojo(
@@ -8197,7 +8788,7 @@ def fast_sdpa_backward(
                 grad_scores._ptr,
                 probs._ptr,
                 grad_probs._ptr,
-                mask._ptr if has_mask else 0,
+                mask._ptr if mask is not None else 0,
                 batch_heads * q_len,
                 kv_len,
                 int(has_mask),
@@ -8208,7 +8799,7 @@ def fast_sdpa_backward(
                 ctx,
             ),
             arg_dtypes=(probs._dtype, grad_probs._dtype)
-            + ((mask._dtype,) if has_mask else ()),
+            + ((mask._dtype,) if mask is not None else ()),
             output_dtypes=(grad_scores._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
             keepalive=(grad_scores, probs, grad_probs, mask),
@@ -8216,6 +8807,7 @@ def fast_sdpa_backward(
         del grad_probs
         if need_query:
             k = _tc(_t(key))
+            assert k is not None
             grad_query = _alloc(q3_shape, DType.float32, device)
             if causal:
                 _call_mojo(
@@ -8254,6 +8846,7 @@ def fast_sdpa_backward(
             del k
         if need_key:
             q = _tc(_t(query))
+            assert q is not None
             grad_key = _alloc(kv3_shape, DType.float32, device)
             _call_mojo(
                 _SdpaBackwardExtension,
@@ -8283,7 +8876,7 @@ def fast_sdpa_backward(
 # ---------------------------------------------------------------------------
 
 
-def _tf32_dense_2d_layout(tensor: MojoTensorLike) -> bool | None:
+def _tf32_dense_2d_layout(tensor: _SpecTensor) -> bool | None:
     """Return the physical-transpose flag for an exact dense 2-D layout."""
     if len(tensor._shape) != 2:
         return None
@@ -8296,7 +8889,7 @@ def _tf32_dense_2d_layout(tensor: MojoTensorLike) -> bool | None:
     return None
 
 
-def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | None:
+def _tf32_dense_batched_layout(tensor: _SpecTensor) -> tuple[bool, int] | None:
     """Classify dense matrices separated by a non-overlapping batch stride, or
     a broadcast operand (batch stride 0 -- one dense matrix shared by every
     batch item, as `expand()` or a stride-0 `unsqueeze` produces, e.g. conv's
@@ -8334,7 +8927,9 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     return physical_transpose, batch_stride
 
 
-def _gemm16_alignment_favors_split(a, b, *, transpose_b: bool = False) -> bool:
+def _gemm16_alignment_favors_split(
+    a: torch.Tensor, b: torch.Tensor, *, transpose_b: bool = False
+) -> bool:
     """Conservative pre-check: could gemm16 possibly route this shape through
     a v3/v4 tensor-core route (aligned or split-K), regardless of bias?
 
@@ -8368,7 +8963,14 @@ def _gemm16_alignment_favors_split(a, b, *, transpose_b: bool = False) -> bool:
     return m % 64 == 0 and n % 64 == 0 and k % 64 == 0
 
 
-def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
+def _try_gemm16_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    transpose_b: bool = False,
+    output_shape: tuple[int, ...] | None = None,
+) -> TorchMojoTensor | None:
     """Enqueue the dense H100 16-bit tensor-core GEMM, or return ``None``.
 
     The bridge consumes and produces the operand dtype (bfloat16 or float16;
@@ -8449,7 +9051,14 @@ def _try_gemm16_mm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     return out
 
 
-def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
+def _try_tf32_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    transpose_b: bool = False,
+    output_shape: tuple[int, ...] | None = None,
+) -> TorchMojoTensor | None:
     """Enqueue the opt-in dense H100 TF32 GEMM, or return ``None``.
 
     This helper owns only host validation/allocation and the raw bridge call;
@@ -8533,7 +9142,9 @@ def _try_tf32_gemm(a, b, bias=None, *, transpose_b=False, output_shape=None):
     return out
 
 
-def _try_gemm16_bmm(a, b, *, transpose_b=False):
+def _try_gemm16_bmm(
+    a: torch.Tensor, b: torch.Tensor, *, transpose_b: bool = False
+) -> TorchMojoTensor | None:
     """Enqueue the dense H100 16-bit tensor-core BMM over packed or padded
     batches, or return ``None`` (dtypes: ``_GEMM16_DTYPES``)."""
     lhs = _t(a)
@@ -8593,7 +9204,9 @@ def _try_gemm16_bmm(a, b, *, transpose_b=False):
     return out
 
 
-def _try_tf32_bmm(a, b, *, transpose_b=False):
+def _try_tf32_bmm(
+    a: torch.Tensor, b: torch.Tensor, *, transpose_b: bool = False
+) -> TorchMojoTensor | None:
     """Enqueue the dormant dense H100 TF32 BMM, or return ``None``.
 
     This bias-free ABI accepts packed or independently padded batches of
@@ -8660,7 +9273,9 @@ def _try_tf32_bmm(a, b, *, transpose_b=False):
     return out
 
 
-def _try_gemm16_linear(input, weight, bias=None):
+def _try_gemm16_linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> TorchMojoTensor | None:
     """Route a dense rank >= 2 16-bit projection through GEMM without copies.
 
     Every gemm16 tensor-core route (the v3/v4 warp-specialized, TMA, and
@@ -8706,7 +9321,7 @@ def _try_gemm16_linear(input, weight, bias=None):
         )
         if mm_out is not None:
             biased = fast_aten_add(mm_out, bias)
-            if biased is not NOT_HANDLED:
+            if isinstance(biased, TorchMojoTensor):
                 return biased
     # Either the shape can never reach a fast route regardless of bias (see
     # _gemm16_alignment_favors_split), or the fast add declined for this
@@ -8717,7 +9332,9 @@ def _try_gemm16_linear(input, weight, bias=None):
     )
 
 
-def _try_tf32_linear(input, weight, bias=None):
+def _try_tf32_linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> TorchMojoTensor | None:
     """Route a dense rank >= 2 linear projection through TF32 without copies.
 
     The TF32 GEMM ABI is two-dimensional.  A contiguous higher-rank linear
@@ -8755,7 +9372,7 @@ def _try_tf32_linear(input, weight, bias=None):
     )
 
 
-def fast_aten_mm(x, y):
+def fast_aten_mm(x: torch.Tensor, y: torch.Tensor) -> TorchMojoTensor | _NotHandled:
     out = _try_gemm16_mm(x, y)
     if out is not None:
         return out
@@ -8766,7 +9383,14 @@ def fast_aten_mm(x, y):
     return out if out is not None else NOT_HANDLED
 
 
-def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
+def fast_aten_addmm(
+    input: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    *,
+    beta: AtenScalar = 1.0,
+    alpha: AtenScalar = 1.0,
+) -> TorchMojoTensor | _NotHandled:
     # beta/alpha scaling isn't implemented by the fast path (falls through).
     if beta == 1 and alpha == 1:
         # See _try_gemm16_linear: every gemm16 tensor-core route declines
@@ -8797,7 +9421,9 @@ def fast_aten_addmm(input, mat1, mat2, *, beta=1.0, alpha=1.0):
     return NOT_HANDLED
 
 
-def fast_aten_linear(input, weight, bias=None):
+def fast_aten_linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> TorchMojoTensor | _NotHandled:
     # Keep linear as a concrete backend op alongside fast_aten_linear_backward.
     # The GEMM kernel reads B transposed for free, so the weight is never
     # materialized in transposed layout.
@@ -8846,18 +9472,29 @@ def fast_aten_linear(input, weight, bias=None):
     if vector._shape[0] == 0:
         if vector_bias is not None:
             return fast_aten_clone(vector_bias)
-        return fast_filled((output_features,), 0.0, vector._dtype, vector._device)
+        filled = fast_filled((output_features,), 0.0, vector._dtype, vector._device)
+        return filled if filled is not None else NOT_HANDLED
 
-    matrix = fast_aten_view(_tc(vector), (1, vector._shape[0]))
-    if matrix is NOT_HANDLED:
+    contiguous_vector = _tc(vector)
+    assert contiguous_vector is not None
+    matrix = fast_aten_view(contiguous_vector, (1, vector._shape[0]))
+    if not isinstance(matrix, TorchMojoTensor):
         return NOT_HANDLED
     out = fast_aten_linear(matrix, weight, bias)
-    if out is NOT_HANDLED:
+    if not isinstance(out, TorchMojoTensor):
         return NOT_HANDLED
     return fast_aten_view(out, (out._shape[-1],))
 
 
-def fast_aten_linear_backward(self, grad_output, weight, output_mask):
+def fast_aten_linear_backward(
+    self: torch.Tensor,
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    output_mask: Sequence[bool],
+) -> (
+    tuple[TorchMojoTensor | None, TorchMojoTensor | None, TorchMojoTensor | None]
+    | _NotHandled
+):
     input = _t(self)
     grad = _t(grad_output)
     matrix_weight = _t(weight)
@@ -8890,7 +9527,7 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
     # allocation; requesting bias also requires the weight-gradient GEMM.
     need_parameter_grads = mask[1] or mask[2]
 
-    def zeros(shape):
+    def zeros(shape: tuple[int, ...]) -> TorchMojoTensor | None:
         if math.prod(shape) == 0:
             return _alloc(shape, input._dtype, input._device)
         return fast_filled(shape, 0.0, input._dtype, input._device)
@@ -8908,9 +9545,10 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
             else None,
         )
 
-    grad = _tc(grad)
-    grad_matrix = fast_aten_view(grad, (rows, output_features))
-    if grad_matrix is NOT_HANDLED:
+    contiguous_grad = _tc(grad)
+    assert contiguous_grad is not None
+    grad_matrix = fast_aten_view(contiguous_grad, (rows, output_features))
+    if not isinstance(grad_matrix, TorchMojoTensor):
         return NOT_HANDLED
 
     grad_input = None
@@ -8918,11 +9556,11 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
         if input_features == 0:
             grad_input = _alloc(input._shape, input._dtype, input._device)
         else:
-            grad_input = fast_aten_mm(grad_matrix, matrix_weight)
-            if grad_input is NOT_HANDLED:
+            mm_result = fast_aten_mm(grad_matrix, matrix_weight)
+            if not isinstance(mm_result, TorchMojoTensor):
                 return NOT_HANDLED
-            grad_input = fast_aten_view(grad_input, input._shape)
-            if grad_input is NOT_HANDLED:
+            grad_input = fast_aten_view(mm_result, input._shape)
+            if not isinstance(grad_input, TorchMojoTensor):
                 return NOT_HANDLED
 
     grad_weight = None
@@ -8930,21 +9568,23 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
         if input_features == 0:
             grad_weight = _alloc(matrix_weight._shape, input._dtype, input._device)
         else:
-            input_matrix = fast_aten_view(_tc(input), (rows, input_features))
-            if input_matrix is NOT_HANDLED:
+            contiguous_input = _tc(input)
+            assert contiguous_input is not None
+            input_matrix = fast_aten_view(contiguous_input, (rows, input_features))
+            if not isinstance(input_matrix, TorchMojoTensor):
                 return NOT_HANDLED
             grad_transposed = fast_aten_transpose(grad_matrix, 0, 1)
-            if grad_transposed is NOT_HANDLED:
+            if not isinstance(grad_transposed, TorchMojoTensor):
                 return NOT_HANDLED
             grad_weight = fast_aten_mm(grad_transposed, input_matrix)
-            if grad_weight is NOT_HANDLED:
+            if not isinstance(grad_weight, TorchMojoTensor):
                 return NOT_HANDLED
 
     grad_bias = None
     if need_parameter_grads:
         if mask[2]:
             grad_bias = fast_aten_sum(grad_matrix, dim=[0], keepdim=False)
-            if grad_bias is NOT_HANDLED:
+            if not isinstance(grad_bias, TorchMojoTensor):
                 return NOT_HANDLED
         else:
             grad_bias = _alloc((output_features,), input._dtype, input._device)
@@ -8952,7 +9592,9 @@ def fast_aten_linear_backward(self, grad_output, weight, output_mask):
     return grad_input, grad_weight, grad_bias
 
 
-def fast_aten_bmm(input, mat2):
+def fast_aten_bmm(
+    input: torch.Tensor, mat2: torch.Tensor
+) -> TorchMojoTensor | _NotHandled:
     out = _try_gemm16_bmm(input, mat2)
     if out is not None:
         return out
@@ -8963,7 +9605,9 @@ def fast_aten_bmm(input, mat2):
     return out if out is not None else NOT_HANDLED
 
 
-def _fast_aten_bmm_transpose_b(input, mat2):
+def _fast_aten_bmm_transpose_b(
+    input: torch.Tensor, mat2: torch.Tensor
+) -> TorchMojoTensor | _NotHandled:
     """Batched ``input @ mat2.transpose(-2, -1)`` without a transpose copy.
 
     This is an internal eager-autograd helper rather than an ATen registration:
@@ -8989,8 +9633,16 @@ def _fast_aten_bmm_transpose_b(input, mat2):
 
 
 def fast_aten_convolution(
-    input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
-):
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: object,
+) -> TorchMojoTensor | _NotHandled:
     a = _tc(input)
     w = _tc(weight)
     bias_t = _tc(bias) if bias is not None else None
@@ -9008,7 +9660,9 @@ def fast_aten_convolution(
         and len(w._shape) == 4
         and isinstance(groups, int)
         and groups >= 1
-        and None not in (strides, pads, dils)
+        and strides is not None
+        and pads is not None
+        and dils is not None
         and 0 not in a._shape
     ):
         n, c, in_h, in_w = a._shape
@@ -9145,15 +9799,15 @@ def fast_aten_convolution(
 
 
 def fast_aten_scaled_dot_product_attention(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
-):
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> TorchMojoTensor | _NotHandled:
     if attn_mask is not None:
         # None of the fused attention kernels take a mask operand, so a masked
         # call goes straight to the decomposed masked forward.
@@ -9162,7 +9816,7 @@ def fast_aten_scaled_dot_product_attention(
         result = _sdpa_masked_math_forward(
             query, key, value, attn_mask, is_causal, scale
         )
-        if result is NOT_HANDLED:
+        if not isinstance(result, tuple):
             return NOT_HANDLED
         out, _ = result
         return out
@@ -9170,7 +9824,7 @@ def fast_aten_scaled_dot_product_attention(
     fa4_result = fast_fa4_16bit_d64_causal_forward(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
-    if fa4_result is not NOT_HANDLED:
+    if isinstance(fa4_result, tuple):
         output, logsumexp, q_native, k_native, v_native = fa4_result
         del logsumexp, q_native, k_native, v_native
         return output
@@ -9178,7 +9832,7 @@ def fast_aten_scaled_dot_product_attention(
     fused = fast_fused_flash_attention_forward(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
-    if fused is not NOT_HANDLED:
+    if isinstance(fused, tuple):
         output, lse, q_used, k_used, v_used = fused
         del lse, q_used, k_used, v_used
         return output
@@ -9249,7 +9903,7 @@ def fast_aten_scaled_dot_product_attention(
         result = _sdpa_math_forward_with_dropout(
             q, k, v, is_causal, scale, float(dropout_p)
         )
-        if result is NOT_HANDLED:
+        if not isinstance(result, tuple):
             return NOT_HANDLED
         out, _, _ = result
         return out
@@ -9262,7 +9916,9 @@ def fast_aten_scaled_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 
-def fast_aten__softmax(input, dim, half_to_float=False):
+def fast_aten__softmax(
+    input: torch.Tensor, dim: object, half_to_float: bool = False
+) -> TorchMojoTensor | _NotHandled:
     t = _t(input)
     if (
         t is None
@@ -9278,22 +9934,27 @@ def fast_aten__softmax(input, dim, half_to_float=False):
         t = _cast_tensor(t, DType.float32)
     rank = len(t._shape)
     if rank == 0:
-        return fast_filled((), 1.0, t._dtype, t._device)
+        filled = fast_filled((), 1.0, t._dtype, t._device)
+        return filled if filled is not None else NOT_HANDLED
     dim %= rank
     if dim != rank - 1:
         # softmax(x, d) = softmax(x.transpose(d, -1), -1).transpose(d, -1);
         # both transposes are zero-copy, the inner one materializes once.
         # (t is already fp32 here if half_to_float was set, so pass False.)
         swapped = fast_aten_transpose(t, dim, rank - 1)
+        if not isinstance(swapped, TorchMojoTensor):
+            return NOT_HANDLED
         result = fast_aten__softmax(swapped, rank - 1, False)
-        if result is NOT_HANDLED:
+        if not isinstance(result, TorchMojoTensor):
             return NOT_HANDLED
         return fast_aten_transpose(result, dim, rank - 1)
     result = _try_spec_unary("SoftmaxSpec", t, module_name="nn_ops")
     return result if result is not None else NOT_HANDLED
 
 
-def fast_aten_softmax(input, dim=-1, dtype=None):
+def fast_aten_softmax(
+    input: torch.Tensor, dim: object = -1, dtype: torch.dtype | None = None
+) -> TorchMojoTensor | _NotHandled:
     if dtype is not None:
         return NOT_HANDLED
     return fast_aten__softmax(input, dim, False)
@@ -9305,8 +9966,12 @@ def fast_aten_softmax(input, dim=-1, dtype=None):
 
 
 def fast_aten_embedding(
-    input, weight, padding_idx=-1, scale_grad_by_freq=False, sparse=False
-):
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    padding_idx: int = -1,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> TorchMojoTensor | _NotHandled:
     # `input` is the weight table, `weight` the indices (aten naming).
     table = _t(input)
     idx = _t(weight)
@@ -9325,6 +9990,7 @@ def fast_aten_embedding(
     # table's context.
     table = _tc(table)
     idx = _tc(idx)
+    assert table is not None and idx is not None
     row_len = table._shape[1]
     out_shape = tuple(idx._shape) + (row_len,)
     out = _alloc(out_shape, table._dtype, table._device)
@@ -9350,8 +10016,12 @@ def fast_aten_embedding(
 
 
 def fast_aten_embedding_dense_backward(
-    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
-):
+    grad_output: torch.Tensor,
+    indices: torch.Tensor,
+    num_weights: object,
+    padding_idx: object,
+    scale_grad_by_freq: bool,
+) -> TorchMojoTensor | _NotHandled:
     """FP32/int64 GPU embedding backward through the Fable-owned kernel."""
     grad = _t(grad_output)
     idx = _t(indices)
@@ -9388,6 +10058,7 @@ def fast_aten_embedding_dense_backward(
 
     grad = _tc(grad)
     idx = _tc(idx)
+    assert grad is not None and idx is not None
     grad_weight = _alloc((num_weights, embedding_dim), DType.float32, grad._device)
     if grad_weight._numel > 0:
         # This call includes complete output zeroing and accumulation, stays on
@@ -9419,7 +10090,9 @@ def fast_aten_embedding_dense_backward(
 # ---------------------------------------------------------------------------
 
 
-def fast_filled(shape, value, dtype: DType, device):
+def fast_filled(
+    shape: Sequence[int], value: object, dtype: DType, device: Device
+) -> TorchMojoTensor | None:
     """A TorchMojoTensor of `shape` filled with `value`, or None."""
     if isinstance(value, bool):
         value = int(value)
@@ -9442,7 +10115,9 @@ def fast_filled(shape, value, dtype: DType, device):
 _ARANGE_DTYPES = _FILL_DTYPES[:-1]
 
 
-def fast_arange(numel, start, step, dtype: DType, device):
+def fast_arange(
+    numel: int, start: float, step: float, dtype: DType, device: Device
+) -> TorchMojoTensor | None:
     """A 1-D TorchMojoTensor holding start + i*step (device kernel), or None.
 
     The caller resolves torch's arange semantics (numel, dtype). Inputs arrive
@@ -9471,17 +10146,15 @@ def fast_arange(numel, start, step, dtype: DType, device):
 # ---------------------------------------------------------------------------
 
 
-def fast_aten__local_scalar_dense(tensor):
+def fast_aten__local_scalar_dense(tensor: torch.Tensor) -> object:
     t = _t(tensor)
     if t is None or t._numel != 1:
         return NOT_HANDLED
     _call_queue.drain()  # host read: queued launches must land first
-    return eager_kernels.tensor_holder.read_scalar(
-        _ctx_ptr(t._device), t._ptr, t._dtype.value
-    )
+    return _tensor_holder().read_scalar(_ctx_ptr(t._device), t._ptr, t._dtype.value)
 
 
-def _instrument_call_counts():
+def _instrument_call_counts() -> None:
     """Give every fast op a test-only call counter, mirroring what
     `aten_functions.map_to` does, so `CallChecker` can assert that an op
     was handled by either implementation."""
@@ -9491,14 +10164,17 @@ def _instrument_call_counts():
         if not name.startswith("fast_aten"):
             continue
 
-        def make_wrapper(wrapped):
-            @functools.wraps(wrapped)
-            def wrapper(*args, **kwargs):
-                wrapper.call_count += 1
+        def make_wrapper(wrapped: Callable[..., object]) -> CountedCallable:
+            def wrapper(*args: object, **kwargs: object) -> object:
+                result.call_count += 1
                 return wrapped(*args, **kwargs)
 
-            wrapper.call_count = 0
-            return wrapper
+            # functools.wraps's stub can't carry the extra call_count
+            # attribute; update_wrapper does the same __name__/__doc__ copy.
+            functools.update_wrapper(wrapper, wrapped)
+            result = cast(CountedCallable, wrapper)
+            result.call_count = 0
+            return result
 
         globals()[name] = make_wrapper(func)
 

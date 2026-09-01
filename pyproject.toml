@@ -14,7 +14,6 @@ dependencies = [
     "max==26.5",
     "tabulate",
     "torch>=2.10",
-    "beartype>=0.17.0",
 ]
 
 [project.urls]
@@ -27,13 +26,60 @@ packages = ["torch_mojo_backend"]
 
 [tool.ruff]
 target-version = "py311"
+# Untracked scratch clone of unrelated third-party repos (dicp/dipu), not
+# part of this project.
+extend-exclude = ["deeplink"]
 
 [tool.ruff.lint]
 select = [
-    "F",  # pyflakes (includes unused imports)
-    "UP", # pyupgrade
+    "F",   # pyflakes (includes unused imports)
+    "UP",  # pyupgrade
+    "ANN", # flake8-annotations: every function needs type hints (ty then checks them)
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# ty infers unannotated params/returns as Unknown and never flags their misuse,
+# so ANN is what actually forces a hint to exist; tests/ predates that (~5k
+# gaps, mostly pytest fixture params) and current_bench/ is ad hoc GPU
+# profiling scratch, not shipped code -- both excluded, same as in [tool.ty].
+"tests/**" = ["ANN"]
+"current_bench/**" = ["ANN"]
+
+[tool.ty.environment]
+# Pins the venv explicitly: on boxes with an active conda env, ty's
+# site-packages discovery prefers CONDA_PREFIX over sys.prefix and fails
+# outright ("Failed to discover the site-packages directory") when that
+# conda env doesn't look like a normal Python install. `uv run ty check`
+# already sidesteps this, but pin it so a bare `ty check` also works.
+python = ".venv"
+
+[tool.ty.rules]
+# Every occurrence (verified by hand, none blanket-assumed) is one of two
+# deliberate polymorphic-override points that nominal override-checking
+# cannot express: (1) MojoExtension's abstract methods are `*args/**kwargs`
+# placeholders precisely so each concrete descriptor (MojoFileExtension,
+# aten_fast.py's per-op extensions, ...) can declare its own independent
+# call ABI -- callers always go through the concrete subclass, never a
+# MojoExtension-typed reference, so this is runtime-duck-typed dispatch, not
+# a substitutability hole; (2) TorchMojoTensor's __torch_dispatch__,
+# __torch_function__, __repr__, __reduce_ex__ and the autograd Functions'
+# backward() are torch's own documented tensor-subclass/autograd extension
+# points, where every real subclass (including torch's own FakeTensor,
+# LoggingTensor, ...) intentionally uses its own signature. `ty check`
+# exits non-zero on warnings too (no `--exit-zero-on-warning` in CI), so
+# this must be "ignore", not "warn", to keep `ty check` green.
+invalid-method-override = "ignore"
+
+[tool.ty.src]
+exclude = [
+    # Untracked scratch clone of unrelated third-party repos (dicp/dipu), not
+    # part of this project.
+    "deeplink/",
+    # Ad hoc GPU profiling/comparison scratch from past kernel-optimization
+    # engagements, not shipped code; not held to the same typing bar as
+    # benchmarks/ or demo_scripts/.
+    "current_bench/",
+]
 
 [tool.uv]
 python-preference = "only-managed"
@@ -76,4 +122,5 @@ dev = [
     "pytest-random-order>=1.2.0",
     "setuptools>=80.9.0",
     "pydantic>=2.9",
+    "ty>=0.0.77",
 ]

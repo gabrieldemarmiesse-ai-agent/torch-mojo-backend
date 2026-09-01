@@ -3,12 +3,14 @@
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import mojo_device_autograd as autograd
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 
 def _device(*, arch: str = "sm_90a") -> SimpleNamespace:
@@ -42,6 +44,15 @@ def _tensor(
         _is_contiguous=contiguous,
         _holder=object(),
     )
+
+
+def _mt(tensor: SimpleNamespace | None) -> TorchMojoTensor:
+    """`_tensor()` fakes carry every payload attribute the Tensor-/
+    TorchMojoTensor-typed signatures under test read; SimpleNamespace isn't
+    nominally either, so cast at the call boundary. Also covers the rare
+    literal-``None`` call: `_fa4_bhsd_layout`/`_fa4_strided_bthd_layout`
+    check ``tensor is None`` at runtime despite their non-Optional hint."""
+    return cast(TorchMojoTensor, tensor)
 
 
 def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
@@ -80,7 +91,9 @@ def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
         }
         kwargs.update(overrides)
         assert (
-            aten_fast.fast_fa4_16bit_d64_causal_forward(query, key, value, **kwargs)
+            aten_fast.fast_fa4_16bit_d64_causal_forward(
+                _mt(query), _mt(key), _mt(value), **kwargs
+            )
             is aten_fast.NOT_HANDLED
         )
 
@@ -91,10 +104,13 @@ def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
-    public = [
+    # A fixed 3-tuple (not a list/tuple(generator)) so *public below unpacks
+    # to a fixed arity instead of tuple[SimpleNamespace, ...].
+    q_pub, k_pub, v_pub = (
         _tensor(name, shape=(3, 12, 256, 64), device=device, ptr=ptr)
         for name, ptr in zip(("q", "k", "v"), (10, 20, 30), strict=True)
-    ]
+    )
+    public = (q_pub, k_pub, v_pub)
     native = {
         tensor.name: _tensor(
             f"{tensor.name}_native",
@@ -142,8 +158,9 @@ def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
     )
 
     result = aten_fast.fast_fa4_16bit_d64_causal_forward(
-        *public, is_causal=True, scale=0.125
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), is_causal=True, scale=0.125
     )
+    assert isinstance(result, tuple)
     output, logsumexp, q_native, k_native, v_native = result
 
     assert output._shape == (3, 12, 256, 64)
@@ -180,7 +197,9 @@ def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
-    public = [
+    # A fixed 3-tuple (not a list/tuple(generator)) so *public below unpacks
+    # to a fixed arity instead of tuple[SimpleNamespace, ...].
+    q_pub, k_pub, v_pub = (
         _tensor(
             name,
             shape=(3, 12, 256, 64),
@@ -189,7 +208,8 @@ def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
             dtype=aten_fast.DType.float16,
         )
         for name, ptr in zip(("q", "k", "v"), (10, 20, 30), strict=True)
-    ]
+    )
+    public = (q_pub, k_pub, v_pub)
     native = {
         tensor.name: _tensor(
             f"{tensor.name}_native",
@@ -242,8 +262,9 @@ def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
     )
 
     result = aten_fast.fast_fa4_16bit_d64_causal_forward(
-        *public, is_causal=True, scale=0.125
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), is_causal=True, scale=0.125
     )
+    assert isinstance(result, tuple)
     output, logsumexp, q_native, k_native, v_native = result
 
     assert output._shape == (3, 12, 256, 64)
@@ -278,7 +299,9 @@ def test_fa4_rejects_mixed_bf16_f16_inputs(monkeypatch: pytest.MonkeyPatch) -> N
     k = _tensor("k", dtype=aten_fast.DType.float16, device=device)
     v = _tensor("v", dtype=aten_fast.DType.bfloat16, device=device)
     assert (
-        aten_fast._fa4_16bit_d64_causal_inputs(q, k, v, None, 0.0, True, None, False)
+        aten_fast._fa4_16bit_d64_causal_inputs(
+            _mt(q), _mt(k), _mt(v), None, 0.0, True, None, False
+        )
         is None
     )
 
@@ -290,7 +313,7 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
     eligible = _tensor(
         "q_native", shape=shape, ptr=0x1000, strides=strides, contiguous=False
     )
-    assert aten_fast._fa4_strided_bthd_layout(eligible)
+    assert aten_fast._fa4_strided_bthd_layout(_mt(eligible))
     # f16 is the same 2-byte width as bf16, so the same layout is eligible.
     eligible_f16 = _tensor(
         "q_native_f16",
@@ -300,7 +323,7 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
         contiguous=False,
         dtype=aten_fast.DType.float16,
     )
-    assert aten_fast._fa4_strided_bthd_layout(eligible_f16)
+    assert aten_fast._fa4_strided_bthd_layout(_mt(eligible_f16))
 
     invalid = []
     for updates in (
@@ -318,7 +341,9 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
         for name, value in updates.items():
             setattr(candidate, name, value)
         invalid.append(candidate)
-    assert not any(aten_fast._fa4_strided_bthd_layout(tensor) for tensor in invalid)
+    assert not any(
+        aten_fast._fa4_strided_bthd_layout(_mt(tensor)) for tensor in invalid
+    )
 
 
 def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
@@ -332,7 +357,7 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     batch_stride = seqlen * token_stride
     public_strides = (batch_stride, head_dim, token_stride, 1)
     pointers = (0x1000, 0x1600, 0x1C00)
-    public = tuple(
+    q_pub, k_pub, v_pub = (
         _tensor(
             name,
             shape=(batch, heads, seqlen, head_dim),
@@ -391,11 +416,11 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
         ),
     )
 
-    output, logsumexp, q_native, k_native, v_native = (
-        aten_fast.fast_fa4_16bit_d64_causal_forward(
-            *public, is_causal=True, scale=0.125
-        )
+    result = aten_fast.fast_fa4_16bit_d64_causal_forward(
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), is_causal=True, scale=0.125
     )
+    assert isinstance(result, tuple)
+    output, logsumexp, q_native, k_native, v_native = result
 
     physical_strides = (batch_stride, token_stride, head_dim, 1)
     assert output._shape == (batch, heads, seqlen, head_dim)
@@ -439,7 +464,7 @@ def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
     device = _device()
     # +2 bytes (one bf16/f16 element) off a 16-byte-aligned address: still
     # fully contiguous, but ptr % 16 != 0.
-    public = tuple(
+    q_pub, k_pub, v_pub = (
         _tensor(name, shape=(2, 12, 256, 64), device=device, ptr=ptr)
         for name, ptr in zip("qkv", (0x1002, 0x2002, 0x3002), strict=True)
     )
@@ -500,7 +525,7 @@ def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
     )
 
     result = aten_fast.fast_fa4_16bit_d64_causal_forward(
-        *public, is_causal=True, scale=0.125
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), is_causal=True, scale=0.125
     )
 
     assert result is not aten_fast.NOT_HANDLED
@@ -519,10 +544,13 @@ def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
-    public = tuple(
+    # A fixed 3-tuple (not tuple(generator)) so *public below unpacks to a
+    # fixed arity instead of tuple[SimpleNamespace, ...].
+    q_pub, k_pub, v_pub = (
         _tensor(name, shape=(3, 12, 256, 64), device=device, ptr=ptr)
         for name, ptr in zip("qkv", (0x1000, 0x2000, 0x3000), strict=True)
     )
+    public = (q_pub, k_pub, v_pub)
     allocations = []
     bridge_calls = []
 
@@ -561,8 +589,9 @@ def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_
     )
 
     result = aten_fast.fast_fa4_16bit_d64_causal_forward(
-        *public, is_causal=True, scale=0.125
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), is_causal=True, scale=0.125
     )
+    assert isinstance(result, tuple)
     output, logsumexp, q_native, k_native, v_native = result
 
     assert output is allocations[0]
@@ -587,22 +616,22 @@ def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_
 
 def test_fa4_bhsd_layout_requires_contiguity_and_16_byte_alignment() -> None:
     base = _tensor("q", shape=(3, 12, 256, 64), ptr=0x1000)
-    assert aten_fast._fa4_bhsd_layout(base)
+    assert aten_fast._fa4_bhsd_layout(_mt(base))
 
     misaligned = SimpleNamespace(**vars(base))
     misaligned._ptr = base._ptr + 2
-    assert not aten_fast._fa4_bhsd_layout(misaligned)
+    assert not aten_fast._fa4_bhsd_layout(_mt(misaligned))
 
     non_contiguous = SimpleNamespace(**vars(base))
     non_contiguous._is_contiguous = False
-    assert not aten_fast._fa4_bhsd_layout(non_contiguous)
+    assert not aten_fast._fa4_bhsd_layout(_mt(non_contiguous))
 
     wrong_dtype = SimpleNamespace(**vars(base))
     wrong_dtype._dtype = aten_fast.DType.float32
     wrong_dtype._itemsize = 4
-    assert not aten_fast._fa4_bhsd_layout(wrong_dtype)
+    assert not aten_fast._fa4_bhsd_layout(_mt(wrong_dtype))
 
-    assert not aten_fast._fa4_bhsd_layout(None)
+    assert not aten_fast._fa4_bhsd_layout(_mt(None))
 
 
 def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
@@ -639,8 +668,9 @@ def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
     monkeypatch.setattr(aten_fast, "_alloc", alloc)
 
     result = aten_fast.fast_aten__scaled_dot_product_flash_attention(
-        query, key, value, dropout_p=0.0, is_causal=True
+        _mt(query), _mt(key), _mt(value), dropout_p=0.0, is_causal=True
     )
+    assert isinstance(result, tuple)
 
     assert result[:6] == (output, logsumexp, None, None, 256, 256)
     assert result[6]._dtype == aten_fast.DType.uint64
@@ -653,7 +683,12 @@ def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
     ]
     assert (
         aten_fast.fast_aten__scaled_dot_product_flash_attention(
-            query, key, value, dropout_p=0.0, is_causal=True, return_debug_mask=True
+            _mt(query),
+            _mt(key),
+            _mt(value),
+            dropout_p=0.0,
+            is_causal=True,
+            return_debug_mask=True,
         )
         is aten_fast.NOT_HANDLED
     )
@@ -714,20 +749,23 @@ def test_direct_flash_backward_materializes_strided_logsumexp(
     )
 
     result = aten_fast.fast_aten__scaled_dot_product_flash_attention_backward(
-        grad,
-        query,
-        key,
-        value,
-        output,
-        lse,
+        _mt(grad),
+        _mt(query),
+        _mt(key),
+        _mt(value),
+        _mt(output),
+        _mt(lse),
         None,
         None,
         128,
         128,
         0.0,
         True,
-        None,
-        None,
+        # Dropout is 0.0, so philox_seed/philox_offset are read but never
+        # dereferenced -- production accepts this despite the non-Optional
+        # hint (aten_fast.py:8414, `_ = philox_seed, philox_offset`).
+        cast(torch.Tensor, None),
+        cast(torch.Tensor, None),
         scale=0.125,
     )
 
@@ -808,20 +846,26 @@ def test_fa4_saved_variable_recompute_rederives_natives_independently(
     )
 
     result = aten_fast.fast_aten__scaled_dot_product_flash_attention_backward(
-        grad,
-        query,
-        key,
-        value,
-        None,  # out: unpacked as a bare tensor, triggers the recompute path
-        None,  # logsumexp: ditto
+        _mt(grad),
+        _mt(query),
+        _mt(key),
+        _mt(value),
+        # out/logsumexp: unpacked as a bare tensor, triggers the recompute
+        # path -- `_t(None) is None` once _t is monkeypatched to identity
+        # above, despite the non-Optional hint.
+        cast(torch.Tensor, None),
+        cast(torch.Tensor, None),
         None,
         None,
         128,
         128,
         0.0,
         True,
-        None,
-        None,
+        # Dropout is 0.0, so philox_seed/philox_offset are read but never
+        # dereferenced -- production accepts this despite the non-Optional
+        # hint (aten_fast.py:8414, `_ = philox_seed, philox_offset`).
+        cast(torch.Tensor, None),
+        cast(torch.Tensor, None),
         scale=0.125,
     )
 
@@ -901,8 +945,15 @@ def test_fa4_combined_backward_bridge_allocates_exact_scratch(
     )
 
     gradients = aten_fast.fast_fa4_16bit_d64_causal_backward(
-        q_native, k_native, v_native, output, logsumexp, grad_output, 0.125
+        _mt(q_native),
+        _mt(k_native),
+        _mt(v_native),
+        _mt(output),
+        _mt(logsumexp),
+        _mt(grad_output),
+        0.125,
     )
+    assert isinstance(gradients, tuple)
 
     assert [gradient._shape for gradient in gradients] == [(2, 4, 384, 64)] * 3
     assert [(item._shape, item._dtype) for item in allocations] == [
@@ -1029,8 +1080,15 @@ def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
     )
 
     gradients = aten_fast.fast_fa4_16bit_d64_causal_backward(
-        q_native, k_native, v_native, output, logsumexp, grad_output, 0.125
+        _mt(q_native),
+        _mt(k_native),
+        _mt(v_native),
+        _mt(output),
+        _mt(logsumexp),
+        _mt(grad_output),
+        0.125,
     )
+    assert isinstance(gradients, tuple)
 
     assert [gradient._shape for gradient in gradients] == [public_shape] * 3
     assert strided_calls == [
@@ -1070,7 +1128,12 @@ def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     physical BTHD copies are made inside the kernel bridge and are not what
     gets saved) and neither custom Function may be entered.
     """
-    public = tuple(_tensor(name, ptr=index) for index, name in enumerate("qkv", 1))
+    # A literal 3-tuple (not tuple(generator)) so *public below unpacks to a
+    # fixed arity instead of tuple[T, ...].
+    q_pub, k_pub, v_pub = (
+        _tensor(name, ptr=index) for index, name in enumerate("qkv", 1)
+    )
+    public = (q_pub, k_pub, v_pub)
     for tensor in public:
         tensor.requires_grad = True
     output = _tensor("output", ptr=200)
@@ -1097,7 +1160,7 @@ def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     monkeypatch.setattr(autograd._FusedFlashAttentionAutograd, "apply", forbidden)
 
     actual = autograd._scaled_dot_product_attention_autograd(
-        *public, None, 0.0, True, scale=0.125
+        _mt(q_pub), _mt(k_pub), _mt(v_pub), None, 0.0, True, scale=0.125
     )
 
     assert actual is output

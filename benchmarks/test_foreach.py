@@ -211,7 +211,13 @@ def test_fused_adamw(
     steps_ref = [s.to(hw.stock_device) for s in steps_cpu]
     steps_our = [s.to(mojo_device) for s in steps_cpu]
 
-    def step(params, grads, avgs, sqs, steps) -> None:
+    def step(
+        params: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        avgs: list[torch.Tensor],
+        sqs: list[torch.Tensor],
+        steps: list[torch.Tensor],
+    ) -> None:
         torch.ops.aten._fused_adamw_(
             params,
             grads,

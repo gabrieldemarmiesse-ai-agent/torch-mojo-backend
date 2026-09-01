@@ -1,11 +1,16 @@
 from max.experimental import functional as F
-from max.graph import TensorType
+from max.graph import Dim, TensorType
 
-import torch_mojo_backend
+from torch_mojo_backend.torch_compile_backend import compiler
 from torch_mojo_backend.types import MaxTensor, Scalar
 
 
 def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
+    # `Scalar` also covers a symbolic Dim for ops that legitimately take one;
+    # the bitwise ops that call this never do (ATen's Scalar there is a
+    # genuine number), and F.constant only accepts a real number.
+    if isinstance(other, Dim):
+        raise TypeError(f"bitwise scalar ops expect a number, got a Dim: {other!r}")
     return F.broadcast_to(
         F.constant(other, dtype=input.dtype, device=input.device), input.shape
     )
@@ -22,7 +27,7 @@ def gpt2_decode_attention(
         out_types=[
             TensorType(dtype=query.dtype, shape=query.shape, device=query.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]
 
 
@@ -38,7 +43,7 @@ def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]
 
 
@@ -61,7 +66,7 @@ def bitwise_not(input: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]
 
 
@@ -77,7 +82,7 @@ def bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]
 
 
@@ -100,7 +105,7 @@ def bitwise_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]
 
 
@@ -125,5 +130,5 @@ def gelu_backward(
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.paths_to_mojo_kernels,
     )[0]

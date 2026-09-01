@@ -349,7 +349,11 @@ def plan_module(
         )
         ops = [None] if only_ops is None else []
     if only_ops is not None:
-        kept = [op for op in ops if op in only_ops]
+        # Annotated explicitly: `op in only_ops` narrows the comprehension's
+        # inferred element type to plain `str` (a tuple[str, ...] can never
+        # contain None), which -- being invariant -- list[str] then can't
+        # reassign into the list[str | None]-declared `ops` below.
+        kept: list[str | None] = [op for op in ops if op in only_ops]
         if len(kept) != len(ops):
             notes.append(f"--ops skipped {len(ops) - len(kept)} of {len(ops)} op(s)")
         ops = kept
