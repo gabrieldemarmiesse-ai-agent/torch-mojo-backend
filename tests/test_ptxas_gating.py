@@ -247,7 +247,7 @@ class _StubTensor:
     """A `MojoTensorLike` stand-in; the define hooks read only `_dtype`."""
 
     _shape: ClassVar[tuple[int, ...]] = (4, 4)
-    _strides: ClassVar[tuple[int, ...]] = (4, 1)
+    _mojo_strides: ClassVar[tuple[int, ...]] = (4, 1)
     _dtype: ClassVar[DType] = DType.float32
     _device: ClassVar[object] = None
 

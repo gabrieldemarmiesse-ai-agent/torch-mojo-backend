@@ -199,6 +199,35 @@ def get_amp_supported_dtype():
     return [torch.float16, torch.bfloat16]  # TODO change
 
 
+def memory_stats(device: "int | str | torch.device | None" = None) -> dict[str, int]:
+    """Whole-device memory counters, straight from the MAX driver.
+
+    Deliberately NOT torch.cuda's key names ("allocated_bytes.all.current"
+    and friends): those describe a caching allocator's per-process
+    accounting, and MAX exposes no such thing — ``Device.stats`` reports the
+    driver's device-wide free/total plus its graph pools. Inventing the CUDA
+    keys from those would mean reporting another process's allocations as
+    this one's. Callers that want the CUDA schema should read
+    ``torch.cuda.memory_stats`` on a CUDA build; callers that want a number
+    for this device get honest ones here.
+    """
+    from .torch_mojo_tensor import find_equivalent_max_device
+
+    stats = find_equivalent_max_device(_resolve_sync_device(device)).stats
+    return {name: int(value) for name, value in dict(stats).items()}
+
+
+def memory_summary(
+    device: "int | str | torch.device | None" = None, abbreviated: bool = False
+) -> str:
+    """Human-readable ``memory_stats``. FSDP prints this in OOM messages."""
+    resolved = _resolve_sync_device(device)
+    lines = [f"Mojo device memory ({resolved}), as reported by the MAX driver:"]
+    for name, value in memory_stats(device).items():
+        lines.append(f"  {name:24s} {value:>18,d}")
+    return "\n".join(lines)
+
+
 # Streams ("channels"): real torch.Stream/torch.Event support, dispatched
 # here by register_mojo_devices() because the generic classes' C++ guard is
 # a stub for Python PrivateUse1 backends. See mojo_device/streams.py.

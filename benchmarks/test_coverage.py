@@ -109,6 +109,17 @@ SKIPPED_OPS: dict[str, str] = {
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
     ),
     "aten::normal_": "host-side torch RNG + upload; no device kernel of ours",
+    "aten::record_stream": (
+        "stream-lifetime bookkeeping, not compute: records a driver event on "
+        "the named stream so a buffer's free is fenced behind a foreign "
+        "reader (channels.record_use). No kernel launches, so there is no "
+        "device time to measure"
+    ),
+    # -- metadata-only mutation -------------------------------------------
+    "aten::set_.source_Tensor": (
+        "repoints a tensor at another's allocation in place: payload rebind "
+        "plus TensorImpl metadata, zero-copy and no kernel"
+    ),
     # -- out-variant plumbing --------------------------------------------
     "aten::addcdiv.out": _OUT,
     "aten::addcmul.out": _OUT,

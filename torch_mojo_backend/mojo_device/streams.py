@@ -10,6 +10,13 @@ streams are mojo-device channels (extra CUDA streams,
 ``mojo_device/channels.py``) and events are driver events recorded on the
 streams' native handles.
 
+``Stream`` derives from the real ``torch._C.Stream`` so that C++ argument
+parsing accepts it wherever a schema declares a ``Stream`` — most
+importantly ``aten::record_stream``, which FSDP1 calls on every reshard.
+Its ``stream_id`` is the channel's native handle, and that is how the
+``aten::record_stream`` kernel finds the stream to fence a buffer's free
+against (see mojo_device/aten_ops/streams.py).
+
 Execution semantics, stated plainly: eager mojo kernels currently always
 EXECUTE on the device's default stream. ``with stream:`` tracks the
 current stream per thread (``torch.accelerator.current_stream()`` reports
@@ -34,6 +41,7 @@ from torch_mojo_backend.mojo_device.channels import (
     ensure_context_current,
 )
 
+_PRIVATEUSE1_DEVICE_TYPE = int(torch._C._autograd.DeviceType.PrivateUse1)
 _user_stream_ids = itertools.count()
 _current_stacks = threading.local()  # {device_index: [Stream, ...]} per thread
 # No annotation: beartype's claw checks module-level annotated globals and
@@ -139,24 +147,47 @@ class Event:
         return f"torch.mojo.Event(device={self.device}, recorded={self._event is not None})"
 
 
-class Stream:
-    """Mirror of torch.Stream for mojo devices, backed by a channel."""
+class Stream(torch._C.Stream):
+    """Mirror of torch.Stream for mojo devices, backed by a channel.
 
-    def __init__(
-        self,
+    Derived from the real ``torch._C.Stream`` (captured here rather than
+    through ``torch.Stream``, which ``register_mojo_devices()`` replaces with
+    a dispatching wrapper). The base type is what C++ argument parsing
+    accepts: ``aten::record_stream(Tensor, Stream)`` and every other
+    ``Stream``-typed schema check with ``THPStream_Check``, a C-level type
+    test that a plain Python object cannot satisfy — a mojo stream passed
+    there used to fail with the parser's unhelpful "unknown parameter type".
+    The three base fields are filled so the C++ side reads something true:
+    ``stream_id`` is the channel's native ``CUstream`` handle, which is how
+    ``aten::record_stream`` recovers the stream it must fence against.
+
+    Every ordering method below overrides the base's, which for a Python
+    PrivateUse1 backend would reach the stub device guard and do nothing.
+    """
+
+    def __new__(
+        cls,
         device: object = None,
         priority: int = 0,
         *,
         _channel: Channel | None = None,
-    ) -> None:
+    ) -> "Stream":
         index = _resolve_index(device)
         if _channel is None:
             _channel = Channel(_max_device_of(index), f"user-{next(_user_stream_ids)}")
+        self = super().__new__(cls, _channel.handle, index, _PRIVATEUSE1_DEVICE_TYPE)
         self._channel = _channel
         self._index = index
         # MAX's Python API exposes no stream priorities; accepted for
         # signature compatibility, always effectively 0.
         self.priority = 0
+        return self
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        # Everything happens in __new__ (the base type is a C type whose
+        # tp_new takes the three identity fields); accept and ignore the
+        # constructor arguments so `Stream(device, priority=...)` works.
+        pass
 
     @property
     def device(self) -> torch.device:

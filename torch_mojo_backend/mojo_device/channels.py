@@ -262,3 +262,28 @@ def record_use(holder: object, channel: Channel, owner_stream_handle: int) -> No
     holder.record_foreign_use(
         channel.handle, channel.record_event(), owner_stream_handle
     )
+
+
+def record_use_on_handle(
+    holder: object, stream_handle: int, owner_stream_handle: int, ordinal: int
+) -> None:
+    """``record_use`` for a raw stream handle instead of a Channel.
+
+    ``aten::record_stream`` hands the kernel a ``c10::Stream`` — an opaque
+    ``(device, stream_id)`` pair — and mojo streams carry the native
+    ``CUstream`` as their ``stream_id``. Nothing guarantees that handle
+    belongs to a Channel this process minted (a caller may reconstruct a
+    stream from an id), and nothing needs it to: fencing a free only needs
+    an event recorded on the foreign stream, which the driver API will do
+    for any valid handle.
+
+    Recording against the owning stream is a no-op: the free is already
+    ordered there. Handle 0 means "the device's default stream" in c10's
+    encoding, which for this backend is the owning stream too.
+    """
+    if stream_handle == 0 or stream_handle == owner_stream_handle:
+        return
+    ensure_context_current(ordinal)
+    event = CudaEvent()
+    event.record(stream_handle)
+    holder.record_foreign_use(stream_handle, event, owner_stream_handle)

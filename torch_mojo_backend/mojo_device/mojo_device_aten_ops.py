@@ -71,10 +71,12 @@ from .aten_ops.inplace import (
     mojo_device_masked_fill_,
     mojo_device_mul_,
     mojo_device_relu_,
+    mojo_device_set__source_tensor,
     mojo_device_zero_,
 )
 from .aten_ops.reductions import mojo_device_min_dim, mojo_device_min_dim_min
 from .aten_ops.rng import mojo_device_normal_
+from .aten_ops.streams import mojo_device_record_stream
 from .aten_ops.support import _eager_impl, _not_implemented, _out_variant
 from .aten_ops.transfer import mojo_device__copy_from, mojo_device__to_copy
 
@@ -355,6 +357,7 @@ _register_fast("aten::permute", "fast_aten_permute")
 _register_fast("aten::pow.Tensor_Scalar", "fast_aten_pow")
 _register_fast("aten::pow.Tensor_Tensor", "fast_aten_pow_tensor_tensor")
 _register_fast("aten::reciprocal", "fast_aten_reciprocal")
+register_aten_op("aten::record_stream")(mojo_device_record_stream)
 register_aten_op("aten::relu")(mojo_device_relu)
 register_aten_op("aten::relu_")(mojo_device_relu_)
 _register_fast("aten::remainder.Scalar", "fast_aten_remainder")
@@ -378,6 +381,7 @@ _register_out(
 )
 _register_fast("aten::select_scatter", "fast_aten_select_scatter")
 _register_fast("aten::select.int", "fast_aten_select")
+register_aten_op("aten::set_.source_Tensor")(mojo_device_set__source_tensor)
 register_aten_op("aten::sigmoid")(mojo_device_sigmoid)
 _register_fast("aten::sign", "fast_aten_sign")
 _register_fast("aten::silu", "fast_aten_silu")

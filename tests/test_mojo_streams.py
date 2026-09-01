@@ -105,6 +105,50 @@ def test_event_semantics(mojo_gpu: str):
         untimed.elapsed_time(end)
 
 
+def test_stream_is_a_real_torch_stream_for_cpp_argument_parsing(mojo_gpu: str):
+    """C++ schemas taking a Stream check the concrete type, not duck typing.
+
+    ``aten::record_stream(Tensor, Stream)`` runs ``THPStream_Check`` on the
+    argument; a look-alike Python object fails it (and the parser's error
+    path for a Stream parameter reports the unhelpful "unknown parameter
+    type"). The stream's id must also be the native handle, because that is
+    all the kernel gets to identify the stream with.
+    """
+    stream = torch.mojo.current_stream()
+    assert isinstance(stream, torch._C.Stream)
+    assert stream.stream_id == stream.native_handle
+
+
+def test_record_stream_accepts_mojo_streams(mojo_gpu: str):
+    tensor = torch.ones(1024, device=mojo_gpu)
+    # The device's own stream owns the free already: nothing to fence.
+    tensor.record_stream(torch.mojo.current_stream())
+    assert tensor._holder._events is None
+
+    side = torch.mojo.Stream()
+    tensor.record_stream(side)
+    assert set(tensor._holder._events) == {side.native_handle}
+
+    # Recording the same stream twice keeps one (newest) event for it.
+    tensor.record_stream(side)
+    assert set(tensor._holder._events) == {side.native_handle}
+    assert tensor.cpu().sum().item() == 1024.0
+
+
+def test_record_stream_under_no_dispatch(mojo_gpu: str):
+    """Libraries (torch.distributed among them) call record_stream inside
+    ``no_dispatch()``, which skips ``__torch_dispatch__`` and lands directly
+    on the registered PrivateUse1 kernel with the wrapper subclass as self.
+    That direct path must work, not just the dispatched one."""
+    from torch.utils._mode_utils import no_dispatch
+
+    tensor = torch.ones(64, device=mojo_gpu)
+    side = torch.mojo.Stream()
+    with no_dispatch():
+        tensor.record_stream(side)
+    assert set(tensor._holder._events) == {side.native_handle}
+
+
 def test_record_use_fences_free_against_channel_reader(mojo_gpu: str):
     """MAX frees a buffer stream-ordered on the owning stream only, so a
     channel reader races the pool's reuse unless the allocation is recorded

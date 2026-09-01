@@ -32,7 +32,7 @@ def _tensor(
     return SimpleNamespace(
         name=name,
         _shape=shape,
-        _strides=strides,
+        _mojo_strides=strides,
         _offset=0,
         _dtype=dtype or aten_fast.DType.bfloat16,
         _device=device or _device(),
@@ -307,11 +307,11 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
         {"_ptr": eligible._ptr + 2},
         {"_shape": (2, 255, 12, 64)},
         {"_shape": (2, 256, 12, 32)},
-        {"_strides": (strides[0], strides[1], 128, 1)},
-        {"_strides": (strides[0], 12 * 64 - 8, 64, 1)},
-        {"_strides": (strides[0] + 8, strides[1], 64, 1)},
-        {"_strides": (strides[0], strides[1], 64, 2)},
-        {"_strides": (strides[0], strides[1] + 2, 64, 1)},
+        {"_mojo_strides": (strides[0], strides[1], 128, 1)},
+        {"_mojo_strides": (strides[0], 12 * 64 - 8, 64, 1)},
+        {"_mojo_strides": (strides[0] + 8, strides[1], 64, 1)},
+        {"_mojo_strides": (strides[0], strides[1], 64, 2)},
+        {"_mojo_strides": (strides[0], strides[1] + 2, 64, 1)},
         {"_dtype": aten_fast.DType.float32, "_itemsize": 4},
     ):
         candidate = SimpleNamespace(**vars(eligible))
@@ -360,7 +360,7 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     def transpose(tensor, dim0, dim1):
         assert (dim0, dim1) == (1, 2)
         shape = list(tensor._shape)
-        strides = list(tensor._strides)
+        strides = list(tensor._mojo_strides)
         shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
         strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
         return _tensor(
@@ -402,7 +402,8 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     assert logsumexp._shape == (batch, heads, seqlen)
     assert tuple(tensor._ptr for tensor in (q_native, k_native, v_native)) == pointers
     assert all(
-        tensor._strides == physical_strides for tensor in (q_native, k_native, v_native)
+        tensor._mojo_strides == physical_strides
+        for tensor in (q_native, k_native, v_native)
     )
     assert strided_calls == [
         (
@@ -448,7 +449,7 @@ def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
 
     def transpose(tensor, dim0, dim1):
         shape = list(tensor._shape)
-        strides = list(tensor._strides)
+        strides = list(tensor._mojo_strides)
         shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
         strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
         return _tensor(
@@ -997,7 +998,7 @@ def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
 
     def transpose(tensor, dim0, dim1):
         shape = list(tensor._shape)
-        strides = list(tensor._strides)
+        strides = list(tensor._mojo_strides)
         shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
         strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
         return _tensor(

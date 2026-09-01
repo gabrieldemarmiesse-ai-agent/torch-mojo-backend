@@ -159,7 +159,7 @@ def fake_mojo_tensor() -> Callable[..., torch.Tensor]:
         tensor._device = device
         tensor._dtype = dtype
         tensor._shape = shape
-        tensor._strides = strides
+        tensor._mojo_strides = strides
         tensor._offset = 0
         tensor._itemsize = dtype.size_in_bytes
         tensor._numel = math.prod(shape)

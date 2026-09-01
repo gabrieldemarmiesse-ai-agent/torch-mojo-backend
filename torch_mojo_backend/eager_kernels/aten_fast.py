@@ -3,7 +3,8 @@
 Each function here is registered in `mojo_device_aten_ops.py` (through
 `_eager_impl`). Tensors are `TorchMojoTensor`s: a Mojo `TensorHolder`
 ownership token plus Python-side layout metadata (`_ptr`, `_shape`,
-`_strides` in elements, `_offset`, `_dtype`, `_device`, `_is_contiguous`).
+`_mojo_strides` in elements, `_offset`, `_dtype`, `_device`,
+`_is_contiguous`).
 An op runs as one or a few Mojo kernel calls — no graph building, no MLIR
 passes, no interpreter, and *no graph fallback*: when a function returns
 the `NOT_HANDLED` sentinel, the registration raises `NotImplementedError`
@@ -403,7 +404,7 @@ def _reduce_ready_operand(
     view = _view_of(
         a,
         tuple(a._shape[d] for d in perm),
-        tuple(a._strides[d] for d in perm),
+        tuple(a._mojo_strides[d] for d in perm),
         a._offset,
     )
     return view._contig(), trailing
@@ -628,7 +629,7 @@ def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
     if (
         tensor._device != scalar._device
         or tensor._numel == 0
-        or not _is_non_overlapping_and_dense(tensor._shape, tensor._strides)
+        or not _is_non_overlapping_and_dense(tensor._shape, tensor._mojo_strides)
     ):
         return "none"
     tensor_begin = tensor._ptr
@@ -640,7 +641,7 @@ def _foreach_scalar_overlap_kind(tensor, scalar) -> str:
     if (
         tensor_begin == scalar_begin
         and tensor_end == scalar_end
-        and tensor._strides == scalar._strides
+        and tensor._mojo_strides == scalar._mojo_strides
     ):
         return "full"
     return "partial"
@@ -1182,7 +1183,7 @@ def _spec_of(t):
             t._ptr,
             len(t._shape),
             _pad8(t._shape, 1),
-            _pad8(t._strides, 0),
+            _pad8(t._mojo_strides, 0),
             t._offset,
             t._dtype.value,
             t._itemsize,
@@ -2373,7 +2374,7 @@ def _bcast_meta(*tensors):
             if j < 0 or t._shape[j] == 1:
                 st.append(0)
             else:
-                st.append(t._strides[j])
+                st.append(t._mojo_strides[j])
         all_strides.append([0] * (4 - rank) + st)
     return out, dims, all_strides
 
@@ -2802,7 +2803,7 @@ def fast_aten_fill__scalar(input, value):
             a._ptr,
             float(value),
             _pad8(a._shape, 1),
-            _pad8(a._strides, 0),
+            _pad8(a._mojo_strides, 0),
             a._dtype.value,
             _ctx_ptr(a._device),
             keepalive=(a,),
@@ -3619,7 +3620,7 @@ def fast_aten_addr(
     # at dim 0 / dim 1 respectively regardless of rank (see the kernel-side
     # comment in logic_ops.mojo above `_addr_bcast`).
     a_shape = (1,) * (2 - len(a._shape)) + tuple(a._shape)
-    a_strides = (0,) * (2 - len(a._strides)) + tuple(a._strides)
+    a_strides = (0,) * (2 - len(a._mojo_strides)) + tuple(a._mojo_strides)
     if a_shape[0] not in (1, n) or a_shape[1] not in (1, m):
         return NOT_HANDLED
     as0 = a_strides[0] if a_shape[0] != 1 else 0
@@ -3634,7 +3635,7 @@ def fast_aten_addr(
                 a._ptr,
                 b._ptr,
                 c._ptr,
-                (n, m, as0, as1, b._strides[0], c._strides[0]),
+                (n, m, as0, as1, b._mojo_strides[0], c._mojo_strides[0]),
                 float(beta),
                 float(alpha),
                 dtype.value,
@@ -3888,7 +3889,7 @@ def _fast_view(tensor, shape):
         return NOT_HANDLED
     if t._is_contiguous:
         return _view_of(t, sizes, _row_major_strides(sizes), t._offset, contiguous=True)
-    new_strides = _compute_view_strides(t._shape, t._strides, sizes)
+    new_strides = _compute_view_strides(t._shape, t._mojo_strides, sizes)
     if new_strides is None:
         # PyTorch's reshape reads the TensorImpl's (fake-contiguous) strides
         # and routes copy-requiring reshapes here too — materialize.
@@ -3915,8 +3916,8 @@ def fast_aten_unsqueeze(tensor, dim):
     if dim < 0:
         dim += rank + 1
     new_shape = t._shape[:dim] + (1,) + t._shape[dim:]
-    inserted = t._shape[dim] * t._strides[dim] if dim < rank else 1
-    new_strides = t._strides[:dim] + (inserted,) + t._strides[dim:]
+    inserted = t._shape[dim] * t._mojo_strides[dim] if dim < rank else 1
+    new_strides = t._mojo_strides[:dim] + (inserted,) + t._mojo_strides[dim:]
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
@@ -3929,9 +3930,9 @@ def fast_aten_squeeze_dim(tensor, dim):
         return NOT_HANDLED
     dim %= rank
     if t._shape[dim] != 1:
-        return _view_of(t, t._shape, t._strides, t._offset)
+        return _view_of(t, t._shape, t._mojo_strides, t._offset)
     new_shape = t._shape[:dim] + t._shape[dim + 1 :]
-    new_strides = t._strides[:dim] + t._strides[dim + 1 :]
+    new_strides = t._mojo_strides[:dim] + t._mojo_strides[dim + 1 :]
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
@@ -3952,7 +3953,7 @@ def fast_aten_alias(tensor):
             "a TorchMojoTensor allocation holder; its unpack hook must "
             "return a complete TorchMojoTensor or a host tensor"
         )
-    return _view_of(t, t._shape, t._strides, t._offset)
+    return _view_of(t, t._shape, t._mojo_strides, t._offset)
 
 
 fast_aten_detach = fast_aten_alias
@@ -3969,7 +3970,7 @@ def fast_aten_permute(input, dims):
     if None in perm or len(set(perm)) != rank:
         return NOT_HANDLED
     new_shape = tuple(t._shape[p] for p in perm)
-    new_strides = tuple(t._strides[p] for p in perm)
+    new_strides = tuple(t._mojo_strides[p] for p in perm)
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
@@ -3978,7 +3979,7 @@ def fast_aten_t(input):
     if t is None or len(t._shape) > 2:
         return NOT_HANDLED
     if len(t._shape) < 2:
-        return _view_of(t, t._shape, t._strides, t._offset)
+        return _view_of(t, t._shape, t._mojo_strides, t._offset)
     return fast_aten_transpose(input, 0, 1)
 
 
@@ -3988,13 +3989,13 @@ def fast_aten_transpose(input, dim0, dim1):
         return NOT_HANDLED
     rank = len(t._shape)
     if rank == 0:
-        return _view_of(t, t._shape, t._strides, t._offset)
+        return _view_of(t, t._shape, t._mojo_strides, t._offset)
     if not (-rank <= dim0 < rank and -rank <= dim1 < rank):
         return NOT_HANDLED
     dim0 %= rank
     dim1 %= rank
     shape = list(t._shape)
-    strides = list(t._strides)
+    strides = list(t._mojo_strides)
     shape[dim0], shape[dim1] = shape[dim1], shape[dim0]
     strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
     return _view_of(t, shape, strides, t._offset)
@@ -4022,7 +4023,7 @@ def fast_aten_expand(tensor, sizes, *, implicit=False):
             old_size = t._shape[j]
             if s == -1 or s == old_size:
                 new_shape.append(old_size)
-                new_strides.append(t._strides[j])
+                new_strides.append(t._mojo_strides[j])
             elif old_size == 1:
                 new_shape.append(s)
                 new_strides.append(0)
@@ -4082,8 +4083,12 @@ def fast_aten_slice(input, dim=0, start=None, end=None, step=1):
     length = max(end - start, 0)
     length = -(-length // step)  # ceil div for step > 1
     new_shape = t._shape[:dim] + (length,) + t._shape[dim + 1 :]
-    new_strides = t._strides[:dim] + (t._strides[dim] * step,) + t._strides[dim + 1 :]
-    new_offset = t._offset + start * t._strides[dim]
+    new_strides = (
+        t._mojo_strides[:dim]
+        + (t._mojo_strides[dim] * step,)
+        + t._mojo_strides[dim + 1 :]
+    )
+    new_offset = t._offset + start * t._mojo_strides[dim]
     return _view_of(t, new_shape, new_strides, new_offset)
 
 
@@ -4101,8 +4106,8 @@ def fast_aten_select(input, dim, index):
     if not 0 <= index < size:
         return NOT_HANDLED
     new_shape = t._shape[:dim] + t._shape[dim + 1 :]
-    new_strides = t._strides[:dim] + t._strides[dim + 1 :]
-    new_offset = t._offset + index * t._strides[dim]
+    new_strides = t._mojo_strides[:dim] + t._mojo_strides[dim + 1 :]
+    new_offset = t._offset + index * t._mojo_strides[dim]
     return _view_of(t, new_shape, new_strides, new_offset)
 
 
@@ -4305,7 +4310,7 @@ def fast_aten_cat(tensors, dim=0):
                 # instead of materializing a contiguous copy first. The slot
                 # is out[..., pos:pos+len, ...]: same strides as out, offset
                 # pos * out_strides[dim] == the accumulated flat offset.
-                slot = _view_of(out, b._shape, out._strides, offset)
+                slot = _view_of(out, b._shape, out._mojo_strides, offset)
                 _copy_strided_into(slot, b)
         offset += copy_len
     return out
@@ -4634,8 +4639,8 @@ def _fast_scatter(input, dim, index, src, value):
             value_f = float(value)
 
     dims4 = [1] * (4 - rank) + list(idx_c._shape)
-    out_strides4 = [0] * (4 - rank) + list(out._strides)
-    idx_strides4 = [0] * (4 - rank) + list(idx_c._strides)
+    out_strides4 = [0] * (4 - rank) + list(out._mojo_strides)
+    idx_strides4 = [0] * (4 - rank) + list(idx_c._mojo_strides)
     dim_padded = dim + (4 - rank)
     params = (
         tuple(dims4)
@@ -5680,17 +5685,29 @@ def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=
     It used to be composed here as mul -> sum -> sqrt, which is three launches
     and a temporary the size of the input for a reduction that reads each
     element once.
+
+    ``dtype`` selects the accumulation type, so it is honoured by casting
+    first, the same way ``fast_aten_mean`` does. FSDP1's
+    ``clip_grad_norm_`` always passes ``dtype=torch.float32``.
     """
     a = _t(self)
     if (
         a is None
-        or a._dtype not in _FLOAT_DTYPES
         or not isinstance(ord, int | float)
         or isinstance(ord, bool)
         or ord != 2
-        or dtype is not None
         or not isinstance(keepdim, bool)
     ):
+        return NOT_HANDLED
+    if dtype is not None:
+        target = _torch_dtype_to_max(dtype)
+        if target is None or target not in _FLOAT_DTYPES:
+            return NOT_HANDLED
+        if a._dtype != target:
+            if a._dtype not in _CAST_DTYPES or target not in _CAST_DTYPES:
+                return NOT_HANDLED
+            a = _cast_tensor(a, target)
+    if a._dtype not in _FLOAT_DTYPES:
         return NOT_HANDLED
     rank = len(a._shape)
     rdims = _norm_reduce_dims(dim, rank, empty_is_all=True)
@@ -7103,11 +7120,11 @@ def _fa4_strided_bthd_layout(tensor) -> bool:
         or tensor._dtype not in (DType.bfloat16, DType.float16)
         or tensor._itemsize != tensor._dtype.size_in_bytes
         or len(tensor._shape) != 4
-        or len(tensor._strides) != 4
+        or len(tensor._mojo_strides) != 4
     ):
         return False
     batch, seqlen, heads, head_dim = tensor._shape
-    b_stride, s_stride, h_stride, d_stride = tensor._strides
+    b_stride, s_stride, h_stride, d_stride = tensor._mojo_strides
     if (
         batch <= 0
         or seqlen <= 0
@@ -7294,11 +7311,11 @@ def fast_fa4_16bit_d64_causal_forward(
         _device_call(
             forward_fn,
             q_native._ptr,
-            *q_native._strides,
+            *q_native._mojo_strides,
             k_native._ptr,
-            *k_native._strides,
+            *k_native._mojo_strides,
             v_native._ptr,
-            *v_native._strides,
+            *v_native._mojo_strides,
             out_native._ptr,
             logsumexp._ptr,
             batch,
@@ -7372,11 +7389,11 @@ def fast_fa4_16bit_d64_causal_backward(
         _device_call(
             backward_fn,
             q_native._ptr,
-            *q_native._strides,
+            *q_native._mojo_strides,
             k_native._ptr,
-            *k_native._strides,
+            *k_native._mojo_strides,
             v_native._ptr,
-            *v_native._strides,
+            *v_native._mojo_strides,
             out_native._ptr,
             dout_native._ptr,
             logsumexp._ptr,
@@ -7471,7 +7488,7 @@ def _fa_strides(t: MojoTensorLike) -> tuple[int, int, int]:
     The head_dim stride is not passed: it must be 1, and ``_fused_fa_inputs`` is
     what guarantees that.
     """
-    strides = t._strides
+    strides = t._mojo_strides
     return (strides[0], strides[1], strides[2])
 
 
@@ -7564,7 +7581,7 @@ def _fused_fa_inputs(
     ):
         return None
     # The innermost axis must be contiguous; every other stride is free.
-    if q._strides[3] != 1 or k._strides[3] != 1 or v._strides[3] != 1:
+    if q._mojo_strides[3] != 1 or k._mojo_strides[3] != 1 or v._mojo_strides[3] != 1:
         return None
     if scale is not None and (
         not isinstance(scale, int | float)
@@ -7657,15 +7674,15 @@ def fast_fused_flash_attention_backward(
         return NOT_HANDLED
     if g._dtype != q._dtype or tuple(g._shape) != tuple(q._shape):
         return NOT_HANDLED
-    if g._strides[3] != 1:
+    if g._mojo_strides[3] != 1:
         g = _tc(g)
         if g is None:
             return NOT_HANDLED
     if (
-        q._strides[3] != 1
-        or k._strides[3] != 1
-        or v._strides[3] != 1
-        or o._strides[3] != 1
+        q._mojo_strides[3] != 1
+        or k._mojo_strides[3] != 1
+        or v._mojo_strides[3] != 1
+        or o._mojo_strides[3] != 1
     ):
         return NOT_HANDLED
     batch, heads, seq_q, head_dim = q._shape
@@ -8288,7 +8305,7 @@ def _tf32_dense_2d_layout(tensor: MojoTensorLike) -> bool | None:
     if len(tensor._shape) != 2:
         return None
     rows, cols = tensor._shape
-    strides = tuple(tensor._strides)
+    strides = tuple(tensor._mojo_strides)
     if strides == (cols, 1):
         return False
     if strides == (1, rows):
@@ -8317,7 +8334,7 @@ def _tf32_dense_batched_layout(tensor: MojoTensorLike) -> tuple[bool, int] | Non
     if len(tensor._shape) != 3:
         return None
     batch, rows, cols = tensor._shape
-    batch_stride, row_stride, col_stride = tuple(tensor._strides)
+    batch_stride, row_stride, col_stride = tuple(tensor._mojo_strides)
     row_major = col_stride == 1 and (rows == 1 or row_stride == cols)
     transposed = row_stride == 1 and (cols == 1 or col_stride == rows)
     if row_major:
@@ -9237,9 +9254,9 @@ def fast_aten_scaled_dot_product_attention(
             and head_dim % 4 == 0
             and head_dim <= 256
             and kv_len <= 4096
-            and q._strides[3] == 1
-            and k._strides[3] == v._strides[3] == 1
-            and k._strides[2] == v._strides[2] == head_dim
+            and q._mojo_strides[3] == 1
+            and k._mojo_strides[3] == v._mojo_strides[3] == 1
+            and k._mojo_strides[2] == v._mojo_strides[2] == head_dim
         ):
             # Decode step: one fused kernel instead of bmm+softmax+bmm
             # (single launch, no scratch buffers, coalesced K/V reads).
