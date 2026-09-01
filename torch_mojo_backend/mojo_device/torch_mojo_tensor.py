@@ -60,6 +60,57 @@ _FAILED_TRANSFER_OWNERS_LOCK = threading.Lock()
 _WRAPPER_TENSORIMPL_DEVICE = torch.device("privateuseone:0")
 
 
+class _HolderOwner:
+    """Shared owner of one device allocation, fencing its stream-ordered free.
+
+    MAX frees a buffer stream-ordered on its OWNING stream only, so a reader
+    on another stream races the pool's reuse (measured — see
+    device_streams.record_use). ``_wait`` caches
+    ``tensor_holder.fence_event_wait`` at record time because ``__del__`` can
+    run during interpreter shutdown, when module globals are already cleared.
+    """
+
+    __slots__ = ("_holder", "_events", "_owner_ctx", "_wait")
+
+    def __init__(self, holder: object) -> None:
+        self._holder = holder
+        self._events = None  # {foreign stream ctx ptr: newest FenceEvent}
+        self._owner_ctx = 0
+        self._wait = None
+
+    def data_ptr(self) -> int:
+        return self._holder.data_ptr()
+
+    def get_nbytes(self) -> int:
+        return self._holder.get_nbytes()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(object.__getattribute__(self, "_holder"), name)
+
+    def record_foreign_use(
+        self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
+    ) -> None:
+        if self._events is None:
+            self._events = {}
+            self._wait = _holder_mod().fence_event_wait
+        self._owner_ctx = owner_ctx_ptr
+        # A later event on the same stream dominates the earlier one; the
+        # replaced event is released when this rebinding drops it.
+        self._events[stream_ctx_ptr] = event
+
+    def __del__(self) -> None:
+        events = self._events
+        if not events:
+            return
+        try:
+            wait = self._wait
+            owner_ctx = self._owner_ctx
+            for event in events.values():
+                wait(owner_ctx, event)
+        except Exception:
+            pass  # interpreter teardown: the device context is going away too
+
+
 def _ctx_ptr(device):
     # Rebinds this module-level name to the real (cached) implementation on
     # first use, so the lazy import costs one call, not one per call.
@@ -357,6 +408,8 @@ class TorchMojoTensor(torch.Tensor):
     def _make(
         cls, holder, ptr, shape, strides, offset, dtype, device, contiguous=None
     ) -> "TorchMojoTensor":
+        if not isinstance(holder, _HolderOwner):
+            holder = _HolderOwner(holder)
         shape = tuple(shape)
         strides = tuple(strides)
         res = torch.Tensor._make_wrapper_subclass(
