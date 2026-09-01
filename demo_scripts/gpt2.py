@@ -1,6 +1,6 @@
 import math
 import os
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 import torch.nn as nn
@@ -151,7 +151,7 @@ class GPT2(nn.Module):
 
     @classmethod
     def from_pretrained(
-        cls, model_type: str, override_args: dict[str, Any] | None = None
+        cls, model_type: str, override_args: dict[str, float] | None = None
     ) -> "GPT2":
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         override_args = override_args or {}
@@ -170,9 +170,8 @@ class GPT2(nn.Module):
         print("forcing vocab_size=50257, block_size=1024")
         config_args["vocab_size"] = 50257
         config_args["block_size"] = 1024
-        config_args.update(override_args)
 
-        config = GPTConfig(**config_args)
+        config = GPTConfig(**config_args, **override_args)
         model = GPT2(config)
         sd = model.state_dict()
         sd_keys = sd.keys()

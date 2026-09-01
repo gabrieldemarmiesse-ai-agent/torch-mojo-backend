@@ -11,7 +11,7 @@ import itertools
 import math
 import operator
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, TypeVar, cast
+from typing import Literal, TypeVar, cast
 
 import max.driver as max_driver
 import max.graph.ops as max_ops
@@ -41,11 +41,9 @@ from torch_mojo_backend.flags import verbose_enabled
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
-# F.functional's own stub returns Callable[..., Any] (a distributed-dispatch
-# wrapper around the graph op), incompatible with flash_attention_gpu's own
-# precise imported signature -- rebind under a new name instead of narrowing
-# the import.
-_flash_attention_gpu: Callable[..., Any] = F.functional(flash_attention_gpu)
+# F.functional's stub returns Callable[..., Any], incompatible with the
+# imported flash_attention_gpu's precise signature: rebind under a new name.
+_flash_attention_gpu: Callable[..., MaxTensor] = F.functional(flash_attention_gpu)
 
 # MAX made the `functional` reduction helpers (mean/sum/argmax/argmin and the
 # reduction forms of max/min) eager-only: they assert their input is an eager

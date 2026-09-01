@@ -612,9 +612,12 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     return buffer
 
 
+GraphValue = torch.Tensor | int | float | None
+
+
 def boxed_func(
     gm: torch.fx.GraphModule, example_inputs: list[object], mode: str | None = None
-) -> Callable[[list[Any]], Any]:
+) -> Callable[[list[GraphValue]], list[GraphValue]]:
     return make_boxed_func(BaseMaxCompiler(gm, example_inputs, mode).__call__)
 
 
@@ -633,8 +636,8 @@ class mojo_backend:
 
 def dummy_compiler(
     gm: torch.fx.GraphModule, example_inputs: list[object]
-) -> Callable[[list[Any]], Any]:
-    return make_boxed_func(gm.forward)
+) -> Callable[[list[GraphValue]], object]:
+    return make_boxed_func(gm.forward)  # returns whatever the graph returns
 
 
 # Can be used to check if it's the fault of the max backend or not.
