@@ -1188,3 +1188,59 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     assert cuda_peer.device_ordinal(0) is None
     assert cuda_peer.device_ordinal(torch.zeros(8).data_ptr()) is None
     assert not cuda_peer.same_physical_device(on_mojo._ptr, 0)
+
+
+def test_data_assignment_moves_the_payload(mojo_gpu_available):
+    """``x.data = y`` has to move the allocation, not just TensorImpl metadata.
+
+    The C++ setter shallow-copies the TensorImpl and stops; for this
+    storage-less wrapper that left every kernel reading the OLD buffer with
+    no error at all. FSDP1 swaps a flat parameter between its sharded and
+    unsharded buffers with exactly this assignment.
+    """
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    destination = torch.zeros(8, device="mojo:0")
+    source = torch.arange(8, dtype=torch.float32, device="mojo:0") + 100
+    destination.data = source
+    assert destination.cpu().tolist() == source.cpu().tolist()
+
+    # A strided view at a non-zero offset must survive intact: FSDP hands
+    # every original parameter a slice of the flat parameter this way.
+    base = torch.arange(16, dtype=torch.float32, device="mojo:0")
+    view = base[4:12].reshape(2, 4)
+    holder = torch.zeros(1, device="mojo:0")
+    holder.data = view
+    assert tuple(holder.shape) == (2, 4)
+    assert holder.stride() == view.stride()
+    assert holder.cpu().tolist() == [[4.0, 5.0, 6.0, 7.0], [8.0, 9.0, 10.0, 11.0]]
+
+
+def test_library_attributes_do_not_clobber_the_payload(mojo_gpu_available):
+    """A mojo Parameter IS the wrapper object, so torch's own bookkeeping
+    attributes land in the payload's namespace.
+    ``FlatParameter._init_metadata`` writes ``_strides``/``_shapes``/
+    ``_numels``; none of those may disturb the layout metadata."""
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    tensor = torch.arange(8, dtype=torch.float32, device="mojo:0")
+    strides = tensor._mojo_strides
+    tensor._strides = ((1,), (1,))
+    tensor._shapes = (torch.Size([4]), torch.Size([4]))
+    tensor._numels = (4, 4)
+    assert tensor._mojo_strides == strides
+    first, second = torch.split(tensor, [4, 4])
+    assert second.cpu().tolist() == [4.0, 5.0, 6.0, 7.0]
+    assert first.cpu().tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vector_norm_with_an_accumulation_dtype(mojo_gpu_available, dtype):
+    """FSDP1's clip_grad_norm_ asks for the norm in float32 explicitly."""
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    cpu = torch.randn(4096, dtype=dtype)
+    expected = torch.linalg.vector_norm(cpu, 2.0, dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to("mojo:0"), 2.0, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)

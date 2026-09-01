@@ -421,7 +421,7 @@ def test_wrapper_subclass_preserves_native_saved_output(mojo_device):
     assert saved._holder is output._holder
     assert saved._ptr == output._ptr
     assert saved._shape == output._shape
-    assert saved._strides == output._strides
+    assert saved._mojo_strides == output._mojo_strides
     assert saved._device == output._device
 
     output.backward(host_gradient.to(mojo_device))
@@ -1388,7 +1388,7 @@ def test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=aten_fast.DType.float32 if dtype is None else dtype,
             _device=device,
@@ -6421,7 +6421,7 @@ def test_bf16_unavailable_bridge_falls_back_before_allocation(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _dtype=aten_fast.DType.bfloat16,
             _device=device,
             _ptr=1234,
@@ -6631,7 +6631,7 @@ def test_tf32_unavailable_bridge_falls_back_before_allocation(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _dtype=aten_fast.DType.float32,
             _device=device,
             _ptr=1234,
@@ -6928,7 +6928,7 @@ def test_sdpa_forward_tf32_bmm_routing_preserves_raw_fallback(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=aten_fast.DType.float32 if dtype is None else dtype,
             _device=device,
@@ -7065,7 +7065,7 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
         rows, cols = shape
         return SimpleNamespace(
             _shape=shape,
-            _strides=(1, rows) if transposed else (cols, 1),
+            _mojo_strides=(1, rows) if transposed else (cols, 1),
             _offset=offset,
             _dtype=aten_fast.DType.bfloat16,
             _device=device,
@@ -7081,7 +7081,7 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
     rhs = matrix(rhs_shape, rhs_transposed, 2000, 5)
     bias = SimpleNamespace(
         _shape=(n,),
-        _strides=(1,),
+        _mojo_strides=(1,),
         _offset=2,
         _dtype=aten_fast.DType.bfloat16,
         _device=device,
@@ -7102,7 +7102,7 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
         allocations.append(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=dtype,
             _device=actual_device,
@@ -7173,7 +7173,7 @@ def test_bf16_gemm_no_bias_uses_ignored_output_pointer(monkeypatch):
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _dtype=aten_fast.DType.bfloat16,
             _device=device,
             _ptr=ptr,
@@ -7400,7 +7400,7 @@ def test_bf16_gemm_rejects_invalid_metadata_before_resolve_or_allocation(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=(
+            _mojo_strides=(
                 aten_fast._row_major_strides(shape) if strides is None else strides
             ),
             _dtype=dtype,
@@ -7531,7 +7531,7 @@ def test_bf16_bmm_host_bridge_padded_layouts_offsets_and_logical_transpose(
         return (
             SimpleNamespace(
                 _shape=shape,
-                _strides=(batch_stride, 1, rows)
+                _mojo_strides=(batch_stride, 1, rows)
                 if transposed
                 else (batch_stride, cols, 1),
                 _offset=offset,
@@ -7562,7 +7562,7 @@ def test_bf16_bmm_host_bridge_padded_layouts_offsets_and_logical_transpose(
         allocations.append((shape, dtype, actual_device))
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=dtype,
             _device=actual_device,
@@ -7642,7 +7642,7 @@ def test_bf16_bmm_rejects_invalid_metadata_before_resolve_or_allocation(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=(
+            _mojo_strides=(
                 aten_fast._row_major_strides(shape) if strides is None else strides
             ),
             _dtype=dtype,
@@ -7699,7 +7699,7 @@ def test_bf16_bridge_error_propagates_without_retry(monkeypatch, operation):
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _dtype=aten_fast.DType.bfloat16,
             _device=device,
             _ptr=ptr,
@@ -7749,7 +7749,7 @@ def test_bf16_helpers_reject_cross_device_before_resolve_or_allocation(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=aten_fast.DType.bfloat16,
             _device=device,
@@ -7807,7 +7807,7 @@ def test_tf32_helpers_route_each_fake_device_context_and_reject_cross_device(
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
-            _strides=aten_fast._row_major_strides(shape),
+            _mojo_strides=aten_fast._row_major_strides(shape),
             _offset=0,
             _dtype=aten_fast.DType.float32,
             _device=device,
@@ -8759,7 +8759,7 @@ def test_tf32_dense_batched_layout_accepts_broadcast_stride_zero():
     def tensor(shape, strides):
         return SimpleNamespace(
             _shape=tuple(shape),
-            _strides=tuple(strides),
+            _mojo_strides=tuple(strides),
             _dtype=aten_fast.DType.bfloat16,
             _device=h100,
         )
