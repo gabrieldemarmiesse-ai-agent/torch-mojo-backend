@@ -4015,6 +4015,35 @@ def fast_aten_expand(tensor, sizes, *, implicit=False):
     return _view_of(t, new_shape, new_strides, t._offset)
 
 
+def fast_aten_as_strided(tensor, size, stride, storage_offset=None):
+    """Zero-copy relayout over the tensor's storage (the holder allocation).
+
+    ``storage_offset`` is absolute in elements from the storage start, which
+    for this backend is the allocation start — the same convention
+    ``_view_of`` uses. DDP's Reducer builds its gradient bucket views with
+    this op (reducer.cpp initialize_bucket_views).
+    """
+    t = _t(tensor)
+    if t is None:
+        return NOT_HANDLED
+    size = tuple(size)
+    stride = tuple(stride)
+    if len(size) != len(stride) or any(s < 0 for s in size):
+        return NOT_HANDLED
+    if any(s < 0 for s in stride):
+        return NOT_HANDLED  # negative strides need flip support; decline
+    offset = t._offset if storage_offset is None else storage_offset
+    if offset < 0:
+        return NOT_HANDLED
+    # Refuse views that could reach past the allocation: as_strided is the
+    # one view op whose arguments are unconstrained by the input's own shape.
+    if all(size):
+        last = offset + sum((n - 1) * st for n, st in zip(size, stride))
+        if (last + 1) * t._itemsize > t._holder.get_nbytes():
+            return NOT_HANDLED
+    return _view_of(t, size, stride, offset)
+
+
 def fast_aten_slice(input, dim=0, start=None, end=None, step=1):
     t = _t(input)
     if t is None or not isinstance(dim, int) or not isinstance(step, int) or step < 1:
