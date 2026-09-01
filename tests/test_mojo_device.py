@@ -1188,3 +1188,15 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     assert cuda_peer.device_ordinal(0) is None
     assert cuda_peer.device_ordinal(torch.zeros(8).data_ptr()) is None
     assert not cuda_peer.same_physical_device(on_mojo._ptr, 0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vector_norm_with_an_accumulation_dtype(mojo_gpu_available, dtype):
+    """FSDP1's clip_grad_norm_ asks for the norm in float32 explicitly."""
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    cpu = torch.randn(4096, dtype=dtype)
+    expected = torch.linalg.vector_norm(cpu, 2.0, dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to("mojo:0"), 2.0, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
