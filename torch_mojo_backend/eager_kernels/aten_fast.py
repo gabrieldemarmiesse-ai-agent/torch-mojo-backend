@@ -2179,14 +2179,29 @@ class _MatmulSpecExtension(
     MOJO_FILE: ClassVar[Path] = _MatmulExtension.MOJO_FILE
 
     @classmethod
+    def _flag_items(cls, transpose_b: int) -> tuple[tuple[str, bool | int | str], ...]:
+        """The non-dtype defines, in the one place both builders below read.
+
+        `PTXAS_BIG_SMEM` compiles the 128x128 fp32 TN tiles (>48 KiB of
+        static shared memory) in or out; the 64x64 core serves their shapes
+        without it. The two `make_*_defines` hooks must agree exactly — one
+        keys the cache, the other the compile line — so neither spells the
+        flag set itself.
+        """
+        return (
+            ("TRANSPOSE_B", bool(transpose_b)),
+            *eager_kernels.big_static_smem_flags().items(),
+        )
+
+    @classmethod
     def make_defines(
         cls, op: str, tensors: tuple[MojoTensorLike, ...], transpose_b: int
     ) -> dict[str, bool | int | str]:
-        defines = {
+        defines: dict[str, bool | int | str] = {
             "OP": op,
             "DTYPE_OUT": tensors[0]._dtype.name,
-            "TRANSPOSE_B": bool(transpose_b),
         }
+        defines.update(cls._flag_items(transpose_b))
         defines.update(
             (f"DTYPE_ARG_{index}", tensor._dtype.name)
             for index, tensor in enumerate(tensors)
@@ -2201,7 +2216,7 @@ class _MatmulSpecExtension(
             op,
             tuple(t._dtype for t in tensors),
             (tensors[0]._dtype,),
-            (("TRANSPOSE_B", bool(transpose_b)),),
+            cls._flag_items(transpose_b),
         )
 
     @classmethod
@@ -9036,7 +9051,15 @@ def _try_gemm16_mm(
         arg_dtypes=(lhs._dtype, rhs._dtype)
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
-        flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
+        # The >48 KiB static-smem WGMMA routes exist only where ptxas will
+        # assemble; the flag compiles them out where it cannot, leaving the
+        # mma.sync ladder that serves the same shapes. See
+        # `eager_kernels.big_static_smem_flags`.
+        flags={
+            "TRANSPOSE_B": bool(transpose_b),
+            "HAS_BIAS": bias_tensor is not None,
+            **eager_kernels.big_static_smem_flags(),
+        },
         keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
@@ -9189,7 +9212,12 @@ def _try_gemm16_bmm(
         ),
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
-        flags={"TRANSPOSE_B": bool(transpose_b)},
+        # Same >48 KiB static-smem gate as the Gemm16 call above: the batched
+        # WGMMA ladder is compiled out where ptxas will not take it.
+        flags={
+            "TRANSPOSE_B": bool(transpose_b),
+            **eager_kernels.big_static_smem_flags(),
+        },
         keepalive=(out, lhs, rhs),
     )
     return out

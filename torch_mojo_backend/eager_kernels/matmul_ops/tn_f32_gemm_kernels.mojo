@@ -61,6 +61,7 @@ from std.sys.info import _has_sm_9x
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
 from op_utils import _enqueue_cached, _make_ptr
 from tn_f32_gemm_core import _tn_core_kernel, _tn_split_kernel
+from variant_gates import _big_static_smem_on
 
 
 # Split-K workspace cap. 32 MB never binds for the tiny-MN deep-K regime it
@@ -458,6 +459,19 @@ def try_enqueue_tn_f32_gemm(
     var vb4 = n % 4 == 0 and b_addr % 16 == 0
 
     var use_t128 = m >= 96 and n >= 96
+    # Both 128x128 cores stage their tiles in *static* shared memory —
+    # 0x10000 bytes for the quadrant core, up to 0x20000 for the warp-group
+    # split core — and ptxas caps a kernel's static `.shared` at 0xc000
+    # bytes before CUDA 13. It rejects the kernel at assembly time, which
+    # fails the whole `mojo build`, so an assembler with that cap needs a
+    # build these tiles are not *in*, not merely one that avoids selecting
+    # them. Forcing the choice here is the whole of the runtime effect; the
+    # matching `comptime if` on the launches below is what actually keeps
+    # them out of the module. The 64x64 core is correct for any m, n, k >= 1
+    # (see this function's docstring), so it serves these shapes instead,
+    # more slowly on the large ones.
+    comptime if not _big_static_smem_on():
+        use_t128 = False
     var use_split = use_t128 and va4 and vb4
 
     var gx: Int
@@ -498,13 +512,52 @@ def try_enqueue_tn_f32_gemm(
         ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
         c_target = Int(ws.value().unsafe_ptr())
 
-    if use_split:
-        # Deep splits mean short per-group chains (kchunk <= ~2 x
-        # KCHUNK_MIN_T128 slabs); STAGES=2's one-slab prologue amortizes
-        # better there (interleaved A/B on 128x128x131072 ks=114: s2
-        # 0.157 ms vs s4 0.158-0.159 ms). Long chains keep STAGES=4.
-        if ksplits > SPLITK_GENERIC_CAP:
-            _tn_split_launch[128, 128, 16, 2](
+    # The `comptime if` is what keeps the 128x128 tiles out of a build whose
+    # assembler will not take their static shared memory: a runtime `if`
+    # would still elaborate the parametric launch and emit the kernel. Its
+    # partner is the `use_t128 = False` above, which is what makes the
+    # 64x64 launch below unconditional in that build — every path out of
+    # this function still enqueues exactly one GEMM.
+    comptime if _big_static_smem_on():
+        if use_split:
+            # Deep splits mean short per-group chains (kchunk <= ~2 x
+            # KCHUNK_MIN_T128 slabs); STAGES=2's one-slab prologue amortizes
+            # better there (interleaved A/B on 128x128x131072 ks=114: s2
+            # 0.157 ms vs s4 0.158-0.159 ms). Long chains keep STAGES=4.
+            if ksplits > SPLITK_GENERIC_CAP:
+                _tn_split_launch[128, 128, 16, 2](
+                    ctx,
+                    gx,
+                    gy,
+                    ksplits,
+                    c_target,
+                    a_addr,
+                    b_addr,
+                    m,
+                    n,
+                    k,
+                    ksplits,
+                    va4,
+                    vb4,
+                )
+            else:
+                _tn_split_launch[128, 128, 16, 4](
+                    ctx,
+                    gx,
+                    gy,
+                    ksplits,
+                    c_target,
+                    a_addr,
+                    b_addr,
+                    m,
+                    n,
+                    k,
+                    ksplits,
+                    va4,
+                    vb4,
+                )
+        elif use_t128:
+            _tn_core_launch[128, 128, 16, 32, 64, 4, 4, 2](
                 ctx,
                 gx,
                 gy,
@@ -519,39 +572,7 @@ def try_enqueue_tn_f32_gemm(
                 va4,
                 vb4,
             )
-        else:
-            _tn_split_launch[128, 128, 16, 4](
-                ctx,
-                gx,
-                gy,
-                ksplits,
-                c_target,
-                a_addr,
-                b_addr,
-                m,
-                n,
-                k,
-                ksplits,
-                va4,
-                vb4,
-            )
-    elif use_t128:
-        _tn_core_launch[128, 128, 16, 32, 64, 4, 4, 2](
-            ctx,
-            gx,
-            gy,
-            ksplits,
-            c_target,
-            a_addr,
-            b_addr,
-            m,
-            n,
-            k,
-            ksplits,
-            va4,
-            vb4,
-        )
-    else:
+    if not use_t128:
         _tn_core_launch[64, 64, 16, 16, 32, 4, 4, 4](
             ctx,
             gx,

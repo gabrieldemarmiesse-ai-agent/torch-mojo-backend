@@ -52,6 +52,7 @@ from gemm16_tn_v4_kernels import (
     try_enqueue_gemm16_gemm_tt_v4,
 )
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from variant_gates import _big_static_smem_on
 
 
 comptime _V3_DT = _GEMM16_DT
@@ -1512,19 +1513,32 @@ def enqueue_gemm16_gemm(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    if not transpose_a and transpose_b and not has_bias:
-        # Deep-K split-K route first: the persistent kernel below keeps all
-        # SMs resident but cannot parallelize over K, so an output with few
-        # macro-tiles and a deep reduction leaves most of the GPU idle.
-        # The helper gates itself on that regime (see
-        # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
-        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
-            output, a, b, m, n, k, ctx
-        ):
-            return
-        if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
-            return
-    comptime if _has_sm_9x():
+    # Every wgmma/TMA route in this ladder — the v4 kernels reached here and
+    # the v3 kernels defined in this file — stages its operand pipeline in
+    # *static* shared memory, 72 KiB to 208 KiB of it. ptxas caps a kernel's
+    # static `.shared` at 48 KiB before CUDA 13 and fails the whole
+    # `mojo build` on the first kernel over the line, so where the active
+    # assembler is an older one this module has to be compiled without those
+    # routes rather than merely stopped from choosing them. That is the only
+    # thing `_big_static_smem_on()` does here; the shapes they claim fall
+    # through to `_enqueue_accepted_bf16_gemm` at the bottom, the mma.sync
+    # ladder that already serves every layout, bias and dtype this family
+    # accepts (slower — restoring the fast routes under such an assembler
+    # means shrinking their tiles, which is a separate piece of work).
+    comptime if _big_static_smem_on():
+        if not transpose_a and transpose_b and not has_bias:
+            # Deep-K split-K route first: the persistent kernel below keeps
+            # all SMs resident but cannot parallelize over K, so an output
+            # with few macro-tiles and a deep reduction leaves most of the
+            # GPU idle. The helper gates itself on that regime (see
+            # gemm16_tn_v4_kernels.mojo) and returns False otherwise.
+            if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+                output, a, b, m, n, k, ctx
+            ):
+                return
+            if maybe_enqueue_gemm16_nt_v4(output, a, b, m, n, k, ctx):
+                return
+    comptime if _has_sm_9x() and _big_static_smem_on():
         if ctx.api() == "cuda":
             var cc_major = ctx.get_attribute(
                 DeviceAttribute.COMPUTE_CAPABILITY_MAJOR
@@ -1805,23 +1819,31 @@ def enqueue_gemm16_bmm(
     # is a first-class input here, not a special case: the caller passes it
     # straight through, unlike `_tf32_dense_batched_layout` on the aten_fast
     # side which used to reject it (see that function's history).
-    if not transpose_a and not transpose_b:
-        if try_enqueue_bmm16_nn_batched(
-            output,
-            a,
-            b,
-            batch_count,
-            m,
-            n,
-            k,
-            output_batch_stride,
-            a_batch_stride,
-            b_batch_stride,
-            ctx,
-        ):
-            return
+    #
+    # Both routes below are wgmma/TMA kernels with 48 KiB-to-208 KiB static
+    # shared-memory pipelines, so `_big_static_smem_on()` compiles them out
+    # wherever ptxas would refuse to assemble them at all (see the matching
+    # comment in `enqueue_gemm16_gemm`). What remains is
+    # `_enqueue_accepted_bf16_bmm` at the bottom, which serves every layout
+    # unconditionally — the same kernel that already serves NT and TT here.
+    comptime if _big_static_smem_on():
+        if not transpose_a and not transpose_b:
+            if try_enqueue_bmm16_nn_batched(
+                output,
+                a,
+                b,
+                batch_count,
+                m,
+                n,
+                k,
+                output_batch_stride,
+                a_batch_stride,
+                b_batch_stride,
+                ctx,
+            ):
+                return
     if transpose_a and not transpose_b:
-        comptime if _has_sm_9x():
+        comptime if _has_sm_9x() and _big_static_smem_on():
             if ctx.api() == "cuda":
                 var cc_major = ctx.get_attribute(
                     DeviceAttribute.COMPUTE_CAPABILITY_MAJOR

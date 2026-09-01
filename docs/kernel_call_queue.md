@@ -112,6 +112,20 @@ it. An unsupported dtype or flag reported by Mojo indicates a bug in Python's
 definition mapping and is surfaced directly. There is no widening, dtype
 escalation, fallback build, or launch-time retry.
 
+That is also why a toolchain limit has to be answered before the build, not
+after it. ptxas caps a kernel's *static* shared memory at 48 KiB up to CUDA
+12.8 and lifts the cap in CUDA 13; it enforces that inside `mojo build`, and
+one over-limit kernel fails the whole `.so`, so on an older assembler the
+matmul families would not be slow, they would be unimportable. Python probes
+the assembler `MODULAR_NVPTX_COMPILER_PATH` names (`big_static_smem_flags`,
+`_ptxas_supports_big_static_smem`) and sends `PTXAS_BIG_SMEM=1` only when it
+takes the larger allocation. Absent, the `_big_static_smem_on()` gate compiles
+the wgmma/TMA GEMM routes out and the smaller routes that already serve those
+shapes take over. With no such variable set, MAX assembles in-process with the
+compiler it ships and the define is always sent, so a default install compiles
+exactly what it always did. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
+overrides the probe.
+
 Builds are protected by a per-identity file lock (`flock`) and written to a
 temporary file before an atomic rename. Concurrent requests for one identity,
 in this process or another, compile it once, and an interrupted compiler
