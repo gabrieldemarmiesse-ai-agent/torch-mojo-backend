@@ -5635,17 +5635,29 @@ def fast_aten_linalg_vector_norm(self, ord=2, dim=None, keepdim=False, *, dtype=
     It used to be composed here as mul -> sum -> sqrt, which is three launches
     and a temporary the size of the input for a reduction that reads each
     element once.
+
+    ``dtype`` selects the accumulation type, so it is honoured by casting
+    first, the same way ``fast_aten_mean`` does. FSDP1's
+    ``clip_grad_norm_`` always passes ``dtype=torch.float32``.
     """
     a = _t(self)
     if (
         a is None
-        or a._dtype not in _FLOAT_DTYPES
         or not isinstance(ord, int | float)
         or isinstance(ord, bool)
         or ord != 2
-        or dtype is not None
         or not isinstance(keepdim, bool)
     ):
+        return NOT_HANDLED
+    if dtype is not None:
+        target = _torch_dtype_to_max(dtype)
+        if target is None or target not in _FLOAT_DTYPES:
+            return NOT_HANDLED
+        if a._dtype != target:
+            if a._dtype not in _CAST_DTYPES or target not in _CAST_DTYPES:
+                return NOT_HANDLED
+            a = _cast_tensor(a, target)
+    if a._dtype not in _FLOAT_DTYPES:
         return NOT_HANDLED
     rank = len(a._shape)
     rdims = _norm_reduce_dims(dim, rank, empty_is_all=True)
