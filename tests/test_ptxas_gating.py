@@ -12,7 +12,6 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import ClassVar
 
 import pytest
 from max.dtype import DType
@@ -246,10 +245,10 @@ def test_matmul_spec_defines_carry_the_flag_and_agree_with_the_cache_key(
 class _StubTensor:
     """A `MojoTensorLike` stand-in; the define hooks read only `_dtype`."""
 
-    _shape: ClassVar[tuple[int, ...]] = (4, 4)
-    _mojo_strides: ClassVar[tuple[int, ...]] = (4, 1)
-    _dtype: ClassVar[DType] = DType.float32
-    _device: ClassVar[object] = None
+    _shape: tuple[int, ...] = (4, 4)
+    _mojo_strides: tuple[int, ...] = (4, 1)
+    _dtype: DType = DType.float32
+    _device: object = None
 
 
 def test_gated_routes_leave_an_unconditional_fallback_behind() -> None:

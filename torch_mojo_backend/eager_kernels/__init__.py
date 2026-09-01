@@ -411,8 +411,8 @@ def _build_env() -> dict[str, str]:
 
 _PTXAS_PROBE_SOURCE = _PACKAGE_DIR / "ptxas_probe.mojo"
 
-# (over the 48 KiB ceiling, exactly at it). The control leg tells a capped
-# assembler apart from a probe that fails for unrelated reasons.
+# Probe requests: over the 48 KiB ceiling, then exactly at it. The control leg
+# tells a capped assembler apart from a probe that fails for unrelated reasons.
 _PTXAS_PROBE_SIZES = (131072, 49152)
 
 _PTXAS_BIG_SMEM_ENV = "TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM"
