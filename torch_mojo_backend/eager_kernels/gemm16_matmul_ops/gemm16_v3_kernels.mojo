@@ -1513,18 +1513,9 @@ def enqueue_gemm16_gemm(
     # helper enqueues only for regimes it fully supports (SM90, aligned
     # n/k, TMA-compatible sizes) and returns False otherwise, in which case
     # the pre-existing NT path below remains the fallback.
-    # Every wgmma/TMA route in this ladder — the v4 kernels reached here and
-    # the v3 kernels defined in this file — stages its operand pipeline in
-    # *static* shared memory, 72 KiB to 208 KiB of it. ptxas caps a kernel's
-    # static `.shared` at 48 KiB before CUDA 13 and fails the whole
-    # `mojo build` on the first kernel over the line, so where the active
-    # assembler is an older one this module has to be compiled without those
-    # routes rather than merely stopped from choosing them. That is the only
-    # thing `_big_static_smem_on()` does here; the shapes they claim fall
-    # through to `_enqueue_accepted_bf16_gemm` at the bottom, the mma.sync
-    # ladder that already serves every layout, bias and dtype this family
-    # accepts (slower — restoring the fast routes under such an assembler
-    # means shrinking their tiles, which is a separate piece of work).
+    # The wgmma/TMA routes (v4 and the v3 kernels below) use 72-208 KiB of
+    # static smem; `_big_static_smem_on()` compiles them out where ptxas
+    # rejects that, and `_enqueue_accepted_bf16_gemm` serves their shapes.
     comptime if _big_static_smem_on():
         if not transpose_a and transpose_b and not has_bias:
             # Deep-K split-K route first: the persistent kernel below keeps
@@ -1820,12 +1811,8 @@ def enqueue_gemm16_bmm(
     # straight through, unlike `_tf32_dense_batched_layout` on the aten_fast
     # side which used to reject it (see that function's history).
     #
-    # Both routes below are wgmma/TMA kernels with 48 KiB-to-208 KiB static
-    # shared-memory pipelines, so `_big_static_smem_on()` compiles them out
-    # wherever ptxas would refuse to assemble them at all (see the matching
-    # comment in `enqueue_gemm16_gemm`). What remains is
-    # `_enqueue_accepted_bf16_bmm` at the bottom, which serves every layout
-    # unconditionally — the same kernel that already serves NT and TT here.
+    # Both wgmma/TMA routes are compiled out where ptxas rejects their static
+    # smem (see enqueue_gemm16_gemm); `_enqueue_accepted_bf16_bmm` remains.
     comptime if _big_static_smem_on():
         if not transpose_a and not transpose_b:
             if try_enqueue_bmm16_nn_batched(

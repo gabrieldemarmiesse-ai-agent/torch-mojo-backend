@@ -2180,14 +2180,8 @@ class _MatmulSpecExtension(
 
     @classmethod
     def _flag_items(cls, transpose_b: int) -> tuple[tuple[str, bool | int | str], ...]:
-        """The non-dtype defines, in the one place both builders below read.
-
-        `PTXAS_BIG_SMEM` compiles the 128x128 fp32 TN tiles (>48 KiB of
-        static shared memory) in or out; the 64x64 core serves their shapes
-        without it. The two `make_*_defines` hooks must agree exactly — one
-        keys the cache, the other the compile line — so neither spells the
-        flag set itself.
-        """
+        """Non-dtype defines. Both `make_*_defines` hooks must send the same
+        set: one keys the cache, the other the compile line."""
         return (
             ("TRANSPOSE_B", bool(transpose_b)),
             *eager_kernels.big_static_smem_flags().items(),
@@ -9051,10 +9045,6 @@ def _try_gemm16_mm(
         arg_dtypes=(lhs._dtype, rhs._dtype)
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
-        # The >48 KiB static-smem WGMMA routes exist only where ptxas will
-        # assemble; the flag compiles them out where it cannot, leaving the
-        # mma.sync ladder that serves the same shapes. See
-        # `eager_kernels.big_static_smem_flags`.
         flags={
             "TRANSPOSE_B": bool(transpose_b),
             "HAS_BIAS": bias_tensor is not None,
@@ -9212,8 +9202,6 @@ def _try_gemm16_bmm(
         ),
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
-        # Same >48 KiB static-smem gate as the Gemm16 call above: the batched
-        # WGMMA ladder is compiled out where ptxas will not take it.
         flags={
             "TRANSPOSE_B": bool(transpose_b),
             **eager_kernels.big_static_smem_flags(),

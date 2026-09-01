@@ -409,40 +409,21 @@ def _build_env() -> dict[str, str]:
     }
 
 
-# A ptxas capability probe, not a kernel: `ptxas_probe.mojo` declares one GPU
-# entry with a *static* `.shared` array of `PROBE_SIZE` bytes (a `-D` define)
-# and is built with `mojo build`, the same toolchain and (`_build_env`)
-# environment real extensions use, rather than by handing synthetic PTX to a
-# guessed assembler binary. ptxas rejects a static `.shared` allocation over
-# 48 KiB (0xc000) up to and including CUDA 12.8, and accepts it from CUDA 13
-# on; `mojo build` surfaces that as a nonzero exit and nothing is ever
-# launched.
-#
-# `mojo build` only shells out to the assembler `MODULAR_NVPTX_COMPILER_PATH`
-# names when it auto-detects a real, physically attached accelerator to build
-# for (confirmed empirically: passing an explicit `--target-accelerator`, or
-# building with none attached at all, both make it defer to PTX-only
-# embedding for later JIT and never touch that env var). `_ptxas_assembles`
-# therefore builds the same way `_extension_cmd` does -- no accelerator
-# override -- which also means the probe is only ever reachable in practice
-# where it matters: `big_static_smem_flags()` is only consulted while
-# building a real GEMM/BMM extension for an actual mojo device, which
-# requires an accelerator to exist in the first place.
 _PTXAS_PROBE_SOURCE = _PACKAGE_DIR / "ptxas_probe.mojo"
 
-# The static-shared ceiling every ptxas enforces without an opt-in, and the
-# smallest request above it. 49152 must assemble everywhere: it is the
-# control leg that tells a real ceiling apart from a probe that failed for
-# an unrelated reason (a sandboxed exec, a missing binary).
+# (over the 48 KiB ceiling, exactly at it). The control leg tells a capped
+# assembler apart from a probe that fails for unrelated reasons.
 _PTXAS_PROBE_SIZES = (131072, 49152)
 
 _PTXAS_BIG_SMEM_ENV = "TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM"
 
 
 def _ptxas_assembles(size: int) -> bool:
-    """Whether `mojo build` compiles the probe kernel with `size` bytes of
-    static smem, under the active `MODULAR_NVPTX_COMPILER_PATH` (inherited
-    from `os.environ` through `_build_env`, exactly like a real build)."""
+    """Build the probe kernel with `size` bytes of static smem.
+
+    No `--target-accelerator`: given one, `mojo build` embeds PTX only and
+    never runs `MODULAR_NVPTX_COMPILER_PATH`.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir) / "probe.so"
         proc = subprocess.run(
@@ -465,24 +446,10 @@ def _ptxas_assembles(size: int) -> bool:
 
 
 def _ptxas_probe_cache_path(compiler: str) -> Path:
-    """On-disk verdict location for one (toolchain, compiler-binary) pair.
-
-    `_TOOLCHAIN_IDENTITY` covers the mojo/max package versions and host ABI;
-    the compiler path plus its file's size+mtime cover the actual binary
-    `MODULAR_NVPTX_COMPILER_PATH` names, so pointing it at a different
-    install invalidates the entry -- the realistic way an assembler changes.
-    A path that cannot be stat'd (does not exist, no permission) still gets
-    a stable key -- probing it is cheap since `mojo build` fails immediately,
-    and the answer does not depend on a fingerprint that does not exist.
-
-    This can only invalidate what it can see. `mojo build` keeps its own
-    persistent compilation cache under `MODULAR_HOME`, and empirically (see
-    tests/test_ptxas_gating.py) that cache is keyed on the compiler *path
-    string*, not on the bytes at that path -- a ptxas binary replaced in
-    place at a path `mojo` has already built against can still answer from
-    its stale cache even in a brand new process. Nothing at this layer can
-    see that; it is a property of the toolchain, not of this probe.
-    """
+    """Keyed by toolchain identity plus the compiler binary's path and
+    size+mtime. `mojo build`'s own cache under `MODULAR_HOME` is keyed on the
+    path string alone, so a binary replaced in place can still be answered
+    stale from there; this layer cannot see that."""
     try:
         info = os.stat(compiler)
         fingerprint = f"{info.st_size}:{info.st_mtime_ns}"
@@ -516,14 +483,11 @@ def _write_ptxas_probe_cache(path: Path, verdict: bool) -> None:
 
 
 def _probe_ptxas_big_static_smem(compiler: str) -> bool:
-    """Run both probe legs and apply the broken-vs-capped fallback rule."""
     big, control = _PTXAS_PROBE_SIZES
     if _ptxas_assembles(big):
         return True
-    # The big leg failed. Only a passing control leg makes that a statement
-    # about the ceiling; if even 48 KiB fails, the probe itself is broken and
-    # gating the fast kernels out on that evidence would be a silent,
-    # permanent slowdown. Keep today's behaviour and say so.
+    # An assembler that fails the control leg too is broken, not capped;
+    # gating on that evidence would be a silent, permanent slowdown.
     if _ptxas_assembles(control):
         return False
     sys.stderr.write(
@@ -540,35 +504,16 @@ def _probe_ptxas_big_static_smem(compiler: str) -> bool:
 def _ptxas_supports_big_static_smem() -> bool:
     """Whether the active PTX assembler accepts >48 KiB of *static* shared memory.
 
-    Answering False compiles the sm_90 WGMMA/TMA GEMM routes out of the build
-    (see `_big_static_smem_on` in variant_gates.mojo): ptxas fails the whole
-    `mojo build`, not the one over-limit kernel, so an extension carrying such
-    a kernel is not slow on an old assembler, it is unimportable — and this
-    loader deliberately has no run-time fallback (docs/kernel_call_queue.md).
-    The routes that stay serve every shape those ones did, more slowly.
+    ptxas caps static `.shared` at 48 KiB through CUDA 12.8 and fails the
+    whole `mojo build` on one over-limit kernel, so the sm_90 wgmma/TMA GEMM
+    routes must be compiled out (`_big_static_smem_on` in variant_gates.mojo),
+    not merely left unselected; the smaller routes serve the same shapes.
 
-    The answer is a property of the assembler, so it is asked by actually
-    building `ptxas_probe.mojo` with `mojo build` rather than guessed from a
-    version string:
-
-    * `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1` overrides everything, for
-      tests and for a machine whose probe is wrong. It short-circuits before
-      either the build or the disk cache below.
-    * With `MODULAR_NVPTX_COMPILER_PATH` unset, MAX assembles PTX in-process
-      with the PTX compiler it ships (CUDA 13 today, which accepts big static
-      smem) and there is no external binary to interrogate: answer True, so
-      the default install compiles exactly the kernels it always did.
-    * Otherwise that env var names the `ptxas` MAX will hand the PTX to, and
-      it is the one binary whose limits matter. A `mojo build` of the probe
-      costs real seconds, so the verdict is memoized on disk under
-      `_CACHE_DIR`, keyed by toolchain identity plus the compiler binary's
-      path and size+mtime fingerprint (`_ptxas_probe_cache_path`); this
-      `functools.cache` is only the in-process layer on top of that file.
-
-    Only NVIDIA is affected. AMD and Apple builds never consult
-    `MODULAR_NVPTX_COMPILER_PATH`, so they take the True branch above and
-    nothing about them changes; the routes gated on this flag are in any case
-    already behind an sm_9x comptime check.
+    `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1` overrides the probe. With
+    `MODULAR_NVPTX_COMPILER_PATH` unset, MAX assembles with the CUDA 13
+    compiler it bundles and the answer is True. Otherwise `ptxas_probe.mojo`
+    is built once per (toolchain, compiler binary) and the verdict memoized
+    under `_CACHE_DIR`.
     """
     override = os.environ.get(_PTXAS_BIG_SMEM_ENV)
     if override in ("0", "1"):
@@ -586,14 +531,9 @@ def _ptxas_supports_big_static_smem() -> bool:
 
 
 def big_static_smem_flags() -> dict[str, DefineValue]:
-    """The `PTXAS_BIG_SMEM` define for a family that has >48 KiB-smem routes.
-
-    Empty when the assembler cannot take them, because every gate in
-    variant_gates.mojo is written so that an absent define reads back as ""
-    and selects nothing. Callers merge this into their `flags`; a family with
-    no such route must not, or it forks a second, byte-identical build of
-    itself for no reason (see this module's docstring).
-    """
+    """The `PTXAS_BIG_SMEM` define, empty when the assembler cannot take the
+    big routes (an absent define gates off). Only a family with such a route
+    may merge this in: an unread define forks a byte-identical build."""
     return {"PTXAS_BIG_SMEM": 1} if _ptxas_supports_big_static_smem() else {}
 
 

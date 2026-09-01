@@ -112,38 +112,15 @@ it. An unsupported dtype or flag reported by Mojo indicates a bug in Python's
 definition mapping and is surfaced directly. There is no widening, dtype
 escalation, fallback build, or launch-time retry.
 
-That is also why a toolchain limit has to be answered before the build, not
-after it. ptxas caps a kernel's *static* shared memory at 48 KiB up to CUDA
-12.8 and lifts the cap in CUDA 13; it enforces that inside `mojo build`, and
-one over-limit kernel fails the whole `.so`, so on an older assembler the
-matmul families would not be slow, they would be unimportable. Python asks
-the real toolchain rather than guessing which assembler MAX will use:
-`_ptxas_supports_big_static_smem` builds `eager_kernels/ptxas_probe.mojo` --
-a GPU kernel whose only content is a static `.shared` array sized by a `-D
-PROBE_SIZE` define -- with the loader's own `mojo build`, once for a size
-over the ceiling and, only if that fails, once more for a control size at
-exactly the ceiling (a failing control means the toolchain itself is unusable
-for the probe, not that it is capped, so the answer stays the pre-probe
-default). `mojo build` only shells out to the binary
-`MODULAR_NVPTX_COMPILER_PATH` names when it auto-detects a real accelerator
-to build for -- an explicit `--target-accelerator`, or no accelerator
-attached at all, both make it defer to PTX-only embedding and never touch
-that binary -- so the probe is built the same way, and is only ever
-consulted in practice where a real accelerator already exists
-(`big_static_smem_flags` runs while building an actual GEMM/BMM extension for
-an actual mojo device). `_ptxas_supports_big_static_smem` sends
-`PTXAS_BIG_SMEM=1` only when the over-ceiling build succeeds. Absent, the
-`_big_static_smem_on()` gate compiles the wgmma/TMA GEMM routes out and the
-smaller routes that already serve those shapes take over. With no
-`MODULAR_NVPTX_COMPILER_PATH` set, MAX assembles in-process with the compiler
-it ships and the define is always sent, so a default install compiles
-exactly what it always did -- and no probe build ever runs, since that
-in-process compiler is never named by a binary path to fingerprint. A build's
-verdict is memoized on disk under `__mojocache__`, keyed by toolchain
-identity plus the named binary's path and size/mtime, so only the first
-process per (toolchain, compiler binary) pays the `mojo build` seconds.
-`TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1` overrides the probe, short-circuiting
-before either the build or the disk cache.
+A toolchain limit has to be answered before the build for the same reason.
+ptxas caps a kernel's *static* shared memory at 48 KiB through CUDA 12.8, and
+one over-limit kernel fails the whole `.so`. `_ptxas_supports_big_static_smem`
+(eager_kernels/__init__.py) builds `ptxas_probe.mojo` once per (toolchain,
+`MODULAR_NVPTX_COMPILER_PATH` binary) to find out, and sends `PTXAS_BIG_SMEM=1`
+only when the assembler accepts it; otherwise `_big_static_smem_on()` in
+variant_gates.mojo compiles the wgmma/TMA GEMM routes out and the smaller
+routes serve their shapes. `TORCH_MOJO_BACKEND_PTXAS_BIG_SMEM=0`/`=1`
+overrides the probe.
 
 Builds are protected by a per-identity file lock (`flock`) and written to a
 temporary file before an atomic rename. Concurrent requests for one identity,

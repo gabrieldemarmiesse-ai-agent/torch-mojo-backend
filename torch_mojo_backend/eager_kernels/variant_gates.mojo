@@ -23,21 +23,10 @@ comptime _PTXAS_BIG_SMEM = get_defined_string["PTXAS_BIG_SMEM", ""]()
 def _big_static_smem_on() -> Bool:
     """Whether this build may contain kernels using >48 KiB of *static* smem.
 
-    ptxas caps a kernel's static (non-opt-in) `.shared` at 0xc000 bytes on
-    every sm_90 part up to CUDA 12.8 and lifts the cap in CUDA 13, and it
-    fails the whole `mojo build` rather than the one over-limit kernel — so a
-    route that needs a bigger tile has to be compiled out, not merely left
-    unselected, wherever the active assembler is the older one. Python probes
-    that assembler once per process and passes `PTXAS_BIG_SMEM=1` only when
-    it accepts the larger allocation (`_ptxas_supports_big_static_smem` in
-    eager_kernels/__init__.py); the define is absent otherwise, so the
-    default below gates the big routes off exactly like every other gate in
-    this file treats a define nobody sent.
-
-    A route behind this gate must therefore never be the only one able to
-    serve a shape: its `else` has to reach an existing kernel that fits in
-    48 KiB, which for the 16-bit GEMMs is the mma.sync ladder in
-    gemm16_kernels.mojo and for fp32 is the 64x64 TN core.
+    Sent as `PTXAS_BIG_SMEM=1` only when the assembler accepts that much
+    (`_ptxas_supports_big_static_smem` in eager_kernels/__init__.py). A
+    route behind this gate must never be the only one serving a shape: its
+    fallback has to fit in 48 KiB.
     """
     comptime if _PTXAS_BIG_SMEM == "1":
         return True

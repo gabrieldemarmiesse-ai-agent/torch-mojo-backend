@@ -459,17 +459,9 @@ def try_enqueue_tn_f32_gemm(
     var vb4 = n % 4 == 0 and b_addr % 16 == 0
 
     var use_t128 = m >= 96 and n >= 96
-    # Both 128x128 cores stage their tiles in *static* shared memory —
-    # 0x10000 bytes for the quadrant core, up to 0x20000 for the warp-group
-    # split core — and ptxas caps a kernel's static `.shared` at 0xc000
-    # bytes before CUDA 13. It rejects the kernel at assembly time, which
-    # fails the whole `mojo build`, so an assembler with that cap needs a
-    # build these tiles are not *in*, not merely one that avoids selecting
-    # them. Forcing the choice here is the whole of the runtime effect; the
-    # matching `comptime if` on the launches below is what actually keeps
-    # them out of the module. The 64x64 core is correct for any m, n, k >= 1
-    # (see this function's docstring), so it serves these shapes instead,
-    # more slowly on the large ones.
+    # The 128x128 cores use 64-128 KiB of static smem, over ptxas's 48 KiB
+    # cap before CUDA 13; the `comptime if` below keeps them out of such a
+    # build and the 64x64 core (correct for any m, n, k >= 1) serves instead.
     comptime if not _big_static_smem_on():
         use_t128 = False
     var use_split = use_t128 and va4 and vb4
@@ -512,12 +504,8 @@ def try_enqueue_tn_f32_gemm(
         ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
         c_target = Int(ws.value().unsafe_ptr())
 
-    # The `comptime if` is what keeps the 128x128 tiles out of a build whose
-    # assembler will not take their static shared memory: a runtime `if`
-    # would still elaborate the parametric launch and emit the kernel. Its
-    # partner is the `use_t128 = False` above, which is what makes the
-    # 64x64 launch below unconditional in that build — every path out of
-    # this function still enqueues exactly one GEMM.
+    # `comptime if`, not a runtime `if`: a runtime branch would still
+    # elaborate the parametric launch and emit the over-limit kernel.
     comptime if _big_static_smem_on():
         if use_split:
             # Deep splits mean short per-group chains (kchunk <= ~2 x
