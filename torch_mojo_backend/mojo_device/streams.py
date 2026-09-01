@@ -30,18 +30,20 @@ import itertools
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import TypeAlias
 
 import max.driver
 import torch
+from torch._C._autograd import DeviceType
 
 from torch_mojo_backend.mojo_device import device_streams
 
-_PRIVATEUSE1_DEVICE_TYPE = int(torch._C._autograd.DeviceType.PrivateUse1)
+_DeviceLike: TypeAlias = torch.device | str | int | None
+
+_PRIVATEUSE1_DEVICE_TYPE = DeviceType.PrivateUse1.value
 _user_stream_ids = itertools.count()
 _current_stacks = threading.local()  # {device_index: [Stream, ...]} per thread
-# No annotation: beartype's claw checks module-level annotated globals and
-# rejects the forward reference to Stream (defined below).
-_default_streams = {}  # {device_index: Stream}
+_default_streams: dict[int, "Stream"] = {}
 _default_streams_lock = threading.Lock()
 
 
@@ -51,7 +53,7 @@ def _current_device_index() -> int:
     return torch_mojo_device_module.current_device()
 
 
-def _resolve_index(device: object) -> int:
+def _resolve_index(device: _DeviceLike) -> int:
     if device is None:
         return _current_device_index()
     if isinstance(device, int):
@@ -62,7 +64,7 @@ def _resolve_index(device: object) -> int:
     return resolved.index if resolved.index is not None else _current_device_index()
 
 
-def _max_device_of(index: int) -> object:
+def _max_device_of(index: int) -> max.driver.Device:
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
         find_equivalent_max_device,
     )
@@ -80,7 +82,7 @@ class Event:
 
     def __init__(
         self,
-        device: object = None,
+        device: _DeviceLike = None,
         *,
         enable_timing: bool = False,
         blocking: bool = False,
@@ -140,7 +142,7 @@ class Event:
         return self._event.elapsed_time(end_event._event)
 
     @classmethod
-    def from_ipc_handle(cls, device: object, handle: bytes) -> "Event":
+    def from_ipc_handle(cls, device: _DeviceLike, handle: bytes) -> "Event":
         raise NotImplementedError(
             "interprocess events are not supported on the mojo device"
         )
@@ -160,9 +162,13 @@ class Stream(torch._C.Stream):
     base's stub PrivateUse1 device-guard no-op.
     """
 
+    _device_stream: device_streams.Stream
+    _index: int
+    priority: int
+
     def __new__(
         cls,
-        device: object = None,
+        device: _DeviceLike = None,
         priority: int = 0,
         *,
         _device_stream: device_streams.Stream | None = None,
@@ -257,7 +263,7 @@ class Stream(torch._C.Stream):
         )
 
 
-def _stream_of(stream: object, index: int) -> device_streams.Stream:
+def _stream_of(stream: torch.Stream, index: int) -> device_streams.Stream:
     """The device stream of ours, or of a stub torch.Stream (= the default
     stream: the stub PrivateUse1 guard can only ever describe that one)."""
     if isinstance(stream, Stream):
@@ -265,7 +271,7 @@ def _stream_of(stream: object, index: int) -> device_streams.Stream:
     return default_stream(index)._device_stream
 
 
-def default_stream(device: object = None) -> Stream:
+def default_stream(device: _DeviceLike = None) -> Stream:
     index = _resolve_index(device)
     with _default_streams_lock:
         stream = _default_streams.get(index)
@@ -278,7 +284,7 @@ def default_stream(device: object = None) -> Stream:
         return stream
 
 
-def current_stream(device: object = None) -> Stream:
+def current_stream(device: _DeviceLike = None) -> Stream:
     index = _resolve_index(device)
     stacks = getattr(_current_stacks, "stacks", None)
     if stacks and stacks.get(index):

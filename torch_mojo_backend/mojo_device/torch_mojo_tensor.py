@@ -3,7 +3,7 @@ import math
 import sys
 import threading
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import ClassVar, Protocol, cast, runtime_checkable
 
@@ -22,6 +22,13 @@ from torch_mojo_backend.eager_kernels.output_specs import (
 from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
 
 
+class _MojoTensorHolder(Protocol):
+    """The Mojo `TensorHolder` owning one device allocation (no Python stubs)."""
+
+    def data_ptr(self) -> int: ...
+    def get_nbytes(self) -> int: ...
+
+
 @runtime_checkable
 class _TensorHolderModule(Protocol):
     """The subset of the JIT-compiled `tensor_holder` Mojo extension this
@@ -29,10 +36,10 @@ class _TensorHolderModule(Protocol):
     Mojo, not Python); every member here is a raw PythonObject-in,
     PythonObject-out native call, so `object` is the honest signature."""
 
-    def alloc(self, ctx_ptr: int, nbytes: int) -> tuple[object, int]: ...
+    def alloc(self, ctx_ptr: int, nbytes: int) -> tuple[_MojoTensorHolder, int]: ...
     def alloc_from_host(
         self, ctx_ptr: int, data_ptr: int, nbytes: int
-    ) -> tuple[object, int, object]: ...
+    ) -> tuple[_MojoTensorHolder, int, object]: ...
     def copy_to_host(
         self, ctx_ptr: int, src_ptr: int, dst_ptr: int, nbytes: int
     ) -> object: ...
@@ -40,6 +47,11 @@ class _TensorHolderModule(Protocol):
         self, ctx_ptr: int, src_ptr: int, nbytes: int
     ) -> tuple[object, int]: ...
     def CopyStrided(self, *args: object) -> object: ...
+    def copy_d2d(
+        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
+    ) -> None: ...
+    def fence_event_record(self, ctx_ptr: int) -> object: ...
+    def fence_event_wait(self, ctx_ptr: int, event: object) -> None: ...
 
 
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
@@ -100,17 +112,29 @@ class _HolderOwner:
 
     __slots__ = ("_holder", "_events", "_owner_ctx", "_wait")
 
-    def __init__(self, holder: object) -> None:
+    # A compile-backend output is owned by its MAX Buffer instead (compiler.py).
+    _holder: _MojoTensorHolder | max.driver.Buffer
+    _events: dict[int, object] | None  # {foreign stream ctx ptr: newest FenceEvent}
+    _owner_ctx: int | None
+    _wait: Callable[[int, object], None] | None
+
+    def __init__(self, holder: "_MojoTensorHolder | max.driver.Buffer") -> None:
         self._holder = holder
-        self._events = None  # {foreign stream ctx ptr: newest FenceEvent}
+        self._events = None
         self._owner_ctx = None
         self._wait = None
 
     def data_ptr(self) -> int:
-        return self._holder.data_ptr()
+        holder = self._holder
+        if isinstance(holder, max.driver.Buffer):
+            return holder._data_ptr()
+        return holder.data_ptr()
 
     def get_nbytes(self) -> int:
-        return self._holder.get_nbytes()
+        holder = self._holder
+        if isinstance(holder, max.driver.Buffer):
+            return holder.num_elements * holder.dtype.size_in_bytes
+        return holder.get_nbytes()
 
     def record_foreign_use(
         self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
@@ -124,11 +148,11 @@ class _HolderOwner:
         self._events[stream_ctx_ptr] = event
 
     def __del__(self) -> None:
-        events = self._events
-        if not events or _is_finalizing():
+        events, wait, owner_ctx = self._events, self._wait, self._owner_ctx
+        if not events or wait is None or owner_ctx is None or _is_finalizing():
             return
         for event in events.values():
-            self._wait(self._owner_ctx, event)
+            wait(owner_ctx, event)
 
 
 def _ctx_ptr(device: max.driver.Device) -> int:
@@ -318,7 +342,7 @@ class _SynchronizableDevice(Protocol):
 
 def _alloc_with_recovery(
     device: _SynchronizableDevice, nbytes: int
-) -> tuple[object, int]:
+) -> tuple[_MojoTensorHolder, int]:
     """One device allocation, with the reactive last resort under the budget.
 
     When the allocator refuses, the largest reclaimable set is whatever the
@@ -439,9 +463,7 @@ class TorchMojoTensor(torch.Tensor):
 
     # Declared here (not just assigned in `_make`) so the type checker
     # resolves reads across the codebase; matches `_PAYLOAD_ATTRIBUTES` below.
-    # `_holder`/`_ptr` are opaque handles into the Mojo extension module,
-    # which carries no stubs.
-    _holder: object
+    _holder: _HolderOwner
     _ptr: int
     _shape: tuple[int, ...]
     _mojo_strides: tuple[int, ...]
@@ -480,7 +502,7 @@ class TorchMojoTensor(torch.Tensor):
     @classmethod
     def _make(
         cls,
-        holder: object,
+        holder: "_HolderOwner | _MojoTensorHolder | max.driver.Buffer",
         ptr: int,
         shape: Sequence[int],
         strides: Sequence[int],
@@ -953,14 +975,6 @@ def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     _as_strided_tensorimpl(dst, src._shape, src._mojo_strides, src._offset)
 
 
-@runtime_checkable
-class _HolderWithNbytes(Protocol):
-    """`_holder` is opaque `object` (a Mojo TensorHolder, no Python stubs);
-    this narrows just the one method `_resize_payload` needs from it."""
-
-    def get_nbytes(self) -> int: ...
-
-
 def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
     """Resize an eager out tensor and keep aliases when storage is sufficient.
 
@@ -976,7 +990,7 @@ def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
         return
 
     required_bytes = math.prod(shape) * dst._itemsize
-    allocation_bytes = int(cast(_HolderWithNbytes, dst._holder).get_nbytes())
+    allocation_bytes = int(dst._holder.get_nbytes())
     available_bytes = allocation_bytes - dst._offset * dst._itemsize
     if available_bytes < 0:
         available_bytes = 0

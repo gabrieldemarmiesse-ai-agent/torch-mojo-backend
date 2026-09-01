@@ -1,10 +1,13 @@
+from collections.abc import Callable
 from functools import wraps
 from types import ModuleType
+from typing import TypeVar
 
 import torch
 
 from .mojo_device_aten_ops import _aten_ops_registry
 
+_T = TypeVar("_T")
 _registered = False
 
 
@@ -61,7 +64,7 @@ def _install_torch_accelerator_synchronize(
     torch.accelerator.synchronize = synchronize  # ty: ignore[invalid-assignment]
 
 
-def _install_torch_accelerator_stream_api(torch_mojo_device_module):
+def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType) -> None:
     """Route torch.accelerator.current_stream/set_stream to mojo streams.
 
     Same reason as the synchronize patch above: the Python PrivateUse1
@@ -75,29 +78,36 @@ def _install_torch_accelerator_stream_api(torch_mojo_device_module):
     mojo_device = torch.device("mojo")
 
     @wraps(original_current_stream)
-    def current_stream(device=None):
+    def current_stream(device: torch.device | str | int | None = None) -> torch.Stream:
         if torch.accelerator.current_accelerator() != mojo_device:
             return original_current_stream(device)
         return torch_mojo_device_module.current_stream(device)
 
-    current_stream._torch_mojo_backend = True
-    torch.accelerator.current_stream = current_stream
+    # Same deliberate monkeypatch and sentinel as `synchronize` above.
+    current_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.accelerator.current_stream = current_stream  # ty: ignore[invalid-assignment]
 
     original_set_stream = torch.accelerator.set_stream
 
     @wraps(original_set_stream)
-    def set_stream(stream):
+    def set_stream(stream: torch.Stream) -> None:
         from torch_mojo_backend.mojo_device.streams import Stream as MojoStream
 
         if isinstance(stream, MojoStream):
             return torch_mojo_device_module.set_stream(stream)
         return original_set_stream(stream)
 
-    set_stream._torch_mojo_backend = True
-    torch.accelerator.set_stream = set_stream
+    set_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.accelerator.set_stream = set_stream  # ty: ignore[invalid-assignment]
 
 
-def _install_torch_stream_event_dispatch():
+def _forwarding_constructor(cls: type[_T]) -> Callable[..., _T]:
+    """`cls` as an opaque callable: the metaclasses below forward whatever
+    constructor arguments the caller passed, and only `cls` knows their shape."""
+    return cls
+
+
+def _install_torch_stream_event_dispatch() -> None:
     """Dispatch torch.Stream/torch.Event on mojo devices to real classes.
 
     Construction through the original classes reaches the stub C++ guard and
@@ -112,45 +122,54 @@ def _install_torch_stream_event_dispatch():
 
     original_stream = torch.Stream
     original_event = torch.Event
+    construct_stream = _forwarding_constructor(original_stream)
+    construct_mojo_stream = _forwarding_constructor(mojo_streams.Stream)
+    construct_event = _forwarding_constructor(original_event)
+    construct_mojo_event = _forwarding_constructor(mojo_streams.Event)
 
-    def _wants_mojo(args, kwargs):
+    def _wants_mojo(args: tuple[object, ...], kwargs: dict[str, object]) -> bool:
         device = kwargs.get("device", args[0] if args else None)
         if device is None or isinstance(device, int):
             accelerator = torch.accelerator.current_accelerator()
             return accelerator is not None and accelerator.type == "mojo"
+        if not isinstance(device, str | torch.device):
+            return False  # torch.device() would raise TypeError
         try:
             return torch.device(device).type == "mojo"
         except (TypeError, RuntimeError, ValueError):
             return False
 
     class _StreamMeta(type):
-        def __call__(cls, *args, **kwargs):
+        def __call__(cls, *args: object, **kwargs: object) -> torch.Stream:
             if "stream_id" in kwargs or "device_type" in kwargs:
-                return original_stream(*args, **kwargs)
+                return construct_stream(*args, **kwargs)
             if _wants_mojo(args, kwargs):
-                return mojo_streams.Stream(*args, **kwargs)
-            return original_stream(*args, **kwargs)
+                return construct_mojo_stream(*args, **kwargs)
+            return construct_stream(*args, **kwargs)
 
-        def __instancecheck__(cls, instance):
+        def __instancecheck__(cls, instance: object) -> bool:
             return isinstance(instance, (original_stream, mojo_streams.Stream))
 
     class Stream(metaclass=_StreamMeta):
         _torch_mojo_backend = True
 
     class _EventMeta(type):
-        def __call__(cls, *args, **kwargs):
+        def __call__(
+            cls, *args: object, **kwargs: object
+        ) -> torch.Event | mojo_streams.Event:
             if _wants_mojo(args, kwargs):
-                return mojo_streams.Event(*args, **kwargs)
-            return original_event(*args, **kwargs)
+                return construct_mojo_event(*args, **kwargs)
+            return construct_event(*args, **kwargs)
 
-        def __instancecheck__(cls, instance):
+        def __instancecheck__(cls, instance: object) -> bool:
             return isinstance(instance, (original_event, mojo_streams.Event))
 
     class Event(metaclass=_EventMeta):
         _torch_mojo_backend = True
 
-    torch.Stream = Stream
-    torch.Event = Event
+    # Deliberate replacement of torch's classes by the dispatching wrappers.
+    torch.Stream = Stream  # ty: ignore[invalid-assignment]
+    torch.Event = Event  # ty: ignore[invalid-assignment]
 
 
 def _declare_mojo_tensor_as_plain_tensor() -> None:
