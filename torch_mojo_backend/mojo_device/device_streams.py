@@ -85,6 +85,15 @@ class Stream:
             return
         self._stream.wait_for(self.device)
 
+    def wait_stream(self, other: "Stream") -> None:
+        """Order later work here after everything `other` has right now.
+
+        Tail-at-call-time semantics — the free fence wants the different
+        thing (a point-in-time wait), and uses `record_fence_event` instead.
+        """
+        if other is not self:
+            self._stream.wait_for(other._stream)
+
     def make_default_stream_wait(self) -> None:
         """Order subsequent default-stream work after this stream's work."""
         if self.is_default:
@@ -101,8 +110,16 @@ class Stream:
         """Waitable by another stream at any later time — see module docstring."""
         return _holder_mod().fence_event_record(self.ctx_ptr)
 
-    def record_event(self) -> max.driver.DeviceEvent:
-        return self._stream.record_event()
+    def record_event(
+        self, event: max.driver.DeviceEvent | None = None
+    ) -> max.driver.DeviceEvent:
+        """Capture everything enqueued here so far. Pass an existing event
+        to re-record it (e.g. a timing event) instead of minting a new one.
+        """
+        if event is None:
+            return self._stream.record_event()
+        self._stream.record_event(event)
+        return event
 
     def query(self) -> bool:
         """True once this stream's enqueued work has completed.

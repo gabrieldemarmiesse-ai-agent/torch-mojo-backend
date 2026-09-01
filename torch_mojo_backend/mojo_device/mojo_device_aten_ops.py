@@ -75,6 +75,7 @@ from .aten_ops.inplace import (
 )
 from .aten_ops.reductions import mojo_device_min_dim, mojo_device_min_dim_min
 from .aten_ops.rng import mojo_device_normal_
+from .aten_ops.streams import mojo_device_record_stream
 from .aten_ops.support import _eager_impl, _not_implemented, _out_variant
 from .aten_ops.transfer import mojo_device__copy_from, mojo_device__to_copy
 
@@ -355,6 +356,7 @@ _register_fast("aten::permute", "fast_aten_permute")
 _register_fast("aten::pow.Tensor_Scalar", "fast_aten_pow")
 _register_fast("aten::pow.Tensor_Tensor", "fast_aten_pow_tensor_tensor")
 _register_fast("aten::reciprocal", "fast_aten_reciprocal")
+register_aten_op("aten::record_stream")(mojo_device_record_stream)
 register_aten_op("aten::relu")(mojo_device_relu)
 register_aten_op("aten::relu_")(mojo_device_relu_)
 _register_fast("aten::remainder.Scalar", "fast_aten_remainder")
