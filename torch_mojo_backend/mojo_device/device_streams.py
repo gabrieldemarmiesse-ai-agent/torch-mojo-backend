@@ -1,45 +1,20 @@
 """Side device streams for the mojo device.
 
-The eager backend runs compute, transfers, and stream-ordered frees on ONE
-stream per device — the MAX DeviceContext's default stream (see
-docs/kernel_call_queue.md). This module adds *extra* streams for work that
-should overlap it, e.g. NCCL collectives (torch_mojo_backend/distributed).
+All compute, transfers, and stream-ordered frees ride ONE stream per device
+(the MAX default stream); a `Stream` here is an extra stream for work that
+overlaps it, e.g. NCCL collectives. Everything uses MAX's Python driver API
+except the one primitive it lacks — waiting on an event recorded at a point
+in time, enqueued arbitrarily later (at destructor time) — carried by
+`tensor_holder.fence_event_record`/`fence_event_wait` in Mojo. Streams are
+addressed by their per-stream `DeviceContext` pointer; `Stream.handle` (the
+native CUstream) exists only for native libraries like NCCL. MAX/AsyncRT
+thread-safety is undocumented; AMD should work through the same abstractions
+but is unverified.
 
-A Stream wraps a `max.driver.DeviceStream`; everything goes through MAX's
-Python driver API plus two Mojo functions in the `tensor_holder` extension
-for one primitive Python lacks: a fence event recorded at a POINT IN TIME on
-the foreign stream, waited on the owning stream ARBITRARILY LATER at
-destructor time. `DeviceStream.wait_for(stream)` only waits on the other
-stream's TAIL at call time, and the Python `DeviceEvent` has no wait-on-event
-at all — neither fits a destructor-time wait, hence
-`tensor_holder.fence_event_record` / `fence_event_wait`.
-`Stream.record_event`/`is_ready`/`synchronize` are for host-side completion
-polling instead (see the process group's completion worker).
-
-Streams are addressed by their per-stream `DeviceContext` pointer, the same
-handle the kernel extensions take for a device context. `Stream.handle` (the
-native `CUstream`/`hipStream_t`) is kept only for native libraries that need
-one (NCCL) — ordering never uses it.
-
-Thread-safety: the completion worker polls events from its own thread while
-holder destructors run on whatever thread drops the last reference; MAX/
-AsyncRT's thread-safety is undocumented and this module does not serialize
-around it.
-
-AMD is expected to work through these same abstractions but is unverified —
-no AMD hardware was available when this was written.
-
-Correctness rules for stream users:
-
-1. Drain the kernel-call queue before ordering a side stream against the
-   default stream — a queued-but-unlaunched kernel is invisible to any
-   stream (`deferred_compile.drain()`).
-2. Hold a Python reference to every tensor a side stream reads or writes
-   until its work is known complete. Frees are stream-ordered on the
-   DEFAULT stream, so a buffer freed while a side stream still uses it is a
-   use-after-free.
-3. Anything the default stream must observe from a side stream needs an
-   explicit fence (event or host wait); nothing is implicit.
+Rules for stream users: drain the kernel-call queue before any cross-stream
+ordering (a queued launch is invisible to every stream); hold references to
+tensors a side stream touches until its work completes (frees are
+default-stream-ordered); nothing is fenced implicitly.
 """
 
 import threading

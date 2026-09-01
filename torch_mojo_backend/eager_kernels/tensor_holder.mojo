@@ -404,36 +404,15 @@ def read_scalar(
 
 
 # ---------------------------------------------------------------------------
-# Fence events: cross-stream ordering for the stream-ordered free.
-#
-# A holder's release is stream-ordered on its OWNING stream only, so a reader
-# on another stream races the allocator's reuse of the block. The remedy
-# (mojo_device/device_streams.py, mojo_device/torch_mojo_tensor._HolderOwner) needs
-# exactly one primitive Python's `max.driver` does not expose: enqueue a wait
-# for an event recorded at a POINT IN TIME on one stream onto another stream
-# ARBITRARILY LATER — at destructor time, long after the recording stream has
-# moved on. `DeviceStream.wait_for(stream)` waits on the other stream's
-# current TAIL instead, which over-fences and would require keeping the
-# foreign stream object alive; `DeviceEvent` has no Python wait-on-event. Mojo
-# has both, so the two functions below carry it.
-#
-# `FenceEvent` is a MAX `DeviceEvent` owned by a CPython object: the AsyncRT
-# refcount is managed by Mojo's own destructor when Python drops the last
-# reference, so nothing crosses the ABI as a bare pointer and there is no
-# manual retain/release to get wrong. Streams are addressed by their
-# per-stream `DeviceContext` pointer (`DeviceStream._device_context_ptr()` on
-# the Python side), the same integer handle every other function here takes
-# for a device context.
-#
-# There is deliberately no host wait here: `DeviceEvent.synchronize()` is the
-# only other thing Mojo's event offers, and Python's `max.driver.DeviceEvent`
-# already provides that plus `is_ready()` and `elapsed_time()`, so host-side
-# completion is entirely a Python-side concern (mojo_device/device_streams.py).
-#
-# Dropping a FenceEvent immediately after enqueuing its waits is safe: the
-# driver defers the real destruction until the captured work completes.
-# `create_event`'s defaults (timing disabled, non-blocking sync) are what a
-# pure ordering event wants.
+# Fence events: the one primitive Python's `max.driver` lacks — enqueue a
+# wait on stream B for an event recorded at a point in time on stream A,
+# arbitrarily later (at destructor time). Python's `wait_for(stream)` waits
+# on the other stream's current TAIL instead, which over-fences; Mojo has
+# the real thing. `FenceEvent` owns the MAX `DeviceEvent` via the CPython
+# refcount (no bare pointers cross the ABI); streams are addressed by their
+# per-stream `DeviceContext` pointer. Dropping a FenceEvent right after
+# enqueuing its waits is safe: the driver defers destruction until the
+# captured work completes.
 # ---------------------------------------------------------------------------
 
 
