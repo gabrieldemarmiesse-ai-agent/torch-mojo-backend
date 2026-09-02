@@ -87,7 +87,7 @@ class Event:
         enable_timing: bool = False,
         blocking: bool = False,
         interprocess: bool = False,
-    ) -> None:
+    ):
         if interprocess:
             raise NotImplementedError(
                 "interprocess events are not supported on the mojo device"
@@ -107,7 +107,7 @@ class Event:
             return None
         return torch.device("mojo", self._device_index)
 
-    def record(self, stream: "Stream | None" = None) -> None:
+    def record(self, stream: "Stream | None" = None):
         if stream is None:
             stream = current_stream(self._device_index)
         device_stream = stream._device_stream
@@ -120,7 +120,7 @@ class Event:
         self._fence = device_stream.record_fence_event()
         self._device_index = stream.device_index
 
-    def wait(self, stream: "Stream | None" = None) -> None:
+    def wait(self, stream: "Stream | None" = None):
         if self._fence is None:
             raise RuntimeError("Event must be recorded before it can be waited on")
         if stream is None:
@@ -130,7 +130,7 @@ class Event:
     def query(self) -> bool:
         return True if self._event is None else self._event.is_ready()
 
-    def synchronize(self) -> None:
+    def synchronize(self):
         if self._event is not None:
             self._event.synchronize()
 
@@ -188,7 +188,7 @@ class Stream(torch._C.Stream):
         self.priority = 0
         return self
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: object, **kwargs: object):
         # Everything happens in __new__ (the base type is a C type whose
         # tp_new takes the three identity fields); accept and ignore the
         # constructor arguments so `Stream(device, priority=...)` works.
@@ -217,13 +217,13 @@ class Stream(torch._C.Stream):
     def query(self) -> bool:
         return self._device_stream.query()
 
-    def synchronize(self) -> None:
+    def synchronize(self):
         self._device_stream.synchronize()
 
-    def wait_event(self, event: Event) -> None:
+    def wait_event(self, event: Event):
         event.wait(self)
 
-    def wait_stream(self, other: "Stream | torch.Stream") -> None:
+    def wait_stream(self, other: "Stream | torch.Stream"):
         """Order this stream after everything enqueued on `other` so far."""
         self._device_stream.wait_stream(_stream_of(other, self._index))
 
@@ -243,7 +243,7 @@ class Stream(torch._C.Stream):
         stacks.setdefault(self._index, []).append(self)
         return self
 
-    def __exit__(self, *exc_info: object) -> None:
+    def __exit__(self, *exc_info: object):
         _current_stacks.stacks[self._index].pop()
 
     def __eq__(self, other: object) -> bool:
@@ -292,7 +292,7 @@ def current_stream(device: _DeviceLike = None) -> Stream:
     return default_stream(index)
 
 
-def set_stream(stream: Stream) -> None:
+def set_stream(stream: Stream):
     """Make `stream` this thread's ambient current stream (no nesting)."""
     stacks = getattr(_current_stacks, "stacks", None)
     if stacks is None:

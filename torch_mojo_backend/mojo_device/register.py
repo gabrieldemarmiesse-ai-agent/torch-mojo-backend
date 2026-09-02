@@ -11,9 +11,7 @@ _T = TypeVar("_T")
 _registered = False
 
 
-def _install_torch_accelerator_synchronize(
-    torch_mojo_device_module: ModuleType,
-) -> None:
+def _install_torch_accelerator_synchronize(torch_mojo_device_module: ModuleType):
     """Route generic accelerator synchronization to the Mojo device module.
 
     PyTorch's Python PrivateUse1 guard does not yet forward synchronizeDevice
@@ -33,7 +31,7 @@ def _install_torch_accelerator_synchronize(
         )
 
     @wraps(original_synchronize)
-    def synchronize(device: torch.device | str | int | None = None) -> None:
+    def synchronize(device: torch.device | str | int | None = None):
         current = torch.accelerator.current_accelerator()
         if current != mojo_device:
             original_synchronize(device)
@@ -64,7 +62,7 @@ def _install_torch_accelerator_synchronize(
     torch.accelerator.synchronize = synchronize  # ty: ignore[invalid-assignment]
 
 
-def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType) -> None:
+def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType):
     """Route torch.accelerator.current_stream/set_stream to mojo streams.
 
     Same reason as the synchronize patch above: the Python PrivateUse1
@@ -90,12 +88,13 @@ def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType) 
     original_set_stream = torch.accelerator.set_stream
 
     @wraps(original_set_stream)
-    def set_stream(stream: torch.Stream) -> None:
+    def set_stream(stream: torch.Stream):
         from torch_mojo_backend.mojo_device.streams import Stream as MojoStream
 
         if isinstance(stream, MojoStream):
-            return torch_mojo_device_module.set_stream(stream)
-        return original_set_stream(stream)
+            torch_mojo_device_module.set_stream(stream)
+        else:
+            original_set_stream(stream)
 
     set_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
     torch.accelerator.set_stream = set_stream  # ty: ignore[invalid-assignment]
@@ -107,7 +106,7 @@ def _forwarding_constructor(cls: type[_T]) -> Callable[..., _T]:
     return cls
 
 
-def _install_torch_stream_event_dispatch() -> None:
+def _install_torch_stream_event_dispatch():
     """Dispatch torch.Stream/torch.Event on mojo devices to real classes.
 
     Construction through the original classes reaches the stub C++ guard and
@@ -172,7 +171,7 @@ def _install_torch_stream_event_dispatch() -> None:
     torch.Event = Event  # ty: ignore[invalid-assignment]
 
 
-def _declare_mojo_tensor_as_plain_tensor() -> None:
+def _declare_mojo_tensor_as_plain_tensor():
     """Add TorchMojoTensor to torch's HANDLED_TYPES allowlists.
 
     TorchMojoTensor's wrapper dispatch is transparent to numerical operations;
@@ -293,7 +292,7 @@ def _declare_mojo_tensor_as_plain_tensor() -> None:
     FunctionalTensorMode.__torch_dispatch__ = functional_mode_dispatch
 
 
-def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo() -> None:
+def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo():
     """Let TorchDynamo model a mojo tensor as an ordinary device tensor.
 
     ``VariableBuilder`` only builds a ``TensorVariable`` for a tensor
@@ -323,7 +322,7 @@ def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo() -> None:
         table[TorchMojoTensor] = VariableBuilder.wrap_tensor
 
 
-def _keep_mojo_kernels_out_of_fake_tensor_construction() -> None:
+def _keep_mojo_kernels_out_of_fake_tensor_construction():
     """Make FakeTensor construction skip the PrivateUse1 Python kernels.
 
     `FakeTensor.__new__` calls `Tensor._make_subclass(cls, elem, ...,
@@ -368,7 +367,7 @@ def _keep_mojo_kernels_out_of_fake_tensor_construction() -> None:
     )
 
 
-def register_mojo_devices() -> None:
+def register_mojo_devices():
     """Enable the mojo device globally and register all aten ops"""
     from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
 

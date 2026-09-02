@@ -75,7 +75,7 @@ class _StalledBuild:
     """Make one loaded unit look like it is still compiling, releasable on
     demand — a deterministic stand-in for a slow `mojo build`."""
 
-    def __init__(self, unit: eager_kernels._DefinedUnit) -> None:
+    def __init__(self, unit: eager_kernels._DefinedUnit):
         unit.load_blocking()  # make sure the real defined extension exists
         self._unit = unit
         self._module = unit.module
@@ -99,7 +99,7 @@ class _StalledBuild:
     def _request(self) -> "_FakeJob":
         return self._job
 
-    def release(self) -> None:
+    def release(self):
         unit = self._unit
         if unit.module is None:
             unit.module = self._module
@@ -108,10 +108,10 @@ class _StalledBuild:
 
 
 class _FakeJob:
-    def __init__(self, stall: _StalledBuild) -> None:
+    def __init__(self, stall: _StalledBuild):
         self._stall = stall
 
-    def wait(self) -> None:
+    def wait(self):
         # A blocking drain releases the "build" (as a finished compile would).
         self._stall.release()
 
@@ -126,7 +126,7 @@ class _StalledUnits:
     the test never waits on a compiler.
     """
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, limit: int | None) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, limit: int | None):
         loader = eager_kernels.MOJO_EXTENSION_LOADER
         original = loader.unit_canonical
         self.stalls: list[_StalledBuild] = []
@@ -145,7 +145,7 @@ class _StalledUnits:
 
         monkeypatch.setattr(loader, "unit_canonical", unit_canonical)
 
-    def release(self) -> None:
+    def release(self):
         for stall in self.stalls:
             stall.release()
 
@@ -165,12 +165,12 @@ def _prepare_add(
 
 
 class _FakeExtension:
-    def __init__(self, log: list[str], error: BaseException | None = None) -> None:
+    def __init__(self, log: list[str], error: BaseException | None = None):
         self._log = log
         self._error = error
         self.calls = 0
 
-    def call(self, label: str) -> None:
+    def call(self, label: str):
         self.calls += 1
         self._log.append(label)
         if self._error is not None:
@@ -187,7 +187,7 @@ class _FakeUnit:
         ready: bool = False,
         error: BaseException | None = None,
         build_error: BaseException | None = None,
-    ) -> None:
+    ):
         self.extension: _FakeExtension = _FakeExtension(log, error)
         self.ext: object | None = self.extension if ready else None
         self.build_error = build_error
@@ -197,12 +197,12 @@ class _FakeUnit:
         self.builds += 1
         return self  # doubles as its own job: `wait()` completes the build
 
-    def wait(self) -> None:
+    def wait(self):
         if self.build_error is not None:
             raise self.build_error
         self.ready()
 
-    def ready(self) -> None:
+    def ready(self):
         self.ext = self.extension
 
 
@@ -220,7 +220,7 @@ class _Buffer:
 # Queue contracts, host-only
 
 
-def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None:
+def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue):
     """Rule 5, through the public entry points.
 
     A launch error is held (``pump()`` never raises), the rest of the queue
@@ -264,9 +264,7 @@ def test_launch_error_ends_the_episode_at_the_next_drain(isolated_queue) -> None
     assert log == ["first", "failing", "after"]
 
 
-def test_build_failure_behind_a_queued_launch_surfaces_from_drain(
-    isolated_queue,
-) -> None:
+def test_build_failure_behind_a_queued_launch_surfaces_from_drain(isolated_queue):
     """The other way a deferred launch fails: its .so never builds."""
     log: list[str] = []
     failure = ImportError("mojo build failed for elementwise_ops")
@@ -287,7 +285,7 @@ def test_build_failure_behind_a_queued_launch_surfaces_from_drain(
     assert retained() is None  # the abandoned tail released its references
 
 
-def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -> None:
+def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue):
     """OOM translation must survive deferral: the launch that exhausts the
     allocator now happens at drain time, far from the aten call that
     produced it, and it must still arrive as ``torch.OutOfMemoryError``."""
@@ -308,7 +306,7 @@ def test_queued_launch_out_of_memory_is_still_reported_as_such(isolated_queue) -
 
 def test_thread_switch_synchronizes_once_and_keeps_fifo(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """Rule 4: device work is ordered only within one enqueuing thread, so a
     launch from another thread synchronizes first — and still launches the
     queue in enqueue order, not its own order."""
@@ -334,7 +332,7 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
 
     failures: list[BaseException] = []
 
-    def drain_from_another_thread() -> None:
+    def drain_from_another_thread():
         try:
             call_queue.drain()
         except BaseException as exc:  # pragma: no cover - reported below
@@ -350,7 +348,7 @@ def test_thread_switch_synchronizes_once_and_keeps_fifo(
     assert call_queue._DEVICE_THREAD[0] is worker
 
 
-def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -> None:
+def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue):
     """A launch can re-enter the queue: releasing a holder or synchronizing
     the device calls back into ``drain()``. That nested call must be a
     no-op, or the item already popped launches after its successors and
@@ -360,7 +358,7 @@ def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -
     queued = weakref.ref(follower_buffer := _Buffer())
 
     class _ReentrantExtension:
-        def call(self, label: str) -> None:
+        def call(self, label: str):
             log.append(f"{label}:enter")
             call_queue.drain()
             call_queue.pump()
@@ -387,7 +385,7 @@ def test_a_drain_reached_from_inside_a_launch_does_not_reorder(isolated_queue) -
     assert in_flight() is None and queued() is None  # released at launch
 
 
-def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
+def test_external_calls_hold_their_fifo_position(isolated_queue):
     """Rule 6: an always-loaded device call (tensor_holder, fa4) is
     launchable at once but must not overtake queued producers of its
     inputs, and its keep-alive is explicit."""
@@ -407,14 +405,14 @@ def test_external_calls_hold_their_fifo_position(isolated_queue) -> None:
     assert retained() is None  # released once its launch ran
 
 
-def test_external_call_runs_inline_when_nothing_is_queued(isolated_queue) -> None:
+def test_external_call_runs_inline_when_nothing_is_queued(isolated_queue):
     log: list[str] = []
     call_queue.external_call(log.append, ("now",), ())
     assert log == ["now"]
     assert not call_queue.active()
 
 
-def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None:
+def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue):
     """Rule 3, per item: the SDPA/flash-attention autograd nodes run above
     __torch_dispatch__ and drop their intermediates as soon as they queue a
     launch against them — the queued item itself must keep them alive."""
@@ -435,7 +433,7 @@ def test_a_cold_launch_retains_the_output_it_writes_into(isolated_queue) -> None
 
 def test_failed_allocation_drains_synchronizes_and_retries_once(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """The reactive layer under the budget: a device-OOM allocation drains
     the queue (releasing what its items retain), synchronizes the device so
     the stream-ordered frees land, and retries exactly once. Non-OOM errors
@@ -453,7 +451,7 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
     oom = Exception("CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)")
 
     class _FlakyHolder:
-        def __init__(self, failures: list[BaseException]) -> None:
+        def __init__(self, failures: list[BaseException]):
             self.failures = failures
             self.calls = 0
 
@@ -501,14 +499,14 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
 
 def test_budget_is_computed_from_free_device_memory(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """Without the env override, the bound adapts to the device: half the
     smallest free-VRAM figure across the accelerators, floored at 1 GiB,
     falling back to 8 GiB when nothing can report memory statistics."""
     import torch_mojo_backend
 
     class _FakeAccelerator:
-        def __init__(self, free: int) -> None:
+        def __init__(self, free: int):
             self.stats = {"free_memory": free, "total_memory": free}
 
     gib = 1024 * 1024 * 1024
@@ -543,7 +541,7 @@ def test_budget_is_computed_from_free_device_memory(
 
 def test_retention_budget_bounds_cold_run_ahead(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """Rule 3's bound: a read-free cold storm may not retain unbounded
     bytes. The enqueue that crosses the budget waits the builds out and
     launches everything, releasing the retention — the fix for the 70+ GB
@@ -578,7 +576,7 @@ def test_retention_budget_bounds_cold_run_ahead(
 
 def test_retention_budget_holds_launch_errors_for_the_next_drain(
     isolated_queue, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """The budget drain serves memory, not a value: a launch failure inside
     it is held and raised by the next real drain(), per rule 5."""
 
@@ -611,7 +609,7 @@ def test_retention_budget_holds_launch_errors_for_the_next_drain(
 )
 def test_mode_knobs_are_value_tested_not_truthiness_tested(
     monkeypatch: pytest.MonkeyPatch, knob: str, value: str, expected: bool
-) -> None:
+):
     """A knob set to "0" must never mean "on" (the deleted
     ``TMB_NO_TRIGGER_DEFER`` did exactly that), and the answer is memoized,
     so it only changes when ``refresh()`` says so."""
@@ -623,7 +621,7 @@ def test_mode_knobs_are_value_tested_not_truthiness_tested(
     assert call_queue.enabled() is expected
 
 
-def test_queue_disabled_under_suite_by_default() -> None:
+def test_queue_disabled_under_suite_by_default():
     assert len(list(get_accelerators())) >= 0  # touch the backend
     assert not call_queue.enabled()
 
@@ -716,7 +714,7 @@ def test_queue_orders_across_threads(mojo_gpu, forced_queue):
     results: list[torch.Tensor] = []
     failures: list[BaseException] = []
 
-    def double_on_another_thread(y: torch.Tensor) -> None:
+    def double_on_another_thread(y: torch.Tensor):
         try:
             results.append((y * 2.0).cpu())
         except BaseException as exc:  # pragma: no cover - reported below

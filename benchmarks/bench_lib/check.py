@@ -132,14 +132,14 @@ class Bench:
 
     def __init__(
         self, request: pytest.FixtureRequest, hw: Hardware, mojo: torch.device
-    ) -> None:
+    ):
         self._request = request
         self._hw = hw
         self._mojo = mojo
 
     def run(
         self, ref_fn: Callable[[], object], our_fn: Callable[[], object], flops: float
-    ) -> None:
+    ):
         hw = self._hw
         entry_key = bench_key(self._request.node)
         iters = iters_for_flops(flops)
@@ -185,7 +185,7 @@ class Bench:
 
     def _check(
         self, entry_key: baselines.BenchKey, result: Measurement, attempts: int = 1
-    ) -> None:
+    ):
         mode = update_mode(self._request.config)
         data = baselines.load()
         base = baselines.lookup(data, self._hw.key, entry_key)
@@ -250,7 +250,7 @@ class Bench:
         entry_key: baselines.BenchKey,
         ratio: float,
         message: str,
-    ) -> None:
+    ):
         if mode is not None:
             self._record(entry_key, ratio)
             self._note(f"recorded {entry_key}: {message}")
@@ -259,10 +259,10 @@ class Bench:
                 f"NOT recorded (rerun with --update-baselines) {entry_key}: {message}"
             )
 
-    def _record(self, entry_key: baselines.BenchKey, ratio: float) -> None:
+    def _record(self, entry_key: baselines.BenchKey, ratio: float):
         baselines.merge_write(self._hw.key, {entry_key: ratio})
 
-    def _note(self, message: str) -> None:
+    def _note(self, message: str):
         stash = self._request.config.stash
         notes = stash.setdefault(BENCH_NOTES_KEY, [])
         notes.append(message)

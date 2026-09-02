@@ -42,7 +42,7 @@ def _rng_device_index(device: "int | str | torch.device | None" = None) -> int:
     return index
 
 
-def manual_seed_all(seed: int) -> None:
+def manual_seed_all(seed: int):
     """Reset every Mojo device to the same Philox seed and counter zero."""
     global _rng_default_seed
     normalized = _normalize_rng_seed(seed)
@@ -68,7 +68,7 @@ def get_rng_state(device: "int | str | torch.device | None" = None) -> torch.Ten
 
 def set_rng_state(
     new_state: torch.Tensor, device: "int | str | torch.device | None" = None
-) -> None:
+):
     """Restore an exact state produced by :func:`get_rng_state`."""
     if not isinstance(new_state, torch.Tensor):
         raise TypeError("Mojo RNG state must be a torch.Tensor")
@@ -116,7 +116,7 @@ def current_device() -> int:
     return _current_device
 
 
-def set_device(device_idx: int) -> None:
+def set_device(device_idx: int):
     global _current_device
     if device_idx < 0 or device_idx >= device_count():
         raise ValueError(f"Invalid device index {device_idx}")
@@ -129,7 +129,7 @@ class device:
     module when loading a checkpoint with ``map_location="mojo"``
     (``torch._utils._to`` enters ``device_module.device(...)``)."""
 
-    def __init__(self, device: "int | str | torch.device | None") -> None:
+    def __init__(self, device: "int | str | torch.device | None"):
         if device is None:
             self.idx = -1
             return
@@ -139,7 +139,7 @@ class device:
         torch_device = torch.device(device)
         self.idx = -1 if torch_device.index is None else torch_device.index
 
-    def __enter__(self) -> None:
+    def __enter__(self):
         self.prev_idx = _current_device
         if self.idx >= 0 and self.idx != _current_device:
             set_device(self.idx)
@@ -161,7 +161,7 @@ def _resolve_sync_device(device: "int | str | torch.device | None") -> torch.dev
     return torch_device
 
 
-def _device_synchronize(device: "int | str | torch.device | None" = None) -> None:
+def _device_synchronize(device: "int | str | torch.device | None" = None):
     """Device-only barrier: wait for already-launched work and release the
     completed asynchronous transfer owners.
 
@@ -188,7 +188,7 @@ def _device_synchronize(device: "int | str | torch.device | None" = None) -> Non
     _release_synchronized_d2h_owners(max_device)
 
 
-def synchronize(device: "int | str | torch.device | None" = None) -> None:
+def synchronize(device: "int | str | torch.device | None" = None):
     """Public: wait for work and release completed asynchronous transfer
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume

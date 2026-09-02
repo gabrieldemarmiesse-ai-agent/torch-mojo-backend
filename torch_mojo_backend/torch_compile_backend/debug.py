@@ -24,14 +24,14 @@ output_directory = Path("/tmp/.torch_mojo_backend_debug")
 output_directory_max = output_directory / "max"
 
 
-def set_print_options(session: engine.InferenceSession) -> None:
+def set_print_options(session: engine.InferenceSession):
     output_directory_max.mkdir(parents=True, exist_ok=True)
     session.set_debug_print_options(
         "BINARY_MAX_CHECKPOINT", output_directory=output_directory_max
     )
 
 
-def add_prints(node_idx: int, func_name: str, func_output: object) -> None:
+def add_prints(node_idx: int, func_name: str, func_output: object):
     if not debug_graph():
         return
     outputs: Sequence[TensorValue]
@@ -125,7 +125,7 @@ def make_debug_function(
     return new_function
 
 
-def debug_graph_if_required(gm: torch.fx.GraphModule, args: tuple[object, ...]) -> None:
+def debug_graph_if_required(gm: torch.fx.GraphModule, args: tuple[object, ...]):
     if not debug_graph():
         return
 

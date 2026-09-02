@@ -20,7 +20,7 @@ class _NativeCallModule(Protocol):
     call: Callable[..., object]
 
 
-def test_defines_are_canonical_independent_of_mapping_order() -> None:
+def test_defines_are_canonical_independent_of_mapping_order():
     first = {
         "OP": "AddSpec",
         "DTYPE_ARG_1": "bfloat16",
@@ -47,7 +47,7 @@ def test_defines_are_canonical_independent_of_mapping_order() -> None:
     ) == eager_kernels.defines_cache_string(second)
 
 
-def test_exact_call_defines_use_ordered_argument_and_output_roles() -> None:
+def test_exact_call_defines_use_ordered_argument_and_output_roles():
     defines = eager_kernels.exact_call_defines(
         "WhereSelect",
         ("bool", "float32", "bfloat16"),
@@ -67,15 +67,13 @@ def test_exact_call_defines_use_ordered_argument_and_output_roles() -> None:
 
 
 @pytest.mark.parametrize("name", ["op", "HAS-DASH", "1_DTYPE", ""])
-def test_define_names_must_be_explicit_compiler_identifiers(name: str) -> None:
+def test_define_names_must_be_explicit_compiler_identifiers(name: str):
     with pytest.raises(ValueError, match="define name"):
         eager_kernels.normalize_defines({name: "value"})
 
 
 @pytest.mark.parametrize("value", [None, 1.5, object()])
-def test_define_values_reject_types_outside_the_compiler_contract(
-    value: object,
-) -> None:
+def test_define_values_reject_types_outside_the_compiler_contract(value: object):
     normalize_value = inspect.unwrap(eager_kernels._normalize_define_value)
     with pytest.raises(TypeError, match="must be bool, int, or str"):
         normalize_value(value)
@@ -83,7 +81,7 @@ def test_define_values_reject_types_outside_the_compiler_contract(
 
 def test_build_extension_compiles_original_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     package_dir = tmp_path / "eager_kernels"
     package_dir.mkdir()
     source = package_dir / "sample_ops.mojo"
@@ -149,7 +147,7 @@ _GATED_SOURCE = (
 
 def test_loader_reuses_one_variant_per_distinct_define_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     """One .so per distinct define set, and exactly one.
 
     The key is the defines as sent, so order must not matter but any
@@ -212,7 +210,7 @@ def test_loader_reuses_one_variant_per_distinct_define_set(
 
 def test_source_hash_includes_loader_cache_abi(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     source = tmp_path / "sample_ops.mojo"
     source.write_text("def PyInit_sample_ops():\n    pass\n")
     monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", tmp_path)
@@ -225,7 +223,7 @@ def test_source_hash_includes_loader_cache_abi(
 
 def test_source_hash_includes_compiler_toolchain_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     source = tmp_path / "sample_ops.mojo"
     source.write_text("def PyInit_sample_ops():\n    pass\n")
     monkeypatch.setattr(eager_kernels, "_PACKAGE_DIR", tmp_path)
@@ -238,7 +236,7 @@ def test_source_hash_includes_compiler_toolchain_identity(
 
 def test_nested_module_hash_includes_private_and_shared_dependencies(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     package_dir = tmp_path / "eager_kernels"
     operation_dir = package_dir / "sample_ops"
     operation_dir.mkdir(parents=True)
@@ -264,7 +262,7 @@ def test_nested_module_hash_includes_private_and_shared_dependencies(
 
 def test_defined_unit_memoizes_one_failed_build_across_all_waiters(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     source = tmp_path / "elementwise_ops.mojo"
     source.write_text("def PyInit_elementwise_ops():\n    pass\n")
     defines = eager_kernels.normalize_defines(
@@ -347,7 +345,7 @@ class _ElementwiseAdd(eager_kernels.MojoExtension[_TensorMetadata, _TensorMetada
 
 def test_descriptor_prepares_output_metadata_without_loading_and_has_no_state(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     def unexpected_build(
         source: Path, defines: eager_kernels.CanonicalDefines | None
     ) -> Path:
@@ -376,7 +374,7 @@ def test_descriptor_prepares_output_metadata_without_loading_and_has_no_state(
         _ElementwiseAdd()
 
 
-def test_prepared_call_invokes_only_constant_call_entrypoint() -> None:
+def test_prepared_call_invokes_only_constant_call_entrypoint():
     calls: list[tuple[object, ...]] = []
     module = ModuleType("defined_elementwise_add")
 
@@ -405,18 +403,18 @@ def test_prepared_call_invokes_only_constant_call_entrypoint() -> None:
     assert not hasattr(module, "AddSpec")
 
 
-def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch):
     launches: list[str] = []
 
     class FakeJob:
-        def wait(self) -> None:
+        def wait(self):
             return None
 
     class QueuedUnit:
         """The whole contract the queue needs of a unit: a module once its
         build lands, and a job to wait on until then."""
 
-        def __init__(self) -> None:
+        def __init__(self):
             self.ext: ModuleType | None = None
             self.job = FakeJob()
 
@@ -452,7 +450,7 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
 
     module = ModuleType("queued_elementwise_add")
 
-    def call(label: str) -> None:
+    def call(label: str):
         launches.append(label)
 
     cast(_NativeCallModule, module).call = call
@@ -463,7 +461,7 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     assert not queue.active()
 
 
-def test_spec_descriptor_canonical_defines_match_make_defines() -> None:
+def test_spec_descriptor_canonical_defines_match_make_defines():
     """The memoized canonical defines must stay field-for-field equal to the
     literal ``make_defines`` dicts: the define-gate scanner reads the dicts,
     the hot path uses the memo, and the two must never drift."""

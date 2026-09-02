@@ -16,5 +16,5 @@ class LoggingMode(TorchDispatchMode):
         return func(*args, **kwargs or {})
 
 
-def log_aten_calls() -> None:
+def log_aten_calls():
     LoggingMode().__enter__()

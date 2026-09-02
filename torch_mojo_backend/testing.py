@@ -43,7 +43,7 @@ class CallChecker:
     fast path (eager) — no per-test bookkeeping needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._functions_to_check: tuple[CountedCallable, ...] | None = None
         self._counts_before_starting_to_check: list[int] | None = None
 
@@ -108,7 +108,7 @@ class CallChecker:
                 twins.append(counter)
         return twins
 
-    def register(self, *funcs: Callable[..., object]) -> None:
+    def register(self, *funcs: Callable[..., object]):
         """Register the functions expected to run.
 
         `funcs` are typed `Callable` (each caller's own precise signature,
@@ -131,7 +131,7 @@ class CallChecker:
             f.call_count for f in self._functions_to_check
         ]
 
-    def check_was_called(self) -> None:
+    def check_was_called(self):
         if (
             self._functions_to_check is None
             or self._counts_before_starting_to_check is None
@@ -164,7 +164,7 @@ def check_functions_are_equivalent(
     fn_compiled: Callable[..., torch.Tensor | Sequence[torch.Tensor]] | None = None,
     rtol: float | None = None,
     atol: float | None = None,
-) -> None:
+):
     fn_compiled = fn_compiled or torch.compile(backend=mojo_backend)(fn)
     if device is not None:
         inputs = [input_tensor.to(device) for input_tensor in inputs]
@@ -209,7 +209,7 @@ def check_outputs(
     *,
     rtol: float | None = None,
     atol: float | None = None,
-) -> None:
+):
     # We compare to eager cpu execution
     # We first check if the function has a device argument
     has_device_arg = "device" in inspect.signature(fn).parameters

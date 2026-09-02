@@ -817,7 +817,7 @@ def _foreach_launch(
     scalars: Sequence[float] = (),
     aux: tuple[int, ...] = (),
     keepalive: tuple[object, ...] = (),
-) -> None:
+):
     """One launch of the batched foreach family for a whole TensorList.
 
     `lists` are the parallel operand lists in the order the Mojo bridge
@@ -2106,7 +2106,7 @@ def _try_spec_reduce(
     return result
 
 
-def _raise_if_device_oom(exc: BaseException) -> None:
+def _raise_if_device_oom(exc: BaseException):
     """Keep TensorSpec fallbacks from disguising allocator exhaustion.
 
     Mojo TensorSpec dispatch reports both unsupported metadata and runtime
@@ -2352,7 +2352,7 @@ def _on_gpu(t: _SpecTensor) -> bool:
     return _device_of(t).label == "gpu"
 
 
-def _alert_not_deterministic(caller: str) -> None:
+def _alert_not_deterministic(caller: str):
     """Match PyTorch's deterministic-algorithm error/warn-only contract."""
     if not torch.are_deterministic_algorithms_enabled():
         return
@@ -2375,7 +2375,7 @@ def _alert_not_deterministic(caller: str) -> None:
     )
 
 
-def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     """dst[...] = src[...] for equal shapes/dtypes, any strides on both."""
     if dst._numel == 0:
         return
@@ -2547,7 +2547,7 @@ def _launch_where_bcast(
     operands: tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor],
     meta: tuple[list[int], list[int], list[list[int]]],
     dtype: DType,
-) -> None:
+):
     out_shape, dims, strides = meta
     params = tuple(dims) + tuple(s for st in strides for s in st)
     _call_mojo(
@@ -2573,7 +2573,7 @@ def _launch_masked_fill_scalar(
     value: float,
     meta: tuple[list[int], list[int], list[list[int]]],
     dtype: DType,
-) -> None:
+):
     """masked_fill(_).Scalar's fast path: `value` is baked into the launch
     as an argument, never materialized into a device buffer first (that
     used to cost a whole extra Fill kernel launch -- see MaskedFillScalar's
@@ -10152,7 +10152,7 @@ def fast_aten__local_scalar_dense(tensor: torch.Tensor) -> object:
     return _tensor_holder().read_scalar(_ctx_ptr(t._device), t._ptr, t._dtype.value)
 
 
-def _instrument_call_counts() -> None:
+def _instrument_call_counts():
     """Give every fast op a test-only call counter, mirroring what
     `aten_functions.map_to` does, so `CallChecker` can assert that an op
     was handled by either implementation."""

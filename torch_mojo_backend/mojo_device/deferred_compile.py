@@ -95,7 +95,7 @@ def dispatch(
     return _direct(func, args, kwargs)
 
 
-def drain() -> None:
+def drain():
     """Public: wait for all pending kernel launches (device synchronize).
 
     The single façade for the queue's drain — device code that reads tensor

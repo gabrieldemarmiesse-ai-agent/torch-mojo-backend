@@ -21,43 +21,32 @@ def inplace_dispatcher(op_name: str, fast_name: str) -> Callable[..., None]:
     packet_name, _, overload_name = op_name.removeprefix("aten::").partition(".")
     aten_op = getattr(getattr(torch.ops.aten, packet_name), overload_name or "default")
 
-    def dispatcher(self: list[torch.Tensor], *args: object, **kwargs: object) -> None:
+    def dispatcher(self: list[torch.Tensor], *args: object, **kwargs: object):
         aten_fast = _fast()
         result = getattr(aten_fast, fast_name)(self, *args, **kwargs)
         if result is aten_fast.NOT_HANDLED:
-            result = aten_op.redispatch(
-                _COMPOSITE_EXPLICIT_AUTOGRAD, self, *args, **kwargs
-            )
-            # This explicit redispatch runs below ADInplaceOrView, so the
-            # TensorList version update is manual on both paths (mutable
-            # TensorList schemas returning () get no automatic bump).
-            torch.autograd.graph.increment_version(self)
-            return result
+            aten_op.redispatch(_COMPOSITE_EXPLICIT_AUTOGRAD, self, *args, **kwargs)
+        # This explicit redispatch runs below ADInplaceOrView, so the
+        # TensorList version update is manual on both paths (mutable
+        # TensorList schemas returning () get no automatic bump).
         torch.autograd.graph.increment_version(self)
-        return None
 
     return dispatcher
 
 
-def mojo_device__foreach_mul__tensor(
-    self: list[torch.Tensor], other: torch.Tensor
-) -> None:
+def mojo_device__foreach_mul__tensor(self: list[torch.Tensor], other: torch.Tensor):
     aten_fast = _fast()
     result = aten_fast.fast_aten__foreach_mul__tensor(self, other)
     if result is aten_fast.NOT_HANDLED:
-        result = torch.ops.aten._foreach_mul_.Tensor.redispatch(
-            _COMPOSITE_EXPLICIT_AUTOGRAD, self, other
-        )
         # This explicit redispatch runs below ADInplaceOrView. A true wrapper
         # subclass therefore needs the same manual TensorList version update
         # as the direct Mojo kernel path.
-        torch.autograd.graph.increment_version(self)
-        return result
-
+        torch.ops.aten._foreach_mul_.Tensor.redispatch(
+            _COMPOSITE_EXPLICIT_AUTOGRAD, self, other
+        )
     # Mutable TensorList schemas returning () do not receive an automatic
     # version bump. Match CUDA, including empty and duplicate list entries.
     torch.autograd.graph.increment_version(self)
-    return None
 
 
 def mojo_device__foreach_norm_scalar(

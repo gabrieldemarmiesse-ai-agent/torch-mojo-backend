@@ -40,7 +40,7 @@ class GemmaConfig(TypedDict):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, cfg: GemmaConfig) -> None:
+    def __init__(self, cfg: GemmaConfig):
         super().__init__()
         self.fc1 = nn.Linear(
             cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False
@@ -60,7 +60,7 @@ class FeedForward(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, emb_dim: int, eps: float = 1e-6, bias: bool = False) -> None:
+    def __init__(self, emb_dim: int, eps: float = 1e-6, bias: bool = False):
         super().__init__()
         self.eps = eps
         # Gemma3 stores zero-centered weights and uses (1 + weight) during forward
@@ -147,7 +147,7 @@ class GroupedQueryAttention(nn.Module):
         qk_norm: bool = False,
         query_pre_attn_scalar: float | None = None,
         dtype: torch.dtype | None = None,
-    ) -> None:
+    ):
         super().__init__()
         assert num_heads % num_kv_groups == 0, (
             "num_heads must be divisible by num_kv_groups"
@@ -235,7 +235,7 @@ class GroupedQueryAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: GemmaConfig, attn_type: str) -> None:
+    def __init__(self, cfg: GemmaConfig, attn_type: str):
         super().__init__()
         self.attn_type = attn_type
 
@@ -298,7 +298,7 @@ class Gemma3Model(nn.Module):
     cos_global: torch.Tensor
     sin_global: torch.Tensor
 
-    def __init__(self, cfg: GemmaConfig) -> None:
+    def __init__(self, cfg: GemmaConfig):
         super().__init__()
         assert (
             cfg["layer_types"] is not None
@@ -506,7 +506,7 @@ model.to(device)
 
 def load_weights_into_gemma(
     model: Gemma3Model, param_config: GemmaConfig, params: dict[str, torch.Tensor]
-) -> None:
+):
     def assign(
         left: torch.Tensor, right: torch.Tensor, tensor_name: str = "unknown"
     ) -> nn.Parameter:
@@ -661,7 +661,7 @@ del weights_dict
 
 
 class GemmaTokenizer:
-    def __init__(self, tokenizer_file_path: str) -> None:
+    def __init__(self, tokenizer_file_path: str):
         tok_file = Path(tokenizer_file_path)
         self._tok = Tokenizer.from_file(str(tok_file))
         # Attempt to identify EOS and padding tokens

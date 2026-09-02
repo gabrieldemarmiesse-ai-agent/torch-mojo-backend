@@ -41,7 +41,7 @@ class _ForeignUseRecorder(Protocol):
 
     def record_foreign_use(
         self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
-    ) -> None: ...
+    ): ...
 
 
 def default_stream_ctx_ptr(device: max.driver.Device) -> int:
@@ -67,7 +67,7 @@ class Stream:
 
     def __init__(
         self, device: max.driver.Device, name: str, wrap_default: bool = False
-    ) -> None:
+    ):
         if device.api == "cpu":
             raise NotImplementedError(
                 "side streams require an accelerator; the CPU device runs "
@@ -86,14 +86,14 @@ class Stream:
         # (NCCL). Ordering never uses it — that goes through ctx_ptr.
         self.handle = self._stream.native_stream_handle
 
-    def wait_default_stream(self) -> None:
+    def wait_default_stream(self):
         """Order this stream after the default stream (drain the kernel-call
         queue first — see rule 1 above)."""
         if self.is_default:
             return
         self._stream.wait_for(self.device)
 
-    def wait_stream(self, other: "Stream") -> None:
+    def wait_stream(self, other: "Stream"):
         """Order later work here after everything `other` has right now.
 
         Tail-at-call-time semantics — the free fence wants the different
@@ -102,7 +102,7 @@ class Stream:
         if other is not self:
             self._stream.wait_for(other._stream)
 
-    def make_default_stream_wait(self) -> None:
+    def make_default_stream_wait(self):
         """Order subsequent default-stream work after this stream's work."""
         if self.is_default:
             return
@@ -111,7 +111,7 @@ class Stream:
     # `object` rather than a real type on the two fence-event methods: the
     # class (`tensor_holder.FenceEvent`) only exists once the Mojo extension
     # has been built and imported, so there is nothing to annotate against.
-    def wait_fence_event(self, event: object) -> None:
+    def wait_fence_event(self, event: object):
         _holder_mod().fence_event_wait(self.ctx_ptr, event)
 
     def record_fence_event(self) -> object:
@@ -137,7 +137,7 @@ class Stream:
         """
         return self._stream.record_event().is_ready()
 
-    def synchronize(self) -> None:
+    def synchronize(self):
         self._stream.synchronize()
 
 
@@ -167,7 +167,7 @@ def default_stream(device: max.driver.Device) -> Stream:
 
 def record_use(
     holder: _ForeignUseRecorder, stream: Stream, owner_ctx_ptr: int | None = None
-) -> None:
+):
     """Order `holder`'s eventual free after `stream` work enqueued so far.
 
     The record_stream analog for this backend. MAX frees a buffer
@@ -190,7 +190,7 @@ def record_use(
 
 def record_use_on_stream_ctx(
     holder: _ForeignUseRecorder, stream_ctx_ptr: int, owner_ctx_ptr: int
-) -> None:
+):
     """``record_use`` for a bare stream context pointer instead of a Stream.
 
     ``aten::record_stream`` hands an opaque ``(device, stream_id)`` pair, and

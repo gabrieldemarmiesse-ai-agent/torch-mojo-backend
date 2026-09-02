@@ -27,9 +27,7 @@ class _TensorHolderModule(Protocol):
     module needs -- it's a compiled-on-first-use native module (no stubs
     possible), reached via `eager_kernels`' PEP 562 `__getattr__`."""
 
-    def copy_d2d(
-        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
-    ) -> None: ...
+    def copy_d2d(self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int): ...
     def copy_from_host(
         self, ctx_ptr: int, dev_ptr: int, host_ptr: int, nbytes: int
     ) -> object: ...

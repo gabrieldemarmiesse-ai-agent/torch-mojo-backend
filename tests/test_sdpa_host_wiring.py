@@ -37,7 +37,7 @@ def _patch_saved_and_views(
     monkeypatch: pytest.MonkeyPatch,
     saved: tuple[_Token, ...],
     views: list[tuple[str, tuple[int, ...]]],
-) -> None:
+):
     monkeypatch.setattr(autograd, "_restore_saved_mojo_tensors", lambda _ctx: saved)
 
     def contiguous_view(tensor: _Token, shape) -> _Token:
@@ -65,7 +65,7 @@ def _query_gradient_context(has_dropout: bool) -> SimpleNamespace:
     )
 
 
-def test_sdpa_backward_bridge_is_lazy_registered() -> None:
+def test_sdpa_backward_bridge_is_lazy_registered():
     from torch_mojo_backend.eager_kernels import aten_fast
 
     assert aten_fast._SdpaBackwardExtension.MOJO_FILE.name == "sdpa_backward_ops.mojo"
@@ -73,7 +73,7 @@ def test_sdpa_backward_bridge_is_lazy_registered() -> None:
 
 def test_missing_sdpa_kernel_module_returns_not_handled_before_device_work(
     monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
+):
     from torch_mojo_backend.eager_kernels import aten_fast
 
     device = object()
@@ -114,7 +114,7 @@ def test_missing_sdpa_kernel_module_returns_not_handled_before_device_work(
 @pytest.mark.parametrize("has_dropout", [False, True])
 def test_sdpa_query_gradient_prefers_fused_dropout_softmax_backward(
     monkeypatch: pytest.MonkeyPatch, has_dropout: bool
-) -> None:
+):
     ctx = _query_gradient_context(has_dropout)
     saved = tuple(_Token(name) for name in ctx.saved_names)
     views: list[tuple[str, tuple[int, ...]]] = []
@@ -175,7 +175,7 @@ def test_sdpa_query_gradient_prefers_fused_dropout_softmax_backward(
 @pytest.mark.parametrize("has_dropout", [False, True])
 def test_sdpa_fused_not_handled_preserves_decomposition_order(
     monkeypatch: pytest.MonkeyPatch, has_dropout: bool
-) -> None:
+):
     ctx = _query_gradient_context(has_dropout)
     saved = tuple(_Token(name) for name in ctx.saved_names)
     views: list[tuple[str, tuple[int, ...]]] = []
@@ -245,7 +245,7 @@ def test_sdpa_fused_not_handled_preserves_decomposition_order(
 @pytest.mark.parametrize("has_dropout", [False, True])
 def test_sdpa_value_only_gradient_skips_fused_score_gradient(
     monkeypatch: pytest.MonkeyPatch, has_dropout: bool
-) -> None:
+):
     names = ["probabilities"]
     if has_dropout:
         names.append("dropout_mask")

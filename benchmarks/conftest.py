@@ -37,7 +37,7 @@ from bench_lib.hw import Hardware, detect
 KEY_DUMP_ENV = "TORCH_MOJO_BACKEND_BENCH_DUMP_KEYS"
 
 
-def pytest_collection_finish(session: pytest.Session) -> None:
+def pytest_collection_finish(session: pytest.Session):
     dump = os.environ.get(KEY_DUMP_ENV)
     if not dump:
         return
@@ -49,7 +49,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     Path(dump).write_text("".join(f"{key}\n" for key in keys))
 
 
-def pytest_configure(config: pytest.Config) -> None:
+def pytest_configure(config: pytest.Config):
     config.addinivalue_line(
         "markers",
         "bench_op(name): store this benchmark under the given op token in "
@@ -58,7 +58,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
+def pytest_addoption(parser: pytest.Parser):
     parser.addoption(
         "--update-baselines",
         nargs="?",
@@ -93,7 +93,7 @@ def mojo_device(hw: Hardware) -> torch.device:
 
 
 @pytest.fixture(autouse=True)
-def deterministic_operands() -> None:
+def deterministic_operands():
     # Same operand data in every process: a reproducible measurement should
     # feed reproducible inputs.  Tested on S1-tf32: data content is NOT the
     # driver of the residual ~2% between-process drift (that is allocator /
@@ -113,7 +113,7 @@ def pytest_terminal_summary(
     terminalreporter: TerminalReporter,
     exitstatus: pytest.ExitCode,
     config: pytest.Config,
-) -> None:
+):
     notes = config.stash.get(BENCH_NOTES_KEY, [])
     if not notes:
         return

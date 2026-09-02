@@ -70,7 +70,7 @@ _FlashForwardOut = tuple[
 @pytest.mark.bench_op("scaled_dot_product_attention")
 def test_sdpa(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: F.scaled_dot_product_attention(*refs, is_causal=True),
@@ -84,7 +84,7 @@ def test_sdpa(
 @pytest.mark.bench_op("_scaled_dot_product_flash_attention")
 def test_sdpa_flash(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_flash_attention(
@@ -102,7 +102,7 @@ def test_sdpa_flash(
 @pytest.mark.bench_op("_scaled_dot_product_efficient_attention")
 def test_sdpa_efficient(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_efficient_attention(
@@ -120,7 +120,7 @@ def test_sdpa_efficient(
 @pytest.mark.bench_op("_scaled_dot_product_attention_math")
 def test_sdpa_math(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_attention_math(
@@ -138,7 +138,7 @@ def test_sdpa_math(
 @pytest.mark.bench_op("_scaled_dot_product_flash_attention_backward")
 def test_sdpa_flash_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     b, h, s, d = SHAPES[shape_id]
     g_ref, g_our = both(

@@ -132,27 +132,25 @@ def register_aten_op(
     return decorator
 
 
-def _register_fast(op_name: str, fast_name: str) -> None:
+def _register_fast(op_name: str, fast_name: str):
     """Bind an op to `aten_fast.<fast_name>`."""
     register_aten_op(op_name)(_eager_impl(fast_name, op_name))
 
 
-def _register_out(
-    op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast"
-) -> None:
+def _register_out(op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast"):
     """Bind an `out=` overload to a functional `aten_fast.<fast_name>`."""
     register_aten_op(op_name)(
         _out_variant(op_name, fast_name, dtype_policy=dtype_policy)
     )
 
 
-def _register_foreach_inplace(op_name: str, fast_name: str) -> None:
+def _register_foreach_inplace(op_name: str, fast_name: str):
     """Bind a mutable ()-returning foreach op, ATen's sequential semantics as
     the fallback."""
     register_aten_op(op_name)(foreach.inplace_dispatcher(op_name, fast_name))
 
 
-def _register_missing(op_name: str) -> None:
+def _register_missing(op_name: str):
     """Register an explicit raiser for an op with no fast implementation yet,
     so users get an actionable message and the remaining surface stays
     greppable."""

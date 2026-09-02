@@ -40,7 +40,7 @@ if sys.platform == "darwin":
 _state = threading.local()
 
 
-def note_op_dispatched() -> None:
+def note_op_dispatched():
     """Count one dispatched op; cycle this thread's pool every interval."""
     if _libobjc is None:
         return

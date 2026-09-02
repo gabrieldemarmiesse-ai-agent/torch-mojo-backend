@@ -186,7 +186,7 @@ def call_checker():
     call_checker_instance.check_was_called()
 
 
-def require_cuda_autograd(device: str) -> None:
+def require_cuda_autograd(device: str):
     """Skip when this process can no longer run a CUDA backward.
 
     `at::getAccelerator()` names exactly one accelerator device type, and it

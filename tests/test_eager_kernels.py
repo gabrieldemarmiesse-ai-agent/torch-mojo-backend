@@ -30,13 +30,13 @@ class _MojoBackendModule(Protocol):
     mechanism (`_setup_privateuseone_for_python_backend`), so no static stub
     knows about it."""
 
-    def manual_seed_all(self, seed: int) -> None: ...
+    def manual_seed_all(self, seed: int): ...
     def get_rng_state(
         self, device: torch.device | int | None = None
     ) -> torch.Tensor: ...
     def set_rng_state(
         self, new_state: torch.Tensor, device: torch.device | int | None = None
-    ) -> None: ...
+    ): ...
 
 
 def _torch_mojo() -> _MojoBackendModule:
@@ -95,7 +95,7 @@ def _spy_defined_native_calls(
 def _replace_defined_native_calls(
     monkeypatch: pytest.MonkeyPatch,
     replacements: dict[tuple[str, str], Callable[..., object]],
-) -> None:
+):
     """Replace selected constant `call` entry points without compiling them."""
     from torch_mojo_backend import eager_kernels
 
@@ -4968,7 +4968,7 @@ _ARGREDUCE_SPLIT_SHAPES = (4095, 4096, 8193, 1 << 20)
 
 def _assert_argreduce_matches(
     device: str, cpu_tensor: torch.Tensor, dim: int | None = None
-) -> None:
+):
     device_tensor = cpu_tensor.to(device)
     for fn in _ARGREDUCE_FNS:
         expected = fn(cpu_tensor) if dim is None else fn(cpu_tensor, dim=dim)
@@ -4980,16 +4980,14 @@ def _assert_argreduce_matches(
 
 
 @pytest.mark.parametrize("size", _ARGREDUCE_SPLIT_SHAPES)
-def test_fast_argreduce_full_reduction_across_split_sizes(
-    mojo_gpu: str, size: int
-) -> None:
+def test_fast_argreduce_full_reduction_across_split_sizes(mojo_gpu: str, size: int):
     """A full reduction is one output: it always takes the split path."""
     generator = torch.Generator().manual_seed(20260811)
     _assert_argreduce_matches(mojo_gpu, torch.randn(size, generator=generator))
 
 
 @pytest.mark.parametrize("size", _ARGREDUCE_SPLIT_SHAPES)
-def test_fast_argreduce_ties_take_the_lowest_index(mojo_gpu: str, size: int) -> None:
+def test_fast_argreduce_ties_take_the_lowest_index(mojo_gpu: str, size: int):
     """Every element equal, and the extremum repeated at known positions:
     both must answer with the FIRST of them however the axis was split."""
     _assert_argreduce_matches(mojo_gpu, torch.full((size,), 3.5))
@@ -5006,7 +5004,7 @@ def test_fast_argreduce_ties_take_the_lowest_index(mojo_gpu: str, size: int) -> 
 
 
 @pytest.mark.parametrize("size", (1000, 1 << 20))
-def test_fast_argreduce_nan_beats_every_number(mojo_gpu: str, size: int) -> None:
+def test_fast_argreduce_nan_beats_every_number(mojo_gpu: str, size: int):
     """torch propagates NaN: the index of the first NaN is the answer."""
     generator = torch.Generator().manual_seed(20260811)
     for position in (0, 3, size // 2, size - 1):
@@ -5022,7 +5020,7 @@ def test_fast_argreduce_nan_beats_every_number(mojo_gpu: str, size: int) -> None
 
 
 @pytest.mark.parametrize("size", (1000, 1 << 20))
-def test_fast_argreduce_saturated_identity_values(mojo_gpu: str, size: int) -> None:
+def test_fast_argreduce_saturated_identity_values(mojo_gpu: str, size: int):
     """A row of the identity element (-inf for argmax, +inf for argmin) still
     has an answer: index 0.  A lane seeded with the identity and a strict
     comparison would report "nothing found" here."""
@@ -5033,7 +5031,7 @@ def test_fast_argreduce_saturated_identity_values(mojo_gpu: str, size: int) -> N
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
 )
-def test_fast_argreduce_dtypes(mojo_gpu: str, dtype: torch.dtype) -> None:
+def test_fast_argreduce_dtypes(mojo_gpu: str, dtype: torch.dtype):
     generator = torch.Generator().manual_seed(20260811)
     if dtype.is_floating_point:
         values = torch.randn(3, 5000, generator=generator).to(dtype)
@@ -5057,9 +5055,7 @@ def test_fast_argreduce_dtypes(mojo_gpu: str, dtype: torch.dtype) -> None:
         ((70000, 2, 32), 1),  # outer past the 65535 cap on grid.y / grid.z
     ],
 )
-def test_fast_argreduce_strided_axis(
-    mojo_gpu: str, shape: tuple[int, ...], dim: int
-) -> None:
+def test_fast_argreduce_strided_axis(mojo_gpu: str, shape: tuple[int, ...], dim: int):
     """Non-trailing reduce dims: the strided kernel reads the source in place
     above the coalescing floor and the materialized route runs below it, and
     both must agree with torch (including on ties)."""
@@ -5074,9 +5070,7 @@ def test_fast_argreduce_strided_axis(
     _assert_argreduce_matches(mojo_gpu, with_nan, dim=dim)
 
 
-def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(
-    mojo_gpu: str,
-) -> None:
+def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(mojo_gpu: str):
     """The Python gate and the Mojo kernel must agree about which layouts go
     in place: a queued launch cannot fall back."""
     from torch_mojo_backend.eager_kernels.aten_fast import (
@@ -5106,7 +5100,7 @@ def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(
     assert not _arg_strided_direct_ok("ArgmaxSpec", cube, (0, 2))
 
 
-def test_fast_argreduce_views_and_keepdim(mojo_gpu: str) -> None:
+def test_fast_argreduce_views_and_keepdim(mojo_gpu: str):
     generator = torch.Generator().manual_seed(20260811)
     base = torch.randn(64, 128, generator=generator)
     for view in (base.t(), base[:, 3:70], base[::2, ::3]):
@@ -6951,7 +6945,7 @@ def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(
     lhs = fake_tensor((2, 3))
     rhs = fake_tensor((3, 4))
 
-    def raise_allocator_oom(*_args: object, **_kwargs: object) -> None:
+    def raise_allocator_oom(*_args: object, **_kwargs: object):
         raise NotImplementedError(
             "CUDA call failed: CUDA_ERROR_OUT_OF_MEMORY (out of memory)"
         )
@@ -7385,7 +7379,7 @@ def _gemm16_operands(
 @pytest.mark.parametrize("layout", _GEMM16_LAYOUTS)
 def test_gemm16_float16_mm_matches_fp32_reference_on_every_layout(
     mojo_h100: torch.device, layout: str
-) -> None:
+):
     """float16 reaches the tensor-core family, not the generic tiled GEMM.
 
     The tolerance is the point of the assertion: the kernels accumulate in
@@ -7415,7 +7409,7 @@ def test_gemm16_float16_mm_matches_fp32_reference_on_every_layout(
 @pytest.mark.parametrize("op", ["mm", "addmm", "linear", "bmm", "bmm_transpose_b"])
 def test_gemm16_float16_every_entry_point_launches_the_bridge(
     mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch, op: str
-) -> None:
+):
     """mm / addmm / linear / bmm all route float16 through the same bridge."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
@@ -7462,7 +7456,7 @@ def test_gemm16_float16_every_entry_point_launches_the_bridge(
 
 def test_gemm16_float16_and_bfloat16_are_separate_specializations(
     mojo_h100: torch.device, monkeypatch: pytest.MonkeyPatch
-) -> None:
+):
     """One source, one .so per dtype: the define travels, the kernel does not.
 
     Mixing the two dtypes in one call must decline rather than reinterpret the
@@ -7485,9 +7479,7 @@ def test_gemm16_float16_and_bfloat16_are_separate_specializations(
     assert len(calls[("gemm16_matmul_ops.mojo", "Gemm16")]) == 2
 
 
-def test_gemm16_float16_linear_backward_matches_fp32_reference(
-    mojo_h100: torch.device,
-) -> None:
+def test_gemm16_float16_linear_backward_matches_fp32_reference(mojo_h100: torch.device):
     """linear_backward's dgrad/wgrad pair is the NN and TN route in float16."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
@@ -9193,9 +9185,7 @@ def _f32_transposed_dense_pair(
     return host, dev
 
 
-def _assert_f32_seq_k_close(
-    actual: torch.Tensor, expected: torch.Tensor, k: int
-) -> None:
+def _assert_f32_seq_k_close(actual: torch.Tensor, expected: torch.Tensor, k: int):
     """Compare an fp32 GEMM against an fp64 oracle with the sequential-over-k
     fp32 accumulation tolerance (random-walk rounding grows ~sqrt(k))."""
     assert actual.dtype == torch.float32
@@ -9231,7 +9221,7 @@ def _assert_f32_seq_k_close(
 )
 def test_f32_tn_transposed_a_route_matches_fp64_oracle(
     mojo_h100: str, monkeypatch: pytest.MonkeyPatch, m: int, n: int, k: int, offset: int
-) -> None:
+):
     """Every dispatch regime of the sm_90 fp32 TN route against fp64."""
     generator = torch.Generator().manual_seed(20260808)
     host_a, mojo_a = _f32_transposed_dense_pair(generator, m, k, offset, mojo_h100)
@@ -9254,7 +9244,7 @@ def test_f32_tn_transposed_a_route_matches_fp64_oracle(
     _assert_f32_seq_k_close(actual.cpu(), expected, k)
 
 
-def test_f32_tn_route_declined_regimes_stay_correct(mojo_h100: str) -> None:
+def test_f32_tn_route_declined_regimes_stay_correct(mojo_h100: str):
     """Regimes the TN route declines (m == 1, bias, TT, bmm) keep the
     scratch-copy path and stay correct."""
     generator = torch.Generator().manual_seed(20260808)
@@ -9303,7 +9293,7 @@ def test_f32_tn_route_declined_regimes_stay_correct(mojo_h100: str) -> None:
         torch.set_float32_matmul_precision(old_precision)
 
 
-def test_f32_tn_route_linear_weight_gradient(mojo_h100: str) -> None:
+def test_f32_tn_route_linear_weight_gradient(mojo_h100: str):
     """nn.Linear backward produces the dW = dY^T @ X layout the route claims;
     the full autograd round trip must stay correct."""
     generator = torch.Generator().manual_seed(20260808)

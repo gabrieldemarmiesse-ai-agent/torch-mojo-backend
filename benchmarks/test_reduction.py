@@ -76,7 +76,7 @@ def _dim_case(
 @pytest.mark.bench_op("sum.dim_IntList")
 def test_sum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     d = 0 if dim is None else dim
     bench.run(
@@ -90,7 +90,7 @@ def test_sum(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     if dim is None:
         bench.run(
@@ -110,7 +110,7 @@ def test_mean(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_max(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -123,7 +123,7 @@ def test_max(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_min(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -136,7 +136,7 @@ def test_min(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_amax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -150,7 +150,7 @@ def test_amax(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_amin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -164,7 +164,7 @@ def test_amin(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_argmax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.argmax(x_ref, dim=dim),
@@ -177,7 +177,7 @@ def test_argmax(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_argmin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.argmin(x_ref, dim=dim),
@@ -190,7 +190,7 @@ def test_argmin(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_all(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.999, hw, mojo_device)
     if dim is None:
@@ -211,7 +211,7 @@ def test_all(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_any(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.001, hw, mojo_device)
     if dim is None:
@@ -233,7 +233,7 @@ def test_any(
 @pytest.mark.bench_op("min.dim")
 def test_min_dim(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -248,7 +248,7 @@ def test_min_dim(
 @pytest.mark.bench_op("var.correction")
 def test_var(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     if dim is None:
         bench.run(
@@ -269,7 +269,7 @@ def test_var(
 @pytest.mark.bench_op("linalg_vector_norm")
 def test_vector_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -284,7 +284,7 @@ def test_vector_norm(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_cumsum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -298,7 +298,7 @@ def test_cumsum(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_nonzero(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     # Fixed 50% density under the seeded fixture: the output size, and so
     # the kernel work, is identical on both legs and across runs.
     x_ref, x_our = both(torch.rand(FULL_SHAPES[shape_id]) < 0.5, hw, mojo_device)

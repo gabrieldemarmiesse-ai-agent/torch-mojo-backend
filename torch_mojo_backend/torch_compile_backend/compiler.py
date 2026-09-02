@@ -63,7 +63,7 @@ def global_max_objects() -> GlobalMaxObjects:
     return _global_max_objects
 
 
-def gather_stats_on_graph(gm: torch.fx.GraphModule) -> None:
+def gather_stats_on_graph(gm: torch.fx.GraphModule):
     # count the number of times we see each function.
     # print and sort alphabetically.
     function_counts: dict[str, int] = {}
@@ -79,10 +79,10 @@ def gather_stats_on_graph(gm: torch.fx.GraphModule) -> None:
 
 
 class TensorsBook:
-    def __init__(self) -> None:
+    def __init__(self):
         self.tensors: dict[str, Any] = {}
 
-    def __setitem__(self, name: str, tensor: object) -> None:
+    def __setitem__(self, name: str, tensor: object):
         self.tensors[name] = tensor
 
     def convert_to_max(self, something: object) -> object:
@@ -155,7 +155,7 @@ class _GraphFactory:
         self,
         replace_inputs: dict[str, torch.Tensor] = {},
         force_device: DeviceRef | None = None,
-    ) -> None:
+    ):
         """Creates the MAX graph according to the input fx graph.
 
         Create a new instance for each new graph to be created.
@@ -184,7 +184,7 @@ class _GraphFactory:
         self.replace_inputs = replace_inputs
         self.force_device = force_device
 
-    def initialize_graph(self) -> None:
+    def initialize_graph(self):
         if self.graph is not None:
             raise RuntimeError("Graph has already been initialized.")
 
@@ -214,7 +214,7 @@ class _GraphFactory:
         # torch_device_to_max_device also handles the eager "mojo" device.
         return torch_device_to_max_device(tensor.device)
 
-    def handle_placeholder(self, node: torch.fx.Node) -> None:
+    def handle_placeholder(self, node: torch.fx.Node):
         if node.name in self.replace_inputs:
             # We short-circuit this input and use a constant instead.
             # We still have to place it in the graph inputs list because
@@ -253,7 +253,7 @@ class _GraphFactory:
             )
             self.names_to_input_idx[node.name] = len(self.graph_inputs) - 1
 
-    def handle_call_function(self, node_idx: int, node: torch.fx.Node) -> None:
+    def handle_call_function(self, node_idx: int, node: torch.fx.Node):
         func_args = [self.tensor_book.convert_to_max(x) for x in node.args]
         func_kwargs = {
             k: self.tensor_book.convert_to_max(v) for k, v in node.kwargs.items()
@@ -310,7 +310,7 @@ class _GraphFactory:
 
         self.tensor_book[node.name] = func_output
 
-    def handle_get_attr(self, node: torch.fx.Node) -> None:
+    def handle_get_attr(self, node: torch.fx.Node):
         owning_module = node.graph.owning_module
         assert owning_module is not None
         assert isinstance(node.target, str)
@@ -484,7 +484,7 @@ class BaseMaxCompiler:
         gm: torch.fx.GraphModule,
         example_inputs: list[object],
         mode: str | None = None,
-    ) -> None:
+    ):
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
         if profiling_enabled():
@@ -576,7 +576,7 @@ class BaseMaxCompiler:
 _buffer_cache: "dict[int, tuple[max.driver.Buffer, int, weakref.finalize[[int], torch.Tensor]]]" = {}
 
 
-def _evict_buffer(tensor_id: int, /) -> None:
+def _evict_buffer(tensor_id: int, /):
     _buffer_cache.pop(tensor_id, None)
 
 
@@ -618,7 +618,7 @@ def boxed_func(
 
 
 class mojo_backend:
-    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]) -> None:
+    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]):
         self.func_to_execute = aot_autograd(
             fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE
         )(gm, example_inputs)

@@ -1,7 +1,7 @@
 from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
 
-def _enable_apple_fast_add() -> None:
+def _enable_apple_fast_add():
     """Select the isolated Metal contiguous-add implementation.
 
     Patching once during device registration keeps CUDA and ROCm on the
@@ -14,7 +14,7 @@ def _enable_apple_fast_add() -> None:
     aten_fast.fast_aten_add = aten_fast.fast_aten_add_apple  # ty: ignore[invalid-assignment]
 
 
-def register_apple_optimizations() -> None:
+def register_apple_optimizations():
     """Install optional integrations that are profitable only on Apple GPUs."""
     if any(device.api == "metal" for device in get_accelerators()):
         _enable_apple_fast_add()

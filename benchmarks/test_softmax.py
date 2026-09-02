@@ -43,7 +43,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("_softmax")
 def test_softmax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         torch.randn(SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
     )
@@ -59,7 +59,7 @@ def test_softmax(
 @pytest.mark.bench_op("_log_softmax")
 def test_log_softmax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         torch.randn(SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
     )
@@ -75,7 +75,7 @@ def test_log_softmax(
 @pytest.mark.bench_op("_log_softmax_backward_data")
 def test_log_softmax_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(SHAPES[shape_id], dtype=dtype), hw, mojo_device)
     g_ref, g_our = both(torch.randn(SHAPES[shape_id], dtype=dtype), hw, mojo_device)
@@ -92,7 +92,7 @@ def test_log_softmax_backward(
 @pytest.mark.parametrize("shape_id", ELEM_SHAPES)
 def test_gelu_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     dtype = DTYPES[dtype_id]
     shape = ELEM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)

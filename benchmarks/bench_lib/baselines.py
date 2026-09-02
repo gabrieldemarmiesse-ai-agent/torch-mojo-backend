@@ -212,7 +212,7 @@ class BenchKey(typing.NamedTuple):
         return f"{self.op}/{self.dtype}/{self.shape}/{self.layout}"
 
 
-def _check_ratio(value: float, where: str) -> None:
+def _check_ratio(value: float, where: str):
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(
             f"{where}: a baseline ratio must be a finite positive number "
@@ -396,7 +396,7 @@ def canonical_dump(data: BaselinesFile) -> str:
     return "\n" + text.replace("<", "\\u003c") + "\n"
 
 
-def write(data: BaselinesFile, path: Path = BASELINES_PATH) -> None:
+def write(data: BaselinesFile, path: Path = BASELINES_PATH):
     """Splice `data` into the file's data block, atomically.
 
     The viewer around the block survives byte-for-byte.
@@ -410,7 +410,7 @@ def write(data: BaselinesFile, path: Path = BASELINES_PATH) -> None:
 
 def merge_write(
     hw_key: str, entries: dict[BenchKey, float], path: Path = BASELINES_PATH
-) -> None:
+):
     """Merge `entries` into the file.
 
     Every line not in `entries` survives byte-for-byte: only the measured
@@ -468,7 +468,7 @@ def _transposed(configs: dict[str, dict[str, object]]) -> dict[str, dict[str, ob
     return typing.cast("dict[str, dict[str, object]]", out)
 
 
-def rebuild(path: Path = BASELINES_PATH) -> None:
+def rebuild(path: Path = BASELINES_PATH):
     """Re-canonicalize the data block: prune empty blocks, sort, rewrite.
 
     The escape hatch for the two documented manual situations — resolving

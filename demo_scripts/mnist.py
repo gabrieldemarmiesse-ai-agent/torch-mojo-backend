@@ -29,7 +29,7 @@ os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "0"
 class SimpleNet(nn.Module):
     """Simple feedforward neural network for MNIST classification."""
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         # Input: 28x28 = 784 pixels
         self.fc1 = nn.Linear(784, 128)
@@ -124,7 +124,7 @@ def evaluate(
     return avg_loss, accuracy
 
 
-def main() -> None:
+def main():
     # Hyperparameters
     batch_size = 64
     test_batch_size = 1000

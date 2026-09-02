@@ -218,7 +218,7 @@ def test_scaled_dot_product_attention_bool_mask(conf: Conf, call_checker: CallCh
 @pytest.mark.parametrize("mask_batch", [1, 2])
 def test_scaled_dot_product_attention_cross_attention_4d_mask(
     conf: Conf, call_checker: CallChecker, mask_batch: int
-) -> None:
+):
     """Cross attention (key length != query length) with a rank-4 mask.
 
     ``mask_batch=1`` additionally exercises a mask that broadcasts over the
@@ -2444,7 +2444,7 @@ def test_aten_bucketize_tensor(
     dtype: torch.dtype,
     right: bool,
     out_int32: bool,
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(aten_functions.aten_bucketize)
 
@@ -2468,7 +2468,7 @@ def test_aten_searchsorted_batched(
     dtype: torch.dtype,
     side: str,
     out_int32: bool,
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(aten_functions.aten_searchsorted)
 
@@ -2487,7 +2487,7 @@ def test_aten_searchsorted_batched(
 )
 def test_aten_searchsorted_sorter(
     mojo_device: str, call_checker: CallChecker, dtype: torch.dtype
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(aten_functions.aten_searchsorted)
 
@@ -2515,7 +2515,7 @@ def test_aten_searchsorted_dtype_promotion(
     call_checker: CallChecker,
     boundary_dtype: torch.dtype,
     value_dtype: torch.dtype,
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(aten_functions.aten_searchsorted)
 
@@ -2530,7 +2530,7 @@ def test_aten_searchsorted_dtype_promotion(
 @pytest.mark.parametrize("out_int32", [False, True])
 def test_aten_searchsorted_and_bucketize_scalar_overloads(
     conf: Conf, call_checker: CallChecker, out_int32: bool
-) -> None:
+):
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
     )
@@ -2552,7 +2552,7 @@ def test_aten_searchsorted_and_bucketize_scalar_overloads(
 @pytest.mark.parametrize("right", [False, True])
 def test_aten_searchsorted_and_bucketize_empty_edges(
     conf: Conf, call_checker: CallChecker, right: bool
-) -> None:
+):
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
     )
@@ -2591,7 +2591,7 @@ def test_aten_searchsorted_and_bucketize_empty_edges(
 
 def test_aten_searchsorted_and_bucketize_eager_cpu_and_gpu(
     mojo_device: str, call_checker: CallChecker
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
@@ -2613,7 +2613,7 @@ def test_aten_searchsorted_and_bucketize_eager_cpu_and_gpu(
 @pytest.mark.parametrize("right", [False, True])
 def test_aten_searchsorted_and_bucketize_nan_boundaries_eager(
     mojo_device: str, call_checker: CallChecker, right: bool
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
@@ -2635,7 +2635,7 @@ def test_aten_searchsorted_and_bucketize_nan_boundaries_eager(
 @pytest.mark.parametrize("out_int32", [False, True])
 def test_aten_searchsorted_and_bucketize_out_variants(
     mojo_device: str, call_checker: CallChecker, out_int32: bool
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
@@ -2681,7 +2681,7 @@ def test_aten_searchsorted_and_bucketize_out_variants(
 
 def test_aten_searchsorted_and_bucketize_errors(
     mojo_device: str, call_checker: CallChecker
-) -> None:
+):
     register_mojo_devices()
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
@@ -2717,9 +2717,7 @@ def test_aten_searchsorted_and_bucketize_errors(
         aten.bucketize.Tensor(values, boundaries.unsqueeze(0))
 
 
-def test_aten_searchsorted_and_bucketize_compile_backend(
-    call_checker: CallChecker,
-) -> None:
+def test_aten_searchsorted_and_bucketize_compile_backend(call_checker: CallChecker):
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
     )
@@ -2754,7 +2752,7 @@ def test_aten_searchsorted_and_bucketize_compile_backend(
 @pytest.mark.parametrize("right", [False, True])
 def test_aten_searchsorted_and_bucketize_nan_boundaries_compile_backend(
     call_checker: CallChecker, right: bool
-) -> None:
+):
     call_checker.register(
         aten_functions.aten_searchsorted, aten_functions.aten_bucketize
     )
@@ -2772,7 +2770,7 @@ def test_aten_searchsorted_and_bucketize_nan_boundaries_compile_backend(
     check_outputs(fn, Conf("cpu", True), [boundaries, values])
 
 
-def test_aten_searchsorted_compile_backend_declines_unchecked_sorter() -> None:
+def test_aten_searchsorted_compile_backend_declines_unchecked_sorter():
     def fn(
         boundaries: torch.Tensor, values: torch.Tensor, sorter: torch.Tensor
     ) -> torch.Tensor:

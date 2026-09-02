@@ -68,7 +68,7 @@ def _fp32_wrapper(op: torch._ops.OpOverload) -> Callable[..., object]:
     return _policy_wrapper(op, lambda: torch.float32)
 
 
-def register_autocast_ops() -> None:
+def register_autocast_ops():
     """Install fallthrough plus the explicit CUDA-matching GPT policies."""
     global _registered, _fallback_library, _aten_library
     if _registered:

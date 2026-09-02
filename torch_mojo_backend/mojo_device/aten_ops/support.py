@@ -74,7 +74,7 @@ def _refuse_unsupported_backward(
     backward_op: str,
     operands: tuple[torch.Tensor | None, ...],
     workaround: str,
-) -> None:
+):
     """Refuse, from the forward, a call whose autograd node we cannot run.
 
     An exception raised while the autograd engine runs a *native* backward node
@@ -137,7 +137,7 @@ def _not_implemented(op_name: str) -> Callable[..., NoReturn]:
     return raiser
 
 
-def _copy_into_tensor(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _copy_into_tensor(dst: TorchMojoTensor, src: TorchMojoTensor):
     """dst[...] = src[...] with dtype cast + broadcast, any strides."""
     aten_fast = _fast()
     if src._dtype != dst._dtype:

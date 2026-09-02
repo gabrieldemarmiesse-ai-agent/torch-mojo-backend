@@ -296,8 +296,11 @@ This ensures the operation works in both `torch.compile()` and on the `mojo` dev
 ## Type hints
 
 Every function written must have type hints in its signature: annotate all
-arguments and the return type. Do not put type hints in the function body
-(no annotated local variables like `x: Foo = ...`).
+arguments and the return type, except that a function returning nothing is
+left without `-> None` (ruff's `suppress-none-returning` exempts it, and
+`tests/test_no_none_return_annotations.py` bans the spelling). Do not put
+type hints in the function body (no annotated local variables like
+`x: Foo = ...`).
 
 Use `: object` only when no other option is possible. Prefer precise types,
 unions, `Protocol`s (e.g. `MojoTensorLike` for payload-level helpers), or a

@@ -9,7 +9,7 @@ from torch_mojo_backend.mojo_device.aten_ops.support import _unsupported
 
 
 # aten::record_stream(Tensor(a!) self, Stream s) -> ()
-def mojo_device_record_stream(self: TorchMojoTensor, s: torch._C.Stream) -> None:
+def mojo_device_record_stream(self: TorchMojoTensor, s: torch._C.Stream):
     """Order ``self``'s eventual free after work already on stream ``s``.
 
     A thin adapter onto ``device_streams.record_use_on_stream_ctx``: the
