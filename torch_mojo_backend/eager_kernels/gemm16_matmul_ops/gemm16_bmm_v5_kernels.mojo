@@ -41,6 +41,7 @@ kernel (never atomics).
 The operand dtype is bfloat16 or float16 via _GEMM16_DT, same as the family.
 """
 
+from std.collections import OptionalReg
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_dim,
@@ -48,10 +49,19 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle, create_tma_descriptor
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
-from max.gpu.memory import fence_async_view_proxy, fence_mbarrier_init
+from max.gpu.memory import (
+    external_memory,
+    fence_async_view_proxy,
+    fence_mbarrier_init,
+)
 from std.memory import AddressSpace
 from max.gpu.sync import barrier, named_barrier
 from max.gpu.primitives import (
@@ -60,6 +70,7 @@ from max.gpu.primitives import (
     cluster_sync_relaxed,
 )
 from std.memory import stack_allocation
+from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
 from std.utils.static_tuple import StaticTuple
@@ -79,9 +90,131 @@ comptime _B5_DT = _GEMM16_DT
 comptime _B5_F32 = DType.float32
 comptime _B5_PTR = UnsafePointer[Scalar[_B5_DT], MutAnyOrigin]
 comptime _B5_F32_PTR = UnsafePointer[Scalar[_B5_F32], MutAnyOrigin]
+comptime _B5_SMEM = UnsafePointer[
+    Scalar[_B5_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
+]
 comptime _B5_BK = 64
 comptime _B5_GROUP = 4
 comptime _B5_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
+
+# ---------------------------------------------------------------------------
+# Where the operand pipelines live.
+#
+# Both bodies below stage their operand pipeline (and, with the TMA-store
+# epilogue, the C tile) in shared memory: 32 KiB to 208 KiB of it depending on
+# the instantiation, and all but the two smallest exceed the 49152 bytes ptxas
+# allows a kernel in *static* `.shared` on sm_90 before CUDA 13 -- where it
+# fails the whole `mojo build`, not just the offending kernel.  Those carve one
+# `external_memory` slab into their three tiles instead; the dynamic window
+# has never been subject to the cap (it is opted into per launch with
+# MAX_DYNAMIC_SHARED_SIZE_BYTES, the scheme eager_flash_attention uses).
+#
+# The instantiations that FIT stay static, because the dynamic window is not
+# free: its base sits past the static mbarriers rounded up to the 1024-byte
+# alignment below, so converting a kernel that fits costs it ~1 KiB and can
+# cost the smallest one a resident CTA.  `_b5_dynamic_smem` decides from the
+# instantiation's own byte count, so the split is geometry, not a toolchain
+# question.
+#
+# The mbarriers stay static either way: 16-48 bytes, and keeping them out of
+# the carve keeps the dynamic size a simple function of the tile geometry.
+# The scalar-C instantiations reserve 1 KiB for the dummy C tile ptxas
+# dead-eliminates, because a carve that dropped it would hand the epilogue a
+# pointer into the B pipeline if anyone ever un-gated it; no converted config
+# loses a resident CTA to that 1 KiB.
+#
+# The carve is aligned to 1024 bytes, NOT to the 128 the TMA instructions
+# themselves ask for, and that is load-bearing rather than cautious.  128B
+# swizzling repeats over an atom of 8 rows x 128 bytes = 1024 bytes.  The TMA
+# loads survive any 128-byte base because the writer (TMA) and the reader (the
+# wgmma descriptor) both derive the swizzle from the same shared address, so a
+# shifted base shifts both alike.  The TMA-store epilogue does not: it stages C
+# by hand at `((lcol // 8) ^ (row % 8))`, an XOR on the tile-RELATIVE row, and
+# the store's hardware de-swizzle is an XOR on the ADDRESS.  Those agree only
+# when the tile starts on an atom boundary.  A 128-byte-aligned carve was built
+# and measured: the mainloop stayed exact (the scalar-C epilogue passed every
+# case) while every TMA-store case came back scrambled.  The static path's
+# `alignment=1024` on the C tile is that same requirement, and each tile offset
+# below is a whole number of atoms, so aligning the base carries it to all
+# three.
+# ---------------------------------------------------------------------------
+
+
+# The sm_90 static `.shared` ceiling ptxas enforces before CUDA 13, and the
+# mbarrier allowance to charge against it: the persistent body declares two
+# arrays of `stages` 8-byte barriers (48 B at its deepest pipeline), the tiny
+# body one (24 B).  Charging every instantiation the larger figure keeps the
+# fit test independent of which body is asking.
+comptime _B5_STATIC_SHARED_CAP = 49152
+comptime _B5_MBAR_ALLOWANCE = 48
+
+
+@always_inline
+def _b5_tile_bytes[stages: Int, bm: Int, bn: Int, tma_store: Bool]() -> Int:
+    """Shared bytes the A/B pipeline and the C staging tile occupy.
+
+    The scalar-C epilogue never reads its C tile, and ptxas drops the dead
+    allocation, so it contributes nothing here -- which is what makes this
+    agree with the measured static `.shared` of every instantiation.
+    """
+    return (
+        stages * (bm + bn) * _B5_BK + (bm * bn if tma_store else 0)
+    ) * size_of[_B5_DT]()
+
+
+@always_inline
+def _b5_dynamic_smem[stages: Int, bm: Int, bn: Int, tma_store: Bool]() -> Bool:
+    """Whether this instantiation stages its tiles in the DYNAMIC window.
+
+    True for everything that would not fit in static `.shared` -- every
+    instantiation but `tiny_m64n64` (40976 B) and `tiny_m64n64_scalar_c`
+    (32784 B).
+    """
+    return (
+        _b5_tile_bytes[stages, bm, bn, tma_store]() + _B5_MBAR_ALLOWANCE
+        > _B5_STATIC_SHARED_CAP
+    )
+
+
+@always_inline
+def _b5_smem_bytes[stages: Int, bm: Int, bn: Int, tma_store: Bool]() -> Int:
+    """Bytes of dynamic shared memory one CTA of this instantiation needs.
+
+    A + B pipeline slabs plus the C staging tile, in that order -- the order
+    the kernel carves them.  Zero for an instantiation that stages statically:
+    the dynamic window is unused then and the launch must not reserve any of
+    it.
+    """
+    # The C tile's offset inside the carve has to keep the 1024-byte swizzle
+    # atom the hand-written epilogue assumes (see the header comment); every
+    # (stages, bm, bn) the ladder instantiates satisfies it, and this says so
+    # to the next one that does not.
+    comptime assert (
+        stages * (bm + bn) * _B5_BK * size_of[_B5_DT]()
+    ) % 1024 == 0, "v5 BMM: C staging tile must start on a 128B-swizzle atom"
+    comptime if not _b5_dynamic_smem[stages, bm, bn, tma_store]():
+        return 0
+    return (
+        stages * (bm + bn) * _B5_BK + (bm * bn if tma_store else 512)
+    ) * size_of[_B5_DT]()
+
+
+@always_inline
+def _b5_smem_arg[bytes: Int]() -> OptionalReg[Int]:
+    """`shared_mem_bytes` for a launch, absent when nothing is dynamic."""
+    comptime if bytes == 0:
+        return OptionalReg[Int](None)
+    return OptionalReg[Int](bytes)
+
+
+@always_inline
+def _b5_smem_attr[bytes: Int]() -> OptionalReg[FuncAttribute]:
+    """The >48 KiB dynamic-shared opt-in, absent when nothing is dynamic."""
+    comptime if bytes == 0:
+        return OptionalReg[FuncAttribute](None)
+    return OptionalReg[FuncAttribute](
+        FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(bytes))
+    )
 
 
 @always_inline
@@ -156,20 +289,6 @@ def _b5_bmm_nn_persistent_ws[
         ]()
         comptime A_PIPE_LAYOUT = Layout.row_major(stages, bm * _B5_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(stages, bn * _B5_BK)
-        var a_pipeline = LayoutTensor[
-            _B5_DT,
-            A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _B5_DT,
-            B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
         # C staging tile for the TMA-store epilogue (swizzled 128B rows of
         # 64 elements, bn // 64 chunks).  A dummy allocation for the scalar
         # epilogue: staging + a coalesced cooperative flush was tried there
@@ -177,13 +296,54 @@ def _b5_bmm_nn_persistent_ws[
         # flush sits on the consumer's critical path while the direct
         # stores' 82% sector waste is absorbed by L2 (89% hit, DRAM 7%).
         comptime C_SMEM_ELEMS = bm * bn if tma_store else 512
-        var c_smem = LayoutTensor[
-            _B5_DT,
-            Layout.row_major(1, C_SMEM_ELEMS),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=1024,
-        ].stack_allocation()
+        # A/B pipeline + C tile: static if it fits, else one extern slab
+        # carved in that order (see the header comment).
+        var a_smem: _B5_SMEM
+        var b_smem: _B5_SMEM
+        var c_smem: _B5_SMEM
+        comptime if not _b5_dynamic_smem[stages, bm, bn, tma_store]():
+            a_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    A_PIPE_LAYOUT,
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+            b_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    B_PIPE_LAYOUT,
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+            c_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    Layout.row_major(1, C_SMEM_ELEMS),
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=1024,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+        else:
+            var smem_base = external_memory[
+                Scalar[_B5_DT],
+                address_space=AddressSpace.SHARED,
+                alignment=1024,
+            ]().as_unsafe_any_origin()
+            a_smem = smem_base
+            b_smem = smem_base + stages * bm * _B5_BK
+            c_smem = b_smem + stages * bn * _B5_BK
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -266,7 +426,7 @@ def _b5_bmm_nn_persistent_ws[
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
                             alignment=128,
-                        ](a_pipeline.ptr + stage * bm * _B5_BK)
+                        ](a_smem + stage * bm * _B5_BK)
                         var k0 = t * _B5_BK
                         a_tma.async_copy_3d(
                             a_tile, full_barriers[stage], (k0, m0, ab)
@@ -283,11 +443,7 @@ def _b5_bmm_nn_persistent_ws[
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
-                            ](
-                                b_pipeline.ptr
-                                + stage * bn * _B5_BK
-                                + cc * 64 * _B5_BK
-                            )
+                            ](b_smem + stage * bn * _B5_BK + cc * 64 * _B5_BK)
                             comptime if cluster_m > 1:
                                 b_tma.async_multicast_load_3d(
                                     b_chunk,
@@ -356,14 +512,14 @@ def _b5_bmm_nn_persistent_ws[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_pipeline.ptr + stage * bm * _B5_BK)
+                    ](a_smem + stage * bm * _B5_BK)
                     var b_tile = LayoutTensor[
                         _B5_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](b_pipeline.ptr + stage * bn * _B5_BK)
+                    ](b_smem + stage * bn * _B5_BK)
                     warpgroup_fence(accum)
                     wgmma.arrive()
                     wgmma.wgmma[consumers](
@@ -412,7 +568,7 @@ def _b5_bmm_nn_persistent_ws[
                             + ((lcol // 8) ^ (row % 8)) * 8
                             + lcol % 8
                         )
-                        c_smem.ptr.store[alignment=4](elem, pair)
+                        c_smem.store[alignment=4](elem, pair)
                     fence_async_view_proxy()
                     named_barrier[NCONS](1)
                     if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -423,7 +579,7 @@ def _b5_bmm_nn_persistent_ws[
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
-                            ](c_smem.ptr + chunk * bm * 64)
+                            ](c_smem + chunk * bm * 64)
                             c_tma.async_store_3d(
                                 c_chunk, (n0 + chunk * 64, m0, bidx)
                             )
@@ -519,28 +675,55 @@ def _b5_bmm_nn_tiny[
         comptime B_CHUNK_LAYOUT = tile_layout_mn_major[
             _B5_DT, 64, _B5_BK, _B5_SWIZZLE
         ]()
-        var a_pipeline = LayoutTensor[
-            _B5_DT,
-            Layout.row_major(stages, bm * _B5_BK),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _B5_DT,
-            Layout.row_major(stages, bn * _B5_BK),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
         comptime C_SMEM_ELEMS = bm * bn if tma_store else 512
-        var c_smem = LayoutTensor[
-            _B5_DT,
-            Layout.row_major(1, C_SMEM_ELEMS),
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=1024,
-        ].stack_allocation()
+        # A/B pipeline + C tile: static if it fits, else one extern slab
+        # carved in that order (see the header comment).
+        var a_smem: _B5_SMEM
+        var b_smem: _B5_SMEM
+        var c_smem: _B5_SMEM
+        comptime if not _b5_dynamic_smem[stages, bm, bn, tma_store]():
+            a_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    Layout.row_major(stages, bm * _B5_BK),
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+            b_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    Layout.row_major(stages, bn * _B5_BK),
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=128,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+            c_smem = (
+                LayoutTensor[
+                    _B5_DT,
+                    Layout.row_major(1, C_SMEM_ELEMS),
+                    MutAnyOrigin,
+                    address_space=AddressSpace.SHARED,
+                    alignment=1024,
+                ]
+                .stack_allocation()
+                .ptr
+            )
+        else:
+            var smem_base = external_memory[
+                Scalar[_B5_DT],
+                address_space=AddressSpace.SHARED,
+                alignment=1024,
+            ]().as_unsafe_any_origin()
+            a_smem = smem_base
+            b_smem = smem_base + stages * bm * _B5_BK
+            c_smem = b_smem + stages * bn * _B5_BK
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -584,7 +767,7 @@ def _b5_bmm_nn_tiny[
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](a_pipeline.ptr + stage * bm * _B5_BK)
+            ](a_smem + stage * bm * _B5_BK)
             a_tma.async_copy_3d(a_tile, full_barriers[stage], (k0, m0, ab))
             comptime for cc in range(B_CHUNKS):
                 var b_chunk = LayoutTensor[
@@ -593,7 +776,7 @@ def _b5_bmm_nn_tiny[
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](b_pipeline.ptr + stage * bn * _B5_BK + cc * 64 * _B5_BK)
+                ](b_smem + stage * bn * _B5_BK + cc * 64 * _B5_BK)
                 b_tma.async_copy_3d(
                     b_chunk, full_barriers[stage], (n0 + cc * 64, k0, bb)
                 )
@@ -631,14 +814,14 @@ def _b5_bmm_nn_tiny[
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](a_pipeline.ptr + stage * bm * _B5_BK)
+            ](a_smem + stage * bm * _B5_BK)
             var b_tile = LayoutTensor[
                 _B5_DT,
                 B_LAYOUT,
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](b_pipeline.ptr + stage * bn * _B5_BK)
+            ](b_smem + stage * bn * _B5_BK)
             warpgroup_fence(accum)
             wgmma.arrive()
             wgmma.wgmma[1](a_tile, b_tile, accum, 0)
@@ -676,7 +859,7 @@ def _b5_bmm_nn_tiny[
                     + ((lcol // 8) ^ (row % 8)) * 8
                     + lcol % 8
                 )
-                c_smem.ptr.store[alignment=4](elem, pair)
+                c_smem.store[alignment=4](elem, pair)
             fence_async_view_proxy()
             barrier()
             if thread_idx.x == 0:
@@ -687,7 +870,7 @@ def _b5_bmm_nn_tiny[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](c_smem.ptr + chunk * bm * 64)
+                    ](c_smem + chunk * bm * 64)
                     c_tma.async_store_3d(c_chunk, (n0 + chunk * 64, m0, bidx))
                 c_tma.commit_group()
                 c_tma.wait_group[0]()
@@ -778,6 +961,8 @@ def _b5_enqueue_tiny[
     var macro_rows = (m + bm - 1) // bm
     var blocks_n = (n + bn - 1) // bn
     var total_works = batch_count * macro_rows * blocks_n
+    # Both absent for an instantiation that stages statically.
+    comptime SMEM = _b5_smem_bytes[stages, bm, bn, tma_store]()
     ctx.enqueue_function[_b5_bmm_nn_tiny[stages, bn, tma_store]](
         a_tma,
         b_tma,
@@ -792,6 +977,8 @@ def _b5_enqueue_tiny[
         Int64(0 if b_bs == 0 else 1),
         grid_dim=(total_works,),
         block_dim=(128,),
+        shared_mem_bytes=_b5_smem_arg[SMEM](),
+        func_attribute=_b5_smem_attr[SMEM](),
     )
 
 
@@ -878,6 +1065,8 @@ def _b5_enqueue_batched[
     # SM overlap them instead.
     var num_clusters = min(occ * (sm_count // cluster_m), total_works)
     var grid_x = num_clusters * cluster_m
+    # Both absent for an instantiation that stages statically.
+    comptime SMEM = _b5_smem_bytes[stages, bm, bn, tma_store]()
     ctx.enqueue_function[
         _b5_bmm_nn_persistent_ws[
             stages, cluster_m, bm, bn, consumers, tma_store
@@ -896,6 +1085,8 @@ def _b5_enqueue_batched[
         Int64(0 if b_bs == 0 else 1),
         grid_dim=(grid_x,),
         block_dim=(128 * (consumers + 1),),
+        shared_mem_bytes=_b5_smem_arg[SMEM](),
+        func_attribute=_b5_smem_attr[SMEM](),
     )
 
 
