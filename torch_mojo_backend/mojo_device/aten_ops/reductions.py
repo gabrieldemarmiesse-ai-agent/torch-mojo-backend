@@ -1,14 +1,13 @@
 """min along one dim: functional (values, indices) + out= variant."""
 
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    TorchMojoTensor,
-    _resize_payload,
-)
-
 from torch_mojo_backend.mojo_device.aten_ops.support import (
     _copy_into_tensor,
     _fast,
     _unsupported,
+)
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    TorchMojoTensor,
+    _resize_payload,
 )
 
 

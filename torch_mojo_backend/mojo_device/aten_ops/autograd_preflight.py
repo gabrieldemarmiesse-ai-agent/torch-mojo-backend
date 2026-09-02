@@ -13,14 +13,13 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
-
 from torch_mojo_backend.mojo_device.aten_ops.support import (
     _eager_impl,
     _fast,
     _refuse_unsupported_backward,
     _unsupported,
 )
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 # Most of these ops have no autograd escape other than turning grad off: their
 # parameters legitimately require grad during training, so unlike batch norm

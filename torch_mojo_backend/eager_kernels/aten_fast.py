@@ -33,25 +33,7 @@ from max.dtype import DType
 from max.experimental.torch import max_dtype_to_torch
 
 from torch_mojo_backend import eager_kernels, is_running_tests
-from torch_mojo_backend.eager_kernels import call_queue as _call_queue
-from torch_mojo_backend.eager_kernels import _ctx_ptr
-from torch_mojo_backend.eager_kernels.output_specs import (
-    _allocate_output_spec,
-    _submit_prepared_into,
-    _TensorOutputSpec,
-)
-from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
-    _reserve_philox_state,
-)
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    MojoTensorLike,
-    TorchMojoTensor,
-    _copy_strided_into,
-    _pad8,
-    _resize_payload,
-    _row_major_strides,
-)
-from torch_mojo_backend.types import CountedCallable
+from torch_mojo_backend.eager_kernels import _ctx_ptr, call_queue as _call_queue
 from torch_mojo_backend.eager_kernels.activation_backward_ops import (
     ActivationBackwardExtension as _ActivationBackwardExtension,
 )
@@ -92,6 +74,11 @@ from torch_mojo_backend.eager_kernels.normalization_forward_ops import (
 from torch_mojo_backend.eager_kernels.optimizer_ops import (
     OptimizerExtension as _OptimizerExtension,
 )
+from torch_mojo_backend.eager_kernels.output_specs import (
+    _allocate_output_spec,
+    _submit_prepared_into,
+    _TensorOutputSpec,
+)
 from torch_mojo_backend.eager_kernels.random_ops import (
     RandomExtension as _RandomExtension,
 )
@@ -110,6 +97,18 @@ from torch_mojo_backend.eager_kernels.softmax_backward_ops import (
 from torch_mojo_backend.eager_kernels.tf32_matmul_ops import (
     TF32MatmulExtension as _Tf32MatmulExtension,
 )
+from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
+    _reserve_philox_state,
+)
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    MojoTensorLike,
+    TorchMojoTensor,
+    _copy_strided_into,
+    _pad8,
+    _resize_payload,
+    _row_major_strides,
+)
+from torch_mojo_backend.types import CountedCallable
 
 _VariantFlag = bool | int | str
 
@@ -6381,8 +6380,8 @@ def fast_aten__log_softmax_backward_data(
         )
         viewed_grad = fast_aten_view(work_grad, flat_shape)
         viewed_output = fast_aten_view(work_output, flat_shape)
-        if not isinstance(viewed_grad, TorchMojoTensor) or not isinstance(
-            viewed_output, TorchMojoTensor
+        if isinstance(viewed_grad, _NotHandled) or isinstance(
+            viewed_output, _NotHandled
         ):
             return NOT_HANDLED
         work_grad, work_output = viewed_grad, viewed_output
@@ -6401,15 +6400,15 @@ def fast_aten__log_softmax_backward_data(
 
     if summed is None:
         summed_result = fast_aten_sum(work_grad, dim=[work_dim], keepdim=True)
-        if not isinstance(summed_result, TorchMojoTensor):
+        if isinstance(summed_result, _NotHandled):
             return NOT_HANDLED
         summed = summed_result
     probabilities = fast_aten_exp(work_output)
-    if not isinstance(probabilities, TorchMojoTensor):
+    if isinstance(probabilities, _NotHandled):
         return NOT_HANDLED
 
     grad_input = fast_aten_addcmul(work_grad, probabilities, summed, value=-1.0)
-    if not isinstance(grad_input, TorchMojoTensor):
+    if isinstance(grad_input, _NotHandled):
         return NOT_HANDLED
 
     # The launches above have captured their inputs on this device stream.
@@ -6418,7 +6417,7 @@ def fast_aten__log_softmax_backward_data(
     del probabilities, summed
     if restore_shape is not None:
         restored = fast_aten_view(grad_input, restore_shape)
-        if not isinstance(restored, TorchMojoTensor):
+        if isinstance(restored, _NotHandled):
             return NOT_HANDLED
         grad_input = restored
     if grad_input._dtype != target_dtype:
@@ -7299,7 +7298,7 @@ def _sdpa_math_forward_with_dropout(
         # and neither path reserves RNG state at this endpoint.
         zeroed_probs = fast_aten_mul(probs, 0.0)
         dropout_mask = fast_filled(probs._shape, False, DType.bool, probs._device)
-        if not isinstance(zeroed_probs, TorchMojoTensor) or dropout_mask is None:
+        if isinstance(zeroed_probs, _NotHandled) or dropout_mask is None:
             return NOT_HANDLED
         effective_probs = zeroed_probs
     elif dropout_p > 0.0:
@@ -7307,7 +7306,6 @@ def _sdpa_math_forward_with_dropout(
         if not isinstance(dropout_result, tuple):
             return NOT_HANDLED
         effective_probs, dropout_mask = dropout_result
-        assert isinstance(effective_probs, TorchMojoTensor)
         del dropout_result
 
     if metal_causal:
@@ -7357,7 +7355,7 @@ def _sdpa_math_forward_with_dropout(
                 flags={"TRANSPOSE_B": False},
                 keepalive=(out, effective_probs, v),
             )
-        assert isinstance(out, TorchMojoTensor)
+        assert not isinstance(out, _NotHandled)
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
     # mask, avoiding one persistent f32 (B,H,L,S) allocation per layer.
     del effective_probs
@@ -7630,7 +7628,7 @@ def _fa4_bhsd_layout(tensor: TorchMojoTensor) -> bool:
 def _fa4_native_bthd(tensor: torch.Tensor) -> TorchMojoTensor | None:
     """Expose public BHTD storage as FA4-native BTHD, copying if required."""
     physical = fast_aten_transpose(tensor, 1, 2)
-    if not isinstance(physical, TorchMojoTensor):
+    if isinstance(physical, _NotHandled):
         return None
     if _fa4_strided_bthd_layout(physical):
         return physical
@@ -7729,11 +7727,6 @@ def fast_fa4_16bit_d64_causal_forward(
     fa4_ops = load_fa4_ops()
     assert isinstance(inputs, tuple)
     q, k, v = inputs
-    assert (
-        isinstance(q, TorchMojoTensor)
-        and isinstance(k, TorchMojoTensor)
-        and isinstance(v, TorchMojoTensor)
-    )
     qkv_dtype = q._dtype
     batch, heads, seqlen, head_dim = q._shape
     bhsd_eligible = _fa4_bhsd_layout(q) and _fa4_bhsd_layout(k) and _fa4_bhsd_layout(v)

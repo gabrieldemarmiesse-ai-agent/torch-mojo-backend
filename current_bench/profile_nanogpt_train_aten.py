@@ -171,7 +171,7 @@ def render_shape_table(events: list[object], total_us: float, row_limit: int) ->
     )
 
 
-def write_op_csv(path: Path, events: list[object], total_us: float, steps: int) -> None:
+def write_op_csv(path: Path, events: list[object], total_us: float, steps: int):
     with path.open("w", newline="") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -200,9 +200,7 @@ def write_op_csv(path: Path, events: list[object], total_us: float, steps: int) 
             )
 
 
-def write_shape_csv(
-    path: Path, events: list[object], total_us: float, steps: int
-) -> None:
+def write_shape_csv(path: Path, events: list[object], total_us: float, steps: int):
     with path.open("w", newline="") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -255,15 +253,15 @@ def measure_phase_split(
             _, loss = model(inputs, targets)
         return loss
 
-    def through_backward(inputs: torch.Tensor, targets: torch.Tensor) -> None:
+    def through_backward(inputs: torch.Tensor, targets: torch.Tensor):
         forward_only(inputs, targets).backward()
 
-    def through_clip(inputs: torch.Tensor, targets: torch.Tensor) -> None:
+    def through_clip(inputs: torch.Tensor, targets: torch.Tensor):
         through_backward(inputs, targets)
         if grad_clip != 0.0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    def full_step(inputs: torch.Tensor, targets: torch.Tensor) -> None:
+    def full_step(inputs: torch.Tensor, targets: torch.Tensor):
         training_step(model, optimizer, inputs, targets, context, grad_clip)
 
     def time_prefix(body: Callable[[torch.Tensor, torch.Tensor], object]) -> float:
@@ -322,7 +320,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("PyTorch cannot access the GPU")

@@ -19,8 +19,6 @@ from collections.abc import Callable
 from typing import cast
 
 import torch_mojo_backend.is_running_tests
-from torch_mojo_backend.types import CountedCallable
-
 from torch_mojo_backend.mojo_device.aten_ops import foreach
 from torch_mojo_backend.mojo_device.aten_ops.autograd_preflight import (
     mojo_device__adaptive_avg_pool2d,
@@ -90,6 +88,7 @@ from torch_mojo_backend.mojo_device.aten_ops.transfer import (
     mojo_device__copy_from,
     mojo_device__to_copy,
 )
+from torch_mojo_backend.types import CountedCallable
 
 # Global registry for functions to register
 _aten_ops_registry: list[tuple[str, Callable[..., object]]] = []

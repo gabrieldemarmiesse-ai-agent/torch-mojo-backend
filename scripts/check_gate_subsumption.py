@@ -46,9 +46,7 @@ MIN_GATE_TERMS = 3
 class Gate:
     """One ``if``/``elif`` predicate, flattened to its conjunction of terms."""
 
-    def __init__(
-        self, function: str, line: int, indent: int, terms: frozenset[str]
-    ) -> None:
+    def __init__(self, function: str, line: int, indent: int, terms: frozenset[str]):
         self.function = function
         self.line = line
         self.indent = indent

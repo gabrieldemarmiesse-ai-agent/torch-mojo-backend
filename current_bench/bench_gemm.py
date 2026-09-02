@@ -131,7 +131,7 @@ def extract_cases(rocm_dir: Path, mojo_dir: Path) -> list[GemmCase]:
     return cases
 
 
-def rocm_smi_snapshot(label: str) -> None:
+def rocm_smi_snapshot(label: str):
     result = subprocess.run(
         [
             "rocm-smi",
@@ -286,7 +286,7 @@ def run_case(case: GemmCase, mojo_synchronize, warmup: int, iterations: int) -> 
     return result
 
 
-def write_table(path: Path, results: list[dict]) -> None:
+def write_table(path: Path, results: list[dict]):
     columns = [
         "case",
         "phase",

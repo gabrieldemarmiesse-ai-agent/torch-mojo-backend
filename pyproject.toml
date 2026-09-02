@@ -38,6 +38,10 @@ extend-select = [
     "TID252", # relative imports (banned below)
 ]
 
+[tool.ruff.lint.isort]
+# Keep `from m import (A as A, B as B)` re-exports as one statement.
+combine-as-imports = true
+
 [tool.ruff.lint.flake8-annotations]
 suppress-none-returning = true
 

@@ -1,7 +1,7 @@
+import datetime as dt
 import time
 import traceback
 import weakref
-import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -14,24 +14,22 @@ import torch
 from functorch.compile import make_boxed_func
 from max import engine
 from max.experimental.torch.torch import torch_dtype_to_max
-from max.graph import DeviceRef, Graph, KernelLibrary
-from max.graph import ops as max_ops
+from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 
 from torch_mojo_backend.aten_functions import (
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
+    MAPPING_TORCH_ATEN_TO_MOJO,
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
+    get_accelerators,
     get_error_message,
     get_fully_qualified_name,
 )
-
-from torch_mojo_backend.aten_functions import MAPPING_TORCH_ATEN_TO_MOJO
-from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
 
 class MojoCompilerError(Exception):

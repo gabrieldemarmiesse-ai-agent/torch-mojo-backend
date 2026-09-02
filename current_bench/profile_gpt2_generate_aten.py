@@ -205,7 +205,7 @@ def render_shape_table(events, total_us: float, row_limit: int) -> str:
     )
 
 
-def write_op_csv(path: Path, events, total_us: float) -> None:
+def write_op_csv(path: Path, events, total_us: float):
     with path.open("w", newline="") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -224,7 +224,7 @@ def write_op_csv(path: Path, events, total_us: float) -> None:
             )
 
 
-def write_shape_csv(path: Path, events, total_us: float) -> None:
+def write_shape_csv(path: Path, events, total_us: float):
     with path.open("w", newline="") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(

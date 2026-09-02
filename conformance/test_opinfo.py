@@ -63,7 +63,7 @@ def _to_cpu(value: object) -> object:
     return value
 
 
-def _run_declared_unsupported(reason: str, run: Callable[[], None]) -> None:
+def _run_declared_unsupported(reason: str, run: Callable[[], None]):
     """Run a case `known_unsupported.py` declares cannot pass, and hold it to it.
 
     xfail-strict semantics, and the strictness is the entire reason a
@@ -279,7 +279,7 @@ class TestOpInfoConformance(TestCase):
     """One test per (operator, dtype), driven entirely by OpInfo metadata."""
 
     @ops(op_db, allowed_dtypes=_DTYPES)
-    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
+    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: OpInfo):
         """Same operator, same inputs, mojo vs CPU, at OpInfo's own tolerance.
 
         Samples are built on the CPU and moved, never built on the device.
@@ -310,7 +310,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
+    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: OpInfo):
         """One `test_matches_cpu` case: every sample, device leg vs CPU leg."""
         placements = _opinfo_placements(op, dtype)
         checked = 0
@@ -334,7 +334,7 @@ class TestOpInfoConformance(TestCase):
         [op for op in op_db if op.error_inputs_func is not None],
         allowed_dtypes=(torch.float32,),
     )
-    def test_errors_match(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
+    def test_errors_match(self, device: str, dtype: torch.dtype, op: OpInfo):
         """The inputs PyTorch says must raise, must raise here too.
 
         A backend that silently accepts a malformed call is a worse failure
@@ -358,7 +358,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _check_error_inputs(self, device: str, op: OpInfo) -> None:
+    def _check_error_inputs(self, device: str, op: OpInfo):
         """One `test_errors_match` case: every error input OpInfo declares."""
         checked = 0
         for error_input in op.error_inputs(device):

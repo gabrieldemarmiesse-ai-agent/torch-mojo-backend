@@ -7,17 +7,16 @@ import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
 from torch_mojo_backend.mojo_device import cuda_peer, torch_mojo_device_module
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _copy_into_tensor,
+    _fast,
+    max_dtype_to_torch_dtype,
+)
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
     _copy_strided_into,
     _record_h2d_source,
     find_equivalent_max_device,
-)
-
-from torch_mojo_backend.mojo_device.aten_ops.support import (
-    _copy_into_tensor,
-    _fast,
-    max_dtype_to_torch_dtype,
 )
 
 

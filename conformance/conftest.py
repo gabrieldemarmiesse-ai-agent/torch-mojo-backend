@@ -31,7 +31,7 @@ from torch_mojo_backend import register_mojo_devices  # noqa: E402
 register_mojo_devices()
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
+def pytest_addoption(parser: pytest.Parser):
     parser.addoption(
         "--op",
         action="store",
