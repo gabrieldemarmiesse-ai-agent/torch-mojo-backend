@@ -53,6 +53,8 @@ from layout.tensor_core_async import tile_layout_k_major, tile_layout_mn_major
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_nn_v4_kernels import (
+    _v4_dyn_smem_attr,
+    _v4_dyn_smem_tile,
     _v4_mma_tile,
     maybe_enqueue_gemm16_tn_v4_persistent,
 )
@@ -96,6 +98,15 @@ def _v4_b_smem_layout[BN: Int, KMAJ_B: Bool]() -> Layout:
     comptime if KMAJ_B:
         return tile_layout_k_major[_V4_DT, BN, _V4_BK, _V4_SWIZZLE]()
     return tile_layout_mn_major[_V4_DT, BN, _V4_BK, _V4_SWIZZLE]()
+
+
+# Shared bytes one `_v4_tn_ws_body` CTA carves out of its slab: the two
+# operand pipelines, in the order the body carves them.  The body asserts at
+# compile time that this equals the end of its own last carving, so the
+# launch size and the carve cannot drift.
+@always_inline
+def _v4_ws_smem_bytes[STAGES: Int, BM: Int, BN: Int]() -> Int:
+    return STAGES * (BM + BN) * _V4_BK * 2
 
 
 # ============================================================================
@@ -144,20 +155,18 @@ def _v4_tn_ws_body[
         comptime A_PIPE_LAYOUT = Layout.row_major(STAGES, BM * _V4_BK)
         comptime B_PIPE_LAYOUT = Layout.row_major(STAGES, BN * _V4_BK)
 
-        var a_pipeline = LayoutTensor[
-            _V4_DT,
-            A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V4_DT,
-            B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = STAGES * BM * _V4_BK
+        var a_pipeline = _v4_dyn_smem_tile[A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[B_PIPE_LAYOUT, 128, B_PIPE_OFFSET]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[STAGES, BM, BN]()
+            == (B_PIPE_OFFSET + STAGES * BN * _V4_BK) * 2
+        ), "TN warp-specialized smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             STAGES,
             SharedMemBarrier,
@@ -708,6 +717,7 @@ def _v4_enqueue_splitk_m128n256[
     var count = m * n
     var ws = ctx.enqueue_create_buffer[DType.float32](splits * count)
     var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
+    comptime DYN_SMEM = _v4_ws_smem_bytes[4, _V4_BM, 256]()
     comptime if COL_A and not KMAJ_B:
         ctx.enqueue_function[_v4_tn_splitk_m128n256_s4](
             _v4_make_a_tma(a, m, k, ctx),
@@ -719,6 +729,8 @@ def _v4_enqueue_splitk_m128n256[
             Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
         )
     elif not COL_A and KMAJ_B:
         ctx.enqueue_function[_v4_nt_splitk_m128n256_s4](
@@ -731,6 +743,8 @@ def _v4_enqueue_splitk_m128n256[
             Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
         )
     elif not COL_A and not KMAJ_B:
         ctx.enqueue_function[_v4_nn_splitk_m128n256_s4](
@@ -743,6 +757,8 @@ def _v4_enqueue_splitk_m128n256[
             Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
         )
     else:
         ctx.enqueue_function[_v4_tt_splitk_m128n256_s4](
@@ -755,6 +771,8 @@ def _v4_enqueue_splitk_m128n256[
             Int64(chunk_tiles),
             grid_dim=(grid_x, splits),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
         )
     ctx.enqueue_function[_v4_tn_splitk_reduce](
         output,
@@ -794,6 +812,8 @@ def _v4_enqueue_direct_m128n192(
     var b_tma = TMATensorTile[_V4_DT, 2, Index(_V4_BK, 192), Index(_V4_BK, 64)](
         b_desc
     )
+    comptime DYN_SMEM_S3 = _v4_ws_smem_bytes[3, _V4_BM, 192]()
+    comptime DYN_SMEM_S4 = _v4_ws_smem_bytes[4, _V4_BM, 192]()
     if multi_wave:
         ctx.enqueue_function[_v4_tn_direct_m128n192_s3g16](
             a_tma,
@@ -804,6 +824,8 @@ def _v4_enqueue_direct_m128n192(
             Int64(k),
             grid_dim=(grid_x,),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM_S3,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM_S3](),
         )
     else:
         ctx.enqueue_function[_v4_tn_direct_m128n192_s4](
@@ -815,6 +837,8 @@ def _v4_enqueue_direct_m128n192(
             Int64(k),
             grid_dim=(grid_x,),
             block_dim=(_V4_THREADS,),
+            shared_mem_bytes=DYN_SMEM_S4,
+            func_attribute=_v4_dyn_smem_attr[DYN_SMEM_S4](),
         )
 
 
@@ -828,6 +852,7 @@ def _v4_enqueue_tt_direct_m128n64(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
+    comptime DYN_SMEM = _v4_ws_smem_bytes[4, _V4_BM, 64]()
     ctx.enqueue_function[_v4_tt_direct_m128n64_s4](
         _v4_make_a_tma(a, m, k, ctx),
         _v4_make_b_kmaj_tma[64](b, n, k, ctx),
@@ -837,6 +862,8 @@ def _v4_enqueue_tt_direct_m128n64(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V4_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -850,6 +877,7 @@ def _v4_enqueue_tt_direct_m64n128(
     grid_x: Int,
     ctx: DeviceContext,
 ) raises:
+    comptime DYN_SMEM = _v4_ws_smem_bytes[3, 64, 128]()
     ctx.enqueue_function[_v4_tt_direct_m64n128_s3](
         _v4_make_a_tma[64](a, m, k, ctx),
         _v4_make_b_kmaj_tma[128](b, n, k, ctx),
@@ -859,6 +887,8 @@ def _v4_enqueue_tt_direct_m64n128(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(256,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 

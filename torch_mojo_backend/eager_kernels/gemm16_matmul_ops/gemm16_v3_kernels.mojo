@@ -44,9 +44,14 @@ from gemm16_kernels import (
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
 from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
-from gemm16_nn_v4_kernels import maybe_enqueue_gemm16_nn_v4
+from gemm16_nn_v4_kernels import (
+    _v4_dyn_smem_attr,
+    _v4_dyn_smem_tile,
+    maybe_enqueue_gemm16_nn_v4,
+)
 from gemm16_nt_v4_kernels import maybe_enqueue_gemm16_nt_v4
 from gemm16_tn_v4_kernels import (
+    _v4_ws_smem_bytes,
     try_enqueue_gemm16_gemm_splitk_rm_v4,
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
@@ -218,6 +223,26 @@ comptime _V3_TN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 )
 
 
+# ============================================================================
+# Where the operand pipelines live.
+#
+# Each of the five warp-specialized kernels below stages one A and one B
+# pipeline in shared memory: 72 KiB for the 64x128 tiles, 144 KiB for the
+# 128x256 ones, so both come from the dynamic (`extern`) shared window, as the
+# whole gemm16 family does -- see the design comment above `_v4_dyn_smem_tile`
+# in gemm16_nn_v4_kernels.mojo.
+#
+# These kernels have no C staging tile -- the epilogue writes accumulator
+# registers straight to global, so nothing here re-derives a swizzle from a
+# tile-relative row the way a TMA-store epilogue does -- and the carve is
+# therefore A pipeline then B pipeline and nothing else, which is the layout
+# `_v4_ws_smem_bytes` already sizes for the identically-shaped v4 TN bodies.
+# Every kernel asserts at compile time that its own last carving ends where
+# that size says it should.  The mbarriers stay static: two arrays of three
+# 8-byte barriers, 48 bytes.
+# ============================================================================
+
+
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
 @__llvm_arg_metadata(b_tma, `nvvm.grid_constant`)
 @__llvm_metadata(
@@ -238,20 +263,20 @@ def _v3_nn_ws_m128n256_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = _V3_NN_STAGES * _V3_NN_BM * _V3_NN_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NN_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NN_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_NN_STAGES, _V3_NN_BM, _V3_NN_BN]()
+            == (B_PIPE_OFFSET + _V3_NN_STAGES * _V3_NN_BN * _V3_NN_BK) * 2
+        ), "v3 NN 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NN_STAGES,
             SharedMemBarrier,
@@ -423,6 +448,7 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NN_A_TMA(a_desc)
     var b_tma = _V3_NN_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[_V3_NN_STAGES, _V3_NN_BM, _V3_NN_BN]()
     ctx.enqueue_function[_v3_nn_ws_m128n256_tma_s3](
         a_tma,
         b_tma,
@@ -432,6 +458,8 @@ def _v3_enqueue_nn_ws_m128n256_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -457,20 +485,28 @@ def _v3_nn_ws_m64n128_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_SMALL_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NN_SMALL_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = (
+            _V3_NN_SMALL_STAGES * _V3_NN_SMALL_BM * _V3_NN_SMALL_BK
+        )
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NN_SMALL_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NN_SMALL_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[
+                _V3_NN_SMALL_STAGES, _V3_NN_SMALL_BM, _V3_NN_SMALL_BN
+            ]()
+            == (
+                B_PIPE_OFFSET
+                + _V3_NN_SMALL_STAGES * _V3_NN_SMALL_BN * _V3_NN_SMALL_BK
+            )
+            * 2
+        ), "v3 NN 64x128 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NN_SMALL_STAGES,
             SharedMemBarrier,
@@ -647,6 +683,9 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
     )
     var a_tma = _V3_NN_SMALL_A_TMA(a_desc)
     var b_tma = _V3_NN_SMALL_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_NN_SMALL_STAGES, _V3_NN_SMALL_BM, _V3_NN_SMALL_BN
+    ]()
     ctx.enqueue_function[_v3_nn_ws_m64n128_tma_s3](
         a_tma,
         b_tma,
@@ -656,6 +695,8 @@ def _v3_enqueue_nn_ws_m64n128_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NN_SMALL_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -679,20 +720,20 @@ def _v3_nt_ws_m128n256_tma_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NT_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_NT_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = _V3_NT_STAGES * _V3_NT_BM * _V3_NT_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_NT_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_NT_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_NT_STAGES, _V3_NT_BM, _V3_NT_BN]()
+            == (B_PIPE_OFFSET + _V3_NT_STAGES * _V3_NT_BN * _V3_NT_BK) * 2
+        ), "v3 NT 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NT_STAGES,
             SharedMemBarrier,
@@ -862,6 +903,7 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
     )
     var a_tma = _V3_NT_A_TMA(a_desc)
     var b_tma = _V3_B_K_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[_V3_NT_STAGES, _V3_NT_BM, _V3_NT_BN]()
     ctx.enqueue_function[_v3_nt_ws_m128n256_tma_s3](
         a_tma,
         b_tma,
@@ -871,6 +913,8 @@ def _v3_enqueue_nt_ws_m128n256_tma_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_NT_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -896,20 +940,28 @@ def _v3_tn_ws_m64n128_tma_col_a_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     comptime if _is_sm_9x():
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_SMALL_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_SMALL_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = (
+            _V3_TN_SMALL_STAGES * _V3_TN_SMALL_BM * _V3_TN_SMALL_BK
+        )
+        var a_pipeline = _v4_dyn_smem_tile[_V3_TN_SMALL_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_TN_SMALL_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[
+                _V3_TN_SMALL_STAGES, _V3_TN_SMALL_BM, _V3_TN_SMALL_BN
+            ]()
+            == (
+                B_PIPE_OFFSET
+                + _V3_TN_SMALL_STAGES * _V3_TN_SMALL_BN * _V3_TN_SMALL_BK
+            )
+            * 2
+        ), "v3 TN 64x128 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_TN_SMALL_STAGES,
             SharedMemBarrier,
@@ -1115,6 +1167,9 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
     )
     var a_tma = _V3_TN_SMALL_A_TMA(a_desc)
     var b_tma = _V3_TN_SMALL_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_TN_SMALL_STAGES, _V3_TN_SMALL_BM, _V3_TN_SMALL_BN
+    ]()
     ctx.enqueue_function[_v3_tn_ws_m64n128_tma_col_a_s3](
         a_tma,
         b_tma,
@@ -1124,6 +1179,8 @@ def _v3_enqueue_tn_ws_m64n128_tma_col_a_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_SMALL_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 
@@ -1153,20 +1210,21 @@ def _v3_tn_ws_m128n256_tma_col_a_s3(
         # directly into an MN-major shared layout, which is exactly the
         # column-major A representation accepted by SM90 WGMMA.  This avoids
         # the explicit shared-memory transpose used by the fallback TN path.
-        var a_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_WS_A_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
-        var b_pipeline = LayoutTensor[
-            _V3_DT,
-            _V3_TN_WS_B_PIPE_LAYOUT,
-            MutAnyOrigin,
-            address_space=AddressSpace.SHARED,
-            alignment=128,
-        ].stack_allocation()
+        # Two carvings of one extern slab -- see `_v4_dyn_smem_tile`
+        # (gemm16_nn_v4_kernels.mojo).
+        comptime B_PIPE_OFFSET = _V3_TN_WS_STAGES * _V3_TN_WS_BM * _V3_TN_WS_BK
+        var a_pipeline = _v4_dyn_smem_tile[_V3_TN_WS_A_PIPE_LAYOUT, 128, 0]()
+        var b_pipeline = _v4_dyn_smem_tile[
+            _V3_TN_WS_B_PIPE_LAYOUT, 128, B_PIPE_OFFSET
+        ]()
+        # The B pipeline is the last carving, so its end IS the slab size the
+        # launch must ask for; keeping the two in step is not left to a
+        # comment.
+        comptime assert (
+            _v4_ws_smem_bytes[_V3_TN_WS_STAGES, _V3_TN_WS_BM, _V3_TN_WS_BN]()
+            == (B_PIPE_OFFSET + _V3_TN_WS_STAGES * _V3_TN_WS_BN * _V3_TN_WS_BK)
+            * 2
+        ), "v3 TN 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_TN_WS_STAGES,
             SharedMemBarrier,
@@ -1373,6 +1431,9 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
     )
     var a_tma = _V3_TN_WS_A_TMA(a_desc)
     var b_tma = _V3_TN_WS_B_TMA(b_desc)
+    comptime DYN_SMEM = _v4_ws_smem_bytes[
+        _V3_TN_WS_STAGES, _V3_TN_WS_BM, _V3_TN_WS_BN
+    ]()
     ctx.enqueue_function[_v3_tn_ws_m128n256_tma_col_a_s3](
         a_tma,
         b_tma,
@@ -1382,6 +1443,8 @@ def _v3_enqueue_tn_ws_m128n256_tma_col_a_s3(
         Int64(k),
         grid_dim=(grid_x,),
         block_dim=(_V3_TN_WS_THREADS,),
+        shared_mem_bytes=DYN_SMEM,
+        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
 
 

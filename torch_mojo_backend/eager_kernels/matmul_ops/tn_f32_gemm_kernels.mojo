@@ -51,16 +51,28 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.sync import barrier
+from std.builtin.device_passable import DevicePassable
+from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
-from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from std.memory import AddressSpace
 from std.math import ceildiv
-from std.memory import stack_allocation
+from std.memory import alloc, stack_allocation
 from std.sys.info import _has_sm_9x
 
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
 from op_utils import _enqueue_cached, _make_ptr
-from tn_f32_gemm_core import _tn_core_kernel, _tn_split_kernel
+from tn_f32_gemm_core import (
+    _tn_core_kernel,
+    _tn_core_smem_bytes,
+    _tn_split_kernel,
+    _tn_split_smem_bytes,
+)
 
 
 # Split-K workspace cap. 32 MB never binds for the tiny-MN deep-K regime it
@@ -145,6 +157,69 @@ def _tn_ksplit_reduce_wide_kernel(
 
 
 @always_inline
+def _enqueue_cached_smem3d[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+    *Ts: DevicePassable,
+](
+    ctx: DeviceContext,
+    key: String,
+    gx: Int,
+    gy: Int,
+    gz: Int,
+    threads: Int,
+    smem_bytes: Int,
+    *args: *Ts,
+) raises:
+    """`op_utils._enqueue_cached`, 3D grid, with a
+    `MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in baked into the cached
+    `DeviceFunction` -- the 3D-grid twin of
+    `softmax_backward_ops.softmax_backward_kernels._enqueue_cached_smem`
+    (kept local rather than shared: that helper is keyed for a caller
+    serving many different `smem_bytes` per process, which the TN cores
+    never do -- `smem_bytes` is a comptime constant of `func` here, so one
+    process only ever asks this helper for one value per `key`).
+
+    The `_tn_core_kernel`/`_tn_split_kernel` it launches stage their tiles
+    from `external_memory` (tn_f32_gemm_core.mojo), sized here by
+    `smem_bytes`.
+    """
+    var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
+    comptime FuncT = type_of(ctx.compile_function[func]())
+
+    if global_ptr := _get_global_or_null(name):
+        var fptr = global_ptr.value().bitcast[FuncT]()
+        ctx.enqueue_function(
+            fptr[],
+            *args,
+            grid_dim=(gx, gy, gz),
+            block_dim=(threads,),
+            shared_mem_bytes=smem_bytes,
+        )
+        return
+
+    var compiled = ctx.compile_function[func](
+        func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+            UInt32(smem_bytes)
+        )
+    )
+    var fptr = alloc[FuncT](1)
+    fptr.init_pointee_move(compiled^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name),
+        fptr.bitcast[NoneType](),
+    )
+    ctx.enqueue_function(
+        fptr[],
+        *args,
+        grid_dim=(gx, gy, gz),
+        block_dim=(threads,),
+        shared_mem_bytes=smem_bytes,
+    )
+
+
+@always_inline
 def _tn_core_launch[
     BM: Int,
     BN: Int,
@@ -178,6 +253,10 @@ def _tn_core_launch[
     a[(kt+kk)*m + bm+cm] — coalesced along m, no transpose, no copy.
     """
     comptime THREADS = (BM // WM) * (BN // WN) * 32
+    # Both instantiations stage from the dynamic shared window, sized here and
+    # in the kernel from the one formula (`_tn_core_smem_bytes`, see
+    # tn_f32_gemm_core.mojo).
+    comptime SMEM_BYTES = _tn_core_smem_bytes[BM, BN, BK, STAGES]()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     var a = (
         _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
@@ -187,7 +266,7 @@ def _tn_core_launch[
     )
 
     if va4 and vb4:
-        _enqueue_cached[
+        _enqueue_cached_smem3d[
             _tn_core_kernel[BM, BN, BK, WM, WN, LR, 4, 4, STAGES, MINB, PUMP]
         ](
             ctx,
@@ -196,6 +275,7 @@ def _tn_core_launch[
             gy,
             gz,
             THREADS,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -205,7 +285,7 @@ def _tn_core_launch[
             Int64(ksplits),
         )
     elif va4:
-        _enqueue_cached[
+        _enqueue_cached_smem3d[
             _tn_core_kernel[BM, BN, BK, WM, WN, LR, 4, 1, STAGES, MINB, PUMP]
         ](
             ctx,
@@ -214,6 +294,7 @@ def _tn_core_launch[
             gy,
             gz,
             THREADS,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -223,7 +304,7 @@ def _tn_core_launch[
             Int64(ksplits),
         )
     elif vb4:
-        _enqueue_cached[
+        _enqueue_cached_smem3d[
             _tn_core_kernel[BM, BN, BK, WM, WN, LR, 1, 4, STAGES, MINB, PUMP]
         ](
             ctx,
@@ -232,6 +313,7 @@ def _tn_core_launch[
             gy,
             gz,
             THREADS,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -241,7 +323,7 @@ def _tn_core_launch[
             Int64(ksplits),
         )
     else:
-        _enqueue_cached[
+        _enqueue_cached_smem3d[
             _tn_core_kernel[BM, BN, BK, WM, WN, LR, 1, 1, STAGES, MINB, PUMP]
         ](
             ctx,
@@ -250,6 +332,7 @@ def _tn_core_launch[
             gy,
             gz,
             THREADS,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -285,6 +368,9 @@ def _tn_split_launch[
 ) raises:
     """Launch the warp-group split core (256 threads) with VEC_A/VEC_B
     picked by the caller's alignment gates."""
+    # Only ever instantiated at BM=BN=128, so its 65536-131072 B slab comes
+    # from the dynamic shared window -- see tn_f32_gemm_core.mojo.
+    comptime SMEM_BYTES = _tn_split_smem_bytes[BM, BN, BK, STAGES]()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
     var a = (
         _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
@@ -294,13 +380,16 @@ def _tn_split_launch[
     )
 
     if va4 and vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 4, STAGES, LR, SERP]](
+        _enqueue_cached_smem3d[
+            _tn_split_kernel[BM, BN, BK, 4, 4, STAGES, LR, SERP]
+        ](
             ctx,
             String(t"tn_s_{BM}x{BN}x{BK}_v44_s{STAGES}_l{LR}_z{SERP}"),
             gx,
             gy,
             gz,
             256,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -310,13 +399,16 @@ def _tn_split_launch[
             Int64(ksplits),
         )
     elif va4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 4, 1, STAGES, LR, SERP]](
+        _enqueue_cached_smem3d[
+            _tn_split_kernel[BM, BN, BK, 4, 1, STAGES, LR, SERP]
+        ](
             ctx,
             String(t"tn_s_{BM}x{BN}x{BK}_v41_s{STAGES}_l{LR}_z{SERP}"),
             gx,
             gy,
             gz,
             256,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -326,13 +418,16 @@ def _tn_split_launch[
             Int64(ksplits),
         )
     elif vb4:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 4, STAGES, LR, SERP]](
+        _enqueue_cached_smem3d[
+            _tn_split_kernel[BM, BN, BK, 1, 4, STAGES, LR, SERP]
+        ](
             ctx,
             String(t"tn_s_{BM}x{BN}x{BK}_v14_s{STAGES}_l{LR}_z{SERP}"),
             gx,
             gy,
             gz,
             256,
+            SMEM_BYTES,
             c,
             a,
             b,
@@ -342,13 +437,16 @@ def _tn_split_launch[
             Int64(ksplits),
         )
     else:
-        _enqueue_cached[_tn_split_kernel[BM, BN, BK, 1, 1, STAGES, LR, SERP]](
+        _enqueue_cached_smem3d[
+            _tn_split_kernel[BM, BN, BK, 1, 1, STAGES, LR, SERP]
+        ](
             ctx,
             String(t"tn_s_{BM}x{BN}x{BK}_v11_s{STAGES}_l{LR}_z{SERP}"),
             gx,
             gy,
             gz,
             256,
+            SMEM_BYTES,
             c,
             a,
             b,

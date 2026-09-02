@@ -112,6 +112,16 @@ it. An unsupported dtype or flag reported by Mojo indicates a bug in Python's
 definition mapping and is surfaced directly. There is no widening, dtype
 escalation, fallback build, or launch-time retry.
 
+One toolchain limit shapes the kernels rather than the build identity. ptxas
+caps a kernel's *static* shared memory at 48 KiB before CUDA 13 and fails the
+whole `.so` on the first kernel over the line, so every route needing more than
+that — the wgmma/TMA GEMM kernels, flash attention, the tf32 and fp32 cores —
+stages its tiles in dynamic (`extern`) shared memory, sized per launch by
+`shared_mem_bytes` and opted into with
+`FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES`. That window has never been
+capped that way, so those kernels assemble under any ptxas and nothing has to
+be probed or gated.
+
 Builds are protected by a per-identity file lock (`flock`) and written to a
 temporary file before an atomic rename. Concurrent requests for one identity,
 in this process or another, compile it once, and an interrupted compiler

@@ -75,12 +75,27 @@ from max.gpu.memory import (
     async_copy,
     async_copy_commit_group,
     async_copy_wait_group,
+    external_memory,
 )
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
 from std.math import ceildiv
-from std.memory import stack_allocation
 from std.utils.static_tuple import StaticTuple
+
+
+# Bytes of *shared* memory each core carves out of its dynamic slab, as a
+# function of its own tile parameters. Read by the launch wrappers in
+# tn_f32_gemm_kernels.mojo to size the `MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in:
+# one source of a number that must agree on both sides of a launch, rather
+# than two formulas that could drift.
+@always_inline
+def _tn_core_smem_bytes[BM: Int, BN: Int, BK: Int, STAGES: Int]() -> Int:
+    return (STAGES * BM * BK + STAGES * BK * BN) * 4
+
+
+@always_inline
+def _tn_split_smem_bytes[BM: Int, BN: Int, BK: Int, STAGES: Int]() -> Int:
+    return 2 * STAGES * BK * (BM + BN) * 4
 
 
 @__llvm_metadata(
@@ -164,12 +179,23 @@ def _tn_core_kernel[
     var tr = lane // LC
     var tc = lane % LC
 
-    var a_smem = stack_allocation[
-        STAGES * BM * BK, F32, address_space=AddressSpace.SHARED
+    # ---- shared-memory staging ----
+    # The 128x128 instantiation stages 65536 B, past the 49152 B ptxas allows
+    # a kernel in *static* `.shared` before CUDA 13 (and it fails the whole
+    # `mojo build`, not just this kernel), so both instantiations carve the
+    # dynamic window instead, like FA4's `external_memory` base
+    # (fa4_fwd_kernel.mojo): one alignment=16 allocation split at a comptime
+    # offset (STAGES * BM * BK floats) so B's slab keeps the 16B-aligned
+    # source cp.async needs, which the assert below is what actually holds a
+    # future (STAGES, BM) to.
+    comptime assert (
+        STAGES * BM * BK * 4
+    ) % 16 == 0, "B slab offset breaks the 16B alignment cp.async needs"
+    var smem_base = external_memory[
+        Scalar[F32], address_space=AddressSpace.SHARED, alignment=16
     ]()
-    var b_smem = stack_allocation[
-        STAGES * BK * BN, F32, address_space=AddressSpace.SHARED
-    ]()
+    var a_smem = smem_base
+    var b_smem = smem_base + STAGES * BM * BK
 
     # Fragment base columns within a smem row.
     var am0 = wr * WM + tr * TM
@@ -471,8 +497,18 @@ def _tn_split_kernel[
     comptime EX_CHUNK = min((TM * QN) // 2, GROUP_F // (TG * 4))
     comptime EX_ROUNDS = (TM * QN + EX_CHUNK - 1) // EX_CHUNK
     comptime assert EX_CHUNK >= 1
-    var smem = stack_allocation[
-        2 * GROUP_F, F32, address_space=AddressSpace.SHARED
+    # Carved from the dynamic window -- see _tn_core_kernel's comment. This
+    # kernel is only ever instantiated at BM=BN=128 (comptime assert above),
+    # so `smem` is 65536 B at STAGES=2 and 131072 B at STAGES=4. Every
+    # downstream offset (`a_smem`, `b_smem`, `ex_smem`) is a comptime multiple
+    # of BK * BM (or BN) = 2048 floats = 8192 B, so the carve stays
+    # 16B-aligned -- the assert below is what holds a future
+    # (STAGES, BK, BM, BN) to that rather than a comment.
+    comptime assert (GROUP_F * 4) % 16 == 0 and (
+        STAGES * BK * BM * 4
+    ) % 16 == 0, "smem carve breaks the 16B alignment cp.async needs"
+    var smem = external_memory[
+        Scalar[F32], address_space=AddressSpace.SHARED, alignment=16
     ]()
     var a_smem = smem + gid * GROUP_F
     var b_smem = a_smem + STAGES * BK * BM
