@@ -185,6 +185,59 @@ def check_functions_are_equivalent(
         torch.testing.assert_close(original, compiled, rtol=rtol, atol=atol)
 
 
+# torch.testing.assert_close's default (rtol, atol) per floating dtype.
+_DEFAULT_TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
+    torch.float16: (1e-3, 1e-5),
+    torch.bfloat16: (1.6e-2, 1e-5),
+    torch.float32: (1.3e-6, 1e-5),
+    torch.float64: (1e-7, 1e-7),
+}
+
+
+def assert_close_fp64_anchored(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    slack: float = 2.0,
+) -> None:
+    """`actual` must sit as close to the float64 `reference` as `expected`
+    (torch's own result in the working dtype) does, within a factor `slack`.
+
+    For fp32 reductions torch's default bar (rtol 1.3e-6, atol 1e-5) is
+    tighter than torch's own rounding error against the exact answer, so
+    two correct implementations that merely sum in a different order fail
+    it on some elements, depending on the CPU's SIMD width. This bar asks
+    the question the default one means to: is the kernel as accurate as
+    torch's? The default tolerance stays as a floor, so where torch is exact
+    the check is the ordinary one.
+    """
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    assert actual.dtype == expected.dtype, (actual.dtype, expected.dtype)
+    assert reference.dtype == torch.float64, reference.dtype
+    rtol, atol = _DEFAULT_TOLERANCES[expected.dtype]
+    actual, expected = actual.cpu(), expected.cpu()
+    if not torch.isfinite(reference).all():
+        torch.testing.assert_close(
+            actual, expected, rtol=rtol, atol=atol, equal_nan=True
+        )
+        return
+    error = (actual.double() - reference).abs()
+    torch_error = (expected.double() - reference).abs()
+    allowed = torch.clamp(atol + rtol * reference.abs(), min=slack * torch_error.max())
+    bad = error > allowed
+    if bad.any():
+        worst = int(error.flatten().argmax())
+        raise AssertionError(
+            f"{int(bad.sum())} / {bad.numel()} elements further from the float64 "
+            f"reference than {slack}x torch's own worst error "
+            f"({float(torch_error.max()):.3g}) and outside rtol={rtol}, atol={atol}. "
+            f"Worst: actual {float(actual.flatten()[worst])!r}, torch "
+            f"{float(expected.flatten()[worst])!r}, reference "
+            f"{float(reference.flatten()[worst])!r} at flat index {worst}."
+        )
+
+
 @dataclass
 class Conf:
     device: str

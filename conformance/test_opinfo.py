@@ -46,6 +46,8 @@ from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.common_utils import TestCase, run_tests
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput
 
+from torch_mojo_backend.testing import assert_close_fp64_anchored
+
 # The dtypes worth exercising on an accelerator backend.  Deliberately not the
 # full OpInfo set: float64 is absent on some GPUs we target and complex is not
 # implemented at all, so including them would report a backend-wide gap once
@@ -275,6 +277,22 @@ def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str 
     return None
 
 
+# Nodes compared through `assert_close_fp64_anchored` instead of the default
+# bar: fp32 reductions whose result depends on summation order, so two correct
+# kernels differ by more than rtol 1.3e-6 / atol 1e-5 on a few elements, and
+# WHICH elements depends on the CPU's SIMD width (this node passed or failed
+# on GitHub's runners depending on the machine drawn). torch's own fp32
+# conv2d lands up to 4.6e-5 from the float64 answer on these very samples.
+# Kept to the nodes that have shown it; not a general policy.
+_FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
+    {("nn_functional_conv2d", torch.float32)}
+)
+
+
+def _to_float64(sample: SampleInput) -> SampleInput:
+    return sample.transform(lambda t: t.double() if t.is_floating_point() else t)
+
+
 class TestOpInfoConformance(TestCase):
     """One test per (operator, dtype), driven entirely by OpInfo metadata."""
 
@@ -323,9 +341,22 @@ class TestOpInfoConformance(TestCase):
             moved = _to_device(sample, device, placement)
             actual = op(moved.input, *moved.args, **moved.kwargs)
             expected = op(sample.input, *sample.args, **sample.kwargs)
-            # assertEqual carries the OpInfo precisionOverride for this dtype
-            # when the operator declares one; otherwise assert_close defaults.
-            self.assertEqual(_to_cpu(actual), expected, exact_dtype=True)
+            if (
+                (op.formatted_name, dtype) in _FP64_ANCHORED
+                and isinstance(actual, torch.Tensor)
+                and isinstance(expected, torch.Tensor)
+            ):
+                exact = _to_float64(sample)
+                reference = op(exact.input, *exact.args, **exact.kwargs)
+                assert isinstance(reference, torch.Tensor)
+                cpu_actual = _to_cpu(actual)
+                assert isinstance(cpu_actual, torch.Tensor)
+                assert_close_fp64_anchored(cpu_actual, expected, reference)
+            else:
+                # assertEqual carries the OpInfo precisionOverride for this
+                # dtype when the operator declares one; otherwise assert_close
+                # defaults.
+                self.assertEqual(_to_cpu(actual), expected, exact_dtype=True)
             checked += 1
         if checked == 0:
             self.skipTest("OpInfo produced no sample inputs for this dtype")
