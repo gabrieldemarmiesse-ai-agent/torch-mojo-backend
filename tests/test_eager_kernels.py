@@ -6470,6 +6470,38 @@ def test_bf16_module_is_available_for_lazy_import():
     assert aten_fast._Gemm16MatmulExtension.MOJO_FILE.name == "gemm16_matmul_ops.mojo"
 
 
+def test_big_smem_gemm_routes_stage_in_dynamic_shared_memory():
+    """ptxas caps a kernel's *static* `.shared` at 48 KiB (every target
+    through CUDA 12.8, portable targets still in 13.x) and fails the whole
+    `mojo build` on the first kernel over the line, so every GEMM route
+    needing more carves `external_memory` and opts in per launch with
+    MAX_DYNAMIC_SHARED_SIZE_BYTES."""
+    from torch_mojo_backend import eager_kernels
+
+    for relative in (
+        "gemm16_matmul_ops/gemm16_nn_v4_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_bmm_v5_kernels.mojo",
+        "matmul_ops/tn_f32_gemm_core.mojo",
+    ):
+        source = (eager_kernels._PACKAGE_DIR / relative).read_text()
+        assert "external_memory[" in source, relative
+
+    for relative in (
+        "gemm16_matmul_ops/gemm16_nn_v4_kernels.mojo",
+        "gemm16_matmul_ops/gemm16_bmm_v5_kernels.mojo",
+        "matmul_ops/tn_f32_gemm_kernels.mojo",
+    ):
+        source = (eager_kernels._PACKAGE_DIR / relative).read_text()
+        assert "MAX_DYNAMIC_SHARED_SIZE_BYTES" in source, relative
+
+    # Both 128x128 fp32 TN cores are picked on shape alone: nothing routes
+    # around them to keep a build's shared-memory footprint down.
+    tn = (
+        eager_kernels._PACKAGE_DIR / "matmul_ops/tn_f32_gemm_kernels.mojo"
+    ).read_text()
+    assert "use_t128 = m >= 96 and n >= 96" in tn
+
+
 def test_bf16_v3_source_dependency_and_kernel_contract():
     """The lazy bridge includes v3 while v2 remains its explicit fallback."""
     from torch_mojo_backend.eager_kernels import aten_fast
