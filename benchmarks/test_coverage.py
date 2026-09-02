@@ -120,6 +120,11 @@ SKIPPED_OPS: dict[str, str] = {
         "reader (device_streams.record_use). No kernel launches, so there "
         "is no device time to measure"
     ),
+    # -- metadata-only mutation -------------------------------------------
+    "aten::set_.source_Tensor": (
+        "repoints a tensor at another's allocation in place: payload rebind "
+        "plus TensorImpl metadata, zero-copy and no kernel"
+    ),
     # -- out-variant plumbing --------------------------------------------
     "aten::addcdiv.out": _OUT,
     "aten::addcmul.out": _OUT,

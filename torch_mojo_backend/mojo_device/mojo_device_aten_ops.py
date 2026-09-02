@@ -71,6 +71,7 @@ from torch_mojo_backend.mojo_device.aten_ops.inplace import (
     mojo_device_masked_fill_,
     mojo_device_mul_,
     mojo_device_relu_,
+    mojo_device_set__source_tensor,
     mojo_device_zero_,
 )
 from torch_mojo_backend.mojo_device.aten_ops.reductions import (
@@ -395,6 +396,7 @@ _register_out(
 )
 _register_fast("aten::select_scatter", "fast_aten_select_scatter")
 _register_fast("aten::select.int", "fast_aten_select")
+register_aten_op("aten::set_.source_Tensor")(mojo_device_set__source_tensor)
 register_aten_op("aten::sigmoid")(mojo_device_sigmoid)
 _register_fast("aten::sign", "fast_aten_sign")
 _register_fast("aten::silu", "fast_aten_silu")
