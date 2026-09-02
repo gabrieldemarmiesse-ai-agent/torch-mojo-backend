@@ -3,7 +3,7 @@ import os
 POSITIVE_VALUES = ("1", "true", "yes")
 
 
-def profiling_enabled():
+def profiling_enabled() -> bool:
     """
     Check if profiling is enabled by looking for the environment variable.
     """
@@ -13,7 +13,7 @@ def profiling_enabled():
     return x in POSITIVE_VALUES or py_x in POSITIVE_VALUES
 
 
-def verbose_enabled():
+def verbose_enabled() -> bool:
     """
     Check if verbose mode is enabled by looking for the environment variable.
     """
@@ -23,7 +23,7 @@ def verbose_enabled():
     return x in POSITIVE_VALUES or py_x in POSITIVE_VALUES
 
 
-def debug_graph():
+def debug_graph() -> bool:
     """
     Check if graph debugging is enabled by looking for the environment variable.
     """

@@ -52,11 +52,12 @@ def _preflight_unsupported_backward(
     def preflighted(
         *args: object, **kwargs: object
     ) -> TorchMojoTensor | tuple[TorchMojoTensor, ...]:
-        operands = [
-            args[index]
-            for index in grad_operands
-            if index < len(args) and isinstance(args[index], torch.Tensor)
-        ]
+        operands: list[torch.Tensor] = []
+        for index in grad_operands:
+            if index < len(args):
+                arg = args[index]
+                if isinstance(arg, torch.Tensor):
+                    operands.append(arg)
         if len(operands) < len(grad_operands):
             # The PrivateUse1 boxed kernel passes every positional schema
             # argument positionally, so this is unreachable today. If some call
@@ -211,8 +212,12 @@ def mojo_device_convolution(
 
 
 def mojo_device_embedding(
-    weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
-):
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    padding_idx: int = -1,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> TorchMojoTensor:
     """Native-autograd embedding with a forward-time autograd-mode preflight.
 
     An exception raised while the autograd engine runs a backward node aborts
@@ -281,26 +286,30 @@ def _linear_backward_unsupported_reason(
     supported = getattr(aten_fast, "_FLOAT_DTYPES", None)
     if supported is None:
         return None
-    try:
-        if input._dtype not in supported:
-            covered = ", ".join(
-                str(dtype).removeprefix("DType.") for dtype in supported
-            )
-            return (
-                f"linear_backward covers {covered} only, and these operands "
-                f"are {input.dtype}"
-            )
-        if weight._dtype != input._dtype or (
-            bias is not None and bias._dtype != input._dtype
-        ):
-            return (
-                "linear_backward requires input, weight and bias to share one "
-                f"dtype, and these are {input.dtype}/{weight.dtype}"
-                + ("" if bias is None else f"/{bias.dtype}")
-            )
-    except AttributeError:
-        # A non-mojo operand: the forward below reports that far better.
+    # getattr rather than a bare `.tensor._dtype` + except AttributeError: a
+    # non-mojo operand (no `_dtype`) is reported far better by the forward
+    # below, so it falls through to None the same way the old except did.
+    input_dtype = getattr(input, "_dtype", None)
+    weight_dtype = getattr(weight, "_dtype", None)
+    bias_dtype = getattr(bias, "_dtype", None) if bias is not None else None
+    if (
+        input_dtype is None
+        or weight_dtype is None
+        or (bias is not None and bias_dtype is None)
+    ):
         return None
+    if input_dtype not in supported:
+        covered = ", ".join(str(dtype).removeprefix("DType.") for dtype in supported)
+        return (
+            f"linear_backward covers {covered} only, and these operands "
+            f"are {input.dtype}"
+        )
+    if weight_dtype != input_dtype or (bias is not None and bias_dtype != input_dtype):
+        return (
+            "linear_backward requires input, weight and bias to share one "
+            f"dtype, and these are {input.dtype}/{weight.dtype}"
+            + ("" if bias is None else f"/{bias.dtype}")
+        )
     return None
 
 

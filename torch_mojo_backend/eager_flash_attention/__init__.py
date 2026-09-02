@@ -8,12 +8,13 @@ import fcntl
 import hashlib
 import importlib
 from pathlib import Path
+from types import ModuleType
 
 import mojo.importer  # noqa: F401 - installs the .mojo import hook
 
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
-_MODULE = None
+_MODULE: ModuleType | None = None
 
 
 def _sources_hash() -> str:
@@ -24,7 +25,7 @@ def _sources_hash() -> str:
     return hasher.hexdigest()[:16]
 
 
-def load_fa4_ops():
+def load_fa4_ops() -> ModuleType:
     """Compile once on first eligible use, then return the bridge module."""
     global _MODULE
     if _MODULE is not None:

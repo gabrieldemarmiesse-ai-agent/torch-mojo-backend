@@ -6,7 +6,11 @@ import torch
 import torch.nn.functional
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
-from torch.ops import aten
+
+# torch.ops is a `_Ops` instance registered into sys.modules at runtime
+# (torch/_ops.py), not a real package on disk, so no static resolver can
+# see `torch/ops/__init__.py` or `torch/ops.py`.
+from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
@@ -51,7 +55,7 @@ def test_scaled_dot_product_flash_attention_basic(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_scaled_dot_product_flash_attention_with_causal(conf: Conf, dtype: str):
+def test_scaled_dot_product_flash_attention_with_causal(conf: Conf, dtype: torch.dtype):
     """Test _scaled_dot_product_flash_attention with causal masking"""
     # Flash attention only works on CUDA
     if conf.device != "cuda:0":

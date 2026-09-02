@@ -3,17 +3,52 @@
 import functools
 import math
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Protocol, cast
 
 import pytest
 import torch
 from max.driver import CPU
 from torch.testing._internal.common_methods_invocations import op_db
 
-from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend import TorchMojoTensor, get_accelerators, register_mojo_devices
 
 pytestmark = pytest.mark.xdist_group(name="group1")
+
+
+class _NativeCallModule(Protocol):
+    """A loaded Mojo extension module: `ModuleType` plus its `call` ABI."""
+
+    call: Callable[..., object]
+
+
+class _MojoBackendModule(Protocol):
+    """`torch.mojo`: registered onto the `torch` module at runtime by
+    `register_mojo_devices()` via torch's own PrivateUse1 backend-module
+    mechanism (`_setup_privateuseone_for_python_backend`), so no static stub
+    knows about it."""
+
+    def manual_seed_all(self, seed: int) -> None: ...
+    def get_rng_state(
+        self, device: torch.device | int | None = None
+    ) -> torch.Tensor: ...
+    def set_rng_state(
+        self, new_state: torch.Tensor, device: torch.device | int | None = None
+    ) -> None: ...
+
+
+def _torch_mojo() -> _MojoBackendModule:
+    return cast(_MojoBackendModule, torch.mojo)  # ty: ignore[unresolved-attribute]
+
+
+def _opaque_tensor() -> torch.Tensor:
+    """A routing-only placeholder: identity-compared, never touched by real
+    tensor ops (the routes under test are monkeypatched away first), so a
+    bare `object()` is the actual runtime value -- cast to satisfy the real
+    `Tensor`-typed signatures of the aten_fast entry points under test."""
+    return cast(torch.Tensor, object())
 
 
 @pytest.fixture(autouse=True)
@@ -41,14 +76,14 @@ def _spy_defined_native_calls(
         key = (mojo_file.name, dict(defines).get("OP", ""))
         if key not in targets:
             return module
-        native_call = module.call
+        native_call = cast(_NativeCallModule, module).call
 
         def call(*args: object, **kwargs: object) -> object:
             calls[key].append((args, kwargs))
             return native_call(*args, **kwargs)
 
         wrapped = ModuleType(f"{module.__name__}.spy")
-        wrapped.call = call
+        cast(_NativeCallModule, wrapped).call = call
         return wrapped
 
     monkeypatch.setattr(
@@ -58,7 +93,8 @@ def _spy_defined_native_calls(
 
 
 def _replace_defined_native_calls(
-    monkeypatch: pytest.MonkeyPatch, replacements: dict[tuple[str, str], object]
+    monkeypatch: pytest.MonkeyPatch,
+    replacements: dict[tuple[str, str], Callable[..., object]],
 ) -> None:
     """Replace selected constant `call` entry points without compiling them."""
     from torch_mojo_backend import eager_kernels
@@ -73,7 +109,7 @@ def _replace_defined_native_calls(
         if replacement is None:
             return original_load(mojo_file, defines)
         module = ModuleType(f"mock_{mojo_file.stem}_{key[1]}")
-        module.call = replacement  # type: ignore[attr-defined]
+        cast(_NativeCallModule, module).call = replacement
         return module
 
     monkeypatch.setattr(
@@ -441,10 +477,14 @@ def test_wrapper_subclass_preserves_native_saved_output(mojo_device):
 
     actual = host_input.to(mojo_device).requires_grad_()
     output = torch.exp(actual)
+    assert isinstance(output, TorchMojoTensor)
+    assert output.grad_fn is not None
     assert type(output.grad_fn).__name__ == "ExpBackward0"
 
-    saved = output.grad_fn._saved_result
-    assert isinstance(saved, type(output))
+    # `_saved_result` is codegen'd per-op onto ExpBackward0 and friends, not
+    # declared on the generic Node type torch's stubs expose.
+    saved = getattr(output.grad_fn, "_saved_result")
+    assert isinstance(saved, TorchMojoTensor)
     assert saved is not output
     assert saved._holder is output._holder
     assert saved._ptr == output._ptr
@@ -1305,6 +1345,8 @@ def test_fast_group_norm_without_affine(mojo_gpu):
 def test_fast_batch_norm_inference(mojo_device):
     x = torch.randn(2, 64, 14, 14)
     bn = torch.nn.BatchNorm2d(64).eval()
+    assert bn.running_mean is not None
+    assert bn.running_var is not None
     bn.running_mean.normal_()
     bn.running_var.uniform_(0.5, 2.0)
     bn_dev = torch.nn.BatchNorm2d(64).eval()
@@ -1387,7 +1429,9 @@ def test_fast_native_layer_norm_fp32_gpu_optional_affine_without_fill(
     )
 
     assert actual is not aten_fast.NOT_HANDLED
+    assert isinstance(actual, tuple)
     for got, want, tolerance in zip(actual, expected, (1e-5, 1e-5, 1e-4), strict=True):
+        assert isinstance(got, TorchMojoTensor)
         torch.testing.assert_close(got.cpu(), want, atol=tolerance, rtol=tolerance)
     torch.testing.assert_close(device_storage.cpu(), input_storage, rtol=0, atol=0)
 
@@ -1412,7 +1456,9 @@ def test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu(
     device = SimpleNamespace(label="gpu")
     next_ptr = iter(range(300, 400))
 
-    def tensor(shape, dtype=None):
+    def tensor(
+        shape: tuple[int, ...], dtype: aten_fast.DType | None = None
+    ) -> SimpleNamespace:
         shape = tuple(shape)
         return SimpleNamespace(
             _shape=shape,
@@ -1450,15 +1496,22 @@ def test_fast_native_layer_norm_gpu_prologue_runs_without_a_gpu(
         },
     )
 
-    actual = aten_fast.fast_aten_native_layer_norm(input, (7,), weight, bias, 1e-5)
+    actual = aten_fast.fast_aten_native_layer_norm(
+        cast(torch.Tensor, input),
+        (7,),
+        cast("torch.Tensor | None", weight),
+        cast("torch.Tensor | None", bias),
+        1e-5,
+    )
 
     assert actual is not aten_fast.NOT_HANDLED
+    assert isinstance(actual, tuple)
     out, mean, rstd = actual
     assert (out._shape, mean._shape, rstd._shape) == ((3, 7), (3, 1), (3, 1))
     assert len(calls) == 1
     launch = calls[0]
-    assert launch[4] == (weight._ptr if has_weight else 0)
-    assert launch[5] == (bias._ptr if has_bias else 0)
+    assert launch[4] == (weight._ptr if weight is not None else 0)
+    assert launch[5] == (bias._ptr if bias is not None else 0)
     assert launch[6:8] == (3, 7)
     assert launch[9:11] == (int(has_weight), int(has_bias))
 
@@ -1487,6 +1540,7 @@ def test_fast_native_layer_norm_fp32_gpu_noncontiguous_inputs(mojo_gpu):
     assert actual[2].is_contiguous()
     assert actual[1].shape == actual[2].shape == torch.Size([2, 1, 1])
     for got, want, tolerance in zip(actual, expected, (1e-5, 1e-5, 1e-4), strict=True):
+        assert isinstance(got, TorchMojoTensor)
         torch.testing.assert_close(got.cpu(), want, atol=tolerance, rtol=tolerance)
 
 
@@ -1996,6 +2050,8 @@ def test_fast_native_layer_norm_weight_only_autograd(mojo_gpu):
 
     assert device_input._version == input_version
     assert device_weight._version == weight_version
+    assert device_input.grad is not None
+    assert device_weight.grad is not None
     torch.testing.assert_close(
         device_input.grad.cpu(), host_input.grad, atol=2e-3, rtol=2e-3
     )
@@ -2132,9 +2188,14 @@ def test_fast_native_layer_norm_backward_empty_rows(mojo_gpu):
     weight = torch.randn(cols).to(mojo_gpu)
     bias = torch.randn(cols).to(mojo_gpu)
 
-    grad_input, grad_weight, grad_bias = aten_fast.fast_aten_native_layer_norm_backward(
+    backward_result = aten_fast.fast_aten_native_layer_norm_backward(
         grad_output, input, (cols,), mean, rstd, weight, bias, (True, True, True)
     )
+    assert isinstance(backward_result, tuple)
+    grad_input, grad_weight, grad_bias = backward_result
+    assert isinstance(grad_input, TorchMojoTensor)
+    assert isinstance(grad_weight, TorchMojoTensor)
+    assert isinstance(grad_bias, TorchMojoTensor)
 
     assert grad_input.shape == input.shape
     assert grad_input.numel() == 0
@@ -2154,15 +2215,15 @@ def test_fast_layer_norm_training_backward(mojo_gpu, affine):
     bias = torch.randn(384, generator=generator) if affine else None
 
     reference_input = input.clone().requires_grad_()
-    reference_weight = weight.clone().requires_grad_() if affine else None
-    reference_bias = bias.clone().requires_grad_() if affine else None
+    reference_weight = weight.clone().requires_grad_() if weight is not None else None
+    reference_bias = bias.clone().requires_grad_() if bias is not None else None
     torch.nn.functional.layer_norm(
         reference_input, (384,), reference_weight, reference_bias, 1e-5
     ).backward(grad_output)
 
     mojo_input = input.to(mojo_gpu).requires_grad_()
-    mojo_weight = weight.to(mojo_gpu).requires_grad_() if affine else None
-    mojo_bias = bias.to(mojo_gpu).requires_grad_() if affine else None
+    mojo_weight = weight.to(mojo_gpu).requires_grad_() if weight is not None else None
+    mojo_bias = bias.to(mojo_gpu).requires_grad_() if bias is not None else None
     backward_counter = EAGER_CALL_COUNTERS["aten::native_layer_norm_backward"]
     calls_before = backward_counter.call_count
     mojo_output = torch.nn.functional.layer_norm(
@@ -2178,6 +2239,10 @@ def test_fast_layer_norm_training_backward(mojo_gpu, affine):
         mojo_input.grad.cpu(), reference_input.grad, atol=2e-4, rtol=2e-4
     )
     if affine:
+        assert mojo_weight is not None
+        assert mojo_bias is not None
+        assert reference_weight is not None
+        assert reference_bias is not None
         assert mojo_weight.grad is not None
         assert mojo_bias.grad is not None
         torch.testing.assert_close(
@@ -2215,20 +2280,22 @@ def test_fast_layer_norm_native_saved_tensor_hooks(mojo_gpu):
     host_bias = torch.randn(7, generator=generator)
     grad_output = torch.randn(3, 7, generator=generator)
 
-    reference = [
+    # A fixed-length tuple (not a list) so ty can see *reference[1:] unpacks
+    # exactly (weight, bias) below.
+    reference = (
         host_input.clone().requires_grad_(),
         host_weight.clone().requires_grad_(),
         host_bias.clone().requires_grad_(),
-    ]
+    )
     torch.nn.functional.layer_norm(reference[0], (7,), *reference[1:]).backward(
         grad_output
     )
 
-    actual = [
+    actual = (
         host_input.to(mojo_gpu).requires_grad_(),
         host_weight.to(mojo_gpu).requires_grad_(),
         host_bias.to(mojo_gpu).requires_grad_(),
-    ]
+    )
     hook_calls = []
 
     def pack(tensor):
@@ -2268,18 +2335,20 @@ def test_fast_layer_norm_native_double_backward(mojo_gpu):
         )
         return input_grad, *second_grads
 
-    reference = [
+    # A fixed-length tuple (not a list) so ty can see *reference/*actual
+    # unpack exactly 3 positional args below.
+    reference = (
         host_input.clone().requires_grad_(),
         host_weight.clone().requires_grad_(),
         host_bias.clone().requires_grad_(),
-    ]
+    )
     expected = derivatives(*reference, first_seed, second_seed)
 
-    actual = [
+    actual = (
         host_input.to(mojo_gpu).requires_grad_(),
         host_weight.to(mojo_gpu).requires_grad_(),
         host_bias.to(mojo_gpu).requires_grad_(),
-    ]
+    )
     got = derivatives(*actual, first_seed.to(mojo_gpu), second_seed.to(mojo_gpu))
 
     assert type(got[0].grad_fn).__name__ == "NativeLayerNormBackwardBackward0"
@@ -2358,11 +2427,11 @@ def test_fast_native_layer_norm_rejects_wrong_affine_shape(mojo_gpu, monkeypatch
 def test_fast_native_dropout_forward_semantics(mojo_gpu, p, train, should_advance_rng):
     input = torch.linspace(-4.0, 4.0, 257)
     mojo_input = input.to(mojo_gpu)
-    torch.mojo.manual_seed_all((1 << 63) + 20260718)
-    before = torch.mojo.get_rng_state(mojo_input.device)
+    _torch_mojo().manual_seed_all((1 << 63) + 20260718)
+    before = _torch_mojo().get_rng_state(mojo_input.device)
 
     output, mask = torch.ops.aten.native_dropout.default(mojo_input, p, train)
-    after = torch.mojo.get_rng_state(mojo_input.device)
+    after = _torch_mojo().get_rng_state(mojo_input.device)
 
     assert output is not mojo_input
     assert output.shape == mojo_input.shape
@@ -2388,23 +2457,23 @@ def test_fast_native_dropout_forward_semantics(mojo_gpu, p, train, should_advanc
 def test_fast_native_dropout_inference_ignores_probability(mojo_gpu, p):
     input = torch.linspace(-4.0, 4.0, 17)
     mojo_input = input.to(mojo_gpu)
-    torch.mojo.manual_seed_all(20260718)
-    before = torch.mojo.get_rng_state(mojo_input.device)
+    _torch_mojo().manual_seed_all(20260718)
+    before = _torch_mojo().get_rng_state(mojo_input.device)
 
     output, mask = torch.ops.aten.native_dropout.default(mojo_input, p, False)
 
     assert output is not mojo_input
     torch.testing.assert_close(output.cpu(), input)
     assert mask.cpu().all()
-    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_input.device), before)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(mojo_input.device), before)
 
 
 def test_fast_native_dropout_empty_does_not_advance_rng(mojo_gpu):
     input = torch.empty(0, 7).to(mojo_gpu)
-    torch.mojo.manual_seed_all(20260718)
-    before = torch.mojo.get_rng_state(input.device)
+    _torch_mojo().manual_seed_all(20260718)
+    before = _torch_mojo().get_rng_state(input.device)
     output, mask = torch.ops.aten.native_dropout.default(input, 0.0, True)
-    after = torch.mojo.get_rng_state(input.device)
+    after = _torch_mojo().get_rng_state(input.device)
 
     assert output is not input
     assert output.shape == input.shape
@@ -2415,17 +2484,17 @@ def test_fast_native_dropout_empty_does_not_advance_rng(mojo_gpu):
 
 def test_fast_native_dropout_rng_state_replays_exactly(mojo_gpu):
     input = torch.randn(4097).to(mojo_gpu)
-    torch.mojo.manual_seed_all((1 << 63) + 0x12345)
-    initial = torch.mojo.get_rng_state(input.device)
+    _torch_mojo().manual_seed_all((1 << 63) + 0x12345)
+    initial = _torch_mojo().get_rng_state(input.device)
     first_output, first_mask = torch.ops.aten.native_dropout.default(input, 0.2, True)
-    advanced = torch.mojo.get_rng_state(input.device)
+    advanced = _torch_mojo().get_rng_state(input.device)
 
-    torch.mojo.set_rng_state(initial, input.device)
+    _torch_mojo().set_rng_state(initial, input.device)
     replay_output, replay_mask = torch.ops.aten.native_dropout.default(input, 0.2, True)
 
     torch.testing.assert_close(replay_mask.cpu(), first_mask.cpu())
     torch.testing.assert_close(replay_output.cpu(), first_output.cpu())
-    torch.testing.assert_close(torch.mojo.get_rng_state(input.device), advanced)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(input.device), advanced)
 
 
 def _philox_rng_state(seed: int, counter: int) -> torch.Tensor:
@@ -2449,9 +2518,11 @@ def test_fast_native_dropout_reserves_exact_full_width_interval(mojo_gpu, monkey
     input = torch.arange(9, dtype=torch.float32).to(mojo_gpu)
     seed = (1 << 63) + 0x1234_5678
     counter = (1 << 63) + 0x9ABC_DEF0
-    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), input.device)
+    _torch_mojo().set_rng_state(_philox_rng_state(seed, counter), input.device)
 
-    output, mask = aten_fast.fast_aten_native_dropout(input, 0.0, True)
+    dropout_result = aten_fast.fast_aten_native_dropout(input, 0.0, True)
+    assert isinstance(dropout_result, tuple)
+    output, mask = dropout_result
 
     assert output.shape == input.shape
     assert mask.shape == input.shape
@@ -2466,7 +2537,7 @@ def test_fast_native_dropout_reserves_exact_full_width_interval(mojo_gpu, monkey
         counter & 0xFFFF_FFFF,
         counter >> 32,
     )
-    assert _decode_philox_rng_state(torch.mojo.get_rng_state(input.device)) == (
+    assert _decode_philox_rng_state(_torch_mojo().get_rng_state(input.device)) == (
         seed,
         counter + 3,
     )
@@ -2484,16 +2555,16 @@ def test_fast_native_dropout_reservation_wrap_does_not_mutate_state(
     )
     input = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
     seed = (1 << 64) - 1
-    torch.mojo.set_rng_state(_philox_rng_state(seed, (1 << 64) - 2), input.device)
+    _torch_mojo().set_rng_state(_philox_rng_state(seed, (1 << 64) - 2), input.device)
 
     aten_fast.fast_aten_native_dropout(input, 0.0, True)
-    endpoint = torch.mojo.get_rng_state(input.device)
+    endpoint = _torch_mojo().get_rng_state(input.device)
     assert _decode_philox_rng_state(endpoint) == (seed, (1 << 64) - 1)
     assert len(calls) == 1
 
     with pytest.raises(OverflowError, match="wrap uint64"):
         aten_fast.fast_aten_native_dropout(input, 0.0, True)
-    torch.testing.assert_close(torch.mojo.get_rng_state(input.device), endpoint)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(input.device), endpoint)
     assert len(calls) == 1
 
 
@@ -2505,8 +2576,8 @@ def test_fast_native_dropout_invalid_probability_does_not_touch_rng_or_input(
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
     input = torch.randn(3, 8).to(mojo_gpu)[:, ::2]
-    torch.mojo.manual_seed_all(20260718)
-    before = torch.mojo.get_rng_state(input.device)
+    _torch_mojo().manual_seed_all(20260718)
+    before = _torch_mojo().get_rng_state(input.device)
 
     def fail_materialization(_self):
         raise AssertionError("invalid dropout metadata materialized the input")
@@ -2516,7 +2587,7 @@ def test_fast_native_dropout_invalid_probability_does_not_touch_rng_or_input(
     )
     with pytest.raises(RuntimeError, match="probability has to be between 0 and 1"):
         aten_fast.fast_aten_native_dropout(input, p, True)
-    torch.testing.assert_close(torch.mojo.get_rng_state(input.device), before)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(input.device), before)
 
 
 def test_fast_native_dropout_backward_multiplication_semantics(mojo_gpu):
@@ -2627,6 +2698,7 @@ def test_fast_native_dropout_saved_tensor_hooks(mojo_gpu):
 
     shape = (3, 17)
     assert hook_calls == [("pack", "mojo", shape), ("unpack", "cpu", shape)]
+    assert input.grad is not None
     torch.testing.assert_close(input.grad.cpu(), grad_output * mask.cpu() * 1.25)
 
 
@@ -2647,7 +2719,7 @@ UNIFORM_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.float64]
 @pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-100.0, 100.0), (1.0, 2.0)])
 def test_fast_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
     """Half-open [from, to) on a large sample, plus the first two moments."""
-    torch.mojo.manual_seed_all(20260814)
+    _torch_mojo().manual_seed_all(20260814)
     drawn = torch.empty(200_000, dtype=dtype, device=mojo_device).uniform_(low, high)
     host = drawn.cpu().double()
 
@@ -2668,7 +2740,7 @@ def test_fast_uniform_narrow_dtype_never_reaches_to(mojo_device, dtype):
     `from` instead, and `from` is otherwise unreachable here: only an exact
     zero word produces it, with probability 2**-24 per element.
     """
-    torch.mojo.manual_seed_all(20260814)
+    _torch_mojo().manual_seed_all(20260814)
     host = (
         torch.empty(200_000, dtype=dtype, device=mojo_device)
         .uniform_(0.0, 1.0)
@@ -2711,7 +2783,7 @@ def test_fast_uniform_reserves_one_counter_per_philox_group(
     drawn = torch.empty(numel, dtype=dtype, device=mojo_gpu)
     seed = (1 << 63) + 0x1234_5678
     counter = (1 << 63) + 0x9ABC_DEF0
-    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), drawn.device)
+    _torch_mojo().set_rng_state(_philox_rng_state(seed, counter), drawn.device)
 
     drawn.uniform_(-1.0, 3.0)
 
@@ -2724,7 +2796,7 @@ def test_fast_uniform_reserves_one_counter_per_philox_group(
         counter & 0xFFFF_FFFF,
         counter >> 32,
     )
-    assert _decode_philox_rng_state(torch.mojo.get_rng_state(drawn.device)) == (
+    assert _decode_philox_rng_state(_torch_mojo().get_rng_state(drawn.device)) == (
         seed,
         counter + counters,
     )
@@ -2737,7 +2809,7 @@ def test_fast_uniform_adjacent_draws_are_independent(mojo_gpu):
     advance at all, shows up here and nowhere else: exact float32 collisions
     between two 8192-element draws are otherwise ~1 in 2**24 per element.
     """
-    torch.mojo.manual_seed_all(20260814)
+    _torch_mojo().manual_seed_all(20260814)
     first = torch.empty(8192, device=mojo_gpu).uniform_().cpu()
     second = torch.empty(8192, device=mojo_gpu).uniform_().cpu()
 
@@ -2752,40 +2824,40 @@ def test_fast_uniform_adjacent_draws_are_independent(mojo_gpu):
 
 def test_fast_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
     """A ragged draw leaves the stream exactly two counters further on."""
-    torch.mojo.manual_seed_all(20260814)
-    state = torch.mojo.get_rng_state(mojo_gpu)
+    _torch_mojo().manual_seed_all(20260814)
+    state = _torch_mojo().get_rng_state(mojo_gpu)
     seed, counter = _decode_philox_rng_state(state)
 
     first = torch.empty(7, device=mojo_gpu).uniform_().cpu()
     second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
 
-    torch.mojo.set_rng_state(_philox_rng_state(seed, counter + 2), mojo_gpu)
+    _torch_mojo().set_rng_state(_philox_rng_state(seed, counter + 2), mojo_gpu)
     replayed_second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
     assert torch.equal(second, replayed_second)
     assert not torch.equal(first, second)
 
 
 def test_fast_uniform_is_reproducible_under_manual_seed(mojo_device):
-    torch.mojo.manual_seed_all(4242)
+    _torch_mojo().manual_seed_all(4242)
     first = torch.empty(1023, device=mojo_device).uniform_(-2.0, 5.0).cpu()
-    torch.mojo.manual_seed_all(4242)
+    _torch_mojo().manual_seed_all(4242)
     second = torch.empty(1023, device=mojo_device).uniform_(-2.0, 5.0).cpu()
 
     assert torch.equal(first, second)
 
 
 def test_fast_uniform_rng_state_round_trips(mojo_device):
-    torch.mojo.manual_seed_all((1 << 63) + 0x54321)
-    initial = torch.mojo.get_rng_state(mojo_device)
+    _torch_mojo().manual_seed_all((1 << 63) + 0x54321)
+    initial = _torch_mojo().get_rng_state(mojo_device)
     first = torch.empty(1025, device=mojo_device).uniform_().cpu()
-    advanced = torch.mojo.get_rng_state(mojo_device)
+    advanced = _torch_mojo().get_rng_state(mojo_device)
     assert not torch.equal(initial, advanced)
 
-    torch.mojo.set_rng_state(initial, mojo_device)
+    _torch_mojo().set_rng_state(initial, mojo_device)
     replayed = torch.empty(1025, device=mojo_device).uniform_().cpu()
 
     assert torch.equal(first, replayed)
-    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_device), advanced)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(mojo_device), advanced)
 
 
 def test_fast_uniform_wide_and_scalar_store_paths_agree(mojo_gpu):
@@ -2795,14 +2867,15 @@ def test_fast_uniform_wide_and_scalar_store_paths_agree(mojo_gpu):
     scalar kernel runs instead. Both kernels index the stream the same way, so
     the same reservation has to produce the same values.
     """
-    torch.mojo.manual_seed_all(20260814)
-    state = torch.mojo.get_rng_state(mojo_gpu)
+    _torch_mojo().manual_seed_all(20260814)
+    state = _torch_mojo().get_rng_state(mojo_gpu)
     aligned = torch.zeros(8, device=mojo_gpu)
     aligned.uniform_(-1.0, 1.0)
 
-    torch.mojo.set_rng_state(state, mojo_gpu)
+    _torch_mojo().set_rng_state(state, mojo_gpu)
     storage = torch.zeros(9, device=mojo_gpu)
     offset_view = storage[1:]
+    assert isinstance(offset_view, TorchMojoTensor)
     assert offset_view._ptr % 16 != 0
     offset_view.uniform_(-1.0, 1.0)
 
@@ -2813,11 +2886,11 @@ def test_fast_uniform_wide_and_scalar_store_paths_agree(mojo_gpu):
 
 def test_fast_uniform_strided_destination_matches_contiguous(mojo_gpu):
     """A view's values depend on its logical index, never on its layout."""
-    torch.mojo.manual_seed_all(20260814)
-    state = torch.mojo.get_rng_state(mojo_gpu)
+    _torch_mojo().manual_seed_all(20260814)
+    state = _torch_mojo().get_rng_state(mojo_gpu)
     contiguous = torch.empty(4, 4, device=mojo_gpu).uniform_(10.0, 11.0)
 
-    torch.mojo.set_rng_state(state, mojo_gpu)
+    _torch_mojo().set_rng_state(state, mojo_gpu)
     storage = torch.zeros(4, 8, device=mojo_gpu)
     view = storage[:, ::2]
     assert not view.is_contiguous()
@@ -2830,11 +2903,11 @@ def test_fast_uniform_strided_destination_matches_contiguous(mojo_gpu):
 
 def test_fast_uniform_empty_does_not_advance_rng(mojo_gpu):
     drawn = torch.empty(0, 5, device=mojo_gpu)
-    torch.mojo.manual_seed_all(20260814)
-    before = torch.mojo.get_rng_state(drawn.device)
+    _torch_mojo().manual_seed_all(20260814)
+    before = _torch_mojo().get_rng_state(drawn.device)
 
     assert drawn.uniform_() is drawn
-    torch.testing.assert_close(torch.mojo.get_rng_state(drawn.device), before)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(drawn.device), before)
 
 
 @pytest.mark.parametrize(
@@ -2849,23 +2922,23 @@ def test_fast_uniform_empty_does_not_advance_rng(mojo_gpu):
 )
 def test_fast_uniform_rejects_bad_bounds(mojo_gpu, dtype, low, high, message):
     """ATen's own checks, including on an empty tensor (ATen checks first)."""
-    torch.mojo.manual_seed_all(20260814)
-    before = torch.mojo.get_rng_state(mojo_gpu)
+    _torch_mojo().manual_seed_all(20260814)
+    before = _torch_mojo().get_rng_state(mojo_gpu)
     for numel in (10, 0):
         drawn = torch.empty(numel, dtype=dtype, device=mojo_gpu)
         with pytest.raises(RuntimeError, match=message):
             drawn.uniform_(low, high)
-    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_gpu), before)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(mojo_gpu), before)
 
 
 def test_fast_uniform_refuses_an_explicit_generator(mojo_gpu):
-    torch.mojo.manual_seed_all(20260814)
-    before = torch.mojo.get_rng_state(mojo_gpu)
+    _torch_mojo().manual_seed_all(20260814)
+    before = _torch_mojo().get_rng_state(mojo_gpu)
     drawn = torch.empty(4, device=mojo_gpu)
 
     with pytest.raises(NotImplementedError, match="explicit generator"):
         drawn.uniform_(0.0, 1.0, generator=torch.Generator())
-    torch.testing.assert_close(torch.mojo.get_rng_state(mojo_gpu), before)
+    torch.testing.assert_close(_torch_mojo().get_rng_state(mojo_gpu), before)
 
 
 def test_fast_uniform_declines_integer_dtypes(mojo_gpu):
@@ -2916,8 +2989,10 @@ def test_fast_lerp_scalar_out_and_inplace_alias(mojo_gpu):
     expected = torch.lerp(start, end, weight)
     device_start = start.to(mojo_gpu)
     device_end = end.to(mojo_gpu)
+    assert isinstance(device_start, TorchMojoTensor)
 
     out = torch.empty_like(device_start)
+    assert isinstance(out, TorchMojoTensor)
     out_holder, out_ptr = out._holder, out._ptr
     returned = torch.lerp(device_start, device_end, weight, out=out)
     assert returned is out
@@ -2944,6 +3019,7 @@ def test_fast_l2_norm_out_and_mul_inplace_alias(mojo_gpu):
     expected = torch.linalg.vector_norm(input)
 
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    assert isinstance(out, TorchMojoTensor)
     out_holder, out_ptr = out._holder, out._ptr
     returned = torch.linalg.vector_norm(device_input, out=out)
     assert returned is out
@@ -2957,6 +3033,7 @@ def test_fast_l2_norm_out_and_mul_inplace_alias(mojo_gpu):
     )
 
     base = torch.arange(12, dtype=torch.float32).to(mojo_gpu)
+    assert isinstance(base, TorchMojoTensor)
     view = base[::2]
     observer = base.view(3, 4)
     base_holder, base_ptr = base._holder, base._ptr
@@ -3050,7 +3127,9 @@ def test_fast_foreach_add_scalar_inplace_chunk_boundary(mojo_gpu, dtype):
         for index in range(1, 65)
     ]
     host_inputs.append(torch.linspace(-3.0, 4.0, 65_537).to(dtype))
-    device_inputs = [tensor.to(mojo_gpu) for tensor in host_inputs]
+    device_inputs = cast(
+        list[TorchMojoTensor], [tensor.to(mojo_gpu) for tensor in host_inputs]
+    )
     allocation_state = [
         (tensor._holder, tensor._ptr, tensor._version) for tensor in device_inputs
     ]
@@ -3149,7 +3228,10 @@ def test_fast_foreach_add_scalar_matches_adamw_step_counters(mojo_gpu, monkeypat
     bridge_calls = native_calls[target]
     assert len(bridge_calls) == 3
     bridge_args = [args for args, _ in bridge_calls]
-    assert all(len(args[0]) == 150 for args in bridge_args)
+    for args in bridge_args:
+        first_arg = args[0]
+        assert isinstance(first_arg, list | tuple)
+        assert len(first_arg) == 150
     for step in steps:
         assert step.shape == torch.Size([])
         assert step.cpu().item() == 3.0
@@ -3162,7 +3244,9 @@ def test_fast_foreach_mul_tensor_inplace_chunk_boundary(mojo_gpu):
         torch.tensor([float(index), -float(index)]) for index in range(1, 64)
     ]
     host_inputs.append(torch.linspace(-3.0, 4.0, 65_537))
-    device_inputs = [tensor.to(mojo_gpu) for tensor in host_inputs]
+    device_inputs = cast(
+        list[TorchMojoTensor], [tensor.to(mojo_gpu) for tensor in host_inputs]
+    )
     allocation_state = [
         (tensor._holder, tensor._ptr, tensor._version) for tensor in device_inputs
     ]
@@ -3205,6 +3289,7 @@ def test_fast_foreach_mul_tensor_duplicate_is_sequential(mojo_gpu):
     """A duplicate entry is multiplied twice and bumps its version twice."""
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
     input = torch.tensor([2.0, -3.0, 5.0]).to(mojo_gpu)
+    assert isinstance(input, TorchMojoTensor)
     holder, ptr, version = input._holder, input._ptr, input._version
     coefficient = torch.tensor(0.5, dtype=torch.float32).to(mojo_gpu)
 
@@ -3221,10 +3306,10 @@ def test_fast_foreach_mul_tensor_duplicate_is_sequential(mojo_gpu):
 
 def test_fast_foreach_mul_tensor_validates_scalar_before_writes(mojo_gpu):
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
-    inputs = [
-        torch.tensor([1.0, 2.0]).to(mojo_gpu),
-        torch.tensor([-3.0, 4.0]).to(mojo_gpu),
-    ]
+    inputs = cast(
+        list[TorchMojoTensor],
+        [torch.tensor([1.0, 2.0]).to(mojo_gpu), torch.tensor([-3.0, 4.0]).to(mojo_gpu)],
+    )
     allocation_state = [
         (tensor._holder, tensor._ptr, tensor._version, tensor.cpu())
         for tensor in inputs
@@ -3248,6 +3333,7 @@ def test_fast_foreach_mul_tensor_preserves_strided_fallback(mojo_gpu):
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
     base = torch.arange(12, dtype=torch.float32).to(mojo_gpu)
     input = base[::2]
+    assert isinstance(input, TorchMojoTensor)
     assert not input.is_contiguous()
     holder, ptr, version = input._holder, input._ptr, input._version
     coefficient = torch.tensor(0.25, dtype=torch.float32).to(mojo_gpu)
@@ -3283,6 +3369,7 @@ def test_fast_foreach_mul_tensor_overlapping_views_are_sequential(mojo_gpu):
 def test_fast_foreach_mul_tensor_rejects_scalar_alias_before_writes(mojo_gpu):
     counter, calls_before = _eager_registration_snapshot("aten::_foreach_mul_.Tensor")
     input = torch.tensor([2.0, 3.0, 4.0]).to(mojo_gpu)
+    assert isinstance(input, TorchMojoTensor)
     scalar_alias = input[0]
     holder, ptr, version = input._holder, input._ptr, input._version
 
@@ -3373,6 +3460,7 @@ def test_fast_clip_grad_norm_foreach_routing(mojo_gpu, foreach):
     assert mul_counter.call_count == mul_calls_before + expected_foreach_calls
     torch.testing.assert_close(actual_norm.cpu(), expected_norm)
     for actual, expected in zip(device_parameters, host_parameters, strict=True):
+        assert actual.grad is not None
         torch.testing.assert_close(actual.grad.cpu(), expected.grad)
 
 
@@ -3403,6 +3491,7 @@ def test_fast_sum_contiguous_adjacent_dims(mojo_device, shape, dims, keepdim):
     expected_input = host_storage[1:-1].reshape(shape)
     device_storage = host_storage.to(mojo_device)
     device_input = device_storage[1:-1].view(shape)
+    assert isinstance(device_input, TorchMojoTensor)
     holder, ptr = device_input._holder, device_input._ptr
 
     actual = device_input.sum(dim=dims, keepdim=keepdim)
@@ -3745,6 +3834,8 @@ def test_fast_embedding_dense_backward_repeated_padding(mojo_gpu, strided):
         assert not grad_output.is_contiguous()
         device_indices = index_storage.to(mojo_gpu)[:, ::2]
         device_grad_output = grad_storage.to(mojo_gpu)[..., ::2]
+        assert isinstance(device_indices, TorchMojoTensor)
+        assert isinstance(device_grad_output, TorchMojoTensor)
         assert not device_indices._is_contiguous
         assert not device_grad_output._is_contiguous
     else:
@@ -3781,6 +3872,8 @@ def test_fast_embedding_dense_backward_strided_temporary_lifetime(
     )
     device_indices = indices_storage.to(mojo_gpu)[:, ::2]
     device_grad_output = grad_storage.to(mojo_gpu)[..., ::2]
+    assert isinstance(device_indices, TorchMojoTensor)
+    assert isinstance(device_grad_output, TorchMojoTensor)
     assert not device_indices._is_contiguous
     assert not device_grad_output._is_contiguous
 
@@ -3812,6 +3905,8 @@ def test_fast_embedding_dense_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     )
     grad_output = grad_storage[3:].view(2, 3, 5)
     indices = index_storage[2:].view(2, 3)
+    assert isinstance(grad_output, TorchMojoTensor)
+    assert isinstance(indices, TorchMojoTensor)
     calls = []
     _replace_defined_native_calls(
         monkeypatch,
@@ -3825,6 +3920,7 @@ def test_fast_embedding_dense_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     output = aten_fast.fast_aten_embedding_dense_backward(
         grad_output, indices, 11, 7, False
     )
+    assert isinstance(output, TorchMojoTensor)
 
     assert len(calls) == 1
     assert calls[0] == (
@@ -3840,7 +3936,9 @@ def test_fast_embedding_dense_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     )
     assert calls[0][-1] == output._device._device_context_ptr()
     assert output._device == grad_output._device
-    assert output._holder.get_nbytes() == 11 * 5 * torch.float32.itemsize
+    # _holder is the opaque Mojo TensorHolder (no Python stub); get_nbytes is
+    # its own native method.
+    assert getattr(output._holder, "get_nbytes")() == 11 * 5 * torch.float32.itemsize
 
 
 def test_fast_embedding_dense_backward_uses_each_gpu_context():
@@ -3897,6 +3995,7 @@ def test_fast_embedding_training_backward(mojo_gpu):
     )
     actual.backward(grad_output.to(mojo_gpu))
     torch.testing.assert_close(actual.cpu(), expected.detach(), rtol=0, atol=0)
+    assert device_weight.grad is not None
     torch.testing.assert_close(device_weight.grad.cpu(), weight.grad, rtol=0, atol=0)
 
 
@@ -3993,11 +4092,13 @@ def test_fast_gelu_forward_bf16_direct_runtime_layout(
     input = backing[storage_offset:].view(shape)
     device_backing = backing.to(mojo_gpu)
     device_input = device_backing[storage_offset:].view(shape)
+    assert isinstance(device_input, TorchMojoTensor)
     input_ptr = device_input._ptr
     input_version = device_input._version
     target = ("activation_forward_ops.mojo", "GeluForwardBF16")
     native_calls = _spy_defined_native_calls(monkeypatch, {target})
     actual = torch.nn.functional.gelu(device_input, approximate=approximate)
+    assert isinstance(actual, TorchMojoTensor)
     expected = torch.nn.functional.gelu(input, approximate=approximate)
 
     assert [args for args, _ in native_calls[target]] == [
@@ -4379,7 +4480,9 @@ def test_fast_gelu_backward_rejects_mixed_dtype_before_materialization(
 @pytest.mark.parametrize("value", [False, True])
 def test_fast_bool_fill_scalar(mojo_device, value):
     actual = torch.empty(3, 5, dtype=torch.bool).to(mojo_device)
+    assert isinstance(actual, TorchMojoTensor)
     returned = actual.t().fill_(value)
+    assert isinstance(returned, TorchMojoTensor)
     assert returned is not actual
     assert returned._ptr == actual._ptr
     torch.testing.assert_close(actual.cpu(), torch.full((3, 5), value))
@@ -4671,7 +4774,9 @@ def test_fast_mm_addmm(mojo_gpu):
 # operands straight to it, so a copy-free route reading the wrong strides -- or
 # a missing scratch copy -- shows up here rather than as a wrong training loss.
 # Queued and inline launches both, because a queued launch cannot fall back.
-def _strided_matmul_cases(device: torch.device) -> list[tuple[str, object, object]]:
+def _strided_matmul_cases(
+    device: torch.device,
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
     def to(x: torch.Tensor) -> torch.Tensor:
         return x.to(device)
 
@@ -4981,6 +5086,7 @@ def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(
     )
 
     contiguous = _t(torch.randn(8, _ARG_DIRECT_MIN_INNER).to(mojo_gpu))
+    assert contiguous is not None
     assert _arg_strided_direct_ok("ArgminSpec", contiguous, (0,))
     assert _arg_strided_direct_ok("ArgmaxSpec", contiguous, (0,))
     # trailing dims belong to the contiguous-axis kernels
@@ -4989,11 +5095,14 @@ def test_fast_argreduce_strided_direct_gate_matches_the_kernel_regime(
     assert not _arg_strided_direct_ok("SumSpec", contiguous, (0,))
     # below the coalescing floor, and non-contiguous operands, materialize
     narrow = _t(torch.randn(8, _ARG_DIRECT_MIN_INNER - 1).to(mojo_gpu))
+    assert narrow is not None
     assert not _arg_strided_direct_ok("ArgmaxSpec", narrow, (0,))
     strided = _t(torch.randn(8, 64).to(mojo_gpu)[:, ::2])
+    assert strided is not None
     assert not _arg_strided_direct_ok("ArgmaxSpec", strided, (0,))
     # a non-adjacent dim interval is not a (outer, reduce, inner) view
     cube = _t(torch.randn(4, 5, 64).to(mojo_gpu))
+    assert cube is not None
     assert not _arg_strided_direct_ok("ArgmaxSpec", cube, (0, 2))
 
 
@@ -5878,6 +5987,7 @@ def test_fast_nll_loss_rejects_unsupported_metadata_without_resizing(mojo_gpu):
     device_log_probs = log_probs.to(mojo_gpu)
     device_target = target.to(mojo_gpu)
     output = torch.empty(3, device=mojo_gpu)
+    assert isinstance(output, TorchMojoTensor)
     bad_total_weight = torch.empty((), dtype=torch.float16, device=mojo_gpu)
 
     with pytest.raises(NotImplementedError, match="nll_loss_forward.output"):
@@ -6012,6 +6122,7 @@ def test_fast_nll_loss_autograd_uses_saved_tensor_hooks(mojo_gpu):
     assert hook_calls == [("pack", "mojo", shape) for shape in expected_shapes] + [
         ("unpack", "cpu", shape) for shape in expected_shapes
     ]
+    assert actual.grad is not None
     torch.testing.assert_close(actual.grad.cpu(), reference.grad)
 
 
@@ -6127,11 +6238,16 @@ def test_fast_linear_training_backward(mojo_gpu, with_bias):
     bias = torch.randn(64, generator=generator) if with_bias else None
     grad_output = torch.randn(2, 16, 64, generator=generator)
 
-    reference_inputs = [x.clone().requires_grad_(), weight.clone().requires_grad_()]
+    # Fixed-length tuples (not lists) so ty sees *reference_inputs/*mojo_inputs
+    # unpack exactly (input, weight) below.
+    reference_inputs = (x.clone().requires_grad_(), weight.clone().requires_grad_())
     reference_bias = bias.clone().requires_grad_() if bias is not None else None
     torch.nn.functional.linear(*reference_inputs, reference_bias).backward(grad_output)
 
-    mojo_inputs = [tensor.to(mojo_gpu).requires_grad_() for tensor in (x, weight)]
+    mojo_inputs = (
+        x.to(mojo_gpu).requires_grad_(),
+        weight.to(mojo_gpu).requires_grad_(),
+    )
     mojo_bias = bias.to(mojo_gpu).requires_grad_() if bias is not None else None
     backward_counter = EAGER_CALL_COUNTERS["aten::linear_backward"]
     calls_before = backward_counter.call_count
@@ -6148,6 +6264,7 @@ def test_fast_linear_training_backward(mojo_gpu, with_bias):
             actual.grad.cpu(), expected.grad, atol=2e-4, rtol=2e-4
         )
     if mojo_bias is not None:
+        assert reference_bias is not None
         assert mojo_bias.grad is not None
         torch.testing.assert_close(
             mojo_bias.grad.cpu(), reference_bias.grad, atol=2e-4, rtol=2e-4
@@ -6509,7 +6626,12 @@ def test_bf16_matmul_family_precedes_tf32_and_tensorspec(monkeypatch):
     """Every eligible public entry point gives BF16 the first opportunity."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    lhs, rhs, bias, weight = object(), object(), object(), object()
+    lhs, rhs, bias, weight = (
+        _opaque_tensor(),
+        _opaque_tensor(),
+        _opaque_tensor(),
+        _opaque_tensor(),
+    )
     gemm_result, linear_result, bmm_result = object(), object(), object()
     gemm_calls = []
     linear_calls = []
@@ -6594,7 +6716,7 @@ def test_addmm_skips_split_for_misaligned_shapes(monkeypatch):
     def tensor(shape):
         return SimpleNamespace(_shape=tuple(shape))
 
-    lhs, rhs, bias = tensor((357, 333)), tensor((333, 789)), object()
+    lhs, rhs, bias = tensor((357, 333)), tensor((333, 789)), _opaque_tensor()
     fused_result = object()
     fused_calls = []
 
@@ -6622,7 +6744,7 @@ def test_addmm_tries_split_for_aligned_shapes(monkeypatch):
     def tensor(shape):
         return SimpleNamespace(_shape=tuple(shape))
 
-    lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), object()
+    lhs, rhs, bias = tensor((128, 128)), tensor((128, 128)), _opaque_tensor()
     mm_result, biased_result = object(), object()
     gemm_calls = []
     add_calls = []
@@ -6720,7 +6842,12 @@ def test_tf32_matmul_family_prefers_opt_in_routes(monkeypatch):
     """Eligible public matmul calls return before the TensorSpec fallback."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    lhs, rhs, bias, weight = object(), object(), object(), object()
+    lhs, rhs, bias, weight = (
+        _opaque_tensor(),
+        _opaque_tensor(),
+        _opaque_tensor(),
+        _opaque_tensor(),
+    )
     gemm_result, linear_result, bmm_result = object(), object(), object()
     gemm_calls = []
     linear_calls = []
@@ -6769,7 +6896,7 @@ def test_tf32_matmul_family_highest_retains_tensorspec_fallback(monkeypatch):
     from torch_mojo_backend import eager_kernels
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    lhs, rhs, bias, input, weight = (object() for _ in range(5))
+    lhs, rhs, bias, input, weight = (_opaque_tensor() for _ in range(5))
     fallback = object()
     spec_calls = []
     tf32_import_calls = []
@@ -6833,7 +6960,7 @@ def test_matmul_spec_device_oom_is_not_disguised_as_unsupported(
         _mojo_file: Path, _defines: eager_kernels.CanonicalDefines
     ) -> ModuleType:
         module = ModuleType("matmul_oom_test_extension")
-        module.call = raise_allocator_oom
+        cast(_NativeCallModule, module).call = raise_allocator_oom
         return module
 
     def fake_allocate_output(
@@ -6867,7 +6994,9 @@ def test_tf32_addmm_scalars_retain_existing_not_handled_contract(monkeypatch):
     )
 
     assert (
-        aten_fast.fast_aten_addmm(object(), object(), object(), alpha=2.0)
+        aten_fast.fast_aten_addmm(
+            _opaque_tensor(), _opaque_tensor(), _opaque_tensor(), alpha=2.0
+        )
         is aten_fast.NOT_HANDLED
     )
     assert calls == []
@@ -6876,7 +7005,7 @@ def test_tf32_addmm_scalars_retain_existing_not_handled_contract(monkeypatch):
 def test_tf32_linear_flattens_contiguous_gpt_input_as_zero_copy_view(monkeypatch):
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    input, weight, bias = object(), object(), object()
+    input, weight, bias = _opaque_tensor(), _opaque_tensor(), _opaque_tensor()
     holder = object()
     input_metadata = SimpleNamespace(
         _shape=(2, 3, 4, 8), _is_contiguous=True, _offset=7, _holder=holder
@@ -6918,7 +7047,7 @@ def test_tf32_linear_flattens_contiguous_gpt_input_as_zero_copy_view(monkeypatch
 def test_tf32_linear_noncontiguous_batch_retains_tensorspec_path(monkeypatch):
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    input, weight = object(), object()
+    input, weight = _opaque_tensor(), _opaque_tensor()
     input_metadata = SimpleNamespace(_shape=(2, 3, 8), _is_contiguous=False)
     weight_metadata = SimpleNamespace(_shape=(11, 8))
     fallback = object()
@@ -7039,9 +7168,11 @@ def test_sdpa_forward_tf32_bmm_routing_preserves_raw_fallback(
         },
     )
 
-    out, probabilities, mask = aten_fast._sdpa_math_forward_with_dropout(
+    sdpa_result = aten_fast._sdpa_math_forward_with_dropout(
         q, k, v, False, None, dropout_p
     )
+    assert isinstance(sdpa_result, tuple)
+    out, probabilities, mask = sdpa_result
 
     assert out._shape == (2, 3, 5, 4)
     assert probabilities._shape == (2, 3, 5, 7)
@@ -7163,7 +7294,11 @@ def test_bf16_gemm_host_bridge_layouts_offsets_context_and_highest(
 
     try:
         out = aten_fast._try_gemm16_mm(
-            lhs, rhs, bias, transpose_b=transpose_b, output_shape=(2, 3, n)
+            lhs,
+            rhs,
+            cast("torch.Tensor | None", bias),
+            transpose_b=transpose_b,
+            output_shape=(2, 3, n),
         )
     finally:
         torch.set_float32_matmul_precision(old_precision)
@@ -7319,6 +7454,7 @@ def test_gemm16_float16_every_entry_point_launches_the_bridge(
         expected = torch.bmm(a.cpu().float(), b.cpu().float().transpose(1, 2))
         launched = ("gemm16_matmul_ops.mojo", "Bmm16")
 
+    assert isinstance(actual, torch.Tensor)
     assert actual.dtype == torch.float16
     assert len(calls[launched]) == 1, f"{op} did not reach the 16-bit GEMM bridge"
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-3)
@@ -7364,13 +7500,18 @@ def test_gemm16_float16_linear_backward_matches_fp32_reference(
     host_weight = half(out_features, in_features)
     host_grad = half(rows, out_features)
 
-    grad_input, grad_weight, grad_bias = aten_fast.fast_aten_linear_backward(
+    linear_backward_result = aten_fast.fast_aten_linear_backward(
         host_input.to(mojo_h100),
         host_grad.to(mojo_h100),
         host_weight.to(mojo_h100),
         [True, True, True],
     )
-    assert grad_input is not aten_fast.NOT_HANDLED
+    assert linear_backward_result is not aten_fast.NOT_HANDLED
+    assert isinstance(linear_backward_result, tuple)
+    grad_input, grad_weight, grad_bias = linear_backward_result
+    assert isinstance(grad_input, torch.Tensor)
+    assert isinstance(grad_weight, torch.Tensor)
+    assert isinstance(grad_bias, torch.Tensor)
     assert grad_input.dtype == torch.float16
     assert grad_weight.dtype == torch.float16
 
@@ -7484,13 +7625,18 @@ def test_bf16_gemm_rejects_invalid_metadata_before_resolve_or_allocation(
     monkeypatch.setattr(aten_fast, "_alloc", fail_late_path)
     monkeypatch.setattr(aten_fast, "_ctx_ptr", fail_late_path)
 
-    assert aten_fast._try_gemm16_mm(lhs, rhs, bias, output_shape=output_shape) is None
+    assert (
+        aten_fast._try_gemm16_mm(
+            lhs, rhs, cast("torch.Tensor | None", bias), output_shape=output_shape
+        )
+        is None
+    )
 
 
 def test_bf16_linear_flattens_contiguous_gpt_input_without_precision_query(monkeypatch):
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    input, weight, bias = object(), object(), object()
+    input, weight, bias = _opaque_tensor(), _opaque_tensor(), _opaque_tensor()
     holder = object()
     input_metadata = SimpleNamespace(
         _shape=(2, 3, 4, 8), _is_contiguous=True, _offset=7, _holder=holder
@@ -7881,6 +8027,8 @@ def test_tf32_helpers_route_each_fake_device_context_and_reject_cross_device(
 
         gemm_output = aten_fast._try_tf32_gemm(lhs, rhs)
         bmm_output = aten_fast._try_tf32_bmm(batched_lhs, batched_rhs)
+        assert gemm_output is not None
+        assert bmm_output is not None
         assert gemm_output._device is device
         assert bmm_output._device is device
         assert gemm_calls[-1][-1] == 8000 + device.id
@@ -7931,6 +8079,7 @@ def test_tf32_gemm_host_bridge_layouts(
     rhs_shape = (n, k) if transpose_b else (k, n)
     rhs = dense_view(rhs_shape, rhs_transposed)
     bias = torch.randn(n).to(mojo_h100)
+    assert isinstance(bias, TorchMojoTensor)
     calls = []
 
     def record(*args):
@@ -8017,8 +8166,8 @@ def test_tf32_gemm_rejects_non_mojo_bias_before_operand_inspection(monkeypatch):
     """A supplied CPU bias cannot be silently reinterpreted as no bias."""
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    lhs = object()
-    rhs = object()
+    lhs = _opaque_tensor()
+    rhs = _opaque_tensor()
     cpu_bias = torch.randn(7)
     mojo_metadata = object()
 
@@ -8096,6 +8245,7 @@ def test_tf32_gemm_host_bridge_rejects_before_allocation(
         rhs = torch.randn(5, 7).to(mojo_cpu)
     elif invalid_case == "inner_stride":
         storage = torch.empty(128).to(mojo_h100)
+        assert isinstance(storage, TorchMojoTensor)
         lhs = aten_fast._view_of(storage, (6, 5), (10, 2), 1)
     else:
         output_shape = (5, 7)
@@ -8128,6 +8278,7 @@ def test_tf32_bmm_host_bridge_strided_dense_layouts(
         batch_stride = matrix_elements + gap
         storage_elements = offset + (batches - 1) * batch_stride + matrix_elements
         storage = torch.empty(storage_elements + 4).to(mojo_h100)
+        assert isinstance(storage, TorchMojoTensor)
         strides = (batch_stride, 1, rows) if transposed else (batch_stride, cols, 1)
         return aten_fast._view_of(storage, shape, strides, offset), batch_stride
 
@@ -8209,9 +8360,11 @@ def test_tf32_bmm_host_bridge_rejects_unsupported_inputs(
     rhs = torch.randn(2, 9, 5).to(mojo_h100)
     if invalid_case == "inner_stride":
         storage = torch.empty(512).to(mojo_h100)
+        assert isinstance(storage, TorchMojoTensor)
         lhs = aten_fast._view_of(storage, (2, 7, 9), (200, 20, 2), 1)
     elif invalid_case == "overlap":
         storage = torch.empty(256).to(mojo_h100)
+        assert isinstance(storage, TorchMojoTensor)
         lhs = aten_fast._view_of(storage, (2, 7, 9), (62, 9, 1), 0)
     elif invalid_case == "batch":
         rhs = torch.randn(3, 9, 5).to(mojo_h100)
@@ -8258,7 +8411,9 @@ def _bf16_dense_matrix_pair(generator, shape, transposed, offset, mojo_h100):
     )
     strides = (1, rows) if transposed else (cols, 1)
     host = torch.as_strided(storage, shape, strides, offset)
-    device = aten_fast._view_of(storage.to(mojo_h100), shape, strides, offset)
+    device_storage = storage.to(mojo_h100)
+    assert isinstance(device_storage, TorchMojoTensor)
+    device = aten_fast._view_of(device_storage, shape, strides, offset)
     return host, device
 
 
@@ -8279,7 +8434,9 @@ def _bf16_dense_batched_pair(
     storage = torch.randn(storage_elements, generator=generator).to(dtype)
     strides = (batch_stride, 1, rows) if transposed else (batch_stride, cols, 1)
     host = torch.as_strided(storage, shape, strides, offset)
-    device = aten_fast._view_of(storage.to(mojo_h100), shape, strides, offset)
+    device_storage = storage.to(mojo_h100)
+    assert isinstance(device_storage, TorchMojoTensor)
+    device = aten_fast._view_of(device_storage, shape, strides, offset)
     return host, device
 
 
@@ -8526,9 +8683,9 @@ def test_bf16_real_gemm_extension_handles_tails_offsets_and_all_layouts(
     )
     bias_storage = torch.randn(n + 7, generator=generator).to(torch.bfloat16)
     bias = bias_storage[3 : 3 + n]
-    mojo_bias = aten_fast._view_of(
-        bias_storage.to(mojo_h100), (n,), (1,), 3, contiguous=True
-    )
+    device_bias_storage = bias_storage.to(mojo_h100)
+    assert isinstance(device_bias_storage, TorchMojoTensor)
+    mojo_bias = aten_fast._view_of(device_bias_storage, (n,), (1,), 3, contiguous=True)
 
     product = torch.mm(lhs.float(), rhs.float())
     expected = (product if operation == "mm" else product + bias.float()).to(
@@ -8698,6 +8855,7 @@ def test_bf16_real_bmm_extension_handles_all_layouts_offsets_and_padded_batches(
         actual = aten_fast._fast_aten_bmm_transpose_b(mojo_lhs, mojo_rhs)
     else:
         actual = torch.bmm(mojo_lhs, mojo_rhs)
+    assert isinstance(actual, torch.Tensor)
 
     _assert_bf16_fp32_accumulation_close(actual.cpu(), expected)
 
@@ -8889,6 +9047,7 @@ def test_bf16_real_bmm_batched_nn_v5_broadcast_a(
     a2d = torch.randn(m, k, generator=generator).to(dtype)
     lhs = a2d.unsqueeze(0).expand(batch, m, k)
     mojo_a2d = a2d.to(mojo_h100)
+    assert isinstance(mojo_a2d, TorchMojoTensor)
     mojo_lhs = aten_fast._view_of(mojo_a2d, (batch, m, k), (0, k, 1), 0)
     rhs, mojo_rhs = _bf16_dense_batched_pair(
         generator, (batch, k, n), False, 0, 2, mojo_h100, dtype
@@ -9028,7 +9187,9 @@ def _f32_transposed_dense_pair(
 
     storage = torch.randn(offset + m * k + 4, generator=generator)
     host = torch.as_strided(storage, (m, k), (1, m), offset)
-    dev = aten_fast._view_of(storage.to(device), (m, k), (1, m), offset)
+    device_storage = storage.to(device)
+    assert isinstance(device_storage, TorchMojoTensor)
+    dev = aten_fast._view_of(device_storage, (m, k), (1, m), offset)
     return host, dev
 
 
@@ -9182,7 +9343,9 @@ def _tf32_dense_matrix_pair(generator, shape, transposed, offset, mojo_h100):
     storage = torch.randn(offset + rows * cols + 4, generator=generator)
     strides = (1, rows) if transposed else (cols, 1)
     host = torch.as_strided(storage, shape, strides, offset)
-    device = aten_fast._view_of(storage.to(mojo_h100), shape, strides, offset)
+    device_storage = storage.to(mojo_h100)
+    assert isinstance(device_storage, TorchMojoTensor)
+    device = aten_fast._view_of(device_storage, shape, strides, offset)
     return host, device
 
 
@@ -9197,7 +9360,9 @@ def _tf32_dense_batched_pair(generator, shape, transposed, gap, offset, mojo_h10
     storage = torch.randn(storage_elements, generator=generator)
     strides = (batch_stride, 1, rows) if transposed else (batch_stride, cols, 1)
     host = torch.as_strided(storage, shape, strides, offset)
-    device = aten_fast._view_of(storage.to(mojo_h100), shape, strides, offset)
+    device_storage = storage.to(mojo_h100)
+    assert isinstance(device_storage, TorchMojoTensor)
+    device = aten_fast._view_of(device_storage, shape, strides, offset)
     return host, device
 
 
@@ -9226,9 +9391,9 @@ def test_tf32_real_gemm_extension_handles_tails_offsets_and_layouts(
     )
     bias_storage = torch.randn(n + 7, generator=generator)
     bias = bias_storage[3 : 3 + n]
-    mojo_bias = aten_fast._view_of(
-        bias_storage.to(mojo_h100), (n,), (1,), 3, contiguous=True
-    )
+    device_bias_storage = bias_storage.to(mojo_h100)
+    assert isinstance(device_bias_storage, TorchMojoTensor)
+    mojo_bias = aten_fast._view_of(device_bias_storage, (n,), (1,), 3, contiguous=True)
 
     def fail_spec(*_args, **_kwargs):
         raise AssertionError("eligible TF32 GEMM reached the SIMT fallback")
@@ -9284,6 +9449,7 @@ def test_tf32_real_bmm_extension_handles_layouts_offsets_and_padded_batches(
     finally:
         torch.set_float32_matmul_precision(old_precision)
 
+    assert isinstance(actual, torch.Tensor)
     torch.testing.assert_close(actual.cpu(), expected, atol=5e-2, rtol=5e-2)
 
 
@@ -9543,13 +9709,16 @@ def test_fa4_causal_gapped_qkv_forward_backward(
         actual_output = torch.nn.functional.scaled_dot_product_attention(
             *mojo_inputs, dropout_p=0.0, is_causal=True
         )
+        assert isinstance(actual_output, TorchMojoTensor)
         assert type(actual_output.grad_fn).__name__ == (
             "ScaledDotProductFlashAttentionBackward0"
         )
         assert backward_counter.call_count == calls_before
         assert actual_output.dtype == dtype
         assert not actual_output._is_contiguous
-        assert actual_output.transpose(1, 2)._is_contiguous
+        transposed_output = actual_output.transpose(1, 2)
+        assert isinstance(transposed_output, TorchMojoTensor)
+        assert transposed_output._is_contiguous
         actual_output.backward(grad_output.to(mojo_h100))
         assert backward_counter.call_count == calls_before + 1
 
@@ -9688,9 +9857,13 @@ def test_fa4_bhsd_native_forward_backward_matches_reference(
     )
     reference_output.backward(grad_output.float())
 
-    mojo_inputs = [
-        tensor.to(mojo_h100).detach().requires_grad_() for tensor in (query, key, value)
-    ]
+    mojo_inputs = cast(
+        list[TorchMojoTensor],
+        [
+            tensor.to(mojo_h100).detach().requires_grad_()
+            for tensor in (query, key, value)
+        ],
+    )
     for tensor in mojo_inputs:
         assert tensor._is_contiguous
         assert tensor._ptr % 16 == 0
@@ -9771,11 +9944,16 @@ def test_fa4_bhsd_d64_direct_partial_tail_block(mojo_h100, batch, heads, seqlen,
     )
 
     q, k, v = (tensor.to(mojo_h100) for tensor in (query, key, value))
+    assert isinstance(q, TorchMojoTensor)
+    assert isinstance(k, TorchMojoTensor)
+    assert isinstance(v, TorchMojoTensor)
     for tensor in (q, k, v):
         assert tensor._is_contiguous
         assert tensor._ptr % 16 == 0
     out = torch.empty(batch, heads, seqlen, head_dim, dtype=dtype, device=mojo_h100)
     logsumexp = torch.empty(batch, heads, seqlen, dtype=torch.float32, device=mojo_h100)
+    assert isinstance(out, TorchMojoTensor)
+    assert isinstance(logsumexp, TorchMojoTensor)
     assert out._ptr % 16 == 0
     scale = 1.0 / math.sqrt(head_dim)
 
@@ -9859,7 +10037,9 @@ def test_fa4_sdpa_odd_seqlen_forward_matches_reference(
         *reference_inputs, dropout_p=0.0, is_causal=True
     )
 
-    mojo_inputs = [tensor.to(mojo_h100) for tensor in (query, key, value)]
+    mojo_inputs = cast(
+        list[TorchMojoTensor], [tensor.to(mojo_h100) for tensor in (query, key, value)]
+    )
     for tensor in mojo_inputs:
         assert tensor._is_contiguous
         assert tensor._ptr % 16 == 0
@@ -10048,6 +10228,7 @@ def test_fa4_bhsd_gate_rejects_misaligned_offset_view(mojo_h100, monkeypatch, he
             torch.randn(numel + 1, generator=generator, dtype=torch.float32) * 0.25
         ).to(torch.bfloat16)
         view = host.to(mojo_h100)[1:].view(batch, heads, seqlen, head_dim)
+        assert isinstance(view, TorchMojoTensor)
         assert view._is_contiguous
         assert view._ptr % 16 != 0
         return view
@@ -10119,7 +10300,10 @@ def test_fast_sdpa_causal_training_backward(mojo_gpu):
         *ref_inputs, dropout_p=0.0, is_causal=True
     )
     ref_output.backward(grad_output.to(reference_device))
-    ref_grads = [tensor.grad.cpu() for tensor in ref_inputs]
+    ref_grads = []
+    for tensor in ref_inputs:
+        assert tensor.grad is not None
+        ref_grads.append(tensor.grad.cpu())
 
     mojo_inputs = [
         tensor.detach().clone().to(mojo_gpu).requires_grad_() for tensor in (q, k, v)
@@ -10253,7 +10437,10 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     actual_output = torch.nn.functional.scaled_dot_product_attention(
         *actual_inputs, dropout_p=0.0, is_causal=True
     )
-    assert actual_output.grad_fn.saved_names == expected_saved
+    assert actual_output.grad_fn is not None
+    # `saved_names` is codegen'd per-op onto the concrete backward Node, not
+    # declared on the generic Node type torch's stubs expose.
+    assert getattr(actual_output.grad_fn, "saved_names") == expected_saved
     # The counts below are about the backward. The causal forward also issues a
     # batched GEMM through the same helper, so zero the counters here rather than
     # let a forward call be mistaken for a gradient's.
@@ -10277,6 +10464,7 @@ def test_fast_sdpa_partial_gradients_save_and_compute_only_dependencies(
     ):
         assert (actual.grad is not None) == (name == requires)
         if name == requires:
+            assert isinstance(actual.grad, TorchMojoTensor)
             assert actual.grad._is_contiguous
             torch.testing.assert_close(
                 actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
@@ -10320,8 +10508,13 @@ def test_fused_flash_attention_partial_gradients_match_reference(mojo_gpu, requi
         for name, tensor in zip(names, host_inputs, strict=True)
     ]
     # Only meaningful if the fused path actually claims these inputs.
+    # actual_inputs is a list comprehension result; ty can't see its length
+    # is fixed at 3, so unpack it into a known-arity tuple first.
+    actual_q, actual_k, actual_v = actual_inputs
     assert (
-        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, True, None, False)
+        aten_fast._fused_fa_inputs(
+            actual_q, actual_k, actual_v, None, 0.0, True, None, False
+        )
         is not None
     ), "fused path declined the inputs this test exists to cover"
 
@@ -10334,6 +10527,7 @@ def test_fused_flash_attention_partial_gradients_match_reference(mojo_gpu, requi
     ):
         assert (actual.grad is not None) == (name == requires)
         if name == requires:
+            assert actual.grad is not None
             assert torch.isfinite(actual.grad.cpu()).all()
             torch.testing.assert_close(
                 actual.grad.cpu(), reference.grad, atol=3e-2, rtol=3e-2
@@ -10379,14 +10573,19 @@ def test_fast_sdpa_saved_tensor_hooks_own_saved_allocations(mojo_gpu, monkeypatc
         actual_output = torch.nn.functional.scaled_dot_product_attention(
             *actual_inputs, dropout_p=0.0, is_causal=False
         )
-        assert actual_output.grad_fn.saved_names == (
+        assert actual_output.grad_fn is not None
+        # `saved_names`/`saved_payloads` are codegen'd per-op onto the
+        # concrete backward Node, not declared on the generic Node type
+        # torch's stubs expose.
+        assert getattr(actual_output.grad_fn, "saved_names") == (
             "query",
             "key",
             "value",
             "probabilities",
         )
         assert all(
-            payload.holder is None for payload in actual_output.grad_fn.saved_payloads
+            payload.holder is None
+            for payload in getattr(actual_output.grad_fn, "saved_payloads")
         )
         actual_output.backward(grad_output.to(mojo_gpu))
 
@@ -10440,8 +10639,13 @@ def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu
         return tensor
 
     actual_inputs = [tensor.to(mojo_gpu).requires_grad_() for tensor in host_inputs]
+    # actual_inputs is a list comprehension result; ty can't see its length
+    # is fixed at 3, so unpack it into a known-arity tuple first.
+    actual_q, actual_k, actual_v = actual_inputs
     assert (
-        aten_fast._fused_fa_inputs(*actual_inputs, None, 0.0, False, None, False)
+        aten_fast._fused_fa_inputs(
+            actual_q, actual_k, actual_v, None, 0.0, False, None, False
+        )
         is not None
     ), "fused path declined the inputs this test exists to cover"
 
@@ -10449,7 +10653,11 @@ def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu
         actual_output = torch.nn.functional.scaled_dot_product_attention(
             *actual_inputs, dropout_p=0.0, is_causal=False
         )
-        assert actual_output.grad_fn.saved_names == (
+        assert actual_output.grad_fn is not None
+        # `saved_names`/`saved_payloads` are codegen'd per-op onto the
+        # concrete backward Node, not declared on the generic Node type
+        # torch's stubs expose.
+        assert getattr(actual_output.grad_fn, "saved_names") == (
             "query",
             "key",
             "value",
@@ -10460,7 +10668,8 @@ def test_fused_flash_attention_saved_tensor_hooks_own_saved_allocations(mojo_gpu
         # may retain the original holder -- that is what would defeat a
         # CPU/offload hook.
         assert all(
-            payload.holder is None for payload in actual_output.grad_fn.saved_payloads
+            payload.holder is None
+            for payload in getattr(actual_output.grad_fn, "saved_payloads")
         )
         actual_output.backward(grad_output.to(mojo_gpu))
 
@@ -10514,6 +10723,9 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     probabilities = probs_storage[1 : 1 + elements].view(shape)
     grad = grad_storage[2 : 2 + elements].view(shape)
     mask = mask_storage[3 : 3 + elements].view(shape)
+    assert isinstance(probabilities, TorchMojoTensor)
+    assert isinstance(grad, TorchMojoTensor)
+    assert isinstance(mask, TorchMojoTensor)
     calls = []
     _replace_defined_native_calls(
         monkeypatch,
@@ -10529,6 +10741,7 @@ def test_sdpa_fused_backward_host_bridge_abi(mojo_gpu, monkeypatch):
     )
 
     assert out is not aten_fast.NOT_HANDLED
+    assert isinstance(out, TorchMojoTensor)
     assert tuple(out.shape) == shape
     assert len(calls) == 1
     args = calls[0]
@@ -10546,6 +10759,9 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     probabilities = torch.randn(shape).to(mojo_gpu).transpose(1, 2)
     grad = torch.randn(shape).to(mojo_gpu).transpose(1, 2)
     mask = torch.ones(shape, dtype=torch.bool).to(mojo_gpu).transpose(1, 2)
+    assert isinstance(probabilities, TorchMojoTensor)
+    assert isinstance(grad, TorchMojoTensor)
+    assert isinstance(mask, TorchMojoTensor)
     assert not probabilities._is_contiguous
     assert not grad._is_contiguous
     assert not mask._is_contiguous
@@ -10565,6 +10781,7 @@ def test_sdpa_fused_backward_materializes_strided_operands(mojo_gpu, monkeypatch
     )
 
     assert out is not aten_fast.NOT_HANDLED
+    assert isinstance(out, TorchMojoTensor)
     assert tuple(out.shape) == (2, 5, 3)
     assert out._is_contiguous
     assert len(calls) == 1
@@ -10618,6 +10835,7 @@ def test_sdpa_fused_backward_empty_skips_bridge(mojo_gpu, monkeypatch):
     )
 
     assert out is not aten_fast.NOT_HANDLED
+    assert isinstance(out, TorchMojoTensor)
     assert tuple(out.shape) == (2, 0)
     assert calls == []
 
@@ -10695,17 +10913,18 @@ def test_fast_sdpa_dropout_matches_captured_mask_reference(
 
     def capture_dropout(input, p, train):
         result = native_dropout(input, p, train)
+        assert isinstance(result, tuple)
         captured_masks.append(result[1])
         return result
 
     monkeypatch.setattr(aten_fast, "fast_aten_native_dropout", capture_dropout)
-    torch.mojo.manual_seed_all((1 << 63) + 20260718)
+    _torch_mojo().manual_seed_all((1 << 63) + 20260718)
     actual_output = torch.nn.functional.scaled_dot_product_attention(
         *mojo_inputs, dropout_p=0.2, is_causal=is_causal
     )
     assert len(captured_masks) == 1
     keep = captured_masks[0].cpu().reshape(batch, heads, length, length)
-    state_after_forward = torch.mojo.get_rng_state(mojo_inputs[0].device)
+    state_after_forward = _torch_mojo().get_rng_state(mojo_inputs[0].device)
 
     reference_inputs = [tensor.clone().requires_grad_() for tensor in host_inputs]
     query, key, value = reference_inputs
@@ -10720,7 +10939,7 @@ def test_fast_sdpa_dropout_matches_captured_mask_reference(
     actual_output.backward(grad_output.to(mojo_gpu))
 
     torch.testing.assert_close(
-        torch.mojo.get_rng_state(mojo_inputs[0].device), state_after_forward
+        _torch_mojo().get_rng_state(mojo_inputs[0].device), state_after_forward
     )
     torch.testing.assert_close(
         actual_output.cpu(), reference_output.detach(), atol=2e-2, rtol=2e-2
@@ -10742,14 +10961,14 @@ def test_fast_sdpa_dropout_reserves_exact_probability_interval(mojo_gpu, dropout
     value = torch.randn(batch, heads, key_length, head_dim).to(mojo_gpu)
     seed = (1 << 63) + 0x1234
     counter = (1 << 63) + 0x5678
-    torch.mojo.set_rng_state(_philox_rng_state(seed, counter), query.device)
+    _torch_mojo().set_rng_state(_philox_rng_state(seed, counter), query.device)
 
     output = torch.nn.functional.scaled_dot_product_attention(
         query, key, value, dropout_p=dropout_p, is_causal=True
     )
     probability_elements = batch * heads * query_length * key_length
     expected_increment = (probability_elements + 3) // 4 if 0.0 < dropout_p < 1.0 else 0
-    assert _decode_philox_rng_state(torch.mojo.get_rng_state(query.device)) == (
+    assert _decode_philox_rng_state(_torch_mojo().get_rng_state(query.device)) == (
         seed,
         counter + expected_increment,
     )
@@ -10880,6 +11099,7 @@ def test_fast_log_softmax_uses_saved_tensor_hooks(mojo_gpu):
         )
 
     assert hook_calls == [("pack", "mojo"), ("unpack", "cpu")]
+    assert actual.grad is not None
     torch.testing.assert_close(actual.grad.cpu(), reference.grad, atol=2e-5, rtol=2e-5)
 
 

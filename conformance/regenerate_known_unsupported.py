@@ -43,7 +43,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
 from typing import Any
+
+import pytest
+from _pytest.runner import CallInfo
 
 _RECORD_DIR_ENV = "CONFORMANCE_UNSUPPORTED_RECORD_DIR"
 _HERE = Path(__file__).resolve().parent
@@ -107,7 +111,11 @@ def _record(event: dict[str, Any]) -> None:
         handle.flush()
 
 
-def pytest_exception_interact(node: Any, call: Any, report: Any) -> None:
+def pytest_exception_interact(
+    node: pytest.Item | pytest.Collector,
+    call: CallInfo[Any],
+    report: pytest.CollectReport | pytest.TestReport,
+) -> None:
     """Record what a failing node raised."""
     if not report.failed or call.excinfo is None:
         return
@@ -127,7 +135,7 @@ def pytest_exception_interact(node: Any, call: Any, report: Any) -> None:
     )
 
 
-def pytest_runtest_logreport(report: Any) -> None:
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """Record every node's outcome, so a node that ran can be told from one that
     did not: only the first is evidence about the table."""
     if report.when != "call":
@@ -153,7 +161,7 @@ def pytest_runtest_logreport(report: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _import_suite() -> Any:
+def _import_suite() -> ModuleType:
     """The conformance test module, imported the way its conftest does."""
     os.environ.setdefault("PYTORCH_TESTING_DEVICE_FOR_CUSTOM", "privateuse1")
     sys.path.insert(0, str(_HERE))
@@ -177,7 +185,7 @@ def _device_token() -> str:
     return str(torch._C._get_privateuse1_backend_name())
 
 
-def _node_index(suite: Any) -> dict[str, tuple[str, str, str]]:
+def _node_index(suite: ModuleType) -> dict[str, tuple[str, str, str]]:
     """Generated node name -> (test name, operator token, dtype token).
 
     Built from the same op_db and dtypes the suite parametrizes over, so

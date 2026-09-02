@@ -1,13 +1,3 @@
-import os
-
-# Off by default: beartype's wrapper frames cost real per-call CPU time in
-# eager hot paths. The test suite opts in via tests/conftest.py.
-if os.environ.get("TORCH_MOJO_BACKEND_BEARTYPE", "0") == "1":
-    from beartype.claw import beartype_this_package
-
-    beartype_this_package()
-
-
 from torch_mojo_backend.custom_torch_ops_in_mojo.torch_custom_ops import (
     make_torch_op_from_mojo,
 )

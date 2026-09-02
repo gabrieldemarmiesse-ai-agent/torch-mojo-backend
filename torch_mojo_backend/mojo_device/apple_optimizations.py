@@ -9,7 +9,9 @@ def _enable_apple_fast_add() -> None:
     """
     from torch_mojo_backend.eager_kernels import aten_fast
 
-    aten_fast.fast_aten_add = aten_fast.fast_aten_add_apple
+    # Deliberate module-attribute monkeypatch; ty compares the two
+    # same-signature `def`s nominally, so this can never structurally match.
+    aten_fast.fast_aten_add = aten_fast.fast_aten_add_apple  # ty: ignore[invalid-assignment]
 
 
 def register_apple_optimizations() -> None:

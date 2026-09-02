@@ -18,7 +18,7 @@ def inplace_dispatcher(op_name: str, fast_name: str) -> Callable:
     packet_name, _, overload_name = op_name.removeprefix("aten::").partition(".")
     aten_op = getattr(getattr(torch.ops.aten, packet_name), overload_name or "default")
 
-    def dispatcher(self, *args, **kwargs):
+    def dispatcher(self: list[torch.Tensor], *args: object, **kwargs: object) -> None:
         aten_fast = _fast()
         result = getattr(aten_fast, fast_name)(self, *args, **kwargs)
         if result is aten_fast.NOT_HANDLED:
@@ -36,7 +36,9 @@ def inplace_dispatcher(op_name: str, fast_name: str) -> Callable:
     return dispatcher
 
 
-def mojo_device__foreach_mul__tensor(self, other):
+def mojo_device__foreach_mul__tensor(
+    self: list[torch.Tensor], other: torch.Tensor
+) -> None:
     aten_fast = _fast()
     result = aten_fast.fast_aten__foreach_mul__tensor(self, other)
     if result is aten_fast.NOT_HANDLED:
@@ -55,7 +57,11 @@ def mojo_device__foreach_mul__tensor(self, other):
     return None
 
 
-def mojo_device__foreach_norm_scalar(self, ord=2, dtype=None):
+def mojo_device__foreach_norm_scalar(
+    self: list[torch.Tensor],
+    ord: bool | int | float = 2,
+    dtype: torch.dtype | None = None,
+) -> list[torch.Tensor]:
     aten_fast = _fast()
     result = aten_fast.fast_aten__foreach_norm(self, ord, dtype=dtype)
     if result is aten_fast.NOT_HANDLED:
@@ -67,7 +73,7 @@ def mojo_device__foreach_norm_scalar(self, ord=2, dtype=None):
     return result
 
 
-def mojo_device__foreach_sqrt(self):
+def mojo_device__foreach_sqrt(self: list[torch.Tensor]) -> list[torch.Tensor]:
     aten_fast = _fast()
     result = aten_fast.fast_aten__foreach_sqrt(self)
     if result is aten_fast.NOT_HANDLED:

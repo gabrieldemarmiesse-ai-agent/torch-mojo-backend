@@ -76,7 +76,10 @@ def _sync_for(device: str) -> Callable[[], None]:
     if device == "mps":
         return torch.mps.synchronize
     if device == "mojo":
-        return torch.mojo.synchronize
+        # torch.mojo is installed at runtime by register_mojo_devices()
+        # (_setup_privateuseone_for_python_backend), not a real torch stub
+        # module.
+        return torch.mojo.synchronize  # ty: ignore[unresolved-attribute]
     return lambda: None
 
 
@@ -116,6 +119,12 @@ def bench_key(node: pytest.Function) -> baselines.BenchKey:
         shape=params["shape_id"],
         layout=params.get("layout", "contig"),
     )
+
+
+# Notes staged for the terminal summary (see pytest_terminal_summary in
+# conftest.py). pytest.Config.stash is the typed, plugin-private alternative
+# to bolting an ad hoc attribute onto the Config instance.
+BENCH_NOTES_KEY: pytest.StashKey[list[str]] = pytest.StashKey()
 
 
 class Bench:
@@ -254,8 +263,6 @@ class Bench:
         baselines.merge_write(self._hw.key, {entry_key: ratio})
 
     def _note(self, message: str) -> None:
-        notes = getattr(self._request.config, "_bench_notes", None)
-        if notes is None:
-            notes = []
-            self._request.config._bench_notes = notes
+        stash = self._request.config.stash
+        notes = stash.setdefault(BENCH_NOTES_KEY, [])
         notes.append(message)

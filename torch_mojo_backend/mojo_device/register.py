@@ -1,13 +1,19 @@
+from collections.abc import Callable
 from functools import wraps
+from types import ModuleType
+from typing import TypeVar
 
 import torch
 
 from .mojo_device_aten_ops import _aten_ops_registry
 
+_T = TypeVar("_T")
 _registered = False
 
 
-def _install_torch_accelerator_synchronize(torch_mojo_device_module):
+def _install_torch_accelerator_synchronize(
+    torch_mojo_device_module: ModuleType,
+) -> None:
     """Route generic accelerator synchronization to the Mojo device module.
 
     PyTorch's Python PrivateUse1 guard does not yet forward synchronizeDevice
@@ -27,10 +33,11 @@ def _install_torch_accelerator_synchronize(torch_mojo_device_module):
         )
 
     @wraps(original_synchronize)
-    def synchronize(device=None):
+    def synchronize(device: torch.device | str | int | None = None) -> None:
         current = torch.accelerator.current_accelerator()
         if current != mojo_device:
-            return original_synchronize(device)
+            original_synchronize(device)
+            return
 
         if device is None:
             device_index = torch_mojo_device_module.current_device()
@@ -47,13 +54,17 @@ def _install_torch_accelerator_synchronize(torch_mojo_device_module):
                 if selected.index is None
                 else selected.index
             )
-        return torch_mojo_device_module.synchronize(device_index)
+        torch_mojo_device_module.synchronize(device_index)
 
-    synchronize._torch_mojo_backend = True
-    torch.accelerator.synchronize = synchronize
+    # Deliberate monkeypatch of torch.accelerator.synchronize: the sentinel
+    # attribute is how this function detects, on a later call, that its own
+    # replacement (not the original) is already installed. ty can't type an
+    # ad hoc attribute on a stdlib callable.
+    synchronize._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.accelerator.synchronize = synchronize  # ty: ignore[invalid-assignment]
 
 
-def _install_torch_accelerator_stream_api(torch_mojo_device_module):
+def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType) -> None:
     """Route torch.accelerator.current_stream/set_stream to mojo streams.
 
     Same reason as the synchronize patch above: the Python PrivateUse1
@@ -67,29 +78,36 @@ def _install_torch_accelerator_stream_api(torch_mojo_device_module):
     mojo_device = torch.device("mojo")
 
     @wraps(original_current_stream)
-    def current_stream(device=None):
+    def current_stream(device: torch.device | str | int | None = None) -> torch.Stream:
         if torch.accelerator.current_accelerator() != mojo_device:
             return original_current_stream(device)
         return torch_mojo_device_module.current_stream(device)
 
-    current_stream._torch_mojo_backend = True
-    torch.accelerator.current_stream = current_stream
+    # Same deliberate monkeypatch and sentinel as `synchronize` above.
+    current_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.accelerator.current_stream = current_stream  # ty: ignore[invalid-assignment]
 
     original_set_stream = torch.accelerator.set_stream
 
     @wraps(original_set_stream)
-    def set_stream(stream):
+    def set_stream(stream: torch.Stream) -> None:
         from torch_mojo_backend.mojo_device.streams import Stream as MojoStream
 
         if isinstance(stream, MojoStream):
             return torch_mojo_device_module.set_stream(stream)
         return original_set_stream(stream)
 
-    set_stream._torch_mojo_backend = True
-    torch.accelerator.set_stream = set_stream
+    set_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.accelerator.set_stream = set_stream  # ty: ignore[invalid-assignment]
 
 
-def _install_torch_stream_event_dispatch():
+def _forwarding_constructor(cls: type[_T]) -> Callable[..., _T]:
+    """`cls` as an opaque callable: the metaclasses below forward whatever
+    constructor arguments the caller passed, and only `cls` knows their shape."""
+    return cls
+
+
+def _install_torch_stream_event_dispatch() -> None:
     """Dispatch torch.Stream/torch.Event on mojo devices to real classes.
 
     Construction through the original classes reaches the stub C++ guard and
@@ -104,48 +122,57 @@ def _install_torch_stream_event_dispatch():
 
     original_stream = torch.Stream
     original_event = torch.Event
+    construct_stream = _forwarding_constructor(original_stream)
+    construct_mojo_stream = _forwarding_constructor(mojo_streams.Stream)
+    construct_event = _forwarding_constructor(original_event)
+    construct_mojo_event = _forwarding_constructor(mojo_streams.Event)
 
-    def _wants_mojo(args, kwargs):
+    def _wants_mojo(args: tuple[object, ...], kwargs: dict[str, object]) -> bool:
         device = kwargs.get("device", args[0] if args else None)
         if device is None or isinstance(device, int):
             accelerator = torch.accelerator.current_accelerator()
             return accelerator is not None and accelerator.type == "mojo"
+        if not isinstance(device, str | torch.device):
+            return False  # torch.device() would raise TypeError
         try:
             return torch.device(device).type == "mojo"
         except (TypeError, RuntimeError, ValueError):
             return False
 
     class _StreamMeta(type):
-        def __call__(cls, *args, **kwargs):
+        def __call__(cls, *args: object, **kwargs: object) -> torch.Stream:
             if "stream_id" in kwargs or "device_type" in kwargs:
-                return original_stream(*args, **kwargs)
+                return construct_stream(*args, **kwargs)
             if _wants_mojo(args, kwargs):
-                return mojo_streams.Stream(*args, **kwargs)
-            return original_stream(*args, **kwargs)
+                return construct_mojo_stream(*args, **kwargs)
+            return construct_stream(*args, **kwargs)
 
-        def __instancecheck__(cls, instance):
+        def __instancecheck__(cls, instance: object) -> bool:
             return isinstance(instance, (original_stream, mojo_streams.Stream))
 
     class Stream(metaclass=_StreamMeta):
         _torch_mojo_backend = True
 
     class _EventMeta(type):
-        def __call__(cls, *args, **kwargs):
+        def __call__(
+            cls, *args: object, **kwargs: object
+        ) -> torch.Event | mojo_streams.Event:
             if _wants_mojo(args, kwargs):
-                return mojo_streams.Event(*args, **kwargs)
-            return original_event(*args, **kwargs)
+                return construct_mojo_event(*args, **kwargs)
+            return construct_event(*args, **kwargs)
 
-        def __instancecheck__(cls, instance):
+        def __instancecheck__(cls, instance: object) -> bool:
             return isinstance(instance, (original_event, mojo_streams.Event))
 
     class Event(metaclass=_EventMeta):
         _torch_mojo_backend = True
 
-    torch.Stream = Stream
-    torch.Event = Event
+    # Deliberate replacement of torch's classes by the dispatching wrappers.
+    torch.Stream = Stream  # ty: ignore[invalid-assignment]
+    torch.Event = Event  # ty: ignore[invalid-assignment]
 
 
-def _declare_mojo_tensor_as_plain_tensor():
+def _declare_mojo_tensor_as_plain_tensor() -> None:
     """Add TorchMojoTensor to torch's HANDLED_TYPES allowlists.
 
     TorchMojoTensor's wrapper dispatch is transparent to numerical operations;
@@ -171,7 +198,7 @@ def _declare_mojo_tensor_as_plain_tensor():
       "unsupported operand type(s) for +: 'FunctionalTensor' and
       'TorchMojoTensor'".
     """
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
     import torch._subclasses.fake_tensor as fake_tensor_module
@@ -184,15 +211,26 @@ def _declare_mojo_tensor_as_plain_tensor():
     from .torch_mojo_tensor import TorchMojoTensor
 
     if TorchMojoTensor not in proxy_tensor.HANDLED_TYPES:
-        proxy_tensor.HANDLED_TYPES = (*proxy_tensor.HANDLED_TYPES, TorchMojoTensor)
+        # Deliberate monkeypatch: torch infers HANDLED_TYPES' type from its
+        # own fixed-length tuple literal, so extending it by one element is
+        # always a "wrong length" mismatch to the checker.
+        proxy_tensor.HANDLED_TYPES = (  # ty: ignore[invalid-assignment]
+            *proxy_tensor.HANDLED_TYPES,
+            TorchMojoTensor,
+        )
     runtime_wrappers.HANDLED_TYPES = proxy_tensor.HANDLED_TYPES
 
     original_check = fake_tensor_module._check_for_subclass_arg
 
-    def check_for_subclass_arg_except_mojo(x):
+    def check_for_subclass_arg_except_mojo(x: object) -> bool:
         return original_check(x) and not isinstance(x, TorchMojoTensor)
 
-    fake_tensor_module._check_for_subclass_arg = check_for_subclass_arg_except_mojo
+    # Deliberate monkeypatch: ty treats each `def` as its own nominal type
+    # even with an identical signature, so this never structurally matches
+    # the attribute it replaces.
+    fake_tensor_module._check_for_subclass_arg = (  # ty: ignore[invalid-assignment]
+        check_for_subclass_arg_except_mojo
+    )
 
     # Once past the subclass check, lifting a real mojo tensor constant
     # still fails: the const-propagation path is gated on `type(out) is
@@ -202,7 +240,13 @@ def _declare_mojo_tensor_as_plain_tensor():
     # constant as a graph input like any other mojo tensor.
     original_dispatch_impl = fake_tensor_module.FakeTensorMode._dispatch_impl
 
-    def dispatch_impl_lifting_mojo_constants(self, func, types, args, kwargs):
+    def dispatch_impl_lifting_mojo_constants(
+        self: fake_tensor_module.FakeTensorMode,
+        func: torch._ops.OpOverload,
+        types: Sequence[type],
+        args: Sequence[object],
+        kwargs: Mapping[str, object],
+    ) -> fake_tensor_module.FakeTensor | None:
         if func in self.lift_fns and args and isinstance(args[0], TorchMojoTensor):
             return self.fake_tensor_converter.from_real_tensor(self, args[0])
         return original_dispatch_impl(self, func, types, args, kwargs)
@@ -223,6 +267,8 @@ def _declare_mojo_tensor_as_plain_tensor():
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
+        assert isinstance(self, FunctionalTensor)
+        assert isinstance(func, torch._ops.OpOverload)
         return original_tensor_dispatch(
             self, func, as_plain_tensor_types(types), args, kwargs
         )
@@ -238,6 +284,8 @@ def _declare_mojo_tensor_as_plain_tensor():
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
+        assert isinstance(self, FunctionalTensorMode)
+        assert isinstance(func, torch._ops.OpOverload)
         return original_mode_dispatch(
             self, func, as_plain_tensor_types(types), args, kwargs
         )
@@ -275,7 +323,7 @@ def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo() -> None:
         table[TorchMojoTensor] = VariableBuilder.wrap_tensor
 
 
-def _keep_mojo_kernels_out_of_fake_tensor_construction():
+def _keep_mojo_kernels_out_of_fake_tensor_construction() -> None:
     """Make FakeTensor construction skip the PrivateUse1 Python kernels.
 
     `FakeTensor.__new__` calls `Tensor._make_subclass(cls, elem, ...,
@@ -299,14 +347,28 @@ def _keep_mojo_kernels_out_of_fake_tensor_construction():
     exclude_privateuse1 = torch._C.DispatchKeySet(torch._C.DispatchKey.PrivateUse1)
     original_new = FakeTensor.__new__
 
-    def fake_new_without_mojo_kernels(cls, *args, **kwargs):
+    def fake_new_without_mojo_kernels(
+        cls: type[FakeTensor], *args: object, **kwargs: object
+    ) -> FakeTensor:
         with torch._C._ExcludeDispatchKeyGuard(exclude_privateuse1):
-            return original_new(cls, *args, **kwargs)
+            # Forwarded blindly (see version-compatibility note above): the
+            # checker can't match object-typed *args/**kwargs against
+            # __new__'s concrete parameter list.
+            return original_new(
+                cls,
+                *args,  # ty: ignore[invalid-argument-type]
+                **kwargs,
+            )
 
-    FakeTensor.__new__ = staticmethod(fake_new_without_mojo_kernels)
+    # Deliberate *args/**kwargs passthrough: FakeTensor.__new__'s real
+    # signature is torch-version-dependent (AGENTS.md: support many
+    # versions), so this wrapper forwards blindly rather than hardcoding it.
+    FakeTensor.__new__ = staticmethod(  # ty: ignore[invalid-assignment]
+        fake_new_without_mojo_kernels
+    )
 
 
-def register_mojo_devices():
+def register_mojo_devices() -> None:
     """Enable the mojo device globally and register all aten ops"""
     from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
 
@@ -344,7 +406,10 @@ def register_mojo_devices():
         foreach_utils._foreach_supported_types,
     ):
         if TorchMojoTensor not in supported_types:
-            supported_types.append(TorchMojoTensor)
+            # Deliberate monkeypatch: torch declared these lists' element
+            # type from their own literal contents (Tensor/Parameter), which
+            # doesn't include our subclass by construction.
+            supported_types.append(TorchMojoTensor)  # ty: ignore[invalid-argument-type]
 
     # Register all collected aten operations
     for op_name, func in _aten_ops_registry:

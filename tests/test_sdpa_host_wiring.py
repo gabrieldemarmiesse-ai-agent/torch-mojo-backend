@@ -1,9 +1,11 @@
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from torch_mojo_backend import eager_kernels
 from torch_mojo_backend.mojo_device import mojo_device_autograd as autograd
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 
 class _Token:
@@ -15,6 +17,20 @@ class _Token:
 
     def __repr__(self) -> str:
         return self.name
+
+
+def _gt(token: "_Token") -> TorchMojoTensor:
+    """`backward()` reads `TorchMojoTensor` methods/fields no `_Token` has,
+    but every call in this file replaces `_fast()` wholesale with a fake
+    whose ops only ever pass `_Token`s around; cast at the call boundary."""
+    return cast(TorchMojoTensor, token)
+
+
+def _ctx(namespace: SimpleNamespace) -> autograd._MojoAutogradCtx:
+    """The namespaces below set every field `backward()` actually reads
+    (`getattr(ctx, "is_causal", False)` tolerates the rest); cast at the
+    call boundary since SimpleNamespace isn't nominally the Protocol."""
+    return cast(autograd._MojoAutogradCtx, namespace)
 
 
 def _patch_saved_and_views(
@@ -136,10 +152,10 @@ def test_sdpa_query_gradient_prefers_fused_dropout_softmax_backward(
     monkeypatch.setattr(autograd, "_fast", lambda: fake_fast)
 
     result = autograd._ScaledDotProductAttentionAutograd.backward(
-        ctx, _Token("grad_output")
+        _ctx(ctx), _gt(_Token("grad_output"))
     )
 
-    assert result[0].name.startswith("view(dquery(dscores-fused")
+    assert cast(_Token, result[0]).name.startswith("view(dquery(dscores-fused")
     assert result[1:] == (None, None, None, None, None, None, None)
     assert len(fused_calls) == 1
     probabilities, grad, mask, dropout_scale, score_scale, causal, q_len = fused_calls[
@@ -205,7 +221,7 @@ def test_sdpa_fused_not_handled_preserves_decomposition_order(
     monkeypatch.setattr(autograd, "_fast", lambda: fake_fast)
 
     result = autograd._ScaledDotProductAttentionAutograd.backward(
-        ctx, _Token("grad_output")
+        _ctx(ctx), _gt(_Token("grad_output"))
     )
 
     names = [operation[0] for operation in operations]
@@ -223,7 +239,7 @@ def test_sdpa_fused_not_handled_preserves_decomposition_order(
     assert multiplies[1][1] == "centered"
     assert multiplies[1][2].startswith("view(probabilities")
     assert multiplies[2][2] == ctx.scale
-    assert result[0].name.startswith("view(dquery")
+    assert cast(_Token, result[0]).name.startswith("view(dquery")
 
 
 @pytest.mark.parametrize("has_dropout", [False, True])
@@ -276,11 +292,11 @@ def test_sdpa_value_only_gradient_skips_fused_score_gradient(
     monkeypatch.setattr(autograd, "_fast", lambda: fake_fast)
 
     result = autograd._ScaledDotProductAttentionAutograd.backward(
-        ctx, _Token("grad_output")
+        _ctx(ctx), _gt(_Token("grad_output"))
     )
 
     assert result[:2] == (None, None)
-    assert result[2].name.startswith("view(view(transpose")
+    assert cast(_Token, result[2]).name.startswith("view(view(transpose")
     assert [call[0] for call in calls] == (
         ["dropout", "transpose", "bmm", "transpose"]
         if has_dropout

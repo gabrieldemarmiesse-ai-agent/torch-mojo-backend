@@ -16,8 +16,10 @@ function in the matching `aten_ops/` module.
 
 import functools
 from collections.abc import Callable
+from typing import cast
 
 import torch_mojo_backend.is_running_tests
+from torch_mojo_backend.types import CountedCallable
 
 from .aten_ops import foreach
 from .aten_ops.autograd_preflight import (
@@ -86,10 +88,10 @@ _aten_ops_registry: list[tuple[str, Callable]] = []
 # counter so `CallChecker` can assert the backend's impl for a given op ran
 # — uniformly for fast, custom, and out-variant registrations (see
 # torch_mojo_backend/testing.py). Keyed by the aten op name.
-EAGER_CALL_COUNTERS: dict[str, Callable] = {}
+EAGER_CALL_COUNTERS: dict[str, CountedCallable] = {}
 
 
-def register_aten_op(op_name: str):
+def register_aten_op(op_name: str) -> Callable[[Callable], Callable]:
     """Decorator to mark a function for aten op registration.
 
     Args:
@@ -99,15 +101,19 @@ def register_aten_op(op_name: str):
     def decorator(func: Callable) -> Callable:
         if torch_mojo_backend.is_running_tests.IS_RUNNING_TESTS:
 
-            @functools.wraps(func)
-            def counted(*args, **kwargs):
-                counted.call_count += 1
+            def counted(*args: object, **kwargs: object) -> object:
+                result.call_count += 1
                 return func(*args, **kwargs)
 
-            counted.call_count = 0
-            EAGER_CALL_COUNTERS[op_name] = counted
-            _aten_ops_registry.append((op_name, counted))
-            return counted
+            # functools.wraps's stub types its result as a plain callable
+            # with no room for the extra `call_count` attribute; update_wrapper
+            # does the same __name__/__doc__/__wrapped__ copy without that.
+            functools.update_wrapper(counted, func)
+            result = cast(CountedCallable, counted)
+            result.call_count = 0
+            EAGER_CALL_COUNTERS[op_name] = result
+            _aten_ops_registry.append((op_name, result))
+            return result
         _aten_ops_registry.append((op_name, func))
         return func
 

@@ -5,8 +5,6 @@ from collections.abc import Callable
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
 os.environ["TORCH_MOJO_BACKEND_TESTING"] = "1"
-# Type-check the whole package under tests; production imports leave it off.
-os.environ.setdefault("TORCH_MOJO_BACKEND_BEARTYPE", "1")
 import pytest
 
 # must be called before importing torch_mojo_backend
@@ -151,7 +149,7 @@ def fake_mojo_tensor() -> Callable[..., torch.Tensor]:
             storage_offset=0,
             dtype=_torch_dtype_of(dtype),
             layout=torch.strided,
-            device="cpu",
+            device=torch.device("cpu"),
             requires_grad=False,
         )
         tensor._holder = object()

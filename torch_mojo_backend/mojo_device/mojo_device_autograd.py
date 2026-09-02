@@ -8,7 +8,9 @@ values that hooks deliberately unpack onto the host.
 """
 
 import math
-from typing import TypeVar
+from collections.abc import Sequence
+from types import ModuleType
+from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
 
@@ -21,7 +23,7 @@ _ResultT = TypeVar("_ResultT")
 _registered = False
 
 
-def _fast():
+def _fast() -> ModuleType:
     from torch_mojo_backend.eager_kernels import aten_fast
 
     return aten_fast
@@ -36,7 +38,7 @@ def _require_handled(result: _ResultT | None, operation: str) -> _ResultT:
     return result
 
 
-def _contiguous_view(tensor: TorchMojoTensor, shape) -> TorchMojoTensor:
+def _contiguous_view(tensor: TorchMojoTensor, shape: Sequence[int]) -> TorchMojoTensor:
     tensor = tensor._contig()
     return _require_handled(_fast().fast_aten_view(tensor, tuple(shape)), "view")
 
@@ -70,7 +72,7 @@ class _SavedMojoPayload:
         "is_contiguous",
     )
 
-    def __init__(self, tensor: TorchMojoTensor):
+    def __init__(self, tensor: TorchMojoTensor) -> None:
         self.holder = None if _saved_tensor_hooks_active() else tensor._holder
         self.ptr = tensor._ptr
         self.shape = tensor._shape
@@ -180,7 +182,33 @@ def _saved_tensor_hooks_active() -> bool:
         return False
 
 
-def _restore_saved_mojo_tensors(ctx):
+@runtime_checkable
+class _MojoAutogradCtx(Protocol):
+    """A `torch.autograd.Function` ctx as this module's forward/backward use
+    it: `save_for_backward`/`needs_input_grad`/`set_materialize_grads` are
+    `FunctionCtx`'s real (but unstubbed) members; `saved_payloads`,
+    `saved_names`, `is_causal`, `scale`, `needed_input_gradients` are sidecar
+    attributes this module's own forward methods stash for their backward."""
+
+    saved_tensors: tuple[torch.Tensor, ...]
+    saved_payloads: tuple[_SavedMojoPayload, ...]
+    saved_names: tuple[str, ...]
+    is_causal: bool
+    scale: float | None
+    needed_input_gradients: tuple[bool, ...]
+    needs_input_grad: tuple[bool, ...]
+    # _ScaledDotProductAttentionAutograd's own additional sidecar fields.
+    query_shape: tuple[int, ...]
+    key_shape: tuple[int, ...]
+    value_shape: tuple[int, ...]
+    has_dropout: bool
+    dropout_scale: float
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+    def set_materialize_grads(self, value: bool) -> None: ...
+
+
+def _restore_saved_mojo_tensors(ctx: _MojoAutogradCtx) -> tuple[TorchMojoTensor, ...]:
     saved_tensors = ctx.saved_tensors
     payloads = ctx.saved_payloads
     if len(saved_tensors) != len(payloads):
@@ -202,8 +230,16 @@ class _FusedFlashAttentionAutograd(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
-    ):
+        ctx: _MojoAutogradCtx,
+        query: TorchMojoTensor,
+        key: TorchMojoTensor,
+        value: TorchMojoTensor,
+        attn_mask: TorchMojoTensor | None,
+        dropout_p: float,
+        is_causal: bool,
+        scale: float | None,
+        enable_gqa: bool,
+    ) -> TorchMojoTensor:
         aten_fast = _fast()
         result = aten_fast.fast_fused_flash_attention_forward(
             query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
@@ -233,7 +269,9 @@ class _FusedFlashAttentionAutograd(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: _MojoAutogradCtx, grad_output: TorchMojoTensor | None
+    ) -> tuple[TorchMojoTensor | None, ...]:
         if grad_output is None:
             return (None,) * 8
         aten_fast = _fast()
@@ -266,8 +304,16 @@ class _FusedFlashAttentionAutograd(torch.autograd.Function):
 class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
-    ):
+        ctx: _MojoAutogradCtx,
+        query: TorchMojoTensor,
+        key: TorchMojoTensor,
+        value: TorchMojoTensor,
+        attn_mask: TorchMojoTensor | None,
+        dropout_p: float,
+        is_causal: bool,
+        scale: float | None,
+        enable_gqa: bool,
+    ) -> TorchMojoTensor:
         if attn_mask is not None or enable_gqa:
             raise NotImplementedError(
                 "Mojo eager SDPA autograd currently supports no attention mask, "
@@ -287,10 +333,10 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         need_query, need_key, need_value = (
             bool(ctx.needs_input_grad[index]) for index in range(3)
         )
-        saved = []
-        saved_names = []
+        saved: list[TorchMojoTensor] = []
+        saved_names: list[str] = []
 
-        def save(name, tensor):
+        def save(name: str, tensor: TorchMojoTensor) -> None:
             saved_names.append(name)
             saved.append(tensor)
 
@@ -327,7 +373,9 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: _MojoAutogradCtx, grad_output: TorchMojoTensor
+    ) -> tuple[TorchMojoTensor | None, ...]:
         aten_fast = _fast()
         restored = _restore_saved_mojo_tensors(ctx)
         saved = dict(zip(ctx.saved_names, restored, strict=True))
@@ -345,6 +393,8 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
 
         mask3 = None
         if ctx.has_dropout:
+            # forward sets has_dropout iff it saved a real dropout_mask.
+            assert dropout_mask is not None
             mask3 = _contiguous_view(
                 dropout_mask, (batch_heads, query_length, key_length)
             )
@@ -552,27 +602,35 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         if saved:
             raise RuntimeError(f"unused Mojo SDPA saved tensors: {tuple(saved)}")
 
-        grad_query = (
-            _contiguous_view(grad_query3, ctx.query_shape) if need_query else None
-        )
-        grad_key = _contiguous_view(grad_key3, ctx.key_shape) if need_key else None
-        grad_value = (
-            _contiguous_view(grad_value3, ctx.value_shape) if need_value else None
-        )
+        if need_query:
+            assert grad_query3 is not None
+            grad_query = _contiguous_view(grad_query3, ctx.query_shape)
+        else:
+            grad_query = None
+        if need_key:
+            assert grad_key3 is not None
+            grad_key = _contiguous_view(grad_key3, ctx.key_shape)
+        else:
+            grad_key = None
+        if need_value:
+            assert grad_value3 is not None
+            grad_value = _contiguous_view(grad_value3, ctx.value_shape)
+        else:
+            grad_value = None
         return grad_query, grad_key, grad_value, None, None, None, None, None
 
 
 def _scaled_dot_product_attention_autograd(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
+    query: TorchMojoTensor,
+    key: TorchMojoTensor,
+    value: TorchMojoTensor,
+    attn_mask: TorchMojoTensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
     *,
-    scale=None,
-    enable_gqa=False,
-):
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
     needs_backward = torch.is_grad_enabled() and (
         query.requires_grad or key.requires_grad or value.requires_grad
     )

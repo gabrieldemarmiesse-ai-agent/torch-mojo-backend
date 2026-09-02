@@ -6,14 +6,19 @@ evaluating a neural network on the MNIST dataset.
 """
 
 import os
+from collections.abc import Sized
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+
+# torchvision is a demo-only extra, not a project dependency (pip install it
+# yourself to run this script).
+from torchvision import datasets, transforms  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import mojo_backend
 
@@ -24,14 +29,14 @@ os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "0"
 class SimpleNet(nn.Module):
     """Simple feedforward neural network for MNIST classification."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         # Input: 28x28 = 784 pixels
         self.fc1 = nn.Linear(784, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 10)  # 10 classes (digits 0-9)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Flatten the input
         x = x.view(-1, 784)
 
@@ -44,12 +49,23 @@ class SimpleNet(nn.Module):
         return x
 
 
-def train_epoch(model, device, train_loader, optimizer, criterion, epoch):
+def train_epoch(
+    model: nn.Module,
+    device: torch.device,
+    train_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.Module,
+    epoch: int,
+) -> tuple[float, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    # Dataset (as opposed to IterableDataset) always supports len(), but the
+    # DataLoader.dataset attribute is typed against the common base.
+    assert isinstance(train_loader.dataset, Sized)
+    dataset_size = len(train_loader.dataset)
 
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -72,7 +88,7 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch):
         # Print progress
         if batch_idx % 100 == 0:
             print(
-                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} "
+                f"Train Epoch: {epoch} [{batch_idx * len(data)}/{dataset_size} "
                 f"({100.0 * batch_idx / len(train_loader):.0f}%)]\t"
                 f"Loss: {loss.item():.6f}"
             )
@@ -82,7 +98,12 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch):
     return avg_loss, accuracy
 
 
-def evaluate(model, device, test_loader, criterion):
+def evaluate(
+    model: nn.Module,
+    device: torch.device,
+    test_loader: DataLoader,
+    criterion: nn.Module,
+) -> tuple[float, float]:
     """Evaluate the model on test data."""
     model.eval()
     test_loss = 0
@@ -103,7 +124,7 @@ def evaluate(model, device, test_loader, criterion):
     return avg_loss, accuracy
 
 
-def main():
+def main() -> None:
     # Hyperparameters
     batch_size = 64
     test_batch_size = 1000
@@ -140,8 +161,10 @@ def main():
     # Model, loss, and optimizer
     model = SimpleNet().to(device)
 
-    # Compile the model with mojo_backend
-    model = torch.compile(model, backend=mojo_backend, fullgraph=True)
+    # Compile the model with mojo_backend. torch.compile's stub returns a
+    # generic Callable, but the OptimizedModule it actually returns is still
+    # an nn.Module (.parameters()/.state_dict()/.train()/.eval() all work).
+    model = cast(nn.Module, torch.compile(model, backend=mojo_backend, fullgraph=True))
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=momentum)

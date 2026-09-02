@@ -23,11 +23,13 @@ def get_fully_qualified_name(func: Callable | str) -> str:
     if isinstance(func, str):
         return f"torch.Tensor.{func}"
     result = ""
-    if hasattr(func, "__module__"):
-        result += func.__module__ + "."
+    module = getattr(func, "__module__", None)
+    if isinstance(module, str):
+        result += module + "."
 
-    if hasattr(func, "__qualname__"):
-        result += func.__qualname__
+    qualname = getattr(func, "__qualname__", None)
+    if isinstance(qualname, str):
+        result += qualname
 
     result += " of type " + str(type(func)) + " "
     return result

@@ -12,22 +12,22 @@ _rng_states: dict[int, tuple[int, int]] = {}
 _rng_lock = threading.Lock()
 
 
-def cpu():
+def cpu() -> torch.device:
     return torch.device(f"mojo:{len(list(get_accelerators())) - 1}")
 
 
-def _is_in_bad_fork():
+def _is_in_bad_fork() -> bool:
     return False
 
 
-def _normalize_rng_seed(seed) -> int:
+def _normalize_rng_seed(seed: int) -> int:
     value = int(seed)
     if value < -(1 << 63) or value > _UINT64_MASK:
         raise ValueError("Overflow when unpacking long long")
     return value & _UINT64_MASK
 
 
-def _rng_device_index(device=None) -> int:
+def _rng_device_index(device: "int | str | torch.device | None" = None) -> int:
     if device is None:
         index = _current_device
     elif isinstance(device, int):
@@ -42,7 +42,7 @@ def _rng_device_index(device=None) -> int:
     return index
 
 
-def manual_seed_all(seed):
+def manual_seed_all(seed: int) -> None:
     """Reset every Mojo device to the same Philox seed and counter zero."""
     global _rng_default_seed
     normalized = _normalize_rng_seed(seed)
@@ -53,11 +53,11 @@ def manual_seed_all(seed):
             _rng_states[index] = (normalized, 0)
 
 
-def device_count():
+def device_count() -> int:
     return len(list(get_accelerators()))
 
 
-def get_rng_state(device=None):
+def get_rng_state(device: "int | str | torch.device | None" = None) -> torch.Tensor:
     """Return the selected device's exact ``(seed, counter)`` state."""
     index = _rng_device_index(device)
     with _rng_lock:
@@ -66,7 +66,9 @@ def get_rng_state(device=None):
     return torch.tensor(list(encoded), dtype=torch.uint8)
 
 
-def set_rng_state(new_state, device=None):
+def set_rng_state(
+    new_state: torch.Tensor, device: "int | str | torch.device | None" = None
+) -> None:
     """Restore an exact state produced by :func:`get_rng_state`."""
     if not isinstance(new_state, torch.Tensor):
         raise TypeError("Mojo RNG state must be a torch.Tensor")
@@ -81,7 +83,9 @@ def set_rng_state(new_state, device=None):
         _rng_states[index] = (seed, counter)
 
 
-def _reserve_philox_state(device, counter_increment: int) -> tuple[int, int]:
+def _reserve_philox_state(
+    device: "int | str | torch.device | None", counter_increment: int
+) -> tuple[int, int]:
     """Atomically reserve a per-device Philox counter interval.
 
     The caller passes the returned seed/base counter to an asynchronous device
@@ -99,20 +103,20 @@ def _reserve_philox_state(device, counter_increment: int) -> tuple[int, int]:
     return seed, counter
 
 
-def is_available():
+def is_available() -> bool:
     # Always true as there is at least the CPU
     return True
 
 
-def is_initialized():
+def is_initialized() -> bool:
     return True
 
 
-def current_device():
+def current_device() -> int:
     return _current_device
 
 
-def set_device(device_idx: int):
+def set_device(device_idx: int) -> None:
     global _current_device
     if device_idx < 0 or device_idx >= device_count():
         raise ValueError(f"Invalid device index {device_idx}")
@@ -195,7 +199,7 @@ def synchronize(device: "int | str | torch.device | None" = None) -> None:
     _device_synchronize(device)
 
 
-def get_amp_supported_dtype():
+def get_amp_supported_dtype() -> list[torch.dtype]:
     return [torch.float16, torch.bfloat16]  # TODO change
 
 

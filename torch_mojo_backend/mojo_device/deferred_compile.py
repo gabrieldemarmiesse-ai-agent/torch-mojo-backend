@@ -50,7 +50,7 @@ from torch_mojo_backend.eager_kernels import call_queue
 _DEVICE_LOCK = call_queue._LOCK
 
 
-def _direct(func: object, args: tuple, kwargs: dict) -> object:
+def _direct(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
     """Execute one aten op through the PrivateUse1 kernels."""
     with _DEVICE_LOCK:
         call_queue.order_direct_launch()
@@ -74,7 +74,7 @@ def _crosses_device(args: tuple, kwargs: dict) -> bool:
     return len(devices) > 1
 
 
-def dispatch(func: object, args: tuple, kwargs: dict) -> object:
+def dispatch(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
     """Entry point called from TorchMojoTensor.__torch_dispatch__."""
     if not call_queue.enabled():
         return _direct(func, args, kwargs)

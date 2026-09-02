@@ -67,7 +67,8 @@ Per-op call, (64, 64) float32 on the GPU mojo_device:
 | torch native CUDA eager (reference) | ~21 |
 
 End-to-end speedup today: **~50×**; the remaining ~24 µs over the bare
-call is the PyTorch dispatcher + `TorchMojoTensor` wrapping + beartype,
+call is the PyTorch dispatcher + `TorchMojoTensor` wrapping (beartype's
+runtime checking has since been replaced by static `ty` checks),
 which can be shaved independently.
 
 ## Compile granularity: one `.so` per variant, built in the background
@@ -286,8 +287,9 @@ Three structural changes, in order of impact:
    access. Fast-path tensors that only ever feed other fast ops (the vast
    majority) never construct one (~1.7 µs + a sharding-mesh init each);
    slow-path fallbacks materialize it on demand.
-3. **Hot functions opt out of beartype** with `@typing.no_type_check`
-   (the claw hook honors it), and the device lookup is `functools.cache`d.
+3. **Hot functions carried no runtime type checking** (historically a
+   beartype opt-out; checking is static via `ty` now), and the device
+   lookup is `functools.cache`d.
 
 Resulting per-op end-to-end costs at the torch level (H100 box): view
 ~8 µs, relu ~10 µs, addmm ~20 µs, conv ~35 µs — at which point resnet-18

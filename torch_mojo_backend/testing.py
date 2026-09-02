@@ -1,15 +1,17 @@
 import contextlib
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
 from torch_mojo_backend import mojo_backend
+from torch_mojo_backend.types import CountedCallable
 
 
 @contextlib.contextmanager
-def _xfail_if_unsupported(device):
+def _xfail_if_unsupported(device: str) -> Iterator[None]:
     """xfail (rather than fail) when the mojo eager backend raises
     NotImplementedError for an input its fast kernels don't cover.
 
@@ -41,12 +43,12 @@ class CallChecker:
     fast path (eager) — no per-test bookkeeping needed.
     """
 
-    def __init__(self):
-        self._functions_to_check = None
-        self._counts_before_starting_to_check = None
+    def __init__(self) -> None:
+        self._functions_to_check: tuple[CountedCallable, ...] | None = None
+        self._counts_before_starting_to_check: list[int] | None = None
 
     @staticmethod
-    def _fast_twins(func: Callable) -> list[Callable]:
+    def _fast_twins(func: Callable) -> list[CountedCallable]:
         """The aten_fast counterparts of an aten_functions twin.
 
         Matches `fast_<name>` and its variants `fast_<name>_<suffix>` (e.g.
@@ -71,7 +73,7 @@ class CallChecker:
         return twins
 
     @staticmethod
-    def _eager_twins(func: Callable) -> list[Callable]:
+    def _eager_twins(func: Callable) -> list[CountedCallable]:
         """The instrumented mojo registration(s) whose op matches an
         aten_functions twin. Covers ops implemented as custom / out-variant
         registrations (empty_like, mean.out, normal_, ...) that don't route
@@ -106,11 +108,21 @@ class CallChecker:
                 twins.append(counter)
         return twins
 
-    def register(self, *funcs: Callable):
-        expanded: list[Callable] = []
+    def register(self, *funcs: Callable) -> None:
+        """Register the functions expected to run.
+
+        `funcs` are typed `Callable` (each caller's own precise signature,
+        e.g. `aten_functions.aten_min`), not `CountedCallable`: under tests
+        `map_to`/`register_aten_op` always wrap them with a `call_count`
+        attribute, but that fact is deliberately hidden from their static
+        type (see `aten_functions.map_to`) so callers elsewhere keep a
+        precise signature. Cast here, at the one place that relies on it.
+        """
+        expanded: list[CountedCallable] = []
         for func in funcs:
-            if func not in expanded:
-                expanded.append(func)
+            counted_func = cast(CountedCallable, func)
+            if counted_func not in expanded:
+                expanded.append(counted_func)
             for twin in self._fast_twins(func) + self._eager_twins(func):
                 if twin not in expanded:
                     expanded.append(twin)
@@ -119,8 +131,11 @@ class CallChecker:
             f.call_count for f in self._functions_to_check
         ]
 
-    def check_was_called(self):
-        if self._functions_to_check is None:
+    def check_was_called(self) -> None:
+        if (
+            self._functions_to_check is None
+            or self._counts_before_starting_to_check is None
+        ):
             raise ValueError(
                 "No function to check was set, call call_checker.register first"
             )
@@ -141,9 +156,9 @@ def check_functions_are_equivalent(
     device: str | None,
     inputs: list[torch.Tensor],
     fn_compiled: Callable | None = None,
-    rtol=None,
-    atol=None,
-):
+    rtol: float | None = None,
+    atol: float | None = None,
+) -> None:
     fn_compiled = fn_compiled or torch.compile(backend=mojo_backend)(fn)
     if device is not None:
         inputs = [input_tensor.to(device) for input_tensor in inputs]
@@ -184,8 +199,13 @@ def to_device(tensors: list[torch.Tensor], device: str) -> list[torch.Tensor]:
 
 
 def check_outputs(
-    fn: Callable, conf: Conf, inputs: list[torch.Tensor], *, rtol=None, atol=None
-):
+    fn: Callable,
+    conf: Conf,
+    inputs: list[torch.Tensor],
+    *,
+    rtol: float | None = None,
+    atol: float | None = None,
+) -> None:
     # We compare to eager cpu execution
     # We first check if the function has a device argument
     has_device_arg = "device" in inspect.signature(fn).parameters

@@ -18,22 +18,30 @@ default-stream-ordered); nothing is fenced implicitly.
 """
 
 import threading
-from types import ModuleType
+from typing import TYPE_CHECKING, Protocol
 
 import max.driver
 
-# The Mojo extension carrying the fence-event functions, resolved on first
-# use so that importing this module never triggers a Mojo kernel build.
-_tensor_holder: ModuleType | None = None
+if TYPE_CHECKING:
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import _TensorHolderModule
 
 
-def _holder_mod() -> ModuleType:
-    global _tensor_holder
-    if _tensor_holder is None:
-        from torch_mojo_backend import eager_kernels
+def _holder_mod() -> "_TensorHolderModule":
+    # Lazy: importing this module must not trigger a Mojo kernel build.
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+        _holder_mod as holder_mod,
+    )
 
-        _tensor_holder = eager_kernels.tensor_holder
-    return _tensor_holder
+    return holder_mod()
+
+
+class _ForeignUseRecorder(Protocol):
+    """`torch_mojo_tensor._HolderOwner`, structurally (importing it here would
+    be circular)."""
+
+    def record_foreign_use(
+        self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
+    ) -> None: ...
 
 
 def default_stream_ctx_ptr(device: max.driver.Device) -> int:
@@ -158,7 +166,7 @@ def default_stream(device: max.driver.Device) -> Stream:
 
 
 def record_use(
-    holder: object, stream: Stream, owner_ctx_ptr: int | None = None
+    holder: _ForeignUseRecorder, stream: Stream, owner_ctx_ptr: int | None = None
 ) -> None:
     """Order `holder`'s eventual free after `stream` work enqueued so far.
 
@@ -181,7 +189,7 @@ def record_use(
 
 
 def record_use_on_stream_ctx(
-    holder: object, stream_ctx_ptr: int, owner_ctx_ptr: int
+    holder: _ForeignUseRecorder, stream_ctx_ptr: int, owner_ctx_ptr: int
 ) -> None:
     """``record_use`` for a bare stream context pointer instead of a Stream.
 

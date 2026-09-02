@@ -3,13 +3,21 @@
 import inspect
 import subprocess
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol, cast
 
 import pytest
 
 from torch_mojo_backend import eager_kernels
+
+
+class _NativeCallModule(Protocol):
+    """A loaded Mojo extension module: `ModuleType` plus its `call` ABI."""
+
+    call: Callable[..., object]
 
 
 def test_defines_are_canonical_independent_of_mapping_order() -> None:
@@ -163,7 +171,7 @@ def test_loader_reuses_one_variant_per_distinct_define_set(
 
     def fake_load_extension(module_name: str, so_path: Path) -> ModuleType:
         module = ModuleType(f"loaded_{so_path.stem}")
-        module.call = lambda: so_path.name  # type: ignore[attr-defined]
+        cast(_NativeCallModule, module).call = lambda: so_path.name
         loaded.append(module)
         return module
 
@@ -378,7 +386,7 @@ def test_prepared_call_invokes_only_constant_call_entrypoint() -> None:
         assert isinstance(output, _TensorMetadata)
         return output
 
-    module.call = call  # type: ignore[attr-defined]
+    cast(_NativeCallModule, module).call = call
 
     class FakeLoader(eager_kernels.MojoExtensionLoader):
         def load_canonical(
@@ -447,7 +455,7 @@ def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch) -
     def call(label: str) -> None:
         launches.append(label)
 
-    module.call = call  # type: ignore[attr-defined]
+    cast(_NativeCallModule, module).call = call
     unit.ext = module
     queue.drain()
 
@@ -490,5 +498,16 @@ def test_spec_descriptor_canonical_defines_match_make_defines() -> None:
         (aten_fast._MatmulSpecExtension, ("MatmulSpec", (a, b), 1)),
     ]
     for extension, args in cases:
-        expected = eager_kernels.normalize_defines(extension.make_defines(*args))
-        assert extension.make_canonical_defines(*args) == expected, extension.__name__
+        # Each row pairs one concrete MojoExtension subclass with the args
+        # tuple shaped for THAT subclass's own make_defines signature (the
+        # documented per-descriptor call ABI, see MojoExtension in
+        # eager_kernels/__init__.py) -- a heterogeneous list can't correlate
+        # `extension` with `args` per row for the type checker, only at
+        # runtime.
+        expected = eager_kernels.normalize_defines(
+            extension.make_defines(*args)  # ty: ignore[missing-argument, invalid-argument-type, too-many-positional-arguments]
+        )
+        assert (
+            extension.make_canonical_defines(*args)  # ty: ignore[missing-argument, invalid-argument-type, too-many-positional-arguments]
+            == expected
+        ), extension.__name__

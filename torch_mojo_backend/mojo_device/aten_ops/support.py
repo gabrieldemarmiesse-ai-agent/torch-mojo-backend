@@ -7,8 +7,11 @@ implementation module ever has to import another one.
 """
 
 from collections.abc import Callable
+from types import ModuleType
+from typing import NoReturn
 
 import torch
+from max.dtype import DType
 
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
@@ -25,7 +28,7 @@ _COMPOSITE_EXPLICIT_AUTOGRAD = torch._C.DispatchKeySet(
 _aten_fast_module = None
 
 
-def _fast():
+def _fast() -> ModuleType:
     """The aten_fast module.
 
     Imported lazily: the first import triggers the (cached) Mojo kernel
@@ -39,13 +42,13 @@ def _fast():
     return _aten_fast_module
 
 
-def max_dtype_to_torch_dtype(dtype):
+def max_dtype_to_torch_dtype(dtype: DType) -> torch.dtype:
     from max.experimental.torch import max_dtype_to_torch
 
     return max_dtype_to_torch(dtype)
 
 
-def _describe_args(args, kwargs) -> str:
+def _describe_args(args: tuple[object, ...], kwargs: dict[str, object]) -> str:
     descs = []
     for a in list(args) + list(kwargs.values()):
         if isinstance(a, TorchMojoTensor):
@@ -55,7 +58,9 @@ def _describe_args(args, kwargs) -> str:
     return ", ".join(descs) or "none"
 
 
-def _unsupported(op_name: str, args=(), kwargs=None) -> NotImplementedError:
+def _unsupported(
+    op_name: str, args: tuple[object, ...] = (), kwargs: dict[str, object] | None = None
+) -> NotImplementedError:
     return NotImplementedError(
         f"{op_name} is not supported by mojo eager mode for these inputs "
         f"(tensor args: {_describe_args(args, kwargs or {})}). The graph "
@@ -106,7 +111,7 @@ def _eager_impl(fast_name: str, op_name: str) -> Callable:
     fast_fn: Callable | None = None
     not_handled = None
 
-    def dispatcher(*args, **kwargs):
+    def dispatcher(*args: object, **kwargs: object) -> object:
         nonlocal fast_fn, not_handled
         if fast_fn is None:
             aten_fast = _fast()
@@ -126,7 +131,7 @@ def _not_implemented(op_name: str) -> Callable:
     unregistered) so users get an actionable message, and so the remaining
     surface is greppable."""
 
-    def raiser(*args, **kwargs):
+    def raiser(*args: object, **kwargs: object) -> NoReturn:
         raise _unsupported(op_name, args, kwargs)
 
     return raiser
@@ -145,11 +150,15 @@ def _copy_into_tensor(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     aten_fast._copy_into(dst, src)
 
 
-def _out_variant(op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast"):
+def _out_variant(
+    op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast"
+) -> Callable:
     """Wrap a functional fast implementation as an out= variant: compute,
     then copy into `out` (strided-safe)."""
 
-    def dispatcher(*args, out: TorchMojoTensor, **kwargs):
+    def dispatcher(
+        *args: object, out: TorchMojoTensor, **kwargs: object
+    ) -> TorchMojoTensor:
         if not isinstance(out, TorchMojoTensor):
             raise RuntimeError(f"{op_name}: expected out to be a mojo tensor")
 

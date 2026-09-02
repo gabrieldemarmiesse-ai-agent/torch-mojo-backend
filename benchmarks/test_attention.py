@@ -10,6 +10,8 @@ single-sequence decode-prefill regime.  All cases are causal.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -35,16 +37,18 @@ SKIPPED: dict[str, str] = {}
 
 def _qkv(
     shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
-) -> tuple[list[torch.Tensor], list[torch.Tensor], float]:
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    float,
+]:
     b, h, s, d = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
-    refs, ours = [], []
-    for _ in range(3):
-        ref, our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
-        refs.append(ref)
-        ours.append(our)
+    q_ref, q_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
+    k_ref, k_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
+    v_ref, v_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
     flops = 4.0 * b * h * s * s * d / 2.0  # causal halves the score matrix
-    return refs, ours, flops
+    return (q_ref, k_ref, v_ref), (q_our, k_our, v_our), flops
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f16"))
@@ -127,7 +131,7 @@ def test_sdpa_flash_backward(
         torch.randn(b, h, s, d, dtype=DTYPES[dtype_id]), hw, mojo_device
     )
 
-    def forward(leg: list[torch.Tensor]) -> tuple:
+    def forward(leg: Sequence[torch.Tensor]) -> tuple:
         return torch.ops.aten._scaled_dot_product_flash_attention(
             *leg, 0.0, True, False
         )
@@ -140,7 +144,7 @@ def test_sdpa_flash_backward(
     except NotImplementedError as exc:
         pytest.skip(f"not supported on the mojo device: {exc}")
 
-    def backward(grad: torch.Tensor, leg: list[torch.Tensor], fwd: tuple) -> tuple:
+    def backward(grad: torch.Tensor, leg: Sequence[torch.Tensor], fwd: tuple) -> tuple:
         out, logsumexp, cum_q, cum_k, max_q, max_k, seed, offset, _ = fwd
         return torch.ops.aten._scaled_dot_product_flash_attention_backward(
             grad,

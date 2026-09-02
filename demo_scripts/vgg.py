@@ -4,7 +4,10 @@ from io import BytesIO
 import requests
 import torch
 from PIL import Image
-from torchvision import models, transforms
+
+# torchvision is a demo-only extra, not a project dependency (pip install it
+# yourself to run this script).
+from torchvision import models, transforms  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import register_mojo_devices
 
@@ -33,7 +36,7 @@ preprocess = transforms.Compose(
 )
 
 
-def load_image(image_path_or_url):
+def load_image(image_path_or_url: str) -> Image.Image:
     if image_path_or_url.startswith("http"):
         response = requests.get(image_path_or_url)
         image = Image.open(BytesIO(response.content))
@@ -46,14 +49,14 @@ def load_image(image_path_or_url):
     return image
 
 
-def load_imagenet_labels():
+def load_imagenet_labels() -> list[str]:
     url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
     response = requests.get(url)
     labels = response.text.strip().split("\n")
     return labels
 
 
-def predict_image(image_path_or_url, top_k=5):
+def predict_image(image_path_or_url: str, top_k: int = 5) -> None:
     image = load_image(image_path_or_url)
 
     input_tensor = preprocess(image)
@@ -72,7 +75,7 @@ def predict_image(image_path_or_url, top_k=5):
 
     print("Top Predictions: (boxer should come first)")
     for i in range(top_k):
-        class_idx = top_class[i].item()
+        class_idx = int(top_class[i].item())
         prob = top_prob[i].item()
         label = labels[class_idx]
         print(f"{i + 1:2d}. {label:30s} ({prob:.3f})")

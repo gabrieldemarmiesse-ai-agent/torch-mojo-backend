@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from torch_mojo_backend import TorchMojoTensor
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
@@ -20,7 +21,9 @@ def test_mul_out_resize_preserves_existing_storage_alias(
 ):
     _watch_eager_op(call_checker, "aten::mul.out")
     base = torch.arange(8, dtype=torch.float32).to(mojo_gpu)
+    assert isinstance(base, TorchMojoTensor)
     out = base[storage_offset:storage_offset]
+    assert isinstance(out, TorchMojoTensor)
     lhs = torch.tensor([2.0, 3.0], device=mojo_gpu)
     rhs = torch.tensor([5.0, 7.0], device=mojo_gpu)
     holder = base._holder
@@ -45,6 +48,7 @@ def test_resized_out_invalidates_cached_tensor_spec(
     from torch_mojo_backend.eager_kernels.aten_fast import _spec_of
 
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    assert isinstance(out, TorchMojoTensor)
     _spec_of(out)
     assert "_spec" in out.__dict__
 

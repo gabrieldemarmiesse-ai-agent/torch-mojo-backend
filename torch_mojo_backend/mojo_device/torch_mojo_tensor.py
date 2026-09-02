@@ -3,8 +3,9 @@ import math
 import sys
 import threading
 from collections import deque
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Protocol, cast, runtime_checkable
 
 import max.driver
 import torch
@@ -20,17 +21,52 @@ from torch_mojo_backend.eager_kernels.output_specs import (
 )
 from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
 
+
+class _MojoTensorHolder(Protocol):
+    """The Mojo `TensorHolder` owning one device allocation (no Python stubs)."""
+
+    def data_ptr(self) -> int: ...
+    def get_nbytes(self) -> int: ...
+
+
+@runtime_checkable
+class _TensorHolderModule(Protocol):
+    """The subset of the JIT-compiled `tensor_holder` Mojo extension this
+    file calls directly. The module itself has no stubs (its source is
+    Mojo, not Python); every member here is a raw PythonObject-in,
+    PythonObject-out native call, so `object` is the honest signature."""
+
+    def alloc(self, ctx_ptr: int, nbytes: int) -> tuple[_MojoTensorHolder, int]: ...
+    def alloc_from_host(
+        self, ctx_ptr: int, data_ptr: int, nbytes: int
+    ) -> tuple[_MojoTensorHolder, int, object]: ...
+    def copy_to_host(
+        self, ctx_ptr: int, src_ptr: int, dst_ptr: int, nbytes: int
+    ) -> object: ...
+    def copy_to_pinned_host(
+        self, ctx_ptr: int, src_ptr: int, nbytes: int
+    ) -> tuple[object, int]: ...
+    def CopyStrided(self, *args: object) -> object: ...
+    def copy_d2d(
+        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
+    ) -> None: ...
+    def fence_event_record(self, ctx_ptr: int) -> object: ...
+    def fence_event_wait(self, ctx_ptr: int, event: object) -> None: ...
+
+
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
 # resolved lazily so that importing torch_mojo_backend never triggers a Mojo
 # kernel compile.
-_tensor_holder = None
+_tensor_holder: _TensorHolderModule | None = None
 
 
-def _holder_mod():
+def _holder_mod() -> _TensorHolderModule:
     global _tensor_holder
-    if _tensor_holder is None:
-        _tensor_holder = eager_kernels.tensor_holder
-    return _tensor_holder
+    holder = _tensor_holder
+    if holder is None:
+        holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
+        _tensor_holder = holder
+    return holder
 
 
 # GPU H2D copies consume a MAX-owned pinned staging allocation asynchronously.
@@ -76,17 +112,29 @@ class _HolderOwner:
 
     __slots__ = ("_holder", "_events", "_owner_ctx", "_wait")
 
-    def __init__(self, holder: object) -> None:
+    # A compile-backend output is owned by its MAX Buffer instead (compiler.py).
+    _holder: _MojoTensorHolder | max.driver.Buffer
+    _events: dict[int, object] | None  # {foreign stream ctx ptr: newest FenceEvent}
+    _owner_ctx: int | None
+    _wait: Callable[[int, object], None] | None
+
+    def __init__(self, holder: "_MojoTensorHolder | max.driver.Buffer") -> None:
         self._holder = holder
-        self._events = None  # {foreign stream ctx ptr: newest FenceEvent}
+        self._events = None
         self._owner_ctx = None
         self._wait = None
 
     def data_ptr(self) -> int:
-        return self._holder.data_ptr()
+        holder = self._holder
+        if isinstance(holder, max.driver.Buffer):
+            return holder._data_ptr()
+        return holder.data_ptr()
 
     def get_nbytes(self) -> int:
-        return self._holder.get_nbytes()
+        holder = self._holder
+        if isinstance(holder, max.driver.Buffer):
+            return holder.num_elements * holder.dtype.size_in_bytes
+        return holder.get_nbytes()
 
     def record_foreign_use(
         self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
@@ -100,31 +148,34 @@ class _HolderOwner:
         self._events[stream_ctx_ptr] = event
 
     def __del__(self) -> None:
-        events = self._events
-        if not events or _is_finalizing():
+        events, wait, owner_ctx = self._events, self._wait, self._owner_ctx
+        if not events or wait is None or owner_ctx is None or _is_finalizing():
             return
         for event in events.values():
-            self._wait(self._owner_ctx, event)
+            wait(owner_ctx, event)
 
 
-def _ctx_ptr(device):
+def _ctx_ptr(device: max.driver.Device) -> int:
     # Rebinds this module-level name to the real (cached) implementation on
     # first use, so the lazy import costs one call, not one per call.
     global _ctx_ptr
     from torch_mojo_backend.eager_kernels import _ctx_ptr as real_ctx_ptr
 
-    _ctx_ptr = real_ctx_ptr
+    # Self-rebind via `global`: ty compares the two same-shaped `def`s
+    # nominally, not structurally, and treats reassigning a function to
+    # (what is, at runtime,) itself as unsound.
+    _ctx_ptr = real_ctx_ptr  # ty: ignore[invalid-assignment]
     return real_ctx_ptr(device)
 
 
-def _retain_failed_transfer_owner(device, owner: object) -> object:
+def _retain_failed_transfer_owner(device: max.driver.Device, owner: object) -> object:
     token = object()
     with _FAILED_TRANSFER_OWNERS_LOCK:
         _FAILED_TRANSFER_OWNERS.setdefault(device, []).append((token, owner))
     return token
 
 
-def _forget_failed_transfer_owner(device, token: object) -> None:
+def _forget_failed_transfer_owner(device: max.driver.Device, token: object) -> None:
     with _FAILED_TRANSFER_OWNERS_LOCK:
         retained = _FAILED_TRANSFER_OWNERS.get(device)
         if retained is None:
@@ -134,7 +185,9 @@ def _forget_failed_transfer_owner(device, token: object) -> None:
             _FAILED_TRANSFER_OWNERS.pop(device, None)
 
 
-def _record_h2d_source(device, source: object, non_blocking: bool) -> None:
+def _record_h2d_source(
+    device: max.driver.Device, source: object, non_blocking: bool
+) -> None:
     """Retain a pinned transfer owner until its default-stream H2D ends."""
     # MAX's CPU device uses a worker pool whose copies are not stream-ordered
     # with kernels. The Mojo helper drains it before returning; keep the Python
@@ -171,7 +224,7 @@ def _record_h2d_source(device, source: object, non_blocking: bool) -> None:
         # event keeps its exact source alive until DMA completion.
 
 
-def _release_synchronized_h2d_sources(device) -> None:
+def _release_synchronized_h2d_sources(device: max.driver.Device) -> None:
     """Drop ready sources after the caller synchronized ``device``'s stream.
 
     Another thread may enqueue a transfer between the stream synchronization
@@ -186,7 +239,7 @@ def _release_synchronized_h2d_sources(device) -> None:
             _PENDING_H2D.pop(device, None)
 
 
-def _record_d2h_owner(device, owner: object) -> None:
+def _record_d2h_owner(device: max.driver.Device, owner: object) -> None:
     """Retain a pinned D2H allocation until its default-stream DMA ends."""
     try:
         event = device.default_stream.record_event()
@@ -207,7 +260,7 @@ def _record_d2h_owner(device, owner: object) -> None:
             pending.popleft()
 
 
-def _release_synchronized_d2h_owners(device) -> None:
+def _release_synchronized_d2h_owners(device: max.driver.Device) -> None:
     """Drop pinned D2H owners whose stream events have completed."""
     with _PENDING_D2H_LOCK:
         pending = _PENDING_D2H.get(device)
@@ -240,7 +293,15 @@ class MojoTensorLike(Protocol):
     _device: object
 
 
-def _dispatch_entry(func: object, args: tuple, kwargs: dict) -> object:
+def _device_of(tensor: MojoTensorLike) -> max.driver.Device:
+    """MojoTensorLike._device is `object` for host-contract test doubles
+    (checked invariantly, so even TorchMojoTensor's own concrete Device
+    can't narrow the Protocol member); real operands are always a
+    TorchMojoTensor with a genuine Device."""
+    return cast(max.driver.Device, tensor._device)
+
+
+def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
     """``deferred_compile.dispatch``, resolved on first use.
 
     ``deferred_compile`` imports the call queue this module feeds, so it
@@ -252,22 +313,36 @@ def _dispatch_entry(func: object, args: tuple, kwargs: dict) -> object:
     global _dispatch_entry
     from . import deferred_compile
 
-    _dispatch_entry = deferred_compile.dispatch
+    # Same nominal-vs-structural self-rebind quirk as _ctx_ptr above, even
+    # though both sides print identically.
+    _dispatch_entry = deferred_compile.dispatch  # ty: ignore[invalid-assignment]
     return _dispatch_entry(func, args, kwargs)
+
+
+@runtime_checkable
+class _SynchronizableStream(Protocol):
+    def synchronize(self) -> None: ...
 
 
 @runtime_checkable
 class _SynchronizableDevice(Protocol):
     """What allocation recovery needs from a device: a default stream it can
     synchronize. ``max.driver.Device`` satisfies it; host-contract tests use
-    lightweight stand-ins."""
+    lightweight stand-ins.
 
-    default_stream: object
+    ``default_stream`` is a ``@property`` (not a plain data attribute) so it
+    is checked covariantly: a data member would be checked invariantly and
+    ``max.driver.Device``'s own concrete ``default_stream`` -> ``DeviceStream``
+    property could never satisfy it.
+    """
+
+    @property
+    def default_stream(self) -> _SynchronizableStream: ...
 
 
 def _alloc_with_recovery(
     device: _SynchronizableDevice, nbytes: int
-) -> tuple[object, int]:
+) -> tuple[_MojoTensorHolder, int]:
     """One device allocation, with the reactive last resort under the budget.
 
     When the allocator refuses, the largest reclaimable set is whatever the
@@ -281,7 +356,11 @@ def _alloc_with_recovery(
     propagate untouched.
     """
     holder_mod = _holder_mod()
-    ctx_ptr = _ctx_ptr(device)
+    # _ctx_ptr wants a real max.driver.Device; production always passes one
+    # here (only its default_stream is used above), and host-contract tests
+    # that pass a lighter _SynchronizableDevice stand-in monkeypatch
+    # `_ctx_ptr` itself rather than calling into the real implementation.
+    ctx_ptr = _ctx_ptr(cast(max.driver.Device, device))
     try:
         return holder_mod.alloc(ctx_ptr, nbytes)
     except Exception as exc:
@@ -299,14 +378,14 @@ def _alloc_with_recovery(
         return holder_mod.alloc(ctx_ptr, nbytes)
 
 
-def _row_major_strides(shape) -> tuple[int, ...]:
+def _row_major_strides(shape: Sequence[int]) -> tuple[int, ...]:
     strides = [1] * len(shape)
     for i in range(len(shape) - 2, -1, -1):
         strides[i] = strides[i + 1] * shape[i + 1]
     return tuple(strides)
 
 
-def _compute_contiguous(shape, strides) -> bool:
+def _compute_contiguous(shape: Sequence[int], strides: Sequence[int]) -> bool:
     """torch's relaxed contiguity: size-1 dims never break contiguity."""
     expected = 1
     for size, stride in zip(reversed(shape), reversed(strides)):
@@ -320,10 +399,10 @@ def _compute_contiguous(shape, strides) -> bool:
 
 # max DType -> torch dtype, cached as a plain dict: max_dtype_to_torch is
 # called once per tensor wrapper created (~600/decode step).
-_TORCH_DTYPE_OF: dict = {}
+_TORCH_DTYPE_OF: dict[DType, torch.dtype] = {}
 
 
-def _torch_dtype_of(dtype):
+def _torch_dtype_of(dtype: DType) -> torch.dtype:
     td = _TORCH_DTYPE_OF.get(dtype)
     if td is None:
         td = _TORCH_DTYPE_OF[dtype] = max_dtype_to_torch(dtype)
@@ -334,10 +413,10 @@ def _torch_dtype_of(dtype):
 # once per wrapper created so the `device` property is a plain attribute
 # read — which also lets dynamo trace `x.device` inside compiled functions
 # (the property body must not construct max.driver objects).
-_TORCH_DEVICE_OF: dict = {}
+_TORCH_DEVICE_OF: dict[max.driver.Device, torch.device] = {}
 
 
-def _torch_device_of(device):
+def _torch_device_of(device: max.driver.Device) -> torch.device:
     td = _TORCH_DEVICE_OF.get(device)
     if td is None:
         if device == CPU():
@@ -352,7 +431,7 @@ def _torch_device_of(device):
 MAX_RANK = 8
 
 
-def _pad8(values, fill: int) -> tuple[int, ...]:
+def _pad8(values: Sequence[int], fill: int) -> tuple[int, ...]:
     values = tuple(values)
     if len(values) > MAX_RANK:
         raise NotImplementedError(
@@ -382,8 +461,28 @@ class TorchMojoTensor(torch.Tensor):
     output for backward, preserving the Python-side allocation payload.
     """
 
+    # Declared here (not just assigned in `_make`) so the type checker
+    # resolves reads across the codebase; matches `_PAYLOAD_ATTRIBUTES` below.
+    _holder: _HolderOwner
+    _ptr: int
+    _shape: tuple[int, ...]
+    _mojo_strides: tuple[int, ...]
+    _offset: int
+    _dtype: DType
+    _itemsize: int
+    _numel: int
+    _device: max.driver.Device
+    _torch_device: torch.device
+    _is_contiguous: bool
+
     @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(
+        cls,
+        func: torch._ops.OpOverload,
+        types: Sequence[type],
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> object:
         """Redispatch wrapper operations to the existing Mojo backend kernels."""
         # Give higher-priority wrappers such as FakeTensor and
         # FunctionalTensor their opportunity to handle mixed-subclass calls.
@@ -402,7 +501,15 @@ class TorchMojoTensor(torch.Tensor):
 
     @classmethod
     def _make(
-        cls, holder, ptr, shape, strides, offset, dtype, device, contiguous=None
+        cls,
+        holder: "_HolderOwner | _MojoTensorHolder | max.driver.Buffer",
+        ptr: int,
+        shape: Sequence[int],
+        strides: Sequence[int],
+        offset: int,
+        dtype: DType,
+        device: max.driver.Device,
+        contiguous: bool | None = None,
     ) -> "TorchMojoTensor":
         if not isinstance(holder, _HolderOwner):
             holder = _HolderOwner(holder)
@@ -435,7 +542,7 @@ class TorchMojoTensor(torch.Tensor):
 
     @classmethod
     def _alloc(
-        cls, shape, dtype: DType, device: max.driver.Device
+        cls, shape: Sequence[int], dtype: DType, device: max.driver.Device
     ) -> "TorchMojoTensor":
         """A new contiguous uninitialized tensor (one device allocation)."""
         shape = tuple(shape)
@@ -455,7 +562,12 @@ class TorchMojoTensor(torch.Tensor):
 
     @classmethod
     def _view_of(
-        cls, base: "TorchMojoTensor", shape, strides, offset, contiguous=None
+        cls,
+        base: "TorchMojoTensor",
+        shape: Sequence[int],
+        strides: Sequence[int],
+        offset: int,
+        contiguous: bool | None = None,
     ) -> "TorchMojoTensor":
         """A zero-copy view: shares base's holder, new layout metadata.
 
@@ -584,7 +696,7 @@ class TorchMojoTensor(torch.Tensor):
         """self if already contiguous, else a materialized copy."""
         return self if self._is_contiguous else self._materialize_contiguous()
 
-    def __dlpack__(self, *, stream=None, **_unused):
+    def __dlpack__(self, *, stream: int | None = None, **_unused: object) -> object:
         """Export the device allocation as a "dltensor" capsule.
 
         torch's inherited `__dlpack__` would export the zero-byte meta
@@ -609,12 +721,14 @@ class TorchMojoTensor(torch.Tensor):
             src._holder, src._ptr, src._shape, src._dtype, src._device
         )
 
-    def __dlpack_device__(self):
+    def __dlpack_device__(self) -> tuple[int, int]:
         from torch_mojo_backend.mojo_device import dlpack
 
         return dlpack.dlpack_device(self._device)
 
-    def __coerce_same_metadata_as_tangent__(self, expected_meta, expected_type=None):
+    def __coerce_same_metadata_as_tangent__(
+        self, expected_meta: object, expected_type: type | None = None
+    ) -> "TorchMojoTensor | None":
         """Accept mojo tensors as backward tangents under torch.compile.
 
         AOTAutograd guesses tangent types from fake tensors, which are plain
@@ -626,7 +740,7 @@ class TorchMojoTensor(torch.Tensor):
             return None
         return self
 
-    def __reduce_ex__(self, protocol):
+    def __reduce_ex__(self, protocol: int) -> object:
         """Pickle as a portable plain CPU tensor.
 
         torch.Tensor's reduce would pickle this subclass's `__dict__`, which
@@ -639,7 +753,7 @@ class TorchMojoTensor(torch.Tensor):
             return self._to_cpu_tensor().__reduce_ex__(protocol)
         return super().__reduce_ex__(protocol)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if hasattr(self, "_holder"):
             return f"TorchMojoTensor({self._to_cpu_tensor()!r}, device='{self.device}')"
         return super().__repr__()
@@ -659,7 +773,7 @@ class TorchMojoTensor(torch.Tensor):
     # MAX backend cannot supply). It is also slower than the C++ accessor.
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         # A plain attribute read so dynamo can trace `x.device` in compiled
         # functions (e.g. `torch.arange(T, device=idx.device)`).
         if hasattr(self, "_torch_device"):
@@ -690,11 +804,18 @@ class TorchMojoTensor(torch.Tensor):
                 )
             _rebind_payload_exact(self, value)
             return
-        torch._C.TensorBase.data.__set__(self, value)
+        # torch's stub types `TensorBase.data` as a plain Tensor (the
+        # instance-level property return), not the getset_descriptor it
+        # actually is when accessed on the class -- real at runtime, just
+        # unmodeled by the stub.
+        torch._C.TensorBase.data.__set__(self, value)  # ty: ignore[unresolved-attribute]
 
     # Only the setter is overridden; reads keep going straight to the C++
     # getset descriptor so nothing about `x.data` changes for dynamo.
-    data = property(torch._C.TensorBase.data.__get__, _set_data)
+    data = property(
+        torch._C.TensorBase.data.__get__,  # ty: ignore[unresolved-attribute]
+        _set_data,
+    )
 
     __torch_function__ = torch._C._disabled_torch_function_impl
 
@@ -723,7 +844,9 @@ class _PermuteCopyExtension(
 
     @classmethod
     def expected_output_specs(cls, tensor: MojoTensorLike) -> _TensorOutputSpec:
-        return _TensorOutputSpec(tuple(tensor._shape), tensor._dtype, tensor._device)
+        return _TensorOutputSpec(
+            tuple(tensor._shape), tensor._dtype, _device_of(tensor)
+        )
 
     @classmethod
     def extension_args(
@@ -731,13 +854,17 @@ class _PermuteCopyExtension(
     ) -> tuple[object, ...]:
         rank = len(tensor._shape)
         pad = 4 - rank
+        # extension_args is only ever called with the concrete wrapper (the
+        # MojoTensorLike param type is for host-contract stand-ins in
+        # make_defines/expected_output_specs, which don't need `_ptr`).
+        mojo_tensor = cast(TorchMojoTensor, tensor)
         return (
             out._ptr,
-            tensor._ptr,
+            mojo_tensor._ptr,
             (1,) * pad + tuple(tensor._shape),
             (0,) * pad + tuple(tensor._mojo_strides),
             tensor._dtype.size_in_bytes,
-            _ctx_ptr(tensor._device),
+            _ctx_ptr(_device_of(tensor)),
         )
 
 
@@ -758,14 +885,16 @@ _PAYLOAD_ATTRIBUTES = (
 )
 
 
-def _resize_tensorimpl(dst: TorchMojoTensor, shape) -> None:
+def _resize_tensorimpl(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
     """Set dst's TensorImpl sizes (and grow its placeholder storage)."""
     torch.ops.aten.resize_.default.redispatch(
         _CPU_KEYSET, dst, shape, memory_format=None
     )
 
 
-def _as_strided_tensorimpl(dst: TorchMojoTensor, shape, strides, offset: int) -> None:
+def _as_strided_tensorimpl(
+    dst: TorchMojoTensor, shape: Sequence[int], strides: Sequence[int], offset: int
+) -> None:
     """State dst's TensorImpl layout exactly. Metadata only, no data moved."""
     torch.ops.aten.as_strided_.default.redispatch(
         _CPU_KEYSET, dst, shape, strides, offset
@@ -846,7 +975,7 @@ def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     _as_strided_tensorimpl(dst, src._shape, src._mojo_strides, src._offset)
 
 
-def _resize_payload(dst: TorchMojoTensor, shape) -> None:
+def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
     """Resize an eager out tensor and keep aliases when storage is sufficient.
 
     PyTorch resets a resized view to contiguous strides at its existing
@@ -925,7 +1054,7 @@ def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
 
 
 @functools.cache
-def get_ordered_accelerators():
+def get_ordered_accelerators() -> list[max.driver.Device]:
     """Get accelerators ordered with GPUs first, then CPU last"""
     from torch_mojo_backend.torch_compile_backend.compiler import get_accelerators
 

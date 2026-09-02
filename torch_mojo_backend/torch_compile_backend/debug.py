@@ -7,8 +7,8 @@ and compare each intermediate result.
 This is not public yet but still useful for debugging.
 """
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
 
 import max.graph.ops as max_ops
 import torch
@@ -24,20 +24,24 @@ output_directory = Path("/tmp/.torch_mojo_backend_debug")
 output_directory_max = output_directory / "max"
 
 
-def set_print_options(session: engine.InferenceSession):
+def set_print_options(session: engine.InferenceSession) -> None:
     output_directory_max.mkdir(parents=True, exist_ok=True)
     session.set_debug_print_options(
         "BINARY_MAX_CHECKPOINT", output_directory=output_directory_max
     )
 
 
-def add_prints(node_idx: int, func_name: str, func_output: Any):
+def add_prints(node_idx: int, func_name: str, func_output: object) -> None:
     if not debug_graph():
         return
+    outputs: Sequence[TensorValue]
     if isinstance(func_output, TensorValue):
-        func_output = [func_output]
+        outputs = [func_output]
+    else:
+        assert isinstance(func_output, Sequence)
+        outputs = func_output
 
-    for i, output_tensor in enumerate(func_output):
+    for i, output_tensor in enumerate(outputs):
         label = get_tensor_label(node_idx, i, func_name)
         max_ops.print(output_tensor, label)
 
@@ -46,7 +50,7 @@ def get_tensor_label(node_idx: int, i: int, func_name: str) -> str:
     return f"node-idx-{node_idx:09}-output-{i}-function-{func_name}"
 
 
-def pp(x) -> str:
+def pp(x: object) -> str:
     if isinstance(x, torch.Tensor):
         return repr(x)[:-1] + f", shape={x.shape})"
     if isinstance(x, list):
@@ -56,13 +60,18 @@ def pp(x) -> str:
     return repr(x)
 
 
-def make_debug_function(node_idx, old_func, node):
-    def new_function(*func_args, **func_kwargs):
+def make_debug_function(
+    node_idx: int, old_func: Callable[..., object], node: torch.fx.Node
+) -> Callable[..., object]:
+    def new_function(*func_args: object, **func_kwargs: object) -> object:
         print(f"Debugging node {node_idx} function {old_func}")
         result = old_func(*func_args, **func_kwargs)
-        to_check = result
-        if isinstance(to_check, torch.Tensor):
-            to_check = [to_check]
+        to_check: Sequence[object]
+        if isinstance(result, torch.Tensor):
+            to_check = [result]
+        else:
+            assert isinstance(result, Sequence)
+            to_check = result
         for output_idx, tensor in enumerate(to_check):
             if isinstance(tensor, torch.Tensor):
                 # Load the corresponding tensor from MAX
@@ -116,7 +125,7 @@ def make_debug_function(node_idx, old_func, node):
     return new_function
 
 
-def debug_graph_if_required(gm: torch.fx.GraphModule, args):
+def debug_graph_if_required(gm: torch.fx.GraphModule, args: tuple[object, ...]) -> None:
     if not debug_graph():
         return
 

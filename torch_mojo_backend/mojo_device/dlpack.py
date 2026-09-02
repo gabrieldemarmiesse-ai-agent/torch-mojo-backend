@@ -15,8 +15,15 @@ runs, which is the same refcount-based ownership the rest of the eager
 backend relies on.
 """
 
-import ctypes
+# ctypes._CData / ctypes._Pointer are typeshed-only names (not real runtime
+# attributes of the ctypes module); deferred evaluation keeps annotations
+# that reference them from crashing at import time.
+from __future__ import annotations
 
+import ctypes
+from collections.abc import Callable, Sequence
+
+import max.driver
 from max.dtype import DType
 
 
@@ -118,7 +125,13 @@ class _ExportState:
         "released",
     )
 
-    def __init__(self, managed, shape_arr, holder, registry):
+    def __init__(
+        self,
+        managed: _DLManagedTensor,
+        shape_arr: ctypes.Array,
+        holder: object,
+        registry: dict[int, _ExportState],
+    ) -> None:
         self.managed = managed
         self.shape_arr = shape_arr
         self.holder = holder
@@ -136,13 +149,13 @@ _live_exports: dict[int, _ExportState] = {}
 
 
 def _release_export(
-    handle,
+    handle: ctypes._Pointer[_DLManagedTensor],
     *,
-    addressof=ctypes.addressof,
-    cast=ctypes.cast,
-    py_object=ctypes.py_object,
-    py_decref=_pyapi.Py_DecRef,
-):
+    addressof: Callable[[ctypes._CData], int] = ctypes.addressof,
+    cast: Callable[[int, type[ctypes.py_object]], ctypes.py_object] = ctypes.cast,
+    py_object: type[ctypes.py_object] = ctypes.py_object,
+    py_decref: Callable[[object], None] = _pyapi.Py_DecRef,
+) -> None:
     """Release the producer reference owned by ``manager_ctx`` exactly once.
 
     All helpers needed during release are captured as defaults. An old ctypes
@@ -167,7 +180,12 @@ def _release_export(
     py_decref(state)
 
 
-def _deleter_impl(handle, release_export=_release_export):
+def _deleter_impl(
+    handle: ctypes._Pointer[_DLManagedTensor],
+    release_export: Callable[
+        [ctypes._Pointer[_DLManagedTensor]], None
+    ] = _release_export,
+) -> None:
     release_export(handle)
 
 
@@ -175,15 +193,15 @@ _managed_deleter = _DLManagedTensorDeleter(_deleter_impl)
 
 
 def _capsule_destructor_impl(
-    capsule_ptr,
+    capsule_ptr: object,
     *,
-    capsule_name=_CAPSULE_NAME,
-    capsule_is_valid=_pyapi.PyCapsule_IsValid,
-    capsule_get_pointer=_pyapi.PyCapsule_GetPointer,
-    cast=ctypes.cast,
-    managed_pointer=ctypes.POINTER(_DLManagedTensor),
-    release_export=_release_export,
-):
+    capsule_name: bytes = _CAPSULE_NAME,
+    capsule_is_valid: Callable[[object, bytes], bool] = _pyapi.PyCapsule_IsValid,
+    capsule_get_pointer: Callable[[object, bytes], int] = _pyapi.PyCapsule_GetPointer,
+    cast: Callable[..., object] = ctypes.cast,
+    managed_pointer: object = ctypes.POINTER(_DLManagedTensor),
+    release_export: Callable[..., None] = _release_export,
+) -> None:
     # A consumer that adopted the memory renames the capsule to
     # "used_dltensor" and becomes responsible for calling the deleter; if
     # the capsule dies still named "dltensor" it was never consumed and the
@@ -196,7 +214,7 @@ def _capsule_destructor_impl(
 _capsule_destructor = _PyCapsule_Destructor(_capsule_destructor_impl)
 
 
-def dlpack_device(device) -> tuple[int, int]:
+def dlpack_device(device: max.driver.Device) -> tuple[int, int]:
     """The DLPack (device_type, device_id) pair for a max.driver.Device."""
     if device.label == "cpu":
         return (_DLPACK_DEVICE_TYPE_OF["cpu"], 0)
@@ -206,7 +224,13 @@ def dlpack_device(device) -> tuple[int, int]:
     return (device_type, device.id)
 
 
-def make_capsule(holder, data_ptr: int, shape, dtype: DType, device):
+def make_capsule(
+    holder: object,
+    data_ptr: int,
+    shape: Sequence[int],
+    dtype: DType,
+    device: max.driver.Device,
+) -> object:
     """A "dltensor" PyCapsule for a contiguous device allocation.
 
     `holder` is any Python object whose refcount keeps the allocation

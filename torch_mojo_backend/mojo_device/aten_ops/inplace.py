@@ -11,7 +11,7 @@ from .support import (
 
 
 def mojo_device_add_(
-    self: TorchMojoTensor, other, alpha: int | float = 1.0
+    self: TorchMojoTensor, other: TorchMojoTensor, alpha: int | float = 1.0
 ) -> TorchMojoTensor:
     # `alpha` is a Scalar in the schema, not a float: unlike the `float`
     # arguments of, say, native_batch_norm, PyTorch's argument parser does not
@@ -22,7 +22,9 @@ def mojo_device_add_(
     return result
 
 
-def mojo_device_fill__scalar(self: TorchMojoTensor, value) -> TorchMojoTensor:
+def mojo_device_fill__scalar(
+    self: TorchMojoTensor, value: bool | int | float
+) -> TorchMojoTensor:
     result = _fast().fast_aten_fill__scalar(self, value)
     if result is None:
         raise _unsupported("aten::fill_.Scalar", (self, value))
@@ -30,7 +32,7 @@ def mojo_device_fill__scalar(self: TorchMojoTensor, value) -> TorchMojoTensor:
 
 
 def mojo_device_masked_fill_(
-    self: TorchMojoTensor, mask: TorchMojoTensor, value
+    self: TorchMojoTensor, mask: TorchMojoTensor, value: bool | int | float
 ) -> TorchMojoTensor:
     result = _fast().fast_aten_masked_fill_(self, mask, value)
     if result is None:
@@ -38,7 +40,7 @@ def mojo_device_masked_fill_(
     return result
 
 
-def mojo_device_mul_(self: TorchMojoTensor, other) -> TorchMojoTensor:
+def mojo_device_mul_(self: TorchMojoTensor, other: TorchMojoTensor) -> TorchMojoTensor:
     result = _fast().fast_aten_mul_(self, other)
     if result is None:
         raise _unsupported("aten::mul_.Tensor", (self, other))

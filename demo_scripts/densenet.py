@@ -3,8 +3,11 @@ import os
 import requests
 import torch
 from PIL import Image
-from torchvision import transforms
-from torchvision.models import densenet121
+
+# torchvision is a demo-only extra, not a project dependency (pip install it
+# yourself to run this script).
+from torchvision import transforms  # ty: ignore[unresolved-import]
+from torchvision.models import densenet121  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import get_accelerators, mojo_backend
 
