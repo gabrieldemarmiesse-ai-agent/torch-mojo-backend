@@ -6471,10 +6471,11 @@ def test_bf16_module_is_available_for_lazy_import():
 
 
 def test_big_smem_gemm_routes_stage_in_dynamic_shared_memory():
-    """ptxas caps a kernel's *static* `.shared` at 48 KiB before CUDA 13 and
-    fails the whole `mojo build` on the first kernel over the line, so every
-    GEMM route needing more carves `external_memory` and opts in per launch
-    with MAX_DYNAMIC_SHARED_SIZE_BYTES."""
+    """ptxas caps a kernel's *static* `.shared` at 48 KiB (every target
+    through CUDA 12.8, portable targets still in 13.x) and fails the whole
+    `mojo build` on the first kernel over the line, so every GEMM route
+    needing more carves `external_memory` and opts in per launch with
+    MAX_DYNAMIC_SHARED_SIZE_BYTES."""
     from torch_mojo_backend import eager_kernels
 
     for relative in (
