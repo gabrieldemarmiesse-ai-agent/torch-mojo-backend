@@ -26,7 +26,7 @@ import torch
 from torch.testing._internal.common_methods_invocations import op_db
 
 
-def test_a_declared_case_that_passes_fails_the_suite() -> None:
+def test_a_declared_case_that_passes_fails_the_suite():
     """The invariant that keeps the list from rotting into a permanent mute."""
     with pytest.raises(AssertionError) as failure:
         test_opinfo._run_declared_unsupported(
@@ -37,8 +37,8 @@ def test_a_declared_case_that_passes_fails_the_suite() -> None:
     assert "Delete that entry" in message
 
 
-def test_a_declared_case_that_still_fails_is_an_expected_failure() -> None:
-    def run() -> None:
+def test_a_declared_case_that_still_fails_is_an_expected_failure():
+    def run():
         raise RuntimeError("no fast implementation for aten::something")
 
     with pytest.raises(pytest.xfail.Exception) as outcome:
@@ -46,20 +46,18 @@ def test_a_declared_case_that_still_fails_is_an_expected_failure() -> None:
     assert "entry Y" in str(outcome.value)
 
 
-def test_a_declared_case_that_skips_still_skips() -> None:
+def test_a_declared_case_that_skips_still_skips():
     """A case the harness declined to compare never ran, so it is evidence
     neither for nor against the declaration."""
 
-    def run() -> None:
+    def run():
         raise unittest.SkipTest("OpInfo produced no sample inputs for this dtype")
 
     with pytest.raises(unittest.SkipTest):
         test_opinfo._run_declared_unsupported("declared unsupported: entry Z", run)
 
 
-def test_an_accelerator_delta_replaces_the_base_line(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_an_accelerator_delta_replaces_the_base_line(monkeypatch: pytest.MonkeyPatch):
     """One lookup rule: an operator listed for an accelerator replaces its base
     line there, and the empty tuple means "supported here"."""
     monkeypatch.setitem(
@@ -89,7 +87,7 @@ def test_an_accelerator_delta_replaces_the_base_line(
     assert declared(torch.float16, "gpu-that-does-it-all") is None
 
 
-def test_operator_tokens_identify_one_operator() -> None:
+def test_operator_tokens_identify_one_operator():
     """The table's key is `OpInfo.formatted_name`, so two OpInfos sharing one
     would make an entry ambiguous."""
     counts = collections.Counter(op.formatted_name for op in op_db)
@@ -125,7 +123,7 @@ def _instantiated_nodes() -> dict[str, dict[str, frozenset[str]]]:
 
 
 @pytest.mark.parametrize("test", sorted(known_unsupported.TABLE_NAMES))
-def test_every_declared_entry_addresses_a_node_that_exists(test: str) -> None:
+def test_every_declared_entry_addresses_a_node_that_exists(test: str):
     """A stale entry is a mute: nothing runs, so nothing can ever fail and
     tell its author to delete it."""
     instantiated = _instantiated_nodes()[test]

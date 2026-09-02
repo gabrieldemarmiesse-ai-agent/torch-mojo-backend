@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int):
     """CI shards the suite 20 ways then filters with -k; a shard whose chunk
     contains no test matching the filter must count as empty, not failed."""
     if (

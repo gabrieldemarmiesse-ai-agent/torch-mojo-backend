@@ -17,14 +17,13 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend
 import torch_mojo_backend.torch_compile_backend.compiler
+from tests.conftest import require_cuda_autograd
 from torch_mojo_backend import (
     MAPPING_TORCH_ATEN_TO_MOJO,
     make_torch_op_from_mojo,
     mojo_backend,
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
-
-from tests.conftest import require_cuda_autograd
 
 
 # MAX lowers an fp32 matmul to TF32 tensor cores on NVIDIA GPUs while torch

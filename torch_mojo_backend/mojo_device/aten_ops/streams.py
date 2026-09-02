@@ -3,9 +3,8 @@
 import torch
 
 from torch_mojo_backend.mojo_device import device_streams
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
-
 from torch_mojo_backend.mojo_device.aten_ops.support import _unsupported
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 
 # aten::record_stream(Tensor(a!) self, Stream s) -> ()

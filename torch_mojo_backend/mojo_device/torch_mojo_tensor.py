@@ -716,9 +716,7 @@ class TorchMojoTensor(torch.Tensor):
         not see a buffer whose producing launches -- including the copy a
         strided export just queued -- are still waiting on a compile.
         """
-        from torch_mojo_backend.mojo_device import dlpack
-
-        from torch_mojo_backend.mojo_device import deferred_compile
+        from torch_mojo_backend.mojo_device import deferred_compile, dlpack
 
         src = self._contig()
         deferred_compile.drain()

@@ -85,7 +85,7 @@ class KernelStats:
 
 def run_rocprofv3(
     command: list[str], output_dir: Path, pmc: str | None, kernel_trace: bool
-) -> None:
+):
     argv = [find_rocprofv3()]
     if kernel_trace or not pmc:
         argv.append("--kernel-trace")
@@ -234,7 +234,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     command = args.command
     if command and command[0] == "--":

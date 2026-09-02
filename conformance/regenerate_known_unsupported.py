@@ -97,7 +97,7 @@ def _looks_absent(exc: BaseException) -> bool:
     return "no fast implementation" in text or "unsupported torch dtype" in text
 
 
-def _record(event: dict[str, Any]) -> None:
+def _record(event: dict[str, Any]):
     """Append one event, if recording is on.
 
     One file per process: xdist workers never share one, and a segfaulting node
@@ -115,7 +115,7 @@ def pytest_exception_interact(
     node: pytest.Item | pytest.Collector,
     call: CallInfo[Any],
     report: pytest.CollectReport | pytest.TestReport,
-) -> None:
+):
     """Record what a failing node raised."""
     if not report.failed or call.excinfo is None:
         return
@@ -135,7 +135,7 @@ def pytest_exception_interact(
     )
 
 
-def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+def pytest_runtest_logreport(report: pytest.TestReport):
     """Record every node's outcome, so a node that ran can be told from one that
     did not: only the first is evidence about the table."""
     if report.when != "call":
@@ -317,7 +317,7 @@ def _splice(text: str, test: str, rendered: str) -> str:
 
 def _report_diff(
     test: str, merged: dict[str, set[str]], declared: dict[str, frozenset[str]]
-) -> None:
+):
     print(f"\n{test}:")
     pairs = {(op, d) for op, dtypes in merged.items() for d in dtypes}
     now = {(op, d) for op, dtypes in declared.items() for d in dtypes}

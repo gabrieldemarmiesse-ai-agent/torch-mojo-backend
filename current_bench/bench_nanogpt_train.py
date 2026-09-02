@@ -199,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     if args.device.startswith("mojo"):
         from torch_mojo_backend import register_mojo_devices

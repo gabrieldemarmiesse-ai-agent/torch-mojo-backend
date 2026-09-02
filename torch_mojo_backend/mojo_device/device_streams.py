@@ -68,7 +68,7 @@ class Stream:
     def __init__(
         self, device: max.driver.Device, name: str, wrap_default: bool = False
     ):
-        if device.api == "cpu":
+        if device.api == "cpu" and not wrap_default:
             raise NotImplementedError(
                 "side streams require an accelerator; the CPU device runs "
                 "everything on one stream already"

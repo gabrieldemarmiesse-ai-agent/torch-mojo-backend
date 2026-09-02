@@ -9,15 +9,15 @@ import re
 from pathlib import Path
 
 _REPO_DIR = Path(__file__).parent.parent
-_SCANNED_DIRS = ("torch_mojo_backend", "tests", "benchmarks", "demo_scripts")
+_SKIPPED_DIRS = {".venv", "deeplink", "__mojocache__"}
 _NONE_RETURN_RE = re.compile(r"\)\s*->\s*None\s*:")
 
 
 def test_no_none_return_annotations():
     sources = sorted(
         path
-        for directory in _SCANNED_DIRS
-        for path in (_REPO_DIR / directory).rglob("*.py")
+        for path in _REPO_DIR.rglob("*.py")
+        if not _SKIPPED_DIRS & set(path.relative_to(_REPO_DIR).parts)
     )
     assert sources, f"no .py sources found under {_REPO_DIR}"
     offenders = []

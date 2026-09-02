@@ -107,7 +107,7 @@ def measure(
     )
 
 
-def rocm_smi(label: str) -> None:
+def rocm_smi(label: str):
     result = subprocess.run(
         ["rocm-smi", "--showclocks", "--showtemp", "--showuse", "--showpower"],
         check=False,
@@ -118,7 +118,7 @@ def rocm_smi(label: str) -> None:
     print(result.stdout)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iterations", type=int, default=100)
@@ -139,7 +139,7 @@ def main() -> None:
     ctx = _ctx_ptr(device)
     tuning = load_tuning_extension()
 
-    def synchronize() -> None:
+    def synchronize():
         tensor_holder.synchronize(ctx)
 
     configs = args.config or list(CONFIGS)
@@ -181,7 +181,7 @@ def main() -> None:
             if cfg not in CONFIGS:
                 raise ValueError(f"unknown config {cfg}")
 
-            def launch() -> None:
+            def launch():
                 tuning.AmdBf16Tune(
                     out._ptr, a._ptr, b._ptr, bias._ptr, (m, n, k, cfg), ctx
                 )

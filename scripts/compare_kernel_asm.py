@@ -380,7 +380,7 @@ def collect(out_dir: Path) -> dict[str, str]:
     return kernels
 
 
-def print_diff(kernel: str, before: str, after: str) -> None:
+def print_diff(kernel: str, before: str, after: str):
     """Print a unified diff of one kernel's assembly."""
     print(
         "\n".join(
@@ -611,7 +611,7 @@ def run_builds(
     lock = threading.Lock()
     done = 0
 
-    def build(job: tuple[ModulePlan, Variant]) -> None:
+    def build(job: tuple[ModulePlan, Variant]):
         nonlocal done
         plan, variant = job
         built, failures = build_both_sides(args, trees, plan, variant)

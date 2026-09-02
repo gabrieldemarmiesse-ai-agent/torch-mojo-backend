@@ -10,8 +10,10 @@ import pytest
 import torch
 
 from torch_mojo_backend import TorchMojoTensor, register_mojo_devices
-from torch_mojo_backend.mojo_device import torch_mojo_device_module
-from torch_mojo_backend.mojo_device import torch_mojo_tensor as mojo_tensor_module
+from torch_mojo_backend.mojo_device import (
+    torch_mojo_device_module,
+    torch_mojo_tensor as mojo_tensor_module,
+)
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
 )
