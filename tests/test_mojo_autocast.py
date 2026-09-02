@@ -24,7 +24,7 @@ def mojo_h100():
     return "mojo:0"
 
 
-def test_mojo_autocast_fallback_and_required_policies_are_registered() -> None:
+def test_mojo_autocast_fallback_and_required_policies_are_registered():
     # Exists at runtime; missing from torch's own DispatchKey stub.
     assert torch._C._dispatch_has_backend_fallback(
         getattr(torch._C.DispatchKey, "AutocastPrivateUse1")
@@ -47,7 +47,7 @@ def test_mojo_autocast_fallback_and_required_policies_are_registered() -> None:
         ), name
 
 
-def test_mojo_bf16_autocast_linear_loss_and_grad_dtypes(mojo_h100) -> None:
+def test_mojo_bf16_autocast_linear_loss_and_grad_dtypes(mojo_h100):
     generator = torch.Generator().manual_seed(20260718)
     host_input = torch.randn(8, 16, generator=generator)
     host_weight = torch.randn(11, 16, generator=generator)
@@ -71,7 +71,7 @@ def test_mojo_bf16_autocast_linear_loss_and_grad_dtypes(mojo_h100) -> None:
         assert torch.isfinite(tensor.grad.cpu()).all()
 
 
-def test_mojo_bf16_autocast_layernorm_and_fa4_dtypes(mojo_h100) -> None:
+def test_mojo_bf16_autocast_layernorm_and_fa4_dtypes(mojo_h100):
     generator = torch.Generator().manual_seed(20260718)
     layer_input = torch.randn(4, 64, generator=generator).to(mojo_h100)
     layer_weight = torch.randn(64, generator=generator).to(mojo_h100)

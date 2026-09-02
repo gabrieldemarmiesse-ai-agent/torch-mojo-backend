@@ -212,7 +212,7 @@ class BenchKey(typing.NamedTuple):
         return f"{self.op}/{self.dtype}/{self.shape}/{self.layout}"
 
 
-def _check_ratio(value: float, where: str) -> None:
+def _check_ratio(value: float, where: str):
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(
             f"{where}: a baseline ratio must be a finite positive number "
@@ -396,7 +396,7 @@ def canonical_dump(data: BaselinesFile) -> str:
     return "\n" + text.replace("<", "\\u003c") + "\n"
 
 
-def write(data: BaselinesFile, path: Path = BASELINES_PATH) -> None:
+def write(data: BaselinesFile, path: Path = BASELINES_PATH):
     """Splice `data` into the file's data block, atomically.
 
     The viewer around the block survives byte-for-byte.
@@ -410,7 +410,7 @@ def write(data: BaselinesFile, path: Path = BASELINES_PATH) -> None:
 
 def merge_write(
     hw_key: str, entries: dict[BenchKey, float], path: Path = BASELINES_PATH
-) -> None:
+):
     """Merge `entries` into the file.
 
     Every line not in `entries` survives byte-for-byte: only the measured
@@ -443,7 +443,7 @@ def _without_legacy_aggregates(node: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _transposed(configs: dict[str, dict]) -> dict[str, dict]:
+def _transposed(configs: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
     """Formats 3 and 4 nested dtype above op; format 5 nests op above dtype.
 
     Rebuilds each config as ops -> dtypes -> shapes, carrying the shape
@@ -453,16 +453,22 @@ def _transposed(configs: dict[str, dict]) -> dict[str, dict]:
     out = {}
     for config_key, config in configs.items():
         ops = {}
-        for dtype, dtype_block in config.get("dtypes", {}).items():
-            for op, op_block in dtype_block.get("ops", {}).items():
+        dtype_blocks = typing.cast(
+            "dict[str, dict[str, object]]", config.get("dtypes", {})
+        )
+        for dtype, dtype_block in dtype_blocks.items():
+            op_blocks = typing.cast(
+                "dict[str, dict[str, object]]", dtype_block.get("ops", {})
+            )
+            for op, op_block in op_blocks.items():
                 ops.setdefault(op, {})[dtype] = {"shapes": op_block.get("shapes", {})}
         out[config_key] = {
             "ops": {op: {"dtypes": dtypes} for op, dtypes in ops.items()}
         }
-    return out
+    return typing.cast("dict[str, dict[str, object]]", out)
 
 
-def rebuild(path: Path = BASELINES_PATH) -> None:
+def rebuild(path: Path = BASELINES_PATH):
     """Re-canonicalize the data block: prune empty blocks, sort, rewrite.
 
     The escape hatch for the two documented manual situations — resolving
@@ -476,6 +482,8 @@ def rebuild(path: Path = BASELINES_PATH) -> None:
         stripped = _without_legacy_aggregates(raw)
         # Parsed JSON, shape guaranteed by the format-3/4 contract this
         # migration handles, not something isinstance can verify past "dict".
-        configs = typing.cast("dict[str, dict]", stripped.get("configs", {}))
+        configs = typing.cast(
+            "dict[str, dict[str, object]]", stripped.get("configs", {})
+        )
         raw = {"configs": _transposed(configs), "format": FORMAT_VERSION}
     write(_parse(raw, path), path)

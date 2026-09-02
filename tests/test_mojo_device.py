@@ -991,7 +991,7 @@ def function_equivalent_on_both_devices(
         out1 = func(*args, device=device, **kwargs)
         out2 = func(*args, device="cpu", **kwargs)
     if isinstance(out1, list | tuple):
-        assert type(out1) == type(out2)
+        assert type(out1) is type(out2)
     else:
         assert isinstance(out1, torch.Tensor)
         assert isinstance(out2, torch.Tensor)

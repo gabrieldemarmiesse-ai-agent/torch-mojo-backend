@@ -29,7 +29,7 @@ os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "0"
 class SimpleNet(nn.Module):
     """Simple feedforward neural network for MNIST classification."""
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         # Input: 28x28 = 784 pixels
         self.fc1 = nn.Linear(784, 128)
@@ -52,7 +52,7 @@ class SimpleNet(nn.Module):
 def train_epoch(
     model: nn.Module,
     device: torch.device,
-    train_loader: DataLoader,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     epoch: int,
@@ -101,7 +101,7 @@ def train_epoch(
 def evaluate(
     model: nn.Module,
     device: torch.device,
-    test_loader: DataLoader,
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     criterion: nn.Module,
 ) -> tuple[float, float]:
     """Evaluate the model on test data."""
@@ -124,7 +124,7 @@ def evaluate(
     return avg_loss, accuracy
 
 
-def main() -> None:
+def main():
     # Hyperparameters
     batch_size = 64
     test_batch_size = 1000

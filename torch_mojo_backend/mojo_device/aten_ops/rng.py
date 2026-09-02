@@ -4,7 +4,11 @@ import torch
 
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
-from .support import _copy_into_tensor, _unsupported, max_dtype_to_torch_dtype
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _copy_into_tensor,
+    _unsupported,
+    max_dtype_to_torch_dtype,
+)
 
 
 def mojo_device_normal_(

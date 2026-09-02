@@ -34,6 +34,24 @@ from max.experimental.torch import max_dtype_to_torch
 
 from torch_mojo_backend import eager_kernels, is_running_tests
 from torch_mojo_backend.eager_kernels import call_queue as _call_queue
+from torch_mojo_backend.eager_kernels import _ctx_ptr
+from torch_mojo_backend.eager_kernels.output_specs import (
+    _allocate_output_spec,
+    _submit_prepared_into,
+    _TensorOutputSpec,
+)
+from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
+    _reserve_philox_state,
+)
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    MojoTensorLike,
+    TorchMojoTensor,
+    _copy_strided_into,
+    _pad8,
+    _resize_payload,
+    _row_major_strides,
+)
+from torch_mojo_backend.types import CountedCallable
 from torch_mojo_backend.eager_kernels.activation_backward_ops import (
     ActivationBackwardExtension as _ActivationBackwardExtension,
 )
@@ -136,26 +154,6 @@ def _call_mojo(
     except Exception as exc:
         _raise_if_device_oom(exc)
         raise
-
-
-from torch_mojo_backend.eager_kernels import _ctx_ptr
-from torch_mojo_backend.eager_kernels.output_specs import (
-    _allocate_output_spec,
-    _submit_prepared_into,
-    _TensorOutputSpec,
-)
-from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
-    _reserve_philox_state,
-)
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    MojoTensorLike,
-    TorchMojoTensor,
-    _copy_strided_into,
-    _pad8,
-    _resize_payload,
-    _row_major_strides,
-)
-from torch_mojo_backend.types import CountedCallable
 
 
 @runtime_checkable
@@ -819,7 +817,7 @@ def _foreach_launch(
     scalars: Sequence[float] = (),
     aux: tuple[int, ...] = (),
     keepalive: tuple[object, ...] = (),
-) -> None:
+):
     """One launch of the batched foreach family for a whole TensorList.
 
     `lists` are the parallel operand lists in the order the Mojo bridge
@@ -1613,7 +1611,7 @@ def _try_spec_binary_into(
     if dtype == DType.bool and spec_fn_name not in _SPEC_BOOL_OK_NAMES:
         return None
     if spec_fn_name not in _SPEC_CMP_NAMES:
-        if spec_fn_name in _SPEC_FLOAT_ONLY_NAMES and not kdtype in (
+        if spec_fn_name in _SPEC_FLOAT_ONLY_NAMES and kdtype not in (
             DType.float32,
             DType.float16,
             DType.bfloat16,
@@ -2108,7 +2106,7 @@ def _try_spec_reduce(
     return result
 
 
-def _raise_if_device_oom(exc: BaseException) -> None:
+def _raise_if_device_oom(exc: BaseException):
     """Keep TensorSpec fallbacks from disguising allocator exhaustion.
 
     Mojo TensorSpec dispatch reports both unsupported metadata and runtime
@@ -2129,8 +2127,8 @@ _call_queue.set_error_translator(_raise_if_device_oom)
 
 
 def _spec_matmul_out_shape(
-    spec_fn_name: str, ts: list, transpose_b: int
-) -> tuple | None:
+    spec_fn_name: str, ts: list[MojoTensorLike], transpose_b: int
+) -> tuple[int, ...] | None:
     """Output shape for a queueable matmul spec launch, or None when any
     Mojo-side check might fail (a queued launch cannot fall back).
 
@@ -2165,7 +2163,7 @@ def _spec_matmul_out_shape(
         return None
     k = a._shape[-1]
     n, kb = (b._shape[0], b._shape[1]) if transpose_b else (b._shape[1], b._shape[0])
-    if kb != k or k == 0 or n == 0 or a._numel == 0:
+    if kb != k or k == 0 or n == 0 or 0 in a._shape:
         return None
     if spec_fn_name == "MatmulBiasSpec":
         bias = ts[2]
@@ -2354,7 +2352,7 @@ def _on_gpu(t: _SpecTensor) -> bool:
     return _device_of(t).label == "gpu"
 
 
-def _alert_not_deterministic(caller: str) -> None:
+def _alert_not_deterministic(caller: str):
     """Match PyTorch's deterministic-algorithm error/warn-only contract."""
     if not torch.are_deterministic_algorithms_enabled():
         return
@@ -2377,7 +2375,7 @@ def _alert_not_deterministic(caller: str) -> None:
     )
 
 
-def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     """dst[...] = src[...] for equal shapes/dtypes, any strides on both."""
     if dst._numel == 0:
         return
@@ -2549,7 +2547,7 @@ def _launch_where_bcast(
     operands: tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor],
     meta: tuple[list[int], list[int], list[list[int]]],
     dtype: DType,
-) -> None:
+):
     out_shape, dims, strides = meta
     params = tuple(dims) + tuple(s for st in strides for s in st)
     _call_mojo(
@@ -2575,7 +2573,7 @@ def _launch_masked_fill_scalar(
     value: float,
     meta: tuple[list[int], list[int], list[list[int]]],
     dtype: DType,
-) -> None:
+):
     """masked_fill(_).Scalar's fast path: `value` is baked into the launch
     as an argument, never materialized into a device buffer first (that
     used to cost a whole extra Fill kernel launch -- see MaskedFillScalar's
@@ -8195,8 +8193,8 @@ def fast_fused_flash_attention_backward(
     k = _t(key)
     v = _t(value)
     o = _t(output)
-    l = _t(lse)
-    if g is None or q is None or k is None or v is None or o is None or l is None:
+    lse_t = _t(lse)
+    if g is None or q is None or k is None or v is None or o is None or lse_t is None:
         return NOT_HANDLED
     if g._dtype != q._dtype or tuple(g._shape) != tuple(q._shape):
         return NOT_HANDLED
@@ -8229,7 +8227,7 @@ def fast_fused_flash_attention_backward(
             k._ptr,
             v._ptr,
             o._ptr,
-            l._ptr,
+            lse_t._ptr,
             (batch, heads, seq_q, seq_kv, head_dim),
             _fa_strides(g)
             + _fa_strides(q)
@@ -8244,10 +8242,10 @@ def fast_fused_flash_attention_backward(
             q._dtype.value,
             _ctx_ptr(q._device),
         ),
-        arg_dtypes=(g._dtype, q._dtype, k._dtype, v._dtype, o._dtype, l._dtype),
+        arg_dtypes=(g._dtype, q._dtype, k._dtype, v._dtype, o._dtype, lse_t._dtype),
         output_dtypes=(grad_query._dtype, grad_key._dtype, grad_value._dtype),
         flags={"CAUSAL": bool(is_causal)},
-        keepalive=(grad_query, grad_key, grad_value, g, q, k, v, o, l),
+        keepalive=(grad_query, grad_key, grad_value, g, q, k, v, o, lse_t),
     )
     return grad_query, grad_key, grad_value
 
@@ -10154,7 +10152,7 @@ def fast_aten__local_scalar_dense(tensor: torch.Tensor) -> object:
     return _tensor_holder().read_scalar(_ctx_ptr(t._device), t._ptr, t._dtype.value)
 
 
-def _instrument_call_counts() -> None:
+def _instrument_call_counts():
     """Give every fast op a test-only call counter, mirroring what
     `aten_functions.map_to` does, so `CallChecker` can assert that an op
     was handled by either implementation."""

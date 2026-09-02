@@ -51,7 +51,7 @@ def test_tensor_spec_fallbacks_propagate_device_oom(
     def as_tensor(candidate: object) -> object | None:
         return candidate if any(candidate is tensor for tensor in tensors) else None
 
-    def raise_allocator_oom(*_args: object, **_kwargs: object) -> None:
+    def raise_allocator_oom(*_args: object, **_kwargs: object):
         raise NotImplementedError(_CUDA_OOM)
 
     def load_oom_module(
@@ -116,7 +116,7 @@ def test_tensor_spec_unsupported_metadata_still_uses_fallback(
     device = CPU()
     tensor = fake_mojo_tensor(device)
 
-    def raise_unsupported(*_args: object, **_kwargs: object) -> None:
+    def raise_unsupported(*_args: object, **_kwargs: object):
         raise NotImplementedError("mojo spec neg: strided input is unsupported")
 
     def load_unsupported_module(

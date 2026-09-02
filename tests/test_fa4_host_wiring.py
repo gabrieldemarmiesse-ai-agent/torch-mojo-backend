@@ -57,7 +57,7 @@ def _mt(tensor: SimpleNamespace | None) -> TorchMojoTensor:
 
 def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     import torch_mojo_backend.eager_flash_attention as package
 
     monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
@@ -100,7 +100,7 @@ def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
 
 def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
@@ -188,7 +188,7 @@ def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
 
 def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """f16 Q/K/V select the f16 bridge symbol and f16 output allocation.
 
     Mirrors ``test_fa4_forward_bridge_uses_dynamic_bthd_allocations`` above,
@@ -291,7 +291,7 @@ def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
     ]
 
 
-def test_fa4_rejects_mixed_bf16_f16_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fa4_rejects_mixed_bf16_f16_inputs(monkeypatch: pytest.MonkeyPatch):
     """Q/K/V must share one dtype from {bf16, f16} -- mixing is not eligible."""
     monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
     device = _device()
@@ -306,7 +306,7 @@ def test_fa4_rejects_mixed_bf16_f16_inputs(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
-def test_fa4_strided_layout_contract_is_strict() -> None:
+def test_fa4_strided_layout_contract_is_strict():
     shape = (2, 256, 12, 64)
     token_stride = 3 * shape[2] * shape[3]
     strides = (shape[1] * token_stride, token_stride, 64, 1)
@@ -348,7 +348,7 @@ def test_fa4_strided_layout_contract_is_strict() -> None:
 
 def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
@@ -451,7 +451,7 @@ def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
 
 def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """A public (B, H, S, D) tensor that is fully contiguous but whose base
     pointer is NOT 16-byte aligned (e.g. a sliced/offset view into a larger
     buffer) must be rejected by ``_fa4_bhsd_layout`` and fall back to the
@@ -536,7 +536,7 @@ def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
 
 def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_qkv(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """A public (B, H, S, D) tensor that is fully contiguous AND 16-byte
     aligned skips BTHD materialization entirely: no transpose, no copy, and
     the output is allocated directly in the (B, H, S, D) layout and
@@ -614,7 +614,7 @@ def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_
     ]
 
 
-def test_fa4_bhsd_layout_requires_contiguity_and_16_byte_alignment() -> None:
+def test_fa4_bhsd_layout_requires_contiguity_and_16_byte_alignment():
     base = _tensor("q", shape=(3, 12, 256, 64), ptr=0x1000)
     assert aten_fast._fa4_bhsd_layout(_mt(base))
 
@@ -636,7 +636,7 @@ def test_fa4_bhsd_layout_requires_contiguity_and_16_byte_alignment() -> None:
 
 def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     device = _device()
     query, key, value = (
         _tensor(name, shape=(2, 8, 256, 64), device=device, ptr=ptr)
@@ -696,7 +696,7 @@ def test_direct_flash_aten_returns_real_lse_and_cuda_shaped_auxiliaries(
 
 def test_direct_flash_backward_materializes_strided_logsumexp(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     device = _device()
     shape = (2, 4, 128, 64)
     query, key, value = (
@@ -776,7 +776,7 @@ def test_direct_flash_backward_materializes_strided_logsumexp(
 
 def test_fa4_saved_variable_recompute_rederives_natives_independently(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """Regression test for the SavedVariable-recompute fallback (``out``/
     ``logsumexp`` unpacked as bare tensors without their Python payload).
 
@@ -888,7 +888,7 @@ def test_fa4_saved_variable_recompute_rederives_natives_independently(
 
 def test_fa4_combined_backward_bridge_allocates_exact_scratch(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
@@ -989,7 +989,7 @@ def test_fa4_combined_backward_bridge_allocates_exact_scratch(
 
 def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     import torch_mojo_backend.eager_flash_attention as package
 
     device = _device()
@@ -1119,7 +1119,7 @@ def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
 
 def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """An eligible FA4 call that needs gradients goes to the lower ATen pair.
 
     The custom SDPA Function used to own the FA4 saves itself; PyTorch's
@@ -1168,7 +1168,7 @@ def test_fa4_eligible_backward_routes_to_native_flash_with_public_inputs(
     assert flash_calls == [((*public, 0.0, True, False), {"scale": 0.125})]
 
 
-def test_vendored_fa4_sources_have_no_torch_cuda_or_internal_sync() -> None:
+def test_vendored_fa4_sources_have_no_torch_cuda_or_internal_sync():
     source_dir = Path(aten_fast.__file__).parents[1] / "eager_flash_attention"
     source_by_name = {path.name: path.read_text() for path in source_dir.glob("*.mojo")}
     sources = "\n".join(source_by_name.values())

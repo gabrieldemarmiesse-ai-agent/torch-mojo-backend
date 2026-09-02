@@ -68,7 +68,7 @@ def selfload_soak_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out_path
 
 
-def test_selfload_soak_no_race(selfload_soak_binary: Path) -> None:
+def test_selfload_soak_no_race(selfload_soak_binary: Path):
     """64 back-to-back self-load launches per shape must be bitwise
     deterministic and match the phase-2b kernel within tolerance."""
     result = subprocess.run(

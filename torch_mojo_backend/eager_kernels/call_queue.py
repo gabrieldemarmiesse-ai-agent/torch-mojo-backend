@@ -95,18 +95,27 @@ class _QueueUnit(Protocol):
 # raw `args` name — retained until the item launches (rule 3) — and the
 # device bytes that retention holds, pre-computed for the run-ahead budget.
 _QueueItem = tuple[
-    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread, tuple, int
+    _QueueUnit | None,
+    Callable[..., object] | None,
+    tuple[object, ...],
+    threading.Thread,
+    tuple[object, ...],
+    int,
 ]
 
 _LOCK = threading.RLock()  # queue + every device touch (see rule 6)
 _QUEUE: deque[_QueueItem] = deque()
 _HELD_ERROR: list[BaseException] = []
-_DEVICE_THREAD: list = [None]  # last thread to issue device work (rule 4)
-_QUEUE_LAUNCH_THREAD: list = [None]  # last thread to launch FROM the queue
-_ERROR_TRANSLATOR: list = [None]
-_ENABLED: list = [None]  # memoized enabled(); refresh() invalidates
+_DEVICE_THREAD: list[threading.Thread | None] = [
+    None
+]  # last thread to issue device work (rule 4)
+_QUEUE_LAUNCH_THREAD: list[threading.Thread | None] = [
+    None
+]  # last thread to launch FROM the queue
+_ERROR_TRANSLATOR: list[Callable[[BaseException], None] | None] = [None]
+_ENABLED: list[bool | None] = [None]  # memoized enabled(); refresh() invalidates
 _RETAINED_BYTES: list[int] = [0]  # bytes held by queued items (rule 3 budget)
-_BUDGET_BYTES: list = [None]  # memoized budget; refresh() invalidates
+_BUDGET_BYTES: list[int | None] = [None]  # memoized budget; refresh() invalidates
 _TLS = threading.local()  # .in_launch
 
 # Run-ahead bound. During a cold storm the host can enqueue whole training
@@ -144,7 +153,7 @@ def enabled() -> bool:
     return cached
 
 
-def refresh() -> None:
+def refresh():
     """Re-read the mode environment variables on the next `enabled()`."""
     _ENABLED[0] = None
     _BUDGET_BYTES[0] = None
@@ -210,7 +219,7 @@ def active() -> bool:
     return bool(_QUEUE)
 
 
-def set_error_translator(fn: Callable[[BaseException], None]) -> None:
+def set_error_translator(fn: Callable[[BaseException], None]):
     """Install the hook that retypes a device error raised by a *deferred*
     launch (aten_fast installs `_raise_if_device_oom`, so an allocator
     exhaustion still surfaces as `torch.OutOfMemoryError` even when the
@@ -234,14 +243,14 @@ def _translate(exc: BaseException) -> BaseException:
 # Execution
 
 
-def _device_only_synchronize() -> None:
+def _device_only_synchronize():
     """The device barrier that never drains: safe inside the launch path."""
     from torch_mojo_backend.mojo_device import torch_mojo_device_module as _dm
 
     _dm._device_synchronize()
 
 
-def order_direct_launch() -> None:
+def order_direct_launch():
     """A direct (non-queued) launch is about to run on the current thread.
 
     Direct launches are issued by the thread that runs the op, so they are
@@ -266,7 +275,7 @@ def order_direct_launch() -> None:
     _DEVICE_THREAD[0] = me
 
 
-def _order_queue_launch_locked() -> None:
+def _order_queue_launch_locked():
     """The queue is about to launch, on the current thread, items other
     threads may have enqueued — the replay pattern that empirically read
     stale results without a barrier (rule 4). Synchronize once, before
@@ -288,7 +297,7 @@ def _order_queue_launch_locked() -> None:
     _DEVICE_THREAD[0] = me
 
 
-def _exec(item: _QueueItem) -> None:
+def _exec(item: _QueueItem):
     unit, fn, args, _enqueuer, _keepalive, _nbytes = item
     if unit is None:
         assert fn is not None  # exactly one of unit/fn is set
@@ -315,7 +324,7 @@ def _abandon_locked(exc: BaseException) -> BaseException:
     return _translate(exc)
 
 
-def _pump_locked() -> None:
+def _pump_locked():
     """Launch the longest ready prefix; stop at a head whose unit is still
     building. Held errors stay held until the next drain."""
     if _HELD_ERROR or not _QUEUE:
@@ -340,7 +349,7 @@ def _pump_locked() -> None:
             return
 
 
-def _drain_over_budget_locked() -> None:
+def _drain_over_budget_locked():
     """Rule 3's bound: queued items retain more device bytes than the budget
     allows, so stop running ahead — wait builds out and launch until the
     retention is released. This drain serves memory, not a value: a launch
@@ -365,7 +374,7 @@ def _drain_over_budget_locked() -> None:
             return
 
 
-def _enforce_budget_locked() -> None:
+def _enforce_budget_locked():
     """Drain when the just-appended item pushed retention past the budget.
     Skipped inside a launch (a reentrant enqueue must never re-enter the
     queue) — the outer launch path is already emptying it."""
@@ -380,7 +389,7 @@ def _enforce_budget_locked() -> None:
             _TLS.in_launch = False
 
 
-def pump() -> None:
+def pump():
     """Launch whatever is ready. Non-blocking: never waits on a build."""
     if not _QUEUE or getattr(_TLS, "in_launch", False):
         return
@@ -392,7 +401,7 @@ def pump() -> None:
         _TLS.in_launch = False
 
 
-def drain() -> None:
+def drain():
     """Launch everything (waiting out builds); re-raise launch errors.
     Called before any host read of device values.
 
@@ -449,7 +458,9 @@ def _launch_prefix(unit: _QueueUnit | None) -> bool:
     return True
 
 
-def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
+def kernel_call_into(
+    unit: _QueueUnit, args: tuple[object, ...], keepalive: tuple[object, ...]
+):
     """Queue a descriptor call whose outputs were preallocated in Python.
     The call writes into them and returns nothing — always queueable
     regardless of the *Spec naming convention.
@@ -470,7 +481,9 @@ def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
         _enforce_budget_locked()
 
 
-def external_call(fn: Callable[..., object], args: tuple, keepalive: tuple) -> None:
+def external_call(
+    fn: Callable[..., object], args: tuple[object, ...], keepalive: tuple[object, ...]
+):
     """An ungated device call (tensor_holder, fa4): always launchable, but
     must hold its FIFO position behind queued producers of its inputs.
 

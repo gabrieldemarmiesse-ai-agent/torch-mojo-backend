@@ -5,7 +5,11 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     _resize_payload,
 )
 
-from .support import _copy_into_tensor, _fast, _unsupported
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _copy_into_tensor,
+    _fast,
+    _unsupported,
+)
 
 
 def mojo_device_min_dim(

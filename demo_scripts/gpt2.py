@@ -26,7 +26,7 @@ class GPTConfig:
         n_head: int,
         n_embd: int,
         **kwargs: object,
-    ) -> None:
+    ):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
@@ -41,7 +41,7 @@ class CausalSelfAttention(nn.Module):
     # give the type checker anything to infer the attribute's type from.
     bias: torch.Tensor
 
-    def __init__(self, config: GPTConfig) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: GPTConfig) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=True)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=True)
@@ -96,7 +96,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
@@ -110,7 +110,7 @@ class Block(nn.Module):
 
 
 class GPT2(nn.Module):
-    def __init__(self, config: GPTConfig) -> None:
+    def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -141,7 +141,7 @@ class GPT2(nn.Module):
                     p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
                 )
 
-    def _init_weights(self, module: nn.Module) -> None:
+    def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -324,7 +324,7 @@ def load_tokenizer() -> Tokenizer:
         print("tiktoken not found, using simple character-level tokenizer")
 
         class SimpleTokenizer:
-            def __init__(self) -> None:
+            def __init__(self):
                 self.vocab = {chr(i): i for i in range(256)}
                 self.vocab.update({"<|endoftext|>": 50256})
                 self.inv_vocab = {v: k for k, v in self.vocab.items()}
@@ -338,7 +338,7 @@ def load_tokenizer() -> Tokenizer:
         return SimpleTokenizer()
 
 
-def main() -> None:
+def main():
     device = "cuda" if len(list(get_accelerators())) >= 2 else "cpu"
     print(f"Using device: {device}")
 

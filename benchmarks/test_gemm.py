@@ -124,7 +124,7 @@ def test_mm(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     m, n, k = SHAPES[shape_id]
     dtype, precision = DTYPES[dtype_id]
     with matmul_precision(precision):
@@ -147,7 +147,7 @@ def test_bmm(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     m, n, k = BMM_SHAPES[shape_id]
     dtype, precision = DTYPES[dtype_id]
     with matmul_precision(precision):
@@ -172,7 +172,7 @@ def test_addmm(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     m, n, k = SHAPES[shape_id]
     dtype, precision = DTYPES[dtype_id]
     with matmul_precision(precision):
@@ -193,7 +193,7 @@ def test_addmm(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_linear(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     m, n, k = SHAPES[shape_id]
     dtype, precision = DTYPES[dtype_id]
     with matmul_precision(precision):
@@ -218,7 +218,7 @@ def test_linear(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_linear_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     m, n, k = SHAPES[shape_id]
     dtype, precision = DTYPES[dtype_id]
     with matmul_precision(precision):

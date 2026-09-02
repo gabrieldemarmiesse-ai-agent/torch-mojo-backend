@@ -45,7 +45,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("native_layer_norm")
 def test_layer_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, dim = LN_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(rows, dim, dtype=dtype), hw, mojo_device)
@@ -63,7 +63,7 @@ def test_layer_norm(
 @pytest.mark.bench_op("native_layer_norm_backward")
 def test_layer_norm_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, dim = LN_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(rows, dim, dtype=dtype), hw, mojo_device)
@@ -111,7 +111,7 @@ def _bn_operands(
 @pytest.mark.bench_op("native_batch_norm")
 def test_batch_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours = _bn_operands(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten.native_batch_norm(*refs, True, 0.1, 1e-5),
@@ -125,7 +125,7 @@ def test_batch_norm(
 @pytest.mark.bench_op("_native_batch_norm_legit_no_training")
 def test_batch_norm_inference(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours = _bn_operands(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._native_batch_norm_legit_no_training(*refs, 0.1, 1e-5),
@@ -139,7 +139,7 @@ def test_batch_norm_inference(
 @pytest.mark.bench_op("native_group_norm")
 def test_group_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w, groups = GN_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(n, c, h, w, dtype=dtype), hw, mojo_device)

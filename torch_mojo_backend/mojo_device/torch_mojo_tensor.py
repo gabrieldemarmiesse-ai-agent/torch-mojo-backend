@@ -47,11 +47,9 @@ class _TensorHolderModule(Protocol):
         self, ctx_ptr: int, src_ptr: int, nbytes: int
     ) -> tuple[object, int]: ...
     def CopyStrided(self, *args: object) -> object: ...
-    def copy_d2d(
-        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
-    ) -> None: ...
+    def copy_d2d(self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int): ...
     def fence_event_record(self, ctx_ptr: int) -> object: ...
-    def fence_event_wait(self, ctx_ptr: int, event: object) -> None: ...
+    def fence_event_wait(self, ctx_ptr: int, event: object): ...
 
 
 # The Mojo extension module (torch_mojo_backend.eager_kernels.tensor_holder),
@@ -69,17 +67,24 @@ def _holder_mod() -> _TensorHolderModule:
     return holder
 
 
+class _ReadyEvent(Protocol):
+    """The one thing the pending-transfer queues ask of a recorded event
+    (`max.driver.DeviceEvent`; tests inject stand-ins)."""
+
+    def is_ready(self) -> bool: ...
+
+
 # GPU H2D copies consume a MAX-owned pinned staging allocation asynchronously.
 # Keep that transfer owner alive until an event recorded behind its DMA
 # completes. This mirrors the lifetime tracking performed by CUDA's pinned
 # memory allocator without depending on torch-cuda.
-_PENDING_H2D: dict[max.driver.Device, deque] = {}
+_PENDING_H2D: dict[max.driver.Device, deque[tuple[_ReadyEvent, object]]] = {}
 _PENDING_H2D_LOCK = threading.Lock()
 
 # A non-blocking D2H returns a CPU tensor that aliases a MAX-owned pinned host
 # allocation. DLPack ties that owner to the returned tensor, while this queue
 # also retains it until the DMA event completes if the tensor dies early.
-_PENDING_D2H: dict[max.driver.Device, deque] = {}
+_PENDING_D2H: dict[max.driver.Device, deque[tuple[_ReadyEvent, object]]] = {}
 _PENDING_D2H_LOCK = threading.Lock()
 
 # A stream/event failure is already a fatal device condition, but raw-pointer
@@ -118,7 +123,7 @@ class _HolderOwner:
     _owner_ctx: int | None
     _wait: Callable[[int, object], None] | None
 
-    def __init__(self, holder: "_MojoTensorHolder | max.driver.Buffer") -> None:
+    def __init__(self, holder: "_MojoTensorHolder | max.driver.Buffer"):
         self._holder = holder
         self._events = None
         self._owner_ctx = None
@@ -138,7 +143,7 @@ class _HolderOwner:
 
     def record_foreign_use(
         self, stream_ctx_ptr: int, event: object, owner_ctx_ptr: int
-    ) -> None:
+    ):
         if self._events is None:
             self._events = {}
             self._wait = _holder_mod().fence_event_wait
@@ -147,7 +152,7 @@ class _HolderOwner:
         # replaced event is released when this rebinding drops it.
         self._events[stream_ctx_ptr] = event
 
-    def __del__(self) -> None:
+    def __del__(self):
         events, wait, owner_ctx = self._events, self._wait, self._owner_ctx
         if not events or wait is None or owner_ctx is None or _is_finalizing():
             return
@@ -175,7 +180,7 @@ def _retain_failed_transfer_owner(device: max.driver.Device, owner: object) -> o
     return token
 
 
-def _forget_failed_transfer_owner(device: max.driver.Device, token: object) -> None:
+def _forget_failed_transfer_owner(device: max.driver.Device, token: object):
     with _FAILED_TRANSFER_OWNERS_LOCK:
         retained = _FAILED_TRANSFER_OWNERS.get(device)
         if retained is None:
@@ -185,9 +190,7 @@ def _forget_failed_transfer_owner(device: max.driver.Device, token: object) -> N
             _FAILED_TRANSFER_OWNERS.pop(device, None)
 
 
-def _record_h2d_source(
-    device: max.driver.Device, source: object, non_blocking: bool
-) -> None:
+def _record_h2d_source(device: max.driver.Device, source: object, non_blocking: bool):
     """Retain a pinned transfer owner until its default-stream H2D ends."""
     # MAX's CPU device uses a worker pool whose copies are not stream-ordered
     # with kernels. The Mojo helper drains it before returning; keep the Python
@@ -224,7 +227,7 @@ def _record_h2d_source(
         # event keeps its exact source alive until DMA completion.
 
 
-def _release_synchronized_h2d_sources(device: max.driver.Device) -> None:
+def _release_synchronized_h2d_sources(device: max.driver.Device):
     """Drop ready sources after the caller synchronized ``device``'s stream.
 
     Another thread may enqueue a transfer between the stream synchronization
@@ -239,7 +242,7 @@ def _release_synchronized_h2d_sources(device: max.driver.Device) -> None:
             _PENDING_H2D.pop(device, None)
 
 
-def _record_d2h_owner(device: max.driver.Device, owner: object) -> None:
+def _record_d2h_owner(device: max.driver.Device, owner: object):
     """Retain a pinned D2H allocation until its default-stream DMA ends."""
     try:
         event = device.default_stream.record_event()
@@ -260,7 +263,7 @@ def _record_d2h_owner(device: max.driver.Device, owner: object) -> None:
             pending.popleft()
 
 
-def _release_synchronized_d2h_owners(device: max.driver.Device) -> None:
+def _release_synchronized_d2h_owners(device: max.driver.Device):
     """Drop pinned D2H owners whose stream events have completed."""
     with _PENDING_D2H_LOCK:
         pending = _PENDING_D2H.get(device)
@@ -301,7 +304,9 @@ def _device_of(tensor: MojoTensorLike) -> max.driver.Device:
     return cast(max.driver.Device, tensor._device)
 
 
-def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
+def _dispatch_entry(
+    func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
     """``deferred_compile.dispatch``, resolved on first use.
 
     ``deferred_compile`` imports the call queue this module feeds, so it
@@ -311,7 +316,7 @@ def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> o
     trick as ``output_specs._alloc``).
     """
     global _dispatch_entry
-    from . import deferred_compile
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     # Same nominal-vs-structural self-rebind quirk as _ctx_ptr above, even
     # though both sides print identically.
@@ -321,7 +326,7 @@ def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> o
 
 @runtime_checkable
 class _SynchronizableStream(Protocol):
-    def synchronize(self) -> None: ...
+    def synchronize(self): ...
 
 
 @runtime_checkable
@@ -480,8 +485,8 @@ class TorchMojoTensor(torch.Tensor):
         cls,
         func: torch._ops.OpOverload,
         types: Sequence[type],
-        args: tuple = (),
-        kwargs: dict | None = None,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
     ) -> object:
         """Redispatch wrapper operations to the existing Mojo backend kernels."""
         # Give higher-priority wrappers such as FakeTensor and
@@ -639,7 +644,7 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
-        from . import deferred_compile
+        from torch_mojo_backend.mojo_device import deferred_compile
 
         src = self if self._is_contiguous else self._materialize_contiguous()
         # Reading device bytes is a host read: every queued launch must have
@@ -713,7 +718,7 @@ class TorchMojoTensor(torch.Tensor):
         """
         from torch_mojo_backend.mojo_device import dlpack
 
-        from . import deferred_compile
+        from torch_mojo_backend.mojo_device import deferred_compile
 
         src = self._contig()
         deferred_compile.drain()
@@ -780,7 +785,7 @@ class TorchMojoTensor(torch.Tensor):
             return self._torch_device
         return super().device
 
-    def _set_data(self, value: torch.Tensor) -> None:
+    def _set_data(self, value: torch.Tensor):
         """``tensor.data = other`` for a wrapper whose payload is in Python.
 
         The C++ setter reaches ``Variable::set_data``, which shallow-copies
@@ -885,7 +890,7 @@ _PAYLOAD_ATTRIBUTES = (
 )
 
 
-def _resize_tensorimpl(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
+def _resize_tensorimpl(dst: TorchMojoTensor, shape: Sequence[int]):
     """Set dst's TensorImpl sizes (and grow its placeholder storage)."""
     torch.ops.aten.resize_.default.redispatch(
         _CPU_KEYSET, dst, shape, memory_format=None
@@ -894,14 +899,14 @@ def _resize_tensorimpl(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
 
 def _as_strided_tensorimpl(
     dst: TorchMojoTensor, shape: Sequence[int], strides: Sequence[int], offset: int
-) -> None:
+):
     """State dst's TensorImpl layout exactly. Metadata only, no data moved."""
     torch.ops.aten.as_strided_.default.redispatch(
         _CPU_KEYSET, dst, shape, strides, offset
     )
 
 
-def _move_payload_attributes(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _move_payload_attributes(dst: TorchMojoTensor, src: TorchMojoTensor):
     for name in _PAYLOAD_ATTRIBUTES:
         setattr(dst, name, getattr(src, name))
     # Any cached spec describes the old allocation or layout. Rebuild it on
@@ -923,7 +928,7 @@ def _storage_extent(tensor: TorchMojoTensor) -> int:
     )
 
 
-def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor):
     """Move ``src``'s eager payload into ``dst`` without changing identity.
 
     Both the Python payload and the real TensorImpl must move together. A
@@ -943,7 +948,7 @@ def _rebind_payload(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     _move_payload_attributes(dst, src)
 
 
-def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor):
     """``_rebind_payload`` that also reproduces src's strides and offset.
 
     ``_rebind_payload`` moves the payload and resizes the TensorImpl, but
@@ -975,7 +980,7 @@ def _rebind_payload_exact(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     _as_strided_tensorimpl(dst, src._shape, src._mojo_strides, src._offset)
 
 
-def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
+def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]):
     """Resize an eager out tensor and keep aliases when storage is sufficient.
 
     PyTorch resets a resized view to contiguous strides at its existing
@@ -1010,7 +1015,7 @@ def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]) -> None:
     _rebind_payload(dst, replacement)
 
 
-def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor):
     """Queue the strided copy as an external call (tensor_holder is always
     loaded, so the item is always launch-ready; it only holds FIFO order).
     The queue holds raw pointers, so both tensors are handed over as the
@@ -1030,7 +1035,7 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
     _cq.external_call(holder.CopyStrided, args, keepalive=(dst, src))
 
 
-def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
+def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     """dst[coords] = src[coords]; same shape and dtype, any strides.
 
     The shared materialize/copy primitive: powers .contiguous(), copy_ into

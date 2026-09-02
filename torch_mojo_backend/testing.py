@@ -1,6 +1,6 @@
 import contextlib
 import inspect
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -43,12 +43,12 @@ class CallChecker:
     fast path (eager) — no per-test bookkeeping needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._functions_to_check: tuple[CountedCallable, ...] | None = None
         self._counts_before_starting_to_check: list[int] | None = None
 
     @staticmethod
-    def _fast_twins(func: Callable) -> list[CountedCallable]:
+    def _fast_twins(func: Callable[..., object]) -> list[CountedCallable]:
         """The aten_fast counterparts of an aten_functions twin.
 
         Matches `fast_<name>` and its variants `fast_<name>_<suffix>` (e.g.
@@ -73,7 +73,7 @@ class CallChecker:
         return twins
 
     @staticmethod
-    def _eager_twins(func: Callable) -> list[CountedCallable]:
+    def _eager_twins(func: Callable[..., object]) -> list[CountedCallable]:
         """The instrumented mojo registration(s) whose op matches an
         aten_functions twin. Covers ops implemented as custom / out-variant
         registrations (empty_like, mean.out, normal_, ...) that don't route
@@ -108,7 +108,7 @@ class CallChecker:
                 twins.append(counter)
         return twins
 
-    def register(self, *funcs: Callable) -> None:
+    def register(self, *funcs: Callable[..., object]):
         """Register the functions expected to run.
 
         `funcs` are typed `Callable` (each caller's own precise signature,
@@ -131,7 +131,7 @@ class CallChecker:
             f.call_count for f in self._functions_to_check
         ]
 
-    def check_was_called(self) -> None:
+    def check_was_called(self):
         if (
             self._functions_to_check is None
             or self._counts_before_starting_to_check is None
@@ -151,14 +151,20 @@ class CallChecker:
             )
 
 
+def _as_tensor_list(
+    outputs: torch.Tensor | Sequence[torch.Tensor],
+) -> list[torch.Tensor]:
+    return [outputs] if isinstance(outputs, torch.Tensor) else list(outputs)
+
+
 def check_functions_are_equivalent(
-    fn: Callable,
+    fn: Callable[..., torch.Tensor | Sequence[torch.Tensor]],
     device: str | None,
     inputs: list[torch.Tensor],
-    fn_compiled: Callable | None = None,
+    fn_compiled: Callable[..., torch.Tensor | Sequence[torch.Tensor]] | None = None,
     rtol: float | None = None,
     atol: float | None = None,
-) -> None:
+):
     fn_compiled = fn_compiled or torch.compile(backend=mojo_backend)(fn)
     if device is not None:
         inputs = [input_tensor.to(device) for input_tensor in inputs]
@@ -168,13 +174,11 @@ def check_functions_are_equivalent(
     output_compiled = fn_compiled(*inputs)
     output_original = fn(*inputs)
 
-    assert type(output_original) == type(output_compiled)
+    assert type(output_original) is type(output_compiled)
 
-    if isinstance(output_original, torch.Tensor):
-        output_original = [output_original]
-        output_compiled = [output_compiled]
-
-    for i, (original, compiled) in enumerate(zip(output_original, output_compiled)):
+    for i, (original, compiled) in enumerate(
+        zip(_as_tensor_list(output_original), _as_tensor_list(output_compiled))
+    ):
         assert original.shape == compiled.shape, f"Issue with output {i}"
         assert original.device == compiled.device, f"Issue with output {i}"
         assert original.dtype == compiled.dtype, f"Issue with output {i}"
@@ -199,13 +203,13 @@ def to_device(tensors: list[torch.Tensor], device: str) -> list[torch.Tensor]:
 
 
 def check_outputs(
-    fn: Callable,
+    fn: Callable[..., torch.Tensor | Sequence[torch.Tensor]],
     conf: Conf,
     inputs: list[torch.Tensor],
     *,
     rtol: float | None = None,
     atol: float | None = None,
-) -> None:
+):
     # We compare to eager cpu execution
     # We first check if the function has a device argument
     has_device_arg = "device" in inspect.signature(fn).parameters
@@ -227,13 +231,8 @@ def check_outputs(
         else:
             outputs_conf = fn_to_run(*inputs_on_device)
 
-    # Now we compare outputs
-    if isinstance(outputs_eager_cpu, torch.Tensor):
-        outputs_eager_cpu = [outputs_eager_cpu]
-        outputs_conf = [outputs_conf]
-
     for i, (output_eager_cpu, output_conf) in enumerate(
-        zip(outputs_eager_cpu, outputs_conf)
+        zip(_as_tensor_list(outputs_eager_cpu), _as_tensor_list(outputs_conf))
     ):
         expected_device = torch.device(conf.device)
         if not (output_conf.device == expected_device):

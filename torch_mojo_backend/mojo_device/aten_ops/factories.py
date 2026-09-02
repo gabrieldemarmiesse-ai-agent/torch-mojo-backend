@@ -13,7 +13,12 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     find_equivalent_max_device,
 )
 
-from .support import _copy_into_tensor, _fast, _unsupported, max_dtype_to_torch_dtype
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _copy_into_tensor,
+    _fast,
+    _unsupported,
+    max_dtype_to_torch_dtype,
+)
 
 
 def _require_device(device: torch.device | None) -> torch.device:

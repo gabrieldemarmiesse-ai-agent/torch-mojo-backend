@@ -54,18 +54,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import IO, ClassVar, Generic, TypeVar, cast
+from typing import IO, ClassVar, Generic, NoReturn, TypeVar, cast
 
 from max import driver
 from max.dtype import DType
 
-from . import call_queue
+from torch_mojo_backend.eager_kernels import call_queue
 
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
 
 
-_MOJO_EXE_CACHE: list = []
+_MOJO_EXE_CACHE: list[Path] = []
 
 
 def _find_mojo() -> Path:
@@ -429,7 +429,7 @@ _BUILD_NOTICE_LOCK = threading.Lock()
 _BUILD_NOTICE_SHOWN = False
 
 
-def _trace(message: str) -> None:
+def _trace(message: str):
     """Build tracing, on by default; TORCH_MOJO_BACKEND_TRACE=0 silences it.
 
     No timestamp: a raw `t=<monotonic>` told a reader nothing on its own --
@@ -441,7 +441,7 @@ def _trace(message: str) -> None:
         sys.stderr.write(f"[TRACE] {message}\n")
 
 
-def _announce_build() -> None:
+def _announce_build():
     """One notice per process, not one per specialization.
 
     A cold process compiles dozens of variants across up to `_pool_size()`
@@ -588,12 +588,12 @@ def _resolve_mojo_file(mojo_file: Path) -> Path:
 
 
 class _AsyncLoadJob:
-    def __init__(self, unit: "_DefinedUnit") -> None:
+    def __init__(self, unit: "_DefinedUnit"):
         self.unit = unit
         self.done = threading.Event()
         self.error: BaseException | None = None
 
-    def run(self) -> None:
+    def run(self):
         try:
             with _ASYNC_BUILD_SLOTS:
                 self.unit.load_blocking()
@@ -612,7 +612,7 @@ class _AsyncLoadJob:
 
 
 class _DefinedUnit:
-    def __init__(self, mojo_file: Path, defines: CanonicalDefines) -> None:
+    def __init__(self, mojo_file: Path, defines: CanonicalDefines):
         self.mojo_file = mojo_file
         self.defines = defines
         self.lock = threading.Lock()
@@ -683,7 +683,7 @@ class _DefinedUnit:
 class MojoExtensionLoader:
     """Stateful build/module cache shared by stateless operation classes."""
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._lock = threading.Lock()
         self._units: dict[tuple[Path, CanonicalDefines], _DefinedUnit] = {}
         self._requests: dict[tuple[Path, CanonicalDefines], _DefinedUnit] = {}
@@ -728,7 +728,7 @@ _ExtensionResult = TypeVar("_ExtensionResult")
 
 @dataclass(frozen=True)
 class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
-    extension: type["MojoExtension"]
+    extension: type["MojoExtension[_OutputSpecs, _ExtensionResult]"]
     defines: CanonicalDefines
     output_specs: _OutputSpecs
     args: tuple[object, ...]
@@ -748,7 +748,7 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
         extension_args: tuple[object, ...],
         keepalive: tuple[object, ...],
         loader: MojoExtensionLoader | None = None,
-    ) -> None:
+    ):
         """Queue a non-returning `call(..., out)` into preallocated outputs.
 
         `keepalive` names the objects whose buffers `extension_args`'
@@ -765,7 +765,7 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
     __slots__ = ()
     MOJO_FILE: ClassVar[Path]
 
-    def __new__(cls) -> "MojoExtension":
+    def __new__(cls) -> NoReturn:
         raise TypeError(
             f"{cls.__name__} is a stateless descriptor and cannot be instantiated"
         )

@@ -75,7 +75,7 @@ def test_unary(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = UNARY_OPS[op_name]
     shape = SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
@@ -86,7 +86,7 @@ def test_unary(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_bitwise_not(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randint(-1000, 1000, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -102,7 +102,7 @@ def test_bitwise_not(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_logical_not(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
     bench.run(

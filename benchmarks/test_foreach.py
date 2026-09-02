@@ -64,7 +64,7 @@ def _total(shape_id: str) -> float:
 @pytest.mark.bench_op("_foreach_add_.Scalar")
 def test_foreach_add_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     bench.run(
         lambda: torch._foreach_add_(ref, 1e-5),
@@ -78,7 +78,7 @@ def test_foreach_add_(
 @pytest.mark.bench_op("_foreach_addcdiv_.ScalarList")
 def test_foreach_addcdiv_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     (ref, our), (t1_ref, t1_our), (t2_ref, t2_our) = _lists(
         shape_id, hw, mojo_device, count=3
     )
@@ -95,7 +95,7 @@ def test_foreach_addcdiv_(
 @pytest.mark.bench_op("_foreach_addcmul_.Scalar")
 def test_foreach_addcmul_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     (ref, our), (t1_ref, t1_our), (t2_ref, t2_our) = _lists(
         shape_id, hw, mojo_device, count=3
     )
@@ -111,7 +111,7 @@ def test_foreach_addcmul_(
 @pytest.mark.bench_op("_foreach_div_.ScalarList")
 def test_foreach_div_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     scalars = [1.0001] * len(ref)
     bench.run(
@@ -126,7 +126,7 @@ def test_foreach_div_(
 @pytest.mark.bench_op("_foreach_lerp_.Scalar")
 def test_foreach_lerp_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     (ref, our), (end_ref, end_our) = _lists(shape_id, hw, mojo_device, count=2)
     bench.run(
         lambda: torch._foreach_lerp_(ref, end_ref, 0.01),
@@ -140,7 +140,7 @@ def test_foreach_lerp_(
 @pytest.mark.bench_op("_foreach_mul_.Scalar")
 def test_foreach_mul_scalar(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     bench.run(
         lambda: torch._foreach_mul_(ref, 1.0001),
@@ -154,7 +154,7 @@ def test_foreach_mul_scalar(
 @pytest.mark.bench_op("_foreach_mul_.Tensor")
 def test_foreach_mul_tensor(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     m_ref, m_our = (
         torch.tensor(1.0001).to(hw.stock_device),
@@ -172,7 +172,7 @@ def test_foreach_mul_tensor(
 @pytest.mark.bench_op("_foreach_norm.Scalar")
 def test_foreach_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     bench.run(
         lambda: torch._foreach_norm(ref, 2.0),
@@ -186,7 +186,7 @@ def test_foreach_norm(
 @pytest.mark.bench_op("_foreach_sqrt")
 def test_foreach_sqrt(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ((ref, our),) = _lists(shape_id, hw, mojo_device)
     bench.run(
         lambda: torch._foreach_sqrt(ref),
@@ -200,7 +200,7 @@ def test_foreach_sqrt(
 @pytest.mark.bench_op("_fused_adamw_")
 def test_fused_adamw(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     (
         (params_ref, params_our),
         (grads_ref, grads_our),
@@ -217,7 +217,7 @@ def test_fused_adamw(
         avgs: list[torch.Tensor],
         sqs: list[torch.Tensor],
         steps: list[torch.Tensor],
-    ) -> None:
+    ):
         torch.ops.aten._fused_adamw_(
             params,
             grads,

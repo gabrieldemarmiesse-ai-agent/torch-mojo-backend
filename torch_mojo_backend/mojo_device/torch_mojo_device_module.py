@@ -2,7 +2,7 @@ import threading
 
 import torch
 
-from ..torch_compile_backend.utils import get_accelerators
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
 _current_device = 0
 _UINT64_MASK = (1 << 64) - 1
@@ -42,7 +42,7 @@ def _rng_device_index(device: "int | str | torch.device | None" = None) -> int:
     return index
 
 
-def manual_seed_all(seed: int) -> None:
+def manual_seed_all(seed: int):
     """Reset every Mojo device to the same Philox seed and counter zero."""
     global _rng_default_seed
     normalized = _normalize_rng_seed(seed)
@@ -68,7 +68,7 @@ def get_rng_state(device: "int | str | torch.device | None" = None) -> torch.Ten
 
 def set_rng_state(
     new_state: torch.Tensor, device: "int | str | torch.device | None" = None
-) -> None:
+):
     """Restore an exact state produced by :func:`get_rng_state`."""
     if not isinstance(new_state, torch.Tensor):
         raise TypeError("Mojo RNG state must be a torch.Tensor")
@@ -116,7 +116,7 @@ def current_device() -> int:
     return _current_device
 
 
-def set_device(device_idx: int) -> None:
+def set_device(device_idx: int):
     global _current_device
     if device_idx < 0 or device_idx >= device_count():
         raise ValueError(f"Invalid device index {device_idx}")
@@ -129,7 +129,7 @@ class device:
     module when loading a checkpoint with ``map_location="mojo"``
     (``torch._utils._to`` enters ``device_module.device(...)``)."""
 
-    def __init__(self, device: "int | str | torch.device | None") -> None:
+    def __init__(self, device: "int | str | torch.device | None"):
         if device is None:
             self.idx = -1
             return
@@ -139,7 +139,7 @@ class device:
         torch_device = torch.device(device)
         self.idx = -1 if torch_device.index is None else torch_device.index
 
-    def __enter__(self) -> None:
+    def __enter__(self):
         self.prev_idx = _current_device
         if self.idx >= 0 and self.idx != _current_device:
             set_device(self.idx)
@@ -161,7 +161,7 @@ def _resolve_sync_device(device: "int | str | torch.device | None") -> torch.dev
     return torch_device
 
 
-def _device_synchronize(device: "int | str | torch.device | None" = None) -> None:
+def _device_synchronize(device: "int | str | torch.device | None" = None):
     """Device-only barrier: wait for already-launched work and release the
     completed asynchronous transfer owners.
 
@@ -176,7 +176,7 @@ def _device_synchronize(device: "int | str | torch.device | None" = None) -> Non
     is nothing of theirs to wait for; only the *other* thread's issued work
     must land first, which is exactly a stream synchronize.
     """
-    from .torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
         find_equivalent_max_device,
@@ -188,12 +188,12 @@ def _device_synchronize(device: "int | str | torch.device | None" = None) -> Non
     _release_synchronized_d2h_owners(max_device)
 
 
-def synchronize(device: "int | str | torch.device | None" = None) -> None:
+def synchronize(device: "int | str | torch.device | None" = None):
     """Public: wait for work and release completed asynchronous transfer
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
     every op it issued has actually run on the device."""
-    from . import deferred_compile
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     deferred_compile.drain()
     _device_synchronize(device)
@@ -215,7 +215,9 @@ def memory_stats(device: "int | str | torch.device | None" = None) -> dict[str, 
     ``torch.cuda.memory_stats`` on a CUDA build; callers that want a number
     for this device get honest ones here.
     """
-    from .torch_mojo_tensor import find_equivalent_max_device
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+        find_equivalent_max_device,
+    )
 
     stats = find_equivalent_max_device(_resolve_sync_device(device)).stats
     return {name: int(value) for name, value in dict(stats).items()}
@@ -237,9 +239,9 @@ def memory_summary(
 # for Python PrivateUse1 backends. See mojo_device/streams.py.
 from torch_mojo_backend.mojo_device.streams import (  # noqa: E402
     Event as Event,
+    Stream as Stream,
+    current_stream as current_stream,
+    default_stream as default_stream,
+    set_stream as set_stream,
+    stream as stream,
 )
-from torch_mojo_backend.mojo_device.streams import Stream as Stream
-from torch_mojo_backend.mojo_device.streams import current_stream as current_stream
-from torch_mojo_backend.mojo_device.streams import default_stream as default_stream
-from torch_mojo_backend.mojo_device.streams import set_stream as set_stream
-from torch_mojo_backend.mojo_device.streams import stream as stream

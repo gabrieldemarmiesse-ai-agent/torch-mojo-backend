@@ -20,11 +20,15 @@ class _SignedTorchOp(Protocol):
 
     __signature__: inspect.Signature
 
-    def __call__(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> None: ...
+    def __call__(self, *args: torch.Tensor, **kwargs: torch.Tensor): ...
 
 
 def make_torch_op_from_mojo(
-    path_to_kernels: Path, mojo_custom_op_str: str, allocate_outputs_fn: Callable
+    path_to_kernels: Path,
+    mojo_custom_op_str: str,
+    allocate_outputs_fn: Callable[
+        ..., torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
+    ],
 ) -> Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]]:
     ops = CustomOpLibrary(path_to_kernels)
     mojo_custom_op = ops.__getattr__(mojo_custom_op_str)
@@ -53,9 +57,7 @@ def make_torch_op_from_mojo(
 
     torch_mojo_backend.torch_compile_backend.compiler._global_max_objects = None
 
-    def mojo_custom_op_with_signature(
-        *args: torch.Tensor, **kwargs: torch.Tensor
-    ) -> None:
+    def mojo_custom_op_with_signature(*args: torch.Tensor, **kwargs: torch.Tensor):
         mojo_custom_op(*args, **kwargs)
 
     signed_op = cast(_SignedTorchOp, mojo_custom_op_with_signature)

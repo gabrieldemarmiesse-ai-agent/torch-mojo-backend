@@ -81,7 +81,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.parametrize("shape_id", CAT_SHAPES)
 def test_cat(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     pieces, elems = CAT_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     refs, ours = [], []
@@ -98,7 +98,7 @@ def test_cat(
 @pytest.mark.parametrize("shape_id", STACK_SHAPES)
 def test_stack(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     pieces, elems = STACK_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     refs, ours = [], []
@@ -117,7 +117,7 @@ def test_stack(
 @pytest.mark.parametrize("shape_id", REPEAT_SHAPES)
 def test_repeat(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, cols, reps = REPEAT_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(rows, cols, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -139,7 +139,7 @@ def test_clone(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     dtype = DTYPES[dtype_id]
     if layout == "T":
         base_ref, base_our = both(torch.randn(4096, 4096, dtype=dtype), hw, mojo_device)
@@ -154,7 +154,7 @@ def test_clone(
 @pytest.mark.parametrize("shape_id", TRI_SHAPES)
 def test_tril(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         torch.randn(TRI_SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
     )
@@ -167,7 +167,7 @@ def test_tril(
 @pytest.mark.parametrize("shape_id", TRI_SHAPES)
 def test_triu(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         torch.randn(TRI_SHAPES[shape_id], dtype=DTYPES[dtype_id]), hw, mojo_device
     )
@@ -180,7 +180,7 @@ def test_triu(
 @pytest.mark.parametrize("shape_id", (f"N_{ARANGE_N}",))
 def test_arange(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     dtype = DTYPES[dtype_id]
     bench.run(
         lambda: torch.arange(ARANGE_N, dtype=dtype, device=hw.stock_device),
@@ -201,7 +201,7 @@ CAST_TARGETS: dict[str, tuple[str, torch.dtype]] = {
 @pytest.mark.bench_op("_to_copy")
 def test_to_copy_cast(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = (16777216,) if shape_id == "C_16777216" else (357, 789)
     _, target = CAST_TARGETS[dtype_id]
     x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)

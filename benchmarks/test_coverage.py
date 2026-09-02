@@ -154,7 +154,7 @@ SKIPPED_OPS: dict[str, str] = {
 }
 
 
-def test_every_registered_op_is_classified() -> None:
+def test_every_registered_op_is_classified():
     from torch_mojo_backend.mojo_device import mojo_device_aten_ops as reg
 
     registered = {name for name, _ in reg._aten_ops_registry}
@@ -249,7 +249,7 @@ def _diagnose(orphans: list[str], keys: set[str]) -> str:
     return "\n".join(lines)
 
 
-def test_every_recorded_baseline_is_still_addressable() -> None:
+def test_every_recorded_baseline_is_still_addressable():
     keys = _addressable_keys()
     assert keys, "the collection run found no benchmark nodes at all"
 

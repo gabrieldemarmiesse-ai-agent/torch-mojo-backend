@@ -14,7 +14,11 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     find_equivalent_max_device,
 )
 
-from .support import _copy_into_tensor, _fast, max_dtype_to_torch_dtype
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _copy_into_tensor,
+    _fast,
+    max_dtype_to_torch_dtype,
+)
 
 
 @runtime_checkable
@@ -23,9 +27,7 @@ class _TensorHolderModule(Protocol):
     module needs -- it's a compiled-on-first-use native module (no stubs
     possible), reached via `eager_kernels`' PEP 562 `__getattr__`."""
 
-    def copy_d2d(
-        self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int
-    ) -> None: ...
+    def copy_d2d(self, ctx_ptr: int, dst_ptr: int, src_ptr: int, nbytes: int): ...
     def copy_from_host(
         self, ctx_ptr: int, dev_ptr: int, host_ptr: int, nbytes: int
     ) -> object: ...

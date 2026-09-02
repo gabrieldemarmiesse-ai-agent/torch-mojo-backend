@@ -128,10 +128,10 @@ class _ExportState:
     def __init__(
         self,
         managed: _DLManagedTensor,
-        shape_arr: ctypes.Array,
+        shape_arr: ctypes.Array[ctypes.c_int64],
         holder: object,
         registry: dict[int, _ExportState],
-    ) -> None:
+    ):
         self.managed = managed
         self.shape_arr = shape_arr
         self.holder = holder
@@ -155,7 +155,7 @@ def _release_export(
     cast: Callable[[int, type[ctypes.py_object]], ctypes.py_object] = ctypes.cast,
     py_object: type[ctypes.py_object] = ctypes.py_object,
     py_decref: Callable[[object], None] = _pyapi.Py_DecRef,
-) -> None:
+):
     """Release the producer reference owned by ``manager_ctx`` exactly once.
 
     All helpers needed during release are captured as defaults. An old ctypes
@@ -185,7 +185,7 @@ def _deleter_impl(
     release_export: Callable[
         [ctypes._Pointer[_DLManagedTensor]], None
     ] = _release_export,
-) -> None:
+):
     release_export(handle)
 
 
@@ -201,7 +201,7 @@ def _capsule_destructor_impl(
     cast: Callable[..., object] = ctypes.cast,
     managed_pointer: object = ctypes.POINTER(_DLManagedTensor),
     release_export: Callable[..., None] = _release_export,
-) -> None:
+):
     # A consumer that adopted the memory renames the capsule to
     # "used_dltensor" and becomes responsible for calling the deleter; if
     # the capsule dies still named "dltensor" it was never consumed and the

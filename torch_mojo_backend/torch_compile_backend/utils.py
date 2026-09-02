@@ -1,5 +1,5 @@
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 from max.driver import CPU, Accelerator, Device, accelerator_count
@@ -19,7 +19,7 @@ def get_accelerators() -> list[Device]:
     return result
 
 
-def get_fully_qualified_name(func: Callable | str) -> str:
+def get_fully_qualified_name(func: Callable[..., object] | str) -> str:
     if isinstance(func, str):
         return f"torch.Tensor.{func}"
     result = ""
@@ -36,7 +36,10 @@ def get_fully_qualified_name(func: Callable | str) -> str:
 
 
 def get_error_message(
-    node: torch.fx.Node, node_idx: int, func_args: list | tuple, func_kwargs: dict
+    node: torch.fx.Node,
+    node_idx: int,
+    func_args: Sequence[object],
+    func_kwargs: Mapping[str, object],
 ) -> str:
     if node.stack_trace is None:
         stack_trace = "No stack trace available, likely because this node is the result of a decomposition."

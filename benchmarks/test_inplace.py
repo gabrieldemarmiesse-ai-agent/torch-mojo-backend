@@ -43,7 +43,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("add_.Tensor")
 def test_add_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -58,7 +58,7 @@ def test_add_(
 @pytest.mark.bench_op("mul_.Tensor")
 def test_mul_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -76,7 +76,7 @@ def test_mul_(
 @pytest.mark.bench_op("relu_")
 def test_relu_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(lambda: x_ref.relu_(), lambda: x_our.relu_(), flops=float(x_ref.numel()))
@@ -87,7 +87,7 @@ def test_relu_(
 @pytest.mark.bench_op("fill_.Scalar")
 def test_fill_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -100,7 +100,7 @@ def test_fill_(
 @pytest.mark.bench_op("uniform_")
 def test_uniform_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     """A generated fill: same write traffic as fill_, plus the generator.
 
     Both legs draw from their own device's default generator (there is no
@@ -128,7 +128,7 @@ def test_masked_fill_(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)

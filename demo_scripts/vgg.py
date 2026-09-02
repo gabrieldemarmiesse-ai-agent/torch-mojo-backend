@@ -56,7 +56,7 @@ def load_imagenet_labels() -> list[str]:
     return labels
 
 
-def predict_image(image_path_or_url: str, top_k: int = 5) -> None:
+def predict_image(image_path_or_url: str, top_k: int = 5):
     image = load_image(image_path_or_url)
 
     input_tensor = preprocess(image)

@@ -14,7 +14,7 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
 
-from .torch_mojo_tensor import TorchMojoTensor
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 # _require_handled passes its argument through unchanged, including the
 # symbolic stand-ins host-contract tests route through it.
@@ -72,7 +72,7 @@ class _SavedMojoPayload:
         "is_contiguous",
     )
 
-    def __init__(self, tensor: TorchMojoTensor) -> None:
+    def __init__(self, tensor: TorchMojoTensor):
         self.holder = None if _saved_tensor_hooks_active() else tensor._holder
         self.ptr = tensor._ptr
         self.shape = tensor._shape
@@ -204,8 +204,8 @@ class _MojoAutogradCtx(Protocol):
     has_dropout: bool
     dropout_scale: float
 
-    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
-    def set_materialize_grads(self, value: bool) -> None: ...
+    def save_for_backward(self, *tensors: torch.Tensor): ...
+    def set_materialize_grads(self, value: bool): ...
 
 
 def _restore_saved_mojo_tensors(ctx: _MojoAutogradCtx) -> tuple[TorchMojoTensor, ...]:
@@ -336,7 +336,7 @@ class _ScaledDotProductAttentionAutograd(torch.autograd.Function):
         saved: list[TorchMojoTensor] = []
         saved_names: list[str] = []
 
-        def save(name: str, tensor: TorchMojoTensor) -> None:
+        def save(name: str, tensor: TorchMojoTensor):
             saved_names.append(name)
             saved.append(tensor)
 
@@ -665,7 +665,7 @@ def _scaled_dot_product_attention_autograd(
     # check above is metadata-only and safe on pending tensors. Buffers
     # these paths allocate afterwards are retained per queued item (queue
     # rule 3), so no extra bookkeeping is owed here.
-    from . import deferred_compile
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     deferred_compile.drain()
     if not needs_backward:
@@ -689,7 +689,7 @@ def _scaled_dot_product_attention_autograd(
     )
 
 
-def register_autograd_ops() -> None:
+def register_autograd_ops():
     """Install concrete AutogradPrivateUse1 kernels once."""
     global _registered
     if _registered:
