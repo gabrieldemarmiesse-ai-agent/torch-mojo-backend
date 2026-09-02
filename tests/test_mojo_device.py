@@ -1309,3 +1309,17 @@ def test_as_strided_zero_copy_view(mojo_gpu_available):
     # A layout that would reach past the allocation must be refused.
     with pytest.raises(NotImplementedError):
         torch.as_strided(dev, (5, 4), (8, 2), 1)
+
+
+def test_set_source_tensor_adopts_the_allocation(mojo_gpu_available):
+    if not mojo_gpu_available:
+        pytest.skip("requires a MAX GPU")
+    destination = torch.zeros(8, device="mojo:0")
+    source = torch.arange(4, dtype=torch.float32, device="mojo:0") + 50
+    returned = destination.set_(source)  # ty: ignore[invalid-argument-type] -- torch's stub lacks the Tensor overload
+    assert returned is destination
+    assert tuple(destination.shape) == (4,)
+    assert destination.cpu().tolist() == [50.0, 51.0, 52.0, 53.0]
+    # Sharing the allocation, not a copy of it.
+    source.add_(1.0)
+    assert destination.cpu().tolist() == [51.0, 52.0, 53.0, 54.0]

@@ -6,7 +6,10 @@ from torch_mojo_backend.mojo_device.aten_ops.support import (
     _refuse_unsupported_backward,
     _unsupported,
 )
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    TorchMojoTensor,
+    _rebind_payload_exact,
+)
 
 
 def mojo_device_add_(
@@ -64,6 +67,30 @@ def mojo_device_relu_(self: TorchMojoTensor) -> TorchMojoTensor:
     if result is aten_fast.NOT_HANDLED:
         raise _unsupported("aten::relu_", (self,))
     _copy_into_tensor(self, result)
+    return self
+
+
+def mojo_device_set__source_tensor(
+    self: TorchMojoTensor, source: TorchMojoTensor
+) -> TorchMojoTensor:
+    """``self.set_(source)``: adopt source's allocation and layout in place.
+
+    ``set_`` is the one op that repoints a tensor at another tensor's
+    storage without copying, keeping the Python object's identity — which is
+    why FSDP1 uses it to turn a flat parameter into its own shard
+    (``FlatParamHandle.shard``). Views already sharing this tensor's holder
+    keep pointing at the old allocation, exactly as on a storage-backed
+    backend; the allocation itself survives while any of them holds a
+    reference.
+    """
+    if not isinstance(self, TorchMojoTensor) or not isinstance(source, TorchMojoTensor):
+        raise _unsupported("aten::set_.source_Tensor", (self, source))
+    if self._device != source._device:
+        raise RuntimeError(
+            "aten::set_.source_Tensor requires both tensors on the same mojo "
+            f"device (got {self.device} and {source.device})"
+        )
+    _rebind_payload_exact(self, source)
     return self
 
 
