@@ -14,8 +14,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from max.dtype import DType
 from max.driver import accelerator_count
+from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels, get_accelerators
 
@@ -34,7 +34,7 @@ def _clear_probe_cache() -> Iterator[None]:
 
 
 @pytest.fixture(scope="module")
-def real_accelerator() -> None:
+def real_accelerator():
     # `get_accelerators()` is truthy even without one (CPU pseudo-device).
     if accelerator_count() == 0:
         pytest.skip("the build-based ptxas probe needs a real accelerator")
@@ -73,12 +73,12 @@ def _fake_ptxas(tmp_path: Path, *, ceiling: int | None, exit_code: int = 1) -> s
 
 def test_bundled_assembler_is_assumed_to_take_big_static_shared(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """No compiler path set: MAX assembles in-process and nothing is probed."""
     monkeypatch.delenv("MODULAR_NVPTX_COMPILER_PATH", raising=False)
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
 
-    def fail(*args: object, **kwargs: object) -> None:
+    def fail(*args: object, **kwargs: object):
         raise AssertionError("the probe must not exec anything with no compiler set")
 
     monkeypatch.setattr(eager_kernels, "_ptxas_assembles", fail)
@@ -90,7 +90,7 @@ def test_bundled_assembler_is_assumed_to_take_big_static_shared(
 @pytest.mark.parametrize(("override", "expected"), [("0", False), ("1", True)])
 def test_env_override_beats_the_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: str, expected: bool
-) -> None:
+):
     """The override wins in both directions over a live probe."""
     # The fake answers the opposite of the override, so an ignored override fails.
     monkeypatch.setenv(
@@ -105,7 +105,7 @@ def test_env_override_beats_the_probe(
 
 def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
     real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
     monkeypatch.setenv(
         "MODULAR_NVPTX_COMPILER_PATH", _fake_ptxas(tmp_path, ceiling=_BIG)
@@ -117,7 +117,7 @@ def test_assembler_that_takes_the_big_request_keeps_the_fast_routes(
 
 def test_assembler_capped_at_48kib_compiles_the_big_routes_out(
     real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     """The CUDA 12.x case: the control leg passes, the big one does not."""
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
     monkeypatch.setenv(
@@ -130,7 +130,7 @@ def test_assembler_capped_at_48kib_compiles_the_big_routes_out(
 
 def test_assembler_that_fails_both_legs_is_not_evidence_of_a_cap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+):
     """An uninformative probe keeps the default rather than downgrading forever."""
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
     monkeypatch.setenv(
@@ -143,7 +143,7 @@ def test_assembler_that_fails_both_legs_is_not_evidence_of_a_cap(
 
 def test_assembler_that_cannot_be_run_is_not_evidence_of_a_cap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+):
     monkeypatch.delenv(eager_kernels._PTXAS_BIG_SMEM_ENV, raising=False)
     monkeypatch.setenv("MODULAR_NVPTX_COMPILER_PATH", str(tmp_path / "no-such-ptxas"))
 
@@ -153,7 +153,7 @@ def test_assembler_that_cannot_be_run_is_not_evidence_of_a_cap(
 
 def test_disk_cache_reprobes_only_when_the_assembler_fingerprint_changes(
     real_accelerator: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+):
     """A warm process reads the disk verdict; a different binary reprobes.
 
     The changed leg uses a second path, not an in-place overwrite: `mojo
@@ -191,7 +191,7 @@ def test_disk_cache_reprobes_only_when_the_assembler_fingerprint_changes(
     assert calls, "a changed fingerprint must not be served from the stale entry"
 
 
-def test_probe_source_declares_more_than_the_ceiling_and_uses_it() -> None:
+def test_probe_source_declares_more_than_the_ceiling_and_uses_it():
     """A probe whose buffer the compiler can prove dead would pass everywhere."""
     text = eager_kernels._PTXAS_PROBE_SOURCE.read_text()
     assert _BIG > _CONTROL == 49152
@@ -201,7 +201,7 @@ def test_probe_source_declares_more_than_the_ceiling_and_uses_it() -> None:
     assert "out_ptr[0]" in text
 
 
-def test_only_the_two_families_with_big_smem_routes_send_the_define() -> None:
+def test_only_the_two_families_with_big_smem_routes_send_the_define():
     """An unread define forks a byte-identical build, so senders must have readers."""
     aten_fast = (_KERNEL_DIR / "aten_fast.py").read_text()
     senders = aten_fast.count("big_static_smem_flags()")
@@ -222,7 +222,7 @@ def test_only_the_two_families_with_big_smem_routes_send_the_define() -> None:
 
 def test_matmul_spec_defines_carry_the_flag_and_agree_with_the_cache_key(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+):
     """A flag on the compile line but not in the cache key would file a gated
     .so under the ungated name."""
     from torch_mojo_backend.eager_kernels import aten_fast
@@ -251,7 +251,7 @@ class _StubTensor:
     _device: object = None
 
 
-def test_gated_routes_leave_an_unconditional_fallback_behind() -> None:
+def test_gated_routes_leave_an_unconditional_fallback_behind():
     """The fallback call must sit outside every `comptime if`, or a gated
     build enqueues nothing for those shapes."""
     v3 = (_KERNEL_DIR / "gemm16_matmul_ops" / "gemm16_v3_kernels.mojo").read_text()
@@ -265,7 +265,7 @@ def test_gated_routes_leave_an_unconditional_fallback_behind() -> None:
 
 
 @pytest.fixture(scope="module")
-def sm90_mojo_gpu() -> None:
+def sm90_mojo_gpu():
     accelerators = list(get_accelerators())
     if not accelerators or accelerators[0].api != "cuda":
         pytest.skip("the gated routes are NVIDIA-only")
@@ -367,7 +367,7 @@ sys.exit(0)
 
 def test_gated_build_still_computes_the_right_answers(
     sm90_mojo_gpu: None, tmp_path: Path
-) -> None:
+):
     """With the fast routes compiled out, mm/bmm/linear/SDPA still match CPU.
     Compiles two extension families on first run."""
     worker = tmp_path / "ptxas_fallback_worker.py"

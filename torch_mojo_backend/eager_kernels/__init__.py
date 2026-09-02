@@ -469,7 +469,7 @@ def _read_ptxas_probe_cache(path: Path) -> bool | None:
     return verdict if isinstance(verdict, bool) else None
 
 
-def _write_ptxas_probe_cache(path: Path, verdict: bool) -> None:
+def _write_ptxas_probe_cache(path: Path, verdict: bool):
     """Best-effort: a write failure just costs the next process a re-probe."""
     tmp = path.with_name(f".tmp{os.getpid()}.{path.name}")
     try:
