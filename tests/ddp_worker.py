@@ -160,6 +160,59 @@ def run_ddp_parity(failures: list[str]):
     dist.barrier()
 
 
+def run_lazy_fence(failures: list[str]):
+    """The comm-stream collective's result is fenced onto the default stream
+    lazily, at its first consumer (mojo_device/comm_fence.py).
+
+    256 MB per collective on purpose: the fence is only under test while the
+    allreduce is still running when the host reaches the consumer a few
+    microseconds later. A few-KB collective would have finished either way
+    and every assertion below would pass with no fence at all.
+
+    Measured against a build with ``comm_fence.mark_pending`` disarmed, (c)
+    is the check that catches the missing fence — (a) and (b) allocate a
+    256 MB destination first, which is usually long enough for the collective
+    to land anyway. They stay because they are the contract users write
+    against; (c) is the one with teeth.
+    """
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    expected = float(world * (world + 1) // 2)
+    numel = 64 * 1024 * 1024
+
+    # (a) host read straight after the collective.
+    a = torch.full((numel,), float(rank + 1), device="mojo")
+    dist.all_reduce(a)
+    _check(failures, "lazy_fence.host_read", bool((a.cpu() == expected).all()))
+    del a
+
+    # (b) device consumer of the result, read back through it.
+    b = torch.full((numel,), float(rank + 1), device="mojo")
+    dist.all_reduce(b)
+    doubled = b + b
+    _check(
+        failures,
+        "lazy_fence.device_consumer",
+        bool((doubled.cpu() == 2 * expected).all()),
+    )
+    del b, doubled
+
+    # (c) write into a VIEW of the reduced buffer. Unfenced, the fill lands
+    # first and the collective's output overwrites it.
+    c = torch.full((numel,), float(rank + 1), device="mojo")
+    dist.all_reduce(c)
+    c.narrow(0, 0, 1024).fill_(-7.0)
+    out = c.cpu()
+    _check(
+        failures,
+        "lazy_fence.view_write",
+        bool((out[:1024] == -7.0).all()) and bool((out[1024:] == expected).all()),
+    )
+    del c, out
+
+    dist.barrier()
+
+
 def main():
     mode = sys.argv[1]
     from torch_mojo_backend import register_mojo_devices
@@ -171,6 +224,8 @@ def main():
         run_collectives(failures)
     elif mode == "ddp_parity":
         run_ddp_parity(failures)
+    elif mode == "lazy_fence":
+        run_lazy_fence(failures)
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()

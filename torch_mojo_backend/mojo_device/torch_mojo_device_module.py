@@ -192,9 +192,12 @@ def synchronize(device: "int | str | torch.device | None" = None):
     """Public: wait for work and release completed asynchronous transfer
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
-    every op it issued has actually run on the device."""
-    from torch_mojo_backend.mojo_device import deferred_compile
+    every op it issued has actually run on the device. So does a collective
+    still flying on the comm stream, which only the default stream is waited
+    on here: fence it onto that stream first (mojo_device/comm_fence.py)."""
+    from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
 
+    comm_fence.fence_all()
     deferred_compile.drain()
     _device_synchronize(device)
 
