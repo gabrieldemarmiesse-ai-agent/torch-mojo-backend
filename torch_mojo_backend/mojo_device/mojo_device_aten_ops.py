@@ -21,8 +21,8 @@ from typing import cast
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend.types import CountedCallable
 
-from .aten_ops import foreach
-from .aten_ops.autograd_preflight import (
+from torch_mojo_backend.mojo_device.aten_ops import foreach
+from torch_mojo_backend.mojo_device.aten_ops.autograd_preflight import (
     mojo_device__adaptive_avg_pool2d,
     mojo_device__scaled_dot_product_efficient_attention,
     mojo_device__softmax,
@@ -42,8 +42,8 @@ from .aten_ops.autograd_preflight import (
     mojo_device_tanh,
     mojo_device_upsample_bilinear2d,
 )
-from .aten_ops.blas import mojo_device_addr
-from .aten_ops.factories import (
+from torch_mojo_backend.mojo_device.aten_ops.blas import mojo_device_addr
+from torch_mojo_backend.mojo_device.aten_ops.factories import (
     empty_strided,
     mojo_device_arange,
     mojo_device_arange_start_out,
@@ -62,12 +62,12 @@ from .aten_ops.factories import (
     mojo_device_zeros,
     mojo_device_zeros_like,
 )
-from .aten_ops.foreach import (
+from torch_mojo_backend.mojo_device.aten_ops.foreach import (
     mojo_device__foreach_mul__tensor,
     mojo_device__foreach_norm_scalar,
     mojo_device__foreach_sqrt,
 )
-from .aten_ops.inplace import (
+from torch_mojo_backend.mojo_device.aten_ops.inplace import (
     mojo_device_add_,
     mojo_device_fill__scalar,
     mojo_device_masked_fill_,
@@ -75,14 +75,24 @@ from .aten_ops.inplace import (
     mojo_device_relu_,
     mojo_device_zero_,
 )
-from .aten_ops.reductions import mojo_device_min_dim, mojo_device_min_dim_min
-from .aten_ops.rng import mojo_device_normal_
-from .aten_ops.streams import mojo_device_record_stream
-from .aten_ops.support import _eager_impl, _not_implemented, _out_variant
-from .aten_ops.transfer import mojo_device__copy_from, mojo_device__to_copy
+from torch_mojo_backend.mojo_device.aten_ops.reductions import (
+    mojo_device_min_dim,
+    mojo_device_min_dim_min,
+)
+from torch_mojo_backend.mojo_device.aten_ops.rng import mojo_device_normal_
+from torch_mojo_backend.mojo_device.aten_ops.streams import mojo_device_record_stream
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _eager_impl,
+    _not_implemented,
+    _out_variant,
+)
+from torch_mojo_backend.mojo_device.aten_ops.transfer import (
+    mojo_device__copy_from,
+    mojo_device__to_copy,
+)
 
 # Global registry for functions to register
-_aten_ops_registry: list[tuple[str, Callable]] = []
+_aten_ops_registry: list[tuple[str, Callable[..., object]]] = []
 
 # Under tests, each registered op's dispatcher is wrapped with a call
 # counter so `CallChecker` can assert the backend's impl for a given op ran
@@ -91,14 +101,16 @@ _aten_ops_registry: list[tuple[str, Callable]] = []
 EAGER_CALL_COUNTERS: dict[str, CountedCallable] = {}
 
 
-def register_aten_op(op_name: str) -> Callable[[Callable], Callable]:
+def register_aten_op(
+    op_name: str,
+) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Decorator to mark a function for aten op registration.
 
     Args:
         op_name: The aten operation name (e.g., "aten::add.Tensor")
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., object]) -> Callable[..., object]:
         if torch_mojo_backend.is_running_tests.IS_RUNNING_TESTS:
 
             def counted(*args: object, **kwargs: object) -> object:

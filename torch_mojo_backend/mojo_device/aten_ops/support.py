@@ -106,9 +106,9 @@ def _refuse_unsupported_backward(
     )
 
 
-def _eager_impl(fast_name: str, op_name: str) -> Callable:
+def _eager_impl(fast_name: str, op_name: str) -> Callable[..., object]:
     """Bind an op to its aten_fast implementation; raise on NOT_HANDLED."""
-    fast_fn: Callable | None = None
+    fast_fn: Callable[..., object] | None = None
     not_handled = None
 
     def dispatcher(*args: object, **kwargs: object) -> object:
@@ -125,7 +125,7 @@ def _eager_impl(fast_name: str, op_name: str) -> Callable:
     return dispatcher
 
 
-def _not_implemented(op_name: str) -> Callable:
+def _not_implemented(op_name: str) -> Callable[..., NoReturn]:
     """Explicit raiser for ops that used to run through the graph fallback
     and have no fast implementation yet. Registered (instead of left
     unregistered) so users get an actionable message, and so the remaining
@@ -152,7 +152,7 @@ def _copy_into_tensor(dst: TorchMojoTensor, src: TorchMojoTensor) -> None:
 
 def _out_variant(
     op_name: str, fast_name: str, *, dtype_policy: str = "safe_cast"
-) -> Callable:
+) -> Callable[..., TorchMojoTensor]:
     """Wrap a functional fast implementation as an out= variant: compute,
     then copy into `out` (strided-safe)."""
 

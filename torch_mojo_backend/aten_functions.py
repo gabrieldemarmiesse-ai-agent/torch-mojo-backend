@@ -126,7 +126,7 @@ def torch_device_to_max_device(x: torch.device) -> DeviceRef:
 # handle_call_function. Lets multi-output mappings check which outputs are
 # actually consumed (e.g. native_layer_norm's mean/rstd are dead in
 # inference graphs, enabling the fused kernel).
-CURRENT_FX_NODE: contextvars.ContextVar = contextvars.ContextVar(
+CURRENT_FX_NODE: contextvars.ContextVar[torch.fx.Node | None] = contextvars.ContextVar(
     "CURRENT_FX_NODE", default=None
 )
 

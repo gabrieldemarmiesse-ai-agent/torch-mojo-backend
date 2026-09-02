@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import load_file
+from tokenizers import Tokenizer
 from torch._dynamo import mark_dynamic
 
 from torch_mojo_backend import mojo_backend
@@ -528,11 +529,11 @@ def load_weights_into_gemma(
         )
 
     # Iterate over transformer layers
-    for l in range(param_config["n_layers"]):
+    for layer in range(param_config["n_layers"]):
         # ModuleList.__getitem__ is typed as -> Module; narrow to the
         # concrete type actually stored (Gemma3Model.__init__ only ever
         # puts TransformerBlocks in `blocks`).
-        block = model.blocks[l]
+        block = model.blocks[layer]
         assert isinstance(block, TransformerBlock)
         att = block.att
         assert att.q_norm is not None
@@ -540,65 +541,65 @@ def load_weights_into_gemma(
         # Attention projections
         att.W_query.weight = assign(
             att.W_query.weight,
-            params[f"model.layers.{l}.self_attn.q_proj.weight"],
-            f"model.layers.{l}.self_attn.q_proj.weight",
+            params[f"model.layers.{layer}.self_attn.q_proj.weight"],
+            f"model.layers.{layer}.self_attn.q_proj.weight",
         )
         att.W_key.weight = assign(
             att.W_key.weight,
-            params[f"model.layers.{l}.self_attn.k_proj.weight"],
-            f"model.layers.{l}.self_attn.k_proj.weight",
+            params[f"model.layers.{layer}.self_attn.k_proj.weight"],
+            f"model.layers.{layer}.self_attn.k_proj.weight",
         )
         att.W_value.weight = assign(
             att.W_value.weight,
-            params[f"model.layers.{l}.self_attn.v_proj.weight"],
-            f"model.layers.{l}.self_attn.v_proj.weight",
+            params[f"model.layers.{layer}.self_attn.v_proj.weight"],
+            f"model.layers.{layer}.self_attn.v_proj.weight",
         )
         att.out_proj.weight = assign(
             att.out_proj.weight,
-            params[f"model.layers.{l}.self_attn.o_proj.weight"],
-            f"model.layers.{l}.self_attn.o_proj.weight",
+            params[f"model.layers.{layer}.self_attn.o_proj.weight"],
+            f"model.layers.{layer}.self_attn.o_proj.weight",
         )
         # QK normalization weights
         att.q_norm.scale = assign(
             att.q_norm.scale,
-            params[f"model.layers.{l}.self_attn.q_norm.weight"],
-            f"model.layers.{l}.self_attn.q_norm.weight",
+            params[f"model.layers.{layer}.self_attn.q_norm.weight"],
+            f"model.layers.{layer}.self_attn.q_norm.weight",
         )
         att.k_norm.scale = assign(
             att.k_norm.scale,
-            params[f"model.layers.{l}.self_attn.k_norm.weight"],
-            f"model.layers.{l}.self_attn.k_norm.weight",
+            params[f"model.layers.{layer}.self_attn.k_norm.weight"],
+            f"model.layers.{layer}.self_attn.k_norm.weight",
         )
         # Feed forward weights
         block.ff.fc1.weight = assign(
             block.ff.fc1.weight,
-            params[f"model.layers.{l}.mlp.gate_proj.weight"],
-            f"model.layers.{l}.mlp.gate_proj.weight",
+            params[f"model.layers.{layer}.mlp.gate_proj.weight"],
+            f"model.layers.{layer}.mlp.gate_proj.weight",
         )
         block.ff.fc2.weight = assign(
             block.ff.fc2.weight,
-            params[f"model.layers.{l}.mlp.up_proj.weight"],
-            f"model.layers.{l}.mlp.up_proj.weight",
+            params[f"model.layers.{layer}.mlp.up_proj.weight"],
+            f"model.layers.{layer}.mlp.up_proj.weight",
         )
         block.ff.fc3.weight = assign(
             block.ff.fc3.weight,
-            params[f"model.layers.{l}.mlp.down_proj.weight"],
-            f"model.layers.{l}.mlp.down_proj.weight",
+            params[f"model.layers.{layer}.mlp.down_proj.weight"],
+            f"model.layers.{layer}.mlp.down_proj.weight",
         )
         # LayerNorm weights
         block.input_layernorm.scale = assign(
             block.input_layernorm.scale,
-            params[f"model.layers.{l}.input_layernorm.weight"],
-            f"model.layers.{l}.input_layernorm.weight",
+            params[f"model.layers.{layer}.input_layernorm.weight"],
+            f"model.layers.{layer}.input_layernorm.weight",
         )
         block.post_attention_layernorm.scale = assign(
             block.post_attention_layernorm.scale,
-            params[f"model.layers.{l}.post_attention_layernorm.weight"],
-            f"model.layers.{l}.post_attention_layernorm.weight",
+            params[f"model.layers.{layer}.post_attention_layernorm.weight"],
+            f"model.layers.{layer}.post_attention_layernorm.weight",
         )
         # Pre‑ and post‑feed forward norms
-        pre_key = f"model.layers.{l}.pre_feedforward_layernorm.weight"
-        post_key = f"model.layers.{l}.post_feedforward_layernorm.weight"
+        pre_key = f"model.layers.{layer}.pre_feedforward_layernorm.weight"
+        post_key = f"model.layers.{layer}.post_feedforward_layernorm.weight"
         if pre_key in params:
             block.pre_feedforward_layernorm.scale = assign(
                 block.pre_feedforward_layernorm.scale, params[pre_key], pre_key
@@ -657,9 +658,6 @@ else:
 load_weights_into_gemma(model, GEMMA3_CONFIG_270M, weights_dict)
 model.to(device)
 del weights_dict
-
-
-from tokenizers import Tokenizer
 
 
 class GemmaTokenizer:

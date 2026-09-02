@@ -2,7 +2,10 @@
 
 import torch
 
-from .support import _COMPOSITE_EXPLICIT_AUTOGRAD, _fast
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _COMPOSITE_EXPLICIT_AUTOGRAD,
+    _fast,
+)
 
 
 def mojo_device_addr(

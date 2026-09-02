@@ -128,7 +128,7 @@ class _ExportState:
     def __init__(
         self,
         managed: _DLManagedTensor,
-        shape_arr: ctypes.Array,
+        shape_arr: ctypes.Array[ctypes.c_int64],
         holder: object,
         registry: dict[int, _ExportState],
     ) -> None:

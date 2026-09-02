@@ -54,18 +54,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import IO, ClassVar, Generic, TypeVar, cast
+from typing import IO, ClassVar, Generic, NoReturn, TypeVar, cast
 
 from max import driver
 from max.dtype import DType
 
-from . import call_queue
+from torch_mojo_backend.eager_kernels import call_queue
 
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
 
 
-_MOJO_EXE_CACHE: list = []
+_MOJO_EXE_CACHE: list[Path] = []
 
 
 def _find_mojo() -> Path:
@@ -728,7 +728,7 @@ _ExtensionResult = TypeVar("_ExtensionResult")
 
 @dataclass(frozen=True)
 class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
-    extension: type["MojoExtension"]
+    extension: type["MojoExtension[_OutputSpecs, _ExtensionResult]"]
     defines: CanonicalDefines
     output_specs: _OutputSpecs
     args: tuple[object, ...]
@@ -765,7 +765,7 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
     __slots__ = ()
     MOJO_FILE: ClassVar[Path]
 
-    def __new__(cls) -> "MojoExtension":
+    def __new__(cls) -> NoReturn:
         raise TypeError(
             f"{cls.__name__} is a stateless descriptor and cannot be instantiated"
         )

@@ -1,6 +1,7 @@
 import time
 import traceback
 import weakref
+import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -29,15 +30,12 @@ from torch_mojo_backend.torch_compile_backend.utils import (
     get_fully_qualified_name,
 )
 
-from ..aten_functions import MAPPING_TORCH_ATEN_TO_MOJO
-from .utils import get_accelerators
+from torch_mojo_backend.aten_functions import MAPPING_TORCH_ATEN_TO_MOJO
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
 
 class MojoCompilerError(Exception):
     pass
-
-
-import datetime as dt
 
 
 @dataclass
@@ -385,10 +383,7 @@ class _GraphFactory:
                 output_tensors.append(converted)
         # Store the none indices for runtime handling
         self.graph.output(
-            *cast(
-                "list[max.graph.value.Value | max.graph.value.TensorValueLike]",
-                output_tensors,
-            )
+            *cast("list[max.graph.value.TensorValueLike]", output_tensors)
         )
         self.graph.__exit__(None, None, None)
         self._graph_open = False
@@ -577,10 +572,11 @@ class BaseMaxCompiler:
 # (catches storage reallocation, e.g. `param.data = ...`), evicted when the
 # tensor dies. Buffers alias the tensor memory, so in-place updates
 # (optimizer steps) are seen without invalidation.
-_buffer_cache: dict[int, tuple[max.driver.Buffer, int, weakref.finalize]] = {}
+# Quoted: `weakref.finalize` is not subscriptable at runtime.
+_buffer_cache: "dict[int, tuple[max.driver.Buffer, int, weakref.finalize[[int], torch.Tensor]]]" = {}
 
 
-def _evict_buffer(tensor_id: int) -> None:
+def _evict_buffer(tensor_id: int, /) -> None:
     _buffer_cache.pop(tensor_id, None)
 
 

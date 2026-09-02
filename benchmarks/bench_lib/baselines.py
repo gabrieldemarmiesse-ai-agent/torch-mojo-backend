@@ -443,7 +443,7 @@ def _without_legacy_aggregates(node: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _transposed(configs: dict[str, dict]) -> dict[str, dict]:
+def _transposed(configs: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
     """Formats 3 and 4 nested dtype above op; format 5 nests op above dtype.
 
     Rebuilds each config as ops -> dtypes -> shapes, carrying the shape
@@ -453,13 +453,19 @@ def _transposed(configs: dict[str, dict]) -> dict[str, dict]:
     out = {}
     for config_key, config in configs.items():
         ops = {}
-        for dtype, dtype_block in config.get("dtypes", {}).items():
-            for op, op_block in dtype_block.get("ops", {}).items():
+        dtype_blocks = typing.cast(
+            "dict[str, dict[str, object]]", config.get("dtypes", {})
+        )
+        for dtype, dtype_block in dtype_blocks.items():
+            op_blocks = typing.cast(
+                "dict[str, dict[str, object]]", dtype_block.get("ops", {})
+            )
+            for op, op_block in op_blocks.items():
                 ops.setdefault(op, {})[dtype] = {"shapes": op_block.get("shapes", {})}
         out[config_key] = {
             "ops": {op: {"dtypes": dtypes} for op, dtypes in ops.items()}
         }
-    return out
+    return typing.cast("dict[str, dict[str, object]]", out)
 
 
 def rebuild(path: Path = BASELINES_PATH) -> None:
@@ -476,6 +482,8 @@ def rebuild(path: Path = BASELINES_PATH) -> None:
         stripped = _without_legacy_aggregates(raw)
         # Parsed JSON, shape guaranteed by the format-3/4 contract this
         # migration handles, not something isinstance can verify past "dict".
-        configs = typing.cast("dict[str, dict]", stripped.get("configs", {}))
+        configs = typing.cast(
+            "dict[str, dict[str, object]]", stripped.get("configs", {})
+        )
         raw = {"configs": _transposed(configs), "format": FORMAT_VERSION}
     write(_parse(raw, path), path)

@@ -95,18 +95,27 @@ class _QueueUnit(Protocol):
 # raw `args` name — retained until the item launches (rule 3) — and the
 # device bytes that retention holds, pre-computed for the run-ahead budget.
 _QueueItem = tuple[
-    _QueueUnit | None, Callable[..., object] | None, tuple, threading.Thread, tuple, int
+    _QueueUnit | None,
+    Callable[..., object] | None,
+    tuple[object, ...],
+    threading.Thread,
+    tuple[object, ...],
+    int,
 ]
 
 _LOCK = threading.RLock()  # queue + every device touch (see rule 6)
 _QUEUE: deque[_QueueItem] = deque()
 _HELD_ERROR: list[BaseException] = []
-_DEVICE_THREAD: list = [None]  # last thread to issue device work (rule 4)
-_QUEUE_LAUNCH_THREAD: list = [None]  # last thread to launch FROM the queue
-_ERROR_TRANSLATOR: list = [None]
-_ENABLED: list = [None]  # memoized enabled(); refresh() invalidates
+_DEVICE_THREAD: list[threading.Thread | None] = [
+    None
+]  # last thread to issue device work (rule 4)
+_QUEUE_LAUNCH_THREAD: list[threading.Thread | None] = [
+    None
+]  # last thread to launch FROM the queue
+_ERROR_TRANSLATOR: list[Callable[[BaseException], None] | None] = [None]
+_ENABLED: list[bool | None] = [None]  # memoized enabled(); refresh() invalidates
 _RETAINED_BYTES: list[int] = [0]  # bytes held by queued items (rule 3 budget)
-_BUDGET_BYTES: list = [None]  # memoized budget; refresh() invalidates
+_BUDGET_BYTES: list[int | None] = [None]  # memoized budget; refresh() invalidates
 _TLS = threading.local()  # .in_launch
 
 # Run-ahead bound. During a cold storm the host can enqueue whole training
@@ -449,7 +458,9 @@ def _launch_prefix(unit: _QueueUnit | None) -> bool:
     return True
 
 
-def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
+def kernel_call_into(
+    unit: _QueueUnit, args: tuple[object, ...], keepalive: tuple[object, ...]
+) -> None:
     """Queue a descriptor call whose outputs were preallocated in Python.
     The call writes into them and returns nothing — always queueable
     regardless of the *Spec naming convention.
@@ -470,7 +481,9 @@ def kernel_call_into(unit: _QueueUnit, args: tuple, keepalive: tuple) -> None:
         _enforce_budget_locked()
 
 
-def external_call(fn: Callable[..., object], args: tuple, keepalive: tuple) -> None:
+def external_call(
+    fn: Callable[..., object], args: tuple[object, ...], keepalive: tuple[object, ...]
+) -> None:
     """An ungated device call (tensor_holder, fa4): always launchable, but
     must hold its FIFO position behind queued producers of its inputs.
 

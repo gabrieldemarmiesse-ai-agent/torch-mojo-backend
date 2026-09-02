@@ -8,10 +8,13 @@ from collections.abc import Callable
 
 import torch
 
-from .support import _COMPOSITE_EXPLICIT_AUTOGRAD, _fast
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _COMPOSITE_EXPLICIT_AUTOGRAD,
+    _fast,
+)
 
 
-def inplace_dispatcher(op_name: str, fast_name: str) -> Callable:
+def inplace_dispatcher(op_name: str, fast_name: str) -> Callable[..., None]:
     """Dispatcher for a mutable ()-returning foreach op: batched fast path,
     with ATen's exact sequential semantics as the fallback (redispatched
     below this PrivateUse1 registration, like `_foreach_mul_.Tensor`)."""

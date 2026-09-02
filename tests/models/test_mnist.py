@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch_mojo_backend import mojo_backend
 from torch_mojo_backend.testing import check_functions_are_equivalent
 
-from ..conftest import require_cuda_autograd
+from tests.conftest import require_cuda_autograd
 
 # TF32 keeps 10 explicit mantissa bits, so its unit roundoff is 2**-11.
 _TF32_UNIT_ROUNDOFF = 2.0**-11

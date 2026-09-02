@@ -52,7 +52,7 @@ class SimpleNet(nn.Module):
 def train_epoch(
     model: nn.Module,
     device: torch.device,
-    train_loader: DataLoader,
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     epoch: int,
@@ -101,7 +101,7 @@ def train_epoch(
 def evaluate(
     model: nn.Module,
     device: torch.device,
-    test_loader: DataLoader,
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     criterion: nn.Module,
 ) -> tuple[float, float]:
     """Evaluate the model on test data."""

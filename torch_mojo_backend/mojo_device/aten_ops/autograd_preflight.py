@@ -15,7 +15,12 @@ import torch
 
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
-from .support import _eager_impl, _fast, _refuse_unsupported_backward, _unsupported
+from torch_mojo_backend.mojo_device.aten_ops.support import (
+    _eager_impl,
+    _fast,
+    _refuse_unsupported_backward,
+    _unsupported,
+)
 
 # Most of these ops have no autograd escape other than turning grad off: their
 # parameters legitimately require grad during training, so unlike batch norm
@@ -37,7 +42,7 @@ def _preflight_unsupported_backward(
     backward_op: str,
     grad_operands: Sequence[int],
     workaround: str = _GRAD_OFF_ONLY,
-) -> Callable[..., TorchMojoTensor | tuple[TorchMojoTensor, ...]]:
+) -> Callable[..., object]:
     """`aten_fast.<fast_name>`, fronted by the forward-time autograd refusal.
 
     One entry per op whose whole native backward is missing, which is the
@@ -49,9 +54,7 @@ def _preflight_unsupported_backward(
     """
     dispatch = _eager_impl(fast_name, op_name)
 
-    def preflighted(
-        *args: object, **kwargs: object
-    ) -> TorchMojoTensor | tuple[TorchMojoTensor, ...]:
+    def preflighted(*args: object, **kwargs: object) -> object:
         operands: list[torch.Tensor] = []
         for index in grad_operands:
             if index < len(args):

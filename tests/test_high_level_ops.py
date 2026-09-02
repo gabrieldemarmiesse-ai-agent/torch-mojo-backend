@@ -139,7 +139,7 @@ def test_new_ones_dtype(device: str):
     check_functions_are_equivalent(fn, device, [a])
 
 
-def test_operator_add(conf: Conf, tensor_shapes: tuple):
+def test_operator_add(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x + y
 
@@ -149,7 +149,7 @@ def test_operator_add(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_subtraction(conf: Conf, tensor_shapes: tuple):
+def test_subtraction(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x - y
 
@@ -159,7 +159,7 @@ def test_subtraction(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_subtraction_different_dtypes(conf: Conf, tensor_shapes: tuple):
+def test_subtraction_different_dtypes(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x - y
 
@@ -169,7 +169,7 @@ def test_subtraction_different_dtypes(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_multiplication(conf: Conf, tensor_shapes: tuple):
+def test_multiplication(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x * y
 
@@ -179,7 +179,7 @@ def test_multiplication(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_multiplication_int32(conf: Conf, tensor_shapes: tuple):
+def test_multiplication_int32(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x * y
 
@@ -189,7 +189,7 @@ def test_multiplication_int32(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_division(device: str, tensor_shapes: tuple):
+def test_division(device: str, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x / y
 
@@ -199,7 +199,7 @@ def test_division(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a, b])
 
 
-def test_floor_division(device: str, tensor_shapes: tuple):
+def test_floor_division(device: str, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x // y
 
@@ -209,7 +209,7 @@ def test_floor_division(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a, b])
 
 
-def test_power(device: str, tensor_shapes: tuple):
+def test_power(device: str, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x**y
 
@@ -219,7 +219,7 @@ def test_power(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a, b])
 
 
-def test_modulo(device: str, tensor_shapes: tuple):
+def test_modulo(device: str, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return x % y
 
@@ -229,7 +229,7 @@ def test_modulo(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a, b])
 
 
-def test_abs(conf: Conf, tensor_shapes: tuple):
+def test_abs(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.abs(x)
 
@@ -238,7 +238,7 @@ def test_abs(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_floor(conf: Conf, tensor_shapes: tuple):
+def test_floor(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.floor(x)
 
@@ -275,7 +275,7 @@ def test_tensor_floor_method(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
-def test_cos(conf: Conf, tensor_shapes: tuple):
+def test_cos(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.cos(x)
 
@@ -284,7 +284,7 @@ def test_cos(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_sin(conf: Conf, tensor_shapes: tuple):
+def test_sin(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.sin(x)
 
@@ -293,7 +293,7 @@ def test_sin(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_tanh(conf: Conf, tensor_shapes: tuple):
+def test_tanh(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.tanh(x)
 
@@ -302,7 +302,7 @@ def test_tanh(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_sign(conf: Conf, tensor_shapes: tuple):
+def test_sign(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.sign(x)
 
@@ -325,7 +325,7 @@ def test_sign_different_dtypes(conf: Conf, dtype):
     check_outputs(fn, conf, [a])
 
 
-def test_atanh(conf: Conf, tensor_shapes: tuple):
+def test_atanh(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return torch.atanh(x)
 
@@ -698,7 +698,7 @@ def test_torch_max_with_dim_positional(device: str, shapes, dims, func):
 
 
 @pytest.mark.parametrize("func", [torch.min, torch.max])
-def test_torch_max_elementwise(conf: Conf, tensor_shapes: tuple, func):
+def test_torch_max_elementwise(conf: Conf, tensor_shapes: tuple[int, ...], func):
     def fn(x, y):
         return func(x, y)
 
@@ -709,7 +709,7 @@ def test_torch_max_elementwise(conf: Conf, tensor_shapes: tuple, func):
 
 
 @pytest.mark.parametrize("func", [torch.minimum, torch.maximum])
-def test_minimum_maximum(conf: Conf, tensor_shapes: tuple, func):
+def test_minimum_maximum(conf: Conf, tensor_shapes: tuple[int, ...], func):
     """Only works with elementwise min/max of two tensors."""
 
     def fn(x, y):
@@ -721,7 +721,7 @@ def test_minimum_maximum(conf: Conf, tensor_shapes: tuple, func):
     check_outputs(fn, conf, [a, b])
 
 
-def test_relu(conf: Conf, tensor_shapes: tuple):
+def test_relu(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x):
         return F.relu(x)
 
@@ -730,7 +730,7 @@ def test_relu(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_cat(conf: Conf, tensor_shapes: tuple):
+def test_cat(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return torch.cat([x, y], dim=0)
 
@@ -754,7 +754,7 @@ def test_cat_skips_legacy_empty(conf: Conf):
     check_outputs(fn, conf, [empty, x, y])
 
 
-def test_combination_add_mul(conf: Conf, tensor_shapes: tuple):
+def test_combination_add_mul(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y, z):
         return (x + y) * z
 
@@ -765,7 +765,7 @@ def test_combination_add_mul(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b, c])
 
 
-def test_combination_sub_div(conf: Conf, tensor_shapes: tuple):
+def test_combination_sub_div(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y, z):
         return (x - y) / z
 
@@ -776,7 +776,7 @@ def test_combination_sub_div(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b, c])
 
 
-def test_combination_trig_arithmetic(conf: Conf, tensor_shapes: tuple):
+def test_combination_trig_arithmetic(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return torch.sin(x) + torch.cos(y)
 
@@ -786,7 +786,7 @@ def test_combination_trig_arithmetic(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b])
 
 
-def test_combination_abs_mul_add(conf: Conf, tensor_shapes: tuple):
+def test_combination_abs_mul_add(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y, z):
         return torch.abs(x) * y + z
 
@@ -797,7 +797,7 @@ def test_combination_abs_mul_add(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a, b, c])
 
 
-def test_combination_pow_mod(device: str, tensor_shapes: tuple):
+def test_combination_pow_mod(device: str, tensor_shapes: tuple[int, ...]):
     def fn(x, y):
         return (x**2) % y
 
@@ -807,7 +807,7 @@ def test_combination_pow_mod(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a, b])
 
 
-def test_complex_combination(conf: Conf, tensor_shapes: tuple):
+def test_complex_combination(conf: Conf, tensor_shapes: tuple[int, ...]):
     def fn(x, y, z):
         return torch.abs(torch.sin(x) * y + torch.cos(z))
 
@@ -1019,7 +1019,7 @@ def test_conv2d_asymmetric_kernel(conf: Conf):
 
 
 @pytest.mark.parametrize("size", [(1, 1, 4, 4), (3, 8, 32, 32), (2, 16, 64, 64)])
-def test_conv2d_different_input_sizes(conf: Conf, size: tuple):
+def test_conv2d_different_input_sizes(conf: Conf, size: tuple[int, ...]):
     """Test conv2d with different input tensor sizes"""
 
     def fn(x, w):
@@ -1176,7 +1176,7 @@ def test_conv1d_large_kernel(conf: Conf):
 
 
 @pytest.mark.parametrize("size", [(1, 1, 8), (3, 8, 32), (2, 16, 64)])
-def test_conv1d_different_input_sizes(conf: Conf, size: tuple):
+def test_conv1d_different_input_sizes(conf: Conf, size: tuple[int, ...]):
     """Test conv1d with different input tensor sizes"""
 
     def fn(x, w):
@@ -1997,7 +1997,7 @@ def test_tensor_trig_with_transpose(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
-def test_tensor_cos_sin_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_tensor_cos_sin_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test tensor.cos() and tensor.sin() with different tensor shapes"""
 
     def fn_cos(x):
@@ -2093,7 +2093,7 @@ def test_tensor_pow_broadcast(conf: Conf):
     check_outputs(fn, conf, [x, y])
 
 
-def test_tensor_pow_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_tensor_pow_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test tensor.pow() with different tensor shapes"""
 
     def fn(x):
@@ -2316,7 +2316,7 @@ def test_complex_to_operations(device: str):
     check_functions_are_equivalent(fn, device, [x])
 
 
-def test_mean_no_dim(conf: Conf, tensor_shapes: tuple):
+def test_mean_no_dim(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test mean without specifying dimensions (reduce all)"""
 
     def fn(x):
@@ -2327,7 +2327,7 @@ def test_mean_no_dim(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_mean_single_dim(device: str, tensor_shapes: tuple):
+def test_mean_single_dim(device: str, tensor_shapes: tuple[int, ...]):
     """Test mean with single dimension"""
 
     def fn(x):
@@ -2338,7 +2338,7 @@ def test_mean_single_dim(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a])
 
 
-def test_mean_negative_dim(device: str, tensor_shapes: tuple):
+def test_mean_negative_dim(device: str, tensor_shapes: tuple[int, ...]):
     """Test mean with negative dimension"""
 
     def fn(x):
@@ -2349,7 +2349,7 @@ def test_mean_negative_dim(device: str, tensor_shapes: tuple):
     check_functions_are_equivalent(fn, device, [a])
 
 
-def test_mean_keepdim_true(device: str, tensor_shapes: tuple):
+def test_mean_keepdim_true(device: str, tensor_shapes: tuple[int, ...]):
     """Test mean with keepdim=True"""
 
     def fn(x):
@@ -2382,7 +2382,7 @@ def test_mean_multiple_dims_keepdim(device: str):
     check_functions_are_equivalent(fn, device, [a])
 
 
-def test_tensor_mean_method(conf: Conf, tensor_shapes: tuple):
+def test_tensor_mean_method(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test tensor.mean() method"""
 
     def fn(x):
@@ -2393,7 +2393,7 @@ def test_tensor_mean_method(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [a])
 
 
-def test_tensor_mean_method_with_dim(device: str, tensor_shapes: tuple):
+def test_tensor_mean_method_with_dim(device: str, tensor_shapes: tuple[int, ...]):
     """Test tensor.mean(dim) method"""
 
     def fn(x):
@@ -2422,7 +2422,7 @@ def test_mean_3d_tensor_change_dtype(device: str):
     check_functions_are_equivalent(fn, device, [a])
 
 
-def test_mean_combined_with_arithmetic(device: str, tensor_shapes: tuple):
+def test_mean_combined_with_arithmetic(device: str, tensor_shapes: tuple[int, ...]):
     """Test mean combined with arithmetic operations"""
 
     def fn(x, y):
@@ -2485,7 +2485,7 @@ def test_tensor_sqrt_method(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
-def test_rsqrt_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_rsqrt_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test rsqrt with different tensor shapes"""
 
     def fn(x):
@@ -2496,7 +2496,7 @@ def test_rsqrt_different_shapes(conf: Conf, tensor_shapes: tuple):
     check_outputs(fn, conf, [x])
 
 
-def test_sqrt_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_sqrt_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test sqrt with different tensor shapes"""
 
     def fn(x):
@@ -3217,7 +3217,7 @@ def test_double_negation(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
-def test_negation_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_negation_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test negation with different tensor shapes"""
 
     def fn(x):
@@ -3796,7 +3796,7 @@ def test_torch_clamp_max_only(conf: Conf, shapes):
     check_outputs(fn, conf, [a])
 
 
-def test_torch_clamp_tensor_bounds(device: str, tensor_shapes: tuple):
+def test_torch_clamp_tensor_bounds(device: str, tensor_shapes: tuple[int, ...]):
     """Test torch.clamp with tensor bounds (min and max as tensors)."""
 
     def fn(x, min_tensor, mojo_tensor):
@@ -4720,7 +4720,7 @@ def test_any_dtypes_with_dim(device: str, dtype, dim):
 
 
 @pytest.mark.parametrize("tensor_shapes", [(2, 3), (1, 5), (4,), (2, 3, 4)])
-def test_full_like_basic(conf: Conf, tensor_shapes: tuple):
+def test_full_like_basic(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test torch.full_like with different shapes and fill values"""
 
     def fn(x):
@@ -4791,7 +4791,7 @@ def test_full_like_negative_fill(conf: Conf):
 
 
 @pytest.mark.parametrize("tensor_shapes", [(1, 1), (10,), (2, 2, 2, 2)])
-def test_full_like_edge_cases(conf: Conf, tensor_shapes: tuple):
+def test_full_like_edge_cases(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test torch.full_like with edge case shapes"""
 
     def fn(x):
@@ -4989,7 +4989,7 @@ def test_scaled_dot_product_attention_with_scale(device: str):
 
 
 @pytest.mark.parametrize("dims", [(0, 1), (1, 0)])
-def test_permute_2d(conf: Conf, dims: tuple):
+def test_permute_2d(conf: Conf, dims: tuple[int, ...]):
     """Test torch.permute with 2D tensors"""
 
     def fn(x):
@@ -5003,7 +5003,7 @@ def test_permute_2d(conf: Conf, dims: tuple):
 @pytest.mark.parametrize(
     "dims", [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
 )
-def test_permute_3d(conf: Conf, dims: tuple):
+def test_permute_3d(conf: Conf, dims: tuple[int, ...]):
     """Test torch.permute with 3D tensors - all permutations"""
 
     def fn(x):
@@ -5073,7 +5073,7 @@ def test_permute_reverse_order(conf: Conf):
 
 
 @pytest.mark.parametrize("tensor_shapes", [(5,), (1, 10), (2, 3, 4), (1, 2, 3, 4, 5)])
-def test_permute_different_shapes(conf: Conf, tensor_shapes: tuple):
+def test_permute_different_shapes(conf: Conf, tensor_shapes: tuple[int, ...]):
     """Test permute with various tensor shapes"""
 
     def fn(x):
@@ -5391,7 +5391,7 @@ def test_tensor_nonzero_method(device: str):
 
 
 @pytest.mark.parametrize("tensor_shapes", [(2,), (3, 4), (2, 3, 4)])
-def test_nonzero_different_shapes(device: str, tensor_shapes: tuple):
+def test_nonzero_different_shapes(device: str, tensor_shapes: tuple[int, ...]):
     """Test nonzero with different tensor shapes"""
 
     def fn(x):
@@ -5612,7 +5612,7 @@ def test_interpolate_large_upsampling(device: str):
 
 
 @pytest.mark.parametrize("size", [(5, 5), (7, 9), (16, 16)])
-def test_interpolate_various_output_sizes(device: str, size: tuple):
+def test_interpolate_various_output_sizes(device: str, size: tuple[int, ...]):
     """Test F.interpolate with various output sizes"""
 
     def fn(x):

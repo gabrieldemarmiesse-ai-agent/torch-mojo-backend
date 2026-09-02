@@ -24,7 +24,7 @@ from torch_mojo_backend import (
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
 
-from .conftest import require_cuda_autograd
+from tests.conftest import require_cuda_autograd
 
 
 # MAX lowers an fp32 matmul to TF32 tensor cores on NVIDIA GPUs while torch

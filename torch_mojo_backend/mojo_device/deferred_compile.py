@@ -50,7 +50,9 @@ from torch_mojo_backend.eager_kernels import call_queue
 _DEVICE_LOCK = call_queue._LOCK
 
 
-def _direct(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
+def _direct(
+    func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
     """Execute one aten op through the PrivateUse1 kernels."""
     with _DEVICE_LOCK:
         call_queue.order_direct_launch()
@@ -62,7 +64,7 @@ def _direct(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
 _DEVICE_CROSSING_OPS = frozenset({"aten::_to_copy", "aten::copy_"})
 
 
-def _crosses_device(args: tuple, kwargs: dict) -> bool:
+def _crosses_device(args: tuple[object, ...], kwargs: dict[str, object]) -> bool:
     """True when a copy/cast actually moves bytes between devices. A
     same-device cast (autocast!) is an ordinary data op that stays in the
     queue; only a real crossing runs an out-of-queue H2D/D2H transfer."""
@@ -70,11 +72,14 @@ def _crosses_device(args: tuple, kwargs: dict) -> bool:
     devices = {a.device.type for a in flat_args if isinstance(a, torch.Tensor)}
     target = kwargs.get("device")
     if target is not None:
+        assert isinstance(target, str | torch.device | int)
         devices.add(torch.device(target).type)
     return len(devices) > 1
 
 
-def dispatch(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
+def dispatch(
+    func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
     """Entry point called from TorchMojoTensor.__torch_dispatch__."""
     if not call_queue.enabled():
         return _direct(func, args, kwargs)

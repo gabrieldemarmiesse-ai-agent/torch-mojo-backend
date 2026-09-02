@@ -51,6 +51,20 @@ def _qkv(
     return (q_ref, k_ref, v_ref), (q_our, k_our, v_our), flops
 
 
+# aten::_scaled_dot_product_flash_attention outputs (max_q / max_k are ints).
+_FlashForwardOut = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f16"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("scaled_dot_product_attention")
@@ -131,7 +145,7 @@ def test_sdpa_flash_backward(
         torch.randn(b, h, s, d, dtype=DTYPES[dtype_id]), hw, mojo_device
     )
 
-    def forward(leg: Sequence[torch.Tensor]) -> tuple:
+    def forward(leg: Sequence[torch.Tensor]) -> _FlashForwardOut:
         return torch.ops.aten._scaled_dot_product_flash_attention(
             *leg, 0.0, True, False
         )
@@ -144,7 +158,9 @@ def test_sdpa_flash_backward(
     except NotImplementedError as exc:
         pytest.skip(f"not supported on the mojo device: {exc}")
 
-    def backward(grad: torch.Tensor, leg: Sequence[torch.Tensor], fwd: tuple) -> tuple:
+    def backward(
+        grad: torch.Tensor, leg: Sequence[torch.Tensor], fwd: _FlashForwardOut
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         out, logsumexp, cum_q, cum_k, max_q, max_k, seed, offset, _ = fwd
         return torch.ops.aten._scaled_dot_product_flash_attention_backward(
             grad,

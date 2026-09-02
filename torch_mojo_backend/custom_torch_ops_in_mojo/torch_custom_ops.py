@@ -24,7 +24,11 @@ class _SignedTorchOp(Protocol):
 
 
 def make_torch_op_from_mojo(
-    path_to_kernels: Path, mojo_custom_op_str: str, allocate_outputs_fn: Callable
+    path_to_kernels: Path,
+    mojo_custom_op_str: str,
+    allocate_outputs_fn: Callable[
+        ..., torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
+    ],
 ) -> Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]]:
     ops = CustomOpLibrary(path_to_kernels)
     mojo_custom_op = ops.__getattr__(mojo_custom_op_str)

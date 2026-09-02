@@ -584,7 +584,9 @@ def test_aten_ones_like(conf: Conf, call_checker: CallChecker, dtype: torch.dtyp
 
 
 @pytest.mark.parametrize("shape", [(1,), (4, 5), (2, 3, 7)])
-def test_aten_ones_like_shape(conf: Conf, call_checker: CallChecker, shape: tuple):
+def test_aten_ones_like_shape(
+    conf: Conf, call_checker: CallChecker, shape: tuple[int, ...]
+):
     call_checker.register(aten_functions.aten_ones_like)
 
     def fn(x):
@@ -1759,7 +1761,9 @@ TRIGON_FUNCTIONS = [aten.asinh, aten.cosh, aten.sinh, aten.tan, aten.tanh]
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_basic(conf: Conf, fn: Callable, dtype: torch.dtype):
+def test_aten_trigon_basic(
+    conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor], dtype: torch.dtype
+):
     """Test trigonometric functions basic functionality with floating point numbers"""
 
     if dtype == torch.float64 and fn in (aten.asinh, aten.tan):
@@ -1774,7 +1778,7 @@ def test_aten_trigon_basic(conf: Conf, fn: Callable, dtype: torch.dtype):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_2d_tensor(conf: Conf, fn: Callable):
+def test_aten_trigon_2d_tensor(conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]):
     """Test trigonometric functions with 2D tensor"""
 
     x = torch.tensor([[-1.5, -0.5], [0.0, 1.0], [1.5, 2.5]], dtype=torch.float32)
@@ -1782,7 +1786,7 @@ def test_aten_trigon_2d_tensor(conf: Conf, fn: Callable):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_3d_tensor(conf: Conf, fn: Callable):
+def test_aten_trigon_3d_tensor(conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]):
     """Test trigonometric functions with 3D tensor"""
 
     x = torch.randn(2, 3, 4, dtype=torch.float32)
@@ -1790,7 +1794,9 @@ def test_aten_trigon_3d_tensor(conf: Conf, fn: Callable):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_large_values(conf: Conf, fn: Callable):
+def test_aten_trigon_large_values(
+    conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]
+):
     """Test trigonometric functions with large values (may approach infinity)"""
 
     # large values will produce large results due to exponential growth
@@ -1799,7 +1805,9 @@ def test_aten_trigon_large_values(conf: Conf, fn: Callable):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_small_values(conf: Conf, fn: Callable):
+def test_aten_trigon_small_values(
+    conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]
+):
     """Test trigonometric functions with small values near zero"""
 
     # for small x, cosh(x) ≈ 1 + x²/2
@@ -1808,7 +1816,9 @@ def test_aten_trigon_small_values(conf: Conf, fn: Callable):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_single_element(conf: Conf, fn: Callable):
+def test_aten_trigon_single_element(
+    conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]
+):
     """Test trigonometric functions with single element tensor"""
 
     x = torch.tensor([1.5], dtype=torch.float32)
@@ -1816,7 +1826,9 @@ def test_aten_trigon_single_element(conf: Conf, fn: Callable):
 
 
 @pytest.mark.parametrize("fn", TRIGON_FUNCTIONS)
-def test_aten_trigon_scalar_tensor(conf: Conf, fn: Callable):
+def test_aten_trigon_scalar_tensor(
+    conf: Conf, fn: Callable[[torch.Tensor], torch.Tensor]
+):
     """Test trigonometric functions with scalar tensor"""
 
     x = torch.tensor(1.0, dtype=torch.float32)
@@ -2256,7 +2268,7 @@ def test_aten_repeat_interleave_3d(device: str):
 
 
 @pytest.mark.parametrize("shape", [(1, 5), (5, 1), (1, 1)])
-def test_aten_repeat_interleave_edge_cases(device: str, shape: tuple):
+def test_aten_repeat_interleave_edge_cases(device: str, shape: tuple[int, ...]):
     """Test aten.repeat_interleave with edge case shapes"""
 
     def fn(x):
@@ -3051,7 +3063,7 @@ def test_aten_square_basic(conf: Conf, dtype: torch.dtype):
 
 
 @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4), (2, 3, 4, 5)])
-def test_aten_square_different_shapes(conf: Conf, shape: tuple):
+def test_aten_square_different_shapes(conf: Conf, shape: tuple[int, ...]):
     """Test aten.square with different tensor shapes"""
 
     def fn(x):
@@ -3200,7 +3212,7 @@ def test_aten_squeeze_empty_dims(device: str):
 
 
 @pytest.mark.parametrize("shape", [(1,), (1, 1), (1, 1, 1)])
-def test_aten_squeeze_edge_cases(device: str, shape: tuple):
+def test_aten_squeeze_edge_cases(device: str, shape: tuple[int, ...]):
     """Test aten.squeeze with edge case shapes"""
 
     def fn(x):
@@ -3232,7 +3244,7 @@ def test_aten_triu_different_diagonals(conf: Conf, diagonal: int):
 
 
 @pytest.mark.parametrize("shape", [(3, 5), (5, 3), (7, 7)])
-def test_aten_triu_rectangular(conf: Conf, shape: tuple):
+def test_aten_triu_rectangular(conf: Conf, shape: tuple[int, ...]):
     """Test aten.triu with rectangular matrices"""
 
     def fn(x):
@@ -3486,7 +3498,9 @@ def test_aten_logical_and_scalar_like(conf: Conf):
 @pytest.mark.parametrize(
     "shape_pair", [((3, 1), (3, 4)), ((1, 4), (3, 4)), ((3, 1, 1), (3, 4, 5))]
 )
-def test_aten_logical_and_broadcasting_shapes(conf: Conf, shape_pair: tuple):
+def test_aten_logical_and_broadcasting_shapes(
+    conf: Conf, shape_pair: tuple[tuple[int, ...], tuple[int, ...]]
+):
     """Test aten.logical_and with various broadcasting shapes"""
 
     def fn(x, y):
@@ -3932,7 +3946,7 @@ def test_aten_var_correction(conf: Conf, correction: int, call_checker: CallChec
 @pytest.mark.parametrize("dim", [(0, 1), (1, 2), (0, 2)])
 @pytest.mark.parametrize("keepdim", [True, False])
 def test_aten_var_multi_dim(
-    conf: Conf, dim: tuple, keepdim: bool, call_checker: CallChecker
+    conf: Conf, dim: tuple[int, ...], keepdim: bool, call_checker: CallChecker
 ):
     """Test aten.var reducing over multiple dimensions"""
     call_checker.register(aten_functions.aten_var)
@@ -3958,7 +3972,7 @@ def test_aten_var_correction_zero_no_dim(conf: Conf, call_checker: CallChecker):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
 def test_aten_silu(
-    conf: Conf, dtype: torch.dtype, shape: tuple, call_checker: CallChecker
+    conf: Conf, dtype: torch.dtype, shape: tuple[int, ...], call_checker: CallChecker
 ):
     """Test aten.silu (x * sigmoid(x)) across dtypes and shapes"""
     call_checker.register(aten_functions.aten_silu)
@@ -3976,7 +3990,7 @@ def test_aten_silu(
 def test_fill_scalar_basic(
     conf: Conf,
     dtype: torch.dtype,
-    shape: tuple,
+    shape: tuple[int, ...],
     value: float,
     call_checker: CallChecker,
 ):
@@ -4000,7 +4014,11 @@ def test_fill_scalar_basic(
 @pytest.mark.parametrize("shape", [(2, 3), (1, 4, 4)])
 @pytest.mark.parametrize("value", [-5, 42])
 def test_fill_scalar_integer_dtypes(
-    conf: Conf, dtype: torch.dtype, shape: tuple, value: int, call_checker: CallChecker
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    value: int,
+    call_checker: CallChecker,
 ):
     """Test fill.Scalar functionality with integer dtypes"""
     from torch_mojo_backend.eager_kernels import aten_fast

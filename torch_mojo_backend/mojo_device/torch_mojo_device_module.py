@@ -2,7 +2,7 @@ import threading
 
 import torch
 
-from ..torch_compile_backend.utils import get_accelerators
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
 _current_device = 0
 _UINT64_MASK = (1 << 64) - 1
@@ -176,7 +176,7 @@ def _device_synchronize(device: "int | str | torch.device | None" = None) -> Non
     is nothing of theirs to wait for; only the *other* thread's issued work
     must land first, which is exactly a stream synchronize.
     """
-    from .torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
         find_equivalent_max_device,
@@ -193,7 +193,7 @@ def synchronize(device: "int | str | torch.device | None" = None) -> None:
     owners. Pending kernel launches count as work, so the queue drains
     first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
     every op it issued has actually run on the device."""
-    from . import deferred_compile
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     deferred_compile.drain()
     _device_synchronize(device)
@@ -215,7 +215,9 @@ def memory_stats(device: "int | str | torch.device | None" = None) -> dict[str, 
     ``torch.cuda.memory_stats`` on a CUDA build; callers that want a number
     for this device get honest ones here.
     """
-    from .torch_mojo_tensor import find_equivalent_max_device
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+        find_equivalent_max_device,
+    )
 
     stats = find_equivalent_max_device(_resolve_sync_device(device)).stats
     return {name: int(value) for name, value in dict(stats).items()}
@@ -237,9 +239,9 @@ def memory_summary(
 # for Python PrivateUse1 backends. See mojo_device/streams.py.
 from torch_mojo_backend.mojo_device.streams import (  # noqa: E402
     Event as Event,
+    Stream as Stream,
+    current_stream as current_stream,
+    default_stream as default_stream,
+    set_stream as set_stream,
+    stream as stream,
 )
-from torch_mojo_backend.mojo_device.streams import Stream as Stream
-from torch_mojo_backend.mojo_device.streams import current_stream as current_stream
-from torch_mojo_backend.mojo_device.streams import default_stream as default_stream
-from torch_mojo_backend.mojo_device.streams import set_stream as set_stream
-from torch_mojo_backend.mojo_device.streams import stream as stream

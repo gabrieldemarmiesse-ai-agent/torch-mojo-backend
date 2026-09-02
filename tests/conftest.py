@@ -1,3 +1,4 @@
+# ruff: noqa: E402 -- the environment variables below must be set before the imports
 import math
 import os
 from collections.abc import Callable

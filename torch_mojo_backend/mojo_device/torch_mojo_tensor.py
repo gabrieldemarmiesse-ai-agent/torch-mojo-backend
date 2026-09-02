@@ -69,17 +69,24 @@ def _holder_mod() -> _TensorHolderModule:
     return holder
 
 
+class _ReadyEvent(Protocol):
+    """The one thing the pending-transfer queues ask of a recorded event
+    (`max.driver.DeviceEvent`; tests inject stand-ins)."""
+
+    def is_ready(self) -> bool: ...
+
+
 # GPU H2D copies consume a MAX-owned pinned staging allocation asynchronously.
 # Keep that transfer owner alive until an event recorded behind its DMA
 # completes. This mirrors the lifetime tracking performed by CUDA's pinned
 # memory allocator without depending on torch-cuda.
-_PENDING_H2D: dict[max.driver.Device, deque] = {}
+_PENDING_H2D: dict[max.driver.Device, deque[tuple[_ReadyEvent, object]]] = {}
 _PENDING_H2D_LOCK = threading.Lock()
 
 # A non-blocking D2H returns a CPU tensor that aliases a MAX-owned pinned host
 # allocation. DLPack ties that owner to the returned tensor, while this queue
 # also retains it until the DMA event completes if the tensor dies early.
-_PENDING_D2H: dict[max.driver.Device, deque] = {}
+_PENDING_D2H: dict[max.driver.Device, deque[tuple[_ReadyEvent, object]]] = {}
 _PENDING_D2H_LOCK = threading.Lock()
 
 # A stream/event failure is already a fatal device condition, but raw-pointer
@@ -301,7 +308,9 @@ def _device_of(tensor: MojoTensorLike) -> max.driver.Device:
     return cast(max.driver.Device, tensor._device)
 
 
-def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> object:
+def _dispatch_entry(
+    func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
     """``deferred_compile.dispatch``, resolved on first use.
 
     ``deferred_compile`` imports the call queue this module feeds, so it
@@ -311,7 +320,7 @@ def _dispatch_entry(func: torch._ops.OpOverload, args: tuple, kwargs: dict) -> o
     trick as ``output_specs._alloc``).
     """
     global _dispatch_entry
-    from . import deferred_compile
+    from torch_mojo_backend.mojo_device import deferred_compile
 
     # Same nominal-vs-structural self-rebind quirk as _ctx_ptr above, even
     # though both sides print identically.
@@ -480,8 +489,8 @@ class TorchMojoTensor(torch.Tensor):
         cls,
         func: torch._ops.OpOverload,
         types: Sequence[type],
-        args: tuple = (),
-        kwargs: dict | None = None,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
     ) -> object:
         """Redispatch wrapper operations to the existing Mojo backend kernels."""
         # Give higher-priority wrappers such as FakeTensor and
@@ -639,7 +648,7 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
-        from . import deferred_compile
+        from torch_mojo_backend.mojo_device import deferred_compile
 
         src = self if self._is_contiguous else self._materialize_contiguous()
         # Reading device bytes is a host read: every queued launch must have
@@ -713,7 +722,7 @@ class TorchMojoTensor(torch.Tensor):
         """
         from torch_mojo_backend.mojo_device import dlpack
 
-        from . import deferred_compile
+        from torch_mojo_backend.mojo_device import deferred_compile
 
         src = self._contig()
         deferred_compile.drain()
