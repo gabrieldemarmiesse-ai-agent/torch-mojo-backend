@@ -436,4 +436,8 @@ def register_mojo_devices():
 
     register_apple_optimizations()
 
+    from torch_mojo_backend.distributed import register_distributed_backend
+
+    register_distributed_backend()
+
     _registered = True
