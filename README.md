@@ -24,7 +24,8 @@ Distributed training with DDP works on NVIDIA and AMD GPUs — single node
 and multi-node under torchrun, over NCCL or RCCL — see
 [docs/distributed.md](docs/distributed.md). On AMD machines install the CPU
 wheel of torch (`--index-url https://download.pytorch.org/whl/cpu`): the
-CUDA wheel makes every first-use kernel load on HIP about 10x slower.
+CUDA wheel makes every first-use kernel load on HIP about 10x slower, and a
+ROCm wheel brings a second HIP runtime the collectives cannot serve.
 
 We don't support yet:
 * Using `torch.compile` with the mojo device, only the cuda device is supported for now. 

@@ -6,10 +6,11 @@ asked of the runtime that MAX itself drives, so the answers are facts about an
 allocation rather than assumptions about how two runtimes enumerate. MAX
 dlopens `libamdhip64.so` from the ROCm install (``$ROCM_PATH`` or
 ``/opt/rocm``); this module reuses THAT copy — found through the process's own
-memory map — instead of resolving the soname a second time, which on a box
-with several ROCm versions could map a different runtime with its own device
-table. RCCL links against the same soname, so the ordinals here, MAX's and
-RCCL's are one numbering.
+memory map, preferring the one under that install when a ROCm torch wheel
+has mapped its own — instead of resolving the soname a second time, which on
+a box with several ROCm versions could map a different runtime with its own
+device table. RCCL links against the same soname, so the ordinals here,
+MAX's and RCCL's are one numbering.
 
 Only the driver-style `hipPointerGetAttribute` (singular) is used: it writes
 a plain int, where `hipPointerGetAttributes` fills a struct whose layout
@@ -20,7 +21,6 @@ API.
 from __future__ import annotations
 
 import ctypes
-import functools
 import os
 from pathlib import Path
 
@@ -36,17 +36,50 @@ _SONAMES = ("libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so")
 HIP_SUCCESS = 0
 
 
-def _mapped_runtime_path() -> Path | None:
-    """The libamdhip64 already loaded in this process (by MAX), if any."""
+def _rocm_roots() -> list[Path]:
+    """Where MAX looks for its HIP runtime, in its order: $ROCM_PATH, then
+    /opt/rocm ($HIP_PATH is the older spelling of the first)."""
+    roots = []
+    for root in (os.environ.get("ROCM_PATH"), os.environ.get("HIP_PATH"), "/opt/rocm"):
+        if root and Path(root) not in roots:
+            roots.append(Path(root))
+    return roots
+
+
+def _mapped_runtime_paths() -> list[Path]:
+    """Every distinct libamdhip64 mapped in this process, in map order."""
+    found: list[Path] = []
     try:
         with open("/proc/self/maps") as maps:
             for line in maps:
                 path = line.rstrip("\n").partition(" /")[2]
-                if path and Path("/" + path).name.startswith("libamdhip64.so"):
-                    return Path("/" + path)
+                if not path:
+                    continue
+                # A replaced file keeps its mapping under "<path> (deleted)".
+                path = "/" + path.removesuffix(" (deleted)")
+                if (
+                    Path(path).name.startswith("libamdhip64.so")
+                    and Path(path) not in found
+                ):
+                    found.append(Path(path))
     except OSError:
         pass
-    return None
+    return found
+
+
+def _mapped_runtime_path() -> Path | None:
+    """The libamdhip64 MAX loaded, if any is mapped yet.
+
+    A ROCm torch wheel maps its own bundled copy too. /proc/self/maps is
+    ordered by address, not by load order, so prefer the copy under the
+    ROCm install MAX resolves its runtime from over any other.
+    """
+    mapped = _mapped_runtime_paths()
+    for root in _rocm_roots():
+        for path in mapped:
+            if root.resolve() in path.resolve().parents:
+                return path
+    return mapped[0] if mapped else None
 
 
 def _candidate_runtime_paths() -> list[str]:
@@ -54,16 +87,25 @@ def _candidate_runtime_paths() -> list[str]:
     mapped = _mapped_runtime_path()
     if mapped is not None:
         candidates.append(str(mapped))
+    # The install MAX will use comes before whatever LD_LIBRARY_PATH resolves
+    # a bare soname to, so a pre-MAX call cannot bind a different runtime.
+    for root in _rocm_roots():
+        candidates.extend(str(root / "lib" / name) for name in _SONAMES)
     candidates.extend(_SONAMES)
-    for root in (os.environ.get("ROCM_PATH"), os.environ.get("HIP_PATH"), "/opt/rocm"):
-        if root:
-            candidates.extend(str(Path(root) / "lib" / name) for name in _SONAMES)
     return candidates
 
 
-@functools.cache
+_RUNTIME: list[ctypes.CDLL] = []
+
+
 def _runtime() -> ctypes.CDLL | None:
-    """libamdhip64, or None where this is not a ROCm stack."""
+    """libamdhip64, or None where this is not a ROCm stack.
+
+    Cached once a load succeeds; a miss is not cached, so a call made before
+    MAX has loaded HIP does not pin the answer for the process.
+    """
+    if _RUNTIME:
+        return _RUNTIME[0]
     for path in _candidate_runtime_paths():
         try:
             lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
@@ -77,10 +119,9 @@ def _runtime() -> ctypes.CDLL | None:
         lib.hipPointerGetAttribute.restype = ctypes.c_int
         lib.hipSetDevice.argtypes = [ctypes.c_int]
         lib.hipSetDevice.restype = ctypes.c_int
-        lib.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
-        lib.hipGetDevice.restype = ctypes.c_int
         lib.hipGetErrorString.argtypes = [ctypes.c_int]
         lib.hipGetErrorString.restype = ctypes.c_char_p
+        _RUNTIME.append(lib)
         return lib
     return None
 
@@ -137,33 +178,64 @@ def set_device(ordinal: int):
         )
 
 
-def warn_if_cuda_torch_on_hip():
-    """One-time hint at registration: a CUDA torch wheel on an AMD box is slow.
+def _amd_gpu_present() -> bool:
+    """The kernel's AMD GPU compute interface; cheaper than any runtime call."""
+    return Path("/dev/kfd").exists()
 
-    The HIP runtime walks every shared object mapped in the process on each
-    kernel load (`dl_iterate_phdr` from libhsa-runtime64, hunting embedded
-    code objects), and the CUDA torch wheel maps ~3 GB of NVIDIA libraries it
-    never uses here. Measured on 4x MI300A, nanoGPT 124M under DDP: the first
-    training step took 14.7 s with torch 2.11+cu130 against 1.0 s with
-    torch 2.11+cpu, and steady state ran 6% slower as well. The CPU wheel is
-    what this backend needs anyway.
+
+def warn_if_gpu_torch_on_hip():
+    """One-time hint at registration: a GPU torch wheel on an AMD box hurts.
+
+    Runs only where an AMD GPU is present (``/dev/kfd``), so it never touches
+    MAX's device enumeration on NVIDIA or CPU-only hosts; and it can only
+    warn, never fail registration.
+
+    - A CUDA wheel: the HIP runtime walks every shared object mapped in the
+      process on each kernel load (``dl_iterate_phdr`` from libhsa-runtime64,
+      hunting embedded code objects), and the CUDA wheel maps ~3 GB of NVIDIA
+      libraries it never uses here. Measured on 4x MI300A, nanoGPT 124M under
+      DDP: the first training step took 14.7 s with torch 2.11+cu130 against
+      1.0 s with torch 2.11+cpu, and steady state ran 6% slower as well.
+    - A ROCm wheel: torch loads its own bundled libamdhip64 at import, next
+      to the one MAX loads from the ROCm install, so the process runs two HIP
+      runtimes. RCCL and the pointer-ownership query bind to one of them and
+      MAX's buffers belong to the other; that combination is untested and the
+      distributed backend refuses to guess about it.
+
+    The CPU wheel is what this backend needs anyway.
     """
     import warnings
 
     import torch
 
-    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
+    if not _amd_gpu_present():
+        return
+    cuda_build = getattr(torch.version, "cuda", None) is not None
+    hip_build = getattr(torch.version, "hip", None) is not None
+    if not (cuda_build or hip_build):
+        return
+    try:
+        from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
-    if getattr(torch.version, "cuda", None) is None:
+        if not any(device.api == "hip" for device in get_accelerators()):
+            return
+    except Exception:  # a hint must never break registration
         return
-    if not any(device.api == "hip" for device in get_accelerators()):
-        return
+    if hip_build:
+        detail = (
+            "a ROCm build, which loads its own HIP runtime next to the one MAX "
+            "uses; the RCCL process group and the pointer-ownership query cannot "
+            "serve buffers from two runtimes"
+        )
+    else:
+        detail = (
+            "a CUDA build; the HIP runtime rescans every mapped library at each "
+            "kernel load, and the CUDA wheel maps gigabytes of unused NVIDIA "
+            "libraries, so first-use kernel loads are ~10x slower"
+        )
     warnings.warn(
-        "torch-mojo-backend: this torch is a CUDA build "
-        f"(torch {torch.__version__}) but the GPUs here are AMD. The HIP "
-        "runtime rescans every mapped library at each kernel load, and the "
-        "CUDA wheel maps gigabytes of unused NVIDIA libraries, so first-use "
-        "kernel loads are ~10x slower. Install the CPU wheel instead: "
+        f"torch-mojo-backend: this torch (torch {torch.__version__}) is {detail}. "
+        "Install the CPU wheel instead: "
         "uv pip install torch --index-url https://download.pytorch.org/whl/cpu",
         RuntimeWarning,
         stacklevel=2,

@@ -94,9 +94,9 @@ def register_mojo_devices():
 
     register_autocast_ops()
 
-    from torch_mojo_backend.mojo_device.hip_peer import warn_if_cuda_torch_on_hip
+    from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 
-    warn_if_cuda_torch_on_hip()
+    warn_if_gpu_torch_on_hip()
 
     from torch_mojo_backend.distributed import register_distributed_backend
 

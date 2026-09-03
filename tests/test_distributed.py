@@ -67,6 +67,34 @@ def test_nccl_dtype_and_op_maps():
         ),
         # AMD with only the runtime-level list set.
         ({"HIP_VISIBLE_DEVICES": "0,1"}, 1, {"HIP_VISIBLE_DEVICES": "1"}),
+        # SLURM's gres plugin exports CUDA_VISIBLE_DEVICES next to the ROCR
+        # list by default, and the HIP runtime reads it as its fallback: the
+        # HSA level takes the rank's entry, the runtime level becomes the
+        # only index left in a one-entry set. Narrowing both by rank would
+        # hide every GPU from every rank but 0.
+        (
+            {"ROCR_VISIBLE_DEVICES": "0,1,2,3", "CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+            2,
+            {"ROCR_VISIBLE_DEVICES": "2", "CUDA_VISIBLE_DEVICES": "0"},
+        ),
+        (
+            {"ROCR_VISIBLE_DEVICES": "0,1,2,3", "HIP_VISIBLE_DEVICES": "0,1,2,3"},
+            3,
+            {"ROCR_VISIBLE_DEVICES": "3", "HIP_VISIBLE_DEVICES": "0"},
+        ),
+        # One srun task per GPU with the runtime level already at 0.
+        (
+            {"ROCR_VISIBLE_DEVICES": "0", "HIP_VISIBLE_DEVICES": "0"},
+            0,
+            {"ROCR_VISIBLE_DEVICES": "0", "HIP_VISIBLE_DEVICES": "0"},
+        ),
+        # An empty value is "unset", and entries may carry spaces.
+        (
+            {"CUDA_VISIBLE_DEVICES": ""},
+            1,
+            {"CUDA_VISIBLE_DEVICES": "1", "HIP_VISIBLE_DEVICES": "1"},
+        ),
+        ({"CUDA_VISIBLE_DEVICES": "0, 1, 2, 3"}, 2, {"CUDA_VISIBLE_DEVICES": "2"}),
         # Nothing set: pin both vendors' variables, whichever runtime is there.
         ({}, 1, {"CUDA_VISIBLE_DEVICES": "1", "HIP_VISIBLE_DEVICES": "1"}),
         # A hand-pinned single entry is respected, and nothing else is set.
@@ -104,6 +132,14 @@ def test_use_local_rank_gpu_rejects_a_rank_beyond_the_visible_list(monkeypatch):
     env = dict(os.environ, ROCR_VISIBLE_DEVICES="0,1", LOCAL_RANK="2")
     monkeypatch.setattr(os, "environ", env)
     with pytest.raises(RuntimeError, match="lists only 2 devices"):
+        use_local_rank_gpu()
+
+
+def test_use_local_rank_gpu_rejects_a_non_integer_local_rank(monkeypatch):
+    from torch_mojo_backend.distributed import use_local_rank_gpu
+
+    monkeypatch.setattr(os, "environ", dict(os.environ, LOCAL_RANK="zero"))
+    with pytest.raises(RuntimeError, match="not an integer"):
         use_local_rank_gpu()
 
 
@@ -204,16 +240,22 @@ def test_hip_pointer_ordinal_identifies_the_owning_gpu():
 
 
 @pytest.mark.parametrize(
-    "cuda_version,apis,expect_warning",
+    "cuda_version,hip_version,apis,amd_present,expect",
     [
-        ("13.0", ["hip", "cpu"], True),  # CUDA wheel driving AMD GPUs
-        (None, ["hip", "cpu"], False),  # the CPU wheel: what AMD wants
-        ("13.0", ["cuda", "cpu"], False),  # CUDA wheel on NVIDIA: fine
-        ("13.0", ["cpu"], False),
+        ("13.0", None, ["hip", "cpu"], True, "CUDA build"),  # CUDA wheel on AMD
+        (None, "6.4.4", ["hip", "cpu"], True, "ROCm build"),  # two HIP runtimes
+        (None, None, ["hip", "cpu"], True, None),  # the CPU wheel: what AMD wants
+        ("13.0", None, ["cuda", "cpu"], False, None),  # CUDA wheel on NVIDIA
+        ("13.0", None, ["hip", "cpu"], False, None),  # no /dev/kfd: never enumerates
     ],
 )
-def test_cuda_torch_on_hip_warns_once_at_registration(
-    monkeypatch, cuda_version: str | None, apis: list[str], expect_warning: bool
+def test_gpu_torch_on_hip_hint(
+    monkeypatch,
+    cuda_version: str | None,
+    hip_version: str | None,
+    apis: list[str],
+    amd_present: bool,
+    expect: str | None,
 ):
     import warnings
     from types import SimpleNamespace
@@ -222,16 +264,43 @@ def test_cuda_torch_on_hip_warns_once_at_registration(
     from torch_mojo_backend.torch_compile_backend import utils
 
     monkeypatch.setattr(torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(
-        utils, "get_accelerators", lambda: [SimpleNamespace(api=api) for api in apis]
-    )
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    monkeypatch.setattr(hip_peer, "_amd_gpu_present", lambda: amd_present)
+    enumerated: list[bool] = []
+
+    def fake_accelerators() -> list[SimpleNamespace]:
+        enumerated.append(True)
+        return [SimpleNamespace(api=api) for api in apis]
+
+    monkeypatch.setattr(utils, "get_accelerators", fake_accelerators)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        hip_peer.warn_if_cuda_torch_on_hip()
-    hints = [w for w in caught if "CUDA build" in str(w.message)]
-    assert bool(hints) == expect_warning
-    if expect_warning:
-        assert "download.pytorch.org/whl/cpu" in str(hints[0].message)
+        hip_peer.warn_if_gpu_torch_on_hip()
+    hints = [str(w.message) for w in caught if "torch-mojo-backend" in str(w.message)]
+    if expect is None:
+        assert hints == []
+    else:
+        assert len(hints) == 1 and expect in hints[0], hints
+        assert "download.pytorch.org/whl/cpu" in hints[0]
+    # Registration must not touch MAX's device enumeration unless an AMD GPU
+    # is present and torch is a GPU build.
+    assert bool(enumerated) == (
+        amd_present and (cuda_version or hip_version) is not None
+    )
+
+
+def test_gpu_torch_on_hip_hint_never_breaks_registration(monkeypatch):
+    from torch_mojo_backend.mojo_device import hip_peer
+    from torch_mojo_backend.torch_compile_backend import utils
+
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
+    monkeypatch.setattr(hip_peer, "_amd_gpu_present", lambda: True)
+
+    def broken() -> list[object]:
+        raise RuntimeError("enumeration failed")
+
+    monkeypatch.setattr(utils, "get_accelerators", broken)
+    hip_peer.warn_if_gpu_torch_on_hip()  # swallowed: a hint, not a gate
 
 
 def test_cpu_collectives_through_gloo_delegation():

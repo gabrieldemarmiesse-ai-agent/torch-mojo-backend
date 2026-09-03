@@ -221,10 +221,8 @@ def main():
         log(f"saved checkpoint to {args.out_dir / 'ckpt.pt'}")
     dist.barrier()
     dist.destroy_process_group()
-    if (
-        device == "mojo"
-        and os.environ.get("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM") == "1"
-    ):
+    vmm = os.environ.get("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM", "").lower()
+    if device == "mojo" and vmm in ("1", "true", "yes", "on"):
         # MAX's on-demand (VMM) device allocator is what makes an APU such as
         # the MI300A usable with one rank per GPU (docs/distributed.md), but
         # with MAX 26.5 + ROCm 6.4.3 the HSA runtime segfaults in its atexit

@@ -14,7 +14,11 @@ bring the GPU stack" motto:
   its HIP runtime from — the one at `$ROCM_PATH` or `/opt/rocm`, or a
   path in `TORCH_MOJO_BACKEND_RCCL_LIB`. Nothing extra to install: every
   ROCm ships RCCL, and taking it from the same install as the HIP runtime
-  is what keeps one runtime (one device numbering) in the process.
+  is what keeps one runtime (one device numbering) in the process. That
+  assumes the CPU torch wheel: a ROCm torch wheel loads its own bundled HIP
+  runtime next to MAX's, RCCL and the pointer-ownership query would bind to
+  one while MAX's buffers belong to the other, and `register_mojo_devices()`
+  warns about it (untested; use the CPU wheel).
 
 Collectives on CPU tensors (object collectives, `barrier()`) are served by a
 private gloo backend inside the same process group.
@@ -54,8 +58,12 @@ the launcher's whole-allocation list by `LOCAL_RANK` — SLURM-style
 `CUDA_VISIBLE_DEVICES=0,...,7` on NVIDIA, `ROCR_VISIBLE_DEVICES=0,...,3` (or
 `HIP_VISIBLE_DEVICES`) on AMD — so `"mojo"` is always the right device and
 each process binds one CUDA context / HIP device. A list already narrowed to
-one entry (one srun task per GPU) is left alone. Call it before anything
-touches the GPU runtime or enumerates MAX devices.
+one entry (one srun task per GPU) is left alone. AMD has two levels, and only
+one is narrowed: when `ROCR_VISIBLE_DEVICES` is present it takes the rank's
+entry, and a `HIP_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` list next to it
+(SLURM's gres plugin exports both by default; the HIP runtime reads either as
+an index into the HSA-visible set) is rewritten to `0`. Call it before
+anything touches the GPU runtime or enumerates MAX devices.
 
 ## What works, what to avoid
 
@@ -219,12 +227,14 @@ Adastra MI300A nodes, ours with the CPU torch wheel and
 | of which step 1 | ~1.5 s | ~8.7 s |
 | steady state | 687–698k tok/s | 660k tok/s |
 | whole process (imports to exit) | 12–13 s | 42–56 s |
-| 2 nodes × 2 ranks over Slingshot: 20 steps | 2.0 / 2.3 s | 9.2–9.8 s |
-| steady state | 646k tok/s | 630k tok/s |
+| 2 nodes × 2 ranks over Slingshot: 30 steps | 4.1 / 4.6 s | 10.7 / 10.4 s |
+| of which step 1 | 1.5 / 1.4 s | 8.1 / 7.6 s |
+| steady state (steps 3–30) | 80 / 84 ms per step, an occasional 100–180 ms step | 79 ms per step, within 1 ms |
 
 The two stacks print identical losses at every logged step. The 2-node
-runs used `NCCL_NET_GDR_LEVEL=0` for ours (see below); stock is shown with
-and without it (9.2 s with GPU Direct, 9.7–9.8 s without).
+runs used the default GPU-Direct transport for both; per-step times come
+from the tokens/s the demo prints for each step (its elapsed column has
+0.1 s resolution).
 
 - **Multi-node status.** On one node pair (a1003/a1004) our ranks failed in
   `ncclCommInitRank` with an RCCL internal error from the libfabric

@@ -974,15 +974,31 @@ def create_mojo_process_group(
     return MojoProcessGroup(store, rank, world_size, timeout)
 
 
-_VISIBLE_DEVICES_VARS = (
-    # NVIDIA. AMD's two levels: ROCR_VISIBLE_DEVICES masks at the HSA level
-    # and HIP_VISIBLE_DEVICES indexes INTO the ROCR-visible set — which is
-    # why exactly one of them may be narrowed per rank (narrowing both would
-    # compose to nothing visible).
-    "CUDA_VISIBLE_DEVICES",
-    "ROCR_VISIBLE_DEVICES",
-    "HIP_VISIBLE_DEVICES",
-)
+# NVIDIA has one visibility variable. AMD has two levels: ROCR_VISIBLE_DEVICES
+# masks at the HSA level and HIP_VISIBLE_DEVICES (or CUDA_VISIBLE_DEVICES, which
+# the HIP runtime reads as its fallback) indexes INTO the ROCR-visible set.
+_HSA_LEVEL = "ROCR_VISIBLE_DEVICES"
+_RUNTIME_LEVEL = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+
+
+def _visible_entries(var: str) -> list[str] | None:
+    """The comma list in `var`, or None when it is unset or empty."""
+    visible = os.environ.get(var)
+    if visible is None:
+        return None
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    return entries or None
+
+
+def _keep_local_rank_entry(var: str, entries: list[str], rank_index: int):
+    if len(entries) <= 1:
+        return  # already pinned, e.g. one srun task per GPU
+    if rank_index >= len(entries):
+        raise RuntimeError(
+            f"LOCAL_RANK={rank_index} but {var}={os.environ[var]!r} lists only "
+            f"{len(entries)} devices"
+        )
+    os.environ[var] = entries[rank_index]
 
 
 def use_local_rank_gpu():
@@ -1001,27 +1017,35 @@ def use_local_rank_gpu():
     alone (one srun task per GPU pins that way). When no variable is set at
     all, both the CUDA and HIP ones are set to LOCAL_RANK, whichever runtime
     turns out to be present.
+
+    Only one level is ever narrowed. When ``ROCR_VISIBLE_DEVICES`` is
+    present it is the level that gets the rank's entry, and any runtime-level
+    list (SLURM's gres plugin exports ``CUDA_VISIBLE_DEVICES`` next to it by
+    default) is rewritten to ``"0"``, the only index that exists in a
+    one-entry HSA set — narrowing both levels by rank would compose to no
+    visible GPU at all for every rank but 0.
     """
     local_rank = os.environ.get("LOCAL_RANK")
     if local_rank is None:
         return
-    rank_index = int(local_rank)
+    try:
+        rank_index = int(local_rank)
+    except ValueError:
+        raise RuntimeError(f"LOCAL_RANK={local_rank!r} is not an integer") from None
+    hsa = _visible_entries(_HSA_LEVEL)
+    if hsa is not None:
+        _keep_local_rank_entry(_HSA_LEVEL, hsa, rank_index)
+        for var in _RUNTIME_LEVEL:
+            if _visible_entries(var) is not None:
+                os.environ[var] = "0"
+        return
     pinned = False
-    for var in _VISIBLE_DEVICES_VARS:
-        visible = os.environ.get(var)
-        if visible is None:
+    for var in _RUNTIME_LEVEL:
+        entries = _visible_entries(var)
+        if entries is None:
             continue
-        entries = [entry for entry in visible.split(",") if entry]
-        if len(entries) <= 1:
-            pinned = True  # already pinned (or nothing to slice)
-            continue
-        if rank_index >= len(entries):
-            raise RuntimeError(
-                f"LOCAL_RANK={rank_index} but {var}={visible!r} lists only "
-                f"{len(entries)} devices"
-            )
-        os.environ[var] = entries[rank_index]
+        _keep_local_rank_entry(var, entries, rank_index)
         pinned = True
     if not pinned:
-        os.environ["CUDA_VISIBLE_DEVICES"] = local_rank
-        os.environ["HIP_VISIBLE_DEVICES"] = local_rank
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank_index)
+        os.environ["HIP_VISIBLE_DEVICES"] = str(rank_index)

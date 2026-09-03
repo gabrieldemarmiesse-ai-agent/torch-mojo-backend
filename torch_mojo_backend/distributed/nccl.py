@@ -252,7 +252,7 @@ def load(api: str) -> CclLibrary:
         raise RuntimeError(
             f"no NCCL-API collective library for the {api!r} device api; the "
             "mojo distributed backend supports NVIDIA (NCCL) and AMD (RCCL) GPUs"
-        )
+        ) from None
     paths = _candidate_librccl_paths() if api == "hip" else _candidate_libnccl_paths()
     errors = []
     for path in paths:
