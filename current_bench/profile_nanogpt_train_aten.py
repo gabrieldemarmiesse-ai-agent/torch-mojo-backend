@@ -38,8 +38,6 @@ import torch
 from tabulate import tabulate
 from torch.profiler import ProfilerActivity, profile
 
-from torch_mojo_backend import get_accelerators, register_mojo_devices
-
 from current_bench.bench_nanogpt_train import (
     DEFAULT_NANOGPT_PATH,
     DTYPES,
@@ -51,6 +49,7 @@ from current_bench.bench_nanogpt_train import (
     make_synchronize,
     training_step,
 )
+from torch_mojo_backend import get_accelerators, register_mojo_devices
 
 
 def self_gpu_us(event: object) -> float:

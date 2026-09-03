@@ -21,7 +21,6 @@ from torch_mojo_backend.mojo_device import (
     torch_mojo_device_module,
     torch_mojo_tensor as mojo_tensor_module,
 )
-from torch_mojo_backend.torch_compile_backend import utils
 from torch_mojo_backend.mojo_device.torch_mojo_device_module import (
     _reserve_philox_state,
 )
@@ -30,6 +29,7 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     find_equivalent_max_device,
     get_ordered_accelerators,
 )
+from torch_mojo_backend.torch_compile_backend import utils
 
 pytestmark = pytest.mark.xdist_group(name="group1")
 

@@ -333,7 +333,10 @@ def main():
             raise RuntimeError(f"Expected MAX accelerator 0 to be a GPU: {max_device}")
 
         def synchronize():
-            from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
+            from torch_mojo_backend.eager_kernels import (  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
+                _ctx_ptr,
+                tensor_holder,
+            )
 
             tensor_holder.synchronize(_ctx_ptr(max_device))
 

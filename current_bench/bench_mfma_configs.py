@@ -133,7 +133,10 @@ def main():
     register_mojo_devices()
     device = list(get_accelerators())[0]
 
-    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
+    from torch_mojo_backend.eager_kernels import (  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
+        _ctx_ptr,
+        tensor_holder,
+    )
 
     ctx = _ctx_ptr(device)
     tuning = load_tuning_extension()

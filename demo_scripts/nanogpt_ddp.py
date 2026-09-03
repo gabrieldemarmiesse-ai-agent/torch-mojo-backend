@@ -98,7 +98,9 @@ def main():
     device = args.device
 
     if device == "mojo":
-        from torch_mojo_backend import register_mojo_devices  # noqa: PLC0415 -- optional, like the import at the top: --device cuda must run in a stock-torch venv
+        from torch_mojo_backend import (  # noqa: PLC0415 -- optional, like the import at the top: --device cuda must run in a stock-torch venv
+            register_mojo_devices,
+        )
 
         register_mojo_devices()
         backend = "mojo"
@@ -117,7 +119,9 @@ def main():
     # rank-offset seed for on-device randomness (dropout).
     torch.manual_seed(args.seed)
     if device == "mojo":
-        from torch_mojo_backend.mojo_device import torch_mojo_device_module  # noqa: PLC0415 -- same optional import as above
+        from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same optional import as above
+            torch_mojo_device_module,
+        )
 
         torch_mojo_device_module.manual_seed_all(args.seed + rank)
     else:

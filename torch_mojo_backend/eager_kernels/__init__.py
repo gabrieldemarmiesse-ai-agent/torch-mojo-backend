@@ -858,7 +858,9 @@ def _bootstrap_allocate_single_output(spec: object) -> object:
     declared `Callable[[object], object]` type.
     """
     global _allocate_single_output
-    from torch_mojo_backend.eager_kernels.output_specs import _allocate_output_spec  # noqa: PLC0415 -- the cycle this docstring describes
+    from torch_mojo_backend.eager_kernels.output_specs import (  # noqa: PLC0415 -- the cycle this docstring describes
+        _allocate_output_spec,
+    )
 
     _allocate_single_output = cast("Callable[[object], object]", _allocate_output_spec)
     return _allocate_single_output(spec)

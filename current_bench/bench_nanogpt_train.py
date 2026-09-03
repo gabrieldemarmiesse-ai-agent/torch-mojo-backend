@@ -57,7 +57,10 @@ def import_nanogpt(nanogpt_path: Path) -> tuple[type, type]:
         )
     if str(nanogpt_path) not in sys.path:
         sys.path.insert(0, str(nanogpt_path))
-    from model import GPT, GPTConfig  # noqa: PLC0415 -- nanoGPT, reachable only via the sys.path insert above
+    from model import (  # noqa: PLC0415 -- nanoGPT, reachable only via the sys.path insert above
+        GPT,
+        GPTConfig,
+    )
 
     return GPTConfig, GPT
 

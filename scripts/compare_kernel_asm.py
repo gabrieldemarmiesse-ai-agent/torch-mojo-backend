@@ -73,13 +73,13 @@ import shutil
 import subprocess
 import sys
 import textwrap
-
-import max as max_package
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+import max as max_package
 
 DEFAULT_KERNEL_DIR = Path("torch_mojo_backend/eager_kernels")
 SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")

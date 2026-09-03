@@ -48,7 +48,9 @@ _default_streams_lock = threading.Lock()
 
 
 def _current_device_index() -> int:
-    from torch_mojo_backend.mojo_device import torch_mojo_device_module  # noqa: PLC0415 -- cycle: torch_mojo_device_module imports this module (see the E402 note at its end)
+    from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- cycle: torch_mojo_device_module imports this module (see the E402 note at its end)
+        torch_mojo_device_module,
+    )
 
     return torch_mojo_device_module.current_device()
 
@@ -230,7 +232,9 @@ class Stream(torch._C.Stream):
         (mojo_device/comm_fence.py) — so fence before observing, once.
         """
         if self._device_stream.is_default:
-            from torch_mojo_backend.mojo_device import comm_fence  # noqa: PLC0415 -- same cycle: comm_fence imports torch_mojo_tensor
+            from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same cycle: comm_fence imports torch_mojo_tensor
+                comm_fence,
+            )
 
             comm_fence.fence_device(self._index)
 

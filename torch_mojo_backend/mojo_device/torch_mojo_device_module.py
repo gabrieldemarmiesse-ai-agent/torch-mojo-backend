@@ -195,7 +195,10 @@ def synchronize(device: "int | str | torch.device | None" = None):
     every op it issued has actually run on the device. So does a collective
     still flying on the comm stream, which only the default stream is waited
     on here: fence it onto that stream first (mojo_device/comm_fence.py)."""
-    from torch_mojo_backend.mojo_device import comm_fence, deferred_compile  # noqa: PLC0415 -- same cycle, through comm_fence's import of torch_mojo_tensor
+    from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same cycle, through comm_fence's import of torch_mojo_tensor
+        comm_fence,
+        deferred_compile,
+    )
 
     comm_fence.fence_all()
     deferred_compile.drain()

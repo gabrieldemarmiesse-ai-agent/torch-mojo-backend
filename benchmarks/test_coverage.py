@@ -37,7 +37,6 @@ from bench_lib import baselines
 # `environment.root = ["benchmarks"]` in [tool.ty], mirroring the sys.path
 # insert -- left for a repo-wide config change rather than a local workaround.)
 from conftest import KEY_DUMP_ENV  # ty: ignore[unresolved-import]
-
 from torch_mojo_backend.mojo_device import mojo_device_aten_ops as reg
 
 BENCH_DIR = Path(__file__).resolve().parent

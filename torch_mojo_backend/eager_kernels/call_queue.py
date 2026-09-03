@@ -165,7 +165,9 @@ def _free_device_memory() -> int | None:
     or None when no accelerator can report one (CPU-only hosts, backends
     without memory statistics)."""
     try:
-        from torch_mojo_backend import get_accelerators  # noqa: PLC0415 -- cycle: the package __init__ reaches this module
+        from torch_mojo_backend import (  # noqa: PLC0415 -- cycle: the package __init__ reaches this module
+            get_accelerators,
+        )
 
         frees = [device.stats["free_memory"] for device in get_accelerators()]
     except Exception:
