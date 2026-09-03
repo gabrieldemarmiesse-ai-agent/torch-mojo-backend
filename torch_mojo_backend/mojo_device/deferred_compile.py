@@ -60,8 +60,9 @@ _DEVICE_LOCK = call_queue._LOCK
 #
 # `__torch_dispatch__` already unboxed this call's arguments, so redispatching
 # through `func(*args, **kwargs)` re-enters the C++ dispatcher only to box and
-# unbox them again for the very same Python callable -- ~5.7 us/op, and eager
-# nanoGPT issues ~2200 ops a step. A dict hit calls that callable straight.
+# unbox them again for the very same Python callable -- ~8 us per dispatch,
+# and an eager nanoGPT step makes ~760 of them (6 ms of a 37 ms host budget
+# at batch 12). A dict hit calls that callable straight.
 #
 # The fallthrough below is what the table cannot cover: CompositeImplicit ops
 # that decompose in C++, and anything with no PrivateUse1 registration.
