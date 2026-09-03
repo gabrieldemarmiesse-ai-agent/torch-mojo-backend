@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch_mojo_backend import get_accelerators, register_mojo_devices
 
 _WORKER = Path(__file__).parent / "ddp_worker.py"
+_OVERHEAD_WORKER = Path(__file__).parent / "comm_fence_overhead.py"
 
 
 def _gpu_count() -> int:
@@ -97,8 +98,53 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
 
 
 @pytest.mark.parametrize("comm_stream", ["1", "0"], ids=["side-stream", "same-stream"])
-@pytest.mark.parametrize("mode", ["collectives", "ddp_parity"])
+@pytest.mark.parametrize("mode", ["collectives", "ddp_parity", "lazy_fence"])
 def test_two_rank_nccl(mode: str, comm_stream: str):
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
     _run_torchrun(2, mode, {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream})
+
+
+def _measure_overhead_microseconds(no_hook: bool) -> dict[str, float]:
+    result = subprocess.run(
+        [sys.executable, str(_OVERHEAD_WORKER)] + (["--no-hook"] if no_hook else []),
+        # os.environ, not the inherited environment: the Mojo runtime setenv()s
+        # PYTHONEXECUTABLE=/usr/bin/python3 at the C level once a kernel
+        # extension loads, which breaks a child launched with sys.executable.
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
+        cwd=Path(__file__).parent.parent,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"overhead worker failed (rc={result.returncode})\n"
+            f"stdout:\n{result.stdout[-4000:]}\nstderr:\n{result.stderr[-4000:]}"
+        )
+    return {
+        key: float(value)
+        for key, _, value in (
+            line.partition("=") for line in result.stdout.splitlines()
+        )
+        if value
+    }
+
+
+def test_comm_fence_hook_per_op_overhead():
+    """What the per-op comm-fence hook costs when no collective is pending.
+
+    One subprocess per leg: the hook is installed once, at registration.
+    """
+    if _gpu_count() < 1:
+        pytest.skip("needs a GPU")
+    with_hook = _measure_overhead_microseconds(no_hook=False)
+    without_hook = _measure_overhead_microseconds(no_hook=True)
+    print(
+        f"\ncomm-fence hook: {with_hook['us_per_op']:.3f} us/op with, "
+        f"{without_hook['us_per_op']:.3f} us/op without "
+        f"({with_hook['us_per_op'] - without_hook['us_per_op']:+.3f} us/op); "
+        f"wrapper frame alone {with_hook['wrapper_us']:.3f} us"
+    )
+    assert with_hook["us_per_op"] - without_hook["us_per_op"] < 5.0
+    assert with_hook["wrapper_us"] < 5.0

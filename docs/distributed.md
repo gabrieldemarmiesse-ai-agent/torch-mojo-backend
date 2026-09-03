@@ -65,16 +65,12 @@ before anything touches CUDA or enumerates MAX devices.
 
 - **A comm stream overlaps compute.** Collectives run on a dedicated side
   device stream per device (`mojo_device/device_streams.py`): it waits for
-  the default stream so every producer kernel comes first, the collective
-  is enqueued, and the Work's future completes from a watcher thread once
-  the collective's end event fires on the device. DDP keeps enqueuing
-  backward compute while bucket allreduces fly; the end-of-backward
-  `future.wait()` blocks only for the un-overlappable tail. Every tensor a
-  collective touches is fenced with `device_streams.record_use` (the
-  backend's `record_stream` analog): its eventual stream-ordered free is
-  ordered after the collective on the device, because MAX does not fence
-  frees across streams by itself (measured; see the memory note in
-  `mojo_device/device_streams.py`).
+  the default stream so every producer kernel comes first, then the
+  collective is enqueued. Every tensor a collective touches is fenced with
+  `device_streams.record_use` (the backend's `record_stream` analog): its
+  eventual stream-ordered free is ordered after the collective on the
+  device, because MAX does not fence frees across streams by itself
+  (measured; see the memory note in `mojo_device/device_streams.py`).
   `TORCH_MOJO_BACKEND_COMM_STREAM=0` pins collectives to the default stream
   instead (simplest ordering, zero overlap) — also the automatic path for
   collectives needing default-stream copies after the NCCL call. Both paths
@@ -82,10 +78,30 @@ before anything touches CUDA or enumerates MAX devices.
   a stream (`docs/kernel_call_queue.md`). One contract carried over from
   stock torch: `wait()` an async collective before reading its result —
   including before exporting it through DLPack.
-- **Work objects** wrap completed `torch.futures.Future`s (no `devices=` —
-  the PrivateUse1 device guard is a stub, and a device-typed future would
-  do out-of-bounds bookkeeping for index ≥ 1). `wait()` is a host no-op by
-  design; device ordering comes from the stream.
+- **Work objects** wrap already-completed `torch.futures.Future`s (no
+  `devices=` — the PrivateUse1 device guard is a stub, and a device-typed
+  future would do out-of-bounds bookkeeping for index ≥ 1), so `wait()` is
+  a host no-op in both paths.
+- **The default stream is ordered after the comm stream lazily**, at the
+  first op that touches a buffer a collective read or wrote
+  (`mojo_device/comm_fence.py`): the collective records those buffers as
+  pending, and a hook in front of every eager op makes the default stream
+  wait on the comm stream when it sees one. Host reads no op mediates —
+  `torch.mojo.synchronize()`, a default-stream `synchronize()`/`query()`,
+  DLPack export, the D2H copy — fence the same way. This is what lets the
+  host run ahead: DDP's reducer never blocks on a bucket's future, so it
+  keeps enqueuing while allreduces fly, and the fence lands in
+  `finalize_backward` where it first reads a reduced bucket — after every
+  backward kernel is already enqueued, so overlap is unchanged. Blocking
+  the host on those futures instead cost ~2 ms of a 96 ms step, spent
+  launching the bucket→grad copies, `clip_grad_norm_` and the optimizer
+  against an idle GPU: nanoGPT 124M on 32 H100s (4 nodes, bf16, batch
+  32×1024 per rank) went 10.89 → 11.10 M tok/s when it stopped doing so
+  (paired A/B/B/A runs, medians of the 10-step windows), closing most of
+  the gap to stock CUDA torch's 11.16. Stock `ProcessGroupNCCL` gets there with a
+  device-typed future whose `wait()` makes the current stream wait; that
+  needs a C++ DeviceGuardImpl for PrivateUse1 which torch does not provide
+  and this backend cannot ship.
 - **The Python PG replaces the whole process group** (torch ≥ 2.10 behavior),
   so torch cannot compose `cpu:gloo` alongside it; the internal gloo handles
   CPU tensors instead, and `_device_types` stays empty, which routes object

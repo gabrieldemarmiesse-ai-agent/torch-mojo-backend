@@ -24,6 +24,7 @@ from torch_mojo_backend.aten_functions import (
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
+from torch_mojo_backend.mojo_device import comm_fence
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -528,6 +529,10 @@ class BaseMaxCompiler:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
+        if comm_fence.PENDING:
+            # The graph reads its inputs' device memory straight from MAX, so
+            # the per-op hook in register.py never sees them; fence here.
+            comm_fence.fence_pending_args(args, {})
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]

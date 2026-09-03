@@ -13,12 +13,9 @@ Design (see docs/distributed.md for the full story):
 - NCCL collectives run on a dedicated comm stream (a side stream,
   ``mojo_device/device_streams.py``) for compute/communication overlap: it
   waits for the default stream first (so producers are ordered before the
-  collective), the collective is enqueued, and a watcher thread completes
-  the Work's future once the end event fires. DDP's Reducer therefore keeps
-  enqueuing backward compute on the default stream while bucket allreduces
-  fly on the comm stream, and its end-of-backward ``future.wait()`` blocks
-  only for the un-overlappable tail. Every tensor a collective touches is
-  fenced via ``device_streams.record_use`` (see that module's docstring).
+  collective) and the collective is enqueued. Every tensor a collective
+  touches is fenced via ``device_streams.record_use`` (see that module's
+  docstring) and recorded as pending in ``mojo_device/comm_fence.py``.
   ``TORCH_MOJO_BACKEND_COMM_STREAM=0`` falls back to the default stream
   itself (ordering free, zero overlap) — also the automatic path for
   collectives needing default-stream copies AFTER the collective
@@ -27,12 +24,24 @@ Design (see docs/distributed.md for the full story):
   first (rule 1 in device_streams.py).
 
 - Work objects wrap an already-completed ``torch.futures.Future`` holding the
-  output tensors. Never pass ``devices=`` to that Future: with a device list
-  it routes through the stub PythonDeviceGuard whose ``deviceCount() == 1``
-  and performs an out-of-bounds write for device indices >= 1. A plain CPU
-  future does zero device bookkeeping, which is exactly right here because
-  stream order already guarantees device-side completion for any consumer on
-  the same stream. ``wait()`` on it is a host-side no-op by design.
+  output tensors, on both paths, so ``wait()`` is a host-side no-op. Never
+  pass ``devices=`` to that Future: with a device list it routes through the
+  stub PythonDeviceGuard whose ``deviceCount() == 1`` and performs an
+  out-of-bounds write for device indices >= 1.
+
+  Completing at enqueue time rather than when the collective's end event
+  fires is what keeps the host free, and it is the whole point of
+  ``comm_fence``. Stock ``ProcessGroupNCCL`` does the same and pays for it
+  with a device-typed future whose ``wait()`` makes the *current stream*
+  wait — a C++ DeviceGuardImpl this backend cannot ship. Instead the device
+  ordering is inserted lazily: the first default-stream op touching a
+  collective's buffer makes the default stream wait on the comm stream.
+  For DDP that lands in ``finalize_backward``, where the Reducer first reads
+  a reduced bucket — after every backward kernel is already enqueued — so
+  overlap is unchanged while the host runs ahead into the bucket→grad
+  copies, ``clip_grad_norm_`` and the optimizer step. Blocking the host on
+  the future instead cost ~2 ms/step of exposed GPU idle: nanoGPT 124M on
+  32 H100s went 10.89 -> 11.10 M tok/s when it stopped doing so.
 
 - The DDP Reducer calls ``allreduce`` through the C++ trampoline and then
   ``Work.get_future()`` (default_comm_hooks.cpp) — both supported by
@@ -46,17 +55,15 @@ One process drives exactly one GPU (torchrun layout). Set
 
 import datetime
 import os
-import queue
 import sys
 import threading
-import time
 import traceback
 from collections.abc import Callable
 from typing import cast
 
 import torch
 import torch.distributed as dist
-from max.driver import Device, DeviceEvent
+from max.driver import Device
 from torch._C._distributed_c10d import (
     AllgatherOptions,
     AllreduceCoalescedOptions,
@@ -74,7 +81,7 @@ from torch._C._distributed_c10d import (
 from torch.distributed import PrefixStore, Store, Work
 
 from torch_mojo_backend.distributed import nccl
-from torch_mojo_backend.mojo_device import torch_mojo_device_module
+from torch_mojo_backend.mojo_device import comm_fence, torch_mojo_device_module
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 _NCCL_DTYPE_OF: dict[torch.dtype, int] = {
@@ -161,74 +168,6 @@ def _loud(fn: Callable[..., Work]) -> Callable[..., Work]:
     return wrapper
 
 
-_CompletionJob = tuple[
-    DeviceEvent, torch.futures.Future[list[torch.Tensor]], list[torch.Tensor]
-]
-
-
-class _CommCompletionWorker:
-    """Completes collective futures once their device-side end event fires.
-
-    One daemon thread per process group; jobs resolve FIFO because events on
-    one stream complete in enqueue order. Polls ``is_ready`` (short spin,
-    then 200 µs sleeps) instead of a blocking wait so ``abort()`` can
-    unstick the thread when a communicator dies mid-collective.
-    """
-
-    def __init__(self):
-        self._jobs: queue.SimpleQueue[_CompletionJob | None] = queue.SimpleQueue()
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-        self.aborted = False
-
-    def submit(
-        self,
-        event: DeviceEvent,
-        future: torch.futures.Future[list[torch.Tensor]],
-        result: list[torch.Tensor],
-    ):
-        with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(
-                    target=self._run, name="mojo-comm-completion", daemon=True
-                )
-                self._thread.start()
-        self._jobs.put((event, future, result))
-
-    def shutdown(self):
-        with self._lock:
-            thread = self._thread
-            self._thread = None
-        if thread is not None:
-            self._jobs.put(None)
-            thread.join(timeout=30)
-
-    def _run(self):
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                return
-            event, future, result = job
-            try:
-                spin_until = time.monotonic() + 0.001
-                while not event.is_ready():
-                    if self.aborted:
-                        raise RuntimeError(
-                            "communicator aborted while a collective was in flight"
-                        )
-                    if time.monotonic() > spin_until:
-                        time.sleep(0.0002)
-                future.set_result(result)
-            except Exception as e:
-                try:
-                    future.set_exception(e)  # ty: ignore[invalid-argument-type] -- the stub types it as the result type
-                except Exception:
-                    pass
-                traceback.print_exc()
-            finally:
-                del event, future, result
-
-
 class MojoProcessGroup(dist.ProcessGroup):
     """NCCL-backed process group for ``mojo`` tensors, gloo for CPU tensors."""
 
@@ -260,7 +199,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._comm_stream_enabled = (
             os.environ.get("TORCH_MOJO_BACKEND_COMM_STREAM", "1") != "0"
         )
-        self._completion = _CommCompletionWorker()
         # Private CPU backend: torch will not compose gloo around a Python PG
         # (see module docstring), so CPU tensors are our job too.
         # The stub declares the collectives on ProcessGroup only; the gloo
@@ -289,21 +227,31 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._group_name = name
 
     def shutdown(self):
-        # Let in-flight comm-stream collectives complete before tearing down
-        # the communicators they run on.
-        self._completion.shutdown()
+        # Nothing waits for a comm-stream collective any more (see
+        # _stream_work), so drain them here before the communicators they
+        # run on are destroyed.
+        self._quiesce_comm_streams()
         for comm in self._comms.values():
             comm.destroy()
         self._comms.clear()
 
     def abort(self):
-        # Flag first so the completion worker errors out its pending futures
-        # instead of waiting forever on events an aborted comm never fires.
-        self._completion.aborted = True
+        # An aborted communicator never finishes its work: drop the pending
+        # fences rather than let a later op wait on the comm stream forever.
+        for index in self._max_devices:
+            comm_fence.discard(index)
         for comm in self._comms.values():
             comm.abort()
         self._comms.clear()
-        self._completion.shutdown()
+
+    def _quiesce_comm_streams(self):
+        """Complete every in-flight comm-stream collective, fences included."""
+        for index, max_device in self._max_devices.items():
+            if self._comm_stream_enabled:
+                from torch_mojo_backend.mojo_device.device_streams import get_stream
+
+                get_stream(max_device, "nccl").synchronize()
+            comm_fence.discard(index)
 
     def _ensure_device_current(self, ordinal: int):
         # NCCL resolves the target GPU from the thread-current CUDA context,
@@ -353,13 +301,13 @@ class MojoProcessGroup(dist.ProcessGroup):
         then runs the same ``enqueue`` on the default stream. Eligibility is
         the caller's job: only collectives needing NO default-stream work
         after the NCCL call (no copy-back into non-contiguous outputs) may
-        come here, because nothing makes the default stream wait for the
-        comm stream; completion is signaled host-side through the Work's
-        future instead.
+        come here, because the default stream is ordered after the comm
+        stream lazily, at the first consumer, not here.
 
-        ``fenced`` lists every tensor the collective reads or writes,
+        ``fenced`` lists every tensor the collective reads or writes. Each is
         recorded against the comm stream (``device_streams.record_use``) so
-        each one's free is ordered after this collective.
+        its free is ordered after this collective, and marked pending in
+        ``comm_fence`` so its first default-stream use is too.
         """
         if not self._comm_stream_enabled:
             return None
@@ -372,11 +320,10 @@ class MojoProcessGroup(dist.ProcessGroup):
         for tensor in fenced:
             assert isinstance(tensor, TorchMojoTensor)
             record_use(tensor._holder, comm_stream)
-        future = torch.futures.Future[
-            list[torch.Tensor]
-        ]()  # no devices= — see module docstring
-        self._completion.submit(comm_stream.record_event(), future, result)
-        return _create_work_from_future(future)
+        comm_fence.mark_pending(
+            index, comm_stream, cast(tuple[TorchMojoTensor, ...], fenced)
+        )
+        return _completed_work(result)
 
     def _fence_default(self, index: int):
         """Drain, and order the default stream after the comm stream.
@@ -385,12 +332,15 @@ class MojoProcessGroup(dist.ProcessGroup):
         issue order. When comm-stream and default-stream collectives mix,
         this fence keeps device execution order equal to issue order. (The
         reverse direction is ``wait_default_stream`` in ``_stream_work``.)
+        Unconditional, unlike ``comm_fence``: a comm-stream collective no
+        consumer has touched yet is still pending on the device.
         """
         self._drained()
         if self._comm_stream_enabled and index in self._max_devices:
             from torch_mojo_backend.mojo_device.device_streams import get_stream
 
             get_stream(self._max_devices[index], "nccl").make_default_stream_wait()
+            comm_fence.discard(index)
 
     def _init_comm(self, index: int, ordinal: int) -> nccl.NcclComm:
         key = f"nccl-uid-{self._comm_seq}"
@@ -987,11 +937,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         # collectives on the comm stream.
         if self._comms:
             torch_mojo_device_module.synchronize()
-            if self._comm_stream_enabled:
-                from torch_mojo_backend.mojo_device.device_streams import get_stream
-
-                for max_device in self._max_devices.values():
-                    get_stream(max_device, "nccl").synchronize()
+            self._quiesce_comm_streams()
         return self._gloo.barrier(opts)
 
     def _one_per_rank(self, tensors: list[torch.Tensor]):

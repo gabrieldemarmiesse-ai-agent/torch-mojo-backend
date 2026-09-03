@@ -215,10 +215,24 @@ class Stream(torch._C.Stream):
         return self._device_stream.handle
 
     def query(self) -> bool:
+        self._fence_pending_comm_work()
         return self._device_stream.query()
 
     def synchronize(self):
+        self._fence_pending_comm_work()
         self._device_stream.synchronize()
+
+    def _fence_pending_comm_work(self):
+        """Both observations above answer "is my work done?" for this stream.
+
+        On the default stream that has to include a collective still in
+        flight on the comm stream, which is ordered onto it lazily
+        (mojo_device/comm_fence.py) — so fence before observing, once.
+        """
+        if self._device_stream.is_default:
+            from torch_mojo_backend.mojo_device import comm_fence
+
+            comm_fence.fence_device(self._index)
 
     def wait_event(self, event: Event):
         event.wait(self)

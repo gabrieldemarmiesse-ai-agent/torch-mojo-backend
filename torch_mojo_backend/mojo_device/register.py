@@ -5,10 +5,32 @@ from typing import TypeVar
 
 import torch
 
+from torch_mojo_backend.mojo_device import comm_fence
 from torch_mojo_backend.mojo_device.mojo_device_aten_ops import _aten_ops_registry
 
 _T = TypeVar("_T")
 _registered = False
+
+
+def _fence_pending_collectives(func: Callable[..., object]) -> Callable[..., object]:
+    """Order this op after any collective still in flight on the comm stream.
+
+    Wrapped around every eager op at registration time — the one choke point
+    where a default-stream consumer of a collective's buffer can be caught
+    (see mojo_device/comm_fence.py). While nothing is pending, which is every
+    op of a non-distributed run, the cost is this frame plus a dict
+    truthiness test.
+    """
+    pending = comm_fence.PENDING  # by reference: comm_fence mutates in place
+    fence_pending_args = comm_fence.fence_pending_args
+
+    @wraps(func)
+    def with_comm_fence(*args: object, **kwargs: object) -> object:
+        if pending:
+            fence_pending_args(args, kwargs)
+        return func(*args, **kwargs)
+
+    return with_comm_fence
 
 
 def _install_torch_accelerator_synchronize(torch_mojo_device_module: ModuleType):
@@ -412,7 +434,7 @@ def register_mojo_devices():
 
     # Register all collected aten operations
     for op_name, func in _aten_ops_registry:
-        torch.library.impl(op_name, "privateuseone")(func)
+        torch.library.impl(op_name, "privateuseone")(_fence_pending_collectives(func))
 
     from torch_mojo_backend.mojo_device.mojo_device_autograd import (
         register_autograd_ops,

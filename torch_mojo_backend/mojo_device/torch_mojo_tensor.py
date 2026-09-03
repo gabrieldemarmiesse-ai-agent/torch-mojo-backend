@@ -644,8 +644,12 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
-        from torch_mojo_backend.mojo_device import deferred_compile
+        from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
 
+        # A collective that wrote these bytes may still be flying on the comm
+        # stream; the default stream this transfer rides is ordered after it
+        # lazily (mojo_device/comm_fence.py), and this is a first use.
+        comm_fence.fence_tensor(self)
         src = self if self._is_contiguous else self._materialize_contiguous()
         # Reading device bytes is a host read: every queued launch must have
         # executed before the transfer is enqueued -- INCLUDING the strided
@@ -716,8 +720,9 @@ class TorchMojoTensor(torch.Tensor):
         not see a buffer whose producing launches -- including the copy a
         strided export just queued -- are still waiting on a compile.
         """
-        from torch_mojo_backend.mojo_device import deferred_compile, dlpack
+        from torch_mojo_backend.mojo_device import comm_fence, deferred_compile, dlpack
 
+        comm_fence.fence_tensor(self)  # same reason as _to_cpu_tensor's
         src = self._contig()
         deferred_compile.drain()
         return dlpack.make_capsule(
