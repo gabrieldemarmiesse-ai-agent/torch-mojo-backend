@@ -20,6 +20,7 @@ Only the eager (mojo_device) path uses this module; the torch.compile
 backend keeps using `aten_functions` directly.
 """
 
+import functools
 import math
 import struct
 import warnings
@@ -2620,9 +2621,22 @@ def _scaled_operand(
     return scaled
 
 
+@functools.cache
+def _has_metal_accelerator() -> bool:
+    """Decided on the first `add`, then a cache hit: CUDA and ROCm never
+    evaluate the Metal conditions, and a process that never adds never asks."""
+    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
+
+    return any(device.api == "metal" for device in get_accelerators())
+
+
 def fast_aten_add(
     input: torch.Tensor, other: object, alpha: int | float = 1
 ) -> TorchMojoTensor | _NotHandled:
+    if _has_metal_accelerator():
+        result = _apple_contiguous_add(input, other, alpha)
+        if result is not None:
+            return result
     if alpha != 1:
         other = _scaled_operand(other, alpha)
         if other is None:
@@ -2639,16 +2653,14 @@ def fast_aten_add(
     return NOT_HANDLED
 
 
-_fast_aten_add_default = fast_aten_add
-
-
-def fast_aten_add_apple(
-    input: torch.Tensor, other: object, alpha: int | float = 1
-) -> TorchMojoTensor | _NotHandled:
-    """Metal specialization for equal-shape contiguous tensor addition."""
+def _apple_contiguous_add(
+    input: torch.Tensor, other: object, alpha: int | float
+) -> TorchMojoTensor | None:
+    """Metal specialization for equal-shape contiguous tensor addition, or
+    None when the operands don't fit it."""
     a = _t(input)
     b = _t(other)
-    if (
+    if not (
         alpha == 1
         and a is not None
         and b is not None
@@ -2660,26 +2672,19 @@ def fast_aten_add_apple(
         and a._dtype in _FLOAT_DTYPES
         and a._shape == b._shape
     ):
-        out = _alloc(a._shape, a._dtype, a._device)
-        if a._numel > 0:
-            _call_mojo(
-                _ElementwiseExtension,
-                "Add",
-                (
-                    out._ptr,
-                    a._ptr,
-                    b._ptr,
-                    a._numel,
-                    a._dtype.value,
-                    _ctx_ptr(a._device),
-                ),
-                arg_dtypes=(a._dtype, b._dtype),
-                output_dtypes=(out._dtype,),
-                flags={"INPLACE": False},
-                keepalive=(out, a, b),
-            )
-        return out
-    return _fast_aten_add_default(input, other, alpha)
+        return None
+    out = _alloc(a._shape, a._dtype, a._device)
+    if a._numel > 0:
+        _call_mojo(
+            _ElementwiseExtension,
+            "Add",
+            (out._ptr, a._ptr, b._ptr, a._numel, a._dtype.value, _ctx_ptr(a._device)),
+            arg_dtypes=(a._dtype, b._dtype),
+            output_dtypes=(out._dtype,),
+            flags={"INPLACE": False},
+            keepalive=(out, a, b),
+        )
+    return out
 
 
 def fast_aten_add_(
