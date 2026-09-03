@@ -393,7 +393,7 @@ def main():
 
     register_mojo_devices()
     max_device = list(get_accelerators())[0]
-    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder
+    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
 
     def mojo_synchronize():
         tensor_holder.synchronize(_ctx_ptr(max_device))

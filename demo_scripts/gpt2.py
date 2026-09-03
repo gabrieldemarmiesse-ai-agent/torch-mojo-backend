@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
+from transformers import GPT2LMHeadModel
 
 from torch_mojo_backend import get_accelerators, mojo_backend
 
@@ -156,8 +157,6 @@ class GPT2(nn.Module):
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         override_args = override_args or {}
         assert all(k == "dropout" for k in override_args)
-
-        from transformers import GPT2LMHeadModel
 
         print(f"loading weights from pretrained gpt: {model_type}")
 
@@ -316,7 +315,7 @@ class Tokenizer(Protocol):
 
 def load_tokenizer() -> Tokenizer:
     try:
-        import tiktoken
+        import tiktoken  # noqa: PLC0415 -- optional: the except branch below is a working fallback
 
         enc = tiktoken.get_encoding("gpt2")
         return enc

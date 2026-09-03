@@ -60,6 +60,7 @@ from types import ModuleType
 from typing import Protocol, runtime_checkable
 
 from torch_mojo_backend.is_running_tests import IS_RUNNING_TESTS
+from torch_mojo_backend.mojo_device import torch_mojo_device_module as _dm
 
 
 @runtime_checkable
@@ -164,7 +165,7 @@ def _free_device_memory() -> int | None:
     or None when no accelerator can report one (CPU-only hosts, backends
     without memory statistics)."""
     try:
-        from torch_mojo_backend import get_accelerators
+        from torch_mojo_backend import get_accelerators  # noqa: PLC0415 -- cycle: the package __init__ reaches this module
 
         frees = [device.stats["free_memory"] for device in get_accelerators()]
     except Exception:
@@ -245,8 +246,6 @@ def _translate(exc: BaseException) -> BaseException:
 
 def _device_only_synchronize():
     """The device barrier that never drains: safe inside the launch path."""
-    from torch_mojo_backend.mojo_device import torch_mojo_device_module as _dm
-
     _dm._device_synchronize()
 
 

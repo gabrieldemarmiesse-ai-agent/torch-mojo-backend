@@ -55,7 +55,7 @@ def _bootstrap_alloc(
     so this rebind type-checks against its declared `_AllocFn` type.
     """
     global _alloc
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor  # noqa: PLC0415 -- the cycle this docstring describes
 
     _alloc = cast(_AllocFn, TorchMojoTensor._alloc)
     return _alloc(shape, dtype, device)

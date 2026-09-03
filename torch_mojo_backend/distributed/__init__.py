@@ -19,7 +19,9 @@ __all__ = ["register_distributed_backend", "use_local_rank_gpu"]
 
 
 def use_local_rank_gpu():
-    from torch_mojo_backend.distributed.process_group import use_local_rank_gpu as impl
+    from torch_mojo_backend.distributed.process_group import (  # noqa: PLC0415 -- process_group needs torch._C._distributed_c10d, absent from torch builds without distributed
+        use_local_rank_gpu as impl,
+    )
 
     impl()
 
@@ -30,7 +32,9 @@ def register_distributed_backend():
         return
     if "mojo" in torch.distributed.Backend.backend_list:
         return
-    from torch_mojo_backend.distributed.process_group import create_mojo_process_group
+    from torch_mojo_backend.distributed.process_group import (  # noqa: PLC0415 -- same as above; the is_available() guard right before is what makes it optional
+        create_mojo_process_group,
+    )
 
     torch.distributed.Backend.register_backend(
         "mojo", create_mojo_process_group, devices=["mojo"]

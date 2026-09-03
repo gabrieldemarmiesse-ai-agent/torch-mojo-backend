@@ -22,6 +22,7 @@ import sys
 import time
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DEVICE = sys.argv[1]
 MODE = sys.argv[2]
@@ -38,8 +39,6 @@ if DEVICE == "mojo" or MODE.startswith("compile-max"):
 
 
 def main():
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained("gpt2")
     model_kwargs = {}
     if MODE == "compile-max-eager-attn":

@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from torch_mojo_backend import register_mojo_devices
+
 
 class ElemwiseNet(torch.nn.Module):
     """Matmul-free so it runs even where GEMM routes are unavailable."""
@@ -215,7 +217,6 @@ def run_lazy_fence(failures: list[str]):
 
 def main():
     mode = sys.argv[1]
-    from torch_mojo_backend import register_mojo_devices
 
     register_mojo_devices()
     dist.init_process_group(backend="mojo", timeout=datetime.timedelta(seconds=300))

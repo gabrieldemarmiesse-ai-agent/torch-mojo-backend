@@ -43,6 +43,19 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 - **Code Quality**: Uses Ruff for linting/formatting with Python 3.11+ target and
   pyupgrade rules, plus flake8-annotations (`ANN`) to require type hints; Astral's
   `ty` (`uv run ty check`) statically checks those hints — see "Type hints" below
+- **Imports** live at module scope (`PLC0415`). An import that genuinely
+  cannot — a real cycle, a `sys.path`/env ordering, an optional dependency —
+  stays where it is with `# noqa: PLC0415 -- <why>`, and the reason must be
+  a checked fact. Verify a suspected cycle by hoisting the import and
+  re-importing the module in a fresh interpreter; most "cycles" are not one.
+  Importing `aten_fast` is not an exception: it loads no Mojo extension
+  (measured: nothing lands in `sys.modules`, 0.02 s), because a kernel is
+  built and dlopened by the first *call* into its descriptor. The one
+  import-time side effect in the kernel layer is reading
+  `eager_kernels.tensor_holder`, whose module `__getattr__` builds and
+  dlopens that extension there and then. Watch for late binding: code and
+  tests that monkeypatch `module.function` need the *module* imported at the
+  top, not the function.
 - **Monkeypatching**: every runtime patch of a torch (or other third-party)
   module or class lives in `torch_mojo_backend/monkeypatching.py`, one
   function per patch with a docstring saying what upstream lacks, so each can

@@ -48,7 +48,7 @@ _default_streams_lock = threading.Lock()
 
 
 def _current_device_index() -> int:
-    from torch_mojo_backend.mojo_device import torch_mojo_device_module
+    from torch_mojo_backend.mojo_device import torch_mojo_device_module  # noqa: PLC0415 -- cycle: torch_mojo_device_module imports this module (see the E402 note at its end)
 
     return torch_mojo_device_module.current_device()
 
@@ -65,7 +65,7 @@ def _resolve_index(device: _DeviceLike) -> int:
 
 
 def _max_device_of(index: int) -> max.driver.Device:
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (  # noqa: PLC0415 -- same cycle, one module further: torch_mojo_tensor imports torch_mojo_device_module
         find_equivalent_max_device,
     )
 
@@ -230,7 +230,7 @@ class Stream(torch._C.Stream):
         (mojo_device/comm_fence.py) — so fence before observing, once.
         """
         if self._device_stream.is_default:
-            from torch_mojo_backend.mojo_device import comm_fence
+            from torch_mojo_backend.mojo_device import comm_fence  # noqa: PLC0415 -- same cycle: comm_fence imports torch_mojo_tensor
 
             comm_fence.fence_device(self._index)
 

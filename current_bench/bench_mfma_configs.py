@@ -11,8 +11,17 @@ from pathlib import Path
 from types import ModuleType
 
 import torch
+from max.dtype import DType
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.eager_kernels import (
+    _build_extension,
+    _load_extension,
+    _resolve_mojo_file,
+    _variant_module_name,
+)
+from torch_mojo_backend.eager_kernels.matmul_ops import MatmulExtension
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 CONFIGS = {
     0: "bm32_bn64_wm16_wn32_bk32",
@@ -70,14 +79,6 @@ def load_tuning_extension() -> ModuleType:
     those two and none of the production kernels.  Building it here keeps this
     tuning harness off the dispatch path it is meant to measure.
     """
-    from torch_mojo_backend.eager_kernels import (
-        _build_extension,
-        _load_extension,
-        _resolve_mojo_file,
-        _variant_module_name,
-    )
-    from torch_mojo_backend.eager_kernels.matmul_ops import MatmulExtension
-
     source = _resolve_mojo_file(MatmulExtension.MOJO_FILE)
     return _load_extension(
         _variant_module_name(source, None), _build_extension(source, None)
@@ -131,10 +132,8 @@ def main():
 
     register_mojo_devices()
     device = list(get_accelerators())[0]
-    from max.dtype import DType
 
-    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
 
     ctx = _ctx_ptr(device)
     tuning = load_tuning_extension()

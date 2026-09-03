@@ -81,8 +81,17 @@ from torch._C._distributed_c10d import (
 from torch.distributed import PrefixStore, Store, Work
 
 from torch_mojo_backend.distributed import nccl
-from torch_mojo_backend.mojo_device import comm_fence, torch_mojo_device_module
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
+from torch_mojo_backend.mojo_device import (
+    comm_fence,
+    cuda_peer,
+    deferred_compile,
+    torch_mojo_device_module,
+)
+from torch_mojo_backend.mojo_device.device_streams import get_stream, record_use
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    TorchMojoTensor,
+    find_equivalent_max_device,
+)
 
 _NCCL_DTYPE_OF: dict[torch.dtype, int] = {
     torch.int8: nccl.NCCL_INT8,
@@ -248,8 +257,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         """Complete every in-flight comm-stream collective, fences included."""
         for index, max_device in self._max_devices.items():
             if self._comm_stream_enabled:
-                from torch_mojo_backend.mojo_device.device_streams import get_stream
-
                 get_stream(max_device, "nccl").synchronize()
             comm_fence.discard(index)
 
@@ -263,11 +270,6 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def _device_state(self, tensor: torch.Tensor) -> tuple[nccl.NcclComm, int, int]:
         """(communicator, default-stream CUstream, device index) for a tensor."""
-        from torch_mojo_backend.mojo_device import cuda_peer
-        from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-            find_equivalent_max_device,
-        )
-
         index = tensor.device.index
         if index is None:
             index = torch_mojo_device_module.current_device()
@@ -311,8 +313,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         """
         if not self._comm_stream_enabled:
             return None
-        from torch_mojo_backend.mojo_device.device_streams import get_stream, record_use
-
         comm_stream = get_stream(self._max_devices[index], "nccl")
         self._drained()  # producers must be ON the stream before we fence it
         comm_stream.wait_default_stream()
@@ -337,8 +337,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         """
         self._drained()
         if self._comm_stream_enabled and index in self._max_devices:
-            from torch_mojo_backend.mojo_device.device_streams import get_stream
-
             get_stream(self._max_devices[index], "nccl").make_default_stream_wait()
             comm_fence.discard(index)
 
@@ -356,8 +354,6 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def _drained(self):
         """Launch every queued mojo kernel so the stream sees all producers."""
-        from torch_mojo_backend.mojo_device import deferred_compile
-
         deferred_compile.drain()
 
     def _dense(self, tensor: torch.Tensor) -> torch.Tensor:

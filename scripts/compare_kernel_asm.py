@@ -73,6 +73,8 @@ import shutil
 import subprocess
 import sys
 import textwrap
+
+import max as max_package
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -152,7 +154,6 @@ def mojo_cli() -> Path:
     candidates = []
     if sys.executable:  # None/'' in embedded interpreters
         candidates.append(Path(sys.executable).parent / "mojo")
-    import max as max_package
 
     for base in list(getattr(max_package, "__path__", ())):
         candidates.extend(parent / "bin" / "mojo" for parent in Path(base).parents)
