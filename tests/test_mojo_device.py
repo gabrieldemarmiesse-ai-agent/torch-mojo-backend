@@ -888,29 +888,27 @@ def test_mojo_clip_grad_norm_matches_cpu(mojo_gpu_available, foreach):
         torch.testing.assert_close(actual.grad.cpu(), expected.grad)
 
 
-def test_apple_optimizations_are_only_registered_for_metal(monkeypatch):
-    from torch_mojo_backend.mojo_device import apple_optimizations
+def test_metal_fast_add_gate_is_decided_once(monkeypatch):
+    from torch_mojo_backend.eager_kernels import aten_fast
+    from torch_mojo_backend.torch_compile_backend import utils
 
-    calls = []
+    aten_fast._has_metal_accelerator.cache_clear()
     monkeypatch.setattr(
-        apple_optimizations, "_enable_apple_fast_add", lambda: calls.append("add")
-    )
-
-    monkeypatch.setattr(
-        apple_optimizations,
+        utils,
         "get_accelerators",
         lambda: [SimpleNamespace(api="cuda"), SimpleNamespace(api="cpu")],
     )
-    apple_optimizations.register_apple_optimizations()
-    assert calls == []
+    assert aten_fast._has_metal_accelerator() is False
 
     monkeypatch.setattr(
-        apple_optimizations,
+        utils,
         "get_accelerators",
         lambda: [SimpleNamespace(api="metal"), SimpleNamespace(api="cpu")],
     )
-    apple_optimizations.register_apple_optimizations()
-    assert calls == ["add"]
+    assert aten_fast._has_metal_accelerator() is False  # cached from the first call
+    aten_fast._has_metal_accelerator.cache_clear()
+    assert aten_fast._has_metal_accelerator() is True
+    aten_fast._has_metal_accelerator.cache_clear()
 
 
 def test_device_ordering():
