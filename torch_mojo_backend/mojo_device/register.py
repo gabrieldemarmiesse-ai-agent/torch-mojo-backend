@@ -481,6 +481,10 @@ def register_mojo_devices():
 
     register_apple_optimizations()
 
+    from torch_mojo_backend.mojo_device.hip_peer import warn_if_cuda_torch_on_hip
+
+    warn_if_cuda_torch_on_hip()
+
     from torch_mojo_backend.distributed import register_distributed_backend
 
     register_distributed_backend()
