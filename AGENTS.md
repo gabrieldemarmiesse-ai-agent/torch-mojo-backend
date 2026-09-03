@@ -43,6 +43,12 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
 - **Code Quality**: Uses Ruff for linting/formatting with Python 3.11+ target and
   pyupgrade rules, plus flake8-annotations (`ANN`) to require type hints; Astral's
   `ty` (`uv run ty check`) statically checks those hints — see "Type hints" below
+- **Monkeypatching**: every runtime patch of a torch (or other third-party)
+  module or class lives in `torch_mojo_backend/monkeypatching.py`, one
+  function per patch with a docstring saying what upstream lacks, so each can
+  be upstreamed and deleted. Never patch elsewhere;
+  `tests/test_monkeypatching_is_centralized.py` enforces it for torch-rooted
+  assignments.
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
