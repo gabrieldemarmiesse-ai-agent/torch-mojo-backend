@@ -94,12 +94,6 @@ def register_mojo_devices():
 
     register_autocast_ops()
 
-    from torch_mojo_backend.mojo_device.apple_optimizations import (
-        register_apple_optimizations,
-    )
-
-    register_apple_optimizations()
-
     from torch_mojo_backend.distributed import register_distributed_backend
 
     register_distributed_backend()

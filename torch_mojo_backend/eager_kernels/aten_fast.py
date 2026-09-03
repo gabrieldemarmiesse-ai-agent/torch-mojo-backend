@@ -20,6 +20,7 @@ Only the eager (mojo_device) path uses this module; the torch.compile
 backend keeps using `aten_functions` directly.
 """
 
+import functools
 import math
 import struct
 import warnings
@@ -2620,20 +2621,19 @@ def _scaled_operand(
     return scaled
 
 
-# Set once at device registration when a Metal device is present, so CUDA and
-# ROCm never evaluate the Metal conditions (see mojo_device/apple_optimizations).
-_APPLE_FAST_ADD = False
+@functools.cache
+def _has_metal_accelerator() -> bool:
+    """Decided on the first `add`, then a cache hit: CUDA and ROCm never
+    evaluate the Metal conditions, and a process that never adds never asks."""
+    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 
-
-def enable_apple_fast_add():
-    global _APPLE_FAST_ADD
-    _APPLE_FAST_ADD = True
+    return any(device.api == "metal" for device in get_accelerators())
 
 
 def fast_aten_add(
     input: torch.Tensor, other: object, alpha: int | float = 1
 ) -> TorchMojoTensor | _NotHandled:
-    if _APPLE_FAST_ADD:
+    if _has_metal_accelerator():
         result = _apple_contiguous_add(input, other, alpha)
         if result is not None:
             return result
