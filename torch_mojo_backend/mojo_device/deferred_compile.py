@@ -9,7 +9,9 @@ compiled units are still building — those wait in the kernel-call queue
 kernel compilation. This layer contributes exactly three things:
 
 - pump the call queue at every dispatch entry (launch the ready prefix);
-- drain it before device work that would bypass the queue (see below).
+- drain it before device work that would bypass the queue (see below);
+- call the op's PrivateUse1 kernel out of ``DIRECT_IMPLS`` rather than let
+  ``func(...)`` walk the C++ dispatcher back to that same callable.
 
 Buffer retention is not this layer's job: every queued item carries the
 tensors its raw pointers name (queue rule 3), stated explicitly at each
@@ -37,6 +39,8 @@ plain tracker update unless the queue recently launched from another
 thread (then it synchronizes once and clears).
 """
 
+from collections.abc import Callable
+
 import torch
 from torch.utils._pytree import tree_flatten
 
@@ -50,12 +54,37 @@ from torch_mojo_backend.eager_kernels import call_queue
 _DEVICE_LOCK = call_queue._LOCK
 
 
+# Every op registered for PrivateUse1, keyed by its OpOverload and holding
+# the exact callable `torch.library.impl` was handed. Filled at device
+# registration (mojo_device/register.py); empty until then.
+#
+# `__torch_dispatch__` already unboxed this call's arguments, so redispatching
+# through `func(*args, **kwargs)` re-enters the C++ dispatcher only to box and
+# unbox them again for the very same Python callable -- ~8 us per dispatch,
+# and an eager nanoGPT step makes ~760 of them (6 ms of a 37 ms host budget
+# at batch 12). A dict hit calls that callable straight.
+#
+# The fallthrough below is what the table cannot cover: CompositeImplicit ops
+# that decompose in C++, and anything with no PrivateUse1 registration.
+#
+# Consequence for implementations: with no `_DisableTorchDispatch` around
+# them, a torch op an impl runs on a mojo tensor re-enters
+# `__torch_dispatch__` instead of dropping straight to the backend kernel.
+# That is correct (and pumps the queue), but an impl for op X must never call
+# op X on a mojo tensor. Impls that need the backend kernel without the round
+# trip use `.redispatch(<keyset>, ...)`, as the foreach and addr fallbacks do.
+DIRECT_IMPLS: dict[torch._ops.OpOverload, Callable[..., object]] = {}
+
+
 def _direct(
     func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
 ) -> object:
     """Execute one aten op through the PrivateUse1 kernels."""
+    impl = DIRECT_IMPLS.get(func)
     with _DEVICE_LOCK:
         call_queue.order_direct_launch()
+        if impl is not None:
+            return impl(*args, **kwargs)
         with torch._C._DisableTorchDispatch():
             return func(*args, **kwargs)
 

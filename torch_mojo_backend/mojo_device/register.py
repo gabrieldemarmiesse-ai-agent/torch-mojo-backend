@@ -5,7 +5,7 @@ from typing import TypeVar
 
 import torch
 
-from torch_mojo_backend.mojo_device import comm_fence
+from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
 from torch_mojo_backend.mojo_device.mojo_device_aten_ops import _aten_ops_registry
 
 _T = TypeVar("_T")
@@ -31,6 +31,21 @@ def _fence_pending_collectives(func: Callable[..., object]) -> Callable[..., obj
         return func(*args, **kwargs)
 
     return with_comm_fence
+
+
+def _resolve_overload(op_name: str) -> torch._ops.OpOverload | None:
+    """``"aten::add.Tensor"`` -> ``torch.ops.aten.add.Tensor``; a name with no
+    overload suffix takes ``.default``. ``None`` when this torch build has no
+    such operator, in which case only the library registration is installed
+    and the op keeps redispatching through C++.
+    """
+    namespace, _, rest = op_name.partition("::")
+    packet_name, _, overload_name = rest.partition(".")
+    try:
+        packet = getattr(getattr(torch.ops, namespace), packet_name)
+        return getattr(packet, overload_name or "default")
+    except AttributeError:
+        return None
 
 
 def _install_torch_accelerator_synchronize(torch_mojo_device_module: ModuleType):
@@ -432,9 +447,17 @@ def register_mojo_devices():
             # doesn't include our subclass by construction.
             supported_types.append(TorchMojoTensor)  # ty: ignore[invalid-argument-type]
 
-    # Register all collected aten operations
+    # Register all collected aten operations. The library registration is what
+    # a call reaching the backend key from C++ finds -- factories such as
+    # `torch.empty(device="mojo")` have no wrapper argument and never pass
+    # through `__torch_dispatch__`. The table beside it is the shortcut for
+    # calls that did (see deferred_compile.DIRECT_IMPLS).
     for op_name, func in _aten_ops_registry:
-        torch.library.impl(op_name, "privateuseone")(_fence_pending_collectives(func))
+        wrapped = _fence_pending_collectives(func)
+        torch.library.impl(op_name, "privateuseone")(wrapped)
+        overload = _resolve_overload(op_name)
+        if overload is not None:
+            deferred_compile.DIRECT_IMPLS[overload] = wrapped
 
     from torch_mojo_backend.mojo_device.mojo_device_autograd import (
         register_autograd_ops,
