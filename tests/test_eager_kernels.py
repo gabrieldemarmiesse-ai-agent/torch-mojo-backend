@@ -11309,23 +11309,32 @@ def _fa4_place_qkv(
             ],
             dim=2,
         ).contiguous()
-        parts = fused.to(device).split(width, dim=2)
-        return tuple(
-            part.view(batch, seqlen, heads, head_dim).transpose(1, 2) for part in parts
+        q_part, k_part, v_part = fused.to(device).split(width, dim=2)
+        return (
+            q_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
+            k_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
+            v_part.view(batch, seqlen, heads, head_dim).transpose(1, 2),
         )
     if layout == "bshd_view":
-        return tuple(
-            tensor.transpose(1, 2).contiguous().to(device).transpose(1, 2)
-            for tensor in (query, key, value)
+        return (
+            query.transpose(1, 2).contiguous().to(device).transpose(1, 2),
+            key.transpose(1, 2).contiguous().to(device).transpose(1, 2),
+            value.transpose(1, 2).contiguous().to(device).transpose(1, 2),
         )
-    return tuple(tensor.contiguous().to(device) for tensor in (query, key, value))
+    return (
+        query.contiguous().to(device),
+        key.contiguous().to(device),
+        value.contiguous().to(device),
+    )
 
 
 _FA4_LAYOUT_VARIANT = {"gapped_qkv": "_strided_qkv", "bshd_view": "", "bhsd": "_bhsd"}
 
 
 @contextlib.contextmanager
-def _fa4_route_spy(monkeypatch) -> Iterator[collections.Counter]:
+def _fa4_route_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[collections.Counter[str]]:
     """Count calls to every compiled FA4 bridge symbol, by symbol name.
 
     Without this the accuracy assertions below would pass just as happily if a
@@ -11335,7 +11344,7 @@ def _fa4_route_spy(monkeypatch) -> Iterator[collections.Counter]:
     from torch_mojo_backend.eager_flash_attention import load_fa4_ops
 
     module = load_fa4_ops()
-    calls: collections.Counter = collections.Counter()
+    calls: collections.Counter[str] = collections.Counter()
     for direction in ("fwd", "bwd"):
         for suffix in ("bf16", "f16"):
             for head_dim in (64, 128):
@@ -11541,10 +11550,11 @@ def test_fa4_backward_saturated_extreme_logit_accuracy(
     ).softmax(-1)
     (expected_probabilities @ expected_inputs[2]).backward(grad_output.double())
 
-    actual_inputs = [
+    actual_query, actual_key, actual_value = (
         tensor.requires_grad_()
         for tensor in _fa4_place_qkv(query, key, value, layout, mojo_h100)
-    ]
+    )
+    actual_inputs = (actual_query, actual_key, actual_value)
     with _fa4_route_spy(monkeypatch) as calls:
         output = torch.nn.functional.scaled_dot_product_attention(
             *actual_inputs, is_causal=True
@@ -11568,6 +11578,7 @@ def test_fa4_backward_saturated_extreme_logit_accuracy(
         names, bounds, actual_inputs, expected_inputs, strict=True
     ):
         assert actual.grad is not None
+        assert expected.grad is not None
         error = actual.grad.cpu().double() - expected.grad
         rms = float(error.pow(2).mean().sqrt())
         assert rms <= bound, (
