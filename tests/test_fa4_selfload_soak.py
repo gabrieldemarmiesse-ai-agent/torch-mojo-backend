@@ -41,6 +41,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from scripts.compare_kernel_asm import build_env, mojo_cli
 from torch_mojo_backend import get_accelerators
+from torch_mojo_backend.mojo_device import torch_mojo_device_module
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROBE = Path(__file__).resolve().parent / "fa4_selfload_soak_probe.mojo"
@@ -127,7 +128,7 @@ def _device_kernel_names(run: Callable[[], object]) -> set[str]:
     """Names of the device kernels `run` launches, per torch.profiler."""
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         run()
-        torch.mojo.synchronize()
+        torch_mojo_device_module.synchronize()
     return {
         event.name
         for event in prof.events()
