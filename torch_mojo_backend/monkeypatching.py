@@ -414,24 +414,3 @@ def apply_torch_monkeypatches(torch_mojo_device_module: ModuleType):
     _declare_mojo_tensor_as_plain_tensor()
     _trace_mojo_tensor_as_a_plain_tensor_in_dynamo()
     _keep_mojo_kernels_out_of_fake_tensor_construction()
-
-
-# --- Patches of this project's own modules -------------------------------
-#
-# Not upstreamable to PyTorch; listed here so the whole inventory is one
-# file. The way to retire one is a refactor on our side.
-
-
-def use_apple_fast_add():
-    """Select the isolated Metal contiguous-add implementation.
-
-    Patching once during device registration keeps CUDA and ROCm on the
-    original Python and Mojo paths with no per-call target check. Called
-    only by ``mojo_device.apple_optimizations`` when a Metal device is
-    present.
-    """
-    from torch_mojo_backend.eager_kernels import aten_fast
-
-    # ty compares the two same-signature `def`s nominally, so this can never
-    # structurally match.
-    aten_fast.fast_aten_add = aten_fast.fast_aten_add_apple  # ty: ignore[invalid-assignment]
