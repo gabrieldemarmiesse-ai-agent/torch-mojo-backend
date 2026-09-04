@@ -2,9 +2,18 @@ from collections.abc import Callable
 from functools import wraps
 
 import torch
+from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
 
-from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
+from torch_mojo_backend.distributed import register_distributed_backend
+from torch_mojo_backend.mojo_device import (
+    comm_fence,
+    deferred_compile,
+    torch_mojo_device_module,
+)
 from torch_mojo_backend.mojo_device.mojo_device_aten_ops import _aten_ops_registry
+from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
+from torch_mojo_backend.mojo_device.mojo_device_autocast import register_autocast_ops
+from torch_mojo_backend.mojo_device.mojo_device_autograd import register_autograd_ops
 from torch_mojo_backend.monkeypatching import apply_torch_monkeypatches
 
 _registered = False
@@ -48,11 +57,6 @@ def _resolve_overload(op_name: str) -> torch._ops.OpOverload | None:
 
 def register_mojo_devices():
     """Enable the mojo device globally and register all aten ops"""
-    from torch.utils.backend_registration import _setup_privateuseone_for_python_backend
-
-    from torch_mojo_backend.mojo_device import torch_mojo_device_module
-
-    # since it's so recent we import it here.
     global _registered
     if _registered:
         # Already registered
@@ -82,24 +86,9 @@ def register_mojo_devices():
         if overload is not None:
             deferred_compile.DIRECT_IMPLS[overload] = wrapped
 
-    from torch_mojo_backend.mojo_device.mojo_device_autograd import (
-        register_autograd_ops,
-    )
-
     register_autograd_ops()
-
-    from torch_mojo_backend.mojo_device.mojo_device_autocast import (
-        register_autocast_ops,
-    )
-
     register_autocast_ops()
-
-    from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
-
     warn_if_gpu_torch_on_hip()
-
-    from torch_mojo_backend.distributed import register_distributed_backend
-
     register_distributed_backend()
 
     _registered = True

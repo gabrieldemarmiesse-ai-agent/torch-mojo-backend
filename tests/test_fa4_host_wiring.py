@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 import torch
 
+import torch_mojo_backend.eager_flash_attention as package
 from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import mojo_device_autograd as autograd
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
@@ -58,8 +59,6 @@ def _mt(tensor: SimpleNamespace | None) -> TorchMojoTensor:
 def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import torch_mojo_backend.eager_flash_attention as package
-
     monkeypatch.setattr(aten_fast, "_t", lambda tensor: tensor)
 
     def forbidden(*_args, **_kwargs):
@@ -101,8 +100,6 @@ def test_fa4_rejects_ineligible_regimes_before_loading_or_device_work(
 def test_fa4_forward_bridge_uses_dynamic_bthd_allocations(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     # A fixed 3-tuple (not a list/tuple(generator)) so *public below unpacks
     # to a fixed arity instead of tuple[SimpleNamespace, ...].
@@ -194,8 +191,6 @@ def test_fa4_forward_bridge_selects_f16_kernel_symbol_and_allocation(
     Mirrors ``test_fa4_forward_bridge_uses_dynamic_bthd_allocations`` above,
     only with f16 inputs: the bf16 bridge symbol must not be touched.
     """
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     # A fixed 3-tuple (not a list/tuple(generator)) so *public below unpacks
     # to a fixed arity instead of tuple[SimpleNamespace, ...].
@@ -349,8 +344,6 @@ def test_fa4_strided_layout_contract_is_strict():
 def test_fa4_canonical_fused_qkv_uses_zero_copy_strided_forward_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     batch, heads, seqlen, head_dim = 2, 12, 256, 64
     token_stride = 3 * heads * head_dim
@@ -459,8 +452,6 @@ def test_fa4_offset_view_public_layout_copies_and_uses_contiguous_fallback(
     the BHSD-native path requires 16-byte alignment and a misaligned base
     pointer violates that even though the tensor is otherwise eligible.
     """
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     # +2 bytes (one bf16/f16 element) off a 16-byte-aligned address: still
     # fully contiguous, but ptr % 16 != 0.
@@ -541,8 +532,6 @@ def test_fa4_forward_bridge_uses_bhsd_native_path_for_aligned_contiguous_public_
     aligned skips BTHD materialization entirely: no transpose, no copy, and
     the output is allocated directly in the (B, H, S, D) layout and
     returned as-is."""
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     # A fixed 3-tuple (not tuple(generator)) so *public below unpacks to a
     # fixed arity instead of tuple[SimpleNamespace, ...].
@@ -889,8 +878,6 @@ def test_fa4_saved_variable_recompute_rederives_natives_independently(
 def test_fa4_combined_backward_bridge_allocates_exact_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     q_native, k_native, v_native = [
         _tensor(name, shape=(2, 384, 4, 64), device=device, ptr=ptr)
@@ -990,8 +977,6 @@ def test_fa4_combined_backward_bridge_allocates_exact_scratch(
 def test_fa4_canonical_fused_qkv_uses_strided_backward_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import torch_mojo_backend.eager_flash_attention as package
-
     device = _device()
     batch, seqlen, heads, head_dim = 2, 256, 12, 64
     token_stride = 3 * heads * head_dim

@@ -6,7 +6,12 @@ import max.driver
 import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
-from torch_mojo_backend.mojo_device import cuda_peer, torch_mojo_device_module
+from torch_mojo_backend import eager_kernels
+from torch_mojo_backend.mojo_device import (
+    cuda_peer,
+    deferred_compile,
+    torch_mojo_device_module,
+)
 from torch_mojo_backend.mojo_device.aten_ops.support import (
     _copy_into_tensor,
     _fast,
@@ -65,9 +70,6 @@ def _upload_on_device(
         return True
     if not cuda_peer.same_physical_device(src.data_ptr(), dest_ptr):
         return False
-    from torch_mojo_backend import eager_kernels
-    from torch_mojo_backend.mojo_device import deferred_compile
-
     deferred_compile.drain()
     torch.cuda.synchronize()
     holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
@@ -120,8 +122,6 @@ def mojo_device__copy_from(
         cpu = cpu.contiguous()
         if dest._is_contiguous:
             if dest._numel > 0:
-                from torch_mojo_backend import eager_kernels
-
                 holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
                 transfer_owner = holder.copy_from_host(
                     eager_kernels._ctx_ptr(dest._device),

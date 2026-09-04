@@ -100,7 +100,9 @@ def main():
     device = args.device
 
     if device == "mojo":
-        from torch_mojo_backend import register_mojo_devices
+        from torch_mojo_backend import (  # noqa: PLC0415 -- optional, like the import at the top: --device cuda must run in a stock-torch venv
+            register_mojo_devices,
+        )
 
         register_mojo_devices()
         backend = "mojo"
@@ -119,14 +121,16 @@ def main():
     # rank-offset seed for on-device randomness (dropout).
     torch.manual_seed(args.seed)
     if device == "mojo":
-        from torch_mojo_backend.mojo_device import torch_mojo_device_module
+        from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same optional import as above
+            torch_mojo_device_module,
+        )
 
         torch_mojo_device_module.manual_seed_all(args.seed + rank)
     else:
         torch.cuda.manual_seed_all(args.seed + rank)
 
     sys.path.insert(0, str(args.nanogpt_path))
-    from model import (  # ty: ignore[unresolved-import] -- nanoGPT, from --nanogpt-path
+    from model import (  # ty: ignore[unresolved-import] -- nanoGPT, from --nanogpt-path  # noqa: PLC0415 -- reachable only via the sys.path insert above
         GPT,
         GPTConfig,
     )

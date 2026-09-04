@@ -32,8 +32,9 @@ import torch
 from max.driver import Device
 from max.dtype import DType
 from max.experimental.torch import max_dtype_to_torch
+from max.experimental.torch.torch import torch_dtype_to_max
 
-from torch_mojo_backend import eager_kernels, is_running_tests
+from torch_mojo_backend import eager_flash_attention, eager_kernels, is_running_tests
 from torch_mojo_backend.eager_kernels import _ctx_ptr, call_queue as _call_queue
 from torch_mojo_backend.eager_kernels.activation_backward_ops import (
     ActivationBackwardExtension as _ActivationBackwardExtension,
@@ -109,6 +110,7 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     _resize_payload,
     _row_major_strides,
 )
+from torch_mojo_backend.torch_compile_backend import utils as _compile_utils
 from torch_mojo_backend.types import CountedCallable
 
 _VariantFlag = bool | int | str
@@ -2625,9 +2627,7 @@ def _scaled_operand(
 def _has_metal_accelerator() -> bool:
     """Decided on the first `add`, then a cache hit: CUDA and ROCm never
     evaluate the Metal conditions, and a process that never adds never asks."""
-    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
-
-    return any(device.api == "metal" for device in get_accelerators())
+    return any(device.api == "metal" for device in _compile_utils.get_accelerators())
 
 
 def fast_aten_add(
@@ -5910,8 +5910,6 @@ def _torch_dtype_to_max(dtype: object) -> DType | None:
     # `object`: the autograd doubles-based tests probe this with non-dtypes.
     if not isinstance(dtype, torch.dtype):
         return None
-    from max.experimental.torch.torch import torch_dtype_to_max
-
     try:
         return torch_dtype_to_max(dtype)
     except (KeyError, ValueError):
@@ -7727,9 +7725,7 @@ def fast_fa4_16bit_d64_causal_forward(
     if inputs is None:
         return NOT_HANDLED
 
-    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
-
-    fa4_ops = load_fa4_ops()
+    fa4_ops = eager_flash_attention.load_fa4_ops()
     assert isinstance(inputs, tuple)
     q, k, v = inputs
     qkv_dtype = q._dtype
@@ -7840,9 +7836,7 @@ def fast_fa4_16bit_d64_causal_backward(
 ) -> tuple[TorchMojoTensor, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """Enqueue FA4 preprocess/main/convert and return public BHTD grads
     (bf16 or f16, matching Q/K/V's shared dtype)."""
-    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
-
-    fa4_ops = load_fa4_ops()
+    fa4_ops = eager_flash_attention.load_fa4_ops()
     batch, seqlen, heads, head_dim = q_native._shape
     qkv_dtype = q_native._dtype
     prepared = _fa4_prepare_qkv_bridge(q_native, k_native, v_native)
@@ -10154,8 +10148,6 @@ def _instrument_call_counts():
     """Give every fast op a test-only call counter, mirroring what
     `aten_functions.map_to` does, so `CallChecker` can assert that an op
     was handled by either implementation."""
-    import functools
-
     for name, func in list(globals().items()):
         if not name.startswith("fast_aten"):
             continue

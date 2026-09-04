@@ -21,15 +21,17 @@ import weakref
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
+import torch_mojo_backend
 from torch_mojo_backend import TorchMojoTensor, eager_kernels, get_accelerators
 from torch_mojo_backend.eager_kernels import aten_fast, call_queue
 from torch_mojo_backend.eager_kernels.output_specs import _TensorOutputSpec
-from torch_mojo_backend.mojo_device import torch_mojo_device_module
+from torch_mojo_backend.mojo_device import torch_mojo_device_module, torch_mojo_tensor
 
 
 @pytest.fixture(autouse=True)
@@ -438,10 +440,6 @@ def test_failed_allocation_drains_synchronizes_and_retries_once(
     the queue (releasing what its items retain), synchronizes the device so
     the stream-ordered frees land, and retries exactly once. Non-OOM errors
     and a second failure propagate untouched."""
-    from types import SimpleNamespace
-
-    from torch_mojo_backend.mojo_device import torch_mojo_tensor
-
     synced: list[bool] = []
     device = SimpleNamespace(
         default_stream=SimpleNamespace(synchronize=lambda: synced.append(True))
@@ -503,7 +501,6 @@ def test_budget_is_computed_from_free_device_memory(
     """Without the env override, the bound adapts to the device: half the
     smallest free-VRAM figure across the accelerators, floored at 1 GiB,
     falling back to 8 GiB when nothing can report memory statistics."""
-    import torch_mojo_backend
 
     class _FakeAccelerator:
         def __init__(self, free: int):

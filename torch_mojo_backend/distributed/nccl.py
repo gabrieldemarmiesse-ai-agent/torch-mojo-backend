@@ -33,6 +33,8 @@ import functools
 import os
 from pathlib import Path
 
+from torch_mojo_backend.mojo_device import cuda_peer, hip_peer
+
 # nccl.h: ncclResult_t
 NCCL_SUCCESS = 0
 NCCL_IN_PROGRESS = 7
@@ -85,7 +87,7 @@ def _candidate_libnccl_paths() -> list[str]:
         return [override]
     candidates = []
     try:
-        import nvidia.nccl
+        import nvidia.nccl  # noqa: PLC0415 -- optional: the wheel may not be installed
 
         # nvidia.nccl is a namespace package: no __file__, only __path__.
         for package_dir in nvidia.nccl.__path__:
@@ -101,8 +103,6 @@ def _candidate_librccl_paths() -> list[str]:
     override = os.environ.get(_RCCL_LIB_ENV)
     if override:
         return [override]
-    from torch_mojo_backend.mojo_device import hip_peer
-
     candidates = []
     # The ROCm whose HIP runtime is already in the process, first: see the
     # module docstring for why the two must come from the same install.
@@ -433,8 +433,6 @@ def set_current_cuda_device(ordinal: int):
 def set_current_device(api: str, ordinal: int):
     """Make GPU `ordinal` the calling thread's current device for `api`."""
     if api == "hip":
-        from torch_mojo_backend.mojo_device import hip_peer
-
         hip_peer.set_device(ordinal)
     elif api == "cuda":
         set_current_cuda_device(ordinal)
@@ -445,11 +443,7 @@ def set_current_device(api: str, ordinal: int):
 def device_ordinal(api: str, ptr: int) -> int | None:
     """The `api` ordinal of the GPU owning `ptr`, or None if it is not one."""
     if api == "hip":
-        from torch_mojo_backend.mojo_device import hip_peer
-
         return hip_peer.device_ordinal(ptr)
     if api == "cuda":
-        from torch_mojo_backend.mojo_device import cuda_peer
-
         return cuda_peer.device_ordinal(ptr)
     return None

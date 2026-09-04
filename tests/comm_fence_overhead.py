@@ -16,10 +16,11 @@ import time
 
 import torch
 
+from torch_mojo_backend.mojo_device import register, torch_mojo_device_module
+from torch_mojo_backend.mojo_device.register import _fence_pending_collectives
+
 
 def _time_add(x: torch.Tensor, y: torch.Tensor, iterations: int) -> float:
-    from torch_mojo_backend.mojo_device import torch_mojo_device_module
-
     start = time.perf_counter()
     for _ in range(iterations):
         torch.add(x, y)
@@ -28,8 +29,6 @@ def _time_add(x: torch.Tensor, y: torch.Tensor, iterations: int) -> float:
 
 
 def _time_wrapper_frame(x: torch.Tensor) -> float:
-    from torch_mojo_backend.mojo_device.register import _fence_pending_collectives
-
     def target(a: object, b: object) -> object:
         return a
 
@@ -47,8 +46,6 @@ def _time_wrapper_frame(x: torch.Tensor) -> float:
 
 
 def main():
-    from torch_mojo_backend.mojo_device import register
-
     if "--no-hook" in sys.argv:
         # The wrapper is applied by register_mojo_devices()'s install loop
         # through this global, so the identity gives the same process minus

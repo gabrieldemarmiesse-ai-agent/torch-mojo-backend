@@ -47,7 +47,10 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import torch
 from _pytest.runner import CallInfo
+
+import torch_mojo_backend
 
 _RECORD_DIR_ENV = "CONFORMANCE_UNSUPPORTED_RECORD_DIR"
 _HERE = Path(__file__).resolve().parent
@@ -165,10 +168,8 @@ def _import_suite() -> ModuleType:
     """The conformance test module, imported the way its conftest does."""
     os.environ.setdefault("PYTORCH_TESTING_DEVICE_FOR_CUSTOM", "privateuse1")
     sys.path.insert(0, str(_HERE))
-    import torch_mojo_backend
-
     torch_mojo_backend.register_mojo_devices()
-    import test_opinfo
+    import test_opinfo  # noqa: PLC0415 -- importable only via the sys.path insert above
 
     return test_opinfo
 
@@ -180,8 +181,6 @@ def _device_token() -> str:
     not after "privateuse1" -- "mojo" for us -- so it is read from torch rather
     than spelled out here.
     """
-    import torch
-
     return str(torch._C._get_privateuse1_backend_name())
 
 
@@ -192,9 +191,10 @@ def _node_index(suite: ModuleType) -> dict[str, tuple[str, str, str]]:
     nothing has to be parsed back out of a node name whose operator token
     itself contains underscores.
     """
-    import known_unsupported
-    import torch
-    from torch.testing._internal.common_methods_invocations import op_db
+    import known_unsupported  # noqa: PLC0415 -- importable only via _import_suite's sys.path insert
+    from torch.testing._internal.common_methods_invocations import (  # noqa: PLC0415 -- pulls in common_device_type, which must not load before PYTORCH_TESTING_DEVICE_FOR_CUSTOM is set (conformance/conftest.py)
+        op_db,
+    )
 
     device = _device_token()
     index: dict[str, tuple[str, str, str]] = {}
@@ -356,7 +356,7 @@ def main() -> int:
         raise SystemExit("--no-run needs --records DIR from an earlier run")
 
     suite = _import_suite()
-    import known_unsupported
+    import known_unsupported  # noqa: PLC0415 -- importable only via _import_suite's sys.path insert
 
     accelerator = known_unsupported.accelerator_key()
     if args.write and accelerator != known_unsupported.BASE_ACCELERATOR:

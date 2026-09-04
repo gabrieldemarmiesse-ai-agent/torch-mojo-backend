@@ -264,4 +264,3 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR:29500" \
     --rdzv-id="$SLURM_JOB_ID" demo_scripts/nanogpt_ddp.py ...
 ```
-

@@ -29,6 +29,8 @@ from _pytest.terminal import TerminalReporter
 from bench_lib.check import BENCH_NOTES_KEY, Bench, bench_key, update_mode
 from bench_lib.hw import Hardware, detect
 
+from torch_mojo_backend import register_mojo_devices
+
 # Set to a path to make collection write every benchmark node's baseline
 # key there, one per line, and measure nothing.  test_coverage.py drives
 # this to reconcile the recorded baselines against the suite: the keys come
@@ -86,8 +88,6 @@ def hw() -> Hardware:
 
 @pytest.fixture(scope="session")
 def mojo_device(hw: Hardware) -> torch.device:
-    from torch_mojo_backend import register_mojo_devices
-
     register_mojo_devices()
     return torch.device("mojo")
 

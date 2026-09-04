@@ -16,6 +16,7 @@ from max import engine
 from max.experimental.torch.torch import torch_dtype_to_max
 from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from torch_mojo_backend.aten_functions import (
     CURRENT_FX_NODE,
@@ -25,6 +26,11 @@ from torch_mojo_backend.aten_functions import (
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
 from torch_mojo_backend.mojo_device import comm_fence
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    TorchMojoTensor,
+    _row_major_strides,
+    find_equivalent_max_device,
+)
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -320,8 +326,6 @@ class _GraphFactory:
             # function). Bake it into the MAX graph as a constant. The
             # compiler runs under AOTAutograd's fake mode, which must not
             # intercept the reads of the real constant.
-            from torch._subclasses.fake_tensor import unset_fake_temporarily
-
             device = self.get_max_device(attr_value)
             with unset_fake_temporarily():
                 host = attr_value.detach().cpu()
@@ -452,11 +456,6 @@ def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
     MAX buffers release their device memory when the last Python reference
     drops, exactly like the eager TensorHolder.
     """
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-        TorchMojoTensor,
-        _row_major_strides,
-    )
-
     shape = tuple(buffer.shape)
     return TorchMojoTensor._make(
         buffer,
@@ -654,13 +653,6 @@ dummy_backend = aot_autograd(fw_compiler=dummy_compiler)
 #   which can take advantage of MAX's automatic kernel fusion.
 def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
     if t.device.type == "cuda":
-        # Deferred: torch_mojo_tensor imports this module (get_ordered_accelerators
-        # -> compiler.get_accelerators), so importing it back at module scope
-        # would cycle.
-        from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-            find_equivalent_max_device,
-        )
-
         stream = torch.cuda.current_stream(t.device).cuda_stream
         # _from_dlpack wants a concrete driver Device, not the graph-building
         # DeviceRef torch_device_to_max_device returns.

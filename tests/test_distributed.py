@@ -10,13 +10,19 @@ import datetime
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.distributed import nccl, use_local_rank_gpu
+from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
+from torch_mojo_backend.mojo_device import hip_peer
+from torch_mojo_backend.torch_compile_backend import utils
 
 _WORKER = Path(__file__).parent / "ddp_worker.py"
 _OVERHEAD_WORKER = Path(__file__).parent / "comm_fence_overhead.py"
@@ -33,9 +39,6 @@ def test_backend_name_registered():
 
 
 def test_nccl_dtype_and_op_maps():
-    from torch_mojo_backend.distributed import nccl
-    from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
-
     assert _nccl_dtype(torch.bfloat16) == nccl.NCCL_BFLOAT16 == 9
     assert _nccl_dtype(torch.float32) == nccl.NCCL_FLOAT32 == 7
     assert _nccl_dtype(torch.int64) == nccl.NCCL_INT64 == 4
@@ -111,8 +114,6 @@ def test_use_local_rank_gpu_pins_one_device_per_rank(
     local_rank: int,
     expected: dict[str, str | None],
 ):
-    from torch_mojo_backend.distributed import use_local_rank_gpu
-
     # A private copy of the environment: the function under test ADDS
     # variables, and monkeypatch.delenv on an absent name records nothing to
     # undo, so a leaked HIP_VISIBLE_DEVICES=1 would narrow MAX's device count
@@ -127,8 +128,6 @@ def test_use_local_rank_gpu_pins_one_device_per_rank(
 
 
 def test_use_local_rank_gpu_rejects_a_rank_beyond_the_visible_list(monkeypatch):
-    from torch_mojo_backend.distributed import use_local_rank_gpu
-
     env = dict(os.environ, ROCR_VISIBLE_DEVICES="0,1", LOCAL_RANK="2")
     monkeypatch.setattr(os, "environ", env)
     with pytest.raises(RuntimeError, match="lists only 2 devices"):
@@ -136,16 +135,12 @@ def test_use_local_rank_gpu_rejects_a_rank_beyond_the_visible_list(monkeypatch):
 
 
 def test_use_local_rank_gpu_rejects_a_non_integer_local_rank(monkeypatch):
-    from torch_mojo_backend.distributed import use_local_rank_gpu
-
     monkeypatch.setattr(os, "environ", dict(os.environ, LOCAL_RANK="zero"))
     with pytest.raises(RuntimeError, match="not an integer"):
         use_local_rank_gpu()
 
 
 def test_use_local_rank_gpu_is_a_no_op_outside_torchrun(monkeypatch):
-    from torch_mojo_backend.distributed import use_local_rank_gpu
-
     env = {k: v for k, v in os.environ.items() if k != "LOCAL_RANK"}
     env["ROCR_VISIBLE_DEVICES"] = "0,1,2,3"
     monkeypatch.setattr(os, "environ", env)
@@ -154,8 +149,6 @@ def test_use_local_rank_gpu_is_a_no_op_outside_torchrun(monkeypatch):
 
 
 def test_collective_library_refuses_an_unknown_device_api():
-    from torch_mojo_backend.distributed import nccl
-
     with pytest.raises(RuntimeError, match="NVIDIA \\(NCCL\\) and AMD \\(RCCL\\)"):
         nccl.load("metal")
 
@@ -257,12 +250,6 @@ def test_gpu_torch_on_hip_hint(
     amd_present: bool,
     expect: str | None,
 ):
-    import warnings
-    from types import SimpleNamespace
-
-    from torch_mojo_backend.mojo_device import hip_peer
-    from torch_mojo_backend.torch_compile_backend import utils
-
     monkeypatch.setattr(torch.version, "cuda", cuda_version)
     monkeypatch.setattr(torch.version, "hip", hip_version)
     monkeypatch.setattr(hip_peer, "_amd_gpu_present", lambda: amd_present)
@@ -290,9 +277,6 @@ def test_gpu_torch_on_hip_hint(
 
 
 def test_gpu_torch_on_hip_hint_never_breaks_registration(monkeypatch):
-    from torch_mojo_backend.mojo_device import hip_peer
-    from torch_mojo_backend.torch_compile_backend import utils
-
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(hip_peer, "_amd_gpu_present", lambda: True)
 

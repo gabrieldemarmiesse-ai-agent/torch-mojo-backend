@@ -7,6 +7,8 @@ from typing import cast
 import torch
 
 from torch_mojo_backend import mojo_backend
+from torch_mojo_backend.eager_kernels import aten_fast
+from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.types import CountedCallable
 
 
@@ -25,7 +27,7 @@ def _xfail_if_unsupported(device: str) -> Iterator[None]:
         yield
     except NotImplementedError as exc:
         if str(device).startswith("mojo") and "mojo" in str(exc):
-            import pytest
+            import pytest  # noqa: PLC0415 -- pytest is a dev dependency; this module imports without it
 
             pytest.xfail(f"unsupported on mojo eager: {exc}")
         raise
@@ -59,10 +61,6 @@ class CallChecker:
         name = getattr(func, "__name__", "")
         if not name.startswith("aten"):
             return []
-        try:
-            from torch_mojo_backend.eager_kernels import aten_fast
-        except Exception:
-            return []
         base = f"fast_{name}"
         twins = []
         for attr in dir(aten_fast):
@@ -83,12 +81,6 @@ class CallChecker:
         if not name.startswith("aten_"):
             return []
         base = name[len("aten_") :]  # e.g. "empty_like", "mean_out", "_log_softmax"
-        try:
-            from torch_mojo_backend.mojo_device.mojo_device_aten_ops import (
-                EAGER_CALL_COUNTERS,
-            )
-        except Exception:
-            return []
         candidates = {f"aten::{base}"}
         if "_" in base:
             head, tail = base.rsplit("_", 1)

@@ -4,6 +4,7 @@ from typing import cast
 import pytest
 
 from torch_mojo_backend import eager_kernels
+from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import mojo_device_autograd as autograd
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
@@ -66,16 +67,12 @@ def _query_gradient_context(has_dropout: bool) -> SimpleNamespace:
 
 
 def test_sdpa_backward_bridge_is_lazy_registered():
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     assert aten_fast._SdpaBackwardExtension.MOJO_FILE.name == "sdpa_backward_ops.mojo"
 
 
 def test_missing_sdpa_kernel_module_returns_not_handled_before_device_work(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     device = object()
     probabilities = SimpleNamespace(
         _dtype=aten_fast.DType.float32, _device=device, _shape=(2, 3)

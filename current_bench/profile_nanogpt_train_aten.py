@@ -49,6 +49,7 @@ from current_bench.bench_nanogpt_train import (
     make_synchronize,
     training_step,
 )
+from torch_mojo_backend import get_accelerators, register_mojo_devices
 
 
 def self_gpu_us(event: object) -> float:
@@ -333,8 +334,6 @@ def main():
     if args.device == "cuda":
         execution_backend = f"PyTorch {vendor}"
     else:
-        from torch_mojo_backend import get_accelerators, register_mojo_devices
-
         register_mojo_devices()
         max_device = list(get_accelerators())[0]
         if "gpu" not in str(max_device).lower():

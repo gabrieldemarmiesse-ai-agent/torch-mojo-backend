@@ -22,7 +22,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import warnings
 from pathlib import Path
+
+import torch
+
+from torch_mojo_backend.torch_compile_backend import utils as _compile_utils
 
 # hip/driver_types.h: hipPointer_attribute (CUDA's CUpointer_attribute values).
 _ATTRIBUTE_MEMORY_TYPE = 2
@@ -204,10 +209,6 @@ def warn_if_gpu_torch_on_hip():
 
     The CPU wheel is what this backend needs anyway.
     """
-    import warnings
-
-    import torch
-
     if not _amd_gpu_present():
         return
     cuda_build = getattr(torch.version, "cuda", None) is not None
@@ -215,9 +216,8 @@ def warn_if_gpu_torch_on_hip():
     if not (cuda_build or hip_build):
         return
     try:
-        from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
-
-        if not any(device.api == "hip" for device in get_accelerators()):
+        # Through the module, not a bound name: tests substitute the function.
+        if not any(device.api == "hip" for device in _compile_utils.get_accelerators()):
             return
     except Exception:  # a hint must never break registration
         return

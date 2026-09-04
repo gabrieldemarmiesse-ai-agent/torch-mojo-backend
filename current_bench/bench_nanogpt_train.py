@@ -30,6 +30,8 @@ from pathlib import Path
 
 import torch
 
+from torch_mojo_backend import register_mojo_devices
+
 DEFAULT_NANOGPT_PATH = Path("/root/nanoGPT")
 
 # nanoGPT train.py defaults for the 124M single-GPU run.
@@ -55,7 +57,10 @@ def import_nanogpt(nanogpt_path: Path) -> tuple[type, type]:
         )
     if str(nanogpt_path) not in sys.path:
         sys.path.insert(0, str(nanogpt_path))
-    from model import GPT, GPTConfig
+    from model import (  # noqa: PLC0415 -- nanoGPT, reachable only via the sys.path insert above
+        GPT,
+        GPTConfig,
+    )
 
     return GPTConfig, GPT
 
@@ -202,8 +207,6 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     if args.device.startswith("mojo"):
-        from torch_mojo_backend import register_mojo_devices
-
         register_mojo_devices()
 
     dtype = DTYPES[args.dtype]

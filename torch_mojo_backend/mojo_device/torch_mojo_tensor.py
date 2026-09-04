@@ -12,14 +12,22 @@ import torch
 from max.driver import CPU
 from max.dtype import DType
 from max.experimental.torch import max_dtype_to_torch
+from max.experimental.torch.torch import torch_dtype_to_max
 
 from torch_mojo_backend import eager_kernels
+from torch_mojo_backend.eager_kernels import _ctx_ptr, call_queue, is_device_oom
 from torch_mojo_backend.eager_kernels.data_movement_ops import DataMovementExtension
 from torch_mojo_backend.eager_kernels.output_specs import (
     _submit_prepared_into,
     _TensorOutputSpec,
 )
-from torch_mojo_backend.mojo_device import objc_autorelease, torch_mojo_device_module
+from torch_mojo_backend.mojo_device import (
+    deferred_compile,
+    dlpack,
+    objc_autorelease,
+    torch_mojo_device_module,
+)
+from torch_mojo_backend.mojo_device.deferred_compile import dispatch as _dispatch_entry
 
 
 class _MojoTensorHolder(Protocol):
@@ -160,19 +168,6 @@ class _HolderOwner:
             wait(owner_ctx, event)
 
 
-def _ctx_ptr(device: max.driver.Device) -> int:
-    # Rebinds this module-level name to the real (cached) implementation on
-    # first use, so the lazy import costs one call, not one per call.
-    global _ctx_ptr
-    from torch_mojo_backend.eager_kernels import _ctx_ptr as real_ctx_ptr
-
-    # Self-rebind via `global`: ty compares the two same-shaped `def`s
-    # nominally, not structurally, and treats reassigning a function to
-    # (what is, at runtime,) itself as unsound.
-    _ctx_ptr = real_ctx_ptr  # ty: ignore[invalid-assignment]
-    return real_ctx_ptr(device)
-
-
 def _retain_failed_transfer_owner(device: max.driver.Device, owner: object) -> object:
     token = object()
     with _FAILED_TRANSFER_OWNERS_LOCK:
@@ -304,26 +299,6 @@ def _device_of(tensor: MojoTensorLike) -> max.driver.Device:
     return cast(max.driver.Device, tensor._device)
 
 
-def _dispatch_entry(
-    func: torch._ops.OpOverload, args: tuple[object, ...], kwargs: dict[str, object]
-) -> object:
-    """``deferred_compile.dispatch``, resolved on first use.
-
-    ``deferred_compile`` imports the call queue this module feeds, so it
-    cannot be imported at module scope. Rebinding the global on the first
-    dispatch keeps that direction intact and leaves the steady state at one
-    plain global lookup instead of a per-op ``sys.modules`` hit (the same
-    trick as ``output_specs._alloc``).
-    """
-    global _dispatch_entry
-    from torch_mojo_backend.mojo_device import deferred_compile
-
-    # Same nominal-vs-structural self-rebind quirk as _ctx_ptr above, even
-    # though both sides print identically.
-    _dispatch_entry = deferred_compile.dispatch  # ty: ignore[invalid-assignment]
-    return _dispatch_entry(func, args, kwargs)
-
-
 @runtime_checkable
 class _SynchronizableStream(Protocol):
     def synchronize(self): ...
@@ -369,8 +344,6 @@ def _alloc_with_recovery(
     try:
         return holder_mod.alloc(ctx_ptr, nbytes)
     except Exception as exc:
-        from torch_mojo_backend.eager_kernels import call_queue, is_device_oom
-
         if not is_device_oom(exc):
             raise
         sys.stderr.write(
@@ -600,8 +573,6 @@ class TorchMojoTensor(torch.Tensor):
         non_blocking: bool = False,
     ) -> "TorchMojoTensor":
         """H2D: allocate and enqueue a copy from a CPU torch tensor."""
-        from max.experimental.torch.torch import torch_dtype_to_max
-
         t = cpu_tensor.detach()
         if t.device.type != "cpu":
             # alloc_from_host below dereferences data_ptr() as HOST memory, so
@@ -644,7 +615,9 @@ class TorchMojoTensor(torch.Tensor):
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
         contract. Blocking and CPU-device copies are ready on return.
         """
-        from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
+        from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- cycle: comm_fence imports this module
+            comm_fence,
+        )
 
         # A collective that wrote these bytes may still be flying on the comm
         # stream; the default stream this transfer rides is ordered after it
@@ -676,8 +649,6 @@ class TorchMojoTensor(torch.Tensor):
         # remain alive until the non-owning DeviceBuffer copy has completed.
         _record_d2h_owner(src._device, (owner, src._holder))
         try:
-            from torch_mojo_backend.mojo_device import dlpack
-
             return torch.from_dlpack(
                 dlpack.make_capsule(owner, ptr, src._shape, src._dtype, CPU())
             )
@@ -720,7 +691,9 @@ class TorchMojoTensor(torch.Tensor):
         not see a buffer whose producing launches -- including the copy a
         strided export just queued -- are still waiting on a compile.
         """
-        from torch_mojo_backend.mojo_device import comm_fence, deferred_compile, dlpack
+        from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- cycle: comm_fence imports this module
+            comm_fence,
+        )
 
         comm_fence.fence_tensor(self)  # same reason as _to_cpu_tensor's
         src = self._contig()
@@ -730,8 +703,6 @@ class TorchMojoTensor(torch.Tensor):
         )
 
     def __dlpack_device__(self) -> tuple[int, int]:
-        from torch_mojo_backend.mojo_device import dlpack
-
         return dlpack.dlpack_device(self._device)
 
     def __coerce_same_metadata_as_tangent__(
@@ -1023,8 +994,6 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor):
     loaded, so the item is always launch-ready; it only holds FIFO order).
     The queue holds raw pointers, so both tensors are handed over as the
     item's keep-alive: their buffers must outlive the launch."""
-    from torch_mojo_backend.eager_kernels import call_queue as _cq
-
     holder = _holder_mod()
     args = (
         dst._ptr,
@@ -1035,7 +1004,7 @@ def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor):
         dst._itemsize,
         _ctx_ptr(dst._device),
     )
-    _cq.external_call(holder.CopyStrided, args, keepalive=(dst, src))
+    call_queue.external_call(holder.CopyStrided, args, keepalive=(dst, src))
 
 
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor):
@@ -1044,9 +1013,7 @@ def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     The shared materialize/copy primitive: powers .contiguous(), copy_ into
     views, and expand materialization (src strides may contain 0s).
     """
-    from torch_mojo_backend.eager_kernels import call_queue as _cq
-
-    if _cq.enabled() and _cq.active():
+    if call_queue.enabled() and call_queue.active():
         # Hold FIFO position behind queued producers of src/dst.
         _copy_strided_enqueue(dst, src)
         return
@@ -1064,7 +1031,9 @@ def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor):
 @functools.cache
 def get_ordered_accelerators() -> list[max.driver.Device]:
     """Get accelerators ordered with GPUs first, then CPU last"""
-    from torch_mojo_backend.torch_compile_backend.compiler import get_accelerators
+    from torch_mojo_backend.torch_compile_backend.compiler import (  # noqa: PLC0415 -- cycle: compiler imports comm_fence, which imports this module
+        get_accelerators,
+    )
 
     accelerators = list(get_accelerators())
 
