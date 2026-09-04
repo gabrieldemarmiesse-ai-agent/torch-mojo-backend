@@ -4,14 +4,17 @@ import inspect
 import subprocess
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol, cast
 
 import pytest
+from max.driver import CPU
+from max.dtype import DType
 
 from torch_mojo_backend import eager_kernels
+from torch_mojo_backend.eager_kernels import aten_fast
 
 
 class _NativeCallModule(Protocol):
@@ -465,13 +468,6 @@ def test_spec_descriptor_canonical_defines_match_make_defines():
     """The memoized canonical defines must stay field-for-field equal to the
     literal ``make_defines`` dicts: the define-gate scanner reads the dicts,
     the hot path uses the memo, and the two must never drift."""
-    from dataclasses import dataclass, field
-
-    from max.driver import CPU
-    from max.dtype import DType
-
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     cpu = CPU()
 
     @dataclass

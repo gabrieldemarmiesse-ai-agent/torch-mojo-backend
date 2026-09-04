@@ -45,6 +45,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -56,6 +57,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import IO, ClassVar, Generic, NoReturn, TypeVar, cast
 
+import max as _max_pkg
 from max import driver
 from max.dtype import DType
 
@@ -78,8 +80,6 @@ def _find_mojo() -> Path:
     candidates: list[Path] = []
     if sys.executable:  # None/'' in embedded interpreters and workers
         candidates.append(Path(sys.executable).parent / "mojo")
-    import max as _max_pkg
-
     for base in list(getattr(_max_pkg, "__path__", ())) or (
         [_max_pkg.__file__] if getattr(_max_pkg, "__file__", None) else []
     ):
@@ -88,8 +88,6 @@ def _find_mojo() -> Path:
         if cand.is_file():
             _MOJO_EXE_CACHE.append(cand)
             return cand
-    import shutil
-
     which = shutil.which("mojo")
     if which is not None:
         _MOJO_EXE_CACHE.append(Path(which))
@@ -860,7 +858,9 @@ def _bootstrap_allocate_single_output(spec: object) -> object:
     declared `Callable[[object], object]` type.
     """
     global _allocate_single_output
-    from torch_mojo_backend.eager_kernels.output_specs import _allocate_output_spec
+    from torch_mojo_backend.eager_kernels.output_specs import (  # noqa: PLC0415 -- the cycle this docstring describes
+        _allocate_output_spec,
+    )
 
     _allocate_single_output = cast("Callable[[object], object]", _allocate_output_spec)
     return _allocate_single_output(spec)

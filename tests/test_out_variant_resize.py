@@ -4,14 +4,14 @@ import pytest
 import torch
 
 from torch_mojo_backend import TorchMojoTensor
+from torch_mojo_backend.eager_kernels.aten_fast import _spec_of
+from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
 
 
 def _watch_eager_op(call_checker: CallChecker, op_name: str):
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS[op_name])
 
 
@@ -45,8 +45,6 @@ def test_resized_out_invalidates_cached_tensor_spec(
 ):
     """A spec operation after resize must use the new pointer and shape."""
     _watch_eager_op(call_checker, "aten::mul.out")
-    from torch_mojo_backend.eager_kernels.aten_fast import _spec_of
-
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
     assert isinstance(out, TorchMojoTensor)
     _spec_of(out)

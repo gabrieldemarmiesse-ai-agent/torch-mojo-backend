@@ -22,13 +22,14 @@ from typing import TYPE_CHECKING, Protocol
 
 import max.driver
 
+from torch_mojo_backend import eager_kernels
+
 if TYPE_CHECKING:
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import _TensorHolderModule
 
 
 def _holder_mod() -> "_TensorHolderModule":
-    # Lazy: importing this module must not trigger a Mojo kernel build.
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (  # noqa: PLC0415 -- cycle: torch_mojo_tensor reaches this module (for `Stream`) before it defines this name
         _holder_mod as holder_mod,
     )
 
@@ -52,8 +53,6 @@ def default_stream_ctx_ptr(device: max.driver.Device) -> int:
     exactly the context pointer the kernel extensions allocate/free through,
     and a test asserts the two stay in sync.
     """
-    from torch_mojo_backend import eager_kernels
-
     return eager_kernels._ctx_ptr(device)
 
 

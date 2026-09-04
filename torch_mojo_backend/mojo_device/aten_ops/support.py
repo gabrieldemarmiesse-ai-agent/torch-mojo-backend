@@ -1,7 +1,7 @@
 """Shared plumbing for the eager aten implementations in this package.
 
-Everything the implementation modules have in common lives here — the lazily
-imported `aten_fast` handle, the actionable `NotImplementedError`, the
+Everything the implementation modules have in common lives here — the
+`aten_fast` handle, the actionable `NotImplementedError`, the
 strided/broadcasting copy that every `out=` variant ends with — so no
 implementation module ever has to import another one.
 """
@@ -12,7 +12,9 @@ from typing import NoReturn
 
 import torch
 from max.dtype import DType
+from max.experimental.torch import max_dtype_to_torch
 
+from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
     _resize_payload,
@@ -25,26 +27,13 @@ _COMPOSITE_EXPLICIT_AUTOGRAD = torch._C.DispatchKeySet(
 )
 
 
-_aten_fast_module = None
-
-
 def _fast() -> ModuleType:
-    """The aten_fast module.
-
-    Imported lazily: the first import triggers the (cached) Mojo kernel
-    compilation, which pure torch.compile workloads should never pay for.
-    """
-    global _aten_fast_module
-    if _aten_fast_module is None:
-        from torch_mojo_backend.eager_kernels import aten_fast
-
-        _aten_fast_module = aten_fast
-    return _aten_fast_module
+    """The aten_fast module. Importing it loads no Mojo extension: a
+    kernel is built and dlopened by the first call into its descriptor."""
+    return aten_fast
 
 
 def max_dtype_to_torch_dtype(dtype: DType) -> torch.dtype:
-    from max.experimental.torch import max_dtype_to_torch
-
     return max_dtype_to_torch(dtype)
 
 

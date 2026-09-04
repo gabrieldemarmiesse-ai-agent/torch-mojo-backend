@@ -71,7 +71,7 @@ def _candidate_libnccl_paths() -> list[str]:
         return [override]
     candidates = []
     try:
-        import nvidia.nccl
+        import nvidia.nccl  # noqa: PLC0415 -- optional: the wheel may not be installed
 
         # nvidia.nccl is a namespace package: no __file__, only __path__.
         for package_dir in nvidia.nccl.__path__:

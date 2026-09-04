@@ -13,6 +13,7 @@ import sys
 import time
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from torch_mojo_backend import register_mojo_devices
 
@@ -25,8 +26,6 @@ ITERS = 3
 
 
 def main():
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained("gpt2")
     model = AutoModelForCausalLM.from_pretrained("gpt2").eval()
     ids = tok(PROMPT, return_tensors="pt").input_ids

@@ -14,6 +14,8 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 import torch
 
+from torch_mojo_backend.eager_kernels import aten_fast as _aten_fast
+from torch_mojo_backend.mojo_device import deferred_compile
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 # _require_handled passes its argument through unchanged, including the
@@ -24,9 +26,9 @@ _registered = False
 
 
 def _fast() -> ModuleType:
-    from torch_mojo_backend.eager_kernels import aten_fast
-
-    return aten_fast
+    """Indirection, not deferral: the host-contract tests swap the whole
+    module out through this function."""
+    return _aten_fast
 
 
 def _require_handled(result: _ResultT | None, operation: str) -> _ResultT:
@@ -665,8 +667,6 @@ def _scaled_dot_product_attention_autograd(
     # check above is metadata-only and safe on pending tensors. Buffers
     # these paths allocate afterwards are retained per queued item (queue
     # rule 3), so no extra bookkeeping is owed here.
-    from torch_mojo_backend.mojo_device import deferred_compile
-
     deferred_compile.drain()
     if not needs_backward:
         return _require_handled(

@@ -176,7 +176,7 @@ def _device_synchronize(device: "int | str | torch.device | None" = None):
     is nothing of theirs to wait for; only the *other* thread's issued work
     must land first, which is exactly a stream synchronize.
     """
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (  # noqa: PLC0415 -- cycle: torch_mojo_tensor imports this module
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
         find_equivalent_max_device,
@@ -195,7 +195,10 @@ def synchronize(device: "int | str | torch.device | None" = None):
     every op it issued has actually run on the device. So does a collective
     still flying on the comm stream, which only the default stream is waited
     on here: fence it onto that stream first (mojo_device/comm_fence.py)."""
-    from torch_mojo_backend.mojo_device import comm_fence, deferred_compile
+    from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same cycle, through comm_fence's import of torch_mojo_tensor
+        comm_fence,
+        deferred_compile,
+    )
 
     comm_fence.fence_all()
     deferred_compile.drain()
@@ -218,7 +221,7 @@ def memory_stats(device: "int | str | torch.device | None" = None) -> dict[str, 
     ``torch.cuda.memory_stats`` on a CUDA build; callers that want a number
     for this device get honest ones here.
     """
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (  # noqa: PLC0415 -- same cycle as _device_synchronize above
         find_equivalent_max_device,
     )
 

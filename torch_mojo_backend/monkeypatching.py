@@ -16,12 +16,23 @@ registration APIs (``torch.library.impl``, the PrivateUse1 backend module,
 ``mojo_device/register.py``.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
 from types import ModuleType
 from typing import TypeVar
 
 import torch
+import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+import torch._subclasses.fake_tensor as fake_tensor_module
+import torch.fx.experimental.proxy_tensor as proxy_tensor
+import torch.optim.optimizer as optimizer_module
+import torch.utils._foreach_utils as foreach_utils
+from torch._dynamo.variables.builder import VariableBuilder
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.functional_tensor import FunctionalTensor, FunctionalTensorMode
+
+from torch_mojo_backend.mojo_device import streams as mojo_streams
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 _T = TypeVar("_T")
 
@@ -103,9 +114,7 @@ def _install_torch_accelerator_stream_api(torch_mojo_device_module: ModuleType):
 
     @wraps(original_set_stream)
     def set_stream(stream: torch.Stream):
-        from torch_mojo_backend.mojo_device.streams import Stream as MojoStream
-
-        if isinstance(stream, MojoStream):
+        if isinstance(stream, mojo_streams.Stream):
             torch_mojo_device_module.set_stream(stream)
         else:
             original_set_stream(stream)
@@ -131,8 +140,6 @@ def _install_torch_stream_event_dispatch():
     """
     if getattr(torch.Stream, "_torch_mojo_backend", False):
         return
-    from torch_mojo_backend.mojo_device import streams as mojo_streams
-
     original_stream = torch.Stream
     original_event = torch.Event
     construct_stream = _forwarding_constructor(original_stream)
@@ -191,11 +198,6 @@ def _declare_mojo_tensor_foreach_capable():
     optimizers. TorchMojoTensor is a transparent PrivateUse1 wrapper, so opt
     it into the same lists as DTensor and other supported tensor types.
     """
-    import torch.optim.optimizer as optimizer_module
-    import torch.utils._foreach_utils as foreach_utils
-
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
-
     for supported_types in (
         optimizer_module._foreach_supported_types,
         foreach_utils._foreach_supported_types,
@@ -233,18 +235,6 @@ def _declare_mojo_tensor_as_plain_tensor():
       "unsupported operand type(s) for +: 'FunctionalTensor' and
       'TorchMojoTensor'".
     """
-    from collections.abc import Mapping, Sequence
-
-    import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
-    import torch._subclasses.fake_tensor as fake_tensor_module
-    import torch.fx.experimental.proxy_tensor as proxy_tensor
-    from torch._subclasses.functional_tensor import (
-        FunctionalTensor,
-        FunctionalTensorMode,
-    )
-
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
-
     if TorchMojoTensor not in proxy_tensor.HANDLED_TYPES:
         # torch infers HANDLED_TYPES' type from its own fixed-length tuple
         # literal, so extending it by one element is always a "wrong length"
@@ -348,10 +338,6 @@ def _trace_mojo_tensor_as_a_plain_tensor_in_dynamo():
     ``wrap_tensor``. Add the mojo wrapper there. The table is memoized per
     ``config.trace_numpy`` value, so populate both.
     """
-    from torch._dynamo.variables.builder import VariableBuilder
-
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
-
     for trace_numpy in (False, True):
         table = VariableBuilder._type_dispatch_impl(trace_numpy)
         table[TorchMojoTensor] = VariableBuilder.wrap_tensor
@@ -376,8 +362,6 @@ def _keep_mojo_kernels_out_of_fake_tensor_construction():
     test has this same rough edge — see test_privateuseone_python_backend
     "prevent compile-time FakeTensor crashes".)
     """
-    from torch._subclasses.fake_tensor import FakeTensor
-
     exclude_privateuse1 = torch._C.DispatchKeySet(torch._C.DispatchKey.PrivateUse1)
     original_new = FakeTensor.__new__
 

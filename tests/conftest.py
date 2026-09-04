@@ -18,6 +18,11 @@ from max.dtype import DType
 from mojo.paths import _build_mojo_source_package
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
+    TorchMojoTensor,
+    _row_major_strides,
+    _torch_dtype_of,
+)
 from torch_mojo_backend.testing import CallChecker, Conf
 from torch_mojo_backend.torch_compile_backend import compiler
 
@@ -127,11 +132,6 @@ def fake_mojo_tensor() -> Callable[..., torch.Tensor]:
     exercised on a machine with no GPU. The pointer is never dereferenced:
     such tests replace the native `call` entry point.
     """
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-        TorchMojoTensor,
-        _row_major_strides,
-        _torch_dtype_of,
-    )
 
     def make(
         device: Device,

@@ -21,7 +21,7 @@ captures the dict by reference, so it is mutated in place, never rebound.
 
 import threading
 
-from torch_mojo_backend.mojo_device import device_streams
+from torch_mojo_backend.mojo_device import deferred_compile, device_streams
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 PENDING: dict[int, int] = {}  # id(holder) -> mojo device index
@@ -63,8 +63,6 @@ def _fence_locked(index: int):
         return
     # Queued launches were issued before this fence and must stay before it
     # on the default stream (rule 1 in device_streams.py).
-    from torch_mojo_backend.mojo_device import deferred_compile
-
     deferred_compile.drain()
     stream.make_default_stream_wait()
     for key in keys:  # only once the wait is on the stream

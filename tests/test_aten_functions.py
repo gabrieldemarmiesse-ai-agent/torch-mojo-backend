@@ -13,6 +13,8 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
+from torch_mojo_backend.eager_kernels import aten_fast
+from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
@@ -374,8 +376,6 @@ def test_native_batch_norm_legit_no_training_2d_input(device: str):
 
 def test_aten_native_batch_norm_inference(conf: Conf, call_checker: CallChecker):
     """Test aten.native_batch_norm in inference mode (training=False)."""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_native_batch_norm, aten_fast.fast_aten_native_batch_norm
     )
@@ -419,8 +419,6 @@ def test_aten_native_layer_norm_basic(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm returns (output, mean, rstd)"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
     )
@@ -466,8 +464,6 @@ def test_aten_native_layer_norm_different_eps(
     conf: Conf, eps: float, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm with different epsilon values"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
     )
@@ -1848,8 +1844,6 @@ def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallCheck
     and ..._bfloat16. beta/alpha values below match the failing OpInfo
     sample exactly.
     """
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
@@ -1867,8 +1861,6 @@ def test_aten_addr_default_beta_alpha(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """aten.addr with default beta=alpha=1 (self + outer(vec1, vec2))."""
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
@@ -1884,8 +1876,6 @@ def test_aten_addr_default_beta_alpha(
 def test_aten_addr_beta_zero(conf: Conf, call_checker: CallChecker):
     """beta=0 must ignore `self` entirely, including nan/inf in it (matches
     ATen's own addr contract, see aten/src/ATen/native/LinearAlgebra.cpp)."""
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
@@ -1903,8 +1893,6 @@ def test_aten_addr_self_broadcast(conf: Conf, call_checker: CallChecker):
     shape (here: 0-d): the fast path's own right-alignment handles this
     directly (see `fast_aten_addr`), so this still goes through the fused
     kernel, not the composite fallback -- verified via call_checker."""
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
 
     def fn(self, vec1, vec2):
@@ -3993,8 +3981,6 @@ def test_fill_scalar_basic(
     call_checker: CallChecker,
 ):
     """Test basic fill.Scalar functionality with different dtypes, shapes, and values"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
     )
@@ -4019,8 +4005,6 @@ def test_fill_scalar_integer_dtypes(
     call_checker: CallChecker,
 ):
     """Test fill.Scalar functionality with integer dtypes"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
     )
@@ -4037,8 +4021,6 @@ def test_fill_scalar_integer_dtypes(
 @pytest.mark.parametrize("value", [-5, 100])
 def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallChecker):
     """Test fill.Scalar with integer values"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
     )
@@ -4054,8 +4036,6 @@ def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallCh
 
 def test_fill_scalar_single_element(conf: Conf, call_checker: CallChecker):
     """Test fill.Scalar with single element tensor"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
     )
@@ -4083,8 +4063,6 @@ def test_fill_scalar_zero_dim(conf: Conf):
 
 def test_fill__scalar_inplace(conf: Conf, call_checker: CallChecker):
     """Test fill_.Scalar fills tensor in-place"""
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten_fill__scalar, aten_fast.fast_aten_fill__scalar
     )
@@ -4290,8 +4268,6 @@ def test_aten_erf_basic(conf: Conf, dtype: torch.dtype):
 
 
 def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
     )
@@ -4307,8 +4283,6 @@ def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
 def test_aten__unsafe_view_dtypes(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     call_checker.register(
         aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
     )

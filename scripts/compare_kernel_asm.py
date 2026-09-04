@@ -79,6 +79,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+import max as max_package
+
 DEFAULT_KERNEL_DIR = Path("torch_mojo_backend/eager_kernels")
 SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
 # Mangling hash, on the file name and on every symbol inside it. The hash is
@@ -152,7 +154,6 @@ def mojo_cli() -> Path:
     candidates = []
     if sys.executable:  # None/'' in embedded interpreters
         candidates.append(Path(sys.executable).parent / "mojo")
-    import max as max_package
 
     for base in list(getattr(max_package, "__path__", ())):
         candidates.extend(parent / "bin" / "mojo" for parent in Path(base).parents)

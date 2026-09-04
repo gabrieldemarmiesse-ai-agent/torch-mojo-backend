@@ -41,6 +41,7 @@ extend-select = [
     "UP",  # pyupgrade
     "ANN", # flake8-annotations: every function needs type hints (ty then checks them)
     "TID252", # relative imports (banned below)
+    "PLC0415", # imports at the top of the file (lazy ones need a noqa saying why)
 ]
 
 [tool.ruff.lint.isort]

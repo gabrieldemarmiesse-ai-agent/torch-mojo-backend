@@ -11,6 +11,12 @@ import sys
 import time
 
 import torch
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageClassification,
+    AutoTokenizer,
+)
 
 from torch_mojo_backend import register_mojo_devices
 
@@ -44,15 +50,11 @@ def _bench_one(model, inputs, device):
 
 
 def _load_resnet():
-    from transformers import AutoModelForImageClassification
-
     m = AutoModelForImageClassification.from_pretrained("microsoft/resnet-18")
     return m, {"pixel_values": torch.randn(1, 3, 224, 224)}
 
 
 def _load_bert():
-    from transformers import AutoModel, AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained("bert-base-uncased")
     m = AutoModel.from_pretrained("bert-base-uncased")
     return m, dict(
@@ -61,8 +63,6 @@ def _load_bert():
 
 
 def _load_gpt2():
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     tok = AutoTokenizer.from_pretrained("gpt2")
     m = AutoModelForCausalLM.from_pretrained("gpt2")
     return m, dict(tok("The quick brown fox jumps over", return_tensors="pt"))

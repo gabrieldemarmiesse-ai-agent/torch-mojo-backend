@@ -23,8 +23,12 @@ import time
 from pathlib import Path
 
 import torch
+import transformers
 from tabulate import tabulate
 from torch.profiler import ProfilerActivity, profile
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from torch_mojo_backend import get_accelerators, register_mojo_devices
 
 PROMPT = "Here is how quantum computing works: "
 
@@ -323,15 +327,16 @@ def main():
         execution_device = "cuda"
         synchronize = torch.cuda.synchronize
     else:
-        from torch_mojo_backend import get_accelerators, register_mojo_devices
-
         register_mojo_devices()
         max_device = list(get_accelerators())[0]
         if "gpu" not in str(max_device).lower():
             raise RuntimeError(f"Expected MAX accelerator 0 to be a GPU: {max_device}")
 
         def synchronize():
-            from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder
+            from torch_mojo_backend.eager_kernels import (  # noqa: PLC0415 -- reading `tensor_holder` runs eager_kernels' module __getattr__, which builds (cold cache) and dlopens the extension
+                _ctx_ptr,
+                tensor_holder,
+            )
 
             tensor_holder.synchronize(_ctx_ptr(max_device))
 
@@ -342,9 +347,6 @@ def main():
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
         args.dtype
     ]
-
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     print(
         "Environment: "

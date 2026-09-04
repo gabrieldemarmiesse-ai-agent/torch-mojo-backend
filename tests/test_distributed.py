@@ -17,6 +17,8 @@ import torch
 import torch.distributed as dist
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.distributed import nccl
+from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
 
 _WORKER = Path(__file__).parent / "ddp_worker.py"
 _OVERHEAD_WORKER = Path(__file__).parent / "comm_fence_overhead.py"
@@ -33,9 +35,6 @@ def test_backend_name_registered():
 
 
 def test_nccl_dtype_and_op_maps():
-    from torch_mojo_backend.distributed import nccl
-    from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
-
     assert _nccl_dtype(torch.bfloat16) == nccl.NCCL_BFLOAT16 == 9
     assert _nccl_dtype(torch.float32) == nccl.NCCL_FLOAT32 == 7
     assert _nccl_dtype(torch.int64) == nccl.NCCL_INT64 == 4

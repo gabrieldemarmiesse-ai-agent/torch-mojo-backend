@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from torch_mojo_backend import TorchMojoTensor
+from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.testing import CallChecker
 
 pytestmark = pytest.mark.xdist_group(name="group1")
@@ -11,8 +12,6 @@ pytestmark = pytest.mark.xdist_group(name="group1")
 
 def _watch_eager_op(call_checker: CallChecker, op_name: str):
     """Require the exact PrivateUse1 registration, not a decomposition twin."""
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
-
     call_checker.register(EAGER_CALL_COUNTERS[op_name])
 
 
@@ -394,8 +393,6 @@ def test_fused_adamw_optimizer_two_groups_matches_cpu(
         eps=1e-8,
         fused=True,
     )
-
-    from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 
     fused_counter = EAGER_CALL_COUNTERS["aten::_fused_adamw_"]
     calls_before = fused_counter.call_count

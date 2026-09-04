@@ -11,9 +11,13 @@ from typing import cast
 import max.driver
 import pytest
 import torch
+from torch.optim.optimizer import _default_to_fused_or_foreach
 
 from torch_mojo_backend import TorchMojoTensor, mojo_backend, register_mojo_devices
+from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import (
+    cuda_peer,
+    dlpack,
     torch_mojo_device_module,
     torch_mojo_tensor as mojo_tensor_module,
 )
@@ -25,6 +29,7 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     find_equivalent_max_device,
     get_ordered_accelerators,
 )
+from torch_mojo_backend.torch_compile_backend import utils
 
 pytestmark = pytest.mark.xdist_group(name="group1")
 
@@ -388,8 +393,6 @@ def test_non_blocking_d2h_survives_destination_destruction(mojo_device):
     if max_device.label != "gpu":
         pytest.skip("requires a MAX GPU")
 
-    from torch_mojo_backend.mojo_device import dlpack
-
     a = torch.randn(4096, 4096).to(mojo_device)
     b = torch.randn(4096, 4096).to(mojo_device)
     source = torch.arange(1 << 20, dtype=torch.float32).to(mojo_device)
@@ -419,8 +422,6 @@ def test_non_blocking_d2h_adoption_failure_synchronizes(mojo_device, monkeypatch
     max_device = find_equivalent_max_device(torch.device(mojo_device))
     if max_device.label != "gpu":
         pytest.skip("requires a MAX GPU")
-
-    from torch_mojo_backend.mojo_device import dlpack
 
     source = torch.arange(1 << 20, dtype=torch.float32).to(mojo_device)
 
@@ -756,8 +757,6 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
 
 
 def test_mojo_parameters_enable_foreach_optimizer_selection(mojo_device):
-    from torch.optim.optimizer import _default_to_fused_or_foreach
-
     parameter = torch.nn.Parameter(torch.ones(8)).to(mojo_device)
     fused, foreach = _default_to_fused_or_foreach([parameter], differentiable=False)
 
@@ -889,9 +888,6 @@ def test_mojo_clip_grad_norm_matches_cpu(mojo_gpu_available, foreach):
 
 
 def test_metal_fast_add_gate_is_decided_once(monkeypatch):
-    from torch_mojo_backend.eager_kernels import aten_fast
-    from torch_mojo_backend.torch_compile_backend import utils
-
     aten_fast._has_metal_accelerator.cache_clear()
     monkeypatch.setattr(
         utils,
@@ -1185,8 +1181,6 @@ def test_same_gpu_transfer_skips_the_host(mojo_gpu):
     measured 375 ms bounced against 0.64 ms on device, so an order of
     magnitude is a wide margin around that.
     """
-    import time
-
     big = torch.randn(1 << 26, device="cuda")  # 256 MB
     big.to(mojo_gpu)
     torch_mojo_device_module.synchronize()
@@ -1215,8 +1209,6 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     `cuda:0` by ordinal would assume both runtimes enumerate alike.  Asking the
     driver who owns each allocation is a fact rather than an assumption.
     """
-    from torch_mojo_backend.mojo_device import cuda_peer
-
     on_mojo = torch.zeros(8, device=mojo_gpu)
     assert isinstance(on_mojo, TorchMojoTensor)
     torch_mojo_device_module.synchronize()
