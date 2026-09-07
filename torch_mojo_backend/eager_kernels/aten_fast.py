@@ -5928,7 +5928,7 @@ class _NormBackwardDeclined(Exception):
     """A composed step declined; the caller returns NOT_HANDLED."""
 
 
-def _norm_bwd(value: object) -> object:
+def _norm_bwd(value: TorchMojoTensor | _NotHandled | None) -> TorchMojoTensor:
     """One composed step's result, or decline the whole op.
 
     The compositions below are a dozen calls deep and every one of them can
@@ -5936,7 +5936,9 @@ def _norm_bwd(value: object) -> object:
     surface as an unrelated AttributeError inside some other op, so it is
     turned into a decline here, at the step that produced it.
     """
-    if value is NOT_HANDLED or value is None:
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if isinstance(value, _NotHandled) or value is None:
         raise _NormBackwardDeclined
     return value
 
@@ -5953,9 +5955,13 @@ def _norm_bwd_f32(t: TorchMojoTensor) -> TorchMojoTensor:
     return _cast_tensor(c, DType.float32)
 
 
-def _norm_bwd_narrow(t: object, dtype: DType) -> object:
+def _norm_bwd_narrow(
+    t: TorchMojoTensor | _NotHandled | None, dtype: DType
+) -> TorchMojoTensor | _NotHandled | None:
     """`t` cast back down to the dtype ATen gives that output, if needed."""
-    if t is None or t is NOT_HANDLED:
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if isinstance(t, _NotHandled) or t is None:
         return t
     if t._dtype == dtype:
         return t
@@ -5988,7 +5994,9 @@ def _group_norm_backward_dx(
     fused = fast_aten_native_layer_norm_backward(
         q2, x2, (K,), mean, rstd, None, None, [True, False, False]
     )
-    if fused is not NOT_HANDLED and fused[0] is not None:
+    # isinstance, not `is`: ty doesn't narrow identity checks against a
+    # custom singleton instance the way it does for `is None`.
+    if not isinstance(fused, _NotHandled) and fused[0] is not None:
         return _norm_bwd(fast_aten_view(fused[0], (N, group, K)))
 
     mean_g = _norm_bwd(fast_aten_view(mean, (N, group, 1)))
@@ -6202,15 +6210,16 @@ def fast_aten_native_batch_norm_backward(
         return NOT_HANDLED
     # Training reads the statistics the forward saved; inference recomputes
     # them from the running buffers, exactly as ATen does.
-    stats = (saved_mean, saved_invstd) if train else (run_mean, run_var)
+    unwrapped_stats = (saved_mean, saved_invstd) if train else (run_mean, run_var)
     if any(
         stat is None
         or stat._device != a._device
         or stat._dtype not in _FLOAT_DTYPES
         or stat._numel != channels
-        for stat in stats
+        for stat in unwrapped_stats
     ):
         return NOT_HANDLED
+    stats = cast(tuple[TorchMojoTensor, TorchMojoTensor], unwrapped_stats)
     if gamma is not None and (
         gamma._device != a._device
         or gamma._dtype not in _FLOAT_DTYPES
@@ -6278,6 +6287,11 @@ def fast_aten_native_batch_norm_backward(
             )
             scale_c = _norm_bwd(fast_aten_view(scale, (1, channels, 1)))
             if train:
+                # mask[0] and train => need_bias and need_weight, so these
+                # were assigned above.
+                assert sum_dy is not None
+                assert xhat is not None
+                assert sum_dyxhat is not None
                 mean_dy = _norm_bwd(
                     fast_aten_view(
                         _norm_bwd(fast_aten_div(sum_dy, float(reduced))),

@@ -12,6 +12,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.conftest import require_cuda_autograd
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
@@ -21,8 +22,6 @@ from torch_mojo_backend.testing import (
     check_functions_are_equivalent,
     check_outputs,
 )
-
-from .conftest import require_cuda_autograd
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -2318,6 +2317,8 @@ def test_group_norm_autograd(conf: Conf, call_checker: CallChecker, affine: bool
         (output * output).sum().backward()
         if not affine:
             return (leaf.grad,)
+        assert gamma is not None
+        assert beta is not None
         return leaf.grad, gamma.grad, beta.grad
 
     torch.manual_seed(2)

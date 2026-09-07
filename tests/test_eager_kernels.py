@@ -1038,7 +1038,14 @@ def test_fast_batch_norm_backward_matches_torch(mojo_gpu, training, affine):
             1e-5,
         )
         (output * output).sum().backward()
-        grads = [x.grad] + ([gamma.grad, beta.grad] if affine else [])
+        assert x.grad is not None
+        grads = [x.grad]
+        if affine:
+            assert gamma is not None
+            assert beta is not None
+            assert gamma.grad is not None
+            assert beta.grad is not None
+            grads += [gamma.grad, beta.grad]
         return [grad.cpu() for grad in grads]
 
     for got, want in zip(run(mojo_gpu), run("cpu"), strict=True):
@@ -1387,7 +1394,14 @@ def test_fast_group_norm_backward_matches_torch(mojo_gpu, shape, group, affine):
         beta = host_bias.to(device).detach().requires_grad_(True) if affine else None
         output = torch.nn.functional.group_norm(x, group, gamma, beta)
         (output * output).sum().backward()
-        grads = [x.grad] + ([gamma.grad, beta.grad] if affine else [])
+        assert x.grad is not None
+        grads = [x.grad]
+        if affine:
+            assert gamma is not None
+            assert beta is not None
+            assert gamma.grad is not None
+            assert beta.grad is not None
+            grads += [gamma.grad, beta.grad]
         return [grad.cpu() for grad in grads]
 
     for got, want in zip(run(mojo_gpu), run("cpu"), strict=True):
@@ -1403,8 +1417,6 @@ def test_fast_group_norm_backward_uses_the_layer_norm_kernel(mojo_gpu, monkeypat
     several more times, so a silent fallback is a performance regression this
     test would otherwise not see.
     """
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     calls = []
     original = aten_fast.fast_aten_native_layer_norm_backward
 
