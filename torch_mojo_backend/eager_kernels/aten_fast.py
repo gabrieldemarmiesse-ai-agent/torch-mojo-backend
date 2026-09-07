@@ -3654,7 +3654,7 @@ def _fast_sort_or_topk(
     swapped = rank > 1 and dim != rank - 1
     if swapped:
         a = fast_aten_transpose(a, dim, rank - 1)
-        if a is NOT_HANDLED:
+        if not isinstance(a, TorchMojoTensor):
             return NOT_HANDLED
 
     n = a._shape[-1] if rank else 1
@@ -3668,6 +3668,7 @@ def _fast_sort_or_topk(
 
     if values._numel and rows:
         a = _tc(a)
+        assert a is not None  # a was already TorchMojoTensor; _tc only materializes.
         on_gpu = a._device.label == "gpu"
         tile = _sort_tile_size(kernel_dtype)
         tiles = (n + tile - 1) // tile

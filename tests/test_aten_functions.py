@@ -3037,6 +3037,7 @@ def test_aten_topk_and_sort_backward(call_checker: CallChecker) -> None:
 
     loss(x).backward()
     loss(reference).backward()
+    assert x.grad is not None
     torch.testing.assert_close(x.grad.cpu(), reference.grad)
 
 
