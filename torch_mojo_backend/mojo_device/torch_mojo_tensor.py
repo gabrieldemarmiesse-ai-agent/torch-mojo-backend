@@ -24,7 +24,6 @@ from torch_mojo_backend.eager_kernels.output_specs import (
 from torch_mojo_backend.mojo_device import (
     deferred_compile,
     dlpack,
-    objc_autorelease,
     torch_mojo_device_module,
 )
 from torch_mojo_backend.mojo_device.deferred_compile import dispatch as _dispatch_entry
@@ -466,11 +465,6 @@ class TorchMojoTensor(torch.Tensor):
         # FunctionalTensor their opportunity to handle mixed-subclass calls.
         if not all(issubclass(cls, tensor_type) for tensor_type in types):
             return NotImplemented
-
-        # The MAX Metal runtime autoreleases ObjC objects per kernel launch;
-        # without a periodically drained pool they leak until macOS SIGKILLs
-        # the process (see objc_autorelease.py). No-op off macOS.
-        objc_autorelease.note_op_dispatched()
 
         # The deferred-compile layer executes ops while kernel variants are
         # still building in the background (and is a plain pass-through to
