@@ -13,6 +13,7 @@ from typing import Protocol, cast
 import pytest
 import torch
 from max.driver import CPU
+from torch.profiler import ProfilerActivity, profile
 from torch.testing._internal.common_methods_invocations import op_db
 
 from torch_mojo_backend import (
@@ -6988,7 +6989,6 @@ def test_tf32_nt_wgmma_shape_admits_mirrors_the_kernel_gate() -> None:
     m is free -- that is the whole point of the relaxation over the 16-bit
     routes' tile-multiple gate.
     """
-    from torch_mojo_backend.eager_kernels import aten_fast
 
     admits = aten_fast._tf32_nt_wgmma_shape_admits
     assert admits(357, 790, 336)  # ragged m, even n, k % 4 == 0
@@ -7017,7 +7017,6 @@ def test_tf32_nt_wgmma_admits_only_nt_layout_under_tf32_precision(
     Only NT is ported to a 4-byte operand, and "highest" means the user asked
     for real FP32 -- neither may reach the WGMMA kernels.
     """
-    from torch_mojo_backend.eager_kernels import aten_fast
 
     device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
 
@@ -7029,7 +7028,7 @@ def test_tf32_nt_wgmma_admits_only_nt_layout_under_tf32_precision(
     ) -> SimpleNamespace:
         return SimpleNamespace(
             _shape=tuple(shape),
-            _strides=tuple(strides),
+            _mojo_strides=tuple(strides),
             _dtype=aten_fast.DType.float32 if dtype is None else dtype,
             _device=device,
             _ptr=ptr,
@@ -7107,7 +7106,6 @@ def test_tf32_declined_shapes_stay_correct_on_the_sm80_route(
     both, and is exact on the same operands.
     """
     _require_real_bf16_gemm_sources()
-    from torch_mojo_backend.eager_kernels import aten_fast
 
     m, n, k = _TF32_DECLINED_SHAPES[shape_id]
     assert not aten_fast._tf32_nt_wgmma_shape_admits(m, n, k)
@@ -7135,7 +7133,6 @@ def test_tf32_wgmma_nt_writes_nothing_past_the_output(
     element.
     """
     _require_real_bf16_gemm_sources()
-    from torch_mojo_backend.eager_kernels import aten_fast
 
     m, n, k = 357, 790, 336
     guard_elements = 4096
@@ -7149,10 +7146,11 @@ def test_tf32_wgmma_nt_writes_nothing_past_the_output(
         buffer = torch.full(
             (m * n + guard_elements,), sentinel, device=mojo_h100, dtype=torch.float32
         )
+        assert isinstance(buffer, TorchMojoTensor)
         head = aten_fast._view_of(buffer, (m, n), (n, 1), 0, contiguous=True)
 
         def alloc_head(
-            shape: tuple[int, ...], dtype: object, device: object
+            shape: tuple[int, ...], dtype: aten_fast.DType, device: aten_fast.Device
         ) -> torch.Tensor:
             if tuple(shape) == (m, n) and dtype == head._dtype:
                 return head
@@ -7162,6 +7160,7 @@ def test_tf32_wgmma_nt_writes_nothing_past_the_output(
         a = host_a.to(mojo_h100)
         b = host_b.to(mojo_h100)
         actual = a @ b.t()
+        assert isinstance(actual, TorchMojoTensor)
         # Aliasing, not identity: what matters is that the kernel wrote into the
         # guarded buffer rather than into a fresh allocation of its own.
         assert actual._ptr == head._ptr
@@ -7181,7 +7180,6 @@ def test_tf32_wgmma_nt_runs_the_named_wgmma_kernels(mojo_h100: torch.device) -> 
     otherwise look exactly like success.
     """
     _require_real_bf16_gemm_sources()
-    from torch.profiler import ProfilerActivity, profile
 
     device_event_types = ("DeviceType.CUDA", "DeviceType.PrivateUse1")
 
@@ -7232,18 +7230,24 @@ def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
     not serve the mm anyway, the split only pays for an extra launch (the S5
     regression `_gemm16_alignment_favors_split` documents).
     """
-    from torch_mojo_backend.eager_kernels import aten_fast
 
     device = SimpleNamespace(label="gpu", api="cuda", architecture_name="sm_90a")
 
-    def tensor(shape: tuple[int, int], strides: tuple[int, int]) -> SimpleNamespace:
-        return SimpleNamespace(
-            _shape=tuple(shape),
-            _strides=tuple(strides),
-            _dtype=aten_fast.DType.float32,
-            _device=device,
-            _ptr=4096,
-            _is_contiguous=strides == (shape[1], 1),
+    def tensor(shape: tuple[int, int], strides: tuple[int, int]) -> torch.Tensor:
+        # Cast to satisfy the real `Tensor`-typed signatures of the
+        # `_try_tf32_linear` / `fast_aten_addmm` entry points under test, the
+        # same way `_opaque_tensor` does above: `_t` is monkeypatched to
+        # identity, so the fake metadata reaches the predicates untouched.
+        return cast(
+            torch.Tensor,
+            SimpleNamespace(
+                _shape=tuple(shape),
+                _mojo_strides=tuple(strides),
+                _dtype=aten_fast.DType.float32,
+                _device=device,
+                _ptr=4096,
+                _is_contiguous=strides == (shape[1], 1),
+            ),
         )
 
     gemm_calls = []
@@ -7268,7 +7272,7 @@ def test_tf32_linear_and_addmm_split_bias_off_the_wgmma_route(
     monkeypatch.setattr(aten_fast, "_try_gemm16_linear", lambda *a, **k: None)
 
     weight = tensor((790, 336), (336, 1))  # (n, k): linear's NT weight
-    bias = object()
+    bias = cast(torch.Tensor, object())
 
     with _tf32_precision("high"):
         # Admitted: k % 4 == 0 and n even -> split.

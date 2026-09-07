@@ -9082,9 +9082,7 @@ def _tf32_nt_wgmma_shape_admits(m: int, n: int, k: int) -> bool:
     return blocks_m * blocks_n <= 2**31 - 1
 
 
-def _tf32_nt_wgmma_admits(
-    a: torch.Tensor, b: torch.Tensor, *, transpose_b: bool = False
-) -> bool:
+def _tf32_nt_wgmma_admits(a: object, b: object, *, transpose_b: bool = False) -> bool:
     """Whether the float32 (TF32) WGMMA route serves this bias-free 2-D mm.
 
     True only for the NT layout, which is the one layout of the gemm16 family
@@ -9481,7 +9479,7 @@ def _try_tf32_linear(
         )
         if mm_out is not None:
             biased = fast_aten_add(mm_out, bias)
-            if biased is not NOT_HANDLED:
+            if not isinstance(biased, _NotHandled):
                 return biased
     return _try_tf32_gemm(
         matrix, weight, bias, transpose_b=True, output_shape=output_shape
