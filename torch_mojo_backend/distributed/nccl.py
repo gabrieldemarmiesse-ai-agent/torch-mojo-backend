@@ -146,7 +146,6 @@ def _declare(lib: ctypes.CDLL):
     ]
     lib.ncclCommDestroy.argtypes = [ctypes.c_void_p]
     lib.ncclCommAbort.argtypes = [ctypes.c_void_p]
-    lib.ncclCommGetAsyncError.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     lib.ncclCommUserRank.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     lib.ncclCommCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     for name, extra in [
@@ -287,16 +286,6 @@ class NcclComm:
             self._ccl._lib.ncclCommAbort(ctypes.c_void_p(self._handle))
             self._aborted = True
             self._handle = 0
-
-    def async_error(self) -> int:
-        err = ctypes.c_int(0)
-        self._ccl._check(
-            "ncclCommGetAsyncError",
-            self._ccl._lib.ncclCommGetAsyncError(
-                ctypes.c_void_p(self._handle), ctypes.byref(err)
-            ),
-        )
-        return err.value
 
     def all_reduce(
         self, send_ptr: int, recv_ptr: int, count: int, dtype: int, op: int, stream: int

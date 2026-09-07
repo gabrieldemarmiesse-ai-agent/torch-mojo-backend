@@ -195,7 +195,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         # this too; the C++-side store stays null and we keep it here instead.
         super().__init__(rank, world_size)  # ty: ignore[missing-argument, invalid-argument-type]
         self._store = store
-        self._timeout = timeout
         self._group_name = ""
         # Communicators keyed by mojo device index, created lazily at the
         # first device collective (a collective, blocking rendezvous — every

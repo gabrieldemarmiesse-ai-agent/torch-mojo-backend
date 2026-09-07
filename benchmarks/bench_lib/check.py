@@ -130,12 +130,9 @@ BENCH_NOTES_KEY: pytest.StashKey[list[str]] = pytest.StashKey()
 class Bench:
     """Measures one case, checks it against the baseline, stages updates."""
 
-    def __init__(
-        self, request: pytest.FixtureRequest, hw: Hardware, mojo: torch.device
-    ):
+    def __init__(self, request: pytest.FixtureRequest, hw: Hardware):
         self._request = request
         self._hw = hw
-        self._mojo = mojo
 
     def run(
         self, ref_fn: Callable[[], object], our_fn: Callable[[], object], flops: float

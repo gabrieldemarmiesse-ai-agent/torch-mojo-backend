@@ -103,10 +103,8 @@ def deterministic_operands():
 
 
 @pytest.fixture
-def bench(
-    request: pytest.FixtureRequest, hw: Hardware, mojo_device: torch.device
-) -> Bench:
-    return Bench(request, hw, mojo_device)
+def bench(request: pytest.FixtureRequest, hw: Hardware) -> Bench:
+    return Bench(request, hw)
 
 
 def pytest_terminal_summary(
