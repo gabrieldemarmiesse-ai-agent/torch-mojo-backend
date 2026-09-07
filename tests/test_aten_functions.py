@@ -3223,11 +3223,9 @@ def test_aten_median_and_kthvalue_compile_backend(call_checker: CallChecker) -> 
 def test_aten_multinomial_dispatches_to_fast_eager(
     mojo_device: str, call_checker: CallChecker
 ) -> None:
-    from torch_mojo_backend.eager_kernels import aten_fast
-
     register_mojo_devices()
     call_checker.register(aten_fast.fast_aten_multinomial)
-    torch.mojo.manual_seed_all(20260819)
+    torch.mojo.manual_seed_all(20260819)  # ty: ignore[unresolved-attribute]
 
     weights = torch.tensor([0.1, 0.2, 0.3, 0.4], device=mojo_device)
     out = torch.multinomial(weights, 5, replacement=True)
