@@ -9658,7 +9658,7 @@ def fast_aten_convolution(
         # convolution is declined here exactly like the rank-4 path below.
         a2d = fast_aten_unsqueeze(a, 2)
         w2d = fast_aten_unsqueeze(w, 2)
-        if a2d is NOT_HANDLED or w2d is NOT_HANDLED:
+        if isinstance(a2d, _NotHandled) or isinstance(w2d, _NotHandled):
             return NOT_HANDLED
         out_padding_1d = int(output_padding[0]) if output_padding else 0
         out2d = fast_aten_convolution(
@@ -9672,7 +9672,7 @@ def fast_aten_convolution(
             [0, out_padding_1d],
             groups,
         )
-        if out2d is NOT_HANDLED:
+        if isinstance(out2d, _NotHandled):
             return NOT_HANDLED
         return fast_aten_squeeze_dim(out2d, 2)
     bias_t = _tc(bias) if bias is not None else None
