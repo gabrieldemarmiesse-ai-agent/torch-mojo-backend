@@ -150,7 +150,7 @@ def _cuda_host_tool(name: str) -> Path | None:
     if found is not None:
         return Path(found)
     try:
-        import triton
+        import triton  # noqa: PLC0415 -- optional: the CPU-only torch install may lack it
     except ImportError:
         return None
     candidate = (
