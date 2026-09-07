@@ -10293,6 +10293,7 @@ def test_fast_sdpa_enable_gqa_grad_enabled_forward_matches_reference(
 def test_fast_sdpa_enable_gqa_multi_query_expansion_is_zero_copy(mojo_gpu):
     """A single K/V head becomes a stride-0 broadcast, never a copy."""
     key = torch.randn(2, 1, 8, 16).to(mojo_gpu)
+    assert isinstance(key, TorchMojoTensor)
     expanded = aten_fast._expand_kv_heads_for_gqa(key, 12)
     assert expanded is not None
     assert tuple(expanded.shape) == (2, 12, 8, 16)
@@ -10392,6 +10393,7 @@ def test_fast_sdpa_enable_gqa_strided_qkv_forward_matches_reference(mojo_gpu, dt
     )
     device_query, device_key, device_value = split(packed.to(mojo_gpu))
     for tensor in (device_query, device_key, device_value):
+        assert isinstance(tensor, TorchMojoTensor)
         assert not tensor._is_contiguous
     with torch.no_grad():
         actual = torch.nn.functional.scaled_dot_product_attention(
@@ -10432,7 +10434,7 @@ def test_fast_sdpa_enable_gqa_backward_matches_reference(
         for tensor in (query, key, value)
     ]
     mojo_output = torch.nn.functional.scaled_dot_product_attention(
-        *mojo_inputs, is_causal=is_causal, enable_gqa=True
+        *mojo_inputs, dropout_p=0.0, is_causal=is_causal, enable_gqa=True
     )
     assert "Flash" not in type(mojo_output.grad_fn).__name__
     mojo_output.backward(grad_output.to(mojo_gpu))
@@ -10512,7 +10514,7 @@ def test_fast_sdpa_enable_gqa_inference_expands_without_repeat_kv_copy(
     device_inputs = [tensor.to(mojo_gpu) for tensor in (query, key, value)]
     with torch.no_grad():
         gqa = torch.nn.functional.scaled_dot_product_attention(
-            *device_inputs, enable_gqa=True
+            *device_inputs, dropout_p=0.0, enable_gqa=True
         )
     assert calls["count"] == 0
     torch.testing.assert_close(gqa.cpu(), reference, atol=2e-3, rtol=2e-3)
@@ -10520,7 +10522,7 @@ def test_fast_sdpa_enable_gqa_inference_expands_without_repeat_kv_copy(
     for tensor in device_inputs:
         tensor.requires_grad_()
     torch.nn.functional.scaled_dot_product_attention(
-        *device_inputs, enable_gqa=True
+        *device_inputs, dropout_p=0.0, enable_gqa=True
     ).sum().backward()
     assert calls["count"] == 1
 
@@ -10635,7 +10637,7 @@ def test_fast_sdpa_enable_gqa_backward_never_uses_native_flash(mojo_h100):
         for tensor in (query, key, value)
     ]
     mojo_output = torch.nn.functional.scaled_dot_product_attention(
-        *mojo_inputs, is_causal=True, enable_gqa=True
+        *mojo_inputs, dropout_p=0.0, is_causal=True, enable_gqa=True
     )
     assert type(mojo_output.grad_fn).__name__ != (
         "ScaledDotProductFlashAttentionBackward0"
@@ -10663,10 +10665,10 @@ def test_fast_sdpa_equal_head_counts_ignore_enable_gqa(mojo_gpu):
     device_inputs = [tensor.to(mojo_gpu) for tensor in (query, key, value)]
     with torch.no_grad():
         plain = torch.nn.functional.scaled_dot_product_attention(
-            *device_inputs, is_causal=True
+            *device_inputs, dropout_p=0.0, is_causal=True
         )
         gqa = torch.nn.functional.scaled_dot_product_attention(
-            *device_inputs, is_causal=True, enable_gqa=True
+            *device_inputs, dropout_p=0.0, is_causal=True, enable_gqa=True
         )
     torch.testing.assert_close(gqa.cpu(), plain.cpu(), atol=0.0, rtol=0.0)
 

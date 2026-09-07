@@ -94,7 +94,11 @@ def test_sdpa(
 
 def _qkv_gqa(
     shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
-) -> tuple[list[torch.Tensor], list[torch.Tensor], float]:
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    float,
+]:
     b, h, kv, s, d = GQA_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     q_ref, q_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
@@ -104,7 +108,7 @@ def _qkv_gqa(
     # still attends over the full (broadcast) K/V, same as the equal-head
     # case above -- the KV ratio changes memory traffic, not FLOPs.
     flops = 4.0 * b * h * s * s * d / 2.0  # causal halves the score matrix
-    return [q_ref, k_ref, v_ref], [q_our, k_our, v_our], flops
+    return (q_ref, k_ref, v_ref), (q_our, k_our, v_our), flops
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f16"))

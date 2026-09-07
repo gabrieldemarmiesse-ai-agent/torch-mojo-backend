@@ -8288,7 +8288,7 @@ def _expand_kv_heads_for_gqa(
     if kv_heads == q_heads:
         return t
     batch, _, length, head_dim = t._shape
-    batch_stride, head_stride, length_stride, dim_stride = t._strides
+    batch_stride, head_stride, length_stride, dim_stride = t._mojo_strides
     expanded_shape = (batch, q_heads, length, head_dim)
     if kv_heads == 1:
         return _view_of(
@@ -8310,7 +8310,9 @@ def _expand_kv_heads_for_gqa(
     )
 
 
-def _sdpa_expanded_gqa_kv(query, key, value):
+def _sdpa_expanded_gqa_kv(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
     """``(key, value)`` with their head axis grown to the query's, or None."""
     q = _t(query)
     if q is None or len(q._shape) != 4:

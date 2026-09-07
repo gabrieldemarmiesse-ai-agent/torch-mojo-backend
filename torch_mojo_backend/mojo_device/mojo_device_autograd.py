@@ -10,7 +10,7 @@ values that hooks deliberately unpack onto the host.
 import math
 from collections.abc import Sequence
 from types import ModuleType
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import torch
 
@@ -710,9 +710,12 @@ def _scaled_dot_product_attention_autograd(
     # directly -- no ``repeat_kv`` copy at all on a multi-query decode step.
     # This runs BEFORE the drain: the expansion queues a copy of its own.
     if needs_backward and enable_gqa:
-        key, value = _require_handled(
-            _expand_gqa_key_value(query, key, value),
-            "aten::scaled_dot_product_attention with enable_gqa=True",
+        key, value = cast(
+            tuple[TorchMojoTensor, TorchMojoTensor],
+            _require_handled(
+                _expand_gqa_key_value(query, key, value),
+                "aten::scaled_dot_product_attention with enable_gqa=True",
+            ),
         )
         enable_gqa = False
     # The remaining paths read q/k/v payloads directly through aten_fast,
