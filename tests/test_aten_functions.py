@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -3907,7 +3908,7 @@ def test_aten_linear_backward_degenerate_features(
 def test_aten_upsample_nearest2d(
     conf: Conf,
     dtype: torch.dtype,
-    kwargs: dict,
+    kwargs: dict[str, Any],
     shape: tuple[int, ...],
     call_checker: CallChecker,
 ):
