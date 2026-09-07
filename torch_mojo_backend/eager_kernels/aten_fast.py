@@ -3769,7 +3769,7 @@ _MEDIAN_KTHVALUE_DTYPES = tuple(d for d in _SORT_DTYPES if d != DType.bool)
 
 def _kth_smallest_along_dim(
     op_label: str, input: TorchMojoTensor, k: int | None, dim: int, keepdim: bool
-) -> tuple[TorchMojoTensor, int, TorchMojoTensor, TorchMojoTensor] | object:
+) -> tuple[TorchMojoTensor, int, TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     """`(t, axis, value, index)` of the k-th smallest (1-indexed) along `dim`,
     in KEEPDIM=TRUE shape regardless of the caller's `keepdim` (callers that
     need more computation at this axis, like median's NaN correction, want
@@ -3812,63 +3812,68 @@ def _kth_smallest_along_dim(
         kk = k
 
     result = _fast_sort_or_topk(t, axis, False, kk)  # ascending: the kk smallest
-    if result is NOT_HANDLED:
+    if isinstance(result, _NotHandled):
         return NOT_HANDLED
+    assert isinstance(result, tuple)
     values_k, indices_k = result
     value = fast_aten_slice(values_k, axis, kk - 1, kk)
     index = fast_aten_slice(indices_k, axis, kk - 1, kk)
-    if value is NOT_HANDLED or index is NOT_HANDLED:
+    if isinstance(value, _NotHandled) or isinstance(index, _NotHandled):
         return NOT_HANDLED
+    assert isinstance(value, TorchMojoTensor) and isinstance(index, TorchMojoTensor)
     return t, axis, value, index
 
 
 def _squeeze_pair_if(
     keepdim: bool, axis: int, value: TorchMojoTensor, index: TorchMojoTensor
-) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     if keepdim:
         return value, index
-    value = fast_aten_select(value, axis, 0)
-    index = fast_aten_select(index, axis, 0)
-    if value is NOT_HANDLED or index is NOT_HANDLED:
+    squeezed_value = fast_aten_select(value, axis, 0)
+    squeezed_index = fast_aten_select(index, axis, 0)
+    if isinstance(squeezed_value, _NotHandled) or isinstance(
+        squeezed_index, _NotHandled
+    ):
         return NOT_HANDLED
-    return value, index
+    return squeezed_value, squeezed_index
 
 
 def fast_aten_kthvalue(
     input: TorchMojoTensor, k: int, dim: int = -1, keepdim: bool = False
-) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     result = _kth_smallest_along_dim("kthvalue", input, k, dim, keepdim)
-    if result is NOT_HANDLED:
+    if isinstance(result, _NotHandled):
         return NOT_HANDLED
     _, axis, value, index = result
+    assert isinstance(value, TorchMojoTensor) and isinstance(index, TorchMojoTensor)
     return _squeeze_pair_if(keepdim, axis, value, index)
 
 
 def fast_aten_median_dim(
     input: TorchMojoTensor, dim: int, keepdim: bool = False
-) -> tuple[TorchMojoTensor, TorchMojoTensor] | object:
+) -> tuple[TorchMojoTensor, TorchMojoTensor] | _NotHandled:
     result = _kth_smallest_along_dim("median", input, None, dim, keepdim)
-    if result is NOT_HANDLED:
+    if isinstance(result, _NotHandled):
         return NOT_HANDLED
     t, axis, value, index = result
 
     if t._dtype.is_float():
         nan_mask = fast_aten_isnan(t)
-        if nan_mask is NOT_HANDLED:
+        if isinstance(nan_mask, _NotHandled):
             return NOT_HANDLED
         key = fast_aten_neg(_cast_tensor(nan_mask, DType.int32))
-        if key is NOT_HANDLED:
+        if isinstance(key, _NotHandled):
             return NOT_HANDLED
         nan_stat = fast_aten_min_dim(key, axis, True)
-        if nan_stat is NOT_HANDLED:
+        if isinstance(nan_stat, _NotHandled):
             return NOT_HANDLED
         min_key, first_nan_index = nan_stat
         has_nan = fast_aten_lt(min_key, 0)
-        if has_nan is NOT_HANDLED:
+        if isinstance(has_nan, _NotHandled):
             return NOT_HANDLED
         value = fast_aten_where(has_nan, float("nan"), value)
         index = fast_aten_where(has_nan, first_nan_index, index)
-        if value is NOT_HANDLED or index is NOT_HANDLED:
+        if isinstance(value, _NotHandled) or isinstance(index, _NotHandled):
             return NOT_HANDLED
 
     return _squeeze_pair_if(keepdim, axis, value, index)
@@ -5930,7 +5935,7 @@ def _multinomial_validate_and_prepare(
     num_samples: int,
     replacement: bool,
     generator: torch.Generator | None,
-) -> tuple[TorchMojoTensor, int, int] | object:
+) -> tuple[TorchMojoTensor, int, int] | _NotHandled:
     """ATen's own checks, in ATen's order, plus a contiguous weights tensor.
 
     Every RuntimeError message below is copied from ATen's own
@@ -5966,6 +5971,7 @@ def _multinomial_validate_and_prepare(
         )
 
     weights = _tc(self)
+    assert weights is not None  # `self` is already a TorchMojoTensor
     if weights._dtype == DType.float64:
         # Neither the validation reductions below (`AminSpec`/`MaxSpec`/
         # `SumSpec` all decline float64) nor `aten::cumsum` (no float64
@@ -5979,27 +5985,32 @@ def _multinomial_validate_and_prepare(
         )
 
     nan_mask = fast_aten_isnan(weights)
-    if nan_mask is NOT_HANDLED:
+    if isinstance(nan_mask, _NotHandled):
         return NOT_HANDLED
     any_nan = fast_aten_any(nan_mask)
-    if any_nan is NOT_HANDLED:
+    if isinstance(any_nan, _NotHandled):
         return NOT_HANDLED
     has_nan = fast_aten__local_scalar_dense(any_nan)
     min_t = fast_aten_min(weights)
     max_t = fast_aten_max(weights)
-    if has_nan is NOT_HANDLED or min_t is NOT_HANDLED or max_t is NOT_HANDLED:
+    if (
+        isinstance(has_nan, _NotHandled)
+        or isinstance(min_t, _NotHandled)
+        or isinstance(max_t, _NotHandled)
+    ):
         return NOT_HANDLED
     min_v = fast_aten__local_scalar_dense(min_t)
     max_v = fast_aten__local_scalar_dense(max_t)
-    if min_v is NOT_HANDLED or max_v is NOT_HANDLED:
+    if isinstance(min_v, _NotHandled) or isinstance(max_v, _NotHandled):
         return NOT_HANDLED
+    assert isinstance(min_v, (int, float)) and isinstance(max_v, (int, float))
     if bool(has_nan) or not (float(min_v) >= 0.0) or float(max_v) == float("inf"):
         raise RuntimeError(
             "probability tensor contains either `inf`, `nan` or element < 0"
         )
 
     row_sums = fast_aten_sum(weights, -1, False)
-    if row_sums is NOT_HANDLED:
+    if isinstance(row_sums, _NotHandled):
         return NOT_HANDLED
     if rank == 1:
         # Already the single 0-d total; `fast_aten_min` declines a 0-d input
@@ -6007,11 +6018,12 @@ def _multinomial_validate_and_prepare(
         min_row_sum = fast_aten__local_scalar_dense(row_sums)
     else:
         min_row_sum_t = fast_aten_min(row_sums)
-        if min_row_sum_t is NOT_HANDLED:
+        if isinstance(min_row_sum_t, _NotHandled):
             return NOT_HANDLED
         min_row_sum = fast_aten__local_scalar_dense(min_row_sum_t)
-    if min_row_sum is NOT_HANDLED:
+    if isinstance(min_row_sum, _NotHandled):
         return NOT_HANDLED
+    assert isinstance(min_row_sum, (int, float))
     if not (float(min_row_sum) > 0.0):
         raise RuntimeError(
             "invalid multinomial distribution (sum of probabilities <= 0)"
@@ -6022,62 +6034,69 @@ def _multinomial_validate_and_prepare(
 
 def _multinomial_with_replacement(
     weights: TorchMojoTensor, rank: int, size: int, num_samples: int
-) -> TorchMojoTensor | object:
+) -> TorchMojoTensor | _NotHandled:
     # `weights` is never float64 here: `_multinomial_validate_and_prepare`
     # already downcast it (aten::cumsum has no float64 kernel at all).
     cumulative = fast_aten_cumsum(weights, -1, dtype=torch.float32)
-    if cumulative is NOT_HANDLED:
+    if isinstance(cumulative, _NotHandled):
         return NOT_HANDLED
     total = fast_aten_select(cumulative, -1, size - 1)
-    if total is NOT_HANDLED:
+    if isinstance(total, _NotHandled):
         return NOT_HANDLED
     if rank == 2:
         total = fast_aten_unsqueeze(total, -1)
-        if total is NOT_HANDLED:
+        if isinstance(total, _NotHandled):
             return NOT_HANDLED
 
     draw_shape = weights._shape[:-1] + (num_samples,)
     draws = _alloc(draw_shape, DType.float32, weights._device)
     filled = fast_aten_uniform_(draws, 0.0, 1.0)
-    if filled is NOT_HANDLED:
+    if isinstance(filled, _NotHandled):
         return NOT_HANDLED
 
     scaled = fast_aten_mul(draws, total)
-    if scaled is NOT_HANDLED:
+    if isinstance(scaled, _NotHandled):
         return NOT_HANDLED
-    return _fast_searchsorted(
+    indices = _fast_searchsorted(
         cumulative, scaled, out_int32=False, right=True, side=None, sorter=None
     )
+    if isinstance(indices, _NotHandled):
+        return NOT_HANDLED
+    assert isinstance(indices, TorchMojoTensor)
+    return indices
 
 
 def _multinomial_without_replacement(
     weights: TorchMojoTensor, num_samples: int
-) -> TorchMojoTensor | object:
+) -> TorchMojoTensor | _NotHandled:
     log_p = fast_aten_log(weights)
-    if log_p is NOT_HANDLED:
+    if isinstance(log_p, _NotHandled):
         return NOT_HANDLED
 
     noise = _alloc(weights._shape, weights._dtype, weights._device)
     filled = fast_aten_uniform_(noise, 0.0, 1.0)
-    if filled is NOT_HANDLED:
+    if isinstance(filled, _NotHandled):
         return NOT_HANDLED
     log_noise = fast_aten_log(noise)
-    neg_log_noise = fast_aten_neg(log_noise) if log_noise is not NOT_HANDLED else None
-    if log_noise is NOT_HANDLED or neg_log_noise is NOT_HANDLED:
+    if isinstance(log_noise, _NotHandled):
+        return NOT_HANDLED
+    neg_log_noise = fast_aten_neg(log_noise)
+    if isinstance(neg_log_noise, _NotHandled):
         return NOT_HANDLED
     log_neg_log_noise = fast_aten_log(neg_log_noise)
-    if log_neg_log_noise is NOT_HANDLED:
+    if isinstance(log_neg_log_noise, _NotHandled):
         return NOT_HANDLED
     gumbel = fast_aten_neg(log_neg_log_noise)
-    if gumbel is NOT_HANDLED:
+    if isinstance(gumbel, _NotHandled):
         return NOT_HANDLED
 
     perturbed = fast_aten_add(log_p, gumbel)
-    if perturbed is NOT_HANDLED:
+    if isinstance(perturbed, _NotHandled):
         return NOT_HANDLED
     result = _fast_sort_or_topk(perturbed, -1, True, num_samples)
-    if result is NOT_HANDLED:
+    if isinstance(result, _NotHandled):
         return NOT_HANDLED
+    assert isinstance(result, tuple)
     _, indices = result
     return indices
 
@@ -6088,7 +6107,7 @@ def fast_aten_multinomial(
     replacement: bool = False,
     *,
     generator: torch.Generator | None = None,
-) -> TorchMojoTensor | object:
+) -> TorchMojoTensor | _NotHandled:
     """`num_samples` int64 category indices, drawn from row(s) of weights.
 
     Correct DISTRIBUTION, not ATen bit-parity: see the module comment above
@@ -6100,7 +6119,7 @@ def fast_aten_multinomial(
     prepared = _multinomial_validate_and_prepare(
         self, num_samples, replacement, generator
     )
-    if prepared is NOT_HANDLED:
+    if isinstance(prepared, _NotHandled):
         return NOT_HANDLED
     weights, rank, size = prepared
     if replacement:

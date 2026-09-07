@@ -2966,9 +2966,9 @@ def aten_median_dim(
         # (bool here), not from the other branch, so a bare `float("nan")`
         # scalar fails to embed -- fill a same-dtype-as-`value` constant
         # first instead.
-        nan_fill = F.full_like(value, float("nan"))
-        value = F.where(has_nan, nan_fill, value)
-        index = F.where(has_nan, first_nan_index, index)
+        nan_fill = aten_full_like(value, float("nan"))
+        value = _where(has_nan, nan_fill, value)
+        index = _where(has_nan, first_nan_index, index)
 
     if not keepdim:
         value = F.squeeze(value, axis=axis)
