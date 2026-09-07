@@ -77,9 +77,7 @@ def _sdpa_dropout_softmax_backward_go(
     var handled = False
     comptime for dt in FLOAT_DTYPES:
         if dtype == dt:
-            var mask: Optional[
-                UnsafePointer[Scalar[DType.bool], MutAnyOrigin]
-            ] = None
+            var mask: Optional[Pointer[Scalar[DType.bool], MutAnyOrigin]] = None
             if has_mask:
                 mask = _make_ptr[DType.bool](
                     mask_address
@@ -131,7 +129,7 @@ def _sdpa_dsb_f32_go(
     ).as_unsafe_any_origin()
     var mask_address = _raw_int(mask_ptr_obj)
     var has_mask = _raw_int(has_mask_obj) != 0
-    var mask: Optional[UnsafePointer[Scalar[DType.bool], MutAnyOrigin]] = None
+    var mask: Optional[Pointer[Scalar[DType.bool], MutAnyOrigin]] = None
     if has_mask:
         if mask_address == 0:
             raise Error(
@@ -176,16 +174,16 @@ def _sdpa_ta_gemm_go(
     var a = (
         _make_ptr[DType.float32](_raw_int(a_ptr_obj))
         .as_unsafe_any_origin()
-        .as_immutable()
+        .as_imm()
     )
     var b = (
         _make_ptr[DType.float32](_raw_int(b_ptr_obj))
         .as_unsafe_any_origin()
-        .as_immutable()
+        .as_imm()
     )
     var mask_address = _raw_int(mask_ptr_obj)
     var has_mask = _raw_tuple_int(params, 4) != 0
-    var mask: Optional[UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin]] = None
+    var mask: Optional[Pointer[Scalar[DType.bool], ImmutAnyOrigin]] = None
     if has_mask:
         if mask_address == 0:
             raise Error(
@@ -193,9 +191,7 @@ def _sdpa_ta_gemm_go(
                 " is true"
             )
         mask = (
-            _make_ptr[DType.bool](mask_address)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.bool](mask_address).as_unsafe_any_origin().as_imm()
         )
     elif mask_address != 0:
         raise Error(

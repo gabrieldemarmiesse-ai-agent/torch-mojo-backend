@@ -206,13 +206,13 @@ def _sched_fence() -> None:
 def _bwd_dq_baseline[
     dtype: DType
 ](
-    dq: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dq: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,
@@ -259,9 +259,13 @@ def _bwd_dq_baseline[
 
     var d = tid
     while d < head_dim:
-        q_s[d] = query[q_row + d].cast[DType.float32]()
-        do_s[d] = grad_output[g_row + d].cast[DType.float32]()
-        acc[d] = 0.0
+        q_s[unsafe_offset=d] = query[unsafe_offset=q_row + d].cast[
+            DType.float32
+        ]()
+        do_s[unsafe_offset=d] = grad_output[unsafe_offset=g_row + d].cast[
+            DType.float32
+        ]()
+        acc[unsafe_offset=d] = 0.0
         d += THREADS
     barrier()
 
@@ -269,10 +273,13 @@ def _bwd_dq_baseline[
     var partial = Float32(0.0)
     var dd = tid
     while dd < head_dim:
-        partial += do_s[dd] * out_fwd[o_row + dd].cast[DType.float32]()
+        partial += (
+            do_s[unsafe_offset=dd]
+            * out_fwd[unsafe_offset=o_row + dd].cast[DType.float32]()
+        )
         dd += THREADS
     var row_d = block.sum[block_size=THREADS](partial)
-    var row_lse = lse[bh * seq_q + qi]
+    var row_lse = lse[unsafe_offset=bh * seq_q + qi]
 
     var limit = seq_kv
     if causal != 0:
@@ -287,8 +294,14 @@ def _bwd_dq_baseline[
         var dp = Float32(0.0)
         var e = tid
         while e < head_dim:
-            sp += q_s[e] * key[krow + e].cast[DType.float32]()
-            dp += do_s[e] * value[vrow + e].cast[DType.float32]()
+            sp += (
+                q_s[unsafe_offset=e]
+                * key[unsafe_offset=krow + e].cast[DType.float32]()
+            )
+            dp += (
+                do_s[unsafe_offset=e]
+                * value[unsafe_offset=vrow + e].cast[DType.float32]()
+            )
             e += THREADS
         var s_dot = block.sum[block_size=THREADS](sp)
         var dp_dot = block.sum[block_size=THREADS](dp)
@@ -296,13 +309,15 @@ def _bwd_dq_baseline[
         var ds = p * (dp_dot - row_d)
         var e2 = tid
         while e2 < head_dim:
-            acc[e2] += ds * key[krow + e2].cast[DType.float32]() * scale
+            acc[unsafe_offset=e2] += (
+                ds * key[unsafe_offset=krow + e2].cast[DType.float32]() * scale
+            )
             e2 += THREADS
         barrier()
 
     var o = tid
     while o < head_dim:
-        dq[dq_row + o] = acc[o].cast[dtype]()
+        dq[unsafe_offset=dq_row + o] = acc[unsafe_offset=o].cast[dtype]()
         o += THREADS
 
 
@@ -310,14 +325,14 @@ def _bwd_dq_baseline[
 def _bwd_dkv_baseline[
     dtype: DType
 ](
-    dk: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dv: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dk: Pointer[Scalar[dtype], MutAnyOrigin],
+    dv: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,
@@ -374,10 +389,14 @@ def _bwd_dkv_baseline[
 
     var d = tid
     while d < head_dim:
-        k_s[d] = key[k_row + d].cast[DType.float32]()
-        v_s[d] = value[v_row + d].cast[DType.float32]()
-        acc_k[d] = 0.0
-        acc_v[d] = 0.0
+        k_s[unsafe_offset=d] = key[unsafe_offset=k_row + d].cast[
+            DType.float32
+        ]()
+        v_s[unsafe_offset=d] = value[unsafe_offset=v_row + d].cast[
+            DType.float32
+        ]()
+        acc_k[unsafe_offset=d] = 0.0
+        acc_v[unsafe_offset=d] = 0.0
         d += THREADS
     barrier()
 
@@ -395,27 +414,36 @@ def _bwd_dkv_baseline[
         var dsum = Float32(0.0)
         var e = tid
         while e < head_dim:
-            var dov = grad_output[g_row + e].cast[DType.float32]()
-            sp += k_s[e] * query[q_row + e].cast[DType.float32]()
-            dp += dov * v_s[e]
-            dsum += dov * out_fwd[o_row + e].cast[DType.float32]()
+            var dov = grad_output[unsafe_offset=g_row + e].cast[DType.float32]()
+            sp += (
+                k_s[unsafe_offset=e]
+                * query[unsafe_offset=q_row + e].cast[DType.float32]()
+            )
+            dp += dov * v_s[unsafe_offset=e]
+            dsum += dov * out_fwd[unsafe_offset=o_row + e].cast[DType.float32]()
             e += THREADS
         var s_dot = block.sum[block_size=THREADS](sp)
         var dp_dot = block.sum[block_size=THREADS](dp)
         var row_d = block.sum[block_size=THREADS](dsum)
-        var p = exp(s_dot * scale - lse[bh * seq_q + qi])
+        var p = exp(s_dot * scale - lse[unsafe_offset=bh * seq_q + qi])
         var ds = p * (dp_dot - row_d)
         var e2 = tid
         while e2 < head_dim:
-            acc_v[e2] += p * grad_output[g_row + e2].cast[DType.float32]()
-            acc_k[e2] += ds * query[q_row + e2].cast[DType.float32]() * scale
+            acc_v[unsafe_offset=e2] += (
+                p * grad_output[unsafe_offset=g_row + e2].cast[DType.float32]()
+            )
+            acc_k[unsafe_offset=e2] += (
+                ds
+                * query[unsafe_offset=q_row + e2].cast[DType.float32]()
+                * scale
+            )
             e2 += THREADS
         barrier()
 
     var o = tid
     while o < head_dim:
-        dk[dk_row + o] = acc_k[o].cast[dtype]()
-        dv[dv_row + o] = acc_v[o].cast[dtype]()
+        dk[unsafe_offset=dk_row + o] = acc_k[unsafe_offset=o].cast[dtype]()
+        dv[unsafe_offset=dv_row + o] = acc_v[unsafe_offset=o].cast[dtype]()
         o += THREADS
 
 
@@ -424,7 +452,7 @@ def _bwd_dkv_baseline[
 # accumulator to scratch. 256 threads is four wave64, one per SIMD.
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
-    `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
+    `rocdl.waves_per_eu`=SIMDLength(WAVES_PER_EU),
 )
 @__name(t"fa_bwd_dq_mfma_{dtype}_h{HD}_n{BN}_q{QT}_x{EXACT}_d{DENSE}")
 def _bwd_dq_mfma[
@@ -438,13 +466,13 @@ def _bwd_dq_mfma[
     IGLP: Int,
     PEEL: Bool,
 ](
-    dq: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dq: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,
@@ -494,8 +522,8 @@ def _bwd_dq_mfma[
             LDS_ELEMS, dtype, address_space=AddressSpace.SHARED, alignment=16
         ]()
         var k_smem = smem
-        var v_smem = smem + BN * KPAD
-        var kt_smem = smem + 2 * BN * KPAD
+        var v_smem = smem.unsafe_offset(BN * KPAD)
+        var kt_smem = smem.unsafe_offset(2 * BN * KPAD)
 
         var tid = Int(thread_idx.x)
         var wave = tid // 64
@@ -590,11 +618,11 @@ def _bwd_dq_mfma[
                 comptime if not EXACT:
                     ok = ok and (8 * s + 4 * hi < head_dim)
                 if ok:
-                    qv = query.load[width=4](qrow + 8 * s)
-                    gv = grad_output.load[width=4](grow + 8 * s)
-                    ov = out_fwd.load[width=4](orow + 8 * s)
-                q_frag.store((qt * KSTEPS + s) * 4, qv)
-                do_frag.store((qt * KSTEPS + s) * 4, gv)
+                    qv = query.unsafe_load[width=4](qrow + 8 * s)
+                    gv = grad_output.unsafe_load[width=4](grow + 8 * s)
+                    ov = out_fwd.unsafe_load[width=4](orow + 8 * s)
+                q_frag.unsafe_store((qt * KSTEPS + s) * 4, qv)
+                do_frag.unsafe_store((qt * KSTEPS + s) * 4, gv)
                 dsum += (
                     gv.cast[DType.float32]() * ov.cast[DType.float32]()
                 ).reduce_add()
@@ -602,19 +630,19 @@ def _bwd_dq_mfma[
             dsum += shuffle_xor(dsum, 32)
             var nl = NEG_ROW
             if live:
-                nl = -lse[lse_base + qg] * LOG2E
+                nl = -lse[unsafe_offset=lse_base + qg] * LOG2E
             else:
                 dsum = 0.0
-            nlse[qt] = nl
-            dval[qt] = dsum
+            nlse[unsafe_offset=qt] = nl
+            dval[unsafe_offset=qt] = dsum
             var lm = seq_kv
             if causal != 0:
                 lm = min(seq_kv, qg + delta + 1)
-            qlim[qt] = Int32(lm)
+            qlim[unsafe_offset=qt] = Int32(lm)
 
         var dq_acc = stack_allocation[DT * QT * 16, DType.float32]()
         comptime for i in range(DT * QT):
-            dq_acc.store(i * 16, SIMD[DType.float32, 16](0))
+            dq_acc.unsafe_store(i * 16, SIMD[DType.float32, 16](0))
 
         var sl = scale * LOG2E
 
@@ -624,8 +652,8 @@ def _bwd_dq_mfma[
         var k_col = (tid % (HD // 8)) * 8
         var t_col = tid % HD
         var t_kvg0 = tid // HD
-        var k_ptr = key + (k_base + k_row0 * kss + k_col)
-        var v_ptr = value + (v_base + k_row0 * vss + k_col)
+        var k_ptr = key.unsafe_offset(k_base + k_row0 * kss + k_col)
+        var v_ptr = value.unsafe_offset(v_base + k_row0 * vss + k_col)
         var k_tile_step = BN * kss
         var v_tile_step = BN * vss
         var k_lds0 = k_row0 * KPAD + k_col
@@ -650,34 +678,44 @@ def _bwd_dq_mfma[
                     var kvals = SIMD[dtype, 8](0)
                     var vvals = SIMD[dtype, 8](0)
                     comptime if EXACT:
-                        kvals = k_ptr.load[width=8](ci * KROW_STEP * kss)
-                        vvals = v_ptr.load[width=8](ci * KROW_STEP * vss)
+                        kvals = k_ptr.unsafe_load[width=8](ci * KROW_STEP * kss)
+                        vvals = v_ptr.unsafe_load[width=8](ci * KROW_STEP * vss)
                     else:
                         if k_col < head_dim:
-                            kvals = k_ptr.load[width=8](ci * KROW_STEP * kss)
-                            vvals = v_ptr.load[width=8](ci * KROW_STEP * vss)
-                    kreg.store(ci * 8, kvals)
-                    vreg.store(ci * 8, vvals)
+                            kvals = k_ptr.unsafe_load[width=8](
+                                ci * KROW_STEP * kss
+                            )
+                            vvals = v_ptr.unsafe_load[width=8](
+                                ci * KROW_STEP * vss
+                            )
+                    kreg.unsafe_store(ci * 8, kvals)
+                    vreg.unsafe_store(ci * 8, vvals)
             else:
                 comptime for ci in range(KITERS):
                     var row = min(kv0 + k_row0 + ci * KROW_STEP, last_row)
                     var kvals = SIMD[dtype, 8](0)
                     var vvals = SIMD[dtype, 8](0)
                     if EXACT or k_col < head_dim:
-                        kvals = key.load[width=8](k_base + row * kss + k_col)
-                        vvals = value.load[width=8](v_base + row * vss + k_col)
-                    kreg.store(ci * 8, kvals)
-                    vreg.store(ci * 8, vvals)
+                        kvals = key.unsafe_load[width=8](
+                            k_base + row * kss + k_col
+                        )
+                        vvals = value.unsafe_load[width=8](
+                            v_base + row * vss + k_col
+                        )
+                    kreg.unsafe_store(ci * 8, kvals)
+                    vreg.unsafe_store(ci * 8, vvals)
             comptime for ci in range(KITERS):
-                k_smem.store(
-                    k_lds0 + ci * KROW_STEP * KPAD, kreg.load[width=8](ci * 8)
+                k_smem.unsafe_store(
+                    k_lds0 + ci * KROW_STEP * KPAD,
+                    kreg.unsafe_load[width=8](ci * 8),
                 )
-                v_smem.store(
-                    k_lds0 + ci * KROW_STEP * KPAD, vreg.load[width=8](ci * 8)
+                v_smem.unsafe_store(
+                    k_lds0 + ci * KROW_STEP * KPAD,
+                    vreg.unsafe_load[width=8](ci * 8),
                 )
 
-            k_ptr += k_tile_step
-            v_ptr += v_tile_step
+            k_ptr = k_ptr.unsafe_offset(k_tile_step)
+            v_ptr = v_ptr.unsafe_offset(v_tile_step)
             barrier()
 
             # ---- K^T comes out of the row-major K tile, not out of a second
@@ -688,8 +726,8 @@ def _bwd_dq_mfma[
                 var kv0l = (t_kvg0 + ti * TKV_STEP) * 4
                 var tv = SIMD[dtype, 4](0)
                 comptime for j in range(4):
-                    tv[j] = k_smem[(kv0l + j) * KPAD + t_col]
-                kt_smem.store(t_lds0 + ti * TKV_STEP * 4, tv)
+                    tv[j] = k_smem[unsafe_offset=(kv0l + j) * KPAD + t_col]
+                kt_smem.unsafe_store(t_lds0 + ti * TKV_STEP * 4, tv)
             barrier()
 
             llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
@@ -701,8 +739,8 @@ def _bwd_dq_mfma[
                     comptime for s in range(KSTEPS):
                         mma(
                             s_acc,
-                            k_smem.load[width=4](abase + 8 * s),
-                            q_frag.load[width=4]((qt * KSTEPS + s) * 4),
+                            k_smem.unsafe_load[width=4](abase + 8 * s),
+                            q_frag.unsafe_load[width=4]((qt * KSTEPS + s) * 4),
                             s_acc,
                         )
                     # ---- GEMM 2: dP^T[kv, q] = sum_d V[kv, d] * dO[q, d]
@@ -710,8 +748,8 @@ def _bwd_dq_mfma[
                     comptime for s in range(KSTEPS):
                         mma(
                             p_acc,
-                            v_smem.load[width=4](abase + 8 * s),
-                            do_frag.load[width=4]((qt * KSTEPS + s) * 4),
+                            v_smem.unsafe_load[width=4](abase + 8 * s),
+                            do_frag.unsafe_load[width=4]((qt * KSTEPS + s) * 4),
                             p_acc,
                         )
 
@@ -722,18 +760,21 @@ def _bwd_dq_mfma[
                             SIMD[DType.int32, 16](kv0 + kt * 32 + 4 * hi)
                             + ACC_ROWS
                         )
-                        s_acc = kvv.lt(SIMD[DType.int32, 16](qlim[qt])).select(
-                            s_acc, NEG_BIG
-                        )
+                        s_acc = kvv.lt(
+                            SIMD[DType.int32, 16](qlim[unsafe_offset=qt])
+                        ).select(s_acc, NEG_BIG)
                     var pv = exp2(
                         s_acc.fma(
                             SIMD[DType.float32, 16](sl),
-                            SIMD[DType.float32, 16](nlse[qt]),
+                            SIMD[DType.float32, 16](nlse[unsafe_offset=qt]),
                         )
                     )
                     var dsv = (
                         pv
-                        * (p_acc - SIMD[DType.float32, 16](dval[qt]))
+                        * (
+                            p_acc
+                            - SIMD[DType.float32, 16](dval[unsafe_offset=qt])
+                        )
                         * SIMD[DType.float32, 16](scale)
                     )
                     var ds_frag = _pack_half[dtype, 16](dsv)
@@ -742,10 +783,12 @@ def _bwd_dq_mfma[
                     comptime for g in range(4):
                         var b = ds_frag.slice[4, offset=g * 4]()
                         comptime for dt in range(DT):
-                            var acc = dq_acc.load[width=16]((dt * QT + qt) * 16)
+                            var acc = dq_acc.unsafe_load[width=16](
+                                (dt * QT + qt) * 16
+                            )
                             mma(
                                 acc,
-                                kt_smem.load[width=4](
+                                kt_smem.unsafe_load[width=4](
                                     (dt * 32 + lo) * TPAD
                                     + kt * 32
                                     + 8 * g
@@ -754,7 +797,7 @@ def _bwd_dq_mfma[
                                 b,
                                 acc,
                             )
-                            dq_acc.store((dt * QT + qt) * 16, acc)
+                            dq_acc.unsafe_store((dt * QT + qt) * 16, acc)
 
             barrier()
 
@@ -773,8 +816,9 @@ def _bwd_dq_mfma[
         _sched_fence()
         var packed = stack_allocation[DT * QT * 16, dtype]()
         comptime for i in range(DT * QT):
-            packed.store(
-                i * 16, _pack_half[dtype, 16](dq_acc.load[width=16](i * 16))
+            packed.unsafe_store(
+                i * 16,
+                _pack_half[dtype, 16](dq_acc.unsafe_load[width=16](i * 16)),
             )
         _sched_fence()
 
@@ -785,9 +829,9 @@ def _bwd_dq_mfma[
             barrier()
             comptime for qt in range(QT):
                 var row = wave * (32 * QT) + qt * 32 + lo
-                var ob = packed.load[width=16]((dt * QT + qt) * 16)
+                var ob = packed.unsafe_load[width=16]((dt * QT + qt) * 16)
                 comptime for g in range(4):
-                    smem.store(
+                    smem.unsafe_store(
                         row * OPAD + 8 * g + 4 * hi,
                         ob.slice[4, offset=g * 4](),
                     )
@@ -801,15 +845,15 @@ def _bwd_dq_mfma[
                 comptime if not EXACT:
                     store = store and dcol < head_dim
                 if store:
-                    dq.store(
+                    dq.unsafe_store(
                         dq_base + qg * dqss + dcol,
-                        smem.load[width=8](r * OPAD + cc),
+                        smem.unsafe_load[width=8](r * OPAD + cc),
                     )
 
 
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(THREADS)),
-    `rocdl.waves_per_eu`=SIMDSize(WAVES_PER_EU),
+    `rocdl.waves_per_eu`=SIMDLength(WAVES_PER_EU),
 )
 @__name(t"fa_bwd_dkv_mfma_{dtype}_h{HD}_m{BM}_k{KT}_x{EXACT}_d{DENSE}")
 def _bwd_dkv_mfma[
@@ -822,14 +866,14 @@ def _bwd_dkv_mfma[
     WAVES_PER_EU: Int,
     IGLP: Int,
 ](
-    dk: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dv: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dk: Pointer[Scalar[dtype], MutAnyOrigin],
+    dv: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,
@@ -881,9 +925,9 @@ def _bwd_dkv_mfma[
             LDS_ELEMS, dtype, address_space=AddressSpace.SHARED, alignment=16
         ]()
         var q_smem = smem
-        var do_smem = smem + BM * QPAD
-        var qt_smem = smem + 2 * BM * QPAD
-        var dot_smem = smem + 2 * BM * QPAD + HD * TPAD
+        var do_smem = smem.unsafe_offset(BM * QPAD)
+        var qt_smem = smem.unsafe_offset(2 * BM * QPAD)
+        var dot_smem = smem.unsafe_offset(2 * BM * QPAD + HD * TPAD)
         # `[-lse * log2(e), D]` per query row of the tile, read back as one
         # broadcast `ds_read_b64` per accumulator row.
         var aux = stack_allocation[
@@ -962,16 +1006,16 @@ def _bwd_dkv_mfma[
                 comptime if not EXACT:
                     ok = ok and (8 * s + 4 * hi < head_dim)
                 if ok:
-                    kv4 = key.load[width=4](krow + 8 * s)
-                    vv4 = value.load[width=4](vrow + 8 * s)
-                k_frag.store((kt * KSTEPS + s) * 4, kv4)
-                v_frag.store((kt * KSTEPS + s) * 4, vv4)
+                    kv4 = key.unsafe_load[width=4](krow + 8 * s)
+                    vv4 = value.unsafe_load[width=4](vrow + 8 * s)
+                k_frag.unsafe_store((kt * KSTEPS + s) * 4, kv4)
+                v_frag.unsafe_store((kt * KSTEPS + s) * 4, vv4)
 
         var dk_acc = stack_allocation[DT * KT * 16, DType.float32]()
         var dv_acc = stack_allocation[DT * KT * 16, DType.float32]()
         comptime for i in range(DT * KT):
-            dk_acc.store(i * 16, SIMD[DType.float32, 16](0))
-            dv_acc.store(i * 16, SIMD[DType.float32, 16](0))
+            dk_acc.unsafe_store(i * 16, SIMD[DType.float32, 16](0))
+            dv_acc.unsafe_store(i * 16, SIMD[DType.float32, 16](0))
 
         var sl = scale * LOG2E
 
@@ -1025,28 +1069,33 @@ def _bwd_dkv_mfma[
                 comptime if not EXACT:
                     ok = r_col < head_dim
                 if ok:
-                    qv = query.load[width=8](q_base + grow * qss + r_col)
-                    gv = grad_output.load[width=8](g_base + grow * gss + r_col)
-                    ov = out_fwd.load[width=8](o_base + grow * oss + r_col)
-                qreg.store(ci * 8, qv)
-                greg.store(ci * 8, gv)
-                oreg.store(ci * 8, ov)
+                    qv = query.unsafe_load[width=8](q_base + grow * qss + r_col)
+                    gv = grad_output.unsafe_load[width=8](
+                        g_base + grow * gss + r_col
+                    )
+                    ov = out_fwd.unsafe_load[width=8](
+                        o_base + grow * oss + r_col
+                    )
+                qreg.unsafe_store(ci * 8, qv)
+                greg.unsafe_store(ci * 8, gv)
+                oreg.unsafe_store(ci * 8, ov)
             if tid < BM:
                 var qg = q0 + tid
                 if qg < seq_q:
-                    lval = -lse[lse_base + qg] * LOG2E
+                    lval = -lse[unsafe_offset=lse_base + qg] * LOG2E
 
             # ---- Stage Q and dO row-major, and the per-row `[-lse*log2e, D]`.
             comptime for ci in range(QITERS):
                 var lrow = r_row0 + ci * RSTEP
-                var gv = greg.load[width=8](ci * 8)
-                q_smem.store(
-                    r_lds0 + ci * RSTEP * QPAD, qreg.load[width=8](ci * 8)
+                var gv = greg.unsafe_load[width=8](ci * 8)
+                q_smem.unsafe_store(
+                    r_lds0 + ci * RSTEP * QPAD,
+                    qreg.unsafe_load[width=8](ci * 8),
                 )
-                do_smem.store(r_lds0 + ci * RSTEP * QPAD, gv)
+                do_smem.unsafe_store(r_lds0 + ci * RSTEP * QPAD, gv)
                 var part = (
                     gv.cast[DType.float32]()
-                    * oreg.load[width=8](ci * 8).cast[DType.float32]()
+                    * oreg.unsafe_load[width=8](ci * 8).cast[DType.float32]()
                 ).reduce_add()
                 part += shuffle_xor(part, 1)
                 part += shuffle_xor(part, 2)
@@ -1056,9 +1105,9 @@ def _bwd_dkv_mfma[
                 comptime if LPR > 16:
                     part += shuffle_xor(part, 16)
                 if row_lane == 0:
-                    aux[2 * lrow + 1] = part
+                    aux[unsafe_offset=2 * lrow + 1] = part
             if tid < BM:
-                aux[2 * tid] = lval
+                aux[unsafe_offset=2 * tid] = lval
             barrier()
 
             # ---- Q^T and dO^T come out of the row-major tiles, not out of a
@@ -1071,10 +1120,10 @@ def _bwd_dkv_mfma[
                 var qv4 = SIMD[dtype, 4](0)
                 var gv4 = SIMD[dtype, 4](0)
                 comptime for j in range(4):
-                    qv4[j] = q_smem[(q0l + j) * QPAD + t_col]
-                    gv4[j] = do_smem[(q0l + j) * QPAD + t_col]
-                qt_smem.store(t_lds0 + ti * TQ_STEP * 4, qv4)
-                dot_smem.store(t_lds0 + ti * TQ_STEP * 4, gv4)
+                    qv4[j] = q_smem[unsafe_offset=(q0l + j) * QPAD + t_col]
+                    gv4[j] = do_smem[unsafe_offset=(q0l + j) * QPAD + t_col]
+                qt_smem.unsafe_store(t_lds0 + ti * TQ_STEP * 4, qv4)
+                dot_smem.unsafe_store(t_lds0 + ti * TQ_STEP * 4, gv4)
             barrier()
 
             llvm_intrinsic["llvm.amdgcn.iglp.opt", NoneType](Int32(IGLP))
@@ -1085,7 +1134,9 @@ def _bwd_dkv_mfma[
                 var dd_v = SIMD[DType.float32, 16](0)
                 comptime for p in range(16):
                     comptime dr = 8 * (p // 4) + (p % 4)
-                    var pair = aux.load[width=2](2 * (mt * 32 + dr + 4 * hi))
+                    var pair = aux.unsafe_load[width=2](
+                        2 * (mt * 32 + dr + 4 * hi)
+                    )
                     nl_v[p] = pair[0]
                     dd_v[p] = pair[1]
 
@@ -1095,8 +1146,8 @@ def _bwd_dkv_mfma[
                     comptime for s in range(KSTEPS):
                         mma(
                             s_acc,
-                            q_smem.load[width=4](abase + 8 * s),
-                            k_frag.load[width=4]((kt * KSTEPS + s) * 4),
+                            q_smem.unsafe_load[width=4](abase + 8 * s),
+                            k_frag.unsafe_load[width=4]((kt * KSTEPS + s) * 4),
                             s_acc,
                         )
                     # ---- GEMM 2: dP[q, kv] = sum_d dO[q, d] * V[kv, d]
@@ -1104,8 +1155,8 @@ def _bwd_dkv_mfma[
                     comptime for s in range(KSTEPS):
                         mma(
                             p_acc,
-                            do_smem.load[width=4](abase + 8 * s),
-                            v_frag.load[width=4]((kt * KSTEPS + s) * 4),
+                            do_smem.unsafe_load[width=4](abase + 8 * s),
+                            v_frag.unsafe_load[width=4]((kt * KSTEPS + s) * 4),
                             p_acc,
                         )
 
@@ -1137,12 +1188,16 @@ def _bwd_dkv_mfma[
                             var toff = (
                                 (dt * 32 + lo) * TPAD + mt * 32 + 8 * g + 4 * hi
                             )
-                            var va = dv_acc.load[width=16]((dt * KT + kt) * 16)
-                            mma(va, dot_smem.load[width=4](toff), bp, va)
-                            dv_acc.store((dt * KT + kt) * 16, va)
-                            var ka = dk_acc.load[width=16]((dt * KT + kt) * 16)
-                            mma(ka, qt_smem.load[width=4](toff), bd, ka)
-                            dk_acc.store((dt * KT + kt) * 16, ka)
+                            var va = dv_acc.unsafe_load[width=16](
+                                (dt * KT + kt) * 16
+                            )
+                            mma(va, dot_smem.unsafe_load[width=4](toff), bp, va)
+                            dv_acc.unsafe_store((dt * KT + kt) * 16, va)
+                            var ka = dk_acc.unsafe_load[width=16](
+                                (dt * KT + kt) * 16
+                            )
+                            mma(ka, qt_smem.unsafe_load[width=4](toff), bd, ka)
+                            dk_acc.unsafe_store((dt * KT + kt) * 16, ka)
 
             barrier()
 
@@ -1162,11 +1217,13 @@ def _bwd_dkv_mfma[
         var pk_v = stack_allocation[DT * KT * 16, dtype]()
         var pk_k = stack_allocation[DT * KT * 16, dtype]()
         comptime for i in range(DT * KT):
-            pk_v.store(
-                i * 16, _pack_half[dtype, 16](dv_acc.load[width=16](i * 16))
+            pk_v.unsafe_store(
+                i * 16,
+                _pack_half[dtype, 16](dv_acc.unsafe_load[width=16](i * 16)),
             )
-            pk_k.store(
-                i * 16, _pack_half[dtype, 16](dk_acc.load[width=16](i * 16))
+            pk_k.unsafe_store(
+                i * 16,
+                _pack_half[dtype, 16](dk_acc.unsafe_load[width=16](i * 16)),
             )
         _sched_fence()
 
@@ -1175,11 +1232,11 @@ def _bwd_dkv_mfma[
                 barrier()
                 comptime for kt in range(KT):
                     var row = wave * (32 * KT) + kt * 32 + lo
-                    var ob = pk_v.load[width=16]((dt * KT + kt) * 16)
+                    var ob = pk_v.unsafe_load[width=16]((dt * KT + kt) * 16)
                     comptime if pass_id == 1:
-                        ob = pk_k.load[width=16]((dt * KT + kt) * 16)
+                        ob = pk_k.unsafe_load[width=16]((dt * KT + kt) * 16)
                     comptime for g in range(4):
-                        smem.store(
+                        smem.unsafe_store(
                             row * OPAD + 8 * g + 4 * hi,
                             ob.slice[4, offset=g * 4](),
                         )
@@ -1193,11 +1250,11 @@ def _bwd_dkv_mfma[
                     comptime if not EXACT:
                         store = store and dcol < head_dim
                     if store:
-                        var vals = smem.load[width=8](r * OPAD + cc)
+                        var vals = smem.unsafe_load[width=8](r * OPAD + cc)
                         comptime if pass_id == 0:
-                            dv.store(dv_base + kvg * dvss + dcol, vals)
+                            dv.unsafe_store(dv_base + kvg * dvss + dcol, vals)
                         else:
-                            dk.store(dk_base + kvg * dkss + dcol, vals)
+                            dk.unsafe_store(dk_base + kvg * dkss + dcol, vals)
 
 
 def _enqueue_mfma_pair[
@@ -1213,15 +1270,15 @@ def _enqueue_mfma_pair[
     IGLP: Int = 1,
     PEEL: Bool = True,
 ](
-    dq: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dk: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dv: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    softmax_lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dq: Pointer[Scalar[dtype], MutAnyOrigin],
+    dk: Pointer[Scalar[dtype], MutAnyOrigin],
+    dv: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    softmax_lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,
@@ -1354,15 +1411,15 @@ def _enqueue_mfma_pair[
 def enqueue_flash_attention_bwd[
     dtype: DType
 ](
-    dq: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dk: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dv: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    query: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    key: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    value: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_fwd: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    softmax_lse: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    dq: Pointer[Scalar[dtype], MutAnyOrigin],
+    dk: Pointer[Scalar[dtype], MutAnyOrigin],
+    dv: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_output: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    query: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    key: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    value: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_fwd: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    softmax_lse: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     g_st: RowStrides,
     q_st: RowStrides,
     k_st: RowStrides,

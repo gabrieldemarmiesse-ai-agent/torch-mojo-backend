@@ -79,9 +79,9 @@ def _tanh_grad[
 
 @__name("gelu_backward_exact")
 def _gelu_backward_exact(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -92,21 +92,25 @@ def _gelu_backward_exact(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
-        var x = input.load[width=_VEC, alignment=16](base)
-        var g = grad_output.load[width=_VEC, alignment=16](base)
-        output.store[width=_VEC, alignment=16](base, _exact_grad[_VEC](x, g))
+        var x = input.unsafe_load[width=_VEC, alignment=16](base)
+        var g = grad_output.unsafe_load[width=_VEC, alignment=16](base)
+        output.unsafe_store[width=_VEC, alignment=16](
+            base, _exact_grad[_VEC](x, g)
+        )
     var i = vec_count * _VEC + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while i < elements:
-        output[i] = _exact_grad[1](input[i], grad_output[i])
+        output[unsafe_offset=i] = _exact_grad[1](
+            input[unsafe_offset=i], grad_output[unsafe_offset=i]
+        )
         i += stride
 
 
 @__name("gelu_backward_tanh")
 def _gelu_backward_tanh(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -117,13 +121,17 @@ def _gelu_backward_tanh(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
-        var x = input.load[width=_VEC, alignment=16](base)
-        var g = grad_output.load[width=_VEC, alignment=16](base)
-        output.store[width=_VEC, alignment=16](base, _tanh_grad[_VEC](x, g))
+        var x = input.unsafe_load[width=_VEC, alignment=16](base)
+        var g = grad_output.unsafe_load[width=_VEC, alignment=16](base)
+        output.unsafe_store[width=_VEC, alignment=16](
+            base, _tanh_grad[_VEC](x, g)
+        )
     var i = vec_count * _VEC + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while i < elements:
-        output[i] = _tanh_grad[1](input[i], grad_output[i])
+        output[unsafe_offset=i] = _tanh_grad[1](
+            input[unsafe_offset=i], grad_output[unsafe_offset=i]
+        )
         i += stride
 
 
@@ -142,9 +150,9 @@ def _grad_val[
 def _gelu_backward_f32_g4[
     tanh_mode: Bool
 ](
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -162,45 +170,47 @@ def _gelu_backward_f32_g4[
     var g = gid
     while g < groups:
         var b = g * 4
-        var x0 = input.load[width=_VEC, alignment=16](b * 4)
-        var x1 = input.load[width=_VEC, alignment=16]((b + 1) * 4)
-        var x2 = input.load[width=_VEC, alignment=16]((b + 2) * 4)
-        var x3 = input.load[width=_VEC, alignment=16]((b + 3) * 4)
-        var g0 = grad_output.load[width=_VEC, alignment=16](b * 4)
-        var g1 = grad_output.load[width=_VEC, alignment=16]((b + 1) * 4)
-        var g2 = grad_output.load[width=_VEC, alignment=16]((b + 2) * 4)
-        var g3 = grad_output.load[width=_VEC, alignment=16]((b + 3) * 4)
-        output.store[width=_VEC, alignment=16](
+        var x0 = input.unsafe_load[width=_VEC, alignment=16](b * 4)
+        var x1 = input.unsafe_load[width=_VEC, alignment=16]((b + 1) * 4)
+        var x2 = input.unsafe_load[width=_VEC, alignment=16]((b + 2) * 4)
+        var x3 = input.unsafe_load[width=_VEC, alignment=16]((b + 3) * 4)
+        var g0 = grad_output.unsafe_load[width=_VEC, alignment=16](b * 4)
+        var g1 = grad_output.unsafe_load[width=_VEC, alignment=16]((b + 1) * 4)
+        var g2 = grad_output.unsafe_load[width=_VEC, alignment=16]((b + 2) * 4)
+        var g3 = grad_output.unsafe_load[width=_VEC, alignment=16]((b + 3) * 4)
+        output.unsafe_store[width=_VEC, alignment=16](
             b * 4, _grad_val[_VEC, tanh_mode](x0, g0)
         )
-        output.store[width=_VEC, alignment=16](
+        output.unsafe_store[width=_VEC, alignment=16](
             (b + 1) * 4, _grad_val[_VEC, tanh_mode](x1, g1)
         )
-        output.store[width=_VEC, alignment=16](
+        output.unsafe_store[width=_VEC, alignment=16](
             (b + 2) * 4, _grad_val[_VEC, tanh_mode](x2, g2)
         )
-        output.store[width=_VEC, alignment=16](
+        output.unsafe_store[width=_VEC, alignment=16](
             (b + 3) * 4, _grad_val[_VEC, tanh_mode](x3, g3)
         )
         g += gstride
     var c = groups * 4 + gid
     if c < vec_count:
-        var x = input.load[width=_VEC, alignment=16](c * 4)
-        var gg = grad_output.load[width=_VEC, alignment=16](c * 4)
-        output.store[width=_VEC, alignment=16](
+        var x = input.unsafe_load[width=_VEC, alignment=16](c * 4)
+        var gg = grad_output.unsafe_load[width=_VEC, alignment=16](c * 4)
+        output.unsafe_store[width=_VEC, alignment=16](
             c * 4, _grad_val[_VEC, tanh_mode](x, gg)
         )
     var i = vec_count * _VEC + gid
     while i < elements:
-        output[i] = _grad_val[1, tanh_mode](input[i], grad_output[i])
+        output[unsafe_offset=i] = _grad_val[1, tanh_mode](
+            input[unsafe_offset=i], grad_output[unsafe_offset=i]
+        )
         i += gstride
 
 
 @__name("gelu_backward_exact_bf16")
 def _gelu_backward_exact_bf16(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -211,30 +221,30 @@ def _gelu_backward_exact_bf16(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC_BF16
-        var x = input.load[width=_VEC_BF16, alignment=16](base).cast[
+        var x = input.unsafe_load[width=_VEC_BF16, alignment=16](base).cast[
             DType.float32
         ]()
-        var g = grad_output.load[width=_VEC_BF16, alignment=16](base).cast[
-            DType.float32
-        ]()
-        output.store[width=_VEC_BF16, alignment=16](
+        var g = grad_output.unsafe_load[width=_VEC_BF16, alignment=16](
+            base
+        ).cast[DType.float32]()
+        output.unsafe_store[width=_VEC_BF16, alignment=16](
             base, _exact_grad[_VEC_BF16](x, g).cast[DType.bfloat16]()
         )
     var i = vec_count * _VEC_BF16 + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while i < elements:
-        output[i] = _exact_grad[1](
-            input[i].cast[DType.float32](),
-            grad_output[i].cast[DType.float32](),
+        output[unsafe_offset=i] = _exact_grad[1](
+            input[unsafe_offset=i].cast[DType.float32](),
+            grad_output[unsafe_offset=i].cast[DType.float32](),
         ).cast[DType.bfloat16]()
         i += stride
 
 
 @__name("gelu_backward_tanh_bf16")
 def _gelu_backward_tanh_bf16(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -245,29 +255,29 @@ def _gelu_backward_tanh_bf16(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC_BF16
-        var x = input.load[width=_VEC_BF16, alignment=16](base).cast[
+        var x = input.unsafe_load[width=_VEC_BF16, alignment=16](base).cast[
             DType.float32
         ]()
-        var g = grad_output.load[width=_VEC_BF16, alignment=16](base).cast[
-            DType.float32
-        ]()
-        output.store[width=_VEC_BF16, alignment=16](
+        var g = grad_output.unsafe_load[width=_VEC_BF16, alignment=16](
+            base
+        ).cast[DType.float32]()
+        output.unsafe_store[width=_VEC_BF16, alignment=16](
             base, _tanh_grad[_VEC_BF16](x, g).cast[DType.bfloat16]()
         )
     var i = vec_count * _VEC_BF16 + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while i < elements:
-        output[i] = _tanh_grad[1](
-            input[i].cast[DType.float32](),
-            grad_output[i].cast[DType.float32](),
+        output[unsafe_offset=i] = _tanh_grad[1](
+            input[unsafe_offset=i].cast[DType.float32](),
+            grad_output[unsafe_offset=i].cast[DType.float32](),
         ).cast[DType.bfloat16]()
         i += stride
 
 
 def enqueue_gelu_backward_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements: Int,
     tanh_approx: Bool,
     ctx: DeviceContext,
@@ -350,9 +360,9 @@ def enqueue_gelu_backward_f32(
 
 
 def enqueue_gelu_backward_bf16(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements: Int,
     tanh_approx: Bool,
     ctx: DeviceContext,
@@ -438,15 +448,15 @@ def _gelu_backward_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _gelu_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
         )
     except e:
         return _spec_unsupported(e)
@@ -486,15 +496,15 @@ def _gelu_backward_bf16_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _gelu_backward_bf16_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
         )
     except e:
         return _spec_unsupported(e)

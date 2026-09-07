@@ -70,7 +70,7 @@ from gemm16_nn_v4_kernels import (
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
+comptime _V4_PTR = Pointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 
 comptime _V4_BM = 128
@@ -117,7 +117,7 @@ def _v4c_nt_smem_bytes[bn: Int, stages: Int]() -> Int:
 def _v4_store_accum_stmatrix[
     bn: Int
 ](
-    wg_half: UnsafePointer[
+    wg_half: Pointer[
         Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     accum: LayoutTensor[
@@ -154,30 +154,30 @@ def _v4_store_accum_stmatrix[
         var data = SIMD[DType.float32, 4](
             bitcast[DType.float32, 1](
                 SIMD[_V4_DT, 2](
-                    accum.ptr[8 * t].cast[_V4_DT](),
-                    accum.ptr[8 * t + 1].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 1].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
                 SIMD[_V4_DT, 2](
-                    accum.ptr[8 * t + 2].cast[_V4_DT](),
-                    accum.ptr[8 * t + 3].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 2].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 3].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
                 SIMD[_V4_DT, 2](
-                    accum.ptr[8 * t + 4].cast[_V4_DT](),
-                    accum.ptr[8 * t + 5].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 4].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 5].cast[_V4_DT](),
                 )
             ),
             bitcast[DType.float32, 1](
                 SIMD[_V4_DT, 2](
-                    accum.ptr[8 * t + 6].cast[_V4_DT](),
-                    accum.ptr[8 * t + 7].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 6].cast[_V4_DT](),
+                    accum.ptr[unsafe_offset=8 * t + 7].cast[_V4_DT](),
                 )
             ),
         )
-        st_matrix[simd_width=4](wg_half + off, data)
+        st_matrix[simd_width=4](wg_half.unsafe_offset(off), data)
 
 
 @always_inline
@@ -282,10 +282,12 @@ def _v4c_nt_persistent[
         ]()
         if thread_idx.x == 0:
             comptime for stage in range(stages):
-                full_barriers[stage].init()
+                full_barriers[unsafe_offset=stage].init()
                 # Each of the two consumer warp groups in BOTH cluster CTAs
                 # signals every slot release (arrive_cluster below).
-                empty_barriers[stage].init(Int32(_V4_CONSUMERS * _V4_CLUSTER))
+                empty_barriers[unsafe_offset=stage].init(
+                    Int32(_V4_CONSUMERS * _V4_CLUSTER)
+                )
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
             c_tma.prefetch_descriptor()
@@ -306,7 +308,7 @@ def _v4c_nt_persistent[
 
         if warp_group_idx > 0 and warp_group_thread_idx < _V4_CLUSTER:
             comptime for stage in range(stages):
-                empty_barriers[stage].arrive_cluster(
+                empty_barriers[unsafe_offset=stage].arrive_cluster(
                     UInt32(warp_group_thread_idx)
                 )
         barrier()
@@ -346,17 +348,21 @@ def _v4c_nt_persistent[
                     while kt < num_k_tiles:
                         var stage = gkt % stages
                         var phase = UInt32((gkt // stages) % 2)
-                        empty_barriers[stage].wait(phase)
-                        full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
+                        empty_barriers[unsafe_offset=stage].wait(phase)
+                        full_barriers[unsafe_offset=stage].expect_bytes(
+                            Int32(TMA_BYTES)
+                        )
                         var a_tile = LayoutTensor[
                             _V4_DT,
                             _V4_A_LAYOUT,
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
                             alignment=128,
-                        ](a_pipeline.ptr + stage * _V4_BM * _V4_BK)
+                        ](a_pipeline.ptr.unsafe_offset(stage * _V4_BM * _V4_BK))
                         var k0 = kt * _V4_BK
-                        a_tma.async_copy(a_tile, full_barriers[stage], (k0, m0))
+                        a_tma.async_copy(
+                            a_tile, full_barriers[unsafe_offset=stage], (k0, m0)
+                        )
                         if can_multicast:
                             # Load our half of B, multicast to both CTAs.
                             var b_half = LayoutTensor[
@@ -366,13 +372,13 @@ def _v4c_nt_persistent[
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
                             ](
-                                b_pipeline.ptr
-                                + stage * bn * _V4_BK
-                                + rank * B_HALF * _V4_BK
+                                b_pipeline.ptr.unsafe_offset(
+                                    stage * bn * _V4_BK + rank * B_HALF * _V4_BK
+                                )
                             )
                             b_tma.async_multicast_load(
                                 b_half,
-                                full_barriers[stage],
+                                full_barriers[unsafe_offset=stage],
                                 (k0, n0 + rank * B_HALF),
                                 UInt16(0b11),
                             )
@@ -386,13 +392,14 @@ def _v4c_nt_persistent[
                                     address_space=AddressSpace.SHARED,
                                     alignment=128,
                                 ](
-                                    b_pipeline.ptr
-                                    + stage * bn * _V4_BK
-                                    + half * B_HALF * _V4_BK
+                                    b_pipeline.ptr.unsafe_offset(
+                                        stage * bn * _V4_BK
+                                        + half * B_HALF * _V4_BK
+                                    )
                                 )
                                 b_tma.async_copy(
                                     b_half,
-                                    full_barriers[stage],
+                                    full_barriers[unsafe_offset=stage],
                                     (k0, n0 + half * B_HALF),
                                 )
                         kt += 1
@@ -419,7 +426,7 @@ def _v4c_nt_persistent[
             var tid = warp_group_thread_idx
             var warp = tid // 32
             var lane = tid % 32
-            var wg_half = c_staging.ptr + (
+            var wg_half = c_staging.ptr.unsafe_offset(
                 (warp_group_idx - 1) * _V4_WG_ROWS * bn
             )
 
@@ -438,21 +445,21 @@ def _v4c_nt_persistent[
                 while kt < num_k_tiles:
                     var stage = gkt % stages
                     var phase = UInt32((gkt // stages) % 2)
-                    full_barriers[stage].wait(phase)
+                    full_barriers[unsafe_offset=stage].wait(phase)
                     var a_tile = LayoutTensor[
                         _V4_DT,
                         _V4_A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_pipeline.ptr + stage * _V4_BM * _V4_BK)
+                    ](a_pipeline.ptr.unsafe_offset(stage * _V4_BM * _V4_BK))
                     var b_tile = LayoutTensor[
                         _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](b_pipeline.ptr + stage * bn * _V4_BK)
+                    ](b_pipeline.ptr.unsafe_offset(stage * bn * _V4_BK))
                     warpgroup_fence(accum)
                     wgmma.arrive()
                     if kt == 0:
@@ -478,14 +485,14 @@ def _v4c_nt_persistent[
                             prev_stage >= 0
                             and warp_group_thread_idx < _V4_CLUSTER
                         ):
-                            empty_barriers[prev_stage].arrive_cluster(
-                                UInt32(warp_group_thread_idx)
-                            )
+                            empty_barriers[
+                                unsafe_offset=prev_stage
+                            ].arrive_cluster(UInt32(warp_group_thread_idx))
                         prev_stage = stage
                     else:
                         wgmma.wait_group()
                         if warp_group_thread_idx < _V4_CLUSTER:
-                            empty_barriers[stage].arrive_cluster(
+                            empty_barriers[unsafe_offset=stage].arrive_cluster(
                                 UInt32(warp_group_thread_idx)
                             )
                     kt += 1
@@ -493,7 +500,7 @@ def _v4c_nt_persistent[
                 comptime if defer_release:
                     wgmma.wait_group[0]()
                     if prev_stage >= 0 and warp_group_thread_idx < _V4_CLUSTER:
-                        empty_barriers[prev_stage].arrive_cluster(
+                        empty_barriers[unsafe_offset=prev_stage].arrive_cluster(
                             UInt32(warp_group_thread_idx)
                         )
 
@@ -552,7 +559,7 @@ def _v4c_enqueue_nt_persistent[
     var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            a.address_space_cast[AddressSpace.GENERIC](),
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -563,7 +570,7 @@ def _v4c_enqueue_nt_persistent[
     var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            b.address_space_cast[AddressSpace.GENERIC](),
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -574,7 +581,7 @@ def _v4c_enqueue_nt_persistent[
     var c_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            output.address_space_cast[AddressSpace.GENERIC](),
+            output.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),

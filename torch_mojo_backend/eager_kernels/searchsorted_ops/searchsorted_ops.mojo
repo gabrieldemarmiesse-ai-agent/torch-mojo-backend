@@ -73,9 +73,9 @@ def _binary_search_position[
     has_sorter: Bool,
     right: Bool,
 ](
-    boundaries: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    values: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    sorter: UnsafePointer[Scalar[DType.int64], ImmutAnyOrigin],
+    boundaries: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    values: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    sorter: Pointer[Scalar[DType.int64], ImmutAnyOrigin],
     value_index: Int,
     boundary_size: Int,
     values_per_batch: Int,
@@ -84,16 +84,16 @@ def _binary_search_position[
     comptime if not boundaries_are_1d:
         boundary_base = (value_index // values_per_batch) * boundary_size
 
-    var value = SIMD[dtype, 1](values[value_index])
+    var value = SIMD[dtype, 1](values[unsafe_offset=value_index])
     var low = 0
     var high = boundary_size
     while low < high:
         var mid = low + ((high - low) >> 1)
         var boundary_index = mid
         comptime if has_sorter:
-            boundary_index = Int(sorter[boundary_base + mid])
+            boundary_index = Int(sorter[unsafe_offset=boundary_base + mid])
         var boundary = SIMD[dtype, 1](
-            boundaries[boundary_base + boundary_index]
+            boundaries[unsafe_offset=boundary_base + boundary_index]
         )
         var advance = _should_advance[dtype, right](boundary, value)
         # Conditional expressions lower to selects: the data-dependent update
@@ -116,10 +116,10 @@ def _binary_search_kernel[
     has_sorter: Bool,
     right: Bool,
 ](
-    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
-    boundaries: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    values: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    sorter: UnsafePointer[Scalar[DType.int64], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    boundaries: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    values: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    sorter: Pointer[Scalar[DType.int64], ImmutAnyOrigin],
     num_values_arg: Int64,
     boundary_size_arg: Int64,
     values_per_batch_arg: Int64,
@@ -130,7 +130,7 @@ def _binary_search_kernel[
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * Int(block_dim.x)
     while i < num_values:
-        out_ptr[i] = _binary_search_position[
+        out_ptr[unsafe_offset=i] = _binary_search_position[
             dtype, boundaries_are_1d, has_sorter, right
         ](
             boundaries,
@@ -164,15 +164,11 @@ def _searchsorted[
 ) raises:
     var out = _make_ptr[out_dtype](out_addr).as_unsafe_any_origin()
     var boundaries = (
-        _make_ptr[dtype](boundaries_addr).as_unsafe_any_origin().as_immutable()
+        _make_ptr[dtype](boundaries_addr).as_unsafe_any_origin().as_imm()
     )
-    var values = (
-        _make_ptr[dtype](values_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var values = _make_ptr[dtype](values_addr).as_unsafe_any_origin().as_imm()
     var sorter = (
-        _make_ptr[DType.int64](sorter_addr)
-        .as_unsafe_any_origin()
-        .as_immutable()
+        _make_ptr[DType.int64](sorter_addr).as_unsafe_any_origin().as_imm()
     )
 
     if ctx.api() == "cpu":
@@ -189,7 +185,7 @@ def _searchsorted[
         )
         def func[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            out[i] = _binary_search_position[
+            out[unsafe_offset=i] = _binary_search_position[
                 dtype, boundaries_are_1d, has_sorter, right
             ](
                 boundaries,

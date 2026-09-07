@@ -25,15 +25,15 @@ struct GeluBackwardNoneKernel(ElementwiseBinaryOp):
         comptime M_SQRT1_2 = 0.7071067811865476  # sqrt(1/2) = 1/sqrt(2)
         comptime PDF_CONSTANT = 0.39894228040143276  # M_2_SQRTPI * M_SQRT1_2 * 0.5
 
-        x = input
-        grad_out = grad_output
+        var x = input
+        var grad_out = grad_output
 
         # Compute CDF term: 0.5 * (1 + erf(x * M_SQRT1_2))
-        cdf = 0.5 * (1.0 + math.erf(x * M_SQRT1_2))
+        var cdf = 0.5 * (1.0 + math.erf(x * M_SQRT1_2))
 
         # Compute PDF term: PDF_CONSTANT * exp(-0.5 * x²)
-        x_squared = x * x
-        pdf = PDF_CONSTANT * math.exp(-0.5 * x_squared)
+        var x_squared = x * x
+        var pdf = PDF_CONSTANT * math.exp(-0.5 * x_squared)
 
         # Gradient: grad_out * (CDF + x * PDF)
         return grad_out * (cdf + x * pdf)
@@ -60,24 +60,24 @@ struct GeluBackwardTanhKernel(ElementwiseBinaryOp):
         comptime k_Beta = 0.7978845608028654  # sqrt(2) * sqrt(2/π) * 0.5
         comptime k_Kappa = 0.044715
 
-        x = input
-        grad_out = grad_output
+        var x = input
+        var grad_out = grad_output
 
         # Compute inner = kBeta * (x + kKappa * x³)
-        x_squared = x * x
-        x_cubed = x_squared * x
-        inner = k_Beta * (x + k_Kappa * x_cubed)
-        tanh_inner = math.tanh(inner)
+        var x_squared = x * x
+        var x_cubed = x_squared * x
+        var inner = k_Beta * (x + k_Kappa * x_cubed)
+        var tanh_inner = math.tanh(inner)
 
         # Left term derivatives
-        left = 0.5 * x
-        right = 1.0 + tanh_inner
-        left_derivative = 0.5 * right
+        var left = 0.5 * x
+        var right = 1.0 + tanh_inner
+        var left_derivative = 0.5 * right
 
         # Right term derivatives
-        tanh_derivative = 1.0 - tanh_inner * tanh_inner
-        inner_derivative = k_Beta * (1.0 + 3.0 * k_Kappa * x_squared)
-        right_derivative = left * tanh_derivative * inner_derivative
+        var tanh_derivative = 1.0 - tanh_inner * tanh_inner
+        var inner_derivative = k_Beta * (1.0 + 3.0 * k_Kappa * x_squared)
+        var right_derivative = left * tanh_derivative * inner_derivative
 
         # Total gradient
         return grad_out * (left_derivative + right_derivative)

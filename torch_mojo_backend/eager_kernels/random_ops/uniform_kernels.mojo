@@ -179,7 +179,7 @@ def _uniform_draw[
 def _uniform_kernel[
     dtype: DType, WIDE: Bool
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     from_out: Scalar[dtype],
     to_out: Scalar[dtype],
     from_math: Scalar[_uniform_math_dtype[dtype]()],
@@ -216,11 +216,11 @@ def _uniform_kernel[
         )
         var base = group * GROUP
         comptime if WIDE:
-            dst_ptr.store[alignment=ALIGN](base, values)
+            dst_ptr.unsafe_store[alignment=ALIGN](base, values)
         else:
             comptime for lane in range(GROUP):
                 if base + lane < size:
-                    dst_ptr[base + lane] = values[lane]
+                    dst_ptr[unsafe_offset=base + lane] = values[lane]
         group += gstride
 
 
@@ -286,7 +286,7 @@ def enqueue_uniform[
 
             comptime for lane in range(GROUP):
                 if base + lane < size:
-                    dst_ptr[base + lane] = values[lane]
+                    dst_ptr[unsafe_offset=base + lane] = values[lane]
 
         elementwise[cpu_group, simd_width=1](Coord(groups), ctx)
         return

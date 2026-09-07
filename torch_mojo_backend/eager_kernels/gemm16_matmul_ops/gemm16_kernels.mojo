@@ -66,8 +66,8 @@ comptime _THREADS = 256
 comptime _GROUP_M = 8
 comptime _DT = _GEMM16_DT
 comptime _F32 = DType.float32
-comptime _Ptr = UnsafePointer[Scalar[_DT], MutAnyOrigin]
-comptime _F32Ptr = UnsafePointer[Scalar[_F32], MutAnyOrigin]
+comptime _Ptr = Pointer[Scalar[_DT], MutAnyOrigin]
+comptime _F32Ptr = Pointer[Scalar[_F32], MutAnyOrigin]
 comptime _I32_MAX = 2_147_483_647
 comptime _I64_MAX = 9_223_372_036_854_775_807
 
@@ -90,8 +90,7 @@ def _g2r_kc[
     # 16B-store phase land 4 rows (320B = 64 mod 128B) apart: conflict-free.
     # Index math stays in Int32 (dims are < 2^31) so loop-carried values take
     # one register, not a 64-bit pair; flat offsets widen to Int at the use.
-    @parameter
-    for it in range(CH):
+    comptime for it in range(CH):
         var q = tid // 4
         var r = (q * 4) % 64 + q // 16 + Int32(it * 64)
         var kc = (tid % 4) * 8
@@ -99,36 +98,34 @@ def _g2r_kc[
         var gk = k0 + kc
         var v = SIMD[_DT, 8]()
 
-        @parameter
-        if FAST:
+        comptime if FAST:
             # FAST proves 16B base alignment and kdim % 8 == 0 for every
             # batch, so each 8-wide chunk is aligned and entirely in or out
             # of bounds.
             if gr < rows and gk < kdim:
-                v = src.load[width=8, alignment=16](
+                v = src.unsafe_load[width=8, alignment=16](
                     Int(gr) * Int(kdim) + Int(gk)
                 )
         else:
             if fast != 0:
                 # Per-batch proof of the same property.
                 if gr < rows and gk < kdim:
-                    v = src.load[width=8, alignment=16](
+                    v = src.unsafe_load[width=8, alignment=16](
                         Int(gr) * Int(kdim) + Int(gk)
                     )
             else:
                 if gr < rows and gk < kdim:
                     if gk + 8 <= kdim:
                         # Whole chunk in bounds; 2B element alignment only.
-                        v = src.load[width=8, alignment=2](
+                        v = src.unsafe_load[width=8, alignment=2](
                             Int(gr) * Int(kdim) + Int(gk)
                         )
                     else:
                         var flat = Int(gr) * Int(kdim) + Int(gk)
 
-                        @parameter
-                        for e in range(8):
+                        comptime for e in range(8):
                             if gk + Int32(e) < kdim:
-                                v[e] = src[flat + e]
+                                v[e] = src[unsafe_offset=flat + e]
         regs[it] = v
 
 
@@ -155,13 +152,11 @@ def _g2r_mc[
     # quad mapping packs four lanes into each pair of sectors.  Used by the
     # small-tile guarded builds together with the k-major staging stores in
     # store_tile, whose addressing must match this mapping exactly.
-    @parameter
-    for it in range(CH):
+    comptime for it in range(CH):
         var kr: Int32
         var rc: Int32
 
-        @parameter
-        if QUAD:
+        comptime if QUAD:
             kr = (tid // 4) % Int32(_BK)
             rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
         else:
@@ -172,35 +167,33 @@ def _g2r_mc[
         var gr = row0 + rc
         var v = SIMD[_DT, 8]()
 
-        @parameter
-        if FAST:
+        comptime if FAST:
             # FAST proves 16B base alignment and rows % 8 == 0 for every
             # batch.
             if gk < kdim and gr < rows:
-                v = src.load[width=8, alignment=16](
+                v = src.unsafe_load[width=8, alignment=16](
                     Int(gk) * Int(rows) + Int(gr)
                 )
         else:
             if fast != 0:
                 # Per-batch proof of the same property.
                 if gk < kdim and gr < rows:
-                    v = src.load[width=8, alignment=16](
+                    v = src.unsafe_load[width=8, alignment=16](
                         Int(gk) * Int(rows) + Int(gr)
                     )
             else:
                 if gk < kdim and gr < rows:
                     if gr + 8 <= rows:
                         # Whole chunk in bounds; 2B element alignment only.
-                        v = src.load[width=8, alignment=2](
+                        v = src.unsafe_load[width=8, alignment=2](
                             Int(gk) * Int(rows) + Int(gr)
                         )
                     else:
                         var flat = Int(gk) * Int(rows) + Int(gr)
 
-                        @parameter
-                        for e in range(8):
+                        comptime for e in range(8):
                             if gr + Int32(e) < rows:
-                                v[e] = src[flat + e]
+                                v[e] = src[unsafe_offset=flat + e]
         regs[it] = v
 
 
@@ -325,14 +318,12 @@ def _mma_tile_impl[
     @parameter
     @always_inline
     def load_tile(k0: Int32):
-        @parameter
-        if TA:
+        comptime if TA:
             _g2r_mc[ACH, FASTK, QKMAJ](ap, bm0, mi, k0, ki, tid, af, va)
         else:
             _g2r_kc[ACH, FASTK](ap, bm0, mi, k0, ki, tid, af, va)
 
-        @parameter
-        if TB:
+        comptime if TB:
             _g2r_kc[BCH, FASTK](bp, bn0, ni, k0, ki, tid, bf, vb)
         else:
             _g2r_mc[BCH, FASTK, QKMAJ](bp, bn0, ni, k0, ki, tid, bf, vb)
@@ -343,93 +334,79 @@ def _mma_tile_impl[
         var base_a = Int32(stage * STAGE_A)
         var base_b = Int32(stage * STAGE_B)
 
-        @parameter
-        if TA and FASTK:
-
-            @parameter
-            for it in range(ACH):
+        comptime if TA and FASTK:
+            comptime for it in range(ACH):
                 var item = tid + Int32(it * _THREADS)
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
-                smem_a.store[alignment=16](
+                smem_a.unsafe_store[alignment=16](
                     Int(base_a + kr * Int32(LDA_K) + rc), va[it]
                 )
         elif TA and QKMAJ:
             # Must mirror the QUAD mapping in _g2r_mc.  rc is a multiple of
             # 8 and the pitch is 144B, so every store keeps 16B alignment.
-            @parameter
-            for it in range(ACH):
+            comptime for it in range(ACH):
                 var kr = (tid // 4) % Int32(_BK)
                 var rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
-                smem_a.store[alignment=16](
+                smem_a.unsafe_store[alignment=16](
                     Int(base_a + kr * Int32(LDA_K) + rc), va[it]
                 )
         elif TA:
-
-            @parameter
-            for it in range(ACH):
+            comptime for it in range(ACH):
                 var item = tid + Int32(it * _THREADS)
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
 
-                @parameter
-                for e in range(8):
+                comptime for e in range(8):
                     smem_a[
-                        Int(base_a + (rc + Int32(e)) * Int32(_LDS) + kr)
+                        unsafe_offset=Int(
+                            base_a + (rc + Int32(e)) * Int32(_LDS) + kr
+                        )
                     ] = va[it][e]
         else:
-
-            @parameter
-            for it in range(ACH):
+            comptime for it in range(ACH):
                 var q = tid // 4
                 var r = (q * 4) % 64 + q // 16 + Int32(it * 64)
                 var kc = (tid % 4) * 8
-                smem_a.store[alignment=16](
+                smem_a.unsafe_store[alignment=16](
                     Int(base_a + r * Int32(_LDS) + kc), va[it]
                 )
 
-        @parameter
-        if TB:
-
-            @parameter
-            for it in range(BCH):
+        comptime if TB:
+            comptime for it in range(BCH):
                 var q = tid // 4
                 var r = (q * 4) % 64 + q // 16 + Int32(it * 64)
                 var kc = (tid % 4) * 8
-                smem_b.store[alignment=16](
+                smem_b.unsafe_store[alignment=16](
                     Int(base_b + r * Int32(_LDS) + kc), vb[it]
                 )
         elif FASTK:
-
-            @parameter
-            for it in range(BCH):
+            comptime for it in range(BCH):
                 var item = tid + Int32(it * _THREADS)
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
-                smem_b.store[alignment=16](
+                smem_b.unsafe_store[alignment=16](
                     Int(base_b + kr * Int32(LDB_K) + rc), vb[it]
                 )
         elif QKMAJ:
             # Must mirror the QUAD mapping in _g2r_mc (see the A branch).
-            @parameter
-            for it in range(BCH):
+            comptime for it in range(BCH):
                 var kr = (tid // 4) % Int32(_BK)
                 var rc = (tid % 4) * 8 + (tid // 128) * 32 + Int32(it * 64)
-                smem_b.store[alignment=16](
+                smem_b.unsafe_store[alignment=16](
                     Int(base_b + kr * Int32(LDB_K) + rc), vb[it]
                 )
         else:
-
-            @parameter
-            for it in range(BCH):
+            comptime for it in range(BCH):
                 var item = tid + Int32(it * _THREADS)
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
 
-                @parameter
-                for e in range(8):
+                comptime for e in range(8):
                     smem_b[
-                        Int(base_b + (rc + Int32(e)) * Int32(_LDS) + kr)
+                        unsafe_offset=Int(
+                            base_b + (rc + Int32(e)) * Int32(_LDS) + kr
+                        )
                     ] = vb[it][e]
 
     @parameter
@@ -438,68 +415,62 @@ def _mma_tile_impl[
         var base_a = Int32(stage * STAGE_A)
         var base_b = Int32(stage * STAGE_B)
 
-        @parameter
-        for ks in range(2):
+        comptime for ks in range(2):
             var kb = Int32(ks * 16) + 2 * tg
             var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
-            @parameter
-            for mt in range(2):
+            comptime for mt in range(2):
                 var row = wm + Int32(mt * 16) + g
 
-                @parameter
-                if TA and (FASTK or QKMAJ):
+                comptime if TA and (FASTK or QKMAJ):
                     var c0 = Int(base_a + kb * Int32(LDA_K) + row)
                     afr[mt] = SIMD[_DT, 8](
-                        smem_a[c0],
-                        smem_a[c0 + LDA_K],
-                        smem_a[c0 + 8],
-                        smem_a[c0 + LDA_K + 8],
-                        smem_a[c0 + 8 * LDA_K],
-                        smem_a[c0 + 9 * LDA_K],
-                        smem_a[c0 + 8 * LDA_K + 8],
-                        smem_a[c0 + 9 * LDA_K + 8],
+                        smem_a[unsafe_offset=c0],
+                        smem_a[unsafe_offset=c0 + LDA_K],
+                        smem_a[unsafe_offset=c0 + 8],
+                        smem_a[unsafe_offset=c0 + LDA_K + 8],
+                        smem_a[unsafe_offset=c0 + 8 * LDA_K],
+                        smem_a[unsafe_offset=c0 + 9 * LDA_K],
+                        smem_a[unsafe_offset=c0 + 8 * LDA_K + 8],
+                        smem_a[unsafe_offset=c0 + 9 * LDA_K + 8],
                     )
                 else:
-                    var a01 = smem_a.load[width=2, alignment=4](
+                    var a01 = smem_a.unsafe_load[width=2, alignment=4](
                         Int(base_a + row * Int32(_LDS) + kb)
                     )
-                    var a23 = smem_a.load[width=2, alignment=4](
+                    var a23 = smem_a.unsafe_load[width=2, alignment=4](
                         Int(base_a + (row + 8) * Int32(_LDS) + kb)
                     )
-                    var a45 = smem_a.load[width=2, alignment=4](
+                    var a45 = smem_a.unsafe_load[width=2, alignment=4](
                         Int(base_a + row * Int32(_LDS) + kb + 8)
                     )
-                    var a67 = smem_a.load[width=2, alignment=4](
+                    var a67 = smem_a.unsafe_load[width=2, alignment=4](
                         Int(base_a + (row + 8) * Int32(_LDS) + kb + 8)
                     )
                     afr[mt] = a01.join(a23).join(a45.join(a67))
 
-            @parameter
-            for nt in range(NT):
+            comptime for nt in range(NT):
                 var nr = wn + Int32(nt * 8) + g
-                var bfr = SIMD[_DT, 4]()
+                var bfr: SIMD[_DT, 4]
 
-                @parameter
-                if TB or not (FASTK or QKMAJ):
-                    var b01 = smem_b.load[width=2, alignment=4](
+                comptime if TB or not (FASTK or QKMAJ):
+                    var b01 = smem_b.unsafe_load[width=2, alignment=4](
                         Int(base_b + nr * Int32(_LDS) + kb)
                     )
-                    var b23 = smem_b.load[width=2, alignment=4](
+                    var b23 = smem_b.unsafe_load[width=2, alignment=4](
                         Int(base_b + nr * Int32(_LDS) + kb + 8)
                     )
                     bfr = b01.join(b23)
                 else:
                     var d0 = Int(base_b + kb * Int32(LDB_K) + nr)
                     bfr = SIMD[_DT, 4](
-                        smem_b[d0],
-                        smem_b[d0 + LDB_K],
-                        smem_b[d0 + 8 * LDB_K],
-                        smem_b[d0 + 9 * LDB_K],
+                        smem_b[unsafe_offset=d0],
+                        smem_b[unsafe_offset=d0 + LDB_K],
+                        smem_b[unsafe_offset=d0 + 8 * LDB_K],
+                        smem_b[unsafe_offset=d0 + 9 * LDB_K],
                     )
 
-                @parameter
-                for mt in range(2):
+                comptime for mt in range(2):
                     mma(acc[mt * NT + nt], afr[mt], bfr, acc[mt * NT + nt])
 
     var kt = (ki + Int32(_BK - 1)) // Int32(_BK)
@@ -508,16 +479,14 @@ def _mma_tile_impl[
     var t0: Int32 = 0
     var t_end: Int32 = kt
 
-    @parameter
-    if SPLITK:
+    comptime if SPLITK:
         t0 = Int32(Int(block_idx.y)) * Int32(chunk_tiles)
         t_end = min(kt, t0 + Int32(chunk_tiles))
 
     @parameter
     @always_inline
     def run_tiles():
-        @parameter
-        for i in range(2 * NT):
+        comptime for i in range(2 * NT):
             acc[i] = SIMD[_F32, 4]()
 
         load_tile(t0 * Int32(_BK))
@@ -537,8 +506,7 @@ def _mma_tile_impl[
             t += 1
         compute_tile(cur)
 
-        @parameter
-        if SPLITK:
+        comptime if SPLITK:
             # Tile-blocked FP32 partial store: each block owns a private
             # BM x BN image at (slice, logical row-major tile id), so every
             # pair store is 8B-aligned and fully coalesced no matter how
@@ -547,46 +515,39 @@ def _mma_tile_impl[
             # out-of-range lanes hold zeros (their staged loads zero-fill).
             var blocks_n_t = (ni + Int32(BN - 1)) // Int32(BN)
             var tile_id = (bm0 // Int32(BM)) * blocks_n_t + bn0 // Int32(BN)
-            var sp = (
-                ws
-                + Int(Int32(Int(block_idx.y))) * ws_pitch
+            var sp = ws.unsafe_offset(
+                Int(Int32(Int(block_idx.y))) * ws_pitch
                 + Int(tile_id) * (BM * BN)
             )
 
-            @parameter
-            for mt in range(2):
+            comptime for mt in range(2):
                 var r0 = wm + Int32(mt * 16) + g
 
-                @parameter
-                for nt in range(NT):
+                comptime for nt in range(NT):
                     var c = wn + Int32(nt * 8) + 2 * tg
                     var frag = acc[mt * NT + nt]
 
-                    @parameter
-                    for h in range(2):
+                    comptime for h in range(2):
                         var r = r0 + Int32(h * 8)
                         var pair = SIMD[_F32, 2](frag[2 * h], frag[2 * h + 1])
-                        sp.store[alignment=8](Int(r) * BN + Int(c), pair)
+                        sp.unsafe_store[alignment=8](Int(r) * BN + Int(c), pair)
             return
 
-        @parameter
-        for mt in range(2):
+        comptime for mt in range(2):
             var row0 = bm0 + wm + Int32(mt * 16) + g
 
-            @parameter
-            for nt in range(NT):
+            comptime for nt in range(NT):
                 var col = bn0 + wn + Int32(nt * 8) + 2 * tg
                 if col < ni:
                     var frag = acc[mt * NT + nt]
                     var add0 = Float32(0)
                     var add1 = Float32(0)
                     if has_bias != 0:
-                        add0 = bias[Int(col)].cast[_F32]()
+                        add0 = bias[unsafe_offset=Int(col)].cast[_F32]()
                         if col + 1 < ni:
-                            add1 = bias[Int(col) + 1].cast[_F32]()
+                            add1 = bias[unsafe_offset=Int(col) + 1].cast[_F32]()
 
-                    @parameter
-                    for h in range(2):
+                    comptime for h in range(2):
                         var row = row0 + Int32(h * 8)
                         if row < mi:
                             var base_idx = Int(row) * n + Int(col)
@@ -595,19 +556,18 @@ def _mma_tile_impl[
                                 var pair = SIMD[_DT, 2](
                                     v0, (frag[2 * h + 1] + add1).cast[_DT]()
                                 )
-                                cp.store[alignment=4](base_idx, pair)
+                                cp.unsafe_store[alignment=4](base_idx, pair)
                             else:
-                                cp[base_idx] = v0
+                                cp[unsafe_offset=base_idx] = v0
                                 if col + 1 < ni:
-                                    cp[base_idx + 1] = (
+                                    cp[unsafe_offset=base_idx + 1] = (
                                         frag[2 * h + 1] + add1
                                     ).cast[_DT]()
 
     @parameter
     @always_inline
     def set_flags():
-        @parameter
-        if FASTK:
+        comptime if FASTK:
             af = 1
             bf = 1
             cpair = 1
@@ -616,14 +576,13 @@ def _mma_tile_impl[
             bf = 1 if (b_fast != 0 and Int(bp) % 16 == 0) else 0
             cpair = 1 if (c_pair != 0 and Int(cp) % 4 == 0) else 0
 
-    @parameter
-    if BATCHED:
+    comptime if BATCHED:
         var bc = Int32(batch_count)
         var first_batch = True
         while bz < bc:
-            ap = a + Int(bz) * a_bstride
-            bp = b + Int(bz) * b_bstride
-            cp = output + Int(bz) * c_bstride
+            ap = a.unsafe_offset(Int(bz) * a_bstride)
+            bp = b.unsafe_offset(Int(bz) * b_bstride)
+            cp = output.unsafe_offset(Int(bz) * c_bstride)
             set_flags()
             if not first_batch:
                 # The previous batch's final compute_tile still reads shared
@@ -636,9 +595,9 @@ def _mma_tile_impl[
         # One batch per grid.z block; GEMM passes zero strides so this folds
         # to the base pointers. Launches with more than 65,535 batches take
         # the grid-striding BATCHED kernels instead.
-        ap = a + Int(bz) * a_bstride
-        bp = b + Int(bz) * b_bstride
-        cp = output + Int(bz) * c_bstride
+        ap = a.unsafe_offset(Int(bz) * a_bstride)
+        bp = b.unsafe_offset(Int(bz) * b_bstride)
+        cp = output.unsafe_offset(Int(bz) * c_bstride)
         set_flags()
         run_tiles()
 
@@ -728,7 +687,7 @@ def _gemm_entry[
         b_fast,
         c_pair,
         batch_count,
-        output.bitcast[Scalar[_F32]](),
+        output.unsafe_bitcast[Scalar[_F32]](),
         0,
         0,
     )
@@ -768,7 +727,7 @@ def _gemm_splitk_entry[
     # `output`/`bias` are unread under SPLITK; the workspace and `a` stand in
     # as dummies the same way BMM reuses `a` for its unread bias pointer.
     _mma_tile_impl[TA, TB, BM, BN, False, False, SPLITK=True](
-        ws.bitcast[Scalar[_DT]](),
+        ws.unsafe_bitcast[Scalar[_DT]](),
         a,
         b,
         a,
@@ -839,30 +798,28 @@ def _gemm_splitk_reduce[
         fill=SIMD[_F32, 4]()
     )
 
-    @parameter
-    for gr in range(_SPLITK_RED_GROUPS):
-        acc[gr] = ws.load[width=4, alignment=16](t * TILE + idx0 + gr * GSTRIDE)
+    comptime for gr in range(_SPLITK_RED_GROUPS):
+        acc[gr] = ws.unsafe_load[width=4, alignment=16](
+            t * TILE + idx0 + gr * GSTRIDE
+        )
     # Two accumulators per group keep pairs of slice loads in flight instead
     # of one serial load-add chain.
     var s = 1
     while s + 1 < splits:
-
-        @parameter
-        for gr in range(_SPLITK_RED_GROUPS):
+        comptime for gr in range(_SPLITK_RED_GROUPS):
             var base = t * TILE + idx0 + gr * GSTRIDE
-            acc[gr] += ws.load[width=4, alignment=16](s * pitch + base)
-            acc_b[gr] += ws.load[width=4, alignment=16]((s + 1) * pitch + base)
+            acc[gr] += ws.unsafe_load[width=4, alignment=16](s * pitch + base)
+            acc_b[gr] += ws.unsafe_load[width=4, alignment=16](
+                (s + 1) * pitch + base
+            )
         s += 2
     if s < splits:
-
-        @parameter
-        for gr in range(_SPLITK_RED_GROUPS):
-            acc[gr] += ws.load[width=4, alignment=16](
+        comptime for gr in range(_SPLITK_RED_GROUPS):
+            acc[gr] += ws.unsafe_load[width=4, alignment=16](
                 s * pitch + t * TILE + idx0 + gr * GSTRIDE
             )
 
-    @parameter
-    for gr in range(_SPLITK_RED_GROUPS):
+    comptime for gr in range(_SPLITK_RED_GROUPS):
         var idx = idx0 + gr * GSTRIDE
         var acc4 = acc[gr] + acc_b[gr]
         # idx is a multiple of 4 and BN is a multiple of 4, so the vec4
@@ -871,20 +828,16 @@ def _gemm_splitk_reduce[
         var col0 = (t % blocks_n) * BN + idx % BN
         if row < m:
             if has_bias != 0:
-
-                @parameter
-                for e in range(4):
+                comptime for e in range(4):
                     if col0 + e < n:
-                        acc4[e] += bias[col0 + e].cast[_F32]()
+                        acc4[e] += bias[unsafe_offset=col0 + e].cast[_F32]()
             var obase = row * n + col0
             if col0 + 4 <= n:
-                output.store[alignment=2](obase, acc4.cast[_DT]())
+                output.unsafe_store[alignment=2](obase, acc4.cast[_DT]())
             else:
-
-                @parameter
-                for e in range(4):
+                comptime for e in range(4):
                     if col0 + e < n:
-                        output[obase + e] = acc4[e].cast[_DT]()
+                        output[unsafe_offset=obase + e] = acc4[e].cast[_DT]()
 
 
 @always_inline
@@ -975,7 +928,7 @@ def _bmm_entry[
         b_fast,
         c_pair,
         batch_count,
-        output.bitcast[Scalar[_F32]](),
+        output.unsafe_bitcast[Scalar[_F32]](),
         0,
         0,
     )
@@ -995,8 +948,7 @@ def _g2r_kc_wide(
     # Full-width copy of the accepted-v1 K-contiguous staging: element
     # (r, kk) lives at src[r * kdim + kk]. Every coordinate and flat offset
     # stays machine Int; the host proved rows * kdim fits in Int.
-    @parameter
-    for it in range(2):
+    comptime for it in range(2):
         var q = tid // 4
         var r = (q * 4) % 64 + q // 16 + it * 64
         var kc = (tid % 4) * 8
@@ -1007,18 +959,16 @@ def _g2r_kc_wide(
             # fast proves 16B base alignment and kdim % 8 == 0, so each
             # 8-wide chunk is aligned and entirely in or out of bounds.
             if gr < rows and gk < kdim:
-                v = src.load[width=8, alignment=16](gr * kdim + gk)
+                v = src.unsafe_load[width=8, alignment=16](gr * kdim + gk)
         else:
             if gr < rows and gk < kdim:
                 if gk + 8 <= kdim:
                     # Whole chunk in bounds; only 2B element alignment holds.
-                    v = src.load[width=8, alignment=2](gr * kdim + gk)
+                    v = src.unsafe_load[width=8, alignment=2](gr * kdim + gk)
                 else:
-
-                    @parameter
-                    for e in range(8):
+                    comptime for e in range(8):
                         if gk + e < kdim:
-                            v[e] = src[gr * kdim + gk + e]
+                            v[e] = src[unsafe_offset=gr * kdim + gk + e]
         regs[it] = v
 
 
@@ -1035,8 +985,7 @@ def _g2r_mc_wide(
 ):
     # Full-width copy of the accepted-v1 row-contiguous staging: element
     # (r, kk) lives at src[kk * rows + r].
-    @parameter
-    for it in range(2):
+    comptime for it in range(2):
         var item = tid + it * _THREADS
         var kr = item % _BK
         var rc = (item // _BK) * 8
@@ -1046,18 +995,16 @@ def _g2r_mc_wide(
         if fast != 0:
             # fast proves 16B base alignment and rows % 8 == 0.
             if gk < kdim and gr < rows:
-                v = src.load[width=8, alignment=16](gk * rows + gr)
+                v = src.unsafe_load[width=8, alignment=16](gk * rows + gr)
         else:
             if gk < kdim and gr < rows:
                 if gr + 8 <= rows:
                     # Whole chunk in bounds; only 2B element alignment holds.
-                    v = src.load[width=8, alignment=2](gk * rows + gr)
+                    v = src.unsafe_load[width=8, alignment=2](gk * rows + gr)
                 else:
-
-                    @parameter
-                    for e in range(8):
+                    comptime for e in range(8):
                         if gr + e < rows:
-                            v[e] = src[gk * rows + gr + e]
+                            v[e] = src[unsafe_offset=gk * rows + gr + e]
         regs[it] = v
 
 
@@ -1108,8 +1055,8 @@ def _mma_tile_wide[
     var gdz = Int(grid_dim.z)
     var lin = Int(block_idx.x)
 
-    var bm0 = 0
-    var bn0 = 0
+    var bm0: Int
+    var bn0: Int
     var ap = a
     var bp = b
     var cp = output
@@ -1134,14 +1081,12 @@ def _mma_tile_wide[
     @parameter
     @always_inline
     def load_tile(k0: Int):
-        @parameter
-        if TA:
+        comptime if TA:
             _g2r_mc_wide(ap, bm0, m, k0, k, tid, af, va)
         else:
             _g2r_kc_wide(ap, bm0, m, k0, k, tid, af, va)
 
-        @parameter
-        if TB:
+        comptime if TB:
             _g2r_kc_wide(bp, bn0, n, k0, k, tid, bf, vb)
         else:
             _g2r_mc_wide(bp, bn0, n, k0, k, tid, bf, vb)
@@ -1152,47 +1097,43 @@ def _mma_tile_wide[
         var base_a = stage * _STAGE_A
         var base_b = stage * _STAGE_B
 
-        @parameter
-        if TA:
-
-            @parameter
-            for it in range(2):
+        comptime if TA:
+            comptime for it in range(2):
                 var item = tid + it * _THREADS
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
 
-                @parameter
-                for e in range(8):
-                    smem_a[base_a + (rc + e) * _LDS + kr] = va[it][e]
+                comptime for e in range(8):
+                    smem_a[unsafe_offset=base_a + (rc + e) * _LDS + kr] = va[
+                        it
+                    ][e]
         else:
-
-            @parameter
-            for it in range(2):
+            comptime for it in range(2):
                 var q = tid // 4
                 var r = (q * 4) % 64 + q // 16 + it * 64
                 var kc = (tid % 4) * 8
-                smem_a.store[alignment=16](base_a + r * _LDS + kc, va[it])
+                smem_a.unsafe_store[alignment=16](
+                    base_a + r * _LDS + kc, va[it]
+                )
 
-        @parameter
-        if TB:
-
-            @parameter
-            for it in range(2):
+        comptime if TB:
+            comptime for it in range(2):
                 var q = tid // 4
                 var r = (q * 4) % 64 + q // 16 + it * 64
                 var kc = (tid % 4) * 8
-                smem_b.store[alignment=16](base_b + r * _LDS + kc, vb[it])
+                smem_b.unsafe_store[alignment=16](
+                    base_b + r * _LDS + kc, vb[it]
+                )
         else:
-
-            @parameter
-            for it in range(2):
+            comptime for it in range(2):
                 var item = tid + it * _THREADS
                 var kr = item % _BK
                 var rc = (item // _BK) * 8
 
-                @parameter
-                for e in range(8):
-                    smem_b[base_b + (rc + e) * _LDS + kr] = vb[it][e]
+                comptime for e in range(8):
+                    smem_b[unsafe_offset=base_b + (rc + e) * _LDS + kr] = vb[
+                        it
+                    ][e]
 
     @parameter
     @always_inline
@@ -1200,41 +1141,37 @@ def _mma_tile_wide[
         var base_a = stage * _STAGE_A
         var base_b = stage * _STAGE_B
 
-        @parameter
-        for ks in range(2):
+        comptime for ks in range(2):
             var kb = ks * 16 + 2 * tg
             var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
-            @parameter
-            for mt in range(2):
+            comptime for mt in range(2):
                 var row = wm + mt * 16 + g
-                var a01 = smem_a.load[width=2, alignment=4](
+                var a01 = smem_a.unsafe_load[width=2, alignment=4](
                     base_a + row * _LDS + kb
                 )
-                var a23 = smem_a.load[width=2, alignment=4](
+                var a23 = smem_a.unsafe_load[width=2, alignment=4](
                     base_a + (row + 8) * _LDS + kb
                 )
-                var a45 = smem_a.load[width=2, alignment=4](
+                var a45 = smem_a.unsafe_load[width=2, alignment=4](
                     base_a + row * _LDS + kb + 8
                 )
-                var a67 = smem_a.load[width=2, alignment=4](
+                var a67 = smem_a.unsafe_load[width=2, alignment=4](
                     base_a + (row + 8) * _LDS + kb + 8
                 )
                 afr[mt] = a01.join(a23).join(a45.join(a67))
 
-            @parameter
-            for nt in range(8):
+            comptime for nt in range(8):
                 var nr = wn + nt * 8 + g
-                var b01 = smem_b.load[width=2, alignment=4](
+                var b01 = smem_b.unsafe_load[width=2, alignment=4](
                     base_b + nr * _LDS + kb
                 )
-                var b23 = smem_b.load[width=2, alignment=4](
+                var b23 = smem_b.unsafe_load[width=2, alignment=4](
                     base_b + nr * _LDS + kb + 8
                 )
                 var bfr = b01.join(b23)
 
-                @parameter
-                for mt in range(2):
+                comptime for mt in range(2):
                     mma(acc[mt * 8 + nt], afr[mt], bfr, acc[mt * 8 + nt])
 
     var kt = (k - 1) // _BK + 1
@@ -1248,9 +1185,9 @@ def _mma_tile_wide[
 
         var bz = Int(block_idx.z)
         while bz < batch_count:
-            ap = a + bz * a_bstride
-            bp = b + bz * b_bstride
-            cp = output + bz * c_bstride
+            ap = a.unsafe_offset(bz * a_bstride)
+            bp = b.unsafe_offset(bz * b_bstride)
+            cp = output.unsafe_offset(bz * c_bstride)
             af = 1 if (a_fast != 0 and Int(ap) % 16 == 0) else 0
             bf = 1 if (b_fast != 0 and Int(bp) % 16 == 0) else 0
             cpair = 1 if (c_pair != 0 and Int(cp) % 4 == 0) else 0
@@ -1263,8 +1200,7 @@ def _mma_tile_wide[
                 barrier()
             first_work = False
 
-            @parameter
-            for i in range(16):
+            comptime for i in range(16):
                 acc[i] = SIMD[_F32, 4]()
 
             load_tile(0)
@@ -1282,24 +1218,21 @@ def _mma_tile_wide[
                 cur = 1 - cur
             compute_tile(cur)
 
-            @parameter
-            for mt in range(2):
+            comptime for mt in range(2):
                 var row0 = bm0 + wm + mt * 16 + g
 
-                @parameter
-                for nt in range(8):
+                comptime for nt in range(8):
                     var col = bn0 + wn + nt * 8 + 2 * tg
                     if col < n:
                         var frag = acc[mt * 8 + nt]
                         var add0 = Float32(0)
                         var add1 = Float32(0)
                         if has_bias != 0:
-                            add0 = bias[col].cast[_F32]()
+                            add0 = bias[unsafe_offset=col].cast[_F32]()
                             if col + 1 < n:
-                                add1 = bias[col + 1].cast[_F32]()
+                                add1 = bias[unsafe_offset=col + 1].cast[_F32]()
 
-                        @parameter
-                        for h in range(2):
+                        comptime for h in range(2):
                             var row = row0 + h * 8
                             if row < m:
                                 var base_idx = row * n + col
@@ -1309,11 +1242,11 @@ def _mma_tile_wide[
                                         v0,
                                         (frag[2 * h + 1] + add1).cast[_DT](),
                                     )
-                                    cp.store[alignment=4](base_idx, pair)
+                                    cp.unsafe_store[alignment=4](base_idx, pair)
                                 else:
-                                    cp[base_idx] = v0
+                                    cp[unsafe_offset=base_idx] = v0
                                     if col + 1 < n:
-                                        cp[base_idx + 1] = (
+                                        cp[unsafe_offset=base_idx + 1] = (
                                             frag[2 * h + 1] + add1
                                         ).cast[_DT]()
 
@@ -1829,10 +1762,10 @@ def _enqueue_gemm_splitk(
 
 
 def enqueue_gemm16_gemm(
-    output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
-    a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
-    b: UnsafePointer[Scalar[_DT], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    output: Pointer[Scalar[_DT], MutAnyOrigin],
+    a: Pointer[Scalar[_DT], MutAnyOrigin],
+    b: Pointer[Scalar[_DT], MutAnyOrigin],
+    bias: Pointer[Scalar[_DT], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -1988,9 +1921,9 @@ def enqueue_gemm16_gemm(
 
 
 def enqueue_gemm16_bmm(
-    output: UnsafePointer[Scalar[_DT], MutAnyOrigin],
-    a: UnsafePointer[Scalar[_DT], MutAnyOrigin],
-    b: UnsafePointer[Scalar[_DT], MutAnyOrigin],
+    output: Pointer[Scalar[_DT], MutAnyOrigin],
+    a: Pointer[Scalar[_DT], MutAnyOrigin],
+    b: Pointer[Scalar[_DT], MutAnyOrigin],
     batch_count: Int,
     m: Int,
     n: Int,
@@ -2079,21 +2012,17 @@ def enqueue_gemm16_bmm(
     # prologue already derived from it, which keeps the old tree's
     # else-catch-all: anything that is not the narrow-N or narrow-M regime
     # runs the 128x128 tiles.
-    @parameter
-    for RI in range(4):
+    comptime for RI in range(4):
         comptime BM = _regime_bm(RI)
         comptime BN = _regime_bn(RI)
 
-        @parameter
-        for FI in range(2):
+        comptime for FI in range(2):
             comptime FASTK = FI == 1
 
-            @parameter
-            for TAI in range(2):
+            comptime for TAI in range(2):
                 comptime TA = TAI == 1
 
-                @parameter
-                for TBI in range(2):
+                comptime for TBI in range(2):
                     comptime TB = TBI == 1
                     if (
                         bm == BM

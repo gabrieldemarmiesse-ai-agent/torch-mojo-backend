@@ -51,7 +51,7 @@ def _dump_ptx_path() -> _DumpPath:
 def _ctx_and_stream(
     ctx_handle_addr: Int,
 ) -> DeviceContext:
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
+    var raw_ctx_ptr = Pointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     return DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
@@ -99,28 +99,28 @@ def launch_bwd_preprocess[
         seq_len_arg = vl_total_q
         nheads_arg = vl_total_qpad
 
-    var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dk_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dk_accum_addr_eff
     )
-    var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dv_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dv_accum_addr
     )
-    var o_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var o_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
-    var do_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var do_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=do_addr
     )
-    var lse_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+    var lse_ptr = Pointer[Float32, ImmutAnyOrigin](
         unsafe_from_address=lse_addr
     )
-    var dpsum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dpsum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dpsum_addr
     )
-    var lse_log2_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var lse_log2_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=lse_log2_addr
     )
-    var dq_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dq_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dq_accum_addr
     )
 
@@ -260,31 +260,31 @@ def launch_bwd_main[
         + mbar_bytes
     )
 
-    var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var q_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=q_addr
     )
-    var k_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var k_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=k_addr
     )
-    var v_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var v_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
     )
-    var do_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var do_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=do_addr
     )
-    var dk_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var dk_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=dk_addr
     )
-    var dv_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var dv_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=dv_addr
     )
-    var lse_log2_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+    var lse_log2_ptr = Pointer[Float32, ImmutAnyOrigin](
         unsafe_from_address=lse_log2_addr
     )
-    var dpsum_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+    var dpsum_ptr = Pointer[Float32, ImmutAnyOrigin](
         unsafe_from_address=dpsum_addr
     )
-    var dq_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dq_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dq_accum_addr
     )
 
@@ -316,10 +316,10 @@ def launch_bwd_main[
     # accumulators (the epilogue bulk-reduce-adds into them; a torch
     # permute-cast converts). The bf16 TMA descriptors below are
     # then unused by the kernel (comptime-dead store path).
-    var dk_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dk_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dk_accum_addr_eff
     )
-    var dv_accum_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var dv_accum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dv_addr
     )
     # Strided mode: Q/K/V become runtime-strided flat (B*S, H, D)
@@ -474,10 +474,10 @@ def launch_bwd_convert[
         unsafe_from_address=stream_handle_addr
     )
 
-    var dq_accum_ptr = UnsafePointer[Float32, ImmutAnyOrigin](
+    var dq_accum_ptr = Pointer[Float32, ImmutAnyOrigin](
         unsafe_from_address=dq_accum_addr
     )
-    var dq_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var dq_ptr = Pointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=dq_addr
     )
 

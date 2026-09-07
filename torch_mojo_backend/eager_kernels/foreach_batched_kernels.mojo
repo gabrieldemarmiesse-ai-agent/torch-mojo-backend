@@ -130,7 +130,6 @@ def _few_addrs[op: Int]() -> Int:
         # Not a fallthrough default: an op with no entry here would otherwise
         # get a plausible-looking arity and mispack its metadata in silence.
         comptime assert False, "no metadata arity for this foreach op"
-        return 0
 
 
 @always_inline
@@ -177,7 +176,6 @@ def _few_label[op: Int]() -> StaticString:
         # A wrong name here would be printed to users by CUPTI/Nsight and would
         # name the wrong algorithm, so this is a build error, not a default.
         comptime assert False, "no kernel-name fragment for this foreach op"
-        return "unknown"
 
 
 @always_inline
@@ -215,7 +213,6 @@ def _few_scalar_family_code[op: Int]() -> Int:
         return FES_DIV
     else:
         comptime assert False, "not a foreach scalar-family op"
-        return FES_MUL
 
 
 @always_inline
@@ -227,7 +224,6 @@ def _few_addc_family_code[op: Int]() -> Int:
         return FEA_ADDCDIV
     else:
         comptime assert False, "not a foreach addc-family op"
-        return FEA_ADDCMUL
 
 
 struct ForeachEwDesc(
@@ -279,10 +275,10 @@ def empty_foreach_ew_desc() -> ForeachEwDesc:
 def _few_element[
     dtype: DType, op: Int, width: Int, alignment: Int
 ](
-    a_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    c_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    a_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    b_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    c_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     index: Int,
     scalar: Float32,
     weight: Float32,
@@ -295,10 +291,10 @@ def _few_element[
     and the scalar peel/tail of `_foreach_ew_kernel` are calls to this, and so
     is nothing else: an op's arithmetic exists once.
     """
-    var a = a_ptr.load[width=width, alignment=alignment](index).cast[
+    var a = a_ptr.unsafe_load[width=width, alignment=alignment](index).cast[
         DType.float32
     ]()
-    var result = a
+    var result: SIMD[DType.float32, width]
     comptime if op == FEW_MUL or op == FEW_MUL_TENSOR:
         result = a * scalar
     elif op == FEW_ADD:
@@ -316,19 +312,19 @@ def _few_element[
         # Metal path in `foreach_elementwise_kernels` blocks that contraction
         # with `_no_fuse`; the volatile round-trip it needs is not worth
         # paying here for one ulp.)
-        var finish = b_ptr.load[width=width, alignment=alignment](index).cast[
-            DType.float32
-        ]()
+        var finish = b_ptr.unsafe_load[width=width, alignment=alignment](
+            index
+        ).cast[DType.float32]()
         var difference = finish - a
         if low_branch == 0:
             result = finish - one_minus_weight * difference
         else:
             result = a + weight * difference
     elif op == FEW_ADDCMUL or op == FEW_ADDCDIV:
-        var b = b_ptr.load[width=width, alignment=alignment](index).cast[
+        var b = b_ptr.unsafe_load[width=width, alignment=alignment](index).cast[
             DType.float32
         ]()
-        var c = c_ptr.load[width=width, alignment=alignment](index).cast[
+        var c = c_ptr.unsafe_load[width=width, alignment=alignment](index).cast[
             DType.float32
         ]()
         comptime if op == FEW_ADDCMUL:
@@ -339,7 +335,9 @@ def _few_element[
         # No default arithmetic: an op with no arm here would otherwise write
         # back its own input, or another op's answer, without a diagnostic.
         comptime assert False, "no element math for this foreach op"
-    out_ptr.store[width=width, alignment=alignment](index, result.cast[dtype]())
+    out_ptr.unsafe_store[width=width, alignment=alignment](
+        index, result.cast[dtype]()
+    )
 
 
 @__name(t"foreach_{_few_label[op]()}_desc_{dtype}_t{FEW_THREADS}")
@@ -377,7 +375,9 @@ def _foreach_ew_kernel[
     comptime if _few_has_scalar[op]():
         scalar = scalars[desc_index]
     comptime if op == FEW_MUL_TENSOR:
-        scalar = _make_ptr[dtype](Int(scalar_addr_arg))[0].cast[DType.float32]()
+        scalar = _make_ptr[dtype](Int(scalar_addr_arg))[unsafe_offset=0].cast[
+            DType.float32
+        ]()
 
     var a_ptr = _make_ptr[dtype](desc.addr0)
     var b_ptr = _make_ptr[dtype](desc.addr1)

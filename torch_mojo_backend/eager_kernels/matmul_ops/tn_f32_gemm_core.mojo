@@ -120,9 +120,9 @@ def _tn_core_kernel[
     MINB: Int,
     PUMP: Int = 1,  # slabs per barrier (1 or 2; 2 needs STAGES >= 6 even)
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -167,7 +167,7 @@ def _tn_core_kernel[
 
     # With ksplits > 1, C is a [ksplits, m, n] workspace; a reduce kernel
     # sums the slices afterwards. Batch is always 1 here (TN wgrad).
-    var c_ptr = c_base + block_idx.z * m * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
 
     var bm = block_idx.y * BM
     var bn = block_idx.x * BN
@@ -195,7 +195,7 @@ def _tn_core_kernel[
         Scalar[F32], address_space=AddressSpace.SHARED, alignment=16
     ]()
     var a_smem = smem_base
-    var b_smem = smem_base + STAGES * BM * BK
+    var b_smem = smem_base.unsafe_offset(STAGES * BM * BK)
 
     # Fragment base columns within a smem row.
     var am0 = wr * WM + tr * TM
@@ -254,7 +254,7 @@ def _tn_core_kernel[
         # A^T (k, m) row-major: chunks along m into As[kk][mm] (coalesced
         # along m — the physical TN layout IS the slab layout; no
         # transpose, no copy).
-        var a_dst = a_smem + (buf * BM * BK + a_bkk * BM + a_cm)
+        var a_dst = a_smem.unsafe_offset(buf * BM * BK + a_bkk * BM + a_cm)
         var a_src = a_srcs
         comptime for t in range(NA):
             var bytes = a_bytes
@@ -262,17 +262,17 @@ def _tn_core_kernel[
                 if kt + a_bkk + t * ROWS_A_STEP >= k_end:
                     bytes = 0
             async_copy[VEC_A * 4, fill=Scalar[F32](0)](
-                (a_base + (a_src + t * a_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (a_dst + t * (ROWS_A_STEP * BM)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
+                (
+                    a_base.unsafe_offset(a_src + t * a_rstep)
+                ).unsafe_address_space_cast[AddressSpace.GLOBAL](),
+                (
+                    a_dst.unsafe_offset(t * (ROWS_A_STEP * BM))
+                ).unsafe_address_space_cast[AddressSpace.SHARED](),
                 src_size=bytes,
             )
 
         # B (k, n) row-major: chunks along n into Bs[kk][nn].
-        var b_dst = b_smem + (buf * BK * BN + b_bkk * BN + b_cn)
+        var b_dst = b_smem.unsafe_offset(buf * BK * BN + b_bkk * BN + b_cn)
         var b_src = b_srcs
         comptime for t in range(NB):
             var bytes = b_bytes
@@ -280,12 +280,12 @@ def _tn_core_kernel[
                 if kt + b_bkk + t * ROWS_B_STEP >= k_end:
                     bytes = 0
             async_copy[VEC_B * 4, fill=Scalar[F32](0)](
-                (b_base + (b_src + t * b_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (b_dst + t * (ROWS_B_STEP * BN)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
+                (
+                    b_base.unsafe_offset(b_src + t * b_rstep)
+                ).unsafe_address_space_cast[AddressSpace.GLOBAL](),
+                (
+                    b_dst.unsafe_offset(t * (ROWS_B_STEP * BN))
+                ).unsafe_address_space_cast[AddressSpace.SHARED](),
                 src_size=bytes,
             )
 
@@ -308,19 +308,21 @@ def _tn_core_kernel[
         # without it Mojo emits align-4 vector loads, which reach PTX as
         # scalar ld.shared.b32 and ptxas only partially re-fuses them
         # (that alone cost ~18% FMA pipe on 4096^3).
-        var a_base_s = a_smem + aoff
-        var b_base_s = b_smem + boff
-        var a_cur = a_base_s.load[width=TM, alignment=16](am0)
+        var a_base_s = a_smem.unsafe_offset(aoff)
+        var b_base_s = b_smem.unsafe_offset(boff)
+        var a_cur = a_base_s.unsafe_load[width=TM, alignment=16](am0)
         var b_cur = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
         comptime for q in range(QN):
-            b_cur[q] = b_base_s.load[width=4, alignment=16](bn0 + q * (LC * 4))
+            b_cur[q] = b_base_s.unsafe_load[width=4, alignment=16](
+                bn0 + q * (LC * 4)
+            )
         comptime for kk in range(BK - 1):
-            var a_nxt = a_base_s.load[width=TM, alignment=16](
+            var a_nxt = a_base_s.unsafe_load[width=TM, alignment=16](
                 (kk + 1) * BM + am0
             )
             var b_nxt = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
             comptime for q in range(QN):
-                b_nxt[q] = b_base_s.load[width=4, alignment=16](
+                b_nxt[q] = b_base_s.unsafe_load[width=4, alignment=16](
                     (kk + 1) * BN + bn0 + q * (LC * 4)
                 )
             comptime for i in range(TM):
@@ -413,11 +415,11 @@ def _tn_core_kernel[
                 var col = bn + wc * WN + qn * (LC * 4) + tc * 4
                 var v = acc[i * QN + qn]
                 if col + 4 <= n:
-                    c_ptr.store[alignment=CALIGN](row * n + col, v)
+                    c_ptr.unsafe_store[alignment=CALIGN](row * n + col, v)
                 else:
                     comptime for j in range(4):
                         if col + j < n:
-                            c_ptr[row * n + col + j] = v[j]
+                            c_ptr[unsafe_offset=row * n + col + j] = v[j]
 
 
 @__llvm_metadata(
@@ -435,9 +437,9 @@ def _tn_split_kernel[
     LR: Int = 8,  # lane-grid rows within a warp (8 -> 8x16, 4 -> 16x8)
     SERP: Bool = False,  # serpentine quadrant order (operand-reuse aid)
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -474,7 +476,7 @@ def _tn_split_kernel[
     if ns <= 0:
         return
 
-    var c_ptr = c_base + block_idx.z * m * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
 
     var bm = block_idx.y * BM
     var bn = block_idx.x * BN
@@ -510,9 +512,9 @@ def _tn_split_kernel[
     var smem = external_memory[
         Scalar[F32], address_space=AddressSpace.SHARED, alignment=16
     ]()
-    var a_smem = smem + gid * GROUP_F
-    var b_smem = a_smem + STAGES * BK * BM
-    var ex_smem = smem + GROUP_F
+    var a_smem = smem.unsafe_offset(gid * GROUP_F)
+    var b_smem = a_smem.unsafe_offset(STAGES * BK * BM)
+    var ex_smem = smem.unsafe_offset(GROUP_F)
 
     var am0 = wr * WM + tr * TM
     var bn0 = wc * WN + tc * 4
@@ -553,7 +555,7 @@ def _tn_split_kernel[
         # buffer `buf`.
         var kt = k_start + s * BK
 
-        var a_dst = a_smem + (buf * BM * BK + a_bkk * BM + a_cm)
+        var a_dst = a_smem.unsafe_offset(buf * BM * BK + a_bkk * BM + a_cm)
         var a_src = a_srcs
         comptime for t in range(NA):
             var bytes = a_bytes
@@ -561,16 +563,16 @@ def _tn_split_kernel[
                 if kt + a_bkk + t * ROWS_A_STEP >= k_end:
                     bytes = 0
             async_copy[VEC_A * 4, fill=Scalar[F32](0)](
-                (a_base + (a_src + t * a_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (a_dst + t * (ROWS_A_STEP * BM)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
+                (
+                    a_base.unsafe_offset(a_src + t * a_rstep)
+                ).unsafe_address_space_cast[AddressSpace.GLOBAL](),
+                (
+                    a_dst.unsafe_offset(t * (ROWS_A_STEP * BM))
+                ).unsafe_address_space_cast[AddressSpace.SHARED](),
                 src_size=bytes,
             )
 
-        var b_dst = b_smem + (buf * BK * BN + b_bkk * BN + b_cn)
+        var b_dst = b_smem.unsafe_offset(buf * BK * BN + b_bkk * BN + b_cn)
         var b_src = b_srcs
         comptime for t in range(NB):
             var bytes = b_bytes
@@ -578,12 +580,12 @@ def _tn_split_kernel[
                 if kt + b_bkk + t * ROWS_B_STEP >= k_end:
                     bytes = 0
             async_copy[VEC_B * 4, fill=Scalar[F32](0)](
-                (b_base + (b_src + t * b_rstep)).address_space_cast[
-                    AddressSpace.GLOBAL
-                ](),
-                (b_dst + t * (ROWS_B_STEP * BN)).address_space_cast[
-                    AddressSpace.SHARED
-                ](),
+                (
+                    b_base.unsafe_offset(b_src + t * b_rstep)
+                ).unsafe_address_space_cast[AddressSpace.GLOBAL](),
+                (
+                    b_dst.unsafe_offset(t * (ROWS_B_STEP * BN))
+                ).unsafe_address_space_cast[AddressSpace.SHARED](),
                 src_size=bytes,
             )
 
@@ -602,19 +604,21 @@ def _tn_split_kernel[
     @always_inline
     @parameter
     def _compute(aoff: Int, boff: Int):
-        var a_base_s = a_smem + aoff
-        var b_base_s = b_smem + boff
-        var a_cur = a_base_s.load[width=TM, alignment=16](am0)
+        var a_base_s = a_smem.unsafe_offset(aoff)
+        var b_base_s = b_smem.unsafe_offset(boff)
+        var a_cur = a_base_s.unsafe_load[width=TM, alignment=16](am0)
         var b_cur = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
         comptime for q in range(QN):
-            b_cur[q] = b_base_s.load[width=4, alignment=16](bn0 + q * (LC * 4))
+            b_cur[q] = b_base_s.unsafe_load[width=4, alignment=16](
+                bn0 + q * (LC * 4)
+            )
         comptime for kk in range(BK - 1):
-            var a_nxt = a_base_s.load[width=TM, alignment=16](
+            var a_nxt = a_base_s.unsafe_load[width=TM, alignment=16](
                 (kk + 1) * BM + am0
             )
             var b_nxt = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
             comptime for q in range(QN):
-                b_nxt[q] = b_base_s.load[width=4, alignment=16](
+                b_nxt[q] = b_base_s.unsafe_load[width=4, alignment=16](
                     (kk + 1) * BN + bn0 + q * (LC * 4)
                 )
             comptime for i in range(TM):
@@ -662,7 +666,7 @@ def _tn_split_kernel[
             comptime for j in range(EX_CHUNK):
                 comptime idx = r * EX_CHUNK + j
                 comptime if idx < TM * QN:
-                    ex_smem.store[alignment=16](
+                    ex_smem.unsafe_store[alignment=16](
                         ltid * (EX_CHUNK * 4) + j * 4, acc[idx]
                     )
         barrier()
@@ -670,7 +674,7 @@ def _tn_split_kernel[
             comptime for j in range(EX_CHUNK):
                 comptime idx = r * EX_CHUNK + j
                 comptime if idx < TM * QN:
-                    acc[idx] += ex_smem.load[width=4, alignment=16](
+                    acc[idx] += ex_smem.unsafe_load[width=4, alignment=16](
                         ltid * (EX_CHUNK * 4) + j * 4
                     )
         comptime if r != EX_ROUNDS - 1:
@@ -688,8 +692,8 @@ def _tn_split_kernel[
                 var col = bn + wc * WN + qn * (LC * 4) + tc * 4
                 var v = acc[i * QN + qn]
                 if col + 4 <= n:
-                    c_ptr.store[alignment=CALIGN](row * n + col, v)
+                    c_ptr.unsafe_store[alignment=CALIGN](row * n + col, v)
                 else:
                     comptime for j in range(4):
                         if col + j < n:
-                            c_ptr[row * n + col + j] = v[j]
+                            c_ptr[unsafe_offset=row * n + col + j] = v[j]
