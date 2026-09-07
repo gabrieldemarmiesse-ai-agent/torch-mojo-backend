@@ -11159,8 +11159,6 @@ def _fa4_route_spy(
     future eligibility-gate change routed the case to the accurate math
     decomposition -- a green test that no longer tests FA4 at all.
     """
-    from torch_mojo_backend.eager_flash_attention import load_fa4_ops
-
     module = load_fa4_ops()
     calls: collections.Counter[str] = collections.Counter()
     for direction in ("fwd", "bwd"):
