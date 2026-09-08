@@ -96,8 +96,8 @@ def _nt_mma8x8(
 
 
 def _nt_ksplit_reduce_kernel(
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     mn_arg: Int64,
     ksplits_arg: Int64,
     total_arg: Int64,
@@ -118,8 +118,8 @@ def _nt_ksplit_reduce_kernel(
         var base = bz * ksplits * mn + off
         var acc = SIMD[DType.float32, 4](0)
         for st in range(ksplits):
-            acc += ws_ptr.load[width=4](base + st * mn)
-        out_ptr.store(i, acc)
+            acc += ws_ptr.unsafe_load[width=4](base + st * mn)
+        out_ptr.unsafe_store(i, acc)
     else:
         for u in range(4):
             var iu = i + u
@@ -130,8 +130,8 @@ def _nt_ksplit_reduce_kernel(
             var baseu = bzu * ksplits * mn + offu
             var accu = Scalar[DType.float32](0)
             for st in range(ksplits):
-                accu += ws_ptr[baseu + st * mn]
-            out_ptr[iu] = accu
+                accu += ws_ptr[unsafe_offset=baseu + st * mn]
+            out_ptr[unsafe_offset=iu] = accu
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +159,9 @@ def _apple8_nt_smem_kernel[
     DOUBLE: Bool = True,
     SWIZZLE: Int = 0,
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -201,9 +201,9 @@ def _apple8_nt_smem_kernel[
 
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice. a_bstride is 0 when A is batch-shared.
-    var c_ptr = c_base + Int(block_idx.z) * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(Int(block_idx.z) * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     # SWIZZLE > 0: the MN grid is launched flattened into grid.x and
     # rasterized in supertiles of SWIZZLE block-rows — consecutive blocks
@@ -266,13 +266,15 @@ def _apple8_nt_smem_kernel[
             var row = bm + mm
             var col = kt + kq
             if row < m and col + 4 <= k_end:
-                a_regs[q] = (a_ptr + row * k + col).load[width=4]()
+                a_regs[q] = (a_ptr.unsafe_offset(row * k + col)).unsafe_load[
+                    width=4
+                ]()
             else:
                 var v = SIMD[DType.float32, 4](0)
                 if row < m:
                     comptime for j in range(4):
                         if col + j < k_end:
-                            v[j] = a_ptr[row * k + col + j]
+                            v[j] = a_ptr[unsafe_offset=row * k + col + j]
                 a_regs[q] = v
         comptime for q in range(BV):
             var fid = q * THREADS + tid
@@ -281,13 +283,15 @@ def _apple8_nt_smem_kernel[
             var row = bn + nn
             var col = kt + kq
             if row < n and col + 4 <= k_end:
-                b_regs[q] = (b_ptr + row * k + col).load[width=4]()
+                b_regs[q] = (b_ptr.unsafe_offset(row * k + col)).unsafe_load[
+                    width=4
+                ]()
             else:
                 var v = SIMD[DType.float32, 4](0)
                 if row < n:
                     comptime for j in range(4):
                         if col + j < k_end:
-                            v[j] = b_ptr[row * k + col + j]
+                            v[j] = b_ptr[unsafe_offset=row * k + col + j]
                 b_regs[q] = v
 
     # Register -> threadgroup store for buffer `buf`. B lands transposed:
@@ -299,19 +303,19 @@ def _apple8_nt_smem_kernel[
         a_regs: InlineArray[SIMD[DType.float32, 4], AV],
         b_regs: InlineArray[SIMD[DType.float32, 4], BV],
     ):
-        var a_dst = a_smem + buf * BM * LDA
-        var b_dst = b_smem + buf * BK * LDB
+        var a_dst = a_smem.unsafe_offset(buf * BM * LDA)
+        var b_dst = b_smem.unsafe_offset(buf * BK * LDB)
         comptime for q in range(AV):
             var fid = q * THREADS + tid
             var mm = fid // KV
             var kq = (fid % KV) * 4
-            a_dst.store(mm * LDA + kq, a_regs[q])
+            a_dst.unsafe_store(mm * LDA + kq, a_regs[q])
         comptime for q in range(BV):
             var fid = q * THREADS + tid
             var nn = fid // KV
             var kq = (fid % KV) * 4
             comptime for j in range(4):
-                b_dst[(kq + j) * LDB + nn] = b_regs[q][j]
+                b_dst[unsafe_offset=(kq + j) * LDB + nn] = b_regs[q][j]
 
     # BK/8 8-slab mma sweeps over threadgroup buffer `buf`.
     @always_inline
@@ -320,23 +324,31 @@ def _apple8_nt_smem_kernel[
         buf: Int,
         mut acc: InlineArray[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
     ):
-        var a_src = a_smem + buf * BM * LDA + (sgm + frow) * LDA + fcol
-        var b_src = b_smem + buf * BK * LDB + frow * LDB + sgn + fcol
+        var a_src = a_smem.unsafe_offset(
+            buf * BM * LDA + (sgm + frow) * LDA + fcol
+        )
+        var b_src = b_smem.unsafe_offset(
+            buf * BK * LDB + frow * LDB + sgn + fcol
+        )
         comptime for kc in range(BK // NT_MMA8_DIM):
             var afrag = InlineArray[SIMD[DType.float32, NT_FRAG8], NT_M](
                 uninitialized=True
             )
             comptime for mi in range(NT_M):
                 afrag[mi] = (
-                    a_src + mi * NT_MMA8_DIM * LDA + kc * NT_MMA8_DIM
-                ).load[width=NT_FRAG8]()
+                    a_src.unsafe_offset(
+                        mi * NT_MMA8_DIM * LDA + kc * NT_MMA8_DIM
+                    )
+                ).unsafe_load[width=NT_FRAG8]()
             var bfrag = InlineArray[SIMD[DType.float32, NT_FRAG8], NT_N](
                 uninitialized=True
             )
             comptime for ni in range(NT_N):
                 bfrag[ni] = (
-                    b_src + kc * NT_MMA8_DIM * LDB + ni * NT_MMA8_DIM
-                ).load[width=NT_FRAG8]()
+                    b_src.unsafe_offset(
+                        kc * NT_MMA8_DIM * LDB + ni * NT_MMA8_DIM
+                    )
+                ).unsafe_load[width=NT_FRAG8]()
             comptime for mi in range(NT_M):
                 comptime for ni in range(NT_N):
                     acc[mi * NT_N + ni] = _nt_mma8x8(
@@ -378,9 +390,9 @@ def _apple8_nt_smem_kernel[
                 var gcol = bn + sgn + ni * NT_MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
                 if gcol + NT_FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 @always_inline
@@ -419,12 +431,8 @@ def apple_nt_smem_enqueue[
     var ksplits = 1
     if blocks < NT_TARGET_BLOCKS // 2:
         ksplits = min(min(ceildiv(NT_TARGET_BLOCKS, blocks), slabs), 8)
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     if ksplits == 1:
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         _enqueue_cached[
@@ -452,7 +460,7 @@ def apple_nt_smem_enqueue[
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
-    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    var ws_mut = Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=Int(ws.unsafe_ptr())
     ).as_unsafe_any_origin()
     _enqueue_cached[
@@ -486,7 +494,7 @@ def apple_nt_smem_enqueue[
         1,
         256,
         c_out,
-        ws_mut.as_immutable(),
+        ws_mut.as_imm(),
         Int64(m * n),
         Int64(ksplits),
         Int64(total),
@@ -513,9 +521,9 @@ def _apple8_nt_direct_kernel[
     SGC: Int = 2,
     SWIZZLE: Int = 0,
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -542,9 +550,9 @@ def _apple8_nt_direct_kernel[
     var k_start = min(k, ks * kchunk)
     var k_end = min(k, k_start + kchunk)
 
-    var c_ptr = c_base + Int(block_idx.z) * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(Int(block_idx.z) * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var bx: Int
     var by: Int
@@ -592,7 +600,7 @@ def _apple8_nt_direct_kernel[
             if grow < m:
                 comptime for s in range(NT_FRAG8):
                     if kk + fcol + s < k_end:
-                        af[s] = a_ptr[grow * k + kk + fcol + s]
+                        af[s] = a_ptr[unsafe_offset=grow * k + kk + fcol + s]
             afrag[mi] = af
         var bfrag = InlineArray[SIMD[DType.float32, NT_FRAG8], NT_N](
             uninitialized=True
@@ -603,7 +611,7 @@ def _apple8_nt_direct_kernel[
                 comptime for s in range(NT_FRAG8):
                     var gj = col_base + ni * NT_MMA8_DIM + fcol + s
                     if gj < n:
-                        bf[s] = b_ptr[gj * k + kk + frow]
+                        bf[s] = b_ptr[unsafe_offset=gj * k + kk + frow]
             bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
@@ -616,29 +624,31 @@ def _apple8_nt_direct_kernel[
     @always_inline
     @parameter
     def _load_a_fast(
-        ap0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, NT_FRAG8], NT_M]:
         var afrag = InlineArray[SIMD[DType.float32, NT_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
-            afrag[mi] = (ap0 + mi * NT_MMA8_DIM * k).load[width=NT_FRAG8]()
+            afrag[mi] = (ap0.unsafe_offset(mi * NT_MMA8_DIM * k)).unsafe_load[
+                width=NT_FRAG8
+            ]()
         return afrag^
 
     @always_inline
     @parameter
     def _load_b_fast(
-        bp0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, NT_FRAG8], NT_N]:
         var bfrag = InlineArray[SIMD[DType.float32, NT_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
             # B is (N, K): the fragment's two slots differ in n-row.
-            var p = bp0 + ni * NT_MMA8_DIM * k
+            var p = bp0.unsafe_offset(ni * NT_MMA8_DIM * k)
             var bf = SIMD[DType.float32, NT_FRAG8](0)
-            bf[0] = p[0]
-            bf[1] = p[k]
+            bf[0] = p[unsafe_offset=0]
+            bf[1] = p[unsafe_offset=k]
             bfrag[ni] = bf
         return bfrag^
 
@@ -659,15 +669,15 @@ def _apple8_nt_direct_kernel[
     if interior:
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue.
-        var ap = a_ptr + (row_base + frow) * k + fcol + k_start
-        var bp = b_ptr + (col_base + fcol) * k + frow + k_start
+        var ap = a_ptr.unsafe_offset((row_base + frow) * k + fcol + k_start)
+        var bp = b_ptr.unsafe_offset((col_base + fcol) * k + frow + k_start)
         var nslabs = (k_end - k_start) // NT_MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap += NT_MMA8_DIM
-                bp += NT_MMA8_DIM
+                ap = ap.unsafe_offset(NT_MMA8_DIM)
+                bp = bp.unsafe_offset(NT_MMA8_DIM)
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -689,9 +699,9 @@ def _apple8_nt_direct_kernel[
                 var gcol = col_base + ni * NT_MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
                 if gcol + NT_FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 @always_inline
@@ -725,12 +735,8 @@ def apple_nt_direct_enqueue[
     var ksplits = 1
     if blocks < NT_TARGET_BLOCKS // 2:
         ksplits = min(min(ceildiv(NT_TARGET_BLOCKS, blocks), slabs), 8)
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     if ksplits == 1:
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         _enqueue_cached[
@@ -753,7 +759,7 @@ def apple_nt_direct_enqueue[
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
-    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    var ws_mut = Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=Int(ws.unsafe_ptr())
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_nt_direct_kernel[True, BM, BN, SGR, SGC, SWIZZLE]](
@@ -782,7 +788,7 @@ def apple_nt_direct_enqueue[
         1,
         256,
         c_out,
-        ws_mut.as_immutable(),
+        ws_mut.as_imm(),
         Int64(m * n),
         Int64(ksplits),
         Int64(total),

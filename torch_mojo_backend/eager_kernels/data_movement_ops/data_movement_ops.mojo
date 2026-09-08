@@ -104,8 +104,8 @@ comptime SCATTER_DTYPES = [
 def _permute_copy_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_arg: Int64,
@@ -134,15 +134,17 @@ def _permute_copy_kernel[
         rest = rest // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        out_ptr[i] = in_ptr[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3]
+        out_ptr[unsafe_offset=i] = in_ptr[
+            unsafe_offset=i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3
+        ]
         i += gstride
 
 
 def _permute_copy_rows4_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_4_arg: Int64,
@@ -174,9 +176,9 @@ def _permute_copy_rows4_kernel[
         rest = rest // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        out_ptr.store[width=4, alignment=vec_align](
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             c * 4,
-            in_ptr.load[width=4, alignment=vec_align](
+            in_ptr.unsafe_load[width=4, alignment=vec_align](
                 i0 * s0 + i1 * s1 + i2 * s2 + j * 4
             ),
         )
@@ -186,8 +188,8 @@ def _permute_copy_rows4_kernel[
 def _permute_copy_rowloop_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_4_arg: Int64,
@@ -221,9 +223,9 @@ def _permute_copy_rowloop_kernel[
         var src = i0 * s0 + i1 * s1 + i2 * s2
         var dst = r * d3_4 * 4
         for j in range(d3_4):
-            out_ptr.store[width=4, alignment=vec_align](
+            out_ptr.unsafe_store[width=4, alignment=vec_align](
                 dst + j * 4,
-                in_ptr.load[width=4, alignment=vec_align](src + j * 4),
+                in_ptr.unsafe_load[width=4, alignment=vec_align](src + j * 4),
             )
         r += gstride
 
@@ -242,8 +244,8 @@ def _permute_copy_rowloop_kernel[
 def _run_gather_kernel[
     dtype: DType, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     spv_arg: Int64,
@@ -278,9 +280,9 @@ def _run_gather_kernel[
         var rest = run // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        out_ptr.store[width=VEC, alignment=ALIGN](
+        out_ptr.unsafe_store[width=VEC, alignment=ALIGN](
             j * VEC,
-            in_ptr.load[width=VEC, alignment=ALIGN](
+            in_ptr.unsafe_load[width=VEC, alignment=ALIGN](
                 i0 * s0 + i1 * s1 + i2 * s2 + off * VEC
             ),
         )
@@ -320,7 +322,9 @@ def _permute_copy[
             rest = rest // d2
             var i1 = rest % d1
             var i0 = rest // d1
-            out_ptr[i] = in_ptr[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3]
+            out_ptr[unsafe_offset=i] = in_ptr[
+                unsafe_offset=i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3
+            ]
 
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
@@ -352,7 +356,7 @@ def _permute_copy[
                     1,
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(d1),
                     Int64(d2),
                     Int64(d3 // VEC),
@@ -385,7 +389,7 @@ def _permute_copy[
                             1,
                             GS_THREADS,
                             out_ptr.as_unsafe_any_origin(),
-                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            in_ptr.as_unsafe_any_origin().as_imm(),
                             Int64(d1),
                             Int64(d2),
                             Int64(d3 // 4),
@@ -404,7 +408,7 @@ def _permute_copy[
                         1,
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(d1),
                         Int64(d2),
                         Int64(d3 // 4),
@@ -464,7 +468,7 @@ def _permute_copy[
                     min(batch, _MAX_GRID_Y),
                     TILE * _T2D_ROWS,
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(d2),
                     Int64(d3),
                     Int64(s3),
@@ -481,7 +485,7 @@ def _permute_copy[
                 1,
                 GS_THREADS,
                 out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
                 Int64(d1),
                 Int64(d2),
                 Int64(d3),
@@ -693,8 +697,8 @@ def _cat_owner(
 def _cat_copy_rows[
     dtype: DType, width: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     seg: CatSeg,
     slot: Int,
     outer: Int,
@@ -715,13 +719,11 @@ def _cat_copy_rows[
     src_index += row * row_len
     dst_index += row * dst_stride
     while row < outer:
-
-        @parameter
-        for step in range(ilp):
+        comptime for step in range(ilp):
             if slot + step * GS_THREADS < seg.nvec:
-                out_ptr.store[width=width, alignment=align](
+                out_ptr.unsafe_store[width=width, alignment=align](
                     dst_index + step * GS_THREADS * width,
-                    src_ptr.load[width=width, alignment=align](
+                    src_ptr.unsafe_load[width=width, alignment=align](
                         src_index + step * GS_THREADS * width
                     ),
                 )
@@ -733,7 +735,7 @@ def _cat_copy_rows[
 def _cat_batched_kernel[
     dtype: DType, width: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     segs: InlineArray[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
@@ -755,9 +757,7 @@ def _cat_batched_kernel[
         if slot < seg.nvec:
             _cat_copy_rows[dtype, width](
                 out_ptr,
-                _make_ptr[dtype](seg.src_addr)
-                .as_unsafe_any_origin()
-                .as_immutable(),
+                _make_ptr[dtype](seg.src_addr).as_unsafe_any_origin().as_imm(),
                 seg,
                 slot,
                 outer,
@@ -771,15 +771,15 @@ def _cat_pick[
     dtype: DType
 ](
     slot: Int,
-    p0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p4: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p5: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p6: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p7: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-) -> UnsafePointer[Scalar[dtype], ImmutAnyOrigin]:
+    p0: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p1: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p2: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p3: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p4: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p5: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p6: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p7: Pointer[Scalar[dtype], ImmutAnyOrigin],
+) -> Pointer[Scalar[dtype], ImmutAnyOrigin]:
     """Select one of the pointer ARGUMENTS (copying them into an array and
     indexing that miscompiles on Metal -- see foreach_elementwise_kernels)."""
     var selected = p0
@@ -803,15 +803,15 @@ def _cat_pick[
 def _cat_slots_kernel[
     dtype: DType, width: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    p0: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p1: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p2: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p3: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p4: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p5: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p6: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    p7: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    p0: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p1: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p2: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p3: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p4: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p5: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p6: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    p7: Pointer[Scalar[dtype], ImmutAnyOrigin],
     segs: InlineArray[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
@@ -846,7 +846,7 @@ def _cat_slots_kernel[
 @always_inline
 def _cat_slot_ptr[
     dtype: DType
-](segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, index: Int) -> UnsafePointer[
+](segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, index: Int) -> Pointer[
     Scalar[dtype], ImmutAnyOrigin
 ]:
     """A translatable pointer for every pointer argument: padding slots
@@ -855,7 +855,7 @@ def _cat_slot_ptr[
     var addr = segs[0].src_addr
     if index < nseg:
         addr = segs[index].src_addr
-    return _make_ptr[dtype](addr).as_unsafe_any_origin().as_immutable()
+    return _make_ptr[dtype](addr).as_unsafe_any_origin().as_imm()
 
 
 @always_inline
@@ -1014,17 +1014,17 @@ def _cat_n_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _cat_n_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
         return _raw_ret_none()
     except e:
@@ -1042,8 +1042,8 @@ def _cat_n_dispatcher(
 def _narrow_copy_dst_kernel2d[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     dst_stride_arg: Int64,
     copy_len4_arg: Int64,
     dst_offset_arg: Int64,
@@ -1061,9 +1061,9 @@ def _narrow_copy_dst_kernel2d[
     var cstride = Int(grid_dim.x) * Int(block_dim.x)
     while c < copy_len4:
         var j = c * 4
-        out_ptr.store[width=4, alignment=vec_align](
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             dst_base + j,
-            in_ptr.load[width=4, alignment=vec_align](src_base + j),
+            in_ptr.unsafe_load[width=4, alignment=vec_align](src_base + j),
         )
         c += cstride
 
@@ -1071,8 +1071,8 @@ def _narrow_copy_dst_kernel2d[
 def _narrow_copy_dst_kernel4[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     dst_stride_arg: Int64,
     copy_len_arg: Int64,
     dst_offset_arg: Int64,
@@ -1091,8 +1091,8 @@ def _narrow_copy_dst_kernel4[
         var i = c * 4
         var o = i // copy_len
         var j = i % copy_len
-        var v = in_ptr.load[width=4, alignment=vec_align](i)
-        out_ptr.store[width=4, alignment=vec_align](
+        var v = in_ptr.unsafe_load[width=4, alignment=vec_align](i)
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             o * dst_stride + dst_offset + j, v
         )
         c += gstride
@@ -1101,8 +1101,8 @@ def _narrow_copy_dst_kernel4[
 def _narrow_copy_dst_kernel1[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     dst_stride_arg: Int64,
     copy_len_arg: Int64,
     dst_offset_arg: Int64,
@@ -1119,7 +1119,9 @@ def _narrow_copy_dst_kernel1[
     while i < total:
         var o = i // copy_len
         var j = i % copy_len
-        out_ptr[o * dst_stride + dst_offset + j] = in_ptr[i]
+        out_ptr[unsafe_offset=o * dst_stride + dst_offset + j] = in_ptr[
+            unsafe_offset=i
+        ]
         i += gstride
 
 
@@ -1162,7 +1164,7 @@ def _narrow_copy_dst[
                         1,
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(dst_stride),
                         Int64(copy_len4),
                         Int64(dst_offset),
@@ -1177,7 +1179,7 @@ def _narrow_copy_dst[
                     1,
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(dst_stride),
                     Int64(copy_len),
                     Int64(dst_offset),
@@ -1193,7 +1195,7 @@ def _narrow_copy_dst[
                     1,
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(dst_stride),
                     Int64(copy_len),
                     Int64(dst_offset),
@@ -1224,7 +1226,9 @@ def _narrow_copy_dst[
         var i = Int(idx[0].value())
         var o = i // copy_len
         var j = i % copy_len
-        out_ptr[o * dst_stride + dst_offset + j] = in_ptr[i]
+        out_ptr[unsafe_offset=o * dst_stride + dst_offset + j] = in_ptr[
+            unsafe_offset=i
+        ]
 
     elementwise[func, simd_width=1](Coord(outer * copy_len), ctx)
 
@@ -1327,10 +1331,10 @@ def _narrow_copy_dst_go(
 def _where_flat_vec_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
+    a_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     total_arg: Int64,
     a_bcast_arg: Int64,
     b_bcast_arg: Int64,
@@ -1353,26 +1357,32 @@ def _where_flat_vec_kernel[
     @always_inline
     @parameter
     def pass_over[a_b: Bool, b_b: Bool]():
-        var a_splat = SIMD[dtype, VW](a_ptr[0]) if a_b else SIMD[dtype, VW](0)
-        var b_splat = SIMD[dtype, VW](b_ptr[0]) if b_b else SIMD[dtype, VW](0)
+        var a_splat = SIMD[dtype, VW](a_ptr[unsafe_offset=0]) if a_b else SIMD[
+            dtype, VW
+        ](0)
+        var b_splat = SIMD[dtype, VW](b_ptr[unsafe_offset=0]) if b_b else SIMD[
+            dtype, VW
+        ](0)
         var c = tid
         while c < nvec:
             var i = c * VW
-            var cond = cond_ptr.load[width=VW, alignment=cond_align](i)
-            var a = a_splat if a_b else a_ptr.load[
+            var cond = cond_ptr.unsafe_load[width=VW, alignment=cond_align](i)
+            var a = a_splat if a_b else a_ptr.unsafe_load[
                 width=VW, alignment=vec_align
             ](i)
-            var b = b_splat if b_b else b_ptr.load[
+            var b = b_splat if b_b else b_ptr.unsafe_load[
                 width=VW, alignment=vec_align
             ](i)
-            out_ptr.store[width=VW, alignment=vec_align](i, cond.select(a, b))
+            out_ptr.unsafe_store[width=VW, alignment=vec_align](
+                i, cond.select(a, b)
+            )
             c += gstride
         var tail = total - nvec * VW
         if tid < tail:
             var i = nvec * VW + tid
-            var a1 = a_splat[0] if a_b else a_ptr[i]
-            var b1 = b_splat[0] if b_b else b_ptr[i]
-            out_ptr[i] = a1 if cond_ptr[i] else b1
+            var a1 = a_splat[0] if a_b else a_ptr[unsafe_offset=i]
+            var b1 = b_splat[0] if b_b else b_ptr[unsafe_offset=i]
+            out_ptr[unsafe_offset=i] = a1 if cond_ptr[unsafe_offset=i] else b1
 
     # The splat flags are loop-invariant, so each arm is INSTANTIATED rather
     # than branched on per iteration (see `_bin_flat_vec_kernel`'s note on
@@ -1392,10 +1402,10 @@ def _where_flat_vec_kernel[
 def _where_bcast_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    a_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
+    a_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_arg: Int64,
@@ -1449,7 +1459,9 @@ def _where_bcast_kernel[
         var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
         var abase = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
         var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-        out_ptr[i] = a_ptr[abase] if cond_ptr[cbase] else b_ptr[bbase]
+        out_ptr[unsafe_offset=i] = a_ptr[unsafe_offset=abase] if cond_ptr[
+            unsafe_offset=cbase
+        ] else b_ptr[unsafe_offset=bbase]
         i += gstride
 
 
@@ -1502,7 +1514,9 @@ def _where_bcast[
             var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
             var abase = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
             var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-            out_ptr[i] = a_ptr[abase] if cond_ptr[cbase] else b_ptr[bbase]
+            out_ptr[unsafe_offset=i] = a_ptr[unsafe_offset=abase] if cond_ptr[
+                unsafe_offset=cbase
+            ] else b_ptr[unsafe_offset=bbase]
 
         elementwise[func, simd_width=1](Coord(total), ctx)
         return
@@ -1567,9 +1581,9 @@ def _where_bcast[
                     1,
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
-                    cond_ptr.as_unsafe_any_origin().as_immutable(),
-                    a_ptr.as_unsafe_any_origin().as_immutable(),
-                    b_ptr.as_unsafe_any_origin().as_immutable(),
+                    cond_ptr.as_unsafe_any_origin().as_imm(),
+                    a_ptr.as_unsafe_any_origin().as_imm(),
+                    b_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(total),
                     Int64(a_scalar),
                     Int64(b_scalar),
@@ -1584,9 +1598,9 @@ def _where_bcast[
                 1,
                 GS_THREADS,
                 out_ptr.as_unsafe_any_origin(),
-                cond_ptr.as_unsafe_any_origin().as_immutable(),
-                a_ptr.as_unsafe_any_origin().as_immutable(),
-                b_ptr.as_unsafe_any_origin().as_immutable(),
+                cond_ptr.as_unsafe_any_origin().as_imm(),
+                a_ptr.as_unsafe_any_origin().as_imm(),
+                b_ptr.as_unsafe_any_origin().as_imm(),
                 Int64(d1),
                 Int64(d2),
                 Int64(d3),
@@ -1630,9 +1644,9 @@ def _where_bcast[
 def _masked_fill_scalar_flat_vec_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     value: Scalar[dtype],
     total_arg: Int64,
     b_bcast_arg: Int64,
@@ -1650,23 +1664,27 @@ def _masked_fill_scalar_flat_vec_kernel[
     @always_inline
     @parameter
     def pass_over[b_b: Bool]():
-        var b_splat = SIMD[dtype, VW](b_ptr[0]) if b_b else SIMD[dtype, VW](0)
+        var b_splat = SIMD[dtype, VW](b_ptr[unsafe_offset=0]) if b_b else SIMD[
+            dtype, VW
+        ](0)
         var c = tid
         while c < nvec:
             var i = c * VW
-            var cond = cond_ptr.load[width=VW, alignment=cond_align](i)
-            var b = b_splat if b_b else b_ptr.load[
+            var cond = cond_ptr.unsafe_load[width=VW, alignment=cond_align](i)
+            var b = b_splat if b_b else b_ptr.unsafe_load[
                 width=VW, alignment=vec_align
             ](i)
-            out_ptr.store[width=VW, alignment=vec_align](
+            out_ptr.unsafe_store[width=VW, alignment=vec_align](
                 i, cond.select(a_splat, b)
             )
             c += gstride
         var tail = total - nvec * VW
         if tid < tail:
             var i = nvec * VW + tid
-            var b1 = b_splat[0] if b_b else b_ptr[i]
-            out_ptr[i] = value if cond_ptr[i] else b1
+            var b1 = b_splat[0] if b_b else b_ptr[unsafe_offset=i]
+            out_ptr[unsafe_offset=i] = value if cond_ptr[
+                unsafe_offset=i
+            ] else b1
 
     if b_bcast_arg != 0:
         pass_over[True]()
@@ -1678,9 +1696,9 @@ def _masked_fill_scalar_flat_vec_kernel[
 def _masked_fill_scalar_bcast_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    cond_ptr: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    cond_ptr: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     value: Scalar[dtype],
     d1_arg: Int64,
     d2_arg: Int64,
@@ -1719,7 +1737,9 @@ def _masked_fill_scalar_bcast_kernel[
         var i0 = rest // d1
         var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
         var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-        out_ptr[i] = value if cond_ptr[cbase] else b_ptr[bbase]
+        out_ptr[unsafe_offset=i] = value if cond_ptr[
+            unsafe_offset=cbase
+        ] else b_ptr[unsafe_offset=bbase]
         i += gstride
 
 
@@ -1769,7 +1789,9 @@ def _masked_fill_scalar_bcast[
             var i0 = rest // d1
             var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
             var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-            out_ptr[i] = value if cond_ptr[cbase] else b_ptr[bbase]
+            out_ptr[unsafe_offset=i] = value if cond_ptr[
+                unsafe_offset=cbase
+            ] else b_ptr[unsafe_offset=bbase]
 
         elementwise[func, simd_width=1](Coord(total), ctx)
         return
@@ -1813,8 +1835,8 @@ def _masked_fill_scalar_bcast[
                 1,
                 GS_THREADS,
                 out_ptr.as_unsafe_any_origin(),
-                cond_ptr.as_unsafe_any_origin().as_immutable(),
-                b_ptr.as_unsafe_any_origin().as_immutable(),
+                cond_ptr.as_unsafe_any_origin().as_imm(),
+                b_ptr.as_unsafe_any_origin().as_imm(),
                 value,
                 Int64(total),
                 Int64(b_scalar),
@@ -1829,8 +1851,8 @@ def _masked_fill_scalar_bcast[
             1,
             GS_THREADS,
             out_ptr.as_unsafe_any_origin(),
-            cond_ptr.as_unsafe_any_origin().as_immutable(),
-            b_ptr.as_unsafe_any_origin().as_immutable(),
+            cond_ptr.as_unsafe_any_origin().as_imm(),
+            b_ptr.as_unsafe_any_origin().as_imm(),
             value,
             Int64(d1),
             Int64(d2),
@@ -2126,8 +2148,8 @@ comptime CAST_THREADS = GS_THREADS
 def _cast_vec_kernel[
     src: DType, dst: DType, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dst], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[src], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dst], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[src], ImmutAnyOrigin],
     nvec_arg: Int64,
     size_arg: Int64,
 ):
@@ -2142,11 +2164,11 @@ def _cast_vec_kernel[
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     var j = tid
     while j < nvec:
-        var v = in_ptr.load[width=VEC, alignment=IALIGN](j * VEC)
+        var v = in_ptr.unsafe_load[width=VEC, alignment=IALIGN](j * VEC)
         comptime if dst == DType.bool:
             # An `i1` vector is not a storable value. Torch's bool is one byte
             # holding 0 or 1, so build those bytes and store them.
-            out_ptr.bitcast[Scalar[DType.uint8]]().store[
+            out_ptr.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_store[
                 width=VEC, alignment=OALIGN
             ](
                 j * VEC,
@@ -2155,19 +2177,23 @@ def _cast_vec_kernel[
                 ),
             )
         else:
-            out_ptr.store[width=VEC, alignment=OALIGN](j * VEC, v.cast[dst]())
+            out_ptr.unsafe_store[width=VEC, alignment=OALIGN](
+                j * VEC, v.cast[dst]()
+            )
         j += gstride
     # The tail is at most VEC-1 elements and the grid is never narrower than
     # one CAST_THREADS-wide block, so the leading threads cover all of it.
     var t = nvec * VEC + tid
     if t < size:
-        var a = in_ptr[t]
+        var a = in_ptr[unsafe_offset=t]
         comptime if dst == DType.bool:
             # rc1: Scalar[dst](Bool) requires an integral dtype; build the
             # concrete bool scalar first (cast is the identity here).
-            out_ptr[t] = Scalar[DType.bool](a != Scalar[src](0)).cast[dst]()
+            out_ptr[unsafe_offset=t] = Scalar[DType.bool](
+                a != Scalar[src](0)
+            ).cast[dst]()
         else:
-            out_ptr[t] = a.cast[dst]()
+            out_ptr[unsafe_offset=t] = a.cast[dst]()
 
 
 @always_inline
@@ -2186,13 +2212,15 @@ def _cast[
         @__copy_capture(out_ptr, in_ptr)
         def func[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            var a = in_ptr[i]
+            var a = in_ptr[unsafe_offset=i]
             comptime if dst == DType.bool:
                 # rc1: Scalar[dst](Bool) requires an integral dtype; build the
                 # concrete bool scalar first (cast is the identity here).
-                out_ptr[i] = Scalar[DType.bool](a != Scalar[src](0)).cast[dst]()
+                out_ptr[unsafe_offset=i] = Scalar[DType.bool](
+                    a != Scalar[src](0)
+                ).cast[dst]()
             else:
-                out_ptr[i] = a.cast[dst]()
+                out_ptr[unsafe_offset=i] = a.cast[dst]()
 
         elementwise[func, simd_width=1](Coord(size), ctx)
         return
@@ -2232,7 +2260,7 @@ def _cast[
                 1,
                 CAST_THREADS,
                 out_ptr.as_unsafe_any_origin(),
-                in_ptr.as_unsafe_any_origin().as_immutable(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
                 Int64(nvec),
                 Int64(size),
             )
@@ -2330,7 +2358,7 @@ def _tile_copy[
             rest = rest // out_shape[d]
             src_off += (coord % in_shape[d]) * in_strides[d]
         src_off += (rest % in_shape[0]) * in_strides[0]
-        out_ptr[i] = in_ptr[src_off]
+        out_ptr[unsafe_offset=i] = in_ptr[unsafe_offset=src_off]
 
     _parallel_for[func](total, ctx)
 
@@ -2545,8 +2573,8 @@ def _repeat_first_row(orow: UInt32, rows: UInt32, nout: UInt32) -> UInt32:
 def _repeat_seg_kernel[
     dtype: DType, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     cout_arg: Int64,
@@ -2586,10 +2614,12 @@ def _repeat_seg_kernel[
         var out_base = Int(orow) * cout
         var c = c0
         while c < cols:
-            var v = in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c))
+            var v = in_ptr.unsafe_load[width=VEC, alignment=ALIGN](
+                in_base + Int(c)
+            )
             var o = out_base + Int(c)
             for _ in range(r1):
-                out_ptr.store[width=VEC, alignment=ALIGN](o, v)
+                out_ptr.unsafe_store[width=VEC, alignment=ALIGN](o, v)
                 o += Int(cols)
             c += cstride
         orow += orowstride
@@ -2602,8 +2632,8 @@ def _repeat_seg_kernel[
 def _repeat_flat_kernel[
     dtype: DType, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     cout_arg: Int64,
@@ -2651,9 +2681,11 @@ def _repeat_flat_kernel[
         var slot = slot0
         var c = c0
         while slot < nslots:
-            out_ptr.store[width=VEC, alignment=ALIGN](
+            out_ptr.unsafe_store[width=VEC, alignment=ALIGN](
                 out_base + Int(slot) * VEC,
-                in_ptr.load[width=VEC, alignment=ALIGN](in_base + Int(c)),
+                in_ptr.unsafe_load[width=VEC, alignment=ALIGN](
+                    in_base + Int(c)
+                ),
             )
             slot += xstride
             c += cadv
@@ -2693,7 +2725,7 @@ def _repeat_seg_launch[
         tx,
         ty,
         out_ptr.as_unsafe_any_origin(),
-        in_ptr.as_unsafe_any_origin().as_immutable(),
+        in_ptr.as_unsafe_any_origin().as_imm(),
         Int64(rows),
         Int64(cols),
         Int64(cout),
@@ -2736,7 +2768,7 @@ def _repeat_flat_launch[
         tx,
         ty,
         out_ptr.as_unsafe_any_origin(),
-        in_ptr.as_unsafe_any_origin().as_immutable(),
+        in_ptr.as_unsafe_any_origin().as_imm(),
         Int64(rows),
         Int64(cols),
         Int64(cout),
@@ -2926,9 +2958,9 @@ def _triangular_copy[
         else:
             keep = c <= r + diagonal
         if keep:
-            out_ptr[i] = in_ptr[i]
+            out_ptr[unsafe_offset=i] = in_ptr[unsafe_offset=i]
         else:
-            out_ptr[i] = Scalar[dtype](0)
+            out_ptr[unsafe_offset=i] = Scalar[dtype](0)
 
     _parallel_for[func](total, ctx)
 
@@ -3012,10 +3044,12 @@ def _gather_rows[
     @__copy_capture(out_ptr, in_ptr, idx_ptr)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var i = Int(coord[0].value())
-        var row = Int(idx_ptr[i // row_len])
+        var row = Int(idx_ptr[unsafe_offset=i // row_len])
         if row < 0:
             row += size0
-        out_ptr[i] = in_ptr[row * row_len + i % row_len]
+        out_ptr[unsafe_offset=i] = in_ptr[
+            unsafe_offset=row * row_len + i % row_len
+        ]
 
     _parallel_for[func](n_indices * row_len, ctx)
 
@@ -3167,7 +3201,9 @@ def _scatter_dim[
         rest = rest // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        var target = Int(index_ptr[i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3])
+        var target = Int(
+            index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
+        )
         var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
         # Replace the coordinate along `dim_padded` with the scatter target.
         if dim_padded == 0:
@@ -3179,10 +3215,10 @@ def _scatter_dim[
         else:
             out_off += (target - i3) * os3
         if is_value != 0:
-            out_ptr[out_off] = scalar
+            out_ptr[unsafe_offset=out_off] = scalar
         else:
-            out_ptr[out_off] = src_ptr[
-                i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+            out_ptr[unsafe_offset=out_off] = src_ptr[
+                unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
             ]
 
     _parallel_for_dt[dtype, func](total, ctx)
@@ -3269,9 +3305,16 @@ def _permute_copy_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _permute_copy_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _permute_copy_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -3282,17 +3325,17 @@ def _narrow_copy_dst_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _narrow_copy_dst_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)
@@ -3304,10 +3347,16 @@ def _where_select_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _where_select_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
         )
     except e:
         return _spec_unsupported(e)
@@ -3319,10 +3368,16 @@ def _masked_fill_scalar_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _masked_fill_scalar_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
         )
     except e:
         return _spec_unsupported(e)
@@ -3334,10 +3389,16 @@ def _tile_copy_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _tile_copy_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
         )
     except e:
         return _spec_unsupported(e)
@@ -3349,17 +3410,17 @@ def _repeat_tiled_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _repeat_tiled_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)
@@ -3371,18 +3432,18 @@ def _triangular_copy_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _triangular_copy_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -3394,18 +3455,18 @@ def _gather_rows_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _gather_rows_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -3417,17 +3478,17 @@ def _scatter_dim_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _scatter_dim_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)

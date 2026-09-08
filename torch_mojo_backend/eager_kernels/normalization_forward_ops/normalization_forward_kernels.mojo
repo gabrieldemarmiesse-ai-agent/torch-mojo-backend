@@ -118,7 +118,7 @@ def _affine_vec_ok[
 def _affine_vec[
     dtype: DType, //, V: Int, affine: Int
 ](
-    p: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p: Pointer[Scalar[dtype], ImmutAnyOrigin],
     col0: Int,
     gbase: Int,
     hxw: Int,
@@ -133,19 +133,21 @@ def _affine_vec[
     var out = SIMD[DType.float32, V](0)
     comptime if affine == AFFINE_COL:
         if vec_ok:
-            return p.load[width=V, alignment=V * size_of[dtype]()](col0).cast[
-                DType.float32
-            ]()
-        return p.load[width=V, alignment=size_of[dtype]()](col0).cast[
+            return p.unsafe_load[width=V, alignment=V * size_of[dtype]()](
+                col0
+            ).cast[DType.float32]()
+        return p.unsafe_load[width=V, alignment=size_of[dtype]()](col0).cast[
             DType.float32
         ]()
     else:
         if vec_ok:
             return SIMD[DType.float32, V](
-                p[gbase + col0 // hxw].cast[DType.float32]()
+                p[unsafe_offset=gbase + col0 // hxw].cast[DType.float32]()
             )
         comptime for k in range(V):
-            out[k] = p[gbase + (col0 + k) // hxw].cast[DType.float32]()
+            out[k] = p[unsafe_offset=gbase + (col0 + k) // hxw].cast[
+                DType.float32
+            ]()
         return out
 
 
@@ -153,16 +155,16 @@ def _affine_vec[
 def _affine_scalar[
     dtype: DType, //, affine: Int
 ](
-    p: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    p: Pointer[Scalar[dtype], ImmutAnyOrigin],
     col: Int,
     gbase: Int,
     hxw: Int,
 ) -> Float32:
     """One column's affine coefficient (the scalar head/tail of a row)."""
     comptime if affine == AFFINE_COL:
-        return p[col].cast[DType.float32]()
+        return p[unsafe_offset=col].cast[DType.float32]()
     else:
-        return p[gbase + col // hxw].cast[DType.float32]()
+        return p[unsafe_offset=gbase + col // hxw].cast[DType.float32]()
 
 
 @always_inline
@@ -181,12 +183,12 @@ def _affine_base[affine: Int](row: Int, group: Int, cpg: Int) -> Int:
 def _norm_rows_cached_kernel[
     dtype: DType, threads: Int, vecs: Int, affine: Int, ragged: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     eps: Float32,
@@ -254,16 +256,16 @@ def _norm_rows_cached_kernel[
         comptime for u in range(vecs):
             var v = tid + u * threads
             if v < n_vec:
-                x[u] = in_ptr.load[width=V, alignment=vec_align](
+                x[u] = in_ptr.unsafe_load[width=V, alignment=vec_align](
                     vec_start + v * V
                 )
                 acc += x[u].cast[DType.float32]()
         var thread_sum = acc.reduce_add()
         if has_head:
-            xh = in_ptr[base + head_col].cast[DType.float32]()
+            xh = in_ptr[unsafe_offset=base + head_col].cast[DType.float32]()
             thread_sum += xh
         if has_tail:
-            xt = in_ptr[base + tail_col].cast[DType.float32]()
+            xt = in_ptr[unsafe_offset=base + tail_col].cast[DType.float32]()
             thread_sum += xt
         # Row-uniform: every lane of the block reaches both reductions.
         var mean = block.sum[block_size=threads](thread_sum) * inv_cols
@@ -286,8 +288,8 @@ def _norm_rows_cached_kernel[
         if variance != variance:
             mean = variance
         if tid == 0:
-            mean_ptr[row] = mean
-            rstd_ptr[row] = rstd
+            mean_ptr[unsafe_offset=row] = mean
+            rstd_ptr[unsafe_offset=row] = rstd
 
         var gbase = _affine_base[affine](row, group, cpg)
         comptime for u in range(vecs):
@@ -306,7 +308,7 @@ def _norm_rows_cached_kernel[
                     r += _affine_vec[V=V, affine=affine](
                         beta_ptr, col0, gbase, hxw, aff_vec_ok
                     )
-                out_ptr.store[width=V, alignment=vec_align](
+                out_ptr.unsafe_store[width=V, alignment=vec_align](
                     vec_start + v * V, r.cast[dtype]()
                 )
         if has_head:
@@ -346,10 +348,10 @@ def _norm_rows_cached_kernel[
 def _norm_write_element[
     dtype: DType, //, affine: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     base: Int,
     col: Int,
     gbase: Int,
@@ -360,12 +362,14 @@ def _norm_write_element[
     has_bias: Bool,
 ):
     """Normalize and store one element of a row (scalar head/tail)."""
-    var r = (in_ptr[base + col].cast[DType.float32]() - mean) * rstd
+    var r = (
+        in_ptr[unsafe_offset=base + col].cast[DType.float32]() - mean
+    ) * rstd
     if has_weight:
         r *= _affine_scalar[affine=affine](gamma_ptr, col, gbase, hxw)
     if has_bias:
         r += _affine_scalar[affine=affine](beta_ptr, col, gbase, hxw)
-    out_ptr[base + col] = r.cast[dtype]()
+    out_ptr[unsafe_offset=base + col] = r.cast[dtype]()
 
 
 @__llvm_metadata(
@@ -375,12 +379,12 @@ def _norm_write_element[
 def _norm_rows_moments_kernel[
     dtype: DType, affine: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     eps: Float32,
@@ -432,7 +436,7 @@ def _norm_rows_moments_kernel[
         _moment_partition[dtype](
             Int(in_ptr), base, cols, head, n_vec, vec_start, tail_start
         )
-        var shift = in_ptr[base].cast[DType.float32]()
+        var shift = in_ptr[unsafe_offset=base].cast[DType.float32]()
         var s = Float32(0)
         var q = Float32(0)
         _moments_scan_contig[V=V, vec_align=vec_align, threads=NORM_THREADS](
@@ -484,8 +488,8 @@ def _norm_rows_moments_kernel[
         if variance != variance:
             mean = variance
         if tid == 0:
-            mean_ptr[row] = mean
-            rstd_ptr[row] = rstd
+            mean_ptr[unsafe_offset=row] = mean
+            rstd_ptr[unsafe_offset=row] = rstd
 
         var gbase = _affine_base[affine](row, group, cpg)
         if vec_io:
@@ -511,7 +515,7 @@ def _norm_rows_moments_kernel[
                 var off = vec_start + v * V
                 var col0 = off - base
                 var r = (
-                    in_ptr.load[width=V, alignment=vec_align](off).cast[
+                    in_ptr.unsafe_load[width=V, alignment=vec_align](off).cast[
                         DType.float32
                     ]()
                     - mean
@@ -531,7 +535,7 @@ def _norm_rows_moments_kernel[
                     r += _affine_vec[V=V, affine=affine](
                         beta_ptr, col0, gbase, hxw, aff_vec_ok
                     )
-                out_ptr.store[width=V, alignment=vec_align](
+                out_ptr.unsafe_store[width=V, alignment=vec_align](
                     off, r.cast[dtype]()
                 )
                 v += NORM_THREADS
@@ -577,12 +581,12 @@ def _norm_rows_moments_kernel[
 def _ln_fwd_warp_rows[
     dtype: DType, //, chunks: Int
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    weight: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    bias: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    weight: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    bias: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     vec_cols: Int,
@@ -606,7 +610,9 @@ def _ln_fwd_warp_rows[
         comptime for u in range(chunks):
             var c = lane + u * WARP_SIZE
             if c < vec_cols:
-                x[u] = input.load[width=V, alignment=vec_align](base + c * V)
+                x[u] = input.unsafe_load[width=V, alignment=vec_align](
+                    base + c * V
+                )
                 acc += x[u].cast[DType.float32]()
         # Row condition is warp-uniform: every lane reaches the shuffles.
         var row_mean = warp.sum(acc.reduce_add()) * inv_cols
@@ -623,21 +629,21 @@ def _ln_fwd_warp_rows[
         if variance != variance:
             row_mean = variance
         if lane == 0:
-            mean[row] = row_mean
-            rstd[row] = row_rstd
+            mean[unsafe_offset=row] = row_mean
+            rstd[unsafe_offset=row] = row_rstd
         comptime for u in range(chunks):
             var c = lane + u * WARP_SIZE
             if c < vec_cols:
                 var result = (x[u].cast[DType.float32]() - row_mean) * row_rstd
                 if has_weight != 0:
-                    result *= weight.load[width=V, alignment=vec_align](
+                    result *= weight.unsafe_load[width=V, alignment=vec_align](
                         c * V
                     ).cast[DType.float32]()
                 if has_bias != 0:
-                    result += bias.load[width=V, alignment=vec_align](
+                    result += bias.unsafe_load[width=V, alignment=vec_align](
                         c * V
                     ).cast[DType.float32]()
-                output.store[width=V, alignment=vec_align](
+                output.unsafe_store[width=V, alignment=vec_align](
                     base + c * V, result.cast[dtype]()
                 )
         row += row_stride
@@ -647,12 +653,12 @@ def _ln_fwd_warp_rows[
 def _ln_fwd_warp_kernel[
     dtype: DType, chunks: Int
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    weight: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    bias: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    weight: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    bias: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -682,12 +688,12 @@ def _ln_fwd_warp_kernel[
 def _enqueue_norm_cached[
     dtype: DType, threads: Int, vecs: Int, affine: Int, ragged: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     eps: Float32,
@@ -730,12 +736,12 @@ def _enqueue_norm_cached[
 def _enqueue_norm_warp[
     dtype: DType, chunks: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mean_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     vec_cols: Int,
@@ -796,13 +802,9 @@ def enqueue_norm_rows[
     var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
     var mean_ptr = _make_ptr[DType.float32](mean_addr).as_unsafe_any_origin()
     var rstd_ptr = _make_ptr[DType.float32](rstd_addr).as_unsafe_any_origin()
-    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
-    var gamma_ptr = (
-        _make_ptr[dtype](gamma_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var beta_ptr = (
-        _make_ptr[dtype](beta_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
+    var gamma_ptr = _make_ptr[dtype](gamma_addr).as_unsafe_any_origin().as_imm()
+    var beta_ptr = _make_ptr[dtype](beta_addr).as_unsafe_any_origin().as_imm()
     var hw = 1 if has_weight else 0
     var hb = 1 if has_bias else 0
 

@@ -22,8 +22,8 @@ comptime TARGET_BLOCKS = 80 if has_apple_gpu_accelerator() else 342
 
 @__name("pure_ksplit_reduce")
 def _ksplit_reduce_kernel(
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     mn_arg: Int64,
     ksplits_arg: Int64,
     total_arg: Int64,
@@ -44,8 +44,8 @@ def _ksplit_reduce_kernel(
         var base = bz * ksplits * mn + off
         var acc = SIMD[DType.float32, 4](0)
         for st in range(ksplits):
-            acc += ws_ptr.load[width=4](base + st * mn)
-        out_ptr.store(i, acc)
+            acc += ws_ptr.unsafe_load[width=4](base + st * mn)
+        out_ptr.unsafe_store(i, acc)
     else:
         for u in range(4):
             var iu = i + u
@@ -56,5 +56,5 @@ def _ksplit_reduce_kernel(
             var baseu = bzu * ksplits * mn + offu
             var accu = Scalar[DType.float32](0)
             for st in range(ksplits):
-                accu += ws_ptr[baseu + st * mn]
-            out_ptr[iu] = accu
+                accu += ws_ptr[unsafe_offset=baseu + st * mn]
+            out_ptr[unsafe_offset=iu] = accu

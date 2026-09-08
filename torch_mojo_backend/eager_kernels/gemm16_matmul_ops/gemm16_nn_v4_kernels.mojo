@@ -92,7 +92,7 @@ from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
+comptime _V4_PTR = Pointer[Scalar[_V4_DT], MutAnyOrigin]
 comptime _V4_BK = 64
 # Macro-rows per rasterization group: consecutive work indices cover
 # _V4_GROUP macro rows before advancing one BN column, keeping the in-flight
@@ -168,14 +168,13 @@ def _v4_dyn_smem_tile[
         address_space=AddressSpace.SHARED,
         alignment=align,
     ](
-        (
-            external_memory[
-                Scalar[_V4_DT],
-                address_space=AddressSpace.SHARED,
-                alignment=_V4_DYN_SMEM_ALIGN,
-            ]()
-            + offset
-        ).as_unsafe_any_origin()
+        external_memory[
+            Scalar[_V4_DT],
+            address_space=AddressSpace.SHARED,
+            alignment=_V4_DYN_SMEM_ALIGN,
+        ]()
+        .unsafe_offset(offset)
+        .as_unsafe_any_origin()
     )
 
 
@@ -212,10 +211,10 @@ def _v4_mma_tile[
     A_LAYOUT: Layout,
     B_LAYOUT: Layout,
 ](
-    a_smem: UnsafePointer[
+    a_smem: Pointer[
         Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
-    b_smem: UnsafePointer[
+    b_smem: Pointer[
         Scalar[_V4_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
     ],
     accum: LayoutTensor[
@@ -422,11 +421,13 @@ def _v4_nn_persistent_ws[
         ]()
         if thread_idx.x == 0:
             comptime for stage in range(stages):
-                full_barriers[stage].init()
+                full_barriers[unsafe_offset=stage].init()
                 # Released by every consumer warp group of every CTA in the
                 # cluster: the multicast source must not overwrite a peer's
                 # tile while that peer is still reading it.
-                empty_barriers[stage].init(Int32(consumers * cluster_m))
+                empty_barriers[unsafe_offset=stage].init(
+                    Int32(consumers * cluster_m)
+                )
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
             comptime if tma_store:
@@ -460,7 +461,7 @@ def _v4_nn_persistent_ws[
         # Release every pipeline slot to the producers (cluster-wide).
         if warp_group_idx > 0 and warp_group_thread_idx < cluster_m:
             comptime for stage in range(stages):
-                empty_barriers[stage].arrive_cluster(
+                empty_barriers[unsafe_offset=stage].arrive_cluster(
                     UInt32(warp_group_thread_idx)
                 )
 
@@ -482,26 +483,32 @@ def _v4_nn_persistent_ws[
                     while t < num_tiles:
                         var stage = gt % stages
                         var phase = UInt32((gt // stages) % 2)
-                        empty_barriers[stage].wait(phase)
-                        full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
+                        empty_barriers[unsafe_offset=stage].wait(phase)
+                        full_barriers[unsafe_offset=stage].expect_bytes(
+                            Int32(TMA_BYTES)
+                        )
                         var a_tile = LayoutTensor[
                             _V4_DT,
                             A_LAYOUT,
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
                             alignment=128,
-                        ](a_pipeline.ptr + stage * bm * _V4_BK)
+                        ](a_pipeline.ptr.unsafe_offset(stage * bm * _V4_BK))
                         var k0 = t * _V4_BK
                         # TMA coordinates are (fastest dim, slower dim) of
                         # the global tensor the descriptor was built over:
                         # (m, k) for the col-major (K, M) wgrad operand.
                         comptime if col_a:
                             a_tma.async_copy(
-                                a_tile, full_barriers[stage], (m0, k0)
+                                a_tile,
+                                full_barriers[unsafe_offset=stage],
+                                (m0, k0),
                             )
                         else:
                             a_tma.async_copy(
-                                a_tile, full_barriers[stage], (k0, m0)
+                                a_tile,
+                                full_barriers[unsafe_offset=stage],
+                                (k0, m0),
                             )
                         # Cooperative B load: each cluster rank reads its
                         # share of the 64-column chunks once from L2 and
@@ -518,9 +525,9 @@ def _v4_nn_persistent_ws[
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
                             ](
-                                b_pipeline.ptr
-                                + stage * bn * _V4_BK
-                                + cc * 64 * _V4_BK
+                                b_pipeline.ptr.unsafe_offset(
+                                    stage * bn * _V4_BK + cc * 64 * _V4_BK
+                                )
                             )
                             # B TMA coordinates follow the descriptor's
                             # global tensor: (k, n) for the K-major (N, K)
@@ -530,14 +537,14 @@ def _v4_nn_persistent_ws[
                                 comptime if kmaj_b:
                                     b_tma.async_multicast_load(
                                         b_chunk,
-                                        full_barriers[stage],
+                                        full_barriers[unsafe_offset=stage],
                                         (k0, n0 + cc * 64),
                                         MCAST_MASK,
                                     )
                                 else:
                                     b_tma.async_multicast_load(
                                         b_chunk,
-                                        full_barriers[stage],
+                                        full_barriers[unsafe_offset=stage],
                                         (n0 + cc * 64, k0),
                                         MCAST_MASK,
                                     )
@@ -545,13 +552,13 @@ def _v4_nn_persistent_ws[
                                 comptime if kmaj_b:
                                     b_tma.async_copy(
                                         b_chunk,
-                                        full_barriers[stage],
+                                        full_barriers[unsafe_offset=stage],
                                         (k0, n0 + cc * 64),
                                     )
                                 else:
                                     b_tma.async_copy(
                                         b_chunk,
-                                        full_barriers[stage],
+                                        full_barriers[unsafe_offset=stage],
                                         (n0 + cc * 64, k0),
                                     )
                             cc += 1
@@ -597,21 +604,21 @@ def _v4_nn_persistent_ws[
                 while t < num_tiles:
                     var stage = gt % stages
                     var phase = UInt32((gt // stages) % 2)
-                    full_barriers[stage].wait(phase)
+                    full_barriers[unsafe_offset=stage].wait(phase)
                     var a_tile = LayoutTensor[
                         _V4_DT,
                         A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_pipeline.ptr + stage * bm * _V4_BK)
+                    ](a_pipeline.ptr.unsafe_offset(stage * bm * _V4_BK))
                     var b_tile = LayoutTensor[
                         _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](b_pipeline.ptr + stage * bn * _V4_BK)
+                    ](b_pipeline.ptr.unsafe_offset(stage * bn * _V4_BK))
                     comptime if col_a or kmaj_b:
                         # Raw descriptor path: TensorCoreAsync has no
                         # col-major A mode (and the TT instantiation's
@@ -630,7 +637,7 @@ def _v4_nn_persistent_ws[
                         warpgroup_fence(accum)
                         wgmma.wait_group()
                     if warp_group_thread_idx < cluster_m:
-                        empty_barriers[stage].arrive_cluster(
+                        empty_barriers[unsafe_offset=stage].arrive_cluster(
                             UInt32(warp_group_thread_idx)
                         )
                     t += 1
@@ -658,8 +665,8 @@ def _v4_nn_persistent_ws[
                         )
                         var col = base_col + (q // 2) * 8
                         var pair = SIMD[_V4_DT, 2](
-                            accum.ptr[e].cast[_V4_DT](),
-                            accum.ptr[e + 1].cast[_V4_DT](),
+                            accum.ptr[unsafe_offset=e].cast[_V4_DT](),
+                            accum.ptr[unsafe_offset=e + 1].cast[_V4_DT](),
                         )
                         # 128B-swizzled staging layout: 16B units within
                         # each 64-element row are XORed with (row % 8).
@@ -670,7 +677,7 @@ def _v4_nn_persistent_ws[
                             + ((lcol // 8) ^ (row % 8)) * 8
                             + lcol % 8
                         )
-                        c_smem.ptr.store[alignment=4](elem, pair)
+                        c_smem.ptr.unsafe_store[alignment=4](elem, pair)
                     fence_async_view_proxy()
                     named_barrier[NCONS](1)
                     if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -681,7 +688,7 @@ def _v4_nn_persistent_ws[
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
-                            ](c_smem.ptr + chunk * bm * 64)
+                            ](c_smem.ptr.unsafe_offset(chunk * bm * 64))
                             c_tma.async_store(c_chunk, (n0 + chunk * 64, m0))
                         c_tma.commit_group()
                 else:
@@ -692,11 +699,11 @@ def _v4_nn_persistent_ws[
                         )
                         var col = base_col + (q // 2) * 8
                         var pair = SIMD[_V4_DT, 2](
-                            accum.ptr[e].cast[_V4_DT](),
-                            accum.ptr[e + 1].cast[_V4_DT](),
+                            accum.ptr[unsafe_offset=e].cast[_V4_DT](),
+                            accum.ptr[unsafe_offset=e + 1].cast[_V4_DT](),
                         )
                         if m0 + row < m and n0 + col + 1 < n:
-                            output.store[alignment=4](
+                            output.unsafe_store[alignment=4](
                                 (m0 + row) * n + n0 + col, pair
                             )
                 w += num_clusters
@@ -743,7 +750,7 @@ def _v4_enqueue_nn_persistent[
     var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            a.address_space_cast[AddressSpace.GENERIC](),
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -756,7 +763,7 @@ def _v4_enqueue_nn_persistent[
     var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            b.address_space_cast[AddressSpace.GENERIC](),
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -767,7 +774,7 @@ def _v4_enqueue_nn_persistent[
     var c_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            output.address_space_cast[AddressSpace.GENERIC](),
+            output.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -941,7 +948,7 @@ def maybe_enqueue_gemm16_nn_v4(
                     #    persistent body wins 16.2 us vs 19.8, likewise at
                     #    k = 4096 (49.9 vs 60.1), and its margin only grows
                     #    with fill (768x4224x1024: 17.7 vs 24.6).
-                    var small_route_wins = False
+                    var small_route_wins: Bool
                     if n % _V4_PROD_BN == 0:
                         small_route_wins = (
                             m % 64 == 0 and total_works * 8 < sm_count

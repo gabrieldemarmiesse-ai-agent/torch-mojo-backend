@@ -29,14 +29,14 @@ from variant_gates import _op_on, _register_call
 
 
 def enqueue_layer_norm_backward_f32(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows: Int,
     cols: Int,
     output_mask: Int,
@@ -139,21 +139,21 @@ def _layer_norm_backward_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _layer_norm_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
+            args[unsafe_offset=11],
         )
     except e:
         return _spec_unsupported(e)

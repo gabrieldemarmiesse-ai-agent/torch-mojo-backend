@@ -121,9 +121,9 @@ comptime OP_MIN = 5
 def _bin_contig_kernel4[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    lhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    lhs_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    rhs_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     n4_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -134,30 +134,30 @@ def _bin_contig_kernel4[
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while c < n4:
         var i = c * 4
-        var a = lhs_ptr.load[width=4, alignment=vec_align](i)
-        var b = rhs_ptr.load[width=4, alignment=vec_align](i)
+        var a = lhs_ptr.unsafe_load[width=4, alignment=vec_align](i)
+        var b = rhs_ptr.unsafe_load[width=4, alignment=vec_align](i)
         comptime if op_code == OP_ADD:
-            out_ptr.store[width=4, alignment=vec_align](i, a + b)
+            out_ptr.unsafe_store[width=4, alignment=vec_align](i, a + b)
         comptime if op_code == OP_SUB:
-            out_ptr.store[width=4, alignment=vec_align](i, a - b)
+            out_ptr.unsafe_store[width=4, alignment=vec_align](i, a - b)
         comptime if op_code == OP_MUL:
-            out_ptr.store[width=4, alignment=vec_align](i, a * b)
+            out_ptr.unsafe_store[width=4, alignment=vec_align](i, a * b)
         comptime if op_code == OP_DIV:
             comptime if dtype.is_floating_point():
-                out_ptr.store[width=4, alignment=vec_align](i, a / b)
+                out_ptr.unsafe_store[width=4, alignment=vec_align](i, a / b)
         comptime if op_code == OP_MAX:
-            out_ptr.store[width=4, alignment=vec_align](i, max(a, b))
+            out_ptr.unsafe_store[width=4, alignment=vec_align](i, max(a, b))
         comptime if op_code == OP_MIN:
-            out_ptr.store[width=4, alignment=vec_align](i, min(a, b))
+            out_ptr.unsafe_store[width=4, alignment=vec_align](i, min(a, b))
         c += gstride
 
 
 def _bin_contig_kernel[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    lhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    rhs_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    lhs_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    rhs_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     size_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -166,21 +166,21 @@ def _bin_contig_kernel[
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < size:
-        var a = lhs_ptr[i]
-        var b = rhs_ptr[i]
+        var a = lhs_ptr[unsafe_offset=i]
+        var b = rhs_ptr[unsafe_offset=i]
         comptime if op_code == OP_ADD:
-            out_ptr[i] = a + b
+            out_ptr[unsafe_offset=i] = a + b
         comptime if op_code == OP_SUB:
-            out_ptr[i] = a - b
+            out_ptr[unsafe_offset=i] = a - b
         comptime if op_code == OP_MUL:
-            out_ptr[i] = a * b
+            out_ptr[unsafe_offset=i] = a * b
         comptime if op_code == OP_DIV:
             comptime if dtype.is_floating_point():
-                out_ptr[i] = a / b
+                out_ptr[unsafe_offset=i] = a / b
         comptime if op_code == OP_MAX:
-            out_ptr[i] = max(a, b)
+            out_ptr[unsafe_offset=i] = max(a, b)
         comptime if op_code == OP_MIN:
-            out_ptr[i] = min(a, b)
+            out_ptr[unsafe_offset=i] = min(a, b)
         i += gstride
 
 
@@ -188,9 +188,9 @@ def _bin_contig_kernel[
 def _bin_elementwise[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    lhs_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    rhs_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    lhs_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    rhs_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     size: Int,
     ctx: DeviceContext,
 ) raises:
@@ -206,20 +206,20 @@ def _bin_elementwise[
             @__copy_capture(out_ptr, lhs_ptr, rhs_ptr)
             def func[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
-                var a = lhs_ptr.load[width=width](i)
-                var b = rhs_ptr.load[width=width](i)
+                var a = lhs_ptr.unsafe_load[width=width](i)
+                var b = rhs_ptr.unsafe_load[width=width](i)
                 comptime if op_code == OP_ADD:
-                    out_ptr.store[width=width](i, a + b)
+                    out_ptr.unsafe_store[width=width](i, a + b)
                 comptime if op_code == OP_SUB:
-                    out_ptr.store[width=width](i, a - b)
+                    out_ptr.unsafe_store[width=width](i, a - b)
                 comptime if op_code == OP_MUL:
-                    out_ptr.store[width=width](i, a * b)
+                    out_ptr.unsafe_store[width=width](i, a * b)
                 comptime if op_code == OP_DIV:
-                    out_ptr.store[width=width](i, a / b)
+                    out_ptr.unsafe_store[width=width](i, a / b)
                 comptime if op_code == OP_MAX:
-                    out_ptr.store[width=width](i, max(a, b))
+                    out_ptr.unsafe_store[width=width](i, max(a, b))
                 comptime if op_code == OP_MIN:
-                    out_ptr.store[width=width](i, min(a, b))
+                    out_ptr.unsafe_store[width=width](i, min(a, b))
 
             elementwise[func, simd_width=simd_width_of[dtype]()](
                 Coord(size), ctx
@@ -237,8 +237,8 @@ def _bin_elementwise[
                             1,
                             GS_THREADS,
                             out_ptr.as_unsafe_any_origin(),
-                            lhs_ptr.as_unsafe_any_origin().as_immutable(),
-                            rhs_ptr.as_unsafe_any_origin().as_immutable(),
+                            lhs_ptr.as_unsafe_any_origin().as_imm(),
+                            rhs_ptr.as_unsafe_any_origin().as_imm(),
                             Int64(n4),
                         )
                         return
@@ -250,8 +250,8 @@ def _bin_elementwise[
                         1,
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
-                        lhs_ptr.as_unsafe_any_origin().as_immutable(),
-                        rhs_ptr.as_unsafe_any_origin().as_immutable(),
+                        lhs_ptr.as_unsafe_any_origin().as_imm(),
+                        rhs_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(size),
                     )
                 else:
@@ -426,8 +426,8 @@ def _float_unary[
 def _unary_contig_kernel[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     size_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -442,28 +442,28 @@ def _unary_contig_kernel[
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < size:
-        var a = in_ptr[i]
+        var a = in_ptr[unsafe_offset=i]
         comptime if op_code == UOP_RELU:
-            out_ptr[i] = max(a, Scalar[dtype](0))
+            out_ptr[unsafe_offset=i] = max(a, Scalar[dtype](0))
         comptime if op_code == UOP_ABS:
-            out_ptr[i] = abs(a)
+            out_ptr[unsafe_offset=i] = abs(a)
         comptime if op_code == UOP_NEG:
             # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
-            out_ptr[i] = -a
+            out_ptr[unsafe_offset=i] = -a
         comptime if op_code == UOP_SIGN:
             var zero = Scalar[dtype](0)
             var pos = a.gt(zero).cast[dtype]()
             var neg = a.lt(zero).cast[dtype]()
             # NaN compares false on both sides -> 0, matching torch.
-            out_ptr[i] = pos - neg
+            out_ptr[unsafe_offset=i] = pos - neg
         comptime if not is_direct:
             comptime if dtype == DType.float16 or dtype == DType.bfloat16:
                 var af = a.cast[DType.float32]()
-                out_ptr[i] = _float_unary[DType.float32, 1, op_code](af).cast[
-                    dtype
-                ]()
+                out_ptr[unsafe_offset=i] = _float_unary[
+                    DType.float32, 1, op_code
+                ](af).cast[dtype]()
             elif dtype.is_floating_point():
-                out_ptr[i] = _float_unary[dtype, 1, op_code](a)
+                out_ptr[unsafe_offset=i] = _float_unary[dtype, 1, op_code](a)
         i += gstride
 
 
@@ -506,8 +506,8 @@ def _unary_apply[
 def _unary_contig_kernel4[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     size_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -528,32 +528,34 @@ def _unary_contig_kernel4[
     var g = gid
     while g < groups:
         var b = g * 4
-        var a0 = in_ptr.load[width=4, alignment=vec_align](b * 4)
-        var a1 = in_ptr.load[width=4, alignment=vec_align]((b + 1) * 4)
-        var a2 = in_ptr.load[width=4, alignment=vec_align]((b + 2) * 4)
-        var a3 = in_ptr.load[width=4, alignment=vec_align]((b + 3) * 4)
-        out_ptr.store[width=4, alignment=vec_align](
+        var a0 = in_ptr.unsafe_load[width=4, alignment=vec_align](b * 4)
+        var a1 = in_ptr.unsafe_load[width=4, alignment=vec_align]((b + 1) * 4)
+        var a2 = in_ptr.unsafe_load[width=4, alignment=vec_align]((b + 2) * 4)
+        var a3 = in_ptr.unsafe_load[width=4, alignment=vec_align]((b + 3) * 4)
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             b * 4, _unary_apply[dtype, 4, op_code](a0)
         )
-        out_ptr.store[width=4, alignment=vec_align](
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             (b + 1) * 4, _unary_apply[dtype, 4, op_code](a1)
         )
-        out_ptr.store[width=4, alignment=vec_align](
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             (b + 2) * 4, _unary_apply[dtype, 4, op_code](a2)
         )
-        out_ptr.store[width=4, alignment=vec_align](
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             (b + 3) * 4, _unary_apply[dtype, 4, op_code](a3)
         )
         g += gstride
     var c = groups * 4 + gid
     if c < vec_count:
-        var a = in_ptr.load[width=4, alignment=vec_align](c * 4)
-        out_ptr.store[width=4, alignment=vec_align](
+        var a = in_ptr.unsafe_load[width=4, alignment=vec_align](c * 4)
+        out_ptr.unsafe_store[width=4, alignment=vec_align](
             c * 4, _unary_apply[dtype, 4, op_code](a)
         )
     var i = vec_count * 4 + gid
     while i < size:
-        out_ptr[i] = _unary_apply[dtype, 1, op_code](in_ptr[i])
+        out_ptr[unsafe_offset=i] = _unary_apply[dtype, 1, op_code](
+            in_ptr[unsafe_offset=i]
+        )
         i += gstride
 
 
@@ -561,8 +563,8 @@ def _unary_contig_kernel4[
 def _unary_elementwise[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     size: Int,
     ctx: DeviceContext,
 ) raises:
@@ -585,30 +587,32 @@ def _unary_elementwise[
             @__copy_capture(out_ptr, in_ptr)
             def func[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
-                var a = in_ptr.load[width=width](i)
+                var a = in_ptr.unsafe_load[width=width](i)
                 comptime if op_code == UOP_RELU:
-                    out_ptr.store[width=width](i, max(a, SIMD[dtype, width](0)))
+                    out_ptr.unsafe_store[width=width](
+                        i, max(a, SIMD[dtype, width](0))
+                    )
                 comptime if op_code == UOP_ABS:
-                    out_ptr.store[width=width](i, abs(a))
+                    out_ptr.unsafe_store[width=width](i, abs(a))
                 comptime if op_code == UOP_NEG:
                     # `-a` (pop.neg) wraps for unsigned/overflow like torch.
-                    out_ptr.store[width=width](i, -a)
+                    out_ptr.unsafe_store[width=width](i, -a)
                 comptime if op_code == UOP_SIGN:
                     var zero = SIMD[dtype, width](0)
                     var pos = a.gt(zero).cast[dtype]()
                     var neg = a.lt(zero).cast[dtype]()
                     # NaN compares false on both sides -> 0, matching torch.
-                    out_ptr.store[width=width](i, pos - neg)
+                    out_ptr.unsafe_store[width=width](i, pos - neg)
                 comptime if not is_direct:
                     comptime if (
                         dtype == DType.float16 or dtype == DType.bfloat16
                     ):
                         var af = a.cast[DType.float32]()
-                        out_ptr.store[width=width](
+                        out_ptr.unsafe_store[width=width](
                             i, _float_unary[op_code=op_code](af).cast[dtype]()
                         )
                     elif dtype.is_floating_point():
-                        out_ptr.store[width=width](
+                        out_ptr.unsafe_store[width=width](
                             i, _float_unary[op_code=op_code](a)
                         )
 
@@ -639,7 +643,7 @@ def _unary_elementwise[
                             1,
                             GS_THREADS,
                             out_ptr.as_unsafe_any_origin(),
-                            in_ptr.as_unsafe_any_origin().as_immutable(),
+                            in_ptr.as_unsafe_any_origin().as_imm(),
                             Int64(size),
                             Int64(vec_count),
                         )
@@ -652,7 +656,7 @@ def _unary_elementwise[
                         1,
                         GS_THREADS,
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(size),
                     )
                 else:
@@ -690,8 +694,8 @@ def _unary_bool_vec[
 def _unary_bool[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[DType.bool], MutUntrackedOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[DType.bool], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     size: Int,
     ctx: DeviceContext,
 ) raises:
@@ -702,10 +706,10 @@ def _unary_bool[
         # Same body as the vectorized path above, through the same helper:
         # the 0/1 uint8 it returns is bit-identical to the bool stored here.
         var i = Int(idx[0].value())
-        out_ptr.store[width=width](
+        out_ptr.unsafe_store[width=width](
             i,
             _unary_bool_vec[dtype, op_code, width](
-                in_ptr.load[width=width](i)
+                in_ptr.unsafe_load[width=width](i)
             ).cast[DType.bool](),
         )
 
@@ -741,8 +745,8 @@ comptime SOP_POW = 2
 def _scalar_elementwise[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     scalar: Float32,
     size: Int,
     ctx: DeviceContext,
@@ -756,14 +760,14 @@ def _scalar_elementwise[
         @__copy_capture(out_ptr, in_ptr, scalar)
         def func[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            var a = in_ptr.load[width=width](i).cast[DType.float32]()
+            var a = in_ptr.unsafe_load[width=width](i).cast[DType.float32]()
             var s = SIMD[DType.float32, width](scalar)
             comptime if op_code == SOP_ADD:
-                out_ptr.store[width=width](i, (a + s).cast[dtype]())
+                out_ptr.unsafe_store[width=width](i, (a + s).cast[dtype]())
             comptime if op_code == SOP_MUL:
-                out_ptr.store[width=width](i, (a * s).cast[dtype]())
+                out_ptr.unsafe_store[width=width](i, (a * s).cast[dtype]())
             comptime if op_code == SOP_POW:
-                out_ptr.store[width=width](i, pow(a, s).cast[dtype]())
+                out_ptr.unsafe_store[width=width](i, pow(a, s).cast[dtype]())
 
         if ctx.api() == "cpu":
             elementwise[func, simd_width=simd_width_of[dtype]()](
@@ -784,8 +788,8 @@ comptime IOP_MUL = 1
 def _int_scalar_elementwise[
     dtype: DType, op_code: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     scalar: Int,
     size: Int,
     ctx: DeviceContext,
@@ -795,11 +799,11 @@ def _int_scalar_elementwise[
     @__copy_capture(out_ptr, in_ptr, scalar)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        var a = in_ptr.load[width=width](i)
+        var a = in_ptr.unsafe_load[width=width](i)
         comptime if op_code == IOP_ADD:
-            out_ptr.store[width=width](i, a + SIMD[dtype, width](scalar))
+            out_ptr.unsafe_store[width=width](i, a + SIMD[dtype, width](scalar))
         comptime if op_code == IOP_MUL:
-            out_ptr.store[width=width](i, a * SIMD[dtype, width](scalar))
+            out_ptr.unsafe_store[width=width](i, a * SIMD[dtype, width](scalar))
 
     if ctx.api() == "cpu":
         elementwise[func, simd_width=simd_width_of[dtype]()](Coord(size), ctx)
@@ -832,7 +836,7 @@ def _fill[
 def _arange[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     start: Float64,
     step: Float64,
     size: Int,
@@ -849,7 +853,9 @@ def _arange[
             @__copy_capture(out_ptr, start, step)
             def cpu_f32[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
-                out_ptr[i] = (start + Float64(i) * step).cast[dtype]()
+                out_ptr[unsafe_offset=i] = (start + Float64(i) * step).cast[
+                    dtype
+                ]()
 
             elementwise[cpu_f32, simd_width=1](Coord(size), ctx)
         else:
@@ -861,7 +867,7 @@ def _arange[
             @__copy_capture(out_ptr, start_f32, step_f32)
             def gpu_f32[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
-                out_ptr[i] = (
+                out_ptr[unsafe_offset=i] = (
                     start_f32 + Scalar[DType.float32](i) * step_f32
                 ).cast[dtype]()
 
@@ -880,9 +886,9 @@ def _arange[
         @__copy_capture(out_ptr, start_f32, step_f32)
         def lowp[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            out_ptr[i] = (start_f32 + Scalar[DType.float32](i) * step_f32).cast[
-                dtype
-            ]()
+            out_ptr[unsafe_offset=i] = (
+                start_f32 + Scalar[DType.float32](i) * step_f32
+            ).cast[dtype]()
 
         if ctx.api() == "cpu":
             elementwise[lowp, simd_width=1](Coord(size), ctx)
@@ -900,9 +906,9 @@ def _arange[
         @__copy_capture(out_ptr, start_i64, step_i64)
         def integral[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            out_ptr[i] = (start_i64 + Scalar[DType.int64](i) * step_i64).cast[
-                dtype
-            ]()
+            out_ptr[unsafe_offset=i] = (
+                start_i64 + Scalar[DType.int64](i) * step_i64
+            ).cast[dtype]()
 
         if ctx.api() == "cpu":
             elementwise[integral, simd_width=1](Coord(size), ctx)
@@ -920,7 +926,7 @@ def _arange[
         @__copy_capture(out_ptr, start, step)
         def f64[width: Int, alignment: Int = 1](idx: Coord):
             var i = Int(idx[0].value())
-            out_ptr[i] = (start + Float64(i) * step).cast[dtype]()
+            out_ptr[unsafe_offset=i] = (start + Float64(i) * step).cast[dtype]()
 
         if ctx.api() == "cpu":
             elementwise[f64, simd_width=1](Coord(size), ctx)
@@ -986,9 +992,16 @@ def _bin_dispatcher[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _bin_go[op_code](args[0], args[1], args[2], args[3], args[4], args[5])
+        _bin_go[op_code](
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -999,9 +1012,16 @@ def _arange_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _arange_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _arange_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -1192,9 +1212,11 @@ def _scalar_inplace_dispatcher[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        return _scalar_inplace_go[op_code](args[0], args[1])
+        return _scalar_inplace_go[op_code](
+            args[unsafe_offset=0], args[unsafe_offset=1]
+        )
     except e:
         return _spec_unsupported(e)
 

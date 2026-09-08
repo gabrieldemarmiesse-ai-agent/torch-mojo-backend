@@ -644,14 +644,12 @@ def _block_fold[
             n_warps, acc, address_space=AddressSpace.SHARED
         ]()
         if tid % WARP_SIZE == 0:
-            smem[tid // WARP_SIZE] = lane_total
+            smem[unsafe_offset=tid // WARP_SIZE] = lane_total
         barrier()
         var total = Op.identity[acc, 1]()[0]
         if tid == 0:
-
-            @parameter
-            for k in range(n_warps):
-                total = Op.combine(total, smem[k])
+            comptime for k in range(n_warps):
+                total = Op.combine(total, smem[unsafe_offset=k])
         return total
 
 
@@ -659,7 +657,7 @@ def _block_fold[
 def _scan_contig[
     Op: ReduceOp, dtype: DType, acc: DType, V: Int, vec_align: Int, lanes: Int
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     start: Int,
     n: Int,
     head: Int,
@@ -681,7 +679,9 @@ def _scan_contig[
         acc_vec = Op.combine(
             acc_vec,
             Op.map[acc=acc](
-                in_ptr.load[width=V, alignment=vec_align](vec_start + v * V)
+                in_ptr.unsafe_load[width=V, alignment=vec_align](
+                    vec_start + v * V
+                )
             ),
         )
         v += lanes
@@ -689,11 +689,15 @@ def _scan_contig[
 
     var jh = lane
     while jh < head:
-        total = Op.combine(total, Op.map[acc=acc](in_ptr[start + jh]))
+        total = Op.combine(
+            total, Op.map[acc=acc](in_ptr[unsafe_offset=start + jh])
+        )
         jh += lanes
     var jt = tail_start + lane
     while jt < n:
-        total = Op.combine(total, Op.map[acc=acc](in_ptr[start + jt]))
+        total = Op.combine(
+            total, Op.map[acc=acc](in_ptr[unsafe_offset=start + jt])
+        )
         jt += lanes
     return total
 
@@ -710,9 +714,9 @@ def _scan_contig[
 def _reduce_contig_kernel[
     Op: ReduceOp, dtype: DType, lanes: Int
 ](
-    out_ptr: UnsafePointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
@@ -783,11 +787,11 @@ def _reduce_contig_kernel[
     var group_total = _block_fold[Op, acc, lanes](lane, total)
     if lane == 0:
         if splits == 1:
-            out_ptr[row] = Op.finish[out_dt=Op.out_dtype[dtype]()](
-                group_total, cols
-            )
+            out_ptr[unsafe_offset=row] = Op.finish[
+                out_dt=Op.out_dtype[dtype]()
+            ](group_total, cols)
         else:
-            ws_ptr[split * outputs + row] = group_total
+            ws_ptr[unsafe_offset=split * outputs + row] = group_total
 
 
 # ---------------------------------------------------------------------------
@@ -802,9 +806,9 @@ def _reduce_contig_kernel[
 def _reduce_strided_kernel[
     Op: ReduceOp, dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
     inner_arg: Int64,
     outputs_arg: Int64,
@@ -841,14 +845,16 @@ def _reduce_strided_kernel[
 
     var total = Op.identity[acc, 1]()[0]
     for r in range(r0, r1):
-        total = Op.combine(total, Op.map[acc=acc](in_ptr[base + r * inner]))
+        total = Op.combine(
+            total, Op.map[acc=acc](in_ptr[unsafe_offset=base + r * inner])
+        )
 
     if splits == 1:
-        out_ptr[out_index] = Op.finish[out_dt=Op.out_dtype[dtype]()](
-            total, reduce_n
-        )
+        out_ptr[unsafe_offset=out_index] = Op.finish[
+            out_dt=Op.out_dtype[dtype]()
+        ](total, reduce_n)
     else:
-        ws_ptr[split * outputs + out_index] = total
+        ws_ptr[unsafe_offset=split * outputs + out_index] = total
 
 
 # ---------------------------------------------------------------------------
@@ -863,8 +869,8 @@ def _reduce_strided_kernel[
 def _reduce_merge_thread_kernel[
     Op: ReduceOp, dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[Op.acc_dtype[dtype]()], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], ImmutAnyOrigin],
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
@@ -879,8 +885,10 @@ def _reduce_merge_thread_kernel[
         return
     var total = Op.identity[acc, 1]()[0]
     for k in range(splits):
-        total = Op.combine(total, ws_ptr[k * outputs + o])
-    out_ptr[o] = Op.finish[out_dt=Op.out_dtype[dtype]()](total, Int(reduce_arg))
+        total = Op.combine(total, ws_ptr[unsafe_offset=k * outputs + o])
+    out_ptr[unsafe_offset=o] = Op.finish[out_dt=Op.out_dtype[dtype]()](
+        total, Int(reduce_arg)
+    )
 
 
 @__llvm_metadata(
@@ -890,8 +898,8 @@ def _reduce_merge_thread_kernel[
 def _reduce_merge_block_kernel[
     Op: ReduceOp, dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[Op.acc_dtype[dtype]()], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[Op.out_dtype[dtype]()], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[Op.acc_dtype[dtype]()], ImmutAnyOrigin],
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
@@ -906,10 +914,10 @@ def _reduce_merge_block_kernel[
     var tid = Int(thread_idx.x)
     var total = Op.identity[acc, 1]()[0]
     for k in range(tid, splits, RED_THREADS):
-        total = Op.combine(total, ws_ptr[k * outputs + o])
+        total = Op.combine(total, ws_ptr[unsafe_offset=k * outputs + o])
     var block_total = _block_fold[Op, acc, RED_THREADS](tid, total)
     if tid == 0:
-        out_ptr[o] = Op.finish[out_dt=Op.out_dtype[dtype]()](
+        out_ptr[unsafe_offset=o] = Op.finish[out_dt=Op.out_dtype[dtype]()](
             block_total, Int(reduce_arg)
         )
 
@@ -974,9 +982,10 @@ def _reduce_generic[
             var total = Op.identity[acc, 1]()[0]
             for r in range(reduce_n):
                 total = Op.combine(
-                    total, Op.map[acc=acc](in_ptr[base + r * inner])
+                    total,
+                    Op.map[acc=acc](in_ptr[unsafe_offset=base + r * inner]),
                 )
-            out_ptr[o] = Op.finish[out_dt=out_dt](total, reduce_n)
+            out_ptr[unsafe_offset=o] = Op.finish[out_dt=out_dt](total, reduce_n)
 
         _parallel_for[func](outputs, ctx)
         return
@@ -986,7 +995,7 @@ def _reduce_generic[
     else:
         var target = RED_BLOCKS_PER_SM * _device_sm_count(ctx)
         var mout = out_ptr.as_unsafe_any_origin()
-        var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
+        var min_ = in_ptr.as_unsafe_any_origin().as_imm()
 
         var base_blocks = outputs
         # The contiguous kernel wants a whole 16-byte vector per thread before
@@ -1114,7 +1123,7 @@ def _reduce_generic[
                 1,
                 RED_THREADS,
                 mout,
-                ws_ptr.as_immutable(),
+                ws_ptr.as_imm(),
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),
@@ -1128,7 +1137,7 @@ def _reduce_generic[
                 1,
                 RED_THREADS,
                 mout,
-                ws_ptr.as_immutable(),
+                ws_ptr.as_imm(),
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),

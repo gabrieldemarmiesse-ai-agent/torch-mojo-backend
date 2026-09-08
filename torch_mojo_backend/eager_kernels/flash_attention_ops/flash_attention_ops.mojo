@@ -84,13 +84,13 @@ def _flash_attention_forward_go(
                     lse.as_unsafe_any_origin(),
                     _make_ptr[dt](_raw_int(q_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(k_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(v_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     q_st,
                     k_st,
                     v_st,
@@ -181,20 +181,20 @@ def _flash_attention_backward_go(
                     dv.as_unsafe_any_origin(),
                     _make_ptr[dt](_raw_int(grad_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(q_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(k_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(v_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
                     _make_ptr[dt](_raw_int(out_obj))
                     .as_unsafe_any_origin()
-                    .as_immutable(),
-                    lse.as_unsafe_any_origin().as_immutable(),
+                    .as_imm(),
+                    lse.as_unsafe_any_origin().as_imm(),
                     g_st,
                     q_st,
                     k_st,

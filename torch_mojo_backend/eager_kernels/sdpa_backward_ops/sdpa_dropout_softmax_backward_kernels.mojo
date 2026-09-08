@@ -52,10 +52,10 @@ comptime _VECTOR_BYTES = 16
 def _fused_rows[
     dtype: DType, has_mask: Bool, causal: Bool, VEC: Int
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    probabilities: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows: Int,
     cols: Int,
     q_len: Int,
@@ -73,22 +73,26 @@ def _fused_rows[
     @always_inline
     @parameter
     def _grad_vec(index: Int) -> SIMD[F32, VEC]:
-        var d_p = grad_after_dropout.load[width=VEC, alignment=ALIGN](
+        var d_p = grad_after_dropout.unsafe_load[width=VEC, alignment=ALIGN](
             index
         ).cast[F32]()
         comptime if has_mask:
             # Preserve the pinned IEEE operation order.  A false mask is
             # multiplied rather than used as a selection, so non-finite
             # gradients still propagate as specified.
-            d_p = d_p * mask.load[width=VEC](index).cast[F32]() * dropout_scale
+            d_p = (
+                d_p
+                * mask.unsafe_load[width=VEC](index).cast[F32]()
+                * dropout_scale
+            )
         return d_p
 
     @always_inline
     @parameter
     def _grad_one(index: Int) -> Float32:
-        var d_p = grad_after_dropout[index].cast[F32]()
+        var d_p = grad_after_dropout[unsafe_offset=index].cast[F32]()
         comptime if has_mask:
-            d_p = d_p * mask[index].cast[F32]() * dropout_scale
+            d_p = d_p * mask[unsafe_offset=index].cast[F32]() * dropout_scale
         return d_p
 
     while row < rows:
@@ -104,7 +108,7 @@ def _fused_rows[
         while col < vec_limit:
             var index = base + col
             acc = (
-                probabilities.load[width=VEC, alignment=ALIGN](index)
+                probabilities.unsafe_load[width=VEC, alignment=ALIGN](index)
                 .cast[F32]()
                 .fma(_grad_vec(index), acc)
             )
@@ -113,9 +117,9 @@ def _fused_rows[
         var tail = vec_limit + lane
         var tail_sum = Float32(0.0)
         if tail < limit:
-            tail_sum = probabilities[base + tail].cast[F32]() * _grad_one(
-                base + tail
-            )
+            tail_sum = probabilities[unsafe_offset=base + tail].cast[
+                F32
+            ]() * _grad_one(base + tail)
 
         # The row bound is warp-uniform, so every lane reaches the shuffles.
         var row_sum = warp.sum(acc.reduce_add() + tail_sum)
@@ -125,17 +129,19 @@ def _fused_rows[
         while col < vec_limit:
             var index = base + col
             var value = (
-                probabilities.load[width=VEC, alignment=ALIGN](index).cast[
-                    F32
-                ]()
+                probabilities.unsafe_load[width=VEC, alignment=ALIGN](
+                    index
+                ).cast[F32]()
                 * (_grad_vec(index) - row_sum)
                 * score_scale
             )
-            output.store[width=VEC, alignment=ALIGN](index, value.cast[dtype]())
+            output.unsafe_store[width=VEC, alignment=ALIGN](
+                index, value.cast[dtype]()
+            )
             col += WARP_SIZE * VEC
         if tail < limit:
-            output[base + tail] = (
-                probabilities[base + tail].cast[F32]()
+            output[unsafe_offset=base + tail] = (
+                probabilities[unsafe_offset=base + tail].cast[F32]()
                 * (_grad_one(base + tail) - row_sum)
                 * score_scale
             ).cast[dtype]()
@@ -145,10 +151,10 @@ def _fused_rows[
         comptime if causal:
             var zero_head = min(cols, ceildiv(limit, VEC) * VEC)
             if limit + lane < zero_head:
-                output[base + limit + lane] = Scalar[dtype](0)
+                output[unsafe_offset=base + limit + lane] = Scalar[dtype](0)
             col = zero_head + lane * VEC
             while col + VEC <= cols:
-                output.store[width=VEC, alignment=ALIGN](
+                output.unsafe_store[width=VEC, alignment=ALIGN](
                     base + col, SIMD[dtype, VEC](Scalar[dtype](0))
                 )
                 col += WARP_SIZE * VEC
@@ -162,10 +168,10 @@ def _fused_rows[
 def _fused_kernel[
     dtype: DType, has_mask: Bool, causal: Bool, VEC: Int
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    probabilities: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     q_len_arg: Int64,
@@ -194,10 +200,10 @@ def _fused_kernel[
 def _enqueue_one[
     dtype: DType, has_mask: Bool, causal: Bool, VEC: Int
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    probabilities: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows: Int,
     cols: Int,
     q_len: Int,
@@ -230,10 +236,10 @@ def _enqueue_one[
 def _enqueue_regime[
     dtype: DType, causal: Bool
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    probabilities: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows: Int,
     cols: Int,
     q_len: Int,
@@ -311,10 +317,10 @@ def _enqueue_regime[
 def enqueue_sdpa_dropout_softmax_backward[
     dtype: DType
 ](
-    output: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    mask: Optional[UnsafePointer[Scalar[DType.bool], MutAnyOrigin]],
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    probabilities: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Optional[Pointer[Scalar[DType.bool], MutAnyOrigin]],
     rows: Int,
     cols: Int,
     q_len: Int,
@@ -349,9 +355,11 @@ def enqueue_sdpa_dropout_softmax_backward[
         # compile-time parameter, so the no-mask instantiation never emits a
         # single mask access.  Pass an aliased operand pointer as the unused
         # argument rather than model nullability all the way into the kernel.
-        var mask_ptr = mask.value() if has_mask else probabilities.bitcast[
-            Scalar[DType.bool]
-        ]()
+        var mask_ptr = (
+            mask.value() if has_mask else probabilities.unsafe_bitcast[
+                Scalar[DType.bool]
+            ]()
+        )
         if causal:
             _enqueue_regime[dtype, True](
                 output,
@@ -413,10 +421,10 @@ comptime _CVEC = 4  # float4 loads; requires 16B-aligned rows
 
 @__name("sdpa_dropout_softmax_backward_masked_f32")
 def _masked_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     dropout_scale: Float32,
@@ -439,11 +447,11 @@ def _masked_f32(
             # false mask is multiplied rather than used as a selection, so
             # non-finite gradients still propagate as specified.
             var masked_d_p = (
-                grad_after_dropout[index]
-                * mask[index].cast[DType.float32]()
+                grad_after_dropout[unsafe_offset=index]
+                * mask[unsafe_offset=index].cast[DType.float32]()
                 * dropout_scale
             )
-            partial_sum += probabilities[index] * masked_d_p
+            partial_sum += probabilities[unsafe_offset=index] * masked_d_p
             col += _APPLE_BLOCK
 
         # Every thread in the block reaches this row reduction. Broadcasting
@@ -455,12 +463,14 @@ def _masked_f32(
         while col < cols:
             var index = base + col
             var masked_d_p = (
-                grad_after_dropout[index]
-                * mask[index].cast[DType.float32]()
+                grad_after_dropout[unsafe_offset=index]
+                * mask[unsafe_offset=index].cast[DType.float32]()
                 * dropout_scale
             )
-            output[index] = (
-                probabilities[index] * (masked_d_p - row_sum) * score_scale
+            output[unsafe_offset=index] = (
+                probabilities[unsafe_offset=index]
+                * (masked_d_p - row_sum)
+                * score_scale
             )
             col += _APPLE_BLOCK
         row += row_stride
@@ -468,9 +478,9 @@ def _masked_f32(
 
 @__name("sdpa_dropout_softmax_backward_unmasked_f32")
 def _unmasked_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     score_scale: Float32,
@@ -488,7 +498,10 @@ def _unmasked_f32(
         var col = tid
         while col < cols:
             var index = base + col
-            partial_sum += probabilities[index] * grad_after_dropout[index]
+            partial_sum += (
+                probabilities[unsafe_offset=index]
+                * grad_after_dropout[unsafe_offset=index]
+            )
             col += _APPLE_BLOCK
 
         var row_sum = block.sum[block_size=_APPLE_BLOCK, broadcast=True](
@@ -497,9 +510,9 @@ def _unmasked_f32(
         col = tid
         while col < cols:
             var index = base + col
-            output[index] = (
-                probabilities[index]
-                * (grad_after_dropout[index] - row_sum)
+            output[unsafe_offset=index] = (
+                probabilities[unsafe_offset=index]
+                * (grad_after_dropout[unsafe_offset=index] - row_sum)
                 * score_scale
             )
             col += _APPLE_BLOCK
@@ -523,10 +536,10 @@ def _unmasked_f32(
 def _masked_causal_warp_f32[
     V: Int, VPT: Int
 ](
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     q_len_arg: Int64,
@@ -558,11 +571,15 @@ def _masked_causal_warp_f32[
             var p = SIMD[DType.float32, V](0)
             var masked_d_p = SIMD[DType.float32, V](0)
             if j0 < allowed:
-                p = probabilities.load[width=V, alignment=V * 4](base + j0)
+                p = probabilities.unsafe_load[width=V, alignment=V * 4](
+                    base + j0
+                )
                 # Preserve the pinned IEEE operation order (`_masked_f32`).
                 masked_d_p = (
-                    grad_after_dropout.load[width=V, alignment=V * 4](base + j0)
-                    * mask.load[width=V](base + j0).cast[DType.float32]()
+                    grad_after_dropout.unsafe_load[width=V, alignment=V * 4](
+                        base + j0
+                    )
+                    * mask.unsafe_load[width=V](base + j0).cast[DType.float32]()
                     * dropout_scale
                 )
                 if j0 + V > allowed:
@@ -587,7 +604,7 @@ def _masked_causal_warp_f32[
                     comptime for li in range(V):
                         if j0 + li >= allowed:
                             value[li] = 0
-                output.store[width=V, alignment=V * 4](base + j0, value)
+                output.unsafe_store[width=V, alignment=V * 4](base + j0, value)
         row += row_stride
 
 
@@ -595,9 +612,9 @@ def _masked_causal_warp_f32[
 def _unmasked_causal_warp_f32[
     V: Int, VPT: Int
 ](
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     q_len_arg: Int64,
@@ -624,8 +641,12 @@ def _unmasked_causal_warp_f32[
             var p = SIMD[DType.float32, V](0)
             var d = SIMD[DType.float32, V](0)
             if j0 < allowed:
-                p = probabilities.load[width=V, alignment=V * 4](base + j0)
-                d = grad_after_dropout.load[width=V, alignment=V * 4](base + j0)
+                p = probabilities.unsafe_load[width=V, alignment=V * 4](
+                    base + j0
+                )
+                d = grad_after_dropout.unsafe_load[width=V, alignment=V * 4](
+                    base + j0
+                )
                 if j0 + V > allowed:
                     comptime for li in range(V):
                         if j0 + li >= allowed:
@@ -646,16 +667,16 @@ def _unmasked_causal_warp_f32[
                     comptime for li in range(V):
                         if j0 + li >= allowed:
                             value[li] = 0
-                output.store[width=V, alignment=V * 4](base + j0, value)
+                output.unsafe_store[width=V, alignment=V * 4](base + j0, value)
         row += row_stride
 
 
 @__name("sdpa_dropout_softmax_backward_masked_causal_f32")
 def _masked_causal_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     q_len_arg: Int64,
@@ -680,11 +701,11 @@ def _masked_causal_f32(
             var index = base + col
             # Preserve the pinned IEEE operation order (see `_masked_f32`).
             var masked_d_p = (
-                grad_after_dropout[index]
-                * mask[index].cast[DType.float32]()
+                grad_after_dropout[unsafe_offset=index]
+                * mask[unsafe_offset=index].cast[DType.float32]()
                 * dropout_scale
             )
-            partial_sum += probabilities[index] * masked_d_p
+            partial_sum += probabilities[unsafe_offset=index] * masked_d_p
             col += _APPLE_BLOCK
 
         var row_sum = block.sum[block_size=_APPLE_BLOCK, broadcast=True](
@@ -696,23 +717,25 @@ def _masked_causal_f32(
             var value = Float32(0.0)
             if col < boundary:
                 var masked_d_p = (
-                    grad_after_dropout[index]
-                    * mask[index].cast[DType.float32]()
+                    grad_after_dropout[unsafe_offset=index]
+                    * mask[unsafe_offset=index].cast[DType.float32]()
                     * dropout_scale
                 )
                 value = (
-                    probabilities[index] * (masked_d_p - row_sum) * score_scale
+                    probabilities[unsafe_offset=index]
+                    * (masked_d_p - row_sum)
+                    * score_scale
                 )
-            output[index] = value
+            output[unsafe_offset=index] = value
             col += _APPLE_BLOCK
         row += row_stride
 
 
 @__name("sdpa_dropout_softmax_backward_unmasked_causal_f32")
 def _unmasked_causal_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     q_len_arg: Int64,
@@ -734,7 +757,10 @@ def _unmasked_causal_f32(
         var col = tid
         while col < boundary:
             var index = base + col
-            partial_sum += probabilities[index] * grad_after_dropout[index]
+            partial_sum += (
+                probabilities[unsafe_offset=index]
+                * grad_after_dropout[unsafe_offset=index]
+            )
             col += _APPLE_BLOCK
 
         var row_sum = block.sum[block_size=_APPLE_BLOCK, broadcast=True](
@@ -746,20 +772,20 @@ def _unmasked_causal_f32(
             var value = Float32(0.0)
             if col < boundary:
                 value = (
-                    probabilities[index]
-                    * (grad_after_dropout[index] - row_sum)
+                    probabilities[unsafe_offset=index]
+                    * (grad_after_dropout[unsafe_offset=index] - row_sum)
                     * score_scale
                 )
-            output[index] = value
+            output[unsafe_offset=index] = value
             col += _APPLE_BLOCK
         row += row_stride
 
 
 def enqueue_sdpa_dropout_softmax_backward_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    probabilities: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_after_dropout: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Optional[UnsafePointer[Scalar[DType.bool], MutAnyOrigin]],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    probabilities: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_after_dropout: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Optional[Pointer[Scalar[DType.bool], MutAnyOrigin]],
     rows: Int,
     cols: Int,
     has_mask: Bool,

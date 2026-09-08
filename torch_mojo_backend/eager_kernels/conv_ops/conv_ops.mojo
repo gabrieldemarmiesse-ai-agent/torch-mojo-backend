@@ -84,9 +84,11 @@ def _im2col[
         var ih = oh * stride_h - pad_h + fh * dil_h
         var iw = ow * stride_w - pad_w + fw * dil_w
         if ih < 0 or ih >= in_h or iw < 0 or iw >= in_w:
-            out_ptr[i] = Scalar[dtype](0)
+            out_ptr[unsafe_offset=i] = Scalar[dtype](0)
         else:
-            out_ptr[i] = in_ptr[((s * channels + c) * in_h + ih) * in_w + iw]
+            out_ptr[unsafe_offset=i] = in_ptr[
+                unsafe_offset=((s * channels + c) * in_h + ih) * in_w + iw
+            ]
 
     _parallel_for[func](batch * channels * kh * kw * out_h * out_w, ctx)
 
@@ -152,9 +154,15 @@ def _im2col_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _im2col_go(args[0], args[1], args[2], args[3], args[4])
+        _im2col_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -185,7 +193,10 @@ def _bias_add_chan[
     @__copy_capture(out_ptr, bias_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
-        out_ptr[i] = out_ptr[i] + bias_ptr[(i // plane) % channels]
+        out_ptr[unsafe_offset=i] = (
+            out_ptr[unsafe_offset=i]
+            + bias_ptr[unsafe_offset=(i // plane) % channels]
+        )
 
     _parallel_for[func](total, ctx)
 
@@ -222,9 +233,15 @@ def _bias_add_chan_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _bias_add_chan_go(args[0], args[1], args[2], args[3], args[4])
+        _bias_add_chan_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()

@@ -112,7 +112,7 @@ def fwd_fa4_kernel[
     k_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     v_tma: TMATensorTile[dtype, 3, kv_tile_shape, kv_desc_shape],
     o_tma: TMATensorTile[dtype, qo_rank, o_tile_shape, o_desc_shape],
-    lse_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    lse_ptr: Pointer[Float32, MutAnyOrigin],
     seq_len_arg: Int64,
     softmax_scale: Float32,
     nheads_arg: Int64,
@@ -181,7 +181,7 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ]((smem_base).as_unsafe_any_origin())
-    var kv_smem_base = smem_base + q_smem_size
+    var kv_smem_base = smem_base.unsafe_offset(q_smem_size)
 
     var mbar_q = stack_allocation[
         1, SharedMemBarrier, address_space=AddressSpace.SHARED, alignment=8
@@ -199,10 +199,10 @@ def fwd_fa4_kernel[
         alignment=8,
     ]()
     if thread_idx.x == 0:
-        mbar_q[0].init()
+        mbar_q[unsafe_offset=0].init()
         comptime for s in range(STAGES):
-            full[s].init(1)
-            empty[s].init(Int32(NWG * 128))
+            full[unsafe_offset=s].init(1)
+            empty[unsafe_offset=s].init(Int32(NWG * 128))
     barrier()
 
     var m_block: Int
@@ -225,18 +225,17 @@ def fwd_fa4_kernel[
         # sees it warp-uniform (same hazard class as the tid-widening
         # trap; see HANDOFF.md).
         var tbl = (
-            UnsafePointer[Int32, ImmutAnyOrigin](
+            Pointer[Int32, ImmutAnyOrigin](
                 unsafe_from_address=sched_swizzle
-            )
-            + 8 * Int(block_idx.x)
+            ).unsafe_offset(8 * Int(block_idx.x))
         )
-        m_block = Int(warp.broadcast(tbl[0]))
-        vl_q_base = Int(warp.broadcast(tbl[1]))
-        vl_k_base = Int(warp.broadcast(tbl[2]))
-        vl_seqlen_q = Int(warp.broadcast(tbl[3]))
-        vl_seqlen_k = Int(warp.broadcast(tbl[4]))
+        m_block = Int(warp.broadcast(tbl[unsafe_offset=0]))
+        vl_q_base = Int(warp.broadcast(tbl[unsafe_offset=1]))
+        vl_k_base = Int(warp.broadcast(tbl[unsafe_offset=2]))
+        vl_seqlen_q = Int(warp.broadcast(tbl[unsafe_offset=3]))
+        vl_seqlen_k = Int(warp.broadcast(tbl[unsafe_offset=4]))
         comptime if window:
-            vl_win_left = Int(warp.broadcast(tbl[5]))
+            vl_win_left = Int(warp.broadcast(tbl[unsafe_offset=5]))
         h_idx = Int(block_idx.y)
         b_idx = 0
     else:
@@ -351,12 +350,12 @@ def fwd_fa4_kernel[
         # ================= producer =================
         warpgroup_reg_dealloc[NUM_PRODUCER_REGS]()
         if thread_idx.x == 0:
-            mbar_q[0].expect_bytes(Int32(BM * D * size_of[dtype]()))
+            mbar_q[unsafe_offset=0].expect_bytes(Int32(BM * D * size_of[dtype]()))
             comptime if bhsd:
                 # (B*H, S, D) planes; S its own dim -> tail zero-fill.
                 q_tma.async_copy_3d(
                     q_smem,
-                    mbar_q[0],
+                    mbar_q[unsafe_offset=0],
                     (0, m_block * BM, b_idx * nheads + h_idx),
                 )
             elif qo_rank == 4:
@@ -365,17 +364,17 @@ def fwd_fa4_kernel[
                 # here and the store-side clamps).
                 q_tma.async_copy_4d(
                     q_smem,
-                    mbar_q[0],
+                    mbar_q[unsafe_offset=0],
                     (0, h_idx, m_block * BM, b_idx),
                 )
             elif varlen:
                 q_tma.async_copy_3d(
-                    q_smem, mbar_q[0], (0, h_idx, vl_q_base + m_block * BM)
+                    q_smem, mbar_q[unsafe_offset=0], (0, h_idx, vl_q_base + m_block * BM)
                 )
             else:
                 q_tma.async_copy_3d(
                     q_smem,
-                    mbar_q[0],
+                    mbar_q[unsafe_offset=0],
                     (0, h_idx, b_idx * seq_len + m_block * BM),
                 )
             # Incremental ring state: K(n) in slot 2n%6, V(n) in
@@ -412,38 +411,38 @@ def fwd_fa4_kernel[
             else:
                 row = b_idx * seq_len
             for _ in range(kv_trips):
-                empty[slot].wait(phase)
+                empty[unsafe_offset=slot].wait(phase)
                 var k_st = LayoutTensor[
                     dtype,
                     k_smem_layout,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ]((kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin())
-                full[slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                ]((kv_smem_base.unsafe_offset(slot * kv_slot_size)).as_unsafe_any_origin())
+                full[unsafe_offset=slot].expect_bytes(Int32(BN * D * size_of[dtype]()))
                 comptime if bhsd:
-                    k_tma.async_copy_3d(k_st, full[slot], (0, row, kv_plane))
+                    k_tma.async_copy_3d(k_st, full[unsafe_offset=slot], (0, row, kv_plane))
                 else:
                     k_tma.async_copy_3d(
-                        k_st, full[slot], (0, h_idx // gqa_ratio, row)
+                        k_st, full[unsafe_offset=slot], (0, h_idx // gqa_ratio, row)
                     )
 
-                empty[slot + 1].wait(phase)
+                empty[unsafe_offset=slot + 1].wait(phase)
                 var v_st = LayoutTensor[
                     dtype,
                     v_smem_layout,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ]((kv_smem_base + (slot + 1) * kv_slot_size).as_unsafe_any_origin())
-                full[slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                ]((kv_smem_base.unsafe_offset((slot + 1) * kv_slot_size)).as_unsafe_any_origin())
+                full[unsafe_offset=slot + 1].expect_bytes(Int32(BN * D * size_of[dtype]()))
                 comptime if bhsd:
                     v_tma.async_copy_3d(
-                        v_st, full[slot + 1], (0, row, kv_plane)
+                        v_st, full[unsafe_offset=slot + 1], (0, row, kv_plane)
                     )
                 else:
                     v_tma.async_copy_3d(
-                        v_st, full[slot + 1], (0, h_idx // gqa_ratio, row)
+                        v_st, full[unsafe_offset=slot + 1], (0, h_idx // gqa_ratio, row)
                     )
 
                 row += row_step
@@ -461,7 +460,7 @@ def fwd_fa4_kernel[
 
     # Unblock the producer's first ring cycle.
     comptime for s in range(STAGES):
-        _ = empty[s].arrive()
+        _ = empty[unsafe_offset=s].arrive()
 
     # Scheduler-pingpong barrier participant count: each barrier id
     # is waited by ONE warpgroup (128) and armed by its predecessor
@@ -535,8 +534,8 @@ def fwd_fa4_kernel[
     var scale_old = stack_allocation[rows_per_thread, Scalar[accum_type]]()
     var neg_inf: Scalar[accum_type] = Scalar[accum_type](-1.0e30)
     comptime for i in range(rows_per_thread):
-        rowmax[i] = neg_inf
-        rowsum[i] = Scalar[accum_type](0)
+        rowmax[unsafe_offset=i] = neg_inf
+        rowsum[unsafe_offset=i] = Scalar[accum_type](0)
 
     var scale_log2: Scalar[accum_type] = (
         softmax_scale * Scalar[DType.float32](log2e)
@@ -568,7 +567,7 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ]:
-        return {(kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin()}
+        return {(kv_smem_base.unsafe_offset(slot * kv_slot_size)).as_unsafe_any_origin()}
 
     @parameter
     @always_inline
@@ -579,7 +578,7 @@ def fwd_fa4_kernel[
         address_space=AddressSpace.SHARED,
         alignment=128,
     ]:
-        return {(kv_smem_base + slot * kv_slot_size).as_unsafe_any_origin()}
+        return {(kv_smem_base.unsafe_offset(slot * kv_slot_size)).as_unsafe_any_origin()}
 
     # fp16 RS fork: the stdlib's register-A wgmma overload is
     # bf16-only (hardcoded .bf16.bf16 asm); the vendored
@@ -598,15 +597,15 @@ def fwd_fa4_kernel[
     def pv_gemm(slot_arg: Int):
         comptime if dtype == DType.float16:
             var b_desc = _wgmma_descriptor[v_canonical, False, swizzle](
-                kv_smem_base + slot_arg * kv_slot_size
+                kv_smem_base.unsafe_offset(slot_arg * kv_slot_size)
             )
-            var o_simd = o_reg.ptr.load[width=c_frag_size_pv]()
+            var o_simd = o_reg.ptr.unsafe_load[width=c_frag_size_pv]()
             comptime for k_mma in range(num_k_mmas_pv):
                 comptime if head_dim == 128:
                     o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
                         wgmma_rs_f16_m64n128(
                             rebind[SIMD[DType.float16, 8]](
-                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                                (p_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
                             ),
                             (b_desc + k_mma * v_k_stride).desc,
                             rebind[SIMD[DType.float32, 64]](o_simd),
@@ -616,13 +615,13 @@ def fwd_fa4_kernel[
                     o_simd = rebind[SIMD[accum_type, c_frag_size_pv]](
                         wgmma_rs_f16_m64n64(
                             rebind[SIMD[DType.float16, 8]](
-                                (p_reg.ptr + 8 * k_mma).load[width=8]()
+                                (p_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
                             ),
                             (b_desc + k_mma * v_k_stride).desc,
                             rebind[SIMD[DType.float32, 32]](o_simd),
                         )
                     )
-            o_reg.ptr.store[width=c_frag_size_pv](o_simd)
+            o_reg.ptr.unsafe_store[width=c_frag_size_pv](o_simd)
         else:
             wgmma_pv.wgmma(p_reg, v_tile(slot_arg), o_reg)
 
@@ -662,7 +661,7 @@ def fwd_fa4_kernel[
             # tanh.approx.f32 — FA4's "fastmath" tanh emulates via
             # ex2 and pays 3.1x kernel time for it.
             comptime for c in range(c_frag_size_qk):
-                s_reg.ptr[c] = tanh(s_reg.ptr[c] * t_scale)
+                s_reg.ptr[unsafe_offset=c] = tanh(s_reg.ptr[unsafe_offset=c] * t_scale)
         comptime if causal:
             comptime if BM == BN and not varlen:
                 if mask_diag:
@@ -670,7 +669,7 @@ def fwd_fa4_kernel[
                         comptime col_base: Int = (c // 4) * 8 + (c & 1)
                         comptime row_off: Int = 8 if (c % 4) >= 2 else 0
                         if col_base + mask_col_lo > mask_row_lo + row_off:
-                            s_reg.ptr[c] = neg_inf
+                            s_reg.ptr[unsafe_offset=c] = neg_inf
             else:
                 # Diagonal-band tile: global mask col + mask_d > row.
                 # (Varlen causal always uses this arm — the
@@ -746,7 +745,7 @@ def fwd_fa4_kernel[
                                 if col_base > (
                                     mask_thr1 if hi_row else mask_thr0
                                 ):
-                                    s_reg.ptr[c] = neg_inf
+                                    s_reg.ptr[unsafe_offset=c] = neg_inf
         comptime if window:
             # Leading window edge (prologue tile only): cols before
             # row - left are outside the window.
@@ -758,13 +757,13 @@ def fwd_fa4_kernel[
                         col_base + mask_col_lo + win_mask_d
                         < mask_row_lo + row_off
                     ):
-                        s_reg.ptr[c] = neg_inf
+                        s_reg.ptr[unsafe_offset=c] = neg_inf
         comptime if varlen and not causal:
             if mask_tail and vl_kv_tail < BN:
                 comptime for c in range(c_frag_size_qk):
                     comptime col_base: Int = (c // 4) * 8 + (c & 1)
                     if col_base + mask_col_lo >= vl_kv_tail:
-                        s_reg.ptr[c] = neg_inf
+                        s_reg.ptr[unsafe_offset=c] = neg_inf
         # TREE-SHAPED row reductions. The natural
         # `local_max[row] = max(local_max[row], s_reg[c])` sweep is two
         # 32-deep dependent chains (~4-cycle FMNMX latency each = ~128
@@ -782,31 +781,41 @@ def fwd_fa4_kernel[
                 rows_per_thread * RED_WAYS, Scalar[accum_type]
             ]()
             comptime for i in range(rows_per_thread * RED_WAYS):
-                part_max[i] = neg_inf
+                part_max[unsafe_offset=i] = neg_inf
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
                 comptime part: Int = (c // 4) % RED_WAYS
-                part_max[row_idx * RED_WAYS + part] = max(
-                    part_max[row_idx * RED_WAYS + part], s_reg.ptr[c]
+                part_max[unsafe_offset=row_idx * RED_WAYS + part] = max(
+                    part_max[unsafe_offset=row_idx * RED_WAYS + part], s_reg.ptr[unsafe_offset=c]
                 )
             comptime for i in range(rows_per_thread):
-                local_max[i] = max(
-                    max(part_max[i * RED_WAYS], part_max[i * RED_WAYS + 1]),
-                    max(part_max[i * RED_WAYS + 2], part_max[i * RED_WAYS + 3]),
+                local_max[unsafe_offset=i] = max(
+                    max(
+                        part_max[unsafe_offset=i * RED_WAYS],
+                        part_max[unsafe_offset=i * RED_WAYS + 1],
+                    ),
+                    max(
+                        part_max[unsafe_offset=i * RED_WAYS + 2],
+                        part_max[unsafe_offset=i * RED_WAYS + 3],
+                    ),
                 )
         else:
             comptime for i in range(rows_per_thread):
-                local_max[i] = neg_inf
+                local_max[unsafe_offset=i] = neg_inf
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-                local_max[row_idx] = max(local_max[row_idx], s_reg.ptr[c])
+                local_max[unsafe_offset=row_idx] = max(
+                    local_max[unsafe_offset=row_idx], s_reg.ptr[unsafe_offset=c]
+                )
         comptime for i in range(rows_per_thread):
-            local_max[i] = warp.lane_group_max[num_lanes=4](local_max[i])
-            var rmax_new: Scalar[accum_type] = max(
-                local_max[i] * scale_log2, rowmax[i]
+            local_max[unsafe_offset=i] = warp.lane_group_max[num_lanes=4](
+                local_max[unsafe_offset=i]
             )
-            scale_old[i] = exp2(rowmax[i] - rmax_new)
-            rowmax[i] = rmax_new
+            var rmax_new: Scalar[accum_type] = max(
+                local_max[unsafe_offset=i] * scale_log2, rowmax[unsafe_offset=i]
+            )
+            scale_old[unsafe_offset=i] = exp2(rowmax[unsafe_offset=i] - rmax_new)
+            rowmax[unsafe_offset=i] = rmax_new
 
         var local_sum = stack_allocation[
             rows_per_thread, Scalar[accum_type]
@@ -816,53 +825,60 @@ def fwd_fa4_kernel[
                 rows_per_thread * RED_WAYS, Scalar[accum_type]
             ]()
             comptime for i in range(rows_per_thread * RED_WAYS):
-                part_sum[i] = Scalar[accum_type](0)
+                part_sum[unsafe_offset=i] = Scalar[accum_type](0)
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
                 comptime part: Int = (c // 4) % RED_WAYS
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[unsafe_offset=c].fma(scale_log2, -rowmax[unsafe_offset=row_idx])
                 )
-                s_reg.ptr[c] = p
-                part_sum[row_idx * RED_WAYS + part] += p
+                s_reg.ptr[unsafe_offset=c] = p
+                part_sum[unsafe_offset=row_idx * RED_WAYS + part] += p
             # Pairwise combine (the ONLY numeric difference vs the
             # a4e8462 kernel: f32 addition is not associative, so rowsum
             # can differ in the last ulp -- tree summation of
             # non-negative exp2 outputs is the better-conditioned order,
             # and the fp64 reference check bounds it).
             comptime for i in range(rows_per_thread):
-                local_sum[i] = (
-                    part_sum[i * RED_WAYS] + part_sum[i * RED_WAYS + 1]
-                ) + (part_sum[i * RED_WAYS + 2] + part_sum[i * RED_WAYS + 3])
+                local_sum[unsafe_offset=i] = (
+                    part_sum[unsafe_offset=i * RED_WAYS]
+                    + part_sum[unsafe_offset=i * RED_WAYS + 1]
+                ) + (
+                    part_sum[unsafe_offset=i * RED_WAYS + 2]
+                    + part_sum[unsafe_offset=i * RED_WAYS + 3]
+                )
         else:
             comptime for i in range(rows_per_thread):
-                local_sum[i] = Scalar[accum_type](0)
+                local_sum[unsafe_offset=i] = Scalar[accum_type](0)
             comptime for c in range(c_frag_size_qk):
                 comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
                 var p: Scalar[accum_type] = exp2(
-                    s_reg.ptr[c].fma(scale_log2, -rowmax[row_idx])
+                    s_reg.ptr[unsafe_offset=c].fma(scale_log2, -rowmax[unsafe_offset=row_idx])
                 )
-                s_reg.ptr[c] = p
-                local_sum[row_idx] += p
+                s_reg.ptr[unsafe_offset=c] = p
+                local_sum[unsafe_offset=row_idx] += p
         comptime for i in range(rows_per_thread):
-            rowsum[i] = rowsum[i] * scale_old[i] + local_sum[i]
+            rowsum[unsafe_offset=i] = (
+                rowsum[unsafe_offset=i] * scale_old[unsafe_offset=i]
+                + local_sum[unsafe_offset=i]
+            )
 
     @parameter
     @always_inline
     def pack_p():
         comptime for c in range(c_frag_size_qk):
-            p_reg.ptr[c] = s_reg.ptr[c].cast[dtype]()
+            p_reg.ptr[unsafe_offset=c] = s_reg.ptr[unsafe_offset=c].cast[dtype]()
 
     @parameter
     @always_inline
     def rescale_o():
         comptime for c in range(c_frag_size_pv):
             comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-            o_reg.ptr[c] *= scale_old[row_idx]
+            o_reg.ptr[unsafe_offset=c] *= scale_old[unsafe_offset=row_idx]
 
     # ---- Prologue: S(0) -> P(0).
-    mbar_q[0].wait(UInt32(0))
-    full[0].wait(UInt32(0))
+    mbar_q[unsafe_offset=0].wait(UInt32(0))
+    full[unsafe_offset=0].wait(UInt32(0))
     warpgroup_fence(s_reg)
     wgmma_qk.arrive()
     wgmma_qk.wgmma[num_warp_groups=NWG, scale_c=0](
@@ -871,7 +887,7 @@ def fwd_fa4_kernel[
     wgmma_qk.commit_group()
     wgmma_qk.wait_group()
     warpgroup_fence(s_reg)
-    _ = empty[0].arrive()
+    _ = empty[unsafe_offset=0].arrive()
 
     # rowmax starts at -inf -> scale_old==0, rowsum init. For causal,
     # m_block 0's single tile IS the diagonal (BM==BN) or may sit in
@@ -926,7 +942,7 @@ def fwd_fa4_kernel[
 
     for it in range(kv_trips - 1):
         # Queue QK(n+1) then PV(n) on the tensor core.
-        full[k_slot].wait(k_phase)
+        full[unsafe_offset=k_slot].wait(k_phase)
         comptime if NWG > 1:
             named_barrier[Int32(SCHED_BAR_N)](Int32(1 + wg))
         warpgroup_fence(s_reg)
@@ -936,7 +952,7 @@ def fwd_fa4_kernel[
         )
         wgmma_qk.commit_group()
 
-        full[v_slot].wait(v_phase)
+        full[unsafe_offset=v_slot].wait(v_phase)
         warpgroup_fence(o_reg)
         wgmma_pv.arrive()
         pv_gemm(v_slot)
@@ -952,7 +968,7 @@ def fwd_fa4_kernel[
         # QK(n+1) retired (PV(n) still running on the tensor core).
         wgmma_qk.wait_group[1]()
         warpgroup_fence(s_reg)
-        _ = empty[k_slot].arrive()
+        _ = empty[unsafe_offset=k_slot].arrive()
 
         # Softmax of S(n+1) overlaps PV(n). For causal the last
         # tile (BM==BN: n+1 == num_kv_blocks-1 == m_block is THE
@@ -985,7 +1001,7 @@ def fwd_fa4_kernel[
         # PV(n) retired: p_reg and o_reg are safe to touch.
         wgmma_pv.wait_group[0]()
         warpgroup_fence(o_reg)
-        _ = empty[v_slot].arrive()
+        _ = empty[unsafe_offset=v_slot].arrive()
         pack_p()  # P(n+1)
         rescale_o()
 
@@ -1003,7 +1019,7 @@ def fwd_fa4_kernel[
             v_phase ^= 1
 
     # ---- Epilogue: PV(N-1) (v_slot/v_phase left at tile N-1).
-    full[v_slot].wait(v_phase)
+    full[unsafe_offset=v_slot].wait(v_phase)
     warpgroup_fence(o_reg)
     wgmma_pv.arrive()
     pv_gemm(v_slot)
@@ -1014,12 +1030,12 @@ def fwd_fa4_kernel[
     # ---- Normalize (reciprocal; one div per row) and store.
     var inv_rowsum = stack_allocation[rows_per_thread, Scalar[accum_type]]()
     comptime for i in range(rows_per_thread):
-        rowsum[i] = warp.lane_group_sum[num_lanes=4](rowsum[i])
-        inv_rowsum[i] = Scalar[accum_type](1) / rowsum[i]
+        rowsum[unsafe_offset=i] = warp.lane_group_sum[num_lanes=4](rowsum[unsafe_offset=i])
+        inv_rowsum[unsafe_offset=i] = Scalar[accum_type](1) / rowsum[unsafe_offset=i]
 
     comptime for c in range(c_frag_size_pv):
         comptime row_idx: Int = 1 if (c % 4) >= 2 else 0
-        o_reg.ptr[c] *= inv_rowsum[row_idx]
+        o_reg.ptr[unsafe_offset=c] *= inv_rowsum[unsafe_offset=row_idx]
 
     # ---- Store: stmatrix-stage O into the dead Q tile (same SW128
     # k-major layout it was loaded with — the bwd dK/dV epilogue's
@@ -1054,7 +1070,7 @@ def fwd_fa4_kernel[
     comptime if varlen:
         if vl_rows < BM:
             full_tile_store = False
-            var o_gptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+            var o_gptr = Pointer[Scalar[dtype], MutAnyOrigin](
                 unsafe_from_address=sched_num_hb_q
             )
             var o_row0: Int = vl_q_base + m_block * BM
@@ -1066,15 +1082,14 @@ def fwd_fa4_kernel[
                 )
                 if row < vl_rows:
                     var pair = SIMD[dtype, 2](
-                        o_reg.ptr[2 * c2].cast[dtype](),
-                        o_reg.ptr[2 * c2 + 1].cast[dtype](),
+                        o_reg.ptr[unsafe_offset=2 * c2].cast[dtype](),
+                        o_reg.ptr[unsafe_offset=2 * c2 + 1].cast[dtype](),
                     )
-                    (
-                        o_gptr
-                        + ((o_row0 + row) * nheads + h_idx) * D
+                    o_gptr.unsafe_offset(
+                        ((o_row0 + row) * nheads + h_idx) * D
                         + col_chunk * 8
                         + 2 * lane_pair
-                    ).store[width=2, alignment=4](pair)
+                    ).unsafe_store[width=2, alignment=4](pair)
 
     if full_tile_store:
         comptime if D == 64:
@@ -1091,8 +1106,8 @@ def fwd_fa4_kernel[
                 )
                 var col: Int = col_chunk * 8 + 2 * lane_pair
                 var pair = SIMD[dtype, 2](
-                    o_reg.ptr[2 * c2].cast[dtype](),
-                    o_reg.ptr[2 * c2 + 1].cast[dtype](),
+                    o_reg.ptr[unsafe_offset=2 * c2].cast[dtype](),
+                    o_reg.ptr[unsafe_offset=2 * c2 + 1].cast[dtype](),
                 )
                 var b_addr: Int = (
                     Int(smem_base)
@@ -1102,8 +1117,8 @@ def fwd_fa4_kernel[
                 )
                 var b_sw: Int = b_addr ^ ((b_addr >> 3) & 112)
                 (
-                    smem_base + ((b_sw >> 1) - (Int(smem_base) >> 1))
-                ).store[width=2, alignment=4](pair)
+                    smem_base.unsafe_offset((b_sw >> 1) - (Int(smem_base) >> 1))
+                ).unsafe_store[width=2, alignment=4](pair)
         else:
             var st_row: Int = (
                 row_warp_base + ((lane // 8) % 2) * 8 + (lane % 8)
@@ -1116,7 +1131,7 @@ def fwd_fa4_kernel[
                     comptime p: Int = 4 * i + jm
                     packed[jm] = bitcast[DType.float32, 1](
                         SIMD[accum_type, 2](
-                            o_reg.ptr[2 * p], o_reg.ptr[2 * p + 1]
+                            o_reg.ptr[unsafe_offset=2 * p], o_reg.ptr[unsafe_offset=2 * p + 1]
                         ).cast[dtype]()
                     )
                 var raw_i: Int = (
@@ -1128,10 +1143,9 @@ def fwd_fa4_kernel[
                 # (raw 16-bit stores; the payload is already bit-packed)
                 # — the cast unblocks fp16 and is a no-op for bf16.
                 st_matrix[simd_width=4](
-                    (
-                        smem_base
-                        + ((sw_i >> 1) - (Int(smem_base) >> 1))
-                    ).bitcast[BFloat16](),
+                    smem_base.unsafe_offset(
+                        (sw_i >> 1) - (Int(smem_base) >> 1)
+                    ).unsafe_bitcast[BFloat16](),
                     packed,
                 )
 
@@ -1155,8 +1169,8 @@ def fwd_fa4_kernel[
             comptime if varlen or qo_rank == 4 or bhsd:
                 lse_ok = r < vl_rows
             if lse_ok:
-                (lse_ptr + lse_row_base + r)[0] = (
-                    rowmax[i] * LN2 + log(rowsum[i])
+                lse_ptr[unsafe_offset=lse_row_base + r] = (
+                    rowmax[unsafe_offset=i] * LN2 + log(rowsum[unsafe_offset=i])
                 ).cast[DType.float32]()
 
     fence_async_view_proxy()

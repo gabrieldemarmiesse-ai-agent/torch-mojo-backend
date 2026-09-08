@@ -146,8 +146,8 @@ def _acc_dtype[dtype: DType]() -> DType:
 def _inner_tile[
     dtype: DType, acc: DType, threads: Int, exclusive: Bool = False
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     base: Int,
     n_valid: Int,
     carry: Scalar[acc],
@@ -165,7 +165,7 @@ def _inner_tile[
     var tid = Int(thread_idx.x)
     var val = Scalar[acc](0)
     if tid < n_valid:
-        val = in_ptr[base + tid].cast[acc]()
+        val = in_ptr[unsafe_offset=base + tid].cast[acc]()
     # Always scan exclusive internally: the inclusive value (needed for the
     # tile-total broadcast either way) is one add away, and the caller's
     # requested flavor is a comptime select, not a second scan.
@@ -174,10 +174,10 @@ def _inner_tile[
 
     comptime if exclusive:
         if tid < n_valid:
-            out_ptr[base + tid] = (carry + excl).cast[dtype]()
+            out_ptr[unsafe_offset=base + tid] = (carry + excl).cast[dtype]()
     else:
         if tid < n_valid:
-            out_ptr[base + tid] = (carry + incl).cast[dtype]()
+            out_ptr[unsafe_offset=base + tid] = (carry + incl).cast[dtype]()
 
     var last = n_valid - 1
     var tile_total = block.broadcast[block_size=threads](incl, src_thread=last)
@@ -191,8 +191,8 @@ def _inner_tile[
 def _cumsum_inner_lines_kernel[
     dtype: DType, threads: Int, exclusive: Bool = False
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     line_len_arg: Int64,
     num_lines_arg: Int64,
 ):
@@ -226,8 +226,8 @@ def _cumsum_inner_lines_kernel[
 def _cumsum_chunk_reduce_kernel[
     dtype: DType, threads: Int, tiles: Int
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    workspace_ptr: UnsafePointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    workspace_ptr: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
     line_len_arg: Int64,
     chunks_per_line_arg: Int64,
 ):
@@ -253,15 +253,14 @@ def _cumsum_chunk_reduce_kernel[
     var tid = Int(thread_idx.x)
     var partial = Scalar[acc](0)
 
-    @parameter
-    for t in range(tiles):
+    comptime for t in range(tiles):
         var local = t * threads + tid
         var global_idx = chunk_start + local
         if global_idx < line_len:
-            partial += in_ptr[row_base + global_idx].cast[acc]()
+            partial += in_ptr[unsafe_offset=row_base + global_idx].cast[acc]()
     var total = block.sum[block_size=threads](partial)
     if tid == 0:
-        workspace_ptr[flat] = total
+        workspace_ptr[unsafe_offset=flat] = total
 
 
 @__llvm_metadata(
@@ -271,9 +270,9 @@ def _cumsum_chunk_reduce_kernel[
 def _cumsum_chunk_finish_kernel[
     dtype: DType, threads: Int, tiles: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    workspace_ptr: UnsafePointer[Scalar[_acc_dtype[dtype]()], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    workspace_ptr: Pointer[Scalar[_acc_dtype[dtype]()], ImmutAnyOrigin],
     line_len_arg: Int64,
     chunks_per_line_arg: Int64,
 ):
@@ -304,28 +303,28 @@ def _cumsum_chunk_finish_kernel[
     var chunk = flat % chunks_per_line
     var chunk_start = chunk * threads * tiles
     var row_base = line * line_len
-    var seed = workspace_ptr[flat]
+    var seed = workspace_ptr[unsafe_offset=flat]
     var tid = Int(thread_idx.x)
     var local_base = chunk_start + tid * tiles
 
     var local_scan = InlineArray[Scalar[acc], tiles](uninitialized=True)
     var running = Scalar[acc](0)
 
-    @parameter
-    for k in range(tiles):
+    comptime for k in range(tiles):
         var idx = local_base + k
         if idx < line_len:
-            running += in_ptr[row_base + idx].cast[acc]()
+            running += in_ptr[unsafe_offset=row_base + idx].cast[acc]()
         local_scan[k] = running
 
     var excl = block.prefix_sum[block_size=threads, exclusive=True](running)
     var base = seed + excl
 
-    @parameter
-    for k in range(tiles):
+    comptime for k in range(tiles):
         var idx = local_base + k
         if idx < line_len:
-            out_ptr[row_base + idx] = (base + local_scan[k]).cast[dtype]()
+            out_ptr[unsafe_offset=row_base + idx] = (base + local_scan[k]).cast[
+                dtype
+            ]()
 
 
 # ===========================================================================
@@ -345,8 +344,8 @@ def _cumsum_chunk_finish_kernel[
 def _cumsum_outer_kernel[
     dtype: DType, threads: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     scan_len_arg: Int64,
     inner_arg: Int64,
     num_lines_arg: Int64,
@@ -366,8 +365,8 @@ def _cumsum_outer_kernel[
         var r = 0
         while r < scan_len:
             var addr = base + r * inner
-            acc_v += in_ptr[addr].cast[acc]()
-            out_ptr[addr] = acc_v.cast[dtype]()
+            acc_v += in_ptr[unsafe_offset=addr].cast[acc]()
+            out_ptr[unsafe_offset=addr] = acc_v.cast[dtype]()
             r += 1
         line += gstride
 
@@ -391,8 +390,8 @@ def enqueue_cumsum_rows[
     dtype: DType
 ](
     ctx: DeviceContext,
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
 ) raises:
@@ -441,11 +440,11 @@ def enqueue_cumsum_rows_workspace[
     dtype: DType
 ](
     ctx: DeviceContext,
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
-    workspace_ptr: UnsafePointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    workspace_ptr: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
 ) raises:
     """INNER family, 'few very long lines' regime: 3-pass workspace scan.
     `workspace_ptr` must hold >= cumsum_workspace_lines[dtype](rows, cols)
@@ -457,7 +456,7 @@ def enqueue_cumsum_rows_workspace[
     comptime esize = size_of[dtype]()
     var chunks_per_line = ceildiv(cols, WS_THREADS * WS_CHUNK_TILES)
     var total_chunks = rows * chunks_per_line
-    var ws_immut = workspace_ptr.as_immutable()
+    var ws_immut = workspace_ptr.as_imm()
     var sm_blocks = min(rows, _device_sm_count(ctx) * 8)
 
     _enqueue_cached[
@@ -532,8 +531,8 @@ def enqueue_cumsum_cols[
     dtype: DType
 ](
     ctx: DeviceContext,
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
 ) raises:

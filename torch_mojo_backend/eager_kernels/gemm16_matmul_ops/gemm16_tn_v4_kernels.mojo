@@ -63,8 +63,8 @@ from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
-comptime _V4_PTR = UnsafePointer[Scalar[_V4_DT], MutAnyOrigin]
-comptime _V4_F32_PTR = UnsafePointer[Scalar[_V4_F32], MutAnyOrigin]
+comptime _V4_PTR = Pointer[Scalar[_V4_DT], MutAnyOrigin]
+comptime _V4_F32_PTR = Pointer[Scalar[_V4_F32], MutAnyOrigin]
 comptime _V4_BM = 128
 comptime _V4_BK = 64
 comptime _V4_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
@@ -181,8 +181,8 @@ def _v4_tn_ws_body[
         ]()
         if thread_idx.x == 0:
             comptime for stage in range(STAGES):
-                full_barriers[stage].init()
-                empty_barriers[stage].init(Int32(CONSUMERS))
+                full_barriers[unsafe_offset=stage].init()
+                empty_barriers[unsafe_offset=stage].init(Int32(CONSUMERS))
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
         # Order barrier initialization before cross-warp-group arrivals.
@@ -216,7 +216,7 @@ def _v4_tn_ws_body[
         # finish.
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(STAGES):
-                _ = empty_barriers[stage].arrive()
+                _ = empty_barriers[unsafe_offset=stage].arrive()
         barrier()
 
         if warp_group_idx == 0:
@@ -226,8 +226,10 @@ def _v4_tn_ws_body[
                 while it < my_tiles:
                     var stage = it % STAGES
                     var phase = UInt32((it // STAGES) % 2)
-                    empty_barriers[stage].wait(phase)
-                    full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
+                    empty_barriers[unsafe_offset=stage].wait(phase)
+                    full_barriers[unsafe_offset=stage].expect_bytes(
+                        Int32(TMA_BYTES)
+                    )
 
                     var a_tile = LayoutTensor[
                         _V4_DT,
@@ -235,25 +237,33 @@ def _v4_tn_ws_body[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_pipeline.ptr + stage * BM * _V4_BK)
+                    ](a_pipeline.ptr.unsafe_offset(stage * BM * _V4_BK))
                     var b_tile = LayoutTensor[
                         _V4_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](b_pipeline.ptr + stage * BN * _V4_BK)
+                    ](b_pipeline.ptr.unsafe_offset(stage * BN * _V4_BK))
                     var k0 = (tile_start + it) * _V4_BK
                     # TMA coordinates are (fastest dim, slower dim) of the
                     # global tensor each descriptor was built over.
                     comptime if COL_A:
-                        a_tma.async_copy(a_tile, full_barriers[stage], (m0, k0))
+                        a_tma.async_copy(
+                            a_tile, full_barriers[unsafe_offset=stage], (m0, k0)
+                        )
                     else:
-                        a_tma.async_copy(a_tile, full_barriers[stage], (k0, m0))
+                        a_tma.async_copy(
+                            a_tile, full_barriers[unsafe_offset=stage], (k0, m0)
+                        )
                     comptime if KMAJ_B:
-                        b_tma.async_copy(b_tile, full_barriers[stage], (k0, n0))
+                        b_tma.async_copy(
+                            b_tile, full_barriers[unsafe_offset=stage], (k0, n0)
+                        )
                     else:
-                        b_tma.async_copy(b_tile, full_barriers[stage], (n0, k0))
+                        b_tma.async_copy(
+                            b_tile, full_barriers[unsafe_offset=stage], (n0, k0)
+                        )
                     it += 1
         else:
             warpgroup_reg_alloc[232]()
@@ -269,28 +279,28 @@ def _v4_tn_ws_body[
             while it < my_tiles:
                 var stage = it % STAGES
                 var phase = UInt32((it // STAGES) % 2)
-                full_barriers[stage].wait(phase)
+                full_barriers[unsafe_offset=stage].wait(phase)
                 var a_tile = LayoutTensor[
                     _V4_DT,
                     A_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](a_pipeline.ptr + stage * BM * _V4_BK)
+                ](a_pipeline.ptr.unsafe_offset(stage * BM * _V4_BK))
                 var b_tile = LayoutTensor[
                     _V4_DT,
                     B_LAYOUT,
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](b_pipeline.ptr + stage * BN * _V4_BK)
+                ](b_pipeline.ptr.unsafe_offset(stage * BN * _V4_BK))
                 # Majorness-generic raw WGMMA slab, shared with the
                 # persistent body in gemm16_nn_v4_kernels.mojo.
                 _v4_mma_tile[BN, COL_A, KMAJ_B, A_LAYOUT, B_LAYOUT](
                     a_tile.ptr, b_tile.ptr, accum, warp_group_idx
                 )
                 if warp_group_thread_idx == 0:
-                    _ = empty_barriers[stage].arrive()
+                    _ = empty_barriers[unsafe_offset=stage].arrive()
                 it += 1
 
             var tid = warp_group_thread_idx
@@ -299,14 +309,17 @@ def _v4_tn_ws_body[
             var base_row = warp * 16 + lane // 4
             var base_col = (lane % 4) * 2
             comptime if SPLITK:
-                var ws_base = ws + Int(block_idx.y) * (m * n)
+                var ws_base = ws.unsafe_offset(Int(block_idx.y) * (m * n))
                 comptime for q in range(CFRAG // 2):
                     var e = q * 2
                     var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                     var col = base_col + (q // 2) * 8
-                    var pair = SIMD[_V4_F32, 2](accum.ptr[e], accum.ptr[e + 1])
+                    var pair = SIMD[_V4_F32, 2](
+                        accum.ptr[unsafe_offset=e],
+                        accum.ptr[unsafe_offset=e + 1],
+                    )
                     if m0 + row < m and n0 + col + 1 < n:
-                        ws_base.store[alignment=8](
+                        ws_base.unsafe_store[alignment=8](
                             (m0 + row) * n + n0 + col, pair
                         )
             else:
@@ -315,11 +328,11 @@ def _v4_tn_ws_body[
                     var row = (warp_group_idx - 1) * 64 + base_row + (q % 2) * 8
                     var col = base_col + (q // 2) * 8
                     var pair = SIMD[_V4_DT, 2](
-                        accum.ptr[e].cast[_V4_DT](),
-                        accum.ptr[e + 1].cast[_V4_DT](),
+                        accum.ptr[unsafe_offset=e].cast[_V4_DT](),
+                        accum.ptr[unsafe_offset=e + 1].cast[_V4_DT](),
                     )
                     if m0 + row < m and n0 + col + 1 < n:
-                        output.store[alignment=4](
+                        output.unsafe_store[alignment=4](
                             (m0 + row) * n + n0 + col, pair
                         )
 
@@ -349,7 +362,14 @@ def _v4_tn_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+        a_tma,
+        b_tma,
+        ws.unsafe_bitcast[Scalar[_V4_DT]](),
+        ws,
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -382,7 +402,14 @@ def _v4_nt_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+        a_tma,
+        b_tma,
+        ws.unsafe_bitcast[Scalar[_V4_DT]](),
+        ws,
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -410,7 +437,14 @@ def _v4_nn_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, False, False](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+        a_tma,
+        b_tma,
+        ws.unsafe_bitcast[Scalar[_V4_DT]](),
+        ws,
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -436,7 +470,14 @@ def _v4_tt_splitk_m128n256_s4(
     var k = Int(k_arg)
     var chunk_tiles = Int(chunk_tiles_arg)
     _v4_tn_ws_body[256, 4, True, 8, True, True](
-        a_tma, b_tma, ws.bitcast[Scalar[_V4_DT]](), ws, m, n, k, chunk_tiles
+        a_tma,
+        b_tma,
+        ws.unsafe_bitcast[Scalar[_V4_DT]](),
+        ws,
+        m,
+        n,
+        k,
+        chunk_tiles,
     )
 
 
@@ -460,7 +501,14 @@ def _v4_tn_direct_m128n192_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     _v4_tn_ws_body[192, 4, False, 8](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+        a_tma,
+        b_tma,
+        output,
+        output.unsafe_bitcast[Scalar[_V4_F32]](),
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -487,7 +535,14 @@ def _v4_tn_direct_m128n192_s3g16(
     var n = Int(n_arg)
     var k = Int(k_arg)
     _v4_tn_ws_body[192, 3, False, 16](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+        a_tma,
+        b_tma,
+        output,
+        output.unsafe_bitcast[Scalar[_V4_F32]](),
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -519,7 +574,14 @@ def _v4_tt_direct_m128n64_s4(
     var n = Int(n_arg)
     var k = Int(k_arg)
     _v4_tn_ws_body[64, 4, False, 8, True, True](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+        a_tma,
+        b_tma,
+        output,
+        output.unsafe_bitcast[Scalar[_V4_F32]](),
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -546,7 +608,14 @@ def _v4_tt_direct_m64n128_s3(
     var n = Int(n_arg)
     var k = Int(k_arg)
     _v4_tn_ws_body[128, 3, False, 8, True, True, 64, 1](
-        a_tma, b_tma, output, output.bitcast[Scalar[_V4_F32]](), m, n, k, 0
+        a_tma,
+        b_tma,
+        output,
+        output.unsafe_bitcast[Scalar[_V4_F32]](),
+        m,
+        n,
+        k,
+        0,
     )
 
 
@@ -578,33 +647,33 @@ def _v4_tn_splitk_reduce(
         # Fast path: all four chains fully in range.
         var acc = StaticTuple[SIMD[_V4_F32, 4], _V4_RED_GROUPS]()
         comptime for g in range(_V4_RED_GROUPS):
-            acc[g] = ws.load[width=4, alignment=16](
+            acc[g] = ws.unsafe_load[width=4, alignment=16](
                 base + g * _V4_RED_THREADS * 4
             )
         for s in range(1, splits):
             var slice_base = s * count + base
             comptime for g in range(_V4_RED_GROUPS):
-                acc[g] += ws.load[width=4, alignment=16](
+                acc[g] += ws.unsafe_load[width=4, alignment=16](
                     slice_base + g * _V4_RED_THREADS * 4
                 )
         comptime for g in range(_V4_RED_GROUPS):
-            output.store[alignment=8](
+            output.unsafe_store[alignment=8](
                 base + g * _V4_RED_THREADS * 4, acc[g].cast[_V4_DT]()
             )
     else:
         comptime for g in range(_V4_RED_GROUPS):
             var i = base + g * _V4_RED_THREADS * 4
             if i + 4 <= count:
-                var acc4 = ws.load[width=4, alignment=16](i)
+                var acc4 = ws.unsafe_load[width=4, alignment=16](i)
                 for s in range(1, splits):
-                    acc4 += ws.load[width=4, alignment=16](s * count + i)
-                output.store[alignment=8](i, acc4.cast[_V4_DT]())
+                    acc4 += ws.unsafe_load[width=4, alignment=16](s * count + i)
+                output.unsafe_store[alignment=8](i, acc4.cast[_V4_DT]())
             else:
                 while i < count:
-                    var acc1 = ws[i]
+                    var acc1 = ws[unsafe_offset=i]
                     for s in range(1, splits):
-                        acc1 += ws[s * count + i]
-                    output[i] = acc1.cast[_V4_DT]()
+                        acc1 += ws[unsafe_offset=s * count + i]
+                    output[unsafe_offset=i] = acc1.cast[_V4_DT]()
                     i += 1
 
 
@@ -619,7 +688,7 @@ def _v4_make_a_tma[
     var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            a.address_space_cast[AddressSpace.GENERIC](),
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -642,7 +711,7 @@ def _v4_make_a_row_tma(
     var a_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            a.address_space_cast[AddressSpace.GENERIC](),
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -664,7 +733,7 @@ def _v4_make_b_mn_tma[
     var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            b.address_space_cast[AddressSpace.GENERIC](),
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -686,7 +755,7 @@ def _v4_make_b_kmaj_tma[
     var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            b.address_space_cast[AddressSpace.GENERIC](),
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -801,7 +870,7 @@ def _v4_enqueue_direct_m128n192(
     var b_desc = create_tma_descriptor[_V4_DT, 2, _V4_SWIZZLE](
         DeviceBuffer(
             ctx,
-            b.address_space_cast[AddressSpace.GENERIC](),
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),

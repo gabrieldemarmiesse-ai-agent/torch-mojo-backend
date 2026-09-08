@@ -169,9 +169,9 @@ comptime _ADD_F32_BF16_VEC = 4
 
 @__name("torch_mojo_add_f32_bf16_vec4")
 def _add_f32_bf16_contig_kernel(
-    output_f32: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input_f32: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    input_bf16: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    output_f32: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input_f32: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    input_bf16: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -183,28 +183,33 @@ def _add_f32_bf16_contig_kernel(
     var gid = Int(block_idx.x) * _ADD_F32_BF16_BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _ADD_F32_BF16_VEC
-        var lhs = input_f32.load[width=_ADD_F32_BF16_VEC, alignment=16](base)
-        var rhs = input_bf16.load[width=_ADD_F32_BF16_VEC, alignment=8](
+        var lhs = input_f32.unsafe_load[width=_ADD_F32_BF16_VEC, alignment=16](
+            base
+        )
+        var rhs = input_bf16.unsafe_load[width=_ADD_F32_BF16_VEC, alignment=8](
             base
         ).cast[DType.float32]()
-        output_f32.store[width=_ADD_F32_BF16_VEC, alignment=16](base, lhs + rhs)
+        output_f32.unsafe_store[width=_ADD_F32_BF16_VEC, alignment=16](
+            base, lhs + rhs
+        )
 
     # The vector body leaves at most three elements.  With an unaligned base,
     # vec_count is zero and this same launch covers the full input scalarly.
     var index = vec_count * _ADD_F32_BF16_VEC + gid
     var stride = Int(grid_dim.x) * _ADD_F32_BF16_BLOCK
     while index < elements:
-        output_f32[index] = (
-            input_f32[index] + input_bf16[index].cast[DType.float32]()
+        output_f32[unsafe_offset=index] = (
+            input_f32[unsafe_offset=index]
+            + input_bf16[unsafe_offset=index].cast[DType.float32]()
         )
         index += stride
 
 
 @always_inline
 def _add_f32_bf16_contig(
-    output_f32: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input_f32: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    input_bf16: UnsafePointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    output_f32: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input_f32: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    input_bf16: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
     elements: Int,
     ctx: DeviceContext,
 ) raises:
@@ -416,9 +421,9 @@ def _bin_vec_op[
 def _bin_bcast_kernel[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
-    l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_arg: Int64,
@@ -460,9 +465,11 @@ def _bin_bcast_kernel[
         rest = rest // d2
         var i1 = rest % d1
         var i0 = rest // d1
-        var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
-        var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-        out_ptr[i] = _bin_vec_op[dtype, out_dtype, op_code, is_cmp, 1](a, b)[0]
+        var a = l_ptr[unsafe_offset=i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
+        var b = r_ptr[unsafe_offset=i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
+        out_ptr[unsafe_offset=i] = _bin_vec_op[
+            dtype, out_dtype, op_code, is_cmp, 1
+        ](a, b)[0]
         i += gstride
 
 
@@ -470,9 +477,9 @@ def _bin_bcast_kernel[
 def _bin_flat_vec_kernel[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
-    l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     total_arg: Int64,
     l_bcast_arg: Int64,
     r_bcast_arg: Int64,
@@ -503,29 +510,33 @@ def _bin_flat_vec_kernel[
         # A flagged operand holds exactly one element, so this read is in
         # range whenever the output is (the launcher returns early on
         # total == 0), and it happens once per thread, not once per element.
-        var l_splat = SIMD[dtype, VW](l_ptr[0]) if l_b else SIMD[dtype, VW](0)
-        var r_splat = SIMD[dtype, VW](r_ptr[0]) if r_b else SIMD[dtype, VW](0)
+        var l_splat = SIMD[dtype, VW](l_ptr[unsafe_offset=0]) if l_b else SIMD[
+            dtype, VW
+        ](0)
+        var r_splat = SIMD[dtype, VW](r_ptr[unsafe_offset=0]) if r_b else SIMD[
+            dtype, VW
+        ](0)
         var c = tid
         while c < nvec:
             var i = c * VW
-            var a = l_splat if l_b else l_ptr.load[
+            var a = l_splat if l_b else l_ptr.unsafe_load[
                 width=VW, alignment=vec_align
             ](i)
-            var b = r_splat if r_b else r_ptr.load[
+            var b = r_splat if r_b else r_ptr.unsafe_load[
                 width=VW, alignment=vec_align
             ](i)
-            out_ptr.store[width=VW, alignment=out_align](
+            out_ptr.unsafe_store[width=VW, alignment=out_align](
                 i, _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b)
             )
             c += gstride
         var tail = total - nvec * VW
         if tid < tail:
             var i = nvec * VW + tid
-            var a = l_splat[0] if l_b else l_ptr[i]
-            var b = r_splat[0] if r_b else r_ptr[i]
-            out_ptr[i] = _bin_vec_op[dtype, out_dtype, op_code, is_cmp, 1](
-                a, b
-            )[0]
+            var a = l_splat[0] if l_b else l_ptr[unsafe_offset=i]
+            var b = r_splat[0] if r_b else r_ptr[unsafe_offset=i]
+            out_ptr[unsafe_offset=i] = _bin_vec_op[
+                dtype, out_dtype, op_code, is_cmp, 1
+            ](a, b)[0]
 
     # The splat flags are loop-invariant, so each arm is INSTANTIATED rather
     # than branched on per iteration: that keeps the tensor-tensor arm the
@@ -548,9 +559,9 @@ def _bin_flat_vec_kernel[
 def _bin_rowvec_kernel[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
-    l_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    r_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     d1_arg: Int64,
     d2_arg: Int64,
     d3_arg: Int64,
@@ -593,9 +604,9 @@ def _bin_rowvec_kernel[
         var j = Int(thread_idx.x) * VW
         var step = Int(block_dim.x) * VW
         while j < d3:
-            var a = l_ptr.load[width=VW, alignment=vec_align](lbase + j)
-            var b = r_ptr.load[width=VW, alignment=vec_align](rbase + j)
-            out_ptr.store[width=VW, alignment=out_align](
+            var a = l_ptr.unsafe_load[width=VW, alignment=vec_align](lbase + j)
+            var b = r_ptr.unsafe_load[width=VW, alignment=vec_align](rbase + j)
+            out_ptr.unsafe_store[width=VW, alignment=out_align](
                 obase + j,
                 _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b),
             )
@@ -655,9 +666,13 @@ def _binary_bcast[
                     rest = rest // d2
                     var i1 = rest % d1
                     var i0 = rest // d1
-                    var a = l_ptr[i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3]
-                    var b = r_ptr[i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
-                    out_ptr[i] = _bin_vec_op[
+                    var a = l_ptr[
+                        unsafe_offset=i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3
+                    ]
+                    var b = r_ptr[
+                        unsafe_offset=i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3
+                    ]
+                    out_ptr[unsafe_offset=i] = _bin_vec_op[
                         dtype,
                         out_dtype,
                         op_code,
@@ -761,8 +776,8 @@ def _binary_bcast[
                                 1,
                                 GS_THREADS,
                                 out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_immutable(),
-                                r_ptr.as_unsafe_any_origin().as_immutable(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
                                 Int64(total),
                                 Int64(l_scalar),
                                 Int64(r_scalar),
@@ -783,8 +798,8 @@ def _binary_bcast[
                                 1,
                                 GS_THREADS,
                                 out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_immutable(),
-                                r_ptr.as_unsafe_any_origin().as_immutable(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
                                 Int64(d1),
                                 Int64(d2),
                                 Int64(d3),
@@ -811,8 +826,8 @@ def _binary_bcast[
                                 1,
                                 GS_THREADS,
                                 out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_immutable(),
-                                r_ptr.as_unsafe_any_origin().as_immutable(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
                                 Int64(d1),
                                 Int64(d2),
                                 Int64(d3),
@@ -863,7 +878,7 @@ def _bitwise_not[
     @__copy_capture(out_ptr, in_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        out_ptr[i] = ~in_ptr[i]
+        out_ptr[unsafe_offset=i] = ~in_ptr[unsafe_offset=i]
 
     _parallel_for[func](size, ctx)
 
@@ -905,9 +920,15 @@ def _bitwise_not_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _bitwise_not_go(args[0], args[1], args[2], args[3], args[4])
+        _bitwise_not_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -943,12 +964,12 @@ def _isin[
         var i = Int(idx[0].value())
         var found = False
         for j in range(n_test):
-            if in_ptr[i] == test_ptr[j]:
+            if in_ptr[unsafe_offset=i] == test_ptr[unsafe_offset=j]:
                 found = True
                 break
         if invert != 0:
             found = not found
-        out_ptr[i] = found
+        out_ptr[unsafe_offset=i] = found
 
     _parallel_for[func](size, ctx)
 
@@ -995,17 +1016,17 @@ def _isin_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _isin_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)
@@ -1043,12 +1064,12 @@ def _clamp_scalar[
     @__copy_capture(out_ptr, in_ptr, lo_s, hi_s, has_min, has_max)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        var v = in_ptr[i]
+        var v = in_ptr[unsafe_offset=i]
         if has_min != 0:
             v = max(v, lo_s)
         if has_max != 0:
             v = min(v, hi_s)
-        out_ptr[i] = v
+        out_ptr[unsafe_offset=i] = v
 
     _parallel_for[func](size, ctx)
 
@@ -1107,18 +1128,18 @@ def _clamp_scalar_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _clamp_scalar_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -1197,16 +1218,26 @@ def _ternary_bcast[
                 rest = rest // d2
                 var i1 = rest % d1
                 var i0 = rest // d1
-                var a = a_ptr[i0 * as0 + i1 * as1 + i2 * as2 + i3 * as3]
-                var b = b_ptr[i0 * bs0 + i1 * bs1 + i2 * bs2 + i3 * bs3]
-                var c = c_ptr[i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3]
+                var a = a_ptr[
+                    unsafe_offset=i0 * as0 + i1 * as1 + i2 * as2 + i3 * as3
+                ]
+                var b = b_ptr[
+                    unsafe_offset=i0 * bs0 + i1 * bs1 + i2 * bs2 + i3 * bs3
+                ]
+                var c = c_ptr[
+                    unsafe_offset=i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
+                ]
                 var af = a.cast[DType.float32]()
                 var bf = b.cast[DType.float32]()
                 var cf = c.cast[DType.float32]()
                 comptime if op_code == TOP_ADDCMUL:
-                    out_ptr[i] = (af + value_f32 * (bf * cf)).cast[dtype]()
+                    out_ptr[unsafe_offset=i] = (
+                        af + value_f32 * (bf * cf)
+                    ).cast[dtype]()
                 else:
-                    out_ptr[i] = (af + value_f32 * (bf / cf)).cast[dtype]()
+                    out_ptr[unsafe_offset=i] = (
+                        af + value_f32 * (bf / cf)
+                    ).cast[dtype]()
 
             _parallel_for[func](total, ctx)
         else:
@@ -1223,17 +1254,23 @@ def _ternary_bcast[
                 rest = rest // d2
                 var i1 = rest % d1
                 var i0 = rest // d1
-                var a = a_ptr[i0 * as0 + i1 * as1 + i2 * as2 + i3 * as3]
-                var b = b_ptr[i0 * bs0 + i1 * bs1 + i2 * bs2 + i3 * bs3]
-                var c = c_ptr[i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3]
+                var a = a_ptr[
+                    unsafe_offset=i0 * as0 + i1 * as1 + i2 * as2 + i3 * as3
+                ]
+                var b = b_ptr[
+                    unsafe_offset=i0 * bs0 + i1 * bs1 + i2 * bs2 + i3 * bs3
+                ]
+                var c = c_ptr[
+                    unsafe_offset=i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
+                ]
                 comptime if dtype.is_floating_point():
                     comptime if op_code == TOP_ADDCMUL:
-                        out_ptr[i] = a + value_dt * (b * c)
+                        out_ptr[unsafe_offset=i] = a + value_dt * (b * c)
                     else:
-                        out_ptr[i] = a + value_dt * (b / c)
+                        out_ptr[unsafe_offset=i] = a + value_dt * (b / c)
                 else:
                     # Integer addcmul: value is an exact integer scalar.
-                    out_ptr[i] = a + value_dt * (b * c)
+                    out_ptr[unsafe_offset=i] = a + value_dt * (b * c)
 
             _parallel_for[func2](total, ctx)
 
@@ -1329,17 +1366,17 @@ def _ternary_bcast_dispatcher[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _ternary_bcast_go[op_code](
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)
@@ -1448,8 +1485,8 @@ def _addr_bcast[
         var i_flat = Int(idx[0].value())
         var i = i_flat // m
         var j = i_flat % m
-        var bv = b_ptr[i * bs0]
-        var cv = c_ptr[j * cs0]
+        var bv = b_ptr[unsafe_offset=i * bs0]
+        var cv = c_ptr[unsafe_offset=j * cs0]
         # Multiply in float32, then explicitly round down to `dtype` and
         # back up before the next op -- one rounding per op, matching
         # CPU's Half/BFloat16 operator overloads (convert to float, do ONE
@@ -1468,13 +1505,15 @@ def _addr_bcast[
         # `self` is masked to 0 rather than branched around: beta==0 must
         # not propagate nan/inf from `self` (matches CPU), and a select on
         # an already-loaded value keeps this branch-free per element.
-        var av = Scalar[dtype](0) if beta_is_zero else a_ptr[i * as0 + j * as1]
+        var av = Scalar[dtype](0) if beta_is_zero else a_ptr[
+            unsafe_offset=i * as0 + j * as1
+        ]
         var t1 = (
             (beta_f32 * av.cast[DType.float32]())
             .cast[dtype]()
             .cast[DType.float32]()
         )
-        out_ptr[i_flat] = (t1 + t3).cast[dtype]()
+        out_ptr[unsafe_offset=i_flat] = (t1 + t3).cast[dtype]()
 
     # Not `_parallel_for` on CPU -- see the module comment above.
     if ctx.api() == "cpu":
@@ -1544,18 +1583,18 @@ def _addr_bcast_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _addr_bcast_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -1619,12 +1658,10 @@ def _add_f32_bf16_spec_into_go(
     if a.numel > 0:
         _add_f32_bf16_contig(
             _make_ptr[DType.float32](out.ptr).as_unsafe_any_origin(),
-            _make_ptr[DType.float32](fp32_addr)
-            .as_unsafe_any_origin()
-            .as_immutable(),
+            _make_ptr[DType.float32](fp32_addr).as_unsafe_any_origin().as_imm(),
             _make_ptr[DType.bfloat16](bf16_addr)
             .as_unsafe_any_origin()
-            .as_immutable(),
+            .as_imm(),
             a.numel,
             ctx,
         )

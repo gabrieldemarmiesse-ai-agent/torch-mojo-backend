@@ -215,8 +215,8 @@ def _moment_finish[
 def _moment_flag_repass[
     dtype: DType
 ](
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     o: Int,
     outputs: Int,
     meta: Int,
@@ -235,12 +235,12 @@ def _moment_flag_repass[
     """
     if _moment_cancels(s, q, reduce_n):
         var base = _moment_slice_base(o, reduce_n, inner)
-        ws_ptr[meta + o] = in_ptr[base].cast[DType.float32]() + s / Float32(
-            reduce_n
-        )
-        ws_ptr[meta + outputs + o] = Float32(1)
+        ws_ptr[unsafe_offset=meta + o] = in_ptr[unsafe_offset=base].cast[
+            DType.float32
+        ]() + s / Float32(reduce_n)
+        ws_ptr[unsafe_offset=meta + outputs + o] = Float32(1)
     else:
-        ws_ptr[meta + outputs + o] = Float32(0)
+        ws_ptr[unsafe_offset=meta + outputs + o] = Float32(0)
 
 
 @always_inline
@@ -259,9 +259,9 @@ def _moment_slice_base(o: Int, reduce_n: Int, inner: Int) -> Int:
 def _moments_contig_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
@@ -297,13 +297,13 @@ def _moments_contig_kernel[
     # Assumed mean: the row's first element, identical in every split of this
     # row so the partial moment pairs merge by addition. On a re-pass it is
     # the accurate mean instead, which leaves no cancellation to correct.
-    var shift = in_ptr[base].cast[DType.float32]()
+    var shift = in_ptr[unsafe_offset=base].cast[DType.float32]()
     if repass:
         # Uniform across the block: an early exit here cannot desynchronize
         # the barriers inside `block.sum` below.
-        if ws_ptr[2 * splits * outputs + outputs + row] == 0:
+        if ws_ptr[unsafe_offset=2 * splits * outputs + outputs + row] == 0:
             return
-        shift = ws_ptr[2 * splits * outputs + row]
+        shift = ws_ptr[unsafe_offset=2 * splits * outputs + row]
 
     # This split's shard of the row. The last shard may be empty (splits does
     # not divide cols); an empty shard contributes (0, 0), the identity.
@@ -368,10 +368,12 @@ def _moments_contig_kernel[
 
     if tid == 0:
         if fused:
-            out_ptr[row] = _moment_finish[dtype](bs, bq, cols, correction)
+            out_ptr[unsafe_offset=row] = _moment_finish[dtype](
+                bs, bq, cols, correction
+            )
         else:
-            ws_ptr[split * outputs + row] = bs
-            ws_ptr[(splits + split) * outputs + row] = bq
+            ws_ptr[unsafe_offset=split * outputs + row] = bs
+            ws_ptr[unsafe_offset=(splits + split) * outputs + row] = bq
 
 
 @__llvm_metadata(
@@ -381,9 +383,9 @@ def _moments_contig_kernel[
 def _moments_strided_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
     inner_arg: Int64,
     outputs_arg: Int64,
@@ -424,17 +426,22 @@ def _moments_strided_kernel[
 
     var base = outer_index * reduce_n * inner + i
     var out_index = outer_index * inner + i
-    var shift = in_ptr[base].cast[DType.float32]()
+    var shift = in_ptr[unsafe_offset=base].cast[DType.float32]()
     if repass:
-        if ws_ptr[2 * splits * outputs + outputs + out_index] == 0:
+        if (
+            ws_ptr[unsafe_offset=2 * splits * outputs + outputs + out_index]
+            == 0
+        ):
             return
-        shift = ws_ptr[2 * splits * outputs + out_index]
+        shift = ws_ptr[unsafe_offset=2 * splits * outputs + out_index]
     var fused = splits == 1 and not repass
 
     var s = Float32(0)
     var q = Float32(0)
     for r in range(r0, r1):
-        var d = in_ptr[base + r * inner].cast[DType.float32]() - shift
+        var d = (
+            in_ptr[unsafe_offset=base + r * inner].cast[DType.float32]() - shift
+        )
         s += d
         q += d * d
 
@@ -445,15 +452,20 @@ def _moments_strided_kernel[
         s = Float32(0)
         q = Float32(0)
         for r in range(r0, r1):
-            var d = in_ptr[base + r * inner].cast[DType.float32]() - shift
+            var d = (
+                in_ptr[unsafe_offset=base + r * inner].cast[DType.float32]()
+                - shift
+            )
             s += d
             q += d * d
 
     if fused:
-        out_ptr[out_index] = _moment_finish[dtype](s, q, reduce_n, correction)
+        out_ptr[unsafe_offset=out_index] = _moment_finish[dtype](
+            s, q, reduce_n, correction
+        )
     else:
-        ws_ptr[split * outputs + out_index] = s
-        ws_ptr[(splits + split) * outputs + out_index] = q
+        ws_ptr[unsafe_offset=split * outputs + out_index] = s
+        ws_ptr[unsafe_offset=(splits + split) * outputs + out_index] = q
 
 
 @__llvm_metadata(
@@ -463,9 +475,9 @@ def _moments_strided_kernel[
 def _moments_merge_thread_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
@@ -492,14 +504,14 @@ def _moments_merge_thread_kernel[
     var o = Int(block_idx.x) * MOMENT_THREADS + Int(thread_idx.x)
     if o >= outputs:
         return
-    if Int(repass_arg) != 0 and ws_ptr[meta + outputs + o] == 0:
+    if Int(repass_arg) != 0 and ws_ptr[unsafe_offset=meta + outputs + o] == 0:
         return
     var s = Float32(0)
     var q = Float32(0)
     for k in range(splits):
-        s += ws_ptr[k * outputs + o]
-        q += ws_ptr[(splits + k) * outputs + o]
-    out_ptr[o] = _moment_finish[dtype](s, q, reduce_n, correction)
+        s += ws_ptr[unsafe_offset=k * outputs + o]
+        q += ws_ptr[unsafe_offset=(splits + k) * outputs + o]
+    out_ptr[unsafe_offset=o] = _moment_finish[dtype](s, q, reduce_n, correction)
     if Int(repass_arg) == 0:
         _moment_flag_repass[dtype](
             ws_ptr, in_ptr, o, outputs, meta, reduce_n, Int(inner_arg), s, q
@@ -513,9 +525,9 @@ def _moments_merge_thread_kernel[
 def _moments_merge_block_kernel[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
@@ -537,17 +549,19 @@ def _moments_merge_block_kernel[
     var tid = Int(thread_idx.x)
     # Uniform across the block (every thread reads the same flag), so this
     # early exit cannot desynchronize the barriers inside `block.sum`.
-    if Int(repass_arg) != 0 and ws_ptr[meta + outputs + o] == 0:
+    if Int(repass_arg) != 0 and ws_ptr[unsafe_offset=meta + outputs + o] == 0:
         return
     var s = Float32(0)
     var q = Float32(0)
     for k in range(tid, splits, MOMENT_THREADS):
-        s += ws_ptr[k * outputs + o]
-        q += ws_ptr[(splits + k) * outputs + o]
+        s += ws_ptr[unsafe_offset=k * outputs + o]
+        q += ws_ptr[unsafe_offset=(splits + k) * outputs + o]
     var bs = block.sum[block_size=MOMENT_THREADS](s)
     var bq = block.sum[block_size=MOMENT_THREADS](q)
     if tid == 0:
-        out_ptr[o] = _moment_finish[dtype](bs, bq, reduce_n, correction)
+        out_ptr[unsafe_offset=o] = _moment_finish[dtype](
+            bs, bq, reduce_n, correction
+        )
         if Int(repass_arg) == 0:
             _moment_flag_repass[dtype](
                 ws_ptr,
@@ -609,7 +623,7 @@ def _var_moments[
         def func[width: Int, alignment: Int = 1](idx: Coord):
             var o = Int(idx[0].value())
             var base = _moment_slice_base(o, reduce_n, inner)
-            var shift = in_ptr[base].cast[DType.float32]()
+            var shift = in_ptr[unsafe_offset=base].cast[DType.float32]()
             var s = Float32(0)
             var q = Float32(0)
             # Same adaptive re-pass as the GPU path: a second read only when
@@ -619,14 +633,19 @@ def _var_moments[
                 q = Float32(0)
                 for r in range(reduce_n):
                     var d = (
-                        in_ptr[base + r * inner].cast[DType.float32]() - shift
+                        in_ptr[unsafe_offset=base + r * inner].cast[
+                            DType.float32
+                        ]()
+                        - shift
                     )
                     s += d
                     q += d * d
                 if not _moment_cancels(s, q, reduce_n):
                     break
                 shift += s / Float32(reduce_n)
-            out_ptr[o] = _moment_finish[dtype](s, q, reduce_n, correction)
+            out_ptr[unsafe_offset=o] = _moment_finish[dtype](
+                s, q, reduce_n, correction
+            )
 
         _parallel_for[func](outputs, ctx)
         return
@@ -635,7 +654,7 @@ def _var_moments[
         comptime sm_count = ctx.default_device_info.sm_count
         var target = MOMENT_BLOCKS_PER_SM * sm_count
         var mout = out_ptr.as_unsafe_any_origin()
-        var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
+        var min_ = in_ptr.as_unsafe_any_origin().as_imm()
 
         var base_blocks = outputs
         # The contiguous kernel wants a whole 16-byte vector per thread before
@@ -820,7 +839,7 @@ comptime LSM_BLOCKS_PER_CU = 4
 @always_inline
 def _lsm_store_out_16B[
     dtype: DType, width: Int, //, vec_align: Int
-](ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin], val: SIMD[dtype, width]):
+](ptr: Pointer[Scalar[dtype], MutAnyOrigin], val: SIMD[dtype, width]):
     """128-bit output store. On NVIDIA use a streaming (evict-first)
     `st.global.cs` store so the writes do not evict the input rows we re-read in
     pass 2; elsewhere fall back to a normal vectorized store."""
@@ -833,7 +852,7 @@ def _lsm_store_out_16B[
             has_side_effect=True,
         ](ptr, u[0], u[1], u[2], u[3])
     else:
-        ptr.store[width=width, alignment=vec_align](val)
+        ptr.unsafe_store[width=width, alignment=vec_align](val)
 
 
 # Fused online (single-read) log-softmax. The reduction reads each row ONCE
@@ -853,8 +872,8 @@ def _lsm_store_out_16B[
 def _log_softmax_rows_block_kernel[
     dtype: DType, threads: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
     rows_arg: Int64,
 ):
@@ -927,7 +946,7 @@ def _log_softmax_rows_block_kernel[
         var s_vec = SIMD[DType.float32, V](0.0)
         var v = tid
         while v < n_vec:
-            var x = in_ptr.load[width=V, alignment=vec_align](
+            var x = in_ptr.unsafe_load[width=V, alignment=vec_align](
                 vec_start + v * V
             ).cast[DType.float32]()
             var new_m = max(m_vec, x)
@@ -943,14 +962,14 @@ def _log_softmax_rows_block_kernel[
         # per element; no-ops when head == tail == 0).
         var jh = tid
         while jh < head:
-            var x = in_ptr[base + jh].cast[DType.float32]()
+            var x = in_ptr[unsafe_offset=base + jh].cast[DType.float32]()
             var nm = max(m_t, x)
             s_t = s_t * exp(m_t - nm) + exp(x - nm)
             m_t = nm
             jh += threads
         var jt = tail_start + tid
         while jt < cols:
-            var x = in_ptr[base + jt].cast[DType.float32]()
+            var x = in_ptr[unsafe_offset=base + jt].cast[DType.float32]()
             var nm = max(m_t, x)
             s_t = s_t * exp(m_t - nm) + exp(x - nm)
             m_t = nm
@@ -969,12 +988,12 @@ def _log_softmax_rows_block_kernel[
             # names a 16-byte boundary in each.
             var vo = tid
             while vo < n_vec_o:
-                var x = in_ptr.load[width=V, alignment=vec_align](
+                var x = in_ptr.unsafe_load[width=V, alignment=vec_align](
                     vec_start_o + vo * V
                 ).cast[DType.float32]()
                 var y = (x - block_m - log_denom).cast[dtype]()
                 _lsm_store_out_16B[vec_align=vec_align](
-                    out_ptr + (vec_start_o + vo * V), y
+                    out_ptr.unsafe_offset(vec_start_o + vo * V), y
                 )
                 vo += threads
         else:
@@ -986,21 +1005,26 @@ def _log_softmax_rows_block_kernel[
                 var off = vec_start_o + vo * V
                 var x = SIMD[DType.float32, V](0.0)
 
-                @parameter
-                for k in range(V):
-                    x[k] = in_ptr[off + k].cast[DType.float32]()
+                comptime for k in range(V):
+                    x[k] = in_ptr[unsafe_offset=off + k].cast[DType.float32]()
                 var y = (x - block_m - log_denom).cast[dtype]()
-                _lsm_store_out_16B[vec_align=vec_align](out_ptr + off, y)
+                _lsm_store_out_16B[vec_align=vec_align](
+                    out_ptr.unsafe_offset(off), y
+                )
                 vo += threads
         var jho = tid
         while jho < head_o:
-            var x = in_ptr[base + jho].cast[DType.float32]()
-            out_ptr[base + jho] = (x - block_m - log_denom).cast[dtype]()
+            var x = in_ptr[unsafe_offset=base + jho].cast[DType.float32]()
+            out_ptr[unsafe_offset=base + jho] = (x - block_m - log_denom).cast[
+                dtype
+            ]()
             jho += threads
         var jto = tail_start_o + tid
         while jto < cols:
-            var x = in_ptr[base + jto].cast[DType.float32]()
-            out_ptr[base + jto] = (x - block_m - log_denom).cast[dtype]()
+            var x = in_ptr[unsafe_offset=base + jto].cast[DType.float32]()
+            out_ptr[unsafe_offset=base + jto] = (x - block_m - log_denom).cast[
+                dtype
+            ]()
             jto += threads
 
         row += Int(grid_dim.x)
@@ -1023,16 +1047,20 @@ def _log_softmax_rows[
             var base = r * cols
             var m = Float32.MIN
             for j in range(cols):
-                var x = in_ptr[base + j].cast[DType.float32]()
+                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
                 if x > m:
                     m = x
             var denom = Float32(0)
             for j in range(cols):
-                denom += exp(in_ptr[base + j].cast[DType.float32]() - m)
+                denom += exp(
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - m
+                )
             var log_denom = log(denom)
             for j in range(cols):
-                var x = in_ptr[base + j].cast[DType.float32]()
-                out_ptr[base + j] = (x - m - log_denom).cast[dtype]()
+                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
+                out_ptr[unsafe_offset=base + j] = (x - m - log_denom).cast[
+                    dtype
+                ]()
 
         _parallel_for[func](rows, ctx)
     else:
@@ -1043,7 +1071,7 @@ def _log_softmax_rows[
             var esize = size_of[dtype]()
             var blocks = min(rows, max(1, LSM_L2_BUDGET // (cols * esize)))
             var mout = out_ptr.as_unsafe_any_origin()
-            var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
+            var min_ = in_ptr.as_unsafe_any_origin().as_imm()
             # Big rows: 1024-thread blocks so the small (L2-capped) grid still
             # saturates memory. Small rows: 256 threads keep every thread busy.
             if cols * esize > LSM_BIG_ROW_BYTES:

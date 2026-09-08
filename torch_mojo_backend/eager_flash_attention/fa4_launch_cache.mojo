@@ -5,7 +5,8 @@ from std.collections import OptionalReg
 from std.ffi import _get_global_or_null, external_call
 from max.gpu.host import DeviceContext, FuncAttribute
 from max.gpu.host.device_context import _DumpPath
-from std.memory import OpaquePointer, alloc
+from std.memory import OpaquePointer
+from std.memory.alloc import unsafe_alloc
 
 
 @always_inline
@@ -36,8 +37,10 @@ def enqueue_fa4_cached[
     )
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    if global_ptr := _get_global_or_null(name):
-        var fptr = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(name)
+
+    if global_ptr:
+        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         comptime if use_external_stream:
             var stream = ctx.create_external_stream(stream_opaque)
             stream.enqueue_function(
@@ -61,11 +64,11 @@ def enqueue_fa4_cached[
         func,
         dump_asm=dump_asm,
     ](func_attribute=func_attribute)
-    var fptr = alloc[FuncT](1)
-    fptr.init_pointee_move(compiled^)
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name),
-        fptr.bitcast[NoneType](),
+        fptr.unsafe_bitcast[NoneType](),
     )
 
     comptime if use_external_stream:

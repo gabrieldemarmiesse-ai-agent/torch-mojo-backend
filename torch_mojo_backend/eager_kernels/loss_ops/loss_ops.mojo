@@ -72,10 +72,10 @@ comptime _VEC_MIN_CLASSES = 4 * _BWD_BLOCK
 
 @__name("nll_forward_none")
 def _nll_forward_none(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
@@ -87,23 +87,23 @@ def _nll_forward_none(
     var ignore_index = Int(ignore_index_arg)
     var row = Int(block_idx.x) * _NONE_BLOCK + Int(thread_idx.x)
     if row == 0:
-        total_weight[0] = 0.0
+        total_weight[unsafe_offset=0] = 0.0
     var stride = Int(grid_dim.x) * _NONE_BLOCK
     while row < rows:
-        var t = Int(target[row])
+        var t = Int(target[unsafe_offset=row])
         var loss = Float32(0.0)
         if t != ignore_index and t >= 0 and t < classes:
-            loss = -log_probs[row * classes + t]
-        output[row] = loss
+            loss = -log_probs[unsafe_offset=row * classes + t]
+        output[unsafe_offset=row] = loss
         row += stride
 
 
 @__name("nll_forward_mean")
 def _nll_forward_mean(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
@@ -123,18 +123,18 @@ def _nll_forward_mean(
     var base = 0
     while base + _MEAN_CHUNK <= rows:
         var r = base + tid * _MEAN_ILP
-        var tv = target.load[width=_MEAN_ILP, alignment=8](r)
+        var tv = target.unsafe_load[width=_MEAN_ILP, alignment=8](r)
         comptime for lane in range(_MEAN_ILP):
             var t = Int(tv[lane])
             if t != ignore_index and t >= 0 and t < classes:
-                acc[lane] += log_probs[(r + lane) * classes + t]
+                acc[lane] += log_probs[unsafe_offset=(r + lane) * classes + t]
                 count[lane] += 1.0
         base += _MEAN_CHUNK
     var row = base + tid
     while row < rows:
-        var t = Int(target[row])
+        var t = Int(target[unsafe_offset=row])
         if t != ignore_index and t >= 0 and t < classes:
-            acc[0] += log_probs[row * classes + t]
+            acc[0] += log_probs[unsafe_offset=row * classes + t]
             count[0] += 1.0
         row += _MEAN_BLOCK
     var total = block.sum[block_size=_MEAN_BLOCK, broadcast=False](
@@ -144,15 +144,15 @@ def _nll_forward_mean(
         count.reduce_add()
     )
     if tid == 0:
-        output[0] = -total / valid
-        total_weight[0] = valid
+        output[unsafe_offset=0] = -total / valid
+        total_weight[unsafe_offset=0] = valid
 
 
 @__name("nll_forward_mean_partial")
 def _nll_forward_mean_partial(
-    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    scratch: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
@@ -167,24 +167,24 @@ def _nll_forward_mean_partial(
     var row = Int(block_idx.x) * _PARTIAL_BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _PARTIAL_BLOCK
     while row < rows:
-        var t = Int(target[row])
+        var t = Int(target[unsafe_offset=row])
         if t != ignore_index and t >= 0 and t < classes:
-            acc += log_probs[row * classes + t]
+            acc += log_probs[unsafe_offset=row * classes + t]
             count += 1.0
         row += stride
     var total = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](acc)
     var valid = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](count)
     if thread_idx.x == 0:
         var b = Int(block_idx.x)
-        scratch[2 * b] = total
-        scratch[2 * b + 1] = valid
+        scratch[unsafe_offset=2 * b] = total
+        scratch[unsafe_offset=2 * b + 1] = valid
 
 
 @__name("nll_forward_mean_final")
 def _nll_forward_mean_final(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    scratch: Pointer[Scalar[DType.float32], MutAnyOrigin],
     partials_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -194,22 +194,22 @@ def _nll_forward_mean_final(
     var count = Float32(0.0)
     var i = Int(thread_idx.x)
     while i < partials:
-        acc += scratch[2 * i]
-        count += scratch[2 * i + 1]
+        acc += scratch[unsafe_offset=2 * i]
+        count += scratch[unsafe_offset=2 * i + 1]
         i += _PARTIAL_BLOCK
     var total = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](acc)
     var valid = block.sum[block_size=_PARTIAL_BLOCK, broadcast=False](count)
     if thread_idx.x == 0:
-        output[0] = -total / valid
-        total_weight[0] = valid
+        output[unsafe_offset=0] = -total / valid
+        total_weight[unsafe_offset=0] = valid
 
 
 @__name("nll_forward_sum")
 def _nll_forward_sum(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     ignore_index_arg: Int64,
@@ -230,11 +230,11 @@ def _nll_forward_sum(
         var row = base + tid
         var loss = Float32(0.0)
         if row < rows:
-            var t = Int(target[row])
+            var t = Int(target[unsafe_offset=row])
             if t != ignore_index and t >= 0 and t < classes:
-                loss = -log_probs[row * classes + t]
+                loss = -log_probs[unsafe_offset=row * classes + t]
                 count += 1.0
-        losses[tid] = loss
+        losses[unsafe_offset=tid] = loss
         barrier()
         if tid == 0:
             # Serial fp32 accumulation in row order; ignored rows contribute
@@ -242,21 +242,21 @@ def _nll_forward_sum(
             # skips them.
             var limit = min(_SUM_BLOCK, rows - base)
             for i in range(limit):
-                acc += losses[i]
+                acc += losses[unsafe_offset=i]
         barrier()
         base += _SUM_BLOCK
     var valid = block.sum[block_size=_SUM_BLOCK, broadcast=False](count)
     if tid == 0:
-        output[0] = acc
-        total_weight[0] = valid
+        output[unsafe_offset=0] = acc
+        total_weight[unsafe_offset=0] = valid
 
 
 @__name("nll_backward_vec4")
 def _nll_backward_vec4(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     reduction_arg: Int64,
@@ -278,16 +278,18 @@ def _nll_backward_vec4(
     var strip = Int(block_idx.x) * (_BWD_BLOCK * _VEC_UNROLL)
     var scale = Float32(0.0)
     if reduction == 1:
-        scale = grad_output[0] / total_weight[0]
+        scale = grad_output[unsafe_offset=0] / total_weight[unsafe_offset=0]
     elif reduction == 2:
-        scale = grad_output[0]
+        scale = grad_output[unsafe_offset=0]
     var row = Int(block_idx.y)
     while row < rows:
-        var t = Int(target[row])
+        var t = Int(target[unsafe_offset=row])
         var valid = t != ignore_index and t >= 0 and t < classes
         var grad = Float32(0.0)
         if valid:
-            grad = -(grad_output[row] if reduction == 0 else scale)
+            grad = -(
+                grad_output[unsafe_offset=row] if reduction == 0 else scale
+            )
         var base = row * classes
         comptime for u in range(_VEC_UNROLL):
             var v = strip + u * _BWD_BLOCK + tid
@@ -299,16 +301,18 @@ def _nll_backward_vec4(
                 comptime for lane in range(4):
                     if valid and t == col + lane:
                         chunk[lane] = grad
-                grad_input.store[width=4, alignment=16](base + col, chunk)
+                grad_input.unsafe_store[width=4, alignment=16](
+                    base + col, chunk
+                )
         row += Int(grid_dim.y)
 
 
 @__name("nll_backward_scalar")
 def _nll_backward_scalar(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     classes_arg: Int64,
     reduction_arg: Int64,
@@ -324,29 +328,33 @@ def _nll_backward_scalar(
     var warp_stride = Int(grid_dim.x) * (_BWD_BLOCK // WARP_SIZE)
     var scale = Float32(0.0)
     if reduction == 1:
-        scale = grad_output[0] / total_weight[0]
+        scale = grad_output[unsafe_offset=0] / total_weight[unsafe_offset=0]
     elif reduction == 2:
-        scale = grad_output[0]
+        scale = grad_output[unsafe_offset=0]
     var row = Int(block_idx.x) * (_BWD_BLOCK // WARP_SIZE) + Int(warp_id())
     while row < rows:
-        var t = Int(target[row])
+        var t = Int(target[unsafe_offset=row])
         var valid = t != ignore_index and t >= 0 and t < classes
         var grad = Float32(0.0)
         if valid:
-            grad = -(grad_output[row] if reduction == 0 else scale)
+            grad = -(
+                grad_output[unsafe_offset=row] if reduction == 0 else scale
+            )
         var base = row * classes
         var col = lane
         while col < classes:
-            grad_input[base + col] = grad if (valid and col == t) else 0.0
+            grad_input[unsafe_offset=base + col] = grad if (
+                valid and col == t
+            ) else 0.0
             col += WARP_SIZE
         row += warp_stride
 
 
 def enqueue_nll_forward_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    log_probs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    log_probs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
     rows: Int,
     classes: Int,
     reduction: Int,
@@ -444,10 +452,10 @@ def enqueue_nll_forward_f32(
 
 
 def enqueue_nll_backward_f32(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    target: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    total_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    target: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    total_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows: Int,
     classes: Int,
     reduction: Int,
@@ -585,18 +593,18 @@ def _nll_forward_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _nll_forward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -608,18 +616,18 @@ def _nll_backward_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _nll_backward_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)

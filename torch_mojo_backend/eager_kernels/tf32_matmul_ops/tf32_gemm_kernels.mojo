@@ -99,10 +99,10 @@ def _tile_body[
     THREADS: Int,
     STAGES: Int,
 ](
-    c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -165,16 +165,18 @@ def _tile_body[
 
         var bz = Int(block_idx.z)
         while bz < batch_count:
-            var a_base = a + bz * a_bs
-            var b_base = b + bz * b_bs
-            var c_base = c + bz * c_bs
+            var a_base = a.unsafe_offset(bz * a_bs)
+            var b_base = b.unsafe_offset(bz * b_bs)
+            var c_base = c.unsafe_offset(bz * c_bs)
 
             @parameter
             @always_inline
             def copy_a(ktile: Int, stage: Int):
-                var sa_ptr = smem + stage * STAGE_WORDS
+                var sa_ptr = smem.unsafe_offset(stage * STAGE_WORDS)
                 var k0 = ktile * _BK
-                var tile = a_base + (k0 * lda + m0 if TA else m0 * lda + k0)
+                var tile = a_base.unsafe_offset(
+                    k0 * lda + m0 if TA else m0 * lda + k0
+                )
                 var rows_avail = (k - k0) if TA else (m - m0)
                 var cols_avail = (m - m0) if TA else (k - k0)
                 if a_vec != 0:
@@ -184,10 +186,14 @@ def _tile_body[
                         if idx < AR * AV:
                             var r = idx // AV
                             var col = (idx - r * AV) * 4
-                            var dst = sa_ptr + r * (AC + APAD) + col
+                            var dst = sa_ptr.unsafe_offset(
+                                r * (AC + APAD) + col
+                            )
                             if r < rows_avail and col + 3 < cols_avail:
                                 async_copy[16](
-                                    (tile + r * lda + col).address_space_cast[
+                                    (
+                                        tile.unsafe_offset(r * lda + col)
+                                    ).unsafe_address_space_cast[
                                         AddressSpace.GLOBAL
                                     ](),
                                     dst,
@@ -199,37 +205,45 @@ def _tile_body[
                                     if r < rows_avail and col + j < cols_avail:
                                         async_copy[4](
                                             (
-                                                tile + r * lda + col + j
-                                            ).address_space_cast[
+                                                tile.unsafe_offset(
+                                                    r * lda + col + j
+                                                )
+                                            ).unsafe_address_space_cast[
                                                 AddressSpace.GLOBAL
                                             ](),
-                                            dst + j,
+                                            dst.unsafe_offset(j),
                                         )
                                     else:
-                                        dst[j] = 0.0
+                                        dst[unsafe_offset=j] = 0.0
                 else:
                     comptime for i in range(ceildiv(AR * AC, THREADS)):
                         var idx = tid + i * THREADS
                         if idx < AR * AC:
                             var r = idx // AC
                             var col = idx - r * AC
-                            var dst = sa_ptr + r * (AC + APAD) + col
+                            var dst = sa_ptr.unsafe_offset(
+                                r * (AC + APAD) + col
+                            )
                             if r < rows_avail and col < cols_avail:
                                 async_copy[4](
-                                    (tile + r * lda + col).address_space_cast[
+                                    (
+                                        tile.unsafe_offset(r * lda + col)
+                                    ).unsafe_address_space_cast[
                                         AddressSpace.GLOBAL
                                     ](),
                                     dst,
                                 )
                             else:
-                                dst[0] = 0.0
+                                dst[unsafe_offset=0] = 0.0
 
             @parameter
             @always_inline
             def copy_b(ktile: Int, stage: Int):
-                var sb_ptr = smem + stage * STAGE_WORDS + SA
+                var sb_ptr = smem.unsafe_offset(stage * STAGE_WORDS + SA)
                 var k0 = ktile * _BK
-                var tile = b_base + (n0 * ldb + k0 if TB else k0 * ldb + n0)
+                var tile = b_base.unsafe_offset(
+                    n0 * ldb + k0 if TB else k0 * ldb + n0
+                )
                 var rows_avail = (n - n0) if TB else (k - k0)
                 var cols_avail = (k - k0) if TB else (n - n0)
                 if b_vec != 0:
@@ -239,10 +253,14 @@ def _tile_body[
                         if idx < BR * BV:
                             var r = idx // BV
                             var col = (idx - r * BV) * 4
-                            var dst = sb_ptr + r * (BC + BPAD) + col
+                            var dst = sb_ptr.unsafe_offset(
+                                r * (BC + BPAD) + col
+                            )
                             if r < rows_avail and col + 3 < cols_avail:
                                 async_copy[16](
-                                    (tile + r * ldb + col).address_space_cast[
+                                    (
+                                        tile.unsafe_offset(r * ldb + col)
+                                    ).unsafe_address_space_cast[
                                         AddressSpace.GLOBAL
                                     ](),
                                     dst,
@@ -252,30 +270,36 @@ def _tile_body[
                                     if r < rows_avail and col + j < cols_avail:
                                         async_copy[4](
                                             (
-                                                tile + r * ldb + col + j
-                                            ).address_space_cast[
+                                                tile.unsafe_offset(
+                                                    r * ldb + col + j
+                                                )
+                                            ).unsafe_address_space_cast[
                                                 AddressSpace.GLOBAL
                                             ](),
-                                            dst + j,
+                                            dst.unsafe_offset(j),
                                         )
                                     else:
-                                        dst[j] = 0.0
+                                        dst[unsafe_offset=j] = 0.0
                 else:
                     comptime for i in range(ceildiv(BR * BC, THREADS)):
                         var idx = tid + i * THREADS
                         if idx < BR * BC:
                             var r = idx // BC
                             var col = idx - r * BC
-                            var dst = sb_ptr + r * (BC + BPAD) + col
+                            var dst = sb_ptr.unsafe_offset(
+                                r * (BC + BPAD) + col
+                            )
                             if r < rows_avail and col < cols_avail:
                                 async_copy[4](
-                                    (tile + r * ldb + col).address_space_cast[
+                                    (
+                                        tile.unsafe_offset(r * ldb + col)
+                                    ).unsafe_address_space_cast[
                                         AddressSpace.GLOBAL
                                     ](),
                                     dst,
                                 )
                             else:
-                                dst[0] = 0.0
+                                dst[unsafe_offset=0] = 0.0
 
             # The batch loop reuses all stages; the previous iteration's
             # consumers must drain before new copies land in stage 0.
@@ -302,8 +326,8 @@ def _tile_body[
                     copy_b(prefetch, prefetch % STAGES)
                 async_copy_commit_group()
 
-                var sa_ptr = smem + (kt % STAGES) * STAGE_WORDS
-                var sb_ptr = sa_ptr + SA
+                var sa_ptr = smem.unsafe_offset((kt % STAGES) * STAGE_WORDS)
+                var sb_ptr = sa_ptr.unsafe_offset(SA)
                 comptime for ks in range(_BK // 8):
                     var a_frag = InlineArray[SIMD[DType.float32, 4], MT](
                         uninitialized=True
@@ -314,20 +338,32 @@ def _tile_body[
                                 wm0 + mt * 16 + g
                             )
                             a_frag[mt] = SIMD[DType.float32, 4](
-                                _tf32(sa_ptr[base]),
-                                _tf32(sa_ptr[base + 8]),
-                                _tf32(sa_ptr[base + 4 * (AC + APAD)]),
-                                _tf32(sa_ptr[base + 4 * (AC + APAD) + 8]),
+                                _tf32(sa_ptr[unsafe_offset=base]),
+                                _tf32(sa_ptr[unsafe_offset=base + 8]),
+                                _tf32(
+                                    sa_ptr[unsafe_offset=base + 4 * (AC + APAD)]
+                                ),
+                                _tf32(
+                                    sa_ptr[
+                                        unsafe_offset=base + 4 * (AC + APAD) + 8
+                                    ]
+                                ),
                             )
                         else:
                             var base = (wm0 + mt * 16 + g) * (AC + APAD) + (
                                 ks * 8 + t
                             )
                             a_frag[mt] = SIMD[DType.float32, 4](
-                                _tf32(sa_ptr[base]),
-                                _tf32(sa_ptr[base + 8 * (AC + APAD)]),
-                                _tf32(sa_ptr[base + 4]),
-                                _tf32(sa_ptr[base + 8 * (AC + APAD) + 4]),
+                                _tf32(sa_ptr[unsafe_offset=base]),
+                                _tf32(
+                                    sa_ptr[unsafe_offset=base + 8 * (AC + APAD)]
+                                ),
+                                _tf32(sa_ptr[unsafe_offset=base + 4]),
+                                _tf32(
+                                    sa_ptr[
+                                        unsafe_offset=base + 8 * (AC + APAD) + 4
+                                    ]
+                                ),
                             )
                     var b_frag = InlineArray[SIMD[DType.float32, 2], NT](
                         uninitialized=True
@@ -338,16 +374,18 @@ def _tile_body[
                                 ks * 8 + t
                             )
                             b_frag[nt] = SIMD[DType.float32, 2](
-                                _tf32(sb_ptr[base]),
-                                _tf32(sb_ptr[base + 4]),
+                                _tf32(sb_ptr[unsafe_offset=base]),
+                                _tf32(sb_ptr[unsafe_offset=base + 4]),
                             )
                         else:
                             var base = (ks * 8 + t) * (BC + BPAD) + (
                                 wn0 + nt * 8 + g
                             )
                             b_frag[nt] = SIMD[DType.float32, 2](
-                                _tf32(sb_ptr[base]),
-                                _tf32(sb_ptr[base + 4 * (BC + BPAD)]),
+                                _tf32(sb_ptr[unsafe_offset=base]),
+                                _tf32(
+                                    sb_ptr[unsafe_offset=base + 4 * (BC + BPAD)]
+                                ),
                             )
                     comptime for mt in range(MT):
                         comptime for nt in range(NT):
@@ -363,23 +401,23 @@ def _tile_body[
                 var bias0 = Float32(0.0)
                 var bias1 = Float32(0.0)
                 if has_bias != 0 and col < n:
-                    bias0 = bias[col]
+                    bias0 = bias[unsafe_offset=col]
                     if col + 1 < n:
-                        bias1 = bias[col + 1]
+                        bias1 = bias[unsafe_offset=col + 1]
                 comptime for mt in range(MT):
                     var v = acc[mt * NT + nt]
                     var row = m0 + wm0 + mt * 16 + g
                     if c_vec != 0:
                         if col < n:
                             if row < m:
-                                c_base.store[width=2, alignment=8](
+                                c_base.unsafe_store[width=2, alignment=8](
                                     row * n + col,
                                     SIMD[DType.float32, 2](
                                         v[0] + bias0, v[1] + bias1
                                     ),
                                 )
                             if row + 8 < m:
-                                c_base.store[width=2, alignment=8](
+                                c_base.unsafe_store[width=2, alignment=8](
                                     (row + 8) * n + col,
                                     SIMD[DType.float32, 2](
                                         v[2] + bias0, v[3] + bias1
@@ -388,14 +426,22 @@ def _tile_body[
                     else:
                         if row < m:
                             if col < n:
-                                c_base[row * n + col] = v[0] + bias0
+                                c_base[unsafe_offset=row * n + col] = (
+                                    v[0] + bias0
+                                )
                             if col + 1 < n:
-                                c_base[row * n + col + 1] = v[1] + bias1
+                                c_base[unsafe_offset=row * n + col + 1] = (
+                                    v[1] + bias1
+                                )
                         if row + 8 < m:
                             if col < n:
-                                c_base[(row + 8) * n + col] = v[2] + bias0
+                                c_base[unsafe_offset=(row + 8) * n + col] = (
+                                    v[2] + bias0
+                                )
                             if col + 1 < n:
-                                c_base[(row + 8) * n + col + 1] = v[3] + bias1
+                                c_base[
+                                    unsafe_offset=(row + 8) * n + col + 1
+                                ] = (v[3] + bias1)
             bz += Int(grid_dim.z)
     else:
         # Portable SIMT fallback so importing this module on another
@@ -403,9 +449,9 @@ def _tile_body[
         # devices on the existing strict fallback path.
         var bz = Int(block_idx.z)
         while bz < batch_count:
-            var a_base = a + bz * a_bs
-            var b_base = b + bz * b_bs
-            var c_base = c + bz * c_bs
+            var a_base = a.unsafe_offset(bz * a_bs)
+            var b_base = b.unsafe_offset(bz * b_bs)
+            var c_base = c.unsafe_offset(bz * c_bs)
             var idx = tid
             while idx < BM * BN:
                 var mm = idx // BN
@@ -415,12 +461,16 @@ def _tile_body[
                 if row < m and col < n:
                     var total = Float32(0.0)
                     for r in range(k):
-                        var av = a_base[r * lda + row if TA else row * lda + r]
-                        var bv = b_base[col * ldb + r if TB else r * ldb + col]
+                        var av = a_base[
+                            unsafe_offset=r * lda + row if TA else row * lda + r
+                        ]
+                        var bv = b_base[
+                            unsafe_offset=col * ldb + r if TB else r * ldb + col
+                        ]
                         total += _tf32(av) * _tf32(bv)
                     if has_bias != 0:
-                        total += bias[col]
-                    c_base[row * n + col] = total
+                        total += bias[unsafe_offset=col]
+                    c_base[unsafe_offset=row * n + col] = total
                 idx += THREADS
             bz += Int(grid_dim.z)
 
@@ -436,10 +486,10 @@ def _gemm_tile[
     THREADS: Int,
     STAGES: Int,
 ](
-    c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -473,9 +523,9 @@ def _bmm_tile[
     THREADS: Int,
     STAGES: Int,
 ](
-    c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -530,10 +580,10 @@ def _launch_tile[
     THREADS: Int,
     STAGES: Int,
 ](
-    c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -611,10 +661,10 @@ def _launch_tile[
 def _dispatch[
     BATCHED: Bool, TA: Bool, TB: Bool
 ](
-    c: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -710,10 +760,10 @@ def _dispatch[
 
 
 def enqueue_tf32_gemm_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -743,9 +793,9 @@ def enqueue_tf32_gemm_f32(
 
 
 def enqueue_tf32_bmm_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    b: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    b: Pointer[Scalar[DType.float32], MutAnyOrigin],
     batch_count: Int,
     m: Int,
     n: Int,

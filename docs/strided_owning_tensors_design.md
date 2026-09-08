@@ -249,7 +249,7 @@ struct OwnedTensor(Movable, Writable):
         print("OWNED_DEL ptr=", Int(self.buf.unsafe_ptr()), " nbytes=", self.nbytes)
 
     @staticmethod
-    def data_ptr(self_ptr: UnsafePointer[Self, MutAnyOrigin]) raises -> PythonObject:
+    def data_ptr(self_ptr: Pointer[Self, MutAnyOrigin]) raises -> PythonObject:
         return PythonObject(Int(self_ptr[].buf.unsafe_ptr()))
 
 

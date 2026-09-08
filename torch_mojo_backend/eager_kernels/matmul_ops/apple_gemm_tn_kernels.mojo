@@ -109,8 +109,8 @@ def _tn_mma8x8(
 
 
 def _tn_ksplit_reduce_kernel(
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     mn_arg: Int64,
     ksplits_arg: Int64,
     total_arg: Int64,
@@ -131,8 +131,8 @@ def _tn_ksplit_reduce_kernel(
         var base = bz * ksplits * mn + off
         var acc = SIMD[DType.float32, 4](0)
         for st in range(ksplits):
-            acc += ws_ptr.load[width=4](base + st * mn)
-        out_ptr.store(i, acc)
+            acc += ws_ptr.unsafe_load[width=4](base + st * mn)
+        out_ptr.unsafe_store(i, acc)
     else:
         for u in range(4):
             var iu = i + u
@@ -143,8 +143,8 @@ def _tn_ksplit_reduce_kernel(
             var baseu = bzu * ksplits * mn + offu
             var accu = Scalar[DType.float32](0)
             for st in range(ksplits):
-                accu += ws_ptr[baseu + st * mn]
-            out_ptr[iu] = accu
+                accu += ws_ptr[unsafe_offset=baseu + st * mn]
+            out_ptr[unsafe_offset=iu] = accu
 
 
 def _apple8_tn_kernel[
@@ -154,9 +154,9 @@ def _apple8_tn_kernel[
     SGR: Int = 2,
     SGC: Int = 2,
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -185,9 +185,9 @@ def _apple8_tn_kernel[
 
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice. a_bstride is 0 when A is batch-shared.
-    var c_ptr = c_base + Int(block_idx.z) * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(Int(block_idx.z) * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var lane = Int(lane_id())
     var fl = _tn_frag8_layout(lane)
@@ -220,7 +220,7 @@ def _apple8_tn_kernel[
                 comptime for s in range(TN_FRAG8):
                     if kk + fcol + s < k_end:
                         # A is (K, M): logical row = stored column.
-                        af[s] = a_ptr[(kk + fcol + s) * m + grow]
+                        af[s] = a_ptr[unsafe_offset=(kk + fcol + s) * m + grow]
             afrag[mi] = af
         var bfrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N](
             uninitialized=True
@@ -231,7 +231,7 @@ def _apple8_tn_kernel[
                 comptime for s in range(TN_FRAG8):
                     var gj = col_base + ni * TN_MMA8_DIM + fcol + s
                     if gj < n:
-                        bf[s] = b_ptr[(kk + frow) * n + gj]
+                        bf[s] = b_ptr[unsafe_offset=(kk + frow) * n + gj]
             bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
@@ -245,29 +245,31 @@ def _apple8_tn_kernel[
     @always_inline
     @parameter
     def _load_a_fast(
-        ap0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M]:
         var afrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
-            var p = ap0 + mi * TN_MMA8_DIM
+            var p = ap0.unsafe_offset(mi * TN_MMA8_DIM)
             var af = SIMD[DType.float32, TN_FRAG8](0)
-            af[0] = p[0]
-            af[1] = p[m]
+            af[0] = p[unsafe_offset=0]
+            af[1] = p[unsafe_offset=m]
             afrag[mi] = af
         return afrag^
 
     @always_inline
     @parameter
     def _load_b_fast(
-        bp0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N]:
         var bfrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
-            bfrag[ni] = (bp0 + ni * TN_MMA8_DIM).load[width=TN_FRAG8]()
+            bfrag[ni] = (bp0.unsafe_offset(ni * TN_MMA8_DIM)).unsafe_load[
+                width=TN_FRAG8
+            ]()
         return bfrag^
 
     @always_inline
@@ -288,15 +290,15 @@ def _apple8_tn_kernel[
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue, so a
         # single simdgroup hides most of the device-load latency itself.
-        var ap = a_ptr + (k_start + fcol) * m + row_base + frow
-        var bp = b_ptr + (k_start + frow) * n + col_base + fcol
+        var ap = a_ptr.unsafe_offset((k_start + fcol) * m + row_base + frow)
+        var bp = b_ptr.unsafe_offset((k_start + frow) * n + col_base + fcol)
         var nslabs = (k_end - k_start) // TN_MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap += TN_MMA8_DIM * m
-                bp += TN_MMA8_DIM * n
+                ap = ap.unsafe_offset(TN_MMA8_DIM * m)
+                bp = bp.unsafe_offset(TN_MMA8_DIM * n)
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -318,9 +320,9 @@ def _apple8_tn_kernel[
                 var gcol = col_base + ni * TN_MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
                 if gcol + TN_FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 @always_inline
@@ -351,12 +353,8 @@ def apple_tn_enqueue[
     # Each shard costs an m*n partials round-trip plus a reduce launch.
     if blocks < TN_TARGET_BLOCKS // 2:
         ksplits = min(min(ceildiv(TN_TARGET_BLOCKS, blocks), slabs), 8)
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     if ksplits == 1:
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         _enqueue_cached[_apple8_tn_kernel[False, BM, BN, SGR, SGC]](
@@ -377,7 +375,7 @@ def apple_tn_enqueue[
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
-    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    var ws_mut = Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=Int(ws.unsafe_ptr())
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_tn_kernel[True, BM, BN, SGR, SGC]](
@@ -406,7 +404,7 @@ def apple_tn_enqueue[
         1,
         256,
         c_out,
-        ws_mut.as_immutable(),
+        ws_mut.as_imm(),
         Int64(m * n),
         Int64(ksplits),
         Int64(total),

@@ -34,7 +34,8 @@ from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from std.gpu.primitives import warp
 from std.math import ceildiv, exp, floor
-from std.memory import alloc, stack_allocation
+from std.memory import stack_allocation
+from std.memory.alloc import unsafe_alloc
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys.info import (
@@ -144,13 +145,13 @@ def _batch_norm[
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var c = (i // inner) % channels
-        var m = mean_ptr[c].cast[DType.float32]()
-        var v = var_ptr[c].cast[DType.float32]()
-        var g = gamma_ptr[c].cast[DType.float32]()
-        var b = beta_ptr[c].cast[DType.float32]()
+        var m = mean_ptr[unsafe_offset=c].cast[DType.float32]()
+        var v = var_ptr[unsafe_offset=c].cast[DType.float32]()
+        var g = gamma_ptr[unsafe_offset=c].cast[DType.float32]()
+        var b = beta_ptr[unsafe_offset=c].cast[DType.float32]()
         var scale = g / ieee_sqrt(v + eps)
-        var a = in_ptr[i].cast[DType.float32]()
-        out_ptr[i] = ((a - m) * scale + b).cast[dtype]()
+        var a = in_ptr[unsafe_offset=i].cast[DType.float32]()
+        out_ptr[unsafe_offset=i] = ((a - m) * scale + b).cast[dtype]()
 
     _parallel_for[func](total, ctx)
 
@@ -249,20 +250,24 @@ def _layer_norm[
             var base = r * cols
             var total = Float32(0)
             for j in range(cols):
-                total += in_ptr[base + j].cast[DType.float32]()
+                total += in_ptr[unsafe_offset=base + j].cast[DType.float32]()
             var mean = total / Float32(cols)
             var var_sum = Float32(0)
             for j in range(cols):
-                var d = in_ptr[base + j].cast[DType.float32]() - mean
+                var d = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - mean
+                )
                 var_sum += d * d
             var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
             for j in range(cols):
-                var x = in_ptr[base + j].cast[DType.float32]()
-                var g = gamma_ptr[j].cast[DType.float32]()
-                var b = beta_ptr[j].cast[DType.float32]()
-                out_ptr[base + j] = ((x - mean) * rstd * g + b).cast[dtype]()
-            mean_out_ptr[r] = mean
-            rstd_out_ptr[r] = rstd
+                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
+                var g = gamma_ptr[unsafe_offset=j].cast[DType.float32]()
+                var b = beta_ptr[unsafe_offset=j].cast[DType.float32]()
+                out_ptr[unsafe_offset=base + j] = (
+                    (x - mean) * rstd * g + b
+                ).cast[dtype]()
+            mean_out_ptr[unsafe_offset=r] = mean
+            rstd_out_ptr[unsafe_offset=r] = rstd
 
         _parallel_for[func](rows, ctx)
     else:
@@ -365,8 +370,8 @@ comptime _APPLE_SM_BIG_ROW_BYTES = 25_000  # 1024-thread blocks above this
 def _softmax_rows_warp_kernel[
     dtype: DType, V: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     scale: Float32,
@@ -403,7 +408,7 @@ def _softmax_rows_warp_kernel[
             var x = SIMD[DType.float32, V](min_finite[DType.float32]())
             if j0 < allowed:  # implies j0 < cols, i.e. a full in-row vector
                 var raw = (
-                    in_ptr.load[width=V, alignment=V * size_of[dtype]()](
+                    in_ptr.unsafe_load[width=V, alignment=V * size_of[dtype]()](
                         base + j0
                     ).cast[DType.float32]()
                     * scale
@@ -437,7 +442,7 @@ def _softmax_rows_warp_kernel[
         comptime for k in range(_APPLE_SM_MAX_VPT):
             var v = lane + k * WARP_SIZE
             if v < n_vec:
-                out_ptr.store[width=V, alignment=V * size_of[dtype]()](
+                out_ptr.unsafe_store[width=V, alignment=V * size_of[dtype]()](
                     base + v * V, (vals[k] * inv).cast[dtype]()
                 )
         row += row_stride
@@ -450,8 +455,8 @@ def _softmax_rows_warp_kernel[
 def _softmax_rows_block_kernel[
     dtype: DType, threads: Int, vec: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     scale: Float32,
@@ -494,7 +499,7 @@ def _softmax_rows_block_kernel[
             var v = tid
             while v < n_vec_a:
                 var x = (
-                    in_ptr.load[width=V, alignment=16](
+                    in_ptr.unsafe_load[width=V, alignment=16](
                         base + head + v * V
                     ).cast[DType.float32]()
                     * scale
@@ -509,14 +514,20 @@ def _softmax_rows_block_kernel[
             # Scalar head plus the partial vector at the causal boundary.
             var jh = tid
             while jh < min(head, allowed):
-                var x = in_ptr[base + jh].cast[DType.float32]() * scale
+                var x = (
+                    in_ptr[unsafe_offset=base + jh].cast[DType.float32]()
+                    * scale
+                )
                 var nm = max(m_t, x)
                 s_t = s_t * exp(m_t - nm) + exp(x - nm)
                 m_t = nm
                 jh += threads
             var jt = head + n_vec_a * V + tid
             while jt < allowed:
-                var x = in_ptr[base + jt].cast[DType.float32]() * scale
+                var x = (
+                    in_ptr[unsafe_offset=base + jt].cast[DType.float32]()
+                    * scale
+                )
                 var nm = max(m_t, x)
                 s_t = s_t * exp(m_t - nm) + exp(x - nm)
                 m_t = nm
@@ -524,7 +535,9 @@ def _softmax_rows_block_kernel[
         else:
             var j = tid
             while j < allowed:
-                var x = in_ptr[base + j].cast[DType.float32]() * scale
+                var x = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
+                )
                 var nm = max(m_t, x)
                 s_t = s_t * exp(m_t - nm) + exp(x - nm)
                 m_t = nm
@@ -547,9 +560,12 @@ def _softmax_rows_block_kernel[
             while jh < head:
                 var y = Scalar[dtype](0)
                 if jh < allowed:
-                    var x = in_ptr[base + jh].cast[DType.float32]() * scale
+                    var x = (
+                        in_ptr[unsafe_offset=base + jh].cast[DType.float32]()
+                        * scale
+                    )
                     y = (exp(x - block_m) * inv).cast[dtype]()
-                out_ptr[base + jh] = y
+                out_ptr[unsafe_offset=base + jh] = y
                 jh += threads
             var v = tid
             while v < n_vec_c:
@@ -557,9 +573,9 @@ def _softmax_rows_block_kernel[
                 var y = SIMD[dtype, V](0)
                 if j0 < allowed:
                     var x = (
-                        in_ptr.load[width=V, alignment=16](base + j0).cast[
-                            DType.float32
-                        ]()
+                        in_ptr.unsafe_load[width=V, alignment=16](
+                            base + j0
+                        ).cast[DType.float32]()
                         * scale
                     )
                     var e = exp(x - block_m) * inv
@@ -568,25 +584,32 @@ def _softmax_rows_block_kernel[
                             if j0 + li >= allowed:
                                 e[li] = 0
                     y = e.cast[dtype]()
-                out_ptr.store[width=V, alignment=16](base + j0, y)
+                out_ptr.unsafe_store[width=V, alignment=16](base + j0, y)
                 v += threads
             var jt = head + n_vec_c * V + tid
             while jt < cols:
                 var y = Scalar[dtype](0)
                 if jt < allowed:
-                    var x = in_ptr[base + jt].cast[DType.float32]() * scale
+                    var x = (
+                        in_ptr[unsafe_offset=base + jt].cast[DType.float32]()
+                        * scale
+                    )
                     y = (exp(x - block_m) * inv).cast[dtype]()
-                out_ptr[base + jt] = y
+                out_ptr[unsafe_offset=base + jt] = y
                 jt += threads
         else:
             var j = tid
             while j < allowed:
-                var x = in_ptr[base + j].cast[DType.float32]() * scale
-                out_ptr[base + j] = (exp(x - block_m) * inv).cast[dtype]()
+                var x = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
+                )
+                out_ptr[unsafe_offset=base + j] = (exp(x - block_m) * inv).cast[
+                    dtype
+                ]()
                 j += threads
             var jz = allowed + tid
             while jz < cols:
-                out_ptr[base + jz] = Scalar[dtype](0)
+                out_ptr[unsafe_offset=base + jz] = Scalar[dtype](0)
                 jz += threads
 
         row += Int(grid_dim.x)
@@ -596,8 +619,8 @@ def _softmax_rows_block_kernel[
 def _softmax_rows_apple[
     dtype: DType
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     rows: Int,
     cols: Int,
     scale: Float32,
@@ -608,7 +631,7 @@ def _softmax_rows_apple[
     """Regime dispatch for the Apple-GPU row-softmax kernels."""
     comptime V = 16 // size_of[dtype]()
     var mout = out_ptr.as_unsafe_any_origin()
-    var min_ = in_ptr.as_unsafe_any_origin().as_immutable()
+    var min_ = in_ptr.as_unsafe_any_origin().as_imm()
     var aligned = Int(out_ptr) % 16 == 0 and Int(in_ptr) % 16 == 0
     var warp_grid = min(
         (rows + _APPLE_SM_WARPS_PER_BLOCK - 1) // _APPLE_SM_WARPS_PER_BLOCK,
@@ -741,10 +764,10 @@ def _softmax_rows_apple[
 )
 @__name("softmax_rows_dropout_warp_f32")
 def _softmax_rows_dropout_warp_kernel(
-    probs_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    pdrop_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask_ptr: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    probs_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    pdrop_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask_ptr: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     scale: Float32,
@@ -779,7 +802,9 @@ def _softmax_rows_dropout_warp_kernel(
             var j0 = (lane + k * WARP_SIZE) * 4
             var x = SIMD[DType.float32, 4](min_finite[DType.float32]())
             if j0 < allowed:
-                var raw = in_ptr.load[width=4, alignment=16](base + j0) * scale
+                var raw = (
+                    in_ptr.unsafe_load[width=4, alignment=16](base + j0) * scale
+                )
                 if j0 + 4 > allowed:
                     comptime for li in range(4):
                         if j0 + li < allowed:
@@ -808,20 +833,20 @@ def _softmax_rows_dropout_warp_kernel(
             var v = lane + k * WARP_SIZE
             if v < n_vec:
                 var y = vals[k] * inv
-                probs_ptr.store[width=4, alignment=16](base + v * 4, y)
+                probs_ptr.unsafe_store[width=4, alignment=16](base + v * 4, y)
                 var rnd = _philox4x32_10(
                     base_offset + UInt64(base // 4 + v), seed
                 )
                 var keep_bits = (
                     rnd.cast[DType.uint64]() - SIMD[DType.uint64, 4](threshold)
                 ) >> 63
-                pdrop_ptr.store[width=4, alignment=16](
+                pdrop_ptr.unsafe_store[width=4, alignment=16](
                     base + v * 4,
                     y * keep_bits.cast[DType.float32]() * keep_scale,
                 )
-                mask_ptr.bitcast[Scalar[DType.uint8]]().store[alignment=4](
-                    base + v * 4, keep_bits.cast[DType.uint8]()
-                )
+                mask_ptr.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_store[
+                    alignment=4
+                ](base + v * 4, keep_bits.cast[DType.uint8]())
         row += row_stride
 
 
@@ -926,9 +951,7 @@ def enqueue_softmax_rows_dropout_f32(
             _make_ptr[DType.float32](probs_addr).as_unsafe_any_origin(),
             _make_ptr[DType.float32](pdrop_addr).as_unsafe_any_origin(),
             _make_ptr[DType.bool](mask_addr).as_unsafe_any_origin(),
-            _make_ptr[DType.float32](in_addr)
-            .as_unsafe_any_origin()
-            .as_immutable(),
+            _make_ptr[DType.float32](in_addr).as_unsafe_any_origin().as_imm(),
             Int64(rows),
             Int64(cols),
             scale,
@@ -955,8 +978,8 @@ comptime _SM_VECTOR_BYTES = 16
 def _softmax_warp_rows[
     dtype: DType, causal: Bool, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     scale: Float32,
@@ -994,7 +1017,9 @@ def _softmax_warp_rows[
         var col = lane * VEC
         while col < vec_limit:
             var x = (
-                in_ptr.load[width=VEC, alignment=ALIGN](base + col).cast[F32]()
+                in_ptr.unsafe_load[width=VEC, alignment=ALIGN](base + col).cast[
+                    F32
+                ]()
                 * scale
             )
             var new_max = max(run_max, x)
@@ -1006,7 +1031,7 @@ def _softmax_warp_rows[
         var tail_max = Float32.MIN_FINITE
         var tail_sum = Float32(0.0)
         if tail < limit:
-            tail_max = in_ptr[base + tail].cast[F32]() * scale
+            tail_max = in_ptr[unsafe_offset=base + tail].cast[F32]() * scale
             tail_sum = 1.0
 
         # Lane-local then warp-wide combination of the (max, sum) pairs.
@@ -1022,25 +1047,31 @@ def _softmax_warp_rows[
         col = lane * VEC
         while col < vec_limit:
             var x = (
-                in_ptr.load[width=VEC, alignment=ALIGN](base + col).cast[F32]()
+                in_ptr.unsafe_load[width=VEC, alignment=ALIGN](base + col).cast[
+                    F32
+                ]()
                 * scale
             )
-            out_ptr.store[width=VEC, alignment=ALIGN](
+            out_ptr.unsafe_store[width=VEC, alignment=ALIGN](
                 base + col, (exp(x - row_max) * inv).cast[dtype]()
             )
             col += WARP_SIZE * VEC
         if tail < limit:
-            out_ptr[base + tail] = (
-                exp(in_ptr[base + tail].cast[F32]() * scale - row_max) * inv
+            out_ptr[unsafe_offset=base + tail] = (
+                exp(
+                    in_ptr[unsafe_offset=base + tail].cast[F32]() * scale
+                    - row_max
+                )
+                * inv
             ).cast[dtype]()
 
         comptime if causal:
             var zero_head = min(cols, ceildiv(limit, VEC) * VEC)
             if limit + lane < zero_head:
-                out_ptr[base + limit + lane] = Scalar[dtype](0)
+                out_ptr[unsafe_offset=base + limit + lane] = Scalar[dtype](0)
             col = zero_head + lane * VEC
             while col + VEC <= cols:
-                out_ptr.store[width=VEC, alignment=ALIGN](
+                out_ptr.unsafe_store[width=VEC, alignment=ALIGN](
                     base + col, SIMD[dtype, VEC](Scalar[dtype](0))
                 )
                 col += WARP_SIZE * VEC
@@ -1053,8 +1084,8 @@ def _softmax_warp_rows[
 def _softmax_warp_kernel[
     dtype: DType, causal: Bool, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     scale: Float32,
@@ -1074,8 +1105,8 @@ def _softmax_warp_kernel[
 def _enqueue_softmax_warp[
     dtype: DType, causal: Bool, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     scale: Float32,
@@ -1127,19 +1158,28 @@ def _softmax_rows[
                 allowed = min(cols, r % q_len + 1)
             var m = Float32.MIN
             for j in range(allowed):
-                var x = in_ptr[base + j].cast[DType.float32]() * scale
+                var x = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
+                )
                 if x > m:
                     m = x
             var denom = Float32(0)
             for j in range(allowed):
-                var x = in_ptr[base + j].cast[DType.float32]() * scale
+                var x = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
+                )
                 denom += exp(x - m)
             for j in range(cols):
                 if j < allowed:
-                    var x = in_ptr[base + j].cast[DType.float32]() * scale
-                    out_ptr[base + j] = (exp(x - m) / denom).cast[dtype]()
+                    var x = (
+                        in_ptr[unsafe_offset=base + j].cast[DType.float32]()
+                        * scale
+                    )
+                    out_ptr[unsafe_offset=base + j] = (exp(x - m) / denom).cast[
+                        dtype
+                    ]()
                 else:
-                    out_ptr[base + j] = Scalar[dtype](0)
+                    out_ptr[unsafe_offset=base + j] = Scalar[dtype](0)
 
         _parallel_for[func](rows, ctx)
     else:
@@ -1164,7 +1204,7 @@ def _softmax_rows[
                 if wide_ok:
                     _enqueue_softmax_warp[dtype, True, WIDE](
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         rows,
                         cols,
                         scale,
@@ -1174,7 +1214,7 @@ def _softmax_rows[
                 else:
                     _enqueue_softmax_warp[dtype, True, 1](
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         rows,
                         cols,
                         scale,
@@ -1192,7 +1232,7 @@ def _softmax_rows[
                 var r = Int(coords[0].value())
                 var c = Int(coords[1].value())
                 var v = (
-                    in_ptr.load[width=_simd_width](r * cols + c).cast[
+                    in_ptr.unsafe_load[width=_simd_width](r * cols + c).cast[
                         DType.float32
                     ]()
                     * scale
@@ -1200,8 +1240,7 @@ def _softmax_rows[
                 if causal != 0:
                     var allowed = min(cols, r % q_len + 1)
 
-                    @parameter
-                    for lane in range(_simd_width):
+                    comptime for lane in range(_simd_width):
                         if c + lane >= allowed:
                             v[lane] = min_or_neg_inf[DType.float32]()
                 # Known trade-off: for float16 input with scale > 1 this
@@ -1290,10 +1329,10 @@ def _attn_decode_kernel[
     MAX_HD: Int = ATTN_MAX_HD,
     RED_STAGES: Int = 8,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    q_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    k_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    v_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    q_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    k_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    v_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     kv_len_arg: Int64,
     head_dim_arg: Int64,
     scale: Float32,
@@ -1351,7 +1390,9 @@ def _attn_decode_kernel[
     ]()
 
     for d in range(tid, head_dim, THREADS):
-        q_smem[d] = q_ptr[q_base + d].cast[DType.float32]()
+        q_smem[unsafe_offset=d] = q_ptr[unsafe_offset=q_base + d].cast[
+            DType.float32
+        ]()
     barrier()
 
     var m = Float32.MIN
@@ -1359,46 +1400,46 @@ def _attn_decode_kernel[
         var krow = k_base + j * k_s_stride
         var acc = Float32(0)
         for d in range(0, head_dim, 4):
-            var k4 = k_ptr.load[width=4, alignment=vec_align](krow + d).cast[
-                DType.float32
-            ]()
-            var q4 = q_smem.load[width=4, alignment=16](d)
+            var k4 = k_ptr.unsafe_load[width=4, alignment=vec_align](
+                krow + d
+            ).cast[DType.float32]()
+            var q4 = q_smem.unsafe_load[width=4, alignment=16](d)
             acc += (q4 * k4).reduce_add()
         var s = acc * scale
-        s_smem[j] = s
+        s_smem[unsafe_offset=j] = s
         if s > m:
             m = s
-    red[tid] = m
+    red[unsafe_offset=tid] = m
     barrier()
     var stride = THREADS // 2
     for _ in range(RED_STAGES):
         if tid < stride:
-            if red[tid + stride] > red[tid]:
-                red[tid] = red[tid + stride]
+            if red[unsafe_offset=tid + stride] > red[unsafe_offset=tid]:
+                red[unsafe_offset=tid] = red[unsafe_offset=tid + stride]
         barrier()
         stride //= 2
     if tid == 0:
-        bcast[0] = red[0]
+        bcast[unsafe_offset=0] = red[unsafe_offset=0]
     barrier()
-    m = bcast[0]
+    m = bcast[unsafe_offset=0]
 
     var s = Float32(0)
     for j in range(tid, kv_len, THREADS):
-        var e = exp(s_smem[j] - m)
-        s_smem[j] = e
+        var e = exp(s_smem[unsafe_offset=j] - m)
+        s_smem[unsafe_offset=j] = e
         s += e
-    red[tid] = s
+    red[unsafe_offset=tid] = s
     barrier()
     stride = THREADS // 2
     for _ in range(RED_STAGES):
         if tid < stride:
-            red[tid] += red[tid + stride]
+            red[unsafe_offset=tid] += red[unsafe_offset=tid + stride]
         barrier()
         stride //= 2
     if tid == 0:
-        bcast[1] = red[0]
+        bcast[unsafe_offset=1] = red[unsafe_offset=0]
     barrier()
-    var inv_denom = 1.0 / bcast[1]
+    var inv_denom = 1.0 / bcast[unsafe_offset=1]
 
     # GPT-2's D=64 matches an AMD wavefront. Partition the V reduction over
     # all four wavefronts so the bandwidth-heavy pass uses the whole block,
@@ -1412,31 +1453,35 @@ def _attn_decode_kernel[
             var acc = Float32(0)
             for j in range(wave, kv_len, 4):
                 acc += (
-                    s_smem[j]
-                    * v_ptr[v_base + j * v_s_stride + lane].cast[
+                    s_smem[unsafe_offset=j]
+                    * v_ptr[unsafe_offset=v_base + j * v_s_stride + lane].cast[
                         DType.float32
                     ]()
                 )
-            red[tid] = acc
+            red[unsafe_offset=tid] = acc
             barrier()
             if wave == 0:
                 acc = (
-                    red[lane]
-                    + red[64 + lane]
-                    + red[128 + lane]
-                    + red[192 + lane]
+                    red[unsafe_offset=lane]
+                    + red[unsafe_offset=64 + lane]
+                    + red[unsafe_offset=128 + lane]
+                    + red[unsafe_offset=192 + lane]
                 )
-                out_ptr[out_base + lane] = (acc * inv_denom).cast[dtype]()
+                out_ptr[unsafe_offset=out_base + lane] = (acc * inv_denom).cast[
+                    dtype
+                ]()
             return
 
     for d in range(tid, head_dim, THREADS):
         var acc = Float32(0)
         for j in range(kv_len):
             acc += (
-                s_smem[j]
-                * v_ptr[v_base + j * v_s_stride + d].cast[DType.float32]()
+                s_smem[unsafe_offset=j]
+                * v_ptr[unsafe_offset=v_base + j * v_s_stride + d].cast[
+                    DType.float32
+                ]()
             )
-        out_ptr[out_base + d] = (acc * inv_denom).cast[dtype]()
+        out_ptr[unsafe_offset=out_base + d] = (acc * inv_denom).cast[dtype]()
 
 
 @always_inline
@@ -1492,35 +1537,39 @@ def _attn_decode_cpu[
             var dot = Float32(0)
             for d in range(head_dim):
                 dot += (
-                    q_ptr[q_base + d].cast[DType.float32]()
-                    * k_ptr[krow + d].cast[DType.float32]()
+                    q_ptr[unsafe_offset=q_base + d].cast[DType.float32]()
+                    * k_ptr[unsafe_offset=krow + d].cast[DType.float32]()
                 )
             var s = dot * scale
             if s > m:
                 m = s
 
-        var acc_out = alloc[Float32](head_dim)
+        var acc_out = unsafe_alloc[Float32](head_dim)
         for d in range(head_dim):
-            acc_out[d] = Float32(0)
+            acc_out[unsafe_offset=d] = Float32(0)
         var denom = Float32(0)
         for j in range(kv_len):
             var krow = k_base + j * k_s_stride
             var dot = Float32(0)
             for d in range(head_dim):
                 dot += (
-                    q_ptr[q_base + d].cast[DType.float32]()
-                    * k_ptr[krow + d].cast[DType.float32]()
+                    q_ptr[unsafe_offset=q_base + d].cast[DType.float32]()
+                    * k_ptr[unsafe_offset=krow + d].cast[DType.float32]()
                 )
             var s = dot * scale
             var p = exp(s - m)
             denom += p
             var vrow = v_base + j * v_s_stride
             for d in range(head_dim):
-                acc_out[d] += p * v_ptr[vrow + d].cast[DType.float32]()
+                acc_out[unsafe_offset=d] += (
+                    p * v_ptr[unsafe_offset=vrow + d].cast[DType.float32]()
+                )
 
         for d in range(head_dim):
-            out_ptr[out_base + d] = (acc_out[d] / denom).cast[dtype]()
-        acc_out.free()
+            out_ptr[unsafe_offset=out_base + d] = (
+                acc_out[unsafe_offset=d] / denom
+            ).cast[dtype]()
+        acc_out.unsafe_free()
 
     # CPU-only launch: `func` uses a host `alloc()`/`free()` for its per-row
     # scratch, and `_parallel_for` would also compile a `target="gpu"`
@@ -1596,15 +1645,9 @@ def _attn_decode[
                     1,
                     APPLE_ATTN_THREADS,
                     _make_ptr[dtype](out_addr).as_unsafe_any_origin(),
-                    _make_ptr[dtype](q_addr)
-                    .as_unsafe_any_origin()
-                    .as_immutable(),
-                    _make_ptr[dtype](k_addr)
-                    .as_unsafe_any_origin()
-                    .as_immutable(),
-                    _make_ptr[dtype](v_addr)
-                    .as_unsafe_any_origin()
-                    .as_immutable(),
+                    _make_ptr[dtype](q_addr).as_unsafe_any_origin().as_imm(),
+                    _make_ptr[dtype](k_addr).as_unsafe_any_origin().as_imm(),
+                    _make_ptr[dtype](v_addr).as_unsafe_any_origin().as_imm(),
                     Int64(kv_len),
                     Int64(head_dim),
                     scale,
@@ -1627,9 +1670,9 @@ def _attn_decode[
             1,
             ATTN_THREADS,
             _make_ptr[dtype](out_addr).as_unsafe_any_origin(),
-            _make_ptr[dtype](q_addr).as_unsafe_any_origin().as_immutable(),
-            _make_ptr[dtype](k_addr).as_unsafe_any_origin().as_immutable(),
-            _make_ptr[dtype](v_addr).as_unsafe_any_origin().as_immutable(),
+            _make_ptr[dtype](q_addr).as_unsafe_any_origin().as_imm(),
+            _make_ptr[dtype](k_addr).as_unsafe_any_origin().as_imm(),
+            _make_ptr[dtype](v_addr).as_unsafe_any_origin().as_imm(),
             Int64(kv_len),
             Int64(head_dim),
             scale,
@@ -1699,12 +1742,12 @@ def _max_pool2d[
                 var iw = ow * stride_w - pad_w + fw * dil_w
                 if iw < 0 or iw >= in_w:
                     continue
-                var v = in_ptr[in_base + ih * in_w + iw]
+                var v = in_ptr[unsafe_offset=in_base + ih * in_w + iw]
                 if v > best:
                     best = v
                     best_idx = ih * in_w + iw
-        out_ptr[i] = best
-        idx_ptr[i] = Int64(best_idx)
+        out_ptr[unsafe_offset=i] = best
+        idx_ptr[unsafe_offset=i] = Int64(best_idx)
 
     _parallel_for[func](planes * out_h * out_w, ctx)
 
@@ -1790,8 +1833,10 @@ def _gather0[
     @__copy_capture(out_ptr, weight_ptr, indices_ptr)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
-        var row = Int(indices_ptr[i // row_len])
-        out_ptr[i] = weight_ptr[row * row_len + i % row_len]
+        var row = Int(indices_ptr[unsafe_offset=i // row_len])
+        out_ptr[unsafe_offset=i] = weight_ptr[
+            unsafe_offset=row * row_len + i % row_len
+        ]
 
     _parallel_for[func](num_indices * row_len, ctx)
 
@@ -1990,8 +2035,8 @@ def _cumsum_rows_portable[
         var base = r * cols
         var total = Scalar[acc](0)
         for j in range(cols):
-            total += in_ptr[base + j].cast[acc]()
-            out_ptr[base + j] = total.cast[dtype]()
+            total += in_ptr[unsafe_offset=base + j].cast[acc]()
+            out_ptr[unsafe_offset=base + j] = total.cast[dtype]()
 
     _parallel_for[func](rows, ctx)
 
@@ -2021,8 +2066,8 @@ def _cumsum_cols_portable[
         var i = 0
         while i < rows:
             var addr = i * cols + c
-            total += in_ptr[addr].cast[acc]()
-            out_ptr[addr] = total.cast[dtype]()
+            total += in_ptr[unsafe_offset=addr].cast[acc]()
+            out_ptr[unsafe_offset=addr] = total.cast[dtype]()
             i += 1
 
     _parallel_for[func](cols, ctx)
@@ -2044,9 +2089,7 @@ def _cumsum_inner_into[
     if ctx.api() == "cuda":
         comptime if has_accelerator():
             var gout = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
-            var gin = (
-                _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
-            )
+            var gin = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
             # sm_count_floor: below this many independent lines, one block
             # per line cannot fill the device — see FILL_WAVES in
             # cumsum_kernels.mojo. Read at runtime (not the compile-time
@@ -2087,9 +2130,7 @@ def _cumsum_outer_into[
     if ctx.api() == "cuda":
         comptime if has_accelerator():
             var gout = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
-            var gin = (
-                _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
-            )
+            var gin = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
             enqueue_cumsum_cols[dtype](ctx, gout, gin, rows, cols)
         else:
             raise Error("no GPU accelerator available at compile time")
@@ -2154,9 +2195,9 @@ def _avg_pool2d[
 
         if ih0 >= ih1 or iw0 >= iw1:
             # Window entirely in padding: torch leaves the output at 0.
-            out_ptr[i] = Scalar[dtype](0)
+            out_ptr[unsafe_offset=i] = Scalar[dtype](0)
         else:
-            var divide_factor = 0
+            var divide_factor: Int
             if divisor_override != 0:
                 divide_factor = divisor_override
             elif count_include_pad != 0:
@@ -2167,8 +2208,12 @@ def _avg_pool2d[
             for ih in range(ih0, ih1):
                 var row = in_base + ih * in_w
                 for iw in range(iw0, iw1):
-                    total += in_ptr[row + iw].cast[DType.float32]()
-            out_ptr[i] = (total / Float32(divide_factor)).cast[dtype]()
+                    total += in_ptr[unsafe_offset=row + iw].cast[
+                        DType.float32
+                    ]()
+            out_ptr[unsafe_offset=i] = (total / Float32(divide_factor)).cast[
+                dtype
+            ]()
 
     _parallel_for[func](planes * out_h * out_w, ctx)
 
@@ -2271,8 +2316,8 @@ def _adaptive_avg_pool2d[
         for ih in range(ih0, ih1):
             var row = in_base + ih * in_w
             for iw in range(iw0, iw1):
-                total += in_ptr[row + iw].cast[DType.float32]()
-        out_ptr[i] = (total / Float32(area)).cast[dtype]()
+                total += in_ptr[unsafe_offset=row + iw].cast[DType.float32]()
+        out_ptr[unsafe_offset=i] = (total / Float32(area)).cast[dtype]()
 
     _parallel_for[func](planes * out_h * out_w, ctx)
 
@@ -2353,21 +2398,25 @@ def _group_norm[
             var base = r * cols
             var total = Float32(0)
             for j in range(cols):
-                total += in_ptr[base + j].cast[DType.float32]()
+                total += in_ptr[unsafe_offset=base + j].cast[DType.float32]()
             var mean = total / Float32(cols)
             var var_sum = Float32(0)
             for j in range(cols):
-                var d = in_ptr[base + j].cast[DType.float32]() - mean
+                var d = (
+                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - mean
+                )
                 var_sum += d * d
             var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
             for j in range(cols):
                 var c = g * cpg + j // hxw
-                var x = in_ptr[base + j].cast[DType.float32]()
-                var gm = gamma_ptr[c].cast[DType.float32]()
-                var bt = beta_ptr[c].cast[DType.float32]()
-                out_ptr[base + j] = ((x - mean) * rstd * gm + bt).cast[dtype]()
-            mean_out_ptr[r] = mean
-            rstd_out_ptr[r] = rstd
+                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
+                var gm = gamma_ptr[unsafe_offset=c].cast[DType.float32]()
+                var bt = beta_ptr[unsafe_offset=c].cast[DType.float32]()
+                out_ptr[unsafe_offset=base + j] = (
+                    (x - mean) * rstd * gm + bt
+                ).cast[dtype]()
+            mean_out_ptr[unsafe_offset=r] = mean
+            rstd_out_ptr[unsafe_offset=r] = rstd
 
         _parallel_for[func](rows, ctx)
     else:
@@ -2510,12 +2559,12 @@ def _upsample_bilinear2d[
 
         var r0 = in_base + ih0 * in_w
         var r1 = in_base + ih1 * in_w
-        var v00 = in_ptr[r0 + iw0].cast[DType.float32]()
-        var v01 = in_ptr[r0 + iw1].cast[DType.float32]()
-        var v10 = in_ptr[r1 + iw0].cast[DType.float32]()
-        var v11 = in_ptr[r1 + iw1].cast[DType.float32]()
+        var v00 = in_ptr[unsafe_offset=r0 + iw0].cast[DType.float32]()
+        var v01 = in_ptr[unsafe_offset=r0 + iw1].cast[DType.float32]()
+        var v10 = in_ptr[unsafe_offset=r1 + iw0].cast[DType.float32]()
+        var v11 = in_ptr[unsafe_offset=r1 + iw1].cast[DType.float32]()
         var res = h0 * (w0 * v00 + w1 * v01) + h1 * (w0 * v10 + w1 * v11)
-        out_ptr[i] = res.cast[dtype]()
+        out_ptr[unsafe_offset=i] = res.cast[dtype]()
 
     _parallel_for[func](planes * out_h * out_w, ctx)
 
@@ -2576,18 +2625,18 @@ def _batch_norm_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _batch_norm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -2599,18 +2648,18 @@ def _layer_norm_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _layer_norm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -2622,18 +2671,18 @@ def _softmax_rows_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _softmax_rows_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -2645,24 +2694,24 @@ def _softmax_rows_dropout_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _softmax_rows_dropout_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-            args[13],
-            args[14],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
+            args[unsafe_offset=11],
+            args[unsafe_offset=12],
+            args[unsafe_offset=13],
+            args[unsafe_offset=14],
         )
     except e:
         return _spec_unsupported(e)
@@ -2674,9 +2723,16 @@ def _max_pool2d_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _max_pool2d_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _max_pool2d_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -2687,9 +2743,15 @@ def _avg_pool2d_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _avg_pool2d_go(args[0], args[1], args[2], args[3], args[4])
+        _avg_pool2d_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -2700,9 +2762,15 @@ def _adaptive_avg_pool2d_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _adaptive_avg_pool2d_go(args[0], args[1], args[2], args[3], args[4])
+        _adaptive_avg_pool2d_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -2713,18 +2781,18 @@ def _group_norm_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _group_norm_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
     except e:
         return _spec_unsupported(e)
@@ -2736,9 +2804,15 @@ def _upsample_bilinear2d_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _upsample_bilinear2d_go(args[0], args[1], args[2], args[3], args[4])
+        _upsample_bilinear2d_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -2749,17 +2823,17 @@ def _gather0_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _gather0_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
     except e:
         return _spec_unsupported(e)
@@ -2771,9 +2845,14 @@ def _all_bool_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _all_bool_go(args[0], args[1], args[2], args[3])
+        _all_bool_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -2784,9 +2863,14 @@ def _any_bool_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _any_bool_go(args[0], args[1], args[2], args[3])
+        _any_bool_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()

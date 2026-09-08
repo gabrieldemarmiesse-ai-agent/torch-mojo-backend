@@ -62,7 +62,8 @@ from max.gpu.host import (
 )
 from std.memory import AddressSpace
 from std.math import ceildiv
-from std.memory import alloc, stack_allocation
+from std.memory import stack_allocation
+from std.memory.alloc import unsafe_alloc
 from std.sys.info import _has_sm_9x
 
 from gemm_splitk_common import TARGET_BLOCKS, _ksplit_reduce_kernel
@@ -112,8 +113,8 @@ comptime DEEPK_MAX_BASE = 7
 # slabs per thread; not latency-bound there).
 @__name("tn_ksplit_reduce_wide")
 def _tn_ksplit_reduce_wide_kernel(
-    c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     mn_arg: Int64,
     ksplits_arg: Int64,
 ):
@@ -133,27 +134,29 @@ def _tn_ksplit_reduce_wide_kernel(
     if o + 4 <= mn:
         var st = j
         while st < ksplits:
-            acc += ws_ptr.load[width=4](st * mn + o)
+            acc += ws_ptr.unsafe_load[width=4](st * mn + o)
             st += 8
     elif o < mn:
         var st = j
         while st < ksplits:
             comptime for u in range(4):
                 if o + u < mn:
-                    acc[u] += ws_ptr[st * mn + o + u]
+                    acc[u] += ws_ptr[unsafe_offset=st * mn + o + u]
             st += 8
-    smem.store[alignment=16](tid * 4, acc)
+    smem.unsafe_store[alignment=16](tid * 4, acc)
     barrier()
     if j == 0:
         var total = SIMD[DType.float32, 4](0)
         comptime for g in range(8):
-            total += smem.load[width=4, alignment=16]((g * 32 + lane) * 4)
+            total += smem.unsafe_load[width=4, alignment=16](
+                (g * 32 + lane) * 4
+            )
         if o + 4 <= mn:
-            c_ptr.store(o, total)
+            c_ptr.unsafe_store(o, total)
         elif o < mn:
             comptime for u in range(4):
                 if o + u < mn:
-                    c_ptr[o + u] = total[u]
+                    c_ptr[unsafe_offset=o + u] = total[u]
 
 
 @always_inline
@@ -188,8 +191,10 @@ def _enqueue_cached_smem3d[
     var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    if global_ptr := _get_global_or_null(name):
-        var fptr = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(name)
+
+    if global_ptr:
+        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             fptr[],
             *args,
@@ -204,11 +209,11 @@ def _enqueue_cached_smem3d[
             UInt32(smem_bytes)
         )
     )
-    var fptr = alloc[FuncT](1)
-    fptr.init_pointee_move(compiled^)
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name),
-        fptr.bitcast[NoneType](),
+        fptr.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
         fptr[],
@@ -258,12 +263,8 @@ def _tn_core_launch[
     # tn_f32_gemm_core.mojo).
     comptime SMEM_BYTES = _tn_core_smem_bytes[BM, BN, BK, STAGES]()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
 
     if va4 and vb4:
         _enqueue_cached_smem3d[
@@ -372,12 +373,8 @@ def _tn_split_launch[
     # from the dynamic shared window -- see tn_f32_gemm_core.mojo.
     comptime SMEM_BYTES = _tn_split_smem_bytes[BM, BN, BK, STAGES]()
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
 
     if va4 and vb4:
         _enqueue_cached_smem3d[
@@ -671,9 +668,7 @@ def try_enqueue_tn_f32_gemm(
         var gxr = ceildiv(total, 1024)
         var c_out = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         var ws_ptr = (
-            _make_ptr[DType.float32](c_target)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](c_target).as_unsafe_any_origin().as_imm()
         )
         # Deep splits: one-pass wide reduce (see _tn_ksplit_reduce_wide);
         # shallow splits keep the stock reduce (its 4-elems/thread grid is

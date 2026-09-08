@@ -43,8 +43,8 @@ comptime FES_DIV = 2
 comptime FEA_ADDCMUL = 0
 comptime FEA_ADDCDIV = 1
 
-comptime _MutPtr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
-comptime _ImmutPtr = UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+comptime _MutPtr = Pointer[Scalar[DType.float32], MutAnyOrigin]
+comptime _ImmutPtr = Pointer[Scalar[DType.float32], ImmutAnyOrigin]
 
 # Per-slot chunk offsets and lengths as they cross the launch ABI. `Int` is
 # not device-passable (its width differs between host and device, and Metal's
@@ -56,7 +56,7 @@ comptime _SlotInts = InlineArray[Int64, FOREACH_EW_SLOTS]
 
 @always_inline
 def _addr_ptr(addr: Int) -> _MutPtr:
-    return UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    return Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=addr
     ).as_unsafe_any_origin()
 
@@ -84,9 +84,9 @@ def _no_fuse[
     is spelled as volatile memory traffic instead.)
     """
     var tmp = x
-    var pointer = UnsafePointer(to=tmp).bitcast[Scalar[DType.float32]]()
-    pointer.store[volatile=True](0, x)
-    return pointer.load[width=width, volatile=True](0)
+    var pointer = Pointer(to=tmp).unsafe_bitcast[Scalar[DType.float32]]()
+    pointer.unsafe_store[volatile=True](0, x)
+    return pointer.unsafe_load[width=width, volatile=True](0)
 
 
 @always_inline
@@ -200,28 +200,28 @@ def _foreach_scalar_kernel[
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
-        var value = values.load[width=_VEC, alignment=4](index)
+        var value = values.unsafe_load[width=_VEC, alignment=4](index)
         comptime if op_code == FES_MUL:
             value = value * scalar
         comptime if op_code == FES_ADD:
             value = value + scalar
         comptime if op_code == FES_DIV:
             value = value / scalar
-        values.store[width=_VEC, alignment=4](index, value)
+        values.unsafe_store[width=_VEC, alignment=4](index, value)
         index += stride
 
     # The chunk size is divisible by _VEC, so only a tensor's last chunk can
     # need this scalar tail.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var value = values[index]
+        var value = values[unsafe_offset=index]
         comptime if op_code == FES_MUL:
             value = value * scalar
         comptime if op_code == FES_ADD:
             value = value + scalar
         comptime if op_code == FES_DIV:
             value = value / scalar
-        values[index] = value
+        values[unsafe_offset=index] = value
         index += FOREACH_EW_THREADS
 
 
@@ -243,7 +243,7 @@ def _foreach_mul_tensor_kernel(
     `aten::_foreach_mul_.Tensor`; element math matches the `mul_.Tensor`
     sequential fallback.
     """
-    var scalar = scalar_ptr[0]
+    var scalar = scalar_ptr[unsafe_offset=0]
     var slot, begin = _slot_begin(chunk_ends, Int(block_idx.x))
     var end = min(begin + FOREACH_EW_CHUNK, Int(numels[slot]))
     var values = _pick_mut(slot, p0, p1, p2, p3, p4, p5, p6, p7)
@@ -251,15 +251,15 @@ def _foreach_mul_tensor_kernel(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
-        var value = values.load[width=_VEC, alignment=4](index)
-        values.store[width=_VEC, alignment=4](index, value * scalar)
+        var value = values.unsafe_load[width=_VEC, alignment=4](index)
+        values.unsafe_store[width=_VEC, alignment=4](index, value * scalar)
         index += stride
 
     # The chunk size is divisible by _VEC, so only a tensor's last chunk can
     # need this scalar tail.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        values[index] = values[index] * scalar
+        values[unsafe_offset=index] = values[unsafe_offset=index] * scalar
         index += FOREACH_EW_THREADS
 
 
@@ -303,24 +303,24 @@ def _foreach_lerp_kernel(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
-        var start = self_values.load[width=_VEC, alignment=4](index)
-        var finish = end_values.load[width=_VEC, alignment=4](index)
+        var start = self_values.unsafe_load[width=_VEC, alignment=4](index)
+        var finish = end_values.unsafe_load[width=_VEC, alignment=4](index)
         var difference = finish - start
         var result = start + _no_fuse[_VEC](weight * difference)
         if low_branch == 0:
             result = finish - _no_fuse[_VEC](one_minus_weight * difference)
-        self_values.store[width=_VEC, alignment=4](index, result)
+        self_values.unsafe_store[width=_VEC, alignment=4](index, result)
         index += stride
 
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var start = self_values[index]
-        var finish = end_values[index]
+        var start = self_values[unsafe_offset=index]
+        var finish = end_values[unsafe_offset=index]
         var difference = finish - start
         var result = start + _no_fuse[1](weight * difference)
         if low_branch == 0:
             result = finish - _no_fuse[1](one_minus_weight * difference)
-        self_values[index] = result
+        self_values[unsafe_offset=index] = result
         index += FOREACH_EW_THREADS
 
 
@@ -369,26 +369,26 @@ def _foreach_addc_kernel[
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
-        var a = self_values.load[width=_VEC, alignment=4](index)
-        var b = first_values.load[width=_VEC, alignment=4](index)
-        var c = second_values.load[width=_VEC, alignment=4](index)
+        var a = self_values.unsafe_load[width=_VEC, alignment=4](index)
+        var b = first_values.unsafe_load[width=_VEC, alignment=4](index)
+        var c = second_values.unsafe_load[width=_VEC, alignment=4](index)
         comptime if op_code == FEA_ADDCMUL:
             a = a + scalar * (b * c)
         else:
             a = a + scalar * (b / c)
-        self_values.store[width=_VEC, alignment=4](index, a)
+        self_values.unsafe_store[width=_VEC, alignment=4](index, a)
         index += stride
 
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var a = self_values[index]
-        var b = first_values[index]
-        var c = second_values[index]
+        var a = self_values[unsafe_offset=index]
+        var b = first_values[unsafe_offset=index]
+        var c = second_values[unsafe_offset=index]
         comptime if op_code == FEA_ADDCMUL:
             a = a + scalar * (b * c)
         else:
             a = a + scalar * (b / c)
-        self_values[index] = a
+        self_values[unsafe_offset=index] = a
         index += FOREACH_EW_THREADS
 
 
@@ -421,13 +421,17 @@ def _foreach_sqrt_kernel(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_EW_THREADS * _VEC
     while index + _VEC <= end:
-        var value = in_values.load[width=_VEC, alignment=4](index)
-        out_values.store[width=_VEC, alignment=4](index, ieee_sqrt(value))
+        var value = in_values.unsafe_load[width=_VEC, alignment=4](index)
+        out_values.unsafe_store[width=_VEC, alignment=4](
+            index, ieee_sqrt(value)
+        )
         index += stride
 
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        out_values[index] = ieee_sqrt(in_values[index])
+        out_values[unsafe_offset=index] = ieee_sqrt(
+            in_values[unsafe_offset=index]
+        )
         index += FOREACH_EW_THREADS
 
 
@@ -452,7 +456,9 @@ def _gather_scalars_kernel(
     var count = Int(count_arg)
     var i = Int(thread_idx.x)
     if i < count:
-        out_ptr[base + i] = _pick_immut(i, s0, s1, s2, s3, s4, s5, s6, s7)[0]
+        out_ptr[unsafe_offset=base + i] = _pick_immut(
+            i, s0, s1, s2, s3, s4, s5, s6, s7
+        )[unsafe_offset=0]
 
 
 def enqueue_foreach_gather_scalars_f32(
@@ -471,14 +477,14 @@ def enqueue_foreach_gather_scalars_f32(
             1,
             FOREACH_EW_SLOTS,
             _addr_ptr(out_addr),
-            _addr_ptr(in_addrs[0]).as_immutable(),
-            _addr_ptr(in_addrs[1]).as_immutable(),
-            _addr_ptr(in_addrs[2]).as_immutable(),
-            _addr_ptr(in_addrs[3]).as_immutable(),
-            _addr_ptr(in_addrs[4]).as_immutable(),
-            _addr_ptr(in_addrs[5]).as_immutable(),
-            _addr_ptr(in_addrs[6]).as_immutable(),
-            _addr_ptr(in_addrs[7]).as_immutable(),
+            _addr_ptr(in_addrs[0]).as_imm(),
+            _addr_ptr(in_addrs[1]).as_imm(),
+            _addr_ptr(in_addrs[2]).as_imm(),
+            _addr_ptr(in_addrs[3]).as_imm(),
+            _addr_ptr(in_addrs[4]).as_imm(),
+            _addr_ptr(in_addrs[5]).as_imm(),
+            _addr_ptr(in_addrs[6]).as_imm(),
+            _addr_ptr(in_addrs[7]).as_imm(),
             Int64(base),
             Int64(count),
         )
@@ -544,7 +550,7 @@ def enqueue_foreach_mul_tensor_f32(
             _addr_ptr(addrs[5]),
             _addr_ptr(addrs[6]),
             _addr_ptr(addrs[7]),
-            _addr_ptr(scalar_addr).as_immutable(),
+            _addr_ptr(scalar_addr).as_imm(),
             _slot_ints(chunk_ends),
             _slot_ints(numels),
         )
@@ -579,14 +585,14 @@ def enqueue_foreach_lerp_f32(
             _addr_ptr(self_addrs[5]),
             _addr_ptr(self_addrs[6]),
             _addr_ptr(self_addrs[7]),
-            _addr_ptr(end_addrs[0]).as_immutable(),
-            _addr_ptr(end_addrs[1]).as_immutable(),
-            _addr_ptr(end_addrs[2]).as_immutable(),
-            _addr_ptr(end_addrs[3]).as_immutable(),
-            _addr_ptr(end_addrs[4]).as_immutable(),
-            _addr_ptr(end_addrs[5]).as_immutable(),
-            _addr_ptr(end_addrs[6]).as_immutable(),
-            _addr_ptr(end_addrs[7]).as_immutable(),
+            _addr_ptr(end_addrs[0]).as_imm(),
+            _addr_ptr(end_addrs[1]).as_imm(),
+            _addr_ptr(end_addrs[2]).as_imm(),
+            _addr_ptr(end_addrs[3]).as_imm(),
+            _addr_ptr(end_addrs[4]).as_imm(),
+            _addr_ptr(end_addrs[5]).as_imm(),
+            _addr_ptr(end_addrs[6]).as_imm(),
+            _addr_ptr(end_addrs[7]).as_imm(),
             _slot_ints(chunk_ends),
             _slot_ints(numels),
             weight,
@@ -625,22 +631,22 @@ def enqueue_foreach_addc_f32[
             _addr_ptr(self_addrs[5]),
             _addr_ptr(self_addrs[6]),
             _addr_ptr(self_addrs[7]),
-            _addr_ptr(first_addrs[0]).as_immutable(),
-            _addr_ptr(first_addrs[1]).as_immutable(),
-            _addr_ptr(first_addrs[2]).as_immutable(),
-            _addr_ptr(first_addrs[3]).as_immutable(),
-            _addr_ptr(first_addrs[4]).as_immutable(),
-            _addr_ptr(first_addrs[5]).as_immutable(),
-            _addr_ptr(first_addrs[6]).as_immutable(),
-            _addr_ptr(first_addrs[7]).as_immutable(),
-            _addr_ptr(second_addrs[0]).as_immutable(),
-            _addr_ptr(second_addrs[1]).as_immutable(),
-            _addr_ptr(second_addrs[2]).as_immutable(),
-            _addr_ptr(second_addrs[3]).as_immutable(),
-            _addr_ptr(second_addrs[4]).as_immutable(),
-            _addr_ptr(second_addrs[5]).as_immutable(),
-            _addr_ptr(second_addrs[6]).as_immutable(),
-            _addr_ptr(second_addrs[7]).as_immutable(),
+            _addr_ptr(first_addrs[0]).as_imm(),
+            _addr_ptr(first_addrs[1]).as_imm(),
+            _addr_ptr(first_addrs[2]).as_imm(),
+            _addr_ptr(first_addrs[3]).as_imm(),
+            _addr_ptr(first_addrs[4]).as_imm(),
+            _addr_ptr(first_addrs[5]).as_imm(),
+            _addr_ptr(first_addrs[6]).as_imm(),
+            _addr_ptr(first_addrs[7]).as_imm(),
+            _addr_ptr(second_addrs[0]).as_imm(),
+            _addr_ptr(second_addrs[1]).as_imm(),
+            _addr_ptr(second_addrs[2]).as_imm(),
+            _addr_ptr(second_addrs[3]).as_imm(),
+            _addr_ptr(second_addrs[4]).as_imm(),
+            _addr_ptr(second_addrs[5]).as_imm(),
+            _addr_ptr(second_addrs[6]).as_imm(),
+            _addr_ptr(second_addrs[7]).as_imm(),
             _slot_ints(chunk_ends),
             _slot_ints(numels),
             scalars,
@@ -665,14 +671,14 @@ def enqueue_foreach_sqrt_f32(
             1,
             1,
             FOREACH_EW_THREADS,
-            _addr_ptr(in_addrs[0]).as_immutable(),
-            _addr_ptr(in_addrs[1]).as_immutable(),
-            _addr_ptr(in_addrs[2]).as_immutable(),
-            _addr_ptr(in_addrs[3]).as_immutable(),
-            _addr_ptr(in_addrs[4]).as_immutable(),
-            _addr_ptr(in_addrs[5]).as_immutable(),
-            _addr_ptr(in_addrs[6]).as_immutable(),
-            _addr_ptr(in_addrs[7]).as_immutable(),
+            _addr_ptr(in_addrs[0]).as_imm(),
+            _addr_ptr(in_addrs[1]).as_imm(),
+            _addr_ptr(in_addrs[2]).as_imm(),
+            _addr_ptr(in_addrs[3]).as_imm(),
+            _addr_ptr(in_addrs[4]).as_imm(),
+            _addr_ptr(in_addrs[5]).as_imm(),
+            _addr_ptr(in_addrs[6]).as_imm(),
+            _addr_ptr(in_addrs[7]).as_imm(),
             _addr_ptr(out_addrs[0]),
             _addr_ptr(out_addrs[1]),
             _addr_ptr(out_addrs[2]),
