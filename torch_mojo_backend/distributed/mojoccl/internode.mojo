@@ -871,23 +871,33 @@ def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
 comptime IB_BLOB_BYTES = 24 + 4 * MAX_NODES + 16
 
 
-def ib_port_lid(ib: Int) -> Int:
+def ib_port_lid(ib: Int) raises -> Int:
+    """The port's LID, straight from `ibv_query_port`.
+
+    A nonzero return code (not the same thing as the `try/except` this used
+    to have -- `query_port`'s own C call never raises, it returns an errno)
+    used to be silently discarded, reading LID 0 out of `pa`'s zeroed
+    scratch. For the self-connected flush QP that 0 is not a sentinel
+    anyone downstream checks; it just quietly modifies the flush QP with the
+    wrong address. Raise instead.
+    """
     ref st = _st(ib)[]
     var pa = alloc_bytes(56)
-    try:
-        _ = st.ibv.query_port(st.ctx, st.port, pa)
-    except:
-        return 0
+    var rc = st.ibv.query_port(st.ctx, st.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
     return Int(pa.unsafe_bitcast[UInt16]()[unsafe_offset=17])
 
 
-def ib_port_mtu(ib: Int) -> Int:
+def ib_port_mtu(ib: Int) raises -> Int:
+    """The port's active MTU, straight from `ibv_query_port` (see
+    `ib_port_lid` for why a failed query now raises instead of reading 0 out
+    of zeroed scratch)."""
     ref st = _st(ib)[]
     var pa = alloc_bytes(56)
-    try:
-        _ = st.ibv.query_port(st.ctx, st.port, pa)
-    except:
-        return 0
+    var rc = st.ibv.query_port(st.ctx, st.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
     return ld32(pa, 8)
 
 
