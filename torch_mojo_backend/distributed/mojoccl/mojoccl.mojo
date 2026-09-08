@@ -11,20 +11,39 @@
 # tests/ddp_worker.py skips the checks that need them when
 # TORCH_MOJO_BACKEND_CCL=mojo is set).
 #
-# One process per GPU, one region per rank, raw driver-owned memory shared
-# with legacy IPC (driver.mojo) -- MAX's own allocator memory cannot be
-# exported that way (see docs/mojo_collectives_feasibility.md in the main
-# worktree, §5.6). Bootstrap (the handle exchange ncclCommInitRank itself
-# must do) rides a /dev/shm directory encoded in the 128-byte unique id
-# (bootstrap.mojo); the collectives are the STAND-IN kernel
-# (collectives_kernels.mojo), swapped out wholesale once the production
-# kernel lands.
+# One process per GPU. Within a node, one region per rank of raw
+# driver-owned memory shared with legacy IPC (driver.mojo) -- MAX's own
+# allocator memory cannot be exported that way (see
+# docs/mojo_collectives_feasibility.md, section 5.6) -- and the collectives
+# of collectives_kernels.mojo run over the peer mappings. Across nodes,
+# GPUDirect RDMA written here over libibverbs (ibverbs.mojo,
+# internode.mojo): no vendor collective library takes part at any level.
+#
+# A multi-node communicator runs each collective hierarchically:
+#
+#   allreduce  reduce_scatter_stage (node-local)  ->  one RDMA exchange of
+#              this rank's 1/local_world shard with the SAME local_rank on
+#              every other node, summed by inbox_add  ->  allgather_finish
+#   broadcast  root stages and RDMA-writes to its same-local_rank peers,
+#              then every node runs the node-local broadcast from its own
+#              local root
+#   allgather  node-local allgather into a node block, one RDMA exchange of
+#              node blocks, then place each block by GLOBAL rank (read out
+#              of the bootstrap table, not assumed to be
+#              node * local_world + local_rank)
+#
+# Broadcast and allgather run once at init and are written for clarity
+# rather than speed; allreduce is the one the DDP step waits on.
+#
+# Single-node communicators never touch libibverbs at all -- same fused
+# kernels, same numbers as before this file learned about nodes.
 
 from std.collections import Dict
 from std.ffi import OwnedDLHandle
 from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
+from std.sys import size_of
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceStream
 
@@ -40,25 +59,42 @@ from driver import (
 )
 from bootstrap import (
     UID_BYTES,
-    create_rendezvous_dir,
-    decode_dir,
-    encode_dir,
-    read_rank_handle,
-    remove_rendezvous_dir,
-    wait_for_done,
-    wait_for_rank,
-    write_rank_done,
-    write_rank_handle,
+    BootstrapConn,
+    bootstrap_allgather,
+    bootstrap_barrier,
+    bootstrap_connect,
+    derive_topology,
+    host_hash,
+    make_unique_id,
 )
 from collectives_kernels import (
     MAX_WORLD,
     allgather,
+    allgather_finish,
     allreduce,
     broadcast,
     error_offset,
     region_init,
+    reduce_scatter_stage,
+    shard_range,
     signal_bytes,
 )
+from internode import (
+    IB_BLOB_BYTES,
+    MAX_NODES,
+    ib_connect,
+    ib_enqueue,
+    ib_error,
+    ib_local_info,
+    ib_next_seq,
+    ib_npeers,
+    ib_port_lid,
+    ib_port_mtu,
+    ib_setup,
+    ib_teardown,
+)
+from internode_kernels import copy_bytes, inbox_add, place_blocks
+
 
 # ncclResult_t (nccl.h.in:44-53)
 comptime NCCL_SUCCESS: Int32 = 0
@@ -149,9 +185,12 @@ def _any_dtype_item_bytes(nccl_dtype: Int32) -> Int:
 # Communicator state, behind the opaque `ncclComm_t` (void*) every exported
 # function after ncclCommInitRank receives. Heap-allocated once per
 # communicator and never freed on destroy (the struct itself is a few
-# hundred bytes; only the GPU region and peer IPC mappings -- the resources
-# that matter -- are released there). `regions` is padded to MAX_WORLD with
-# zeros; only indices < world are ever read.
+# hundred bytes; only the GPU region, the peer IPC mappings and the IB
+# resources -- the ones that matter -- are released there).
+#
+# `regions` is indexed by LOCAL rank and padded to MAX_WORLD with zeros:
+# only same-node peers are IPC-mapped, and a node contributes at most
+# MAX_WORLD ranks however large the communicator is.
 # ---------------------------------------------------------------------------
 
 
@@ -168,6 +207,13 @@ struct CommState(Movable):
     var last_stream: Int64
     var aborted: Bool
     var stream_cache: Dict[Int64, DeviceStream]
+    var local_rank: Int
+    var local_world: Int
+    var my_node: Int
+    var nnodes: Int
+    var rank_at: List[Int]
+    var ib: Int
+    var net_off: Int
 
     def __init__(
         out self,
@@ -179,6 +225,13 @@ struct CommState(Movable):
         cap_bytes: Int,
         regions: StaticTuple[Int, MAX_WORLD],
         owned_base: Int,
+        local_rank: Int,
+        local_world: Int,
+        my_node: Int,
+        nnodes: Int,
+        var rank_at: List[Int],
+        ib: Int,
+        net_off: Int,
     ):
         self.rank = rank
         self.world = world
@@ -192,6 +245,18 @@ struct CommState(Movable):
         self.last_stream = 0
         self.aborted = False
         self.stream_cache = Dict[Int64, DeviceStream]()
+        self.local_rank = local_rank
+        self.local_world = local_world
+        self.my_node = my_node
+        self.nnodes = nnodes
+        self.rank_at = rank_at^
+        self.ib = ib
+        self.net_off = net_off
+
+
+@always_inline
+def _align_up(x: Int, a: Int) -> Int:
+    return (x + a - 1) // a * a
 
 
 @always_inline
@@ -326,8 +391,7 @@ def ncclGetErrorString(
 @export
 def ncclGetUniqueId(uid_out: Pointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     try:
-        var dir = create_rendezvous_dir()
-        encode_dir(dir, uid_out)
+        make_unique_id(uid_out)
         return NCCL_SUCCESS
     except e:
         return NCCL_SYSTEM_ERROR
@@ -379,9 +443,7 @@ def ncclCommInitRank(
     # end. Guard explicitly rather than rely on StaticTuple's own bounds
     # check, whose behavior under a release (non-debug) build is not this
     # library's contract to depend on.
-    if Int(nranks) > MAX_WORLD or Int(nranks) < 1:
-        return NCCL_INVALID_ARGUMENT
-    if Int(rank) < 0 or Int(rank) >= Int(nranks):
+    if Int(nranks) < 1 or Int(rank) < 0 or Int(rank) >= Int(nranks):
         return NCCL_INVALID_ARGUMENT
     try:
         var idbuf = unsafe_alloc[UInt8](UID_BYTES)
@@ -402,109 +464,176 @@ def ncclCommInitRank(
         idbuf64[unsafe_offset=13] = id13
         idbuf64[unsafe_offset=14] = id14
         idbuf64[unsafe_offset=15] = id15
-        var dir = decode_dir(_any(idbuf))
-
-        # Everything below either succeeds together or is unwound together:
-        # a failure past this point (region alloc, handle exchange, the
-        # peer-open loop, the done-marker wait) is caught here so rank 0 can
-        # remove the rendezvous directory it created in ncclGetUniqueId --
-        # otherwise it and every rank's handle/done file leak in /dev/shm
-        # forever, since no other rank will ever revisit this path.
-        try:
-            var lib = open_driver()
-            var ordinal = current_device_ordinal(lib)
-            var ctx = DeviceContext(device_id=ordinal)
-
-            var cap_bytes = _region_cap_bytes()
-            # A positive multiple of 4096 (the production kernel's own
-            # precondition, RESULTS.md §9) is what keeps every per-chunk
-            # offset `ncclAllReduce` forms (multiples of cap_bytes, one full
-            # chunk at a time) 16-byte aligned for every supported dtype --
-            # 4096 divides evenly by 2, 4 and 8. A misconfigured
-            # MOJOCCL_REGION_MB (e.g. 0) would otherwise degrade chunk
-            # offsets to non-16-byte-aligned single-element steps.
-            if cap_bytes <= 0 or cap_bytes % 4096 != 0:
-                if Int(rank) == 0:
-                    try:
-                        remove_rendezvous_dir(dir, Int(nranks))
-                    except:
-                        pass
-                return NCCL_INVALID_ARGUMENT
-            var region_bytes = signal_bytes() + 2 * cap_bytes
-            var base = alloc_region(lib, region_bytes)
-            region_init(ctx, base)
-
-            var my_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
-            get_handle(lib, base, _any(my_handle))
-            write_rank_handle(dir, Int(rank), ordinal, _any(my_handle))
-
-            var timeout_s = _bootstrap_timeout_s()
-            var regions = StaticTuple[Int, MAX_WORLD](fill=0)
-            regions[Int(rank)] = base
-            var peer_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
-            for r in range(Int(nranks)):
-                if r == Int(rank):
-                    continue
-                try:
-                    wait_for_rank(dir, r, timeout_s)
-                    _ = read_rank_handle(dir, r, _any(peer_handle))
-                    regions[r] = open_handle(lib, _any(peer_handle))
-                except:
-                    # A peer past this one never got opened: close whatever
-                    # peers < r WERE opened and free our own region before
-                    # propagating, so a failed init leaks no IPC mappings.
-                    for r2 in range(Int(nranks)):
-                        if r2 != Int(rank) and regions[r2] != 0:
-                            try:
-                                close_handle(lib, regions[r2])
-                            except:
-                                pass
-                    try:
-                        free_region(lib, base)
-                    except:
-                        pass
-                    raise
-
-            # Done protocol: every rank marks itself done once it has opened
-            # every peer's handle; rank 0 (and only rank 0) waits for all
-            # `nranks` markers and then removes `dir` -- otherwise
-            # /dev/shm/mojoccl-* directories and their per-rank handle files
-            # accumulate forever on a shared node (mkdtemp never cleans up
-            # after itself). Other ranks return as soon as their own marker
-            # is written; they do not wait for the directory to disappear.
-            write_rank_done(dir, Int(rank))
-            if Int(rank) == 0:
-                for r in range(Int(nranks)):
-                    if r != 0:
-                        wait_for_done(dir, r, timeout_s)
-                try:
-                    remove_rendezvous_dir(dir, Int(nranks))
-                except:
-                    pass  # a leftover /dev/shm dir is a nuisance, not a correctness bug
-
-            var state = CommState(
-                rank=Int(rank),
-                world=Int(nranks),
-                ordinal=ordinal,
-                ctx=ctx,
-                driver=lib^,
-                cap_bytes=cap_bytes,
-                regions=regions,
-                owned_base=base,
-            )
-            var handle_ptr = unsafe_alloc[CommState](1)
-            handle_ptr.unsafe_write(state^)
-            comm_out[] = Int64(Int(handle_ptr))
-            return NCCL_SUCCESS
-        except:
-            if Int(rank) == 0:
-                try:
-                    remove_rendezvous_dir(dir, Int(nranks))
-                except:
-                    pass
-            raise
-    except:
+        return _init_rank(_any(idbuf), Int(rank), Int(nranks), comm_out)
+    except e:
+        print("mojoccl: ncclCommInitRank failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _init_rank(
+    uid: Pointer[UInt8, MutAnyOrigin],
+    rank: Int,
+    nranks: Int,
+    comm_out: Pointer[Int64, MutAnyOrigin],
+) raises -> Int32:
+    """Three bootstrap rounds and everything they gate.
+
+    Round 1 gathers host identity, from which every rank derives the same
+    node/local_rank table. Round 2 gathers the 64-byte IPC handle plus, on a
+    multi-node communicator, this rank's IB connection data. Round 3 is a
+    barrier: past it every peer's region is zeroed, its IPC handles are open
+    and its queue pairs are in RTS, so the first collective may write into
+    it.
+    """
+    var timeout_s = _bootstrap_timeout_s()
+    var conn = bootstrap_connect(uid, rank, nranks, timeout_s)
+
+    # Round 1: host identity.
+    var b1 = unsafe_alloc[UInt8](16)
+    var b1w = b1.unsafe_bitcast[UInt64]()
+    b1w[unsafe_offset=0] = host_hash()
+    b1w[unsafe_offset=1] = UInt64(rank)
+    var t1 = unsafe_alloc[UInt8](16 * nranks)
+    bootstrap_allgather(conn, _any(b1), 16, _any(t1), timeout_s)
+    var t1w = t1.unsafe_bitcast[UInt64]()
+    var hashes = List[UInt64]()
+    for r in range(nranks):
+        hashes.append(t1w[unsafe_offset = 2 * r])
+    var topo = derive_topology(hashes, rank)
+    if topo.local_world > MAX_WORLD:
+        conn.close()
+        raise Error(
+            "mojoccl: "
+            + String(topo.local_world)
+            + " ranks on one node, but the intra-node kernels are built for at"
+            " most "
+            + String(MAX_WORLD)
+        )
+    if topo.nnodes > MAX_NODES:
+        conn.close()
+        raise Error(
+            "mojoccl: " + String(topo.nnodes) + " nodes exceeds the "
+            + String(MAX_NODES) + "-node limit of the inbox layout"
+        )
+
+    var lib = open_driver()
+    var ordinal = current_device_ordinal(lib)
+    var ctx = DeviceContext(device_id=ordinal)
+    var cap_bytes = _region_cap_bytes()
+    # A positive multiple of 4096 (the kernels' own precondition,
+    # RESULTS.md section 9) is what keeps every per-chunk offset the
+    # collectives form 16-byte aligned for every supported dtype.
+    if cap_bytes <= 0 or cap_bytes % 4096 != 0:
+        conn.close()
+        raise Error("mojoccl: MOJOCCL_REGION_MB must be a positive 4 KiB multiple")
+    # A multi-node communicator gets a third cap-sized area on top of
+    # [signal | stage_in | stage_out]: everything the network touches --
+    # the inbox the peers RDMA into, and the staging broadcast and
+    # allgather need because user buffers are not registered -- lives
+    # there and nowhere else. Aliasing it onto stage_in would have been
+    # free in memory and wrong in fact: a peer node writes my inbox as
+    # soon as ITS reduce-scatter is done, which is not ordered against
+    # MY reduce-scatter still using stage_in, nor against a local peer
+    # still reading the previous generation's staging. A single-node
+    # communicator allocates none of it and keeps exactly the old
+    # region.
+    var net_bytes = cap_bytes if topo.nnodes > 1 else 0
+    var net_off = signal_bytes() + 2 * cap_bytes
+    var region_bytes = net_off + net_bytes
+    var base = alloc_region(lib, region_bytes)
+    region_init(ctx, base)
+
+    var ib = 0
+    if topo.nnodes > 1:
+        ib = ib_setup(
+            lib,
+            ordinal,
+            topo.my_local_rank,
+            topo.my_node,
+            topo.nnodes,
+            base,
+            region_bytes,
+        )
+
+    # Round 2: IPC handle + IB connection data.
+    comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES
+    var b2 = unsafe_alloc[UInt8](BLOB2)
+    for i in range(BLOB2):
+        b2[unsafe_offset=i] = 0
+    get_handle(lib, base, _any(b2))
+    var my_lid = 0
+    var my_mtu = 0
+    if ib != 0:
+        my_lid = ib_port_lid(ib)
+        my_mtu = ib_port_mtu(ib)
+        ib_local_info(
+            ib,
+            Pointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=Int(b2) + HANDLE_BYTES
+            ),
+            my_lid,
+            my_mtu,
+        )
+    var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
+    bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
+
+    # Same-node peers only: an IPC handle from another host is meaningless.
+    var regions = StaticTuple[Int, MAX_WORLD](fill=0)
+    regions[topo.my_local_rank] = base
+    for r in range(nranks):
+        if topo.node_of[r] != topo.my_node or r == rank:
+            continue
+        var lr = topo.local_rank_of[r]
+        regions[lr] = open_handle(
+            lib,
+            Pointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=Int(t2) + r * BLOB2
+            ),
+        )
+
+    if ib != 0:
+        var peer_rank_of_node = List[Int]()
+        for j in range(topo.nnodes):
+            peer_rank_of_node.append(
+                topo.rank_at[j * topo.local_world + topo.my_local_rank]
+            )
+        ib_connect(
+            ib,
+            Pointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=Int(t2) + HANDLE_BYTES
+            ),
+            BLOB2,
+            peer_rank_of_node,
+            my_mtu,
+        )
+
+    bootstrap_barrier(conn, timeout_s)
+    conn.close()
+
+    var rank_at = List[Int]()
+    for i in range(len(topo.rank_at)):
+        rank_at.append(topo.rank_at[i])
+    var state = CommState(
+        rank=rank,
+        world=nranks,
+        ordinal=ordinal,
+        ctx=ctx,
+        driver=lib^,
+        cap_bytes=cap_bytes,
+        regions=regions,
+        owned_base=base,
+        local_rank=topo.my_local_rank,
+        local_world=topo.local_world,
+        my_node=topo.my_node,
+        nnodes=topo.nnodes,
+        rank_at=rank_at^,
+        ib=ib,
+        net_off=net_off,
+    )
+    var handle_ptr = unsafe_alloc[CommState](1)
+    handle_ptr.unsafe_write(state^)
+    comm_out[] = Int64(Int(handle_ptr))
+    return NCCL_SUCCESS
 
 
 # ---------------------------------------------------------------------------
@@ -519,8 +648,9 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
         ref state = ptr[]
         if not state.aborted:
             state.ctx.synchronize()
-            for r in range(state.world):
-                if r != state.rank:
+            ib_teardown(state.ib)
+            for r in range(state.local_world):
+                if r != state.local_rank:
                     close_handle(state.driver, state.regions[r])
             free_region(state.driver, state.owned_base)
         return NCCL_SUCCESS
@@ -531,10 +661,11 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
 @export
 def ncclCommAbort(comm: Int64) abi("C") -> Int32:
     ref state = _comm_ptr(comm)[]
-    # No wait, no cleanup of GPU resources here (a dead peer may hang
-    # forever inside its own barrier spin) -- matches ncclCommAbort's
-    # documented "don't wait" contract. ncclCommDestroy is never called
-    # after abort() by nccl.py's NcclComm.
+    # No wait, no cleanup of GPU or IB resources here (a dead peer may hang
+    # forever inside its own barrier spin, and a queue pair torn down under
+    # an in-flight RDMA write is worse than one left alone) -- matches
+    # ncclCommAbort's documented "don't wait" contract. ncclCommDestroy is
+    # never called after abort() by nccl.py's NcclComm.
     state.aborted = True
     return NCCL_SUCCESS
 
@@ -547,6 +678,12 @@ def ncclCommGetAsyncError(
         ref state = _comm_ptr(comm)[]
         if state.aborted:
             err_out[] = NCCL_SYSTEM_ERROR
+            return NCCL_SUCCESS
+        if state.ib != 0 and ib_error(state.ib) != 0:
+            # A host callback gave up (post failed, a completion came back
+            # with a bad status, or nothing arrived inside the deadline).
+            # Host-side state, so it needs no device read.
+            err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
         # Synchronize first: the freshest read this cheaply-checkable word
         # can give is "everything enqueued so far landed", same as before --
@@ -565,7 +702,9 @@ def ncclCommGetAsyncError(
             else DeviceStream(state.ctx)
         )
         s.synchronize()
-        var word = _read_error_word(state.ctx, s, state.regions[state.rank])
+        var word = _read_error_word(
+            state.ctx, s, state.regions[state.local_rank]
+        )
         err_out[] = NCCL_REMOTE_ERROR if Int(word) != 0 else NCCL_SUCCESS
         return NCCL_SUCCESS
     except e:
@@ -612,6 +751,153 @@ def ncclGroupEnd() abi("C") -> Int32:
 # ---------------------------------------------------------------------------
 
 
+def _inter_node_exchange[
+    dtype: DType
+](
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    numel: Int,
+) raises:
+    """The middle third of a multi-node allreduce, for one chunk.
+
+    On entry this rank's node-local sum of its own shard sits in its
+    stage_out (that is `reduce_scatter_stage`'s contract). This enqueues, on
+    the caller's stream: a host callback that RDMA-writes that shard to the
+    same-local_rank rank of every other node and waits for theirs, then the
+    kernel that adds what arrived. On exit the shard holds the sum over the
+    WHOLE communicator, ready for `allgather_finish`.
+
+    Inbox geometry, derived from `(numel, local_world, item)` alone so that
+    a sender computes the same addresses as its receiver: `net_off` holds
+    two halves of `(nnodes-1)` slots of one shard each, and the exchange
+    counter's parity picks the half. `_max_chunk_bytes` keeps both halves
+    inside the area.
+    """
+    comptime item = size_of[dtype]()
+    var lw = state.local_world
+    var sr = shard_range(numel, lw, state.local_rank, item)
+    var off_e = sr[0]
+    var cnt_e = sr[1]
+    var seq = ib_next_seq(state.ib)
+    if cnt_e <= 0:
+        return
+    var npeers = ib_npeers(state.ib)
+    var slot_bytes = _align_up(cnt_e * item, 16)
+    var inbox_off = state.net_off
+    var half = npeers * slot_bytes
+    if 2 * half > state.cap_bytes:
+        raise Error(
+            "mojoccl: the inter-node inbox overflows the network area; this"
+            " is a chunking bug"
+        )
+    var inbox_base = inbox_off + (seq & 1) * half
+    var shard = state.owned_base + signal_bytes() + state.cap_bytes + off_e * item
+    ib_enqueue(
+        state.ib,
+        state.driver,
+        Int(raw_stream),
+        shard,
+        cnt_e * item,
+        inbox_base,
+        slot_bytes,
+        True,
+        npeers,
+        state.owned_base + inbox_base,
+        seq,
+    )
+    inbox_add[dtype](
+        state.ctx,
+        stream,
+        shard,
+        state.owned_base + inbox_base,
+        cnt_e,
+        slot_bytes,
+        npeers,
+    )
+
+
+def _max_chunk_bytes(state: CommState) -> Int:
+    """Largest chunk whose staging and inbox both fit in stage_in.
+
+    A chunk of `B` bytes puts `B/L` bytes in each of the `2(N-1)` inbox
+    slots, so `B <= cap * L / (2(N-1))`, less a page of alignment slop --
+    and never more than `cap`, which the intra-node kernels require anyway.
+    At the shapes DDP produces (27 MiB buckets against a 256 MiB region)
+    the cap never binds: 256 MiB at 2 nodes, 146 MiB at 8.
+    """
+    if state.nnodes <= 1:
+        return state.cap_bytes
+    var denom = 2 * (state.nnodes - 1)
+    var b = (state.cap_bytes * state.local_world // denom) - 2 * 4096
+    b = min(b, state.cap_bytes)
+    if b < 4096:
+        return 4096
+    return b // 4096 * 4096
+
+
+def _do_allreduce[
+    dtype: DType
+](
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+) raises:
+    comptime item = size_of[dtype]()
+    var max_elems = max(1, _max_chunk_bytes(state) // item)
+    var done = 0
+    while done < count:
+        var chunk = min(max_elems, count - done)
+        var off = done * item
+        if state.nnodes == 1:
+            state.generation += 1
+            allreduce[dtype](
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                sendbuff + off,
+                recvbuff + off,
+                chunk,
+                state.cap_bytes,
+                scale,
+                state.generation,
+            )
+        else:
+            state.generation += 1
+            reduce_scatter_stage[dtype](
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                sendbuff + off,
+                chunk,
+                state.cap_bytes,
+                state.generation,
+            )
+            _inter_node_exchange[dtype](state, stream, raw_stream, chunk)
+            state.generation += 1
+            allgather_finish[dtype](
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                recvbuff + off,
+                chunk,
+                state.cap_bytes,
+                scale,
+                state.generation,
+            )
+        done += chunk
+
+
 @export
 def ncclAllReduce(
     sendbuff: Int64,
@@ -628,105 +914,49 @@ def ncclAllReduce(
             return NCCL_INVALID_ARGUMENT
         if op != NCCL_SUM and op != NCCL_AVG:
             return NCCL_INVALID_USAGE
-        # The production kernel's payload loops use 16-byte vector
-        # loads/stores on in_ptr/out_ptr and fault on a misaligned address
-        # (RESULTS.md §9). Every allocator-returned pointer and every chunk
-        # offset this function forms satisfy that (cap_bytes is validated a
-        # multiple of 4096 at init) -- only a mid-tensor view the caller
+        # The payload loops use 16-byte vector loads/stores on
+        # in_ptr/out_ptr and fault on a misaligned address (RESULTS.md
+        # section 9). Every allocator-returned pointer and every chunk
+        # offset this function forms satisfy that (the chunk size is a
+        # multiple of 4096 bytes) -- only a mid-tensor view the caller
         # passes directly can violate it, so reject that case here with a
         # clear error instead of letting the kernel raise.
         if Int(sendbuff) % 16 != 0 or Int(recvbuff) % 16 != 0:
             return NCCL_INVALID_ARGUMENT
-        var ptr = _comm_ptr(comm)
-        ref state = ptr[]
+        ref state = _comm_ptr(comm)[]
         if state.aborted:
             return NCCL_INVALID_USAGE
+        if state.ib != 0 and ib_error(state.ib) != 0:
+            return NCCL_REMOTE_ERROR
         state.last_stream = stream
         _ensure_stream_cached(state, stream)
         ref s = state.stream_cache[stream]
         var scale = Float32(1.0)
         if op == NCCL_AVG:
             scale = Float32(1.0) / Float32(state.world)
-        var max_elems = max(1, state.cap_bytes // item)
-        var total = Int(count)
-        var done = 0
-        while done < total:
-            var chunk = min(max_elems, total - done)
-            state.generation += 1
-            var off = done * item
-            if datatype == NCCL_INT32:
-                allreduce[DType.int32](
-                    state.ctx,
-                    s,
-                    state.rank,
-                    state.world,
-                    state.regions,
-                    Int(sendbuff) + off,
-                    Int(recvbuff) + off,
-                    chunk,
-                    state.cap_bytes,
-                    scale,
-                    state.generation,
-                )
-            elif datatype == NCCL_INT64:
-                allreduce[DType.int64](
-                    state.ctx,
-                    s,
-                    state.rank,
-                    state.world,
-                    state.regions,
-                    Int(sendbuff) + off,
-                    Int(recvbuff) + off,
-                    chunk,
-                    state.cap_bytes,
-                    scale,
-                    state.generation,
-                )
-            elif datatype == NCCL_FLOAT16:
-                allreduce[DType.float16](
-                    state.ctx,
-                    s,
-                    state.rank,
-                    state.world,
-                    state.regions,
-                    Int(sendbuff) + off,
-                    Int(recvbuff) + off,
-                    chunk,
-                    state.cap_bytes,
-                    scale,
-                    state.generation,
-                )
-            elif datatype == NCCL_FLOAT32:
-                allreduce[DType.float32](
-                    state.ctx,
-                    s,
-                    state.rank,
-                    state.world,
-                    state.regions,
-                    Int(sendbuff) + off,
-                    Int(recvbuff) + off,
-                    chunk,
-                    state.cap_bytes,
-                    scale,
-                    state.generation,
-                )
-            else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
-                allreduce[DType.bfloat16](
-                    state.ctx,
-                    s,
-                    state.rank,
-                    state.world,
-                    state.regions,
-                    Int(sendbuff) + off,
-                    Int(recvbuff) + off,
-                    chunk,
-                    state.cap_bytes,
-                    scale,
-                    state.generation,
-                )
-            done += chunk
+        if datatype == NCCL_INT32:
+            _do_allreduce[DType.int32](
+                state, s, stream, Int(sendbuff), Int(recvbuff), Int(count), scale
+            )
+        elif datatype == NCCL_INT64:
+            _do_allreduce[DType.int64](
+                state, s, stream, Int(sendbuff), Int(recvbuff), Int(count), scale
+            )
+        elif datatype == NCCL_FLOAT16:
+            _do_allreduce[DType.float16](
+                state, s, stream, Int(sendbuff), Int(recvbuff), Int(count), scale
+            )
+        elif datatype == NCCL_FLOAT32:
+            _do_allreduce[DType.float32](
+                state, s, stream, Int(sendbuff), Int(recvbuff), Int(count), scale
+            )
+        else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
+            _do_allreduce[DType.bfloat16](
+                state, s, stream, Int(sendbuff), Int(recvbuff), Int(count), scale
+            )
         return NCCL_SUCCESS
-    except:
+    except e:
+        print("mojoccl: ncclAllReduce failed:", e)
         return NCCL_INTERNAL_ERROR
 
 
@@ -744,38 +974,142 @@ def ncclBroadcast(
         var item = _any_dtype_item_bytes(datatype)
         if item == 0:
             return NCCL_INVALID_ARGUMENT
-        var ptr = _comm_ptr(comm)
-        ref state = ptr[]
+        ref state = _comm_ptr(comm)[]
         if state.aborted:
             return NCCL_INVALID_USAGE
         if Int(root) < 0 or Int(root) >= state.world:
             return NCCL_INVALID_ARGUMENT
+        if state.ib != 0 and ib_error(state.ib) != 0:
+            return NCCL_REMOTE_ERROR
         state.last_stream = stream
         _ensure_stream_cached(state, stream)
         ref s = state.stream_cache[stream]
         var total_bytes = Int(count) * item
-        var max_bytes = max(item, state.cap_bytes)
-        var done = 0
-        while done < total_bytes:
-            var chunk = min(max_bytes, total_bytes - done)
-            state.generation += 1
-            broadcast(
-                state.ctx,
-                s,
-                state.rank,
-                Int(root),
-                state.world,
-                state.regions,
-                Int(sendbuff) + done,
-                Int(recvbuff) + done,
-                chunk,
-                state.cap_bytes,
-                state.generation,
-            )
-            done += chunk
+        if state.nnodes == 1:
+            var max_bytes = max(item, state.cap_bytes)
+            var done = 0
+            while done < total_bytes:
+                var chunk = min(max_bytes, total_bytes - done)
+                state.generation += 1
+                broadcast(
+                    state.ctx,
+                    s,
+                    state.local_rank,
+                    Int(root),
+                    state.local_world,
+                    state.regions,
+                    Int(sendbuff) + done,
+                    Int(recvbuff) + done,
+                    chunk,
+                    state.cap_bytes,
+                    state.generation,
+                )
+                done += chunk
+            return NCCL_SUCCESS
+        _broadcast_multinode(
+            state, s, stream, Int(sendbuff), Int(recvbuff), total_bytes, Int(root)
+        )
         return NCCL_SUCCESS
-    except:
+    except e:
+        print("mojoccl: ncclBroadcast failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _broadcast_multinode(
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    total_bytes: Int,
+    root: Int,
+) raises:
+    """Root -> one rank per node over IB, then a node-local broadcast.
+
+    The rank that receives on node j is the one sharing the root's
+    local_rank, because that is the only rank the root has a queue pair to.
+    Correct and simple beats fast here: broadcast runs at DDP init, on
+    parameters, not in the step.
+    """
+    var lw = state.local_world
+    var root_node = 0
+    var root_lr = 0
+    for j in range(state.nnodes):
+        for l in range(lw):
+            if state.rank_at[j * lw + l] == root:
+                root_node = j
+                root_lr = l
+    var i_am_root = state.rank == root
+    var i_am_local_root = state.local_rank == root_lr
+    var receives = i_am_local_root and state.my_node != root_node
+    # The network area holds the root's staged chunk plus both inbox
+    # halves (one slot of `chunk` each): three chunks.
+    var max_bytes = max(4096, (state.cap_bytes // 3 - 2 * 4096) // 4096 * 4096)
+    var done = 0
+    while done < total_bytes:
+        var chunk = min(max_bytes, total_bytes - done)
+        var seq = ib_next_seq(state.ib)
+        var slot_bytes = _align_up(chunk, 16)
+        var inbox_off = state.net_off + _align_up(chunk, 4096)
+        var inbox_base = inbox_off + (seq & 1) * slot_bytes
+        var recv_slot = 0
+        if receives:
+            recv_slot = root_node if root_node < state.my_node else root_node - 1
+        var send_ptr = recvbuff + done
+        if i_am_root:
+            # The user buffer is not registered, so the root's payload has to
+            # be copied into the region before the NIC can read it.
+            copy_bytes(
+                state.ctx,
+                stream,
+                state.owned_base + state.net_off,
+                sendbuff + done,
+                chunk,
+            )
+            ib_enqueue(
+                state.ib,
+                state.driver,
+                Int(raw_stream),
+                state.owned_base + state.net_off,
+                chunk,
+                inbox_base,
+                slot_bytes,
+                True,
+                0,
+                0,
+                seq,
+            )
+            send_ptr = sendbuff + done
+        elif receives:
+            ib_enqueue(
+                state.ib,
+                state.driver,
+                Int(raw_stream),
+                0,
+                0,
+                inbox_base,
+                slot_bytes,
+                False,
+                1,
+                state.owned_base + inbox_base + recv_slot * slot_bytes,
+                seq,
+            )
+            send_ptr = state.owned_base + inbox_base + recv_slot * slot_bytes
+        state.generation += 1
+        broadcast(
+            state.ctx,
+            stream,
+            state.local_rank,
+            root_lr,
+            lw,
+            state.regions,
+            send_ptr,
+            recvbuff + done,
+            chunk,
+            state.cap_bytes,
+            state.generation,
+        )
+        done += chunk
 
 
 @export
@@ -791,36 +1125,147 @@ def ncclAllGather(
         var item = _any_dtype_item_bytes(datatype)
         if item == 0:
             return NCCL_INVALID_ARGUMENT
-        var ptr = _comm_ptr(comm)
-        ref state = ptr[]
+        ref state = _comm_ptr(comm)[]
         if state.aborted:
             return NCCL_INVALID_USAGE
+        if state.ib != 0 and ib_error(state.ib) != 0:
+            return NCCL_REMOTE_ERROR
         state.last_stream = stream
         _ensure_stream_cached(state, stream)
         ref s = state.stream_cache[stream]
         var per_rank_bytes = Int(sendcount) * item
-        var max_bytes = max(item, state.cap_bytes)
-        var done = 0
-        while done < per_rank_bytes:
-            var chunk = min(max_bytes, per_rank_bytes - done)
-            state.generation += 1
-            allgather(
-                state.ctx,
-                s,
-                state.rank,
-                state.world,
-                state.regions,
-                Int(sendbuff) + done,
-                Int(recvbuff) + done,
-                chunk,
-                state.cap_bytes,
-                state.generation,
-                stride_bytes=per_rank_bytes,
-            )
-            done += chunk
+        if state.nnodes == 1:
+            var max_bytes = max(item, state.cap_bytes)
+            var done = 0
+            while done < per_rank_bytes:
+                var chunk = min(max_bytes, per_rank_bytes - done)
+                state.generation += 1
+                allgather(
+                    state.ctx,
+                    s,
+                    state.local_rank,
+                    state.local_world,
+                    state.regions,
+                    Int(sendbuff) + done,
+                    Int(recvbuff) + done,
+                    chunk,
+                    state.cap_bytes,
+                    state.generation,
+                    stride_bytes=per_rank_bytes,
+                )
+                done += chunk
+            return NCCL_SUCCESS
+        _allgather_multinode(
+            state, s, stream, Int(sendbuff), Int(recvbuff), per_rank_bytes
+        )
         return NCCL_SUCCESS
-    except:
+    except e:
+        print("mojoccl: ncclAllGather failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _allgather_multinode(
+    mut state: CommState,
+    stream: DeviceStream,
+    raw_stream: Int64,
+    sendbuff: Int,
+    recvbuff: Int,
+    per_rank_bytes: Int,
+) raises:
+    """Node-local allgather, one RDMA exchange of node blocks, then place.
+
+    Every rank ships its whole node block (`local_world * chunk` bytes)
+    rather than a share of it: at DDP's 8-byte allgather that is 64 bytes on
+    the wire and the simpler code is worth more than the bandwidth. Placement
+    reads the global rank of (node, local_rank) out of the bootstrap table --
+    torchrun makes it `node * local_world + local_rank`, but nothing here
+    assumes so.
+    """
+    var lw = state.local_world
+    var npeers = ib_npeers(state.ib)
+    var block_stage = state.owned_base + state.net_off
+    # The network area holds one node block (lw * chunk) plus both inbox
+    # halves (npeers node blocks each).
+    var denom = lw * (1 + 2 * npeers)
+    var max_bytes = max(16, (state.cap_bytes // denom - 8192) // 16 * 16)
+    var done = 0
+    while done < per_rank_bytes:
+        var chunk = min(max_bytes, per_rank_bytes - done)
+        state.generation += 1
+        allgather(
+            state.ctx,
+            stream,
+            state.local_rank,
+            lw,
+            state.regions,
+            sendbuff + done,
+            block_stage,
+            chunk,
+            state.cap_bytes,
+            state.generation,
+            stride_bytes=chunk,
+        )
+        var seq = ib_next_seq(state.ib)
+        var block = lw * chunk
+        var slot_bytes = _align_up(block, 16)
+        var inbox_off = state.net_off + _align_up(block, 4096)
+        var half = npeers * slot_bytes
+        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+            raise Error("mojoccl: allgather inbox does not fit; chunking bug")
+        var inbox_base = inbox_off + (seq & 1) * half
+        ib_enqueue(
+            state.ib,
+            state.driver,
+            Int(raw_stream),
+            block_stage,
+            block,
+            inbox_base,
+            slot_bytes,
+            True,
+            npeers,
+            state.owned_base + inbox_base,
+            seq,
+        )
+        _place_node_block(
+            state, stream, recvbuff, block_stage, state.my_node, chunk, done,
+            per_rank_bytes,
+        )
+        var slot = 0
+        for j in range(state.nnodes):
+            if j == state.my_node:
+                continue
+            _place_node_block(
+                state,
+                stream,
+                recvbuff,
+                state.owned_base + inbox_base + slot * slot_bytes,
+                j,
+                chunk,
+                done,
+                per_rank_bytes,
+            )
+            slot += 1
+        done += chunk
+
+
+def _place_node_block(
+    mut state: CommState,
+    stream: DeviceStream,
+    recvbuff: Int,
+    src: Int,
+    node: Int,
+    chunk: Int,
+    done: Int,
+    per_rank_bytes: Int,
+) raises:
+    var offs = StaticTuple[Int64, MAX_WORLD](fill=0)
+    for l in range(state.local_world):
+        offs[l] = Int64(
+            state.rank_at[node * state.local_world + l] * per_rank_bytes + done
+        )
+    place_blocks(
+        state.ctx, stream, recvbuff, src, offs, chunk, state.local_world
+    )
 
 
 # ---------------------------------------------------------------------------

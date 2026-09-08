@@ -9,6 +9,7 @@
 # through the library MAX already dlopened -- no C shim, no NCCL/RCCL.
 
 from std.ffi import OwnedDLHandle
+from std.memory.alloc import unsafe_alloc
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.sys import has_amd_gpu_accelerator
 
@@ -20,6 +21,12 @@ comptime FN_OPEN_HANDLE = "hipIpcOpenMemHandle" if AMD else "cuIpcOpenMemHandle"
 comptime FN_CLOSE_HANDLE = "hipIpcCloseMemHandle" if AMD else "cuIpcCloseMemHandle"
 comptime FN_FREE = "hipFree" if AMD else "cuMemFree_v2"
 comptime FN_GET_DEVICE = "hipGetDevice" if AMD else "cuCtxGetDevice"
+comptime FN_LAUNCH_HOST_FUNC = (
+    "hipLaunchHostFunc" if AMD else "cuLaunchHostFunc"
+)
+comptime FN_PCI_BUS_ID = (
+    "hipDeviceGetPCIBusId" if AMD else "cuDeviceGetPCIBusId"
+)
 # CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS == hipIpcMemLazyEnablePeerAccess == 1
 comptime IPC_LAZY_PEER: UInt32 = 1
 # hipDeviceMallocUncached: cross-agent flag buffers must be uncached on AMD
@@ -148,3 +155,50 @@ def zero_bytes(ctx: DeviceContext, addr: Int, nbytes: Int) raises:
     )
     ctx.enqueue_memset(buf, 0)
     ctx.synchronize()
+
+
+def launch_host_func(
+    lib: OwnedDLHandle, stream: Int, func_addr: Int, user_data: Int
+) raises:
+    """cuLaunchHostFunc / hipLaunchHostFunc on a RAW stream handle.
+
+    The ordering primitive the inter-node hop stands on: a host function
+    enqueued on the caller's stream runs after everything enqueued before it
+    has completed, and everything enqueued after it waits for it to return.
+    That is what lets `internode.mojo` post its RDMA writes knowing the
+    reduce-scatter's output is final, and lets the add kernel start knowing
+    the peers' shards have landed.
+
+    Contract (identical in both vendors' docs): the callback must not call
+    into the driver. This library's callback only touches libibverbs and its
+    own host memory, never cu*/hip*.
+    """
+    _check(
+        lib.get_function[Int32](FN_LAUNCH_HOST_FUNC)(
+            stream, func_addr, user_data
+        ),
+        FN_LAUNCH_HOST_FUNC,
+    )
+
+
+def device_pci_bus_id(lib: OwnedDLHandle, ordinal: Int) raises -> String:
+    """The GPU's PCI address, e.g. `0000:1b:00.0`, lowercased.
+
+    Used to pair a rank with the IB HCA nearest its GPU (internode.mojo);
+    both vendors expose the same call with the same signature.
+    """
+    var buf = unsafe_alloc[UInt8](32)
+    for i in range(32):
+        buf[unsafe_offset=i] = 0
+    var rc = lib.get_function[Int32](FN_PCI_BUS_ID)(buf, Int32(32), Int32(ordinal))
+    if rc != 0:
+        return String("")
+    var s = String("")
+    var i = 0
+    while i < 31 and buf[unsafe_offset=i] != 0:
+        var c = Int(buf[unsafe_offset=i])
+        if c >= 65 and c <= 90:
+            c += 32
+        s += chr(c)
+        i += 1
+    return s^
