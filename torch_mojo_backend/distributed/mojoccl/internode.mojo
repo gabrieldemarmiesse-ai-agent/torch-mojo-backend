@@ -3,41 +3,51 @@
 # local_rank there -- so the 8 ranks of a node drive 8 independent NICs and
 # each rank only ever exchanges its own 1/local_world shard.
 #
-# Ordering without a proxy thread. The GPU cannot post verbs and the NIC
-# cannot wait on a kernel, so the two meet in a host function enqueued on
-# the caller's stream (`cuLaunchHostFunc`/`hipLaunchHostFunc`):
+# Ordering. The GPU cannot post verbs and the NIC cannot wait on a kernel,
+# so a CPU thread stands between them and the stream is what sequences it:
 #
 #     [reduce_scatter_stage]  my shard is final in my stage_out
-#     [host callback]         post one RDMA_WRITE_WITH_IMM per peer, then
-#                             poll the CQ until every peer's shard has
-#                             landed in my inbox, then flush (below)
+#     [proxy_request]         one thread releases the exchange counter into
+#                             a pinned mailbox
+#       ~ progress thread ~   post one RDMA_WRITE_WITH_IMM per peer, poll
+#                             the CQ until every peer's shard has landed in
+#                             my inbox, flush (below), release `done`
+#     [proxy_wait]            one thread spins until `done` catches up
 #     [inbox_add]             shard += the peers' shards
 #     [allgather_finish]      spread the global sum
 #
-# One fused callback rather than the post/poll pair: they would be adjacent
-# on the stream with nothing in between, so splitting only pays a second
-# dispatch latency. A proxy thread with GPU-visible pinned flags (NCCL's
-# design) is the fallback if the dispatch turns out to dominate; the split
-# above is where it would slot in.
+# The obvious alternative -- one `cuLaunchHostFunc` doing all of it inline
+# -- was written first, shipped, and measured: it costs about 480 us per
+# exchange on this cluster, because the driver has to stop the stream, wake
+# a thread and restart it, and that delay does NOT cancel between the two
+# nodes (each side ends up measuring the other's dispatch jitter; both
+# reported ~390 us of "waiting for the peer" on a transfer worth 3 us). It
+# survives behind `MOJOCCL_IB_PROXY=0`: same exchange body, one fewer core
+# burned, several hundred microseconds slower.
 #
 # The GPUDirect flush. Seeing the RDMA_WRITE_WITH_IMM completion does NOT
 # mean the payload is visible in GPU memory: the completion lands in host
 # memory and the payload in the GPU's BAR, two different PCIe destinations
 # with no ordering between them. A read from the GPU BAR flushes the posted
-# writes ahead of it, so the callback finishes with a 4-byte RDMA_READ of
+# writes ahead of it, so an exchange finishes with a 4-byte RDMA_READ of
 # the inbox over a self-connected QP -- exactly NCCL's `gpuFlush` QP
 # (nccl:src/transport/net_ib/p2p.cc:589-602). Measured 1.9 us.
 #
-# Inbox aliasing and flow control. The inbox lives in stage_in, above
-# whatever the intra-node collective staged there, and is DOUBLE BUFFERED by
-# the parity of a per-communicator exchange counter. The double buffer is
-# not an optimization, it is the proof of safety: peer B writes half `p` at
-# exchanges e and e+2, and B cannot reach e+2 before receiving my e+1 data,
-# which I send only after my own stream ran the add kernel of exchange e.
-# Single buffering would leave B's e+1 write racing my e add kernel with
-# nothing but timing in between. The immediate carries the exchange counter
-# so an arrival that belongs to e+1 is counted into the other parity's
-# tally instead of satisfying e.
+# Flow control. The inbox is DOUBLE BUFFERED by the parity of a
+# per-communicator exchange counter, and that is not an optimization, it is
+# the proof of safety: peer B writes half `p` at exchanges e and e+2, and B
+# cannot reach e+2 before receiving my e+1 data, which I send only after my
+# own stream ran the add kernel of exchange e. Single buffering would leave
+# B's e+1 write racing my e add kernel with nothing but timing in between.
+# The argument needs every exchange to be all-to-all, which is why a rank
+# with nothing to contribute still sends CREDIT_BYTES (mojoccl.mojo). The
+# immediate carries the exchange counter, so an arrival belonging to e+1 is
+# counted into the other parity's tally instead of satisfying e.
+#
+# The inbox lives in the region's own network area, never aliased onto the
+# intra-node staging: a peer node writes it as soon as ITS reduce-scatter is
+# done, which is ordered against neither mine nor a local peer still reading
+# the previous generation (see ncclCommInitRank).
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc
