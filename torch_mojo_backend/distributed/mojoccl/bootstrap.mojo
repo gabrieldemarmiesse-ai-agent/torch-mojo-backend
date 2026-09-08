@@ -15,6 +15,7 @@
 
 from std.ffi import OwnedDLHandle, CStringSlice
 from std.memory.alloc import unsafe_alloc
+from std.os import remove, rmdir
 from std.pathlib import Path
 from std.tempfile import mkdtemp
 from std.time import sleep, perf_counter_ns
@@ -88,6 +89,13 @@ def _rename(old: String, new: String) raises:
         raise Error("mojoccl: rename to " + new + " failed, rc=" + String(rc))
 
 
+def _atomic_write(final_path: String, tmp_path: String, content: String) raises:
+    """write+rename: readers never observe a partially written file."""
+    with open(tmp_path, "w") as f:
+        f.write(content)
+    _rename(tmp_path, final_path)
+
+
 def write_rank_handle(
     dir: String, rank: Int, ordinal: Int, handle: Pointer[UInt8, MutAnyOrigin]
 ) raises:
@@ -97,14 +105,25 @@ def write_rank_handle(
     proto/ipc_probe.mojo's handle-file convention) so there is no binary
     layout to keep in sync between writer and reader.
     """
-    var final_path = dir + "/rank" + String(rank) + ".handle"
-    var tmp_path = dir + "/.rank" + String(rank) + ".handle.tmp"
     var s = String(ordinal)
     for i in range(HANDLE_BYTES):
         s += " " + String(Int(handle[unsafe_offset=i]))
-    with open(tmp_path, "w") as f:
-        f.write(s)
-    _rename(tmp_path, final_path)
+    _atomic_write(
+        dir + "/rank" + String(rank) + ".handle",
+        dir + "/.rank" + String(rank) + ".handle.tmp",
+        s,
+    )
+
+
+def write_rank_done(dir: String, rank: Int) raises:
+    """Atomically publishes that this rank has opened every peer's IPC
+    handle. Rank 0 waits for every rank's marker (`wait_for_done`) before
+    removing `dir` (`remove_rendezvous_dir`) -- see ncclCommInitRank."""
+    _atomic_write(
+        dir + "/rank" + String(rank) + ".done",
+        dir + "/.rank" + String(rank) + ".done.tmp",
+        "1",
+    )
 
 
 def read_rank_handle(
@@ -131,9 +150,7 @@ def read_rank_handle(
     return ordinal
 
 
-def wait_for_rank(dir: String, rank: Int, timeout_s: Float64) raises:
-    """Blocks until `rank`'s handle file exists, or raises past the timeout."""
-    var path = dir + "/rank" + String(rank) + ".handle"
+def _wait_for_file(path: String, rank: Int, timeout_s: Float64, dir: String) raises:
     var t0 = perf_counter_ns()
     var deadline_ns = Int(timeout_s * 1.0e9)
     while not Path(path).exists():
@@ -147,3 +164,36 @@ def wait_for_rank(dir: String, rank: Int, timeout_s: Float64) raises:
                 + dir
             )
         sleep(0.02)
+
+
+def wait_for_rank(dir: String, rank: Int, timeout_s: Float64) raises:
+    """Blocks until `rank`'s handle file exists, or raises past the timeout."""
+    _wait_for_file(dir + "/rank" + String(rank) + ".handle", rank, timeout_s, dir)
+
+
+def wait_for_done(dir: String, rank: Int, timeout_s: Float64) raises:
+    """Blocks until `rank`'s done marker (`write_rank_done`) exists, or
+    raises past the timeout."""
+    _wait_for_file(dir + "/rank" + String(rank) + ".done", rank, timeout_s, dir)
+
+
+def remove_rendezvous_dir(dir: String, nranks: Int) raises:
+    """Removes every rank's handle/done file, then the directory itself.
+
+    Called once, by rank 0, once every rank's done marker has landed
+    (normal completion) or on an init failure rank 0 hit after creating
+    `dir` (`ncclGetUniqueId`). Per-file removal is best-effort -- a file a
+    peer never got around to writing is not an error here -- but the final
+    `rmdir` is not: a non-empty directory after every known file was
+    cleared means something unexpected is in there, worth surfacing.
+    """
+    for r in range(nranks):
+        try:
+            remove(dir + "/rank" + String(r) + ".handle")
+        except:
+            pass
+        try:
+            remove(dir + "/rank" + String(r) + ".done")
+        except:
+            pass
+    rmdir(dir)

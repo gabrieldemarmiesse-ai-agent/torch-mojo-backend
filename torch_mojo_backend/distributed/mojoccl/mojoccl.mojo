@@ -43,7 +43,10 @@ from bootstrap import (
     decode_dir,
     encode_dir,
     read_rank_handle,
+    remove_rendezvous_dir,
+    wait_for_done,
     wait_for_rank,
+    write_rank_done,
     write_rank_handle,
 )
 from collectives_kernels import (
@@ -355,69 +358,105 @@ def ncclCommInitRank(
         idbuf64[unsafe_offset=15] = id15
         var dir = decode_dir(_any(idbuf))
 
-        var lib = open_driver()
-        var ordinal = current_device_ordinal(lib)
-        var ctx = DeviceContext(device_id=ordinal)
+        # Everything below either succeeds together or is unwound together:
+        # a failure past this point (region alloc, handle exchange, the
+        # peer-open loop, the done-marker wait) is caught here so rank 0 can
+        # remove the rendezvous directory it created in ncclGetUniqueId --
+        # otherwise it and every rank's handle/done file leak in /dev/shm
+        # forever, since no other rank will ever revisit this path.
+        try:
+            var lib = open_driver()
+            var ordinal = current_device_ordinal(lib)
+            var ctx = DeviceContext(device_id=ordinal)
 
-        var cap_bytes = _region_cap_bytes()
-        # A positive multiple of 4096 (the production kernel's own
-        # precondition, RESULTS.md §9) is what keeps every per-chunk offset
-        # `ncclAllReduce` forms (multiples of cap_bytes, one full chunk at a
-        # time) 16-byte aligned for every supported dtype -- 4096 divides
-        # evenly by 2, 4 and 8. A misconfigured MOJOCCL_REGION_MB (e.g. 0)
-        # would otherwise degrade chunk offsets to non-16-byte-aligned
-        # single-element steps.
-        if cap_bytes <= 0 or cap_bytes % 4096 != 0:
-            return NCCL_INVALID_ARGUMENT
-        var region_bytes = signal_bytes() + 2 * cap_bytes
-        var base = alloc_region(lib, region_bytes)
-        region_init(ctx, base)
+            var cap_bytes = _region_cap_bytes()
+            # A positive multiple of 4096 (the production kernel's own
+            # precondition, RESULTS.md §9) is what keeps every per-chunk
+            # offset `ncclAllReduce` forms (multiples of cap_bytes, one full
+            # chunk at a time) 16-byte aligned for every supported dtype --
+            # 4096 divides evenly by 2, 4 and 8. A misconfigured
+            # MOJOCCL_REGION_MB (e.g. 0) would otherwise degrade chunk
+            # offsets to non-16-byte-aligned single-element steps.
+            if cap_bytes <= 0 or cap_bytes % 4096 != 0:
+                if Int(rank) == 0:
+                    try:
+                        remove_rendezvous_dir(dir, Int(nranks))
+                    except:
+                        pass
+                return NCCL_INVALID_ARGUMENT
+            var region_bytes = signal_bytes() + 2 * cap_bytes
+            var base = alloc_region(lib, region_bytes)
+            region_init(ctx, base)
 
-        var my_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
-        get_handle(lib, base, _any(my_handle))
-        write_rank_handle(dir, Int(rank), ordinal, _any(my_handle))
+            var my_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
+            get_handle(lib, base, _any(my_handle))
+            write_rank_handle(dir, Int(rank), ordinal, _any(my_handle))
 
-        var timeout_s = _bootstrap_timeout_s()
-        var regions = StaticTuple[Int, MAX_WORLD](fill=0)
-        regions[Int(rank)] = base
-        var peer_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
-        for r in range(Int(nranks)):
-            if r == Int(rank):
-                continue
-            try:
-                wait_for_rank(dir, r, timeout_s)
-                _ = read_rank_handle(dir, r, _any(peer_handle))
-                regions[r] = open_handle(lib, _any(peer_handle))
-            except:
-                # A peer past this one never got opened: close whatever
-                # peers < r WERE opened and free our own region before
-                # propagating, so a failed init leaks no IPC mappings.
-                for r2 in range(Int(nranks)):
-                    if r2 != Int(rank) and regions[r2] != 0:
-                        try:
-                            close_handle(lib, regions[r2])
-                        except:
-                            pass
+            var timeout_s = _bootstrap_timeout_s()
+            var regions = StaticTuple[Int, MAX_WORLD](fill=0)
+            regions[Int(rank)] = base
+            var peer_handle = unsafe_alloc[UInt8](HANDLE_BYTES)
+            for r in range(Int(nranks)):
+                if r == Int(rank):
+                    continue
                 try:
-                    free_region(lib, base)
+                    wait_for_rank(dir, r, timeout_s)
+                    _ = read_rank_handle(dir, r, _any(peer_handle))
+                    regions[r] = open_handle(lib, _any(peer_handle))
+                except:
+                    # A peer past this one never got opened: close whatever
+                    # peers < r WERE opened and free our own region before
+                    # propagating, so a failed init leaks no IPC mappings.
+                    for r2 in range(Int(nranks)):
+                        if r2 != Int(rank) and regions[r2] != 0:
+                            try:
+                                close_handle(lib, regions[r2])
+                            except:
+                                pass
+                    try:
+                        free_region(lib, base)
+                    except:
+                        pass
+                    raise
+
+            # Done protocol: every rank marks itself done once it has opened
+            # every peer's handle; rank 0 (and only rank 0) waits for all
+            # `nranks` markers and then removes `dir` -- otherwise
+            # /dev/shm/mojoccl-* directories and their per-rank handle files
+            # accumulate forever on a shared node (mkdtemp never cleans up
+            # after itself). Other ranks return as soon as their own marker
+            # is written; they do not wait for the directory to disappear.
+            write_rank_done(dir, Int(rank))
+            if Int(rank) == 0:
+                for r in range(Int(nranks)):
+                    if r != 0:
+                        wait_for_done(dir, r, timeout_s)
+                try:
+                    remove_rendezvous_dir(dir, Int(nranks))
+                except:
+                    pass  # a leftover /dev/shm dir is a nuisance, not a correctness bug
+
+            var state = CommState(
+                rank=Int(rank),
+                world=Int(nranks),
+                ordinal=ordinal,
+                ctx=ctx,
+                driver=lib^,
+                cap_bytes=cap_bytes,
+                regions=regions,
+                owned_base=base,
+            )
+            var handle_ptr = unsafe_alloc[CommState](1)
+            handle_ptr.unsafe_write(state^)
+            comm_out[] = Int64(Int(handle_ptr))
+            return NCCL_SUCCESS
+        except:
+            if Int(rank) == 0:
+                try:
+                    remove_rendezvous_dir(dir, Int(nranks))
                 except:
                     pass
-                raise
-
-        var state = CommState(
-            rank=Int(rank),
-            world=Int(nranks),
-            ordinal=ordinal,
-            ctx=ctx,
-            driver=lib^,
-            cap_bytes=cap_bytes,
-            regions=regions,
-            owned_base=base,
-        )
-        var handle_ptr = unsafe_alloc[CommState](1)
-        handle_ptr.unsafe_write(state^)
-        comm_out[] = Int64(Int(handle_ptr))
-        return NCCL_SUCCESS
+            raise
     except:
         return NCCL_INTERNAL_ERROR
 
