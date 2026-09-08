@@ -312,8 +312,8 @@ def _device_arange(
 ) -> TorchMojoTensor | None:
     """torch.arange computed by a device kernel, or None to use the host
     path. HF generation loops call torch.arange(..., device=...) every
-    step; the host path costs a blocking H2D copy (full queue drain) per
-    call, so the common numeric cases run on device instead."""
+    step; the host path costs a blocking H2D copy per call, so the common
+    numeric cases run on device instead."""
     for v in (start, end, step):
         # bool is an int subclass; torch treats it as 0/1 here.
         if not isinstance(v, int | float):

@@ -21,15 +21,15 @@ captures the dict by reference, so it is mutated in place, never rebound.
 
 import threading
 
-from torch_mojo_backend.mojo_device import deferred_compile, device_streams
+from torch_mojo_backend.mojo_device import device_streams
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 PENDING: dict[int, int] = {}  # id(holder) -> mojo device index
 _COMM_STREAMS: dict[int, device_streams.Stream] = {}
 # Collectives are issued from the autograd thread while the main thread runs
 # the optimizer; the truthiness poll on the hot path stays lock-free.
-# Reentrant, and every fence below idempotent, because the fence drains the
-# kernel-call queue while holding it and a launch may fence again.
+# Reentrant (``mark_pending`` fences under the lock), and every fence below
+# is idempotent.
 _LOCK = threading.RLock()
 
 
@@ -61,9 +61,6 @@ def _fence_locked(index: int):
     stream = _COMM_STREAMS.get(index)
     if not keys or stream is None:
         return
-    # Queued launches were issued before this fence and must stay before it
-    # on the default stream (rule 1 in device_streams.py).
-    deferred_compile.drain()
     stream.make_default_stream_wait()
     for key in keys:  # only once the wait is on the stream
         PENDING.pop(key, None)

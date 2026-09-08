@@ -6,10 +6,7 @@ import torch
 from torch.utils._mode_utils import no_dispatch
 
 from torch_mojo_backend import register_mojo_devices
-from torch_mojo_backend.mojo_device import (
-    deferred_compile,
-    torch_mojo_device_module as torch_mojo,
-)
+from torch_mojo_backend.mojo_device import torch_mojo_device_module as torch_mojo
 from torch_mojo_backend.mojo_device.device_streams import (
     default_stream,
     default_stream_ctx_ptr,
@@ -93,7 +90,6 @@ def test_wait_stream_orders_real_work(mojo_gpu: str):
     x = torch.randn(2048, 2048, device=mojo_gpu)
     y = (x * 1.5 + 0.25).tanh()
 
-    deferred_compile.drain()
     side = torch.Stream(device=mojo_gpu)
     side.wait_stream(torch_mojo.current_stream())
     event = side.record_event()
@@ -189,7 +185,6 @@ def test_record_use_fences_free_against_side_stream_reader(mojo_gpu: str):
     for _ in range(10):
         source = torch.full((n,), 1.0, device=mojo_gpu)
         sink = torch.empty((copies * n,), device=mojo_gpu)
-        deferred_compile.drain()
         stream.wait_default_stream()
         source_ptr = _mt(source)._ptr
         for k in range(copies):
@@ -199,7 +194,6 @@ def test_record_use_fences_free_against_side_stream_reader(mojo_gpu: str):
         record_use(_mt(source)._holder, stream)
         del source  # free is now fenced behind the stream's copies
         overwriter = torch.full((n,), 2.0, device=mojo_gpu)
-        deferred_compile.drain()
         reused_any = reused_any or _mt(overwriter)._ptr == source_ptr
         stream.synchronize()
         torch_mojo.synchronize()

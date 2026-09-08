@@ -35,7 +35,7 @@ from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
 from torch_mojo_backend import eager_flash_attention, eager_kernels, is_running_tests
-from torch_mojo_backend.eager_kernels import _ctx_ptr, call_queue as _call_queue
+from torch_mojo_backend.eager_kernels import _ctx_ptr
 from torch_mojo_backend.eager_kernels.activation_backward_ops import (
     ActivationBackwardExtension as _ActivationBackwardExtension,
 )
@@ -78,7 +78,6 @@ from torch_mojo_backend.eager_kernels.optimizer_ops import (
 )
 from torch_mojo_backend.eager_kernels.output_specs import (
     _allocate_output_spec,
-    _submit_prepared_into,
     _TensorOutputSpec,
 )
 from torch_mojo_backend.eager_kernels.random_ops import (
@@ -116,18 +115,6 @@ from torch_mojo_backend.types import CountedCallable
 _VariantFlag = bool | int | str
 
 
-def _device_call(
-    fn: Callable[..., object], *args: object, keepalive: tuple[object, ...]
-) -> object:
-    """Launch an ungated device call (tensor_holder / fa4): when the call
-    queue is active it must hold its FIFO position behind queued producers
-    of its inputs; otherwise call directly. `keepalive` names the tensors
-    whose buffers the raw `args` reference (queue rule 3)."""
-    if _call_queue.enabled():
-        return _call_queue.external_call(fn, args, keepalive)
-    return fn(*args)
-
-
 def _call_mojo(
     extension: type[eager_kernels.MojoFileExtension],
     op: str,
@@ -136,14 +123,8 @@ def _call_mojo(
     arg_dtypes: tuple[DType, ...],
     output_dtypes: tuple[DType, ...] = (),
     flags: dict[str, _VariantFlag] | None = None,
-    keepalive: tuple[object, ...],
 ) -> object:
-    """Invoke one exact, shape-independent stateless Mojo extension.
-
-    `keepalive` names every tensor whose `_spec_of(...)` / raw pointer went
-    into `extension_args`; a queued launch retains them until it runs
-    (queue rule 3). Required and keyword-only so no call site can forget
-    it."""
+    """Invoke one exact, shape-independent stateless Mojo extension."""
     try:
         return extension.invoke(
             op,
@@ -151,7 +132,6 @@ def _call_mojo(
             arg_dtypes=arg_dtypes,
             output_dtypes=output_dtypes,
             flags=flags,
-            keepalive=keepalive,
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -427,12 +407,11 @@ def _reduce_ready_operand(
     materialized HERE, in Python.
 
     The Mojo reduce bridges refuse layouts they would previously have
-    copied into a scratch buffer: materializing through the queued strided
-    copy instead means the transient is allocated by ``_alloc`` — metered
-    by the run-ahead budget, covered by the allocation retry, and retained
-    per queued item like every other buffer. The permuted layout is kept
-    dims ascending then reduce dims ascending (the same layout the bridge
-    geometry derives), so the reduce dims become the trailing ones. The
+    copied into a scratch buffer: materializing here means the transient is
+    allocated by ``_alloc`` and covered by the allocation retry. The
+    permuted layout is kept dims ascending then reduce dims ascending (the
+    same layout the bridge geometry derives), so the reduce dims become the
+    trailing ones. The
     hot path — contiguous input, trailing dims in order — returns the pair
     unchanged, and a permutation that is already contiguous (reordered
     trailing dims) costs a zero-copy view.
@@ -453,8 +432,8 @@ def _reduce_ready_operand(
 
 
 # Operand dtypes the scalar reductions accept.  Mirrors reduce_skeleton.mojo's
-# SCALAR_DTYPES / TRUTHY_DTYPES: a queued launch cannot fall back, so the two
-# lists have to agree.
+# SCALAR_DTYPES / TRUTHY_DTYPES, so an unsupported dtype declines here instead
+# of building a variant that raises.
 _ROW_REDUCE_DTYPES = _FLOAT_DTYPES + (DType.int64, DType.int32)
 
 # Dtypes any()/all() accept as input (the nonzero test works for all of them;
@@ -525,7 +504,7 @@ def _arg_strided_direct_ok(
     otherwise materialize — the whole cost of a `dim=0` arg-reduction.
 
     The gate is the kernel's own regime and the Mojo side accepts whatever it
-    is handed here (a queued launch cannot fall back), so the two must agree:
+    is handed here, so the two must agree:
     contiguous operand, one adjacent ascending dim interval that is not the
     trailing one, on an accelerator, and enough inner elements for the lanes
     to coalesce."""
@@ -606,7 +585,6 @@ def fast_aten__foreach_norm(
         (metadata, partials._ptr, partials._numel, _ctx_ptr(device)),
         arg_dtypes=(DType.float32, DType.float32, DType.float32),
         output_dtypes=(DType.float32,),
-        keepalive=(partials,),
     )
     return outputs
 
@@ -818,7 +796,6 @@ def _foreach_launch(
     *,
     scalars: Sequence[float] = (),
     aux: tuple[int, ...] = (),
-    keepalive: tuple[object, ...] = (),
 ):
     """One launch of the batched foreach family for a whole TensorList.
 
@@ -841,7 +818,6 @@ def _foreach_launch(
         (metadata, tuple(scalars), aux, dtype.value, _ctx_ptr(device)),
         arg_dtypes=(dtype,) * len(lists),
         output_dtypes=(dtype,),
-        keepalive=(*(list(tensors) for tensors in lists), *keepalive),
     )
 
 
@@ -875,9 +851,7 @@ def fast_aten__foreach_mul__tensor(
         return NOT_HANDLED
     if _foreach_mutation_hazard(lists[0], ()):
         return NOT_HANDLED
-    _foreach_launch(
-        _FOREACH_MUL_TENSOR, lists, dtype, aux=(scalar._ptr,), keepalive=(scalar,)
-    )
+    _foreach_launch(_FOREACH_MUL_TENSOR, lists, dtype, aux=(scalar._ptr,))
     return None
 
 
@@ -1209,17 +1183,6 @@ def fast_aten__fused_adamw(
             "GRAD_SCALE": bool(grad_scale_ptr),
             "FOUND_INF": bool(found_inf_ptr),
         },
-        keepalive=(
-            parameters,
-            grads,
-            exp_avgs,
-            exp_avg_sqs,
-            max_exp_avg_sqs,
-            state_steps,
-            lr,
-            grad_scale,
-            found_inf,
-        ),
     )
     return None
 
@@ -1492,48 +1455,13 @@ _UNARY_SPEC_EXTENSIONS = {
 }
 
 
-# Mirrors logic_ops.mojo's SPEC_BCAST_DTYPES — the Mojo-side source of
-# truth for which dtypes the Into spec kernels are compiled for.
-_SPEC_INTO_DTYPES = frozenset(
-    {
-        DType.float32,
-        DType.float16,
-        DType.bfloat16,
-        DType.float64,
-        DType.int8,
-        DType.int16,
-        DType.int32,
-        DType.int64,
-        DType.uint8,
-    }
-)
-_SPEC_CMP_NAMES = frozenset(
-    {
-        "EqSpec",
-        "NeSpec",
-        "LtSpec",
-        "LeSpec",
-        "GtSpec",
-        "GeSpec",
-        "LogicalAndSpec",
-        "LogicalXorSpec",
-    }
-)
-_SPEC_FLOAT_ONLY_NAMES = frozenset({"DivSpec", "PowSpec"})
-_SPEC_INT_ONLY_NAMES = frozenset({"BitwiseAndSpec", "BitwiseOrSpec", "BitwiseXorSpec"})
-_SPEC_BOOL_OK_NAMES = _SPEC_CMP_NAMES | frozenset(
-    {"MulSpec", "BitwiseAndSpec", "BitwiseOrSpec", "BitwiseXorSpec"}
-)
-
-
 def _binary_promotion(
     a_dtype: DType, b_dtype: DType
 ) -> tuple[bool, bool, DType] | None:
     """torch's promotion for a binary pair as (cast lhs?, cast rhs?, dtype).
 
-    The only pairs the eager loops hit, and the single source of truth for
-    both spec-binary paths (queued and drain-and-execute). None means the
-    pair has no supported promotion, i.e. decline the op.
+    The only pairs the eager loops hit. None means the pair has no
+    supported promotion, i.e. decline the op.
     """
     if a_dtype == b_dtype:
         return False, False, a_dtype
@@ -1554,188 +1482,60 @@ def _binary_promotion(
     return None
 
 
-def _try_spec_binary_into(
-    spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None
+def _try_spec_binary(
+    spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None = None
 ) -> TorchMojoTensor | None:
-    """Call-queue mode: pre-allocate the output in Python and queue the
-    Into launch — allocation never forces a drain, the launch is
-    fire-and-forget. Returns the output wrapper, or None to fall back to
-    the legacy (drain + synchronous) spec path. Eligibility is replicated
-    here CONSERVATIVELY: a queued launch cannot fall back, so anything
-    uncertain declines."""
+    """Broadcast binary through a logic_ops spec op, or None.
+
+    Python keeps what Python must do — scalar embedding and torch's
+    promotion rules — and the intermediates stay spec-to-spec: a scalar
+    operand becomes a 0-d FillSpec result and a promoted operand a CastSpec
+    result whose SPECS feed the binary entry directly. rank>4 operands are
+    pre-materialized (the spec's flat path needs contiguity there). Whatever
+    the Mojo side refuses comes back as None so the caller falls back.
+    `out_dtype` overrides the wrapper dtype for ops whose output differs
+    (comparisons -> bool)."""
     a = _t(lhs)
     b = _t(rhs)
     if a is None and b is None:
         return None
     if a is not None and b is not None and a._device != b._device:
         return None
-    anchor_t = a if a is not None else b
-    assert anchor_t is not None
-    device = anchor_t._device
-    dtype = anchor_t._dtype
-
-    if a is not None and b is not None:
-        if len(a._shape) > 4 or len(b._shape) > 4:
-            if tuple(a._shape) != tuple(b._shape):
-                return None
-            a = _tc(a)
-            b = _tc(b)
-            # a/b were already TorchMojoTensor; _tc only materializes.
-            assert a is not None and b is not None
-        promotion = _binary_promotion(a._dtype, b._dtype)
-        if promotion is None:
-            return None
-        # Same ladder as the legacy path; here the casts queue through the
-        # Into cast (never a drain).
-        cast_a, cast_b, dtype = promotion
-        if cast_a:
-            a = _cast_tensor(a, dtype)
-        if cast_b:
-            b = _cast_tensor(b, dtype)
-    else:
-        # One scalar operand: embed it as a queued 0-d fill.
-        scalar = rhs if a is not None else lhs
-        value = _scalar_embed(scalar, dtype)
-        if value is None:
-            return None
-        fill = _submit_prepared_into(
-            _FillSpecExtension.prepare((), value, dtype, device)
-        )
-        if a is not None:
-            b = fill
-        else:
-            a = fill
-
-    assert a is not None and b is not None
-    kdtype = DType.uint8 if dtype == DType.bool else dtype
-    if kdtype not in _SPEC_INTO_DTYPES:
-        return None
-    if dtype == DType.bool and spec_fn_name not in _SPEC_BOOL_OK_NAMES:
-        return None
-    if spec_fn_name not in _SPEC_CMP_NAMES:
-        if spec_fn_name in _SPEC_FLOAT_ONLY_NAMES and kdtype not in (
-            DType.float32,
-            DType.float16,
-            DType.bfloat16,
-            DType.float64,
-        ):
-            return None
-        if spec_fn_name in _SPEC_INT_ONLY_NAMES and kdtype in (
-            DType.float32,
-            DType.float16,
-            DType.bfloat16,
-            DType.float64,
-        ):
-            return None
-    if a._shape != b._shape:
-        # Equal shapes (the residual/grad-sum hot path) skip torch's
-        # broadcast machinery, which costs ~7 µs per probe.
-        try:
-            torch.broadcast_shapes(tuple(a._shape), tuple(b._shape))
-        except RuntimeError:
-            return None
-    return _submit_prepared_into(
-        _BinarySpecExtension.prepare(spec_fn_name, a, b, out_dtype or dtype)
-    )
-
-
-def _try_spec_binary(
-    spec_fn_name: str, lhs: object, rhs: object, out_dtype: DType | None = None
-) -> TorchMojoTensor | None:
-    """Broadcast binary through a logic_ops spec op, or None.
-
-    Python keeps what Python must do — scalar embedding, torch's promotion
-    rules, dim-spec sanity — but the intermediates stay spec-to-spec: a
-    scalar operand becomes a 0-d FillSpec result and a promoted operand a
-    CastSpec result whose SPECS feed the binary entry directly. No wrapper
-    is minted for them; their holders live in locals until the launch is
-    enqueued (the stream-ordered free then lands after the kernel).
-    rank>4 operands are pre-materialized (the spec's flat path needs
-    contiguity there). `out_dtype` overrides the wrapper dtype for ops
-    whose output differs (comparisons -> bool)."""
-    if _call_queue.enabled():
-        into = _try_spec_binary_into(spec_fn_name, lhs, rhs, out_dtype)
-        if into is not None:
-            return into
-        # Ineligible for the queued Into form: the legacy call below drains
-        # and runs synchronously (correct, just not overlapped).
-    a = _t(lhs)
-    b = _t(rhs)
-    spec_a = spec_b = None
-    keep_a = keep_b = None
-    if a is not None and b is not None:
-        if a._device != b._device:
-            return None
-        if len(a._shape) > 4 or len(b._shape) > 4:
-            a = _tc(a)
-            b = _tc(b)
-            # a/b were already TorchMojoTensor; _tc only materializes.
-            assert a is not None and b is not None
-        promotion = _binary_promotion(a._dtype, b._dtype)
-        if promotion is None:
-            return None
-        # Same ladder as the queued path; here the casts drain and execute.
-        cast_a, cast_b, dtype = promotion
-        try:
-            if cast_a:
-                keep_a = _submit_prepared_into(
-                    _CastSpecExtension.prepare(a, dtype), force_sync=True
-                )
-                spec_a = _spec_of(keep_a)
-            if cast_b:
-                keep_b = _submit_prepared_into(
-                    _CastSpecExtension.prepare(b, dtype), force_sync=True
-                )
-                spec_b = _spec_of(keep_b)
-        except Exception as exc:
-            _raise_if_device_oom(exc)
-            return None
-    elif a is not None:
-        device = a._device
-        dtype = a._dtype
-        value = _scalar_embed(rhs, dtype)
-        if value is None:
-            return None
-        try:
-            keep_b = _submit_prepared_into(
-                _FillSpecExtension.prepare((), value, dtype, device), force_sync=True
-            )
-            spec_b = _spec_of(keep_b)
-        except Exception as exc:
-            _raise_if_device_oom(exc)
-            return None
-    elif b is not None:
-        # Scalar-first calls, e.g. rsub-style `1 - tensor`.
-        device = b._device
-        dtype = b._dtype
-        value = _scalar_embed(lhs, dtype)
-        if value is None:
-            return None
-        try:
-            keep_a = _submit_prepared_into(
-                _FillSpecExtension.prepare((), value, dtype, device), force_sync=True
-            )
-            spec_a = _spec_of(keep_a)
-        except Exception as exc:
-            _raise_if_device_oom(exc)
-            return None
-    else:
-        return None
+    anchor = a if a is not None else b
+    assert anchor is not None
+    device = anchor._device
+    dtype = anchor._dtype
     try:
-        result = _submit_prepared_into(
-            _BinarySpecExtension.prepare(
-                spec_fn_name,
-                keep_a if keep_a is not None else a,
-                keep_b if keep_b is not None else b,
-                out_dtype or dtype,
-            ),
-            force_sync=True,
-        )
+        if a is not None and b is not None:
+            if len(a._shape) > 4 or len(b._shape) > 4:
+                a = _tc(a)
+                b = _tc(b)
+                # a/b were already TorchMojoTensor; _tc only materializes.
+                assert a is not None and b is not None
+            promotion = _binary_promotion(a._dtype, b._dtype)
+            if promotion is None:
+                return None
+            cast_a, cast_b, dtype = promotion
+            if cast_a:
+                a = _cast_tensor(a, dtype)
+            if cast_b:
+                b = _cast_tensor(b, dtype)
+        else:
+            # One scalar operand: embed it as a 0-d fill.
+            value = _scalar_embed(rhs if a is not None else lhs, dtype)
+            if value is None:
+                return None
+            fill = _FillSpecExtension.prepare((), value, dtype, device).execute()
+            if a is not None:
+                b = fill
+            else:
+                a = fill
+        return _BinarySpecExtension.prepare(
+            spec_fn_name, a, b, out_dtype or dtype
+        ).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
-    _ = spec_a, spec_b  # keep explicit spec construction covered above
-    return result
 
 
 def _try_spec_add_f32_bf16(lhs: object, rhs: object) -> TorchMojoTensor | None:
@@ -1764,12 +1564,9 @@ def _try_spec_add_f32_bf16(lhs: object, rhs: object) -> TorchMojoTensor | None:
     ):
         return None
     try:
-        # The CPU device was already rejected above, so the metadata is always
-        # queue-eligible; the submit helper runs it synchronously by itself
-        # whenever the queue is disabled.
-        return _submit_prepared_into(
-            _BinarySpecExtension.prepare("AddF32Bf16Spec", a, b, DType.float32)
-        )
+        return _BinarySpecExtension.prepare(
+            "AddF32Bf16Spec", a, b, DType.float32
+        ).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
@@ -1780,43 +1577,8 @@ _SPEC_FLOAT_DTYPES = frozenset(
 )
 # The matmul bridges instantiate `op_utils.FLOAT_DTYPES`, which has no float64
 # entry, so an f64 matmul reaches the kernel only to raise "unsupported dtype"
-# at launch -- and a queued launch cannot fall back.  Decline it in Python.
+# at launch.  Decline it in Python instead of building that variant.
 _SPEC_MATMUL_DTYPES = _SPEC_FLOAT_DTYPES - {DType.float64}
-_SPEC_UNARY_DIRECT_NAMES = frozenset({"ReluSpec", "AbsSpec", "NegSpec", "SignSpec"})
-# Ops eligible for the queued Into form via _try_spec_unary, with the
-# dtype rule the Mojo prologue enforces (a queued launch cannot fall back).
-_SPEC_ROWRED_INTO = frozenset(
-    {DType.float32, DType.float16, DType.bfloat16, DType.int64, DType.int32}
-)
-# The vector norm accumulates in float32 and has no float64 kernel.
-_SPEC_NORM_DTYPES = frozenset({DType.float32, DType.float16, DType.bfloat16})
-_SPEC_ANYALL_INTO = frozenset(
-    {
-        DType.float32,
-        DType.float16,
-        DType.bfloat16,
-        DType.int64,
-        DType.int32,
-        DType.int16,
-        DType.int8,
-        DType.uint8,
-        DType.bool,
-    }
-)
-# (module, spec name) -> (operand dtype rule, output dtype override or None)
-_SPEC_REDUCE_INTO = {
-    ("reduction_ops", "SumSpec"): (_SPEC_ROWRED_INTO, None),
-    ("reduction_ops", "AmaxSpec"): (_SPEC_ROWRED_INTO, None),
-    ("reduction_ops", "AminSpec"): (_SPEC_ROWRED_INTO, None),
-    ("reduction_ops", "ArgminSpec"): (_SPEC_ROWRED_INTO, DType.int64),
-    ("reduction_ops", "NormSpec"): (_SPEC_NORM_DTYPES, None),
-    ("reduction_ops", "VarSpec"): (_SPEC_FLOAT_DTYPES, None),
-    ("reduction_ops", "AllSpec"): (_SPEC_ANYALL_INTO, DType.bool),
-    ("reduction_ops", "AnySpec"): (_SPEC_ANYALL_INTO, DType.bool),
-    ("nn_ops", "MeanSpec"): (_SPEC_FLOAT_DTYPES, None),
-    ("nn_ops", "MaxSpec"): (_SPEC_ROWRED_INTO, None),
-    ("nn_ops", "ArgmaxSpec"): (_SPEC_ROWRED_INTO, DType.int64),
-}
 
 
 class _ReductionSpecExtension(
@@ -1959,21 +1721,14 @@ class _MinDimSpecExtension(
 def _try_spec_min_dim(
     a: TorchMojoTensor, dim: int, keepdim: bool
 ) -> tuple[TorchMojoTensor, TorchMojoTensor] | None:
-    """min.dim through the two-output spec op, or None.
-
-    Same shape as every sibling `_try_spec_*` route: queue-eligible metadata
-    submits into the queue, everything else drains and runs synchronously.
-    """
-    ok = _call_queue.enabled() and a._numel > 0 and a._dtype in _SPEC_ROWRED_INTO
+    """min.dim through the two-output spec op, or None."""
     original_shape = tuple(a._shape)
     if _arg_strided_direct_ok("MinDimSpec", a, (dim,)):
         ready_dims = (dim,)  # zero-copy strided-axis kernel, no materialization
     else:
         a, ready_dims = _reduce_ready_operand(a, (dim,))
     try:
-        outputs = _submit_prepared_into(
-            _MinDimSpecExtension.prepare(a, ready_dims[0], keepdim), force_sync=not ok
-        )
+        outputs = _MinDimSpecExtension.prepare(a, ready_dims[0], keepdim).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
@@ -1987,18 +1742,10 @@ def _try_spec_min_dim(
 
 
 def _try_spec_cumsum(a: TorchMojoTensor, dim: int) -> TorchMojoTensor | None:
-    """cumsum through CumsumSpec (dim-threaded), or None.
-
-    Not queue-eligible yet (mirrors `_try_spec_unary`'s old CumsumSpec
-    branch: "constraints not mirrored" — CumsumSpec is not registered in
-    the call-queue's static rule tables), so every call drains and runs
-    synchronously. `a` must already be contiguous; the caller materializes
-    non-contiguous inputs first.
-    """
+    """cumsum through CumsumSpec (dim-threaded), or None. `a` must already
+    be contiguous; the caller materializes non-contiguous inputs first."""
     try:
-        return _submit_prepared_into(
-            _CumsumSpecExtension.prepare(a, dim), force_sync=True
-        )
+        return _CumsumSpecExtension.prepare(a, dim).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
@@ -2018,31 +1765,12 @@ def _try_spec_unary(
     if a is None:
         return None
     if not a._is_contiguous:
-        # Materialize here, through the queued strided copy: metered by the
-        # budget and covered by the allocation retry. The Mojo bridges no
-        # longer scratch-copy strided operands.
-        a = a._contig()
-    kdtype = DType.uint8 if a._dtype == DType.bool else a._dtype
-    if not _call_queue.enabled():
-        ok = False
-    elif out_dtype == DType.bool and module_name == "elementwise_ops":
-        ok = kdtype in _SPEC_INTO_DTYPES
-    elif module_name == "elementwise_ops":
-        ok = a._dtype in (
-            _SPEC_INTO_DTYPES
-            if spec_fn_name in _SPEC_UNARY_DIRECT_NAMES
-            else _SPEC_FLOAT_DTYPES
-        )
-    elif spec_fn_name in ("LogSoftmaxSpec", "SoftmaxSpec"):
-        ok = a._dtype in _SPEC_FLOAT_DTYPES and len(a._shape) >= 1 and a._numel > 0
-    else:
-        ok = False  # any other spec_fn_name: constraints not mirrored, stay sync
+        a = a._contig()  # the Mojo bridges do not scratch-copy strided operands
     try:
-        return _submit_prepared_into(
-            _UNARY_SPEC_EXTENSIONS[module_name].prepare(
-                spec_fn_name, a, out_dtype or a._dtype
-            ),
-            force_sync=not ok,
+        return (
+            _UNARY_SPEC_EXTENSIONS[module_name]
+            .prepare(spec_fn_name, a, out_dtype or a._dtype)
+            .execute()
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2063,21 +1791,8 @@ def _try_spec_reduce(
     on non-trailing dims / strided input and the classic path takes over."""
     dims = tuple(rdims)
     extras = tuple(extra)
-    ok = False
     odtype = out_dtype or a._dtype
     rank = len(a._shape)
-    if _call_queue.enabled():
-        rule = _SPEC_REDUCE_INTO.get((module_name, spec_fn_name))
-        if (
-            rule is not None
-            and a._numel > 0
-            and a._dtype in rule[0]
-            and dims
-            and len(set(dims)) == len(dims)
-            and all(isinstance(d, int) and 0 <= d < rank for d in dims)
-        ):
-            ok = True
-            odtype = rule[1] or odtype
     if not (
         dims
         and len(set(dims)) == len(dims)
@@ -2092,11 +1807,10 @@ def _try_spec_reduce(
     else:
         a, ready_dims = _reduce_ready_operand(a, dims)
     try:
-        result = _submit_prepared_into(
-            _REDUCTION_SPEC_EXTENSIONS[module_name].prepare(
-                spec_fn_name, a, ready_dims, keepdim, extras, odtype
-            ),
-            force_sync=not ok,
+        result = (
+            _REDUCTION_SPEC_EXTENSIONS[module_name]
+            .prepare(spec_fn_name, a, ready_dims, keepdim, extras, odtype)
+            .execute()
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2121,18 +1835,11 @@ def _raise_if_device_oom(exc: BaseException):
         raise torch.OutOfMemoryError(str(exc)) from exc
 
 
-# A queued launch fails inside `call_queue.drain()`, far from the `_call_mojo`
-# try/except that translates allocator exhaustion into `torch.OutOfMemoryError`.
-# Give the queue the same translation so the exception TYPE a caller catches
-# does not depend on whether the launch happened to be deferred.
-_call_queue.set_error_translator(_raise_if_device_oom)
-
-
 def _spec_matmul_out_shape(
     spec_fn_name: str, ts: list[MojoTensorLike], transpose_b: int
 ) -> tuple[int, ...] | None:
-    """Output shape for a queueable matmul spec launch, or None when any
-    Mojo-side check might fail (a queued launch cannot fall back).
+    """Output shape for a matmul spec launch, or None when a Mojo-side
+    check would fail.
 
     Operand layout is deliberately not checked here.  ``TensorSpec`` carries
     shape and strides, and `_matmul_spec_operands_launch` covers all four
@@ -2238,11 +1945,7 @@ def _submit_spec_matmul(
     device allocator failure still propagates as ``torch.OutOfMemoryError``.
     """
     try:
-        # No force_sync needed: _submit_prepared_into already executes
-        # synchronously whenever the queue is disabled.
-        return _submit_prepared_into(
-            _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b)
-        )
+        return _MatmulSpecExtension.prepare(spec_fn_name, ts, transpose_b).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
@@ -2278,7 +1981,7 @@ def _try_spec_scalar(
     if a is None or a._dtype not in _SPEC_FLOAT_DTYPES:
         return None
     if not a._is_contiguous:
-        a = a._contig()  # queued materialize: metered + covered by the retry
+        a = a._contig()
     out = _alloc(a._shape, a._dtype, a._device)
     try:
         _call_mojo(
@@ -2287,7 +1990,6 @@ def _try_spec_scalar(
             (_spec_of(a), float(scalar), _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
-            keepalive=(a, out),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2315,7 +2017,6 @@ def _try_spec_scalar_inplace(spec_fn_name: str, x: object, scalar: object) -> bo
             arg_dtypes=(a._dtype,),
             output_dtypes=(a._dtype,),
             flags={"INPLACE": True},
-            keepalive=(a,),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2333,7 +2034,7 @@ def _try_spec_int_scalar(
     if a is None or a._dtype not in (DType.int32, DType.int64):
         return None
     if not a._is_contiguous:
-        a = a._contig()  # queued materialize: metered + covered by the retry
+        a = a._contig()
     out = _alloc(a._shape, a._dtype, a._device)
     try:
         _call_mojo(
@@ -2342,7 +2043,6 @@ def _try_spec_int_scalar(
             (_spec_of(a), scalar, _spec_of(out)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
-            keepalive=(a, out),
         )
     except Exception as exc:
         _raise_if_device_oom(exc)
@@ -2382,13 +2082,8 @@ def _copy_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     if dst._numel == 0:
         return
     if dst._is_contiguous and src._is_contiguous:
-        _device_call(
-            _tensor_holder().copy_d2d,
-            _ctx_ptr(dst._device),
-            dst._ptr,
-            src._ptr,
-            dst._numel * dst._itemsize,
-            keepalive=(dst, src),
+        _tensor_holder().copy_d2d(
+            _ctx_ptr(dst._device), dst._ptr, src._ptr, dst._numel * dst._itemsize
         )
     else:
         _copy_strided_into(dst, src)
@@ -2474,20 +2169,16 @@ def _scalar_tensor_0d(
     value: int | float, dtype: DType, device: Device
 ) -> TorchMojoTensor:
     """A 0-d tensor holding `value`, for stride-0 broadcast operands."""
-    return _submit_prepared_into(
-        _FillSpecExtension.prepare((), float(value), dtype, device)
-    )
+    return _FillSpecExtension.prepare((), float(value), dtype, device).execute()
 
 
 def _cast_tensor(x: TorchMojoTensor, dtype: DType) -> TorchMojoTensor:
     """Dtype cast through CastSpec (strided inputs materialize Mojo-side).
 
     Callers pre-gate on _CAST_DTYPES; anything else propagates the spec's
-    NotImplementedError (the classic kernel silently wrote garbage there).
-    Call-queue mode uses the Into form: Python allocates the contiguous
-    output, the launch queues (no drain/sync)."""
+    NotImplementedError (the classic kernel silently wrote garbage there)."""
     t = _t(x)
-    return _submit_prepared_into(_CastSpecExtension.prepare(t, dtype))
+    return _CastSpecExtension.prepare(t, dtype).execute()
 
 
 def _promoted_pair(
@@ -2564,7 +2255,6 @@ def _launch_where_bcast(
         ),
         arg_dtypes=tuple(tensor._dtype for tensor in operands),
         output_dtypes=(out._dtype,),
-        keepalive=(out, operands),
     )
 
 
@@ -2599,7 +2289,6 @@ def _launch_masked_fill_scalar(
         ),
         arg_dtypes=(cond._dtype, b._dtype),
         output_dtypes=(out._dtype,),
-        keepalive=(out, cond, b),
     )
 
 
@@ -2682,7 +2371,6 @@ def _apple_contiguous_add(
             arg_dtypes=(a._dtype, b._dtype),
             output_dtypes=(out._dtype,),
             flags={"INPLACE": False},
-            keepalive=(out, a, b),
         )
     return out
 
@@ -2721,7 +2409,6 @@ def fast_aten_add_(
                 arg_dtypes=(dst._dtype, b._dtype),
                 output_dtypes=(dst._dtype,),
                 flags={"INPLACE": True},
-                keepalive=(dst, b),
             )
         return input
     # A float scalar goes straight into `input`, with no output buffer and no
@@ -2913,15 +2600,13 @@ def fast_aten_fill__scalar(input: torch.Tensor, value: object) -> torch.Tensor |
     if a._dtype == DType.float64 and a._device.api == "metal":
         return None
     if a._numel > 0:
-        _device_call(
-            _tensor_holder().StridedFill,
+        _tensor_holder().StridedFill(
             a._ptr,
             float(value),
             _pad8(a._shape, 1),
             _pad8(a._mojo_strides, 0),
             a._dtype.value,
             _ctx_ptr(a._device),
-            keepalive=(a,),
         )
     return input
 
@@ -3096,7 +2781,6 @@ def fast_aten_gelu(
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
                 flags={"APPROXIMATE": approximate},
-                keepalive=(out, a),
             )
         return out
     return _unary_spec_op(spec, input)
@@ -3142,7 +2826,6 @@ def fast_aten_gelu_backward(
             arg_dtypes=(grad._dtype, input._dtype),
             output_dtypes=(out._dtype,),
             flags={"APPROXIMATE": approximate},
-            keepalive=(out, grad, input),
         )
     return out
 
@@ -3231,7 +2914,6 @@ def fast_aten_bitwise_not(input: torch.Tensor) -> TorchMojoTensor | _NotHandled:
             (out._ptr, a._ptr, out._numel, a._dtype.value, _ctx_ptr(a._device)),
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
-            keepalive=(out, a),
         )
     return out
 
@@ -3276,7 +2958,6 @@ def fast_aten_isin(
             arg_dtypes=(el._dtype, te._dtype),
             output_dtypes=(out._dtype,),
             flags={"INVERT": bool(invert)},
-            keepalive=(out, el, te),
         )
     return out
 
@@ -3508,11 +3189,6 @@ def _fast_searchsorted(
         ),
         arg_dtypes=(common_dtype,),
         output_dtypes=(out_dtype,),
-        keepalive=tuple(
-            tensor
-            for tensor in (out, boundaries, input_tensor, sorter_tensor)
-            if tensor is not None
-        ),
     )
     return out
 
@@ -3613,9 +3289,9 @@ def _try_logical(
     try:
         bool_a = a if a._dtype == DType.bool else _cast_tensor(a, DType.bool)
         bool_b = b if b._dtype == DType.bool else _cast_tensor(b, DType.bool)
-        return _submit_prepared_into(
-            _BinarySpecExtension.prepare(spec_fn_name, bool_a, bool_b, DType.bool)
-        )
+        return _BinarySpecExtension.prepare(
+            spec_fn_name, bool_a, bool_b, DType.bool
+        ).execute()
     except Exception as exc:
         _raise_if_device_oom(exc)
         return None
@@ -3674,7 +3350,6 @@ def fast_aten_clamp(
             arg_dtypes=(a._dtype,),
             output_dtypes=(out._dtype,),
             flags={"HAS_MIN": has_min, "HAS_MAX": has_max},
-            keepalive=(out, a),
         )
     return out
 
@@ -3733,7 +3408,6 @@ def _try_addc(
             ),
             arg_dtypes=(a._dtype, b._dtype, c._dtype),
             output_dtypes=(out._dtype,),
-            keepalive=(out, a, b, c),
         )
     return out
 
@@ -3811,7 +3485,6 @@ def fast_aten_addr(
             ),
             arg_dtypes=(a._dtype, b._dtype, c._dtype),
             output_dtypes=(out._dtype,),
-            keepalive=(out, a, b, c),
         )
     return out
 
@@ -4505,7 +4178,6 @@ def fast_aten_cat(
             ),
             arg_dtypes=(first._dtype,),
             output_dtypes=(out._dtype,),
-            keepalive=(out, *ins),
         )
         return out
     offset = 0
@@ -4528,7 +4200,6 @@ def fast_aten_cat(
                     ),
                     arg_dtypes=(b._dtype,),
                     output_dtypes=(out._dtype,),
-                    keepalive=(out, b),
                 )
             else:
                 # Strided input (e.g. the new-token K/V head-transpose in a
@@ -4590,7 +4261,6 @@ def _try_stack_scalars(
         (tuple(tensor._ptr for tensor in unwrapped), out._ptr, _ctx_ptr(device)),
         arg_dtypes=(DType.float32,),
         output_dtypes=(out._dtype,),
-        keepalive=(tensor, out),
     )
     return out
 
@@ -4698,7 +4368,6 @@ def fast_aten_repeat(
                 ),
                 arg_dtypes=(t._dtype,),
                 output_dtypes=(out._dtype,),
-                keepalive=(out, t),
             )
         else:
             _call_mojo(
@@ -4715,7 +4384,6 @@ def fast_aten_repeat(
                 ),
                 arg_dtypes=(t._dtype,),
                 output_dtypes=(out._dtype,),
-                keepalive=(out, t),
             )
     return out
 
@@ -4752,7 +4420,6 @@ def _fast_triangular(
             arg_dtypes=(t._dtype,),
             output_dtypes=(out._dtype,),
             flags={"UPPER": bool(upper)},
-            keepalive=(out, t),
         )
     return out
 
@@ -4812,7 +4479,6 @@ def fast_aten_index(
                 ),
                 arg_dtypes=(src._dtype, idx_c._dtype),
                 output_dtypes=(out._dtype,),
-                keepalive=(out, src, idx_c),
             )
         return out
 
@@ -4919,7 +4585,6 @@ def _fast_scatter(
             ),
             output_dtypes=(out._dtype,),
             flags={"VALUE_MODE": bool(is_value)},
-            keepalive=(out, idx_c),
         )
     return out
 
@@ -5095,7 +4760,6 @@ def _fast_batch_norm_inference_gpu(
         ),
         arg_dtypes=(a._dtype, mean_t._dtype, gamma_t._dtype),
         output_dtypes=(out._dtype,),
-        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t, save_mean, save_invstd),
     )
     return (out, save_mean, save_invstd)
 
@@ -5186,7 +4850,6 @@ def _fast_batch_norm_training(
             "HAS_BIAS": beta_t is not None,
             "HAS_RUNNING": has_running,
         },
-        keepalive=(out, save_mean, save_invstd, a, gamma_t, beta_t, mean_t, var_t),
     )
     return out, save_mean, save_invstd
 
@@ -5240,7 +4903,6 @@ def _fast_batch_norm_inference(
             ),
             arg_dtypes=(a._dtype, *(stat._dtype for stat in stats)),
             output_dtypes=(out._dtype,),
-            keepalive=(a, stats, out),
         )
         saved = _bn_inference_saved_stats(running_mean, running_var, eps)
         if saved is not None:
@@ -5279,7 +4941,6 @@ def _fast_batch_norm_inference(
             beta_t._dtype,
         ),
         output_dtypes=(out._dtype,),
-        keepalive=(out, a, mean_t, var_t, gamma_t, beta_t),
     )
     saved = _bn_inference_saved_stats(running_mean, running_var, eps)
     if saved is None:
@@ -5399,7 +5060,6 @@ def fast_aten_native_dropout(
         ),
         arg_dtypes=(a._dtype,),
         output_dtypes=(output._dtype, mask._dtype),
-        keepalive=(output, mask, a),
     )
     return output, mask
 
@@ -5440,7 +5100,6 @@ def fast_aten_native_dropout_backward(
             ),
             arg_dtypes=(grad._dtype, keep._dtype),
             output_dtypes=(grad_input._dtype,),
-            keepalive=(grad_input, grad, keep),
         )
     return grad_input
 
@@ -5481,7 +5140,7 @@ def fast_aten_uniform_(
     Nothing round-trips through the host: `_reserve_philox_state` reserves the
     exact counter interval this call will consume (one counter per Philox
     group, `ceil(numel * words_per_element / 4)` of them) without reading a
-    tensor or synchronizing the queue, and the kernel derives every value from
+    tensor or synchronizing the device, and the kernel derives every value from
     `(seed, base_offset, index)` alone. So the draw is asynchronous like any
     other kernel, `torch.mojo.manual_seed_all` reproduces it, and
     `get_rng_state` / `set_rng_state` checkpoint it -- which is the whole
@@ -5573,7 +5232,6 @@ def fast_aten_uniform_(
         ),
         arg_dtypes=(),
         output_dtypes=(target._dtype,),
-        keepalive=(target,),
     )
     if target is not self:
         _copy_into(self, target)
@@ -5708,7 +5366,6 @@ def fast_aten_native_layer_norm(
             ),
             output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
-            keepalive=(out, mean, rstd, a, gamma, beta),
         )
         return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
@@ -5734,7 +5391,6 @@ def fast_aten_native_layer_norm(
         arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
         output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
         flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
-        keepalive=(out, mean, rstd, a, gamma, beta),
     )
     return out, *_layer_norm_stats_to_input_dtype(mean, rstd, a._dtype)
 
@@ -5887,16 +5543,6 @@ def fast_aten_native_layer_norm_backward(
             grad_bias._dtype if grad_bias is not None else a._dtype,
         ),
         flags={"OUTPUT_MASK": mask_bits},
-        keepalive=(
-            grad_input,
-            grad_weight,
-            grad_bias,
-            grad,
-            a,
-            saved_mean,
-            saved_rstd,
-            gamma,
-        ),
     )
     return grad_input, grad_weight, grad_bias
 
@@ -6212,7 +5858,6 @@ def _any_all(
                 (out._ptr, c._ptr, c._numel, _ctx_ptr(a._device)),
                 arg_dtypes=(c._dtype,),
                 output_dtypes=(out._dtype,),
-                keepalive=(out, c),
             )
             return out
     rdims = _norm_reduce_dims(dim, rank, empty_is_all=False)
@@ -6357,7 +6002,6 @@ def fast_aten__log_softmax_backward_data(
                         ),
                         arg_dtypes=(grad._dtype, saved_output._dtype),
                         output_dtypes=(grad_input._dtype,),
-                        keepalive=(grad_input, grad, saved_output),
                     )
                     return grad_input
                 # Unaligned fresh allocation (never expected): fall through
@@ -6526,7 +6170,6 @@ def fast_aten_nll_loss_forward_output(
             arg_dtypes=(log_probs._dtype, labels_c._dtype),
             output_dtypes=(write_output._dtype, write_total_weight._dtype),
             flags={"REDUCTION": reduction},
-            keepalive=(write_output, write_total_weight, log_probs, labels_c),
         )
 
     if write_output is not output:
@@ -6599,7 +6242,6 @@ def fast_aten_nll_loss_backward_grad_input(
             arg_dtypes=(grad_c._dtype, labels_c._dtype, weight_sum_c._dtype),
             output_dtypes=(write_grad_input._dtype,),
             flags={"REDUCTION": reduction},
-            keepalive=(write_grad_input, grad_c, labels_c, weight_sum_c),
         )
 
     if write_grad_input is not grad_input:
@@ -6748,7 +6390,6 @@ def fast_aten_max_pool2d_with_indices(
                 ),
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype, indices._dtype),
-                keepalive=(out, indices, a),
             )
             return out, indices
     return NOT_HANDLED
@@ -6826,7 +6467,6 @@ def fast_aten_avg_pool2d(
                     "COUNT_INCLUDE_PAD": count_include_pad,
                     "HAS_DIVISOR_OVERRIDE": divisor_override is not None,
                 },
-                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -6860,7 +6500,6 @@ def fast_aten__adaptive_avg_pool2d(
                 ),
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
-                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -6938,7 +6577,6 @@ def fast_aten_native_group_norm(
                 ),
                 output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
                 flags={"HAS_WEIGHT": gamma is not None, "HAS_BIAS": beta is not None},
-                keepalive=(out, mean, rstd, a, gamma, beta),
             )
             return out, mean, rstd
         if gamma is None:
@@ -6963,7 +6601,6 @@ def fast_aten_native_group_norm(
             arg_dtypes=(a._dtype, gamma._dtype, beta._dtype),
             output_dtypes=(out._dtype, mean._dtype, rstd._dtype),
             flags={"HAS_WEIGHT": weight is not None, "HAS_BIAS": bias is not None},
-            keepalive=(out, mean, rstd, a, gamma, beta),
         )
         return out, mean, rstd
     return NOT_HANDLED
@@ -7024,7 +6661,6 @@ def fast_aten_upsample_bilinear2d(
                 arg_dtypes=(a._dtype,),
                 output_dtypes=(out._dtype,),
                 flags={"ALIGN_CORNERS": bool(align_corners)},
-                keepalive=(out, a),
             )
             return out
     return NOT_HANDLED
@@ -7096,7 +6732,6 @@ def _try_sdpa_causal_bmm(
         arg_dtypes=(a._dtype, b._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": transpose_b, "CAUSAL_MODE": causal_mode},
-        keepalive=(out, a, b),
     )
     return out
 
@@ -7182,7 +6817,6 @@ def _sdpa_math_forward_with_dropout(
             arg_dtypes=(q._dtype, k._dtype),
             output_dtypes=(scores._dtype,),
             flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
-            keepalive=(scores, q, k),
         )
     else:
         # Off Metal, SDPA_CAUSAL_OUT would skip the fully masked output tiles
@@ -7211,7 +6845,6 @@ def _sdpa_math_forward_with_dropout(
                 arg_dtypes=(q._dtype, k._dtype),
                 output_dtypes=(scores._dtype,),
                 flags={"TRANSPOSE_B": True},
-                keepalive=(scores, q, k),
             )
     probs = _alloc((b * h, q_len, kv_len), q._dtype, q._device)
     # Fused softmax + dropout (Apple f32): one launch writes the pre-dropout
@@ -7259,7 +6892,6 @@ def _sdpa_math_forward_with_dropout(
             arg_dtypes=(scores._dtype,),
             output_dtypes=(probs._dtype, pdrop._dtype, drop_mask._dtype),
             flags={"CAUSAL": bool(is_causal)},
-            keepalive=(probs, pdrop, drop_mask, scores),
         )
         del scores
         effective_probs = pdrop
@@ -7282,7 +6914,6 @@ def _sdpa_math_forward_with_dropout(
             arg_dtypes=(scores._dtype,),
             output_dtypes=(probs._dtype,),
             flags={"CAUSAL": bool(is_causal)},
-            keepalive=(probs, scores),
         )
         # All allocations use stream-ordered lifetime management, so releasing
         # the host reference here cannot recycle scores before SoftmaxRows
@@ -7327,7 +6958,6 @@ def _sdpa_math_forward_with_dropout(
             arg_dtypes=(effective_probs._dtype, v._dtype),
             output_dtypes=(out._dtype,),
             flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
-            keepalive=(out, effective_probs, v),
         )
     else:
         out = None
@@ -7356,7 +6986,6 @@ def _sdpa_math_forward_with_dropout(
                 arg_dtypes=(effective_probs._dtype, v._dtype),
                 output_dtypes=(out._dtype,),
                 flags={"TRANSPOSE_B": False},
-                keepalive=(out, effective_probs, v),
             )
         assert not isinstance(out, _NotHandled)
     # P_drop is not saved: backward cheaply reconstructs it from P and the bool
@@ -7701,7 +7330,7 @@ def fast_fa4_16bit_d64_causal_forward(
     output/LSE plus saved physical inputs.
 
     Loading the bridge happens before materialization or allocation, so a
-    packaging/compiler error cannot leave unnecessary device work queued.
+    packaging/compiler error surfaces before any device work is issued.
 
     Seqlen eligibility is per-route (PR #391 review thread): the BHSD-native
     descriptor path zero-fills/clamps a partial last tile at both d64 and
@@ -7752,8 +7381,7 @@ def fast_fa4_16bit_d64_causal_forward(
         logsumexp = _alloc((batch, heads, seqlen), DType.float32, q._device)
         scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
         forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_bhsd")
-        _device_call(
-            forward_fn,
+        forward_fn(
             q._ptr,
             k._ptr,
             v._ptr,
@@ -7764,7 +7392,6 @@ def fast_fa4_16bit_d64_causal_forward(
             heads,
             scale_value,
             _ctx_ptr(q._device),
-            keepalive=(q, k, v, out_native, logsumexp),
         )
         return out_native, logsumexp, q, k, v
 
@@ -7784,8 +7411,7 @@ def fast_fa4_16bit_d64_causal_forward(
     scale_value = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
     if use_strided_qkv:
         forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim, "_strided_qkv")
-        _device_call(
-            forward_fn,
+        forward_fn(
             q_native._ptr,
             *q_native._mojo_strides,
             k_native._ptr,
@@ -7799,12 +7425,10 @@ def fast_fa4_16bit_d64_causal_forward(
             heads,
             scale_value,
             _ctx_ptr(q._device),
-            keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     else:
         forward_fn = _fa4_symbol(fa4_ops, "fwd", qkv_dtype, head_dim)
-        _device_call(
-            forward_fn,
+        forward_fn(
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -7815,7 +7439,6 @@ def fast_fa4_16bit_d64_causal_forward(
             heads,
             scale_value,
             _ctx_ptr(q._device),
-            keepalive=(q_native, k_native, v_native, out_native, logsumexp),
         )
     output = fast_aten_transpose(out_native, 1, 2)
     # isinstance, not `is`: ty doesn't narrow identity checks against a
@@ -7868,8 +7491,7 @@ def fast_fa4_16bit_d64_causal_backward(
     )
     if use_strided_qkv:
         backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim, "_strided_qkv")
-        _device_call(
-            backward_fn,
+        backward_fn(
             q_native._ptr,
             *q_native._mojo_strides,
             k_native._ptr,
@@ -7890,25 +7512,10 @@ def fast_fa4_16bit_d64_causal_backward(
             heads,
             float(scale),
             _ctx_ptr(q_native._device),
-            keepalive=(
-                q_native,
-                k_native,
-                v_native,
-                out_native,
-                dout_native,
-                logsumexp,
-                dq_native,
-                dk_native,
-                dv_native,
-                dpsum,
-                lse_log2,
-                dq_accum,
-            ),
         )
     else:
         backward_fn = _fa4_symbol(fa4_ops, "bwd", qkv_dtype, head_dim)
-        _device_call(
-            backward_fn,
+        backward_fn(
             q_native._ptr,
             k_native._ptr,
             v_native._ptr,
@@ -7926,20 +7533,6 @@ def fast_fa4_16bit_d64_causal_backward(
             heads,
             float(scale),
             _ctx_ptr(q_native._device),
-            keepalive=(
-                q_native,
-                k_native,
-                v_native,
-                out_native,
-                dout_native,
-                logsumexp,
-                dq_native,
-                dk_native,
-                dv_native,
-                dpsum,
-                lse_log2,
-                dq_accum,
-            ),
         )
     # TensorHolder destruction enqueues frees after the three kernels on the
     # same context; releasing scratch here never synchronizes the CPU.
@@ -8153,7 +7746,6 @@ def fast_fused_flash_attention_forward(
         arg_dtypes=(q._dtype, k._dtype, v._dtype),
         output_dtypes=(output._dtype, lse._dtype),
         flags={"CAUSAL": bool(is_causal)},
-        keepalive=(output, lse, q, k, v),
     )
     return output, lse, q, k, v
 
@@ -8237,7 +7829,6 @@ def fast_fused_flash_attention_backward(
         arg_dtypes=(g._dtype, q._dtype, k._dtype, v._dtype, o._dtype, lse_t._dtype),
         output_dtypes=(grad_query._dtype, grad_key._dtype, grad_value._dtype),
         flags={"CAUSAL": bool(is_causal)},
-        keepalive=(grad_query, grad_key, grad_value, g, q, k, v, o, lse_t),
     )
     return grad_query, grad_key, grad_value
 
@@ -8587,7 +8178,6 @@ def fast_sdpa_dropout_softmax_backward(
         + ((mask._dtype,) if mask is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
-        keepalive=(out, probs, grad, mask),
     )
     return out
 
@@ -8726,7 +8316,6 @@ def fast_sdpa_backward(
             + ((mask._dtype,) if mask is not None else ()),
             output_dtypes=(grad_value._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
-            keepalive=(grad_value, probs, grad, mask),
         )
 
     grad_query = None
@@ -8750,7 +8339,6 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad._dtype, v._dtype),
                 output_dtypes=(grad_probs._dtype,),
                 flags={"TRANSPOSE_B": True, "CAUSAL_MODE": SDPA_CAUSAL_OUT},
-                keepalive=(grad_probs, grad, v),
             )
         else:
             _call_mojo(
@@ -8767,7 +8355,6 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad._dtype, v._dtype),
                 output_dtypes=(grad_probs._dtype,),
                 flags={"TRANSPOSE_B": True},
-                keepalive=(grad_probs, grad, v),
             )
         del v
         grad_scores = _alloc((batch_heads, q_len, kv_len), DType.float32, device)
@@ -8792,7 +8379,6 @@ def fast_sdpa_backward(
             + ((mask._dtype,) if mask is not None else ()),
             output_dtypes=(grad_scores._dtype,),
             flags={"HAS_MASK": has_mask, "CAUSAL": bool(is_causal)},
-            keepalive=(grad_scores, probs, grad_probs, mask),
         )
         del grad_probs
         if need_query:
@@ -8814,7 +8400,6 @@ def fast_sdpa_backward(
                     arg_dtypes=(grad_scores._dtype, k._dtype),
                     output_dtypes=(grad_query._dtype,),
                     flags={"TRANSPOSE_B": False, "CAUSAL_MODE": SDPA_CAUSAL_A_ROWS},
-                    keepalive=(grad_query, grad_scores, k),
                 )
             else:
                 _call_mojo(
@@ -8831,7 +8416,6 @@ def fast_sdpa_backward(
                     arg_dtypes=(grad_scores._dtype, k._dtype),
                     output_dtypes=(grad_query._dtype,),
                     flags={"TRANSPOSE_B": False},
-                    keepalive=(grad_query, grad_scores, k),
                 )
             del k
         if need_key:
@@ -8853,7 +8437,6 @@ def fast_sdpa_backward(
                 arg_dtypes=(grad_scores._dtype, q._dtype),
                 output_dtypes=(grad_key._dtype,),
                 flags={"HAS_MASK": False, "CAUSAL": bool(is_causal)},
-                keepalive=(grad_key, grad_scores, q),
             )
             del q
         del grad_scores
@@ -9036,7 +8619,6 @@ def _try_gemm16_mm(
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
-        keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
 
@@ -9127,7 +8709,6 @@ def _try_tf32_gemm(
         + ((bias_tensor._dtype,) if bias_tensor is not None else ()),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b), "HAS_BIAS": bias_tensor is not None},
-        keepalive=(out, lhs, rhs, bias_tensor),
     )
     return out
 
@@ -9189,7 +8770,6 @@ def _try_gemm16_bmm(
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b)},
-        keepalive=(out, lhs, rhs),
     )
     return out
 
@@ -9258,7 +8838,6 @@ def _try_tf32_bmm(
         arg_dtypes=(lhs._dtype, rhs._dtype),
         output_dtypes=(out._dtype,),
         flags={"TRANSPOSE_B": bool(transpose_b)},
-        keepalive=(out, lhs, rhs),
     )
     return out
 
@@ -9702,7 +9281,6 @@ def fast_aten_convolution(
                     ),
                     arg_dtypes=(a._dtype,),
                     output_dtypes=(col._dtype,),
-                    keepalive=(col, a),
                 )
                 col_ptr = col._ptr
             out = _alloc((n, out_c, cols), a._dtype, a._device)
@@ -9725,7 +9303,6 @@ def fast_aten_convolution(
                     # tuple, matmul_ops._bmm_go), so naming it here would only
                     # fork this call site onto a second .so of identical code.
                     flags={"TRANSPOSE_B": False},
-                    keepalive=(out, w),
                 )
             else:
                 # Channel-major im2col rows make each group a contiguous
@@ -9756,7 +9333,6 @@ def fast_aten_convolution(
                             arg_dtypes=(w._dtype, a._dtype),
                             output_dtypes=(out._dtype,),
                             flags={"TRANSPOSE_B": False},
-                            keepalive=(out, w),
                         )
             if bias_t is not None:
                 _call_mojo(
@@ -9771,7 +9347,6 @@ def fast_aten_convolution(
                     ),
                     arg_dtypes=(out._dtype, bias_t._dtype),
                     output_dtypes=(out._dtype,),
-                    keepalive=(out, bias_t),
                 )
             return _view_of(
                 out,
@@ -9887,7 +9462,6 @@ def fast_aten_scaled_dot_product_attention(
                 ),
                 arg_dtypes=(q._dtype, k._dtype, v._dtype),
                 output_dtypes=(out._dtype,),
-                keepalive=(q, k, v, out),
             )
             return out
         result = _sdpa_math_forward_with_dropout(
@@ -10000,7 +9574,6 @@ def fast_aten_embedding(
             ),
             arg_dtypes=(table._dtype, idx._dtype),
             output_dtypes=(out._dtype,),
-            keepalive=(out, table, idx),
         )
     return out
 
@@ -10069,7 +9642,6 @@ def fast_aten_embedding_dense_backward(
             ),
             arg_dtypes=(grad._dtype, idx._dtype),
             output_dtypes=(grad_weight._dtype,),
-            keepalive=(grad_weight, grad, idx),
         )
     return grad_weight
 
@@ -10095,9 +9667,7 @@ def fast_filled(
     if dtype == DType.float64 and device.api == "metal":
         return None
     shape = tuple(shape)
-    return _submit_prepared_into(
-        _FillSpecExtension.prepare(shape, float(value), dtype, device)
-    )
+    return _FillSpecExtension.prepare(shape, float(value), dtype, device).execute()
 
 
 # What the Arange kernel dispatches on (_FILL_DTYPES minus bool, which
@@ -10126,7 +9696,6 @@ def fast_arange(
             (out._ptr, float(start), float(step), numel, dtype.value, _ctx_ptr(device)),
             arg_dtypes=(),
             output_dtypes=(out._dtype,),
-            keepalive=(out,),
         )
     return out
 
@@ -10140,7 +9709,6 @@ def fast_aten__local_scalar_dense(tensor: torch.Tensor) -> object:
     t = _t(tensor)
     if t is None or t._numel != 1:
         return NOT_HANDLED
-    _call_queue.drain()  # host read: queued launches must land first
     return _tensor_holder().read_scalar(_ctx_ptr(t._device), t._ptr, t._dtype.value)
 
 

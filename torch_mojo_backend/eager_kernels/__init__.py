@@ -61,8 +61,6 @@ import max as _max_pkg
 from max import driver
 from max.dtype import DType
 
-from torch_mojo_backend.eager_kernels import call_queue
-
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
 
@@ -224,8 +222,7 @@ def _build_call_defines(
         if define_name in values:
             raise ValueError(f"duplicate specialization define {define_name!r}")
         values[define_name] = value
-    # Validate here so malformed values fail while the call is prepared, not
-    # in a background compiler thread.
+    # Validate here so malformed values fail while the call is prepared.
     return normalize_defines(values)
 
 
@@ -442,11 +439,9 @@ def _trace(message: str):
 def _announce_build():
     """One notice per process, not one per specialization.
 
-    A cold process compiles dozens of variants across up to `_pool_size()`
-    threads; naming each one buries the only thing a user needs to know,
-    which is that the wait happens once and is cached. The per-variant
-    detail is the [TRACE] lines (on by default). A single write keeps concurrent
-    builder threads from splicing their lines together.
+    A cold process compiles dozens of variants; naming each one buries the
+    only thing a user needs to know, which is that the wait happens once and
+    is cached. The per-variant detail is the [TRACE] lines (on by default).
     """
     global _BUILD_NOTICE_SHOWN
     with _BUILD_NOTICE_LOCK:
@@ -516,13 +511,15 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                 text=True,
                 env=_build_env(),
             )
-            _trace(f"built {label} in {time.monotonic() - started:.2f}s")
+            elapsed = time.monotonic() - started
             if proc.returncode != 0:
+                _trace(f"build of {label} FAILED after {elapsed:.2f}s")
                 raise ImportError(
                     f"mojo build failed for {src.stem} "
                     f"({_defines_tag(defines)}):\n{proc.stderr}"
                 )
             os.replace(tmp, out)
+            _trace(f"built {label} in {elapsed:.2f}s")
         finally:
             tmp.unlink(missing_ok=True)
         return out
@@ -585,50 +582,26 @@ def _resolve_mojo_file(mojo_file: Path) -> Path:
     return mojo_file if mojo_file.is_absolute() else _PACKAGE_DIR / mojo_file
 
 
-class _AsyncLoadJob:
-    def __init__(self, unit: "_DefinedUnit"):
-        self.unit = unit
-        self.done = threading.Event()
-        self.error: BaseException | None = None
-
-    def run(self):
-        try:
-            with _ASYNC_BUILD_SLOTS:
-                self.unit.load_blocking()
-        except BaseException as exc:
-            self.error = exc
-        finally:
-            self.done.set()
-
-    def wait(self) -> ModuleType:
-        self.done.wait()
-        if self.error is not None:
-            raise self.error
-        if self.unit.module is None:
-            raise RuntimeError("extension load completed without a module")
-        return self.unit.module
-
-
 class _DefinedUnit:
+    """One immutable specialization: built and dlopened at its first call,
+    then memoized as a permanent success-or-failure result."""
+
     def __init__(self, mojo_file: Path, defines: CanonicalDefines):
         self.mojo_file = mojo_file
         self.defines = defines
         self.lock = threading.Lock()
-        self.load_lock = threading.Lock()
         self.module: ModuleType | None = None
         self.failure: BaseException | None = None
-        self.job: _AsyncLoadJob | None = None
 
-    def load_blocking(self) -> ModuleType:
-        # Serialize direct and background callers. The filesystem lock avoids
-        # duplicate compiler processes, but this lock also prevents duplicate
-        # imports and gives the unit one permanent success-or-failure result.
-        with self.load_lock:
-            with self.lock:
-                if self.module is not None:
-                    return self.module
-                if self.failure is not None:
-                    raise self.failure
+    def load(self) -> ModuleType:
+        # The filesystem lock in `_build_extension` avoids duplicate compiler
+        # processes; this lock also prevents duplicate imports across threads
+        # and gives the unit one permanent success-or-failure result.
+        with self.lock:
+            if self.module is not None:
+                return self.module
+            if self.failure is not None:
+                raise self.failure
             try:
                 if self.mojo_file.stem != "tensor_holder":
                     _ensure_tensor_holder()
@@ -642,40 +615,10 @@ class _DefinedUnit:
                         "not expose call(); check its OP define"
                     )
             except BaseException as exc:
-                with self.lock:
-                    if self.failure is None:
-                        self.failure = exc
-                    failure = self.failure
-                raise failure
-            with self.lock:
-                self.module = module
-                return module
-
-    @property
-    def ext(self) -> ModuleType | None:
-        """The loaded native module, or None while it is still building.
-        `call_queue` reads this to decide whether an item can launch."""
-        return self.module
-
-    def request_async(self) -> _AsyncLoadJob:
-        with self.lock:
-            job = self.job
-            if job is None:
-                job = _AsyncLoadJob(self)
-                self.job = job
-                if self.module is not None:
-                    job.done.set()
-                    return job
-                if self.failure is not None:
-                    job.error = self.failure
-                    job.done.set()
-                    return job
-                threading.Thread(
-                    target=job.run,
-                    name=f"mojo-build-{self.mojo_file.stem}",
-                    daemon=True,
-                ).start()
-            return job
+                self.failure = exc
+                raise
+            self.module = module
+            return module
 
 
 class MojoExtensionLoader:
@@ -711,13 +654,7 @@ class MojoExtensionLoader:
             return unit
 
     def load_canonical(self, mojo_file: Path, defines: CanonicalDefines) -> ModuleType:
-        return self._unit(mojo_file, defines).load_blocking()
-
-    def unit_canonical(
-        self, mojo_file: Path, defines: CanonicalDefines
-    ) -> _DefinedUnit:
-        """Return the queue-compatible unit for an already canonical key."""
-        return self._unit(mojo_file, defines)
+        return self._unit(mojo_file, defines).load()
 
 
 _OutputSpecs = TypeVar("_OutputSpecs")
@@ -731,30 +668,13 @@ class PreparedExtensionCall(Generic[_OutputSpecs, _ExtensionResult]):
     output_specs: _OutputSpecs
     args: tuple[object, ...]
 
-    def get_loaded_module(
-        self, loader: MojoExtensionLoader | None = None
-    ) -> ModuleType:
-        selected_loader = loader or MOJO_EXTENSION_LOADER
-        return selected_loader.load_canonical(self.extension.MOJO_FILE, self.defines)
-
     def execute(self, loader: MojoExtensionLoader | None = None) -> _ExtensionResult:
-        module = self.get_loaded_module(loader)
+        """Load this exact specialization (building it on first use) and
+        call it."""
+        module = (loader or MOJO_EXTENSION_LOADER).load_canonical(
+            self.extension.MOJO_FILE, self.defines
+        )
         return self.extension.call_extension(module, self.output_specs, *self.args)
-
-    def enqueue_into(
-        self,
-        extension_args: tuple[object, ...],
-        keepalive: tuple[object, ...],
-        loader: MojoExtensionLoader | None = None,
-    ):
-        """Queue a non-returning `call(..., out)` into preallocated outputs.
-
-        `keepalive` names the objects whose buffers `extension_args`'
-        raw pointers reference; the queued item retains them until it
-        launches (queue rule 3)."""
-        selected_loader = loader or MOJO_EXTENSION_LOADER
-        unit = selected_loader.unit_canonical(self.extension.MOJO_FILE, self.defines)
-        call_queue.kernel_call_into(unit, extension_args, keepalive)
 
 
 class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
@@ -795,12 +715,7 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
     def extension_args(
         cls, out: object, *args: object, **kwargs: object
     ) -> tuple[object, ...]:
-        """The native argument tuple for `call`, given the allocated outputs.
-
-        This is the per-operation contract the queue depends on: a queued
-        launch is serialized here, from Python-side allocated outputs, and
-        never goes through `call_extension`.
-        """
+        """The native argument tuple for `call`, given the allocated outputs."""
 
     @classmethod
     def call_extension(
@@ -812,10 +727,8 @@ class MojoExtension(ABC, Generic[_OutputSpecs, _ExtensionResult]):
     ) -> _ExtensionResult:
         """Allocate the outputs, invoke ``extension.call``, return them.
 
-        The synchronous twin of the queued path: the same
-        ``allocate_outputs`` allocation and ``extension_args`` serialization,
-        executed inline. Descriptors with a different call ABI
-        (``MojoFileExtension``) override it.
+        Descriptors with a different call ABI (``MojoFileExtension``)
+        override it.
         """
         out = cls.allocate_outputs(output_specs)
         extension.call(*cls.extension_args(out, *args, **kwargs))  # type: ignore[attr-defined]
@@ -963,62 +876,18 @@ class MojoFileExtension(MojoExtension[object, object]):
         arg_dtypes: tuple[DType | str, ...],
         output_dtypes: tuple[DType | str, ...] = (),
         flags: Mapping[str, DefineValue] | None = None,
-        keepalive: tuple[object, ...],
     ) -> object:
-        """Compile/load this exact variant, preserving the launch FIFO.
-
-        `keepalive` names the tensors whose buffers `extension_args`' raw
-        specs and pointers reference (queue rule 3). Required and
-        keyword-only so no call site can forget it."""
-        prepared = cls.prepare(
+        """Load this exact variant (building it on first use) and call it."""
+        return cls.prepare(
             op,
             extension_args,
             arg_dtypes=arg_dtypes,
             output_dtypes=output_dtypes,
             flags=flags,
-        )
-        if call_queue.enabled():
-            prepared.enqueue_into(extension_args, keepalive)
-            return None
-        return prepared.execute()
+        ).execute()
 
 
 MOJO_EXTENSION_LOADER = MojoExtensionLoader()
-
-
-def _available_memory_gib() -> float | None:
-    """Memory the build pool may assume, or None when the host cannot say.
-
-    Linux answers with MemAvailable; macOS has no procfs, so fall back to
-    total physical memory through sysconf, which overestimates but still
-    scales with the machine. Returning None rather than a fixed guess is what
-    lets the caller fall back to the core count instead of silently
-    serializing every build on hosts neither source covers.
-    """
-    try:
-        with open("/proc/meminfo") as meminfo:
-            for line in meminfo:
-                if line.startswith("MemAvailable"):
-                    return int(line.split()[1]) / (1024 * 1024)
-    except OSError:
-        pass
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
-    except (OSError, ValueError, AttributeError):
-        return None
-
-
-def _pool_size() -> int:
-    """Concurrent `mojo build` subprocesses. Each build peaks around 4.5 GB
-    RSS and uses ~2.5-3 cores, so cap by available RAM (5 GiB per slot with
-    headroom) and by cores; never fewer than 1, never more than 16."""
-    by_cpu = (os.cpu_count() or 4) // 3
-    memory_gib = _available_memory_gib()
-    by_mem = by_cpu if memory_gib is None else int(memory_gib // 5)
-    return max(1, min(by_mem, by_cpu, 16))
-
-
-_ASYNC_BUILD_SLOTS = threading.Semaphore(_pool_size())
 
 
 def __getattr__(name: str) -> object:

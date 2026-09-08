@@ -43,6 +43,10 @@ pip install torch-mojo-backend
 uv add torch-mojo-backend
 ```
 
+On NVIDIA GPUs the kernels are assembled with the CUDA 12.8 `ptxas` from the
+`nvidia-cuda-nvcc-cu12` wheel installed alongside, so any driver from r570 up
+works; set `MODULAR_NVPTX_COMPILER_PATH` to use a different ptxas.
+
 ## Quick Start
 
 
@@ -78,11 +82,9 @@ d = (a + b - c) * 8 / 16
 print(d.cpu())
 ```
 
-Ops are compiled on the fly, and compilation doesn't stop your code, as long as you don't request a host-device sync.
-Torch-mojo-backend uses this optimization to compile multiple ops in the background at the same time. E.g. all the 
-ops needed to perform `(a + b - c) * 8 / 16` will be sent to a compiler process pool to be compiled in parallel.
-A cache is on disk to make sure we don't recompile when the user restarts the process.
-You can look at [this animation](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/kernel_call_queue_animation.html) to understand better how it works.
+Ops are compiled on the fly: the first time an op runs with a given combination of dtypes, its Mojo kernel
+is compiled and the call waits for it. A cache is on disk to make sure we don't recompile when the user
+restarts the process.
 
 We guarantee that changing the shapes or the values of the tensors will not trigger a recompilation.
 

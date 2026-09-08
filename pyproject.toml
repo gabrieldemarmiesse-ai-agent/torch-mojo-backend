@@ -19,6 +19,12 @@ dependencies = [
     # itself, so it runs on any CUDA-12-capable driver (>= r525) regardless of
     # which CUDA version torch was built for.
     "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
+    # ptxas for the eager kernels and the MAX graph compiler on NVIDIA. MAX
+    # bundles the newest CUDA's ptxas, whose cubins need a driver at least as
+    # new (r580 for CUDA 13); the 12.8 wheel's ptxas assembles cubins that
+    # every r570+ driver loads. torch_mojo_backend/_ptxas.py points MAX at it
+    # unless MODULAR_NVPTX_COMPILER_PATH is already set.
+    "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
 ]
 
 [project.urls]

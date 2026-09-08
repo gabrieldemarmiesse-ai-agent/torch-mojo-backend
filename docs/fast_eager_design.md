@@ -77,13 +77,11 @@ This section used to be a "scaling analysis" arguing for compilation at
 *module* granularity and against one `.so` per variant, on the grounds
 that per-variant builds multiply total compile time ~40×. That
 recommendation has been reversed by measurement and the shipped design
-is the opposite one: **one `.so` per exact specialization, built on
-demand in a background pool, with only the device launch waiting.**
-The queue that makes the waiting invisible is documented in
-[docs/kernel_call_queue.md](kernel_call_queue.md).
+is the opposite one: **one `.so` per exact specialization, built inline
+at its first call** ([docs/mojo_extensions.md](mojo_extensions.md)).
 
 The old argument measured the wrong quantity — total compiler *work*
-rather than the wall-clock a cold workload waits. Two things changed it:
+rather than the wall-clock a cold workload waits. What changed it:
 
 - **Compile-time gates.** `variant_gates.mojo` reads `OP`, the
   `DTYPE_ARG_*` and the `DTYPE_OUT*` defines, and every registration and
@@ -91,12 +89,15 @@ rather than the wall-clock a cold workload waits. Two things changed it:
   build therefore compiles roughly one kernel, not the family's ~150
   instantiations, so a variant build is a fraction of a module build
   rather than a repeat of it.
-- **Nothing waits for the build.** Variant builds run on a background
-  thread pool (`_ASYNC_BUILD_SLOTS`, sized by `_pool_size()`: available
-  RAM / 5 GiB and cores / 3, capped at 16) while Python keeps
-  discovering ops and requesting further compilations. Total compiler
-  work went up; wall-clock went down, because the work is now parallel
-  and overlapped with discovery.
+- **Nothing waited for the build.** From August to September 2026 the
+  variant builds ran on a background thread pool behind a kernel-call
+  queue, so a cold workload compiled many variants concurrently while
+  Python kept discovering ops. That machinery (FIFO launch ordering,
+  per-item keep-alives, a run-ahead memory budget, cross-thread barriers)
+  was removed on 2026-09-08 to simplify the codebase: the nominal,
+  warm-cache path is the one to make fast first. Builds now run inline at
+  the first call, and the numbers below are the record of what the pool
+  bought and cost.
 
 ### Measured (H100 PCIe, 24-core host; nanoGPT 124M, batch 12 × 1024, BF16)
 
@@ -118,7 +119,7 @@ Pool-size sweep on the same first step (slots → time): 1 → 56.6 s,
 reproduces the pool-disabled number, as it should. Returns flatten past
 ~8 slots on this 24-core host, and memory rather than cores is the binding
 constraint (each `mojo build` peaks around 4.5 GB RSS), which is what
-`_pool_size()`'s two caps encode.
+the pool's two caps (RAM / 5 GiB, cores / 3) encoded.
 
 **The warm path was a regression; most of it has been recovered.** The
 first measurement on this branch was **101 ms/step vs 60 ms on main**
@@ -149,7 +150,8 @@ What was fixed, in order of measured size (py-spy at batch 12):
 The remaining ~3.6 ms/step at batch 12 (~6%) is the structural cost of
 the Into ABI and the dispatch bracket, spread thin: Python-side output
 allocation (+0.7 ms vs main's Mojo-side alloc), the per-op dispatch
-bracket (+0.94 µs/op), `kernel_call_into` (+0.55 µs/launch), and
+bracket (+0.94 µs/op), the queue's `kernel_call_into` (+0.55 µs/launch,
+since removed), and
 prepare/submit machinery (a warm binary add is ~13 µs of Python vs ~4 µs
 on main). At batch 48 this is fully hidden under GPU time. The cold-start
 numbers above still must not be read as an overall speedup.
@@ -232,7 +234,7 @@ multiple families and the `op_utils` Mojo package remain at the package root.
 A family source file is the compilation *input*, not the compilation unit:
 each `.so` built from it is gated down to one operation and one dtype tuple
 (see "Compile granularity" above and
-[docs/kernel_call_queue.md](kernel_call_queue.md)).
+[docs/mojo_extensions.md](mojo_extensions.md)).
 
 - `elementwise_ops.mojo` — binary/unary ops + Python-scalar variants
   (`x * 0.5`, `x ** 3`, int `x + 1`), tanh; contiguous, dtypes selected by
@@ -295,9 +297,8 @@ Resulting per-op end-to-end costs at the torch level (H100 box): view
 ~8 µs, relu ~10 µs, addmm ~20 µs, conv ~35 µs — at which point resnet-18
 matches torch CUDA. The bare `linalg` vendor matmul call is 8.8 µs.
 Remaining short-gpt2 overhead: two unavoidable sync points (the HF mask
-`.all().item()` check and the final D2H) each drain the ~600-kernel-deep
-queue, and transpose/split/cat run as real copy kernels where CUDA has
-zero-cost strided views.
+`.all().item()` check and the final D2H), and transpose/split/cat run as
+real copy kernels where CUDA has zero-cost strided views.
 
 ### Gotchas discovered (worth keeping in mind)
 

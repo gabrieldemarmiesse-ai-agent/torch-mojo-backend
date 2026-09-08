@@ -4775,9 +4775,7 @@ def _strided_matmul_cases(
     ]
 
 
-@pytest.mark.parametrize("queued", [False, True])
-def test_matmul_every_strided_layout_arm(mojo_gpu, monkeypatch, queued):
-    monkeypatch.setenv("TORCH_MOJO_BACKEND_KERNEL_QUEUE", "1" if queued else "0")
+def test_matmul_every_strided_layout_arm(mojo_gpu):
     for label, a, b in _strided_matmul_cases(mojo_gpu):
         expected = a.cpu() @ b.cpu()
         got = (a @ b).cpu()
