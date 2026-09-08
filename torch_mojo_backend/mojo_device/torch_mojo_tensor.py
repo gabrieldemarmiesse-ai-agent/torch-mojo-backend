@@ -317,10 +317,13 @@ def _alloc_with_recovery(
 ) -> tuple[_MojoTensorHolder, int]:
     """One device allocation, retried once after a device synchronize.
 
-    When the allocator refuses, frees still stream-ordered behind in-flight
-    kernels have not landed yet: synchronize the device so they do, then
-    retry exactly once. Non-OOM errors and a second failure propagate
-    untouched.
+    Workaround for https://github.com/modular/modular/issues/6801: MAX's
+    device allocator fails instead of reclaiming memory whose stream-ordered
+    frees are still pending behind in-flight kernels (the normal state of a
+    training loop whose host runs ahead of the GPU). Synchronizing lands
+    those frees, then the allocation is retried exactly once. Non-OOM errors
+    and a second failure propagate untouched. Delete this function and
+    tests/test_alloc_recovery.py once that issue is fixed.
     """
     holder_mod = _holder_mod()
     # _ctx_ptr wants a real max.driver.Device; production always passes one

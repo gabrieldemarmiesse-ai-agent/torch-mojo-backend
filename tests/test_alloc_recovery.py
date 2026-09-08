@@ -1,6 +1,10 @@
 """``_alloc_with_recovery``: a device-OOM allocation synchronizes the device
 (so stream-ordered frees land) and retries exactly once. Host-only: the
-holder and the device are stand-ins."""
+holder and the device are stand-ins.
+
+Workaround for https://github.com/modular/modular/issues/6801 (MAX's device
+allocator OOMs instead of reclaiming freed-but-pending memory); delete this
+file together with ``_alloc_with_recovery`` once that issue is fixed."""
 
 from types import SimpleNamespace
 
