@@ -1318,6 +1318,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cuda-nvcc-cu12"
+version = "12.8.93"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/86/0a/962e9c861541b08d62ee38a9e9776a46f75b979c75e7236fa7e09b024470/nvidia_cuda_nvcc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:2d6dc36fb7cb5ac9c0b8825bc13d193c35487a315664007287d0126531238011", size = 40128098, upload-time = "2025-03-07T01:41:22.271Z" },
+    { url = "https://files.pythonhosted.org/packages/df/26/38b9f7d19a1d4bc7bc5988aa07c8c7ab8fb20f5a2d92018fd037eaff4eb7/nvidia_cuda_nvcc_cu12-12.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2b35ada240938d19398119ca596faaf626ba5e729511be9715842a29d112926d", size = 38021796, upload-time = "2025-03-07T01:41:01.162Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-nvrtc"
 version = "13.0.88"
 source = { registry = "https://pypi.org/simple" }
@@ -2388,6 +2397,7 @@ source = { editable = "." }
 dependencies = [
     { name = "max" },
     { name = "mojo" },
+    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "tabulate" },
     { name = "torch" },
@@ -2430,6 +2440,7 @@ dev = [
 requires-dist = [
     { name = "max", specifier = "==26.5" },
     { name = "mojo", specifier = "==1.0" },
+    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'", specifier = "==12.8.*" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'", specifier = ">=2.27" },
     { name = "tabulate" },
     { name = "torch", specifier = ">=2.10" },

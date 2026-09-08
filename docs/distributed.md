@@ -144,9 +144,11 @@ anything touches the GPU runtime or enumerates MAX devices.
 
 ## Cluster notes (SLURM, IB — NVIDIA)
 
-- Export `MODULAR_NVPTX_COMPILER_PATH=/usr/local/cuda/bin/ptxas` on nodes
-  whose driver is older than r580 (see the MAX GPU requirements) — in the
-  sbatch script, so every rank gets it.
+- ptxas needs no configuration: the package defaults
+  `MODULAR_NVPTX_COMPILER_PATH` to the CUDA 12.8 ptxas of the
+  `nvidia-cuda-nvcc-cu12` wheel it depends on, whose cubins load on r570+
+  drivers (`torch_mojo_backend/_ptxas.py`). Export the variable yourself
+  only to use another ptxas.
 - `NCCL_DEBUG=WARN` (or `INFO` during bring-up) is the first knob for
   diagnosing init hangs; on multi-homed nodes set `NCCL_SOCKET_IFNAME` if
   NCCL's interface auto-detection picks a dead interface.

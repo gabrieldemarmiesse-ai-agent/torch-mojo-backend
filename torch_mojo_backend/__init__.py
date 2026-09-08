@@ -1,3 +1,4 @@
+import torch_mojo_backend._ptxas  # noqa: F401 -- sets MAX's ptxas default before `max` is imported below
 from torch_mojo_backend.custom_torch_ops_in_mojo.torch_custom_ops import (
     make_torch_op_from_mojo,
 )

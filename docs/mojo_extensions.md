@@ -113,6 +113,12 @@ tiles in dynamic (`extern`) shared memory, sized per launch by
 capped that way, so those kernels assemble under any ptxas and any target, and
 nothing has to be probed or gated.
 
+The ptxas itself comes from the `nvidia-cuda-nvcc-cu12` wheel (CUDA 12.8)
+the package depends on: `torch_mojo_backend/_ptxas.py` sets
+`MODULAR_NVPTX_COMPILER_PATH` to it when the variable is unset, before `max`
+is imported, so the cubins load on any r570+ driver instead of requiring the
+driver that MAX's own bundled ptxas assumes. An explicit setting wins.
+
 Builds are protected by a per-identity file lock (`flock`) and written to a
 temporary file before an atomic rename. Concurrent requests for one identity,
 in this process or another, compile it once, and an interrupted compiler

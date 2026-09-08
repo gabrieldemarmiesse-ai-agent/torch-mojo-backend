@@ -43,6 +43,10 @@ pip install torch-mojo-backend
 uv add torch-mojo-backend
 ```
 
+On NVIDIA GPUs the kernels are assembled with the CUDA 12.8 `ptxas` from the
+`nvidia-cuda-nvcc-cu12` wheel installed alongside, so any driver from r570 up
+works; set `MODULAR_NVPTX_COMPILER_PATH` to use a different ptxas.
+
 ## Quick Start
 
 
