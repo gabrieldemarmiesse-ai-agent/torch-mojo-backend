@@ -16,21 +16,6 @@ def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
     )
 
 
-def gpt2_decode_attention(
-    query: MaxTensor, key: MaxTensor, value: MaxTensor, mask: MaxTensor
-) -> MaxTensor:
-    """Pure-Mojo single-query attention for contiguous BHSD graph tensors."""
-    return F.custom(
-        name="gpt2_decode_attention",
-        device=query.device,
-        values=[query, key, value, mask],
-        out_types=[
-            TensorType(dtype=query.dtype, shape=query.shape, device=query.device)
-        ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
-    )[0]
-
-
 def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_and operation.
