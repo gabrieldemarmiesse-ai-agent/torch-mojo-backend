@@ -4889,7 +4889,7 @@ def test_fast_addmm_gfx942_unaligned_k(mojo_gpu):
     )
 
 
-def test_fast_gpt2_decode_attention_with_strided_kv(mojo_gpu):
+def test_fast_decode_attention_with_strided_kv(mojo_gpu):
     batch, heads, seq_len, capacity, head_dim = 4, 12, 8, 16, 64
     query = torch.randn(batch, heads, 1, head_dim)
     key_storage = torch.randn(batch, heads, capacity, head_dim)
@@ -4908,9 +4908,9 @@ def test_fast_gpt2_decode_attention_with_strided_kv(mojo_gpu):
     torch.testing.assert_close(actual, ref, atol=2e-4, rtol=2e-4)
 
 
-def test_fast_gpt2_logits_argmax(mojo_gpu):
+def test_fast_wide_row_argmax(mojo_gpu):
     if list(get_accelerators())[0].architecture_name != "gfx942":
-        pytest.skip("the GPT-2 argmax specialization targets gfx942")
+        pytest.skip("the wide-row argmax specialization targets gfx942")
 
     logits = torch.randn(256, 50257)
     logits[:, 123] = 100.0
