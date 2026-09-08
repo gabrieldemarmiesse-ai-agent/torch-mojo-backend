@@ -57,7 +57,7 @@ from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
 from std.os import getenv
-from std.time import perf_counter_ns
+from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext, DeviceStream
 
 from std.atomic import Atomic, Ordering
@@ -121,6 +121,12 @@ comptime SEND_WR_DEPTH = 64
 comptime WORK_SLOTS = 512
 comptime MAX_NODES = 16
 comptime DEFAULT_IB_TIMEOUT_S: Float64 = 60.0
+# ncclCommAbort's bound on waiting for the progress thread: long enough for
+# it to notice MB_STOP (immediate when idle, at most one poll_cq when inside
+# `_run_exchange` -- see `_stop_requested`), short enough that abort's
+# documented "don't wait" contract still holds even if the thread is wedged
+# somewhere this bound does not anticipate.
+comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
 # Bytes of the inbox read back by the flush; any read of the destination
 # device flushes the writes ahead of it, the size is irrelevant.
 comptime FLUSH_BYTES = 4
@@ -552,6 +558,41 @@ def _stop_proxy(mut st: IbState):
     )
     _ = external_call["pthread_join", Int32](st.thread_id, Int64(0))
     st.thread_id = 0
+
+
+def ib_signal_abort(ib: Int):
+    """`ncclCommAbort`'s hook: raise MB_STOP and reclaim the progress thread
+    without ncclCommDestroy's unbounded wait.
+
+    Left unsignaled, the thread spins on the mailbox forever (nothing else
+    ever sets MB_STOP for it) and burns one CPU core for the rest of the
+    process. Unlike `_stop_proxy`, the join here is bounded
+    (`IB_ABORT_JOIN_TIMEOUT_S`) with `pthread_tryjoin_np`, polled rather than
+    blocking: abort must not hang because a dead peer left this rank's
+    thread waiting inside `_run_exchange` for a completion that will never
+    come -- `_stop_requested` is what actually gets it out of there quickly;
+    this bound is only insurance against the case that doesn't anticipate.
+    A thread this gives up on is simply left running; it exits on its own
+    once it next checks MB_STOP, and the process exiting reclaims it either
+    way.
+    """
+    if ib == 0:
+        return
+    ref st = _st(ib)[]
+    if st.thread_id == 0:
+        return
+    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+        _mb(st, MB_STOP), 1
+    )
+    var tid = st.thread_id
+    var deadline = perf_counter_ns() + Int(IB_ABORT_JOIN_TIMEOUT_S * 1.0e9)
+    while perf_counter_ns() < deadline:
+        var retval = unsafe_alloc[Int64](1)
+        var rc = external_call["pthread_tryjoin_np", Int32](tid, retval)
+        if rc == 0:
+            st.thread_id = 0
+            return
+        sleep(0.001)
 
 
 def _callback_address() -> Int:

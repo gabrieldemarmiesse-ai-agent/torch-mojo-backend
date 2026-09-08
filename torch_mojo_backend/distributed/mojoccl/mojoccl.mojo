@@ -91,6 +91,7 @@ from internode import (
     ib_port_lid,
     ib_port_mtu,
     ib_setup,
+    ib_signal_abort,
     ib_teardown,
 )
 from internode_kernels import copy_bytes, inbox_add, place_blocks
@@ -734,8 +735,12 @@ def ncclCommAbort(comm: Int64) abi("C") -> Int32:
     # forever inside its own barrier spin, and a queue pair torn down under
     # an in-flight RDMA write is worse than one left alone) -- matches
     # ncclCommAbort's documented "don't wait" contract. ncclCommDestroy is
-    # never called after abort() by nccl.py's NcclComm.
+    # never called after abort() by nccl.py's NcclComm. The progress thread
+    # is the one thing still stopped here: left running it spins a CPU core
+    # for the rest of the process, and `ib_signal_abort`'s join is bounded so
+    # this still does not wait in the way the contract forbids.
     state.aborted = True
+    ib_signal_abort(state.ib)
     return NCCL_SUCCESS
 
 
