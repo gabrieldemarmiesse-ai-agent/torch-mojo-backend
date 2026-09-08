@@ -325,7 +325,7 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
                         break
             elif op == IBV_WC_RDMA_WRITE:
                 sends_done += 1
-        if Int(n) == 0 and perf_counter_ns() > deadline:
+        if perf_counter_ns() > deadline:
             st.error = 3
             w.status = 2
             return
@@ -365,7 +365,7 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
                     return
                 if Int32(ld32(c, WC_OPCODE)) == IBV_WC_RDMA_READ:
                     flushed = True
-            if Int(n) == 0 and perf_counter_ns() > deadline:
+            if perf_counter_ns() > deadline:
                 st.error = 7
                 w.status = 2
                 return
@@ -393,20 +393,26 @@ def _callback_address() -> Int:
 # ===-------------------------------------------------------------------=== #
 
 
-def _readlink(path: String) -> String:
-    var buf = alloc_bytes(1024)
+def _realpath(path: String) -> String:
+    """realpath(3): the ABSOLUTE /sys/devices path behind a sysfs symlink.
+
+    `readlink` would return the stored relative target (`../../..0000:18:00.0`),
+    and two of those share no comparable prefix -- the whole point here is to
+    compare where a GPU and an HCA sit in one PCI tree.
+    """
+    var buf = alloc_bytes(4096)
     var cpath = alloc_bytes(path.byte_length() + 1)
     var pb = path.as_bytes()
     for i in range(len(pb)):
         cpath[unsafe_offset=i] = pb[i]
-    var n = Int(
-        external_call["readlink", Int64](cpath, buf, UInt64(1023))
-    )
-    if n <= 0:
+    var rc = Int(external_call["realpath", Int64](cpath, buf))
+    if rc == 0:
         return String("")
     var s = String("")
-    for i in range(n):
+    var i = 0
+    while i < 4095 and buf[unsafe_offset=i] != 0:
         s += chr(Int(buf[unsafe_offset=i]))
+        i += 1
     return s^
 
 
@@ -434,14 +440,14 @@ def _choose_port(
     """
     if len(ports) == 1 or gpu_bdf.byte_length() == 0:
         return local_rank % len(ports)
-    var gpu_path = _readlink("/sys/bus/pci/devices/" + gpu_bdf)
+    var gpu_path = _realpath("/sys/bus/pci/devices/" + gpu_bdf)
     if gpu_path.byte_length() == 0:
         return local_rank % len(ports)
     var best = -1
     var best_score = -1
     var ties = 0
     for i in range(len(ports)):
-        var hca_path = _readlink(
+        var hca_path = _realpath(
             "/sys/class/infiniband/" + ports[i].name + "/device"
         )
         var score = _common_prefix(gpu_path, hca_path)
@@ -456,7 +462,7 @@ def _choose_port(
         # pair of GPUs). Spread ranks over them deterministically.
         var chosen = List[Int]()
         for i in range(len(ports)):
-            var hca_path = _readlink(
+            var hca_path = _realpath(
                 "/sys/class/infiniband/" + ports[i].name + "/device"
             )
             if _common_prefix(gpu_path, hca_path) == best_score:
@@ -489,9 +495,20 @@ def ib_setup(
             + (" matching MOJOCCL_IB_HCA=" + want if want.byte_length() > 0 else "")
             + "; a multi-node communicator needs one"
         )
-    var gpu_bdf = device_pci_bus_id(driver, ordinal)
+    # Only a hint for HCA affinity: a driver without the symbol, or a
+    # device that will not report one, falls back to round-robin.
+    var gpu_bdf = String("")
+    try:
+        gpu_bdf = device_pci_bus_id(driver, ordinal)
+    except:
+        pass
     var pick = _choose_port(ports, gpu_bdf, local_rank)
     ref port = ports[pick]
+    # These nodes carry ~10 IB HCAs and every rank opened all of them to
+    # read their ports; hold only the one this rank will use.
+    for i in range(len(ports)):
+        if ports[i].ctx != port.ctx:
+            ibv.close_device(ports[i].ctx)
 
     var st = IbState(ibv^, region, my_node, nnodes)
     st.hca = String(port.name)
@@ -738,6 +755,47 @@ def ib_enqueue(
         _callback_address(),
         st.works + slot * size_of[IbWork](),
     )
+
+
+def ib_exchange_now(
+    ib: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+) raises:
+    """Run one exchange inline on the calling thread instead of from a
+    stream callback.
+
+    The bring-up self-test uses it: the transport can be exercised on a host
+    with IB but no GPU (registered host memory, no stream to hang a callback
+    on), which is where the bootstrap/QP/immediate wiring is cheapest to
+    debug. Never correct in a collective -- there the callback's position in
+    stream order is the whole ordering argument.
+    """
+    ref st = _st(ib)[]
+    var w = IbWork()
+    w.state = ib
+    w.send_addr = send_addr
+    w.send_bytes = send_bytes
+    w.inbox_base = inbox_base
+    w.slot_bytes = slot_bytes
+    w.do_send = 1 if do_send else 0
+    w.nrecv = nrecv
+    w.flush_addr = flush_addr
+    w.seq = seq
+    w.status = 0
+    var wp = unsafe_alloc[IbWork](1)
+    wp.unsafe_write(w^)
+    _ib_progress(OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(wp)))
+    if wp[unsafe_offset=0].status != 1:
+        raise Error(
+            "mojoccl: inline exchange failed, ib error " + String(st.error)
+        )
 
 
 def ib_report(ib: Int):

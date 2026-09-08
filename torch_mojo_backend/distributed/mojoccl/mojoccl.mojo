@@ -393,7 +393,7 @@ def ncclGetUniqueId(uid_out: Pointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     try:
         make_unique_id(uid_out)
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_SYSTEM_ERROR
 
 
@@ -647,6 +647,12 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
         var ptr = _comm_ptr(comm)
         ref state = ptr[]
         if not state.aborted:
+            # The inter-node callbacks were enqueued on the CALLER's stream,
+            # not on the context's own, and they dereference the IbState this
+            # tears down -- so drain that stream too before touching it.
+            if state.last_stream != 0:
+                _ensure_stream_cached(state, state.last_stream)
+                state.stream_cache[state.last_stream].synchronize()
             state.ctx.synchronize()
             ib_teardown(state.ib)
             for r in range(state.local_world):
@@ -654,7 +660,7 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
                     close_handle(state.driver, state.regions[r])
             free_region(state.driver, state.owned_base)
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
@@ -707,7 +713,7 @@ def ncclCommGetAsyncError(
         )
         err_out[] = NCCL_REMOTE_ERROR if Int(word) != 0 else NCCL_SUCCESS
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
