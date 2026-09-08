@@ -280,15 +280,17 @@ unchanged; NCCL/RCCL stays the default. Design and measurements:
 Scope, deliberately narrow — it is an experiment showing Mojo can write
 NCCL-class collectives, not a general library:
 
-- one node, 2–8 ranks, one process per GPU under torchrun (`MAX_WORLD = 8`);
-  multi-node transport is in progress on this branch — see "Multi-node"
-  below;
+- 2–8 ranks per node (`MAX_WORLD = 8`), up to 16 nodes, one process per GPU
+  under torchrun; the inter-node hop is Mojo over libibverbs — see
+  "Multi-node" below;
 - `ncclAllReduce` (float32/float16/bfloat16/int32/int64, SUM and AVG),
   `ncclBroadcast` and `ncclAllGather` (every dtype, byte-granular);
   `ncclReduce`, `ncclReduceScatter`, `ncclSend`, `ncclRecv` return
   `ncclInvalidUsage`, so DDP works and anything needing them does not;
-- the rendezvous is a directory under `/dev/shm` encoded in the 128-byte
-  `ncclUniqueId` (rank 0 removes it once every rank has opened its peers);
+- the rendezvous is a TCP socket that `ncclGetUniqueId` opens on rank 0;
+  the 128-byte `ncclUniqueId` carries its address, port and a random magic
+  (NCCL's shape), and `ncclCommInitRank` runs three relayed all-gathers over
+  it (host identity, IPC handle plus IB connection data, barrier);
 - every rank owns one IPC-shared staging region (`MOJOCCL_REGION_MB`, default
   256 MiB, multiple of 4 KiB; larger requests are chunked). MAX's own
   allocations cannot be shared across processes (§5.6 of the study), which
@@ -310,107 +312,96 @@ on an MI300A yet.
 
 ### Multi-node
 
-Work in progress on this branch (`mojo-collectives-multinode`). Everything
-in this subsection describes the target design and the validation harness
-for it, not (yet) a shipped feature — check
-`torch_mojo_backend/distributed/mojoccl/` and the git log for current
-status.
+The inter-node hop is Mojo too: no vendor collective library anywhere.
+Each collective on a communicator spanning N nodes runs, per chunk of at
+most `MOJOCCL_REGION_MB`: the intra-node reduce-scatter
+(`reduce_scatter_stage`) leaves every rank its shard of the node-reduced
+bucket in its own `stage_out`; each rank RDMA-writes that shard to the
+counterpart rank (same `local_rank`) on every other node and receives theirs
+into a third, cap-sized `network` area of its region; a small kernel sums the
+N−1 inbox shards into the shard; the intra-node all-gather
+(`allgather_finish`) then pulls the globally reduced shards into the user
+output, scaled for AVG. Broadcast and all-gather use the same RDMA path with
+a simpler schedule (root's node fans out to its counterparts, then
+intra-node; node blocks exchanged, then placed by global rank). Single-node
+communicators keep the fused intra-node path and never touch IB.
+
+**Transport** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
+internode_kernels,bootstrap}.mojo`): libibverbs is dlopened; setup calls are
+symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
+through the `ibv_context_ops` table at the header's offsets, as NCCL's
+`ibvwrap` does. One RC queue pair per remote node, attributes borrowed from
+NCCL's `net_ib/connect.cc` (cited in the source); one `ibv_reg_mr` of the
+whole region (`nvidia_peermem`; dmabuf is not implemented), with relaxed
+ordering through `ibv_reg_mr_iova2`; each shard is one
+`IBV_WR_RDMA_WRITE_WITH_IMM`, empty recv work requests exist only so the
+immediate produces a completion, and a self-QP `IBV_WR_RDMA_READ` flush
+orders the payload in GPU memory behind the completion that landed in host
+memory. The inbox is double-buffered by the exchange counter's parity
+carried in the immediate, which is sound only because every exchange is
+all-to-all: a rank whose shard is empty (7 of 8 ranks on DDP's 4-byte AVG
+allreduce) still posts a 16-byte credit. The GPU/network hand-off is a
+spinning progress thread per rank (one core) driven through a pinned,
+device-mapped mailbox: a one-thread kernel releases the exchange, the thread
+posts, waits for the N−1 arrivals and flushes, a second one-thread kernel
+spins until it is done. A `cuLaunchHostFunc`/`hipLaunchHostFunc` stream
+callback does the same job behind `MOJOCCL_IB_PROXY=0` and costs about
+480 µs of fixed driver latency per exchange on this cluster (2.6× slower at
+the DDP bucket), which is why the thread is the default. HCA choice: the
+longest common `/sys/devices` prefix between the GPU's and the HCA's PCI
+paths, ties by `local_rank`; only ACTIVE InfiniBand ports (the RoCE ports
+are skipped). Addressing is LID-only, so one IB subnet.
+
+| variable | default | controls |
+|---|---|---|
+| `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
+| `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | deadline for every bootstrap socket wait |
+| `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
+| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for its peers' shards before latching an error |
+| `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread |
+| `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
+| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, exchanges, mean µs posting / waiting / flushing |
+| `MOJOCCL_REGION_MB` | 256 | region area size; a multi-node communicator has three areas (`signal, stage_in, stage_out, network`) |
+
+Limits and failure modes: 8 ranks per node, 16 nodes; more than one node
+with no ACTIVE InfiniBand port fails `ncclCommInitRank` with "no ACTIVE
+InfiniBand port found" (so Slingshot on Adastra is not covered; a
+libfabric/cxi transport would be a second backend); a peer that stops
+responding is reported through `ncclCommGetAsyncError` after
+`MOJOCCL_IB_TIMEOUT_S`; a stale unique id (tag `MOJOCCL2`) is rejected with
+a clear message.
+
+**Requirements.** rdma-core/libibverbs on the nodes (here MLNX OFED 24.10),
+GPUDirect RDMA through `nvidia_peermem`, active InfiniBand ports reachable
+between every pair of nodes, a routable interface for the TCP bootstrap.
 
 **Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
-is a 16-rank (2 nodes × 8 GPU) SLURM job that runs `tests/ddp_worker.py`
-(`collectives`/`ddp_parity`/`stress`), the allreduce device-time bench
-(`ar_bench_gpt2.py`), and a 40-step nanoGPT DDP run, each ABBA'd between
-real NCCL and mojoccl:
+is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
+(`collectives`/`ddp_parity`/`stress`) under NCCL and under mojoccl, the
+allreduce device-time bench (`ar_bench_gpt2.py`) in ABBA order, and a
+40-step nanoGPT DDP run under both. `RUN_MOJO=0` keeps only the NCCL legs.
+`tests/multinode/summarize.py <job log>` turns a log into the tables below.
+`/home/gabriel/ddp_work/ib_selftest/` holds two GPU-free self-tests of the
+bootstrap and of the RDMA transport between processes (they run on the
+login node, which has IB HCAs; set `MOJOCCL_IB_PROXY=0` there).
 
-```bash
-# Vendor-only NCCL reference (no mojoccl multi-node transport needed):
-sbatch --export=ALL,RUN_MOJO=0 tests/multinode/run_two_node_checks.sbatch
-# Full A/B once the transport below lands:
-sbatch tests/multinode/run_two_node_checks.sbatch
-# Turn a job log into one markdown report:
-uv run --no-sync python tests/multinode/summarize.py \
-    /home/gabriel/ddp_work/logs/mojoccl_2node_<jobid>.log
-```
+**Results**, 16 ranks on 2×8 H100 (job 234040, nodes cl02s02dgx26 +
+cl02s04dgx01), `ar_bench_gpt2.py` through the process group, ABBA legs,
+medians in µs; NCCL 2.31.2 picks `NVLS_TREE/SIMPLE` from 9 MiB up:
 
-See `tests/multinode/README.md` for the full leg-by-leg description, and
-`/home/gabriel/ddp_work/mojo_collectives/mn/NCCL_REFERENCE_16.md` for the
-vendor-only 16-rank NCCL reference numbers this harness already measured
-(node names, SM clock, NCCL algo/protocol choices).
-
-**Algorithm (hierarchical allreduce).** Each bucket is reduced in three
-steps: an intra-node Mojo reduce-scatter leaves every rank owning
-`1/local_world_size` of the reduced bucket (the same RS kernel the
-intra-node path already uses); each rank then exchanges its shard with its
-counterpart rank on every other node over RDMA, directly between GPUs
-using GPUDirect RDMA (`ibv_reg_dmabuf_mr` on a handle obtained from the
-device buffer, matching NCCL's own `net_ib` transport — see the
-feasibility study §7 for the verbs call sequence: queue-pair connect via
-the c10d store, `ibv_post_send` WRITE/WRITE_WITH_IMM, `ibv_poll_cq`); an
-intra-node Mojo all-gather then reassembles the fully-reduced bucket. No
-vendor collective library is on the inter-node hop — this is the
-libibverbs-based alternative in the feasibility study's §7, not the
-NCCL/RCCL-inter-node fallback its §8 minimal plan describes; the trade is
-more engineering (an RDMA transport of our own, ≈2–3k lines per the study's
-estimate) for staying inside this project's "bring the whole GPU stack
-ourselves" motto all the way to the wire.
-
-**New environment variables (TODO — to be filled in by whichever agent
-lands the transport; keep this list in sync with what it actually reads).**
-Expected, from the feasibility study's §7 verbs sketch and this project's
-existing `TORCH_MOJO_BACKEND_*`/`MOJOCCL_*` naming:
-
-- `MOJOCCL_SOCKET_IFNAME` — TODO: network interface for the store/bootstrap
-  exchange (QPN/LID/GID, rkeys), the mojoccl analog of NCCL's
-  `NCCL_SOCKET_IFNAME`.
-- `MOJOCCL_IB_HCA` — TODO: which HCA(s)/ports to use when a node has more
-  than one (this cluster's nodes report multiple IB + RoCE devices per
-  `docs/mojo_collectives_feasibility.md` §5.5 — 10×400 Gb/s IB +
-  2×100 Gb/s RoCE, unmerged); presumably an NCCL-`NCCL_IB_HCA`-style
-  include/exclude list.
-- TODO: whatever else the transport needs — a GID index override, a
-  timeout/retry knob for the RDMA connection setup, a debug-logging
-  variable analogous to `NCCL_DEBUG`, anything else that shows up in
-  `torch_mojo_backend/distributed/mojoccl/`. **The transport agent should
-  replace this TODO list with the real names and one line each on what
-  they control**, the way `docs/distributed.md` documents
-  `MOJOCCL_REGION_MB` above.
-
-**Requirements (host side).** `rdma-core`/`libibverbs` (the verbs library
-the transport dlopens, the same way `nccl.py` dlopens `libnccl.so.2` —
-no C++ build, no vendor SDK); GPUDirect RDMA support so a QP can post sends
-directly from GPU memory, either the `nvidia_peermem` kernel module (the
-classic path NCCL's `net_ib` uses, see `net_ib/connect.cc` in the
-feasibility study's citations) or a dmabuf-based path
-(`ibv_reg_dmabuf_mr` off `cuMemGetHandleForAddressRange`, the same
-mechanism the feasibility study cites for NCCL's own dmabuf registration);
-active InfiniBand (or RoCE) ports reachable between every pair of nodes.
-None of this is optional the way the intra-node kernels' IB dependency
-isn't optional either — there is no non-RDMA fallback path planned for the
-performance-bar case (a gloo/TCP-staged shard exchange is the
-"acceptable for a demo, not for the bar" alternative the feasibility study
-names in §7, and is not what this transport targets).
-
-**Not covered: Slingshot.** This RDMA/libibverbs transport is
-NVIDIA-cluster-shaped (InfiniBand/RoCE verbs). CINES Adastra's Slingshot
-fabric needs a separate libfabric/cxi transport (see the "Cluster notes
-(SLURM, Slingshot — AMD MI300A)" section above, and
-`docs/mojo_collectives_feasibility.md` §7's cxi estimate) — out of scope
-here, and multi-node mojoccl will raise or fall back to NCCL/RCCL rather
-than silently do something slow on Slingshot until that transport exists.
-
-**Results.** To be filled in from `tests/multinode/summarize.py`'s output
-once the transport lands (allreduce bench medians/ratio by dtype and size,
-`ddp_worker` pass/fail by mode, and the nanoGPT DDP step-40 loss/val-loss/
-tok-s for each leg):
-
-| dtype | size (MiB) | vendor median (µs) | mojo median (µs) | mojo/vendor |
-|---|---|---|---|---|
-| _(TODO: paste the "Allreduce bench" table from a `summarize.py` run here)_ | | | | |
-
-| ccl | mode | result |
-|---|---|---|
-| _(TODO: paste the "ddp_worker checks" table here)_ | | |
-
-| ccl | leg | step | loss | val loss | tok/s | result |
+| MiB | mojo fp32 | NCCL fp32 | ratio | mojo bf16 | NCCL bf16 | ratio |
 |---|---|---|---|---|---|---|
-| _(TODO: paste the "nanoGPT DDP training" table here)_ | | | | | | |
+| 1 | 52–81 | 87–117 | 0.6–0.9 | 52–57 | 86 | 0.60 |
+| 9 | 119 | 174 | 0.68 | 120 | 167 | 0.72 |
+| 27 (DDP bucket) | 278 | 264 | 1.05 | 279 | 262 | 1.06 |
+| 168 (tail bucket) | 1527 | 939 | 1.63 | 1522 | 947 | 1.61 |
+| 512 | 4619 | 2366 | 1.95 | 4622 | 2385 | 1.94 |
+
+`collectives`, `ddp_parity` and `stress` pass at 16 ranks. With
+`MOJOCCL_IB_TRACE=1` the RDMA itself runs at 40–45 GB/s per rank, near line
+rate for one 400 Gb/s HCA; at the bucket the mean split is 0.05 µs posting,
+~330 µs waiting (the transfer), 2.3 µs flushing. Above 27 MiB the gap is the
+intra-node half (the split reduce-scatter/all-gather pair is ~1004 µs at
+168 MiB on one node against NCCL's 751 µs NVLS multicast), not the network.
+Pipelining the shard so the RDMA overlaps the reduce-scatter is the next
+lever for the large sizes.
