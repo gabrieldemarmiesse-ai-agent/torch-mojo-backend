@@ -382,6 +382,10 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
 
     var sends_done = 0
     while sends_done < nsend or _arrivals(st, parity) < w.nrecv:
+        if _stop_requested(st):
+            st.error = 6
+            w.status = 2
+            return
         var n = poll_cq(st.cq, 16, _b(st.wc))
         if n < 0:
             st.error = 2
@@ -423,6 +427,10 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
             return
         var flushed = False
         while not flushed:
+            if _stop_requested(st):
+                st.error = 6
+                w.status = 2
+                return
             var n = poll_cq(st.cq, 16, _b(st.wc))
             if n < 0:
                 st.error = 5
@@ -458,6 +466,27 @@ def _arrivals(st: IbState, parity: Int) -> Int:
 @always_inline
 def _mb(st: IbState, off: Int) -> Pointer[UInt64, MutAnyOrigin]:
     return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox + off)
+
+
+@always_inline
+def _stop_requested(st: IbState) -> Bool:
+    """True once `ncclCommAbort` (or teardown) has raised MB_STOP.
+
+    Checked inside `_run_exchange`'s two poll loops so a stop request ends a
+    stuck exchange (a dead peer, nothing left to poll) promptly instead of
+    making `_stop_proxy`'s `pthread_join` wait out the rest of
+    `MOJOCCL_IB_TIMEOUT_S`. Only meaningful under the proxy -- the mailbox is
+    allocated only when `st.proxy`, so the `MOJOCCL_IB_PROXY=0` callback path
+    and the self-test's `ib_exchange_now` (no mailbox, no thread) never see
+    it set.
+    """
+    return (
+        st.mailbox != 0
+        and Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+            _mb(st, MB_STOP)
+        )
+        != 0
+    )
 
 
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
