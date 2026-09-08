@@ -764,63 +764,70 @@ def ib_setup(
     st.port = port.port
     st.timeout_ns = Int(_ib_timeout_s() * 1.0e9)
 
-    st.pd = st.ibv.alloc_pd(st.ctx)
-    if st.pd == 0:
-        raise Error("mojoccl: ibv_alloc_pd failed on " + st.hca)
-    var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
-    var acc = (
-        IBV_ACCESS_LOCAL_WRITE
-        | IBV_ACCESS_REMOTE_WRITE
-        | IBV_ACCESS_REMOTE_READ
-    )
-    st.mr = (
-        st.ibv.reg_mr_relaxed(st.pd, region, region_bytes, acc)
-        if ro
-        else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
-    )
-    if st.mr == 0:
-        raise Error(
-            "mojoccl: ibv_reg_mr of the "
-            + String(region_bytes // (1024 * 1024))
-            + " MiB device region failed on "
-            + st.hca
-            + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+    # Every step below can raise after an earlier one already allocated a
+    # real ibverbs/host resource (pd, mr, cq, QPs, the pinned mailbox) --
+    # unwind whatever got that far instead of leaking it.
+    try:
+        st.pd = st.ibv.alloc_pd(st.ctx)
+        if st.pd == 0:
+            raise Error("mojoccl: ibv_alloc_pd failed on " + st.hca)
+        var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
+        var acc = (
+            IBV_ACCESS_LOCAL_WRITE
+            | IBV_ACCESS_REMOTE_WRITE
+            | IBV_ACCESS_REMOTE_READ
         )
-    var mrp = P8(unsafe_from_address=st.mr)
-    st.lkey = ldu32(mrp, MR_LKEY)
-    st.rkey = ldu32(mrp, MR_RKEY)
-
-    # Host landing pad for the flush read.
-    st.flush_host = Int(alloc_bytes(4096))
-    st.flush_mr = st.ibv.reg_mr(
-        st.pd, st.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
-    )
-    if st.flush_mr == 0:
-        raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
-    st.flush_lkey = ldu32(P8(unsafe_from_address=st.flush_mr), MR_LKEY)
-
-    st.cq = st.ibv.create_cq(st.ctx, CQ_SIZE)
-    if st.cq == 0:
-        raise Error("mojoccl: ibv_create_cq failed")
-
-    for j in range(nnodes):
-        if j == my_node:
-            continue
-        var qp = create_rc_qp(
-            st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
+        st.mr = (
+            st.ibv.reg_mr_relaxed(st.pd, region, region_bytes, acc)
+            if ro
+            else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
         )
-        qp_to_init(st.ibv, qp, st.port)
-        st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
-    st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
-    qp_to_init(st.ibv, st.flush_qp, st.port)
+        if st.mr == 0:
+            raise Error(
+                "mojoccl: ibv_reg_mr of the "
+                + String(region_bytes // (1024 * 1024))
+                + " MiB device region failed on "
+                + st.hca
+                + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+            )
+        var mrp = P8(unsafe_from_address=st.mr)
+        st.lkey = ldu32(mrp, MR_LKEY)
+        st.rkey = ldu32(mrp, MR_RKEY)
 
-    if st.proxy:
-        st.mailbox = alloc_host(driver, MB_BYTES)
-        st.mailbox_dev = host_device_ptr(driver, st.mailbox)
-        for i in range(MB_BYTES // 8):
-            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox)[
-                unsafe_offset=i
-            ] = 0
+        # Host landing pad for the flush read.
+        st.flush_host = Int(alloc_bytes(4096))
+        st.flush_mr = st.ibv.reg_mr(
+            st.pd, st.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
+        )
+        if st.flush_mr == 0:
+            raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
+        st.flush_lkey = ldu32(P8(unsafe_from_address=st.flush_mr), MR_LKEY)
+
+        st.cq = st.ibv.create_cq(st.ctx, CQ_SIZE)
+        if st.cq == 0:
+            raise Error("mojoccl: ibv_create_cq failed")
+
+        for j in range(nnodes):
+            if j == my_node:
+                continue
+            var qp = create_rc_qp(
+                st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
+            )
+            qp_to_init(st.ibv, qp, st.port)
+            st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
+        st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
+        qp_to_init(st.ibv, st.flush_qp, st.port)
+
+        if st.proxy:
+            st.mailbox = alloc_host(driver, MB_BYTES)
+            st.mailbox_dev = host_device_ptr(driver, st.mailbox)
+            for i in range(MB_BYTES // 8):
+                Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox)[
+                    unsafe_offset=i
+                ] = 0
+    except e:
+        _teardown_ib_resources(st)
+        raise e
 
     var holder = unsafe_alloc[IbState](1)
     holder.unsafe_write(st^)
@@ -1103,18 +1110,23 @@ def ib_report(ib: Int):
     )
 
 
-def ib_teardown(ib: Int):
-    if ib == 0:
-        return
-    ref st = _st(ib)[]
-    _stop_proxy(st)
-    ib_report(ib)
+def _teardown_ib_resources(mut st: IbState):
+    """Release every ibverbs/host resource `ib_setup` may have created.
+
+    Shared by `ib_teardown` (a live communicator) and `ib_setup`'s own
+    failure path (a later step raised after an earlier one already
+    succeeded) -- both leave `st` in the same "some fields non-zero, some
+    still their zero default" shape, and every field here is zero-guarded
+    for exactly that reason.
+    """
     if st.mailbox != 0:
         # Pinned, device-mapped host memory: a scarce OS resource, unlike the
         # few hundred bytes of plain heap this struct also holds. Safe here
-        # and only here -- the progress thread is joined and the caller
-        # synchronized the stream the spin kernels were on. `open_driver`
-        # re-opens an already-loaded library, so it costs a refcount.
+        # and only here -- the progress thread is joined (or, from
+        # `ib_setup`'s failure path, never started) and, for a live
+        # communicator, the caller synchronized the stream the spin kernels
+        # were on. `open_driver` re-opens an already-loaded library, so it
+        # costs a refcount.
         try:
             free_host(open_driver(), st.mailbox)
         except:
@@ -1138,3 +1150,12 @@ def ib_teardown(ib: Int):
             st.ibv.close_device(st.ctx)
     except:
         pass
+
+
+def ib_teardown(ib: Int):
+    if ib == 0:
+        return
+    ref st = _st(ib)[]
+    _stop_proxy(st)
+    ib_report(ib)
+    _teardown_ib_resources(st)
