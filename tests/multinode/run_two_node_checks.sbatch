@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p kyutai_debug
+#SBATCH -p kyutai
 #SBATCH -N 2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
