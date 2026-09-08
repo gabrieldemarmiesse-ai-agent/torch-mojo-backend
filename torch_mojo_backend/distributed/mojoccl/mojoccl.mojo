@@ -384,9 +384,25 @@ def ncclCommInitRank(
         for r in range(Int(nranks)):
             if r == Int(rank):
                 continue
-            wait_for_rank(dir, r, timeout_s)
-            _ = read_rank_handle(dir, r, _any(peer_handle))
-            regions[r] = open_handle(lib, _any(peer_handle))
+            try:
+                wait_for_rank(dir, r, timeout_s)
+                _ = read_rank_handle(dir, r, _any(peer_handle))
+                regions[r] = open_handle(lib, _any(peer_handle))
+            except:
+                # A peer past this one never got opened: close whatever
+                # peers < r WERE opened and free our own region before
+                # propagating, so a failed init leaks no IPC mappings.
+                for r2 in range(Int(nranks)):
+                    if r2 != Int(rank) and regions[r2] != 0:
+                        try:
+                            close_handle(lib, regions[r2])
+                        except:
+                            pass
+                try:
+                    free_region(lib, base)
+                except:
+                    pass
+                raise
 
         var state = CommState(
             rank=Int(rank),
@@ -402,7 +418,7 @@ def ncclCommInitRank(
         handle_ptr.unsafe_write(state^)
         comm_out[] = Int64(Int(handle_ptr))
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
