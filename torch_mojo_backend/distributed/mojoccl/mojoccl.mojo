@@ -183,8 +183,11 @@ def _wrap_stream(ctx: DeviceContext, handle: Int64) raises -> DeviceStream:
 
 @export
 def ncclGetVersion(version: Pointer[Int32, MutAnyOrigin]) abi("C") -> Int32:
-    # 2.31.2-shaped: matches the pinned header this ABI was written against.
-    version[] = 22031
+    # 2.31.2, encoded per nccl.h.in's NCCL_VERSION macro: X*10000+Y*100+Z for
+    # Y>8 (true from 2.9 on) -- 2*10000 + 31*100 + 2 = 23102, matching the
+    # pinned header this ABI was written against. (A prior value here, 22031,
+    # did not decode to 2.31.2 under that formula.)
+    version[] = 23102
     return NCCL_SUCCESS
 
 
