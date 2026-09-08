@@ -360,6 +360,15 @@ def ncclCommInitRank(
         var ctx = DeviceContext(device_id=ordinal)
 
         var cap_bytes = _region_cap_bytes()
+        # A positive multiple of 4096 (the production kernel's own
+        # precondition, RESULTS.md §9) is what keeps every per-chunk offset
+        # `ncclAllReduce` forms (multiples of cap_bytes, one full chunk at a
+        # time) 16-byte aligned for every supported dtype -- 4096 divides
+        # evenly by 2, 4 and 8. A misconfigured MOJOCCL_REGION_MB (e.g. 0)
+        # would otherwise degrade chunk offsets to non-16-byte-aligned
+        # single-element steps.
+        if cap_bytes <= 0 or cap_bytes % 4096 != 0:
+            return NCCL_INVALID_ARGUMENT
         var region_bytes = signal_bytes() + 2 * cap_bytes
         var base = alloc_region(lib, region_bytes)
         region_init(ctx, base)
@@ -511,6 +520,15 @@ def ncclAllReduce(
             return NCCL_INVALID_ARGUMENT
         if op != NCCL_SUM and op != NCCL_AVG:
             return NCCL_INVALID_USAGE
+        # The production kernel's payload loops use 16-byte vector
+        # loads/stores on in_ptr/out_ptr and fault on a misaligned address
+        # (RESULTS.md §9). Every allocator-returned pointer and every chunk
+        # offset this function forms satisfy that (cap_bytes is validated a
+        # multiple of 4096 at init) -- only a mid-tensor view the caller
+        # passes directly can violate it, so reject that case here with a
+        # clear error instead of letting the kernel raise.
+        if Int(sendbuff) % 16 != 0 or Int(recvbuff) % 16 != 0:
+            return NCCL_INVALID_ARGUMENT
         var ptr = _comm_ptr(comm)
         ref state = ptr[]
         if state.aborted:
