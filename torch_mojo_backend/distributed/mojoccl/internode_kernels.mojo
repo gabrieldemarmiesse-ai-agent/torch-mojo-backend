@@ -18,9 +18,6 @@ from collectives_kernels import BLOCK, MAX_WORLD, _copy_bytes, _enqueue_cached
 
 comptime _UNROLL = 4
 comptime _MAX_BLOCKS = 432
-# (nnodes - 1) inbox slots; 16 nodes x 8 GPUs is far past what this library
-# is built for, and the array below is what makes it a compile-time bound.
-comptime MAX_NODES = 16
 
 
 @__llvm_metadata(

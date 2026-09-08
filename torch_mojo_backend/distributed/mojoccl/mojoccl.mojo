@@ -548,7 +548,8 @@ def _bootstrap(
     if topo.nnodes > MAX_NODES:
         raise Error(
             "mojoccl: " + String(topo.nnodes) + " nodes exceeds the "
-            + String(MAX_NODES) + "-node limit of the inbox layout"
+            + String(MAX_NODES)
+            + "-node limit of the per-node QPN table in the bootstrap blob"
         )
 
     var lib = open_driver()
