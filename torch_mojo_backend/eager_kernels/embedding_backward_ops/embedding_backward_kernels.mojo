@@ -55,7 +55,8 @@ from max.gpu.sync import barrier
 from std.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceContext
 from std.math import ceildiv
-from std.memory import AddressSpace, alloc, stack_allocation
+from std.memory import AddressSpace, stack_allocation
+from std.memory.alloc import unsafe_alloc
 from std.sys import inlined_assembly, is_amd_gpu, is_nvidia_gpu
 from std.sys.info import _is_sm_9x_or_newer, has_apple_gpu_accelerator
 
@@ -92,18 +93,19 @@ def _cached_max_grid(ctx: DeviceContext) raises -> Int:
     the per-op path.
     """
     var name = String(t"TMB_EMB_BWD_MAXGRID_{ctx.id()}")
-    if global_ptr := _get_global_or_null(name):
-        return global_ptr.value().bitcast[Int]()[]
+    var global_ptr = _get_global_or_null(name)
+    if global_ptr:
+        return global_ptr.value().unsafe_bitcast[Int]()[]
     var sm_count: Int
     try:
         sm_count = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     except:
         sm_count = 64
     var value = max(1, sm_count) * 16
-    var cached = alloc[Int](1)
+    var cached = unsafe_alloc[Int](1)
     cached[] = value
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), cached.bitcast[NoneType]()
+        StringSlice(name), cached.unsafe_bitcast[NoneType]()
     )
     return value
 
@@ -122,7 +124,7 @@ def _device_scope() -> StaticString:
 
 @always_inline
 def _atomic_add_f32(
-    ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin], value: Float32
+    ptr: Pointer[Scalar[DType.float32], MutAnyOrigin], value: Float32
 ):
     _ = Atomic[DType.float32, scope=_device_scope()].fetch_add[
         ordering=Ordering.RELAXED
@@ -131,7 +133,7 @@ def _atomic_add_f32(
 
 @always_inline
 def _atomic_add_f32_vec4(
-    ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
     value: SIMD[DType.float32, _VEC],
 ):
     # One 128-bit vector reduction replaces four scalar L2 atomic ops; the
@@ -146,12 +148,12 @@ def _atomic_add_f32_vec4(
         ](UInt64(Int(ptr)), value[0], value[1], value[2], value[3])
     else:
         comptime for k in range(_VEC):
-            _atomic_add_f32(ptr + k, value[k])
+            _atomic_add_f32(ptr.unsafe_offset(k), value[k])
 
 
 @__name("embedding_dense_backward_zero_vec4")
 def _zero_vec4(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     head_arg: Int64,
     vec_count_arg: Int64,
     tail_arg: Int64,
@@ -165,19 +167,21 @@ def _zero_vec4(
     var stride = Int(grid_dim.x) * _BLOCK
     # head/tail are < _VEC scalars around the 16-byte-aligned body.
     if tid < head:
-        grad_weight[tid] = 0.0
+        grad_weight[unsafe_offset=tid] = 0.0
     if tid < tail:
-        grad_weight[head + vec_count * _VEC + tid] = 0.0
+        grad_weight[unsafe_offset=head + vec_count * _VEC + tid] = 0.0
     var zeros = SIMD[DType.float32, _VEC](0.0)
     var v = tid
     while v < vec_count:
-        grad_weight.store[width=_VEC, alignment=16](head + v * _VEC, zeros)
+        grad_weight.unsafe_store[width=_VEC, alignment=16](
+            head + v * _VEC, zeros
+        )
         v += stride
 
 
 @__name("embedding_dense_backward_zero_scalar")
 def _zero_scalar(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -186,15 +190,15 @@ def _zero_scalar(
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < elements:
-        grad_weight[index] = 0.0
+        grad_weight[unsafe_offset=index] = 0.0
         index += stride
 
 
 @__name("embedding_dense_backward_scatter_vec4")
 def _scatter_vec4(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     vec_cols_arg: Int64,
     padding_idx_arg: Int64,
@@ -210,20 +214,20 @@ def _scatter_vec4(
     while e < total:
         var row = e // vec_cols
         var col = e - row * vec_cols
-        var target = Int(indices[row])
+        var target = Int(indices[unsafe_offset=row])
         if target != padding_idx:
-            var v = grad_output.load[width=_VEC, alignment=16](e * _VEC)
+            var v = grad_output.unsafe_load[width=_VEC, alignment=16](e * _VEC)
             _atomic_add_f32_vec4(
-                grad_weight + (target * vec_cols + col) * _VEC, v
+                grad_weight.unsafe_offset((target * vec_cols + col) * _VEC), v
             )
         e += stride
 
 
 @__name("embedding_dense_backward_scatter_scalar")
 def _scatter_scalar(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     embedding_dim_arg: Int64,
     padding_idx_arg: Int64,
@@ -239,17 +243,18 @@ def _scatter_scalar(
     while e < total:
         var row = e // embedding_dim
         var col = e - row * embedding_dim
-        var target = Int(indices[row])
+        var target = Int(indices[unsafe_offset=row])
         if target != padding_idx:
             _atomic_add_f32(
-                grad_weight + target * embedding_dim + col, grad_output[e]
+                grad_weight.unsafe_offset(target * embedding_dim + col),
+                grad_output[unsafe_offset=e],
             )
         e += stride
 
 
 @__name("embedding_dense_backward_count_zero")
 def _count_zero(
-    counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    counts: Pointer[Scalar[DType.int32], MutAnyOrigin],
     num_weights_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -258,14 +263,14 @@ def _count_zero(
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < num_weights:
-        counts[index] = 0
+        counts[unsafe_offset=index] = 0
         index += stride
 
 
 @__name("embedding_dense_backward_count")
 def _count(
-    counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    counts: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     padding_idx_arg: Int64,
 ):
@@ -276,18 +281,18 @@ def _count(
     var index = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * _BLOCK
     while index < num_indices:
-        var target = Int(indices[index])
+        var target = Int(indices[unsafe_offset=index])
         if target != padding_idx:
             _ = Atomic[DType.int32, scope=_device_scope()].fetch_add[
                 ordering=Ordering.RELAXED
-            ](counts + target, 1)
+            ](counts.unsafe_offset(target), 1)
         index += stride
 
 
 @__name("embedding_dense_backward_zero_untouched")
 def _zero_untouched(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    counts: Pointer[Scalar[DType.int32], MutAnyOrigin],
     num_weights_arg: Int64,
     vec_cols_arg: Int64,
 ):
@@ -306,8 +311,8 @@ def _zero_untouched(
     if col >= vec_cols:
         return
     while row < num_weights:
-        if counts[row] != 1:
-            grad_weight.store[width=_VEC, alignment=16](
+        if counts[unsafe_offset=row] != 1:
+            grad_weight.unsafe_store[width=_VEC, alignment=16](
                 (row * vec_cols + col) * _VEC, zeros
             )
         row += row_stride
@@ -315,10 +320,10 @@ def _zero_untouched(
 
 @__name("embedding_dense_backward_scatter_hist_vec4")
 def _scatter_hist_vec4(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    counts: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    counts: Pointer[Scalar[DType.int32], MutAnyOrigin],
     num_indices_arg: Int64,
     vec_cols_arg: Int64,
     padding_idx_arg: Int64,
@@ -334,26 +339,26 @@ def _scatter_hist_vec4(
     if col >= vec_cols:
         return
     while row < num_indices:
-        var target = Int(indices[row])
+        var target = Int(indices[unsafe_offset=row])
         if target != padding_idx:
-            var v = grad_output.load[width=_VEC, alignment=16](
+            var v = grad_output.unsafe_load[width=_VEC, alignment=16](
                 (row * vec_cols + col) * _VEC
             )
             var dst = (target * vec_cols + col) * _VEC
-            if counts[target] == 1:
+            if counts[unsafe_offset=target] == 1:
                 # Sole contributor: plain store skips the atomic
                 # read-modify-write and the zero-pass write for this row.
-                grad_weight.store[width=_VEC, alignment=16](dst, v)
+                grad_weight.unsafe_store[width=_VEC, alignment=16](dst, v)
             else:
-                _atomic_add_f32_vec4(grad_weight + dst, v)
+                _atomic_add_f32_vec4(grad_weight.unsafe_offset(dst), v)
         row += row_stride
 
 
 @__name("embedding_dense_backward_owner_vec4")
 def _owner_vec4(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     vec_cols_arg: Int64,
     num_weights_arg: Int64,
@@ -384,13 +389,15 @@ def _owner_vec4(
     while base < num_indices:
         var count = min(_OWN_TILE, num_indices - base)
         if tid < count:
-            var t = Int(indices[base + tid])
-            tile[tid] = Int32(-1) if t == padding_idx else Int32(t)
+            var t = Int(indices[unsafe_offset=base + tid])
+            tile[unsafe_offset=tid] = Int32(-1) if t == padding_idx else Int32(
+                t
+            )
         barrier()
         if active:
             for k in range(count):
-                if Int(tile[k]) == row:
-                    acc += grad_output.load[width=_VEC, alignment=16](
+                if Int(tile[unsafe_offset=k]) == row:
+                    acc += grad_output.unsafe_load[width=_VEC, alignment=16](
                         ((base + k) * vec_cols + col) * _VEC
                     )
         barrier()
@@ -398,16 +405,16 @@ def _owner_vec4(
     if active:
         # Full ownership: the plain store doubles as the zero pass for rows
         # no index touched.
-        grad_weight.store[width=_VEC, alignment=16](
+        grad_weight.unsafe_store[width=_VEC, alignment=16](
             (row * vec_cols + col) * _VEC, acc
         )
 
 
 @__name("embedding_dense_backward_owner_scalar")
 def _owner_scalar(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     embedding_dim_arg: Int64,
     num_weights_arg: Int64,
@@ -433,24 +440,28 @@ def _owner_scalar(
     while base < num_indices:
         var count = min(_OWN_TILE, num_indices - base)
         if tid < count:
-            var t = Int(indices[base + tid])
-            tile[tid] = Int32(-1) if t == padding_idx else Int32(t)
+            var t = Int(indices[unsafe_offset=base + tid])
+            tile[unsafe_offset=tid] = Int32(-1) if t == padding_idx else Int32(
+                t
+            )
         barrier()
         if active:
             for k in range(count):
-                if Int(tile[k]) == row:
-                    acc += grad_output[(base + k) * embedding_dim + col]
+                if Int(tile[unsafe_offset=k]) == row:
+                    acc += grad_output[
+                        unsafe_offset=(base + k) * embedding_dim + col
+                    ]
         barrier()
         base += _OWN_TILE
     if active:
-        grad_weight[row * embedding_dim + col] = acc
+        grad_weight[unsafe_offset=row * embedding_dim + col] = acc
 
 
 @__name("embedding_dense_backward_table_accum")
 def _table_accum(
-    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    scratch: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices_arg: Int64,
     embedding_dim_arg: Int64,
     num_weights_arg: Int64,
@@ -480,7 +491,7 @@ def _table_accum(
     var used = num_weights * _TABLE_COLS
     var i = tid
     while i < used:
-        table[i] = 0.0
+        table[unsafe_offset=i] = 0.0
         i += _TABLE_COLS * _TABLE_ROWG
     barrier()
 
@@ -498,23 +509,23 @@ def _table_accum(
             var t = InlineArray[Int, _TABLE_UNROLL](uninitialized=True)
             var v = InlineArray[Float32, _TABLE_UNROLL](uninitialized=True)
             comptime for u in range(_TABLE_UNROLL):
-                t[u] = Int(indices[row + u * _TABLE_ROWG])
+                t[u] = Int(indices[unsafe_offset=row + u * _TABLE_ROWG])
             comptime for u in range(_TABLE_UNROLL):
                 v[u] = grad_output[
-                    (row + u * _TABLE_ROWG) * embedding_dim + col
+                    unsafe_offset=(row + u * _TABLE_ROWG) * embedding_dim + col
                 ]
             comptime for u in range(_TABLE_UNROLL):
                 if t[u] != padding_idx:
                     _ = Atomic[DType.float32].fetch_add[
                         ordering=Ordering.RELAXED
-                    ](table + t[u] * _TABLE_COLS + tx, v[u])
+                    ](table.unsafe_offset(t[u] * _TABLE_COLS + tx), v[u])
             row += _TABLE_UNROLL * _TABLE_ROWG
         while row < row_end:
-            var t = Int(indices[row])
+            var t = Int(indices[unsafe_offset=row])
             if t != padding_idx:
                 _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
-                    table + t * _TABLE_COLS + tx,
-                    grad_output[row * embedding_dim + col],
+                    table.unsafe_offset(t * _TABLE_COLS + tx),
+                    grad_output[unsafe_offset=row * embedding_dim + col],
                 )
             row += _TABLE_ROWG
     barrier()
@@ -525,16 +536,16 @@ def _table_accum(
         var chunk_base = Int(block_idx.y) * num_weights
         var r = ty
         while r < num_weights:
-            scratch[(chunk_base + r) * dim_pad + col] = table[
-                r * _TABLE_COLS + tx
+            scratch[unsafe_offset=(chunk_base + r) * dim_pad + col] = table[
+                unsafe_offset=r * _TABLE_COLS + tx
             ]
             r += _TABLE_ROWG
 
 
 @__name("embedding_dense_backward_table_reduce")
 def _table_reduce(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    scratch: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    scratch: Pointer[Scalar[DType.float32], MutAnyOrigin],
     num_weights_arg: Int64,
     embedding_dim_arg: Int64,
     dim_pad_arg: Int64,
@@ -575,51 +586,53 @@ def _table_reduce(
             var base = r * dim_pad + (e - r * vec_pad) * _VEC
             var k = ty
             while k + 3 * _RED_TY < chunks:
-                acc0 += scratch.load[width=_VEC, alignment=16](
+                acc0 += scratch.unsafe_load[width=_VEC, alignment=16](
                     base + k * chunk_stride
                 )
-                acc1 += scratch.load[width=_VEC, alignment=16](
+                acc1 += scratch.unsafe_load[width=_VEC, alignment=16](
                     base + (k + _RED_TY) * chunk_stride
                 )
-                acc2 += scratch.load[width=_VEC, alignment=16](
+                acc2 += scratch.unsafe_load[width=_VEC, alignment=16](
                     base + (k + 2 * _RED_TY) * chunk_stride
                 )
-                acc3 += scratch.load[width=_VEC, alignment=16](
+                acc3 += scratch.unsafe_load[width=_VEC, alignment=16](
                     base + (k + 3 * _RED_TY) * chunk_stride
                 )
                 k += 4 * _RED_TY
             while k < chunks:
-                acc0 += scratch.load[width=_VEC, alignment=16](
+                acc0 += scratch.unsafe_load[width=_VEC, alignment=16](
                     base + k * chunk_stride
                 )
                 k += _RED_TY
-        partials.store[width=_VEC, alignment=16](
+        partials.unsafe_store[width=_VEC, alignment=16](
             (ty * _RED_TX + tx) * _VEC, (acc0 + acc1) + (acc2 + acc3)
         )
         barrier()
         if ty == 0 and e < total:
             var acc = SIMD[DType.float32, _VEC](0.0)
             comptime for y in range(_RED_TY):
-                acc += partials.load[width=_VEC, alignment=16](
+                acc += partials.unsafe_load[width=_VEC, alignment=16](
                     (y * _RED_TX + tx) * _VEC
                 )
             var r = e // vec_pad
             var c = (e - r * vec_pad) * _VEC
             var out_offset = r * embedding_dim + c
             if out_vec_ok != 0:
-                grad_weight.store[width=_VEC, alignment=16](out_offset, acc)
+                grad_weight.unsafe_store[width=_VEC, alignment=16](
+                    out_offset, acc
+                )
             else:
                 comptime for j in range(_VEC):
                     if c + j < embedding_dim:
-                        grad_weight[out_offset + j] = acc[j]
+                        grad_weight[unsafe_offset=out_offset + j] = acc[j]
         barrier()
         block_base += grid_stride
 
 
 def enqueue_embedding_dense_backward_f32_i64(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    indices: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    indices: Pointer[Scalar[DType.int64], MutAnyOrigin],
     num_indices: Int,
     embedding_dim: Int,
     num_weights: Int,

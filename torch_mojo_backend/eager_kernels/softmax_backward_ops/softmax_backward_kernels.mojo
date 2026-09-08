@@ -42,7 +42,7 @@ from max.gpu.memory import external_memory
 from std.memory import AddressSpace
 from max.gpu.primitives import block
 from std.math import ceildiv, exp
-from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from std.sys.info import has_accelerator, size_of
 from std.utils.static_tuple import StaticTuple
 
@@ -77,9 +77,9 @@ comptime _REG_MAX_SLOTS = 8
 def _log_softmax_bwd_smem_kernel[
     dtype: DType, threads: Int
 ](
-    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gi: Pointer[Scalar[dtype], MutAnyOrigin],
+    g: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
 ):
@@ -111,16 +111,16 @@ def _log_softmax_bwd_smem_kernel[
     var vsum = SIMD[DType.float32, VEC](0)
     var ssum = Float32(0)
     if tid < head:
-        ssum += g[base + tid].cast[DType.float32]()
+        ssum += g[unsafe_offset=base + tid].cast[DType.float32]()
     var v = tid
     while v < nvec:
-        var gv = g.load[width=VEC, alignment=16](base + head + v * VEC)
-        smem_g.store[width=VEC, alignment=16](v * VEC, gv)
+        var gv = g.unsafe_load[width=VEC, alignment=16](base + head + v * VEC)
+        smem_g.unsafe_store[width=VEC, alignment=16](v * VEC, gv)
         vsum += gv.cast[DType.float32]()
         v += threads
     var j = tail_start + tid
     while j < cols:
-        ssum += g[base + j].cast[DType.float32]()
+        ssum += g[unsafe_offset=base + j].cast[DType.float32]()
         j += threads
     var srow = block.sum[block_size=threads, broadcast=True](
         vsum.reduce_add() + ssum
@@ -128,27 +128,29 @@ def _log_softmax_bwd_smem_kernel[
 
     if tid < head:
         var idx = base + tid
-        gi[idx] = (
-            g[idx].cast[DType.float32]()
-            - exp(o[idx].cast[DType.float32]()) * srow
+        gi[unsafe_offset=idx] = (
+            g[unsafe_offset=idx].cast[DType.float32]()
+            - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
         ).cast[dtype]()
     v = tid
     while v < nvec:
         var idx = base + head + v * VEC
-        var gv = smem_g.load[width=VEC, alignment=16](v * VEC).cast[
+        var gv = smem_g.unsafe_load[width=VEC, alignment=16](v * VEC).cast[
             DType.float32
         ]()
-        var ov = o.load[width=VEC, alignment=16](idx).cast[DType.float32]()
-        gi.store[width=VEC, alignment=16](
+        var ov = o.unsafe_load[width=VEC, alignment=16](idx).cast[
+            DType.float32
+        ]()
+        gi.unsafe_store[width=VEC, alignment=16](
             idx, (gv - exp(ov) * srow).cast[dtype]()
         )
         v += threads
     j = tail_start + tid
     while j < cols:
         var idx = base + j
-        gi[idx] = (
-            g[idx].cast[DType.float32]()
-            - exp(o[idx].cast[DType.float32]()) * srow
+        gi[unsafe_offset=idx] = (
+            g[unsafe_offset=idx].cast[DType.float32]()
+            - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
         ).cast[dtype]()
         j += threads
 
@@ -160,9 +162,9 @@ def _log_softmax_bwd_smem_kernel[
 def _log_softmax_bwd_nosmem_kernel[
     dtype: DType
 ](
-    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gi: Pointer[Scalar[dtype], MutAnyOrigin],
+    g: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
 ):
@@ -186,15 +188,15 @@ def _log_softmax_bwd_nosmem_kernel[
     var vsum = SIMD[DType.float32, VEC](0)
     var ssum = Float32(0)
     if tid < head:
-        ssum += g[base + tid].cast[DType.float32]()
+        ssum += g[unsafe_offset=base + tid].cast[DType.float32]()
     var v = tid
     while v < nvec:
-        var gv = g.load[width=VEC, alignment=16](base + head + v * VEC)
+        var gv = g.unsafe_load[width=VEC, alignment=16](base + head + v * VEC)
         vsum += gv.cast[DType.float32]()
         v += _NOSMEM_THREADS
     var j = tail_start + tid
     while j < cols:
-        ssum += g[base + j].cast[DType.float32]()
+        ssum += g[unsafe_offset=base + j].cast[DType.float32]()
         j += _NOSMEM_THREADS
     var srow = block.sum[block_size=_NOSMEM_THREADS, broadcast=True](
         vsum.reduce_add() + ssum
@@ -202,25 +204,29 @@ def _log_softmax_bwd_nosmem_kernel[
 
     if tid < head:
         var idx = base + tid
-        gi[idx] = (
-            g[idx].cast[DType.float32]()
-            - exp(o[idx].cast[DType.float32]()) * srow
+        gi[unsafe_offset=idx] = (
+            g[unsafe_offset=idx].cast[DType.float32]()
+            - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
         ).cast[dtype]()
     v = tid
     while v < nvec:
         var idx = base + head + v * VEC
-        var gv = g.load[width=VEC, alignment=16](idx).cast[DType.float32]()
-        var ov = o.load[width=VEC, alignment=16](idx).cast[DType.float32]()
-        gi.store[width=VEC, alignment=16](
+        var gv = g.unsafe_load[width=VEC, alignment=16](idx).cast[
+            DType.float32
+        ]()
+        var ov = o.unsafe_load[width=VEC, alignment=16](idx).cast[
+            DType.float32
+        ]()
+        gi.unsafe_store[width=VEC, alignment=16](
             idx, (gv - exp(ov) * srow).cast[dtype]()
         )
         v += _NOSMEM_THREADS
     j = tail_start + tid
     while j < cols:
         var idx = base + j
-        gi[idx] = (
-            g[idx].cast[DType.float32]()
-            - exp(o[idx].cast[DType.float32]()) * srow
+        gi[unsafe_offset=idx] = (
+            g[unsafe_offset=idx].cast[DType.float32]()
+            - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
         ).cast[dtype]()
         j += _NOSMEM_THREADS
 
@@ -232,9 +238,9 @@ def _log_softmax_bwd_nosmem_kernel[
 def _log_softmax_bwd_reg_kernel[
     dtype: DType, threads: Int, slots: Int
 ](
-    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gi: Pointer[Scalar[dtype], MutAnyOrigin],
+    g: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
 ):
@@ -264,16 +270,18 @@ def _log_softmax_bwd_reg_kernel[
         var vsum = SIMD[DType.float32, VEC](0)
         var ssum = Float32(0)
         if tid < head:
-            ssum += g[base + tid].cast[DType.float32]()
+            ssum += g[unsafe_offset=base + tid].cast[DType.float32]()
         comptime for u in range(slots):
             var v = tid + u * threads
             if v < nvec:
-                var gv = g.load[width=VEC, alignment=16](base + head + v * VEC)
+                var gv = g.unsafe_load[width=VEC, alignment=16](
+                    base + head + v * VEC
+                )
                 cache[u] = gv
                 vsum += gv.cast[DType.float32]()
         var j = tail_start + tid
         while j < cols:
-            ssum += g[base + j].cast[DType.float32]()
+            ssum += g[unsafe_offset=base + j].cast[DType.float32]()
             j += threads
         var srow = block.sum[block_size=threads, broadcast=True](
             vsum.reduce_add() + ssum
@@ -281,27 +289,27 @@ def _log_softmax_bwd_reg_kernel[
 
         if tid < head:
             var idx = base + tid
-            gi[idx] = (
-                g[idx].cast[DType.float32]()
-                - exp(o[idx].cast[DType.float32]()) * srow
+            gi[unsafe_offset=idx] = (
+                g[unsafe_offset=idx].cast[DType.float32]()
+                - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
             ).cast[dtype]()
         comptime for u in range(slots):
             var v = tid + u * threads
             if v < nvec:
                 var idx = base + head + v * VEC
                 var gv = cache[u].cast[DType.float32]()
-                var ov = o.load[width=VEC, alignment=16](idx).cast[
+                var ov = o.unsafe_load[width=VEC, alignment=16](idx).cast[
                     DType.float32
                 ]()
-                gi.store[width=VEC, alignment=16](
+                gi.unsafe_store[width=VEC, alignment=16](
                     idx, (gv - exp(ov) * srow).cast[dtype]()
                 )
         j = tail_start + tid
         while j < cols:
             var idx = base + j
-            gi[idx] = (
-                g[idx].cast[DType.float32]()
-                - exp(o[idx].cast[DType.float32]()) * srow
+            gi[unsafe_offset=idx] = (
+                g[unsafe_offset=idx].cast[DType.float32]()
+                - exp(o[unsafe_offset=idx].cast[DType.float32]()) * srow
             ).cast[dtype]()
             j += threads
 
@@ -312,9 +320,9 @@ def _log_softmax_bwd_reg_kernel[
 def _enqueue_bwd_reg[
     dtype: DType, slots: Int
 ](
-    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gi: Pointer[Scalar[dtype], MutAnyOrigin],
+    g: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     blocks: Int,
@@ -361,8 +369,10 @@ def _enqueue_cached_smem[
     var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    if global_ptr := _get_global_or_null(name):
-        var fptr = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(name)
+
+    if global_ptr:
+        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             fptr[],
             *args,
@@ -381,11 +391,11 @@ def _enqueue_cached_smem[
         )
     else:
         compiled = ctx.compile_function[func]()
-    var fptr = alloc[FuncT](1)
-    fptr.init_pointee_move(compiled^)
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name),
-        fptr.bitcast[NoneType](),
+        fptr.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
         fptr[],
@@ -422,9 +432,9 @@ def _dyn_smem_capacity(ctx: DeviceContext) -> Int:
 def enqueue_log_softmax_backward[
     dtype: DType
 ](
-    gi: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    g: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    o: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    gi: Pointer[Scalar[dtype], MutAnyOrigin],
+    g: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    o: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows: Int,
     cols: Int,
     ctx: DeviceContext,

@@ -88,9 +88,9 @@ from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 comptime _B5_DT = _GEMM16_DT
 comptime _B5_F32 = DType.float32
-comptime _B5_PTR = UnsafePointer[Scalar[_B5_DT], MutAnyOrigin]
+comptime _B5_PTR = Pointer[Scalar[_B5_DT], MutAnyOrigin]
 comptime _B5_F32_PTR = UnsafePointer[Scalar[_B5_F32], MutAnyOrigin]
-comptime _B5_SMEM = UnsafePointer[
+comptime _B5_SMEM = Pointer[
     Scalar[_B5_DT], MutAnyOrigin, address_space=AddressSpace.SHARED
 ]
 comptime _B5_BK = 64
@@ -342,8 +342,8 @@ def _b5_bmm_nn_persistent_ws[
                 alignment=1024,
             ]().as_unsafe_any_origin()
             a_smem = smem_base
-            b_smem = smem_base + stages * bm * _B5_BK
-            c_smem = b_smem + stages * bn * _B5_BK
+            b_smem = smem_base.unsafe_offset(stages * bm * _B5_BK)
+            c_smem = b_smem.unsafe_offset(stages * bn * _B5_BK)
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -358,8 +358,10 @@ def _b5_bmm_nn_persistent_ws[
         ]()
         if thread_idx.x == 0:
             comptime for stage in range(stages):
-                full_barriers[stage].init()
-                empty_barriers[stage].init(Int32(consumers * cluster_m))
+                full_barriers[unsafe_offset=stage].init()
+                empty_barriers[unsafe_offset=stage].init(
+                    Int32(consumers * cluster_m)
+                )
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
             comptime if tma_store:
@@ -392,7 +394,7 @@ def _b5_bmm_nn_persistent_ws[
         # Release every pipeline slot to the producers (cluster-wide).
         if warp_group_idx > 0 and warp_group_thread_idx < cluster_m:
             comptime for stage in range(stages):
-                empty_barriers[stage].arrive_cluster(
+                empty_barriers[unsafe_offset=stage].arrive_cluster(
                     UInt32(warp_group_thread_idx)
                 )
 
@@ -418,18 +420,22 @@ def _b5_bmm_nn_persistent_ws[
                     while t < num_tiles:
                         var stage = gt % stages
                         var phase = UInt32((gt // stages) % 2)
-                        empty_barriers[stage].wait(phase)
-                        full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
+                        empty_barriers[unsafe_offset=stage].wait(phase)
+                        full_barriers[unsafe_offset=stage].expect_bytes(
+                            Int32(TMA_BYTES)
+                        )
                         var a_tile = LayoutTensor[
                             _B5_DT,
                             A_LAYOUT,
                             MutAnyOrigin,
                             address_space=AddressSpace.SHARED,
                             alignment=128,
-                        ](a_smem + stage * bm * _B5_BK)
+                        ](a_smem.unsafe_offset(stage * bm * _B5_BK))
                         var k0 = t * _B5_BK
                         a_tma.async_copy_3d(
-                            a_tile, full_barriers[stage], (k0, m0, ab)
+                            a_tile,
+                            full_barriers[unsafe_offset=stage],
+                            (k0, m0, ab),
                         )
                         # Cooperative B load: each cluster rank reads its
                         # share of the 64-column chunks once from L2 and
@@ -443,18 +449,22 @@ def _b5_bmm_nn_persistent_ws[
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
-                            ](b_smem + stage * bn * _B5_BK + cc * 64 * _B5_BK)
+                            ](
+                                b_smem.unsafe_offset(
+                                    stage * bn * _B5_BK + cc * 64 * _B5_BK
+                                )
+                            )
                             comptime if cluster_m > 1:
                                 b_tma.async_multicast_load_3d(
                                     b_chunk,
-                                    full_barriers[stage],
+                                    full_barriers[unsafe_offset=stage],
                                     (n0 + cc * 64, k0, bb),
                                     MCAST_MASK,
                                 )
                             else:
                                 b_tma.async_copy_3d(
                                     b_chunk,
-                                    full_barriers[stage],
+                                    full_barriers[unsafe_offset=stage],
                                     (n0 + cc * 64, k0, bb),
                                 )
                             cc += 1
@@ -505,21 +515,21 @@ def _b5_bmm_nn_persistent_ws[
                 while t < num_tiles:
                     var stage = gt % stages
                     var phase = UInt32((gt // stages) % 2)
-                    full_barriers[stage].wait(phase)
+                    full_barriers[unsafe_offset=stage].wait(phase)
                     var a_tile = LayoutTensor[
                         _B5_DT,
                         A_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](a_smem + stage * bm * _B5_BK)
+                    ](a_smem.unsafe_offset(stage * bm * _B5_BK))
                     var b_tile = LayoutTensor[
                         _B5_DT,
                         B_LAYOUT,
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](b_smem + stage * bn * _B5_BK)
+                    ](b_smem.unsafe_offset(stage * bn * _B5_BK))
                     warpgroup_fence(accum)
                     wgmma.arrive()
                     wgmma.wgmma[consumers](
@@ -529,7 +539,7 @@ def _b5_bmm_nn_persistent_ws[
                     warpgroup_fence(accum)
                     wgmma.wait_group()
                     if warp_group_thread_idx < cluster_m:
-                        empty_barriers[stage].arrive_cluster(
+                        empty_barriers[unsafe_offset=stage].arrive_cluster(
                             UInt32(warp_group_thread_idx)
                         )
                     t += 1
@@ -556,8 +566,8 @@ def _b5_bmm_nn_persistent_ws[
                         )
                         var col = base_col + (q // 2) * 8
                         var pair = SIMD[_B5_DT, 2](
-                            accum.ptr[e].cast[_B5_DT](),
-                            accum.ptr[e + 1].cast[_B5_DT](),
+                            accum.ptr[unsafe_offset=e].cast[_B5_DT](),
+                            accum.ptr[unsafe_offset=e + 1].cast[_B5_DT](),
                         )
                         # 128B-swizzled staging layout: 16B units within each
                         # 64-element row are XORed with (row % 8).
@@ -568,7 +578,7 @@ def _b5_bmm_nn_persistent_ws[
                             + ((lcol // 8) ^ (row % 8)) * 8
                             + lcol % 8
                         )
-                        c_smem.store[alignment=4](elem, pair)
+                        c_smem.unsafe_store[alignment=4](elem, pair)
                     fence_async_view_proxy()
                     named_barrier[NCONS](1)
                     if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -579,7 +589,7 @@ def _b5_bmm_nn_persistent_ws[
                                 MutAnyOrigin,
                                 address_space=AddressSpace.SHARED,
                                 alignment=128,
-                            ](c_smem + chunk * bm * 64)
+                            ](c_smem.unsafe_offset(chunk * bm * 64))
                             c_tma.async_store_3d(
                                 c_chunk, (n0 + chunk * 64, m0, bidx)
                             )
@@ -598,15 +608,21 @@ def _b5_bmm_nn_persistent_ws[
                         if m0 + row < m:
                             var off = bidx * c_bs + (m0 + row) * n + n0 + col
                             if n0 + col + 1 < n:
-                                output.store[alignment=2](
+                                output.unsafe_store[alignment=2](
                                     off,
                                     SIMD[_B5_DT, 2](
-                                        accum.ptr[e].cast[_B5_DT](),
-                                        accum.ptr[e + 1].cast[_B5_DT](),
+                                        accum.ptr[unsafe_offset=e].cast[
+                                            _B5_DT
+                                        ](),
+                                        accum.ptr[unsafe_offset=e + 1].cast[
+                                            _B5_DT
+                                        ](),
                                     ),
                                 )
                             elif n0 + col < n:
-                                output[off] = accum.ptr[e].cast[_B5_DT]()
+                                output[unsafe_offset=off] = accum.ptr[
+                                    unsafe_offset=e
+                                ].cast[_B5_DT]()
                 w += num_clusters
             # Outstanding bulk stores must complete before kernel exit.
             comptime if tma_store:
@@ -618,7 +634,7 @@ def _b5_bmm_nn_persistent_ws[
 
 @always_inline
 def _b5_p(addr: Int) -> _B5_PTR:
-    return UnsafePointer[Scalar[_B5_DT], MutUntrackedOrigin](
+    return Pointer[Scalar[_B5_DT], MutUntrackedOrigin](
         unsafe_from_address=addr
     ).as_unsafe_any_origin()
 
@@ -722,8 +738,8 @@ def _b5_bmm_nn_tiny[
                 alignment=1024,
             ]().as_unsafe_any_origin()
             a_smem = smem_base
-            b_smem = smem_base + stages * bm * _B5_BK
-            c_smem = b_smem + stages * bn * _B5_BK
+            b_smem = smem_base.unsafe_offset(stages * bm * _B5_BK)
+            c_smem = b_smem.unsafe_offset(stages * bn * _B5_BK)
         var full_barriers = stack_allocation[
             stages,
             SharedMemBarrier,
@@ -732,7 +748,7 @@ def _b5_bmm_nn_tiny[
         ]()
         if thread_idx.x == 0:
             comptime for stage in range(stages):
-                full_barriers[stage].init()
+                full_barriers[unsafe_offset=stage].init()
             a_tma.prefetch_descriptor()
             b_tma.prefetch_descriptor()
             comptime if tma_store:
@@ -759,7 +775,7 @@ def _b5_bmm_nn_tiny[
         @always_inline
         def issue_tile(t: Int):
             var stage = t % stages
-            full_barriers[stage].expect_bytes(Int32(TMA_BYTES))
+            full_barriers[unsafe_offset=stage].expect_bytes(Int32(TMA_BYTES))
             var k0 = t * _B5_BK
             var a_tile = LayoutTensor[
                 _B5_DT,
@@ -767,8 +783,10 @@ def _b5_bmm_nn_tiny[
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](a_smem + stage * bm * _B5_BK)
-            a_tma.async_copy_3d(a_tile, full_barriers[stage], (k0, m0, ab))
+            ](a_smem.unsafe_offset(stage * bm * _B5_BK))
+            a_tma.async_copy_3d(
+                a_tile, full_barriers[unsafe_offset=stage], (k0, m0, ab)
+            )
             comptime for cc in range(B_CHUNKS):
                 var b_chunk = LayoutTensor[
                     _B5_DT,
@@ -776,9 +794,11 @@ def _b5_bmm_nn_tiny[
                     MutAnyOrigin,
                     address_space=AddressSpace.SHARED,
                     alignment=128,
-                ](b_smem + stage * bn * _B5_BK + cc * 64 * _B5_BK)
+                ](b_smem.unsafe_offset(stage * bn * _B5_BK + cc * 64 * _B5_BK))
                 b_tma.async_copy_3d(
-                    b_chunk, full_barriers[stage], (n0 + cc * 64, k0, bb)
+                    b_chunk,
+                    full_barriers[unsafe_offset=stage],
+                    (n0 + cc * 64, k0, bb),
                 )
 
         if thread_idx.x == 0:
@@ -807,21 +827,21 @@ def _b5_bmm_nn_tiny[
         while t < num_tiles:
             var stage = t % stages
             var phase = UInt32((t // stages) % 2)
-            full_barriers[stage].wait(phase)
+            full_barriers[unsafe_offset=stage].wait(phase)
             var a_tile = LayoutTensor[
                 _B5_DT,
                 A_LAYOUT,
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](a_smem + stage * bm * _B5_BK)
+            ](a_smem.unsafe_offset(stage * bm * _B5_BK))
             var b_tile = LayoutTensor[
                 _B5_DT,
                 B_LAYOUT,
                 MutAnyOrigin,
                 address_space=AddressSpace.SHARED,
                 alignment=128,
-            ](b_smem + stage * bn * _B5_BK)
+            ](b_smem.unsafe_offset(stage * bn * _B5_BK))
             warpgroup_fence(accum)
             wgmma.arrive()
             wgmma.wgmma[1](a_tile, b_tile, accum, 0)
@@ -849,8 +869,8 @@ def _b5_bmm_nn_tiny[
                 var row = base_row + (q % 2) * 8
                 var col = base_col + (q // 2) * 8
                 var pair = SIMD[_B5_DT, 2](
-                    accum.ptr[e].cast[_B5_DT](),
-                    accum.ptr[e + 1].cast[_B5_DT](),
+                    accum.ptr[unsafe_offset=e].cast[_B5_DT](),
+                    accum.ptr[unsafe_offset=e + 1].cast[_B5_DT](),
                 )
                 var lcol = col % 64
                 var elem = (
@@ -859,7 +879,7 @@ def _b5_bmm_nn_tiny[
                     + ((lcol // 8) ^ (row % 8)) * 8
                     + lcol % 8
                 )
-                c_smem.store[alignment=4](elem, pair)
+                c_smem.unsafe_store[alignment=4](elem, pair)
             fence_async_view_proxy()
             barrier()
             if thread_idx.x == 0:
@@ -870,7 +890,7 @@ def _b5_bmm_nn_tiny[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ](c_smem + chunk * bm * 64)
+                    ](c_smem.unsafe_offset(chunk * bm * 64))
                     c_tma.async_store_3d(c_chunk, (n0 + chunk * 64, m0, bidx))
                 c_tma.commit_group()
                 c_tma.wait_group[0]()
@@ -882,15 +902,17 @@ def _b5_bmm_nn_tiny[
                 if m0 + row < m:
                     var off = bidx * c_bs + (m0 + row) * n + n0 + col
                     if n0 + col + 1 < n:
-                        output.store[alignment=2](
+                        output.unsafe_store[alignment=2](
                             off,
                             SIMD[_B5_DT, 2](
-                                accum.ptr[e].cast[_B5_DT](),
-                                accum.ptr[e + 1].cast[_B5_DT](),
+                                accum.ptr[unsafe_offset=e].cast[_B5_DT](),
+                                accum.ptr[unsafe_offset=e + 1].cast[_B5_DT](),
                             ),
                         )
                     elif n0 + col < n:
-                        output[off] = accum.ptr[e].cast[_B5_DT]()
+                        output[unsafe_offset=off] = accum.ptr[
+                            unsafe_offset=e
+                        ].cast[_B5_DT]()
 
 
 def _b5_enqueue_tiny[
@@ -919,7 +941,10 @@ def _b5_enqueue_tiny[
     var b_stride = k * b_row_stride if b_bs == 0 else b_bs
     var a_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
-            ctx, a.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
+            ctx,
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
         ),
         IndexList[3](a_items, m, k),
         IndexList[3](a_stride, a_row_stride, 1),
@@ -927,7 +952,10 @@ def _b5_enqueue_tiny[
     )
     var b_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
-            ctx, b.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
+            ctx,
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
         ),
         IndexList[3](b_items, k, n),
         IndexList[3](b_stride, b_row_stride, 1),
@@ -941,7 +969,7 @@ def _b5_enqueue_tiny[
     var c_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx,
-            output.address_space_cast[AddressSpace.GENERIC](),
+            output.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -1015,7 +1043,10 @@ def _b5_enqueue_batched[
     var b_stride = k * b_row_stride if b_bs == 0 else b_bs
     var a_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
-            ctx, a.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
+            ctx,
+            a.unsafe_address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
         ),
         IndexList[3](a_items, m, k),
         IndexList[3](a_stride, a_row_stride, 1),
@@ -1023,7 +1054,10 @@ def _b5_enqueue_batched[
     )
     var b_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
-            ctx, b.address_space_cast[AddressSpace.GENERIC](), 1, owning=False
+            ctx,
+            b.unsafe_address_space_cast[AddressSpace.GENERIC](),
+            1,
+            owning=False,
         ),
         IndexList[3](b_items, k, n),
         IndexList[3](b_stride, b_row_stride, 1),
@@ -1039,7 +1073,7 @@ def _b5_enqueue_batched[
     var c_desc = create_tma_descriptor[_B5_DT, 3, _B5_SWIZZLE](
         DeviceBuffer(
             ctx,
-            output.address_space_cast[AddressSpace.GENERIC](),
+            output.unsafe_address_space_cast[AddressSpace.GENERIC](),
             1,
             owning=False,
         ),
@@ -1313,17 +1347,19 @@ def _b5_repack2_kernel(
         # legalizes them (same idiom as the v2 kernels' guarded loads).
         var c = lane * 8
         while c + 8 <= row_len:
-            var v = src.load[width=8, alignment=2](src_base + c)
-            dst.store[alignment=16](dst_base + c, v)
+            var v = src.unsafe_load[width=8, alignment=2](src_base + c)
+            dst.unsafe_store[alignment=16](dst_base + c, v)
             c += 32 * 8
         if c < row_len:
             comptime for e in range(8):
                 if c + e < row_len:
-                    dst[dst_base + c + e] = src[src_base + c + e]
+                    dst[unsafe_offset=dst_base + c + e] = src[
+                        unsafe_offset=src_base + c + e
+                    ]
         r += rstride
 
 
-comptime _B5_UPTR = UnsafePointer[Scalar[_B5_DT], MutUntrackedOrigin]
+comptime _B5_UPTR = Pointer[Scalar[_B5_DT], MutUntrackedOrigin]
 
 
 struct _B5RepackOp(ImplicitlyCopyable):

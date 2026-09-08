@@ -89,9 +89,9 @@ def _philox4x32_10(counter: UInt64, seed: UInt64) -> SIMD[DType.uint32, 4]:
 
 @__name("native_dropout_forward_philox_vec4")
 def _forward_vec4(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
     seed: UInt64,
     base_offset: UInt64,
@@ -110,10 +110,10 @@ def _forward_vec4(
         var keep_bits = (
             rnd.cast[DType.uint64]() - SIMD[DType.uint64, 4](threshold)
         ) >> 63
-        var x = input.load[width=4, alignment=16](base)
+        var x = input.unsafe_load[width=4, alignment=16](base)
         var result = x * keep_bits.cast[DType.float32]() * scale
-        output.store[alignment=16](base, result)
-        mask.bitcast[Scalar[DType.uint8]]().store[alignment=4](
+        output.unsafe_store[alignment=16](base, result)
+        mask.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_store[alignment=4](
             base, keep_bits.cast[DType.uint8]()
         )
     else:
@@ -123,17 +123,19 @@ def _forward_vec4(
                 var keep_bit = (
                     rnd[lane].cast[DType.uint64]() - threshold
                 ) >> 63
-                output[idx] = (
-                    input[idx] * keep_bit.cast[DType.float32]() * scale
+                output[unsafe_offset=idx] = (
+                    input[unsafe_offset=idx]
+                    * keep_bit.cast[DType.float32]()
+                    * scale
                 )
-                mask[idx] = Scalar[DType.bool](keep_bit != 0)
+                mask[unsafe_offset=idx] = Scalar[DType.bool](keep_bit != 0)
 
 
 @__name("native_dropout_forward_philox_generic")
 def _forward_generic(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements_arg: Int64,
     seed: UInt64,
     base_offset: UInt64,
@@ -153,14 +155,18 @@ def _forward_generic(
         var idx = base + lane
         if idx < elements:
             var keep_bit = (rnd[lane].cast[DType.uint64]() - threshold) >> 63
-            output[idx] = input[idx] * keep_bit.cast[DType.float32]() * scale
-            mask[idx] = Scalar[DType.bool](keep_bit != 0)
+            output[unsafe_offset=idx] = (
+                input[unsafe_offset=idx]
+                * keep_bit.cast[DType.float32]()
+                * scale
+            )
+            mask[unsafe_offset=idx] = Scalar[DType.bool](keep_bit != 0)
 
 
 @__name("native_dropout_forward_zero_fill")
 def _forward_zero_fill(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     elements_arg: Int64,
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
@@ -171,15 +177,15 @@ def _forward_zero_fill(
     comptime for lane in range(4):
         var idx = base + lane
         if idx < elements:
-            output[idx] = Float32(0.0)
-            mask[idx] = Scalar[DType.bool](False)
+            output[unsafe_offset=idx] = Float32(0.0)
+            mask[unsafe_offset=idx] = Scalar[DType.bool](False)
 
 
 @__name("native_dropout_backward_vec4")
 def _backward_vec4(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     elements_arg: Int64,
     scale: Float32,
 ):
@@ -190,27 +196,29 @@ def _backward_vec4(
     if base >= elements:
         return
     if base + 4 <= elements:
-        var g = grad_output.load[width=4, alignment=16](base)
-        var mask_bytes = mask.bitcast[Scalar[DType.uint8]]().load[
+        var g = grad_output.unsafe_load[width=4, alignment=16](base)
+        var mask_bytes = mask.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_load[
             width=4, alignment=4
         ](base)
         # Bool storage is 0/1 by contract, so the byte cast is Float32(mask).
         var m = mask_bytes.cast[DType.float32]()
-        grad_input.store[alignment=16](base, g * m * scale)
+        grad_input.unsafe_store[alignment=16](base, g * m * scale)
     else:
         comptime for lane in range(4):
             var idx = base + lane
             if idx < elements:
-                grad_input[idx] = (
-                    grad_output[idx] * mask[idx].cast[DType.float32]() * scale
+                grad_input[unsafe_offset=idx] = (
+                    grad_output[unsafe_offset=idx]
+                    * mask[unsafe_offset=idx].cast[DType.float32]()
+                    * scale
                 )
 
 
 @__name("native_dropout_backward_generic")
 def _backward_generic(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     elements_arg: Int64,
     scale: Float32,
 ):
@@ -224,8 +232,10 @@ def _backward_generic(
     comptime for lane in range(4):
         var idx = base + lane
         if idx < elements:
-            grad_input[idx] = (
-                grad_output[idx] * mask[idx].cast[DType.float32]() * scale
+            grad_input[unsafe_offset=idx] = (
+                grad_output[unsafe_offset=idx]
+                * mask[unsafe_offset=idx].cast[DType.float32]()
+                * scale
             )
 
 
@@ -235,9 +245,9 @@ def _is_aligned(address: Int, alignment: Int) -> Bool:
 
 
 def enqueue_native_dropout_f32(
-    output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
     elements: Int,
     p: Float64,
     seed: UInt64,
@@ -306,9 +316,9 @@ def enqueue_native_dropout_f32(
 
 
 def enqueue_native_dropout_backward_f32(
-    grad_input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: UnsafePointer[Scalar[DType.bool], MutAnyOrigin],
+    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     elements: Int,
     scale: Float64,
     ctx: DeviceContext,

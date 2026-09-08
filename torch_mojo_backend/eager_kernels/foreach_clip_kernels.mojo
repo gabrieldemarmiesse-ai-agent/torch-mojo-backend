@@ -13,7 +13,7 @@ from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from std.math import min
-from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from std.sys.info import has_apple_gpu_accelerator
 
 from foreach_clip_contract import (
@@ -38,8 +38,8 @@ comptime _VEC = 4
 
 
 @always_inline
-def _ptr(addr: Int) -> UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin]:
-    return UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+def _ptr(addr: Int) -> Pointer[Scalar[DType.float32], MutUntrackedOrigin]:
+    return Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=addr
     )
 
@@ -78,7 +78,7 @@ def _norm_chunk_partials(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_THREADS * _VEC
     while index + _VEC <= end:
-        var value = values.load[width=_VEC, alignment=4](index)
+        var value = values.unsafe_load[width=_VEC, alignment=4](index)
         accum = value.fma(value, accum)
         index += stride
 
@@ -87,7 +87,7 @@ def _norm_chunk_partials(
     # of a tensor can need this scalar tail.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var value = values[index]
+        var value = values[unsafe_offset=index]
         scalar_accum += value * value
         index += FOREACH_THREADS
 
@@ -95,7 +95,7 @@ def _norm_chunk_partials(
         scalar_accum
     )
     if thread_idx.x == 0:
-        _ptr(partials_addr)[chunk] = total
+        _ptr(partials_addr)[unsafe_offset=chunk] = total
 
 
 @__name("foreach_l2_norm_f32_finalize_v1")
@@ -119,10 +119,10 @@ def _norm_finalize(
     for chunk in range(
         begin + Int(thread_idx.x), desc.chunk_end, FOREACH_THREADS
     ):
-        accum += _ptr(partials_addr)[chunk]
+        accum += _ptr(partials_addr)[unsafe_offset=chunk]
     var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
     if thread_idx.x == 0:
-        _ptr(desc.output_addr)[0] = ieee_sqrt(total)
+        _ptr(desc.output_addr)[unsafe_offset=0] = ieee_sqrt(total)
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +137,8 @@ def _norm_finalize(
 # bitwise identical to the former per-tensor-launch variants.
 # ---------------------------------------------------------------------------
 
-comptime _ImmutPtr = UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
-comptime _MutPtr = UnsafePointer[Scalar[DType.float32], MutAnyOrigin]
+comptime _ImmutPtr = Pointer[Scalar[DType.float32], ImmutAnyOrigin]
+comptime _MutPtr = Pointer[Scalar[DType.float32], MutAnyOrigin]
 
 
 def _norm_partials_batched_apple(
@@ -162,7 +162,7 @@ def _norm_partials_batched_apple(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = FOREACH_THREADS * _VEC
     while index + _VEC <= end:
-        var value = values.load[width=_VEC, alignment=4](index)
+        var value = values.unsafe_load[width=_VEC, alignment=4](index)
         accum = value.fma(value, accum)
         index += stride
 
@@ -171,7 +171,7 @@ def _norm_partials_batched_apple(
     # tensor can need this scalar tail.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var value = values[index]
+        var value = values[unsafe_offset=index]
         scalar_accum += value * value
         index += FOREACH_THREADS
 
@@ -179,7 +179,7 @@ def _norm_partials_batched_apple(
         scalar_accum
     )
     if thread_idx.x == 0:
-        partials_ptr[Int(block_idx.x)] = total
+        partials_ptr[unsafe_offset=Int(block_idx.x)] = total
 
 
 def _norm_finalize_batched_apple(
@@ -208,11 +208,11 @@ def _norm_finalize_batched_apple(
     for chunk in range(
         first_chunk + Int(thread_idx.x), Int(chunk_ends[slot]), FOREACH_THREADS
     ):
-        accum += partials_ptr[chunk]
+        accum += partials_ptr[unsafe_offset=chunk]
     var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
     if thread_idx.x == 0:
         var out_ptr = _pick_mut(slot, o0, o1, o2, o3, o4, o5, o6, o7)
-        out_ptr[0] = ieee_sqrt(total)
+        out_ptr[unsafe_offset=0] = ieee_sqrt(total)
 
 
 def _enqueue_norm_partials_cached(
@@ -224,8 +224,9 @@ def _enqueue_norm_partials_cached(
 ) raises:
     var cache_name = String(t"FOREACH_NORM_PARTIALS_F32_V1_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[_norm_chunk_partials]())
-    if global_ptr := _get_global_or_null(cache_name):
-        var cached = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(cache_name)
+    if global_ptr:
+        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             cached[],
             descs,
@@ -236,10 +237,10 @@ def _enqueue_norm_partials_cached(
         )
         return
     var compiled = ctx.compile_function[_norm_chunk_partials]()
-    var cached = alloc[FuncT](1)
-    cached.init_pointee_move(compiled^)
+    var cached = unsafe_alloc[FuncT](1)
+    cached.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.bitcast[NoneType]()
+        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
     )
     ctx.enqueue_function(
         cached[],
@@ -259,8 +260,9 @@ def _enqueue_norm_finalize_cached(
 ) raises:
     var cache_name = String(t"FOREACH_NORM_FINALIZE_F32_V1_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[_norm_finalize]())
-    if global_ptr := _get_global_or_null(cache_name):
-        var cached = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(cache_name)
+    if global_ptr:
+        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             cached[],
             descs,
@@ -271,10 +273,10 @@ def _enqueue_norm_finalize_cached(
         )
         return
     var compiled = ctx.compile_function[_norm_finalize]()
-    var cached = alloc[FuncT](1)
-    cached.init_pointee_move(compiled^)
+    var cached = unsafe_alloc[FuncT](1)
+    cached.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.bitcast[NoneType]()
+        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
     )
     ctx.enqueue_function(
         cached[],
@@ -339,14 +341,14 @@ def enqueue_foreach_l2_norm_f32(
                     1,
                     FOREACH_THREADS,
                     partials,
-                    _ptr(in_addrs[0]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[1]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[2]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[3]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[4]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[5]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[6]).as_unsafe_any_origin().as_immutable(),
-                    _ptr(in_addrs[7]).as_unsafe_any_origin().as_immutable(),
+                    _ptr(in_addrs[0]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[1]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[2]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[3]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[4]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[5]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[6]).as_unsafe_any_origin().as_imm(),
+                    _ptr(in_addrs[7]).as_unsafe_any_origin().as_imm(),
                     _slot_ints(chunk_ends),
                     _slot_ints(numels),
                 )
@@ -365,7 +367,7 @@ def enqueue_foreach_l2_norm_f32(
                 _ptr(out_addrs[5]).as_unsafe_any_origin(),
                 _ptr(out_addrs[6]).as_unsafe_any_origin(),
                 _ptr(out_addrs[7]).as_unsafe_any_origin(),
-                partials.as_immutable(),
+                partials.as_imm(),
                 _slot_ints(chunk_ends),
                 Int64(used_slots),
             )

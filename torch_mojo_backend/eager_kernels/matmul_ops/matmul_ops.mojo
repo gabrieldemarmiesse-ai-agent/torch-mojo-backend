@@ -12,7 +12,8 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.math import ceildiv
-from std.memory import alloc, stack_allocation
+from std.memory import stack_allocation
+from std.memory.alloc import unsafe_alloc
 from std.os import abort
 from max.gpu.sync import barrier
 from std.gpu import (
@@ -175,9 +176,9 @@ def _gemm_tiled_kernel[
     TN: Int,
     transpose_b: Bool,
 ](
-    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[dtype], MutAnyOrigin],
+    a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -209,9 +210,9 @@ def _gemm_tiled_kernel[
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice; a reduce kernel sums them afterwards.
     # a_bstride is 0 when A is shared across the batch (conv weights).
-    var c_ptr = c_base + block_idx.z * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var bm = block_idx.y * BM
     var bn = block_idx.x * BN
@@ -243,8 +244,8 @@ def _gemm_tiled_kernel[
             var col = kt + kk
             var val = Scalar[dtype](0)
             if row < m and col < k_end:
-                val = a_ptr[row * k + col]
-            a_smem[kk * BM + mm] = val
+                val = a_ptr[unsafe_offset=row * k + col]
+            a_smem[unsafe_offset=kk * BM + mm] = val
 
         comptime for t in range(LB):
             var i = t * THREADS + tid
@@ -256,26 +257,26 @@ def _gemm_tiled_kernel[
                 var row = bn + nn  # row of B (n, k)
                 var col = kt + kk
                 if row < n and col < k_end:
-                    val = b_ptr[row * k + col]
-                b_smem[kk * BN + nn] = val
+                    val = b_ptr[unsafe_offset=row * k + col]
+                b_smem[unsafe_offset=kk * BN + nn] = val
             else:
                 var kk = i // BN
                 var nn = i % BN
                 var row = kt + kk  # row of B (k, n)
                 var col = bn + nn
                 if row < k_end and col < n:
-                    val = b_ptr[row * n + col]
-                b_smem[kk * BN + nn] = val
+                    val = b_ptr[unsafe_offset=row * n + col]
+                b_smem[unsafe_offset=kk * BN + nn] = val
 
         barrier()
 
         # Runtime loop on kk: full comptime unrolling of the slab kept ~190
         # live registers (1 block/SM); this stays ~2x lower.
         for kk in range(BK):
-            var a_frag = a_smem.load[width=TM](kk * BM + tm0).cast[
+            var a_frag = a_smem.unsafe_load[width=TM](kk * BM + tm0).cast[
                 DType.float32
             ]()
-            var b_frag = b_smem.load[width=TN](kk * BN + tn0).cast[
+            var b_frag = b_smem.unsafe_load[width=TN](kk * BN + tn0).cast[
                 DType.float32
             ]()
             comptime for i in range(TM):
@@ -288,12 +289,12 @@ def _gemm_tiled_kernel[
         if row < m:
             var out = acc[i].cast[dtype]()
             if bn + tn0 + TN <= n:
-                c_ptr.store(row * n + bn + tn0, out)
+                c_ptr.unsafe_store(row * n + bn + tn0, out)
             else:
                 comptime for j in range(TN):
                     var col = bn + tn0 + j
                     if col < n:
-                        c_ptr[row * n + col] = out[j]
+                        c_ptr[unsafe_offset=row * n + col] = out[j]
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +323,9 @@ def _gemm_pipe_kernel[
     VEC_B: Int,
     transpose_b: Bool,
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -359,9 +360,9 @@ def _gemm_pipe_kernel[
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice; a reduce kernel sums them afterwards.
     # a_bstride is 0 when A is shared across the batch (conv weights).
-    var c_ptr = c_base + block_idx.z * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var bm = block_idx.y * BM
     var bn = block_idx.x * BN
@@ -401,30 +402,30 @@ def _gemm_pipe_kernel[
             var vec = SIMD[F32, VEC_A](0)
             if row < m:
                 if col + VEC_A <= k_end:
-                    vec = a_ptr.load[width=VEC_A](row * k + col)
+                    vec = a_ptr.unsafe_load[width=VEC_A](row * k + col)
                 elif col < k_end:
                     for u in range(k_end - col):
-                        vec[u] = a_ptr[row * k + col + u]
+                        vec[u] = a_ptr[unsafe_offset=row * k + col + u]
             regs[t] = vec
 
     @always_inline
     @parameter
     @__copy_capture(a_smem, tid)
     def _store_a_smem(buf: Int, regs: InlineArray[SIMD[F32, VEC_A], NA]):
-        var base = a_smem + buf * BK * BM
+        var base = a_smem.unsafe_offset(buf * BK * BM)
         comptime for t in range(NA):
             var ci = t * THREADS + tid
             var mm = ci // (BK // VEC_A)
             var ck = (ci % (BK // VEC_A)) * VEC_A
             comptime for u in range(VEC_A):
-                base[(ck + u) * BM + mm] = regs[t][u]
+                base[unsafe_offset=(ck + u) * BM + mm] = regs[t][u]
 
     @always_inline
     @parameter
     @__copy_capture(b_ptr, bn, n, k, k_end)
     def _cpasync_b(kt: Int, buf: Int):
         # B (k, n) row-major: chunks along n, straight into Bs[kk][nn].
-        var base = b_smem + buf * BK * BN
+        var base = b_smem.unsafe_offset(buf * BK * BN)
         comptime for t in range(NB):
             var ci = t * THREADS + tid
             var kk = ci // (BN // VEC_B)
@@ -436,8 +437,12 @@ def _gemm_pipe_kernel[
                 bytes = Int32(max(0, min(VEC_B, n - col)) * 4)
             var src_off = (row * n + col) if bytes > 0 else 0
             async_copy[VEC_B * 4, fill=Scalar[F32](0)](
-                (b_ptr + src_off).address_space_cast[AddressSpace.GLOBAL](),
-                (base + kk * BN + cn).address_space_cast[AddressSpace.SHARED](),
+                (b_ptr.unsafe_offset(src_off)).unsafe_address_space_cast[
+                    AddressSpace.GLOBAL
+                ](),
+                (base.unsafe_offset(kk * BN + cn)).unsafe_address_space_cast[
+                    AddressSpace.SHARED
+                ](),
                 src_size=bytes,
             )
 
@@ -455,23 +460,23 @@ def _gemm_pipe_kernel[
             var vec = SIMD[F32, VEC_B](0)
             if row < n:
                 if col + VEC_B <= k_end:
-                    vec = b_ptr.load[width=VEC_B](row * k + col)
+                    vec = b_ptr.unsafe_load[width=VEC_B](row * k + col)
                 elif col < k_end:
                     for u in range(k_end - col):
-                        vec[u] = b_ptr[row * k + col + u]
+                        vec[u] = b_ptr[unsafe_offset=row * k + col + u]
             regs[t] = vec
 
     @always_inline
     @parameter
     @__copy_capture(b_smem, tid)
     def _store_b_smem(buf: Int, regs: InlineArray[SIMD[F32, VEC_B], NB]):
-        var base = b_smem + buf * BK * BN
+        var base = b_smem.unsafe_offset(buf * BK * BN)
         comptime for t in range(NB):
             var ci = t * THREADS + tid
             var nn = ci // (BK // VEC_B)
             var ck = (ci % (BK // VEC_B)) * VEC_B
             comptime for u in range(VEC_B):
-                base[(ck + u) * BN + nn] = regs[t][u]
+                base[unsafe_offset=(ck + u) * BN + nn] = regs[t][u]
 
     @always_inline
     @parameter
@@ -512,11 +517,11 @@ def _gemm_pipe_kernel[
             comptime if transpose_b:
                 _load_b_regs(k_start + (s + 1) * BK, b_regs)
 
-        var a_base_s = a_smem + cur * BK * BM
-        var b_base_s = b_smem + cur * BK * BN
+        var a_base_s = a_smem.unsafe_offset(cur * BK * BM)
+        var b_base_s = b_smem.unsafe_offset(cur * BK * BN)
         for kk in range(BK):
-            var a_frag = a_base_s.load[width=TM](kk * BM + tm0)
-            var b_frag = b_base_s.load[width=TN](kk * BN + tn0)
+            var a_frag = a_base_s.unsafe_load[width=TM](kk * BM + tm0)
+            var b_frag = b_base_s.unsafe_load[width=TN](kk * BN + tn0)
             comptime for i in range(TM):
                 acc[i] = b_frag.fma(SIMD[F32, TN](a_frag[i]), acc[i])
 
@@ -535,12 +540,12 @@ def _gemm_pipe_kernel[
         var row = bm + tm0 + i
         if row < m:
             if bn + tn0 + TN <= n:
-                c_ptr.store(row * n + bn + tn0, acc[i])
+                c_ptr.unsafe_store(row * n + bn + tn0, acc[i])
             else:
                 comptime for j in range(TN):
                     var col = bn + tn0 + j
                     if col < n:
-                        c_ptr[row * n + col] = acc[i][j]
+                        c_ptr[unsafe_offset=row * n + col] = acc[i][j]
 
 
 # ---------------------------------------------------------------------------
@@ -560,8 +565,8 @@ comptime PIPE3_STAGES = 4
 # (96 KB for a GPT-2 decode step; ~1 µs).
 @__name("pure_transpose_small")
 def _transpose_small_kernel(
-    out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     k_arg: Int64,
 ):
@@ -575,7 +580,7 @@ def _transpose_small_kernel(
         return
     var mm = i // k
     var kk = i % k
-    out_ptr[kk * m + mm] = in_ptr[i]
+    out_ptr[unsafe_offset=kk * m + mm] = in_ptr[unsafe_offset=i]
 
 
 @__llvm_metadata(
@@ -605,15 +610,15 @@ def _gemm_pipe3_kernel[
     # -1 keeps the historical default (2 for BM >= 128 else 3).
     # BIAS: fuse `c[row, col] += bias[col]` into the epilogue (the ks == 0
     # split only, so split-K partial sums receive the bias exactly once).
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
     a_bstride_arg: Int64,
     ksplits_arg: Int64,
-    bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    bias_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
 ):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
@@ -642,9 +647,9 @@ def _gemm_pipe3_kernel[
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice; a reduce kernel sums them afterwards.
     # a_bstride is 0 when A is shared across the batch (conv weights).
-    var c_ptr = c_base + block_idx.z * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var bm = block_idx.y * BM
     var bn = block_idx.x * BN
@@ -671,8 +676,8 @@ def _gemm_pipe3_kernel[
     def _fetch(s: Int):
         var buf = s % STAGES
         var kt = k_start + s * BK
-        var a_dst = a_smem + buf * BM * BK
-        var b_dst = b_smem + buf * BK * BN
+        var a_dst = a_smem.unsafe_offset(buf * BM * BK)
+        var b_dst = b_smem.unsafe_offset(buf * BK * BN)
 
         comptime if AT:
             # A^T (k, m) row-major: chunks along m into As[kk][mm], so the
@@ -689,10 +694,12 @@ def _gemm_pipe3_kernel[
                     bytes = Int32(max(0, min(VEC_A, m - col)) * 4)
                 var src_off = (row * m + col) if bytes > 0 else 0
                 async_copy[VEC_A * 4, fill=Scalar[F32](0)](
-                    (a_ptr + src_off).address_space_cast[AddressSpace.GLOBAL](),
-                    (a_dst + kk * BM + cm).address_space_cast[
-                        AddressSpace.SHARED
+                    (a_ptr.unsafe_offset(src_off)).unsafe_address_space_cast[
+                        AddressSpace.GLOBAL
                     ](),
+                    (
+                        a_dst.unsafe_offset(kk * BM + cm)
+                    ).unsafe_address_space_cast[AddressSpace.SHARED](),
                     src_size=bytes,
                 )
         else:
@@ -708,10 +715,12 @@ def _gemm_pipe3_kernel[
                     bytes = Int32(max(0, min(VEC_A, k_end - col)) * 4)
                 var src_off = (row * k + col) if bytes > 0 else 0
                 async_copy[VEC_A * 4, fill=Scalar[F32](0)](
-                    (a_ptr + src_off).address_space_cast[AddressSpace.GLOBAL](),
-                    (a_dst + mm * BK + ck).address_space_cast[
-                        AddressSpace.SHARED
+                    (a_ptr.unsafe_offset(src_off)).unsafe_address_space_cast[
+                        AddressSpace.GLOBAL
                     ](),
+                    (
+                        a_dst.unsafe_offset(mm * BK + ck)
+                    ).unsafe_address_space_cast[AddressSpace.SHARED](),
                     src_size=bytes,
                 )
 
@@ -727,8 +736,10 @@ def _gemm_pipe3_kernel[
                 bytes = Int32(max(0, min(VEC_B, n - col)) * 4)
             var src_off = (row * n + col) if bytes > 0 else 0
             async_copy[VEC_B * 4, fill=Scalar[F32](0)](
-                (b_ptr + src_off).address_space_cast[AddressSpace.GLOBAL](),
-                (b_dst + kk * BN + cn).address_space_cast[
+                (b_ptr.unsafe_offset(src_off)).unsafe_address_space_cast[
+                    AddressSpace.GLOBAL
+                ](),
+                (b_dst.unsafe_offset(kk * BN + cn)).unsafe_address_space_cast[
                     AddressSpace.SHARED
                 ](),
                 src_size=bytes,
@@ -747,8 +758,8 @@ def _gemm_pipe3_kernel[
         barrier()
 
         var buf = s % STAGES
-        var a_base_s = a_smem + buf * BM * BK
-        var b_base_s = b_smem + buf * BK * BN
+        var a_base_s = a_smem.unsafe_offset(buf * BM * BK)
+        var b_base_s = b_smem.unsafe_offset(buf * BK * BN)
 
         # Fully unrolled with register-double-buffered fragments: the
         # loads for slab column kk + 1 issue before the FMAs of column
@@ -756,21 +767,21 @@ def _gemm_pipe3_kernel[
         # instead of stalling every iteration.
         var a_cur: SIMD[F32, TM]
         comptime if AT:
-            a_cur = a_base_s.load[width=TM](tm0)
+            a_cur = a_base_s.unsafe_load[width=TM](tm0)
         else:
             a_cur = SIMD[F32, TM](0)
             comptime for i in range(TM):
-                a_cur[i] = a_base_s[(tm0 + i) * BK]
-        var b_cur = b_base_s.load[width=TN](tn0)
+                a_cur[i] = a_base_s[unsafe_offset=(tm0 + i) * BK]
+        var b_cur = b_base_s.unsafe_load[width=TN](tn0)
         comptime for kk in range(BK - 1):
             var a_nxt: SIMD[F32, TM]
             comptime if AT:
-                a_nxt = a_base_s.load[width=TM]((kk + 1) * BM + tm0)
+                a_nxt = a_base_s.unsafe_load[width=TM]((kk + 1) * BM + tm0)
             else:
                 a_nxt = SIMD[F32, TM](0)
                 comptime for i in range(TM):
-                    a_nxt[i] = a_base_s[(tm0 + i) * BK + kk + 1]
-            var b_nxt = b_base_s.load[width=TN]((kk + 1) * BN + tn0)
+                    a_nxt[i] = a_base_s[unsafe_offset=(tm0 + i) * BK + kk + 1]
+            var b_nxt = b_base_s.unsafe_load[width=TN]((kk + 1) * BN + tn0)
             comptime for i in range(TM):
                 acc[i] = b_cur.fma(SIMD[F32, TN](a_cur[i]), acc[i])
             a_cur = a_nxt
@@ -797,33 +808,33 @@ def _gemm_pipe3_kernel[
                 comptime for i in range(TM):
                     out[i] = acc[i][j]
                 if row0 + TM <= m:
-                    c_ptr.store(col * m + row0, out)
+                    c_ptr.unsafe_store(col * m + row0, out)
                 else:
                     comptime for i in range(TM):
                         if row0 + i < m:
-                            c_ptr[col * m + row0 + i] = out[i]
+                            c_ptr[unsafe_offset=col * m + row0 + i] = out[i]
     else:
         comptime if BIAS:
             var bias_frag = SIMD[F32, TN](0)
             if ks == 0:
                 if bn + tn0 + TN <= n:
-                    bias_frag = bias_ptr.load[width=TN](bn + tn0)
+                    bias_frag = bias_ptr.unsafe_load[width=TN](bn + tn0)
                 else:
                     comptime for j in range(TN):
                         if bn + tn0 + j < n:
-                            bias_frag[j] = bias_ptr[bn + tn0 + j]
+                            bias_frag[j] = bias_ptr[unsafe_offset=bn + tn0 + j]
             comptime for i in range(TM):
                 acc[i] = acc[i] + bias_frag
         comptime for i in range(TM):
             var row = bm + tm0 + i
             if row < m:
                 if bn + tn0 + TN <= n:
-                    c_ptr.store(row * n + bn + tn0, acc[i])
+                    c_ptr.unsafe_store(row * n + bn + tn0, acc[i])
                 else:
                     comptime for j in range(TN):
                         var col = bn + tn0 + j
                         if col < n:
-                            c_ptr[row * n + col] = acc[i][j]
+                            c_ptr[unsafe_offset=row * n + col] = acc[i][j]
 
 
 # ---------------------------------------------------------------------------
@@ -845,9 +856,9 @@ def _gemm_smallm_kernel[
     dtype: DType,
     transpose_b: Bool,
 ](
-    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[dtype], MutAnyOrigin],
+    a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -875,9 +886,9 @@ def _gemm_smallm_kernel[
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice; a reduce kernel sums them afterwards.
     # a_bstride is 0 when A is shared across the batch (conv weights).
-    var c_ptr = c_base + block_idx.z * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(block_idx.z * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var acc = InlineArray[Scalar[DType.float32], SMALLM_MR](
         fill=Scalar[DType.float32](0)
@@ -892,9 +903,9 @@ def _gemm_smallm_kernel[
     @parameter
     def _load_b(kk: Int) -> Scalar[DType.float32]:
         comptime if transpose_b:
-            return b_ptr[col * k + kk].cast[DType.float32]()
+            return b_ptr[unsafe_offset=col * k + kk].cast[DType.float32]()
         else:
-            return b_ptr[kk * n + col].cast[DType.float32]()
+            return b_ptr[unsafe_offset=kk * n + col].cast[DType.float32]()
 
     for kt in range(k_start, k4, KU):
         var bv = InlineArray[Scalar[DType.float32], KU](uninitialized=True)
@@ -904,7 +915,7 @@ def _gemm_smallm_kernel[
             comptime for r in range(SMALLM_MR):
                 if r < m:
                     acc[r] = (
-                        a_ptr[r * k + kt + u]
+                        a_ptr[unsafe_offset=r * k + kt + u]
                         .cast[DType.float32]()
                         .fma(bv[u], acc[r])
                     )
@@ -913,11 +924,15 @@ def _gemm_smallm_kernel[
         var bv = _load_b(kk)
         comptime for r in range(SMALLM_MR):
             if r < m:
-                acc[r] = a_ptr[r * k + kk].cast[DType.float32]().fma(bv, acc[r])
+                acc[r] = (
+                    a_ptr[unsafe_offset=r * k + kk]
+                    .cast[DType.float32]()
+                    .fma(bv, acc[r])
+                )
 
     comptime for r in range(SMALLM_MR):
         if r < m:
-            c_ptr[r * n + col] = acc[r].cast[dtype]()
+            c_ptr[unsafe_offset=r * n + col] = acc[r].cast[dtype]()
 
 
 # ---------------------------------------------------------------------------
@@ -938,10 +953,10 @@ def _gemm_smallm_kernel[
 def _amd_dynamic_mfma_edge_kernel[
     dtype: DType, transpose_b: Bool, fuse_bias: Bool
 ](
-    c: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    bias: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c: Pointer[Scalar[dtype], MutAnyOrigin],
+    a: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    bias: Pointer[Scalar[dtype], ImmutAnyOrigin],
     n_arg: Int64,
     k_arg: Int64,
     row_start_arg: Int64,
@@ -972,24 +987,26 @@ def _amd_dynamic_mfma_edge_kernel[
     var k4 = (k // 4) * 4
     for kk in range(0, k4, 4):
         comptime for u in range(4):
-            var bv = b[col * k + kk + u] if transpose_b else b[
-                (kk + u) * n + col
+            var bv = b[unsafe_offset=col * k + kk + u] if transpose_b else b[
+                unsafe_offset=(kk + u) * n + col
             ]
             acc = (
-                a[row * k + kk + u]
+                a[unsafe_offset=row * k + kk + u]
                 .cast[DType.float32]()
                 .fma(bv.cast[DType.float32](), acc)
             )
     for kk in range(k4, k):
-        var bv = b[col * k + kk] if transpose_b else b[kk * n + col]
+        var bv = b[unsafe_offset=col * k + kk] if transpose_b else b[
+            unsafe_offset=kk * n + col
+        ]
         acc = (
-            a[row * k + kk]
+            a[unsafe_offset=row * k + kk]
             .cast[DType.float32]()
             .fma(bv.cast[DType.float32](), acc)
         )
     comptime if fuse_bias:
-        acc += bias[col].cast[DType.float32]()
-    c[row * n + col] = acc.cast[dtype]()
+        acc += bias[unsafe_offset=col].cast[DType.float32]()
+    c[unsafe_offset=row * n + col] = acc.cast[dtype]()
 
 
 @always_inline
@@ -1056,7 +1073,7 @@ def _amd_dynamic_mfma_gemm[
     var c_ptr = _make_ptr[dtype](c_addr)
     var c = TileTensor(c_ptr, row_major(Coord(m, n)))
     var a = TileTensor(
-        _make_ptr[dtype](a_addr).as_immutable(), row_major(Coord(m, k))
+        _make_ptr[dtype](a_addr).as_imm(), row_major(Coord(m, k))
     )
 
     @always_inline
@@ -1069,15 +1086,17 @@ def _amd_dynamic_mfma_gemm[
         var col = Int(coords[1])
         var off = row * n + col
         if col + width <= n:
-            c_ptr.store[width=width, alignment=4](off, value.cast[dtype]())
+            c_ptr.unsafe_store[width=width, alignment=4](
+                off, value.cast[dtype]()
+            )
         else:
             comptime for i in range(width):
                 if col + i < n:
-                    c_ptr[off + i] = value[i].cast[dtype]()
+                    c_ptr[unsafe_offset=off + i] = value[i].cast[dtype]()
 
     comptime edge_epilogue = Optional[elementwise_epilogue_type](_edge_store)
 
-    var bias_ptr = _make_ptr[dtype](bias_addr).as_immutable()
+    var bias_ptr = _make_ptr[dtype](bias_addr).as_imm()
 
     @always_inline
     @parameter
@@ -1090,14 +1109,18 @@ def _amd_dynamic_mfma_gemm[
         var off = row * n + col
         if col + width <= n:
             var result = (
-                value.cast[F32]() + bias_ptr.load[width=width](col).cast[F32]()
+                value.cast[F32]()
+                + bias_ptr.unsafe_load[width=width](col).cast[F32]()
             )
-            c_ptr.store[width=width, alignment=4](off, result.cast[dtype]())
+            c_ptr.unsafe_store[width=width, alignment=4](
+                off, result.cast[dtype]()
+            )
         else:
             comptime for i in range(width):
                 if col + i < n:
-                    c_ptr[off + i] = (
-                        value[i].cast[F32]() + bias_ptr[col + i].cast[F32]()
+                    c_ptr[unsafe_offset=off + i] = (
+                        value[i].cast[F32]()
+                        + bias_ptr[unsafe_offset=col + i].cast[F32]()
                     ).cast[dtype]()
 
     comptime bias_epilogue = Optional[elementwise_epilogue_type](_bias_store)
@@ -1111,7 +1134,7 @@ def _amd_dynamic_mfma_gemm[
         k_group_size=K_GROUP_SIZE,
     )
     var b = TileTensor(
-        _make_ptr[dtype](b_addr).as_immutable(),
+        _make_ptr[dtype](b_addr).as_imm(),
         row_major(Coord(n, k)) if transpose_b else row_major(Coord(k, n)),
     )
 
@@ -1139,8 +1162,8 @@ def _amd_dynamic_mfma_gemm[
             ),
         )
     var c_raw = c_ptr.as_unsafe_any_origin()
-    var a_raw = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable()
-    var b_raw = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable()
+    var a_raw = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_imm()
+    var b_raw = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_imm()
     if n_full < n:
         var col_count = n - n_full
         _enqueue_cached[
@@ -1205,9 +1228,9 @@ def _amd_splitk_mfma_kernel[
     BLOCK_K: Int,
     config: MatmulConfig[dtype, dtype, DType.float32, False],
 ](
-    ws_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -1228,20 +1251,22 @@ def _amd_splitk_mfma_kernel[
 
     var z = Int(block_idx.z)
     var k_off = z * k_per
-    var ws_ptr = ws_base + z * m * n
+    var ws_ptr = ws_base.unsafe_offset(z * m * n)
     var c = TileTensor(ws_ptr, row_major(Coord(m, n)))
     # A keeps its true row stride `k` and is merely offset along the contraction
     # axis; B's slab is `k_per` whole rows, so its extent carries the slab length
     # and the core's K loop follows it.
-    var a = TileTensor(a_base + k_off, row_major(Coord(m, k)))
-    var b = TileTensor(b_base + k_off * n, row_major(Coord(k_per, n)))
+    var a = TileTensor(a_base.unsafe_offset(k_off), row_major(Coord(m, k)))
+    var b = TileTensor(
+        b_base.unsafe_offset(k_off * n), row_major(Coord(k_per, n))
+    )
 
     @always_inline
     @parameter
     def _store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](coords: IndexList[2], value: SIMD[value_dtype, width]):
-        ws_ptr.store[width=width, alignment=size_of[DType.float32]()](
+        ws_ptr.unsafe_store[width=width, alignment=size_of[DType.float32]()](
             Int(coords[0]) * n + Int(coords[1]),
             value.cast[DType.float32](),
         )
@@ -1256,8 +1281,8 @@ def _amd_splitk_mfma_kernel[
 def _splitk_reduce_kernel[
     dtype: DType, VEC: Int
 ](
-    c_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     total_arg: Int64,
     parts_arg: Int64,
     vec_count_arg: Int64,
@@ -1276,10 +1301,10 @@ def _splitk_reduce_kernel[
     while j < vec_count:
         var acc = SIMD[DType.float32, VEC](0)
         for p in range(parts):
-            acc += ws_ptr.load[width=VEC, alignment=VEC * 4](
+            acc += ws_ptr.unsafe_load[width=VEC, alignment=VEC * 4](
                 p * total + j * VEC
             )
-        c_ptr.store[width=VEC, alignment=VEC * size_of[dtype]()](
+        c_ptr.unsafe_store[width=VEC, alignment=VEC * size_of[dtype]()](
             j * VEC, acc.cast[dtype]()
         )
         j += gstride
@@ -1287,8 +1312,8 @@ def _splitk_reduce_kernel[
     while tail < total:
         var acc = Scalar[DType.float32](0)
         for p in range(parts):
-            acc += ws_ptr[p * total + tail]
-        c_ptr[tail] = acc.cast[dtype]()
+            acc += ws_ptr[unsafe_offset=p * total + tail]
+        c_ptr[unsafe_offset=tail] = acc.cast[dtype]()
         tail += gstride
 
 
@@ -1327,8 +1352,8 @@ def _amd_splitk_mfma_gemm[
         _amd_splitk_mfma_kernel[dtype, BM, BN, BLOCK_K, config]
     ](
         ws.unsafe_ptr().as_unsafe_any_origin(),
-        _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable(),
-        _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable(),
+        _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_imm(),
+        _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_imm(),
         Int64(m),
         Int64(n),
         Int64(k),
@@ -1352,7 +1377,7 @@ def _amd_splitk_mfma_gemm[
         1,
         256,
         _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
-        ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+        ws.unsafe_ptr().as_unsafe_any_origin().as_imm(),
         Int64(total),
         Int64(parts),
         Int64(total // VEC),
@@ -1473,9 +1498,9 @@ def _amd_batched_mfma_kernel[
     CAUSAL: Int,
     config: MatmulConfig[dtype, dtype, dtype, transpose_b],
 ](
-    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[dtype], MutAnyOrigin],
+    a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -1499,7 +1524,7 @@ def _amd_batched_mfma_kernel[
     var z = Int(block_idx.z)
     var row_block = Int(block_idx.y)
     var col_block = Int(block_idx.x)
-    var c_ptr = c_base + z * c_bstride
+    var c_ptr = c_base.unsafe_offset(z * c_bstride)
 
     # A shortened or late-starting K range, in elements.  BM and BN are multiples
     # of BLOCK_K and the dispatch guarantees `k % 32 == 0`, so every bound below
@@ -1523,11 +1548,11 @@ def _amd_batched_mfma_kernel[
     # shortened K only has to be expressed in B's extent; A keeps its true row
     # stride and is merely offset along the contraction axis.
     var a = TileTensor(
-        a_base + z * a_bstride + (k_off if not transpose_b else 0),
+        a_base.unsafe_offset(z * a_bstride + (k_off if not transpose_b else 0)),
         row_major(Coord(m, k)),
     )
     var b = TileTensor(
-        b_base + z * b_bstride + k_off * n,
+        b_base.unsafe_offset(z * b_bstride + k_off * n),
         row_major(Coord(n, k)) if transpose_b else row_major(Coord(k_live, n)),
     )
 
@@ -1540,7 +1565,7 @@ def _amd_batched_mfma_kernel[
     def _store[
         value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
     ](coords: IndexList[2], value: SIMD[value_dtype, width]):
-        c_ptr.store[width=width, alignment=size_of[dtype]()](
+        c_ptr.unsafe_store[width=width, alignment=size_of[dtype]()](
             Int(coords[0]) * n + Int(coords[1]), value.cast[dtype]()
         )
 
@@ -1559,7 +1584,7 @@ def _amd_batched_mfma_kernel[
                 var row = row_block * BM + index // BN
                 var col = col_block * BN + index % BN
                 if row < row_end and col < col_end:
-                    c_ptr[row * n + col] = Scalar[dtype](0)
+                    c_ptr[unsafe_offset=row * n + col] = Scalar[dtype](0)
                 index += threads
             return
 
@@ -1576,9 +1601,9 @@ def _amd_batched_mfma_kernel[
 def _amd_batched_mfma_edge_kernel[
     dtype: DType, transpose_b: Bool, CAUSAL: Int
 ](
-    c_base: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[dtype], MutAnyOrigin],
+    a_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -1610,13 +1635,15 @@ def _amd_batched_mfma_edge_kernel[
     var z = Int(block_idx.y)
     var row = idx // col_count
     var col = col_start + idx % col_count
-    var a = a_base + z * a_bstride
-    var b = b_base + z * b_bstride
+    var a = a_base.unsafe_offset(z * a_bstride)
+    var b = b_base.unsafe_offset(z * b_bstride)
     var k_begin = 0
     var k_end = k
     comptime if CAUSAL == CAUSAL_OUT:
         if col > row:
-            (c_base + z * c_bstride)[row * n + col] = Scalar[dtype](0)
+            (c_base.unsafe_offset(z * c_bstride))[
+                unsafe_offset=row * n + col
+            ] = Scalar[dtype](0)
             return
     comptime if CAUSAL == CAUSAL_A_ROWS:
         k_end = min(k, row + 1)
@@ -1624,13 +1651,17 @@ def _amd_batched_mfma_edge_kernel[
         k_begin = min(k, col)
     var acc = Scalar[DType.float32](0)
     for kk in range(k_begin, k_end):
-        var bv = b[col * k + kk] if transpose_b else b[kk * n + col]
+        var bv = b[unsafe_offset=col * k + kk] if transpose_b else b[
+            unsafe_offset=kk * n + col
+        ]
         acc = (
-            a[row * k + kk]
+            a[unsafe_offset=row * k + kk]
             .cast[DType.float32]()
             .fma(bv.cast[DType.float32](), acc)
         )
-    (c_base + z * c_bstride)[row * n + col] = acc.cast[dtype]()
+    (c_base.unsafe_offset(z * c_bstride))[
+        unsafe_offset=row * n + col
+    ] = acc.cast[dtype]()
 
 
 @always_inline
@@ -1680,8 +1711,8 @@ def _amd_batched_mfma_gemm[
         num_warp_k_partitions=WARP_K_PARTITIONS,
     )
     var c_ptr = _make_ptr[dtype](c_addr).as_unsafe_any_origin()
-    var a_ptr = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable()
-    var b_ptr = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable()
+    var a_ptr = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_imm()
+    var b_ptr = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_imm()
     var n_full = (n // BN) * BN
     if n_full > 0:
         ctx.enqueue_function[
@@ -2031,9 +2062,9 @@ def _nt_mfma_kernel[
     FILL_AT: Int = 0,
     WBODY: Bool = False,
 ](
-    c: UnsafePointer[Scalar[otype], MutAnyOrigin],
-    a: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    b: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    c: Pointer[Scalar[otype], MutAnyOrigin],
+    a: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b: Pointer[Scalar[dtype], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -2272,14 +2303,14 @@ def _nt_mfma_kernel[
         var bkr = tid // XPB
         var bxc = (tid % XPB) * NT_HVEC
         var k0 = slab * k_per
-        var a_ptr = a + (
+        var a_ptr = a.unsafe_offset(
             (m0 + trow) * k
             + tcol
             + k0 if A_KMAJOR else (k0 + NROWS * akr) * m
             + m0
             + axc
         )
-        var b_ptr = b + (
+        var b_ptr = b.unsafe_offset(
             (n0 + trow) * k
             + tcol
             + k0 if B_KMAJOR else (k0 + NROWS * bkr) * n
@@ -2303,7 +2334,7 @@ def _nt_mfma_kernel[
 
         var acc = stack_allocation[MT * NTL * 16, DType.float32]()
         comptime for i in range(MT * NTL):
-            acc.store(i * 16, SIMD[DType.float32, 16](0))
+            acc.unsafe_store(i * 16, SIMD[DType.float32, 16](0))
 
         var areg = stack_allocation[APASS * NT_VEC, dtype]()
         var breg = stack_allocation[BPASS * NT_VEC, dtype]()
@@ -2330,8 +2361,8 @@ def _nt_mfma_kernel[
                         live = live and m0 + trow + p * ROWS < m
                     var v = SIMD[dtype, NT_VEC](0)
                     if live:
-                        v = a_ptr.load[width=NT_VEC](p * pass_step)
-                    areg.store(p * NT_VEC, v)
+                        v = a_ptr.unsafe_load[width=NT_VEC](p * pass_step)
+                    areg.unsafe_store(p * NT_VEC, v)
             else:
                 comptime for p in range(APASS):
                     var live = True
@@ -2356,14 +2387,16 @@ def _nt_mfma_kernel[
                         )
                     var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
-                        v0 = a_ptr.load[width=NT_HVEC](p * a_pass)
+                        v0 = a_ptr.unsafe_load[width=NT_HVEC](p * a_pass)
                     comptime if PAIR:
                         var v1 = SIMD[dtype, NT_HVEC](0)
                         if live:
-                            v1 = a_ptr.load[width=NT_HVEC](p * a_pass + m)
-                        areg.store(p * NT_VEC, v0.interleave(v1))
+                            v1 = a_ptr.unsafe_load[width=NT_HVEC](
+                                p * a_pass + m
+                            )
+                        areg.unsafe_store(p * NT_VEC, v0.interleave(v1))
                     else:
-                        areg.store(p * NT_VEC, v0)
+                        areg.unsafe_store(p * NT_VEC, v0)
             comptime if B_KMAJOR:
                 comptime for p in range(BPASS):
                     var live = kok
@@ -2373,8 +2406,8 @@ def _nt_mfma_kernel[
                         live = live and n0 + trow + p * ROWS < n
                     var v = SIMD[dtype, NT_VEC](0)
                     if live:
-                        v = b_ptr.load[width=NT_VEC](p * pass_step)
-                    breg.store(p * NT_VEC, v)
+                        v = b_ptr.unsafe_load[width=NT_VEC](p * pass_step)
+                    breg.unsafe_store(p * NT_VEC, v)
             else:
                 comptime for p in range(BPASS):
                     var live = True
@@ -2393,16 +2426,18 @@ def _nt_mfma_kernel[
                         )
                     var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
-                        v0 = b_ptr.load[width=NT_HVEC](p * b_pass)
+                        v0 = b_ptr.unsafe_load[width=NT_HVEC](p * b_pass)
                     comptime if PAIR:
                         var v1 = SIMD[dtype, NT_HVEC](0)
                         if live:
-                            v1 = b_ptr.load[width=NT_HVEC](p * b_pass + n)
-                        breg.store(p * NT_VEC, v0.interleave(v1))
+                            v1 = b_ptr.unsafe_load[width=NT_HVEC](
+                                p * b_pass + n
+                            )
+                        breg.unsafe_store(p * NT_VEC, v0.interleave(v1))
                     else:
-                        breg.store(p * NT_VEC, v0)
-            a_ptr += a_step
-            b_ptr += b_step
+                        breg.unsafe_store(p * NT_VEC, v0)
+            a_ptr = a_ptr.unsafe_offset(a_step)
+            b_ptr = b_ptr.unsafe_offset(b_step)
 
         @always_inline
         @parameter
@@ -2414,12 +2449,14 @@ def _nt_mfma_kernel[
         ):
             comptime if SWIZZLE:
                 comptime for h in range(NT_VEC // 4):
-                    dst.store(
+                    dst.unsafe_store(
                         row_base + 4 * ((chunk0 + h) ^ sw_w),
-                        regs.load[width=4](reg_off + 4 * h),
+                        regs.unsafe_load[width=4](reg_off + 4 * h),
                     )
             else:
-                dst.store(row_base + tcol, regs.load[width=NT_VEC](reg_off))
+                dst.unsafe_store(
+                    row_base + tcol, regs.unsafe_load[width=NT_VEC](reg_off)
+                )
 
         # The interleaved k pair lands contiguously at `2 * x` of pair row `p`,
         # so the whole NT_VEC is still one `ds_write_b128`.
@@ -2434,8 +2471,9 @@ def _nt_mfma_kernel[
             reg_off: Int,
         ):
             comptime if PAIR:
-                dst.store(
-                    pair * 2 * w + 2 * xcol, regs.load[width=NT_VEC](reg_off)
+                dst.unsafe_store(
+                    pair * 2 * w + 2 * xcol,
+                    regs.unsafe_load[width=NT_VEC](reg_off),
                 )
             else:
                 # Unpaired, the fragment's four elements are `BX` apart and
@@ -2443,9 +2481,9 @@ def _nt_mfma_kernel[
                 # would land on the banks the `lo` half already holds.  Permuting
                 # the row by `x ^ (32 * ((k >> 2) & 1))` costs no LDS and makes
                 # them disjoint, and `(k >> 2) & 1` is exactly the reader's `hi`.
-                dst.store(
+                dst.unsafe_store(
                     pair * w + (xcol ^ (32 * ((pair >> 2) & 1))),
-                    regs.load[width=NT_VEC](reg_off),
+                    regs.unsafe_load[width=NT_VEC](reg_off),
                 )
 
         @always_inline
@@ -2532,9 +2570,11 @@ def _nt_mfma_kernel[
                     kof = 4 * ((2 * s) ^ t0)
                 comptime for i in range(MT):
                     comptime if A_KMAJOR:
-                        af.store(
+                        af.unsafe_store(
                             (s * MT + i) * 4,
-                            pa.load[width=4](abase + i * NT_MMA * PAD + kof),
+                            pa.unsafe_load[width=4](
+                                abase + i * NT_MMA * PAD + kof
+                            ),
                         )
                     else:
                         var base = (
@@ -2548,22 +2588,24 @@ def _nt_mfma_kernel[
                             )
                         )
                         comptime if PAIR:
-                            af.store(
+                            af.unsafe_store(
                                 (s * MT + i) * 4,
-                                pa.load[width=2](base).join(
-                                    pa.load[width=2](base + 2 * BM)
+                                pa.unsafe_load[width=2](base).join(
+                                    pa.unsafe_load[width=2](base + 2 * BM)
                                 ),
                             )
                         else:
                             var v = SIMD[dtype, 4]()
                             comptime for e in range(4):
-                                v[e] = pa[base + e * BM]
-                            af.store((s * MT + i) * 4, v)
+                                v[e] = pa[unsafe_offset=base + e * BM]
+                            af.unsafe_store((s * MT + i) * 4, v)
                 comptime for j in range(NTL):
                     comptime if B_KMAJOR:
-                        bf.store(
+                        bf.unsafe_store(
                             (s * NTL + j) * 4,
-                            pb.load[width=4](bbase + j * NT_MMA * PAD + kof),
+                            pb.unsafe_load[width=4](
+                                bbase + j * NT_MMA * PAD + kof
+                            ),
                         )
                     else:
                         var base = (
@@ -2577,17 +2619,17 @@ def _nt_mfma_kernel[
                             )
                         )
                         comptime if PAIR:
-                            bf.store(
+                            bf.unsafe_store(
                                 (s * NTL + j) * 4,
-                                pb.load[width=2](base).join(
-                                    pb.load[width=2](base + 2 * BN)
+                                pb.unsafe_load[width=2](base).join(
+                                    pb.unsafe_load[width=2](base + 2 * BN)
                                 ),
                             )
                         else:
                             var v = SIMD[dtype, 4]()
                             comptime for e in range(4):
-                                v[e] = pb[base + e * BN]
-                            bf.store((s * NTL + j) * 4, v)
+                                v[e] = pb[unsafe_offset=base + e * BN]
+                            bf.unsafe_store((s * NTL + j) * 4, v)
 
         @always_inline
         @parameter
@@ -2595,19 +2637,19 @@ def _nt_mfma_kernel[
             comptime for s in range(S0, S1):
                 comptime for i in range(MT):
                     comptime for j in range(NTL):
-                        var d = acc.load[width=16]((i * NTL + j) * 16)
+                        var d = acc.unsafe_load[width=16]((i * NTL + j) * 16)
                         mma(
                             d,
-                            af.load[width=4]((s * MT + i) * 4),
-                            bf.load[width=4]((s * NTL + j) * 4),
+                            af.unsafe_load[width=4]((s * MT + i) * 4),
+                            bf.unsafe_load[width=4]((s * NTL + j) * 4),
                             d,
                         )
-                        acc.store((i * NTL + j) * 16, d)
+                        acc.unsafe_store((i * NTL + j) * 16, d)
 
         var ca = smem
-        var cb = smem + SA
-        var na = smem + (SA + SB if STAGES == 2 else 0)
-        var nb = na + SA
+        var cb = smem.unsafe_offset(SA)
+        var na = smem.unsafe_offset(SA + SB if STAGES == 2 else 0)
+        var nb = na.unsafe_offset(SA)
 
         # k tiles THIS workgroup runs.  Under `SPLITK` the slab length `k_per` is a
         # whole number of k tiles but need NOT divide the tile count: the last slab
@@ -2765,7 +2807,9 @@ def _nt_mfma_kernel[
         var out = stack_allocation[(MT * NTL if OUT_ALL else 1) * 16, otype]()
         comptime if OUT_ALL:
             comptime for i in range(MT * NTL):
-                out.store(i * 16, acc.load[width=16](i * 16).cast[otype]())
+                out.unsafe_store(
+                    i * 16, acc.unsafe_load[width=16](i * 16).cast[otype]()
+                )
         llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
 
         # Register p of accumulator (i, j) is row
@@ -2775,7 +2819,7 @@ def _nt_mfma_kernel[
         # Under SPLITK each slab owns its own FP32 plane of the workspace; the
         # only rounding to the output dtype is the one the reduction performs,
         # exactly as in the unsplit path.
-        var cp = c + (slab * m * n if SPLITK else 0)
+        var cp = c.unsafe_offset(slab * m * n if SPLITK else 0)
         var cbase = (m0 + wm0 + 4 * hi) * n + n0 + wn0 + lo
         # Distance to the edge, so each guard is one compare against a
         # compile-time offset instead of a recomputed address.
@@ -2786,8 +2830,11 @@ def _nt_mfma_kernel[
                 comptime dc = j * NT_MMA
                 comptime if not OUT_ALL:
                     _nt_sched_fence()
-                    out.store(
-                        0, acc.load[width=16]((i * NTL + j) * 16).cast[otype]()
+                    out.unsafe_store(
+                        0,
+                        acc.unsafe_load[width=16]((i * NTL + j) * 16).cast[
+                            otype
+                        ](),
                     )
                     llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](
                         Int32(0)
@@ -2796,13 +2843,17 @@ def _nt_mfma_kernel[
                 comptime if not MASK_STORE:
                     comptime for p in range(16):
                         comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
-                        cp[cbase + dr * n + dc] = out[OFF + p]
+                        cp[unsafe_offset=cbase + dr * n + dc] = out[
+                            unsafe_offset=OFF + p
+                        ]
                 else:
                     if dc < cmax:
                         comptime for p in range(16):
                             comptime dr = i * NT_MMA + 8 * (p // 4) + (p % 4)
                             if dr < rmax:
-                                cp[cbase + dr * n + dc] = out[OFF + p]
+                                cp[unsafe_offset=cbase + dr * n + dc] = out[
+                                    unsafe_offset=OFF + p
+                                ]
 
 
 # Bytes per CU cycle the epilogue and the split-K workspace move.  Fitted from
@@ -3049,8 +3100,8 @@ def _nt_mfma_gemm[
             ]
         ](
             _make_ptr[otype](c_addr),
-            _make_ptr[dtype](a_addr).as_immutable(),
-            _make_ptr[dtype](b_addr).as_immutable(),
+            _make_ptr[dtype](a_addr).as_imm(),
+            _make_ptr[dtype](b_addr).as_imm(),
             Int64(m),
             Int64(n),
             Int64(k),
@@ -3381,7 +3432,7 @@ def _dense_mfma_route[
             1,
             256,
             _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
-            ws.unsafe_ptr().as_unsafe_any_origin().as_immutable(),
+            ws.unsafe_ptr().as_unsafe_any_origin().as_imm(),
             Int64(m * n),
             Int64(b_parts),
             Int64(m * n // VEC),
@@ -3856,12 +3907,8 @@ def _enqueue_pipe[
 ) raises:
     comptime THREADS = (BM // TM) * (BN // TN)
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     var va4 = k % 4 == 0  # A (and B when transposed) is loaded along k
 
     comptime if transpose_b:
@@ -4096,8 +4143,8 @@ def _gemm_enqueue[
             ):
                 return
 
-        var a = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable()
-        var b = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable()
+        var a = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_imm()
+        var b = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_imm()
 
         # Skinny-M float32 paths (decode-step GEMMs: m = batch <= 32). The
         # BM=64 tiles waste half of every block there; the BM=32 pipe3 tile
@@ -4444,7 +4491,7 @@ def _gemm_enqueue[
             var ws_ptr = (
                 _make_ptr[DType.float32](c_target)
                 .as_unsafe_any_origin()
-                .as_immutable()
+                .as_imm()
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
@@ -4517,12 +4564,8 @@ def _gemv_enqueue[
 ) raises:
     comptime if has_accelerator():
         var c_ptr = _make_ptr[dtype](c_addr).as_unsafe_any_origin()
-        var a_ptr = (
-            _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_immutable()
-        )
-        var b_ptr = (
-            _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_immutable()
-        )
+        var a_ptr = _make_ptr[dtype](a_addr).as_unsafe_any_origin().as_imm()
+        var b_ptr = _make_ptr[dtype](b_addr).as_unsafe_any_origin().as_imm()
         var c = TileTensor(c_ptr, row_major(m, n))
         var a = TileTensor(a_ptr, row_major(m, k))
         comptime if transpose_b:
@@ -4609,10 +4652,10 @@ def _gemv_dtype_dispatch(
 def _apple8_gemm_kernel[
     HAS_BIAS: Bool, SPLIT: Bool, TRANSPOSE_B: Bool
 ](
-    c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    bias_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -4659,7 +4702,9 @@ def _apple8_gemm_kernel[
         comptime for mi in range(NT_M):
             var grow = row_base + mi * MMA8_DIM + frow
             if interior or grow < m:
-                afrag[mi] = (a_ptr + grow * k + kk + fcol).load[width=FRAG8]()
+                afrag[mi] = (
+                    a_ptr.unsafe_offset(grow * k + kk + fcol)
+                ).unsafe_load[width=FRAG8]()
             else:
                 afrag[mi] = SIMD[DType.float32, FRAG8](0)
         var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
@@ -4671,17 +4716,19 @@ def _apple8_gemm_kernel[
                 comptime for s in range(FRAG8):
                     var gj = col_base + ni * MMA8_DIM + fcol + s
                     if interior or gj < n:
-                        bf[s] = b_ptr[gj * k + kk + frow]
+                        bf[s] = b_ptr[unsafe_offset=gj * k + kk + frow]
                 bfrag[ni] = bf
             else:
                 var krow = kk + frow
                 var gj = col_base + ni * MMA8_DIM + fcol
                 if interior or gj + 1 < n:
-                    bfrag[ni] = (b_ptr + krow * n + gj).load[width=FRAG8]()
+                    bfrag[ni] = (
+                        b_ptr.unsafe_offset(krow * n + gj)
+                    ).unsafe_load[width=FRAG8]()
                 else:
                     var bf = SIMD[DType.float32, FRAG8](0)
                     if gj < n:
-                        bf[0] = b_ptr[krow * n + gj]
+                        bf[0] = b_ptr[unsafe_offset=krow * n + gj]
                     bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
@@ -4699,19 +4746,19 @@ def _apple8_gemm_kernel[
                 if grow < m and gcol < n:
                     var v = frag[s]
                     comptime if SPLIT:
-                        c_ptr[out_base + grow * n + gcol] = v
+                        c_ptr[unsafe_offset=out_base + grow * n + gcol] = v
                     else:
                         comptime if HAS_BIAS:
-                            v += bias_ptr[gcol]
-                        c_ptr[grow * n + gcol] = v
+                            v += bias_ptr[unsafe_offset=gcol]
+                        c_ptr[unsafe_offset=grow * n + gcol] = v
 
 
 def _apple8_reduce_kernel[
     HAS_BIAS: Bool
 ](
-    c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    bias_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     mn_arg: Int64,
     n_arg: Int64,
     ksplits_arg: Int64,
@@ -4727,10 +4774,10 @@ def _apple8_reduce_kernel[
     while i < mn:
         var acc = Float32(0)
         for z in range(ksplits):
-            acc += ws_ptr[z * mn + i]
+            acc += ws_ptr[unsafe_offset=z * mn + i]
         comptime if HAS_BIAS:
-            acc += bias_ptr[i % n]
-        c_ptr[i] = acc
+            acc += bias_ptr[unsafe_offset=i % n]
+        c_ptr[unsafe_offset=i] = acc
         i += gstride
 
 
@@ -4750,16 +4797,12 @@ def _apple8_enqueue[
     var gx = ceildiv(n, 64)
     var gy = ceildiv(m, 32)
     var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     var bias = (
         _make_ptr[DType.float32](bias_addr if bias_addr != 0 else a_addr)
         .as_unsafe_any_origin()
-        .as_immutable()
+        .as_imm()
     )
     var slabs = k // MMA8_DIM
     var ksplits = 1
@@ -4787,7 +4830,7 @@ def _apple8_enqueue[
         )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](ksplits * m * n)
-    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    var ws_mut = Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=Int(ws.unsafe_ptr())
     ).as_unsafe_any_origin()
     _enqueue_cached[_apple8_gemm_kernel[False, True, TRANSPOSE_B]](
@@ -4815,7 +4858,7 @@ def _apple8_enqueue[
         1,
         256,
         c,
-        ws_mut.as_immutable(),
+        ws_mut.as_imm(),
         bias,
         Int64(mn),
         Int64(n),
@@ -4853,9 +4896,9 @@ def _apple8_fat_kernel[
     CAUSAL: Int = 0,
     TRANSPOSE_A: Bool = False,
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -4884,9 +4927,9 @@ def _apple8_fat_kernel[
 
     # With ksplits > 1, C is a [batch * ksplits, m, n] workspace and each
     # split writes its own slice. a_bstride is 0 when A is batch-shared.
-    var c_ptr = c_base + Int(block_idx.z) * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(Int(block_idx.z) * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var lane = Int(lane_id())
     var fl = _frag8_layout(lane)
@@ -4935,9 +4978,13 @@ def _apple8_fat_kernel[
                     if kk + fcol + s < k_end:
                         comptime if TRANSPOSE_A:
                             # A (K, M): logical row = stored column.
-                            af[s] = a_ptr[(kk + fcol + s) * m + grow]
+                            af[s] = a_ptr[
+                                unsafe_offset=(kk + fcol + s) * m + grow
+                            ]
                         else:
-                            af[s] = a_ptr[grow * k + kk + fcol + s]
+                            af[s] = a_ptr[
+                                unsafe_offset=grow * k + kk + fcol + s
+                            ]
             afrag[mi] = af
         var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
             uninitialized=True
@@ -4949,13 +4996,13 @@ def _apple8_fat_kernel[
                     comptime for s in range(FRAG8):
                         var gj = col_base + ni * MMA8_DIM + fcol + s
                         if gj < n:
-                            bf[s] = b_ptr[gj * k + kk + frow]
+                            bf[s] = b_ptr[unsafe_offset=gj * k + kk + frow]
             else:
                 if kk + frow < k_end:
                     comptime for s in range(FRAG8):
                         var gj = col_base + ni * MMA8_DIM + fcol + s
                         if gj < n:
-                            bf[s] = b_ptr[(kk + frow) * n + gj]
+                            bf[s] = b_ptr[unsafe_offset=(kk + frow) * n + gj]
             bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
@@ -4968,7 +5015,7 @@ def _apple8_fat_kernel[
     @always_inline
     @parameter
     def _load_a_fast(
-        ap0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_M]:
         var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
             uninitialized=True
@@ -4977,19 +5024,21 @@ def _apple8_fat_kernel[
             comptime if TRANSPOSE_A:
                 # A (K, M): the fragment's two slots differ by one stored
                 # row (stride m) — per-lane scalar pairs, like transposed B.
-                var p = ap0 + mi * MMA8_DIM
+                var p = ap0.unsafe_offset(mi * MMA8_DIM)
                 var af = SIMD[DType.float32, FRAG8](0)
                 comptime for s in range(FRAG8):
-                    af[s] = p[s * m]
+                    af[s] = p[unsafe_offset=s * m]
                 afrag[mi] = af
             else:
-                afrag[mi] = (ap0 + mi * MMA8_DIM * k).load[width=FRAG8]()
+                afrag[mi] = (ap0.unsafe_offset(mi * MMA8_DIM * k)).unsafe_load[
+                    width=FRAG8
+                ]()
         return afrag^
 
     @always_inline
     @parameter
     def _load_b_fast(
-        bp0: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+        bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_N]:
         var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
             uninitialized=True
@@ -4997,13 +5046,15 @@ def _apple8_fat_kernel[
         comptime for ni in range(NT_N):
             comptime if TRANSPOSE_B:
                 # B is (N, K): the fragment's two slots differ in n-row.
-                var p = bp0 + ni * MMA8_DIM * k
+                var p = bp0.unsafe_offset(ni * MMA8_DIM * k)
                 var bf = SIMD[DType.float32, FRAG8](0)
-                bf[0] = p[0]
-                bf[1] = p[k]
+                bf[0] = p[unsafe_offset=0]
+                bf[1] = p[unsafe_offset=k]
                 bfrag[ni] = bf
             else:
-                bfrag[ni] = (bp0 + ni * MMA8_DIM).load[width=FRAG8]()
+                bfrag[ni] = (bp0.unsafe_offset(ni * MMA8_DIM)).unsafe_load[
+                    width=FRAG8
+                ]()
         return bfrag^
 
     @always_inline
@@ -5024,29 +5075,29 @@ def _apple8_fat_kernel[
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue, so a
         # single simdgroup hides most of the device-load latency itself.
-        var ap: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+        var ap: Pointer[Scalar[DType.float32], ImmutAnyOrigin]
         var astep: Int
         comptime if TRANSPOSE_A:
-            ap = a_ptr + (k_start + fcol) * m + row_base + frow
+            ap = a_ptr.unsafe_offset((k_start + fcol) * m + row_base + frow)
             astep = MMA8_DIM * m
         else:
-            ap = a_ptr + (row_base + frow) * k + fcol + k_start
+            ap = a_ptr.unsafe_offset((row_base + frow) * k + fcol + k_start)
             astep = MMA8_DIM
-        var bp: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin]
+        var bp: Pointer[Scalar[DType.float32], ImmutAnyOrigin]
         var bstep: Int
         comptime if TRANSPOSE_B:
-            bp = b_ptr + (col_base + fcol) * k + frow + k_start
+            bp = b_ptr.unsafe_offset((col_base + fcol) * k + frow + k_start)
             bstep = MMA8_DIM
         else:
-            bp = b_ptr + (k_start + frow) * n + col_base + fcol
+            bp = b_ptr.unsafe_offset((k_start + frow) * n + col_base + fcol)
             bstep = MMA8_DIM * n
         var nslabs = (k_end - k_start) // MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap += astep
-                bp += bstep
+                ap = ap.unsafe_offset(astep)
+                bp = bp.unsafe_offset(bstep)
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -5068,9 +5119,9 @@ def _apple8_fat_kernel[
                 var gcol = col_base + ni * MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
                 if gcol + FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 @always_inline
@@ -5118,12 +5169,8 @@ def _apple8_fat_enqueue[
     # core busy; each shard costs an m*n partials round-trip.
     if blocks < TARGET_BLOCKS // 2:
         ksplits = min(min(ceildiv(TARGET_BLOCKS, blocks), slabs), 8)
-    var a = (
-        _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var b = (
-        _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+    var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
     if ksplits == 1:
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         comptime if STAGED:
@@ -5178,7 +5225,7 @@ def _apple8_fat_enqueue[
             )
         return
     var ws = ctx.enqueue_create_buffer[DType.float32](batch * ksplits * m * n)
-    var ws_mut = UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+    var ws_mut = Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=Int(ws.unsafe_ptr())
     ).as_unsafe_any_origin()
     comptime if STAGED:
@@ -5239,7 +5286,7 @@ def _apple8_fat_enqueue[
         1,
         256,
         c_out,
-        ws_mut.as_immutable(),
+        ws_mut.as_imm(),
         Int64(m * n),
         Int64(ksplits),
         Int64(total),
@@ -5268,9 +5315,9 @@ def _apple8_fat_enqueue[
 def _apple8_smem_kernel[
     SPLIT: Bool, TRANSPOSE_B: Bool, TRANSPOSE_A: Bool = False
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -5306,9 +5353,9 @@ def _apple8_smem_kernel[
     var k_start = min(k, ks * kchunk)
     var k_end = min(k, k_start + kchunk)
 
-    var c_ptr = c_base + Int(block_idx.z) * m * n
-    var a_ptr = a_base + bz * a_bstride
-    var b_ptr = b_base + bz * k * n
+    var c_ptr = c_base.unsafe_offset(Int(block_idx.z) * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var bm = Int(block_idx.y) * BLOCK_M
     var bn = Int(block_idx.x) * BLOCK_N
@@ -5351,13 +5398,15 @@ def _apple8_smem_kernel[
                 var row = kt + kk
                 var col = bm + mq
                 if row < k_end and col + 4 <= m:
-                    a_regs[q] = (a_ptr + row * m + col).load[width=4]()
+                    a_regs[q] = (
+                        a_ptr.unsafe_offset(row * m + col)
+                    ).unsafe_load[width=4]()
                 else:
                     var v = SIMD[DType.float32, 4](0)
                     if row < k_end:
                         comptime for j in range(4):
                             if col + j < m:
-                                v[j] = a_ptr[row * m + col + j]
+                                v[j] = a_ptr[unsafe_offset=row * m + col + j]
                     a_regs[q] = v
             else:
                 var mm = fid >> 2
@@ -5365,13 +5414,15 @@ def _apple8_smem_kernel[
                 var row = bm + mm
                 var col = kt + kq
                 if row < m and col + 4 <= k_end:
-                    a_regs[q] = (a_ptr + row * k + col).load[width=4]()
+                    a_regs[q] = (
+                        a_ptr.unsafe_offset(row * k + col)
+                    ).unsafe_load[width=4]()
                 else:
                     var v = SIMD[DType.float32, 4](0)
                     if row < m:
                         comptime for j in range(4):
                             if col + j < k_end:
-                                v[j] = a_ptr[row * k + col + j]
+                                v[j] = a_ptr[unsafe_offset=row * k + col + j]
                     a_regs[q] = v
         comptime for q in range(BV):
             var fid = q * THREADS + tid
@@ -5382,13 +5433,15 @@ def _apple8_smem_kernel[
                 var row = bn + nn
                 var col = kt + kq
                 if row < n and col + 4 <= k_end:
-                    b_regs[q] = (b_ptr + row * k + col).load[width=4]()
+                    b_regs[q] = (
+                        b_ptr.unsafe_offset(row * k + col)
+                    ).unsafe_load[width=4]()
                 else:
                     var v = SIMD[DType.float32, 4](0)
                     if row < n:
                         comptime for j in range(4):
                             if col + j < k_end:
-                                v[j] = b_ptr[row * k + col + j]
+                                v[j] = b_ptr[unsafe_offset=row * k + col + j]
                     b_regs[q] = v
             else:
                 # B (K, N): a straight row-segment copy.
@@ -5397,13 +5450,15 @@ def _apple8_smem_kernel[
                 var row = kt + kk
                 var col = bn + nq
                 if row < k_end and col + 4 <= n:
-                    b_regs[q] = (b_ptr + row * n + col).load[width=4]()
+                    b_regs[q] = (
+                        b_ptr.unsafe_offset(row * n + col)
+                    ).unsafe_load[width=4]()
                 else:
                     var v = SIMD[DType.float32, 4](0)
                     if row < k_end:
                         comptime for j in range(4):
                             if col + j < n:
-                                v[j] = b_ptr[row * n + col + j]
+                                v[j] = b_ptr[unsafe_offset=row * n + col + j]
                     b_regs[q] = v
 
     # Register -> threadgroup store for buffer `buf`.
@@ -5414,30 +5469,30 @@ def _apple8_smem_kernel[
         a_regs: InlineArray[SIMD[DType.float32, 4], AV],
         b_regs: InlineArray[SIMD[DType.float32, 4], BV],
     ):
-        var a_dst = a_smem + buf * BLOCK_M * LDA
-        var b_dst = b_smem + buf * BK * LDB
+        var a_dst = a_smem.unsafe_offset(buf * BLOCK_M * LDA)
+        var b_dst = b_smem.unsafe_offset(buf * BK * LDB)
         comptime for q in range(AV):
             var fid = q * THREADS + tid
             comptime if TRANSPOSE_A:
                 var kk = fid >> 4
                 var mq = (fid & 15) * 4
                 comptime for j in range(4):
-                    a_dst[(mq + j) * LDA + kk] = a_regs[q][j]
+                    a_dst[unsafe_offset=(mq + j) * LDA + kk] = a_regs[q][j]
             else:
                 var mm = fid >> 2
                 var kq = (fid & 3) * 4
-                a_dst.store(mm * LDA + kq, a_regs[q])
+                a_dst.unsafe_store(mm * LDA + kq, a_regs[q])
         comptime for q in range(BV):
             var fid = q * THREADS + tid
             comptime if TRANSPOSE_B:
                 var nn = fid >> 2
                 var kq = (fid & 3) * 4
                 comptime for j in range(4):
-                    b_dst[(kq + j) * LDB + nn] = b_regs[q][j]
+                    b_dst[unsafe_offset=(kq + j) * LDB + nn] = b_regs[q][j]
             else:
                 var kk = fid >> 4
                 var nq = (fid & 15) * 4
-                b_dst.store(kk * LDB + nq, b_regs[q])
+                b_dst.unsafe_store(kk * LDB + nq, b_regs[q])
 
     # Two 8-slab mma sweeps over threadgroup buffer `buf`.
     @always_inline
@@ -5446,23 +5501,27 @@ def _apple8_smem_kernel[
         buf: Int,
         mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
-        var a_src = a_smem + buf * BLOCK_M * LDA + (sgm + frow) * LDA + fcol
-        var b_src = b_smem + buf * BK * LDB + frow * LDB + sgn + fcol
+        var a_src = a_smem.unsafe_offset(
+            buf * BLOCK_M * LDA + (sgm + frow) * LDA + fcol
+        )
+        var b_src = b_smem.unsafe_offset(
+            buf * BK * LDB + frow * LDB + sgn + fcol
+        )
         comptime for kc in range(BK // MMA8_DIM):
             var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
                 uninitialized=True
             )
             comptime for mi in range(NT_M):
-                afrag[mi] = (a_src + mi * MMA8_DIM * LDA + kc * MMA8_DIM).load[
-                    width=FRAG8
-                ]()
+                afrag[mi] = (
+                    a_src.unsafe_offset(mi * MMA8_DIM * LDA + kc * MMA8_DIM)
+                ).unsafe_load[width=FRAG8]()
             var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
                 uninitialized=True
             )
             comptime for ni in range(NT_N):
-                bfrag[ni] = (b_src + kc * MMA8_DIM * LDB + ni * MMA8_DIM).load[
-                    width=FRAG8
-                ]()
+                bfrag[ni] = (
+                    b_src.unsafe_offset(kc * MMA8_DIM * LDB + ni * MMA8_DIM)
+                ).unsafe_load[width=FRAG8]()
             comptime for mi in range(NT_M):
                 comptime for ni in range(NT_N):
                     acc[mi * NT_N + ni] = _mma8x8(
@@ -5490,9 +5549,9 @@ def _apple8_smem_kernel[
                 var gcol = bn + sgn + ni * MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
                 if gcol + FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 def _tune_enqueue[
@@ -5536,23 +5595,15 @@ def _tune_enqueue[
             )
             c_target = Int(ws.value().unsafe_ptr())
         var c = _make_ptr[DType.float32](c_target).as_unsafe_any_origin()
-        var a = (
-            _make_ptr[DType.float32](a_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
-        )
-        var b = (
-            _make_ptr[DType.float32](b_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
-        )
+        var a = _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
+        var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
         comptime if pipe3:
             var bias = (
                 _make_ptr[DType.float32](
                     bias_addr if bias_addr != 0 else a_addr
                 )
                 .as_unsafe_any_origin()
-                .as_immutable()
+                .as_imm()
             )
             _enqueue_cached[
                 _gemm_pipe3_kernel[
@@ -5602,7 +5653,7 @@ def _tune_enqueue[
             var ws_ptr = (
                 _make_ptr[DType.float32](c_target)
                 .as_unsafe_any_origin()
-                .as_immutable()
+                .as_imm()
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
@@ -5649,9 +5700,7 @@ def _ct_enqueue[
         var at_buf = ctx.enqueue_create_buffer[DType.float32](m * k)
         var at_addr = Int(at_buf.unsafe_ptr())
         var a_in = (
-            _make_ptr[DType.float32](a_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
         )
         var at_out = _make_ptr[DType.float32](at_addr).as_unsafe_any_origin()
         _enqueue_cached[_transpose_small_kernel](
@@ -5668,14 +5717,10 @@ def _ct_enqueue[
         )
         var c = _make_ptr[DType.float32](c_addr).as_unsafe_any_origin()
         var wa = (
-            _make_ptr[DType.float32](b_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
         )
         var at = (
-            _make_ptr[DType.float32](at_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](at_addr).as_unsafe_any_origin().as_imm()
         )
         # Swapped roles: kernel-m = n (weight rows), kernel-n = m.
         _enqueue_cached[
@@ -5725,9 +5770,7 @@ def _pipe3t_enqueue[
         var at_buf = ctx.enqueue_create_buffer[DType.float32](m * k)
         var at_addr = Int(at_buf.unsafe_ptr())
         var a_in = (
-            _make_ptr[DType.float32](a_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](a_addr).as_unsafe_any_origin().as_imm()
         )
         var at_out = _make_ptr[DType.float32](at_addr).as_unsafe_any_origin()
         _enqueue_cached[_transpose_small_kernel](
@@ -5756,15 +5799,9 @@ def _pipe3t_enqueue[
             c_target = Int(ws.value().unsafe_ptr())
         var c = _make_ptr[DType.float32](c_target).as_unsafe_any_origin()
         var at = (
-            _make_ptr[DType.float32](at_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
+            _make_ptr[DType.float32](at_addr).as_unsafe_any_origin().as_imm()
         )
-        var b = (
-            _make_ptr[DType.float32](b_addr)
-            .as_unsafe_any_origin()
-            .as_immutable()
-        )
+        var b = _make_ptr[DType.float32](b_addr).as_unsafe_any_origin().as_imm()
         _enqueue_cached[
             _gemm_pipe3_kernel[
                 BM, BN, BK, TM, TN, 4, 4, False, STAGES, True, MINB
@@ -5792,7 +5829,7 @@ def _pipe3t_enqueue[
             var ws_ptr = (
                 _make_ptr[DType.float32](c_target)
                 .as_unsafe_any_origin()
-                .as_immutable()
+                .as_imm()
             )
             _enqueue_cached[_ksplit_reduce_kernel](
                 ctx,
@@ -6011,9 +6048,9 @@ def _gemm_dtype_dispatch(
 def _cpu_gemm_naive[
     dtype: DType
 ](
-    c_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    a_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
-    b_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    c_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    a_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    b_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     batch: Int,
     m: Int,
     n: Int,
@@ -6035,27 +6072,27 @@ def _cpu_gemm_naive[
     def row_func(row: Int):
         var bz = row // m
         var mm = row % m
-        var a_row = a_ptr + bz * a_bstride + mm * k
-        var c_row = c_ptr + row * n
-        var b_base = b_ptr + bz * b_batch_stride
+        var a_row = a_ptr.unsafe_offset(bz * a_bstride + mm * k)
+        var c_row = c_ptr.unsafe_offset(row * n)
+        var b_base = b_ptr.unsafe_offset(bz * b_batch_stride)
         for j in range(n):
             var acc = Float32(0)
             if transpose_b:
-                var b_row = b_base + j * k
+                var b_row = b_base.unsafe_offset(j * k)
                 for kk in range(k):
                     acc += (
-                        a_row[kk].cast[DType.float32]()
-                        * b_row[kk].cast[DType.float32]()
+                        a_row[unsafe_offset=kk].cast[DType.float32]()
+                        * b_row[unsafe_offset=kk].cast[DType.float32]()
                     )
             else:
                 for kk in range(k):
                     acc += (
-                        a_row[kk].cast[DType.float32]()
-                        * b_base[kk * n + j].cast[DType.float32]()
+                        a_row[unsafe_offset=kk].cast[DType.float32]()
+                        * b_base[unsafe_offset=kk * n + j].cast[DType.float32]()
                     )
             if has_bias:
-                acc += bias_ptr[j].cast[DType.float32]()
-            c_row[j] = acc.cast[dtype]()
+                acc += bias_ptr[unsafe_offset=j].cast[DType.float32]()
+            c_row[unsafe_offset=j] = acc.cast[dtype]()
 
     parallelize[row_func](batch * m, ctx)
 
@@ -6064,9 +6101,9 @@ def _cpu_gemm_naive[
 def _cpu_matmul_one[
     ab_dtype: DType, c_dtype: DType, transpose_b: Bool
 ](
-    c_ptr: UnsafePointer[Scalar[c_dtype], MutUntrackedOrigin],
-    a_ptr: UnsafePointer[Scalar[ab_dtype], MutUntrackedOrigin],
-    b_ptr: UnsafePointer[Scalar[ab_dtype], MutUntrackedOrigin],
+    c_ptr: Pointer[Scalar[c_dtype], MutUntrackedOrigin],
+    a_ptr: Pointer[Scalar[ab_dtype], MutUntrackedOrigin],
+    b_ptr: Pointer[Scalar[ab_dtype], MutUntrackedOrigin],
     m: Int,
     n: Int,
     k: Int,
@@ -6106,9 +6143,9 @@ def _cpu_gemm[
     bias_addr: Int,  # 0 means no bias
     ctx: DeviceContext,
 ) raises:
-    var c_base = _make_ptr[dtype](c_addr) + c_off
-    var a_base = _make_ptr[dtype](a_addr) + a_off
-    var b_base = _make_ptr[dtype](b_addr) + b_off
+    var c_base = _make_ptr[dtype](c_addr).unsafe_offset(c_off)
+    var a_base = _make_ptr[dtype](a_addr).unsafe_offset(a_off)
+    var b_base = _make_ptr[dtype](b_addr).unsafe_offset(b_off)
     var has_bias = bias_addr != 0
 
     # Shapes the library CPU matmul mishandles (see the section comment):
@@ -6140,9 +6177,9 @@ def _cpu_gemm[
         # fp32: matmul each batch straight into C, then optional fp32 bias
         # (broadcast over all batch * m rows).
         for bz in range(batch):
-            var c_ptr = c_base + bz * (m * n)
-            var a_ptr = a_base + bz * a_bstride
-            var b_ptr = b_base + bz * b_batch_stride
+            var c_ptr = c_base.unsafe_offset(bz * (m * n))
+            var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+            var b_ptr = b_base.unsafe_offset(bz * b_batch_stride)
             if transpose_b:
                 _cpu_matmul_one[dtype, dtype, True](
                     c_ptr, a_ptr, b_ptr, m, n, k, ctx
@@ -6165,7 +6202,7 @@ def _cpu_gemm[
             # Accumulate A@B in an fp32 scratch, then add bias in fp32 and
             # cast to the output dtype exactly once.
             var total = batch * m * n
-            var scratch = alloc[Scalar[DType.float32]](total)
+            var scratch = unsafe_alloc[Scalar[DType.float32]](total)
             var bias_ptr = _make_ptr[dtype](bias_addr)
 
             @always_inline
@@ -6173,14 +6210,17 @@ def _cpu_gemm[
             @__copy_capture(scratch, c_base, bias_ptr)
             def add_cast_func[width: Int, alignment: Int = 1](idx: StdCoord):
                 var i = Int(idx[0].value())
-                var acc = scratch[i] + bias_ptr[i % n].cast[DType.float32]()
-                c_base[i] = acc.cast[dtype]()
+                var acc = (
+                    scratch[unsafe_offset=i]
+                    + bias_ptr[unsafe_offset=i % n].cast[DType.float32]()
+                )
+                c_base[unsafe_offset=i] = acc.cast[dtype]()
 
             try:
                 for bz in range(batch):
-                    var s_ptr = scratch + bz * (m * n)
-                    var a_ptr = a_base + bz * a_bstride
-                    var b_ptr = b_base + bz * b_batch_stride
+                    var s_ptr = scratch.unsafe_offset(bz * (m * n))
+                    var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+                    var b_ptr = b_base.unsafe_offset(bz * b_batch_stride)
                     if transpose_b:
                         _cpu_matmul_one[dtype, DType.float32, True](
                             s_ptr, a_ptr, b_ptr, m, n, k, ctx
@@ -6191,12 +6231,12 @@ def _cpu_gemm[
                         )
                 elementwise[add_cast_func, simd_width=1](StdCoord(total), ctx)
             finally:
-                scratch.free()
+                scratch.unsafe_free()
         else:
             for bz in range(batch):
-                var c_ptr = c_base + bz * (m * n)
-                var a_ptr = a_base + bz * a_bstride
-                var b_ptr = b_base + bz * b_batch_stride
+                var c_ptr = c_base.unsafe_offset(bz * (m * n))
+                var a_ptr = a_base.unsafe_offset(bz * a_bstride)
+                var b_ptr = b_base.unsafe_offset(bz * b_batch_stride)
                 if transpose_b:
                     _cpu_matmul_one[dtype, dtype, True](
                         c_ptr, a_ptr, b_ptr, m, n, k, ctx
@@ -6463,9 +6503,16 @@ def _bmm_causal_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _bmm_causal_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _bmm_causal_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -6491,7 +6538,9 @@ def _bias_add_row[
     @__copy_capture(out_ptr, bias_ptr)
     def func[width: Int, alignment: Int = 1](idx: StdCoord):
         var i = Int(idx[0].value())
-        out_ptr[i] = out_ptr[i] + bias_ptr[i % cols]
+        out_ptr[unsafe_offset=i] = (
+            out_ptr[unsafe_offset=i] + bias_ptr[unsafe_offset=i % cols]
+        )
 
     if ctx.api() == "cpu":
         elementwise[func, simd_width=1](StdCoord(total), ctx)
@@ -6665,9 +6714,16 @@ def _matmul_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _matmul_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _matmul_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -6678,9 +6734,16 @@ def _bmm_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _bmm_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _bmm_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()

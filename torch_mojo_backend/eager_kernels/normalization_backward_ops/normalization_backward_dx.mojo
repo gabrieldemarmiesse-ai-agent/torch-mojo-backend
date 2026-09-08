@@ -73,12 +73,12 @@ comptime _MAX_WARP_CHUNKS = 6 if has_apple_gpu_accelerator() else 8
 def _dx_warp_rows[
     chunks: Int
 ](
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows: Int,
     cols: Int,
     vec_cols: Int,
@@ -125,8 +125,8 @@ def _dx_warp_rows[
     var inv_cols = 1.0 / Float32(cols)
 
     while row < rows:
-        var m = mean[row]
-        var r = rstd[row]
+        var m = mean[unsafe_offset=row]
+        var r = rstd[unsafe_offset=row]
         var scale = r * inv_cols
         var base = row * cols
         var acc_q = SIMD[DType.float32, _VEC](0.0)
@@ -149,16 +149,18 @@ def _dx_warp_rows[
                         alignment=16,
                     ](input, offset)
                 else:
-                    q = grad_output.load[width=_VEC, alignment=16](offset)
-                    x = input.load[width=_VEC, alignment=16](offset)
+                    q = grad_output.unsafe_load[width=_VEC, alignment=16](
+                        offset
+                    )
+                    x = input.unsafe_load[width=_VEC, alignment=16](offset)
                 if has_weight != 0:
-                    q *= weight.load[width=_VEC, alignment=16](c * _VEC)
+                    q *= weight.unsafe_load[width=_VEC, alignment=16](c * _VEC)
                 var xh = (x - m) * r
-                q_shared.store[width=_VEC, alignment=16](
+                q_shared.unsafe_store[width=_VEC, alignment=16](
                     warp_slot + u * WARP_SIZE * _VEC, q
                 )
                 comptime if stage_xh:
-                    xh_shared.store[width=_VEC, alignment=16](
+                    xh_shared.unsafe_store[width=_VEC, alignment=16](
                         warp_slot + u * WARP_SIZE * _VEC, xh
                     )
                 acc_q += q
@@ -172,29 +174,31 @@ def _dx_warp_rows[
             var c = lane + u * WARP_SIZE
             if c < vec_cols:
                 var offset = base + c * _VEC
-                var q = q_shared.load[width=_VEC, alignment=16](
+                var q = q_shared.unsafe_load[width=_VEC, alignment=16](
                     warp_slot + u * WARP_SIZE * _VEC
                 )
                 var xh: SIMD[DType.float32, _VEC]
                 comptime if stage_xh:
-                    xh = xh_shared.load[width=_VEC, alignment=16](
+                    xh = xh_shared.unsafe_load[width=_VEC, alignment=16](
                         warp_slot + u * WARP_SIZE * _VEC
                     )
                 else:
-                    xh = (input.load[width=_VEC, alignment=16](offset) - m) * r
+                    xh = (
+                        input.unsafe_load[width=_VEC, alignment=16](offset) - m
+                    ) * r
                 var out = q.fma(r, xh.fma(-kc, -kb))
-                dx.store[width=_VEC, alignment=16](offset, out)
+                dx.unsafe_store[width=_VEC, alignment=16](offset, out)
         row += row_stride
 
 
 @__name("layer_norm_backward_dx_f32_c1")
 def _dx_c1(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -222,12 +226,12 @@ def _dx_c1(
 
 @__name("layer_norm_backward_dx_f32_c2")
 def _dx_c2(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -255,12 +259,12 @@ def _dx_c2(
 
 @__name("layer_norm_backward_dx_f32_c3")
 def _dx_c3(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -288,12 +292,12 @@ def _dx_c3(
 
 @__name("layer_norm_backward_dx_f32_c4")
 def _dx_c4(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -321,12 +325,12 @@ def _dx_c4(
 
 @__name("layer_norm_backward_dx_f32_c6")
 def _dx_c6(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -354,12 +358,12 @@ def _dx_c6(
 
 @__name("layer_norm_backward_dx_f32_c8")
 def _dx_c8(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     vec_cols_arg: Int64,
@@ -387,12 +391,12 @@ def _dx_c8(
 
 @__name("layer_norm_backward_dx_f32_generic")
 def _dx_generic(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     has_weight_arg: Int64,
@@ -406,17 +410,17 @@ def _dx_generic(
     var row = Int(block_idx.x)
     var row_stride = Int(grid_dim.x)
     while row < rows:
-        var m = mean[row]
-        var r = rstd[row]
+        var m = mean[unsafe_offset=row]
+        var r = rstd[unsafe_offset=row]
         var base = row * cols
         var acc_q = Float32(0.0)
         var acc_qx = Float32(0.0)
         var col = tid
         while col < cols:
-            var q = grad_output[base + col]
+            var q = grad_output[unsafe_offset=base + col]
             if has_weight != 0:
-                q *= weight[col]
-            var xh = (input[base + col] - m) * r
+                q *= weight[unsafe_offset=col]
+            var xh = (input[unsafe_offset=base + col] - m) * r
             acc_q += q
             acc_qx += q * xh
             col += _GEN_BLOCK
@@ -434,22 +438,22 @@ def _dx_generic(
         )
         col = tid
         while col < cols:
-            var q = grad_output[base + col]
+            var q = grad_output[unsafe_offset=base + col]
             if has_weight != 0:
-                q *= weight[col]
-            var xh = (input[base + col] - m) * r
-            dx[base + col] = q * r - kb - xh * kc
+                q *= weight[unsafe_offset=col]
+            var xh = (input[unsafe_offset=base + col] - m) * r
+            dx[unsafe_offset=base + col] = q * r - kb - xh * kc
             col += _GEN_BLOCK
         row += row_stride
 
 
 def enqueue_layer_norm_backward_dx_f32(
-    dx: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    dx: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows: Int,
     cols: Int,
     has_weight: Bool,

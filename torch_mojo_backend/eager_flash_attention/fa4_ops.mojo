@@ -49,7 +49,7 @@ def _fa4_bhsd_selfload_waves(
     that stay on the phase-2b geometry, an unmeasured combination this
     gate must not create (NOTES.md "Phase 2c" handoff item 4).
     """
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
+    var raw_ctx_ptr = Pointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))

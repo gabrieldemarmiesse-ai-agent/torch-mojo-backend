@@ -23,7 +23,7 @@
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceEvent, HostBuffer
-from std.memory import memcpy
+from std.memory import unsafe_memcpy
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.python.bindings import PythonModuleBuilder
@@ -99,7 +99,7 @@ def _stage_pageable_h2d(
 ) raises -> PythonObject:
     """Copy pageable CPU bytes to pinned memory, then enqueue pinned H2D."""
     var staging = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
-    memcpy(
+    unsafe_memcpy(
         dest=staging.unsafe_ptr(),
         src=_u8_ptr(host_ptr),
         count=nbytes,
@@ -123,7 +123,7 @@ def _stage_pageable_h2d(
 @always_inline
 def _u8_ptr(
     addr: Int,
-) -> UnsafePointer[Scalar[DType.uint8], MutUntrackedOrigin]:
+) -> Pointer[Scalar[DType.uint8], MutUntrackedOrigin]:
     return _make_ptr[DType.uint8](addr)
 
 
@@ -263,8 +263,8 @@ def copy_to_pinned_host(
 
 
 def _d2d_copy_vec4_kernel(
-    dst_ptr: UnsafePointer[Scalar[DType.uint32], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[DType.uint32], ImmutAnyOrigin],
+    dst_ptr: Pointer[Scalar[DType.uint32], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[DType.uint32], ImmutAnyOrigin],
     vec_count_arg: Int64,
     tail_words_arg: Int64,
 ):
@@ -283,7 +283,9 @@ def _d2d_copy_vec4_kernel(
     var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     if gid < tail_words:
-        dst_ptr[vec_count * 4 + gid] = src_ptr[vec_count * 4 + gid]
+        dst_ptr[unsafe_offset=vec_count * 4 + gid] = src_ptr[
+            unsafe_offset=vec_count * 4 + gid
+        ]
     # Each thread owns a group of 16 consecutive 16-byte chunks — one
     # sequential 256-byte stream per thread, the length the strided-permute
     # rowloop kernel measured streaming at ~2x the one-chunk-per-thread
@@ -293,14 +295,15 @@ def _d2d_copy_vec4_kernel(
     while g < groups:
         var b = g * 16
         for j in range(16):
-            dst_ptr.store[width=4, alignment=16](
-                (b + j) * 4, src_ptr.load[width=4, alignment=16]((b + j) * 4)
+            dst_ptr.unsafe_store[width=4, alignment=16](
+                (b + j) * 4,
+                src_ptr.unsafe_load[width=4, alignment=16]((b + j) * 4),
             )
         g += gstride
     var c = groups * 16 + gid
     if c < vec_count:
-        dst_ptr.store[width=4, alignment=16](
-            c * 4, src_ptr.load[width=4, alignment=16](c * 4)
+        dst_ptr.unsafe_store[width=4, alignment=16](
+            c * 4, src_ptr.unsafe_load[width=4, alignment=16](c * 4)
         )
 
 
@@ -346,7 +349,7 @@ def _copy_d2d_raw(
                 _make_ptr[DType.uint32](dst_addr).as_unsafe_any_origin(),
                 _make_ptr[DType.uint32](src_addr)
                 .as_unsafe_any_origin()
-                .as_immutable(),
+                .as_imm(),
                 Int64(vec_count),
                 Int64(words - vec_count * 4),
             )
@@ -363,13 +366,13 @@ def _copy_d2d_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _copy_d2d_raw(
-            _raw_ctx(args[0]),
-            _raw_int(args[1]),
-            _raw_int(args[2]),
-            _raw_int(args[3]),
+            _raw_ctx(args[unsafe_offset=0]),
+            _raw_int(args[unsafe_offset=1]),
+            _raw_int(args[unsafe_offset=2]),
+            _raw_int(args[unsafe_offset=3]),
         )
         return _raw_ret_none()
     except e:
@@ -393,7 +396,9 @@ def read_scalar(
             var src = _wrap_raw(ctx, Int(py=dev_ptr), size_of[dt]())
             src.enqueue_copy_to(staging.unsafe_ptr())
             ctx.synchronize()
-            var val = staging.unsafe_ptr().bitcast[Scalar[dt]]()[0]
+            var val = staging.unsafe_ptr().unsafe_bitcast[Scalar[dt]]()[
+                unsafe_offset=0
+            ]
             comptime if dt == DType.bool:
                 return PythonObject(Bool(val))
             elif dt.is_floating_point():
@@ -511,10 +516,16 @@ def _copy_strided_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         _copy_strided_go(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
         )
     except e:
         return _spec_unsupported(e)
@@ -587,9 +598,16 @@ def _strided_fill_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
-        _strided_fill_go(args[0], args[1], args[2], args[3], args[4], args[5])
+        _strided_fill_go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
     except e:
         return _spec_unsupported(e)
     return _raw_ret_none()
@@ -642,19 +660,19 @@ def _make_spec_dispatcher(
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         return _make_spec_go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
         )
     except e:
         return _spec_unsupported(e)

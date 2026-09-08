@@ -14,7 +14,8 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
 from std.math import ceildiv, cos, floor, sin, sqrt, tan
 from std.math.polynomial import polynomial_evaluate
-from std.memory import OpaquePointer, alloc, bitcast, stack_allocation
+from std.memory import OpaquePointer, bitcast, stack_allocation
+from std.memory.alloc import unsafe_alloc
 from std.python import Python, PythonObject
 from std.python._cpython import PyObjectPtr, Py_ssize_t
 from std.sys import llvm_intrinsic
@@ -60,7 +61,7 @@ comptime FLOAT_DTYPES = [DType.float32, DType.float16, DType.bfloat16]
 # gfx942 assembly), and Apple uses `llvm.air.sqrt`.
 @always_inline
 def ieee_sqrt[
-    dtype: DType, width: SIMDSize, //
+    dtype: DType, width: SIMDLength, //
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
     """Elementwise square root that is correctly rounded on every backend.
 
@@ -106,7 +107,7 @@ def ieee_sqrt[
 # per-vendor accuracy claim.
 @always_inline
 def custom_tan[
-    dtype: DType, width: SIMDSize, //, *, exact: Bool = True
+    dtype: DType, width: SIMDLength, //, *, exact: Bool = True
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
     """Elementwise tangent that keeps its relative accuracy on every backend.
 
@@ -314,7 +315,7 @@ def _fmod_narrow_float_exact_scalar(
 
 @always_inline
 def custom_remainder[
-    dtype: DType, width: SIMDSize, //
+    dtype: DType, width: SIMDLength, //
 ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
     """Elementwise `a % b` with Python/torch semantics -- the result takes the
     DIVISOR's sign -- exact for every dtype.
@@ -396,19 +397,21 @@ def _enqueue_cached[
     var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    if global_ptr := _get_global_or_null(name):
-        var fptr = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(name)
+
+    if global_ptr:
+        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             fptr[], *args, grid_dim=(gx, gy, gz), block_dim=(threads,)
         )
         return
 
     var compiled = ctx.compile_function[func]()
-    var fptr = alloc[FuncT](1)
-    fptr.init_pointee_move(compiled^)
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name),
-        fptr.bitcast[NoneType](),
+        fptr.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
         fptr[], *args, grid_dim=(gx, gy, gz), block_dim=(threads,)
@@ -435,8 +438,10 @@ def _enqueue_cached_2d[
     var name = String(t"TMB_KERNEL_2D_{key}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
 
-    if global_ptr := _get_global_or_null(name):
-        var fptr = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(name)
+
+    if global_ptr:
+        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             fptr[],
             *args,
@@ -446,11 +451,11 @@ def _enqueue_cached_2d[
         return
 
     var compiled = ctx.compile_function[func]()
-    var fptr = alloc[FuncT](1)
-    fptr.init_pointee_move(compiled^)
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(name),
-        fptr.bitcast[NoneType](),
+        fptr.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
         fptr[],
@@ -565,7 +570,7 @@ def _device_attr_cached(
         var name = String(t"TMB_DEVATTR_{key}_{ctx.id()}")
         var cached = _get_global_or_null(name)
         if cached:
-            return cached.value().bitcast[Int]()[]
+            return cached.value().unsafe_bitcast[Int]()[]
         var value = fallback
         try:
             var queried = ctx.get_attribute(attr)
@@ -575,10 +580,10 @@ def _device_attr_cached(
             # A backend that does not answer this query caches the fallback
             # too, so it is asked exactly once rather than on every launch.
             value = fallback
-        var slot = alloc[Int](1)
-        slot.init_pointee_move(value)
+        var slot = unsafe_alloc[Int](1)
+        slot.unsafe_write(value)
         external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-            StringSlice(name), slot.bitcast[NoneType]()
+            StringSlice(name), slot.unsafe_bitcast[NoneType]()
         )
         return value
     except:
@@ -796,7 +801,7 @@ def _moment_partition[
 def _moments_scan_contig[
     dtype: DType, //, V: Int, vec_align: Int, threads: Int
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     start: Int,
     n: Int,
     head: Int,
@@ -824,9 +829,9 @@ def _moments_scan_contig[
     var v = tid
     while v < n_vec:
         var d = (
-            in_ptr.load[width=V, alignment=vec_align](vec_start + v * V).cast[
-                DType.float32
-            ]()
+            in_ptr.unsafe_load[width=V, alignment=vec_align](
+                vec_start + v * V
+            ).cast[DType.float32]()
             - shift
         )
         s_vec += d
@@ -837,13 +842,13 @@ def _moments_scan_contig[
 
     var jh = tid
     while jh < head:
-        var d = in_ptr[start + jh].cast[DType.float32]() - shift
+        var d = in_ptr[unsafe_offset=start + jh].cast[DType.float32]() - shift
         s_t += d
         q_t += d * d
         jh += threads
     var jt = tail_start + tid
     while jt < n:
-        var d = in_ptr[start + jt].cast[DType.float32]() - shift
+        var d = in_ptr[unsafe_offset=start + jt].cast[DType.float32]() - shift
         s_t += d
         q_t += d * d
         jt += threads
@@ -852,11 +857,9 @@ def _moments_scan_contig[
 @always_inline
 def _make_ptr[
     dtype: DType
-](addr: Int) -> UnsafePointer[Scalar[dtype], MutUntrackedOrigin]:
+](addr: Int) -> Pointer[Scalar[dtype], MutUntrackedOrigin]:
     """Create a typed pointer from a raw integer address."""
-    return UnsafePointer[Scalar[dtype], MutUntrackedOrigin](
-        unsafe_from_address=addr
-    )
+    return Pointer[Scalar[dtype], MutUntrackedOrigin](unsafe_from_address=addr)
 
 
 def _get_ctx(device_context_ptr: PythonObject) raises -> DeviceContext:
@@ -1100,7 +1103,7 @@ def _check_into(a: TensorSpec, dst: TensorSpec, expected_dtype: DType) raises:
 
 
 @always_inline
-def _spec_ptr(o: PyObjectPtr) -> UnsafePointer[TensorSpec, MutAnyOrigin]:
+def _spec_ptr(o: PyObjectPtr) -> Pointer[TensorSpec, MutAnyOrigin]:
     """The TensorSpec behind a borrowed spec argument — a pure pointer cast.
 
     Callers are internal and guarantee the type (never consults the type
@@ -1145,11 +1148,11 @@ def _spec_dispatcher2[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 2:
             raise Error(what, " expects exactly 2 arguments")
-        go(args[0], args[1])
+        go(args[unsafe_offset=0], args[unsafe_offset=1])
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1163,11 +1166,11 @@ def _spec_dispatcher3[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 3:
             raise Error(what, " expects exactly 3 arguments")
-        go(args[0], args[1], args[2])
+        go(args[unsafe_offset=0], args[unsafe_offset=1], args[unsafe_offset=2])
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1183,11 +1186,16 @@ def _spec_dispatcher4[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 4:
             raise Error(what, " expects exactly 4 arguments")
-        go(args[0], args[1], args[2], args[3])
+        go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+        )
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1203,11 +1211,17 @@ def _spec_dispatcher5[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 5:
             raise Error(what, " expects exactly 5 arguments")
-        go(args[0], args[1], args[2], args[3], args[4])
+        go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+        )
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1228,11 +1242,18 @@ def _spec_dispatcher6[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 6:
             raise Error(what, " expects exactly 6 arguments")
-        go(args[0], args[1], args[2], args[3], args[4], args[5])
+        go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+        )
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1254,11 +1275,19 @@ def _spec_dispatcher7[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 7:
             raise Error(what, " expects exactly 7 arguments")
-        go(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+        go(
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+        )
         return _raw_ret_none()
     except e:
         return _spec_unsupported(e)
@@ -1281,19 +1310,19 @@ def _spec_dispatcher8[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 8:
             raise Error(what, " expects exactly 8 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
         )
         return _raw_ret_none()
     except e:
@@ -1318,20 +1347,20 @@ def _spec_dispatcher9[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 9:
             raise Error(what, " expects exactly 9 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
         )
         return _raw_ret_none()
     except e:
@@ -1357,21 +1386,21 @@ def _spec_dispatcher10[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 10:
             raise Error(what, " expects exactly 10 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
         )
         return _raw_ret_none()
     except e:
@@ -1398,22 +1427,22 @@ def _spec_dispatcher11[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 11:
             raise Error(what, " expects exactly 11 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
         )
         return _raw_ret_none()
     except e:
@@ -1441,23 +1470,23 @@ def _spec_dispatcher12[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 12:
             raise Error(what, " expects exactly 12 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
+            args[unsafe_offset=11],
         )
         return _raw_ret_none()
     except e:
@@ -1486,24 +1515,24 @@ def _spec_dispatcher13[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 13:
             raise Error(what, " expects exactly 13 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
+            args[unsafe_offset=11],
+            args[unsafe_offset=12],
         )
         return _raw_ret_none()
     except e:
@@ -1534,26 +1563,26 @@ def _spec_dispatcher15[
     args_safe: Pointer[PyObjectPtr, MutUntrackedOrigin],
     nargs: Py_ssize_t,
 ) abi("C") -> PyObjectPtr:
-    var args = UnsafePointer(args_safe)
+    var args = Pointer(args_safe)
     try:
         if nargs != 15:
             raise Error(what, " expects exactly 15 arguments")
         go(
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-            args[6],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-            args[11],
-            args[12],
-            args[13],
-            args[14],
+            args[unsafe_offset=0],
+            args[unsafe_offset=1],
+            args[unsafe_offset=2],
+            args[unsafe_offset=3],
+            args[unsafe_offset=4],
+            args[unsafe_offset=5],
+            args[unsafe_offset=6],
+            args[unsafe_offset=7],
+            args[unsafe_offset=8],
+            args[unsafe_offset=9],
+            args[unsafe_offset=10],
+            args[unsafe_offset=11],
+            args[unsafe_offset=12],
+            args[unsafe_offset=13],
+            args[unsafe_offset=14],
         )
         return _raw_ret_none()
     except e:
@@ -1600,8 +1629,8 @@ def _flat_vec_unary_kernel[
     op: def[w: Int](SIMD[dtype, w]) thin -> SIMD[out_dtype, w],
     name: StaticString,
 ](
-    out_ptr: UnsafePointer[Scalar[out_dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     total_arg: Int64,
 ):
     """One 16-byte load and one (possibly narrower) store per thread, plus a
@@ -1619,14 +1648,14 @@ def _flat_vec_unary_kernel[
     var c = tid
     while c < nvec:
         var i = c * VW
-        out_ptr.store[width=VW, alignment=out_align](
-            i, op[VW](in_ptr.load[width=VW, alignment=vec_align](i))
+        out_ptr.unsafe_store[width=VW, alignment=out_align](
+            i, op[VW](in_ptr.unsafe_load[width=VW, alignment=vec_align](i))
         )
         c += gstride
     var tail = total - nvec * VW
     if tid < tail:
         var i = nvec * VW + tid
-        out_ptr[i] = op[1](in_ptr[i])[0]
+        out_ptr[unsafe_offset=i] = op[1](in_ptr[unsafe_offset=i])[0]
 
 
 @always_inline
@@ -1663,7 +1692,7 @@ def _flat_vec_unary[
             1,
             GS_THREADS,
             _make_ptr[out_dtype](out_addr).as_unsafe_any_origin(),
-            _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable(),
+            _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm(),
             Int64(total),
         )
         return True
@@ -1699,8 +1728,8 @@ def _parallel_for_dt[
 def _copy_strided_kernel[
     dtype: DType
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     shape: IndexList[MAX_RANK],
     dst_strides: IndexList[MAX_RANK],
     src_strides: IndexList[MAX_RANK],
@@ -1723,7 +1752,7 @@ def _copy_strided_kernel[
             src_off += coord * src_strides[d]
         dst_off += rest * dst_strides[0]
         src_off += rest * src_strides[0]
-        dst_ptr[dst_off] = src_ptr[src_off]
+        dst_ptr[unsafe_offset=dst_off] = src_ptr[unsafe_offset=src_off]
         i += gstride
 
 
@@ -1775,8 +1804,8 @@ def _t2dv_vec[dtype: DType]() -> Int:
 def _transpose2d_vec_kernel[
     dtype: DType
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     src_ld_arg: Int64,
@@ -1833,17 +1862,17 @@ def _transpose2d_vec_kernel[
             var r0 = ((q // cb) * LR + lane // LC) * VEC
             if c0 < cols and r0 < rows:
                 comptime for j in range(VEC):
-                    vals.store(
+                    vals.unsafe_store(
                         j * VEC,
-                        src_ptr.load[width=VEC](
+                        src_ptr.unsafe_load[width=VEC](
                             src_base + (c0 + j) * src_ld + r0
                         ),
                     )
                 comptime for i in range(VEC):
                     var o = SIMD[dtype, VEC]()
                     comptime for j in range(VEC):
-                        o[j] = vals[j * VEC + i]
-                    dst_ptr.store(dst_base + (r0 + i) * cols + c0, o)
+                        o[j] = vals[unsafe_offset=j * VEC + i]
+                    dst_ptr.unsafe_store(dst_base + (r0 + i) * cols + c0, o)
             q += gstride
         b += Int(grid_dim.z)
 
@@ -1851,8 +1880,8 @@ def _transpose2d_vec_kernel[
 def _transpose2d_kernel[
     dtype: DType
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    src_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     src_ld_arg: Int64,
@@ -1907,8 +1936,8 @@ def _transpose2d_kernel[
                 while y < TILE:
                     var c = c0 + y
                     if c < cols:
-                        tile[y * (TILE + 1) + tx] = src_ptr[
-                            src_base + c * src_ld + r
+                        tile[unsafe_offset=y * (TILE + 1) + tx] = src_ptr[
+                            unsafe_offset=src_base + c * src_ld + r
                         ]
                     y += _T2D_ROWS
             barrier()
@@ -1920,8 +1949,8 @@ def _transpose2d_kernel[
                 while y < TILE:
                     var row = r0 + y
                     if row < rows:
-                        dst_ptr[dst_base + row * cols + c] = tile[
-                            tx * (TILE + 1) + y
+                        dst_ptr[unsafe_offset=dst_base + row * cols + c] = tile[
+                            unsafe_offset=tx * (TILE + 1) + y
                         ]
                     y += _T2D_ROWS
             # Every lane must finish reading the LDS tile before the next row
@@ -1970,7 +1999,7 @@ def _copy_strided[
                 src_off += coord * src_strides[d]
             dst_off += rest * dst_strides[0]
             src_off += rest * src_strides[0]
-            dst_ptr[dst_off] = src_ptr[src_off]
+            dst_ptr[unsafe_offset=dst_off] = src_ptr[unsafe_offset=src_off]
 
         elementwise[func, simd_width=1](Coord(total), ctx)
     else:
@@ -2050,7 +2079,7 @@ def _copy_strided[
                         min(batch, _MAX_GRID_Y),
                         _T2DV_THREADS,
                         dst_ptr.as_unsafe_any_origin(),
-                        src_ptr.as_unsafe_any_origin().as_immutable(),
+                        src_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(rows),
                         Int64(cols),
                         Int64(src_strides[MAX_RANK - 1]),
@@ -2070,7 +2099,7 @@ def _copy_strided[
                     min(batch, _MAX_GRID_Y),
                     TILE * _T2D_ROWS,
                     dst_ptr.as_unsafe_any_origin(),
-                    src_ptr.as_unsafe_any_origin().as_immutable(),
+                    src_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(rows),
                     Int64(cols),
                     Int64(src_strides[MAX_RANK - 1]),
@@ -2087,7 +2116,7 @@ def _copy_strided[
                 1,
                 GS_THREADS,
                 dst_ptr.as_unsafe_any_origin(),
-                src_ptr.as_unsafe_any_origin().as_immutable(),
+                src_ptr.as_unsafe_any_origin().as_imm(),
                 shape,
                 dst_strides,
                 src_strides,
@@ -2267,7 +2296,7 @@ def _fill_blocks(slots: Int) -> Int:
 def _fill_vec_kernel[
     dtype: DType, VEC: Int
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     value: Scalar[dtype],
     nvec_arg: Int64,
     size_arg: Int64,
@@ -2283,20 +2312,20 @@ def _fill_vec_kernel[
     var wide = SIMD[dtype, VEC](value)
     var j = tid
     while j < nvec:
-        dst_ptr.store[width=VEC, alignment=ALIGN](j * VEC, wide)
+        dst_ptr.unsafe_store[width=VEC, alignment=ALIGN](j * VEC, wide)
         j += gstride
     # The tail is at most VEC-1 elements and the grid is never narrower than
     # one FILL_THREADS-wide block, so the leading threads cover all of it.
     var t = nvec * VEC + tid
     if t < size:
-        dst_ptr[t] = value
+        dst_ptr[unsafe_offset=t] = value
 
 
 @__name(t"fill_strided_{8 * size_of[dtype]()}bit_r{RANK}_v{VEC}")
 def _fill_strided_kernel[
     dtype: DType, RANK: Int, VEC: Int
 ](
-    dst_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dst_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     value: Scalar[dtype],
     shape: IndexList[MAX_RANK],
     strides: IndexList[MAX_RANK],
@@ -2322,7 +2351,7 @@ def _fill_strided_kernel[
             off += (rest % shape[d]) * strides[d]
             rest = rest // shape[d]
         off += rest * strides[0]
-        dst_ptr.store[width=VEC, alignment=ALIGN](off * VEC, wide)
+        dst_ptr.unsafe_store[width=VEC, alignment=ALIGN](off * VEC, wide)
         i += gstride
 
 
@@ -2358,7 +2387,7 @@ def _fill_contig[
         @parameter
         @__copy_capture(dst_ptr, value)
         def func[width: Int, alignment: Int = 1](idx: Coord):
-            dst_ptr.store[width=width](
+            dst_ptr.unsafe_store[width=width](
                 Int(idx[0].value()), SIMD[dtype, width](value)
             )
 
@@ -2426,7 +2455,7 @@ def _fill_strided[
                 off += (rest % shape[d]) * strides[d]
                 rest = rest // shape[d]
             off += rest * strides[0]
-            dst_ptr.store[width=VEC](off * VEC, SIMD[dtype, VEC](value))
+            dst_ptr.unsafe_store[width=VEC](off * VEC, SIMD[dtype, VEC](value))
 
         elementwise[func, simd_width=1](Coord(total), ctx)
         return

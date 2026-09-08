@@ -52,10 +52,8 @@ def _log_softmax_backward_go(
                     _make_ptr[dt](grad_input_addr).as_unsafe_any_origin(),
                     _make_ptr[dt](grad_output_addr)
                     .as_unsafe_any_origin()
-                    .as_immutable(),
-                    _make_ptr[dt](output_addr)
-                    .as_unsafe_any_origin()
-                    .as_immutable(),
+                    .as_imm(),
+                    _make_ptr[dt](output_addr).as_unsafe_any_origin().as_imm(),
                     rows,
                     cols,
                     ctx,

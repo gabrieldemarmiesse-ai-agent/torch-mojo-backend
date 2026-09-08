@@ -12,7 +12,8 @@ from std.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp2
 from std.math.polynomial import polynomial_evaluate
-from std.memory import alloc, bitcast
+from std.memory import bitcast
+from std.memory.alloc import unsafe_alloc
 
 
 comptime _BLOCK = 256
@@ -114,8 +115,8 @@ def _gelu_exact_bf16[
 
 @__name("gelu_forward_bf16_exact_vec16")
 def _gelu_forward_bf16_exact(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -126,19 +127,23 @@ def _gelu_forward_bf16_exact(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
-        var values = input.load[width=_VEC, alignment=16](base)
-        output.store[width=_VEC, alignment=16](base, _gelu_exact_bf16(values))
+        var values = input.unsafe_load[width=_VEC, alignment=16](base)
+        output.unsafe_store[width=_VEC, alignment=16](
+            base, _gelu_exact_bf16(values)
+        )
     var index = vec_count * _VEC + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while index < elements:
-        output[index] = _gelu_exact_bf16(input.load[width=1](index))[0]
+        output[unsafe_offset=index] = _gelu_exact_bf16(
+            input.unsafe_load[width=1](index)
+        )[0]
         index += stride
 
 
 @__name("gelu_forward_bf16_tanh_vec16")
 def _gelu_forward_bf16_tanh(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements_arg: Int64,
     vec_count_arg: Int64,
 ):
@@ -149,18 +154,18 @@ def _gelu_forward_bf16_tanh(
     var gid = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
     if gid < vec_count:
         var base = gid * _VEC
-        var values = input.load[width=_VEC, alignment=16](base)
-        output.store[width=_VEC, alignment=16](base, gelu_tanh(values))
+        var values = input.unsafe_load[width=_VEC, alignment=16](base)
+        output.unsafe_store[width=_VEC, alignment=16](base, gelu_tanh(values))
     var index = vec_count * _VEC + gid
     var stride = Int(grid_dim.x) * _BLOCK
     while index < elements:
-        output[index] = gelu_tanh(input[index])
+        output[unsafe_offset=index] = gelu_tanh(input[unsafe_offset=index])
         index += stride
 
 
 def _enqueue_exact_cached(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements: Int,
     vec_count: Int,
     blocks: Int,
@@ -168,8 +173,9 @@ def _enqueue_exact_cached(
 ) raises:
     var cache_name = String(t"GELU_FORWARD_BF16_EXACT_VEC16_V1_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[_gelu_forward_bf16_exact]())
-    if global_ptr := _get_global_or_null(cache_name):
-        var cached = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(cache_name)
+    if global_ptr:
+        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             cached[],
             output,
@@ -181,10 +187,10 @@ def _enqueue_exact_cached(
         )
         return
     var compiled = ctx.compile_function[_gelu_forward_bf16_exact]()
-    var cached = alloc[FuncT](1)
-    cached.init_pointee_move(compiled^)
+    var cached = unsafe_alloc[FuncT](1)
+    cached.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.bitcast[NoneType]()
+        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
     )
     ctx.enqueue_function(
         cached[],
@@ -198,8 +204,8 @@ def _enqueue_exact_cached(
 
 
 def _enqueue_tanh_cached(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements: Int,
     vec_count: Int,
     blocks: Int,
@@ -207,8 +213,9 @@ def _enqueue_tanh_cached(
 ) raises:
     var cache_name = String(t"GELU_FORWARD_BF16_TANH_VEC16_V1_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[_gelu_forward_bf16_tanh]())
-    if global_ptr := _get_global_or_null(cache_name):
-        var cached = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(cache_name)
+    if global_ptr:
+        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             cached[],
             output,
@@ -220,10 +227,10 @@ def _enqueue_tanh_cached(
         )
         return
     var compiled = ctx.compile_function[_gelu_forward_bf16_tanh]()
-    var cached = alloc[FuncT](1)
-    cached.init_pointee_move(compiled^)
+    var cached = unsafe_alloc[FuncT](1)
+    cached.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.bitcast[NoneType]()
+        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
     )
     ctx.enqueue_function(
         cached[],
@@ -237,8 +244,8 @@ def _enqueue_tanh_cached(
 
 
 def enqueue_gelu_forward_bf16(
-    output: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     elements: Int,
     tanh_approx: Bool,
     ctx: DeviceContext,

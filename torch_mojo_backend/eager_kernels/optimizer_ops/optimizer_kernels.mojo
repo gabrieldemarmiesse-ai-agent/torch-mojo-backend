@@ -11,7 +11,7 @@ from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import min, pow
-from std.memory import alloc
+from std.memory.alloc import unsafe_alloc
 from std.sys.info import has_apple_gpu_accelerator
 
 from op_utils import _enqueue_cached, ieee_sqrt
@@ -27,8 +27,8 @@ comptime _VEC = 4
 
 
 @always_inline
-def _ptr(addr: Int) -> UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin]:
-    return UnsafePointer[Scalar[DType.float32], MutUntrackedOrigin](
+def _ptr(addr: Int) -> Pointer[Scalar[DType.float32], MutUntrackedOrigin]:
+    return Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=addr
     )
 
@@ -98,7 +98,10 @@ def _fused_adamw_f32(
     var grad_scale_ptr_addr = Int(grad_scale_ptr_addr_arg)
     var found_inf_ptr_addr = Int(found_inf_ptr_addr_arg)
     # found_inf must gate every mutation, including gradient writeback.
-    if found_inf_ptr_addr != 0 and _ptr(found_inf_ptr_addr)[0] == 1.0:
+    if (
+        found_inf_ptr_addr != 0
+        and _ptr(found_inf_ptr_addr)[unsafe_offset=0] == 1.0
+    ):
         return
 
     var chunk = Int(block_idx.x)
@@ -122,12 +125,12 @@ def _fused_adamw_f32(
 
     var lr = lr_scalar
     if lr_ptr_addr != 0:
-        lr = _ptr(lr_ptr_addr)[0]
+        lr = _ptr(lr_ptr_addr)[unsafe_offset=0]
     var inv_grad_scale = Float32(1.0)
     if grad_scale_ptr_addr != 0:
-        inv_grad_scale /= _ptr(grad_scale_ptr_addr)[0]
+        inv_grad_scale /= _ptr(grad_scale_ptr_addr)[unsafe_offset=0]
     var grad_sign = Float32(-1.0) if maximize_int != 0 else Float32(1.0)
-    var step = steps[0]
+    var step = steps[unsafe_offset=0]
     var bias1 = Float32(1.0) - pow(beta1, step)
     var sqrt_bias2 = ieee_sqrt(Float32(1.0) - pow(beta2, step))
     var amsgrad = amsgrad_int != 0
@@ -135,17 +138,17 @@ def _fused_adamw_f32(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = ADAMW_THREADS * _VEC
     while index + _VEC <= end:
-        var p = params.load[width=_VEC, alignment=4](index)
-        var g = grads.load[width=_VEC, alignment=4](index)
+        var p = params.unsafe_load[width=_VEC, alignment=4](index)
+        var g = grads.unsafe_load[width=_VEC, alignment=4](index)
         if grad_scale_ptr_addr != 0:
             g *= inv_grad_scale
-            grads.store[width=_VEC, alignment=4](index, g)
+            grads.unsafe_store[width=_VEC, alignment=4](index, g)
         g *= grad_sign
-        var m = exp_avgs.load[width=_VEC, alignment=4](index)
-        var v = exp_avg_sqs.load[width=_VEC, alignment=4](index)
+        var m = exp_avgs.unsafe_load[width=_VEC, alignment=4](index)
+        var v = exp_avg_sqs.unsafe_load[width=_VEC, alignment=4](index)
         var max_v = v
         if amsgrad:
-            max_v = max_exp_avg_sqs.load[width=_VEC, alignment=4](index)
+            max_v = max_exp_avg_sqs.unsafe_load[width=_VEC, alignment=4](index)
         var new_p, new_m, new_v, new_max = _adamw_update[_VEC](
             p,
             g,
@@ -161,28 +164,30 @@ def _fused_adamw_f32(
             sqrt_bias2,
             amsgrad,
         )
-        params.store[width=_VEC, alignment=4](index, new_p)
-        exp_avgs.store[width=_VEC, alignment=4](index, new_m)
-        exp_avg_sqs.store[width=_VEC, alignment=4](index, new_v)
+        params.unsafe_store[width=_VEC, alignment=4](index, new_p)
+        exp_avgs.unsafe_store[width=_VEC, alignment=4](index, new_m)
+        exp_avg_sqs.unsafe_store[width=_VEC, alignment=4](index, new_v)
         if amsgrad:
-            max_exp_avg_sqs.store[width=_VEC, alignment=4](index, new_max)
+            max_exp_avg_sqs.unsafe_store[width=_VEC, alignment=4](
+                index, new_max
+            )
         index += stride
 
     # Only the final chunk of a tensor can have a scalar tail. Starting it at
     # the first lane after the vector region keeps stores disjoint.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var p = params[index]
-        var g = grads[index]
+        var p = params[unsafe_offset=index]
+        var g = grads[unsafe_offset=index]
         if grad_scale_ptr_addr != 0:
             g *= inv_grad_scale
-            grads[index] = g
+            grads[unsafe_offset=index] = g
         g *= grad_sign
-        var m = exp_avgs[index]
-        var v = exp_avg_sqs[index]
+        var m = exp_avgs[unsafe_offset=index]
+        var v = exp_avg_sqs[unsafe_offset=index]
         var max_v = v
         if amsgrad:
-            max_v = max_exp_avg_sqs[index]
+            max_v = max_exp_avg_sqs[unsafe_offset=index]
         var new_p, new_m, new_v, new_max = _adamw_update[1](
             p,
             g,
@@ -198,11 +203,11 @@ def _fused_adamw_f32(
             sqrt_bias2,
             amsgrad,
         )
-        params[index] = new_p[0]
-        exp_avgs[index] = new_m[0]
-        exp_avg_sqs[index] = new_v[0]
+        params[unsafe_offset=index] = new_p[0]
+        exp_avgs[unsafe_offset=index] = new_m[0]
+        exp_avg_sqs[unsafe_offset=index] = new_v[0]
         if amsgrad:
-            max_exp_avg_sqs[index] = new_max[0]
+            max_exp_avg_sqs[unsafe_offset=index] = new_max[0]
         index += ADAMW_THREADS
 
 
@@ -214,15 +219,15 @@ def _fused_adamw_f32(
 # are passed as a valid dummy plus a has_* flag, never as null.
 @__name("fused_adamw_f32_tensor_apple_v1")
 def _fused_adamw_f32_tensor_apple(
-    params: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grads: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    exp_avgs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    exp_avg_sqs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    max_exp_avg_sqs: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    steps: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    lr_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    grad_scale_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    found_inf_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
+    params: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grads: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    exp_avgs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    exp_avg_sqs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    max_exp_avg_sqs: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    steps: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    lr_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    grad_scale_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    found_inf_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
     numel_arg: Int64,
     lr_scalar: Float32,
     has_lr_ptr_arg: Int64,
@@ -244,7 +249,7 @@ def _fused_adamw_f32_tensor_apple(
     var has_grad_scale = Int(has_grad_scale_arg)
     var has_found_inf = Int(has_found_inf_arg)
     # found_inf must gate every mutation, including gradient writeback.
-    if has_found_inf != 0 and found_inf_ptr[0] == 1.0:
+    if has_found_inf != 0 and found_inf_ptr[unsafe_offset=0] == 1.0:
         return
 
     var begin = Int(block_idx.x) * ADAMW_CHUNK_ELEMENTS
@@ -252,12 +257,12 @@ def _fused_adamw_f32_tensor_apple(
 
     var lr = lr_scalar
     if has_lr_ptr != 0:
-        lr = lr_ptr[0]
+        lr = lr_ptr[unsafe_offset=0]
     var inv_grad_scale = Float32(1.0)
     if has_grad_scale != 0:
-        inv_grad_scale /= grad_scale_ptr[0]
+        inv_grad_scale /= grad_scale_ptr[unsafe_offset=0]
     var grad_sign = Float32(-1.0) if maximize_int != 0 else Float32(1.0)
-    var step = steps[0]
+    var step = steps[unsafe_offset=0]
     var bias1 = Float32(1.0) - pow(beta1, step)
     var sqrt_bias2 = ieee_sqrt(Float32(1.0) - pow(beta2, step))
     var amsgrad = amsgrad_int != 0
@@ -265,17 +270,17 @@ def _fused_adamw_f32_tensor_apple(
     var index = begin + Int(thread_idx.x) * _VEC
     var stride = ADAMW_THREADS * _VEC
     while index + _VEC <= end:
-        var p = params.load[width=_VEC, alignment=4](index)
-        var g = grads.load[width=_VEC, alignment=4](index)
+        var p = params.unsafe_load[width=_VEC, alignment=4](index)
+        var g = grads.unsafe_load[width=_VEC, alignment=4](index)
         if has_grad_scale != 0:
             g *= inv_grad_scale
-            grads.store[width=_VEC, alignment=4](index, g)
+            grads.unsafe_store[width=_VEC, alignment=4](index, g)
         g *= grad_sign
-        var m = exp_avgs.load[width=_VEC, alignment=4](index)
-        var v = exp_avg_sqs.load[width=_VEC, alignment=4](index)
+        var m = exp_avgs.unsafe_load[width=_VEC, alignment=4](index)
+        var v = exp_avg_sqs.unsafe_load[width=_VEC, alignment=4](index)
         var max_v = v
         if amsgrad:
-            max_v = max_exp_avg_sqs.load[width=_VEC, alignment=4](index)
+            max_v = max_exp_avg_sqs.unsafe_load[width=_VEC, alignment=4](index)
         var new_p, new_m, new_v, new_max = _adamw_update[_VEC](
             p,
             g,
@@ -291,28 +296,30 @@ def _fused_adamw_f32_tensor_apple(
             sqrt_bias2,
             amsgrad,
         )
-        params.store[width=_VEC, alignment=4](index, new_p)
-        exp_avgs.store[width=_VEC, alignment=4](index, new_m)
-        exp_avg_sqs.store[width=_VEC, alignment=4](index, new_v)
+        params.unsafe_store[width=_VEC, alignment=4](index, new_p)
+        exp_avgs.unsafe_store[width=_VEC, alignment=4](index, new_m)
+        exp_avg_sqs.unsafe_store[width=_VEC, alignment=4](index, new_v)
         if amsgrad:
-            max_exp_avg_sqs.store[width=_VEC, alignment=4](index, new_max)
+            max_exp_avg_sqs.unsafe_store[width=_VEC, alignment=4](
+                index, new_max
+            )
         index += stride
 
     # Only the final chunk of a tensor can have a scalar tail. Starting it at
     # the first lane after the vector region keeps stores disjoint.
     index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
     while index < end:
-        var p = params[index]
-        var g = grads[index]
+        var p = params[unsafe_offset=index]
+        var g = grads[unsafe_offset=index]
         if has_grad_scale != 0:
             g *= inv_grad_scale
-            grads[index] = g
+            grads[unsafe_offset=index] = g
         g *= grad_sign
-        var m = exp_avgs[index]
-        var v = exp_avg_sqs[index]
+        var m = exp_avgs[unsafe_offset=index]
+        var v = exp_avg_sqs[unsafe_offset=index]
         var max_v = v
         if amsgrad:
-            max_v = max_exp_avg_sqs[index]
+            max_v = max_exp_avg_sqs[unsafe_offset=index]
         var new_p, new_m, new_v, new_max = _adamw_update[1](
             p,
             g,
@@ -328,11 +335,11 @@ def _fused_adamw_f32_tensor_apple(
             sqrt_bias2,
             amsgrad,
         )
-        params[index] = new_p[0]
-        exp_avgs[index] = new_m[0]
-        exp_avg_sqs[index] = new_v[0]
+        params[unsafe_offset=index] = new_p[0]
+        exp_avgs[unsafe_offset=index] = new_m[0]
+        exp_avg_sqs[unsafe_offset=index] = new_v[0]
         if amsgrad:
-            max_exp_avg_sqs[index] = new_max[0]
+            max_exp_avg_sqs[unsafe_offset=index] = new_max[0]
         index += ADAMW_THREADS
 
 
@@ -384,10 +391,10 @@ def enqueue_fused_adamw_f32(
                 _ptr(desc.exp_avg_addr).as_unsafe_any_origin(),
                 _ptr(desc.exp_avg_sq_addr).as_unsafe_any_origin(),
                 _ptr(max_addr).as_unsafe_any_origin(),
-                _ptr(desc.step_addr).as_unsafe_any_origin().as_immutable(),
-                _ptr(lr_addr).as_unsafe_any_origin().as_immutable(),
-                _ptr(gs_addr).as_unsafe_any_origin().as_immutable(),
-                _ptr(fi_addr).as_unsafe_any_origin().as_immutable(),
+                _ptr(desc.step_addr).as_unsafe_any_origin().as_imm(),
+                _ptr(lr_addr).as_unsafe_any_origin().as_imm(),
+                _ptr(gs_addr).as_unsafe_any_origin().as_imm(),
+                _ptr(fi_addr).as_unsafe_any_origin().as_imm(),
                 Int64(desc.numel),
                 lr_scalar,
                 Int64(1 if lr_ptr_addr != 0 else 0),
@@ -407,8 +414,9 @@ def enqueue_fused_adamw_f32(
     # key, so dynamic input sizes never trigger recompilation.
     var cache_name = String(t"FUSED_ADAMW_F32_V5_ABI1_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[_fused_adamw_f32]())
-    if global_ptr := _get_global_or_null(cache_name):
-        var cached = global_ptr.value().bitcast[FuncT]()
+    var global_ptr = _get_global_or_null(cache_name)
+    if global_ptr:
+        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
             cached[],
             descs,
@@ -429,11 +437,11 @@ def enqueue_fused_adamw_f32(
         return
 
     var compiled = ctx.compile_function[_fused_adamw_f32]()
-    var cached = alloc[FuncT](1)
-    cached.init_pointee_move(compiled^)
+    var cached = unsafe_alloc[FuncT](1)
+    cached.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(cache_name),
-        cached.bitcast[NoneType](),
+        cached.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
         cached[],

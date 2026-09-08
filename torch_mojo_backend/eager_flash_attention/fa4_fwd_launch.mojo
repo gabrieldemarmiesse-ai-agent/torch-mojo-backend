@@ -96,7 +96,7 @@ def launch_fwd_fa4[
         and gqa_ratio == 1
         and softcap_x1000 == 0
     ), "strided_qkv supports only dense d64/d128 (no varlen/window/gqa/softcap)"
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
+    var raw_ctx_ptr = Pointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
@@ -118,16 +118,16 @@ def launch_fwd_fa4[
         q_bytes + kFa4KVStages * kv_slot_bytes + mbar_bytes
     )
 
-    var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var q_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=q_addr
     )
-    var k_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var k_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=k_addr
     )
-    var v_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var v_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
     )
-    var lse_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var lse_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=lse_addr
     )
     # 3D TMA descriptors over the (B*L, H, D) gmem view.
@@ -168,7 +168,7 @@ def launch_fwd_fa4[
         var v_tma_b = create_split_tma[
             kv_smem_shape_b, gmem_shape, swizzle_mode=swizzle
         ](ctx, v_ptr, planes_kv, seqlen_int)
-        var o_imm_ptr_b = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+        var o_imm_ptr_b = Pointer[Scalar[dtype], ImmutAnyOrigin](
             unsafe_from_address=o_addr
         )
         var o_tma_b = create_split_tma[
@@ -310,7 +310,7 @@ def launch_fwd_fa4[
     # whole-tile TMA store. (The previous unswizzled 16B-chunk
     # descriptor cost 16 serialized UTMASTG issues per CTA — ~8% of
     # a short-seq CTA, PC-sampling-verified.)
-    var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var o_imm_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
     # Dense hdim64 gives Q/O RANK-4 descriptors (B, S, H, D): with

@@ -88,7 +88,7 @@ def launch_fwd_fa4_selfload[
     comptime assert (
         (head_dim == 64) and causal and softcap_x1000 == 0
     ), "self-load geometry is d64-only, dense-causal-bhsd only (d128/non-causal keep the phase-2b launcher)"
-    var raw_ctx_ptr = UnsafePointer[_DeviceContextCpp, MutUntrackedOrigin](
+    var raw_ctx_ptr = Pointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
@@ -110,16 +110,16 @@ def launch_fwd_fa4_selfload[
         q_bytes + kFa4KVStages * kv_slot_bytes + mbar_bytes
     )
 
-    var q_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var q_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=q_addr
     )
-    var k_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var k_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=k_addr
     )
-    var v_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var v_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
     )
-    var lse_ptr = UnsafePointer[Float32, MutAnyOrigin](
+    var lse_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=lse_addr
     )
     # PUBLIC-layout consumption (the fix the phase-2 bhsd descriptors
@@ -142,7 +142,7 @@ def launch_fwd_fa4_selfload[
     var v_tma = create_split_tma[
         kv_smem_shape, gmem_shape, swizzle_mode=swizzle
     ](ctx, v_ptr, planes_kv, seqlen_int)
-    var o_imm_ptr = UnsafePointer[Scalar[dtype], ImmutAnyOrigin](
+    var o_imm_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=o_addr
     )
     var o_tma = create_split_tma[

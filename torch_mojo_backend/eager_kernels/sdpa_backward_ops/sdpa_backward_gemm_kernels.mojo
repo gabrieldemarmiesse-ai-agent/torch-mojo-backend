@@ -94,10 +94,10 @@ comptime _THREADS = 128
 def _sdpa_ta_gemm_kernel[
     MASKED: Bool, CAUSAL: Bool
 ](
-    c_base: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_base: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mask_base: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+    c_base: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_base: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    mask_base: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -111,10 +111,10 @@ def _sdpa_ta_gemm_kernel[
     comptime F32 = DType.float32
 
     var bz = Int(block_idx.z)
-    var c_ptr = c_base + bz * m * n
-    var a_ptr = a_base + bz * k * m
-    var b_ptr = b_base + bz * k * n
-    var mask_ptr = mask_base + bz * k * m
+    var c_ptr = c_base.unsafe_offset(bz * m * n)
+    var a_ptr = a_base.unsafe_offset(bz * k * m)
+    var b_ptr = b_base.unsafe_offset(bz * k * n)
+    var mask_ptr = mask_base.unsafe_offset(bz * k * m)
 
     var lane = Int(lane_id())
     var fl = _frag8_layout(lane)
@@ -152,11 +152,13 @@ def _sdpa_ta_gemm_kernel[
                 comptime for s in range(FRAG8):
                     var kl = kk + fcol + s
                     if kl < k:
-                        var av = a_ptr[kl * m + grow]
+                        var av = a_ptr[unsafe_offset=kl * m + grow]
                         comptime if MASKED:
                             av = (
                                 av
-                                * mask_ptr[kl * m + grow].cast[F32]()
+                                * mask_ptr[unsafe_offset=kl * m + grow].cast[
+                                    F32
+                                ]()
                                 * drop_scale
                             )
                         af[s] = av
@@ -168,7 +170,7 @@ def _sdpa_ta_gemm_kernel[
                 comptime for s in range(FRAG8):
                     var gj = col_base + ni * MMA8_DIM + fcol + s
                     if gj < n:
-                        bf[s] = b_ptr[(kk + frow) * n + gj]
+                        bf[s] = b_ptr[unsafe_offset=(kk + frow) * n + gj]
             bfrag[ni] = bf
         comptime for mi in range(_NT_M):
             comptime for ni in range(_NT_N):
@@ -182,30 +184,34 @@ def _sdpa_ta_gemm_kernel[
     @always_inline
     @parameter
     def _load_a_fast(
-        ap0: UnsafePointer[Scalar[F32], ImmutAnyOrigin],
-        mp0: UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin],
+        ap0: Pointer[Scalar[F32], ImmutAnyOrigin],
+        mp0: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[F32, FRAG8], _NT_M]:
         var afrag = InlineArray[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
         comptime for mi in range(_NT_M):
-            var p = ap0 + mi * MMA8_DIM
+            var p = ap0.unsafe_offset(mi * MMA8_DIM)
             var af = SIMD[F32, FRAG8](0)
             comptime for s in range(FRAG8):
-                af[s] = p[s * m]
+                af[s] = p[unsafe_offset=s * m]
             comptime if MASKED:
-                var mp = mp0 + mi * MMA8_DIM
+                var mp = mp0.unsafe_offset(mi * MMA8_DIM)
                 comptime for s in range(FRAG8):
-                    af[s] = af[s] * mp[s * m].cast[F32]() * drop_scale
+                    af[s] = (
+                        af[s] * mp[unsafe_offset=s * m].cast[F32]() * drop_scale
+                    )
             afrag[mi] = af
         return afrag^
 
     @always_inline
     @parameter
     def _load_b_fast(
-        bp0: UnsafePointer[Scalar[F32], ImmutAnyOrigin],
+        bp0: Pointer[Scalar[F32], ImmutAnyOrigin],
     ) -> InlineArray[SIMD[F32, FRAG8], _NT_N]:
         var bfrag = InlineArray[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
         comptime for ni in range(_NT_N):
-            bfrag[ni] = (bp0 + ni * MMA8_DIM).load[width=FRAG8]()
+            bfrag[ni] = (bp0.unsafe_offset(ni * MMA8_DIM)).unsafe_load[
+                width=FRAG8
+            ]()
         return bfrag^
 
     @always_inline
@@ -225,17 +231,17 @@ def _sdpa_ta_gemm_kernel[
     if interior:
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue.
-        var ap = a_ptr + (k_start + fcol) * m + row_base + frow
-        var mp = mask_ptr + (k_start + fcol) * m + row_base + frow
-        var bp = b_ptr + (k_start + frow) * n + col_base + fcol
+        var ap = a_ptr.unsafe_offset((k_start + fcol) * m + row_base + frow)
+        var mp = mask_ptr.unsafe_offset((k_start + fcol) * m + row_base + frow)
+        var bp = b_ptr.unsafe_offset((k_start + frow) * n + col_base + fcol)
         var nslabs = (k - k_start) // MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap, mp)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap += MMA8_DIM * m
-                mp += MMA8_DIM * m
-                bp += MMA8_DIM * n
+                ap = ap.unsafe_offset(MMA8_DIM * m)
+                mp = mp.unsafe_offset(MMA8_DIM * m)
+                bp = bp.unsafe_offset(MMA8_DIM * n)
                 var nxta = _load_a_fast(ap, mp)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -257,16 +263,16 @@ def _sdpa_ta_gemm_kernel[
                 var gcol = col_base + ni * MMA8_DIM + fcol
                 var frag = accum[mi * _NT_N + ni]
                 if gcol + FRAG8 <= n:
-                    c_ptr.store(grow * n + gcol, frag)
+                    c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
-                    c_ptr[grow * n + gcol] = frag[0]
+                    c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
 
 
 def enqueue_sdpa_ta_gemm_f32(
-    c_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    a_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    b_ptr: UnsafePointer[Scalar[DType.float32], ImmutAnyOrigin],
-    mask: Optional[UnsafePointer[Scalar[DType.bool], ImmutAnyOrigin]],
+    c_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    b_ptr: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    mask: Optional[Pointer[Scalar[DType.bool], ImmutAnyOrigin]],
     batch: Int,
     m: Int,
     n: Int,
@@ -292,7 +298,7 @@ def enqueue_sdpa_ta_gemm_f32(
         var scale_f32 = Float32(drop_scale)
         # The unmasked kernels never dereference the mask pointer; alias A
         # so the argument stays a valid translated device pointer.
-        var mask_arg = a_ptr.bitcast[Scalar[DType.bool]]()
+        var mask_arg = a_ptr.unsafe_bitcast[Scalar[DType.bool]]()
         if mask:
             mask_arg = mask.value()
         if mask:

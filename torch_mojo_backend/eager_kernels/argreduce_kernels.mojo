@@ -185,31 +185,35 @@ def _ar_block_merge[
     var idx_smem = stack_allocation[
         AR_THREADS, DType.int64, address_space=AddressSpace.SHARED
     ]()
-    val_smem[tid] = best_val
-    idx_smem[tid] = best_idx
+    val_smem[unsafe_offset=tid] = best_val
+    idx_smem[unsafe_offset=tid] = best_idx
     barrier()
     var stride = AR_THREADS // 2
     for _ in range(AR_STAGES):
         if tid < stride:
             if _ar_better[dtype, is_min](
-                val_smem[tid + stride],
-                idx_smem[tid + stride],
-                val_smem[tid],
-                idx_smem[tid],
+                val_smem[unsafe_offset=tid + stride],
+                idx_smem[unsafe_offset=tid + stride],
+                val_smem[unsafe_offset=tid],
+                idx_smem[unsafe_offset=tid],
             ):
-                val_smem[tid] = val_smem[tid + stride]
-                idx_smem[tid] = idx_smem[tid + stride]
+                val_smem[unsafe_offset=tid] = val_smem[
+                    unsafe_offset=tid + stride
+                ]
+                idx_smem[unsafe_offset=tid] = idx_smem[
+                    unsafe_offset=tid + stride
+                ]
         barrier()
         stride //= 2
-    best_val = val_smem[0]
-    best_idx = idx_smem[0]
+    best_val = val_smem[unsafe_offset=0]
+    best_idx = idx_smem[unsafe_offset=0]
 
 
 @always_inline
 def _ar_scan_row[
     dtype: DType, is_min: Bool, VEC: Int
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     base: Int,
     start: Int,
     end: Int,
@@ -228,15 +232,14 @@ def _ar_scan_row[
     var nslots = (end - start) // VEC
     for k in range(tid, nslots, AR_THREADS):
         var off = start + k * VEC
-        var v = in_ptr.load[width=VEC, alignment=ALIGN](base + off)
+        var v = in_ptr.unsafe_load[width=VEC, alignment=ALIGN](base + off)
 
-        @parameter
-        for lane in range(VEC):
+        comptime for lane in range(VEC):
             if best_idx < 0 or _ar_take_next[dtype, is_min](v[lane], best_val):
                 best_val = v[lane]
                 best_idx = Int64(off + lane)
     for j in range(start + nslots * VEC + tid, end, AR_THREADS):
-        var v = in_ptr[base + j]
+        var v = in_ptr[unsafe_offset=base + j]
         if best_idx < 0 or _ar_take_next[dtype, is_min](v, best_val):
             best_val = v
             best_idx = Int64(j)
@@ -254,8 +257,8 @@ def _ar_scan_row[
 def _argreduce_rows_kernel[
     dtype: DType, is_min: Bool, VEC: Int
 ](
-    out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
 ):
     """One block per row (grid.x = rows), for the saturated regime."""
@@ -271,7 +274,7 @@ def _argreduce_rows_kernel[
     )
     _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
     if tid == 0:
-        out_ptr[r] = best_idx
+        out_ptr[unsafe_offset=r] = best_idx
 
 
 @__llvm_metadata(
@@ -281,9 +284,9 @@ def _argreduce_rows_kernel[
 def _argreduce_rows_split_kernel[
     dtype: DType, is_min: Bool, VEC: Int
 ](
-    ws_val: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_idx: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_val: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_idx: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
     chunk_arg: Int64,
 ):
@@ -305,8 +308,8 @@ def _argreduce_rows_split_kernel[
     )
     _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
     if tid == 0:
-        ws_val[r * splits + s] = best_val
-        ws_idx[r * splits + s] = best_idx
+        ws_val[unsafe_offset=r * splits + s] = best_val
+        ws_idx[unsafe_offset=r * splits + s] = best_idx
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +324,8 @@ def _argreduce_rows_split_kernel[
 def _argreduce_cols_kernel[
     dtype: DType, is_min: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
     inner_arg: Int64,
     lanes_arg: Int64,
@@ -343,14 +346,14 @@ def _argreduce_cols_kernel[
     if i >= inner:
         return
     var base = o * reduce_n * inner + i
-    var best_val = in_ptr[base]
+    var best_val = in_ptr[unsafe_offset=base]
     var best_idx = Int64(0)
     for r in range(1, reduce_n):
-        var v = in_ptr[base + r * inner]
+        var v = in_ptr[unsafe_offset=base + r * inner]
         if _ar_take_next[dtype, is_min](v, best_val):
             best_val = v
             best_idx = Int64(r)
-    out_ptr[o * inner + i] = best_idx
+    out_ptr[unsafe_offset=o * inner + i] = best_idx
 
 
 @__llvm_metadata(
@@ -360,9 +363,9 @@ def _argreduce_cols_kernel[
 def _argreduce_cols_split_kernel[
     dtype: DType, is_min: Bool
 ](
-    ws_val: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_idx: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_val: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_idx: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
     inner_arg: Int64,
     lanes_arg: Int64,
@@ -386,16 +389,16 @@ def _argreduce_cols_split_kernel[
     var best_val = Scalar[dtype](0)
     var best_idx = Int64(-1)
     if start < end:
-        best_val = in_ptr[base + start * inner]
+        best_val = in_ptr[unsafe_offset=base + start * inner]
         best_idx = Int64(start)
         for r in range(start + 1, end):
-            var v = in_ptr[base + r * inner]
+            var v = in_ptr[unsafe_offset=base + r * inner]
             if _ar_take_next[dtype, is_min](v, best_val):
                 best_val = v
                 best_idx = Int64(r)
     var p = o * inner + i
-    ws_val[p * splits + s] = best_val
-    ws_idx[p * splits + s] = best_idx
+    ws_val[unsafe_offset=p * splits + s] = best_val
+    ws_idx[unsafe_offset=p * splits + s] = best_idx
 
 
 # ---------------------------------------------------------------------------
@@ -413,9 +416,9 @@ def _argreduce_cols_split_kernel[
 def _minmax_rows_kernel[
     dtype: DType, is_min: Bool, VEC: Int
 ](
-    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    val_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     cols_arg: Int64,
 ):
     """One block per row (grid.x = rows), for the saturated regime."""
@@ -429,8 +432,8 @@ def _minmax_rows_kernel[
     )
     _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
     if tid == 0:
-        val_ptr[r] = best_val
-        idx_ptr[r] = best_idx
+        val_ptr[unsafe_offset=r] = best_val
+        idx_ptr[unsafe_offset=r] = best_idx
 
 
 @__llvm_metadata(
@@ -440,9 +443,9 @@ def _minmax_rows_kernel[
 def _minmax_cols_kernel[
     dtype: DType, is_min: Bool
 ](
-    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    val_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     reduce_arg: Int64,
     inner_arg: Int64,
     lanes_arg: Int64,
@@ -456,15 +459,15 @@ def _minmax_cols_kernel[
     if i >= inner:
         return
     var base = o * reduce_n * inner + i
-    var best_val = in_ptr[base]
+    var best_val = in_ptr[unsafe_offset=base]
     var best_idx = Int64(0)
     for r in range(1, reduce_n):
-        var v = in_ptr[base + r * inner]
+        var v = in_ptr[unsafe_offset=base + r * inner]
         if _ar_take_next[dtype, is_min](v, best_val):
             best_val = v
             best_idx = Int64(r)
-    val_ptr[o * inner + i] = best_val
-    idx_ptr[o * inner + i] = best_idx
+    val_ptr[unsafe_offset=o * inner + i] = best_val
+    idx_ptr[unsafe_offset=o * inner + i] = best_idx
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +482,9 @@ def _minmax_cols_kernel[
 def _argreduce_merge_kernel[
     dtype: DType, is_min: Bool
 ](
-    out_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    ws_val: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    ws_idx: UnsafePointer[Scalar[DType.int64], ImmutAnyOrigin],
+    out_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    ws_val: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_idx: Pointer[Scalar[DType.int64], ImmutAnyOrigin],
     splits_arg: Int64,
 ):
     """One block per output element, merging its `splits` partials. The
@@ -495,13 +498,16 @@ def _argreduce_merge_kernel[
     var best_idx = Int64(-1)
     for s in range(tid, splits, AR_THREADS):
         if _ar_better[dtype, is_min](
-            ws_val[base + s], ws_idx[base + s], best_val, best_idx
+            ws_val[unsafe_offset=base + s],
+            ws_idx[unsafe_offset=base + s],
+            best_val,
+            best_idx,
         ):
-            best_val = ws_val[base + s]
-            best_idx = ws_idx[base + s]
+            best_val = ws_val[unsafe_offset=base + s]
+            best_idx = ws_idx[unsafe_offset=base + s]
     _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
     if tid == 0:
-        out_ptr[p] = best_idx
+        out_ptr[unsafe_offset=p] = best_idx
 
 
 @__llvm_metadata(
@@ -511,10 +517,10 @@ def _argreduce_merge_kernel[
 def _minmax_merge_kernel[
     dtype: DType, is_min: Bool
 ](
-    val_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    idx_ptr: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
-    ws_val: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    ws_idx: UnsafePointer[Scalar[DType.int64], ImmutAnyOrigin],
+    val_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    idx_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    ws_val: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_idx: Pointer[Scalar[DType.int64], ImmutAnyOrigin],
     splits_arg: Int64,
 ):
     """`_argreduce_merge_kernel` keeping the winning value as well."""
@@ -526,14 +532,17 @@ def _minmax_merge_kernel[
     var best_idx = Int64(-1)
     for s in range(tid, splits, AR_THREADS):
         if _ar_better[dtype, is_min](
-            ws_val[base + s], ws_idx[base + s], best_val, best_idx
+            ws_val[unsafe_offset=base + s],
+            ws_idx[unsafe_offset=base + s],
+            best_val,
+            best_idx,
         ):
-            best_val = ws_val[base + s]
-            best_idx = ws_idx[base + s]
+            best_val = ws_val[unsafe_offset=base + s]
+            best_idx = ws_idx[unsafe_offset=base + s]
     _ar_block_merge[dtype, is_min](tid, best_val, best_idx)
     if tid == 0:
-        val_ptr[p] = best_val
-        idx_ptr[p] = best_idx
+        val_ptr[unsafe_offset=p] = best_val
+        idx_ptr[unsafe_offset=p] = best_idx
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +554,7 @@ def _minmax_merge_kernel[
 def _ar_cpu_scan[
     dtype: DType, is_min: Bool
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
     base: Int,
     stride: Int,
     n: Int,
@@ -558,10 +567,10 @@ def _ar_cpu_scan[
     change the parallel-for kernel argmin/argmax emit for no reason -- without
     the scan itself existing twice.
     """
-    var best = in_ptr[base]
+    var best = in_ptr[unsafe_offset=base]
     var best_idx = 0
     for r in range(1, n):
-        var v = in_ptr[base + r * stride]
+        var v = in_ptr[unsafe_offset=base + r * stride]
         if _ar_take_next[dtype, is_min](v, best):
             best = v
             best_idx = r
@@ -595,8 +604,8 @@ def _ar_merge_launch[
 ](
     out_addr: Int,
     val_addr: Int,
-    ws_val: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    ws_idx: UnsafePointer[Scalar[DType.int64], MutAnyOrigin],
+    ws_val: Pointer[Scalar[dtype], MutAnyOrigin],
+    ws_idx: Pointer[Scalar[DType.int64], MutAnyOrigin],
     outputs: Int,
     splits: Int,
     ctx: DeviceContext,
@@ -611,8 +620,8 @@ def _ar_merge_launch[
             AR_THREADS,
             _make_ptr[dtype](val_addr).as_unsafe_any_origin(),
             _make_ptr[DType.int64](out_addr).as_unsafe_any_origin(),
-            ws_val.as_immutable(),
-            ws_idx.as_immutable(),
+            ws_val.as_imm(),
+            ws_idx.as_imm(),
             Int64(splits),
         )
     else:
@@ -624,8 +633,8 @@ def _ar_merge_launch[
             1,
             AR_THREADS,
             _make_ptr[DType.int64](out_addr).as_unsafe_any_origin(),
-            ws_val.as_immutable(),
-            ws_idx.as_immutable(),
+            ws_val.as_imm(),
+            ws_idx.as_imm(),
             Int64(splits),
         )
 
@@ -659,8 +668,8 @@ def _argreduce_rows[
                 var best, best_idx = _ar_cpu_scan[dtype, is_min](
                     in_ptr, r * cols, 1, cols
                 )
-                out_ptr[r] = Int64(best_idx)
-                val_ptr[r] = best
+                out_ptr[unsafe_offset=r] = Int64(best_idx)
+                val_ptr[unsafe_offset=r] = best
 
             _parallel_for[func_v](rows, ctx)
         else:
@@ -673,7 +682,7 @@ def _argreduce_rows[
                 var _best, best_idx = _ar_cpu_scan[dtype, is_min](
                     in_ptr, r * cols, 1, cols
                 )
-                out_ptr[r] = Int64(best_idx)
+                out_ptr[unsafe_offset=r] = Int64(best_idx)
 
             _parallel_for[func](rows, ctx)
         return
@@ -711,7 +720,7 @@ def _argreduce_rows[
                         AR_THREADS,
                         val_ptr.as_unsafe_any_origin(),
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(cols),
                     )
                 else:
@@ -723,7 +732,7 @@ def _argreduce_rows[
                         1,
                         AR_THREADS,
                         out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_immutable(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(cols),
                     )
                 return True
@@ -740,7 +749,7 @@ def _argreduce_rows[
                 AR_THREADS,
                 ws_val_ptr,
                 ws_idx_ptr,
-                in_ptr.as_unsafe_any_origin().as_immutable(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
                 Int64(cols),
                 Int64(chunk),
             )
@@ -795,8 +804,8 @@ def _argreduce_cols[
                 var best, best_idx = _ar_cpu_scan[dtype, is_min](
                     in_ptr, base, inner, reduce_n
                 )
-                out_ptr[p] = Int64(best_idx)
-                val_ptr[p] = best
+                out_ptr[unsafe_offset=p] = Int64(best_idx)
+                val_ptr[unsafe_offset=p] = best
 
             _parallel_for[func_v](outputs, ctx)
         else:
@@ -810,7 +819,7 @@ def _argreduce_cols[
                 var _best, best_idx = _ar_cpu_scan[dtype, is_min](
                     in_ptr, base, inner, reduce_n
                 )
-                out_ptr[p] = Int64(best_idx)
+                out_ptr[unsafe_offset=p] = Int64(best_idx)
 
             _parallel_for[func](outputs, ctx)
         return
@@ -831,7 +840,7 @@ def _argreduce_cols[
                     AR_THREADS,
                     val_ptr.as_unsafe_any_origin(),
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(reduce_n),
                     Int64(inner),
                     Int64(lanes),
@@ -845,7 +854,7 @@ def _argreduce_cols[
                     1,
                     AR_THREADS,
                     out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_immutable(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(reduce_n),
                     Int64(inner),
                     Int64(lanes),
@@ -866,7 +875,7 @@ def _argreduce_cols[
             AR_THREADS,
             ws_val_ptr,
             ws_idx_ptr,
-            in_ptr.as_unsafe_any_origin().as_immutable(),
+            in_ptr.as_unsafe_any_origin().as_imm(),
             Int64(reduce_n),
             Int64(inner),
             Int64(lanes),

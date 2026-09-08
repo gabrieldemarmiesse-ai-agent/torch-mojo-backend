@@ -68,7 +68,9 @@ def _gpt2_decode_attention_kernel[
     ]()
 
     for d in range(tid, head_dim, THREADS):
-        q_smem[d] = query.ptr[q_base + d].cast[DType.float32]()
+        q_smem[unsafe_offset=d] = query.ptr[unsafe_offset=q_base + d].cast[
+            DType.float32
+        ]()
     barrier()
 
     var row_max = Float32.MIN
@@ -76,45 +78,53 @@ def _gpt2_decode_attention_kernel[
         var krow = kv_base + j * head_dim
         var dot = Float32(0)
         for d in range(0, head_dim, 4):
-            var k4 = key.ptr.load[width=4, alignment=vec_align](krow + d).cast[
-                DType.float32
-            ]()
-            var q4 = q_smem.load[width=4, alignment=16](d)
+            var k4 = key.ptr.unsafe_load[width=4, alignment=vec_align](
+                krow + d
+            ).cast[DType.float32]()
+            var q4 = q_smem.unsafe_load[width=4, alignment=16](d)
             dot += (q4 * k4).reduce_add()
-        var score = dot * scale + mask.ptr[mask_base + j].cast[DType.float32]()
-        scores[j] = score
+        var score = (
+            dot * scale
+            + mask.ptr[unsafe_offset=mask_base + j].cast[DType.float32]()
+        )
+        scores[unsafe_offset=j] = score
         row_max = max(row_max, score)
 
-    reduction[tid] = row_max
+    reduction[unsafe_offset=tid] = row_max
     barrier()
     var stride = THREADS // 2
     comptime for _ in range(8):
         if tid < stride:
-            reduction[tid] = max(reduction[tid], reduction[tid + stride])
+            reduction[unsafe_offset=tid] = max(
+                reduction[unsafe_offset=tid],
+                reduction[unsafe_offset=tid + stride],
+            )
         barrier()
         stride //= 2
     if tid == 0:
-        broadcast[0] = reduction[0]
+        broadcast[unsafe_offset=0] = reduction[unsafe_offset=0]
     barrier()
-    row_max = broadcast[0]
+    row_max = broadcast[unsafe_offset=0]
 
     var row_sum = Float32(0)
     for j in range(tid, kv_len, THREADS):
-        var probability = exp(scores[j] - row_max)
-        scores[j] = probability
+        var probability = exp(scores[unsafe_offset=j] - row_max)
+        scores[unsafe_offset=j] = probability
         row_sum += probability
-    reduction[tid] = row_sum
+    reduction[unsafe_offset=tid] = row_sum
     barrier()
     stride = THREADS // 2
     comptime for _ in range(8):
         if tid < stride:
-            reduction[tid] += reduction[tid + stride]
+            reduction[unsafe_offset=tid] += reduction[
+                unsafe_offset=tid + stride
+            ]
         barrier()
         stride //= 2
     if tid == 0:
-        broadcast[1] = reduction[0]
+        broadcast[unsafe_offset=1] = reduction[unsafe_offset=0]
     barrier()
-    var inv_sum = 1.0 / broadcast[1]
+    var inv_sum = 1.0 / broadcast[unsafe_offset=1]
 
     # GPT-2 has D=64 on AMD wave64. Split the KV reduction across all four
     # wavefronts instead of leaving three quarters of the block idle during
@@ -125,19 +135,23 @@ def _gpt2_decode_attention_kernel[
     if lane < head_dim:
         for j in range(wave, kv_len, 4):
             acc += (
-                scores[j]
-                * value.ptr[kv_base + j * head_dim + lane].cast[DType.float32]()
+                scores[unsafe_offset=j]
+                * value.ptr[unsafe_offset=kv_base + j * head_dim + lane].cast[
+                    DType.float32
+                ]()
             )
-    reduction[tid] = acc
+    reduction[unsafe_offset=tid] = acc
     barrier()
     if wave == 0 and lane < head_dim:
         acc = (
-            reduction[lane]
-            + reduction[64 + lane]
-            + reduction[128 + lane]
-            + reduction[192 + lane]
+            reduction[unsafe_offset=lane]
+            + reduction[unsafe_offset=64 + lane]
+            + reduction[unsafe_offset=128 + lane]
+            + reduction[unsafe_offset=192 + lane]
         )
-        output.ptr[out_base + lane] = (acc * inv_sum).cast[dtype]()
+        output.ptr[unsafe_offset=out_base + lane] = (acc * inv_sum).cast[
+            dtype
+        ]()
 
 
 @compiler.register("gpt2_decode_attention")

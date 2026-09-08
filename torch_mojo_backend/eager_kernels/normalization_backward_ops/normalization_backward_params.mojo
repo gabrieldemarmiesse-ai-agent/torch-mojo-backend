@@ -40,12 +40,12 @@ comptime _FINAL_TY = 32
 
 @__name("layer_norm_backward_params_direct")
 def _direct_kernel(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     want_weight_arg: Int64,
@@ -65,28 +65,30 @@ def _direct_kernel(
     var index = col
     if want_weight != 0:
         for row in range(rows):
-            var dy = grad_output[index]
-            var xhat = (input[index] - mean[row]) * rstd[row]
+            var dy = grad_output[unsafe_offset=index]
+            var xhat = (
+                input[unsafe_offset=index] - mean[unsafe_offset=row]
+            ) * rstd[unsafe_offset=row]
             weight_acc += dy * xhat
             bias_acc += dy
             index += cols
-        grad_weight[col] = weight_acc
+        grad_weight[unsafe_offset=col] = weight_acc
     else:
         for _ in range(rows):
-            bias_acc += grad_output[index]
+            bias_acc += grad_output[unsafe_offset=index]
             index += cols
     if want_bias != 0:
-        grad_bias[col] = bias_acc
+        grad_bias[unsafe_offset=col] = bias_acc
 
 
 @__name("layer_norm_backward_params_partial")
 def _partial_kernel(
-    partial_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    partial_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows_arg: Int64,
     cols_arg: Int64,
     chunk_rows_arg: Int64,
@@ -113,39 +115,45 @@ def _partial_kernel(
     if want_weight != 0:
         while row + _UNROLL <= row_end:
             comptime for k in range(_UNROLL):
-                var dy = grad_output[index + k * cols]
-                var x = input[index + k * cols]
-                weight_acc += dy * ((x - mean[row + k]) * rstd[row + k])
+                var dy = grad_output[unsafe_offset=index + k * cols]
+                var x = input[unsafe_offset=index + k * cols]
+                weight_acc += dy * (
+                    (x - mean[unsafe_offset=row + k])
+                    * rstd[unsafe_offset=row + k]
+                )
                 bias_acc += dy
             row += _UNROLL
             index += _UNROLL * cols
         while row < row_end:
-            var dy = grad_output[index]
-            weight_acc += dy * ((input[index] - mean[row]) * rstd[row])
+            var dy = grad_output[unsafe_offset=index]
+            weight_acc += dy * (
+                (input[unsafe_offset=index] - mean[unsafe_offset=row])
+                * rstd[unsafe_offset=row]
+            )
             bias_acc += dy
             row += 1
             index += cols
-        partial_weight[chunk * cols + col] = weight_acc
+        partial_weight[unsafe_offset=chunk * cols + col] = weight_acc
     else:
         while row + _UNROLL <= row_end:
             comptime for k in range(_UNROLL):
-                bias_acc += grad_output[index + k * cols]
+                bias_acc += grad_output[unsafe_offset=index + k * cols]
             row += _UNROLL
             index += _UNROLL * cols
         while row < row_end:
-            bias_acc += grad_output[index]
+            bias_acc += grad_output[unsafe_offset=index]
             row += 1
             index += cols
     if want_bias != 0:
-        partial_bias[chunk * cols + col] = bias_acc
+        partial_bias[unsafe_offset=chunk * cols + col] = bias_acc
 
 
 @__name("layer_norm_backward_params_final")
 def _final_kernel(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    partial_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    partial_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
     cols_arg: Int64,
     num_chunks_arg: Int64,
     want_weight_arg: Int64,
@@ -178,33 +186,33 @@ def _final_kernel(
         while chunk < num_chunks:
             var index = chunk * cols + col
             if want_weight != 0:
-                weight_acc += partial_weight[index]
+                weight_acc += partial_weight[unsafe_offset=index]
             if want_bias != 0:
-                bias_acc += partial_bias[index]
+                bias_acc += partial_bias[unsafe_offset=index]
             chunk += _FINAL_TY
-    shared_weight[ty * _FINAL_TX + tx] = weight_acc
-    shared_bias[ty * _FINAL_TX + tx] = bias_acc
+    shared_weight[unsafe_offset=ty * _FINAL_TX + tx] = weight_acc
+    shared_bias[unsafe_offset=ty * _FINAL_TX + tx] = bias_acc
     barrier()
     if ty == 0 and col < cols:
         if want_weight != 0:
             var total = Float32(0.0)
             comptime for lane in range(_FINAL_TY):
-                total += shared_weight[lane * _FINAL_TX + tx]
-            grad_weight[col] = total
+                total += shared_weight[unsafe_offset=lane * _FINAL_TX + tx]
+            grad_weight[unsafe_offset=col] = total
         if want_bias != 0:
             var total = Float32(0.0)
             comptime for lane in range(_FINAL_TY):
-                total += shared_bias[lane * _FINAL_TX + tx]
-            grad_bias[col] = total
+                total += shared_bias[unsafe_offset=lane * _FINAL_TX + tx]
+            grad_bias[unsafe_offset=col] = total
 
 
 def enqueue_layer_norm_backward_params_f32(
-    grad_weight: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_bias: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    input: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    mean: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    rstd: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
     rows: Int,
     cols: Int,
     want_weight: Bool,
@@ -275,7 +283,9 @@ def enqueue_layer_norm_backward_params_f32(
         var scratch = ctx.enqueue_create_buffer[DType.float32](lanes * lane)
         var scratch_base = scratch.unsafe_ptr().as_unsafe_any_origin()
         var partial_weight = scratch_base
-        var partial_bias = scratch_base + (lane if want_weight else 0)
+        var partial_bias = scratch_base.unsafe_offset(
+            lane if want_weight else 0
+        )
 
         _enqueue_cached[_partial_kernel](
             ctx,

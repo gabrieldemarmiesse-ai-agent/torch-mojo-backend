@@ -51,7 +51,7 @@ def create_split_tma_4d[
     swizzle_mode: TensorMapSwizzle,
 ](
     ctx: DeviceContext,
-    ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     runtime_dim0: Int,
     runtime_dim1: Int,
     runtime_dim2: Int,
@@ -87,7 +87,7 @@ def create_split_tma_3d_strided[
     swizzle_mode: TensorMapSwizzle,
 ](
     ctx: DeviceContext,
-    ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     dim0: Int,
     dim1: Int,
     dim2: Int,
@@ -123,7 +123,7 @@ def create_split_tma_4d_strided[
     swizzle_mode: TensorMapSwizzle,
 ](
     ctx: DeviceContext,
-    ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     dim0: Int,
     dim1: Int,
     dim2: Int,

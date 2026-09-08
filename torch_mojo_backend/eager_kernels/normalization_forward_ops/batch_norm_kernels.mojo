@@ -98,10 +98,10 @@ comptime BN_MIN_RUNS_PER_SPLIT = 2
 def _bn_scale_shift[
     pdtype: DType, sdtype: DType, //, from_invstd: Bool
 ](
-    mean_ptr: UnsafePointer[Scalar[sdtype], ImmutAnyOrigin],
-    var_ptr: UnsafePointer[Scalar[sdtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
+    mean_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    var_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
     c: Int,
     eps: Float32,
     has_weight: Bool,
@@ -116,16 +116,18 @@ def _bn_scale_shift[
     `1/sqrt(var + eps)` (the training route, whose merge inverted it) rather
     than the variance (the inference route, reading a running variance).
     """
-    mean = mean_ptr[c].cast[DType.float32]()
+    mean = mean_ptr[unsafe_offset=c].cast[DType.float32]()
     comptime if from_invstd:
-        scale = var_ptr[c].cast[DType.float32]()
+        scale = var_ptr[unsafe_offset=c].cast[DType.float32]()
     else:
-        scale = 1.0 / ieee_sqrt(var_ptr[c].cast[DType.float32]() + eps)
+        scale = 1.0 / ieee_sqrt(
+            var_ptr[unsafe_offset=c].cast[DType.float32]() + eps
+        )
     if has_weight:
-        scale *= gamma_ptr[c].cast[DType.float32]()
+        scale *= gamma_ptr[unsafe_offset=c].cast[DType.float32]()
     shift = Float32(0)
     if has_bias:
-        shift = beta_ptr[c].cast[DType.float32]()
+        shift = beta_ptr[unsafe_offset=c].cast[DType.float32]()
 
 
 @__llvm_metadata(
@@ -139,14 +141,14 @@ def _bn_elementwise_kernel[
     V: Int,
     from_invstd: Bool,
 ](
-    out_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
-    mean_ptr: UnsafePointer[Scalar[sdtype], ImmutAnyOrigin],
-    var_ptr: UnsafePointer[Scalar[sdtype], ImmutAnyOrigin],
-    gamma_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
-    beta_ptr: UnsafePointer[Scalar[pdtype], ImmutAnyOrigin],
-    save_mean_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    save_invstd_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    var_ptr: Pointer[Scalar[sdtype], ImmutAnyOrigin],
+    gamma_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    beta_ptr: Pointer[Scalar[pdtype], ImmutAnyOrigin],
+    save_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    save_invstd_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
     eps: Float32,
     inner_slots_arg: Int64,
     channels_arg: Int64,
@@ -188,9 +190,12 @@ def _bn_elementwise_kernel[
         if slot == 0:
             var c = Int(block_idx.y)
             while c < channels:
-                save_mean_ptr[c] = mean_ptr[c]
-                save_invstd_ptr[c] = (
-                    1.0 / ieee_sqrt(var_ptr[c].cast[DType.float32]() + eps)
+                save_mean_ptr[unsafe_offset=c] = mean_ptr[unsafe_offset=c]
+                save_invstd_ptr[unsafe_offset=c] = (
+                    1.0
+                    / ieee_sqrt(
+                        var_ptr[unsafe_offset=c].cast[DType.float32]() + eps
+                    )
                 ).cast[sdtype]()
                 c += plane_stride
     while plane < planes:
@@ -211,8 +216,10 @@ def _bn_elementwise_kernel[
             shift,
         )
         var at = plane * inner_slots * V + slot * V
-        var x = in_ptr.load[width=V, alignment=align](at).cast[DType.float32]()
-        out_ptr.store[width=V, alignment=align](
+        var x = in_ptr.unsafe_load[width=V, alignment=align](at).cast[
+            DType.float32
+        ]()
+        out_ptr.unsafe_store[width=V, alignment=align](
             at, ((x - mean) * scale + shift).cast[dtype]()
         )
         plane += plane_stride
@@ -228,7 +235,7 @@ def _bn_run_base(n: Int, c: Int, channels: Int, hxw: Int) -> Int:
 def _bn_scan_shard[
     dtype: DType, //
 ](
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     c: Int,
     channels: Int,
     hxw: Int,
@@ -296,10 +303,10 @@ def _bn_scan_shard[
 def _bn_finalize[
     sdtype: DType, //
 ](
-    mean_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    invstd_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    run_mean_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    run_var_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
+    mean_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    invstd_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    run_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    run_var_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
     c: Int,
     mean: Float32,
     m2_in: Float32,
@@ -315,18 +322,20 @@ def _bn_finalize[
         m2 = Float32(0)
     var nf = Float32(count)
     var biased = m2 / nf
-    mean_out_ptr[c] = mean
-    invstd_out_ptr[c] = 1.0 / ieee_sqrt(biased + eps)
+    mean_out_ptr[unsafe_offset=c] = mean
+    invstd_out_ptr[unsafe_offset=c] = 1.0 / ieee_sqrt(biased + eps)
     if has_running:
         var keep = 1.0 - momentum
-        run_mean_ptr[c] = (
-            keep * run_mean_ptr[c].cast[DType.float32]() + momentum * mean
+        run_mean_ptr[unsafe_offset=c] = (
+            keep * run_mean_ptr[unsafe_offset=c].cast[DType.float32]()
+            + momentum * mean
         ).cast[sdtype]()
         var unbiased = biased
         if count > 1:
             unbiased = m2 / (nf - 1.0)
-        run_var_ptr[c] = (
-            keep * run_var_ptr[c].cast[DType.float32]() + momentum * unbiased
+        run_var_ptr[unsafe_offset=c] = (
+            keep * run_var_ptr[unsafe_offset=c].cast[DType.float32]()
+            + momentum * unbiased
         ).cast[sdtype]()
 
 
@@ -337,11 +346,11 @@ def _bn_finalize[
 def _bn_moments_fused_kernel[
     dtype: DType, sdtype: DType
 ](
-    mean_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    invstd_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    run_mean_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    run_var_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    invstd_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    run_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    run_var_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     channels_arg: Int64,
     runs_arg: Int64,
     hxw_arg: Int64,
@@ -361,7 +370,7 @@ def _bn_moments_fused_kernel[
     var c = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var count = runs * hxw
-    var shift = in_ptr[c * hxw].cast[DType.float32]()
+    var shift = in_ptr[unsafe_offset=c * hxw].cast[DType.float32]()
 
     var s = Float32(0)
     var q = Float32(0)
@@ -400,8 +409,8 @@ def _bn_moments_fused_kernel[
 def _bn_moments_kernel[
     dtype: DType
 ](
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     channels_arg: Int64,
     runs_arg: Int64,
     hxw_arg: Int64,
@@ -436,13 +445,13 @@ def _bn_moments_kernel[
     # Assumed mean: the channel's very first element, identical in every shard
     # of this channel so the partial moment pairs merge by addition. On a
     # re-pass it is the accurate mean instead, which leaves no cancellation.
-    var shift = in_ptr[c * hxw].cast[DType.float32]()
+    var shift = in_ptr[unsafe_offset=c * hxw].cast[DType.float32]()
     if repass:
         # Uniform across the block: this early exit cannot desynchronize the
         # barriers inside `block.sum` below.
-        if ws_ptr[meta + channels + c] == 0:
+        if ws_ptr[unsafe_offset=meta + channels + c] == 0:
             return
-        shift = ws_ptr[meta + c]
+        shift = ws_ptr[unsafe_offset=meta + c]
 
     var chunk_n = ceildiv(runs, splits_n)
     var n0 = (k // splits_j) * chunk_n
@@ -461,8 +470,8 @@ def _bn_moments_kernel[
     var bs = block.sum[block_size=BN_THREADS](s_tot)
     var bq = block.sum[block_size=BN_THREADS](q_tot)
     if tid == 0:
-        ws_ptr[k * channels + c] = bs
-        ws_ptr[(splits + k) * channels + c] = bq
+        ws_ptr[unsafe_offset=k * channels + c] = bs
+        ws_ptr[unsafe_offset=(splits + k) * channels + c] = bq
 
 
 @__llvm_metadata(
@@ -472,12 +481,12 @@ def _bn_moments_kernel[
 def _bn_merge_kernel[
     dtype: DType, sdtype: DType
 ](
-    mean_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    invstd_out_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    run_mean_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    run_var_ptr: UnsafePointer[Scalar[sdtype], MutAnyOrigin],
-    ws_ptr: UnsafePointer[Scalar[DType.float32], MutAnyOrigin],
-    in_ptr: UnsafePointer[Scalar[dtype], ImmutAnyOrigin],
+    mean_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    invstd_out_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    run_mean_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    run_var_ptr: Pointer[Scalar[sdtype], MutAnyOrigin],
+    ws_ptr: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     channels_arg: Int64,
     splits_arg: Int64,
     count_arg: Int64,
@@ -512,20 +521,20 @@ def _bn_merge_kernel[
     var s = Float32(0)
     var q = Float32(0)
     for k in range(splits):
-        s += ws_ptr[k * channels + c]
-        q += ws_ptr[(splits + k) * channels + c]
+        s += ws_ptr[unsafe_offset=k * channels + c]
+        q += ws_ptr[unsafe_offset=(splits + k) * channels + c]
     var nf = Float32(count)
-    var shift = in_ptr[c * Int(hxw_arg)].cast[DType.float32]()
-    if finalize and ws_ptr[meta + channels + c] != 0:
-        shift = ws_ptr[meta + c]
+    var shift = in_ptr[unsafe_offset=c * Int(hxw_arg)].cast[DType.float32]()
+    if finalize and ws_ptr[unsafe_offset=meta + channels + c] != 0:
+        shift = ws_ptr[unsafe_offset=meta + c]
     var mean = shift + s / nf
 
     if not finalize:
         if _moment_cancels(s, q, count):
-            ws_ptr[meta + c] = mean
-            ws_ptr[meta + channels + c] = Float32(1)
+            ws_ptr[unsafe_offset=meta + c] = mean
+            ws_ptr[unsafe_offset=meta + channels + c] = Float32(1)
         else:
-            ws_ptr[meta + channels + c] = Float32(0)
+            ws_ptr[unsafe_offset=meta + channels + c] = Float32(0)
         return
 
     _bn_finalize(
@@ -586,7 +595,7 @@ def enqueue_batch_norm_stats[
     elements, plus the ATen running-statistics update."""
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
-    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
+    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
     var mean_ptr = _make_ptr[DType.float32](mean_addr).as_unsafe_any_origin()
     var invstd_ptr = _make_ptr[DType.float32](
         invstd_addr
@@ -706,19 +715,13 @@ def enqueue_batch_norm_elementwise[
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
-    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_immutable()
-    var mean_ptr = (
-        _make_ptr[sdtype](mean_addr).as_unsafe_any_origin().as_immutable()
-    )
-    var var_ptr = (
-        _make_ptr[sdtype](var_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var in_ptr = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
+    var mean_ptr = _make_ptr[sdtype](mean_addr).as_unsafe_any_origin().as_imm()
+    var var_ptr = _make_ptr[sdtype](var_addr).as_unsafe_any_origin().as_imm()
     var gamma_ptr = (
-        _make_ptr[pdtype](gamma_addr).as_unsafe_any_origin().as_immutable()
+        _make_ptr[pdtype](gamma_addr).as_unsafe_any_origin().as_imm()
     )
-    var beta_ptr = (
-        _make_ptr[pdtype](beta_addr).as_unsafe_any_origin().as_immutable()
-    )
+    var beta_ptr = _make_ptr[pdtype](beta_addr).as_unsafe_any_origin().as_imm()
     var save_mean_ptr = _make_ptr[sdtype](save_mean_addr).as_unsafe_any_origin()
     var save_invstd_ptr = _make_ptr[sdtype](
         save_invstd_addr
