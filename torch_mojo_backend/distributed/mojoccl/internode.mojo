@@ -927,6 +927,46 @@ def ib_enqueue(
     )
 
 
+def ib_exchange_now(
+    ib: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+) raises:
+    """Run one exchange inline on the calling thread.
+
+    The bring-up self-test uses it: the transport can then be exercised on
+    a host with InfiniBand but no GPU (registered host memory, no stream to
+    hang kernels on), which is where the bootstrap/QP/immediate wiring is
+    cheapest to debug -- run it with `MOJOCCL_IB_PROXY=0`, since the proxy
+    mailbox needs a driver that can pin host memory. Never correct inside a
+    collective: there the exchange's position in stream order is the whole
+    ordering argument.
+    """
+    ref st = _st(ib)[]
+    var w = IbWork()
+    w.state = ib
+    w.send_addr = send_addr
+    w.send_bytes = send_bytes
+    w.inbox_base = inbox_base
+    w.slot_bytes = slot_bytes
+    w.do_send = 1 if do_send else 0
+    w.nrecv = nrecv
+    w.flush_addr = flush_addr
+    w.seq = seq
+    w.status = 0
+    _run_exchange(st, w)
+    if w.status != 1:
+        raise Error(
+            "mojoccl: inline exchange failed, ib error " + String(st.error)
+        )
+
+
 def ib_report(ib: Int):
     ref st = _st(ib)[]
     if not st.trace or st.n_exchanges == 0:
