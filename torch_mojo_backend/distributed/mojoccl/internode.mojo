@@ -296,6 +296,39 @@ def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
     return Pointer[IbState, MutAnyOrigin](unsafe_from_address=ib)
 
 
+# `IbState.error` and `IbWork.status` are written by the proxy thread (or the
+# `MOJOCCL_IB_PROXY=0` callback thread) inside `_run_exchange` and read by
+# the calling thread -- `ib_error` from the torch-facing calling thread,
+# `ib_enqueue`'s ring-reuse check from the same -- with no other
+# synchronization between the two. Every access goes through these two
+# helpers rather than a plain field read/write so that relationship is a
+# real release/acquire pair, not two threads racing a plain `Int`.
+@always_inline
+def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
+    return Int(
+        Atomic[DType.int64].load[ordering = Ordering.ACQUIRE](
+            p.unsafe_bitcast[Int64]()
+        )
+    )
+
+
+@always_inline
+def _store_atomic_i(p: Pointer[Int, MutAnyOrigin], v: Int):
+    Atomic[DType.int64].store[ordering = Ordering.RELEASE](
+        p.unsafe_bitcast[Int64](), Int64(v)
+    )
+
+
+@always_inline
+def _err_ptr(mut st: IbState) -> Pointer[Int, MutAnyOrigin]:
+    return Pointer(to=st.error).unsafe_origin_cast[MutAnyOrigin]()
+
+
+@always_inline
+def _status_ptr(mut w: IbWork) -> Pointer[Int, MutAnyOrigin]:
+    return Pointer(to=w.status).unsafe_origin_cast[MutAnyOrigin]()
+
+
 # ===-------------------------------------------------------------------=== #
 # The host callback
 # ===-------------------------------------------------------------------=== #
@@ -311,7 +344,10 @@ def _consume_wc(mut st: IbState, c: P8, npeers: Int) -> Int:
     on, and a recv WR nobody reposts.
     """
     if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
-        st.error = 1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR)
+        _store_atomic_i(
+            _err_ptr(st),
+            1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR),
+        )
         return -1
     var op = Int32(ld32(c, WC_OPCODE))
     if op == IBV_WC_RECV_RDMA_WITH_IMM:
@@ -351,8 +387,8 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
 
 def _run_exchange(mut st: IbState, mut w: IbWork):
     """Post this exchange's RDMA writes, wait for the peers', flush."""
-    if st.error != 0:
-        w.status = 2
+    if _load_atomic_i(_err_ptr(st)) != 0:
+        _store_atomic_i(_status_ptr(w), 2)
         return
     var npeers = len(st.peers)
     var parity = w.seq & 1
@@ -380,8 +416,8 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
                 True,
             )
             if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
-                st.error = 1
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 1)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             nsend += 1
     var t1 = perf_counter_ns()
@@ -389,26 +425,26 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
     var sends_done = 0
     while sends_done < nsend or _arrivals(st, parity) < w.nrecv:
         if _stop_requested(st):
-            st.error = 6
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 6)
+            _store_atomic_i(_status_ptr(w), 2)
             return
         var n = poll_cq(st.cq, 16, _b(st.wc))
         if n < 0:
-            st.error = 2
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 2)
+            _store_atomic_i(_status_ptr(w), 2)
             return
         for i in range(Int(n)):
             var kind = _consume_wc(
                 st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
             )
             if kind < 0:
-                w.status = 2
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             if kind == 1:
                 sends_done += 1
         if perf_counter_ns() > deadline:
-            st.error = 3
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 3)
+            _store_atomic_i(_status_ptr(w), 2)
             return
     if parity == 0:
         st.arrivals0 -= w.nrecv
@@ -428,32 +464,32 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
             st.rkey,
         )
         if post_send(st.flush_qp, _b(st.wr), _b(st.bad)) != 0:
-            st.error = 4
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 4)
+            _store_atomic_i(_status_ptr(w), 2)
             return
         var flushed = False
         while not flushed:
             if _stop_requested(st):
-                st.error = 6
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 6)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             var n = poll_cq(st.cq, 16, _b(st.wc))
             if n < 0:
-                st.error = 5
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 5)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             for i in range(Int(n)):
                 var kind = _consume_wc(
                     st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
                 )
                 if kind < 0:
-                    w.status = 2
+                    _store_atomic_i(_status_ptr(w), 2)
                     return
                 if kind == 2:
                     flushed = True
             if perf_counter_ns() > deadline:
-                st.error = 7
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 7)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
     var t3 = perf_counter_ns()
 
@@ -461,7 +497,7 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
     st.t_wait_ns += t2 - t1
     st.t_flush_ns += t3 - t2
     st.n_exchanges += 1
-    w.status = 1
+    _store_atomic_i(_status_ptr(w), 1)
 
 
 @always_inline
@@ -925,7 +961,8 @@ def ib_npeers(ib: Int) -> Int:
 
 
 def ib_error(ib: Int) -> Int:
-    return _st(ib)[].error
+    ref st = _st(ib)[]
+    return _load_atomic_i(_err_ptr(st))
 
 
 def ib_next_seq(ib: Int) -> Int:
@@ -968,7 +1005,7 @@ def ib_enqueue(
     ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
         unsafe_offset=slot
     ]
-    if w.status == 0:
+    if _load_atomic_i(_status_ptr(w)) == 0:
         raise Error(
             "mojoccl: the inter-node work ring wrapped with an exchange still"
             " in flight; MOJOCCL_IB_TRACE=1 to see how far behind the network"
@@ -983,7 +1020,7 @@ def ib_enqueue(
     w.nrecv = nrecv
     w.flush_addr = flush_addr
     w.seq = seq
-    w.status = 0
+    _store_atomic_i(_status_ptr(w), 0)
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
         proxy_wait(
@@ -1035,11 +1072,12 @@ def ib_exchange_now(
     w.nrecv = nrecv
     w.flush_addr = flush_addr
     w.seq = seq
-    w.status = 0
+    _store_atomic_i(_status_ptr(w), 0)
     _run_exchange(st, w)
-    if w.status != 1:
+    if _load_atomic_i(_status_ptr(w)) != 1:
         raise Error(
-            "mojoccl: inline exchange failed, ib error " + String(st.error)
+            "mojoccl: inline exchange failed, ib error "
+            + String(_load_atomic_i(_err_ptr(st)))
         )
 
 
