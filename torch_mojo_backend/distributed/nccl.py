@@ -33,6 +33,7 @@ import functools
 import os
 from pathlib import Path
 
+from torch_mojo_backend.distributed import mojoccl_build
 from torch_mojo_backend.mojo_device import cuda_peer, hip_peer
 
 # nccl.h: ncclResult_t
@@ -62,6 +63,10 @@ NCCL_UNIQUE_ID_BYTES = 128
 
 _NCCL_LIB_ENV = "TORCH_MOJO_BACKEND_NCCL_LIB"
 _RCCL_LIB_ENV = "TORCH_MOJO_BACKEND_RCCL_LIB"
+# "mojo": build (first use only, cached) and use libmojoccl.so -- the
+# in-repo NCCL-API implementation (torch_mojo_backend/distributed/mojoccl) --
+# instead of vendor NCCL/RCCL. Same C ABI, same `_declare()` argtypes below.
+_CCL_ENV = "TORCH_MOJO_BACKEND_CCL"
 
 # MAX's `Device.api` string -> the library implementing the NCCL API there.
 _LIBRARY_NAME_OF = {"cuda": "NCCL", "hip": "RCCL"}
@@ -253,6 +258,11 @@ def load(api: str) -> CclLibrary:
             f"no NCCL-API collective library for the {api!r} device api; the "
             "mojo distributed backend supports NVIDIA (NCCL) and AMD (RCCL) GPUs"
         ) from None
+    if os.environ.get(_CCL_ENV) == "mojo":
+        path = mojoccl_build.ensure_built()
+        lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        _declare(lib)
+        return CclLibrary(lib, path, "mojoccl")
     paths = _candidate_librccl_paths() if api == "hip" else _candidate_libnccl_paths()
     errors = []
     for path in paths:
