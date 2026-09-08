@@ -511,13 +511,15 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                 text=True,
                 env=_build_env(),
             )
-            _trace(f"built {label} in {time.monotonic() - started:.2f}s")
+            elapsed = time.monotonic() - started
             if proc.returncode != 0:
+                _trace(f"build of {label} FAILED after {elapsed:.2f}s")
                 raise ImportError(
                     f"mojo build failed for {src.stem} "
                     f"({_defines_tag(defines)}):\n{proc.stderr}"
                 )
             os.replace(tmp, out)
+            _trace(f"built {label} in {elapsed:.2f}s")
         finally:
             tmp.unlink(missing_ok=True)
         return out
