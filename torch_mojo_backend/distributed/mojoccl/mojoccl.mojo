@@ -20,6 +20,7 @@
 # (collectives_kernels.mojo), swapped out wholesale once the production
 # kernel lands.
 
+from std.collections import Dict
 from std.ffi import OwnedDLHandle
 from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
@@ -166,6 +167,7 @@ struct CommState(Movable):
     var generation: Int
     var last_stream: Int64
     var aborted: Bool
+    var stream_cache: Dict[Int64, DeviceStream]
 
     def __init__(
         out self,
@@ -189,6 +191,7 @@ struct CommState(Movable):
         self.generation = 0
         self.last_stream = 0
         self.aborted = False
+        self.stream_cache = Dict[Int64, DeviceStream]()
 
 
 @always_inline
@@ -204,11 +207,23 @@ def _any(p: Pointer[UInt8, MutUntrackedOrigin]) -> Pointer[UInt8, MutAnyOrigin]:
     return Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p))
 
 
-@always_inline
-def _wrap_stream(ctx: DeviceContext, handle: Int64) raises -> DeviceStream:
-    return ctx.create_external_stream(
-        OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(handle))
-    )
+def _ensure_stream_cached(mut state: CommState, handle: Int64) raises:
+    """`create_external_stream` wraps a raw `cudaStream_t`/`hipStream_t` in a
+    `DeviceStream`; every collective call was re-wrapping the SAME handle
+    (torch hands this library one stable stream per torch.Stream for the
+    whole communicator's life -- it is not reused across streams), so cache
+    the wrapper in `state.stream_cache` keyed by the raw handle instead of
+    re-wrapping on every call. A handle not seen before is wrapped and
+    inserted; callers then read `state.stream_cache[handle]` directly (a
+    `ref`, no copy). If a handle were ever reused for a different stream this
+    would keep returning the stale wrapper -- not something a torch process
+    does, but worth knowing if that assumption ever breaks.
+    """
+    if handle not in state.stream_cache:
+        var wrapped = state.ctx.create_external_stream(
+            OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(handle))
+        )
+        _ = state.stream_cache.insert(handle, wrapped^)
 
 
 def _copy_error_word(
@@ -537,8 +552,15 @@ def ncclCommGetAsyncError(
         # can give is "everything enqueued so far landed", same as before --
         # only the read itself changes, from a host dereference of device
         # memory (wrong) to a real D2H copy (_read_error_word).
+        # Not cached: an error poll, not a collective -- rare enough that the
+        # wrap cost this library's cache exists to avoid does not matter here,
+        # and this is the one call site that needs a *fresh* wrap or the
+        # comm's own default stream depending on whether a collective has
+        # run yet, which does not fit the single-handle cache lookup below.
         var s = (
-            _wrap_stream(state.ctx, state.last_stream)
+            state.ctx.create_external_stream(
+                OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(state.last_stream))
+            )
             if state.last_stream != 0
             else DeviceStream(state.ctx)
         )
@@ -620,7 +642,8 @@ def ncclAllReduce(
         if state.aborted:
             return NCCL_INVALID_USAGE
         state.last_stream = stream
-        var s = _wrap_stream(state.ctx, stream)
+        _ensure_stream_cached(state, stream)
+        ref s = state.stream_cache[stream]
         var scale = Float32(1.0)
         if op == NCCL_AVG:
             scale = Float32(1.0) / Float32(state.world)
@@ -703,7 +726,7 @@ def ncclAllReduce(
                 )
             done += chunk
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
@@ -728,7 +751,8 @@ def ncclBroadcast(
         if Int(root) < 0 or Int(root) >= state.world:
             return NCCL_INVALID_ARGUMENT
         state.last_stream = stream
-        var s = _wrap_stream(state.ctx, stream)
+        _ensure_stream_cached(state, stream)
+        ref s = state.stream_cache[stream]
         var total_bytes = Int(count) * item
         var max_bytes = max(item, state.cap_bytes)
         var done = 0
@@ -750,7 +774,7 @@ def ncclBroadcast(
             )
             done += chunk
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
@@ -772,7 +796,8 @@ def ncclAllGather(
         if state.aborted:
             return NCCL_INVALID_USAGE
         state.last_stream = stream
-        var s = _wrap_stream(state.ctx, stream)
+        _ensure_stream_cached(state, stream)
+        ref s = state.stream_cache[stream]
         var per_rank_bytes = Int(sendcount) * item
         var max_bytes = max(item, state.cap_bytes)
         var done = 0
@@ -794,7 +819,7 @@ def ncclAllGather(
             )
             done += chunk
         return NCCL_SUCCESS
-    except e:
+    except:
         return NCCL_INTERNAL_ERROR
 
 
