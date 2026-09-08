@@ -129,13 +129,13 @@ comptime NCCL_AVG: Int32 = 4
 # Every exchange is all-to-all among the ranks sharing a local_rank, even
 # when only one of them has data (a broadcast, or an allreduce whose shard
 # table leaves this rank empty), and that is a correctness requirement, not
-# tidiness. The inbox is double buffered by the exchange counter's parity,
-# so what has to be true is: peer B's write for exchange e+2 lands after MY
-# add kernel for exchange e has read that half. All-to-all makes it a proof
-# -- B cannot post e+2 before its callback for e+1 returned, which needed MY
-# e+1 message, which my stream sent only after running my add kernel for e.
-# Let one exchange be one-directional and that chain breaks, leaving nothing
-# but a timing margin between B's write and my read.
+# tidiness. The inbox is double buffered by the exchange counter's parity
+# (`_inbox_base`), so what has to be true is: peer B's write for exchange
+# e+2 lands after MY add kernel for exchange e has read that half. All-to-all
+# makes it a proof -- B cannot post e+2 before its callback for e+1 returned,
+# which needed MY e+1 message, which my stream sent only after running my add
+# kernel for e. Let one exchange be one-directional and that chain breaks,
+# leaving nothing but a timing margin between B's write and my read.
 comptime CREDIT_BYTES = 16
 
 comptime DEFAULT_REGION_MB = 256
@@ -564,11 +564,13 @@ def _bootstrap(
     # [signal | stage_in | stage_out]: everything the network touches --
     # the inbox the peers RDMA into, and the staging broadcast and
     # allgather need because user buffers are not registered -- lives
-    # there and nowhere else. Aliasing it onto stage_in would have been
-    # free in memory and wrong in fact: a peer node writes my inbox as
-    # soon as ITS reduce-scatter is done, which is not ordered against
-    # MY reduce-scatter still using stage_in, nor against a local peer
-    # still reading the previous generation's staging. A single-node
+    # there and nowhere else, carved as
+    # [staging: cap/2 | inbox half0: cap/4 | inbox half1: cap/4]
+    # (`_inbox_base`). Aliasing it onto stage_in would have been free in
+    # memory and wrong in fact: a peer node writes my inbox as soon as ITS
+    # reduce-scatter is done, which is not ordered against MY
+    # reduce-scatter still using stage_in, nor against a local peer still
+    # reading the previous generation's staging. A single-node
     # communicator allocates none of it and keeps exactly the old
     # region.
     var net_bytes = cap_bytes if topo.nnodes > 1 else 0
@@ -807,11 +809,10 @@ def _inter_node_exchange[
     kernel that adds what arrived. On exit the shard holds the sum over the
     WHOLE communicator, ready for `allgather_finish`.
 
-    Inbox geometry is derived from `(numel, local_world, item)` alone so that
-    a sender computes the same addresses as its receiver: `net_off` holds two
-    halves of `(nnodes-1)` slots of one shard each, and the exchange
-    counter's parity picks the half. `_max_chunk_bytes` keeps both halves
-    inside the area.
+    Slot geometry is derived from `(numel, local_world, item)` alone so that
+    a sender computes the same addresses as its receiver: a half holds
+    `(nnodes-1)` slots of one shard each, at the fixed base `_inbox_base`
+    picks by parity. `_max_chunk_bytes` keeps a half inside its quarter.
     """
     comptime item = size_of[dtype]()
     var sr = shard_range(numel, state.local_world, state.local_rank, item)
@@ -821,13 +822,12 @@ def _inter_node_exchange[
     var npeers = ib_npeers(state.ib)
     var nbytes = cnt_e * item
     var slot_bytes = _align_up(max(nbytes, CREDIT_BYTES), 16)
-    var half = npeers * slot_bytes
-    if 2 * half > state.cap_bytes:
+    if npeers * slot_bytes > _inbox_half_bytes(state):
         raise Error(
             "mojoccl: the inter-node inbox overflows the network area; this"
             " is a chunking bug"
         )
-    var inbox_base = state.net_off + (seq & 1) * half
+    var inbox_base = _inbox_base(state, seq)
     var shard = (
         state.owned_base + signal_bytes() + state.cap_bytes + off_e * item
     )
@@ -862,19 +862,52 @@ def _inter_node_exchange[
         )
 
 
-def _max_chunk_bytes(state: CommState) -> Int:
-    """Largest chunk whose staging and inbox both fit in stage_in.
+def _inbox_half_bytes(state: CommState) -> Int:
+    """Bytes each parity half of the inbox may hold. See `_inbox_base`."""
+    return state.cap_bytes // 4
 
-    A chunk of `B` bytes puts `B/L` bytes in each of the `2(N-1)` inbox
-    slots, so `B <= cap * L / (2(N-1))`, less a page of alignment slop --
+
+def _inbox_base(state: CommState, seq: Int) -> Int:
+    """Region offset of exchange `seq`'s inbox half.
+
+    FIXED, not derived from the message: the network area is carved once as
+    `[staging: cap/2 | half0: cap/4 | half1: cap/4]` and the exchange
+    counter's parity picks a half.
+
+    That the halves do not move is what makes the double buffer a proof
+    rather than a timing margin. Sizing a half from the current message --
+    which is what this used to do -- kept e and e+2 apart but let e and e+1
+    OVERLAP whenever consecutive exchanges had different geometry, and DDP
+    produces exactly that: a 4-byte AVG allreduce (slot 16 B, half 16 B)
+    next to a 27 MiB bucket (half 3.4 MiB) put the small exchange's half 1
+    at `net_off+16` and the big one's half 0 at `net_off+0`. Nothing orders
+    a peer's e+1 write against MY e add kernel -- the peer's e+1 send is
+    gated on its own e completing, not on my consumption -- so the overlap
+    is a silent data race on the inbox, and mixing collectives (an
+    allreduce's half 0 at `net_off` against a broadcast's staged chunk,
+    also at `net_off`) is the same bug once more.
+    """
+    return (
+        state.net_off
+        + state.cap_bytes // 2
+        + (seq & 1) * _inbox_half_bytes(state)
+    )
+
+
+def _max_chunk_bytes(state: CommState) -> Int:
+    """Largest allreduce chunk whose inbox half fits.
+
+    A chunk of `B` bytes puts `B/L` bytes in each of the `N-1` slots of one
+    half, so `B <= (cap/4) * L / (N-1)`, less a page of alignment slop --
     and never more than `cap`, which the intra-node kernels require anyway.
     At the shapes DDP produces (27 MiB buckets against a 256 MiB region)
-    the cap never binds: 256 MiB at 2 nodes, 146 MiB at 8.
+    the cap never binds: 256 MiB at 2 nodes, 73 MiB at 8.
     """
     if state.nnodes <= 1:
         return state.cap_bytes
-    var denom = 2 * (state.nnodes - 1)
-    var b = (state.cap_bytes * state.local_world // denom) - 2 * 4096
+    var b = (
+        _inbox_half_bytes(state) * state.local_world // (state.nnodes - 1)
+    ) - 2 * 4096
     b = min(b, state.cap_bytes)
     if b < 4096:
         return 4096
@@ -1088,23 +1121,27 @@ def _broadcast_multinode(
     var i_am_root = state.rank == root
     var i_am_local_root = state.local_rank == root_lr
     var receives = i_am_local_root and state.my_node != root_node
-    # The network area holds the root's staged chunk plus both inbox halves,
-    # and a half is one slot PER PEER now that the exchange is all-to-all.
+    # The root's staged chunk goes in the network area's staging half; a
+    # peer slot has to fit an inbox quarter, one slot PER PEER now that the
+    # exchange is all-to-all.
     var npeers = ib_npeers(state.ib)
     var max_bytes = max(
         4096,
-        (state.cap_bytes // (1 + 2 * npeers) - 2 * 4096) // 4096 * 4096,
+        (
+            min(state.cap_bytes // 2, _inbox_half_bytes(state) // npeers)
+            - 2 * 4096
+        )
+        // 4096
+        * 4096,
     )
     var done = 0
     while done < total_bytes:
         var chunk = min(max_bytes, total_bytes - done)
         var seq = ib_next_seq(state.ib)
         var slot_bytes = _align_up(chunk, 16)
-        var inbox_off = state.net_off + _align_up(chunk, 4096)
-        var half = npeers * slot_bytes
-        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+        if npeers * slot_bytes > _inbox_half_bytes(state):
             raise Error("mojoccl: broadcast inbox does not fit; chunking bug")
-        var inbox_base = inbox_off + (seq & 1) * half
+        var inbox_base = _inbox_base(state, seq)
         var recv_slot = 0
         if receives:
             recv_slot = root_node if root_node < state.my_node else root_node - 1
@@ -1236,10 +1273,12 @@ def _allgather_multinode(
     var lw = state.local_world
     var npeers = ib_npeers(state.ib)
     var block_stage = state.owned_base + state.net_off
-    # The network area holds one node block (lw * chunk) plus both inbox
-    # halves (npeers node blocks each).
-    var denom = lw * (1 + 2 * npeers)
-    var max_bytes = max(16, (state.cap_bytes // denom - 8192) // 16 * 16)
+    # One node block (lw * chunk) in the staging half; an inbox quarter has
+    # to hold npeers of them.
+    var max_block = min(
+        state.cap_bytes // 2, _inbox_half_bytes(state) // npeers
+    )
+    var max_bytes = max(16, ((max_block - 8192) // lw) // 16 * 16)
     var done = 0
     while done < per_rank_bytes:
         var chunk = min(max_bytes, per_rank_bytes - done)
@@ -1260,11 +1299,9 @@ def _allgather_multinode(
         var seq = ib_next_seq(state.ib)
         var block = lw * chunk
         var slot_bytes = _align_up(block, 16)
-        var inbox_off = state.net_off + _align_up(block, 4096)
-        var half = npeers * slot_bytes
-        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+        if npeers * slot_bytes > _inbox_half_bytes(state):
             raise Error("mojoccl: allgather inbox does not fit; chunking bug")
-        var inbox_base = inbox_off + (seq & 1) * half
+        var inbox_base = _inbox_base(state, seq)
         ib_enqueue(
             state.ib,
             state.driver,

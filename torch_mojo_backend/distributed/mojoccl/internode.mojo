@@ -39,10 +39,14 @@
 # cannot reach e+2 before receiving my e+1 data, which I send only after my
 # own stream ran the add kernel of exchange e. Single buffering would leave
 # B's e+1 write racing my e add kernel with nothing but timing in between.
-# The argument needs every exchange to be all-to-all, which is why a rank
-# with nothing to contribute still sends CREDIT_BYTES (mojoccl.mojo). The
-# immediate carries the exchange counter, so an arrival belonging to e+1 is
-# counted into the other parity's tally instead of satisfying e.
+# The argument needs two things. Every exchange must be all-to-all, which is
+# why a rank with nothing to contribute still sends CREDIT_BYTES
+# (mojoccl.mojo); and the two halves must be DISJOINT ADDRESSES for every
+# exchange alike, which is why `_inbox_base` carves them out of the region
+# once instead of sizing them from the message in flight (mojoccl.mojo has
+# the case that broke). The immediate carries the exchange counter, so an
+# arrival belonging to e+1 is counted into the other parity's tally instead
+# of satisfying e.
 #
 # The inbox lives in the region's own network area, never aliased onto the
 # intra-node staging: a peer node writes it as soon as ITS reduce-scatter is
