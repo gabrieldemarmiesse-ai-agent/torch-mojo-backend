@@ -490,6 +490,32 @@ def _init_rank(
     nranks: Int,
     comm_out: Pointer[Int64, MutAnyOrigin],
 ) raises -> Int32:
+    """Bring the rendezvous up, run init under it, and always hand it back.
+
+    `BootstrapConn` has no destructor, so every path out of `_bootstrap`
+    has to close its sockets explicitly: a leaked root listener keeps the
+    unique id's port bound for the life of the process, and a leaked
+    per-rank socket leaves the peers blocked in `_recv_all` until their own
+    deadline instead of failing fast on a closed connection.
+    """
+    var timeout_s = _bootstrap_timeout_s()
+    var conn = bootstrap_connect(uid, rank, nranks, timeout_s)
+    try:
+        var rc = _bootstrap(conn, rank, nranks, comm_out, timeout_s)
+        conn.close()
+        return rc
+    except e:
+        conn.close()
+        raise e
+
+
+def _bootstrap(
+    mut conn: BootstrapConn,
+    rank: Int,
+    nranks: Int,
+    comm_out: Pointer[Int64, MutAnyOrigin],
+    timeout_s: Float64,
+) raises -> Int32:
     """Three bootstrap rounds and everything they gate.
 
     Round 1 gathers host identity, from which every rank derives the same
@@ -499,9 +525,6 @@ def _init_rank(
     and its queue pairs are in RTS, so the first collective may write into
     it.
     """
-    var timeout_s = _bootstrap_timeout_s()
-    var conn = bootstrap_connect(uid, rank, nranks, timeout_s)
-
     # Round 1: host identity.
     var b1 = unsafe_alloc[UInt8](16)
     var b1w = b1.unsafe_bitcast[UInt64]()
@@ -515,7 +538,6 @@ def _init_rank(
         hashes.append(t1w[unsafe_offset = 2 * r])
     var topo = derive_topology(hashes, rank)
     if topo.local_world > MAX_WORLD:
-        conn.close()
         raise Error(
             "mojoccl: "
             + String(topo.local_world)
@@ -524,7 +546,6 @@ def _init_rank(
             + String(MAX_WORLD)
         )
     if topo.nnodes > MAX_NODES:
-        conn.close()
         raise Error(
             "mojoccl: " + String(topo.nnodes) + " nodes exceeds the "
             + String(MAX_NODES) + "-node limit of the inbox layout"
@@ -538,7 +559,6 @@ def _init_rank(
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
     if cap_bytes <= 0 or cap_bytes % 4096 != 0:
-        conn.close()
         raise Error("mojoccl: MOJOCCL_REGION_MB must be a positive 4 KiB multiple")
     # A multi-node communicator gets a third cap-sized area on top of
     # [signal | stage_in | stage_out]: everything the network touches --
@@ -622,7 +642,6 @@ def _init_rank(
         )
 
     bootstrap_barrier(conn, timeout_s)
-    conn.close()
 
     var rank_at = List[Int]()
     for i in range(len(topo.rank_at)):
