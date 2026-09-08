@@ -15,7 +15,6 @@ from typing import Protocol, TypeVar, runtime_checkable
 import torch
 
 from torch_mojo_backend.eager_kernels import aten_fast as _aten_fast
-from torch_mojo_backend.mojo_device import deferred_compile
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import TorchMojoTensor
 
 # _require_handled passes its argument through unchanged, including the
@@ -655,19 +654,10 @@ def _scaled_dot_product_attention_autograd(
         )
         is not None
     ):
-        # Redispatches through __torch_dispatch__: the deferred-compile
-        # layer sees the flash op and orders/queues it like any other.
+        # Redispatches through __torch_dispatch__ like any other op.
         return torch.ops.aten._scaled_dot_product_flash_attention.default(
             query, key, value, dropout_p, is_causal, False, scale=scale
         )[0]
-    # The remaining paths read q/k/v payloads directly through aten_fast,
-    # ABOVE __torch_dispatch__ — invisible to the deferred-compile queue —
-    # so every still-pending producer must land first (FIFO granularity: the
-    # whole queue drains, which covers q/k/v/attn_mask). The eligibility
-    # check above is metadata-only and safe on pending tensors. Buffers
-    # these paths allocate afterwards are retained per queued item (queue
-    # rule 3), so no extra bookkeeping is owed here.
-    deferred_compile.drain()
     if not needs_backward:
         return _require_handled(
             aten_fast.fast_aten_scaled_dot_product_attention(

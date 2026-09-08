@@ -7,7 +7,7 @@ from torch.utils.backend_registration import _setup_privateuseone_for_python_bac
 from torch_mojo_backend.distributed import register_distributed_backend
 from torch_mojo_backend.mojo_device import (
     comm_fence,
-    deferred_compile,
+    dispatch,
     torch_mojo_device_module,
 )
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
@@ -78,13 +78,13 @@ def register_mojo_devices():
     # a call reaching the backend key from C++ finds -- factories such as
     # `torch.empty(device="mojo")` have no wrapper argument and never pass
     # through `__torch_dispatch__`. The table beside it is the shortcut for
-    # calls that did (see deferred_compile.DIRECT_IMPLS).
+    # calls that did (see dispatch.DIRECT_IMPLS).
     for op_name, func in _aten_ops_registry:
         wrapped = _fence_pending_collectives(func)
         torch.library.impl(op_name, "privateuseone")(wrapped)
         overload = _resolve_overload(op_name)
         if overload is not None:
-            deferred_compile.DIRECT_IMPLS[overload] = wrapped
+            dispatch.DIRECT_IMPLS[overload] = wrapped
 
     register_autograd_ops()
     register_autocast_ops()

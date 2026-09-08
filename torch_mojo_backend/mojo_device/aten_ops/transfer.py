@@ -7,11 +7,7 @@ import torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
 from torch_mojo_backend import eager_kernels
-from torch_mojo_backend.mojo_device import (
-    cuda_peer,
-    deferred_compile,
-    torch_mojo_device_module,
-)
+from torch_mojo_backend.mojo_device import cuda_peer, torch_mojo_device_module
 from torch_mojo_backend.mojo_device.aten_ops.support import (
     _copy_into_tensor,
     _fast,
@@ -48,10 +44,8 @@ def _upload_on_device(
     the pointers rather than from device ordinals, so this stays correct on a
     multi-GPU box where the two runtimes may not enumerate alike.
 
-    Three synchronizations are load-bearing and none is optional:
+    Two synchronizations are load-bearing and neither is optional:
 
-    * the queue drain, because a pending queued write to the destination would
-      otherwise land AFTER this copy and silently overwrite it;
     * the CUDA synchronize, because this runtime knows nothing about torch's
       stream and would otherwise read bytes CUDA has not written yet;
     * the mojo synchronize, because torch's caching allocator may hand the
@@ -70,7 +64,6 @@ def _upload_on_device(
         return True
     if not cuda_peer.same_physical_device(src.data_ptr(), dest_ptr):
         return False
-    deferred_compile.drain()
     torch.cuda.synchronize()
     holder = cast(_TensorHolderModule, eager_kernels.tensor_holder)
     holder.copy_d2d(

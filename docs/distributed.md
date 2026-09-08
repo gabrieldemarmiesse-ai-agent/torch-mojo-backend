@@ -94,10 +94,9 @@ anything touches the GPU runtime or enumerates MAX devices.
   (measured; see the memory note in `mojo_device/device_streams.py`).
   `TORCH_MOJO_BACKEND_COMM_STREAM=0` pins collectives to the default stream
   instead (simplest ordering, zero overlap) — also the automatic path for
-  collectives needing default-stream copies after the NCCL call. Both paths
-  drain the host-side kernel-call queue first so producers are actually on
-  a stream (`docs/kernel_call_queue.md`). One contract carried over from
-  stock torch: `wait()` an async collective before reading its result —
+  collectives needing default-stream copies after the NCCL call. One
+  contract carried over from stock torch: `wait()` an async collective
+  before reading its result —
   including before exporting it through DLPack.
 - **Work objects** wrap already-completed `torch.futures.Future`s (no
   `devices=` — the PrivateUse1 device guard is a stub, and a device-typed

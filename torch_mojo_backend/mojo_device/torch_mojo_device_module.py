@@ -163,19 +163,8 @@ def _resolve_sync_device(device: "int | str | torch.device | None") -> torch.dev
 
 def _device_synchronize(device: "int | str | torch.device | None" = None):
     """Device-only barrier: wait for already-launched work and release the
-    completed asynchronous transfer owners.
-
-    Deliberately does NOT drain the kernel-call queue. This is the ordering
-    primitive the queue itself uses when a launch must be barriered against
-    another thread's device work (``call_queue._device_only_synchronize``,
-    reached from ``order_direct_launch`` / ``_order_queue_launch_locked``),
-    where a drain would re-enter the queue in the middle of a launch —
-    running items 2..N before the item already popped, and freeing its
-    keep-alive. It is also what that path
-    actually needs: the queued items have not been launched at all, so there
-    is nothing of theirs to wait for; only the *other* thread's issued work
-    must land first, which is exactly a stream synchronize.
-    """
+    completed asynchronous transfer owners. Unlike ``synchronize`` it does
+    not fence pending collectives first."""
     from torch_mojo_backend.mojo_device.torch_mojo_tensor import (  # noqa: PLC0415 -- cycle: torch_mojo_tensor imports this module
         _release_synchronized_d2h_owners,
         _release_synchronized_h2d_sources,
@@ -190,18 +179,14 @@ def _device_synchronize(device: "int | str | torch.device | None" = None):
 
 def synchronize(device: "int | str | torch.device | None" = None):
     """Public: wait for work and release completed asynchronous transfer
-    owners. Pending kernel launches count as work, so the queue drains
-    first — a caller of ``torch.mojo.synchronize()`` is entitled to assume
-    every op it issued has actually run on the device. So does a collective
-    still flying on the comm stream, which only the default stream is waited
-    on here: fence it onto that stream first (mojo_device/comm_fence.py)."""
+    owners. A collective still flying on the comm stream counts as work,
+    but only the default stream is waited on here: fence it onto that
+    stream first (mojo_device/comm_fence.py)."""
     from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- same cycle, through comm_fence's import of torch_mojo_tensor
         comm_fence,
-        deferred_compile,
     )
 
     comm_fence.fence_all()
-    deferred_compile.drain()
     _device_synchronize(device)
 
 

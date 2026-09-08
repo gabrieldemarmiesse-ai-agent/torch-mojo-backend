@@ -52,8 +52,6 @@ run on their own side stream and overlap compute; see `docs/distributed.md`.)
 Redirecting kernel launches through per-stream MAX DeviceContexts is the
 known follow-up that would make `with s:` fully concurrent.
 
-Two rules carried over from CUDA apply unchanged: work you enqueue is only
-on a stream once the kernel-call queue has launched it (host reads and
-`torch.mojo.synchronize()` drain it for you), and a tensor produced on one
+One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —
 including external consumers — touches it.

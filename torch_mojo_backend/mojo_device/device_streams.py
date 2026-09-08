@@ -11,10 +11,9 @@ native CUstream) exists only for native libraries like NCCL. MAX/AsyncRT
 thread-safety is undocumented; AMD should work through the same abstractions
 but is unverified.
 
-Rules for stream users: drain the kernel-call queue before any cross-stream
-ordering (a queued launch is invisible to every stream); hold references to
-tensors a side stream touches until its work completes (frees are
-default-stream-ordered); nothing is fenced implicitly.
+Rules for stream users: hold references to tensors a side stream touches
+until its work completes (frees are default-stream-ordered); nothing is
+fenced implicitly.
 """
 
 import threading
@@ -86,8 +85,7 @@ class Stream:
         self.handle = self._stream.native_stream_handle
 
     def wait_default_stream(self):
-        """Order this stream after the default stream (drain the kernel-call
-        queue first — see rule 1 above)."""
+        """Order this stream after the default stream."""
         if self.is_default:
             return
         self._stream.wait_for(self.device)

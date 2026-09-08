@@ -15,18 +15,11 @@ from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import torch_dtype_to_max
 
 from torch_mojo_backend import eager_kernels
-from torch_mojo_backend.eager_kernels import _ctx_ptr, call_queue, is_device_oom
+from torch_mojo_backend.eager_kernels import _ctx_ptr, is_device_oom
 from torch_mojo_backend.eager_kernels.data_movement_ops import DataMovementExtension
-from torch_mojo_backend.eager_kernels.output_specs import (
-    _submit_prepared_into,
-    _TensorOutputSpec,
-)
-from torch_mojo_backend.mojo_device import (
-    deferred_compile,
-    dlpack,
-    torch_mojo_device_module,
-)
-from torch_mojo_backend.mojo_device.deferred_compile import dispatch as _dispatch_entry
+from torch_mojo_backend.eager_kernels.output_specs import _TensorOutputSpec
+from torch_mojo_backend.mojo_device import dlpack, torch_mojo_device_module
+from torch_mojo_backend.mojo_device.dispatch import dispatch as _dispatch_entry
 
 
 class _MojoTensorHolder(Protocol):
@@ -322,17 +315,12 @@ class _SynchronizableDevice(Protocol):
 def _alloc_with_recovery(
     device: _SynchronizableDevice, nbytes: int
 ) -> tuple[_MojoTensorHolder, int]:
-    """One device allocation, with the reactive last resort under the budget.
+    """One device allocation, retried once after a device synchronize.
 
-    When the allocator refuses, the largest reclaimable set is whatever the
-    kernel-call queue still retains: drain it (launching every pending item,
-    waiting builds out), synchronize the device so the stream-ordered frees
-    actually land, and retry exactly once. This cannot defeat size-class
-    carve-up — the arena never splits or merges, which is what the proactive
-    run-ahead budget prevents — but it converts pressure the budget cannot
-    see (a model simply large for the card, external processes) into a
-    stall instead of a failure. Non-OOM errors and a second failure
-    propagate untouched.
+    When the allocator refuses, frees still stream-ordered behind in-flight
+    kernels have not landed yet: synchronize the device so they do, then
+    retry exactly once. Non-OOM errors and a second failure propagate
+    untouched.
     """
     holder_mod = _holder_mod()
     # _ctx_ptr wants a real max.driver.Device; production always passes one
@@ -347,10 +335,8 @@ def _alloc_with_recovery(
             raise
         sys.stderr.write(
             f"torch-mojo-backend: device allocation of {nbytes} bytes failed; "
-            f"draining {len(call_queue._QUEUE)} queued launch(es), "
-            "synchronizing, and retrying once...\n"
+            "synchronizing and retrying once...\n"
         )
-        call_queue.drain()
         device.default_stream.synchronize()
         return holder_mod.alloc(ctx_ptr, nbytes)
 
@@ -466,9 +452,7 @@ class TorchMojoTensor(torch.Tensor):
         if not all(issubclass(cls, tensor_type) for tensor_type in types):
             return NotImplemented
 
-        # The deferred-compile layer executes ops while kernel variants are
-        # still building in the background (and is a plain pass-through to
-        # the ordinary PrivateUse1 path when no compile is in flight).
+        # Calls the PrivateUse1 kernel straight out of dispatch.DIRECT_IMPLS.
         return _dispatch_entry(func, args, kwargs or {})
 
     @classmethod
@@ -582,7 +566,7 @@ class TorchMojoTensor(torch.Tensor):
         dtype = torch_dtype_to_max(t.dtype)
         nbytes = t.numel() * t.element_size()
         if nbytes == 0:
-            # Nothing to transfer; skip alloc_from_host's full queue drain.
+            # Nothing to transfer.
             return cls._alloc(tuple(t.shape), dtype, device)
         holder, ptr, transfer_owner = _holder_mod().alloc_from_host(
             _ctx_ptr(device), t.data_ptr(), nbytes
@@ -602,8 +586,6 @@ class TorchMojoTensor(torch.Tensor):
     def _to_cpu_tensor(self, *, non_blocking: bool = False) -> torch.Tensor:
         """D2H into MAX-owned pinned storage exposed as a CPU tensor.
 
-        Host read: queued kernel launches must land first (call queue).
-
         With ``non_blocking=True`` on a GPU, the returned tensor aliases the
         pinned destination immediately and the caller must synchronize before
         consuming it, matching PyTorch's asynchronous accelerator-to-CPU
@@ -618,10 +600,6 @@ class TorchMojoTensor(torch.Tensor):
         # lazily (mojo_device/comm_fence.py), and this is a first use.
         comm_fence.fence_tensor(self)
         src = self if self._is_contiguous else self._materialize_contiguous()
-        # Reading device bytes is a host read: every queued launch must have
-        # executed before the transfer is enqueued -- INCLUDING the strided
-        # materialization just queued above, whose output is what this reads.
-        deferred_compile.drain()
         if src._numel == 0:
             return torch.empty(self._shape, dtype=max_dtype_to_torch(self._dtype))
 
@@ -660,7 +638,7 @@ class TorchMojoTensor(torch.Tensor):
             # PermuteCopy gathers a strided source into a contiguous
             # destination with no destination index math and half the
             # coordinate math of the generic rank-8 CopyStrided.
-            return _submit_prepared_into(_PermuteCopyExtension.prepare(self))
+            return _PermuteCopyExtension.prepare(self).execute()
         out = TorchMojoTensor._alloc(self._shape, self._dtype, self._device)
         if self._numel > 0:
             _copy_strided_into(out, self)
@@ -679,11 +657,6 @@ class TorchMojoTensor(torch.Tensor):
         and the capsule pins the (materialized) tensor's holder. `stream` is
         ignored: producers and consumers share the device's default stream
         (the same assumption the eager kernels make).
-
-        Publishing a raw pointer is a payload read from outside
-        `__torch_dispatch__`, so it drains the call queue: the consumer must
-        not see a buffer whose producing launches -- including the copy a
-        strided export just queued -- are still waiting on a compile.
         """
         from torch_mojo_backend.mojo_device import (  # noqa: PLC0415 -- cycle: comm_fence imports this module
             comm_fence,
@@ -691,7 +664,6 @@ class TorchMojoTensor(torch.Tensor):
 
         comm_fence.fence_tensor(self)  # same reason as _to_cpu_tensor's
         src = self._contig()
-        deferred_compile.drain()
         return dlpack.make_capsule(
             src._holder, src._ptr, src._shape, src._dtype, src._device
         )
@@ -983,34 +955,12 @@ def _resize_payload(dst: TorchMojoTensor, shape: Sequence[int]):
     _rebind_payload(dst, replacement)
 
 
-def _copy_strided_enqueue(dst: TorchMojoTensor, src: TorchMojoTensor):
-    """Queue the strided copy as an external call (tensor_holder is always
-    loaded, so the item is always launch-ready; it only holds FIFO order).
-    The queue holds raw pointers, so both tensors are handed over as the
-    item's keep-alive: their buffers must outlive the launch."""
-    holder = _holder_mod()
-    args = (
-        dst._ptr,
-        src._ptr,
-        _pad8(dst._shape, 1),
-        _pad8(dst._mojo_strides, 0),
-        _pad8(src._mojo_strides, 0),
-        dst._itemsize,
-        _ctx_ptr(dst._device),
-    )
-    call_queue.external_call(holder.CopyStrided, args, keepalive=(dst, src))
-
-
 def _copy_strided_into(dst: TorchMojoTensor, src: TorchMojoTensor):
     """dst[coords] = src[coords]; same shape and dtype, any strides.
 
     The shared materialize/copy primitive: powers .contiguous(), copy_ into
     views, and expand materialization (src strides may contain 0s).
     """
-    if call_queue.enabled() and call_queue.active():
-        # Hold FIFO position behind queued producers of src/dst.
-        _copy_strided_enqueue(dst, src)
-        return
     _holder_mod().CopyStrided(
         dst._ptr,
         src._ptr,

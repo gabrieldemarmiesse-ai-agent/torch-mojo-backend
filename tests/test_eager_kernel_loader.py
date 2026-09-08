@@ -2,7 +2,6 @@
 
 import inspect
 import subprocess
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -263,7 +262,7 @@ def test_nested_module_hash_includes_private_and_shared_dependencies(
     assert eager_kernels._source_hash(source) != after_private_change
 
 
-def test_defined_unit_memoizes_one_failed_build_across_all_waiters(
+def test_defined_unit_memoizes_one_failed_build(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     source = tmp_path / "elementwise_ops.mojo"
@@ -290,17 +289,12 @@ def test_defined_unit_memoizes_one_failed_build_across_all_waiters(
     monkeypatch.setattr(eager_kernels, "_build_extension", fail_build)
     unit = eager_kernels._DefinedUnit(source, defines)
 
-    job = unit.request_async()
     with pytest.raises(ImportError) as first:
-        job.wait()
+        unit.load()
     assert first.value is failure
-    assert unit.request_async() is job
     with pytest.raises(ImportError) as second:
-        unit.request_async().wait()
+        unit.load()
     assert second.value is failure
-    with pytest.raises(ImportError) as blocking:
-        unit.load_blocking()
-    assert blocking.value is failure
     assert attempts == 1
 
 
@@ -404,64 +398,6 @@ def test_prepared_call_invokes_only_constant_call_entrypoint():
     assert prepared.execute(FakeLoader()) == _TensorMetadata((4, 8), "float32")
     assert calls == [(left, right, prepared.output_specs, True)]
     assert not hasattr(module, "AddSpec")
-
-
-def test_prepared_calls_enqueue_in_fifo_order(monkeypatch: pytest.MonkeyPatch):
-    launches: list[str] = []
-
-    class FakeJob:
-        def wait(self):
-            return None
-
-    class QueuedUnit:
-        """The whole contract the queue needs of a unit: a module once its
-        build lands, and a job to wait on until then."""
-
-        def __init__(self):
-            self.ext: ModuleType | None = None
-            self.job = FakeJob()
-
-        def request_async(self) -> FakeJob:
-            return self.job
-
-    unit = QueuedUnit()
-
-    class FakeLoader(eager_kernels.MojoExtensionLoader):
-        def unit_canonical(
-            self, mojo_file: Path, defines: eager_kernels.CanonicalDefines
-        ) -> object:
-            assert mojo_file == _ElementwiseAdd.MOJO_FILE
-            assert ("OP", "AddSpec") in defines
-            return unit
-
-    queue = eager_kernels.call_queue
-    monkeypatch.setattr(queue, "_QUEUE", deque())
-    monkeypatch.setattr(queue, "_HELD_ERROR", [])
-    monkeypatch.setattr(queue, "_DEVICE_THREAD", [None])
-    monkeypatch.setattr(queue, "_QUEUE_LAUNCH_THREAD", [None])
-
-    loader = FakeLoader()
-    first = _ElementwiseAdd.prepare(
-        _TensorMetadata((2,), "float32"), _TensorMetadata((2,), "float32")
-    )
-    second = _ElementwiseAdd.prepare(
-        _TensorMetadata((9,), "float32"), _TensorMetadata((9,), "float32")
-    )
-    first.enqueue_into(("first",), (), loader)
-    second.enqueue_into(("second",), (), loader)
-    assert queue.active()
-
-    module = ModuleType("queued_elementwise_add")
-
-    def call(label: str):
-        launches.append(label)
-
-    cast(_NativeCallModule, module).call = call
-    unit.ext = module
-    queue.drain()
-
-    assert launches == ["first", "second"]
-    assert not queue.active()
 
 
 def test_spec_descriptor_canonical_defines_match_make_defines():

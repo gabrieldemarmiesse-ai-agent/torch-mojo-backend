@@ -24,8 +24,7 @@ Design (see docs/distributed.md for the full story):
   itself (ordering free, zero overlap) — also the automatic path for
   collectives needing default-stream copies AFTER the collective
   (non-contiguous outputs, list-form allgather/reduce_scatter,
-  gather/scatter/alltoall staging). Both paths drain the kernel-call queue
-  first (rule 1 in device_streams.py).
+  gather/scatter/alltoall staging).
 
 - Work objects wrap an already-completed ``torch.futures.Future`` holding the
   output tensors, on both paths, so ``wait()`` is a host-side no-op. Never
@@ -86,11 +85,7 @@ from torch._C._distributed_c10d import (
 from torch.distributed import PrefixStore, Store, Work
 
 from torch_mojo_backend.distributed import nccl
-from torch_mojo_backend.mojo_device import (
-    comm_fence,
-    deferred_compile,
-    torch_mojo_device_module,
-)
+from torch_mojo_backend.mojo_device import comm_fence, torch_mojo_device_module
 from torch_mojo_backend.mojo_device.device_streams import get_stream, record_use
 from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
     TorchMojoTensor,
@@ -329,7 +324,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         if not self._comm_stream_enabled:
             return None
         comm_stream = get_stream(self._max_devices[index], "nccl")
-        self._drained()  # producers must be ON the stream before we fence it
         comm_stream.wait_default_stream()
         enqueue(comm_stream.handle)
         for tensor in fenced:
@@ -341,7 +335,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         return _completed_work(result)
 
     def _fence_default(self, index: int):
-        """Drain, and order the default stream after the comm stream.
+        """Order the default stream after the comm stream.
 
         NCCL and RCCL require every rank to EXECUTE a communicator's
         operations in issue order. When comm-stream and default-stream
@@ -351,7 +345,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         Unconditional, unlike ``comm_fence``: a comm-stream collective no
         consumer has touched yet is still pending on the device.
         """
-        self._drained()
         if self._comm_stream_enabled and index in self._max_devices:
             get_stream(self._max_devices[index], "nccl").make_default_stream_wait()
             comm_fence.discard(index)
@@ -370,10 +363,6 @@ class MojoProcessGroup(dist.ProcessGroup):
                     f"bad {self._ccl.name} unique id from store key {key}"
                 )
         return self._ccl.init_rank(self.size(), unique_id, self.rank())
-
-    def _drained(self):
-        """Launch every queued mojo kernel so the stream sees all producers."""
-        deferred_compile.drain()
 
     def _dense(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor if tensor.is_contiguous() else tensor.contiguous()

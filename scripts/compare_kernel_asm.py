@@ -400,9 +400,9 @@ def print_diff(kernel: str, before: str, after: str):
 def default_jobs() -> int:
     """Concurrent `mojo build` subprocesses.
 
-    A build peaks around 4.5 GB RSS and uses ~2.5-3 cores -- the figures
-    `eager_kernels._pool_size` is tuned to -- so cap by available RAM (5 GiB per
-    slot with headroom) and by cores; never fewer than 1, never more than 16.
+    A build peaks around 4.5 GB RSS and uses ~2.5-3 cores, so cap by
+    available RAM (5 GiB per slot with headroom) and by cores; never fewer
+    than 1, never more than 16.
     """
     mem_gib = 8.0
     try:

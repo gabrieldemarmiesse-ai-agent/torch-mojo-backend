@@ -1,7 +1,7 @@
 """The direct-impl table `__torch_dispatch__` uses instead of redispatching.
 
-`deferred_compile._direct` calls the PrivateUse1 callable straight out of
-`deferred_compile.DIRECT_IMPLS` rather than re-entering the C++ dispatcher.
+`dispatch.dispatch` calls the PrivateUse1 callable straight out of
+`dispatch.DIRECT_IMPLS` rather than re-entering the C++ dispatcher.
 That is only sound if a library kernel and `__torch_dispatch__` hand an impl
 the same `(args, kwargs)`, so the probe library below registers one kernel per
 argument shape most likely to diverge -- a defaulted keyword-only scalar, an
@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from torch_mojo_backend import register_mojo_devices
-from torch_mojo_backend.mojo_device import deferred_compile
+from torch_mojo_backend.mojo_device import dispatch
 from torch_mojo_backend.mojo_device.mojo_device_aten_ops import (
     EAGER_CALL_COUNTERS,
     _aten_ops_registry,
@@ -40,7 +40,7 @@ def test_registered_ops_resolve_into_the_direct_table():
         packet_name, _, overload = name.removeprefix("aten::").partition(".")
         packet = getattr(torch.ops.aten, packet_name, None)
         assert packet is None or (overload or "default") not in packet.overloads()
-    assert len(deferred_compile.DIRECT_IMPLS) == len(set(names)) - len(unresolved)
+    assert len(dispatch.DIRECT_IMPLS) == len(set(names)) - len(unresolved)
 
 
 def test_table_holds_the_call_counted_callable():
@@ -51,19 +51,19 @@ def test_table_holds_the_call_counted_callable():
     x = torch.ones(4, device="mojo")
     (x + x).cpu()
     assert counted.call_count > before
-    table_entry = deferred_compile.DIRECT_IMPLS[torch.ops.aten.add.Tensor]
+    table_entry = dispatch.DIRECT_IMPLS[torch.ops.aten.add.Tensor]
     assert getattr(table_entry, "__wrapped__", None) is counted
 
 
 @contextlib.contextmanager
 def _table_disabled(overload: torch._ops.OpOverload):
     """Force `overload` back onto the C++ redispatch path."""
-    entry = deferred_compile.DIRECT_IMPLS.pop(overload, None)
+    entry = dispatch.DIRECT_IMPLS.pop(overload, None)
     try:
         yield
     finally:
         if entry is not None:
-            deferred_compile.DIRECT_IMPLS[overload] = entry
+            dispatch.DIRECT_IMPLS[overload] = entry
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +125,13 @@ def _both_paths(probe, name, call):
         call()
         assert len(seen) == 1, f"{name} never reached its PrivateUse1 kernel"
         through_cpp = seen.pop()
-    deferred_compile.DIRECT_IMPLS[overload] = kernels[name]
+    dispatch.DIRECT_IMPLS[overload] = kernels[name]
     try:
         call()
         assert len(seen) == 1
         direct = seen.pop()
     finally:
-        deferred_compile.DIRECT_IMPLS.pop(overload, None)
+        dispatch.DIRECT_IMPLS.pop(overload, None)
     return through_cpp, direct
 
 
@@ -271,7 +271,7 @@ def test_real_ops_agree_on_both_paths(overload, run):
 
     direct = to_cpu(run("mojo"))
     with _table_disabled(overload):
-        assert overload not in deferred_compile.DIRECT_IMPLS
+        assert overload not in dispatch.DIRECT_IMPLS
         redispatched = to_cpu(run("mojo"))
     expected = to_cpu(run("cpu"))
     if isinstance(expected, list):
