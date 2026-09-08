@@ -621,25 +621,3 @@ def list_ib_ports(ibv: Ibv, want: String) raises -> List[IbPort]:
             ibv.close_device(ctx)
     ibv.free_device_list(lst)
     return out^
-
-
-def gpu_pci_bus(sysfs_hca: String) -> String:
-    """The PCI bus id an HCA hangs off, e.g. `0000:18:00.0` -> `18`.
-
-    /sys/class/infiniband/<hca>/device is a symlink into the PCI tree; its
-    last path component is the BDF. Used to pair an HCA with the GPU on the
-    same PCI switch when the GPU's bus id is known."""
-    var link: String
-    try:
-        with open("/sys/class/infiniband/" + sysfs_hca + "/device/uevent", "r") as f:
-            link = f.read()
-    except:
-        return String("")
-    for line in link.split("\n"):
-        var s = String(line)
-        if s.startswith("PCI_SLOT_NAME="):
-            var bdf = s[byte=14:]
-            var parts = bdf.split(":")
-            if len(parts) >= 2:
-                return String(parts[1])
-    return String("")
