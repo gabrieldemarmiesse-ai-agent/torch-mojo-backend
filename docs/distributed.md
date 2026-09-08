@@ -281,8 +281,8 @@ Scope, deliberately narrow — it is an experiment showing Mojo can write
 NCCL-class collectives, not a general library:
 
 - one node, 2–8 ranks, one process per GPU under torchrun (`MAX_WORLD = 8`);
-  multi-node is not implemented (the study's plan keeps NCCL/RCCL for the
-  inter-node shard allreduce, hierarchically);
+  multi-node transport is in progress on this branch — see "Multi-node"
+  below;
 - `ncclAllReduce` (float32/float16/bfloat16/int32/int64, SUM and AVG),
   `ncclBroadcast` and `ncclAllGather` (every dtype, byte-granular);
   `ncclReduce`, `ncclReduceScatter`, `ncclSend`, `ncclRecv` return
@@ -307,3 +307,110 @@ runs at the same throughput and the same losses within the training step's
 own run-to-run noise. AMD: the same source cross-compiles for gfx942 (the
 one vendor gate is a release fence on AMD's `s_barrier`), but it has not run
 on an MI300A yet.
+
+### Multi-node
+
+Work in progress on this branch (`mojo-collectives-multinode`). Everything
+in this subsection describes the target design and the validation harness
+for it, not (yet) a shipped feature — check
+`torch_mojo_backend/distributed/mojoccl/` and the git log for current
+status.
+
+**Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
+is a 16-rank (2 nodes × 8 GPU) SLURM job that runs `tests/ddp_worker.py`
+(`collectives`/`ddp_parity`/`stress`), the allreduce device-time bench
+(`ar_bench_gpt2.py`), and a 40-step nanoGPT DDP run, each ABBA'd between
+real NCCL and mojoccl:
+
+```bash
+# Vendor-only NCCL reference (no mojoccl multi-node transport needed):
+sbatch --export=ALL,RUN_MOJO=0 tests/multinode/run_two_node_checks.sbatch
+# Full A/B once the transport below lands:
+sbatch tests/multinode/run_two_node_checks.sbatch
+# Turn a job log into one markdown report:
+uv run --no-sync python tests/multinode/summarize.py \
+    /home/gabriel/ddp_work/logs/mojoccl_2node_<jobid>.log
+```
+
+See `tests/multinode/README.md` for the full leg-by-leg description, and
+`/home/gabriel/ddp_work/mojo_collectives/mn/NCCL_REFERENCE_16.md` for the
+vendor-only 16-rank NCCL reference numbers this harness already measured
+(node names, SM clock, NCCL algo/protocol choices).
+
+**Algorithm (hierarchical allreduce).** Each bucket is reduced in three
+steps: an intra-node Mojo reduce-scatter leaves every rank owning
+`1/local_world_size` of the reduced bucket (the same RS kernel the
+intra-node path already uses); each rank then exchanges its shard with its
+counterpart rank on every other node over RDMA, directly between GPUs
+using GPUDirect RDMA (`ibv_reg_dmabuf_mr` on a handle obtained from the
+device buffer, matching NCCL's own `net_ib` transport — see the
+feasibility study §7 for the verbs call sequence: queue-pair connect via
+the c10d store, `ibv_post_send` WRITE/WRITE_WITH_IMM, `ibv_poll_cq`); an
+intra-node Mojo all-gather then reassembles the fully-reduced bucket. No
+vendor collective library is on the inter-node hop — this is the
+libibverbs-based alternative in the feasibility study's §7, not the
+NCCL/RCCL-inter-node fallback its §8 minimal plan describes; the trade is
+more engineering (an RDMA transport of our own, ≈2–3k lines per the study's
+estimate) for staying inside this project's "bring the whole GPU stack
+ourselves" motto all the way to the wire.
+
+**New environment variables (TODO — to be filled in by whichever agent
+lands the transport; keep this list in sync with what it actually reads).**
+Expected, from the feasibility study's §7 verbs sketch and this project's
+existing `TORCH_MOJO_BACKEND_*`/`MOJOCCL_*` naming:
+
+- `MOJOCCL_SOCKET_IFNAME` — TODO: network interface for the store/bootstrap
+  exchange (QPN/LID/GID, rkeys), the mojoccl analog of NCCL's
+  `NCCL_SOCKET_IFNAME`.
+- `MOJOCCL_IB_HCA` — TODO: which HCA(s)/ports to use when a node has more
+  than one (this cluster's nodes report multiple IB + RoCE devices per
+  `docs/mojo_collectives_feasibility.md` §5.5 — 10×400 Gb/s IB +
+  2×100 Gb/s RoCE, unmerged); presumably an NCCL-`NCCL_IB_HCA`-style
+  include/exclude list.
+- TODO: whatever else the transport needs — a GID index override, a
+  timeout/retry knob for the RDMA connection setup, a debug-logging
+  variable analogous to `NCCL_DEBUG`, anything else that shows up in
+  `torch_mojo_backend/distributed/mojoccl/`. **The transport agent should
+  replace this TODO list with the real names and one line each on what
+  they control**, the way `docs/distributed.md` documents
+  `MOJOCCL_REGION_MB` above.
+
+**Requirements (host side).** `rdma-core`/`libibverbs` (the verbs library
+the transport dlopens, the same way `nccl.py` dlopens `libnccl.so.2` —
+no C++ build, no vendor SDK); GPUDirect RDMA support so a QP can post sends
+directly from GPU memory, either the `nvidia_peermem` kernel module (the
+classic path NCCL's `net_ib` uses, see `net_ib/connect.cc` in the
+feasibility study's citations) or a dmabuf-based path
+(`ibv_reg_dmabuf_mr` off `cuMemGetHandleForAddressRange`, the same
+mechanism the feasibility study cites for NCCL's own dmabuf registration);
+active InfiniBand (or RoCE) ports reachable between every pair of nodes.
+None of this is optional the way the intra-node kernels' IB dependency
+isn't optional either — there is no non-RDMA fallback path planned for the
+performance-bar case (a gloo/TCP-staged shard exchange is the
+"acceptable for a demo, not for the bar" alternative the feasibility study
+names in §7, and is not what this transport targets).
+
+**Not covered: Slingshot.** This RDMA/libibverbs transport is
+NVIDIA-cluster-shaped (InfiniBand/RoCE verbs). CINES Adastra's Slingshot
+fabric needs a separate libfabric/cxi transport (see the "Cluster notes
+(SLURM, Slingshot — AMD MI300A)" section above, and
+`docs/mojo_collectives_feasibility.md` §7's cxi estimate) — out of scope
+here, and multi-node mojoccl will raise or fall back to NCCL/RCCL rather
+than silently do something slow on Slingshot until that transport exists.
+
+**Results.** To be filled in from `tests/multinode/summarize.py`'s output
+once the transport lands (allreduce bench medians/ratio by dtype and size,
+`ddp_worker` pass/fail by mode, and the nanoGPT DDP step-40 loss/val-loss/
+tok-s for each leg):
+
+| dtype | size (MiB) | vendor median (µs) | mojo median (µs) | mojo/vendor |
+|---|---|---|---|---|
+| _(TODO: paste the "Allreduce bench" table from a `summarize.py` run here)_ | | | | |
+
+| ccl | mode | result |
+|---|---|---|
+| _(TODO: paste the "ddp_worker checks" table here)_ | | |
+
+| ccl | leg | step | loss | val loss | tok/s | result |
+|---|---|---|---|---|---|---|
+| _(TODO: paste the "nanoGPT DDP training" table here)_ | | | | | | |
