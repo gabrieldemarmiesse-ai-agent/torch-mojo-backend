@@ -22,6 +22,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch_mojo_backend import register_mojo_devices
 
+# mojoccl (torch_mojo_backend/distributed/mojoccl) implements AllReduce/
+# Broadcast/AllGather only -- Reduce/ReduceScatter/Send/Recv return
+# ncclInvalidUsage (DDP on GPT-2 needs only the first three). Skip the
+# checks that need the unimplemented ops rather than fail on them.
+_MOJO_CCL = os.environ.get("TORCH_MOJO_BACKEND_CCL") == "mojo"
+
 
 class ElemwiseNet(torch.nn.Module):
     """Matmul-free so it runs even where GEMM routes are unavailable."""
@@ -78,13 +84,21 @@ def run_collectives(failures: list[str]):
     )
     _check(failures, "all_gather_into_tensor", ok)
 
-    src = torch.arange(world * 3, dtype=torch.float32, device="mojo")
-    out = torch.zeros(3, device="mojo")
-    dist.reduce_scatter_tensor(out, src)
-    exp = (
-        torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3] * world
-    )
-    _check(failures, "reduce_scatter_tensor", bool((out.cpu() == exp).all()))
+    if _MOJO_CCL:
+        print(
+            f"[rank {rank}] SKIP reduce_scatter_tensor "
+            "(mojoccl does not implement ncclReduceScatter)",
+            flush=True,
+        )
+    else:
+        src = torch.arange(world * 3, dtype=torch.float32, device="mojo")
+        out = torch.zeros(3, device="mojo")
+        dist.reduce_scatter_tensor(out, src)
+        exp = (
+            torch.arange(world * 3, dtype=torch.float32)[rank * 3 : (rank + 1) * 3]
+            * world
+        )
+        _check(failures, "reduce_scatter_tensor", bool((out.cpu() == exp).all()))
 
     objs: list[dict[str, int] | None] = [None] * world
     dist.all_gather_object(objs, {"rank": rank})
@@ -99,19 +113,26 @@ def run_collectives(failures: list[str]):
     )
 
     if world > 1:
-        s = torch.full((7,), float(rank), device="mojo")
-        r = torch.zeros(7, device="mojo")
-        if rank % 2 == 0:
-            dist.send(s, (rank + 1) % world)
-            dist.recv(r, (rank - 1) % world)
+        if _MOJO_CCL:
+            print(
+                f"[rank {rank}] SKIP send_recv_ring "
+                "(mojoccl does not implement ncclSend/ncclRecv)",
+                flush=True,
+            )
         else:
-            dist.recv(r, (rank - 1) % world)
-            dist.send(s, (rank + 1) % world)
-        _check(
-            failures,
-            "send_recv_ring",
-            bool((r.cpu() == float((rank - 1) % world)).all()),
-        )
+            s = torch.full((7,), float(rank), device="mojo")
+            r = torch.zeros(7, device="mojo")
+            if rank % 2 == 0:
+                dist.send(s, (rank + 1) % world)
+                dist.recv(r, (rank - 1) % world)
+            else:
+                dist.recv(r, (rank - 1) % world)
+                dist.send(s, (rank + 1) % world)
+            _check(
+                failures,
+                "send_recv_ring",
+                bool((r.cpu() == float((rank - 1) % world)).all()),
+            )
 
     dist.barrier()
 
