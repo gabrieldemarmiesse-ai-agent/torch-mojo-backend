@@ -122,11 +122,18 @@ comptime WORK_SLOTS = 512
 comptime MAX_NODES = 16
 comptime DEFAULT_IB_TIMEOUT_S: Float64 = 60.0
 # ncclCommAbort's bound on waiting for the progress thread: long enough for
-# it to notice MB_STOP (immediate when idle, at most one poll_cq when inside
-# `_run_exchange` -- see `_stop_requested`), short enough that abort's
-# documented "don't wait" contract still holds even if the thread is wedged
-# somewhere this bound does not anticipate.
+# it to notice MB_STOP (at most one idle-backoff quantum plus one poll_cq
+# when inside `_run_exchange` -- see `_stop_requested`), short enough that
+# abort's documented "don't wait" contract still holds even if the thread is
+# wedged somewhere this bound does not anticipate.
 comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
+# Default idle-wait quantum for the progress thread between exchanges (see
+# `_proxy_main`). An exchange takes ~280 us at the DDP bucket, so a few tens
+# of us of wake-up latency between exchanges is cheap; measured end to end
+# (job 234072, 2x8 H100) an unconditional hot spin here cost nanoGPT DDP
+# ~20% of its steady-state tok/s against real NCCL, competing for a core/SMT
+# sibling with the ~760-aten-op-per-step host dispatch of the training loop.
+comptime DEFAULT_IB_PROXY_IDLE_US: Int = 20
 # Bytes of the inbox read back by the flush; any read of the destination
 # device flushes the writes ahead of it, the size is irrelevant.
 comptime FLUSH_BYTES = 4
@@ -534,18 +541,27 @@ def _stop_requested(st: IbState) -> Bool:
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     """The progress thread: one exchange at a time, in stream order.
 
-    Spins on the mailbox word a one-thread kernel releases after the
+    Waits on the mailbox word a one-thread kernel releases after the
     reduce-scatter, runs the exchange, releases the done word the matching
     spin kernel is waiting on. Exchanges are strictly ordered on the
     communicator's stream and the counter is dense, so slot `(seq-1) mod
     WORK_SLOTS` is this exchange's work item and no queue is needed.
 
-    A pure spin, like NCCL's proxy: the whole point is that neither side
-    ever sleeps. One core per rank, and `MOJOCCL_IB_PROXY=0` gives it back
-    at the cost of the host-callback latency.
+    Hard-spins like NCCL's proxy only WHILE AN EXCHANGE IS IN FLIGHT
+    (`_run_exchange`'s own poll loops) -- between exchanges, this loop backs
+    off (`sched_yield` once, then a short `nanosleep`) instead of burning a
+    full core on a mailbox word that is not going to change for a while. A
+    training step's host-side dispatch (hundreds of aten launches on the
+    Python main thread) shares this core's SMT sibling, and measured end to
+    end (job 234072, 2x8 H100) an unconditional hot spin here cost nanoGPT
+    DDP ~20% of its steady-state tok/s against real NCCL even though the
+    per-bucket allreduce itself was within 5%. `MOJOCCL_IB_PROXY_IDLE_US`
+    tunes the backoff quantum; `MOJOCCL_IB_PROXY=0` gives the core back
+    entirely, at the cost of the host-callback latency.
     """
     ref st = _st(Int(arg))[]
     var next_seq = 1
+    var idle_ns = _proxy_idle_ns()
     while True:
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_STOP)
@@ -554,6 +570,13 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) < UInt64(next_seq):
+            # Idle: yield once (catches a request that lands right away for
+            # free) and only pay for a sleep if that didn't help.
+            _ = external_call["sched_yield", Int32]()
+            if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+                _mb(st, MB_REQUEST)
+            ) < UInt64(next_seq):
+                _nanosleep_ns(idle_ns)
             continue
         ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
             unsafe_offset = (next_seq - 1) % WORK_SLOTS
@@ -574,6 +597,26 @@ def _proxy_address() -> Int:
     return Pointer(to=f).unsafe_bitcast[Int]()[]
 
 
+def _set_thread_affinity(tid: Int, cpu: Int) raises:
+    """`pthread_setaffinity_np` to a single CPU. `cpu_set_t` is a 128-byte
+    (1024-bit) bitmask on this ABI; only the one bit for `cpu` is set."""
+    comptime CPU_SET_BYTES = 128
+    var byte_idx = cpu // 8
+    if cpu < 0 or byte_idx >= CPU_SET_BYTES:
+        raise Error(
+            "mojoccl: MOJOCCL_IB_PROXY_CPU=" + String(cpu) + " out of range"
+        )
+    var mask = alloc_bytes(CPU_SET_BYTES)
+    mask[unsafe_offset=byte_idx] = UInt8(1) << UInt8(cpu % 8)
+    var rc = external_call["pthread_setaffinity_np", Int32](
+        Int64(tid), UInt64(CPU_SET_BYTES), mask
+    )
+    if rc != 0:
+        raise Error(
+            "mojoccl: pthread_setaffinity_np failed, rc=" + String(rc)
+        )
+
+
 def _start_proxy(ib: Int) raises:
     ref st = _st(ib)[]
     var tid = unsafe_alloc[Int64](1)
@@ -584,6 +627,15 @@ def _start_proxy(ib: Int) raises:
     if rc != 0:
         raise Error("mojoccl: pthread_create failed, rc=" + String(rc))
     st.thread_id = Int(tid[unsafe_offset=0])
+    # Opt-in only (default: no pinning) -- a best-effort placement hint, not
+    # load-bearing for correctness, so a bad CPU index or a failed syscall
+    # only prints rather than failing communicator init.
+    var cpu_s = getenv("MOJOCCL_IB_PROXY_CPU", "")
+    if cpu_s.byte_length() > 0:
+        try:
+            _set_thread_affinity(st.thread_id, Int(cpu_s))
+        except e:
+            print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
 
 
 def _stop_proxy(mut st: IbState):
@@ -842,6 +894,33 @@ def _ib_timeout_s() -> Float64:
         return Float64(s)
     except:
         return DEFAULT_IB_TIMEOUT_S
+
+
+def _proxy_idle_ns() -> Int:
+    """`MOJOCCL_IB_PROXY_IDLE_US`, read once at thread start (not from inside
+    the progress-thread loop -- a `getenv` per idle iteration would defeat
+    the point of backing off)."""
+    var s = getenv(
+        "MOJOCCL_IB_PROXY_IDLE_US", String(DEFAULT_IB_PROXY_IDLE_US)
+    )
+    var us = DEFAULT_IB_PROXY_IDLE_US
+    try:
+        var parsed = Int(s)
+        if parsed > 0:
+            us = parsed
+    except:
+        pass
+    return us * 1000
+
+
+def _nanosleep_ns(ns: Int):
+    """`nanosleep(2)` for `ns` nanoseconds; `struct timespec{tv_sec,tv_nsec}`,
+    16 bytes on this ABI. Best-effort: an interrupted sleep just returns
+    early, which only means the next mailbox check happens a bit sooner."""
+    var ts = unsafe_alloc[Int64](2)
+    ts[unsafe_offset=0] = 0
+    ts[unsafe_offset=1] = Int64(ns)
+    _ = external_call["nanosleep", Int32](ts, Int64(0))
 
 
 def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
