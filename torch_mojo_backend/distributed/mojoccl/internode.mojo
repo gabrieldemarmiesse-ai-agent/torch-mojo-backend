@@ -251,6 +251,38 @@ def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
 # ===-------------------------------------------------------------------=== #
 
 
+def _consume_wc(mut st: IbState, c: P8, npeers: Int) -> Int:
+    """Classify one completion; returns 1 for a send, 2 for the flush read,
+    0 for anything else, -1 for a failed completion (error recorded).
+
+    Shared by both poll loops on purpose. An arrival for the NEXT exchange
+    can land while this one is flushing, and a loop that only looked for its
+    own opcode would drop it -- losing a tally the next callback is waiting
+    on, and a recv WR nobody reposts.
+    """
+    if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
+        st.error = 1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR)
+        return -1
+    var op = Int32(ld32(c, WC_OPCODE))
+    if op == IBV_WC_RECV_RDMA_WITH_IMM:
+        if Int(be32(ldu32(c, WC_IMM_DATA))) & 1 == 0:
+            st.arrivals0 += 1
+        else:
+            st.arrivals1 += 1
+        var qpn = ldu32(c, WC_QP_NUM)
+        for k in range(npeers):
+            if st.peers[k].qpn == qpn:
+                build_recv_wr(_b(st.rwr), 0)
+                _ = post_recv(st.peers[k].qp, _b(st.rwr), _b(st.bad))
+                break
+        return 0
+    if op == IBV_WC_RDMA_WRITE:
+        return 1
+    if op == IBV_WC_RDMA_READ:
+        return 2
+    return 0
+
+
 def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
     """Post this exchange's RDMA writes, wait for the peers', flush.
 
@@ -303,27 +335,13 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
             w.status = 2
             return
         for i in range(Int(n)):
-            var c = P8(unsafe_from_address=st.wc + i * SZ_WC)
-            if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
-                st.error = 1000 + ld32(c, WC_STATUS) * 1000 + ld32(
-                    c, WC_VENDOR_ERR
-                )
+            var kind = _consume_wc(
+                st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
+            )
+            if kind < 0:
                 w.status = 2
                 return
-            var op = Int32(ld32(c, WC_OPCODE))
-            if op == IBV_WC_RECV_RDMA_WITH_IMM:
-                var seq = Int(be32(ldu32(c, WC_IMM_DATA)))
-                if seq & 1 == 0:
-                    st.arrivals0 += 1
-                else:
-                    st.arrivals1 += 1
-                var qpn = ldu32(c, WC_QP_NUM)
-                for k in range(npeers):
-                    if st.peers[k].qpn == qpn:
-                        build_recv_wr(_b(st.rwr), 0)
-                        _ = post_recv(st.peers[k].qp, _b(st.rwr), _b(st.bad))
-                        break
-            elif op == IBV_WC_RDMA_WRITE:
+            if kind == 1:
                 sends_done += 1
         if perf_counter_ns() > deadline:
             st.error = 3
@@ -358,12 +376,13 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
                 w.status = 2
                 return
             for i in range(Int(n)):
-                var c = P8(unsafe_from_address=st.wc + i * SZ_WC)
-                if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
-                    st.error = 6
+                var kind = _consume_wc(
+                    st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
+                )
+                if kind < 0:
                     w.status = 2
                     return
-                if Int32(ld32(c, WC_OPCODE)) == IBV_WC_RDMA_READ:
+                if kind == 2:
                     flushed = True
             if perf_counter_ns() > deadline:
                 st.error = 7
