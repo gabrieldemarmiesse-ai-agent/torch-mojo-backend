@@ -279,6 +279,15 @@ def ncclCommInitRank(
     id14: UInt64,
     id15: UInt64,
 ) abi("C") -> Int32:
+    # `regions` (CommState and every collective kernel's argument list) is a
+    # fixed StaticTuple[.., MAX_WORLD]: a larger world would index past its
+    # end. Guard explicitly rather than rely on StaticTuple's own bounds
+    # check, whose behavior under a release (non-debug) build is not this
+    # library's contract to depend on.
+    if Int(nranks) > MAX_WORLD or Int(nranks) < 1:
+        return NCCL_INVALID_ARGUMENT
+    if Int(rank) < 0 or Int(rank) >= Int(nranks):
+        return NCCL_INVALID_ARGUMENT
     try:
         var idbuf = unsafe_alloc[UInt8](UID_BYTES)
         var idbuf64 = idbuf.unsafe_bitcast[UInt64]()
