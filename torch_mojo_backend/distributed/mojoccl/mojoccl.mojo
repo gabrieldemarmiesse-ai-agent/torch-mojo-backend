@@ -672,6 +672,34 @@ def _bootstrap(
     return NCCL_SUCCESS
 
 
+def _cached_stream_handles(state: CommState) -> List[Int64]:
+    """Every raw stream handle wrapped in `state.stream_cache`, copied into a
+    plain List.
+
+    Kept to exactly this -- iterating `Dict.keys()` inside a `raises`
+    function narrows the function's inferred error type to `DictKeyError`,
+    which then rejects every unrelated `raise Error(...)` still in scope. A
+    helper doing nothing else keeps that narrowing from leaking into
+    `_drain_all_streams` or its callers.
+    """
+    var handles = List[Int64]()
+    for h in state.stream_cache.keys():
+        handles.append(h)
+    return handles^
+
+
+def _drain_all_streams(mut state: CommState) raises:
+    """Synchronize every stream a collective has ever run on.
+
+    `state.last_stream` is only the MOST RECENT one: `stream_cache` can hold
+    several (the side-stream test in the suite uses two), and an exchange
+    still in flight on a stream that isn't the last one used would otherwise
+    find its QPs destroyed out from under it by `ncclCommDestroy`.
+    """
+    for h in _cached_stream_handles(state):
+        state.stream_cache[h].synchronize()
+
+
 # ---------------------------------------------------------------------------
 # Communicator lifecycle
 # ---------------------------------------------------------------------------
@@ -683,12 +711,11 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
         var ptr = _comm_ptr(comm)
         ref state = ptr[]
         if not state.aborted:
-            # The inter-node callbacks were enqueued on the CALLER's stream,
+            # The inter-node callbacks were enqueued on the CALLER's stream(s),
             # not on the context's own, and they dereference the IbState this
-            # tears down -- so drain that stream too before touching it.
-            if state.last_stream != 0:
-                _ensure_stream_cached(state, state.last_stream)
-                state.stream_cache[state.last_stream].synchronize()
+            # tears down -- so drain every cached stream too before touching
+            # it, not just the last one used (see `_drain_all_streams`).
+            _drain_all_streams(state)
             state.ctx.synchronize()
             ib_teardown(state.ib)
             for r in range(state.local_world):
