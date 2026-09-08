@@ -124,6 +124,20 @@ comptime NCCL_BFLOAT16: Int32 = 9
 comptime NCCL_SUM: Int32 = 0
 comptime NCCL_AVG: Int32 = 4
 
+# Payload a rank sends when it has nothing to contribute to an exchange.
+#
+# Every exchange is all-to-all among the ranks sharing a local_rank, even
+# when only one of them has data (a broadcast, or an allreduce whose shard
+# table leaves this rank empty), and that is a correctness requirement, not
+# tidiness. The inbox is double buffered by the exchange counter's parity,
+# so what has to be true is: peer B's write for exchange e+2 lands after MY
+# add kernel for exchange e has read that half. All-to-all makes it a proof
+# -- B cannot post e+2 before its callback for e+1 returned, which needed MY
+# e+1 message, which my stream sent only after running my add kernel for e.
+# Let one exchange be one-directional and that chain breaks, leaving nothing
+# but a timing margin between B's write and my read.
+comptime CREDIT_BYTES = 16
+
 comptime DEFAULT_REGION_MB = 256
 comptime DEFAULT_BOOTSTRAP_TIMEOUT_S: Float64 = 120.0
 
@@ -774,53 +788,57 @@ def _inter_node_exchange[
     kernel that adds what arrived. On exit the shard holds the sum over the
     WHOLE communicator, ready for `allgather_finish`.
 
-    Inbox geometry, derived from `(numel, local_world, item)` alone so that
-    a sender computes the same addresses as its receiver: `net_off` holds
-    two halves of `(nnodes-1)` slots of one shard each, and the exchange
+    Inbox geometry is derived from `(numel, local_world, item)` alone so that
+    a sender computes the same addresses as its receiver: `net_off` holds two
+    halves of `(nnodes-1)` slots of one shard each, and the exchange
     counter's parity picks the half. `_max_chunk_bytes` keeps both halves
     inside the area.
     """
     comptime item = size_of[dtype]()
-    var lw = state.local_world
-    var sr = shard_range(numel, lw, state.local_rank, item)
+    var sr = shard_range(numel, state.local_world, state.local_rank, item)
     var off_e = sr[0]
     var cnt_e = sr[1]
     var seq = ib_next_seq(state.ib)
-    if cnt_e <= 0:
-        return
     var npeers = ib_npeers(state.ib)
-    var slot_bytes = _align_up(cnt_e * item, 16)
-    var inbox_off = state.net_off
+    var nbytes = cnt_e * item
+    var slot_bytes = _align_up(max(nbytes, CREDIT_BYTES), 16)
     var half = npeers * slot_bytes
     if 2 * half > state.cap_bytes:
         raise Error(
             "mojoccl: the inter-node inbox overflows the network area; this"
             " is a chunking bug"
         )
-    var inbox_base = inbox_off + (seq & 1) * half
-    var shard = state.owned_base + signal_bytes() + state.cap_bytes + off_e * item
+    var inbox_base = state.net_off + (seq & 1) * half
+    var shard = (
+        state.owned_base + signal_bytes() + state.cap_bytes + off_e * item
+    )
+    # A rank with an empty shard (numel below local_world's rounded-up shard
+    # size -- DDP's 4-byte AVG allreduce does exactly this on 7 of 8 local
+    # ranks) still exchanges, with CREDIT_BYTES of ignored payload. See
+    # `CREDIT_BYTES` for why every exchange has to be all-to-all.
     ib_enqueue(
         state.ib,
         state.driver,
         Int(raw_stream),
-        shard,
-        cnt_e * item,
+        shard if cnt_e > 0 else state.owned_base,
+        nbytes if cnt_e > 0 else CREDIT_BYTES,
         inbox_base,
         slot_bytes,
         True,
         npeers,
-        state.owned_base + inbox_base,
+        state.owned_base + inbox_base if cnt_e > 0 else 0,
         seq,
     )
-    inbox_add[dtype](
-        state.ctx,
-        stream,
-        shard,
-        state.owned_base + inbox_base,
-        cnt_e,
-        slot_bytes,
-        npeers,
-    )
+    if cnt_e > 0:
+        inbox_add[dtype](
+            state.ctx,
+            stream,
+            shard,
+            state.owned_base + inbox_base,
+            cnt_e,
+            slot_bytes,
+            npeers,
+        )
 
 
 def _max_chunk_bytes(state: CommState) -> Int:
@@ -1034,8 +1052,9 @@ def _broadcast_multinode(
 
     The rank that receives on node j is the one sharing the root's
     local_rank, because that is the only rank the root has a queue pair to.
-    Correct and simple beats fast here: broadcast runs at DDP init, on
-    parameters, not in the step.
+    Every OTHER rank still runs a credit-only exchange with its own
+    same-local_rank peers (CREDIT_BYTES). Correct and simple beats fast
+    here: broadcast runs at DDP init, on parameters, not in the step.
     """
     var lw = state.local_world
     var root_node = 0
@@ -1048,20 +1067,32 @@ def _broadcast_multinode(
     var i_am_root = state.rank == root
     var i_am_local_root = state.local_rank == root_lr
     var receives = i_am_local_root and state.my_node != root_node
-    # The network area holds the root's staged chunk plus both inbox
-    # halves (one slot of `chunk` each): three chunks.
-    var max_bytes = max(4096, (state.cap_bytes // 3 - 2 * 4096) // 4096 * 4096)
+    # The network area holds the root's staged chunk plus both inbox halves,
+    # and a half is one slot PER PEER now that the exchange is all-to-all.
+    var npeers = ib_npeers(state.ib)
+    var max_bytes = max(
+        4096,
+        (state.cap_bytes // (1 + 2 * npeers) - 2 * 4096) // 4096 * 4096,
+    )
     var done = 0
     while done < total_bytes:
         var chunk = min(max_bytes, total_bytes - done)
         var seq = ib_next_seq(state.ib)
         var slot_bytes = _align_up(chunk, 16)
         var inbox_off = state.net_off + _align_up(chunk, 4096)
-        var inbox_base = inbox_off + (seq & 1) * slot_bytes
+        var half = npeers * slot_bytes
+        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+            raise Error("mojoccl: broadcast inbox does not fit; chunking bug")
+        var inbox_base = inbox_off + (seq & 1) * half
         var recv_slot = 0
         if receives:
             recv_slot = root_node if root_node < state.my_node else root_node - 1
         var send_ptr = recvbuff + done
+        # Everyone in this local_rank group exchanges; only the root's
+        # payload is real (see CREDIT_BYTES).
+        var send_addr = state.owned_base
+        var send_bytes = CREDIT_BYTES
+        var flush_addr = 0
         if i_am_root:
             # The user buffer is not registered, so the root's payload has to
             # be copied into the region before the NIC can read it.
@@ -1072,35 +1103,27 @@ def _broadcast_multinode(
                 sendbuff + done,
                 chunk,
             )
-            ib_enqueue(
-                state.ib,
-                state.driver,
-                Int(raw_stream),
-                state.owned_base + state.net_off,
-                chunk,
-                inbox_base,
-                slot_bytes,
-                True,
-                0,
-                0,
-                seq,
-            )
+            send_addr = state.owned_base + state.net_off
+            send_bytes = chunk
             send_ptr = sendbuff + done
         elif receives:
-            ib_enqueue(
-                state.ib,
-                state.driver,
-                Int(raw_stream),
-                0,
-                0,
-                inbox_base,
-                slot_bytes,
-                False,
-                1,
-                state.owned_base + inbox_base + recv_slot * slot_bytes,
-                seq,
+            flush_addr = (
+                state.owned_base + inbox_base + recv_slot * slot_bytes
             )
-            send_ptr = state.owned_base + inbox_base + recv_slot * slot_bytes
+            send_ptr = flush_addr
+        ib_enqueue(
+            state.ib,
+            state.driver,
+            Int(raw_stream),
+            send_addr,
+            send_bytes,
+            inbox_base,
+            slot_bytes,
+            True,
+            npeers,
+            flush_addr,
+            seq,
+        )
         state.generation += 1
         broadcast(
             state.ctx,
