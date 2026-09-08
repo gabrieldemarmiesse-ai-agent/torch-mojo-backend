@@ -21,6 +21,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch_mojo_backend import register_mojo_devices
+from torch_mojo_backend.distributed import nccl
+from torch_mojo_backend.distributed.process_group import (
+    MojoProcessGroup,
+    _nccl_dtype,
+    _nccl_red_op,
+    _ptr_of,
+)
+from torch_mojo_backend.mojo_device import torch_mojo_device_module
 
 # mojoccl (torch_mojo_backend/distributed/mojoccl) implements AllReduce/
 # Broadcast/AllGather only -- Reduce/ReduceScatter/Send/Recv return
@@ -236,6 +244,225 @@ def run_lazy_fence(failures: list[str]):
     dist.barrier()
 
 
+# ---------------------------------------------------------------------------
+# stress: mojoccl-only regression coverage ported from the kernel harness
+# (/home/gabriel/ddp_work/mojo_collectives/kernel/harness.mojo `mix` and
+# `verify`) into the real torchrun/c10d path -- vendor NCCL/RCCL never see
+# this mode (nothing here would fail against them; it exists to catch
+# mojoccl-specific ABI bugs like the interleaving bug RESULTS.md §6 found).
+# ---------------------------------------------------------------------------
+
+_VERIFY_DTYPES: list[torch.dtype] = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int32,
+    torch.int64,
+]
+_INT_DTYPES = (torch.int32, torch.int64)
+
+
+def _fill(dtype: torch.dtype, rank: int, n: int) -> torch.Tensor:
+    """Deterministic per-(rank, index) values, no RNG, on the CPU.
+
+    Integers land in [-128, 127]: exact CPU references, no overflow summing
+    up to 8 ranks. Floats are k/128 with |k| <= 128: exactly representable
+    in fp16/bf16/fp32 (<= 8 significant bits), so only the cross-rank SUM can
+    round, never the fill itself -- the same trick harness.mojo's _val_f64
+    uses and for the same reason.
+    """
+    idx = torch.arange(n, dtype=torch.int64)
+    h = (rank * 1000003 + idx * 2654435761) & 0xFF
+    if dtype in _INT_DTYPES:
+        return (h - 128).to(dtype)
+    return ((h.to(torch.float64) - 128.0) / 128.0).to(dtype)
+
+
+def _reference(dtype: torch.dtype, world: int, n: int, avg: bool) -> torch.Tensor:
+    """The CPU sum (or, for floats, AVG) of `_fill(dtype, r, n)` over every
+    rank r, accumulated wide (int64 / float64) then rounded once to `dtype`
+    -- mojoccl ignores `scale` for integer dtypes (collectives_kernels.mojo's
+    allreduce docstring: "ignored for integer dtypes"), so AVG on int32/int64
+    is SUM, matching what the library actually computes, not what real NCCL's
+    ncclAvg would do.
+    """
+    acc_dtype = torch.int64 if dtype in _INT_DTYPES else torch.float64
+    acc = torch.zeros(n, dtype=acc_dtype)
+    for r in range(world):
+        acc += _fill(dtype, r, n).to(acc_dtype)
+    if avg and dtype not in _INT_DTYPES:
+        acc = acc / world
+    return acc.to(dtype)
+
+
+def _matches(dtype: torch.dtype, got: torch.Tensor, want: torch.Tensor) -> bool:
+    """Exact for float32/int32/int64; half a bf16 ulp for fp16/bf16 -- the
+    same tolerance harness.mojo's verify_ar uses, validated there against
+    this exact kernel (RESULTS.md §7)."""
+    if dtype in (torch.float16, torch.bfloat16):
+        got64 = got.to(torch.float64)
+        want64 = want.to(torch.float64)
+        tol = 0.004 * torch.clamp(want64.abs(), min=1.0)
+        return bool((got64 - want64).abs().le(tol).all())
+    return torch.equal(got, want)
+
+
+def _pg_comm(tensor: torch.Tensor) -> tuple[nccl.NcclComm, int]:
+    """(NcclComm, default-stream handle) for `tensor`'s device, bypassing
+    dist.all_reduce's always-in-place call shape (process_group.py always
+    passes the same pointer as sendbuff and recvbuff) so the verify matrix
+    below can also exercise a genuine sendbuff != recvbuff ncclAllReduce.
+    `dist.group.WORLD` is this backend's own `MojoProcessGroup` instance
+    directly -- no C++ PG wraps it (see MojoProcessGroup.__init__).
+
+    Callers MUST synchronize the device before enqueuing on the returned
+    stream if a prior collective on this comm went through dist.all_reduce:
+    that path can run on a side comm-stream (TORCH_MOJO_BACKEND_COMM_STREAM,
+    the default), and NCCL/RCCL-style comms require every op on a
+    communicator to execute in issue order across ranks
+    (process_group.py's `_fence_default` exists for exactly this) -- this
+    raw call bypasses that fencing, so the caller re-establishes the
+    ordering with a full sync instead.
+    """
+    pg = dist.group.WORLD
+    assert isinstance(pg, MojoProcessGroup)
+    comm, stream, _ = pg._device_state(tensor)
+    return comm, stream
+
+
+def _stress_mix(failures: list[str], rank: int, world: int):
+    """Port of `harness.mojo mix`: several hundred generations interleaving a
+    4-byte one-shot allreduce, a 27 MiB two-shot allreduce, a broadcast and
+    an allgather, all sharing mojoccl's staging arena with different
+    layouts -- the pattern that found the interleaving bug (RESULTS.md §6).
+    The two allreduces run in place with AVG, which is idempotent once every
+    rank holds the mean, so a single corrupted generation anywhere in the
+    200 rounds (800 generations) still shows up in the final check. The
+    broadcast/allgather payloads are cheap (2 KiB, 8 B/rank) and change every
+    round, so they are verified every round instead.
+    """
+    rounds = 200
+    big_n = (27 * 1024 * 1024) // 4  # 27 MiB of float32
+
+    a_small = torch.full((1,), float(rank + 1), device="mojo")
+    a_big = torch.full((big_n,), float(rank + 1), device="mojo")
+    bcast_n = 500  # 2000 bytes of float32
+    bcast_buf = torch.zeros(bcast_n, device="mojo")
+    ag_per_rank = 2
+    ag_in = torch.zeros(ag_per_rank, device="mojo")
+    ag_out = torch.zeros(world * ag_per_rank, device="mojo")
+
+    bcast_ok = True
+    gather_ok = True
+    for r in range(rounds):
+        dist.all_reduce(a_small, op=dist.ReduceOp.AVG)
+        dist.all_reduce(a_big, op=dist.ReduceOp.AVG)
+
+        bval = float((r % 97) + 1) * 0.25
+        if rank == 0:
+            bcast_buf.fill_(bval)
+        dist.broadcast(bcast_buf, src=0)
+        if not bool((bcast_buf.cpu() == bval).all()):
+            bcast_ok = False
+
+        ag_in.fill_(float(r * 1000 + rank))
+        dist.all_gather_into_tensor(ag_out, ag_in)
+        want = torch.cat(
+            [torch.full((ag_per_rank,), float(r * 1000 + p)) for p in range(world)]
+        )
+        if not torch.equal(ag_out.cpu(), want):
+            gather_ok = False
+
+    _check(failures, "stress.mix.broadcast", bcast_ok)
+    _check(failures, "stress.mix.allgather", gather_ok)
+
+    expected_mean = float(world + 1) / 2.0
+    small_ok = bool(torch.allclose(a_small.cpu(), torch.full((1,), expected_mean)))
+    big_ok = bool(torch.allclose(a_big.cpu(), torch.full((big_n,), expected_mean)))
+    _check(failures, "stress.mix.allreduce_4B", small_ok)
+    _check(failures, "stress.mix.allreduce_27MiB", big_ok)
+    dist.barrier()
+
+
+def _stress_verify_matrix(failures: list[str], rank: int, world: int):
+    """dtypes x ragged sizes x {SUM, AVG} x {in place, out of place}.
+
+    Sizes: 1, 1003 (not a multiple of the 16-byte vector width), a size one
+    element short of the region cap, and one element past it (forces the ABI
+    layer's chunking loop). MOJOCCL_REGION_MB is set small for this mode (see
+    test_distributed.py) specifically so "past the cap" stays a small tensor.
+    """
+    cap_bytes = int(os.environ.get("MOJOCCL_REGION_MB", "256")) * 1024 * 1024
+
+    for dtype in _VERIFY_DTYPES:
+        item_bytes = torch.zeros((), dtype=dtype).element_size()
+        max_elems = cap_bytes // item_bytes
+        sizes = [1, 1003, max(1, (cap_bytes - 1) // item_bytes), max_elems + 1]
+        for n in sizes:
+            for op, avg in ((dist.ReduceOp.SUM, False), (dist.ReduceOp.AVG, True)):
+                want = _reference(dtype, world, n, avg)
+                tag = f"stress.verify.{dtype}.n{n}.{op.name}"
+
+                x = _fill(dtype, rank, n).to("mojo")
+                dist.all_reduce(x, op=op)
+                _check(failures, f"{tag}.inplace", _matches(dtype, x.cpu(), want))
+
+                # Full sync: the in-place step above may have run on the
+                # comm side-stream: see _pg_comm's docstring.
+                torch_mojo_device_module.synchronize()
+                src = _fill(dtype, rank, n).to("mojo")
+                dst = torch.zeros(n, dtype=dtype, device="mojo")
+                comm, stream = _pg_comm(src)
+                comm.all_reduce(
+                    _ptr_of(src),
+                    _ptr_of(dst),
+                    n,
+                    _nccl_dtype(dtype),
+                    _nccl_red_op(op),
+                    stream,
+                )
+                _check(failures, f"{tag}.outofplace", _matches(dtype, dst.cpu(), want))
+    dist.barrier()
+
+
+def _stress_broadcast_allgather_edges(failures: list[str], rank: int, world: int):
+    """Broadcast from a non-zero root; allgather with a per-rank size that is
+    not a multiple of 16 bytes (12 bytes of float32)."""
+    root = world - 1
+    n = 777
+    buf = torch.zeros(n, device="mojo")
+    if rank == root:
+        buf.copy_(_fill(torch.float32, root, n).to("mojo"))
+    dist.broadcast(buf, src=root)
+    want_bcast = _fill(torch.float32, root, n)
+    _check(
+        failures, "stress.broadcast_nonzero_root", torch.equal(buf.cpu(), want_bcast)
+    )
+
+    per_rank = 3  # 12 bytes -- not a multiple of 16
+    mine = _fill(torch.float32, rank, per_rank).to("mojo")
+    out = torch.zeros(world * per_rank, device="mojo")
+    dist.all_gather_into_tensor(out, mine)
+    want_gather = torch.cat([_fill(torch.float32, r, per_rank) for r in range(world)])
+    _check(
+        failures, "stress.allgather_non16_per_rank", torch.equal(out.cpu(), want_gather)
+    )
+    dist.barrier()
+
+
+def run_stress(failures: list[str]):
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    if not _MOJO_CCL:
+        print(
+            f"[rank {rank}] SKIP stress (mojoccl-only regression coverage)", flush=True
+        )
+        return
+    _stress_mix(failures, rank, world)
+    _stress_verify_matrix(failures, rank, world)
+    _stress_broadcast_allgather_edges(failures, rank, world)
+
+
 def main():
     mode = sys.argv[1]
 
@@ -248,6 +475,8 @@ def main():
         run_ddp_parity(failures)
     elif mode == "lazy_fence":
         run_lazy_fence(failures)
+    elif mode == "stress":
+        run_stress(failures)
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()
