@@ -819,6 +819,8 @@ def _inter_node_exchange[
     ib_enqueue(
         state.ib,
         state.driver,
+        state.ctx,
+        stream,
         Int(raw_stream),
         shard if cnt_e > 0 else state.owned_base,
         nbytes if cnt_e > 0 else CREDIT_BYTES,
@@ -1114,6 +1116,8 @@ def _broadcast_multinode(
         ib_enqueue(
             state.ib,
             state.driver,
+            state.ctx,
+            stream,
             Int(raw_stream),
             send_addr,
             send_bytes,
@@ -1245,6 +1249,8 @@ def _allgather_multinode(
         ib_enqueue(
             state.ib,
             state.driver,
+            state.ctx,
+            stream,
             Int(raw_stream),
             block_stage,
             block,

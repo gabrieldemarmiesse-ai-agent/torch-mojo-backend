@@ -7,7 +7,9 @@
 # no flag protocol here and no peer pointer -- every address is inside this
 # rank's own region or its own user buffers.
 
+from std.atomic import Atomic, Ordering
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
+from std.time import global_perf_counter_ns
 from std.sys import size_of
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
@@ -65,6 +67,59 @@ def _inbox_add_kernel[
             var src = inbox.unsafe_offset(j * sb).unsafe_bitcast[Scalar[dtype]]()
             acc += src[unsafe_offset=i]
         shard[unsafe_offset=i] = acc
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_internode_proxy_request")
+def _proxy_request_kernel(
+    mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64
+):
+    """Hand exchange `seq` to the progress thread.
+
+    A release store into pinned host memory, so everything the stream did
+    before this kernel -- the reduce-scatter that produced the shard the
+    thread is about to send -- is visible to the CPU that acquires it.
+    """
+    if global_idx.x == 0:
+        Atomic[DType.uint64].store[ordering = Ordering.RELEASE](mailbox, seq)
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_internode_proxy_wait")
+def _proxy_wait_kernel(
+    mailbox: Pointer[UInt64, MutAnyOrigin],
+    error_word: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
+    timeout_ns: UInt64,
+):
+    """Hold the stream until the progress thread reports exchange `seq` done.
+
+    One thread spinning on pinned host memory. This is the whole reason the
+    proxy exists: the same rendezvous through `cuLaunchHostFunc` cost about
+    480 us per exchange on this cluster (measured, job 234035 -- 1 MiB
+    allreduce 496 us against 24 us on one node), because the driver has to
+    stop the stream, wake a thread and restart it. A spin kernel and a
+    spinning CPU thread cost a launch each.
+
+    On the deadline it writes the region's error word and gives up rather
+    than hanging the stream forever; the add kernel then runs on stale
+    inbox bytes, which `ncclCommGetAsyncError` reports.
+    """
+    if global_idx.x == 0:
+        var t0 = global_perf_counter_ns()
+        while (
+            Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](mailbox)
+            < seq
+        ):
+            if global_perf_counter_ns() - t0 > timeout_ns:
+                Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+                    error_word, UInt64(9) * 1_000_000
+                )
+                return
 
 
 @__llvm_metadata(
@@ -193,4 +248,37 @@ def place_blocks(
         dst_offsets,
         Int64(block_bytes),
         Int32(nblocks),
+    )
+
+
+def proxy_request(
+    ctx: DeviceContext, stream: DeviceStream, mailbox: Int, seq: Int
+) raises:
+    _enqueue_cached[_proxy_request_kernel](
+        ctx,
+        stream,
+        "ib_req",
+        1,
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
+        UInt64(seq),
+    )
+
+
+def proxy_wait(
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    mailbox: Int,
+    error_word: Int,
+    seq: Int,
+    timeout_ns: Int,
+) raises:
+    _enqueue_cached[_proxy_wait_kernel](
+        ctx,
+        stream,
+        "ib_wait",
+        1,
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=error_word),
+        UInt64(seq),
+        UInt64(timeout_ns),
     )

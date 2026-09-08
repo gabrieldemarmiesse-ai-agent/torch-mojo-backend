@@ -35,6 +35,11 @@ comptime IBV_QPT_RC: Int32 = 2
 comptime IBV_ACCESS_LOCAL_WRITE: Int32 = 1
 comptime IBV_ACCESS_REMOTE_WRITE: Int32 = 2
 comptime IBV_ACCESS_REMOTE_READ: Int32 = 4
+# 1<<20, and above the range the versioned `ibv_reg_mr@IBVERBS_1.1` will
+# accept -- reaching it needs `ibv_reg_mr_iova2@IBVERBS_1.8`, which is the
+# only reason NCCL calls that entry point at all
+# (nccl:src/transport/net_ib/reg.cc:41-46).
+comptime IBV_ACCESS_RELAXED_ORDERING: Int32 = 0x100000
 
 # The three composite attr masks, spelled out at nccl:src/transport/net_ib/
 # connect.cc:377 (INIT), :435+441 (RTR), :492+500 (RTS).
@@ -268,16 +273,49 @@ struct Ibv(Movable):
         _ = self.lib.get_function[Int32]("ibv_dealloc_pd")(pd)
 
     def reg_mr(self, pd: Int, addr: Int, length: Int, access: Int32) raises -> Int:
-        """Plain `ibv_reg_mr`, no IBV_ACCESS_RELAXED_ORDERING: the RO bit
-        (1<<20) is above the range the versioned `ibv_reg_mr@IBVERBS_1.1`
-        accepts, and reaching it needs `ibv_reg_mr_iova2` (what NCCL does,
-        nccl:src/transport/net_ib/reg.cc:41-46). RO is a PCIe throughput
-        tweak, not a correctness requirement; left out until measured."""
+        """Plain `ibv_reg_mr@IBVERBS_1.1`."""
         return Int(
             self.lib.get_function[Int64]("ibv_reg_mr")(
                 pd, addr, UInt64(length), access
             )
         )
+
+    def reg_mr_relaxed(
+        self, pd: Int, addr: Int, length: Int, access: Int32
+    ) raises -> Int:
+        """`ibv_reg_mr_iova2` with IBV_ACCESS_RELAXED_ORDERING, falling back
+        to `reg_mr`.
+
+        PCIe relaxed ordering is what lets the NIC's writes into GPU memory
+        retire out of order; without it a GPUDirect RDMA transfer runs at a
+        fraction of link rate on this class of machine. NCCL turns it on by
+        default (`NCCL_IB_PCI_RELAXED_ORDERING=2`,
+        nccl:src/transport/net_ib/init.cc:11,141-150) and reaches it through
+        `ibv_reg_mr_iova2` for the same ABI reason: the older entry point
+        silently drops access bits above 0xFFFFF.
+
+        The iova passed is the address itself -- the identity mapping NCCL
+        also uses -- so remote addresses stay plain virtual addresses.
+        Ordering of the DATA against its COMPLETION is not what RO relaxes
+        and not what this library relies on: the flush read in
+        internode.mojo is what makes the payload visible, and it is posted
+        after the completion either way.
+        """
+        try:
+            var mr = Int(
+                self.lib.get_function[Int64]("ibv_reg_mr_iova2")(
+                    pd,
+                    addr,
+                    UInt64(length),
+                    UInt64(addr),
+                    UInt32(access | IBV_ACCESS_RELAXED_ORDERING),
+                )
+            )
+            if mr != 0:
+                return mr
+        except:
+            pass  # IBVERBS_1.8 absent: an old rdma-core, RO simply unavailable
+        return self.reg_mr(pd, addr, length, access)
 
     def dereg_mr(self, mr: Int) raises:
         _ = self.lib.get_function[Int32]("ibv_dereg_mr")(mr)

@@ -27,6 +27,15 @@ comptime FN_LAUNCH_HOST_FUNC = (
 comptime FN_PCI_BUS_ID = (
     "hipDeviceGetPCIBusId" if AMD else "cuDeviceGetPCIBusId"
 )
+comptime FN_HOST_ALLOC = "hipHostMalloc" if AMD else "cuMemHostAlloc"
+comptime FN_HOST_FREE = "hipHostFree" if AMD else "cuMemFreeHost"
+comptime FN_HOST_DEVPTR = (
+    "hipHostGetDevicePointer" if AMD else "cuMemHostGetDevicePointer_v2"
+)
+# PORTABLE | DEVICEMAP, spelled the same in both APIs
+# (CU_MEMHOSTALLOC_PORTABLE|CU_MEMHOSTALLOC_DEVICEMAP,
+# hipHostMallocPortable|hipHostMallocMapped).
+comptime HOST_ALLOC_FLAGS: UInt32 = 3
 # CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS == hipIpcMemLazyEnablePeerAccess == 1
 comptime IPC_LAZY_PEER: UInt32 = 1
 # hipDeviceMallocUncached: cross-agent flag buffers must be uncached on AMD
@@ -202,3 +211,41 @@ def device_pci_bus_id(lib: OwnedDLHandle, ordinal: Int) raises -> String:
         s += chr(c)
         i += 1
     return s^
+
+
+def alloc_host(lib: OwnedDLHandle, nbytes: Int) raises -> Int:
+    """Pinned, device-mapped host memory: the proxy thread's mailbox.
+
+    The two words the GPU and the progress thread exchange live here --
+    written by a one-thread kernel with a system-scope release and read by
+    the CPU (and the reverse). Pageable memory would not do: the device
+    mapping is what lets a kernel touch it at all.
+    """
+    var p: Int = 0
+    _check(
+        lib.get_function[Int32](FN_HOST_ALLOC)(
+            Pointer(to=p), nbytes, HOST_ALLOC_FLAGS
+        ),
+        FN_HOST_ALLOC,
+    )
+    return p
+
+
+def host_device_ptr(lib: OwnedDLHandle, host_addr: Int) raises -> Int:
+    """The address a kernel must use for `alloc_host` memory.
+
+    Equal to the host address under unified addressing on both vendors, but
+    asked for rather than assumed.
+    """
+    var d: Int = 0
+    _check(
+        lib.get_function[Int32](FN_HOST_DEVPTR)(
+            Pointer(to=d), host_addr, UInt32(0)
+        ),
+        FN_HOST_DEVPTR,
+    )
+    return d
+
+
+def free_host(lib: OwnedDLHandle, addr: Int) raises:
+    _check(lib.get_function[Int32](FN_HOST_FREE)(addr), FN_HOST_FREE)
