@@ -24,12 +24,11 @@
 #      first order (see AGENTS.md "Benchmark harness notes").
 #   C. demo_scripts/nanogpt_ddp.py, 40 steps, ABBA order, under both ccls.
 #
-# RUN_MOJO=0 (default 1): skip every mojo-ccl leg. Multi-node mojoccl
-# transport is not implemented yet (torch_mojo_backend/distributed/mojoccl/
-# is intra-node-only as of this writing: rendezvous is a /dev/shm directory,
-# one node only) -- use RUN_MOJO=0 to get the vendor-only NCCL reference
-# numbers without burning the job's time budget on mojo legs that will
-# fail/hang until the transport agent's work lands on this branch.
+# RUN_MOJO=0 (default 1): skip every mojo-ccl leg. mojoccl's multi-node
+# transport (TCP bootstrap carried in the unique id, GPUDirect RDMA over
+# libibverbs -- see the "Multi-node" subsection of docs/distributed.md) is
+# exercised by default; RUN_MOJO=0 instead gets a vendor-only NCCL reference
+# run without spending the job's time budget on the mojo legs.
 #
 # Every leg is one torchrun launch across both nodes (--nnodes=2
 # --nproc-per-node=8), guarded per node by `flock /tmp/gpu_lock_0.lock`
