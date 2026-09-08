@@ -265,3 +265,45 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR:29500" \
     --rdzv-id="$SLURM_JOB_ID" demo_scripts/nanogpt_ddp.py ...
 ```
+
+## Mojo collectives (experimental): `TORCH_MOJO_BACKEND_CCL=mojo`
+
+An in-repo replacement for NCCL/RCCL's intra-node collectives, written in Mojo
+and exposed through **NCCL's own C ABI**: `torch_mojo_backend/distributed/mojoccl/`
+builds `libmojoccl.so` on first use (into the eager kernels' `__mojocache__`,
+same lock/atomic-rename machinery) and `nccl.py` dlopens it instead of
+`libnccl.so.2` when `TORCH_MOJO_BACKEND_CCL=mojo`. `process_group.py` is
+unchanged; NCCL/RCCL stays the default. Design and measurements:
+`docs/mojo_collectives_feasibility.md` (study) and
+`docs/mojo_collectives_kernel_results.md` (kernels).
+
+Scope, deliberately narrow — it is an experiment showing Mojo can write
+NCCL-class collectives, not a general library:
+
+- one node, 2–8 ranks, one process per GPU under torchrun (`MAX_WORLD = 8`);
+  multi-node is not implemented (the study's plan keeps NCCL/RCCL for the
+  inter-node shard allreduce, hierarchically);
+- `ncclAllReduce` (float32/float16/bfloat16/int32/int64, SUM and AVG),
+  `ncclBroadcast` and `ncclAllGather` (every dtype, byte-granular);
+  `ncclReduce`, `ncclReduceScatter`, `ncclSend`, `ncclRecv` return
+  `ncclInvalidUsage`, so DDP works and anything needing them does not;
+- the rendezvous is a directory under `/dev/shm` encoded in the 128-byte
+  `ncclUniqueId` (rank 0 removes it once every rank has opened its peers);
+- every rank owns one IPC-shared staging region (`MOJOCCL_REGION_MB`, default
+  256 MiB, multiple of 4 KiB; larger requests are chunked). MAX's own
+  allocations cannot be shared across processes (§5.6 of the study), which
+  is why the kernels stage through this region; the push / local-reduce /
+  pull design makes the staging free;
+- a rank that stops responding makes its peers time out after 60 s inside the
+  kernel and `ncclCommGetAsyncError` reports it; there is no abort path.
+
+Measured on 8×H100 SXM through the process group (wall over 20 launches,
+median of 5, interleaved legs; NCCL 2.31.2 NVLS for comparison): 1 MiB 29 vs
+31 µs, 9 MiB 70 vs 92, 27 MiB (the DDP bucket) 164 vs 181, 168 MiB 975 vs
+755, 512 MiB 2.95 vs 2.15 ms. The large sizes are the unicast ceiling
+(~310 GB/s per direction over NVSwitch); matching NCCL there needs NVLS
+multicast (`cuMulticastCreate`), not implemented. nanoGPT-124M DDP on 8 ranks
+runs at the same throughput and the same losses within the training step's
+own run-to-run noise. AMD: the same source cross-compiles for gfx942 (the
+one vendor gate is a release fence on AMD's `s_barrier`), but it has not run
+on an MI300A yet.

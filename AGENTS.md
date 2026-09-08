@@ -69,6 +69,9 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
     every specialization compiles inline at its first call and is cached in
     `__mojocache__`; build timings print by default
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
+  - `TORCH_MOJO_BACKEND_CCL=mojo` swaps NCCL/RCCL for the in-repo Mojo
+    collectives (`docs/distributed.md`, "Mojo collectives"); default is
+    the vendor library.
 - **Model Examples**: `demo_scripts/` contains examples showing real-world usage:
   - GPT-2, Gemma3 (LLM models)
   - VGG, DenseNet (vision models)
