@@ -61,8 +61,10 @@ from std.atomic import Atomic, Ordering
 from driver import (
     alloc_host,
     device_pci_bus_id,
+    free_host,
     host_device_ptr,
     launch_host_func,
+    open_driver,
 )
 from internode_kernels import proxy_request, proxy_wait
 from ibverbs import (
@@ -995,6 +997,18 @@ def ib_teardown(ib: Int):
     ref st = _st(ib)[]
     _stop_proxy(st)
     ib_report(ib)
+    if st.mailbox != 0:
+        # Pinned, device-mapped host memory: a scarce OS resource, unlike the
+        # few hundred bytes of plain heap this struct also holds. Safe here
+        # and only here -- the progress thread is joined and the caller
+        # synchronized the stream the spin kernels were on. `open_driver`
+        # re-opens an already-loaded library, so it costs a refcount.
+        try:
+            free_host(open_driver(), st.mailbox)
+        except:
+            pass
+        st.mailbox = 0
+        st.mailbox_dev = 0
     try:
         for i in range(len(st.peers)):
             st.ibv.destroy_qp(st.peers[i].qp)
