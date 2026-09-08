@@ -3,7 +3,8 @@
 Deliverable: `collectives_kernels.mojo` (this directory). Harness: `harness.mojo`
 + `validate.sbatch` (correctness + the tables below, NCCL legs interleaved),
 `ab.sbatch` (the NCCL A/B alone), `sweep.sbatch` / `tune.sbatch` /
-`diag.sbatch` (the tuning sweeps), `bench.sbatch`, `smoke.sbatch`.
+`diag.sbatch` (the tuning sweeps), `bench.sbatch`, `smoke.sbatch`,
+`split.sbatch` + `split_report.py` (the split allreduce of §10).
 `./build.sh` builds the per-dtype harnesses and the assembly dumps;
 `./build.sh sweeps` also builds the `-D`-tuned variants the sweep scripts
 expect. Raw logs: `/home/gabriel/ddp_work/logs/ccl_*.log`.
@@ -327,6 +328,9 @@ marked as such in the source.
 
 ## 9. What the ABI layer needs to know
 
+(§10 adds three more names for the multi-node path; everything below applies to
+them unchanged.)
+
 Six exported names, matching the contract exactly: `signal_bytes`,
 `error_offset`, `region_init(ctx, region)` (no stream — it blocks),
 `allreduce[dtype](ctx, stream, ...)`, `broadcast(...)`,
@@ -368,3 +372,183 @@ Two notes on the surrounding layer:
   start barrier's whole job is to order one generation's writes after the
   previous generation's reads. A repeated or decreasing generation silently
   passes barriers it should not.
+
+## 10. Split allreduce for the multi-node path (job 233937)
+
+The hierarchical allreduce of §7 of the feasibility study needs the intra-node
+allreduce cut in half so the vendor library can allreduce one shard across
+nodes in between. Three names were added; the six existing exports are
+untouched (their device code is **byte-identical** before and after -- checked
+by diffing `asm/{ar2,ar1,bcast,ag}_{sm_90a,gfx942}.asm` against a build of the
+previous file).
+
+```
+shard_range(numel, world, rank, elem_bytes) -> (offset_elems, count_elems)
+reduce_scatter_stage[dtype](ctx, stream, rank, world, regions, in_ptr,
+                            numel, cap_bytes, generation)
+allgather_finish[dtype](ctx, stream, rank, world, regions, out_ptr,
+                        numel, cap_bytes, scale, generation)
+```
+
+`rank`/`world`/`regions` are the **node-local** group. The sequence per bucket:
+
+```
+reduce_scatter_stage(g)        push + local reduce; my shard, SUM over the
+                               node, unscaled, lands in MY stage_out
+<vendor allreduce, in place>   region + signal_bytes() + cap_bytes
+                               + offset*elem_bytes, count elements, SAME stream
+allgather_finish(g+1)          start barrier, then pull every rank's shard
+                               (mine included) into out_ptr, times `scale`
+```
+
+Preconditions are `allreduce`'s (16-byte aligned buffer, `numel*elem_bytes <=
+cap_bytes`, strictly increasing generation); the pair costs **two**
+generations. `out_ptr` may be the same buffer as `in_ptr`.
+
+### 10.1 Shard placement
+
+`shard_range` is a different partition from the fused kernel's and
+deliberately so: equal shards of `per` elements with `per` rounded up to the
+16-byte vector width, the last non-empty shard short, ranks past the end
+empty. Every offset is therefore 16-byte aligned, every rank derives the same
+table from `(numel, world, elem_bytes)` alone, and the ABI layer can state the
+inter-node collective's arguments in one line. Imbalance against the fused
+kernel's balanced split is at most one 16-byte vector per rank.
+
+The shard sits in stage_out **at its own element offset**, i.e. stage_out is an
+image of the whole buffer of which only my shard is live. The push slots go at
+the base of stage_in and are *compacted* to `world-1` (rank s never writes its
+own slot): `world` uncompacted slots can be up to `16*world` bytes larger than
+stage_in when `numel*elem_bytes == cap_bytes`, which would spill onto rank 0's
+shard in stage_out. Checked exhaustively over every dtype width, world and cap.
+
+### 10.2 The three ordering questions, and why no new protocol was needed
+
+1. **A foreign library rewrites my stage_out shard between the two calls.**
+   `allgather_finish`'s start barrier is the fence: a rank publishes its
+   generation g+1 flags only from inside that kernel, which its stream starts
+   only after its inter-node op completed. Seeing peer p's flag therefore
+   implies p's shard is final.
+2. **Peer p's shard was written by a previous kernel**, not by the thread that
+   publishes the flag. Stream order puts that kernel's writes happen-before the
+   release store, and the release/acquire pair is system-scoped and cumulative,
+   so the acquiring reader sees them (on gfx942 `_sync`'s AMD-only release
+   fence supplies the `buffer_wbl2 sc0 sc1` the workgroup barrier omits). The
+   consequence is worth stating: block-index matching, which the fused kernel
+   needs *within* one launch, is **not** needed across this boundary, so the
+   two halves may be launched with different grids -- and they are.
+3. **Arena reuse after the pulls.** Nothing new: the next collective of any
+   kind opens with a start barrier and a rank reaches it only after its own
+   `allgather_finish` retired, so no generation g+2 write can race a generation
+   g+1 pull. The split pair just spends two generations. The existing
+   buffer-reuse invariant covers it as written -- verified, not assumed, by the
+   extended `mix` below.
+
+### 10.3 Split vs fused, 8xH100 SXM, 1980 MHz (job 233937)
+
+`harness.mojo split` runs, per size, five legs back to back in one process:
+the fused `allreduce`; each half alone (both are legal standalone collectives);
+the stand-in inter-node step alone, so it can be subtracted; and the whole
+pair. Device time from `%globaltimer` stamps on the stream, 20 back-to-back
+launches x 5 reps, median, max over ranks, three interleaved rounds.
+
+fp32, world 8 (us):
+
+| bytes | fused | rs stage | stub | ag finish | **pair** | pair-fused | minus stub |
+|---|---|---|---|---|---|---|---|
+| 4 B | 9.5 | 8.8 | 2.1 | 7.1 | **17.6** | +8.1 | +5.9 |
+| 9 MiB | 64.7 | 36.3 | 3.1 | 35.5 | **74.8** | +10.1 | +7.1 |
+| **27 MiB** | 162.7 | 89.6 | 3.7 | 93.6 | **186.3** | +23.7 | +19.9 |
+| 168 MiB | 935.4 | 507.2 | 9.8 | 492.4 | **1003.9** | +68.5 | +58.8 |
+| 512 MiB | 2777.6 | 1513.2 | 60.7 | 1457.9 | **3025.8** | +248.2 | +187.5 |
+
+bf16, world 8 (us):
+
+| bytes | fused | rs stage | stub | ag finish | **pair** | pair-fused | minus stub |
+|---|---|---|---|---|---|---|---|
+| 4 B | 9.6 | 8.9 | 2.3 | 7.0 | **17.9** | +8.3 | +6.1 |
+| 9 MiB | 64.7 | 36.3 | 3.3 | 35.5 | **74.9** | +10.2 | +6.9 |
+| **27 MiB** | 162.4 | 89.7 | 4.2 | 93.6 | **187.9** | +25.4 | +21.3 |
+| 168 MiB | 935.9 | 503.1 | 11.6 | 491.5 | **1012.2** | +76.3 | +64.7 |
+| 512 MiB | 2778.8 | 1501.4 | 101.2 | 1458.8 | **3057.7** | +278.9 | +177.7 |
+
+The stand-in is a one-pass read-modify-write of the shard on the same stream
+(it adds a rank-independent constant, so the verify can tell "the inter-node
+step ran" from "it was skipped"); a real `ncclAllReduce` over `nNodes` costs
+much more, and these columns exist so it can be substituted rather than
+guessed at.
+
+**Net of the stand-in the pair costs +6 to +8 us up to 9 MiB and +6-7% at
+168-512 MiB**, i.e. the promised "fused plus one launch" at small and medium
+sizes, growing to a percentage at the bandwidth-bound end. Where it goes:
+
+* one extra kernel launch and one extra 8-way start barrier (~6 us, and that
+  is the whole story at 4 B and 9 MiB);
+* `allgather_finish` pulls **`world`** shards, not `world-1`: my own shard has
+  to come back out of my stage_out because the inter-node step rewrote it,
+  where the fused kernel wrote its own shard straight to the user output during
+  the reduce. That is `bytes/world` of extra local read at every size, and it
+  is the term that grows.
+
+Neither half is slow in itself: `ag finish` at 27 MiB (93.6 us) matches the
+standalone `allgather` collective on the same per-rank size (96-98 us, §4), and
+`rs stage` (89.6) is its mirror image. The split simply cannot amortise the
+second launch the way one kernel does. Whether that matters is a question for
+the ABI layer: at the 9 MiB and 27 MiB DDP buckets it is +7 and +20 us against
+an inter-node leg of 60-90 us.
+
+### 10.4 Correctness
+
+`harness.mojo split` verifies against a host reference recomputed from the same
+deterministic splitmix64 fill, with the stand-in's constant folded into the
+expectation -- so a pair that silently skipped the inter-node step fails, and
+does not merely look like a rounding difference. 116 passing cases:
+
+* dtypes float32, bfloat16, float16, int32, int64 at world 8; float32 at world
+  4, 2 and **1**; bfloat16 world 5, int64 world 3, int32 world 7 (odd worlds
+  take the runtime-`world` kernel instantiation).
+* eight sizes per configuration, chosen ragged: 1, 2, 3, 6, 1003, 65537,
+  7079424 (27 MiB) and 16777215 elements at fp32, and the corresponding counts
+  at the other widths -- i.e. non-multiples of the 16-byte vector width, sizes
+  smaller than `world` (so most shards are empty), and `cap-4` bytes.
+* each size also re-checked after the timing legs, whose last leg is the pair
+  with a zero stand-in -- a plain allreduce, checked as one.
+* float32 is checked exactly. bf16/fp16 get a wider band than the fused path
+  and have to: the split stores the node-local sum in the *wire* dtype (the
+  vendor library reduces that buffer, so it cannot stay in fp32) and rounds
+  again on the scaled pull, where the fused kernel rounds once. That is a
+  property of the hierarchical algorithm, not of this implementation -- NCCL's
+  own hierarchical paths do the same.
+* the region's error word is read back after every case (stays 0).
+
+`harness.mojo mix` now rotates **eight** generations per round instead of four:
+4-byte one-shot allreduce, 27 MiB two-shot allreduce, 2000-byte broadcast,
+8-byte allgather, then a 4-byte split pair and a 27 MiB split pair, each with
+the stand-in kernel running between its halves. The split pairs run in place
+with a zero stand-in so they stay idempotent like the fused calls and a single
+corrupted generation anywhere in the run still survives to the final check.
+**200 rounds = 1600 generations**, passing for float32 and bfloat16 at world 8,
+float32 at world 4 and bfloat16 at world 5. This is the test that the
+buffer-reuse invariant of §10.2(3) actually holds with a foreign kernel writing
+the arena mid-collective.
+
+### 10.5 Build
+
+Both new kernels build warning-free for both targets from the same source
+(`./build.sh`, which now also dumps `asm/rs_*.asm` and `asm/agf_*.asm`):
+
+| | sm_90a | gfx942 |
+|---|---|---|
+| `_rs_stage_kernel` payload | 13 `ld.global.v4.b32` / 6 `st.global.v4.b32` | 13 `global_load_dwordx4` / 6 `global_store_dwordx4` |
+| `_ag_finish_kernel` payload | 10 / 10 | 10 / 10 |
+| flags | 3 `st.release.sys.global` + 4 `ld.acquire.sys.global` | `buffer_wbl2 sc0 sc1` / `buffer_inv sc0 sc1` |
+| local/scratch traffic | none | none |
+
+Zero `ld.local` / `scratch_` in either kernel on either target, i.e. the
+MOCO-1431 pointer-array trap of §6 was avoided here too (slot addresses are
+formed arithmetically inside the unrolled loop).
+
+Reproduce: `sbatch split.sbatch`, then
+`python3 split_report.py /home/gabriel/ddp_work/logs/split_<jobid>`.
+Raw logs: `/home/gabriel/ddp_work/logs/ccl_split_233937.log` and
+`/home/gabriel/ddp_work/logs/split_233937/*.txt` (every rank's CSV).

@@ -20,6 +20,11 @@
 #                       slots (used only when they fit);
 #   broadcast/allgather: the base of the arena, one message-sized stage per
 #                        rank (the caller chunks anything larger than cap).
+#   split allreduce:    `world-1` compacted push slots at the base of
+#                       stage_in, and the reduced shard at its own element
+#                       offset inside stage_out (see `shard_range`), so the
+#                       inter-node library can rewrite it in place between the
+#                       two halves.
 #
 # Why the data path looks like it does
 # ------------------------------------
@@ -58,6 +63,12 @@
 # finished reading the previous generation.  That is what lets collectives of
 # different kinds and sizes share the staging area -- see the invariant above
 # `_ar_twoshot_kernel`.
+#
+# The hierarchical (multi-node) allreduce splits that into
+# `reduce_scatter_stage` (phases 1-2) and `allgather_finish` (phase 3), with
+# the vendor library's inter-node allreduce of one shard in between; the split
+# spends two generations and one extra launch. See the block comment above
+# `_rs_stage_kernel`.
 #
 # Broadcast is scatter + all-gather, not "root stages, everyone reads": the
 # latter puts (world-1) x nbytes on the root's one outbound link and measured
@@ -177,6 +188,8 @@ comptime _COPY_MAX_BLOCKS = get_defined_int["ccl_copy_blocks", 432]()
 comptime ERR_ALLREDUCE_SYNC = 1
 comptime ERR_BROADCAST_SYNC = 2
 comptime ERR_ALLGATHER_SYNC = 3
+comptime ERR_RS_STAGE_SYNC = 4
+comptime ERR_AG_FINISH_SYNC = 5
 
 
 # ===-------------------------------------------------------------------=== #
@@ -398,6 +411,78 @@ def _copy_bytes[
     _copy_scalar_tail(dst, src, nvec * 16, nbytes - nvec * 16, tid, stride)
 
 
+@always_inline
+def _copy_span[
+    dtype: DType, W: Int, U: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], MutAnyOrigin],
+    count: Int,
+    tid: Int,
+    stride: Int,
+):
+    """`count` elements: the 16-byte vectors, then the `count % W` tail."""
+    var vc = count // W
+    _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
+    _copy_scalar_tail(dst, src, vc * W, count - vc * W, tid, stride)
+
+
+@always_inline
+def _copy_span_scaled[
+    dtype: DType, W: Int, U: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], MutAnyOrigin],
+    count: Int,
+    tid: Int,
+    stride: Int,
+    scale: Float32,
+):
+    """`_copy_span` times `scale`; integer dtypes ignore `scale` (as NCCL's
+    ncclAvg does, and as the fused allreduce does). `scale == 1` takes the
+    plain copy, so the all-gather half of a SUM allreduce costs no more than a
+    peer copy."""
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
+    comptime if accum.is_floating_point():
+        if scale != Float32(1.0):
+            var sv = SIMD[accum, W](scale.cast[accum]())
+            var vc = count // W
+            var v = tid
+            var lim = vc - (U - 1) * stride
+            while v < lim:
+                var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+                comptime for u in range(U):
+                    tmp[u] = src.unsafe_load[width=W, alignment=16](
+                        (v + u * stride) * W
+                    )
+                comptime for u in range(U):
+                    dst.unsafe_store[width=W, alignment=16](
+                        (v + u * stride) * W,
+                        (tmp[u].cast[accum]() * sv).cast[dtype](),
+                    )
+                v += U * stride
+            while v < vc:
+                dst.unsafe_store[width=W, alignment=16](
+                    v * W,
+                    (
+                        src.unsafe_load[width=W, alignment=16](v * W).cast[
+                            accum
+                        ]()
+                        * sv
+                    ).cast[dtype](),
+                )
+                v += stride
+            for i in range(tid, count - vc * W, stride):
+                var k = vc * W + i
+                dst[unsafe_offset=k] = (
+                    src[unsafe_offset=k].cast[accum]() * scale.cast[accum]()
+                ).cast[dtype]()
+            return
+    _copy_span[dtype, W, U](dst, src, count, tid, stride)
+
+
 # ===-------------------------------------------------------------------=== #
 # Shard partition. Every rank derives the same table from (numel, world).
 # ===-------------------------------------------------------------------=== #
@@ -414,6 +499,74 @@ def _vcount(s: Int, q: Int, rem: Int) -> Int:
     """16-byte vectors in rank `s`'s shard (the `numel % W` scalar tail, if
     any, belongs to the last rank and is counted separately)."""
     return q + (1 if s < rem else 0)
+
+
+# ===-------------------------------------------------------------------=== #
+# Split shard partition -- the one the hierarchical (multi-node) path uses
+# ===-------------------------------------------------------------------=== #
+#
+# `shard_range` is a *different* partition from `_vstart`/`_vcount` above and
+# deliberately so. The fused allreduce spreads the `nvec % world` leftover
+# vectors one each over the first ranks, which balances best but makes every
+# shard's offset depend on the whole remainder table. The split path hands its
+# shard offset to a foreign library (NCCL/RCCL, which allreduces shard `r`
+# across nodes among the ranks whose local index is `r`), so the rule has to be
+# something a caller can state in one line and every rank must derive the same
+# answer from (numel, world, elem_bytes) alone:
+#
+#     equal shards of `per` elements, `per` rounded up to the 16-byte vector
+#     width, the last non-empty shard short, the ranks past the end empty.
+#
+# Imbalance is at most one vector per rank against the balanced split -- below
+# the noise at every size that reaches the split path -- and in exchange every
+# shard starts 16-byte aligned, which the vector loops and the vendor library
+# both want.
+
+
+@always_inline
+def _shard_per(numel: Int, world: Int, W: Int) -> Int:
+    """Elements per shard, rounded up to the 16-byte vector width `W`."""
+    if numel <= 0 or world <= 0:
+        return 0
+    var c = (numel + world - 1) // world
+    return (c + W - 1) // W * W
+
+
+@always_inline
+def _shard_off(numel: Int, per: Int, s: Int) -> Int:
+    """First element of rank `s`'s shard (== numel once the shards run out)."""
+    var o = s * per
+    return o if o < numel else numel
+
+
+@always_inline
+def _shard_cnt(numel: Int, per: Int, s: Int) -> Int:
+    """Elements in rank `s`'s shard; 0 for the ranks past the end."""
+    var rest = numel - _shard_off(numel, per, s)
+    return per if per < rest else rest
+
+
+def shard_range(
+    numel: Int, world: Int, rank: Int, elem_bytes: Int
+) -> Tuple[Int, Int]:
+    """`(offset_elems, count_elems)` of rank `rank`'s shard of a `numel` buffer.
+
+    Pure host arithmetic, no device state, identical on every rank -- the ABI
+    layer calls it to address the shard `reduce_scatter_stage` leaves in
+    stage_out and to size the inter-node collective it runs on it.
+
+    Shards are contiguous and cover `[0, numel)` in rank order; every offset is
+    16-byte aligned for this dtype (so the shard pointer is as well, given a
+    16-byte aligned buffer); the last non-empty shard may be shorter and the
+    ranks past the end get `(numel, 0)`. `elem_bytes` must divide 16 (all
+    supported dtypes are 1, 2, 4 or 8 bytes wide).
+    """
+    if elem_bytes <= 0 or elem_bytes > 16 or 16 % elem_bytes != 0:
+        return Tuple(0, 0)
+    var per = _shard_per(numel, world, 16 // elem_bytes)
+    if per == 0 or rank < 0 or rank >= world:
+        return Tuple(0, 0)
+    return Tuple(_shard_off(numel, per, rank), _shard_cnt(numel, per, rank))
 
 
 # ===-------------------------------------------------------------------=== #
@@ -692,6 +845,241 @@ def _ar_oneshot_kernel[
         comptime if accum.is_floating_point():
             a *= scale.cast[accum]()
         out_ptr[unsafe_offset=k] = a.cast[dtype]()
+
+
+# ===-------------------------------------------------------------------=== #
+# Split allreduce -- reduce-scatter stage, then all-gather finish
+# ===-------------------------------------------------------------------=== #
+#
+# The hierarchical (multi-node) allreduce is
+#
+#   reduce_scatter_stage(g)   my shard, summed over the node, into my stage_out
+#   <inter-node step>         NCCL/RCCL allreduces that shard across nodes,
+#                             in place, on the same stream, among the ranks
+#                             that share my local index
+#   allgather_finish(g+1)     pull every rank's now-global shard into my output
+#
+# Layout. Shards follow `shard_range` (equal, 16-byte aligned, last one short).
+#   push slots  stage_in base, `world-1` slots of `per * elem_bytes` bytes.
+#               Slot indices are *compacted*: writer r stores into destination
+#               rank s's slot `r if r < s else r-1`, because s never writes its
+#               own slot (it reads its own contribution from user memory). The
+#               compaction is not cosmetic: `world` uncompacted slots can be
+#               up to 16*world bytes larger than stage_in when
+#               numel*elem_bytes == cap (the per-shard round-up to the vector
+#               width, times world), which would spill onto rank 0's shard in
+#               stage_out. `world-1` of them never can -- checked exhaustively
+#               for every dtype width, world and cap.
+#   shard       stage_out + offset(rank) * elem_bytes, i.e. stage_out is an
+#               image of the whole buffer of which only my shard is live. That
+#               placement is what makes the ABI layer's job one line -- the
+#               inter-node collective gets `stage_out + offset*elem_bytes` and
+#               `count` -- and it makes the pull address the same on both
+#               sides. It always fits: offset+count <= numel and
+#               numel*elem_bytes <= cap_bytes.
+#
+# Ordering. Three things happen between the two kernels that the fused
+# allreduce never has to think about, and all three are covered without a new
+# protocol:
+#
+#  1. A foreign library writes my stage_out shard in place. Nobody may read it
+#     before that write lands. `allgather_finish`'s start barrier is the fence:
+#     a rank publishes its generation g+1 flags only from inside that kernel,
+#     which its stream starts only after its inter-node op has completed, so
+#     seeing peer p's flag implies p's shard is final.
+#  2. Peer p's shard was written by a *previous kernel* (p's reduce_scatter_
+#     stage), not by the thread that publishes the flag. Stream order makes
+#     that kernel's writes happen-before the flag's release store, and the
+#     release/acquire pair is system-scoped and cumulative, so they are visible
+#     to the acquiring reader. (On gfx942 `_sync`'s AMD-only release fence adds
+#     the `buffer_wbl2 sc0 sc1` writeback that the workgroup barrier omits.)
+#     Note the consequence: block-index matching, which the fused allreduce
+#     relies on *within* a kernel, is not needed across this boundary -- the
+#     two kernels may be launched with different grids, and they are.
+#  3. Arena reuse after the pulls. Nothing extra is needed: the next collective
+#     of any kind opens with a start barrier, and a rank reaches it only after
+#     its own `allgather_finish` retired, so no generation g+2 write can race a
+#     generation g+1 pull. That is the same one rule as everywhere else in this
+#     file -- the split pair just spends two generations instead of one.
+#
+# Each call consumes one generation. `reduce_scatter_stage` uses flag phases
+# 0 and 1, `allgather_finish` phase 0.
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name(t"ccl_reduce_scatter_stage_{dtype}_w{NW}")
+def _rs_stage_kernel[
+    dtype: DType, W: Int, U: Int, NW: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    numel: Int64,
+    per_e: Int64,
+    slot_stride_b: Int64,
+    push_off_b: Int64,
+    out_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    timeout_ns: UInt64,
+):
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
+    comptime esize = size_of[dtype]()
+    var t0 = global_perf_counter_ns()
+    var world = NW if NW > 0 else Int(world_i)
+    var rank = Int(rank_i)
+    var tid = Int(global_idx.x)
+    var stride = Int(grid_dim.x) * BLOCK
+    var n = Int(numel)
+    var per = Int(per_e)
+    var slot_stride = Int(slot_stride_b)
+    var push_off = Int(push_off_b)
+    var out_off = Int(out_off_b)
+
+    # --- phase 0: start barrier (the arena-reuse invariant) -----------------
+    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
+        _record_error(regions, rank, ERR_RS_STAGE_SYNC, 0)
+        return
+
+    # --- phase 1: push shard s of my input into peer s's slot for me --------
+    for i in range(1, world):
+        var s = rank + i
+        if s >= world:
+            s -= world
+        var off = _shard_off(n, per, s)
+        var cnt = _shard_cnt(n, per, s)
+        if cnt <= 0:
+            continue
+        var dst = regions[s].unsafe_offset(
+            push_off + slot_stride * (rank if rank < s else rank - 1)
+        ).unsafe_bitcast[Scalar[dtype]]()
+        _copy_span[dtype, W, U](
+            dst, in_ptr.unsafe_offset(off), cnt, tid, stride
+        )
+
+    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
+        _record_error(regions, rank, ERR_RS_STAGE_SYNC, 1)
+        return
+
+    # --- phase 2: sum the `world` contributions to my shard into stage_out --
+    # SUM only, unscaled: the caller's inter-node step reduces the same shard
+    # again, so any averaging has to happen once, at the end, in
+    # `allgather_finish`.
+    var my_off = _shard_off(n, per, rank)
+    var my_cnt = _shard_cnt(n, per, rank)
+    if my_cnt <= 0:
+        return
+    var uin = in_ptr.unsafe_offset(my_off)
+    var shard = regions[rank].unsafe_offset(
+        out_off + my_off * esize
+    ).unsafe_bitcast[Scalar[dtype]]()
+    # Slot pointers are formed arithmetically, never held in a stack array:
+    # such an array is demoted to local memory (MOCO-1431) and every payload
+    # load becomes a generic-address `ld.v4.b32` plus an `ld.local.b64`.
+    var slots = regions[rank].unsafe_offset(push_off)
+    var my_vc = my_cnt // W
+
+    for v in range(tid, my_vc, stride):
+        var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        comptime if NW > 0:
+            comptime for j in range(1, NW):
+                var p = rank + j
+                if p >= NW:
+                    p -= NW
+                acc += (
+                    slots.unsafe_offset(
+                        slot_stride * (p if p < rank else p - 1)
+                    )
+                    .unsafe_bitcast[Scalar[dtype]]()
+                    .unsafe_load[width=W, alignment=16](v * W)
+                    .cast[accum]()
+                )
+        else:
+            for j in range(1, world):
+                var p = rank + j
+                if p >= world:
+                    p -= world
+                acc += (
+                    slots.unsafe_offset(
+                        slot_stride * (p if p < rank else p - 1)
+                    )
+                    .unsafe_bitcast[Scalar[dtype]]()
+                    .unsafe_load[width=W, alignment=16](v * W)
+                    .cast[accum]()
+                )
+        shard.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
+
+    for i in range(tid, my_cnt - my_vc * W, stride):
+        var k = my_vc * W + i
+        var a = uin[unsafe_offset=k].cast[accum]()
+        for j in range(1, world):
+            var p = rank + j
+            if p >= world:
+                p -= world
+            a += (
+                slots.unsafe_offset(slot_stride * (p if p < rank else p - 1))
+                .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
+                .cast[accum]()
+            )
+        shard[unsafe_offset=k] = a.cast[dtype]()
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name(t"ccl_allgather_finish_{dtype}_w{NW}")
+def _ag_finish_kernel[
+    dtype: DType, W: Int, U: Int, NW: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    numel: Int64,
+    per_e: Int64,
+    out_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    scale: Float32,
+    timeout_ns: UInt64,
+):
+    comptime esize = size_of[dtype]()
+    var t0 = global_perf_counter_ns()
+    var world = NW if NW > 0 else Int(world_i)
+    var rank = Int(rank_i)
+    var tid = Int(global_idx.x)
+    var stride = Int(grid_dim.x) * BLOCK
+    var n = Int(numel)
+    var per = Int(per_e)
+    var out_off = Int(out_off_b)
+
+    # Start barrier. Doubles as the wait for every peer's inter-node step: a
+    # peer publishes this flag from inside this kernel, which its stream runs
+    # after that step.
+    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
+        _record_error(regions, rank, ERR_AG_FINISH_SYNC, 0)
+        return
+
+    # My own shard is pulled out of my own stage_out like everyone else's: the
+    # inter-node step rewrote it, so the reduce-scatter's result in the user
+    # buffer would be stale even if it had been written there.
+    for i in range(world):
+        var p = rank + i
+        if p >= world:
+            p -= world
+        var off = _shard_off(n, per, p)
+        var cnt = _shard_cnt(n, per, p)
+        if cnt <= 0:
+            continue
+        var src = regions[p].unsafe_offset(out_off + off * esize).unsafe_bitcast[
+            Scalar[dtype]
+        ]()
+        _copy_span_scaled[dtype, W, U](
+            out_ptr.unsafe_offset(off), src, cnt, tid, stride, scale
+        )
 
 
 # ===-------------------------------------------------------------------=== #
@@ -1071,7 +1459,7 @@ def allreduce[
     scale: Float32,
     generation: Int,
 ) raises:
-    """out[i] = scale * sum over ranks of in_r[i], enqueued on `stream`.
+    """Elementwise `out[i] = scale * sum over ranks of in_r[i]`, on `stream`.
 
     `in_ptr` may equal `out_ptr`. `numel * size_of[dtype]()` must be <=
     `cap_bytes`. `scale` is applied on the final write and ignored for integer
@@ -1125,6 +1513,227 @@ def allreduce[
         )
 
 
+@always_inline
+def _split_blocks[dtype: DType, W: Int](numel: Int, per: Int) -> Int:
+    """Grid for both halves of the split allreduce: sized by the shard, capped
+    by the same one-wave rule the fused kernel uses (RESULTS.md block sweep).
+    The two halves need not agree -- see ordering note 2 above the kernels."""
+    var cap_blocks = (
+        _AR_BIG_BLOCKS if numel * size_of[dtype]() >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
+    )
+    return min(cap_blocks, max(1, (per // W + 1 + BLOCK - 1) // BLOCK))
+
+
+def _check_split[
+    dtype: DType, W: Int
+](
+    rank: Int,
+    world: Int,
+    ptr: Int,
+    numel: Int,
+    cap_bytes: Int,
+    generation: Int,
+    what: String,
+) raises -> Int:
+    """Shared preconditions of the two split entry points; returns `per`."""
+    _check_common(rank, world, cap_bytes, generation)
+    if numel < 0:
+        raise Error("collectives: numel must be >= 0")
+    if numel * size_of[dtype]() > cap_bytes:
+        raise Error("collectives: " + what + " message exceeds cap_bytes")
+    if ptr % 16 != 0:
+        # Same rule as `allreduce`: the payload loops use 16-byte vectors.
+        raise Error("collectives: " + what + " needs a 16-byte aligned buffer")
+    var per = _shard_per(numel, world, W)
+    if (world - 1) * per * size_of[dtype]() > cap_bytes:
+        # Cannot happen -- the compacted slot table is ~(world-1)/world of the
+        # message -- but the arena has no guard page, so check it anyway.
+        raise Error("collectives: split push slots exceed the region")
+    return per
+
+
+@always_inline
+def _launch_rs_stage[
+    dtype: DType, W: Int, NW: Int
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Int,
+    numel: Int,
+    per: Int,
+    world: Int,
+    rank: Int,
+    cap_bytes: Int,
+    generation: Int,
+) raises:
+    _enqueue_cached[_rs_stage_kernel[dtype, W, _UNROLL, NW]](
+        ctx,
+        stream,
+        String(t"rs_{dtype}_{NW}"),
+        _split_blocks[dtype, W](numel, per),
+        regions,
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=in_ptr),
+        Int64(numel),
+        Int64(per),
+        Int64(per * size_of[dtype]()),
+        Int64(_SIGNAL_BYTES),
+        Int64(_SIGNAL_BYTES + cap_bytes),
+        Int32(world),
+        Int32(rank),
+        _flag_target(generation, 0),
+        UInt64(DEFAULT_TIMEOUT_NS),
+    )
+
+
+@always_inline
+def _launch_ag_finish[
+    dtype: DType, W: Int, NW: Int
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    out_ptr: Int,
+    numel: Int,
+    per: Int,
+    world: Int,
+    rank: Int,
+    cap_bytes: Int,
+    scale: Float32,
+    generation: Int,
+) raises:
+    _enqueue_cached[_ag_finish_kernel[dtype, W, _UNROLL, NW]](
+        ctx,
+        stream,
+        String(t"agf_{dtype}_{NW}"),
+        _split_blocks[dtype, W](numel, per),
+        regions,
+        Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=out_ptr),
+        Int64(numel),
+        Int64(per),
+        Int64(_SIGNAL_BYTES + cap_bytes),
+        Int32(world),
+        Int32(rank),
+        _flag_target(generation, 0),
+        scale,
+        UInt64(DEFAULT_TIMEOUT_NS),
+    )
+
+
+def reduce_scatter_stage[
+    dtype: DType
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    in_ptr: Int,
+    numel: Int,
+    cap_bytes: Int,
+    generation: Int,
+) raises:
+    """First half of a hierarchical allreduce: push + local reduce, on `stream`.
+
+    When the enqueued work completes, this rank's shard --
+    `shard_range(numel, world, rank, size_of[dtype]())` -- summed (SUM,
+    **unscaled**) over the `world` node-local ranks, sits in this rank's own
+    stage_out, at element offset `offset` from `region + signal_bytes() +
+    cap_bytes`. The caller then runs the inter-node collective in place on
+    exactly that range, on this same stream, and calls `allgather_finish` with
+    `generation + 1`.
+
+    `rank` / `world` / `regions` are the node-local group. Preconditions are
+    `allreduce`'s: 16-byte aligned `in_ptr`, `numel * size_of[dtype]() <=
+    cap_bytes`, strictly increasing `generation`.
+    """
+    comptime W = 16 // size_of[dtype]()
+    var per = _check_split[dtype, W](
+        rank, world, in_ptr, numel, cap_bytes, generation, "reduce_scatter"
+    )
+    if numel == 0:
+        return
+    var rp = _region_ptrs(regions, rank, world)
+    # world == 1 needs no special case: the push loop is empty, the sync is a
+    # self-rendezvous and the reduce copies the input into stage_out.
+    if world == 8:
+        _launch_rs_stage[dtype, W, 8](
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+        )
+    elif world == 4:
+        _launch_rs_stage[dtype, W, 4](
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+        )
+    elif world == 2:
+        _launch_rs_stage[dtype, W, 2](
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+        )
+    else:
+        _launch_rs_stage[dtype, W, 0](
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+        )
+
+
+def allgather_finish[
+    dtype: DType
+](
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    out_ptr: Int,
+    numel: Int,
+    cap_bytes: Int,
+    scale: Float32,
+    generation: Int,
+) raises:
+    """Second half: start barrier, then pull every rank's shard, on `stream`.
+
+    The start barrier is also the wait for the peers' inter-node steps -- a
+    peer publishes this generation's flags from inside this kernel, which its
+    stream runs only after that step. Then rank p's shard is read from p's
+    stage_out (mine included, since the inter-node step rewrote it) into
+    `out_ptr` at the same element offset, times `scale` (ignored for integer
+    dtypes). Same `numel`, `world` and preconditions as the matching
+    `reduce_scatter_stage`; `generation` is that call's plus one.
+
+    In place is safe: `out_ptr` may be the `in_ptr` the matching
+    `reduce_scatter_stage` read, because the two are separate launches on one
+    stream and no rank ever touches another rank's user memory.
+
+    No exit protocol is needed: the next collective's start barrier already
+    orders any arena reuse after every peer's pulls.
+    """
+    comptime W = 16 // size_of[dtype]()
+    var per = _check_split[dtype, W](
+        rank, world, out_ptr, numel, cap_bytes, generation, "allgather_finish"
+    )
+    if numel == 0:
+        return
+    var rp = _region_ptrs(regions, rank, world)
+    if world == 8:
+        _launch_ag_finish[dtype, W, 8](
+            ctx, stream, rp, out_ptr, numel, per, world, rank, cap_bytes, scale,
+            generation,
+        )
+    elif world == 4:
+        _launch_ag_finish[dtype, W, 4](
+            ctx, stream, rp, out_ptr, numel, per, world, rank, cap_bytes, scale,
+            generation,
+        )
+    elif world == 2:
+        _launch_ag_finish[dtype, W, 2](
+            ctx, stream, rp, out_ptr, numel, per, world, rank, cap_bytes, scale,
+            generation,
+        )
+    else:
+        _launch_ag_finish[dtype, W, 0](
+            ctx, stream, rp, out_ptr, numel, per, world, rank, cap_bytes, scale,
+            generation,
+        )
+
+
 def broadcast(
     ctx: DeviceContext,
     stream: DeviceStream,
@@ -1138,7 +1747,7 @@ def broadcast(
     cap_bytes: Int,
     generation: Int,
 ) raises:
-    """recv on every rank <- send on `root`, dtype-agnostic, on `stream`.
+    """Every rank's `recv` <- `root`'s `send`, dtype-agnostic, on `stream`.
 
     Out-of-place capable: `send_ptr` and `recv_ptr` may differ (only the root
     reads `send_ptr`). `nbytes` must be <= `cap_bytes`; the caller chunks
@@ -1189,7 +1798,7 @@ def allgather(
     generation: Int,
     stride_bytes: Int = -1,
 ) raises:
-    """out[r*stride_bytes ...] <- rank r's `nbytes_per_rank` input, on `stream`.
+    """Gather: `out[r*stride_bytes ...]` <- rank r's input, on `stream`.
 
     `stride_bytes` defaults to `nbytes_per_rank` and is the output layout's
     true per-rank size, which differs when the caller splits one rank's
