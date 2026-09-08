@@ -21,10 +21,11 @@
 # kernel lands.
 
 from std.ffi import OwnedDLHandle
+from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
 from std.utils import StaticTuple
-from max.gpu.host import DeviceContext, DeviceStream
+from max.gpu.host import DeviceContext, DeviceBuffer, DeviceStream
 
 from driver import (
     HANDLE_BYTES,
@@ -174,6 +175,51 @@ def _wrap_stream(ctx: DeviceContext, handle: Int64) raises -> DeviceStream:
     return ctx.create_external_stream(
         OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(handle))
     )
+
+
+def _copy_error_word(
+    dst: Pointer[UInt64, MutAnyOrigin], src: Pointer[UInt64, MutAnyOrigin]
+):
+    """One-thread device kernel: copies the error word out of a region's
+    signal area -- raw driver memory (`cuMemAlloc`/`hipExtMallocWithFlags`),
+    not host-accessible -- into a proper `DeviceBuffer` `enqueue_copy` can
+    D2H-copy from. Mirrors the production kernel harness's `_copy_u64`
+    (kernel/harness.mojo, `check_error`): the error word cannot be read by
+    dereferencing a host pointer at the region address, that faults or reads
+    garbage.
+    """
+    if global_idx.x == 0:
+        dst[unsafe_offset=0] = src[unsafe_offset=0]
+
+
+def _read_error_word(
+    ctx: DeviceContext, stream: DeviceStream, region: Int
+) raises -> UInt64:
+    """The UInt64 error word at `region + error_offset()`, fetched to the
+    host via a real device-to-host copy (see `_copy_error_word`).
+
+    Enqueues the copy kernel on `stream` -- ordered after whatever
+    collective on it last wrote the word -- then a D2H `enqueue_copy`, then
+    blocks for both. Callers that need the fully up-to-date word (a peer's
+    in-flight barrier timeout, not just what already landed) must
+    synchronize `stream` themselves first, as `ncclCommGetAsyncError` does.
+    """
+    var src = Pointer[UInt64, MutAnyOrigin](
+        unsafe_from_address=region + error_offset()
+    )
+    var dev_word = ctx.enqueue_create_buffer[DType.uint64](1)
+    var compiled = ctx.compile_function[_copy_error_word]()
+    stream.enqueue_function(
+        compiled,
+        dev_word.unsafe_ptr(),
+        src,
+        grid_dim=(1, 1, 1),
+        block_dim=(32, 1, 1),
+    )
+    var host_word = unsafe_alloc[UInt64](1)
+    ctx.enqueue_copy(host_word, dev_word)
+    ctx.synchronize()
+    return host_word[unsafe_offset=0]
 
 
 # ---------------------------------------------------------------------------
@@ -392,13 +438,18 @@ def ncclCommGetAsyncError(
         if state.aborted:
             err_out[] = NCCL_SYSTEM_ERROR
             return NCCL_SUCCESS
-        if state.last_stream != 0:
-            var s = _wrap_stream(state.ctx, state.last_stream)
-            s.synchronize()
-        var err_word = Pointer[UInt64, MutAnyOrigin](
-            unsafe_from_address=state.regions[state.rank] + error_offset()
+        # Synchronize first: the freshest read this cheaply-checkable word
+        # can give is "everything enqueued so far landed", same as before --
+        # only the read itself changes, from a host dereference of device
+        # memory (wrong) to a real D2H copy (_read_error_word).
+        var s = (
+            _wrap_stream(state.ctx, state.last_stream)
+            if state.last_stream != 0
+            else DeviceStream(state.ctx)
         )
-        err_out[] = NCCL_REMOTE_ERROR if Int(err_word[]) != 0 else NCCL_SUCCESS
+        s.synchronize()
+        var word = _read_error_word(state.ctx, s, state.regions[state.rank])
+        err_out[] = NCCL_REMOTE_ERROR if Int(word) != 0 else NCCL_SUCCESS
         return NCCL_SUCCESS
     except e:
         return NCCL_INTERNAL_ERROR
