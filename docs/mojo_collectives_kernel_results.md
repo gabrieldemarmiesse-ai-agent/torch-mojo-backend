@@ -305,32 +305,41 @@ are OOM-killed on this APU, and with it the process segfaults in HIP's atexit
 handler unless the script ends in `os._exit(0)` — both already in
 `docs/distributed.md`.
 
-**The flake.** `allreduce.int64` — a *one-element* int64 allreduce, which
-takes the one-shot path with a single 8-byte store and a single 8-byte load,
-one block, one active thread — fails intermittently **at 2 ranks**. Measured
-today: 2 failures in 14 runs of `ddp_worker.py collectives` at 2 ranks; every
-4-rank run of every mode passed, and 8 consecutive 2-rank repeats passed
-before one failed. It is the smallest and most latency-sensitive collective in
-the suite, and the first failing check in the file, so a run either fails
-immediately or not at all.
+**A flake that cost the large messages 6%.** During the work the barrier's
+acquire was cheapened: spin on a *relaxed* load (still `sc0 sc1`, so it cannot
+read a stale flag) and issue one acquire fence after the wait, instead of an
+acquire load — and therefore a whole-L1-and-L2 `buffer_inv` — on every
+iteration. It looks exactly as strong and it is worth a lot: 243 µs against
+465 at 27 MiB with a 1024-block grid, because the per-iteration invalidate
+throws the payload out of L2 for every block still working.
 
-What is known and what is not:
+With it, `allreduce.int64` — a *one-element* int64 allreduce, the smallest
+collective in the suite: one-shot path, one block, one 8-byte store and one
+8-byte load by a single thread — failed intermittently **at 2 ranks**:
+2 failures in 13 runs of `ddp_worker.py collectives`. Every 4-rank run of
+every mode passed. With the acquire load restored: **0 failures in 12 runs**
+(`perf-work/flake.sh`, same node, same session).
 
-* the one-shot kernel itself is **unchanged** by this work; the only thing
-  under it that changed is `_sync`'s acquire (relaxed spin plus one acquire
-  fence after the wait, instead of an acquire load per iteration), so that is
-  the first suspect;
-* the same rare failure was also seen with the *intermediate* barrier (the one
-  that moved the release writeback after the block barrier), alongside
-  reproducible broadcast failures that the shipped barrier fixed;
-* **whether the pre-MI300A tree also flakes here was not established.** The
-  A/B was attempted (`perf-work/flake.sh`, 8 runs per tree) and the
-  before-tree half is void: those runs die in `ncclCommInitRank` with
-  `ncclResult_t=3` in this harness, which is a harness problem, not a result.
+Neither sample proves anything on its own — Fisher's exact on 2/13 against
+0/12 is p ≈ 0.5. It is reverted anyway, and the reasoning is worth recording
+because it is the lesson of the day rather than a number:
 
-Next step for whoever picks this up: run `perf-work/flake.sh` a few dozen
-times on the shipped tree and on the same tree with the acquire reverted to
-`Atomic.load[ACQUIRE]` in the spin — a couple of hundred runs will separate a
-pre-existing race from one introduced here, and the acquire is the only knob
-between them. Do not read the current numbers as clearing it.
+* the one-shot kernel is **unchanged** by this work, so the only thing that
+  could have introduced a failure under it is the barrier;
+* the argument for the cheap acquire was a symmetry ("the invalidate after the
+  loop is at the same point as the invalidate in the last iteration"), not a
+  guarantee — and that exact style of reasoning produced **two** unsound
+  release spellings earlier the same day, both of which broke only the small
+  collectives, which is precisely what this is;
+* a rare silent wrong answer inside an allreduce costs incomparably more than
+  75 µs on a 168 MiB message.
+
+**What was not established**: whether the pre-MI300A tree flakes here too. The
+A/B was attempted (`perf-work/flake.sh`, 8 runs per tree) and the before-tree
+half is void — those runs die in `ncclCommInitRank` with `ncclResult_t=3` in
+that harness, a harness problem rather than a result. So it is still unknown
+whether this is a pre-existing race that the cheap acquire merely made more
+likely. Settling it needs a few hundred runs of the 2-rank `collectives` mode
+on both trees with the before-tree harness fixed; the shipped tree at
+0/12 is not evidence of absence.
 
