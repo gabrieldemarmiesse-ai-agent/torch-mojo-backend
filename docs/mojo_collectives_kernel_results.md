@@ -261,6 +261,533 @@ The crossover sits just above 512 KiB, so `_ONESHOT_MAX_BYTES = 512 KiB`. Below
   both allreduces in place so a single corrupted generation survives to the end
   — is the regression test.
 
+## 7. Correctness
+
+`harness.mojo verify` (job 233776, 94 passing cases) checks every result against
+a host reference recomputed from the same deterministic splitmix64 fill (no
+RNG):
+
+* dtypes float32, bfloat16, float16, int32, int64 — world 8; plus float32 world
+  4, 2 and **1**, int64 world 3, bfloat16 world 5, int32 world 7 (odd worlds
+  take the runtime-`world` kernel instantiation; world 1 degenerates to
+  `out = scale * in` and is exercised, not special-cased away).
+* sizes 1, 2, 3, 1003, one page, 65537 and `(cap−1)/element_size` elements — i.e.
+  ragged, non-multiples of the 16-byte vector width, and the 4-byte case.
+* every size run twice: out-of-place and **in-place** (`in_ptr == out_ptr`).
+* float32 is checked **exactly** (the fill is k/128 with |k| ≤ 128, so the sum of
+  8 is exact in fp32 and the ×1/8 scale is a power of two); bf16/fp16 to half a
+  bf16 ulp; **int64 against an Int64 reference with samples of magnitude 2⁵⁶**,
+  which no fp64 reference could verify.
+* the region's error word is read back after every case (it stays 0).
+
+`harness.mojo mix` is the interleaving regression test: 200 rounds x (4-byte
+one-shot allreduce, 27 MiB two-shot allreduce, 2000-byte broadcast, 8-byte
+allgather) = **800 generations** whose staging layouts overlap, both allreduces
+in place with `scale = 1/world` so the value is idempotent once every rank holds
+the mean and a single corrupted generation anywhere in the run is still visible
+in the final buffer. Passes for float32 and bfloat16 at world 8, float32 at world 4 and bfloat16 at
+world 5 (jobs 233776, 233789, 233794). This is the test that the start barrier
+exists for.
+
+Broadcast and allgather results are checked byte-for-byte against the same hash
+(sampled every 997 bytes) in the `ops` suite.
+
+## 8. Build
+
+Both targets build from the one file, no vendor `#ifdef` in the device code:
+
+```
+uv run --no-sync mojo build harness.mojo -I . --target-accelerator sm_90a  -D dtype=float32 -o harness_float32
+uv run --no-sync mojo build harness.mojo -I . --target-accelerator gfx942  -D dtype=float32 -o harness_f32_gfx942
+```
+
+`collectives_kernels.mojo` compiles warning-free on both. The emitted device
+code is what NCCL/RCCL rely on (`asm/` holds the dumps, produced by
+`dump_asm.mojo` with no GPU present):
+
+| | sm_90a | gfx942 |
+|---|---|---|
+| flag publish | `st.release.sys.global.b64` | `global_store … sc0 sc1` + `buffer_wbl2 sc0 sc1` |
+| flag wait | `ld.acquire.sys.global.b64` | `global_load … sc0 sc1` + `buffer_inv sc0 sc1` |
+| payload | `ld/st.global.v4.b32` (18/12 in the allreduce) | `global_load/store_dwordx4` (18/12) |
+| block barrier | `bar.sync` | `s_barrier` |
+| deadline | `%globaltimer` | `s_memrealtime` |
+
+Blocks are 256 threads (RCCL's gfx942 maximum) and every layout is wave-64
+safe. The file has exactly **one** comptime vendor gate, in `_sync`: gfx942
+emits its workgroup barrier as `s_waitcnt lgkmcnt(0); s_barrier`, which does
+*not* wait on vector memory, so another wave's payload stores can still be in
+flight when one thread publishes the flag. RCCL solves this by putting
+`vmcnt(0)` inside its block barrier; the portable spelling is a release fence
+in every thread, which lowers to `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`.
+NVIDIA needs nothing there (`bar.sync` is a CTA-scope fence and the release
+store is cumulative over it — what NCCL's `postPeer` relies on), and the gate
+is comptime, so the sm_90a instruction mix is byte-identical with and without
+it (checked by diffing the dumps).
+
+AMD numbers are unmeasured (no MI300A here). Two things the AMD host side will
+need, from RCCL's source: the region must be allocated **uncached**
+(`hipExtMallocWithFlags(hipDeviceMallocUncached)`) — RCCL's precondition for
+polled flags on MI300 — and the tuning constants above are H100 fits and are
+marked as such in the source.
+
+## 9. What the ABI layer needs to know
+
+(§10 adds three more names for the multi-node path; everything below applies to
+them unchanged.)
+
+Six exported names, matching the contract exactly: `signal_bytes`,
+`error_offset`, `region_init(ctx, region)` (no stream — it blocks),
+`allreduce[dtype](ctx, stream, ...)`, `broadcast(...)`,
+`allgather(..., stride_bytes=-1)`. `MAX_WORLD = 8`. Everything is enqueued on
+the stream passed in and returns right after the enqueue; `ctx` is only the
+compile/cache handle (`DeviceFunction`s are cached process-globally per
+`ctx.id()`, so the per-call cost is the enqueue, not a ~180 us
+`compile_function`).
+
+Preconditions the file enforces by raising, all of them cheap host-side checks:
+
+* `numel * size_of[dtype]() <= cap_bytes`, `nbytes <= cap_bytes`,
+  `nbytes_per_rank <= cap_bytes` — the caller chunks anything larger (it does).
+* **`in_ptr` and `out_ptr` of `allreduce` must be 16-byte aligned.** The payload
+  loops use 16-byte vectors, which fault on a misaligned address. Every
+  allocator-returned pointer satisfies this and so does every chunk offset the
+  ABI layer forms (they are multiples of `cap_bytes`); a mid-tensor *view* may
+  not, and such a tensor must be staged into an aligned buffer by the caller
+  rather than have the kernel guess. `broadcast`/`allgather` need no such rule —
+  the byte copier checks alignment at run time and falls back to a scalar loop.
+* `world` in `1..8` (world 1 works and degenerates to `out = scale * in`),
+  `rank < world`, `generation >= 1`, `cap_bytes` a positive multiple of 4096.
+* `scale` is applied on the final write for floating-point dtypes and ignored
+  for integers (the caller passes 1.0 there, which is what NCCL's `ncclAvg`
+  does anyway).
+
+Two notes on the surrounding layer:
+
+* **The error word is device memory.** `error_offset()` is a byte offset into
+  the region, which is `cuMemAlloc`/`hipMalloc` memory: it cannot be read by
+  dereferencing a host pointer (that faults or reads garbage). Copy it back with
+  `cuMemcpyDtoH` / a one-thread kernel, as `harness.mojo`'s `check_error` does.
+  A nonzero value is `code * 1_000_000 + phase` and means some block gave up
+  waiting for a peer (60 s deadline, measured with the GPU's own timer, never
+  compared across GPUs); the collective's result is undefined from that
+  generation on.
+* `generation` must be strictly increasing per communicator **across all
+  collective kinds** — the flag values are `generation * 8 + phase` and the
+  start barrier's whole job is to order one generation's writes after the
+  previous generation's reads. A repeated or decreasing generation silently
+  passes barriers it should not.
+
+## 10. Split allreduce for the multi-node path (job 233937)
+
+The hierarchical allreduce of §7 of the feasibility study needs the intra-node
+allreduce cut in half so the vendor library can allreduce one shard across
+nodes in between. Three names were added; the six existing exports are
+untouched (their device code is **byte-identical** before and after -- checked
+by diffing `asm/{ar2,ar1,bcast,ag}_{sm_90a,gfx942}.asm` against a build of the
+previous file).
+
+```
+shard_range(numel, world, rank, elem_bytes) -> (offset_elems, count_elems)
+reduce_scatter_stage[dtype](ctx, stream, rank, world, regions, in_ptr,
+                            numel, cap_bytes, generation)
+allgather_finish[dtype](ctx, stream, rank, world, regions, out_ptr,
+                        numel, cap_bytes, scale, generation)
+```
+
+`rank`/`world`/`regions` are the **node-local** group. The sequence per bucket:
+
+```
+reduce_scatter_stage(g)        push + local reduce; my shard, SUM over the
+                               node times `scale` (default 1), lands in MY
+                               stage_out
+<vendor allreduce, in place>   region + signal_bytes() + cap_bytes
+                               + offset*elem_bytes, count elements, SAME stream
+allgather_finish(g+1)          start barrier, then pull every rank's shard
+                               (mine included) into out_ptr, times `scale`
+```
+
+Preconditions are `allreduce`'s (16-byte aligned buffer, `numel*elem_bytes <=
+cap_bytes`, strictly increasing generation); the pair costs **two**
+generations. `out_ptr` may be the same buffer as `in_ptr`.
+
+### 10.1 Shard placement
+
+`shard_range` is a different partition from the fused kernel's and
+deliberately so: equal shards of `per` elements with `per` rounded up to the
+16-byte vector width, the last non-empty shard short, ranks past the end
+empty. Every offset is therefore 16-byte aligned, every rank derives the same
+table from `(numel, world, elem_bytes)` alone, and the ABI layer can state the
+inter-node collective's arguments in one line. Imbalance against the fused
+kernel's balanced split is at most one 16-byte vector per rank.
+
+The shard sits in stage_out **at its own element offset**, i.e. stage_out is an
+image of the whole buffer of which only my shard is live. The push slots go at
+the base of stage_in and are *compacted* to `world-1` (rank s never writes its
+own slot): `world` uncompacted slots can be up to `16*world` bytes larger than
+stage_in when `numel*elem_bytes == cap_bytes`, which would spill onto rank 0's
+shard in stage_out. Checked exhaustively over every dtype width, world and cap.
+
+### 10.2 The three ordering questions, and why no new protocol was needed
+
+1. **A foreign library rewrites my stage_out shard between the two calls.**
+   `allgather_finish`'s start barrier is the fence: a rank publishes its
+   generation g+1 flags only from inside that kernel, which its stream starts
+   only after its inter-node op completed. Seeing peer p's flag therefore
+   implies p's shard is final.
+2. **Peer p's shard was written by a previous kernel**, not by the thread that
+   publishes the flag. Stream order puts that kernel's writes happen-before the
+   release store, and the release/acquire pair is system-scoped and cumulative,
+   so the acquiring reader sees them (on gfx942 `_sync`'s AMD-only release
+   fence supplies the `buffer_wbl2 sc0 sc1` the workgroup barrier omits). The
+   consequence is worth stating: block-index matching, which the fused kernel
+   needs *within* one launch, is **not** needed across this boundary, so the
+   two halves may be launched with different grids -- and they are.
+3. **Arena reuse after the pulls.** Nothing new: the next collective of any
+   kind opens with a start barrier and a rank reaches it only after its own
+   `allgather_finish` retired, so no generation g+2 write can race a generation
+   g+1 pull. The split pair just spends two generations. The existing
+   buffer-reuse invariant covers it as written -- verified, not assumed, by the
+   extended `mix` below.
+
+The ABI layer now runs several such pairs CONCURRENTLY, to overlap the
+inter-node hop with the intra-node halves of other chunks (see the
+"Multi-node" subsection of `docs/distributed.md`). It needs nothing from this
+file to do it: each in-flight chunk is handed a different arena -- a shifted
+region base and a smaller `cap_bytes`, carved so the arenas are disjoint --
+so every rule above applies per arena, unchanged, and point 3 is what orders
+one arena's reuse `PIPE_ARENAS` chunks later. Generations stay strictly
+increasing globally (two are reserved per chunk, so a chunk's all-gather is
+still its own reduce-scatter's plus one) and therefore per arena.
+
+### 10.3 Split vs fused, 8xH100 SXM, 1980 MHz (job 233937)
+
+`harness.mojo split` runs, per size, five legs back to back in one process:
+the fused `allreduce`; each half alone (both are legal standalone collectives);
+the stand-in inter-node step alone, so it can be subtracted; and the whole
+pair. Device time from `%globaltimer` stamps on the stream, 20 back-to-back
+launches x 5 reps, median, max over ranks, three interleaved rounds.
+
+fp32, world 8 (us):
+
+| bytes | fused | rs stage | stub | ag finish | **pair** | pair-fused | minus stub |
+|---|---|---|---|---|---|---|---|
+| 4 B | 9.5 | 8.8 | 2.1 | 7.1 | **17.6** | +8.1 | +5.9 |
+| 9 MiB | 64.7 | 36.3 | 3.1 | 35.5 | **74.8** | +10.1 | +7.1 |
+| **27 MiB** | 162.7 | 89.6 | 3.7 | 93.6 | **186.3** | +23.7 | +19.9 |
+| 168 MiB | 935.4 | 507.2 | 9.8 | 492.4 | **1003.9** | +68.5 | +58.8 |
+| 512 MiB | 2777.6 | 1513.2 | 60.7 | 1457.9 | **3025.8** | +248.2 | +187.5 |
+
+bf16, world 8 (us):
+
+| bytes | fused | rs stage | stub | ag finish | **pair** | pair-fused | minus stub |
+|---|---|---|---|---|---|---|---|
+| 4 B | 9.6 | 8.9 | 2.3 | 7.0 | **17.9** | +8.3 | +6.1 |
+| 9 MiB | 64.7 | 36.3 | 3.3 | 35.5 | **74.9** | +10.2 | +6.9 |
+| **27 MiB** | 162.4 | 89.7 | 4.2 | 93.6 | **187.9** | +25.4 | +21.3 |
+| 168 MiB | 935.9 | 503.1 | 11.6 | 491.5 | **1012.2** | +76.3 | +64.7 |
+| 512 MiB | 2778.8 | 1501.4 | 101.2 | 1458.8 | **3057.7** | +278.9 | +177.7 |
+
+The stand-in is a one-pass read-modify-write of the shard on the same stream
+(it adds a rank-independent constant, so the verify can tell "the inter-node
+step ran" from "it was skipped"); a real `ncclAllReduce` over `nNodes` costs
+much more, and these columns exist so it can be substituted rather than
+guessed at.
+
+**Net of the stand-in the pair costs +6 to +8 us up to 9 MiB and +6-7% at
+168-512 MiB**, i.e. the promised "fused plus one launch" at small and medium
+sizes, growing to a percentage at the bandwidth-bound end. Where it goes:
+
+* one extra kernel launch and one extra 8-way start barrier (~6 us, and that
+  is the whole story at 4 B and 9 MiB);
+* `allgather_finish` pulls **`world`** shards, not `world-1`: my own shard has
+  to come back out of my stage_out because the inter-node step rewrote it,
+  where the fused kernel wrote its own shard straight to the user output during
+  the reduce. That is `bytes/world` of extra local read at every size, and it
+  is the term that grows.
+
+Neither half is slow in itself: `ag finish` at 27 MiB (93.6 us) matches the
+standalone `allgather` collective on the same per-rank size (96-98 us, §4), and
+`rs stage` (89.6) is its mirror image. The split simply cannot amortise the
+second launch the way one kernel does. Whether that matters is a question for
+the ABI layer: at the 9 MiB and 27 MiB DDP buckets it is +7 and +20 us against
+an inter-node leg of 60-90 us.
+
+### 10.4 Correctness
+
+`harness.mojo split` verifies against a host reference recomputed from the same
+deterministic splitmix64 fill, with the stand-in's constant folded into the
+expectation -- so a pair that silently skipped the inter-node step fails, and
+does not merely look like a rounding difference. 116 passing cases:
+
+* dtypes float32, bfloat16, float16, int32, int64 at world 8; float32 at world
+  4, 2 and **1**; bfloat16 world 5, int64 world 3, int32 world 7 (odd worlds
+  take the runtime-`world` kernel instantiation).
+* eight sizes per configuration, chosen ragged: 1, 2, 3, 6, 1003, 65537,
+  7079424 (27 MiB) and 16777215 elements at fp32, and the corresponding counts
+  at the other widths -- i.e. non-multiples of the 16-byte vector width, sizes
+  smaller than `world` (so most shards are empty), and `cap-4` bytes.
+* each size also re-checked after the timing legs, whose last leg is the pair
+  with a zero stand-in -- a plain allreduce, checked as one.
+* float32 is checked exactly. bf16/fp16 get a wider band than the fused path
+  and have to: the split stores the node-local sum in the *wire* dtype (the
+  vendor library reduces that buffer, so it cannot stay in fp32) and rounds
+  again on the scaled pull, where the fused kernel rounds once. That is a
+  property of the hierarchical algorithm, not of this implementation -- NCCL's
+  own hierarchical paths do the same.
+* the region's error word is read back after every case (stays 0).
+
+`harness.mojo mix` now rotates **eight** generations per round instead of four:
+4-byte one-shot allreduce, 27 MiB two-shot allreduce, 2000-byte broadcast,
+8-byte allgather, then a 4-byte split pair and a 27 MiB split pair, each with
+the stand-in kernel running between its halves. The split pairs run in place
+with a zero stand-in so they stay idempotent like the fused calls and a single
+corrupted generation anywhere in the run still survives to the final check.
+**200 rounds = 1600 generations**, passing for float32 and bfloat16 at world 8,
+float32 at world 4 and bfloat16 at world 5. This is the test that the
+buffer-reuse invariant of §10.2(3) actually holds with a foreign kernel writing
+the arena mid-collective.
+
+### 10.5 Build
+
+Both new kernels build warning-free for both targets from the same source
+(`./build.sh`, which now also dumps `asm/rs_*.asm` and `asm/agf_*.asm`):
+
+| | sm_90a | gfx942 |
+|---|---|---|
+| `_rs_stage_kernel` payload | 13 `ld.global.v4.b32` / 6 `st.global.v4.b32` | 13 `global_load_dwordx4` / 6 `global_store_dwordx4` |
+| `_ag_finish_kernel` payload | 10 / 10 | 10 / 10 |
+| flags | 3 `st.release.sys.global` + 4 `ld.acquire.sys.global` | `buffer_wbl2 sc0 sc1` / `buffer_inv sc0 sc1` |
+| local/scratch traffic | none | none |
+
+Zero `ld.local` / `scratch_` in either kernel on either target, i.e. the
+MOCO-1431 pointer-array trap of §6 was avoided here too (slot addresses are
+formed arithmetically inside the unrolled loop).
+
+Reproduce: `sbatch split.sbatch`, then
+`python3 split_report.py /home/gabriel/ddp_work/logs/split_<jobid>`.
+Raw logs: `/home/gabriel/ddp_work/logs/ccl_split_233937.log` and
+`/home/gabriel/ddp_work/logs/split_233937/*.txt` (every rank's CSV).
+
+---
+
+# MI300A (gfx942), 4 ranks — 2026-09-09
+
+One Adastra node, 4 × MI300A (gfx942, 228 CUs, ROCm 6.4.3), CPU torch 2.11,
+MAX 26.5. Reference: RCCL 2.22.3 from the same ROCm install, through the same
+process group. All device times are the streamed statistic `ar_bench.py`
+prints: 20 back-to-back collectives on the comm stream, one synchronize,
+wall/20, max over ranks of the median of 5 repetitions — the number comparable
+to torch-profiler GPU time. Legs are interleaved RCCL, mojo, mojo, RCCL.
+
+Clocks were **not** locked: `rocm-smi --setperfdeterminism` needs privileges a
+job step does not have on this cluster, and the node is shared. The ABBA
+ordering is what bounds the drift; run-to-run spread on repeated points was
+under 4%.
+
+## 1. The link-direction probe
+
+`perf-work/linkbw.mojo` — one process, four `DeviceContext`s, raw
+`hipExtMallocWithFlags` buffers, peer access enabled between every pair, timed
+with HIP events on each device's own stream, deterministic hash fill and
+host-verified samples. The copy loop is `_copy_vec`'s exact shape (16-byte
+vectors, 4 in flight, 256-thread blocks, grid-stride). Per-GPU GB/s:
+
+| mode | 4 MiB | 11733296 B | 27 MiB | 168 MiB |
+|---|---|---|---|---|
+| local HBM copy | 332 | 1028 | 1674 | 1453 |
+| local copy, source = the **uncached** region | 293 | 928 | 1630 | 1434 |
+| one link, write (GPU0 → GPU1) | 80 | 90 | 91 | 91 |
+| one link, read (GPU0 ← GPU1) | 80 | 87 | 88 | 90 |
+| ring of writers (each → successor) | 79 | 87 | 88 | 91 |
+| ring of readers (each ← successor) | 46 | 49 | 52 | 56 |
+| **all-to-all writes (3 peers)** | 208 | 222 | **238** | **233** |
+| **all-to-all reads (3 peers)** | 88 | 83 | **81** | **93** |
+| all-to-all writes + a second local store | 200 | 177 | 223 | 218 |
+
+Three facts come out of it:
+
+1. One xGMI link direction does ~91 GB/s either way.
+2. **Writes scale across the three links; reads do not.** Three outbound
+   streams reach 233–238 GB/s, three inbound reads 81–93, and a ring of
+   simultaneous readers *falls* to 52–56. A GPU-initiated remote load is
+   limited per GPU, not per link.
+3. 233 GB/s is RCCL's number: 512 MiB in 3410 µs at world 4 is 236 GB/s of
+   busbw. RCCL's P2P transport hard-wires `read = 0` on AMD
+   (`rccl:src/graph/paths.cc:441`).
+
+Reading the uncached region locally costs nothing (1434 vs 1453 GB/s), which
+is what makes the redesign below affordable. Region memory type was swept
+separately: `hipDeviceMallocUncached` beats plain `hipMalloc` at 4 MiB
+(208 vs 178 GB/s of all-to-all write) and ties at 27 and 168 MiB.
+
+## 2. The redesign: nothing crosses a link in the read direction
+
+`_ar_twoshot_kernel` on AMD (NVIDIA is untouched, §5):
+
+| | phase 1 | phase 2 | phase 3 |
+|---|---|---|---|
+| NVIDIA | push shard *s* into peer *s*'s slot | reduce my shard → my region + user output | **pull** the peers' reduced shards into the user output |
+| AMD | same | reduce my shard → user output **and every peer's gather slot** | **local copy** of my own gather slots into the user output |
+
+Cross-link traffic is identical — `2(world-1)/world × bytes` per GPU, the
+unicast minimum — and only its direction changes. The user's output is a MAX
+allocation and cannot be IPC-mapped, so a peer cannot write it directly; that
+is the whole reason for the local copy, and at 0.75 × message and 1434 GB/s it
+costs ~90 µs at 168 MiB against the ~1130 µs the wire needs.
+
+The phase-2 stores are fused: one reduce, `world` stores (the user output slice
+plus each peer's gather slot), which is NCCL's `MULTIDSTS` shape
+(`rccl:src/device/common_kernel.h`, `reduceCopyPacks` stores to every
+destination from one accumulator). gfx942 emits it as four
+`global_store_dwordx4` from one `v[20:23]`. Doing it as a second pass over the
+shard instead measured 1437 µs at 168 MiB against 1332 for the fused form
+(128 blocks, both with the same fence).
+
+Arena: the `world` push slots are unchanged and the area that held the single
+reduced shard on NVIDIA holds `world-1` compacted gather slots on AMD, at the
+same base offset. `world*slot` is already about `numel*elem` ≤ cap, so a full
+`world` more slots would not fit a `2*cap` arena at the largest message; the
+compaction (writer *w* uses slot `w if w < owner else w-1`, the same rule the
+split allreduce already used for its push slots) bounds the total at
+`cap*(2 - 1/world)`.
+
+The all-gather and the broadcast's gather half became pushes for the same
+reason. The all-gather needs `world-1` message-sized slots rather than one, so
+`allgather_max_bytes` chunks at `2*cap/(world-1)` on AMD and stays the
+identity on NVIDIA. The broadcast keeps its scatter and adds a push phase and
+one more sync: root scatters shard *p* into rank *p*'s region, every rank
+writes its shard into every other non-root rank's gather slot, everyone
+assembles locally.
+
+`_ag_finish_kernel` — the second half of the multi-node split allreduce — is
+the one collective still pulling. Converting it needs an extra sync inside the
+kernel (the vendor library rewrites the shard between the two halves, so the
+push cannot happen in the first one) and this engagement had no second node to
+measure or test it on, so it was left alone deliberately rather than changed
+blind.
+
+## 3. The barrier
+
+On gfx942 `Atomic.store[RELEASE]` lowers to `buffer_wbl2 sc0 sc1` + the store
+and `Atomic.load[ACQUIRE]` to the load + `buffer_inv sc0 sc1`. Both are
+**whole-cache** operations: `wbl2` writes the device's L2 back to memory,
+`inv` drops the CU's L1 and the device's L2. That makes the barrier expensive
+in proportion to the grid -- the acquire in particular sits inside the spin
+loop, so every polling thread invalidates the whole cache on every iteration
+and throws the payload out of L2 for every block still working: 27 MiB
+measured 243 microseconds at 128 blocks and 465 at 1024 with that spelling.
+
+**Three cheaper spellings were tried. All three are given up, and the shipped
+barrier is the one that was there before this work.** They are recorded
+because the pattern is the same every time and it is the lesson of the
+engagement: each looked provably equivalent, and each broke only the *small*
+collectives, where a payload is a few hundred bytes instead of megabytes and
+therefore does not drain out of a cache on its own.
+
+| spelling | 27 MiB allreduce | broadcast, 4 ranks | 1-element allreduce, 2 ranks |
+|---|---|---|---|
+| no release writeback at all (RCCL's `skip_fence`) | correct | **5 failures** | — |
+| release writeback moved after the barrier, into the `world` publishing threads | correct | correct | **fails** |
+| relaxed spin + one acquire fence after the wait | correct | correct | **2 failures in 13 runs** |
+| shipped: release fence in every thread, acquire load per iteration | correct | correct | 0 failures in 12 runs |
+
+RCCL's `skip_fence` (`rccl:src/include/rccl_common.h:262-273`, on for cudaArch
+940 when the buffers are uncached) is sound for RCCL and not for us: our region
+*is* `hipDeviceMallocUncached`, but the mapping a peer writes **through** comes
+from `hipIpcOpenMemHandle` and does not carry that memory type, so a few bytes
+can still be sitting in the writer's cache when the flag lands. The third row
+is the one that hurts -- it is worth 75 microseconds at 168 MiB and its
+failure evidence is weak (Fisher p about 0.5 against the fourth row) -- and
+section 7 explains why it went anyway.
+
+The one thing that did *not* have to be given up is the AMD `vmcnt(0)` drain
+that was already there: `fence[RELEASE]()` in every thread before the block
+barrier lowers to `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`, which is what
+makes a peer's payload visible before the flag it will be told about. RCCL
+puts the same `vmcnt(0)` inside its block barrier
+(`rccl:src/device/prims_simple.h:193-210`) for exactly this reason.
+
+## 4. Grid caps
+
+Both are fitted on this card and both are documented next to their
+definitions. `_AR_MAX_BLOCKS` (messages < 64 MiB) and `_AR_BIG_BLOCKS` (above)
+on AMD, fp32, 4 ranks, µs:
+
+| blocks | 9 MiB | 27 MiB | 168 MiB | 512 MiB |
+|---|---|---|---|---|
+| 64 | 118 | 285 | 1987* | 6638* |
+| **128** | **121** | **254** | 1330* | 4065* |
+| 160 | — | — | 1302* | 4804* |
+| 224 | 144 | 258 | 2224* | 6053* |
+| 456 | — | — | 1509 | 7177 |
+| **912** | — | — | **1221** | **3744** |
+
+(`*` measured with the intermediate barrier; the 456/912 rows and the small
+sizes are with the shipped one. The response is not monotonic — 224 is the
+worst point at the large sizes and 64 starves the 27 MiB transfer — so do not
+interpolate, re-sweep.) 912 is four waves of the 228 CUs. The best small-size
+value moved from 224 down to 128 when the release fence went back to every
+thread, because the grid cost there is the per-thread `buffer_wbl2`.
+
+## 5. NVIDIA is untouched
+
+Every behavioural difference is behind `has_amd_gpu_accelerator()` at compile
+time, in the kernel and in the two host lines that size the arena and chunk
+the all-gather. The arena layout and its capacity arithmetic are byte for byte
+what they were on NVIDIA (the AMD gather slots sit at the same base offset the
+single reduced shard used).
+
+Proof: `mojo build mojoccl.mojo --emit asm --target-accelerator sm_90a -I .
+-I ../../eager_kernels` in this tree and in the pre-MI300A tree, PTX sidecars
+compared with the 8-hex-digit mangling hash masked in both the file name and
+the body — **97 kernels before, 97 after, 0 only-before, 0 only-after, 0
+differing** (`perf-work/asm90_diff.py`).
+
+## 6. Headline: A/B against RCCL 2.22.3, 4 ranks
+
+Interleaved RCCL, mojo, mojo, RCCL in one job on one node, shipped constants
+and shipped barrier; each cell is the mean of that leg pair and both legs are
+given so the spread is visible. Device time in microseconds. Both legs run
+with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`: without it four ranks
+reserve ~124 GB each on this APU, the node runs out of memory and every leg
+reads hundreds of ms, which does not look like a measurement error.
+
+| dtype | size | RCCL | mojo | ratio | legs (RCCL / mojo) |
+|---|---|---|---|---|---|
+| fp32 | 1 MiB | 53.4 | 51.1 | **0.96** | 53,54 / 52,51 |
+| fp32 | 9 MiB | 105.4 | 113.3 | 1.08 | 104,106 / 114,113 |
+| fp32 | 27 MiB (DDP bucket) | 226.9 | 226.7 | **1.00** | 226,228 / 227,226 |
+| fp32 | 168 MiB | 1155.4 | 1335.4 | 1.16 | 1157,1154 / 1335,1336 |
+| fp32 | 512 MiB | 3411.3 | 3790.2 | 1.11 | 3414,3408 / 3787,3793 |
+| bf16 | 1 MiB | 57.8 | 65.3 | 1.13* | 50,65 / 76,55 |
+| bf16 | 9 MiB | 110.0 | 113.8 | **1.04** | 110,110 / 114,114 |
+| bf16 | 27 MiB | 233.0 | 226.8 | **0.97** | 233,233 / 228,226 |
+| bf16 | 168 MiB | 1164.4 | 1335.2 | 1.15 | 1164,1164 / 1335,1335 |
+| bf16 | 512 MiB | 3438.3 | 3774.5 | 1.10 | 3439,3438 / 3775,3774 |
+
+\* 50 and 65 microseconds against 76 and 55, on a 1 MiB message whose kernel is
+about 20 microseconds of work: launch noise, not a measurement of the kernel.
+
+Where this started, on the same node: the shipped pull kernels with the peer
+rotation and the first MI300A grid caps measured 147 / 345 / 1745 / 5300
+microseconds at 9 / 27 / 168 / 512 MiB against RCCL's 108 / 230 / 1160 / 3410
+-- ratios of 1.36 to 1.55. The size that matters for DDP is now at parity.
+
+**168 and 512 MiB are the two that still miss.** The arithmetic says why, and
+it is not the schedule. Per GPU the collective must move 1.5 x message across
+the fabric, which at the 233 GB/s all-to-all write ceiling of section 1 is
+1134 microseconds at 168 MiB -- RCCL's own 1155, i.e. RCCL is running at the
+ceiling with no measurable overhead. On top of that this design pays the local
+gather copy (0.75 x message read and written locally, ~90 microseconds
+measured) and the barrier's whole-cache operations at the 912-block grid the
+large sizes want (measured: the same allreduce is 1221 microseconds at 912
+blocks with a cheapened barrier and 1335 with the shipped one; section 7 says
+why the cheap one was given up). Removing either needs a change this
+engagement did not make: overlapping the gather copy with the second push
+behind a sub-chunk pipeline, or a barrier that is both demonstrably sound here
+and cheaper than one whole-cache operation per thread per sync.
+
 ## 6b. All-gather and broadcast
 
 Same ABBA protocol, fp32, 4 ranks, per-rank contribution for the all-gather

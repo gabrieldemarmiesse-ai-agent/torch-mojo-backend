@@ -356,28 +356,20 @@ all-gather and the broadcast's gather half became pushes for the same reason.
 Two other gfx942 details are copied from RCCL and matter as much as the
 direction:
 
-- **Only the acquire side of the barrier could be made cheaper.** On gfx942 a
-  release store lowers to `buffer_wbl2 sc0 sc1` (write the whole L2 back) and
-  an acquire load to `buffer_inv sc0 sc1` (drop the whole L1 and L2). The
-  invalidate sat *inside the spin loop*, so every polling thread was throwing
-  the payload out of L2 for every block still working, and it cost more the
-  larger the grid — 27 MiB measured 243 µs at 128 blocks against 465 at 1024.
-  Spinning on a relaxed load instead (still `sc0 sc1`, so it bypasses the
-  caches and cannot go stale) and invalidating **once** after the wait is
-  exactly as strong at the point it matters, and the trailing block barrier
-  publishes it to the whole block.
-  The release side was left alone, after two cheaper spellings were tried and
-  both turned out wrong on this box, in the same way and only for small
-  payloads: dropping the writeback entirely (RCCL's `skip_fence` for cudaArch
-  940, `rccl:src/include/rccl_common.h:262-273`, which is sound for RCCL
-  because its P2P buffers are uncached) broke every broadcast; moving it after
-  the barrier into the `world` threads that publish flags fixed the broadcast
-  at 4 ranks but still failed a 1-element allreduce and a broadcast at 2
-  ranks. Our region *is* `hipDeviceMallocUncached`, but the mapping a peer
-  writes **through** comes from `hipIpcOpenMemHandle` and does not carry that
-  memory type, so a few bytes can still be sitting in the writer's cache when
-  the flag lands. Megabyte payloads drain on their own, which is why only the
-  small collectives ever failed.
+- **The barrier could not be made cheaper, and that is measured, not assumed.**
+  A release store lowers to `buffer_wbl2 sc0 sc1` and an acquire load to
+  `buffer_inv sc0 sc1`, both whole-cache operations, and the acquire sits
+  inside the spin loop — so the barrier costs more the larger the grid (27 MiB
+  measured 243 µs at 128 blocks and 465 at 1024). Three cheaper spellings were
+  tried and all three broke *small* collectives only, which is the trap: a
+  megabyte payload drains out of a cache on its own and a few hundred bytes do
+  not, so "the big benchmark still passes" says nothing. RCCL's own cheap
+  variant for gfx942 (`skip_fence`,
+  `rccl:src/include/rccl_common.h:262-273`) is among them: it is sound for
+  RCCL because its P2P buffers are uncached, and unsound here because the
+  mapping a peer writes *through* comes from `hipIpcOpenMemHandle`, which does
+  not carry the memory type. Details and the failure table are in
+  `docs/mojo_collectives_kernel_results.md` §3 and §7.
 - **The grid caps are not H100's**, and the response to the grid is not
   monotonic. See the sweeps in `docs/mojo_collectives_kernel_results.md`.
 
