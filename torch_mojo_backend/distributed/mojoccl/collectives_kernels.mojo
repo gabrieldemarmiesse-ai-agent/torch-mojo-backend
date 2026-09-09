@@ -246,7 +246,7 @@ def _record_error(
 ):
     """Publish a failure in my own region's error word (host-readable)."""
     if thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             regions[rank].unsafe_bitcast[UInt64](),
             UInt64(code) * 1_000_000 + UInt64(phase),
         )
@@ -276,7 +276,7 @@ def _sync(
     learns that through shared memory so no thread is left inside a `barrier()`.
     """
     var failed = stack_allocation[
-        1, DType.uint32, address_space = AddressSpace.SHARED
+        1, DType.uint32, address_space=AddressSpace.SHARED
     ]()
     if thread_idx.x == 0:
         failed[unsafe_offset=0] = 0
@@ -289,21 +289,20 @@ def _sync(
         # `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`). NVIDIA needs nothing:
         # `bar.sync` is a CTA-scope fence and the release store below is
         # cumulative over it, which is what NCCL's postPeer relies on.
-        fence[ordering = Ordering.RELEASE]()
+        fence[ordering=Ordering.RELEASE]()
     barrier()
 
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x)
-        Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer]).unsafe_offset(bid * MAX_WORLD + rank),
             target,
         )
         var mine = _flags(regions[rank]).unsafe_offset(bid * MAX_WORLD + peer)
         var spins = 0
         while (
-            Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](mine)
-            < target
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
         ):
             spins += 1
             if spins >= _SPIN_CHECK:
@@ -365,7 +364,7 @@ def _copy_scalar_tail[
 ):
     """The `numel % W` elements a 16-byte vector loop cannot cover."""
     for i in range(tid, count, stride):
-        dst[unsafe_offset = base + i] = src[unsafe_offset = base + i]
+        dst[unsafe_offset=base + i] = src[unsafe_offset=base + i]
 
 
 @always_inline
@@ -394,7 +393,7 @@ def _copy_bytes[
     else:
         for v in range(tid, nvec, stride):
             comptime for j in range(16):
-                dst[unsafe_offset = v * 16 + j] = src[unsafe_offset = v * 16 + j]
+                dst[unsafe_offset=v * 16 + j] = src[unsafe_offset=v * 16 + j]
     _copy_scalar_tail(dst, src, nvec * 16, nbytes - nvec * 16, tid, stride)
 
 
@@ -492,9 +491,11 @@ def _ar_twoshot_kernel[
             s -= world
         var src = in_ptr.unsafe_offset(_vstart(s, q, rem) * W)
         var vc = _vcount(s, q, rem)
-        var dst = regions[s].unsafe_offset(
-            push_off + slot_stride * rank
-        ).unsafe_bitcast[Scalar[dtype]]()
+        var dst = (
+            regions[s]
+            .unsafe_offset(push_off + slot_stride * rank)
+            .unsafe_bitcast[Scalar[dtype]]()
+        )
         _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
         if tail > 0 and s == world - 1:
             _copy_scalar_tail(dst, src, vc * W, tail, tid, stride)
@@ -509,9 +510,9 @@ def _ar_twoshot_kernel[
     var my_tail = tail if rank == world - 1 else 0
     var uin = in_ptr.unsafe_offset(my_vs * W)
     var uout = out_ptr.unsafe_offset(my_vs * W)
-    var shard = regions[rank].unsafe_offset(shard_off).unsafe_bitcast[
-        Scalar[dtype]
-    ]()
+    var shard = (
+        regions[rank].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
+    )
 
     # Slot pointers are formed by arithmetic inside the unrolled loop, never
     # held in an array: a stack array of `world` pointers is demoted to local
@@ -577,9 +578,9 @@ def _ar_twoshot_kernel[
             p -= world
         var vs = _vstart(p, q, rem)
         var vc = _vcount(p, q, rem)
-        var src = regions[p].unsafe_offset(shard_off).unsafe_bitcast[
-            Scalar[dtype]
-        ]()
+        var src = (
+            regions[p].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
+        )
         var dst = out_ptr.unsafe_offset(vs * W)
         _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
         if tail > 0 and p == world - 1:
@@ -636,9 +637,11 @@ def _ar_oneshot_kernel[
         var s = rank + i
         if s >= world:
             s -= world
-        var dst = regions[s].unsafe_offset(
-            push_off + slot_stride * rank
-        ).unsafe_bitcast[Scalar[dtype]]()
+        var dst = (
+            regions[s]
+            .unsafe_offset(push_off + slot_stride * rank)
+            .unsafe_bitcast[Scalar[dtype]]()
+        )
         _copy_vec[dtype, W, U](dst, in_ptr, nvec, tid, stride)
         if tail > 0:
             _copy_scalar_tail(dst, in_ptr, nvec * W, tail, tid, stride)
@@ -872,8 +875,9 @@ def _zero_kernel(ptr: Pointer[UInt32, MutAnyOrigin], nwords: Int32):
 
 @always_inline
 def _enqueue_cached[
-    declared_arg_types: TypeList[Trait=AnyType, ...], //,
-    func: def (*args: *declared_arg_types) thin -> None,
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
     *Ts: DevicePassable,
 ](
     ctx: DeviceContext,
@@ -984,12 +988,8 @@ def _launch_allreduce[
     var esize = size_of[dtype]()
     var nvec = numel // W
     var tail = numel - nvec * W
-    var ip = Pointer[Scalar[dtype], MutAnyOrigin](
-        unsafe_from_address=in_ptr
-    )
-    var op = Pointer[Scalar[dtype], MutAnyOrigin](
-        unsafe_from_address=out_ptr
-    )
+    var ip = Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=in_ptr)
+    var op = Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=out_ptr)
 
     if one_shot:
         # `world` slots, each a whole message, at the base of the arena. They
@@ -1000,9 +1000,7 @@ def _launch_allreduce[
         if world * slot > 2 * cap_bytes:
             raise Error("collectives: one-shot slots exceed the region")
         var push_off = arena
-        var blocks = min(
-            _AR_MAX_BLOCKS, max(1, (nvec + BLOCK - 1) // BLOCK)
-        )
+        var blocks = min(_AR_MAX_BLOCKS, max(1, (nvec + BLOCK - 1) // BLOCK))
         _enqueue_cached[_ar_oneshot_kernel[dtype, W, _UNROLL, NW]](
             ctx,
             stream,
@@ -1024,9 +1022,7 @@ def _launch_allreduce[
 
     var q = nvec // world
     var rem = nvec % world
-    var max_shard_elems = max(
-        (q + (1 if rem > 0 else 0)) * W, q * W + tail
-    )
+    var max_shard_elems = max((q + (1 if rem > 0 else 0)) * W, q * W + tail)
     var slot = _align_up(max_shard_elems * esize, 16)
     var push_off = arena
     var shard_off = arena + world * slot
@@ -1105,23 +1101,63 @@ def allreduce[
 
     if world == 8:
         _launch_allreduce[dtype, W, 8](
-            ctx, stream, rp, in_ptr, out_ptr, numel, world, rank, cap_bytes, scale,
-            generation, one_shot,
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            numel,
+            world,
+            rank,
+            cap_bytes,
+            scale,
+            generation,
+            one_shot,
         )
     elif world == 4:
         _launch_allreduce[dtype, W, 4](
-            ctx, stream, rp, in_ptr, out_ptr, numel, world, rank, cap_bytes, scale,
-            generation, one_shot,
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            numel,
+            world,
+            rank,
+            cap_bytes,
+            scale,
+            generation,
+            one_shot,
         )
     elif world == 2:
         _launch_allreduce[dtype, W, 2](
-            ctx, stream, rp, in_ptr, out_ptr, numel, world, rank, cap_bytes, scale,
-            generation, one_shot,
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            numel,
+            world,
+            rank,
+            cap_bytes,
+            scale,
+            generation,
+            one_shot,
         )
     else:
         _launch_allreduce[dtype, W, 0](
-            ctx, stream, rp, in_ptr, out_ptr, numel, world, rank, cap_bytes, scale,
-            generation, one_shot,
+            ctx,
+            stream,
+            rp,
+            in_ptr,
+            out_ptr,
+            numel,
+            world,
+            rank,
+            cap_bytes,
+            scale,
+            generation,
+            one_shot,
         )
 
 

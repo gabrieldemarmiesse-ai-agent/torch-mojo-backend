@@ -150,7 +150,9 @@ def read_rank_handle(
     return ordinal
 
 
-def _wait_for_file(path: String, rank: Int, timeout_s: Float64, dir: String) raises:
+def _wait_for_file(
+    path: String, rank: Int, timeout_s: Float64, dir: String
+) raises:
     var t0 = perf_counter_ns()
     var deadline_ns = Int(timeout_s * 1.0e9)
     while not Path(path).exists():
@@ -168,7 +170,9 @@ def _wait_for_file(path: String, rank: Int, timeout_s: Float64, dir: String) rai
 
 def wait_for_rank(dir: String, rank: Int, timeout_s: Float64) raises:
     """Blocks until `rank`'s handle file exists, or raises past the timeout."""
-    _wait_for_file(dir + "/rank" + String(rank) + ".handle", rank, timeout_s, dir)
+    _wait_for_file(
+        dir + "/rank" + String(rank) + ".handle", rank, timeout_s, dir
+    )
 
 
 def wait_for_done(dir: String, rank: Int, timeout_s: Float64) raises:
@@ -182,18 +186,16 @@ def remove_rendezvous_dir(dir: String, nranks: Int) raises:
 
     Called once, by rank 0, once every rank's done marker has landed
     (normal completion) or on an init failure rank 0 hit after creating
-    `dir` (`ncclGetUniqueId`). Per-file removal is best-effort -- a file a
-    peer never got around to writing is not an error here -- but the final
-    `rmdir` is not: a non-empty directory after every known file was
-    cleared means something unexpected is in there, worth surfacing.
+    `dir` (`ncclGetUniqueId`). A file a peer never got around to writing is
+    not an error here and is skipped; any other failure propagates, and so
+    does the final `rmdir`: a non-empty directory after every known file
+    was cleared means something unexpected is in there, worth surfacing.
     """
     for r in range(nranks):
-        try:
-            remove(dir + "/rank" + String(r) + ".handle")
-        except:
-            pass
-        try:
-            remove(dir + "/rank" + String(r) + ".done")
-        except:
-            pass
+        var handle = dir + "/rank" + String(r) + ".handle"
+        if Path(handle).exists():
+            remove(handle)
+        var done = dir + "/rank" + String(r) + ".done"
+        if Path(done).exists():
+            remove(done)
     rmdir(dir)

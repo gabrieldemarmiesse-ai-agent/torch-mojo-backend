@@ -10,7 +10,7 @@
 
 from std.ffi import OwnedDLHandle
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys import has_amd_gpu_accelerator
+from std.sys import has_amd_gpu_accelerator, stderr
 
 comptime AMD = has_amd_gpu_accelerator()
 comptime DRIVER_LIB = "libamdhip64.so" if AMD else "libcuda.so.1"
@@ -148,3 +148,13 @@ def zero_bytes(ctx: DeviceContext, addr: Int, nbytes: Int) raises:
     )
     ctx.enqueue_memset(buf, 0)
     ctx.synchronize()
+
+
+def warn_teardown(what: String, e: Error):
+    """Best-effort cleanup that failed: say so on stderr rather than hide it.
+    The error that started the teardown is the one propagating; this one only
+    needs to be visible."""
+    print(
+        "mojoccl: " + what + " failed during teardown: " + String(e),
+        file=stderr,
+    )

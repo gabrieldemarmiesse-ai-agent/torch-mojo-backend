@@ -37,6 +37,7 @@ from driver import (
     get_handle,
     open_driver,
     open_handle,
+    warn_teardown,
 )
 from bootstrap import (
     UID_BYTES,
@@ -427,8 +428,8 @@ def ncclCommInitRank(
                 if Int(rank) == 0:
                     try:
                         remove_rendezvous_dir(dir, Int(nranks))
-                    except:
-                        pass
+                    except e:
+                        warn_teardown("removing the rendezvous dir", e)
                 return NCCL_INVALID_ARGUMENT
             var region_bytes = signal_bytes() + 2 * cap_bytes
             var base = alloc_region(lib, region_bytes)
@@ -457,12 +458,12 @@ def ncclCommInitRank(
                         if r2 != Int(rank) and regions[r2] != 0:
                             try:
                                 close_handle(lib, regions[r2])
-                            except:
-                                pass
+                            except e:
+                                warn_teardown("closing a peer's IPC handle", e)
                     try:
                         free_region(lib, base)
-                    except:
-                        pass
+                    except e:
+                        warn_teardown("freeing the region", e)
                     raise
 
             # Done protocol: every rank marks itself done once it has opened
@@ -479,8 +480,8 @@ def ncclCommInitRank(
                         wait_for_done(dir, r, timeout_s)
                 try:
                     remove_rendezvous_dir(dir, Int(nranks))
-                except:
-                    pass  # a leftover /dev/shm dir is a nuisance, not a correctness bug
+                except e:
+                    warn_teardown("removing the rendezvous dir", e)
 
             var state = CommState(
                 rank=Int(rank),
@@ -500,8 +501,8 @@ def ncclCommInitRank(
             if Int(rank) == 0:
                 try:
                     remove_rendezvous_dir(dir, Int(nranks))
-                except:
-                    pass
+                except e:
+                    warn_teardown("removing the rendezvous dir", e)
             raise
     except:
         return NCCL_INTERNAL_ERROR
@@ -557,13 +558,11 @@ def ncclCommGetAsyncError(
         # and this is the one call site that needs a *fresh* wrap or the
         # comm's own default stream depending on whether a collective has
         # run yet, which does not fit the single-handle cache lookup below.
-        var s = (
-            state.ctx.create_external_stream(
-                OpaquePointer[MutAnyOrigin](unsafe_from_address=Int(state.last_stream))
+        var s = state.ctx.create_external_stream(
+            OpaquePointer[MutAnyOrigin](
+                unsafe_from_address=Int(state.last_stream)
             )
-            if state.last_stream != 0
-            else DeviceStream(state.ctx)
-        )
+        ) if state.last_stream != 0 else DeviceStream(state.ctx)
         s.synchronize()
         var word = _read_error_word(state.ctx, s, state.regions[state.rank])
         err_out[] = NCCL_REMOTE_ERROR if Int(word) != 0 else NCCL_SUCCESS
