@@ -408,7 +408,12 @@ job 234072), `ar_bench_gpt2.py` through the process group, ABBA legs within
 | 512 | 4635 | 2363 | 1.96 | 4618 | 2380 | 1.94 |
 
 `collectives`, `ddp_parity` and `stress` pass at 16 ranks under both
-libraries, and nanoGPT-124M DDP at 16 ranks reaches the same losses. With
+libraries, and nanoGPT-124M DDP at 16 ranks reaches the same losses. End to
+end (six 40-step runs alternating NCCL and mojoccl on one node pair, job
+234185, median step time over steps 3–40): NCCL 49.7 ms, mojoccl 51.4 ms,
+1.036×; the three adjacent pairs read 1.035, 1.084 and 0.996, so the
+run-to-run noise on these shared nodes is as large as the gap. Of the
+~1.7 ms, ~0.6 ms is the exposed 168 MiB tail bucket (1532 vs 939 µs). With
 `MOJOCCL_IB_TRACE=1` the RDMA itself runs at 40–45 GB/s per rank, near line
 rate for one 400 Gb/s HCA; at the bucket the mean split is 0.05 µs posting,
 ~330 µs waiting (the transfer), 2.3 µs flushing. Above 27 MiB the gap is the
