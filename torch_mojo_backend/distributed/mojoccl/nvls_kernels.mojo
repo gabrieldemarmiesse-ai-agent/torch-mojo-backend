@@ -62,10 +62,10 @@ from max.gpu.sync import barrier
 
 from collectives_kernels import (
     BLOCK,
-    DEFAULT_TIMEOUT_NS,
     _abort_raised,
     _enqueue_cached,
     signal_bytes,
+    spin_timeout_ns,
 )
 
 
@@ -743,5 +743,5 @@ def nvls_allreduce[
             Int32(rb),
             scale,
             UInt64(target),
-            UInt64(DEFAULT_TIMEOUT_NS),
+            spin_timeout_ns(),
         )

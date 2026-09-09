@@ -102,6 +102,7 @@ from std.atomic import Atomic, Ordering, fence
 from std.builtin.device_passable import DevicePassable
 from std.collections import InlineArray
 from std.ffi import _get_global_or_null, external_call
+from std.os import getenv
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -156,7 +157,11 @@ never resets, so headroom costs nothing, but a tight bound documents the
 contract."""
 
 comptime DEFAULT_TIMEOUT_NS = 60_000_000_000
-"""Spin-loop deadline (60 s), measured with this GPU's own timer."""
+"""Default spin-loop deadline (60 s), measured with this GPU's own timer.
+
+`MOJOCCL_IB_TIMEOUT_S` overrides it (`spin_timeout_ns`): one variable for
+"how long a rank waits for a peer that stopped answering", whether the peer
+is on this node's NVLink or on the other end of the fabric."""
 
 comptime _SPIN_CHECK = 4096
 """Spins between two reads of the (not free) global timer."""
@@ -242,6 +247,37 @@ def abort_ptr_offset() -> Int:
 @always_inline
 def _align_up(x: Int, a: Int) -> Int:
     return (x + a - 1) // a * a
+
+
+def spin_timeout_ns() -> UInt64:
+    """The deadline every device spin in this library is launched with.
+
+    `MOJOCCL_IB_TIMEOUT_S` governs it, the same variable the inter-node
+    transport's own waits use: a rank waiting on a peer that stopped
+    answering should give up after one interval, not two different ones
+    depending on which side of the hierarchy the peer is. Read from the
+    environment once per process and cached in a process global -- a getenv
+    and a float parse per collective would be a measurable slice of a 27 MiB
+    allreduce's 164 us.
+    """
+    var g = _get_global_or_null("CCL_SPIN_TIMEOUT_NS")
+    if g:
+        return g.value().unsafe_bitcast[UInt64]()[unsafe_offset=0]
+    var ns = UInt64(DEFAULT_TIMEOUT_NS)
+    var raw = getenv("MOJOCCL_IB_TIMEOUT_S", String(""))
+    if raw != String(""):
+        try:
+            var seconds = Float64(raw)
+            if seconds > 0.0:
+                ns = UInt64(seconds * 1.0e9)
+        except:
+            pass
+    var slot = unsafe_alloc[UInt64](1)
+    slot[unsafe_offset=0] = ns
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice("CCL_SPIN_TIMEOUT_NS"), slot.unsafe_bitcast[NoneType]()
+    )
+    return ns
 
 
 @always_inline
@@ -1491,7 +1527,7 @@ def _launch_allreduce[
             Int32(rank),
             _flag_target(generation, 0),
             scale,
-            UInt64(DEFAULT_TIMEOUT_NS),
+            spin_timeout_ns(),
         )
         return
 
@@ -1525,7 +1561,7 @@ def _launch_allreduce[
         Int32(rank),
         _flag_target(generation, 0),
         scale,
-        UInt64(DEFAULT_TIMEOUT_NS),
+        spin_timeout_ns(),
     )
 
 
@@ -1669,7 +1705,7 @@ def _launch_rs_stage[
         Int32(rank),
         _flag_target(generation, 0),
         scale,
-        UInt64(DEFAULT_TIMEOUT_NS),
+        spin_timeout_ns(),
     )
 
 
@@ -1703,7 +1739,7 @@ def _launch_ag_finish[
         Int32(rank),
         _flag_target(generation, 0),
         scale,
-        UInt64(DEFAULT_TIMEOUT_NS),
+        spin_timeout_ns(),
     )
 
 
@@ -1878,7 +1914,7 @@ def broadcast(
         Int32(rank),
         Int32(root),
         _flag_target(generation, 0),
-        UInt64(DEFAULT_TIMEOUT_NS),
+        spin_timeout_ns(),
     )
 
 
@@ -1931,5 +1967,5 @@ def allgather(
         Int32(world),
         Int32(rank),
         _flag_target(generation, 0),
-        UInt64(DEFAULT_TIMEOUT_NS),
+        spin_timeout_ns(),
     )

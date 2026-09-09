@@ -104,6 +104,7 @@ from collectives_kernels import (
     allgather_finish,
     allreduce,
     broadcast,
+    _enqueue_cached,
     error_offset,
     install_abort_word,
     region_init,
@@ -404,6 +405,14 @@ struct CommState(Movable):
     var nvls_grid: Int
     var nvls_min: Int
     var nvls_bars: Int
+    # `ncclCommGetAsyncError`'s scratch, built once instead of per poll: the
+    # device word the copy kernel writes, the host word it lands in, and the
+    # stream to use before any collective has named one. A watchdog polls
+    # this on a timer, and a fresh DeviceStream, DeviceBuffer and host
+    # allocation per poll was three allocations and a leak of the last one.
+    var err_buf: DeviceBuffer[DType.uint64]
+    var err_host: Int
+    var own_stream: DeviceStream
     # Submission lock (`_lock`/`_unlock`): 0 free, 1 held.
     var lock: Int64
 
@@ -434,7 +443,7 @@ struct CommState(Movable):
         nvls_min: Int,
         abort_host: Int,
         abort_dev: Int,
-    ):
+    ) raises:
         self.rank = rank
         self.world = world
         self.ordinal = ordinal
@@ -471,6 +480,9 @@ struct CommState(Movable):
         # reset, and it is independent of `generation` (different address,
         # different protocol) so the two paths can alternate freely.
         self.nvls_bars = 0
+        self.err_buf = self.ctx.enqueue_create_buffer[DType.uint64](1)
+        self.err_host = Int(unsafe_alloc[UInt64](1))
+        self.own_stream = DeviceStream(self.ctx)
         self.lock = 0
 
 
@@ -665,7 +677,7 @@ def _copy_error_word(
 
 
 def _read_error_word(
-    ctx: DeviceContext, stream: DeviceStream, region: Int
+    mut state: CommState, stream: DeviceStream, region: Int
 ) raises -> UInt64:
     """The UInt64 error word at `region + error_offset()`, fetched to the
     host via a real device-to-host copy (see `_copy_error_word`).
@@ -675,22 +687,19 @@ def _read_error_word(
     blocks for both. Callers that need the fully up-to-date word (a peer's
     in-flight barrier timeout, not just what already landed) must
     synchronize `stream` themselves first, as `ncclCommGetAsyncError` does.
+    Kernel, device word and host word are all cached on the communicator.
     """
     var src = Pointer[UInt64, MutAnyOrigin](
         unsafe_from_address=region + error_offset()
     )
-    var dev_word = ctx.enqueue_create_buffer[DType.uint64](1)
-    var compiled = ctx.compile_function[_copy_error_word]()
-    stream.enqueue_function(
-        compiled,
-        dev_word.unsafe_ptr(),
-        src,
-        grid_dim=(1, 1, 1),
-        block_dim=(32, 1, 1),
+    _enqueue_cached[_copy_error_word](
+        state.ctx, stream, "errword", 1, state.err_buf.unsafe_ptr(), src
     )
-    var host_word = unsafe_alloc[UInt64](1)
-    ctx.enqueue_copy(host_word, dev_word)
-    ctx.synchronize()
+    var host_word = Pointer[UInt64, MutUntrackedOrigin](
+        unsafe_from_address=state.err_host
+    )
+    state.ctx.enqueue_copy(host_word, state.err_buf)
+    state.ctx.synchronize()
     return host_word[unsafe_offset=0]
 
 
@@ -1318,6 +1327,26 @@ def _cached_stream_handles(state: CommState) -> List[Int64]:
     return handles^
 
 
+def _async_error_stream(state: CommState) -> DeviceStream:
+    """The stream `ncclCommGetAsyncError` synchronizes: the cached wrapper for
+    the stream a collective last ran on, or the communicator's own if none
+    has.
+
+    A helper of its own for the same reason `_cached_stream_handles` is one:
+    indexing a `Dict` narrows the enclosing function's inferred error type to
+    `DictKeyError`, which then rejects every unrelated `raise Error(...)`
+    still in scope. It also takes no lock, so `last_stream` may be set by a
+    concurrent submission a moment before that stream is cached -- hence the
+    membership test rather than an insert.
+    """
+    try:
+        if state.last_stream != 0 and state.last_stream in state.stream_cache:
+            return state.stream_cache[state.last_stream]
+    except:
+        pass
+    return state.own_stream
+
+
 def _drain_all_streams(mut state: CommState) raises:
     """Synchronize every stream a collective has ever run on.
 
@@ -1478,16 +1507,12 @@ def ncclCommGetAsyncError(
         # can give is "everything enqueued so far landed", same as before --
         # only the read itself changes, from a host dereference of device
         # memory (wrong) to a real D2H copy (_read_error_word).
-        # Not cached: an error poll, not a collective -- rare enough that the
-        # wrap cost this library's cache exists to avoid does not matter here,
-        # and this is the one call site that needs a *fresh* wrap or the
-        # comm's own default stream depending on whether a collective has
-        # run yet, which does not fit the single-handle cache lookup below.
-        var s = state.ctx.create_external_stream(
-            OpaquePointer[MutAnyOrigin](
-                unsafe_from_address=Int(state.last_stream)
-            )
-        ) if state.last_stream != 0 else DeviceStream(state.ctx)
+        # The wrapper comes out of the same cache the collectives use, and
+        # `own_stream` covers the case where no collective has named a stream
+        # yet. This poll takes no lock, so `last_stream` can be set by a
+        # concurrent submission a moment before it is cached -- hence the
+        # membership test rather than an insert.
+        var s = _async_error_stream(state)
         s.synchronize()
         if state.ib != 0 and ib_error(state.ib) != 0:
             # A proxy failure during that sync releases the spin kernels
@@ -1500,7 +1525,7 @@ def ncclCommGetAsyncError(
         # exactly one.
         for a in range(state.narenas):
             var word = _read_error_word(
-                state.ctx,
+                state,
                 s,
                 state.regions[state.local_rank] + a * state.arena_stride,
             )

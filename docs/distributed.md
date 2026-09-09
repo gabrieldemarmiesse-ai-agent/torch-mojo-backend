@@ -578,7 +578,7 @@ are skipped). Addressing is LID-only, so one IB subnet.
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
 | `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | absolute deadline for the whole rendezvous. Every socket it opens is non-blocking and every wait is a `poll(2)` computed from the deadline (`connect` included, verified with `SO_ERROR`), so no syscall can outlive it; `SO_RCVTIMEO`/`SO_SNDTIMEO` stay on as a backstop |
 | `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
-| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for its peers' shards before latching an error |
+| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for a peer that stopped answering before latching an error — **every** wait: the inter-node exchange, its wait kernel, and the intra-node and NVLS barrier spins, which read it once per process |
 | `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread |
 | `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
 | `MOJOCCL_IB_PROXY_CPU` | unset | pin the progress thread to this CPU |
@@ -595,7 +595,8 @@ with no ACTIVE InfiniBand port fails `ncclCommInitRank` with "no ACTIVE
 InfiniBand port found" (so Slingshot on Adastra is not covered; a
 libfabric/cxi transport would be a second backend); a peer that stops
 responding is reported through `ncclCommGetAsyncError` after
-`MOJOCCL_IB_TIMEOUT_S`; a stale unique id (tag `MOJOCCL2`) is rejected with
+`MOJOCCL_IB_TIMEOUT_S` (one variable for every spin, intra-node and
+inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
 a clear message.
 
 **Requirements.** rdma-core/libibverbs on the nodes (here MLNX OFED 24.10),
