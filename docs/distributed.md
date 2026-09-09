@@ -920,7 +920,8 @@ then comes all the way back to 29k-32k blocks at 505 GB free the moment it
 exits, run after run. On a fresh node the kernel compacts what the job took;
 on a node that has been up for months it does not, and `ncclCommInitRank`
 finds nothing to map. That is also why the failure could not be reproduced on
-demand once the fragmented node went out of allocation.
+demand once the fragmented node went out of allocation: eight nanoGPT runs
+under that ballast took zero retries and had zero init failures.
 
 What this repo does about it: `fab_setup` retries the endpoint bring-up while
 the provider says `-FI_ENOMEM`, for `MOJOCCL_FABRIC_SETUP_RETRY_S` (30 s).
@@ -963,9 +964,9 @@ Two things came out of chasing it:
   elements)" instead of a bare number. Both were verified to fire and to name
   the right side by running with `MOJOCCL_IB_TIMEOUT_S=0.05`.
 
-* **It did not reproduce on a healthy node pair.** 54 consecutive 40-step
+* **It did not reproduce on a healthy node pair.** 62 consecutive 40-step
   nanoGPT 2n x 4r runs on a1003/a1019 (24 before the instrumentation, 30
-  after), plus `ddp_worker.py collectives`/`ddp_parity`/`stress` at 8 ranks
+  after, and 8 more under a 6 GiB memory ballast), plus `ddp_worker.py collectives`/`ddp_parity`/`stress` at 8 ranks
   and the whole self-test suite on both nodes: no stall. The pair on which
   the hangs were seen is also the pair whose `fi_enable` failures are
   explained above by node memory fragmentation, and a stalled rank had
