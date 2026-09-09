@@ -58,11 +58,11 @@ TrainKey = tuple[str, str]  # (ccl, leg)
 
 
 def parse(lines: list[str]) -> dict[str, object]:
-    bench: dict[BenchKey, list[float]] = {}
-    worker: dict[WorkerKey, int | None] = {}
-    train: dict[TrainKey, dict[str, float | int | None]] = {}
-    skipped: list[str] = []
-    current_train: TrainKey | None = None
+    bench = dict[BenchKey, list[float]]()
+    worker = dict[WorkerKey, int | None]()
+    train = dict[TrainKey, dict[str, float | int | None]]()
+    skipped = list[str]()
+    current_train = None
 
     for raw in lines:
         line = raw.rstrip("\n")
@@ -143,7 +143,7 @@ def _fmt(x: float | int | None, spec: str = ".1f") -> str:
 
 
 def render_bench(bench: dict[BenchKey, list[float]]) -> str:
-    sizes: dict[tuple[str, int], dict[str, float]] = {}
+    sizes = dict[tuple[str, int], dict[str, float]]()
     for (ccl, dtype, mib), medians in bench.items():
         sizes.setdefault((dtype, mib), {})[ccl] = statistics.median(medians)
 
@@ -220,7 +220,7 @@ def render(parsed: dict[str, object], source: str) -> str:
     return "\n".join(parts)
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "logs",
@@ -233,7 +233,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    lines: list[str] = []
+    lines = list[str]()
     for path in args.logs:
         lines.extend(path.read_text(errors="replace").splitlines())
 
