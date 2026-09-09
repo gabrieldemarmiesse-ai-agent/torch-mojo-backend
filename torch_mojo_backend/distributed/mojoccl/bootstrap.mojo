@@ -48,6 +48,19 @@ comptime MSG_NOSIGNAL: Int32 = 0x4000
 comptime EINTR: Int32 = 4
 comptime EAGAIN: Int32 = 11
 comptime ECONNREFUSED: Int32 = 111
+comptime SO_ERROR: Int32 = 4
+comptime EINPROGRESS: Int32 = 115
+comptime EALREADY: Int32 = 114
+comptime EISCONN: Int32 = 106
+# SOCK_NONBLOCK, the Linux flag `socket(2)` and `accept4(2)` take in their
+# type argument. Every socket this module opens carries it, so no blocking
+# syscall can outlive the deadline the caller set: the wait happens in
+# `poll(2)` with a computed timeout instead, and SO_RCVTIMEO/SO_SNDTIMEO stay
+# on as a backstop for the cases poll cannot see (a socket wedged in the
+# kernel, a revents race).
+comptime SOCK_NONBLOCK: Int32 = 0x800
+comptime POLLIN: Int32 = 1
+comptime POLLOUT: Int32 = 4
 # sizeof(struct sockaddr_in) == 16: sin_family u16 @0, sin_port u16 @2 (both
 # network order), sin_addr u32 @4, 8 zero bytes. sizeof(struct ifreq) == 40:
 # ifr_name[16] @0, then the sockaddr at 16 (so the IPv4 word is at 20).
@@ -94,6 +107,68 @@ def _set_timeout(fd: Int32, optname: Int32, seconds: Int64) raises:
     )
     if rc != 0:
         raise Error("mojoccl: setsockopt(timeout) failed, errno=" + String(_errno()))
+
+
+def _get_int_opt(fd: Int32, level: Int32, optname: Int32) raises -> Int32:
+    var v = _alloc[Int32](1)
+    v[unsafe_offset=0] = 0
+    var l = _alloc[UInt32](1)
+    l[unsafe_offset=0] = 4
+    if external_call["getsockopt", Int32](fd, level, optname, v, l) != 0:
+        raise Error(
+            "mojoccl: getsockopt failed, errno=" + String(_errno())
+        )
+    return v[unsafe_offset=0]
+
+
+def _wait_ready(fd: Int32, events: Int32, deadline_ns: Int) raises -> Bool:
+    """Wait until `fd` is ready (or its peer hung up), bounded by an ABSOLUTE
+    deadline. False means the deadline passed.
+
+    This is what bounds the blocking, rather than a check after the syscall
+    came back: `connect` on a dropped SYN retries inside the kernel for over
+    two minutes, and by the time it returns, a shorter bootstrap deadline has
+    long expired. `struct pollfd` is {i32 fd, i16 events, i16 revents}.
+    """
+    var pfd = _alloc[Int32](2)
+    while True:
+        var left = deadline_ns - perf_counter_ns()
+        if left <= 0:
+            return False
+        var ms = left // 1_000_000 + 1
+        if ms > Int(SOCK_SLICE_S) * 1000:
+            ms = Int(SOCK_SLICE_S) * 1000
+        pfd[unsafe_offset=0] = fd
+        pfd[unsafe_offset=1] = events & 0xFFFF
+        var rc = external_call["poll", Int32](pfd, UInt64(1), Int32(ms))
+        if rc > 0:
+            return True
+        if rc < 0:
+            var e = _errno()
+            if e != EINTR:
+                raise Error("mojoccl: poll() failed, errno=" + String(e))
+
+
+def _connect_deadline(
+    fd: Int32, sa: Pointer[UInt8, MutAnyOrigin], deadline_ns: Int
+) raises -> Bool:
+    """Non-blocking `connect`, `poll` for writability inside the deadline,
+    then `SO_ERROR` for the verdict -- the three steps a bounded TCP connect
+    needs. False means "not connected" (refused, unreachable, or out of
+    time); the caller decides whether to retry or to give up."""
+    var rc = external_call["connect", Int32](
+        fd, sa, UInt32(SOCKADDR_IN_BYTES)
+    )
+    if rc == 0:
+        return True
+    var e = _errno()
+    if e == EISCONN:
+        return True
+    if e != EINPROGRESS and e != EALREADY and e != EINTR:
+        return False
+    if not _wait_ready(fd, POLLOUT, deadline_ns):
+        return False
+    return _get_int_opt(fd, SOL_SOCKET, SO_ERROR) == 0
 
 
 def _set_int_opt(fd: Int32, level: Int32, optname: Int32, value: Int32) raises:
@@ -339,7 +414,9 @@ def make_unique_id(out_bytes: Pointer[UInt8, MutAnyOrigin]) raises:
     """Bind a listening socket and encode where it is (ncclGetUniqueId).
     """
     var addr = local_ipv4()
-    var fd = external_call["socket", Int32](AF_INET, SOCK_STREAM, Int32(0))
+    var fd = external_call["socket", Int32](
+        AF_INET, SOCK_STREAM | SOCK_NONBLOCK, Int32(0)
+    )
     if fd < 0:
         raise Error("mojoccl: socket() failed, errno=" + String(_errno()))
     try:
@@ -402,6 +479,10 @@ def _send_all(
 ) raises:
     var done = 0
     while done < nbytes:
+        # Checked before every syscall, not only when one returns EAGAIN: a
+        # peer trickling bytes makes progress forever otherwise.
+        if not _wait_ready(fd, POLLOUT, deadline_ns):
+            raise Error("mojoccl: bootstrap send timed out")
         var n = external_call["send", Int64](
             fd,
             Pointer[UInt8, MutAnyOrigin](
@@ -426,6 +507,8 @@ def _recv_all(
 ) raises:
     var done = 0
     while done < nbytes:
+        if not _wait_ready(fd, POLLIN, deadline_ns):
+            raise Error("mojoccl: bootstrap recv timed out")
         var n = external_call["recv", Int64](
             fd,
             Pointer[UInt8, MutAnyOrigin](
@@ -467,32 +550,55 @@ def bootstrap_connect(
     var deadline_ns = perf_counter_ns() + Int(timeout_s * 1.0e9)
     var listen_fd = _take_root(magic)
     var conn = BootstrapConn(rank, nranks, listen_fd >= 0, listen_fd)
+    try:
+        _rendezvous(conn, rank, nranks, addr_be, port_be, magic, deadline_ns,
+                    timeout_s)
+    except e:
+        # Every exit that is not the happy one closes the sockets here: this
+        # function's caller never sees the `BootstrapConn` when it raises, so
+        # a listener left open holds the unique id's port for the life of the
+        # process and a per-rank socket leaves its peer blocked until its own
+        # deadline instead of failing fast on a closed connection.
+        conn.close()
+        raise e
+    return conn^
 
+
+def _rendezvous(
+    mut conn: BootstrapConn,
+    rank: Int,
+    nranks: Int,
+    addr_be: UInt32,
+    port_be: UInt16,
+    magic: UInt64,
+    deadline_ns: Int,
+    timeout_s: Float64,
+) raises:
+    """`bootstrap_connect`'s body, split out so one `except` closes every
+    socket on every failure path."""
     var hello = _alloc[UInt8](16)
     var hw = hello.unsafe_bitcast[UInt64]()
 
     if conn.is_root:
-        _set_timeout(listen_fd, SO_RCVTIMEO, SOCK_SLICE_S)
+        _set_timeout(conn.listen_fd, SO_RCVTIMEO, SOCK_SLICE_S)
         var got = 0
         while got < nranks - 1:
-            var cfd = external_call["accept", Int32](
-                listen_fd, Int64(0), Int64(0)
+            if not _wait_ready(conn.listen_fd, POLLIN, deadline_ns):
+                raise Error(
+                    "mojoccl: bootstrap timed out with "
+                    + String(got + 1)
+                    + " of "
+                    + String(nranks)
+                    + " ranks connected"
+                )
+            var cfd = external_call["accept4", Int32](
+                conn.listen_fd, Int64(0), Int64(0), SOCK_NONBLOCK
             )
             if cfd < 0:
                 var e = _errno()
                 if e == EINTR or e == EAGAIN:
-                    if perf_counter_ns() > deadline_ns:
-                        conn.close()
-                        raise Error(
-                            "mojoccl: bootstrap timed out with "
-                            + String(got + 1)
-                            + " of "
-                            + String(nranks)
-                            + " ranks connected"
-                        )
                     continue
-                conn.close()
-                raise Error("mojoccl: accept() failed, errno=" + String(e))
+                raise Error("mojoccl: accept4() failed, errno=" + String(e))
             try:
                 _set_timeout(cfd, SO_RCVTIMEO, SOCK_SLICE_S)
                 _set_timeout(cfd, SO_SNDTIMEO, SOCK_SLICE_S)
@@ -500,7 +606,6 @@ def bootstrap_connect(
                 _recv_all(cfd, hello, 16, deadline_ns)
             except e:
                 _close(cfd)
-                conn.close()
                 raise e
             var peer_magic = hw[unsafe_offset=0]
             var peer_rank = Int(hw[unsafe_offset=1])
@@ -509,33 +614,42 @@ def bootstrap_connect(
                 continue  # not ours: another communicator's straggler
             if conn.fds[peer_rank] >= 0:
                 _close(cfd)
-                conn.close()
                 raise Error(
                     "mojoccl: two ranks announced rank " + String(peer_rank)
                 )
             conn.fds[peer_rank] = cfd
             got += 1
-        return conn^
+        return
 
     # Non-root: connect, retrying while the root is still coming up.
     while True:
-        var fd = external_call["socket", Int32](AF_INET, SOCK_STREAM, Int32(0))
+        var fd = external_call["socket", Int32](
+            AF_INET, SOCK_STREAM | SOCK_NONBLOCK, Int32(0)
+        )
         if fd < 0:
             raise Error("mojoccl: socket() failed, errno=" + String(_errno()))
         var sa = _alloc[UInt8](SOCKADDR_IN_BYTES)
         _fill_sockaddr(sa, addr_be, port_be)
-        var rc = external_call["connect", Int32](
-            fd, sa, UInt32(SOCKADDR_IN_BYTES)
-        )
-        if rc == 0:
-            _set_timeout(fd, SO_RCVTIMEO, SOCK_SLICE_S)
-            _set_timeout(fd, SO_SNDTIMEO, SOCK_SLICE_S)
-            _set_int_opt(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+        var connected = False
+        try:
+            connected = _connect_deadline(fd, sa, deadline_ns)
+        except e:
+            _close(fd)
+            raise e
+        if connected:
+            try:
+                _set_timeout(fd, SO_RCVTIMEO, SOCK_SLICE_S)
+                _set_timeout(fd, SO_SNDTIMEO, SOCK_SLICE_S)
+                _set_int_opt(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+            except e:
+                _close(fd)
+                raise e
             conn.fds[0] = fd
             hw[unsafe_offset=0] = magic
             hw[unsafe_offset=1] = UInt64(rank)
             _send_all(fd, hello, 16, deadline_ns)
-            return conn^
+            return
+        var err = _errno()
         _close(fd)
         if perf_counter_ns() > deadline_ns:
             raise Error(
@@ -546,7 +660,7 @@ def bootstrap_connect(
                 + " within "
                 + String(timeout_s)
                 + "s (errno="
-                + String(_errno())
+                + String(err)
                 + "); check MOJOCCL_SOCKET_IFNAME reaches every node"
             )
         sleep(0.02)

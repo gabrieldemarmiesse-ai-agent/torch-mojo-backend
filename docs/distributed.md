@@ -576,7 +576,7 @@ are skipped). Addressing is LID-only, so one IB subnet.
 | variable | default | controls |
 |---|---|---|
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
-| `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | deadline for every bootstrap socket wait |
+| `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | absolute deadline for the whole rendezvous. Every socket it opens is non-blocking and every wait is a `poll(2)` computed from the deadline (`connect` included, verified with `SO_ERROR`), so no syscall can outlive it; `SO_RCVTIMEO`/`SO_SNDTIMEO` stay on as a backstop |
 | `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
 | `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for its peers' shards before latching an error |
 | `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread |

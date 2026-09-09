@@ -69,7 +69,16 @@ comptime AF_UNIX: Int32 = 1
 comptime SOCK_DGRAM: Int32 = 2
 comptime SOL_SOCKET: Int32 = 1
 comptime SO_RCVTIMEO: Int32 = 20
+comptime SO_SNDTIMEO: Int32 = 21
 comptime SCM_RIGHTS = 1
+# MSG_DONTWAIT: every sendmsg/recvmsg below is one non-blocking attempt, and
+# the wait is the caller's deadline loop. A blocking `sendmsg` on an AF_UNIX
+# datagram socket waits for room in the RECEIVER's queue, which is bounded by
+# `net.unix.max_dgram_qlen`; with eight ranks each sending to the seven others
+# before receiving anything, a small qlen wedges the whole node's bring-up in
+# a syscall no deadline can reach.
+comptime MSG_DONTWAIT: Int32 = 0x40
+comptime EAGAIN: Int32 = 11
 
 comptime MSG_KIND_MC = 0
 """Payload word 0 of the datagram carrying the multicast object's fd."""
@@ -80,6 +89,12 @@ peer's local rank."""
 comptime NVLS_AVAILABLE = not has_amd_gpu_accelerator()
 """Every entry point below is CUDA-only; HIP has no multicast equivalent and
 RCCL none either, so an AMD build never reaches them."""
+
+
+def _errno() -> Int32:
+    return external_call[
+        "__errno_location", Pointer[Int32, MutAnyOrigin]
+    ]()[unsafe_offset=0]
 
 
 def _cu(lib: OwnedDLHandle, rc: Int32, what: String) raises:
@@ -298,19 +313,27 @@ def scm_unbind(libc: OwnedDLHandle, sock: Int, path: String) raises:
     _ = libc.get_function[Int32]("unlink")(_sockaddr(path).unsafe_offset(2))
 
 
-def scm_send(
-    libc: OwnedDLHandle,
-    path: String,
-    fd: Int,
-    kind: Int,
-    tag: Int,
-    timeout_s: Float64,
-) raises:
-    """Send `fd`, plus an 8-byte `(kind, tag)` payload, to the socket at
-    `path`. Retries while the peer has not bound yet."""
+def _send_socket(libc: OwnedDLHandle, timeout_s: Float64) raises -> Int32:
+    """A datagram socket for sending fds. `SO_SNDTIMEO` is a backstop only --
+    every send below passes `MSG_DONTWAIT` -- but it is what bounds a send
+    that somehow blocks anyway."""
     var s = libc.get_function[Int32]("socket")(AF_UNIX, SOCK_DGRAM, Int32(0))
     if s < 0:
         raise Error("mojoccl: socket(AF_UNIX) failed")
+    var tv = unsafe_alloc[Int64](2)  # struct timeval
+    tv[unsafe_offset=0] = Int64(timeout_s)
+    tv[unsafe_offset=1] = 0
+    _ = libc.get_function[Int32]("setsockopt")(
+        s, SOL_SOCKET, SO_SNDTIMEO, tv, Int32(16)
+    )
+    return s
+
+
+def _fd_msghdr(
+    sa: Pointer[UInt8, MutUntrackedOrigin], fd: Int, kind: Int, tag: Int
+) -> Pointer[UInt64, MutUntrackedOrigin]:
+    """`struct msghdr` (56 B) carrying one SCM_RIGHTS descriptor and an
+    8-byte `(kind, tag)` payload, to the address in `sa`."""
     var payload = unsafe_alloc[UInt32](2)
     payload[unsafe_offset=0] = UInt32(kind)
     payload[unsafe_offset=1] = UInt32(tag)
@@ -321,18 +344,45 @@ def scm_send(
     ctl[unsafe_offset=0] = 20  # cmsg_len = CMSG_LEN(4)
     ctl[unsafe_offset=1] = UInt64(SOL_SOCKET) | (UInt64(SCM_RIGHTS) << 32)
     ctl[unsafe_offset=2] = UInt64(UInt32(fd))  # the fd itself, at CMSG_DATA
-    var msg = unsafe_alloc[UInt64](7)  # struct msghdr, 56 B
-    msg[unsafe_offset=0] = UInt64(Int(_sockaddr(path)))  # msg_name
+    var msg = unsafe_alloc[UInt64](7)
+    msg[unsafe_offset=0] = UInt64(Int(sa))  # msg_name
     msg[unsafe_offset=1] = 110  # msg_namelen (u32 at +8)
     msg[unsafe_offset=2] = UInt64(Int(iov))  # msg_iov
     msg[unsafe_offset=3] = 1  # msg_iovlen
     msg[unsafe_offset=4] = UInt64(Int(ctl))  # msg_control
     msg[unsafe_offset=5] = 24  # msg_controllen
     msg[unsafe_offset=6] = 0  # msg_flags
-    var sendmsg = libc.get_function[Int]("sendmsg")
+    return msg
+
+
+def _send_once(
+    libc: OwnedDLHandle, sock: Int32, msg: Pointer[UInt64, MutUntrackedOrigin]
+) raises -> Int32:
+    """One `MSG_DONTWAIT` sendmsg. 0 on success, else the errno -- EAGAIN for
+    "the peer's queue is full", ENOENT/ECONNREFUSED for "it has not bound
+    yet"; both are retried by the caller under its deadline."""
+    if libc.get_function[Int]("sendmsg")(sock, msg, MSG_DONTWAIT) >= 0:
+        return 0
+    return _errno()
+
+
+def scm_send(
+    libc: OwnedDLHandle,
+    path: String,
+    fd: Int,
+    kind: Int,
+    tag: Int,
+    timeout_s: Float64,
+) raises:
+    """Send `fd`, plus an 8-byte `(kind, tag)` payload, to the socket at
+    `path`. Retries while the peer has not bound yet, or while its datagram
+    queue is full, until `timeout_s` -- and never blocks in the syscall, so
+    the deadline is real."""
+    var s = _send_socket(libc, timeout_s)
+    var msg = _fd_msghdr(_sockaddr(path), fd, kind, tag)
     var deadline = perf_counter_ns() + Int(timeout_s * 1.0e9)
     while True:
-        if sendmsg(s, msg, Int32(0)) >= 0:
+        if _send_once(libc, s, msg) == 0:
             break
         if perf_counter_ns() > deadline:
             _ = libc.get_function[Int32]("close")(s)
@@ -341,8 +391,23 @@ def scm_send(
     _ = libc.get_function[Int32]("close")(s)
 
 
+def scm_try_recv(
+    libc: OwnedDLHandle, sock: Int
+) raises -> Tuple[Int, Int, Int]:
+    """One non-blocking `recvmsg`. Returns `(-1, 0, 0)` when nothing is
+    queued."""
+    return _recv_impl(libc, sock, MSG_DONTWAIT)
+
+
 def scm_recv(libc: OwnedDLHandle, sock: Int) raises -> Tuple[Int, Int, Int]:
-    """Receive one fd and its `(kind, tag)`; returns `(fd, kind, tag)`."""
+    """Receive one fd and its `(kind, tag)`; returns `(fd, kind, tag)`.
+    Blocking, bounded by the `SO_RCVTIMEO` `scm_bind` set."""
+    return _recv_impl(libc, sock, Int32(0))
+
+
+def _recv_impl(
+    libc: OwnedDLHandle, sock: Int, flags: Int32
+) raises -> Tuple[Int, Int, Int]:
     var payload = unsafe_alloc[UInt32](2)
     payload[unsafe_offset=0] = 0
     payload[unsafe_offset=1] = 0
@@ -360,7 +425,9 @@ def scm_recv(libc: OwnedDLHandle, sock: Int) raises -> Tuple[Int, Int, Int]:
     msg[unsafe_offset=4] = UInt64(Int(ctl))
     msg[unsafe_offset=5] = 24
     msg[unsafe_offset=6] = 0
-    if libc.get_function[Int]("recvmsg")(Int32(sock), msg, Int32(0)) < 0:
+    if libc.get_function[Int]("recvmsg")(Int32(sock), msg, flags) < 0:
+        if flags == MSG_DONTWAIT and _errno() == EAGAIN:
+            return Tuple(-1, 0, 0)
         raise Error("mojoccl: recvmsg on the fd socket failed or timed out")
     if ctl[unsafe_offset=0] != 20:
         raise Error("mojoccl: datagram carried no SCM_RIGHTS control message")
@@ -369,6 +436,64 @@ def scm_recv(libc: OwnedDLHandle, sock: Int) raises -> Tuple[Int, Int, Int]:
         Int(payload[unsafe_offset=0]),
         Int(payload[unsafe_offset=1]),
     )
+
+
+def scm_exchange_fds(
+    libc: OwnedDLHandle,
+    sock: Int,
+    paths: List[String],
+    my_fd: Int,
+    kind: Int,
+    tag: Int,
+    timeout_s: Float64,
+) raises -> List[Tuple[Int, Int, Int]]:
+    """Send `my_fd` to every path AND receive one datagram from each, with the
+    two interleaved.
+
+    The all-to-all round of the NVLS bring-up cannot send everything first:
+    `local_world` ranks each pushing `local_world - 1` datagrams before they
+    read one can fill every queue at once, and on a host with a small
+    `net.unix.max_dgram_qlen` a blocking sender then waits on a receiver who
+    is itself blocked sending. Both halves here are one non-blocking attempt
+    per turn, so a rank that cannot send drains its own queue instead -- and
+    the absolute deadline covers the whole exchange, not one syscall.
+    Returns `(fd, kind, tag)` per datagram; the caller validates and closes.
+    """
+    var send_sock = _send_socket(libc, timeout_s)
+    var msgs = List[Pointer[UInt64, MutUntrackedOrigin]]()
+    for i in range(len(paths)):
+        msgs.append(_fd_msghdr(_sockaddr(paths[i]), my_fd, kind, tag))
+    var got = List[Tuple[Int, Int, Int]]()
+    var sent = 0
+    var deadline = perf_counter_ns() + Int(timeout_s * 1.0e9)
+    while sent < len(paths) or len(got) < len(paths):
+        var moved = False
+        if sent < len(paths):
+            if _send_once(libc, send_sock, msgs[sent]) == 0:
+                sent += 1
+                moved = True
+        if len(got) < len(paths):
+            var r = scm_try_recv(libc, sock)
+            if r[0] >= 0:
+                got.append(r)
+                moved = True
+        if moved:
+            continue
+        if perf_counter_ns() > deadline:
+            _ = libc.get_function[Int32]("close")(send_sock)
+            for i in range(len(got)):
+                _ = libc.get_function[Int32]("close")(Int32(got[i][0]))
+            raise Error(
+                "mojoccl: the fd exchange timed out after sending "
+                + String(sent)
+                + " and receiving "
+                + String(len(got))
+                + " of "
+                + String(len(paths))
+            )
+        sleep(0.0005)
+    _ = libc.get_function[Int32]("close")(send_sock)
+    return got^
 
 
 # ===-------------------------------------------------------------------=== #
@@ -598,59 +723,60 @@ def nvls_bind_and_map(
     region.uc = _map(lib, memh, size, region.granularity, ordinal)
     region.peer_va[local_rank] = region.uc
 
-    # Trade unicast handles. Every rank sends before it receives; the
-    # datagrams are buffered by the kernel, and the receive is bounded by
-    # SO_RCVTIMEO.
+    # Trade unicast handles, sending and receiving at the same time: see
+    # `scm_exchange_fds` for why "everyone sends, then everyone receives"
+    # cannot be safe on a host with a small `net.unix.max_dgram_qlen`.
+    # One export covers every peer -- SCM_RIGHTS installs a new descriptor in
+    # each receiver, and a descriptor already in flight stays valid after the
+    # sender closes it.
+    var paths = List[String]()
     for r in range(local_world):
-        if r == local_rank:
-            continue
-        var fd: Int32 = -1
-        _cu(
-            lib,
-            lib.get_function[Int32]("cuMemExportToShareableHandle")(
-                Pointer(to=fd),
-                memh,
-                Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-                UInt64(0),
-            ),
-            "cuMemExportToShareableHandle(unicast)",
-        )
-        try:
-            scm_send(
-                libc,
-                socket_path(dir, magic, r),
-                Int(fd),
-                MSG_KIND_UC,
-                local_rank,
-                timeout_s,
-            )
-        except e:
-            _ = libc.get_function[Int32]("close")(fd)
-            raise e
-        _ = libc.get_function[Int32]("close")(fd)
-    for _ in range(local_world - 1):
-        var got = scm_recv(libc, sock)
-        if got[1] != MSG_KIND_UC or got[2] < 0 or got[2] >= local_world:
-            _ = libc.get_function[Int32]("close")(Int32(got[0]))
-            raise Error(
-                "mojoccl: unexpected datagram on the fd socket, kind "
-                + String(got[1])
-                + " tag "
-                + String(got[2])
-            )
-        var ph: UInt64 = 0
-        var rc = lib.get_function[Int32]("cuMemImportFromShareableHandle")(
-            Pointer(to=ph),
-            got[0],
+        if r != local_rank:
+            paths.append(socket_path(dir, magic, r))
+    var fd: Int32 = -1
+    _cu(
+        lib,
+        lib.get_function[Int32]("cuMemExportToShareableHandle")(
+            Pointer(to=fd),
+            memh,
             Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+            UInt64(0),
+        ),
+        "cuMemExportToShareableHandle(unicast)",
+    )
+    try:
+        var got = scm_exchange_fds(
+            libc, sock, paths, Int(fd), MSG_KIND_UC, local_rank, timeout_s
         )
-        _ = libc.get_function[Int32]("close")(Int32(got[0]))
-        _cu(lib, rc, "cuMemImportFromShareableHandle(peer)")
-        # Recorded before `_map` can raise, so `nvls_teardown` releases it.
-        region.peer_handle[got[2]] = ph
-        region.peer_va[got[2]] = _map(
-            lib, ph, size, region.granularity, ordinal
-        )
+        for i in range(len(got)):
+            var g = got[i]
+            if g[1] != MSG_KIND_UC or g[2] < 0 or g[2] >= local_world:
+                _ = libc.get_function[Int32]("close")(Int32(g[0]))
+                raise Error(
+                    "mojoccl: unexpected datagram on the fd socket, kind "
+                    + String(g[1])
+                    + " tag "
+                    + String(g[2])
+                )
+            var ph: UInt64 = 0
+            var rc = lib.get_function[Int32](
+                "cuMemImportFromShareableHandle"
+            )(
+                Pointer(to=ph),
+                g[0],
+                Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+            )
+            _ = libc.get_function[Int32]("close")(Int32(g[0]))
+            _cu(lib, rc, "cuMemImportFromShareableHandle(peer)")
+            # Recorded before `_map` can raise, so teardown releases it.
+            region.peer_handle[g[2]] = ph
+            region.peer_va[g[2]] = _map(
+                lib, ph, size, region.granularity, ordinal
+            )
+    except e:
+        _ = libc.get_function[Int32]("close")(fd)
+        raise e
+    _ = libc.get_function[Int32]("close")(fd)
     for r in range(local_world):
         if region.peer_va[r] == 0:
             raise Error(
