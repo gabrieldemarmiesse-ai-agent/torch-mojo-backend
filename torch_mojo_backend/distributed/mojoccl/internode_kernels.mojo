@@ -7,11 +7,10 @@
 # no flag protocol here and no peer pointer -- every address is inside this
 # rank's own region or its own user buffers.
 
-from std.atomic import Atomic, Ordering, fence
+from std.atomic import Atomic, Ordering
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from std.time import global_perf_counter_ns
 from std.sys import size_of
-from std.sys.info import _accelerator_arch
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
@@ -24,28 +23,30 @@ comptime _ABORT_CHECK = 256
 across PCIe, so probing every iteration would double the wait kernel's traffic
 for no gain: 256 iterations is well under a millisecond."""
 
-comptime _AMD_SPIN = _accelerator_arch().startswith("amdgpu")
-"""Whether to launch `_proxy_wait_kernel_amd` instead of `_proxy_wait_kernel`.
-
-An acquire load at system scope lowers, on gfx942, to `global_load ... sc0
-sc1` followed by `buffer_inv sc0 sc1` -- a full L1 AND L2 invalidate. In a
-spin loop that is millions of invalidations a second, and they are not
-private to this kernel: every other kernel resident on the GPU loses its L2
-with them, and this one spins for as long as an exchange takes -- under DDP,
-milliseconds, concurrently with the backward pass. On NVIDIA the same load is
-`ld.acquire.sys`, which invalidates nothing.
-
-The two are separate kernels rather than one kernel with a compile-time
-branch so that the NVIDIA one is literally the function that was measured
-(2x8 H100, job 234072) and its PTX is byte-identical; a `comptime if` inside
-one loop body was enough to flip the branch polarity the compiler chose."""
-
-comptime _SPIN_BACKOFF_NS = 500
-"""Clock time between two mailbox polls in `_proxy_wait_kernel_amd`.
-`s_memrealtime` is a scalar read with no vector-memory traffic and no cache
-effect, so backing off on it costs the fabric nothing; 500 ns against an
-exchange measured in tens of microseconds is invisible in wake-up latency and
-cuts the poll rate by more than two orders of magnitude."""
+# REVERTED: polling the mailbox with a relaxed load and one acquire fence at
+# the end.
+#
+# The measurement that motivated it is real. On gfx942 an acquire load at
+# system scope lowers to `global_load ... sc0 sc1` followed by `buffer_inv sc0
+# sc1`, a whole L1 AND L2 invalidate, and this kernel spins for as long as an
+# exchange takes -- so every other kernel resident on the GPU loses its L2,
+# millions of times a second. The relaxed spelling removed every invalidate
+# from the loop (verified in the assembly: 0 in the loop, 1 for the fence
+# after it) and left the sm_90a PTX byte-identical.
+#
+# It is reverted anyway, for the reason the same change was reverted in
+# `collectives_kernels.mojo`'s barrier (see that file's history): there is no
+# argument for why the cheap version is sound on this hardware, only a
+# symmetry that looks right -- the spin load still carries `sc0 sc1`, so it
+# cannot read a stale flag, and the payload ordering is provided once by the
+# fence. A one-element allreduce at 2 ranks flaked 2 runs in 13 with the
+# barrier's version and 0 in 12 without. And the benefit here was never
+# measured on a workload: nanoGPT's throughput was identical with and without
+# it, because what actually cost 26x was MAX's VMM allocator, not this.
+#
+# Unmeasured benefit plus an unexplained multi-node stall in the same
+# neighbourhood is not a trade worth making. If it comes back it should come
+# back with a soundness argument and a workload that shows the win.
 
 
 @__llvm_metadata(
@@ -164,66 +165,6 @@ def _proxy_wait_kernel(
                     error_word, UInt64(9) * 1_000_000
                 )
                 return
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
-)
-@__name("ccl_internode_proxy_wait")
-def _proxy_wait_kernel_amd(
-    mailbox: Pointer[UInt64, MutAnyOrigin],
-    error_word: Pointer[UInt64, MutAnyOrigin],
-    abort_word: Pointer[UInt64, MutAnyOrigin],
-    seq: UInt64,
-    timeout_ns: UInt64,
-):
-    """`_proxy_wait_kernel` without an L2 invalidate per poll -- see `_AMD_SPIN`.
-
-    Same contract, same abort word, same deadline. Two differences:
-
-    * the poll is a RELAXED load. It is still system-scope and still
-      cache-bypassing (`sc0 sc1` sits on the load, and comes from the scope,
-      not from the ordering), so it still observes the progress thread's
-      store; only the `buffer_inv` that acquire adds goes away.
-    * one acquire FENCE once the flag is observed, which is what the payload
-      ordering actually needs, once per exchange instead of once per poll. A
-      trailing acquire load would not do: its result is unused and the
-      compiler drops it, invalidate and all (checked in the assembly).
-
-    Same shape as RCCL's `waitPeer` (rccl:src/device/prims_simple.h): poll
-    relaxed, order once at the end.
-    """
-    if global_idx.x == 0:
-        var t0 = global_perf_counter_ns()
-        var spins = 0
-        while (
-            Atomic[DType.uint64].load[ordering=Ordering.RELAXED](mailbox) < seq
-        ):
-            spins += 1
-            if spins >= _ABORT_CHECK:
-                spins = 0
-                if (
-                    Int(abort_word) != 0
-                    and Atomic[DType.uint64].load[ordering=Ordering.RELAXED](
-                        abort_word
-                    )
-                    != 0
-                ):
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        error_word, UInt64(9) * 1_000_000
-                    )
-                    return
-            var now = global_perf_counter_ns()
-            if now - t0 > timeout_ns:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                    error_word, UInt64(9) * 1_000_000
-                )
-                return
-            # Back off on the clock, not on memory (see _SPIN_BACKOFF_NS).
-            var until = now + UInt64(_SPIN_BACKOFF_NS)
-            while global_perf_counter_ns() < until:
-                pass
-        fence[ordering=Ordering.ACQUIRE]()
 
 
 @__llvm_metadata(
@@ -377,8 +318,7 @@ def proxy_wait(
     seq: Int,
     timeout_ns: Int,
 ) raises:
-    comptime wait_kernel = _proxy_wait_kernel_amd if _AMD_SPIN else _proxy_wait_kernel
-    _enqueue_cached[wait_kernel](
+    _enqueue_cached[_proxy_wait_kernel](
         ctx,
         stream,
         "ib_wait",
