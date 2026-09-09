@@ -126,8 +126,6 @@ from internode import (
     ib_next_seq,
     ib_note_consumed,
     ib_npeers,
-    ib_port_lid,
-    ib_port_mtu,
     ib_set_abort_word,
     ib_setup,
     ib_signal_abort,
@@ -1175,18 +1173,12 @@ def _bootstrap(
             # already have this region through the fd exchange above, and these
             # 64 bytes stay zero.
             get_handle(lib, base, _any(b2))
-        var my_lid = 0
-        var my_mtu = 0
         if ib != 0:
-            my_lid = ib_port_lid(ib)
-            my_mtu = ib_port_mtu(ib)
             ib_local_info(
                 ib,
                 Pointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=Int(b2) + HANDLE_BYTES
                 ),
-                my_lid,
-                my_mtu,
             )
         var cfg = Pointer[Int64, MutAnyOrigin](
             unsafe_from_address=Int(b2) + HANDLE_BYTES + IB_BLOB_BYTES
@@ -1260,7 +1252,6 @@ def _bootstrap(
                 ),
                 BLOB2,
                 peer_rank_of_node,
-                my_mtu,
             )
 
         bootstrap_barrier(conn, timeout_s)

@@ -1,15 +1,30 @@
 # mojoccl transport self-tests that need no GPU
 
-Six standalone Mojo programs that exercise
-`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode,vmm}.mojo`
-on any host with InfiniBand — the SLURM **login node** included, which is
-what makes them cheap enough to run on every change. They caught six real
-bugs (bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`,
-a silently-misread port LID) before any GPU time was spent chasing them.
-`geometry_test`, `fd_exchange` and `sock_deadline` need no InfiniBand
-either, and `sock_deadline` needs no peer processes at all.
+Standalone Mojo programs that exercise
+`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,libfabric,netutil,internode,vmm}.mojo`
+without a GPU or an allocation of one. They caught six real bugs
+(bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`, a
+silently-misread port LID) before any GPU time was spent chasing them.
 
-Build (from a checkout of this repo, no accelerator needed):
+`ib_bringup` and `ib_pipeline` need a NIC, and run against **either**
+transport backend:
+
+* `MOJOCCL_NET=verbs` — a host with an ACTIVE InfiniBand port. On a cluster
+  that has one this is the login node, which is what makes them cheap enough
+  to run on every change.
+* `MOJOCCL_NET=fabric` — a host with a libfabric RMA provider. On Adastra
+  that is a **compute node**: the login node's only rdma device is a RoCE
+  bond (`link_layer: Ethernet`, which `list_ib_ports` correctly skips) and
+  the compute nodes have four Slingshot NICs, `/dev/cxi[0-3]`, and no
+  InfiniBand at all. `FI_LOCAL_COMM` means several processes on one node
+  talk to each other over the NIC, so one node is enough.
+
+`geometry_test`, `fd_exchange`, `sock_deadline` and `fabric_abi` need no NIC
+either, and the last two need no peer processes. `fabric_hmem` is the
+exception to the whole file: it needs a GPU.
+
+Build (from a checkout of this repo, no accelerator needed except where
+noted):
 
     uv run --no-sync mojo build tests/multinode/selftest/bs_test.mojo \
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/bs_test
@@ -23,6 +38,14 @@ Build (from a checkout of this repo, no accelerator needed):
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
     uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/sock_deadline
+    uv run --no-sync mojo build tests/multinode/selftest/fabric_abi.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fabric_abi_check
+    # fabric_hmem picks libamdhip64 vs libcuda from the BUILD host's
+    # accelerator (driver.mojo, comptime): build it on a GPU node, or name
+    # the target.
+    uv run --no-sync mojo build tests/multinode/selftest/fabric_hmem.mojo \
+        --target-accelerator amdgpu:gfx942 \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fabric_hmem
 
 ## `bs_test.mojo` — the TCP bootstrap
 
@@ -50,6 +73,20 @@ every peer's slot against a rank/sequence-derived pattern.
         MOJOCCL_IB_PROXY=0 /tmp/ib_bringup $r 4 /tmp/uid4.txt &
     done; wait
 
+On Slingshot, the same thing with the other backend (on a compute node --
+`srun --overlap --ntasks=1 --cpus-per-task=8`, no GPU needed):
+
+    for r in 0 1 2 3; do
+        MOJOCCL_NET=fabric MOJOCCL_IB_PROXY=0 /tmp/ib_bringup $r 4 /tmp/uid4.txt &
+    done; wait
+
+Exercised on `cxi` at 2, 4 and 6 processes, and at 4 with
+`MOJOCCL_FABRIC_DOMAIN=cxi$((r % 4))` so each process drives its own NIC.
+If a whole batch fails with `fi_enable failed, rc=-12`, that is the
+unresolved flake described in `docs/distributed.md` ("One unresolved flake on
+Slingshot") -- a node condition, not this code. Retry; that has always
+worked.
+
 `MOJOCCL_IB_PROXY=0` is required here and only here: the progress thread's
 mailbox is pinned, device-mapped host memory, which needs a driver that can
 allocate it, and this host has no GPU. Without it `ib_setup` fails with
@@ -70,6 +107,10 @@ for the stream, so `credit_upto` takes the values it takes in production.
     for r in 0 1 2 3; do
         MOJOCCL_IB_PROXY=0 /tmp/ib_pipeline $r 4 /tmp/uidp.txt 5 4 200 &
     done; wait
+
+`MOJOCCL_NET=fabric` runs the same matrix on Slingshot; the credit protocol
+is transport-independent (the immediate's bit 31 means the same thing under
+both) and this is what proves it.
 
 It catches the two failures the credit protocol can have, and they look
 different: a slot group rewritten before its consumer read it is wrong bytes
@@ -132,15 +173,58 @@ the deadline was only read after it came back. It is 1.50 s now.
 
     /tmp/sock_deadline
 
+## `fabric_abi.mojo` + `fabric_abi.c` — the libfabric struct offsets
+
+`libfabric.mojo` reaches libfabric's `static inline` data path the way
+`ibverbs.mojo` reaches libibverbs': by loading a function pointer out of an
+ops table at a hand-written byte offset (`ep->rma->writemsg`,
+`cq->ops->read`, `domain->mr->regattr`, `fid->ops->bind`). `std.ffi` has no
+C-struct ABI (MOCO-3692), so those offsets are numbers in the Mojo source,
+and a wrong one neither fails to compile nor reliably fails to run -- it
+hands the NIC a garbage pointer. `fabric_abi.c` prints every size, offset
+and constant that file believes, straight out of the installed headers, and
+`fabric_abi.mojo` compares the two lists:
+
+    gcc -O0 -I /opt/cray/libfabric/2.2.0rc1/include \
+        -o /tmp/fabric_abi tests/multinode/selftest/fabric_abi.c
+    /tmp/fabric_abi > /tmp/fabric_abi.txt
+    /tmp/fabric_abi_check /tmp/fabric_abi.txt        # prints PASS
+
+135 constants, no NIC, no peers, instant. Run it against any libfabric
+install before trusting the transport on it.
+
+## `fabric_hmem.mojo` — the one part host memory cannot test
+
+`fabric_hmem <rank> <nranks> <uid-file> [nexchanges]`, on a GPU node, under
+the GPU lock. `ib_bringup` and `ib_pipeline` register a plain malloc'd
+region, which on cxi means `iface = FI_HMEM_SYSTEM`. Production hands
+`ib_setup` a `driver.alloc_region` allocation
+(`hipExtMallocWithFlags(hipDeviceMallocUncached)` / `cuMemAlloc_v2`), which
+has to register as FI_HMEM_ROCR instead -- a different provider path, a
+different kernel driver, and the piece most likely to be missing from a
+libfabric build.
+
+    for r in 0 1; do
+        MOJOCCL_NET=fabric MOJOCCL_IB_PROXY=0 MOJOCCL_IB_TRACE=1 \
+            /tmp/fabric_hmem $r 2 /tmp/uidh.txt 50 &
+    done; wait
+
+It checks that every exchange RETIRES -- the payload write landed, every
+peer's notification arrived, this rank's own writes completed, the flush read
+came back, `ib_error` still zero. It does NOT check the bytes: the region is
+device memory and this test has no stream to copy it back with.
+
 Covered by these and NOT by anything that needs a GPU: interface selection,
-the unique-id encoding, the two-round rendezvous, topology derivation, HCA
-and port selection, `ibv_reg_mr`, QP INIT/RTR/RTS with NCCL's attribute
-values, the ops-table dispatch for post_send/post_recv/poll_cq, the
-immediate's sequence and credit tagging, recv reposting, the self-QP
-GPUDirect flush, the credit-based flow control with several exchanges in
-flight, the region geometry, the SCM_RIGHTS fd transport (both its shapes),
-the socket deadlines, and `ib_setup`'s
-unwind of partially-created resources on a failure path. NOT covered: registration of *device* memory
-(needs nvidia_peermem and a GPU), the progress thread and its two spin
-kernels (they need pinned host memory and a stream), and everything in
-`mojoccl.mojo` above the transport.
+the unique-id encoding, the two-round rendezvous, topology derivation, NIC
+and port/domain selection, memory registration, connection setup (QP
+INIT/RTR/RTS with NCCL's attribute values, or address-vector insertion), the
+ops-table dispatch for the data path of both libraries, the immediate's
+sequence and credit tagging (an InfiniBand immediate, or 64 bits of
+libfabric remote CQ data), receive reposting, the GPUDirect flush read, the
+credit-based flow control with several exchanges in flight, the region
+geometry, the `SCM_RIGHTS` fd transport (both its shapes), the socket
+deadlines, the libfabric struct ABI, and `ib_setup`'s unwind of
+partially-created resources on a failure path. NOT covered: the progress
+thread and its two spin kernels (they need pinned host memory and a stream),
+byte-level verification of an RMA write into device memory, and everything
+in `mojoccl.mojo` above the transport.
