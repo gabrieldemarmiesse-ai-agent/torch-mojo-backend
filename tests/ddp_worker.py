@@ -450,6 +450,28 @@ def _stress_broadcast_allgather_edges(failures: list[str], rank: int, world: int
     dist.barrier()
 
 
+def _stress_avg_overflow(failures: list[str], rank: int, world: int):
+    """AVG over half dtypes must never hold the unscaled sum in the wire dtype.
+
+    Every rank contributes 32768: `world` of them sum past fp16's 65504 while
+    the average is exact, so a path that scales after a narrow store reads
+    inf (NCCL pre-multiplies, `ncclDevPreMulSum`). Two sizes: 1003 elements
+    for the small-message kernels, and 24M elements -- 48 MiB of fp16, the
+    NVLS floor on one node and the pipelined hierarchical path on several.
+    """
+    for dtype in (torch.float16, torch.bfloat16):
+        for n in (1003, 24 * 1024 * 1024):
+            x = torch.full((n,), 32768.0, dtype=dtype, device="mojo")
+            dist.all_reduce(x, op=dist.ReduceOp.AVG)
+            want = torch.full((n,), 32768.0, dtype=dtype)
+            _check(
+                failures,
+                f"stress.avg_overflow.{dtype}.n{n}",
+                torch.equal(x.cpu(), want),
+            )
+    dist.barrier()
+
+
 def run_stress(failures: list[str]):
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -461,6 +483,7 @@ def run_stress(failures: list[str]):
     _stress_mix(failures, rank, world)
     _stress_verify_matrix(failures, rank, world)
     _stress_broadcast_allgather_edges(failures, rank, world)
+    _stress_avg_overflow(failures, rank, world)
 
 
 def main():

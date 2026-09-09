@@ -399,7 +399,8 @@ allgather_finish[dtype](ctx, stream, rank, world, regions, out_ptr,
 
 ```
 reduce_scatter_stage(g)        push + local reduce; my shard, SUM over the
-                               node, unscaled, lands in MY stage_out
+                               node times `scale` (default 1), lands in MY
+                               stage_out
 <vendor allreduce, in place>   region + signal_bytes() + cap_bytes
                                + offset*elem_bytes, count elements, SAME stream
 allgather_finish(g+1)          start barrier, then pull every rank's shard

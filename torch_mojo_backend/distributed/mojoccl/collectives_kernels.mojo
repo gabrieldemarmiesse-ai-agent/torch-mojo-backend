@@ -923,6 +923,7 @@ def _rs_stage_kernel[
     world_i: Int32,
     rank_i: Int32,
     flag_base: UInt64,
+    scale: Float32,
     timeout_ns: UInt64,
 ):
     comptime accum = DType.float32 if (
@@ -966,9 +967,12 @@ def _rs_stage_kernel[
         return
 
     # --- phase 2: sum the `world` contributions to my shard into stage_out --
-    # SUM only, unscaled: the caller's inter-node step reduces the same shard
-    # again, so any averaging has to happen once, at the end, in
-    # `allgather_finish`.
+    # Times `scale`, applied in the fp32 accumulator BEFORE the store narrows
+    # to the wire dtype: the inter-node step sums these node partials again in
+    # that dtype, and an unscaled fp16 sum of 8 x 10000 is already inf. This
+    # is NCCL's PreMulSum for AVG (nccl:src/enqueue/enqueue.cc:2517), and for
+    # a power-of-two communicator x/world is exact, so it rounds no more than
+    # the plain sum would. `allgather_finish` then runs with scale 1.
     var my_off = _shard_off(n, per, rank)
     var my_cnt = _shard_cnt(n, per, rank)
     if my_cnt <= 0:
@@ -1011,6 +1015,8 @@ def _rs_stage_kernel[
                     .unsafe_load[width=W, alignment=16](v * W)
                     .cast[accum]()
                 )
+        comptime if accum.is_floating_point():
+            acc *= SIMD[accum, W](scale.cast[accum]())
         shard.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
 
     for i in range(tid, my_cnt - my_vc * W, stride):
@@ -1025,6 +1031,8 @@ def _rs_stage_kernel[
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
                 .cast[accum]()
             )
+        comptime if accum.is_floating_point():
+            a *= scale.cast[accum]()
         shard[unsafe_offset=k] = a.cast[dtype]()
 
 
@@ -1566,6 +1574,7 @@ def _launch_rs_stage[
     rank: Int,
     cap_bytes: Int,
     generation: Int,
+    scale: Float32,
 ) raises:
     _enqueue_cached[_rs_stage_kernel[dtype, W, _UNROLL, NW]](
         ctx,
@@ -1582,6 +1591,7 @@ def _launch_rs_stage[
         Int32(world),
         Int32(rank),
         _flag_target(generation, 0),
+        scale,
         UInt64(DEFAULT_TIMEOUT_NS),
     )
 
@@ -1632,16 +1642,22 @@ def reduce_scatter_stage[
     numel: Int,
     cap_bytes: Int,
     generation: Int,
+    scale: Float32 = Float32(1.0),
 ) raises:
     """First half of a hierarchical allreduce: push + local reduce, on `stream`.
 
     When the enqueued work completes, this rank's shard --
-    `shard_range(numel, world, rank, size_of[dtype]())` -- summed (SUM,
-    **unscaled**) over the `world` node-local ranks, sits in this rank's own
-    stage_out, at element offset `offset` from `region + signal_bytes() +
-    cap_bytes`. The caller then runs the inter-node collective in place on
-    exactly that range, on this same stream, and calls `allgather_finish` with
-    `generation + 1`.
+    `shard_range(numel, world, rank, size_of[dtype]())` -- summed over the
+    `world` node-local ranks and multiplied by `scale` (ignored for integer
+    dtypes), sits in this rank's own stage_out, at element offset `offset`
+    from `region + signal_bytes() + cap_bytes`. The caller then runs the
+    inter-node collective in place on exactly that range, on this same
+    stream, and calls `allgather_finish` with `generation + 1` and scale 1.
+
+    `scale` goes here rather than into `allgather_finish` so that an AVG never
+    stores an unscaled sum in a narrow wire dtype (NCCL's PreMulSum); pass
+    the communicator-wide 1/world, and the inter-node SUM of the node
+    partials is the average.
 
     `rank` / `world` / `regions` are the node-local group. Preconditions are
     `allreduce`'s: 16-byte aligned `in_ptr`, `numel * size_of[dtype]() <=
@@ -1658,19 +1674,23 @@ def reduce_scatter_stage[
     # self-rendezvous and the reduce copies the input into stage_out.
     if world == 8:
         _launch_rs_stage[dtype, W, 8](
-            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes,
+            generation, scale,
         )
     elif world == 4:
         _launch_rs_stage[dtype, W, 4](
-            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes,
+            generation, scale,
         )
     elif world == 2:
         _launch_rs_stage[dtype, W, 2](
-            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes,
+            generation, scale,
         )
     else:
         _launch_rs_stage[dtype, W, 0](
-            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes, generation
+            ctx, stream, rp, in_ptr, numel, per, world, rank, cap_bytes,
+            generation, scale,
         )
 
 

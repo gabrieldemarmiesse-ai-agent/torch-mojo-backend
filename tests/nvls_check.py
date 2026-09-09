@@ -36,7 +36,17 @@ def main():
     dist.init_process_group(backend="mojo")
     cap = int(os.environ.get("MOJOCCL_REGION_MB", "256")) * 1024 * 1024
     bad = 0
-    for dtype in (torch.float32, torch.bfloat16):
+    # (op, fill, expected). The third case fills every rank with 32768: the
+    # unscaled sum overflows fp16 (world x 32768 > 65504) while the average is
+    # exact, so it fails unless AVG's 1/world is applied to the inputs before
+    # the switch narrows the sum (NCCL's PreMulSum), and it is the reason
+    # fp16 is in the dtype list.
+    cases = (
+        (dist.ReduceOp.SUM, float(RANK + 1), WORLD * (WORLD + 1) / 2),
+        (dist.ReduceOp.AVG, float(RANK + 1), (WORLD + 1) / 2),
+        (dist.ReduceOp.AVG, 32768.0, 32768.0),
+    )
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
         item = torch.zeros((), dtype=dtype).element_size()
         for n in (
             47 * 1024 * 1024 // item,  # just below the NVLS floor
@@ -44,15 +54,12 @@ def main():
             64 * 1024 * 1024 // item + 3,  # ragged, above it
             2 * cap // item + 1,  # one element past the NVLS staging arena
         ):
-            for op, avg in ((dist.ReduceOp.SUM, False), (dist.ReduceOp.AVG, True)):
-                x = torch.full((n,), float(RANK + 1), dtype=dtype, device="mojo")
+            for op, fill, want in cases:
+                x = torch.full((n,), fill, dtype=dtype, device="mojo")
                 dist.all_reduce(x, op=op)
-                want = WORLD * (WORLD + 1) / 2
-                if avg:
-                    want /= WORLD
                 got = x.cpu()
                 ok = bool((got == torch.tensor(want, dtype=dtype)).all())
-                tag = f"world{WORLD}.{dtype}.n{n}.{op.name}"
+                tag = f"world{WORLD}.{dtype}.n{n}.{op.name}.fill{int(fill)}"
                 if not ok:
                     bad += 1
                     print(

@@ -344,6 +344,47 @@ def _copy_vec[
 
 
 @always_inline
+def _copy_vec_scaled[
+    dtype: DType, W: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], MutAnyOrigin],
+    nvec: Int,
+    tid: Int,
+    stride: Int,
+    scale: Float32,
+):
+    """`_copy_vec` times `scale`, through an fp32 accumulator for the half
+    dtypes."""
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
+    var sv = SIMD[accum, W](scale.cast[accum]())
+    var v = tid
+    var lim = nvec - (_U - 1) * stride
+    while v < lim:
+        var tmp = StaticTuple[SIMD[dtype, W], _U]()
+        comptime for u in range(_U):
+            tmp[u] = src.unsafe_load[width=W, alignment=16](
+                (v + u * stride) * W
+            )
+        comptime for u in range(_U):
+            dst.unsafe_store[width=W, alignment=16](
+                (v + u * stride) * W, (tmp[u].cast[accum]() * sv).cast[dtype]()
+            )
+        v += _U * stride
+    while v < nvec:
+        dst.unsafe_store[width=W, alignment=16](
+            v * W,
+            (
+                src.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+                * sv
+            ).cast[dtype](),
+        )
+        v += stride
+
+
+@always_inline
 def _copy_in_span[
     dtype: DType, W: Int
 ](
@@ -354,27 +395,51 @@ def _copy_in_span[
     n: Int,
     tid: Int,
     stride: Int,
+    scale: Float32,
 ):
-    """Stage vectors [v0, v1); the vectors past element `n` are zero filled so
-    the multimem phase runs on whole 16-byte operands (see
-    `nvls_padded_vecs`)."""
+    """Stage vectors [v0, v1) times `scale`; the vectors past element `n` are
+    zero filled so the multimem phase runs on whole 16-byte operands (see
+    `nvls_padded_vecs`).
+
+    `scale` is applied HERE, to each rank's input, and not to the reduced
+    value: `multimem.ld_reduce` accumulates in fp32 but returns the sum
+    narrowed to the wire dtype, so two fp16 ranks averaging 40000 would read
+    inf before any scaling. Pre-scaling the inputs is NCCL's PreMulSum for
+    AVG (nccl:src/enqueue/enqueue.cc:2517); for a power-of-two world x/world
+    is exact, so it costs no rounding.
+    """
+    comptime accum = DType.float32 if (
+        dtype == DType.bfloat16 or dtype == DType.float16
+    ) else dtype
     var nfull = n // W
     var lo = min(v0, nfull)
     var hi = min(v1, nfull)
-    _copy_vec[dtype, W](
-        uc_pay.unsafe_offset(lo * W),
-        in_ptr.unsafe_offset(lo * W),
-        hi - lo,
-        tid,
-        stride,
-    )
+    if scale == Float32(1.0):
+        _copy_vec[dtype, W](
+            uc_pay.unsafe_offset(lo * W),
+            in_ptr.unsafe_offset(lo * W),
+            hi - lo,
+            tid,
+            stride,
+        )
+    else:
+        _copy_vec_scaled[dtype, W](
+            uc_pay.unsafe_offset(lo * W),
+            in_ptr.unsafe_offset(lo * W),
+            hi - lo,
+            tid,
+            stride,
+            scale,
+        )
     var v = hi + tid
     while v < v1:
         var x = SIMD[dtype, W](0)
         comptime for k in range(W):
             var idx = v * W + k
             if idx < n:
-                x[k] = in_ptr[unsafe_offset=idx]
+                x[k] = (
+                    in_ptr[unsafe_offset=idx].cast[accum]() * scale.cast[accum]()
+                ).cast[dtype]()
         uc_pay.unsafe_store[width=W, alignment=16](v * W, x)
         v += stride
 
@@ -416,7 +481,6 @@ def _reduce_span[
     mc_pay: Pointer[Scalar[dtype], MutAnyOrigin],
     v0: Int,
     v1: Int,
-    scale: Float32,
     tid: Int,
     stride: Int,
 ):
@@ -424,18 +488,10 @@ def _reduce_span[
 
     Only the rank that owns the span ever touches it, so its read and its write
     need no ordering against each other across ranks: one barrier before (every
-    rank's copy-in is in) and one after (every rank's store landed).
-
-    `scale` is applied here, on the one value that reaches all eight regions,
-    through an fp32 accumulator for the half dtypes -- the same rule
-    `_copy_span_scaled` follows in collectives_kernels.mojo. Integer dtypes
-    never reach this kernel.
+    rank's copy-in is in) and one after (every rank's store landed). Any AVG
+    scale was applied at copy-in (`_copy_in_span`); the switch's sum is stored
+    as is. Integer dtypes never reach this kernel.
     """
-    comptime accum = DType.float32 if (
-        dtype == DType.bfloat16 or dtype == DType.float16
-    ) else dtype
-    var unit = scale == Float32(1.0)
-    var sv = SIMD[accum, W](scale.cast[accum]())
     var v = v0 + tid
     var lim = v1 - (_MMU - 1) * stride
     while v < lim:
@@ -453,9 +509,6 @@ def _reduce_span[
                 ).unsafe_address_space_cast[AddressSpace.GLOBAL]()
             )
         comptime for u in range(_MMU):
-            var x = acc[u] if unit else (acc[u].cast[accum]() * sv).cast[
-                dtype
-            ]()
             multimem_st[
                 dtype,
                 simd_width=W,
@@ -465,7 +518,7 @@ def _reduce_span[
                 mc_pay.unsafe_offset(
                     (v + u * stride) * W
                 ).unsafe_address_space_cast[AddressSpace.GLOBAL](),
-                x,
+                acc[u],
             )
         v += _MMU * stride
     while v < v1:
@@ -479,13 +532,12 @@ def _reduce_span[
             scope=Scope.SYSTEM,
             consistency=Consistency.RELAXED,
         ](a)
-        var y = one if unit else (one.cast[accum]() * sv).cast[dtype]()
         multimem_st[
             dtype,
             simd_width=W,
             scope=Scope.SYSTEM,
             consistency=Consistency.RELAXED,
-        ](a, y)
+        ](a, one)
         v += stride
 
 
@@ -568,7 +620,7 @@ def _nvls_ar_kernel[
 
     if not is_reducer:
         _copy_in_span[dtype, W](
-            uc_pay, in_ptr, 0, min(cv, nvec), n, ctid, cstride
+            uc_pay, in_ptr, 0, min(cv, nvec), n, ctid, cstride, scale
         )
     if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
         _record_error(uc, 1)
@@ -584,14 +636,13 @@ def _nvls_ar_kernel[
                 mc_pay,
                 s0 + rank * per,
                 s0 + rank * per + per,
-                scale,
                 rtid,
                 rstride,
             )
         else:
             if c + 1 < nch:
                 _copy_in_span[dtype, W](
-                    uc_pay, in_ptr, s1, min(s1 + cv, nvec), n, ctid, cstride
+                    uc_pay, in_ptr, s1, min(s1 + cv, nvec), n, ctid, cstride, scale
                 )
             if c > 0:
                 _copy_out_span[dtype, W](

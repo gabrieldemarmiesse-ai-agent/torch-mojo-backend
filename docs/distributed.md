@@ -462,7 +462,9 @@ RDMA-writes that shard to the counterpart rank (same `local_rank`) on every
 other node and receives theirs into the `network` area of its region; a
 small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
-the user output, scaled for AVG. Broadcast and all-gather use the same RDMA
+the user output. AVG's 1/world is applied by the reduce-scatter to each input
+(NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
+in a half dtype. Broadcast and all-gather use the same RDMA
 path with a simpler schedule (root's node fans out to its counterparts, then
 intra-node; node blocks exchanged, then placed by global rank) and stay
 unpipelined — they run at DDP init, not in the step. Single-node

@@ -1678,6 +1678,10 @@ def _do_allreduce[
     var chunk_elems = max(1, _pipeline_chunk_bytes(state, count * item) // item)
     var nchunks = (count + chunk_elems - 1) // chunk_elems
     var depth = min(state.narenas, nchunks)
+    # AVG's 1/world is applied by the reduce-scatter to each input (NCCL's
+    # PreMulSum): the node partials that cross the network and the inbox add
+    # are then already scaled, so no fp16 sum ever exceeds the average, and
+    # the all-gather copies with scale 1.
     # Two generations per chunk, reserved up front, so each chunk's
     # all-gather is its own reduce-scatter's plus one (the split kernels'
     # documented pairing) even though the enqueue order interleaves chunks.
@@ -1702,6 +1706,7 @@ def _do_allreduce[
                 cnt,
                 state.arena_cap,
                 g0 + 2 * k,
+                scale,
             )
             seqs[k] = _exchange_release[dtype](
                 state, stream, raw_stream, k % state.narenas, cnt
@@ -1722,7 +1727,7 @@ def _do_allreduce[
                 recvbuff + off * item,
                 cnt,
                 state.arena_cap,
-                scale,
+                Float32(1.0),
                 g0 + 2 * j + 1,
             )
 
