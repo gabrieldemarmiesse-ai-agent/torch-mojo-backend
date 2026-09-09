@@ -840,6 +840,25 @@ def ib_drive(mut st: IbState) -> Bool:
         # Nothing outstanding can move and nothing has moved for a whole
         # timeout: a peer is gone, or a credit was lost.
         if perf_counter_ns() - st.last_progress_ns > st.timeout_ns:
+            # Say where the engine got to before giving up. This costs one
+            # print on a path that ends the communicator anyway, and it is
+            # the only chance to see the state: `ib_report` runs at teardown,
+            # which a rank that dies on `ncclCommGetAsyncError` never reaches.
+            # The reader wants to know WHICH side stopped -- an engine with
+            # everything posted and nothing arrived is waiting for a peer's
+            # GPU, one short of credits is waiting for a peer's consumer.
+            print(
+                "mojoccl: inter-node engine gave up after",
+                st.timeout_ns // 1_000_000_000,
+                "s with no progress, at",
+                _ring_state(st, st.request_seq),
+                "| blocked ms: credit",
+                Float64(st.t_blocked_credit_ns) / 1.0e6,
+                "arrival",
+                Float64(st.t_blocked_arrive_ns) / 1.0e6,
+                "own sends",
+                Float64(st.t_blocked_sends_ns) / 1.0e6,
+            )
             _store_atomic_i(_err_ptr(st), 3)
             _release_on_error(st)
     return moved
