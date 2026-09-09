@@ -15,7 +15,11 @@
 #   allreduce two-shot: `world` push slots of max-shard size, then the reduced
 #                       shard (`_launch_allreduce`, which raises if that ever
 #                       fails to fit -- it cannot, since world*shard ~ numel
-#                       <= cap and the arena is 2*cap);
+#                       <= cap and the arena is 2*cap).  On AMD that last area
+#                       is `world-1` slots instead of one -- the gather slots
+#                       peers push their reduced shards into -- at the same
+#                       base offset, so the NVIDIA layout is byte for byte
+#                       what it was;
 #   allreduce one-shot: two generation-parity halves of `world` whole-message
 #                       slots (used only when they fit);
 #   broadcast/allgather: the base of the arena, one message-sized stage per
@@ -50,6 +54,39 @@
 # the same as a direct reduce-scatter + all-gather -- and no byte is copied
 # locally that the direct kernel would not also copy.  The staging is free.
 #
+# Link direction: AMD (gfx942 / MI300A) takes a different phase 3
+# ------------------------------------------------------------------
+# On an xGMI mesh a GPU-initiated remote *read* does not scale across links
+# while a remote *write* does.  Measured on a 4x MI300A node with the copy
+# loop below (perf-work/linkbw.mojo, 168 MiB, per-GPU GB/s): one link 91
+# either way; three peers written at once 233; three peers read at once 93,
+# and a ring of simultaneous readers 56.  RCCL reaches the same 236 GB/s at
+# 512 MiB and gets there the same way -- its P2P transport hard-wires
+# `read = 0` on AMD (rccl:src/graph/paths.cc:441 only lets compCap 80 read),
+# so the sender stores into the receiver's buffer and no rank ever loads
+# across a link.
+#
+# So on AMD phase 3 is a second push instead of a pull:
+#
+#   phase 2' each rank writes its reduced shard into EVERY peer's gather slot
+#            (and into its own slice of the user output),
+#   phase 3' each rank copies the `world-1` gather slots of its OWN region
+#            into the user output -- a local HBM copy, because the user's
+#            output cannot be IPC-mapped and so a peer cannot write it
+#            directly.
+#
+# The cross-link traffic is bit for bit the same 2*(world-1)/world * bytes; it
+# has only changed direction.  The price is that local copy, and it is small:
+# the region is `hipDeviceMallocUncached` but reads out of it at full HBM rate
+# (1434 GB/s measured against 1453 for a normal buffer), so 0.75 * message
+# costs ~90 us at 168 MiB against the ~1130 us the wire needs.
+#
+# NVIDIA keeps the pull: behind a switch every direction is equivalent, the
+# pull needs no gather slots and no local copy, and the H100 numbers in
+# docs/mojo_collectives_kernel_results.md were measured with it.  The split is
+# a `comptime if has_amd_gpu_accelerator()` in the kernel and in the one host
+# line that sizes the arena, so NVIDIA device code is unchanged.
+#
 # Synchronisation
 # ---------------
 # The signal area holds one UInt64 flag per (block, writer rank).  Rank r's
@@ -83,12 +120,15 @@
 # (`install_abort_word`, `ncclCommAbort`), which is what makes abort prompt
 # instead of costing a full deadline.
 #
-# Portability: NVIDIA and AMD share every line of the device code.  Ordering is
-# `Atomic[...].store[RELEASE]` / `load[ACQUIRE]` at default (system) scope,
-# which lowers to `st.release.sys.global` / `ld.acquire.sys.global` on sm_90a
-# and to `global_store/load ... sc0 sc1` + `buffer_wbl2 sc0 sc1` / `buffer_inv
-# sc0 sc1` on gfx942 -- exactly the instructions RCCL relies on.  Blocks are
-# 256 threads (RCCL's gfx942 maximum) and every layout is wave-64 safe.
+# Portability: NVIDIA and AMD share every line of the device code except the
+# two places the header calls out (phase 3 of the allreduce, and the fence
+# discipline).  On NVIDIA ordering is `Atomic[...].store[RELEASE]` /
+# `load[ACQUIRE]` at default (system) scope, which lowers to
+# `st.release.sys.global` / `ld.acquire.sys.global` on sm_90a.  On gfx942 the
+# region is uncached and the flags are published with `s_waitcnt lgkmcnt(0)
+# vmcnt(0)` plus a relaxed store -- RCCL's "cheap post-send fence", see
+# `_sync`.  Blocks are 256 threads (RCCL's gfx942 maximum) and every layout is
+# wave-64 safe.
 #
 # Every host function takes the DeviceStream to enqueue on (production wraps
 # the caller's foreign cudaStream_t with `DeviceContext.create_external_stream`);
@@ -125,6 +165,11 @@ from std.utils import StaticTuple
 # ===-------------------------------------------------------------------=== #
 # Compile-time configuration
 # ===-------------------------------------------------------------------=== #
+
+comptime _AMD = has_amd_gpu_accelerator()
+"""Whether this build targets AMD.  Every behavioural difference in this file
+is behind it, so the NVIDIA path is exactly what it was before the MI300A work
+(see the "Link direction" note in the module header)."""
 
 comptime MAX_WORLD = 8
 """Largest world size a single region can address (one flag column per rank)."""
@@ -186,23 +231,33 @@ comptime _AR_MAX_BLOCKS = get_defined_int[
 ]()
 """Grid cap for allreduce, fitted on H100 (132 SMs) / NVSwitch; see the block
 sweep in RESULTS.md. Not portable: re-fit it on another card. The AMD value
-was swept on 4x MI300A (228 CUs): 128 blocks measured 9 MiB at 173 us against
-201 for 216 and 246 for 456, with 27 MiB flat across the sweep."""
+was swept on one 4x MI300A node (228 CUs) with the push/reduce/push-back
+schedule and the barrier this file uses there, fp32, 4 ranks, us at
+9 / 27 MiB: 64 -> 118 / 285, **128 -> 121 / 254**, 224 -> 144 / 258. The cost
+of the grid here is the barrier's `buffer_wbl2` per thread, which is why the
+best value moved down from 224 once the release fence went back to every
+thread; 64 starves the 27 MiB transfer. Re-fit it on another card, and re-fit
+it if the barrier changes."""
 
 comptime _AR_BIG_BYTES = get_defined_int["ccl_ar_big_bytes", 64 * 1024 * 1024]()
 """Above this message size the allreduce grid drops to `_AR_BIG_BLOCKS`."""
 
 comptime _AR_BIG_BLOCKS = get_defined_int[
-    "ccl_ar_big_blocks", 1024 if has_amd_gpu_accelerator() else 128
+    "ccl_ar_big_blocks", 912 if has_amd_gpu_accelerator() else 128
 ]()
 """Grid cap for large allreduces. A grid that fits in one wave of an H100's
 132 SMs measured 8% faster at 512 MiB than 216 blocks (2825 vs 3065 us) and
 the same at 168 MiB, because the barrier is per block index: with more blocks
 than SMs the second wave runs the whole collective after the first, on fewer
-SMs. Fitted on H100 (132 SMs); re-fit on another card. On MI300A the
-opposite holds -- the 228 CUs want many more waves in flight to cover the
-xGMI latency: 512 MiB measured 9662 us at 128 blocks, 6991 at 912 and 6448
-at 1024 (the flag-matrix cap), 168 MiB 2948 -> 2141."""
+SMs. Fitted on H100 (132 SMs); re-fit on another card.
+
+MI300A wants the opposite, and not gently. Swept on one 4x MI300A node with
+the push/reduce/push-back schedule, fp32, 4 ranks, us at 168 / 512 MiB:
+64 -> 1987 / 6638, 96 -> 1393 / 5465, 128 -> 1886 / 5381, 160 -> 1302 / 4804,
+224 -> 2224 / 6053, 456 -> 1262 / 5093, **912 -> 1196 / 3705**. 912 is four
+waves of the 228 CUs and is the only value that is best at both sizes; the
+response in between is not monotonic (224, one block per CU, is the worst
+point measured) so do not interpolate -- re-sweep."""
 
 comptime _COPY_MAX_BLOCKS = get_defined_int["ccl_copy_blocks", 432]()
 """Grid cap for the pure-copy collectives (broadcast / allgather)."""
@@ -364,9 +419,9 @@ def _sync(
     """Block-scoped barrier across the same block index on every rank.
 
     Thread `p` (p < world) publishes `target` into peer p's flags[bid][rank]
-    with a release store -- which orders every payload write this block made
-    into peer memory before the flag becomes visible -- then waits for peer p's
-    flag in my own region to reach `target`.
+    -- after every payload write this block made into peer memory has landed,
+    which is what the fence below is for -- then waits for peer p's flag in my
+    own region to reach `target`.
 
     Blocks are matched by index: every collective in this file gives block b of
     every rank exactly the same grid-stride slice of the index space, so block b
@@ -380,21 +435,51 @@ def _sync(
     ]()
     if thread_idx.x == 0:
         failed[unsafe_offset=0] = 0
-    comptime if has_amd_gpu_accelerator():
+    comptime if _AMD:
         # gfx942's `s_barrier` is emitted with `s_waitcnt lgkmcnt(0)` only, so
         # another wave's payload stores can still be in flight when one thread
         # publishes the flag; RCCL puts `vmcnt(0)` inside its block barrier for
-        # exactly this reason (rccl:src/device/prims_simple.h:193-210), and a
-        # release fence in every thread is the portable spelling (it lowers to
-        # `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`). NVIDIA needs nothing:
-        # `bar.sync` is a CTA-scope fence and the release store below is
-        # cumulative over it, which is what NCCL's postPeer relies on.
+        # exactly this reason (rccl:src/device/prims_simple.h:193-210). A
+        # release fence in every thread is the portable spelling and lowers to
+        # `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`, i.e. the writeback that
+        # makes this block's payload stores visible to the peer that is about
+        # to be told they are there.
+        #
+        # Both cheaper spellings were tried and both are wrong on this box, in
+        # the same way and only for small payloads:
+        #   * no writeback at all (RCCL's `skip_fence` for cudaArch 940, which
+        #     is sound for RCCL because its P2P buffers are uncached) --
+        #     broke every broadcast;
+        #   * the writeback moved after the barrier into the `world` threads
+        #     that publish flags -- fixed the broadcast at 4 ranks but still
+        #     failed a 1-element allreduce and a broadcast at 2 ranks.
+        # Our region is `hipDeviceMallocUncached`, but the mapping a peer
+        # writes *through* comes from `hipIpcOpenMemHandle` and does not carry
+        # that memory type, so a few bytes can still be sitting in the writer's
+        # cache. Megabyte payloads drain on their own, which is why only the
+        # small collectives ever failed. NVIDIA needs nothing: `bar.sync` is a
+        # CTA-scope fence and the release store below is cumulative over it,
+        # which is what NCCL's postPeer relies on.
         fence[ordering=Ordering.RELEASE]()
     barrier()
 
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x)
+        # The acquire stays an acquire *load*, per iteration. Spinning on a
+        # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
+        # invalidating once after the wait looks exactly as strong, is worth
+        # a lot -- it is the difference between 243 us and 465 us at 27 MiB
+        # when the grid is 1024 blocks, because `buffer_inv sc0 sc1` throws
+        # the payload out of L2 for every block still working -- and was
+        # measured to leave a one-element allreduce at 2 ranks failing 2 runs
+        # in 13, against 0 in 12 with this spelling. Neither sample proves
+        # anything on its own (Fisher p ~ 0.5), but there is no argument for
+        # why the cheap version is sound on this hardware, and two cheaper
+        # release spellings already turned out unsound here in exactly this
+        # way -- small payloads only. So: correctness, and the large messages
+        # pay for it. See docs/mojo_collectives_kernel_results.md section 7
+        # for the experiment that would settle it.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer]).unsafe_offset(bid * MAX_WORLD + rank),
             target,
@@ -416,7 +501,6 @@ def _sync(
                     break
     barrier()
     return failed[unsafe_offset=0] == 0
-
 
 
 @always_inline
@@ -447,6 +531,18 @@ def _peer_step0(i: Int, world: Int) -> Int:
         return (i + Int(block_idx.x)) % world
     else:
         return i
+
+
+@always_inline
+def _gather_slot(writer: Int, owner: Int) -> Int:
+    """Index of `writer`'s slot inside `owner`'s gather area (AMD phase 3').
+
+    Compacted, exactly like the split allreduce's push slots: `owner` never
+    writes its own slot (its own reduced shard goes straight to the user
+    output), so `world-1` slots suffice and the area stays inside the arena
+    even when the message is exactly `cap` bytes.
+    """
+    return writer if writer < owner else writer - 1
 
 
 @always_inline
@@ -710,9 +806,11 @@ def shard_range(
 #
 # Within a call the two data syncs order the three phases:
 #     start(g) < push(g) < A(g) < reduce(g) < B(g) < pull(g) < start(g+1)
-# and a sync is a full N-way rendezvous of matching block indices. In-place
-# (in_ptr == out_ptr) is safe because the phases are block-matched: block b
-# writes exactly the elements block b read.
+# (on AMD: reduce-and-push-back instead of reduce, local gather instead of
+# pull -- same three phases, same two data syncs) and a sync is a full N-way
+# rendezvous of matching block indices. In-place (in_ptr == out_ptr) is safe
+# because the phases are block-matched: block b writes exactly the elements
+# block b read.
 
 
 @__llvm_metadata(
@@ -784,8 +882,14 @@ def _ar_twoshot_kernel[
     var my_tail = tail if rank == world - 1 else 0
     var uin = in_ptr.unsafe_offset(my_vs * W)
     var uout = out_ptr.unsafe_offset(my_vs * W)
+    # NVIDIA publishes the reduced shard in its own region for the peers to
+    # pull.  AMD pushes it into theirs instead (phase 2b below), so there is
+    # nothing to publish locally; `shard` then aliases `uout` and the store to
+    # it is elided at compile time.
     var shard = (
-        regions[rank].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
+        uout if _AMD else regions[rank]
+        .unsafe_offset(shard_off)
+        .unsafe_bitcast[Scalar[dtype]]()
     )
 
     # Slot pointers are formed by arithmetic inside the unrolled loop, never
@@ -793,6 +897,27 @@ def _ar_twoshot_kernel[
     # memory (MOCO-1431) and turns every payload load into a generic-address
     # `ld.v4.b32` plus an `ld.local.b64` of the pointer itself.
     var slots = regions[rank].unsafe_offset(push_off)
+
+    # AMD only: the peers' gather slots this rank pushes its reduced shard
+    # into, hoisted out of the element loop.  A `comptime for` writes and
+    # reads this array at constant indices only, so SROA keeps the `world-1`
+    # pointers in registers -- the MOCO-1431 demotion above bites when the
+    # index is a runtime value, which is why the reduce's own source pointers
+    # are still formed by arithmetic.  `NW == 0` (world 3, 5, 6, 7) has no
+    # comptime bound and falls back to a second pass over the shard.
+    var gout = InlineArray[Pointer[Scalar[dtype], MutAnyOrigin], MAX_WORLD](
+        uninitialized=True
+    )
+    comptime if _AMD and NW > 0:
+        comptime for j in range(1, NW):
+            var pj = rank + _peer_step(j, NW)
+            if pj >= NW:
+                pj -= NW
+            gout[j] = (
+                regions[pj]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(rank, pj))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
 
     for v in range(tid, my_vc, stride):
         var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
@@ -821,8 +946,17 @@ def _ar_twoshot_kernel[
         comptime if accum.is_floating_point():
             acc *= SIMD[accum, W](scale.cast[accum]())
         var res = acc.cast[dtype]()
-        shard.unsafe_store[width=W, alignment=16](v * W, res)
+        comptime if not _AMD:
+            shard.unsafe_store[width=W, alignment=16](v * W, res)
         uout.unsafe_store[width=W, alignment=16](v * W, res)
+        # One reduce, `world` stores: my output slice and every peer's gather
+        # slot.  This is NCCL's MULTIDSTS shape (rccl:src/device/
+        # common_kernel.h reduceCopyPacks stores to all destinations from one
+        # accumulator) and it keeps the local reduce traffic inside the wire
+        # transfer instead of adding a pass in front of it.
+        comptime if _AMD and NW > 0:
+            comptime for j in range(1, NW):
+                gout[j].unsafe_store[width=W, alignment=16](v * W, res)
 
     for i in range(tid, my_tail, stride):
         var k = my_vc * W + i
@@ -838,23 +972,59 @@ def _ar_twoshot_kernel[
             )
         comptime if accum.is_floating_point():
             a *= scale.cast[accum]()
-        shard[unsafe_offset=k] = a.cast[dtype]()
+        comptime if not _AMD:
+            shard[unsafe_offset=k] = a.cast[dtype]()
         uout[unsafe_offset=k] = a.cast[dtype]()
+        comptime if _AMD and NW > 0:
+            comptime for j in range(1, NW):
+                gout[j][unsafe_offset=k] = a.cast[dtype]()
+
+    comptime if _AMD and NW == 0:
+        # --- phase 2b (AMD, generic world): push my reduced shard into every
+        # peer's gather slot in a second pass.  Only worlds 3, 5, 6 and 7 come
+        # here; 2, 4 and 8 fuse the stores into the reduce above.  Thread
+        # `tid` reads back only the elements thread `tid` just wrote (both
+        # loops walk `{tid, tid+stride, ...}`), so no fence is involved.
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            var dst = (
+                regions[p]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(rank, p))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
+            _copy_vec[dtype, W, U](dst, uout, my_vc, tid, stride)
+            if my_tail > 0:
+                _copy_scalar_tail(dst, uout, my_vc * W, my_tail, tid, stride)
 
     if not _sync(regions, world, rank, flag_base + 2, t0, timeout_ns):
         _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 2)
         return
 
-    # --- phase 3: pull the peers' reduced shards into the user output -------
+    # --- phase 3: the peers' reduced shards into the user output ------------
+    # NVIDIA reads them across the fabric; AMD reads them out of its own
+    # region, where phase 2b's pushes left them (module header, "Link
+    # direction").
     for i in range(1, world):
         var p = rank + _peer_step(i, world)
         if p >= world:
             p -= world
         var vs = _vstart(p, q, rem)
         var vc = _vcount(p, q, rem)
-        var src = (
-            regions[p].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
-        )
+        var src: Pointer[Scalar[dtype], MutAnyOrigin]
+        comptime if _AMD:
+            src = (
+                regions[rank]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(p, rank))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
+        else:
+            src = (
+                regions[p]
+                .unsafe_offset(shard_off)
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
         var dst = out_ptr.unsafe_offset(vs * W)
         _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
         if tail > 0 and p == world - 1:
@@ -1301,6 +1471,61 @@ def _bcast_kernel[
         _record_error(regions, rank, ERR_BROADCAST_SYNC, 1)
         return
 
+    comptime if _AMD:
+        # The gather half is a push too (module header, "Link direction").
+        # After the scatter every rank holds its own shard in the scatter area
+        # at `stage_off`; each then writes that shard into every OTHER
+        # non-root rank's gather slot, and everyone assembles locally.  The
+        # root needs nothing back -- it copied `send` to `recv` above -- so it
+        # is skipped as a destination, which is also why `world-1` compacted
+        # slots are enough.  The whole staging is `world` shard slots, i.e.
+        # about `nbytes`, so the caller's chunking is unchanged.
+        var sslot = (_vcount(0, q, rem) * 16 + mtail + 15) // 16 * 16
+        var gbase = stage_off + sslot
+        var my_vc = _vcount(rank, q, rem)
+        var my_bytes = my_vc * 16 + (mtail if rank == world - 1 else 0)
+        var mine = regions[rank].unsafe_offset(stage_off)
+        if rank != root:
+            _copy_bytes[U](
+                recv.unsafe_offset(_vstart(rank, q, rem) * 16),
+                mine,
+                my_bytes,
+                tid,
+                stride,
+            )
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            if p == root:
+                continue
+            _copy_bytes[U](
+                regions[p].unsafe_offset(gbase + sslot * _gather_slot(rank, p)),
+                mine,
+                my_bytes,
+                tid,
+                stride,
+            )
+        if not _sync(regions, world, rank, flag_base + 2, t0, timeout_ns):
+            _record_error(regions, rank, ERR_BROADCAST_SYNC, 2)
+            return
+        if rank != root:
+            for i in range(1, world):
+                var p = rank + _peer_step(i, world)
+                if p >= world:
+                    p -= world
+                var vc = _vcount(p, q, rem)
+                _copy_bytes[U](
+                    recv.unsafe_offset(_vstart(p, q, rem) * 16),
+                    regions[rank].unsafe_offset(
+                        gbase + sslot * _gather_slot(p, rank)
+                    ),
+                    vc * 16 + (mtail if p == world - 1 else 0),
+                    tid,
+                    stride,
+                )
+        return
+
     if rank != root:
         for i in range(world):
             var p = rank + _peer_step0(i, world)
@@ -1349,6 +1574,51 @@ def _allgather_kernel[
     var n = Int(nbytes)
     var out_stride = Int(stride_b)
     var stage_off = Int(stage_off_b)
+
+    comptime if _AMD:
+        # Push instead of pull (module header, "Link direction"): my
+        # contribution goes into every peer's slot for me and straight into my
+        # own output slice, and the gather is then a local copy out of my own
+        # region.  `world-1` compacted slots, addressed by `_gather_slot`, so
+        # the staging is `(world-1) * nbytes` -- which is why
+        # `allgather_max_bytes` chunks smaller here than on NVIDIA.
+        var slot = (n + 15) // 16 * 16
+        if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
+            _record_error(regions, rank, ERR_ALLGATHER_SYNC, 0)
+            return
+        _copy_bytes[U](
+            out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
+        )
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            _copy_bytes[U](
+                regions[p].unsafe_offset(
+                    stage_off + slot * _gather_slot(rank, p)
+                ),
+                in_ptr,
+                n,
+                tid,
+                stride,
+            )
+        if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
+            _record_error(regions, rank, ERR_ALLGATHER_SYNC, 1)
+            return
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            _copy_bytes[U](
+                out_ptr.unsafe_offset(p * out_stride),
+                regions[rank].unsafe_offset(
+                    stage_off + slot * _gather_slot(p, rank)
+                ),
+                n,
+                tid,
+                stride,
+            )
+        return
 
     if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
         _record_error(regions, rank, ERR_ALLGATHER_SYNC, 0)
@@ -1583,7 +1853,15 @@ def _launch_allreduce[
     var slot = _align_up(max_shard_elems * esize, 16)
     var push_off = arena
     var shard_off = arena + world * slot
-    if shard_off + slot > arena_end:
+    # NVIDIA parks one reduced shard at `shard_off` for the peers to pull;
+    # AMD parks `world-1` gather slots there for the peers to push into
+    # (module header, "Link direction").  `world*slot` is already about
+    # `numel*esize` <= cap, so `world` more slots would not fit an arena of
+    # 2*cap when the message is exactly cap bytes -- hence the compacted
+    # `world-1`, whose worst case is cap*(2 - 1/world) plus alignment.
+    comptime tail_slots = 1
+    var end = shard_off + (max(world - 1, 1) if _AMD else tail_slots) * slot
+    if end > arena_end:
         raise Error("collectives: allreduce staging exceeds the region")
     var cap_blocks = (
         _AR_BIG_BLOCKS if numel * esize >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
@@ -2075,6 +2353,21 @@ def broadcast(
     )
 
 
+def allgather_max_bytes(cap_bytes: Int, world: Int) -> Int:
+    """Largest per-rank contribution one `allgather` call may carry.
+
+    NVIDIA stages one message-sized buffer per rank in its own region and
+    reads the peers', so `cap_bytes` is the bound and this is the identity.
+    AMD pushes instead, which needs `world-1` message-sized slots inside the
+    `2*cap_bytes` arena; the caller chunks to that.
+    """
+    comptime if _AMD:
+        if world <= 2:
+            return cap_bytes
+        return min(cap_bytes, (2 * cap_bytes // (world - 1)) // 16 * 16)
+    return cap_bytes
+
+
 def allgather(
     ctx: DeviceContext,
     stream: DeviceStream,
@@ -2100,7 +2393,7 @@ def allgather(
         return
     if nbytes_per_rank < 0:
         raise Error("collectives: nbytes_per_rank must be >= 0")
-    if nbytes_per_rank > cap_bytes:
+    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
         raise Error("collectives: allgather message exceeds cap_bytes")
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:

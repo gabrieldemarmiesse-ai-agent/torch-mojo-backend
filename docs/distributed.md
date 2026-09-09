@@ -319,8 +319,71 @@ kernels only** — i.e. `MOJOCCL_NVLS=0`, which is what everything below the
 48 MiB crossover runs anyway: 1 MiB 29 vs 31 µs, 9 MiB 70 vs 92, 27 MiB (the
 DDP bucket) 164 vs 181, 168 MiB 988 vs 756, 512 MiB 2.99 vs 2.15 ms. The last
 two rows are where the multicast path takes over — next subsection. AMD: the
-same source cross-compiles for gfx942 (the one vendor gate is a release fence
-on AMD's `s_barrier`), but it has not run on an MI300A yet.
+same source cross-compiles for gfx942, and it now runs there — see the
+subsection after that.
+
+### AMD MI300A: every cross-link byte goes in the write direction
+
+Measured on one Adastra node, 4 × MI300A (gfx942, 228 CUs), ROCm 6.4.3,
+against RCCL 2.22.3 on the same node.
+
+On an xGMI mesh the two directions are not equivalent. A micro-benchmark that
+copies with the same 16-byte, four-in-flight loop these kernels use
+(per-GPU GB/s, 168 MiB, all four GPUs active):
+
+| | one link | three links at once |
+|---|---|---|
+| remote write | 91 | **233** |
+| remote read | 90 | **93** |
+
+A GPU-initiated remote load is limited per GPU, not per link, so three
+concurrent inbound streams are worth barely more than one — and a ring of
+simultaneous readers is worth *less* (56). Writes scale. RCCL knows this: its
+P2P transport hard-wires `read = 0` on AMD (`rccl:src/graph/paths.cc:441`
+only lets compCap 80 read), the sender stores into the receiver's buffer, and
+RCCL reaches 236 GB/s of busbw at 512 MiB — the same ceiling.
+
+So on AMD the allreduce's third phase is a second push instead of a pull:
+each rank writes its reduced shard into every peer's gather slot, and then
+copies those slots into the user's output *locally*, because a MAX-allocated
+output cannot be IPC-mapped and a peer cannot write it directly. The
+cross-link traffic is unchanged — `2(world-1)/world × bytes` per GPU, the
+unicast minimum — only its direction is. That local copy is the price and it
+is small: the region is `hipDeviceMallocUncached` yet reads out of it at full
+HBM rate (1434 GB/s measured, against 1453 for a normal buffer). The
+all-gather and the broadcast's gather half became pushes for the same reason.
+
+Two other gfx942 details are copied from RCCL and matter as much as the
+direction:
+
+- **The barrier could not be made cheaper, and that is measured, not assumed.**
+  A release store lowers to `buffer_wbl2 sc0 sc1` and an acquire load to
+  `buffer_inv sc0 sc1`, both whole-cache operations, and the acquire sits
+  inside the spin loop — so the barrier costs more the larger the grid (27 MiB
+  measured 243 µs at 128 blocks and 465 at 1024). Three cheaper spellings were
+  tried and all three broke *small* collectives only, which is the trap: a
+  megabyte payload drains out of a cache on its own and a few hundred bytes do
+  not, so "the big benchmark still passes" says nothing. RCCL's own cheap
+  variant for gfx942 (`skip_fence`,
+  `rccl:src/include/rccl_common.h:262-273`) is among them: it is sound for
+  RCCL because its P2P buffers are uncached, and unsound here because the
+  mapping a peer writes *through* comes from `hipIpcOpenMemHandle`, which does
+  not carry the memory type. Details and the failure table are in
+  `docs/mojo_collectives_kernel_results.md` §3 and §7.
+- **The grid caps are not H100's**, and the response to the grid is not
+  monotonic. See the sweeps in `docs/mojo_collectives_kernel_results.md`.
+
+Everything above is behind `has_amd_gpu_accelerator()` at compile time, and
+the sm_90a device code is byte-identical to the tree before this work (97
+kernels, PTX compared with the mangling hash masked).
+
+**One known flake, unresolved.** A *one-element* int64 allreduce at **2 ranks**
+fails intermittently — 2 runs in 14 of `tests/ddp_worker.py collectives`;
+every 4-rank run of every mode passed. It is the smallest collective in the
+suite (one 8-byte store, one 8-byte load, one active thread) and the one-shot
+kernel under it is unchanged by the MI300A work, so the suspect is the
+barrier's cheapened acquire. Whether the pre-MI300A tree flakes the same way
+was not established. See `docs/mojo_collectives_kernel_results.md` §7.
 
 ### NVLS: the large sizes go through the switch
 

@@ -568,3 +568,305 @@ Reproduce: `sbatch split.sbatch`, then
 `python3 split_report.py /home/gabriel/ddp_work/logs/split_<jobid>`.
 Raw logs: `/home/gabriel/ddp_work/logs/ccl_split_233937.log` and
 `/home/gabriel/ddp_work/logs/split_233937/*.txt` (every rank's CSV).
+
+---
+
+# MI300A (gfx942), 4 ranks — 2026-09-09
+
+One Adastra node, 4 × MI300A (gfx942, 228 CUs, ROCm 6.4.3), CPU torch 2.11,
+MAX 26.5. Reference: RCCL 2.22.3 from the same ROCm install, through the same
+process group. All device times are the streamed statistic `ar_bench.py`
+prints: 20 back-to-back collectives on the comm stream, one synchronize,
+wall/20, max over ranks of the median of 5 repetitions — the number comparable
+to torch-profiler GPU time. Legs are interleaved RCCL, mojo, mojo, RCCL.
+
+Clocks were **not** locked: `rocm-smi --setperfdeterminism` needs privileges a
+job step does not have on this cluster, and the node is shared. The ABBA
+ordering is what bounds the drift; run-to-run spread on repeated points was
+under 4%.
+
+## 1. The link-direction probe
+
+`perf-work/linkbw.mojo` — one process, four `DeviceContext`s, raw
+`hipExtMallocWithFlags` buffers, peer access enabled between every pair, timed
+with HIP events on each device's own stream, deterministic hash fill and
+host-verified samples. The copy loop is `_copy_vec`'s exact shape (16-byte
+vectors, 4 in flight, 256-thread blocks, grid-stride). Per-GPU GB/s:
+
+| mode | 4 MiB | 11733296 B | 27 MiB | 168 MiB |
+|---|---|---|---|---|
+| local HBM copy | 332 | 1028 | 1674 | 1453 |
+| local copy, source = the **uncached** region | 293 | 928 | 1630 | 1434 |
+| one link, write (GPU0 → GPU1) | 80 | 90 | 91 | 91 |
+| one link, read (GPU0 ← GPU1) | 80 | 87 | 88 | 90 |
+| ring of writers (each → successor) | 79 | 87 | 88 | 91 |
+| ring of readers (each ← successor) | 46 | 49 | 52 | 56 |
+| **all-to-all writes (3 peers)** | 208 | 222 | **238** | **233** |
+| **all-to-all reads (3 peers)** | 88 | 83 | **81** | **93** |
+| all-to-all writes + a second local store | 200 | 177 | 223 | 218 |
+
+Three facts come out of it:
+
+1. One xGMI link direction does ~91 GB/s either way.
+2. **Writes scale across the three links; reads do not.** Three outbound
+   streams reach 233–238 GB/s, three inbound reads 81–93, and a ring of
+   simultaneous readers *falls* to 52–56. A GPU-initiated remote load is
+   limited per GPU, not per link.
+3. 233 GB/s is RCCL's number: 512 MiB in 3410 µs at world 4 is 236 GB/s of
+   busbw. RCCL's P2P transport hard-wires `read = 0` on AMD
+   (`rccl:src/graph/paths.cc:441`).
+
+Reading the uncached region locally costs nothing (1434 vs 1453 GB/s), which
+is what makes the redesign below affordable. Region memory type was swept
+separately: `hipDeviceMallocUncached` beats plain `hipMalloc` at 4 MiB
+(208 vs 178 GB/s of all-to-all write) and ties at 27 and 168 MiB.
+
+## 2. The redesign: nothing crosses a link in the read direction
+
+`_ar_twoshot_kernel` on AMD (NVIDIA is untouched, §5):
+
+| | phase 1 | phase 2 | phase 3 |
+|---|---|---|---|
+| NVIDIA | push shard *s* into peer *s*'s slot | reduce my shard → my region + user output | **pull** the peers' reduced shards into the user output |
+| AMD | same | reduce my shard → user output **and every peer's gather slot** | **local copy** of my own gather slots into the user output |
+
+Cross-link traffic is identical — `2(world-1)/world × bytes` per GPU, the
+unicast minimum — and only its direction changes. The user's output is a MAX
+allocation and cannot be IPC-mapped, so a peer cannot write it directly; that
+is the whole reason for the local copy, and at 0.75 × message and 1434 GB/s it
+costs ~90 µs at 168 MiB against the ~1130 µs the wire needs.
+
+The phase-2 stores are fused: one reduce, `world` stores (the user output slice
+plus each peer's gather slot), which is NCCL's `MULTIDSTS` shape
+(`rccl:src/device/common_kernel.h`, `reduceCopyPacks` stores to every
+destination from one accumulator). gfx942 emits it as four
+`global_store_dwordx4` from one `v[20:23]`. Doing it as a second pass over the
+shard instead measured 1437 µs at 168 MiB against 1332 for the fused form
+(128 blocks, both with the same fence).
+
+Arena: the `world` push slots are unchanged and the area that held the single
+reduced shard on NVIDIA holds `world-1` compacted gather slots on AMD, at the
+same base offset. `world*slot` is already about `numel*elem` ≤ cap, so a full
+`world` more slots would not fit a `2*cap` arena at the largest message; the
+compaction (writer *w* uses slot `w if w < owner else w-1`, the same rule the
+split allreduce already used for its push slots) bounds the total at
+`cap*(2 - 1/world)`.
+
+The all-gather and the broadcast's gather half became pushes for the same
+reason. The all-gather needs `world-1` message-sized slots rather than one, so
+`allgather_max_bytes` chunks at `2*cap/(world-1)` on AMD and stays the
+identity on NVIDIA. The broadcast keeps its scatter and adds a push phase and
+one more sync: root scatters shard *p* into rank *p*'s region, every rank
+writes its shard into every other non-root rank's gather slot, everyone
+assembles locally.
+
+`_ag_finish_kernel` — the second half of the multi-node split allreduce — is
+the one collective still pulling. Converting it needs an extra sync inside the
+kernel (the vendor library rewrites the shard between the two halves, so the
+push cannot happen in the first one) and this engagement had no second node to
+measure or test it on, so it was left alone deliberately rather than changed
+blind.
+
+## 3. The barrier
+
+On gfx942 `Atomic.store[RELEASE]` lowers to `buffer_wbl2 sc0 sc1` + the store
+and `Atomic.load[ACQUIRE]` to the load + `buffer_inv sc0 sc1`. Both are
+**whole-cache** operations: `wbl2` writes the device's L2 back to memory,
+`inv` drops the CU's L1 and the device's L2. That makes the barrier expensive
+in proportion to the grid -- the acquire in particular sits inside the spin
+loop, so every polling thread invalidates the whole cache on every iteration
+and throws the payload out of L2 for every block still working: 27 MiB
+measured 243 microseconds at 128 blocks and 465 at 1024 with that spelling.
+
+**Three cheaper spellings were tried. All three are given up, and the shipped
+barrier is the one that was there before this work.** They are recorded
+because the pattern is the same every time and it is the lesson of the
+engagement: each looked provably equivalent, and each broke only the *small*
+collectives, where a payload is a few hundred bytes instead of megabytes and
+therefore does not drain out of a cache on its own.
+
+| spelling | 27 MiB allreduce | broadcast, 4 ranks | 1-element allreduce, 2 ranks |
+|---|---|---|---|
+| no release writeback at all (RCCL's `skip_fence`) | correct | **5 failures** | — |
+| release writeback moved after the barrier, into the `world` publishing threads | correct | correct | **fails** |
+| relaxed spin + one acquire fence after the wait | correct | correct | **2 failures in 13 runs** |
+| shipped: release fence in every thread, acquire load per iteration | correct | correct | 0 failures in 12 runs |
+
+RCCL's `skip_fence` (`rccl:src/include/rccl_common.h:262-273`, on for cudaArch
+940 when the buffers are uncached) is sound for RCCL and not for us: our region
+*is* `hipDeviceMallocUncached`, but the mapping a peer writes **through** comes
+from `hipIpcOpenMemHandle` and does not carry that memory type, so a few bytes
+can still be sitting in the writer's cache when the flag lands. The third row
+is the one that hurts -- it is worth 75 microseconds at 168 MiB and its
+failure evidence is weak (Fisher p about 0.5 against the fourth row) -- and
+section 7 explains why it went anyway.
+
+The one thing that did *not* have to be given up is the AMD `vmcnt(0)` drain
+that was already there: `fence[RELEASE]()` in every thread before the block
+barrier lowers to `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`, which is what
+makes a peer's payload visible before the flag it will be told about. RCCL
+puts the same `vmcnt(0)` inside its block barrier
+(`rccl:src/device/prims_simple.h:193-210`) for exactly this reason.
+
+## 4. Grid caps
+
+Both are fitted on this card and both are documented next to their
+definitions. `_AR_MAX_BLOCKS` (messages < 64 MiB) and `_AR_BIG_BLOCKS` (above)
+on AMD, fp32, 4 ranks, µs:
+
+| blocks | 9 MiB | 27 MiB | 168 MiB | 512 MiB |
+|---|---|---|---|---|
+| 64 | 118 | 285 | 1987* | 6638* |
+| **128** | **121** | **254** | 1330* | 4065* |
+| 160 | — | — | 1302* | 4804* |
+| 224 | 144 | 258 | 2224* | 6053* |
+| 456 | — | — | 1509 | 7177 |
+| **912** | — | — | **1221** | **3744** |
+
+(`*` measured with the intermediate barrier; the 456/912 rows and the small
+sizes are with the shipped one. The response is not monotonic — 224 is the
+worst point at the large sizes and 64 starves the 27 MiB transfer — so do not
+interpolate, re-sweep.) 912 is four waves of the 228 CUs. The best small-size
+value moved from 224 down to 128 when the release fence went back to every
+thread, because the grid cost there is the per-thread `buffer_wbl2`.
+
+## 5. NVIDIA is untouched
+
+Every behavioural difference is behind `has_amd_gpu_accelerator()` at compile
+time, in the kernel and in the two host lines that size the arena and chunk
+the all-gather. The arena layout and its capacity arithmetic are byte for byte
+what they were on NVIDIA (the AMD gather slots sit at the same base offset the
+single reduced shard used).
+
+Proof: `mojo build mojoccl.mojo --emit asm --target-accelerator sm_90a -I .
+-I ../../eager_kernels` in this tree and in the pre-MI300A tree, PTX sidecars
+compared with the 8-hex-digit mangling hash masked in both the file name and
+the body — **97 kernels before, 97 after, 0 only-before, 0 only-after, 0
+differing** (`perf-work/asm90_diff.py`).
+
+## 6. Headline: A/B against RCCL 2.22.3, 4 ranks
+
+Interleaved RCCL, mojo, mojo, RCCL in one job on one node, shipped constants
+and shipped barrier; each cell is the mean of that leg pair and both legs are
+given so the spread is visible. Device time in microseconds. Both legs run
+with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`: without it four ranks
+reserve ~124 GB each on this APU, the node runs out of memory and every leg
+reads hundreds of ms, which does not look like a measurement error.
+
+| dtype | size | RCCL | mojo | ratio | legs (RCCL / mojo) |
+|---|---|---|---|---|---|
+| fp32 | 1 MiB | 53.4 | 51.1 | **0.96** | 53,54 / 52,51 |
+| fp32 | 9 MiB | 105.4 | 113.3 | 1.08 | 104,106 / 114,113 |
+| fp32 | 27 MiB (DDP bucket) | 226.9 | 226.7 | **1.00** | 226,228 / 227,226 |
+| fp32 | 168 MiB | 1155.4 | 1335.4 | 1.16 | 1157,1154 / 1335,1336 |
+| fp32 | 512 MiB | 3411.3 | 3790.2 | 1.11 | 3414,3408 / 3787,3793 |
+| bf16 | 1 MiB | 57.8 | 65.3 | 1.13* | 50,65 / 76,55 |
+| bf16 | 9 MiB | 110.0 | 113.8 | **1.04** | 110,110 / 114,114 |
+| bf16 | 27 MiB | 233.0 | 226.8 | **0.97** | 233,233 / 228,226 |
+| bf16 | 168 MiB | 1164.4 | 1335.2 | 1.15 | 1164,1164 / 1335,1335 |
+| bf16 | 512 MiB | 3438.3 | 3774.5 | 1.10 | 3439,3438 / 3775,3774 |
+
+\* 50 and 65 microseconds against 76 and 55, on a 1 MiB message whose kernel is
+about 20 microseconds of work: launch noise, not a measurement of the kernel.
+
+Where this started, on the same node: the shipped pull kernels with the peer
+rotation and the first MI300A grid caps measured 147 / 345 / 1745 / 5300
+microseconds at 9 / 27 / 168 / 512 MiB against RCCL's 108 / 230 / 1160 / 3410
+-- ratios of 1.36 to 1.55. The size that matters for DDP is now at parity.
+
+**168 and 512 MiB are the two that still miss.** The arithmetic says why, and
+it is not the schedule. Per GPU the collective must move 1.5 x message across
+the fabric, which at the 233 GB/s all-to-all write ceiling of section 1 is
+1134 microseconds at 168 MiB -- RCCL's own 1155, i.e. RCCL is running at the
+ceiling with no measurable overhead. On top of that this design pays the local
+gather copy (0.75 x message read and written locally, ~90 microseconds
+measured) and the barrier's whole-cache operations at the 912-block grid the
+large sizes want (measured: the same allreduce is 1221 microseconds at 912
+blocks with a cheapened barrier and 1335 with the shipped one; section 7 says
+why the cheap one was given up). Removing either needs a change this
+engagement did not make: overlapping the gather copy with the second push
+behind a sub-chunk pipeline, or a barrier that is both demonstrably sound here
+and cheaper than one whole-cache operation per thread per sync.
+
+## 6b. All-gather and broadcast
+
+Same ABBA protocol, fp32, 4 ranks, per-rank contribution for the all-gather
+and message size for the broadcast. Busbw is `(world-1)*n/t` and `n/t`
+respectively, the same convention `ar_bench.py` prints.
+
+| op | size | RCCL µs | mojo µs | ratio | mojo busbw | before this work |
+|---|---|---|---|---|---|---|
+| all_gather | 4 MiB | 101.8 | 134.7 | 1.32 | 93 GB/s | |
+| all_gather | 16 MiB | 274.7 | 319.8 | 1.16 | 157 GB/s | |
+| all_gather | 64 MiB | 947.8 | 1146.1 | 1.21 | **176 GB/s** | 80 GB/s |
+| broadcast | 4 MiB | 53.2 | 89.8 | 1.69 | 47 GB/s | |
+| broadcast | 16 MiB | 121.1 | 217.9 | 1.80 | 77 GB/s | |
+| broadcast | 64 MiB | 342.9 | 680.0 | 1.98 | **99 GB/s** | 78 GB/s |
+
+The all-gather is now within ~20% and the remaining gap is the same one the
+allreduce has at the large sizes. The broadcast is not, and the reason is its
+schedule rather than its direction: scatter-then-push-all-gather puts
+`n + (world-1)/world*n` = 1.75 × message of outbound traffic on the root,
+where a ring or a tree puts `n`. Converting the gather half from a pull to a
+push took it from 78 to 99 GB/s; getting to RCCL's 195 needs the root to stop
+being the only sender of the first phase, which is a different algorithm and
+was out of scope here.
+
+## 7. Correctness, and one unresolved flake
+
+`tests/ddp_worker.py` through the process group, `TORCH_MOJO_BACKEND_CCL=mojo`,
+`perf-work/suite.sh`, on the shipped tree:
+
+| mode | 4 ranks | 2 ranks |
+|---|---|---|
+| `collectives` | 20 OK / 0 FAIL | 11 OK / **4 FAIL** (see below) |
+| `ddp_parity` | 5 / 0 | 3 / 0 |
+| `lazy_fence` | 11 / 0 | 6 / 0 |
+| `stress` (`MOJOCCL_REGION_MB=4`, forces chunking) | 282 / 0 | 161 / 0 |
+| `abort` | 16 / 0 | 10 / 0 |
+
+`stress` with the default 256 MiB region also passes (300 OK / 0 FAIL). It
+exits nonzero for reasons that have nothing to do with these kernels: without
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM` four ranks reserving ~124 GB each
+are OOM-killed on this APU, and with it the process segfaults in HIP's atexit
+handler unless the script ends in `os._exit(0)` — both already in
+`docs/distributed.md`.
+
+**A flake that cost the large messages 6%.** During the work the barrier's
+acquire was cheapened: spin on a *relaxed* load (still `sc0 sc1`, so it cannot
+read a stale flag) and issue one acquire fence after the wait, instead of an
+acquire load — and therefore a whole-L1-and-L2 `buffer_inv` — on every
+iteration. It looks exactly as strong and it is worth a lot: 243 µs against
+465 at 27 MiB with a 1024-block grid, because the per-iteration invalidate
+throws the payload out of L2 for every block still working.
+
+With it, `allreduce.int64` — a *one-element* int64 allreduce, the smallest
+collective in the suite: one-shot path, one block, one 8-byte store and one
+8-byte load by a single thread — failed intermittently **at 2 ranks**:
+2 failures in 13 runs of `ddp_worker.py collectives`. Every 4-rank run of
+every mode passed. With the acquire load restored: **0 failures in 12 runs**
+(`perf-work/flake.sh`, same node, same session).
+
+Neither sample proves anything on its own — Fisher's exact on 2/13 against
+0/12 is p ≈ 0.5. It is reverted anyway, and the reasoning is worth recording
+because it is the lesson of the day rather than a number:
+
+* the one-shot kernel is **unchanged** by this work, so the only thing that
+  could have introduced a failure under it is the barrier;
+* the argument for the cheap acquire was a symmetry ("the invalidate after the
+  loop is at the same point as the invalidate in the last iteration"), not a
+  guarantee — and that exact style of reasoning produced **two** unsound
+  release spellings earlier the same day, both of which broke only the small
+  collectives, which is precisely what this is;
+* a rare silent wrong answer inside an allreduce costs incomparably more than
+  75 µs on a 168 MiB message.
+
+**What was not established**: whether the pre-MI300A tree flakes here too. The
+A/B was attempted (`perf-work/flake.sh`, 8 runs per tree) and the before-tree
+half is void — those runs die in `ncclCommInitRank` with `ncclResult_t=3` in
+that harness, a harness problem rather than a result. So it is still unknown
+whether this is a pre-existing race that the cheap acquire merely made more
+likely. Settling it needs a few hundred runs of the 2-rank `collectives` mode
+on both trees with the before-tree harness fixed; the shipped tree at
+0/12 is not evidence of absence.
+
