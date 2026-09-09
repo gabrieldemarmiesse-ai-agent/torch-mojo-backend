@@ -110,6 +110,7 @@ def main() raises:
         driver,
         0,
         topo.my_local_rank,
+        topo.local_world,
         topo.my_node,
         topo.nnodes,
         Int(region),

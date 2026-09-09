@@ -1147,6 +1147,7 @@ def _bootstrap(
                 lib,
                 ordinal,
                 topo.my_local_rank,
+                topo.local_world,
                 topo.my_node,
                 topo.nnodes,
                 base,

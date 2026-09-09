@@ -157,6 +157,10 @@ comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
 # ~20% of its steady-state tok/s against real NCCL, competing for a core/SMT
 # sibling with the ~760-aten-op-per-step host dispatch of the training loop.
 comptime DEFAULT_IB_PROXY_IDLE_US: Int = 20
+# `cpu_set_t` size for `sched_getaffinity`/`pthread_setaffinity_np` on this
+# ABI: 128 bytes (1024 bits), shared by the default-pin CPU scan and the
+# explicit-CPU pin below.
+comptime CPU_SET_BYTES = 128
 # Bytes of the inbox read back by the flush; any read of the destination
 # device flushes the writes ahead of it, the size is irrelevant.
 comptime FLUSH_BYTES = 4
@@ -853,7 +857,6 @@ def _proxy_address() -> Int:
 def _set_thread_affinity(tid: Int, cpu: Int) raises:
     """`pthread_setaffinity_np` to a single CPU. `cpu_set_t` is a 128-byte
     (1024-bit) bitmask on this ABI; only the one bit for `cpu` is set."""
-    comptime CPU_SET_BYTES = 128
     var byte_idx = cpu // 8
     if cpu < 0 or byte_idx >= CPU_SET_BYTES:
         raise Error(
@@ -868,7 +871,111 @@ def _set_thread_affinity(tid: Int, cpu: Int) raises:
         raise Error("mojoccl: pthread_setaffinity_np failed, rc=" + String(rc))
 
 
-def _start_proxy(ib: Int) raises:
+def _cpu_in_mask(mask: P8, cpu: Int) -> Bool:
+    if cpu < 0 or cpu // 8 >= CPU_SET_BYTES:
+        return False
+    return (mask[unsafe_offset=cpu // 8] >> UInt8(cpu % 8)) & 1 != 0
+
+
+def _mask_cpus_desc(mask: P8) -> List[Int]:
+    """CPU ids set in the affinity `mask`, highest first."""
+    var out = List[Int]()
+    for cpu in range(CPU_SET_BYTES * 8 - 1, -1, -1):
+        if _cpu_in_mask(mask, cpu):
+            out.append(cpu)
+    return out^
+
+
+def _smt_sibling_free(cpu: Int, reserved: List[Int]) -> Bool:
+    """Best-effort: True unless `cpu`'s hyperthread sibling is itself one of
+    `reserved` -- i.e. would put two ranks' progress threads on one physical
+    core's shared execution units. "Free" only means "not another rank's
+    proxy pin": Python thread placement isn't ours to observe, so that's the
+    only sibling contention this can detect. Reads
+    `topology/thread_siblings_list` (comma-separated CPU ids/ranges) once; a
+    missing file (no HT, non-Linux sysfs layout, permission) reads as free
+    rather than blocking the pick.
+    """
+    var path = (
+        "/sys/devices/system/cpu/cpu"
+        + String(cpu)
+        + "/topology/thread_siblings_list"
+    )
+    var text: String
+    try:
+        with open(path, "r") as f:
+            text = String(f.read().strip())
+    except:
+        return True
+    for part in text.split(","):
+        var s = String(part)
+        if s.byte_length() == 0:
+            continue
+        var pieces = s.split("-")
+        var lo_s = String(pieces[0])
+        var hi_s = lo_s if len(pieces) < 2 else String(pieces[1])
+        try:
+            var lo = Int(lo_s)
+            var hi = Int(hi_s)
+            for sib in range(lo, hi + 1):
+                if sib != cpu:
+                    for r in reserved:
+                        if r == sib:
+                            return False
+        except:
+            continue
+    return True
+
+
+def _default_proxy_cpu(local_rank: Int, local_world: Int) -> Int:
+    """Default pin when `MOJOCCL_IB_PROXY_CPU` is unset, or -1 for "don't
+    pin".
+
+    torchrun gives every rank of a node the same affinity mask, so taking
+    that mask's CPUs in descending order and indexing by `local_rank` spreads
+    the `local_world` progress threads over the top `local_world` CPUs, out
+    of the way of Python's dispatch threads (unpinned, so scheduled wherever
+    the OS puts them across the whole mask). Needs the mask to hold at least
+    `2 * local_world` CPUs, so pinning never claims a CPU Python is likely to
+    need; a small mask (few cores, or an explicit `--cpus-per-task` slice)
+    leaves the thread unpinned rather than fighting over a scarce core.
+
+    Among those candidates, prefer ones whose SMT sibling is not itself
+    another rank's pin (`_smt_sibling_free`): reorder sibling-free CPUs to
+    the front, then reuse the same descending/by-rank rule. Every rank
+    derives this reordering from the same mask and `local_world` alone, so
+    it needs no coordination and never assigns two ranks the same CPU.
+    """
+    if local_world < 1 or local_rank < 0 or local_rank >= local_world:
+        return -1
+    var mask = alloc_bytes(CPU_SET_BYTES)
+    var rc = external_call["sched_getaffinity", Int32](
+        Int32(0), UInt64(CPU_SET_BYTES), mask
+    )
+    if rc != 0:
+        return -1
+    var desc = _mask_cpus_desc(mask)
+    if len(desc) < 2 * local_world:
+        return -1
+    var naive = desc[local_rank]
+    var reserved = List[Int]()
+    for r in range(local_world):
+        reserved.append(desc[r])
+    if _smt_sibling_free(naive, reserved):
+        return naive
+    var ordered = List[Int]()
+    var dirty = List[Int]()
+    for cpu in desc:
+        if _smt_sibling_free(cpu, reserved):
+            ordered.append(cpu)
+        else:
+            dirty.append(cpu)
+    for cpu in dirty:
+        ordered.append(cpu)
+    return ordered[local_rank]
+
+
+def _start_proxy(ib: Int, local_rank: Int, local_world: Int) raises:
     ref st = _st(ib)[]
     var tid = unsafe_alloc[Int64](1)
     tid[unsafe_offset=0] = 0
@@ -878,15 +985,40 @@ def _start_proxy(ib: Int) raises:
     if rc != 0:
         raise Error("mojoccl: pthread_create failed, rc=" + String(rc))
     st.thread_id = Int(tid[unsafe_offset=0])
-    # Opt-in only (default: no pinning) -- a best-effort placement hint, not
-    # load-bearing for correctness, so a bad CPU index or a failed syscall
-    # only prints rather than failing communicator init.
+    # A best-effort placement hint, not load-bearing for correctness, so a
+    # bad CPU index or a failed syscall only prints rather than failing
+    # communicator init. MOJOCCL_IB_PROXY_CPU=none opts out of the default
+    # policy below (unpinned, like every release before this one); any other
+    # value overrides it with an exact CPU.
     var cpu_s = getenv("MOJOCCL_IB_PROXY_CPU", "")
+    if cpu_s == "none":
+        return
+    var cpu: Int
     if cpu_s.byte_length() > 0:
         try:
-            _set_thread_affinity(st.thread_id, Int(cpu_s))
+            cpu = Int(cpu_s)
         except e:
             print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
+            return
+    else:
+        cpu = _default_proxy_cpu(local_rank, local_world)
+        if cpu < 0:
+            if st.trace:
+                print(
+                    (
+                        "mojoccl: progress thread left unpinned (affinity mask"
+                        " too small for"
+                    ),
+                    local_world,
+                    "local ranks)",
+                )
+            return
+    try:
+        _set_thread_affinity(st.thread_id, cpu)
+        if st.trace:
+            print("mojoccl: progress thread pinned to cpu", cpu)
+    except e:
+        print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
 
 
 def _stop_proxy(mut st: IbState):
@@ -1036,6 +1168,7 @@ def ib_setup(
     driver: OwnedDLHandle,
     ordinal: Int,
     local_rank: Int,
+    local_world: Int,
     my_node: Int,
     nnodes: Int,
     region: Int,
@@ -1052,7 +1185,8 @@ def ib_setup(
     `nslots` is how many fixed inbox slot groups the caller carved out of the
     region and therefore how many exchanges may be outstanding; `credit_off`
     is the region offset of the credit landing pad. Both must be identical on
-    every rank -- they are part of the wire layout.
+    every rank -- they are part of the wire layout. `local_world` only feeds
+    the progress thread's default CPU pin (`_default_proxy_cpu`).
     """
     var ibv = Ibv()
     var want = getenv("MOJOCCL_IB_HCA", "")
@@ -1165,7 +1299,7 @@ def ib_setup(
     holder.unsafe_write(st^)
     if _st(Int(holder))[].proxy:
         try:
-            _start_proxy(Int(holder))
+            _start_proxy(Int(holder), local_rank, local_world)
         except e:
             _teardown_ib_resources(_st(Int(holder))[])
             raise e
