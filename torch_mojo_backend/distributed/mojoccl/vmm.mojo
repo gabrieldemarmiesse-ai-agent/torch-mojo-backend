@@ -92,9 +92,9 @@ RCCL none either, so an AMD build never reaches them."""
 
 
 def _errno() -> Int32:
-    return external_call[
-        "__errno_location", Pointer[Int32, MutAnyOrigin]
-    ]()[unsafe_offset=0]
+    return external_call["__errno_location", Pointer[Int32, MutAnyOrigin]]()[
+        unsafe_offset=0
+    ]
 
 
 def _cu(lib: OwnedDLHandle, rc: Int32, what: String) raises:
@@ -391,9 +391,7 @@ def scm_send(
     _ = libc.get_function[Int32]("close")(s)
 
 
-def scm_try_recv(
-    libc: OwnedDLHandle, sock: Int
-) raises -> Tuple[Int, Int, Int]:
+def scm_try_recv(libc: OwnedDLHandle, sock: Int) raises -> Tuple[Int, Int, Int]:
     """One non-blocking `recvmsg`. Returns `(-1, 0, 0)` when nothing is
     queued."""
     return _recv_impl(libc, sock, MSG_DONTWAIT)
@@ -759,9 +757,7 @@ def nvls_bind_and_map(
                     + String(g[2])
                 )
             var ph: UInt64 = 0
-            var rc = lib.get_function[Int32](
-                "cuMemImportFromShareableHandle"
-            )(
+            var rc = lib.get_function[Int32]("cuMemImportFromShareableHandle")(
                 Pointer(to=ph),
                 g[0],
                 Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),

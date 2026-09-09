@@ -93,7 +93,7 @@ def main() raises:
     bootstrap_allgather(conn, b1, 16, t1, 30.0)
     var hashes = List[UInt64]()
     for r in range(nranks):
-        hashes.append(t1.unsafe_bitcast[UInt64]()[unsafe_offset = 2 * r])
+        hashes.append(t1.unsafe_bitcast[UInt64]()[unsafe_offset=2 * r])
     var topo = derive_topology(hashes, rank)
 
     var nbytes = 16 * 1024
@@ -107,8 +107,15 @@ def main() raises:
     var region = _p(region_bytes)
     var driver = OwnedDLHandle("libc.so.6")
     var ib = ib_setup(
-        driver, 0, topo.my_local_rank, topo.my_node, topo.nnodes,
-        Int(region), region_bytes, nslots, credit_off,
+        driver,
+        0,
+        topo.my_local_rank,
+        topo.my_node,
+        topo.nnodes,
+        Int(region),
+        region_bytes,
+        nslots,
+        credit_off,
     )
     var lid = ib_port_lid(ib)
     var mtu = ib_port_mtu(ib)
@@ -123,8 +130,17 @@ def main() raises:
     bootstrap_barrier(conn, 30.0)
     var npeers = ib_npeers(ib)
     print(
-        "rank", rank, "peers", npeers, "slots", nslots, "depth", depth,
-        "exchanges", nexch, "RTS",
+        "rank",
+        rank,
+        "peers",
+        npeers,
+        "slots",
+        nslots,
+        "depth",
+        depth,
+        "exchanges",
+        nexch,
+        "RTS",
     )
 
     # Each in-flight exchange gets its own send buffer, the way each pipeline
@@ -137,7 +153,7 @@ def main() raises:
             var seq = k + 1
             var sbuf = src + (k % depth) * nbytes
             for i in range(nbytes):
-                region[unsafe_offset = sbuf + i] = UInt8(
+                region[unsafe_offset=sbuf + i] = UInt8(
                     (rank * 31 + seq * 7 + i) & 0xFF
                 )
             var inbox_base = inbox0 + (seq % nslots) * group
@@ -163,7 +179,7 @@ def main() raises:
                 for i in range(nbytes):
                     var want = UInt8((sender * 31 + seq * 7 + i) & 0xFF)
                     if (
-                        region[unsafe_offset = inbox_base + q * slot_bytes + i]
+                        region[unsafe_offset=inbox_base + q * slot_bytes + i]
                         != want
                     ):
                         bad += 1

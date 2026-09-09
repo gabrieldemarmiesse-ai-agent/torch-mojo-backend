@@ -505,8 +505,8 @@ def _lock(mut state: CommState):
     while True:
         var expected: Int64 = 0
         if Atomic[DType.int64].compare_exchange[
-            success_ordering = Ordering.ACQUIRE,
-            failure_ordering = Ordering.RELAXED,
+            success_ordering=Ordering.ACQUIRE,
+            failure_ordering=Ordering.RELAXED,
         ](p, expected, 1):
             return
         _ = external_call["sched_yield", Int32]()
@@ -526,8 +526,8 @@ def _try_lock(mut state: CommState, deadline_ns: Int) -> Bool:
     while True:
         var expected: Int64 = 0
         if Atomic[DType.int64].compare_exchange[
-            success_ordering = Ordering.ACQUIRE,
-            failure_ordering = Ordering.RELAXED,
+            success_ordering=Ordering.ACQUIRE,
+            failure_ordering=Ordering.RELAXED,
         ](p, expected, 1):
             return True
         if perf_counter_ns() > deadline_ns:
@@ -536,7 +536,7 @@ def _try_lock(mut state: CommState, deadline_ns: Int) -> Bool:
 
 
 def _unlock(mut state: CommState):
-    Atomic[DType.int64].store[ordering = Ordering.RELEASE](
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
         Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin](), 0
     )
 
@@ -547,7 +547,7 @@ def _raise_abort_word(state: CommState):
     next check, and no driver call is needed to do it."""
     if state.abort_host == 0:
         return
-    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=state.abort_host),
         UInt64(1),
     )
@@ -1223,7 +1223,8 @@ def _bootstrap(
                     + String(Int(cfg[unsafe_offset=1]))
                     + " / "
                     + String(Int(cfg[unsafe_offset=2]) // (1024 * 1024))
-                    + " MiB; MOJOCCL_REGION_MB and MOJOCCL_NVLS_MIN_MB must match"
+                    + " MiB; MOJOCCL_REGION_MB and MOJOCCL_NVLS_MIN_MB must"
+                    " match"
                     " on every rank"
                 )
 
@@ -1492,8 +1493,10 @@ def ncclCommAbort(comm: Int64) abi("C") -> Int32:
         )
     else:
         print(
-            "mojoccl: ncclCommAbort left the region allocated -- the device"
-            " was still busy after",
+            (
+                "mojoccl: ncclCommAbort left the region allocated -- the device"
+                " was still busy after"
+            ),
             ABORT_QUIESCE_TIMEOUT_S,
             "s",
         )

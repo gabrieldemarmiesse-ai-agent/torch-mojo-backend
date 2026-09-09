@@ -423,7 +423,7 @@ def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
 @always_inline
 def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
     return Int(
-        Atomic[DType.int64].load[ordering = Ordering.ACQUIRE](
+        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
             p.unsafe_bitcast[Int64]()
         )
     )
@@ -431,7 +431,7 @@ def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
 
 @always_inline
 def _store_atomic_i(p: Pointer[Int, MutAnyOrigin], v: Int):
-    Atomic[DType.int64].store[ordering = Ordering.RELEASE](
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
         p.unsafe_bitcast[Int64](), Int64(v)
     )
 
@@ -812,12 +812,15 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     var published = 0
     st.last_progress_ns = perf_counter_ns()
     while True:
-        if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
-            _mb(st, MB_STOP)
-        ) != 0:
+        if (
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                _mb(st, MB_STOP)
+            )
+            != 0
+        ):
             return
         var req = Int(
-            Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_REQUEST)
             )
         )
@@ -830,22 +833,20 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
             # the stream hangs past the point where the error can be
             # reported.
             published = st.done_seq
-            Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
                 _mb(st, MB_DONE), UInt64(published)
             )
         if moved or st.done_seq < st.request_seq:
             continue
         _ = external_call["sched_yield", Int32]()
-        if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+        if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) <= UInt64(st.request_seq):
             _nanosleep_ns(st.ts, idle_ns)
 
 
 def _proxy_address() -> Int:
-    var f: def (
-        OpaquePointer[MutAnyOrigin]
-    ) thin abi("C") -> None = _proxy_main
+    var f: def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> None = _proxy_main
     return Pointer(to=f).unsafe_bitcast[Int]()[]
 
 
@@ -864,9 +865,7 @@ def _set_thread_affinity(tid: Int, cpu: Int) raises:
         Int64(tid), UInt64(CPU_SET_BYTES), mask
     )
     if rc != 0:
-        raise Error(
-            "mojoccl: pthread_setaffinity_np failed, rc=" + String(rc)
-        )
+        raise Error("mojoccl: pthread_setaffinity_np failed, rc=" + String(rc))
 
 
 def _start_proxy(ib: Int) raises:
@@ -893,9 +892,7 @@ def _start_proxy(ib: Int) raises:
 def _stop_proxy(mut st: IbState):
     if st.thread_id == 0:
         return
-    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
-        _mb(st, MB_STOP), 1
-    )
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](_mb(st, MB_STOP), 1)
     _ = external_call["pthread_join", Int32](st.thread_id, Int64(0))
     st.thread_id = 0
 
@@ -934,9 +931,7 @@ def ib_signal_abort(ib: Int) -> Bool:
     ref st = _st(ib)[]
     if st.thread_id == 0:
         return True
-    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
-        _mb(st, MB_STOP), 1
-    )
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](_mb(st, MB_STOP), 1)
     var tid = st.thread_id
     var deadline = perf_counter_ns() + Int(IB_ABORT_JOIN_TIMEOUT_S * 1.0e9)
     var retval = unsafe_alloc[Int64](1)
@@ -950,7 +945,7 @@ def ib_signal_abort(ib: Int) -> Bool:
 
 
 def _callback_address() -> Int:
-    var f: def (OpaquePointer[MutAnyOrigin]) thin abi("C") -> None = _ib_progress
+    var f: def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> None = _ib_progress
     return Pointer(to=f).unsafe_bitcast[Int]()[]
 
 
@@ -1065,7 +1060,10 @@ def ib_setup(
     if len(ports) == 0:
         raise Error(
             "mojoccl: no ACTIVE InfiniBand port found"
-            + (" matching MOJOCCL_IB_HCA=" + want if want.byte_length() > 0 else "")
+            + (
+                " matching MOJOCCL_IB_HCA=" + want if want.byte_length()
+                > 0 else ""
+            )
             + "; a multi-node communicator needs one"
         )
     # Only a hint for HCA affinity: a driver without the symbol, or a
@@ -1109,11 +1107,9 @@ def ib_setup(
             | IBV_ACCESS_REMOTE_WRITE
             | IBV_ACCESS_REMOTE_READ
         )
-        st.mr = (
-            st.ibv.reg_mr_relaxed(st.pd, region, region_bytes, acc)
-            if ro
-            else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
-        )
+        st.mr = st.ibv.reg_mr_relaxed(
+            st.pd, region, region_bytes, acc
+        ) if ro else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
         if st.mr == 0:
             raise Error(
                 "mojoccl: ibv_reg_mr of the "
@@ -1188,9 +1184,7 @@ def _proxy_idle_ns() -> Int:
     """`MOJOCCL_IB_PROXY_IDLE_US`, read once at thread start (not from inside
     the progress-thread loop -- a `getenv` per idle iteration would defeat
     the point of backing off)."""
-    var s = getenv(
-        "MOJOCCL_IB_PROXY_IDLE_US", String(DEFAULT_IB_PROXY_IDLE_US)
-    )
+    var s = getenv("MOJOCCL_IB_PROXY_IDLE_US", String(DEFAULT_IB_PROXY_IDLE_US))
     var us = DEFAULT_IB_PROXY_IDLE_US
     try:
         var parsed = Int(s)
@@ -1233,7 +1227,7 @@ def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
     out_blob.unsafe_bitcast[UInt32]()[unsafe_offset=5] = UInt32(len(st.peers))
     for i in range(len(st.peers)):
         out_blob.unsafe_bitcast[UInt32]()[
-            unsafe_offset = 6 + st.peers[i].node
+            unsafe_offset=6 + st.peers[i].node
         ] = st.peers[i].qpn
 
 
@@ -1271,7 +1265,11 @@ def ib_port_mtu(ib: Int) raises -> Int:
 
 
 def ib_connect(
-    ib: Int, blobs: P8, blob_stride: Int, peer_rank_of_node: List[Int], my_mtu: Int
+    ib: Int,
+    blobs: P8,
+    blob_stride: Int,
+    peer_rank_of_node: List[Int],
+    my_mtu: Int,
 ) raises:
     """Move every QP to RTS from the gathered table, then pre-post recvs.
 
@@ -1290,9 +1288,7 @@ def ib_connect(
         var lid = Int(b.unsafe_bitcast[UInt32]()[unsafe_offset=3])
         var mtu = Int(b.unsafe_bitcast[UInt32]()[unsafe_offset=4])
         # The peer's QP for MY node, not for its own.
-        var dest_qpn = b.unsafe_bitcast[UInt32]()[
-            unsafe_offset = 6 + st.my_node
-        ]
+        var dest_qpn = b.unsafe_bitcast[UInt32]()[unsafe_offset=6 + st.my_node]
         var gid = P8(unsafe_from_address=Int(b) + 24 + 4 * MAX_NODES)
         if lid == 0:
             raise Error(

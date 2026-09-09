@@ -17,7 +17,9 @@ from bootstrap import (
 
 
 def _p8(n: Int) -> Pointer[UInt8, MutAnyOrigin]:
-    return Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(unsafe_alloc[UInt8](n)))
+    return Pointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=Int(unsafe_alloc[UInt8](n))
+    )
 
 
 def main() raises:

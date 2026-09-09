@@ -81,15 +81,13 @@ def _alloc[T: AnyType](n: Int) -> Pointer[T, MutAnyOrigin]:
     one `ncclCommInitRank`, and is handed to libc by address; rebinding to
     `MutAnyOrigin` once here keeps the call sites free of casts.
     """
-    return Pointer[T, MutAnyOrigin](
-        unsafe_from_address=Int(unsafe_alloc[T](n))
-    )
+    return Pointer[T, MutAnyOrigin](unsafe_from_address=Int(unsafe_alloc[T](n)))
 
 
 def _errno() -> Int32:
-    return external_call[
-        "__errno_location", Pointer[Int32, MutAnyOrigin]
-    ]()[unsafe_offset=0]
+    return external_call["__errno_location", Pointer[Int32, MutAnyOrigin]]()[
+        unsafe_offset=0
+    ]
 
 
 def _close(fd: Int32):
@@ -106,7 +104,9 @@ def _set_timeout(fd: Int32, optname: Int32, seconds: Int64) raises:
         fd, SOL_SOCKET, optname, tv, UInt32(16)
     )
     if rc != 0:
-        raise Error("mojoccl: setsockopt(timeout) failed, errno=" + String(_errno()))
+        raise Error(
+            "mojoccl: setsockopt(timeout) failed, errno=" + String(_errno())
+        )
 
 
 def _get_int_opt(fd: Int32, level: Int32, optname: Int32) raises -> Int32:
@@ -115,9 +115,7 @@ def _get_int_opt(fd: Int32, level: Int32, optname: Int32) raises -> Int32:
     var l = _alloc[UInt32](1)
     l[unsafe_offset=0] = 4
     if external_call["getsockopt", Int32](fd, level, optname, v, l) != 0:
-        raise Error(
-            "mojoccl: getsockopt failed, errno=" + String(_errno())
-        )
+        raise Error("mojoccl: getsockopt failed, errno=" + String(_errno()))
     return v[unsafe_offset=0]
 
 
@@ -156,9 +154,7 @@ def _connect_deadline(
     then `SO_ERROR` for the verdict -- the three steps a bounded TCP connect
     needs. False means "not connected" (refused, unreachable, or out of
     time); the caller decides whether to retry or to give up."""
-    var rc = external_call["connect", Int32](
-        fd, sa, UInt32(SOCKADDR_IN_BYTES)
-    )
+    var rc = external_call["connect", Int32](fd, sa, UInt32(SOCKADDR_IN_BYTES))
     if rc == 0:
         return True
     var e = _errno()
@@ -202,8 +198,7 @@ def _fill_sockaddr(
 
 
 def _ipv4_of_iface(name: String) -> UInt32:
-    """SIOCGIFADDR on a throwaway UDP socket; 0 if the interface has no IPv4.
-    """
+    """SIOCGIFADDR on a throwaway UDP socket; 0 if the interface has no IPv4."""
     if name.byte_length() == 0 or name.byte_length() > 15:
         return 0
     var fd = external_call["socket", Int32](AF_INET, SOCK_DGRAM, Int32(0))
@@ -281,7 +276,9 @@ def local_ipv4() raises -> UInt32:
         var a = _ipv4_of_iface(want)
         if a == 0:
             raise Error(
-                "mojoccl: MOJOCCL_SOCKET_IFNAME=" + want + " has no IPv4 address"
+                "mojoccl: MOJOCCL_SOCKET_IFNAME="
+                + want
+                + " has no IPv4 address"
             )
         return a
     for n in _default_route_ifaces():
@@ -411,8 +408,7 @@ def _take_root(magic: UInt64) -> Int32:
 
 
 def make_unique_id(out_bytes: Pointer[UInt8, MutAnyOrigin]) raises:
-    """Bind a listening socket and encode where it is (ncclGetUniqueId).
-    """
+    """Bind a listening socket and encode where it is (ncclGetUniqueId)."""
     var addr = local_ipv4()
     var fd = external_call["socket", Int32](
         AF_INET, SOCK_STREAM | SOCK_NONBLOCK, Int32(0)
@@ -423,9 +419,7 @@ def make_unique_id(out_bytes: Pointer[UInt8, MutAnyOrigin]) raises:
         _set_int_opt(fd, SOL_SOCKET, SO_REUSEADDR, 1)
         var sa = _alloc[UInt8](SOCKADDR_IN_BYTES)
         _fill_sockaddr(sa, addr, 0)  # port 0: let the kernel choose
-        if external_call["bind", Int32](
-            fd, sa, UInt32(SOCKADDR_IN_BYTES)
-        ) != 0:
+        if external_call["bind", Int32](fd, sa, UInt32(SOCKADDR_IN_BYTES)) != 0:
             raise Error("mojoccl: bind() failed, errno=" + String(_errno()))
         # A backlog of 1024 covers every rank connecting at once (NCCL uses
         # 16384, nccl:src/misc/socket.cc:571; 1024 is far past 8 nodes x 8).
@@ -459,7 +453,9 @@ struct BootstrapConn(Movable):
     var listen_fd: Int32
     var fds: List[Int32]
 
-    def __init__(out self, rank: Int, nranks: Int, is_root: Bool, listen_fd: Int32):
+    def __init__(
+        out self, rank: Int, nranks: Int, is_root: Bool, listen_fd: Int32
+    ):
         self.rank = rank
         self.nranks = nranks
         self.is_root = is_root
@@ -485,9 +481,7 @@ def _send_all(
             raise Error("mojoccl: bootstrap send timed out")
         var n = external_call["send", Int64](
             fd,
-            Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=Int(buf) + done
-            ),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(buf) + done),
             UInt64(nbytes - done),
             MSG_NOSIGNAL,
         )
@@ -511,9 +505,7 @@ def _recv_all(
             raise Error("mojoccl: bootstrap recv timed out")
         var n = external_call["recv", Int64](
             fd,
-            Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=Int(buf) + done
-            ),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(buf) + done),
             UInt64(nbytes - done),
             Int32(0),
         )
@@ -551,8 +543,9 @@ def bootstrap_connect(
     var listen_fd = _take_root(magic)
     var conn = BootstrapConn(rank, nranks, listen_fd >= 0, listen_fd)
     try:
-        _rendezvous(conn, rank, nranks, addr_be, port_be, magic, deadline_ns,
-                    timeout_s)
+        _rendezvous(
+            conn, rank, nranks, addr_be, port_be, magic, deadline_ns, timeout_s
+        )
     except e:
         # Every exit that is not the happy one closes the sockets here: this
         # function's caller never sees the `BootstrapConn` when it raises, so
@@ -726,9 +719,9 @@ struct Topology(Movable):
     var local_world: Int
     var my_node: Int
     var my_local_rank: Int
-    var node_of: List[Int]        # global rank -> node index
+    var node_of: List[Int]  # global rank -> node index
     var local_rank_of: List[Int]  # global rank -> local rank
-    var rank_at: List[Int]        # node * local_world + local_rank -> global rank
+    var rank_at: List[Int]  # node * local_world + local_rank -> global rank
 
     def __init__(out self, nranks: Int):
         self.nnodes = 1
@@ -740,9 +733,7 @@ struct Topology(Movable):
         self.rank_at = List[Int](length=nranks, fill=0)
 
 
-def derive_topology(
-    host_hashes: List[UInt64], rank: Int
-) raises -> Topology:
+def derive_topology(host_hashes: List[UInt64], rank: Int) raises -> Topology:
     """Node index = order of first appearance scanning ranks 0..n-1; local
     rank = how many earlier ranks share the host. Pure function of the
     gathered table, so every rank computes the same answer with no round

@@ -82,7 +82,7 @@ def _ipv4_be(dotted: String) raises -> UInt32:
     var c = unsafe_alloc[UInt8](len(b) + 1)
     for i in range(len(b)):
         c[unsafe_offset=i] = b[i]
-    c[unsafe_offset = len(b)] = 0
+    c[unsafe_offset=len(b)] = 0
     return external_call["inet_addr", UInt32](c)
 
 
@@ -203,7 +203,8 @@ def _case_full_queue(mut bad: Int) raises:
         bad += 1
     except:
         _check_bounded(
-            bad, "scm_send: receiver queue full (" + String(filled) + ")",
+            bad,
+            "scm_send: receiver queue full (" + String(filled) + ")",
             _elapsed_s(t0),
         )
     _ = libc.get_function[Int32]("close")(fd)

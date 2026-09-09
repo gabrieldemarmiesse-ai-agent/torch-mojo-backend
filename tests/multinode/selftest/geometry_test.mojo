@@ -69,7 +69,9 @@ def main() raises:
                 "arena count",
                 bad,
             )
-            _check(arena_cap % 4096 == 0 and arena_cap > 0, "arena_cap page", bad)
+            _check(
+                arena_cap % 4096 == 0 and arena_cap > 0, "arena_cap page", bad
+            )
             _check(
                 stride == signal_bytes() + 2 * arena_cap, "arena stride", bad
             )
@@ -80,19 +82,19 @@ def main() raises:
             )
             # The staging total must not grow: that is what keeps the region
             # the size it was before the pipeline.
-            _check(
-                narenas * 2 * arena_cap <= 2 * cap, "staging total", bad
-            )
+            _check(narenas * 2 * arena_cap <= 2 * cap, "staging total", bad)
             if nnodes == 1:
                 _check(arena_cap == cap, "single node keeps the old cap", bad)
-                _check(region_bytes == signal_bytes() + 2 * cap, "single node region", bad)
+                _check(
+                    region_bytes == signal_bytes() + 2 * cap,
+                    "single node region",
+                    bad,
+                )
                 continue
 
             var group = inbox_group_bytes(cap, INBOX_SLOTS)
             _check(group > 0, "inbox group nonempty", bad)
-            _check(
-                INBOX_SLOTS * group <= cap // 2, "inbox groups fit", bad
-            )
+            _check(INBOX_SLOTS * group <= cap // 2, "inbox groups fit", bad)
             _check(
                 CREDIT_AREA_BYTES + net_stage_bytes(cap) <= cap // 2,
                 "credits + staging fit the first half",
@@ -143,7 +145,9 @@ def main() raises:
                             # Every chunk offset must stay 16-byte aligned:
                             # the split kernels use 16-byte vectors.
                             _check(
-                                (off * item) % 16 == 0, "chunk offset align", bad
+                                (off * item) % 16 == 0,
+                                "chunk offset align",
+                                bad,
                             )
                             _check(
                                 cnt * item <= arena_cap,

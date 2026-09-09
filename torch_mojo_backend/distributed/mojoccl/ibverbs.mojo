@@ -261,7 +261,9 @@ struct Ibv(Movable):
             ctx, UInt8(port), out_attr
         )
 
-    def query_gid(self, ctx: Int, port: Int, index: Int, out_gid: P8) raises -> Int32:
+    def query_gid(
+        self, ctx: Int, port: Int, index: Int, out_gid: P8
+    ) raises -> Int32:
         return self.lib.get_function[Int32]("ibv_query_gid")(
             ctx, UInt8(port), Int32(index), out_gid
         )
@@ -272,7 +274,9 @@ struct Ibv(Movable):
     def dealloc_pd(self, pd: Int) raises:
         _ = self.lib.get_function[Int32]("ibv_dealloc_pd")(pd)
 
-    def reg_mr(self, pd: Int, addr: Int, length: Int, access: Int32) raises -> Int:
+    def reg_mr(
+        self, pd: Int, addr: Int, length: Int, access: Int32
+    ) raises -> Int:
         """Plain `ibv_reg_mr@IBVERBS_1.1`."""
         return Int(
             self.lib.get_function[Int64]("ibv_reg_mr")(
@@ -348,16 +352,26 @@ struct Ibv(Movable):
 @always_inline
 def post_send(qp: Int, wr: P8, bad_wr: P8) -> Int32:
     """`qp->context->ops.post_send(qp, wr, &bad_wr)`; 0 or an errno."""
-    var f = _as_fn[def (Int, P8, P8) thin abi("C") -> Int32](
-        ld64(P8(unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)), CTX_POST_SEND)
+    var f = _as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
+        ld64(
+            P8(
+                unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)
+            ),
+            CTX_POST_SEND,
+        )
     )
     return f(qp, wr, bad_wr)
 
 
 @always_inline
 def post_recv(qp: Int, wr: P8, bad_wr: P8) -> Int32:
-    var f = _as_fn[def (Int, P8, P8) thin abi("C") -> Int32](
-        ld64(P8(unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)), CTX_POST_RECV)
+    var f = _as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
+        ld64(
+            P8(
+                unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)
+            ),
+            CTX_POST_RECV,
+        )
     )
     return f(qp, wr, bad_wr)
 
@@ -365,8 +379,13 @@ def post_recv(qp: Int, wr: P8, bad_wr: P8) -> Int32:
 @always_inline
 def poll_cq(cq: Int, num_entries: Int, wc: P8) -> Int32:
     """Number of completions written into `wc`, or negative on error."""
-    var f = _as_fn[def (Int, Int32, P8) thin abi("C") -> Int32](
-        ld64(P8(unsafe_from_address=ld64(P8(unsafe_from_address=cq), QP_CONTEXT)), CTX_POLL_CQ)
+    var f = _as_fn[def(Int, Int32, P8) thin abi("C") -> Int32](
+        ld64(
+            P8(
+                unsafe_from_address=ld64(P8(unsafe_from_address=cq), QP_CONTEXT)
+            ),
+            CTX_POLL_CQ,
+        )
     )
     return f(cq, Int32(num_entries), wc)
 
@@ -503,7 +522,9 @@ def qp_to_init(ibv: Ibv, qp: Int, port: Int) raises:
     _st32(
         a,
         QA_ACCESS_FLAGS,
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ,
+        IBV_ACCESS_LOCAL_WRITE
+        | IBV_ACCESS_REMOTE_WRITE
+        | IBV_ACCESS_REMOTE_READ,
     )
     var rc = ibv.modify_qp(qp, a, QP_MASK_INIT)
     if rc != 0:

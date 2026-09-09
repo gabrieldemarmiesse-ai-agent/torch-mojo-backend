@@ -217,7 +217,9 @@ def device_pci_bus_id(lib: OwnedDLHandle, ordinal: Int) raises -> String:
     var buf = unsafe_alloc[UInt8](32)
     for i in range(32):
         buf[unsafe_offset=i] = 0
-    var rc = lib.get_function[Int32](FN_PCI_BUS_ID)(buf, Int32(32), Int32(ordinal))
+    var rc = lib.get_function[Int32](FN_PCI_BUS_ID)(
+        buf, Int32(32), Int32(ordinal)
+    )
     if rc != 0:
         return String("")
     var s = String("")

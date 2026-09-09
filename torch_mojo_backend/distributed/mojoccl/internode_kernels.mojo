@@ -58,14 +58,18 @@ def _inbox_add_kernel[
     for v in range(tid, nv, stride):
         var acc = shard.unsafe_load[width=W, alignment=16](v * W)
         for j in range(npeers):
-            var src = inbox.unsafe_offset(j * sb).unsafe_bitcast[Scalar[dtype]]()
+            var src = inbox.unsafe_offset(j * sb).unsafe_bitcast[
+                Scalar[dtype]
+            ]()
             acc += src.unsafe_load[width=W, alignment=16](v * W)
         shard.unsafe_store[width=W, alignment=16](v * W, acc)
 
     for i in range(nv * W + tid, n, stride):
         var acc = shard[unsafe_offset=i]
         for j in range(npeers):
-            var src = inbox.unsafe_offset(j * sb).unsafe_bitcast[Scalar[dtype]]()
+            var src = inbox.unsafe_offset(j * sb).unsafe_bitcast[
+                Scalar[dtype]
+            ]()
             acc += src[unsafe_offset=i]
         shard[unsafe_offset=i] = acc
 
@@ -74,9 +78,7 @@ def _inbox_add_kernel[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
 )
 @__name("ccl_internode_proxy_request")
-def _proxy_request_kernel(
-    mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64
-):
+def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
     """Hand exchange `seq` to the progress thread.
 
     A release store into pinned host memory, so everything the stream did
@@ -84,7 +86,7 @@ def _proxy_request_kernel(
     thread is about to send -- is visible to the CPU that acquires it.
     """
     if global_idx.x == 0:
-        Atomic[DType.uint64].store[ordering = Ordering.RELEASE](mailbox, seq)
+        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
 
 
 @__llvm_metadata(
@@ -117,25 +119,24 @@ def _proxy_wait_kernel(
         var t0 = global_perf_counter_ns()
         var spins = 0
         while (
-            Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](mailbox)
-            < seq
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mailbox) < seq
         ):
             spins += 1
             if spins >= _ABORT_CHECK:
                 spins = 0
                 if (
                     Int(abort_word) != 0
-                    and Atomic[DType.uint64].load[
-                        ordering = Ordering.ACQUIRE
-                    ](abort_word)
+                    and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                        abort_word
+                    )
                     != 0
                 ):
-                    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
                         error_word, UInt64(9) * 1_000_000
                     )
                     return
             if global_perf_counter_ns() - t0 > timeout_ns:
-                Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
                     error_word, UInt64(9) * 1_000_000
                 )
                 return

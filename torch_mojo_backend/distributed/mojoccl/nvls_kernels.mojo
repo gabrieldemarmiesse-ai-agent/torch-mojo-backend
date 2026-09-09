@@ -385,8 +385,7 @@ def _copy_vec_scaled[
         dst.unsafe_store[width=W, alignment=16](
             v * W,
             (
-                src.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
-                * sv
+                src.unsafe_load[width=W, alignment=16](v * W).cast[accum]() * sv
             ).cast[dtype](),
         )
         v += stride
@@ -446,7 +445,8 @@ def _copy_in_span[
             var idx = v * W + k
             if idx < n:
                 x[k] = (
-                    in_ptr[unsafe_offset=idx].cast[accum]() * scale.cast[accum]()
+                    in_ptr[unsafe_offset=idx].cast[accum]()
+                    * scale.cast[accum]()
                 ).cast[dtype]()
         uc_pay.unsafe_store[width=W, alignment=16](v * W, x)
         v += stride
@@ -650,7 +650,14 @@ def _nvls_ar_kernel[
         else:
             if c + 1 < nch:
                 _copy_in_span[dtype, W](
-                    uc_pay, in_ptr, s1, min(s1 + cv, nvec), n, ctid, cstride, scale
+                    uc_pay,
+                    in_ptr,
+                    s1,
+                    min(s1 + cv, nvec),
+                    n,
+                    ctid,
+                    cstride,
+                    scale,
                 )
             if c > 0:
                 _copy_out_span[dtype, W](

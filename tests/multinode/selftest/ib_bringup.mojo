@@ -81,7 +81,7 @@ def main() raises:
     bootstrap_allgather(conn, b1, 16, t1, 30.0)
     var hashes = List[UInt64]()
     for r in range(nranks):
-        hashes.append(t1.unsafe_bitcast[UInt64]()[unsafe_offset = 2 * r])
+        hashes.append(t1.unsafe_bitcast[UInt64]()[unsafe_offset=2 * r])
     var topo = derive_topology(hashes, rank)
     print("rank", rank, "nnodes", topo.nnodes, "local_world", topo.local_world)
 
@@ -94,8 +94,15 @@ def main() raises:
     # this test stays a transport test. The credit protocol proper (several
     # exchanges in flight, reuse gated on a peer's credit) is ib_pipeline.
     var ib = ib_setup(
-        driver, 0, topo.my_local_rank, topo.my_node, topo.nnodes, Int(region),
-        region_bytes, 2, net_off,
+        driver,
+        0,
+        topo.my_local_rank,
+        topo.my_node,
+        topo.nnodes,
+        Int(region),
+        region_bytes,
+        2,
+        net_off,
     )
     var lid = ib_port_lid(ib)
     var mtu = ib_port_mtu(ib)
@@ -122,7 +129,9 @@ def main() raises:
     var nseq = 401
     for seq in range(1, nseq):
         for i in range(nbytes):
-            region[unsafe_offset = src + i] = UInt8((rank * 31 + seq * 7 + i) & 0xFF)
+            region[unsafe_offset=src + i] = UInt8(
+                (rank * 31 + seq * 7 + i) & 0xFF
+            )
         var inbox_base = inbox0 + (seq % 2) * half
         ib_exchange_now(
             ib,
@@ -140,10 +149,15 @@ def main() raises:
             var sender = j if j < topo.my_node else j + 1
             for i in range(nbytes):
                 var want = UInt8((sender * 31 + seq * 7 + i) & 0xFF)
-                if region[unsafe_offset = inbox_base + j * slot_bytes + i] != want:
+                if (
+                    region[unsafe_offset=inbox_base + j * slot_bytes + i]
+                    != want
+                ):
                     bad += 1
         if seq % 100 == 0 or seq < 3:
-            print("rank", rank, "seq", seq, "checked", npeers, "slots, bad", bad)
+            print(
+                "rank", rank, "seq", seq, "checked", npeers, "slots, bad", bad
+            )
     ib_teardown(ib)
     conn.close()
     print("rank", rank, "PASS" if bad == 0 else "FAIL")
