@@ -709,6 +709,35 @@ accelerator (Adastra: `libfabric/2.2.0rc1`, provider `cxi`, four
 `/dev/cxi[0-3]` NICs, ROCr HMEM). Either way: a routable interface for the
 TCP bootstrap.
 
+**Measured on Slingshot** (2 nodes x 4 MI300A, job 5393676, 512 MiB fp32
+allreduce at 8 ranks, `ar_bench.py`, one size per process so the numbers are
+attributable):
+
+| | median | busbw | vs RCCL |
+|---|---|---|---|
+| RCCL over the same cxi NICs (aws-ofi-rccl 1.18.0) | 7 072 us | 132.8 GB/s | 1.00x |
+| mojoccl | 10 568 us | 88.9 GB/s | 1.49x |
+| mojoccl, `MOJOCCL_FABRIC_FLUSH=0` | 9 387 us | 100.1 GB/s | 1.33x |
+| mojoccl, same size inside a 1/9/27/168/512 MiB sweep | 21 553 us | 43.6 GB/s | 3.05x |
+
+Three things that says. **The sweep is 2x pessimistic**: the same allreduce
+measured on its own is 10.6 ms against 21.6 ms as the last size of a sweep,
+and the credit stalls that dominate the sweep's trace (80% of exchanges) are
+2-6% (20-57 of 924) when the size runs alone -- so the credit window
+(`INBOX_SLOTS`) is not what caps it and the sweep's degradation is upstream
+of the transport. **The flush read costs 11%** here (1.18 ms of 10.6),
+because on this fabric it is not the 1.9 us it is on InfiniBand: it queues
+behind the exchange's own multi-megabyte writes on the same transmit command
+queue, and the trace reads ~500 us. It stays on by default -- see
+`fab_post_flush` for why the fence probably makes it unnecessary and why
+"probably" is not enough to remove a memory-ordering guarantee -- but
+`MOJOCCL_FABRIC_FLUSH=0` measured `correct=OK`. **The FI_FENCE is not the
+cap**: exchanges do overlap despite it (the sum of per-exchange in-flight
+times, 14 x ~1.9 ms, is 2.5x the 10.6 ms the allreduce takes), so it does not
+serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
+floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
+floor and mojoccl at 1.8x.
+
 **One unresolved flake on Slingshot.** `fi_enable` intermittently returns
 `-FI_ENOMEM` when several ranks come up on one busy node — every rank of a
 batch fails, then minutes later the identical batch passes, in windows of
