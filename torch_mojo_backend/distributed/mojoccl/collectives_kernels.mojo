@@ -181,19 +181,28 @@ two-shot): 128 KiB 9.3/19.0, 256 KiB 12.3/19.3, 512 KiB 18.1/19.8,
 1 MiB 30.0/20.5 -- so the crossover sits just above 512 KiB. The path is taken
 only if 2*world message-sized slots also fit the region."""
 
-comptime _AR_MAX_BLOCKS = get_defined_int["ccl_ar_blocks", 216]()
+comptime _AR_MAX_BLOCKS = get_defined_int[
+    "ccl_ar_blocks", 128 if has_amd_gpu_accelerator() else 216
+]()
 """Grid cap for allreduce, fitted on H100 (132 SMs) / NVSwitch; see the block
-sweep in RESULTS.md. Not portable: re-fit it on another card."""
+sweep in RESULTS.md. Not portable: re-fit it on another card. The AMD value
+was swept on 4x MI300A (228 CUs): 128 blocks measured 9 MiB at 173 us against
+201 for 216 and 246 for 456, with 27 MiB flat across the sweep."""
 
 comptime _AR_BIG_BYTES = get_defined_int["ccl_ar_big_bytes", 64 * 1024 * 1024]()
 """Above this message size the allreduce grid drops to `_AR_BIG_BLOCKS`."""
 
-comptime _AR_BIG_BLOCKS = get_defined_int["ccl_ar_big_blocks", 128]()
+comptime _AR_BIG_BLOCKS = get_defined_int[
+    "ccl_ar_big_blocks", 1024 if has_amd_gpu_accelerator() else 128
+]()
 """Grid cap for large allreduces. A grid that fits in one wave of an H100's
 132 SMs measured 8% faster at 512 MiB than 216 blocks (2825 vs 3065 us) and
 the same at 168 MiB, because the barrier is per block index: with more blocks
 than SMs the second wave runs the whole collective after the first, on fewer
-SMs. Fitted on H100 (132 SMs); re-fit on another card."""
+SMs. Fitted on H100 (132 SMs); re-fit on another card. On MI300A the
+opposite holds -- the 228 CUs want many more waves in flight to cover the
+xGMI latency: 512 MiB measured 9662 us at 128 blocks, 6991 at 912 and 6448
+at 1024 (the flag-matrix cap), 168 MiB 2948 -> 2141."""
 
 comptime _COPY_MAX_BLOCKS = get_defined_int["ccl_copy_blocks", 432]()
 """Grid cap for the pure-copy collectives (broadcast / allgather)."""
