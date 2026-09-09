@@ -785,6 +785,34 @@ def _init_rank(
         raise e
 
 
+def _unwind_init(
+    lib: OwnedDLHandle,
+    ordinal: Int,
+    ib: Int,
+    use_nvls: Bool,
+    mut nvls: NvlsRegion,
+    base: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    local_world: Int,
+    local_rank: Int,
+):
+    """Release what `_bootstrap` acquired before it failed: the IB state
+    (progress thread, QPs, MRs, pinned mailbox), the peer mappings opened so
+    far, and the region itself. Best effort -- the error that got us here is
+    the one worth reporting."""
+    ib_teardown(ib)
+    try:
+        if use_nvls:
+            nvls_teardown(nvls, lib, ordinal)
+        else:
+            for r in range(local_world):
+                if r != local_rank and regions[r] != 0:
+                    close_handle(lib, regions[r])
+            free_region(lib, base)
+    except:
+        pass
+
+
 def _bootstrap(
     mut conn: BootstrapConn,
     rank: Int,
@@ -996,120 +1024,139 @@ def _bootstrap(
         base = nvls.uc
     else:
         base = alloc_region(lib, region_bytes)
-    for a in range(narenas):
-        region_init(ctx, base + a * arena_stride)
-
+    # From here on real resources exist (the region, and on several nodes
+    # the IB state with its progress thread); any later failure -- a geometry
+    # mismatch, an IPC import, ib_connect, the closing barrier -- has to
+    # release them, because no communicator handle is returned through
+    # which the caller could.
     var ib = 0
-    if topo.nnodes > 1:
-        ib = ib_setup(
+    var regions = StaticTuple[Int, MAX_WORLD](fill=0)
+    try:
+        for a in range(narenas):
+            region_init(ctx, base + a * arena_stride)
+
+        if topo.nnodes > 1:
+            ib = ib_setup(
+                lib,
+                ordinal,
+                topo.my_local_rank,
+                topo.my_node,
+                topo.nnodes,
+                base,
+                region_bytes,
+                INBOX_SLOTS,
+                net_off,
+            )
+
+        # Round 2: IPC handle + IB connection data + the geometry every rank has
+        # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
+        # (a per-node environment, a stale export) silently gives the peers
+        # different arena and inbox offsets, which is a data race, not an error;
+        # checking two integers here turns it into a message.
+        comptime CFG_BYTES = 16
+        comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
+        var b2 = unsafe_alloc[UInt8](BLOB2)
+        for i in range(BLOB2):
+            b2[unsafe_offset=i] = 0
+        if not use_nvls:
+            # `cuIpcGetMemHandle` cannot export VMM memory; under NVLS the peers
+            # already have this region through the fd exchange above, and these
+            # 64 bytes stay zero.
+            get_handle(lib, base, _any(b2))
+        var my_lid = 0
+        var my_mtu = 0
+        if ib != 0:
+            my_lid = ib_port_lid(ib)
+            my_mtu = ib_port_mtu(ib)
+            ib_local_info(
+                ib,
+                Pointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=Int(b2) + HANDLE_BYTES
+                ),
+                my_lid,
+                my_mtu,
+            )
+        var cfg = Pointer[Int64, MutAnyOrigin](
+            unsafe_from_address=Int(b2) + HANDLE_BYTES + IB_BLOB_BYTES
+        )
+        cfg[unsafe_offset=0] = Int64(cap_bytes)
+        cfg[unsafe_offset=1] = Int64(
+            narenas * 1000 + INBOX_SLOTS + (1_000_000 if use_nvls else 0)
+        )
+        var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
+        bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
+        for r in range(nranks):
+            var rcfg = Pointer[Int64, MutAnyOrigin](
+                unsafe_from_address=Int(t2)
+                + r * BLOB2
+                + HANDLE_BYTES
+                + IB_BLOB_BYTES
+            )
+            if (
+                rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
+                or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
+            ):
+                raise Error(
+                    "mojoccl: rank "
+                    + String(r)
+                    + " built a region of "
+                    + String(Int(rcfg[unsafe_offset=0]) // (1024 * 1024))
+                    + " MiB with layout code "
+                    + String(Int(rcfg[unsafe_offset=1]))
+                    + ", this rank "
+                    + String(cap_bytes // (1024 * 1024))
+                    + " MiB / "
+                    + String(Int(cfg[unsafe_offset=1]))
+                    + "; MOJOCCL_REGION_MB must match on every rank"
+                )
+
+        # Same-node peers only: an IPC handle from another host is meaningless.
+        regions[topo.my_local_rank] = base
+        if use_nvls:
+            for r in range(topo.local_world):
+                regions[r] = nvls.peer_va[r]
+        else:
+            for r in range(nranks):
+                if topo.node_of[r] != topo.my_node or r == rank:
+                    continue
+                var lr = topo.local_rank_of[r]
+                regions[lr] = open_handle(
+                    lib,
+                    Pointer[UInt8, MutAnyOrigin](
+                        unsafe_from_address=Int(t2) + r * BLOB2
+                    ),
+                )
+
+        if ib != 0:
+            var peer_rank_of_node = List[Int]()
+            for j in range(topo.nnodes):
+                peer_rank_of_node.append(
+                    topo.rank_at[j * topo.local_world + topo.my_local_rank]
+                )
+            ib_connect(
+                ib,
+                Pointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=Int(t2) + HANDLE_BYTES
+                ),
+                BLOB2,
+                peer_rank_of_node,
+                my_mtu,
+            )
+
+        bootstrap_barrier(conn, timeout_s)
+    except e:
+        _unwind_init(
             lib,
             ordinal,
-            topo.my_local_rank,
-            topo.my_node,
-            topo.nnodes,
+            ib,
+            use_nvls,
+            nvls,
             base,
-            region_bytes,
-            INBOX_SLOTS,
-            net_off,
+            regions,
+            topo.local_world,
+            topo.my_local_rank,
         )
-
-    # Round 2: IPC handle + IB connection data + the geometry every rank has
-    # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
-    # (a per-node environment, a stale export) silently gives the peers
-    # different arena and inbox offsets, which is a data race, not an error;
-    # checking two integers here turns it into a message.
-    comptime CFG_BYTES = 16
-    comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
-    var b2 = unsafe_alloc[UInt8](BLOB2)
-    for i in range(BLOB2):
-        b2[unsafe_offset=i] = 0
-    if not use_nvls:
-        # `cuIpcGetMemHandle` cannot export VMM memory; under NVLS the peers
-        # already have this region through the fd exchange above, and these
-        # 64 bytes stay zero.
-        get_handle(lib, base, _any(b2))
-    var my_lid = 0
-    var my_mtu = 0
-    if ib != 0:
-        my_lid = ib_port_lid(ib)
-        my_mtu = ib_port_mtu(ib)
-        ib_local_info(
-            ib,
-            Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=Int(b2) + HANDLE_BYTES
-            ),
-            my_lid,
-            my_mtu,
-        )
-    var cfg = Pointer[Int64, MutAnyOrigin](
-        unsafe_from_address=Int(b2) + HANDLE_BYTES + IB_BLOB_BYTES
-    )
-    cfg[unsafe_offset=0] = Int64(cap_bytes)
-    cfg[unsafe_offset=1] = Int64(
-        narenas * 1000 + INBOX_SLOTS + (1_000_000 if use_nvls else 0)
-    )
-    var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
-    bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
-    for r in range(nranks):
-        var rcfg = Pointer[Int64, MutAnyOrigin](
-            unsafe_from_address=Int(t2)
-            + r * BLOB2
-            + HANDLE_BYTES
-            + IB_BLOB_BYTES
-        )
-        if (
-            rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
-            or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
-        ):
-            raise Error(
-                "mojoccl: rank "
-                + String(r)
-                + " built a region of "
-                + String(Int(rcfg[unsafe_offset=0]) // (1024 * 1024))
-                + " MiB with layout code "
-                + String(Int(rcfg[unsafe_offset=1]))
-                + ", this rank "
-                + String(cap_bytes // (1024 * 1024))
-                + " MiB / "
-                + String(Int(cfg[unsafe_offset=1]))
-                + "; MOJOCCL_REGION_MB must match on every rank"
-            )
-
-    # Same-node peers only: an IPC handle from another host is meaningless.
-    var regions = StaticTuple[Int, MAX_WORLD](fill=0)
-    regions[topo.my_local_rank] = base
-    if use_nvls:
-        for r in range(topo.local_world):
-            regions[r] = nvls.peer_va[r]
-    else:
-        for r in range(nranks):
-            if topo.node_of[r] != topo.my_node or r == rank:
-                continue
-            var lr = topo.local_rank_of[r]
-            regions[lr] = open_handle(
-                lib,
-                Pointer[UInt8, MutAnyOrigin](
-                    unsafe_from_address=Int(t2) + r * BLOB2
-                ),
-            )
-
-    if ib != 0:
-        var peer_rank_of_node = List[Int]()
-        for j in range(topo.nnodes):
-            peer_rank_of_node.append(
-                topo.rank_at[j * topo.local_world + topo.my_local_rank]
-            )
-        ib_connect(
-            ib,
-            Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=Int(t2) + HANDLE_BYTES
-            ),
-            BLOB2,
-            peer_rank_of_node,
-            my_mtu,
-        )
-
-    bootstrap_barrier(conn, timeout_s)
+        raise e
 
     var rank_at = List[Int]()
     for i in range(len(topo.rank_at)):

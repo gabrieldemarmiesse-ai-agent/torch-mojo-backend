@@ -1149,7 +1149,11 @@ def ib_setup(
     var holder = unsafe_alloc[IbState](1)
     holder.unsafe_write(st^)
     if _st(Int(holder))[].proxy:
-        _start_proxy(Int(holder))
+        try:
+            _start_proxy(Int(holder))
+        except e:
+            _teardown_ib_resources(_st(Int(holder))[])
+            raise e
     return Int(holder)
 
 
