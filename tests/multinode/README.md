@@ -72,6 +72,26 @@ any level. See the "Multi-node" subsection of
 spending the job's time budget on the mojo legs (useful when only NCCL's
 numbers are wanted, or while iterating on something unrelated to mojoccl).
 
+## ring_pressure.py
+
+`ring_pressure.py` is a two-node regression test for one specific way the
+inter-node transport can be misused from above: issuing collectives faster
+than the GPU consumes them until the calling thread laps `internode.mojo`'s
+fixed work ring. DDP's `_sync_module_states` does exactly that, and on
+Slingshot (where an exchange costs milliseconds rather than microseconds) it
+killed `DDP(model)` at construction. `N` broadcasts, no synchronize until the
+end:
+
+```bash
+N=1500 MIB=4 MOJOCCL_IB_TRACE=1 torchrun --nnodes=2 --nproc-per-node=4 \
+    --rdzv-backend=c10d --rdzv-endpoint=$MASTER:29500 \
+    tests/multinode/ring_pressure.py
+```
+
+It passes when every rank prints `payload=OK`; the trace line then says how
+far the host ran ahead and how many times it waited for a ring slot. Needs
+two nodes and takes a second.
+
 ## GPU-free self-tests
 
 `tests/multinode/selftest/` holds seven standalone Mojo programs that

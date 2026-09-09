@@ -319,6 +319,11 @@ struct IbState(Movable):
     var last_progress_ns: Int
     var stall_seq: Int  # exchange the last credit stall was counted against
     var n_credit_stalls: Int
+    # How far the calling thread got ahead of the engine, and how often it
+    # had to wait for a ring slot (`_await_ring_slot`). Written only by the
+    # calling thread.
+    var max_ahead: Int
+    var n_ring_waits: Int
     # Host-side: highest exchange whose consumer kernel has been ENQUEUED.
     # Snapshotted into each work item as `credit_upto` (see
     # `ib_note_consumed`); never touched by the engine thread.
@@ -329,6 +334,10 @@ struct IbState(Movable):
     # hundred bytes per communicator).
     var comps: Int  # NetCompletion[COMP_BATCH], filled by the transport
     var ts: Int  # struct timespec scratch for the idle nanosleep
+    # A second timespec, for the calling thread's back-off in
+    # `_await_ring_slot`: `ts` belongs to the progress thread and the two
+    # would otherwise write the same 16 bytes.
+    var ts_host: Int
     var works: Int
     var work_next: Int
     var mailbox: Int  # pinned host address
@@ -384,9 +393,12 @@ struct IbState(Movable):
         self.last_progress_ns = 0
         self.stall_seq = 0
         self.n_credit_stalls = 0
+        self.max_ahead = 0
+        self.n_ring_waits = 0
         self.consumed_enqueued = 0
         self.comps = Int(alloc_bytes(COMP_BATCH * size_of[NetCompletion]()))
         self.ts = Int(alloc_bytes(16))
+        self.ts_host = Int(alloc_bytes(16))
         self.works = Int(unsafe_alloc[IbWork](WORK_SLOTS))
         var wp = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=self.works)
         for i in range(WORK_SLOTS):
@@ -1382,6 +1394,82 @@ def ib_note_consumed(ib: Int, seq: Int):
         st.consumed_enqueued = seq
 
 
+def _ring_state(st: IbState, seq: Int) -> String:
+    """How far behind the engine is, for the ring-pressure messages.
+
+    Every number but the work item's status is engine-owned and read here
+    without synchronisation: this only ever builds a diagnostic string, and a
+    counter that is one step stale in an error message costs nothing.
+    """
+    var s = String("")
+    s += "exchange " + String(seq)
+    s += " (ring slot " + String((seq - 1) % WORK_SLOTS) + " of "
+    s += String(WORK_SLOTS) + "); engine at request "
+    s += String(st.request_seq) + ", posted " + String(st.posted_seq)
+    s += ", done " + String(st.done_seq)
+    s += "; host is " + String(seq - st.done_seq) + " exchanges ahead"
+    s += "; credits sent " + String(st.credit_sent) + ", received"
+    for i in range(len(st.credit_recv)):
+        s += " " + String(st.credit_recv[i])
+    s += "; sends done"
+    for i in range(len(st.send_done)):
+        s += " " + String(st.send_done[i])
+    s += "; stalls " + String(st.n_credit_stalls)
+    return s^
+
+
+def _await_ring_slot(mut st: IbState, seq: Int) raises:
+    """Back-pressure: wait until exchange `seq - WORK_SLOTS` has retired.
+
+    The work ring is `WORK_SLOTS` deep and the calling thread fills it
+    without ever touching the GPU, so how far ahead of the network it can get
+    is bounded by nothing but how fast torch enqueues. One rank of a
+    broadcast receives every byte while its node-mates receive sixteen, so on
+    a slow-enough fabric the receiver's host reaches slot `seq % WORK_SLOTS`
+    while the exchange that used it last is still on the wire. That is
+    ordinary back-pressure, not an error: wait for the slot.
+
+    Waiting here cannot deadlock. The engine is driven by the progress thread
+    (default) or, under `MOJOCCL_IB_PROXY=0`, by a stream callback -- neither
+    needs this thread, and the stream already holds every kernel the
+    outstanding exchanges need. The inline self-test path is the one caller
+    that drives the engine itself, and it does not come through here (see
+    `ib_submit_now`).
+
+    Bounded by `MOJOCCL_IB_TIMEOUT_S`, the same deadline every other wait in
+    this library uses: a slot that never frees is a peer that stopped
+    answering, and the message says how far behind the engine got.
+    """
+    ref w = _work(st, seq)[]
+    var ahead = seq - st.done_seq
+    if ahead > st.max_ahead:
+        st.max_ahead = ahead
+    if _load_atomic_i(_status_ptr(w)) != 0:
+        return
+    st.n_ring_waits += 1
+    var deadline = perf_counter_ns() + st.timeout_ns
+    while _load_atomic_i(_status_ptr(w)) == 0:
+        var err = _load_atomic_i(_err_ptr(st))
+        if err != 0:
+            raise Error(
+                "mojoccl: the inter-node transport failed (error "
+                + String(err)
+                + ") while the host waited for a work-ring slot at "
+                + _ring_state(st, seq)
+            )
+        if perf_counter_ns() > deadline:
+            raise Error(
+                "mojoccl: waited "
+                + String(st.timeout_ns // 1_000_000_000)
+                + "s for the inter-node work ring to free a slot and it never"
+                " did, at "
+                + _ring_state(st, seq)
+                + "; MOJOCCL_IB_TRACE=1 for the per-exchange timings"
+            )
+        _ = external_call["sched_yield", Int32]()
+        _nanosleep_ns(st.ts_host, 20_000)
+
+
 def _fill_work(
     mut st: IbState,
     ib: Int,
@@ -1394,13 +1482,18 @@ def _fill_work(
     flush_addr: Int,
     seq: Int,
     credit_upto: Int,
+    may_wait: Bool,
 ) raises:
     ref w = _work(st, seq)[]
-    if _load_atomic_i(_status_ptr(w)) == 0:
+    if may_wait:
+        _await_ring_slot(st, seq)
+    elif _load_atomic_i(_status_ptr(w)) == 0:
+        # `ib_submit_now`: the caller is the only thing driving the engine, so
+        # blocking here would deadlock rather than back off.
         raise Error(
             "mojoccl: the inter-node work ring wrapped with an exchange still"
-            " in flight; MOJOCCL_IB_TRACE=1 to see how far behind the network"
-            " is"
+            " in flight at "
+            + _ring_state(st, seq)
         )
     w.state = ib
     w.send_addr = send_addr
@@ -1456,6 +1549,7 @@ def ib_enqueue_request(
         flush_addr,
         seq,
         st.consumed_enqueued,
+        True,
     )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
@@ -1522,6 +1616,7 @@ def ib_submit_now(
         flush_addr,
         seq,
         credit_upto,
+        False,
     )
     if seq > st.request_seq:
         st.request_seq = seq
@@ -1590,6 +1685,11 @@ def ib_report(ib: Int):
         st.n_exchanges,
         "credit stalls",
         st.n_credit_stalls,
+        "| host ran up to",
+        st.max_ahead,
+        "exchanges ahead, waited for a ring slot",
+        st.n_ring_waits,
+        "times",
         "| mean us post",
         Float64(st.t_post_ns) / Float64(st.n_exchanges) / 1000.0,
         "in flight",
