@@ -696,8 +696,13 @@ NCCL 49.7 ms vs mojoccl 51.4 ms with adjacent pairs at 1.035, 1.084 and
 0.996, inside those nodes' noise; on `--exclusive` nodes (job 234455) NCCL is
 tight at 44.6–44.9 ms and mojoccl reads 45.1, 45.7 and 50.1 ms — the
 best-decile steps are within 1.7% of NCCL, and the slow run is a mode (steps
-12–35 at a steady 51 ms, 45–46 before and after): the progress thread sharing
-a core with the rank's Python thread. Pinning it by default is the follow-up.
+12–35 at a steady 51 ms, 45–46 before and after). Pinning the progress thread
+by default (now the policy) did not remove it; binding every rank's whole
+process to a compact eighth of the task's CPUs did (job 234658, exclusive
+nodes, same six-run design, `tests/multinode/rank_bind.py` as the torchrun
+entry): NCCL 46.30 ms vs mojoccl 46.37 ms pooled medians, ratio 1.001, pairs
+0.968 / 1.005 / 1.030, and the remaining plateaus appear under both libraries
+alike. Bind ranks to CPUs when measuring; the collective library is at parity.
 
 What is left at the large sizes is the intra-node half, not the network: the
 split reduce-scatter/all-gather pair is ~1004 µs at 168 MiB on one node
