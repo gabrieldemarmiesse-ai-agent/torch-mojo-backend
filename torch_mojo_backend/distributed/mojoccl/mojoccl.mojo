@@ -62,8 +62,9 @@
 # Single-node communicators never touch libibverbs at all -- same fused
 # kernels, same numbers as before this file learned about nodes.
 
+from std.atomic import Atomic, Ordering
 from std.collections import Dict
-from std.ffi import OwnedDLHandle
+from std.ffi import OwnedDLHandle, external_call
 from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
@@ -372,6 +373,8 @@ struct CommState(Movable):
     var nvls_grid: Int
     var nvls_min: Int
     var nvls_bars: Int
+    # Submission lock (`_lock`/`_unlock`): 0 free, 1 held.
+    var lock: Int64
 
     def __init__(
         out self,
@@ -432,6 +435,39 @@ struct CommState(Movable):
         # reset, and it is independent of `generation` (different address,
         # different protocol) so the two paths can alternate freely.
         self.nvls_bars = 0
+        self.lock = 0
+
+
+def _lock(mut state: CommState):
+    """Serialize whole-collective submission on one communicator.
+
+    A collective is several launches plus host bookkeeping (generations,
+    exchange numbers, work descriptors, arena choice). One stream orders the
+    launches, not the sequence: torch can issue collectives from more than
+    one host thread (DDP's reducer runs on the autograd thread while the main
+    thread may broadcast) and ctypes releases the GIL around the call, so two
+    submissions could interleave -- thread A's reduce-scatter, then thread
+    B's on the same arena before A released its exchange. NCCL declares
+    concurrent calls on one communicator unsupported; a spin word costs ~20 ns
+    uncontended and turns that into a serialization. Never taken by
+    `ncclCommAbort` or `ncclCommGetAsyncError`: a watchdog must be able to
+    abort a communicator whose submitter is stuck behind a full launch queue.
+    """
+    var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
+    while True:
+        var expected: Int64 = 0
+        if Atomic[DType.int64].compare_exchange[
+            success_ordering = Ordering.ACQUIRE,
+            failure_ordering = Ordering.RELAXED,
+        ](p, expected, 1):
+            return
+        _ = external_call["sched_yield", Int32]()
+
+
+def _unlock(mut state: CommState):
+    Atomic[DType.int64].store[ordering = Ordering.RELEASE](
+        Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin](), 0
+    )
 
 
 @always_inline
@@ -1148,9 +1184,16 @@ def _drain_all_streams(mut state: CommState) raises:
 
 @export
 def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
+    ref state = _comm_ptr(comm)[]
+    _lock(state)
+    var rc = _destroy_locked(comm)
+    _unlock(state)
+    return rc
+
+
+def _destroy_locked(comm: Int64) -> Int32:
     try:
-        var ptr = _comm_ptr(comm)
-        ref state = ptr[]
+        ref state = _comm_ptr(comm)[]
         if not state.aborted:
             # The inter-node callbacks were enqueued on the CALLER's stream(s),
             # not on the context's own, and they dereference the IbState this
@@ -1647,70 +1690,93 @@ def ncclAllReduce(
         if Int(sendbuff) % 16 != 0 or Int(recvbuff) % 16 != 0:
             return NCCL_INVALID_ARGUMENT
         ref state = _comm_ptr(comm)[]
-        if state.aborted:
-            return NCCL_INVALID_USAGE
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            return NCCL_REMOTE_ERROR
-        state.last_stream = stream
-        _ensure_stream_cached(state, stream)
-        ref s = state.stream_cache[stream]
-        var scale = Float32(1.0)
-        if op == NCCL_AVG:
-            scale = Float32(1.0) / Float32(state.world)
-        if datatype == NCCL_INT32:
-            _do_allreduce[DType.int32](
-                state,
-                s,
-                stream,
-                Int(sendbuff),
-                Int(recvbuff),
-                Int(count),
-                scale,
+        _lock(state)
+        var rc = NCCL_INTERNAL_ERROR
+        try:
+            rc = _allreduce_locked(
+                comm, sendbuff, recvbuff, count, datatype, op, stream
             )
-        elif datatype == NCCL_INT64:
-            _do_allreduce[DType.int64](
-                state,
-                s,
-                stream,
-                Int(sendbuff),
-                Int(recvbuff),
-                Int(count),
-                scale,
-            )
-        elif datatype == NCCL_FLOAT16:
-            _do_allreduce[DType.float16](
-                state,
-                s,
-                stream,
-                Int(sendbuff),
-                Int(recvbuff),
-                Int(count),
-                scale,
-            )
-        elif datatype == NCCL_FLOAT32:
-            _do_allreduce[DType.float32](
-                state,
-                s,
-                stream,
-                Int(sendbuff),
-                Int(recvbuff),
-                Int(count),
-                scale,
-            )
-        else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
-            _do_allreduce[DType.bfloat16](
-                state,
-                s,
-                stream,
-                Int(sendbuff),
-                Int(recvbuff),
-                Int(count),
-                scale,
-            )
-        return NCCL_SUCCESS
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
+        return rc
     except e:
         print("mojoccl: ncclAllReduce failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _allreduce_locked(
+    comm: Int64,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int64,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises -> Int32:
+    ref state = _comm_ptr(comm)[]
+    if state.aborted:
+        return NCCL_INVALID_USAGE
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    state.last_stream = stream
+    _ensure_stream_cached(state, stream)
+    ref s = state.stream_cache[stream]
+    var scale = Float32(1.0)
+    if op == NCCL_AVG:
+        scale = Float32(1.0) / Float32(state.world)
+    if datatype == NCCL_INT32:
+        _do_allreduce[DType.int32](
+            state,
+            s,
+            stream,
+            Int(sendbuff),
+            Int(recvbuff),
+            Int(count),
+            scale,
+        )
+    elif datatype == NCCL_INT64:
+        _do_allreduce[DType.int64](
+            state,
+            s,
+            stream,
+            Int(sendbuff),
+            Int(recvbuff),
+            Int(count),
+            scale,
+        )
+    elif datatype == NCCL_FLOAT16:
+        _do_allreduce[DType.float16](
+            state,
+            s,
+            stream,
+            Int(sendbuff),
+            Int(recvbuff),
+            Int(count),
+            scale,
+        )
+    elif datatype == NCCL_FLOAT32:
+        _do_allreduce[DType.float32](
+            state,
+            s,
+            stream,
+            Int(sendbuff),
+            Int(recvbuff),
+            Int(count),
+            scale,
+        )
+    else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
+        _do_allreduce[DType.bfloat16](
+            state,
+            s,
+            stream,
+            Int(sendbuff),
+            Int(recvbuff),
+            Int(count),
+            scale,
+        )
+    return NCCL_SUCCESS
 
 
 @export
@@ -1728,50 +1794,71 @@ def ncclBroadcast(
         if item == 0:
             return NCCL_INVALID_ARGUMENT
         ref state = _comm_ptr(comm)[]
-        if state.aborted:
-            return NCCL_INVALID_USAGE
-        if Int(root) < 0 or Int(root) >= state.world:
-            return NCCL_INVALID_ARGUMENT
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            return NCCL_REMOTE_ERROR
-        state.last_stream = stream
-        _ensure_stream_cached(state, stream)
-        ref s = state.stream_cache[stream]
-        var total_bytes = Int(count) * item
-        if state.nnodes == 1:
-            var max_bytes = max(item, state.cap_bytes)
-            var done = 0
-            while done < total_bytes:
-                var chunk = min(max_bytes, total_bytes - done)
-                state.generation += 1
-                broadcast(
-                    state.ctx,
-                    s,
-                    state.local_rank,
-                    Int(root),
-                    state.local_world,
-                    state.regions,
-                    Int(sendbuff) + done,
-                    Int(recvbuff) + done,
-                    chunk,
-                    state.cap_bytes,
-                    state.generation,
-                )
-                done += chunk
-            return NCCL_SUCCESS
-        _broadcast_multinode(
-            state,
-            s,
-            stream,
-            Int(sendbuff),
-            Int(recvbuff),
-            total_bytes,
-            Int(root),
-        )
-        return NCCL_SUCCESS
+        _lock(state)
+        var rc = NCCL_INTERNAL_ERROR
+        try:
+            rc = _broadcast_locked(
+                comm, sendbuff, recvbuff, Int(count) * item, root, stream
+            )
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
+        return rc
     except e:
         print("mojoccl: ncclBroadcast failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _broadcast_locked(
+    comm: Int64,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    total_bytes: Int,
+    root: Int32,
+    stream: Int64,
+) raises -> Int32:
+    ref state = _comm_ptr(comm)[]
+    if state.aborted:
+        return NCCL_INVALID_USAGE
+    if Int(root) < 0 or Int(root) >= state.world:
+        return NCCL_INVALID_ARGUMENT
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    state.last_stream = stream
+    _ensure_stream_cached(state, stream)
+    ref s = state.stream_cache[stream]
+    if state.nnodes == 1:
+        var max_bytes = max(1, state.cap_bytes)
+        var done = 0
+        while done < total_bytes:
+            var chunk = min(max_bytes, total_bytes - done)
+            state.generation += 1
+            broadcast(
+                state.ctx,
+                s,
+                state.local_rank,
+                Int(root),
+                state.local_world,
+                state.regions,
+                Int(sendbuff) + done,
+                Int(recvbuff) + done,
+                chunk,
+                state.cap_bytes,
+                state.generation,
+            )
+            done += chunk
+        return NCCL_SUCCESS
+    _broadcast_multinode(
+        state,
+        s,
+        stream,
+        Int(sendbuff),
+        Int(recvbuff),
+        total_bytes,
+        Int(root),
+    )
+    return NCCL_SUCCESS
 
 
 def _broadcast_multinode(
@@ -1908,42 +1995,62 @@ def ncclAllGather(
         if item == 0:
             return NCCL_INVALID_ARGUMENT
         ref state = _comm_ptr(comm)[]
-        if state.aborted:
-            return NCCL_INVALID_USAGE
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            return NCCL_REMOTE_ERROR
-        state.last_stream = stream
-        _ensure_stream_cached(state, stream)
-        ref s = state.stream_cache[stream]
-        var per_rank_bytes = Int(sendcount) * item
-        if state.nnodes == 1:
-            var max_bytes = max(item, state.cap_bytes)
-            var done = 0
-            while done < per_rank_bytes:
-                var chunk = min(max_bytes, per_rank_bytes - done)
-                state.generation += 1
-                allgather(
-                    state.ctx,
-                    s,
-                    state.local_rank,
-                    state.local_world,
-                    state.regions,
-                    Int(sendbuff) + done,
-                    Int(recvbuff) + done,
-                    chunk,
-                    state.cap_bytes,
-                    state.generation,
-                    stride_bytes=per_rank_bytes,
-                )
-                done += chunk
-            return NCCL_SUCCESS
-        _allgather_multinode(
-            state, s, stream, Int(sendbuff), Int(recvbuff), per_rank_bytes
-        )
-        return NCCL_SUCCESS
+        _lock(state)
+        var rc = NCCL_INTERNAL_ERROR
+        try:
+            rc = _allgather_locked(
+                comm, sendbuff, recvbuff, Int(sendcount) * item, stream
+            )
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
+        return rc
     except e:
         print("mojoccl: ncclAllGather failed:", e)
         return NCCL_INTERNAL_ERROR
+
+
+def _allgather_locked(
+    comm: Int64,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    per_rank_bytes: Int,
+    stream: Int64,
+) raises -> Int32:
+    ref state = _comm_ptr(comm)[]
+    if state.aborted:
+        return NCCL_INVALID_USAGE
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    state.last_stream = stream
+    _ensure_stream_cached(state, stream)
+    ref s = state.stream_cache[stream]
+    if state.nnodes == 1:
+        var max_bytes = max(1, state.cap_bytes)
+        var done = 0
+        while done < per_rank_bytes:
+            var chunk = min(max_bytes, per_rank_bytes - done)
+            state.generation += 1
+            allgather(
+                state.ctx,
+                s,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                Int(sendbuff) + done,
+                Int(recvbuff) + done,
+                chunk,
+                state.cap_bytes,
+                state.generation,
+                stride_bytes=per_rank_bytes,
+            )
+            done += chunk
+        return NCCL_SUCCESS
+    _allgather_multinode(
+        state, s, stream, Int(sendbuff), Int(recvbuff), per_rank_bytes
+    )
+    return NCCL_SUCCESS
 
 
 def _allgather_multinode(
