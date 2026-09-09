@@ -295,15 +295,26 @@ def _reference(dtype: torch.dtype, world: int, n: int, avg: bool) -> torch.Tenso
     return acc.to(dtype)
 
 
-def _matches(dtype: torch.dtype, got: torch.Tensor, want: torch.Tensor) -> bool:
+def _matches(
+    dtype: torch.dtype, got: torch.Tensor, want: torch.Tensor, avg: bool, world: int
+) -> bool:
     """Exact for float32/int32/int64; half a bf16 ulp for fp16/bf16 -- the
     same tolerance harness.mojo's verify_ar uses, validated there against
-    this exact kernel (RESULTS.md §7)."""
+    this exact kernel (RESULTS.md §7).
+
+    One exception: a float32 AVG over a world that is not a power of two.
+    1/world is then inexact in fp32, so both NCCL (PreMulSum) and mojoccl
+    round it into each input before summing and the result is a few fp32
+    ulps off the fp64 reference -- seen at 24 ranks, never at 8 or 16, where
+    every step is exact. A few ulps of slack there, not a wider band.
+    """
     if dtype in (torch.float16, torch.bfloat16):
         got64 = got.to(torch.float64)
         want64 = want.to(torch.float64)
         tol = 0.004 * torch.clamp(want64.abs(), min=1.0)
         return bool((got64 - want64).abs().le(tol).all())
+    if dtype == torch.float32 and avg and world & (world - 1):
+        return torch.allclose(got, want, rtol=1e-6, atol=1e-6)
     return torch.equal(got, want)
 
 
@@ -405,7 +416,11 @@ def _stress_verify_matrix(failures: list[str], rank: int, world: int):
 
                 x = _fill(dtype, rank, n).to("mojo")
                 dist.all_reduce(x, op=op)
-                _check(failures, f"{tag}.inplace", _matches(dtype, x.cpu(), want))
+                _check(
+                    failures,
+                    f"{tag}.inplace",
+                    _matches(dtype, x.cpu(), want, avg, world),
+                )
 
                 # Full sync: the in-place step above may have run on the
                 # comm side-stream: see _pg_comm's docstring.
@@ -421,7 +436,11 @@ def _stress_verify_matrix(failures: list[str], rank: int, world: int):
                     _nccl_red_op(op),
                     stream,
                 )
-                _check(failures, f"{tag}.outofplace", _matches(dtype, dst.cpu(), want))
+                _check(
+                    failures,
+                    f"{tag}.outofplace",
+                    _matches(dtype, dst.cpu(), want, avg, world),
+                )
     dist.barrier()
 
 
