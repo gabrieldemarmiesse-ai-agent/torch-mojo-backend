@@ -1031,6 +1031,7 @@ def _bootstrap(
     # which the caller could.
     var ib = 0
     var regions = StaticTuple[Int, MAX_WORLD](fill=0)
+    var nvls_min = _nvls_min_bytes()
     try:
         for a in range(narenas):
             region_init(ctx, base + a * arena_stride)
@@ -1052,8 +1053,10 @@ def _bootstrap(
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
         # (a per-node environment, a stale export) silently gives the peers
         # different arena and inbox offsets, which is a data race, not an error;
-        # checking two integers here turns it into a message.
-        comptime CFG_BYTES = 16
+        # a per-rank `MOJOCCL_NVLS_MIN_MB` sends one rank into the multicast
+        # counter barrier and another into the flag barrier, which is a hang.
+        # Checking three integers here turns both into a message.
+        comptime CFG_BYTES = 24
         comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
         var b2 = unsafe_alloc[UInt8](BLOB2)
         for i in range(BLOB2):
@@ -1083,6 +1086,7 @@ def _bootstrap(
         cfg[unsafe_offset=1] = Int64(
             narenas * 1000 + INBOX_SLOTS + (1_000_000 if use_nvls else 0)
         )
+        cfg[unsafe_offset=2] = Int64(nvls_min if use_nvls else 0)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
         for r in range(nranks):
@@ -1095,6 +1099,7 @@ def _bootstrap(
             if (
                 rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
                 or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
+                or rcfg[unsafe_offset=2] != cfg[unsafe_offset=2]
             ):
                 raise Error(
                     "mojoccl: rank "
@@ -1103,11 +1108,16 @@ def _bootstrap(
                     + String(Int(rcfg[unsafe_offset=0]) // (1024 * 1024))
                     + " MiB with layout code "
                     + String(Int(rcfg[unsafe_offset=1]))
-                    + ", this rank "
+                    + " and NVLS floor "
+                    + String(Int(rcfg[unsafe_offset=2]) // (1024 * 1024))
+                    + " MiB, this rank "
                     + String(cap_bytes // (1024 * 1024))
                     + " MiB / "
                     + String(Int(cfg[unsafe_offset=1]))
-                    + "; MOJOCCL_REGION_MB must match on every rank"
+                    + " / "
+                    + String(Int(cfg[unsafe_offset=2]) // (1024 * 1024))
+                    + " MiB; MOJOCCL_REGION_MB and MOJOCCL_NVLS_MIN_MB must match"
+                    " on every rank"
                 )
 
         # Same-node peers only: an IPC handle from another host is meaningless.
@@ -1188,7 +1198,7 @@ def _bootstrap(
         nvls=nvls^,
         nvls_on=use_nvls,
         nvls_grid=nvls_grid,
-        nvls_min=_nvls_min_bytes(),
+        nvls_min=nvls_min,
     )
     var handle_ptr = unsafe_alloc[CommState](1)
     handle_ptr.unsafe_write(state^)
