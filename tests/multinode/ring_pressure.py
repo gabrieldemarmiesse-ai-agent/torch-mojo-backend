@@ -50,12 +50,12 @@ n = int(mib * 2**20) // 4
 x = torch.full((n,), float(rank + 1), dtype=torch.float32, device=dev)
 
 dist.barrier()
-torch.mojo.synchronize()
+torch.accelerator.synchronize()
 t0 = time.perf_counter()
 # No synchronize inside the loop: this is the point of the test.
 for _ in range(n_bcast):
     dist.broadcast(x, 0)
-torch.mojo.synchronize()
+torch.accelerator.synchronize()
 dt = time.perf_counter() - t0
 got = x.to("cpu")
 ok = bool((got == 1.0).all())

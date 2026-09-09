@@ -37,7 +37,9 @@ from torch_mojo_backend import register_mojo_devices  # noqa: E402
 register_mojo_devices()
 dist.init_process_group(backend="mojo")
 rank = dist.get_rank()
-buckets = [float(s) for s in os.environ.get("BUCKETS", "1,25,25,25,25,25,90").split(",")]
+buckets = [
+    float(s) for s in os.environ.get("BUCKETS", "1,25,25,25,25,25,90").split(",")
+]
 steps = int(os.environ.get("STEPS", "10"))
 alloc = os.environ.get("ALLOC", "once")
 mm = int(os.environ.get("MM", "0"))
@@ -59,15 +61,17 @@ def make():
 
 
 bufs = make() if alloc == "once" else None
-w = torch.randn(mmdim, mmdim, dtype=torch.bfloat16, device=dev) if mm else None
-for t in (bufs if bufs is not None else make()):
+w = torch.randn(
+    mmdim if mm else 1, mmdim if mm else 1, dtype=torch.bfloat16, device=dev
+)
+for t in bufs if bufs is not None else make():
     dist.all_reduce(t)
 if mm:
     for _ in range(mm):
         w = w @ w
-torch.mojo.synchronize()
+torch.accelerator.synchronize()
 dist.barrier()
-torch.mojo.synchronize()
+torch.accelerator.synchronize()
 
 per_step = []
 for s in range(steps):
@@ -83,7 +87,7 @@ for s in range(steps):
         for _ in range(free_n):
             tmp = torch.empty(int(free_mib * 2**20) // 4, dtype=dt, device=dev)
             del tmp
-    torch.mojo.synchronize()
+    torch.accelerator.synchronize()
     per_step.append((time.perf_counter() - t0) * 1e3)
 total_mib = sum(buckets)
 med = sorted(per_step)[len(per_step) // 2]
