@@ -409,6 +409,29 @@ def _sync(
     return failed[unsafe_offset=0] == 0
 
 
+
+@always_inline
+def _peer_step(i: Int, world: Int) -> Int:
+    """Peer offset for loop index `i` (1 <= i < world), rotated by block index.
+
+    Every block still touches exactly the same bytes for every peer -- only
+    the order of the peers differs -- so the block-matched sync invariant is
+    untouched. What changes is link usage on a point-to-point topology such
+    as the MI300A's xGMI mesh (one link per GPU pair): with the plain order
+    the whole grid queues on one peer's link at a time and the other
+    `world-2` links sit idle; rotated, the blocks spread over all of them at
+    once. Behind a switch (NVSwitch) the order is irrelevant. Measured on
+    4x MI300A: see docs/distributed.md, "Cluster notes (AMD MI300A)".
+    """
+    return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
+
+
+@always_inline
+def _peer_step0(i: Int, world: Int) -> Int:
+    """`_peer_step` for loops that include the rank itself (0 <= i < world)."""
+    return (i + Int(block_idx.x)) % world
+
+
 @always_inline
 def _copy_vec[
     dtype: DType, W: Int, U: Int
@@ -720,7 +743,7 @@ def _ar_twoshot_kernel[
 
     # --- phase 1: push shard s of my input into peer s's slot `rank` --------
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var src = in_ptr.unsafe_offset(_vstart(s, q, rem) * W)
@@ -807,7 +830,7 @@ def _ar_twoshot_kernel[
 
     # --- phase 3: pull the peers' reduced shards into the user output -------
     for i in range(1, world):
-        var p = rank + i
+        var p = rank + _peer_step(i, world)
         if p >= world:
             p -= world
         var vs = _vstart(p, q, rem)
@@ -868,7 +891,7 @@ def _ar_oneshot_kernel[
         return
 
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var dst = (
@@ -1032,7 +1055,7 @@ def _rs_stage_kernel[
 
     # --- phase 1: push shard s of my input into peer s's slot for me --------
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var off = _shard_off(n, per, s)
@@ -1165,7 +1188,7 @@ def _ag_finish_kernel[
     # inter-node step rewrote it, so the reduce-scatter's result in the user
     # buffer would be stale even if it had been written there.
     for i in range(world):
-        var p = rank + i
+        var p = rank + _peer_step0(i, world)
         if p >= world:
             p -= world
         var off = _shard_off(n, per, p)
@@ -1263,7 +1286,7 @@ def _bcast_kernel[
 
     if rank != root:
         for i in range(world):
-            var p = rank + i
+            var p = rank + _peer_step0(i, world)
             if p >= world:
                 p -= world
             var vc = _vcount(p, q, rem)
@@ -1326,7 +1349,7 @@ def _allgather_kernel[
         return
 
     for i in range(1, world):
-        var p = rank + i
+        var p = rank + _peer_step(i, world)
         if p >= world:
             p -= world
         _copy_bytes[U](
