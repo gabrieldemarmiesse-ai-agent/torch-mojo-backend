@@ -261,6 +261,30 @@ The crossover sits just above 512 KiB, so `_ONESHOT_MAX_BYTES = 512 KiB`. Below
   both allreduces in place so a single corrupted generation survives to the end
   — is the regression test.
 
+## 6b. All-gather and broadcast
+
+Same ABBA protocol, fp32, 4 ranks, per-rank contribution for the all-gather
+and message size for the broadcast. Busbw is `(world-1)*n/t` and `n/t`
+respectively, the same convention `ar_bench.py` prints.
+
+| op | size | RCCL µs | mojo µs | ratio | mojo busbw | before this work |
+|---|---|---|---|---|---|---|
+| all_gather | 4 MiB | 101.8 | 134.7 | 1.32 | 93 GB/s | |
+| all_gather | 16 MiB | 274.7 | 319.8 | 1.16 | 157 GB/s | |
+| all_gather | 64 MiB | 947.8 | 1146.1 | 1.21 | **176 GB/s** | 80 GB/s |
+| broadcast | 4 MiB | 53.2 | 89.8 | 1.69 | 47 GB/s | |
+| broadcast | 16 MiB | 121.1 | 217.9 | 1.80 | 77 GB/s | |
+| broadcast | 64 MiB | 342.9 | 680.0 | 1.98 | **99 GB/s** | 78 GB/s |
+
+The all-gather is now within ~20% and the remaining gap is the same one the
+allreduce has at the large sizes. The broadcast is not, and the reason is its
+schedule rather than its direction: scatter-then-push-all-gather puts
+`n + (world-1)/world*n` = 1.75 × message of outbound traffic on the root,
+where a ring or a tree puts `n`. Converting the gather half from a pull to a
+push took it from 78 to 99 GB/s; getting to RCCL's 195 needs the root to stop
+being the only sender of the first phase, which is a different algorithm and
+was out of scope here.
+
 ## 7. Correctness
 
 `harness.mojo verify` (job 233776, 94 passing cases) checks every result against
