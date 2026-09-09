@@ -41,7 +41,14 @@
 set -x
 : "${RUN_MOJO:=1}"
 
-REPO=/home/gabriel/ddp_work/mojo_coll_mn
+# The checkout to test. Defaults to the directory sbatch was run from, so a
+# worktree tests its own code; `REPO=<path> sbatch ...` overrides it. SLURM
+# copies this script to its spool directory, so $0 says nothing useful.
+: "${REPO:=${SLURM_SUBMIT_DIR:-$PWD}}"
+if [ ! -d "$REPO/torch_mojo_backend/distributed/mojoccl" ]; then
+  echo "REPO=$REPO is not a torch-mojo-backend checkout" >&2
+  exit 1
+fi
 LOGDIR=/home/gabriel/ddp_work/logs
 NANOGPT=/home/gabriel/ddp_work/nanoGPT
 mkdir -p "$LOGDIR"

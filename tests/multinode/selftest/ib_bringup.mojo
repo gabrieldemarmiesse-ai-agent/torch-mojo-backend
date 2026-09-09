@@ -16,6 +16,7 @@ from bootstrap import (
     make_unique_id,
 )
 from internode import (
+    CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     ib_connect,
     ib_exchange_now,
@@ -86,10 +87,15 @@ def main() raises:
 
     var region_bytes = SIGNAL + 3 * CAP
     var region = _p(region_bytes)
+    var net_off = SIGNAL + 2 * CAP
     var driver = OwnedDLHandle("libc.so.6")  # no GPU here; PCI probe just fails
+    # Two inbox slot groups: enough that consecutive exchanges alternate, and
+    # the credit for e-2 is always in hand by the time e is submitted, so
+    # this test stays a transport test. The credit protocol proper (several
+    # exchanges in flight, reuse gated on a peer's credit) is ib_pipeline.
     var ib = ib_setup(
         driver, 0, topo.my_local_rank, topo.my_node, topo.nnodes, Int(region),
-        region_bytes,
+        region_bytes, 2, net_off,
     )
     var lid = ib_port_lid(ib)
     var mtu = ib_port_mtu(ib)
@@ -108,16 +114,16 @@ def main() raises:
     # RECV_DEPTH so a leaked recv WR would show up as a hang.
     var npeers = ib_npeers(ib)
     var nbytes = 64 * 1024
-    var net_off = SIGNAL + 2 * CAP
+    var inbox0 = net_off + CREDIT_AREA_BYTES
     var slot_bytes = nbytes
     var half = npeers * slot_bytes
-    var src = net_off + 2 * half  # scratch above both inbox halves
+    var src = inbox0 + 2 * half  # scratch above both slot groups
     var bad = 0
     var nseq = 401
     for seq in range(1, nseq):
         for i in range(nbytes):
             region[unsafe_offset = src + i] = UInt8((rank * 31 + seq * 7 + i) & 0xFF)
-        var inbox_base = net_off + (seq & 1) * half
+        var inbox_base = inbox0 + (seq % 2) * half
         ib_exchange_now(
             ib,
             Int(region) + src,
@@ -128,6 +134,7 @@ def main() raises:
             npeers,
             Int(region) + inbox_base,
             seq,
+            seq - 1,  # the previous exchange was checked before this one
         )
         for j in range(npeers):
             var sender = j if j < topo.my_node else j + 1

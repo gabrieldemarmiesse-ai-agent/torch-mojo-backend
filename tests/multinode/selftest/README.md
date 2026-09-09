@@ -1,6 +1,6 @@
 # mojoccl transport self-tests that need no GPU
 
-Two standalone Mojo programs that exercise
+Four standalone Mojo programs that exercise
 `torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode}.mojo`
 on any host with InfiniBand — the SLURM **login node** included, which is
 what makes them cheap enough to run on every change. They caught six real
@@ -13,6 +13,10 @@ Build (from a checkout of this repo, no accelerator needed):
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/bs_test
     uv run --no-sync mojo build tests/multinode/selftest/ib_bringup.mojo \
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_bringup
+    uv run --no-sync mojo build tests/multinode/selftest/ib_pipeline.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_pipeline
+    uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/geometry_test
 
 ## `bs_test.mojo` — the TCP bootstrap
 
@@ -49,12 +53,48 @@ something to paper over, since on a real node that symbol is always there.
 400 exchanges is deliberately past `RECV_DEPTH` (64): a receive WR that is
 consumed and not reposted shows up as a hang rather than as wrong data.
 
+## `ib_pipeline.mojo` — several exchanges in flight, and the credits
+
+`ib_pipeline <rank> <nranks> <uid-file> [nslots] [depth] [nexchanges]`
+(defaults 5, 4, 200 — the shipped `INBOX_SLOTS` and `PIPE_ARENAS`).
+Reproduces the GPU schedule of `mojoccl._do_allreduce` exactly — submit
+chunk k, consume chunk k-(depth-1) — with the calling thread standing in
+for the stream, so `credit_upto` takes the values it takes in production.
+
+    for r in 0 1 2 3; do
+        MOJOCCL_IB_PROXY=0 /tmp/ib_pipeline $r 4 /tmp/uidp.txt 5 4 200 &
+    done; wait
+
+It catches the two failures the credit protocol can have, and they look
+different: a slot group rewritten before its consumer read it is wrong bytes
+(the payload pattern carries the sequence number), while a credit never sent
+or never counted is a **hang**, which is why the run goes well past
+`nslots` exchanges. Exercised at `nslots depth` of `5 4` (shipped), `5 5`
+and `2 2` (the tight window, where a rank blocks until a peer's credit
+arrives), `1 1` (fully serial) and `8 4`, at 4 and 6 ranks.
+
+## `geometry_test.mojo` — the region carving, GPU-free and peer-free
+
+`geometry_test`, no arguments. Sweeps `mojoccl`'s own layout arithmetic
+(`region_layout`, `inbox_group_bytes`, `max_chunk_bytes`,
+`pipeline_chunk_bytes` — the communicator calls these through one-line
+wrappers, so this checks the shipped code and not a copy) over region sizes
+1 MiB–1 GiB, `local_world` 1–8, 2–16 nodes, every allreduce dtype width and
+message sizes from one element to four chunk caps, and asserts that every
+address a collective forms stays inside the area it belongs to: inbox slots
+inside their group, the shard inside stage_out, the compacted push slots
+inside stage_in, chunk offsets 16-byte aligned, the staging total not
+growing, and a single-node region byte-identical to the pre-pipeline one.
+~99k cases, under a second.
+
 Covered by these and NOT by anything that needs a GPU: interface selection,
 the unique-id encoding, the two-round rendezvous, topology derivation, HCA
 and port selection, `ibv_reg_mr`, QP INIT/RTR/RTS with NCCL's attribute
 values, the ops-table dispatch for post_send/post_recv/poll_cq, the
-immediate's parity tagging, recv reposting, the self-QP GPUDirect flush, and
-`ib_setup`'s unwind of partially-created resources on a failure path. NOT
-covered: registration of *device* memory (needs nvidia_peermem and a GPU),
-the progress thread and its two spin kernels (they need pinned host memory
-and a stream), and everything in `mojoccl.mojo` above the transport.
+immediate's sequence and credit tagging, recv reposting, the self-QP
+GPUDirect flush, the credit-based flow control with several exchanges in
+flight, the region geometry, and `ib_setup`'s unwind of partially-created
+resources on a failure path. NOT covered: registration of *device* memory
+(needs nvidia_peermem and a GPU), the progress thread and its two spin
+kernels (they need pinned host memory and a stream), and everything in
+`mojoccl.mojo` above the transport.
