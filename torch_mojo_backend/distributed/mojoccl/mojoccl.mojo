@@ -1310,6 +1310,12 @@ def ncclCommGetAsyncError(
             )
         ) if state.last_stream != 0 else DeviceStream(state.ctx)
         s.synchronize()
+        if state.ib != 0 and ib_error(state.ib) != 0:
+            # A proxy failure during that sync releases the spin kernels
+            # through MB_DONE without touching the device error word; the
+            # host word is the only record of it.
+            err_out[] = NCCL_REMOTE_ERROR
+            return NCCL_SUCCESS
         # One error word per pipeline arena: a multi-node allreduce spreads
         # its chunks over all of them, and a barrier that gave up did so in
         # exactly one.
