@@ -112,6 +112,7 @@ from ibverbs import (
     WC_QP_NUM,
     WC_STATUS,
     WC_VENDOR_ERR,
+    WC_WR_ID,
     Ibv,
     alloc_bytes,
     be32,
@@ -120,6 +121,7 @@ from ibverbs import (
     build_write_wr,
     create_rc_qp,
     ld32,
+    ld64,
     ldu32,
     list_ib_ports,
     poll_cq,
@@ -230,10 +232,11 @@ struct IbWork(Copyable, Movable):
     # this one's request on the stream -- the credit the engine publishes
     # when it picks this exchange up. See the header's flow-control note.
     var credit_upto: Int
-    # Data sends posted, cumulatively, once this exchange is on the wire:
-    # the exchange is not done until that many send completions are in, or
-    # the next reduce-scatter could overwrite a buffer the NIC still reads.
-    var sends_cum: Int
+    # 1 once this exchange's data write is posted to every peer. The exchange
+    # is not done until each of those sends has completed on ITS queue pair
+    # (`IbState.send_done`), or the consumer kernel could overwrite a buffer
+    # the NIC is still reading for a slower peer.
+    var sent: Int
     var t0: Int  # perf_counter_ns when it was posted, for the trace
 
     def __init__(out self):
@@ -248,7 +251,7 @@ struct IbWork(Copyable, Movable):
         self.seq = 0
         self.status = 1
         self.credit_upto = 0
-        self.sends_cum = 0
+        self.sent = 0
         self.t0 = 0
 
 
@@ -284,8 +287,14 @@ struct IbState(Movable):
     var flush_seq: Int  # exchange whose flush read is outstanding (0: none)
     var flush_done: Int  # flush-read completions seen and not yet consumed
     var flush_t0: Int
-    var sends_posted: Int
-    var sends_completed: Int
+    # Per peer, the highest exchange whose data write has completed on that
+    # peer's queue pair (the wr_id of the completion is the exchange number).
+    # Per QP, not one global count: RC completes in order on ONE queue pair
+    # only, so with three or more nodes a completion for e+1 towards a fast
+    # peer can land before the completion for e towards a slow one, and a
+    # global tally would call e's sends finished while the NIC still reads
+    # e's source for the slow peer.
+    var send_done: List[Int]
     var credit_sent: Int  # highest credit published to the peers
     var tally: List[Int]  # arrivals, indexed by `seq % nslots`
     var credit_recv: List[Int]  # per peer, highest credit it published
@@ -355,8 +364,7 @@ struct IbState(Movable):
         self.flush_seq = 0
         self.flush_done = 0
         self.flush_t0 = 0
-        self.sends_posted = 0
-        self.sends_completed = 0
+        self.send_done = List[Int]()
         self.credit_sent = 0
         self.tally = List[Int]()
         for _ in range(nslots):
@@ -549,8 +557,30 @@ def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
             if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
                 _store_atomic_i(_err_ptr(st), 1)
                 return False
-            st.sends_posted += 1
-    w.sends_cum = st.sends_posted
+        w.sent = 1
+    return True
+
+
+@always_inline
+def _peer_index(st: IbState, qpn: UInt32) -> Int:
+    """Index into `st.peers` of the queue pair a completion came from, or -1
+    (the flush QP, whose completions are classified by opcode instead)."""
+    for k in range(len(st.peers)):
+        if st.peers[k].qpn == qpn:
+            return k
+    return -1
+
+
+@always_inline
+def _sends_done(st: IbState, mut w: IbWork) -> Bool:
+    """Every peer's queue pair has completed this exchange's data write.
+    Completions on one RC queue pair are in order, so `send_done[i] >= seq`
+    covers every earlier send on that pair too."""
+    if w.sent == 0:
+        return True
+    for i in range(len(st.send_done)):
+        if st.send_done[i] < w.seq:
+            return False
     return True
 
 
@@ -569,17 +599,16 @@ def _consume_wc(mut st: IbState, c: P8) -> Int:
         )
         return -1
     var op = Int32(ld32(c, WC_OPCODE))
+    var pi = _peer_index(st, ldu32(c, WC_QP_NUM))
     if op == IBV_WC_RECV_RDMA_WITH_IMM:
         var imm = be32(ldu32(c, WC_IMM_DATA))
-        var qpn = ldu32(c, WC_QP_NUM)
-        var pi = -1
-        for k in range(len(st.peers)):
-            if st.peers[k].qpn == qpn:
-                pi = k
-                break
         if pi >= 0:
             build_recv_wr(_b(st.rwr), 0)
-            _ = post_recv(st.peers[pi].qp, _b(st.rwr), _b(st.bad))
+            if post_recv(st.peers[pi].qp, _b(st.rwr), _b(st.bad)) != 0:
+                # A receive slot lost here is a later RNR the peer retries
+                # forever (IB_RNR_RETRY = 7), i.e. a silent hang; latch it.
+                _store_atomic_i(_err_ptr(st), 5)
+                return -1
         var seq = Int(imm & IMM_SEQ_MASK)
         if (imm & IMM_CREDIT_BIT) != 0:
             if pi >= 0 and st.credit_recv[pi] < seq:
@@ -588,7 +617,11 @@ def _consume_wc(mut st: IbState, c: P8) -> Int:
             st.tally[seq % st.nslots] += 1
         return 0
     if op == IBV_WC_RDMA_WRITE:
-        st.sends_completed += 1
+        # Only data writes are signaled (credits are not), and their wr_id
+        # is the exchange number, dense and increasing per queue pair.
+        var seq = ld64(c, WC_WR_ID)
+        if pi >= 0 and st.send_done[pi] < seq:
+            st.send_done[pi] = seq
         return 0
     if op == IBV_WC_RDMA_READ:
         st.flush_done += 1
@@ -600,9 +633,9 @@ def _advance(mut st: IbState) -> Bool:
     """Retire every exchange that is complete, in sequence order.
 
     An exchange is complete when all `nrecv` peers' messages for it have
-    arrived, its own sends have completed (the NIC is done reading the
-    buffer the next reduce-scatter will overwrite) and its GPUDirect flush
-    read has come back.
+    arrived, its own send to EVERY peer has completed (the NIC is done
+    reading the buffer the consumer kernel and the next reduce-scatter will
+    overwrite) and its GPUDirect flush read has come back.
     """
     var moved = False
     while True:
@@ -621,7 +654,7 @@ def _advance(mut st: IbState) -> Bool:
         var e = st.done_seq + 1
         ref w = _work(st, e)[]
         var idx = e % st.nslots
-        if st.tally[idx] < w.nrecv or st.sends_completed < w.sends_cum:
+        if st.tally[idx] < w.nrecv or not _sends_done(st, w):
             break
         st.tally[idx] -= w.nrecv
         if w.nrecv > 0 and w.flush_addr != 0:
@@ -1091,9 +1124,12 @@ def ib_setup(
             var qp = create_rc_qp(
                 st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
             )
-            qp_to_init(st.ibv, qp, st.port)
+            # Recorded before `qp_to_init` can raise, so the unwind below
+            # destroys it.
             st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
             st.credit_recv.append(0)
+            st.send_done.append(0)
+            qp_to_init(st.ibv, qp, st.port)
         st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
         qp_to_init(st.ibv, st.flush_qp, st.port)
 
@@ -1348,7 +1384,7 @@ def _fill_work(
     w.flush_addr = flush_addr
     w.seq = seq
     w.credit_upto = credit_upto
-    w.sends_cum = 0
+    w.sent = 0
     w.t0 = 0
     _store_atomic_i(_status_ptr(w), 0)
 
