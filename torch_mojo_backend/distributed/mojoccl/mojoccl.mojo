@@ -180,6 +180,13 @@ comptime PIPE_MAX_CHUNKS = 16
 # It also keeps a chunk's shard above 1 MiB, where the RDMA is still at line
 # rate, without a second clause: at K > 1 the shard is sqrt(B * 640000 / L)
 # bytes, 1.5 MB at the 27 MiB bucket and 3.8 MB at 168 MiB.
+#
+# Measured, not assumed: halving this to 320_000 (K of 3/8/14 instead of
+# 2/5/10 at 27/168/512 MiB) is WORSE -- 27 MiB unchanged, 168 MiB 1291 vs
+# 1192 us and 512 MiB 3648 vs 3541, 16 ranks on 2x8 H100, ABBA against the
+# same base commit in one job (234242 against 234237). The per-exchange
+# latency an extra chunk adds is not fully hidden, so splitting past the
+# point where the network is covered only buys launches.
 comptime PIPE_SPLIT_UNIT = 640_000
 
 comptime DEFAULT_REGION_MB = 256

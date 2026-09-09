@@ -444,6 +444,16 @@ shard in stage_out. Checked exhaustively over every dtype width, world and cap.
    buffer-reuse invariant covers it as written -- verified, not assumed, by the
    extended `mix` below.
 
+The ABI layer now runs several such pairs CONCURRENTLY, to overlap the
+inter-node hop with the intra-node halves of other chunks (see the
+"Multi-node" subsection of `docs/distributed.md`). It needs nothing from this
+file to do it: each in-flight chunk is handed a different arena -- a shifted
+region base and a smaller `cap_bytes`, carved so the arenas are disjoint --
+so every rule above applies per arena, unchanged, and point 3 is what orders
+one arena's reuse `PIPE_ARENAS` chunks later. Generations stay strictly
+increasing globally (two are reserved per chunk, so a chunk's all-gather is
+still its own reduce-scatter's plus one) and therefore per arena.
+
 ### 10.3 Split vs fused, 8xH100 SXM, 1980 MHz (job 233937)
 
 `harness.mojo split` runs, per size, five legs back to back in one process:

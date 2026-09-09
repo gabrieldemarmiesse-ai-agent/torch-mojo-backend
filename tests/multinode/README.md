@@ -71,16 +71,19 @@ numbers are wanted, or while iterating on something unrelated to mojoccl).
 
 ## GPU-free self-tests
 
-`tests/multinode/selftest/` holds two standalone Mojo programs
-(`bs_test.mojo`, `ib_bringup.mojo`) that exercise the TCP bootstrap and the
-whole libibverbs RDMA transport between processes on any host with
-InfiniBand — the SLURM **login node** included, so they run in seconds
-without a GPU or a job allocation. They caught six real bugs (bootstrap/QP
-wiring, resource leaks on a failed `ib_setup`, a silently-misread port LID)
-before any GPU time was spent chasing them; run them before and after any
-change to `torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,
-internode}.mojo`. See `tests/multinode/selftest/README.md` for build and run
-commands.
+`tests/multinode/selftest/` holds four standalone Mojo programs that
+exercise the TCP bootstrap (`bs_test.mojo`), the libibverbs RDMA transport
+(`ib_bringup.mojo`), the pipelined transport and its credit-based flow
+control (`ib_pipeline.mojo`) and the region geometry
+(`geometry_test.mojo`) — the first three between processes on any host with
+InfiniBand, the SLURM **login node** included, and the last one needing
+nothing at all, so they run in seconds without a GPU or a job allocation.
+They caught six real bugs (bootstrap/QP wiring, resource leaks on a failed
+`ib_setup`, a silently-misread port LID) before any GPU time was spent
+chasing them; run them before and after any change to
+`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode}.mojo`
+or to the region layout in `mojoccl.mojo`. See
+`tests/multinode/selftest/README.md` for build and run commands.
 
 ## Output
 
