@@ -570,7 +570,7 @@ are skipped). Addressing is LID-only, so one IB subnet.
 | `MOJOCCL_IB_PROXY_CPU` | unset | pin the progress thread to this CPU |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
 | `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing |
-| `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region the whole thing is rounded up to the multicast granularity (512 MiB on H100) and the halves grow into the rounding |
+| `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
 | `MOJOCCL_NVLS` | 1 | `0`: no multicast region and no NVLS kernel, on every rank of the communicator (it is ANDed across ranks) |
 | `MOJOCCL_NVLS_MIN_MB` | 48 | single-node allreduces at or above this go through the switch; below it the unicast kernels keep the traffic. The default is the measured crossover |
 | `MOJOCCL_NVLS_GRANULARITY` | `min` | `rec`: size the multicast object with `CU_MULTICAST_GRANULARITY_RECOMMENDED` (NCCL's choice, 512 MiB objects on H100) instead of `MINIMUM` (2 MiB) |
