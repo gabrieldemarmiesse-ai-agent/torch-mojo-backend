@@ -825,26 +825,32 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
         pass
     var hint = String("")
     if rc == -FI_ENOMEM:
-        # Seen intermittently on Adastra, in windows of minutes: every rank
-        # of a batch fails `fi_enable` with -FI_ENOMEM, then the identical
-        # batch passes. Under `FI_LOG_LEVEL=warn` the provider says
-        # `cxil_map: write error` and then "Failed to allocate TX EQ
-        # resources, ret: -12" (prov/cxi/src/cxip_ep.c), i.e. the kernel
-        # driver refused to map the control event queue. Ruled out by
-        # measurement during a failing window: NIC resources (`cxi_service
-        # list -d cxi0 -v` showed 0 of 2047 EQs and 0 of 1024 TXQs in use),
-        # node memory (500 GB of 526 GB free), RLIMIT_MEMLOCK (unlimited),
-        # and the hugetlbfs knobs below (a failing batch stayed failing with
-        # them set, a passing one stayed passing without). Retrying has
-        # always worked, so it reads as contention with something else on
-        # the node rather than anything this library holds.
+        # Two different things reach here and they need different answers.
+        #
+        # A real shortage: on an APU the GPU's allocations ARE system memory,
+        # so a node at 485 of 501 GB has nothing left to pin, and registering
+        # a region needs it contiguous and unswappable. Measured: with MAX's
+        # VMM allocator off, four ranks per node left too little for
+        # `fi_mr_regattr` of the 768 MiB region and every rank failed here.
+        #
+        # And an intermittent condition, seen on Adastra in windows of
+        # minutes: every rank of a batch fails `fi_enable` with -FI_ENOMEM,
+        # then the identical batch passes. Under `FI_LOG_LEVEL=warn` the
+        # provider says `cxil_map: write error` and then "Failed to allocate
+        # TX EQ resources, ret: -12" (prov/cxi/src/cxip_ep.c). Ruled out
+        # during a failing window: NIC resources (`cxi_service list -d cxi0
+        # -v` showed 0 of 2047 EQs and 0 of 1024 TXQs in use), node memory
+        # (500 GB of 526 GB free), RLIMIT_MEMLOCK (unlimited), and the
+        # hugetlbfs knobs (a failing batch stayed failing with them set, a
+        # passing one stayed passing without). Retrying has always worked.
         hint = String(
-            "; on the cxi provider this is an intermittent node condition,"
-            " not a shortage this rank caused -- run with FI_LOG_LEVEL=warn"
-            " to see whether the provider says `cxil_map: write error`,"
-            " check `cxi_service list -d <dev> -v` and HugePages_Free in"
-            " /proc/meminfo, try FI_CXI_DISABLE_EQ_HUGETLB=1"
-            " FI_CXI_DISABLE_CQ_HUGETLB=1, and retry"
+            "; check `free -g` first -- on an APU the GPU's memory IS system"
+            " memory, and a region has to be pinned contiguously, so a nearly"
+            " full node fails here for real. If the node has room, this is"
+            " the intermittent cxi condition instead: run with"
+            " FI_LOG_LEVEL=warn to see whether the provider says `cxil_map:"
+            " write error`, check `cxi_service list -d <dev> -v` and"
+            " HugePages_Free in /proc/meminfo, and retry"
         )
     raise Error(
         "mojoccl: "
