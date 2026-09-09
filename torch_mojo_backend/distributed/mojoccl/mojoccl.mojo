@@ -42,9 +42,8 @@
 # with at most `PIPE_ARENAS` chunks alive, so the proxy exchanges chunk k
 # while the GPU reduce-scatters later chunks and all-gathers earlier ones.
 # Two things make that safe and neither is stream order across ranks: the
-# staging arena is replicated `PIPE_ARENAS` times so concurrent chunks never
-# share stage_in/stage_out (`_arena_regions`), and the inbox is reused only
-# against an explicit credit from the peer's add kernel (internode.mojo).
+# staging arena is replicated (`_arena_regions`), and the inbox is reused
+# only against an explicit credit (internode.mojo's header).
 #
 # Single-node communicators never touch libibverbs at all -- same fused
 # kernels, same numbers as before this file learned about nodes.
@@ -140,56 +139,47 @@ comptime NCCL_BFLOAT16: Int32 = 9
 comptime NCCL_SUM: Int32 = 0
 comptime NCCL_AVG: Int32 = 4
 
-# Payload a rank sends when it has nothing to contribute to an exchange.
-#
-# Every exchange is all-to-all among the ranks sharing a local_rank, even
-# when only one of them has data (a broadcast, or an allreduce whose shard
-# table leaves this rank empty), and that is a correctness requirement, not
-# tidiness: an exchange completes when its arrival tally reaches `npeers`,
-# so a rank that stayed silent would hang its peers. (Inbox REUSE is a
-# separate question, answered by the credit protocol in internode.mojo, not
-# by this.)
+# Payload a rank sends when it has nothing to contribute to an exchange:
+# a broadcast, or an allreduce whose shard table leaves this rank empty
+# (7 of 8 local ranks on DDP's 4-byte AVG allreduce). Every exchange has to
+# be all-to-all because an arrival tally of `npeers` is what completes one,
+# so a rank that stayed silent would hang its peers.
 comptime EMPTY_SHARD_BYTES = 16
 
-# Pipeline depth of the multi-node allreduce: how many staging arenas the
-# region is carved into, and therefore how many chunks may be alive at once.
-# Chunk k uses arena `k % PIPE_ARENAS`, and the schedule enqueues chunk k's
-# all-gather before chunk k+PIPE_ARENAS's reduce-scatter, so the arena's own
-# start barrier is what orders the reuse -- the invariant one arena already
-# had, applied per arena.
+# Staging arenas the multi-node region is carved into, and therefore chunks
+# the pipeline may keep alive (`_arena_regions`, `_do_allreduce`).
 #
-# 4 is the measured default: the pipeline is GPU-bound at every size that
-# gets chunked (the reduce-scatter plus all-gather of one chunk outlasts its
-# RDMA), so depth 2 would already overlap in principle, but the overlap
-# window at depth 2 is one reduce-scatter and the progress thread's idle
-# backoff alone (MOJOCCL_IB_PROXY_IDLE_US, 20 us) can eat that. Depth 4
-# gives a window of two whole chunks. It costs region layout, not memory:
-# each arena is 1/4 of the staging, so the total is what it always was.
+# 4, not 2: the pipeline is GPU-bound at every size that gets chunked, so
+# depth 2 overlaps in principle, but its window is one reduce-scatter and
+# the progress thread's idle backoff alone (MOJOCCL_IB_PROXY_IDLE_US, 20 us)
+# can eat that. Depth 4 gives a window of two whole chunks, and costs region
+# layout rather than memory -- each arena is 1/4 of the staging.
 comptime PIPE_ARENAS = 4
 
-# Fixed inbox slot groups. One more than the arenas on purpose: a peer needs
-# my credit for exchange e-INBOX_SLOTS before it may post e, and my credits
-# ride on my own requests (`credit_upto`), so an extra group means the credit
-# it needs went out one chunk before it was needed instead of exactly when.
+# Fixed inbox slot groups (internode.mojo owns what they are for). One more
+# than the arenas: at PIPE_ARENAS the credit a rank needs arrives exactly
+# when it asks for it, putting a round trip on the critical path; the extra
+# group means it went out a chunk earlier.
 comptime INBOX_SLOTS = PIPE_ARENAS + 1
 
 # Largest number of pipeline chunks one collective is cut into.
 comptime PIPE_MAX_CHUNKS = 16
 
-# Chunking constant, in bytes: the optimum split of a `B`-byte multi-node
-# allreduce is `K = sqrt(B / (local_world * PIPE_SPLIT_UNIT))`.
+# Chunking constant, in bytes: a `B`-byte multi-node allreduce is cut into
+# `K = sqrt(B / (local_world * PIPE_SPLIT_UNIT))` chunks.
 #
-# Derivation. An extra chunk costs one more reduce-scatter and one more
-# all-gather launch, each a kernel launch plus an 8-way start barrier, about
-# 8 us each on this cluster (docs/mojo_collectives_kernel_results.md 10.3
-# reads the pair at 15.9 us for a 4-byte message, which is all fixed cost).
-# Pipelining hides all but ~1/K of the network, and the network of a B-byte
-# allreduce is B/(local_world * 40 GB/s) with the RDMA measured at 40-45 GB/s
-# per rank (one HCA each, job 234072). Minimising 16K + B/(L*40000) us over K
-# gives K = sqrt(B / (L * 640000)). The rule also keeps a chunk's shard
-# comfortably above 1 MiB, where the RDMA is still at line rate, without a
-# second clause: at K > 1 the shard is sqrt(B * 640000 / L) bytes, 1.5 MB at
-# the 27 MiB bucket and 3.8 MB at 168 MiB.
+# An extra chunk costs one more reduce-scatter and one more all-gather
+# launch, each a launch plus an 8-way start barrier, ~8 us apiece on this
+# cluster (docs/mojo_collectives_kernel_results.md 10.3 reads the pair at
+# 15.9 us for a 4-byte message, which is all fixed cost). Pipelining hides
+# all but ~1/K of the network, and the network of a B-byte allreduce is
+# B/(local_world * 40 GB/s), the RDMA measured at 40-45 GB/s per rank (one
+# HCA each, job 234072). Minimising 16K + B/(L*40000) us gives
+# K = sqrt(B / (L * 640000)).
+#
+# It also keeps a chunk's shard above 1 MiB, where the RDMA is still at line
+# rate, without a second clause: at K > 1 the shard is sqrt(B * 640000 / L)
+# bytes, 1.5 MB at the 27 MiB bucket and 3.8 MB at 168 MiB.
 comptime PIPE_SPLIT_UNIT = 640_000
 
 comptime DEFAULT_REGION_MB = 256

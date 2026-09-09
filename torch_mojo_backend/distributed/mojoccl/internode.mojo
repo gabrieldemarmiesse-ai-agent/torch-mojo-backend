@@ -801,6 +801,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         ) <= UInt64(st.request_seq):
             _nanosleep_ns(idle_ns)
 
+
 def _proxy_address() -> Int:
     var f: def (
         OpaquePointer[MutAnyOrigin]
@@ -1305,8 +1306,12 @@ def ib_note_consumed(ib: Int, seq: Int):
     `credit_upto` and published to the peers when the engine picks that
     exchange up -- at which point the request kernel has run and therefore
     every kernel enqueued before it, this consumer included, has completed.
-    Callers must enqueue the consumer first and call this second, on the
-    stream the exchanges run on.
+    Callers enqueue the consumer first and call this second.
+
+    That argument is stream order, so every exchange of one communicator has
+    to be enqueued on ONE stream in issue order. The engine's dense sequence
+    counter already required that (`_work` derives a ring slot from the
+    number); `credit_upto` is the second thing that does.
     """
     ref st = _st(ib)[]
     if seq > st.consumed_enqueued:
