@@ -382,9 +382,11 @@ struct IbState(Movable):
     var mailbox: Int  # pinned host address
     var mailbox_dev: Int  # the same memory as a kernel addresses it
     var error_word: Int  # region + error_offset, for the wait kernel
-    # Device mapping of the communicator's pinned abort word, so the wait
-    # kernel leaves as soon as `ncclCommAbort` raises it instead of holding
-    # the stream to its own deadline. 0 until `ib_set_abort_word` runs.
+    # Device mapping of the communicator's pinned STATUS PAGE (the abort word
+    # is its first word), so the request and wait kernels see both an abort
+    # and an already-latched device deadline instead of holding the stream to
+    # their own deadline or shipping a shard nobody produced. 0 until
+    # `ib_set_abort_word` runs.
     var abort_dev: Int
     var proxy: Bool
     var thread_id: Int
@@ -1209,8 +1211,9 @@ def _stop_proxy(mut st: IbState):
 
 def ib_set_abort_word(ib: Int, abort_dev: Int):
     """Hand the transport the device address of the communicator's pinned
-    abort word (mojoccl.mojo owns it -- a single-node communicator has one
-    too, and there is no IB state there to hold it)."""
+    status page, whose first word is the abort word (mojoccl.mojo owns it --
+    a single-node communicator has one too, and there is no IB state there to
+    hold it)."""
     if ib == 0:
         return
     _st(ib)[].abort_dev = abort_dev
@@ -1714,7 +1717,9 @@ def ib_enqueue_request(
         op_numel,
     )
     if st.proxy:
-        proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
+        proxy_request(
+            ctx, stream, st.mailbox_dev + MB_REQUEST, st.abort_dev, seq
+        )
         return
     launch_host_func(
         driver,

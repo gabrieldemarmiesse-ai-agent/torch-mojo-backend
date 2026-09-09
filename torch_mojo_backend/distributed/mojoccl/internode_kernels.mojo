@@ -14,7 +14,18 @@ from std.sys import size_of
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
-from collectives_kernels import BLOCK, MAX_WORLD, _copy_bytes, _enqueue_cached
+from collectives_kernels import (
+    BLOCK,
+    ERR_PROXY_WAIT,
+    FAULT_NO_PEER,
+    MAX_WORLD,
+    _copy_bytes,
+    _enqueue_cached,
+    abort_raised,
+    fault_latched,
+    latch_arena_error,
+    publish_fault,
+)
 
 comptime _UNROLL = 4
 comptime _MAX_BLOCKS = 432
@@ -103,14 +114,42 @@ def _inbox_add_kernel[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
 )
 @__name("ccl_internode_proxy_request")
-def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
-    """Hand exchange `seq` to the progress thread.
+def _proxy_request_kernel(
+    mailbox: Pointer[UInt64, MutAnyOrigin],
+    status: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
+):
+    """Hand exchange `seq` to the progress thread, unless this communicator
+    has already failed.
 
     A release store into pinned host memory, so everything the stream did
     before this kernel -- the reduce-scatter that produced the shard the
     thread is about to send -- is visible to the CPU that acquires it.
+
+    The guard is the reason a device deadline can no longer corrupt a run.
+    Once any kernel on this communicator has given up (`publish_fault`), the
+    reduce-scatter that was supposed to fill this shard may never have run, so
+    advancing the mailbox would send the peer node whatever the arena happened
+    to hold and it would reduce it as data. Leaving the mailbox alone sends
+    nothing: the peer's engine waits for a request that never comes and says
+    so on its own deadline, which is a message rather than a wrong number. The
+    same applies after `ncclCommAbort` -- there is nothing left to send.
+
+    Two loads from the status page, in a kernel whose entire body is already a
+    store to that same pinned page -- but they are not free, because there is
+    one of these per EXCHANGE. Measured at 8 ranks over two MI300A nodes, a
+    27 MiB fp32 allreduce forced into ~27 exchanges (`MOJOCCL_REGION_MB=4`):
+    1286 us before, 1306 us after, the same sign in all four ABBA pairs, so
+    about +1.6% for that many exchanges and proportionally less for fewer --
+    with the default 256 MiB region the same allreduce is ONE exchange. If it
+    ever matters, the fix is to make `publish_fault` raise the abort word too
+    and check only that: one load here, and every other spin on the rank would
+    leave promptly as a bonus.
     """
     if global_idx.x == 0:
+        var page = Int(status)
+        if abort_raised(page) or fault_latched(page):
+            return
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
 
 
@@ -121,7 +160,7 @@ def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
 def _proxy_wait_kernel(
     mailbox: Pointer[UInt64, MutAnyOrigin],
     error_word: Pointer[UInt64, MutAnyOrigin],
-    abort_word: Pointer[UInt64, MutAnyOrigin],
+    status: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
     timeout_ns: UInt64,
 ):
@@ -134,13 +173,24 @@ def _proxy_wait_kernel(
     stop the stream, wake a thread and restart it. A spin kernel and a
     spinning CPU thread cost a launch each.
 
-    On the deadline -- or as soon as `ncclCommAbort` raises `abort_word`,
-    which is why abort does not cost a full deadline -- it writes the region's
-    error word and gives up rather than hanging the stream forever; the add
-    kernel then runs on stale inbox bytes, which `ncclCommGetAsyncError`
-    reports.
+    On the deadline -- or as soon as `ncclCommAbort` raises the abort word,
+    which is why abort does not cost a full deadline -- it records the failure
+    and gives up rather than hanging the stream forever. A deadline also
+    latches the communicator's fault (`publish_fault`), which is what stops
+    the queued `inbox_add` behind this kernel from being treated as a
+    successful exchange: the host's next collective returns
+    NCCL_REMOTE_ERROR instead of the sum of an inbox nobody filled.
+
+    An already-latched fault is treated exactly like the abort word, at the
+    top and inside the spin: after the first failure `proxy_request` no longer
+    advances any mailbox, so every wait still queued behind it is waiting for
+    an exchange that will never be asked for. Waiting a full deadline each
+    would turn one 60 s stall into as many, one per chunk.
     """
     if global_idx.x == 0:
+        var page = Int(status)
+        if abort_raised(page) or fault_latched(page):
+            return
         var t0 = device_now_ns()
         var spins = 0
         while (
@@ -149,21 +199,30 @@ def _proxy_wait_kernel(
             spins += 1
             if spins >= _ABORT_CHECK:
                 spins = 0
-                if (
-                    Int(abort_word) != 0
-                    and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                        abort_word
-                    )
-                    != 0
-                ):
+                if abort_raised(page):
                     Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        error_word, UInt64(9) * 1_000_000
+                        error_word, UInt64(ERR_PROXY_WAIT) * 1_000_000
                     )
                     return
+                if fault_latched(page):
+                    return
             if device_now_ns() - t0 > timeout_ns:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                    error_word, UInt64(9) * 1_000_000
-                )
+                # The peer of this wait is my own progress thread, not another
+                # rank, so there is no flag and no peer to name: `seen` is how
+                # far the engine had got, `target` the exchange asked for.
+                if latch_arena_error(error_word, ERR_PROXY_WAIT, 0):
+                    publish_fault(
+                        page,
+                        ERR_PROXY_WAIT,
+                        0,
+                        0,
+                        FAULT_NO_PEER,
+                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                            mailbox
+                        ),
+                        seq,
+                        Int(error_word),
+                    )
                 return
 
 
@@ -297,7 +356,11 @@ def place_blocks(
 
 
 def proxy_request(
-    ctx: DeviceContext, stream: DeviceStream, mailbox: Int, seq: Int
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    mailbox: Int,
+    status: Int,
+    seq: Int,
 ) raises:
     _enqueue_cached[_proxy_request_kernel](
         ctx,
@@ -305,6 +368,7 @@ def proxy_request(
         "ib_req",
         1,
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=status),
         UInt64(seq),
     )
 
@@ -314,7 +378,7 @@ def proxy_wait(
     stream: DeviceStream,
     mailbox: Int,
     error_word: Int,
-    abort_word: Int,
+    status: Int,
     seq: Int,
     timeout_ns: Int,
 ) raises:
@@ -325,7 +389,7 @@ def proxy_wait(
         1,
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=error_word),
-        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=abort_word),
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=status),
         UInt64(seq),
         UInt64(timeout_ns),
     )

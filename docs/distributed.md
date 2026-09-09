@@ -354,11 +354,42 @@ NCCL-class collectives, not a general library:
   pull design makes the staging free. The region is either a `cuMemAlloc`
   block shared with legacy IPC or, where NVSwitch multicast is available,
   VMM memory bound to a multicast object — see "NVLS" below;
-- a rank that stops responding makes its peers time out after
-  `MOJOCCL_IB_TIMEOUT_S` (60 s) inside the kernel and
-  `ncclCommGetAsyncError` reports it. `ncclCommAbort` implements nccl.h's
-  contract: it stops submissions (later collectives return
-  `ncclInvalidUsage`), raises a pinned abort word every device spin polls —
+- **a device deadline is loud.** A rank that stops answering makes its peers
+  give up after `MOJOCCL_IB_TIMEOUT_S` (60 s) inside the kernel. The block
+  that gave up records it twice: in its arena's error word, as it always
+  did, and in the communicator's pinned *status page* — host memory the
+  kernel stores into, so the host reads it with one load, no copy and no
+  stream synchronize (`ncclCommGetAsyncError`'s read of the arena word needs
+  a device-to-host copy, which blocks behind the very kernels it is asking
+  about, so no collective could afford to call it — which is why a timed-out
+  barrier used to leave no trace anybody read). That latch is what keeps a
+  timed-out collective from turning into wrong data:
+  - `ncclAllReduce` / `ncclBroadcast` / `ncclAllGather` return
+    `ncclRemoteError` from the next call on, and `process_group.py` raises
+    `NcclError` out of the collective — with a traceback, through `_loud` —
+    so the rank fails instead of training on garbage;
+  - the call that notices prints one line naming the rank, the collective,
+    the arena, the generation, the phase, the block, and the peer whose flag
+    never arrived with the value seen against the value wanted:
+    `mojoccl: rank 1: DEVICE DEADLINE in the allreduce (arena 0, generation
+    3, phase 0): block 0 waited 60.0 s for rank 0's flag, and saw 17 wanting
+    24 -- ...`;
+  - on the inter-node path `proxy_request` stops advancing the mailbox once
+    the fault is latched, so the peer node sees no request rather than a
+    shard nobody produced and reports its own deadline (`inter-node engine
+    gave up after 60 s ...`); `proxy_wait` treats a latched fault like the
+    abort word, so the waits already queued behind the failed one return at
+    once instead of costing a deadline each.
+
+  The FIRST failure is the one kept: the arena word is claimed with a
+  compare-exchange and the status page is written only while it is clear, so
+  what you read is the deadline that started the trouble, not the last of its
+  consequences. The reporting call is one collective behind the kernel that
+  failed — collectives are asynchronous, and catching it on the failing call
+  itself would mean synchronizing the stream on every call.
+- `ncclCommAbort` implements nccl.h's contract: it stops submissions (later
+  collectives return `ncclInvalidUsage`), raises the pinned abort word (word 0
+  of that status page) every device spin polls —
   the intra-node barriers, the NVLS barrier and the inter-node wait kernel
   all leave within a millisecond with their region's error word set, instead
   of running to that deadline — stops the progress thread, and then, once
@@ -593,9 +624,10 @@ so on any node up for more than three minutes the "clock" is a saw-tooth of
 period 184.47 s. Every device spin in this library bounds itself with
 `now - t0 > timeout`, and a spin that straddles a wrap sees an enormous
 unsigned difference and fires its 60 s deadline at once: the block records
-the error word (which nothing reads yet) and returns, its node-mates wait a
-real 60 s for flags it never publishes, and the collective completes with
-garbage on that node. Measured on 2x4 MI300A: about one 40 s `stress` run in
+the error word and returns, its node-mates wait a real 60 s for flags it
+never publishes, and -- before the status-page latch above, which nothing
+read the error word to notice -- the collective completed with garbage on
+that node and the run carried on. Measured on 2x4 MI300A: about one 40 s `stress` run in
 five corrupted a check, always a run 60-120 s longer than a clean one, and
 the same event is what hung DDP runs. `device_now_ns` in
 `collectives_kernels.mojo` reads the 100 MHz counter directly on AMD (with a
@@ -850,9 +882,10 @@ Limits and failure modes: 8 ranks per node, 16 nodes; a multi-node
 communicator on a machine with neither an ACTIVE InfiniBand port nor a
 libfabric RMA provider fails `ncclCommInitRank` with a message naming both
 and pointing at `MOJOCCL_NET`; a peer that stops
-responding is reported through `ncclCommGetAsyncError` after
-`MOJOCCL_IB_TIMEOUT_S` (one variable for every spin, intra-node and
-inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
+responding makes this rank's next collective fail with `ncclRemoteError` and
+one printed line saying which barrier gave up (and is reported through
+`ncclCommGetAsyncError` too) after `MOJOCCL_IB_TIMEOUT_S` (one variable for
+every spin, intra-node and inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
 a clear message.
 
 **Requirements.** Either rdma-core/libibverbs with active InfiniBand ports
