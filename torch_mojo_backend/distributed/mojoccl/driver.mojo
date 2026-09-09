@@ -27,6 +27,7 @@ comptime FN_LAUNCH_HOST_FUNC = (
 comptime FN_PCI_BUS_ID = (
     "hipDeviceGetPCIBusId" if AMD else "cuDeviceGetPCIBusId"
 )
+comptime FN_STREAM_QUERY = "hipStreamQuery" if AMD else "cuStreamQuery"
 comptime FN_HOST_ALLOC = "hipHostMalloc" if AMD else "cuMemHostAlloc"
 comptime FN_HOST_FREE = "hipHostFree" if AMD else "cuMemFreeHost"
 comptime FN_HOST_DEVPTR = (
@@ -188,6 +189,23 @@ def launch_host_func(
         ),
         FN_LAUNCH_HOST_FUNC,
     )
+
+
+def stream_done(lib: OwnedDLHandle, stream: Int) -> Bool:
+    """`cuStreamQuery`/`hipStreamQuery` on a RAW stream handle: has everything
+    enqueued on it completed?
+
+    `ncclCommAbort` polls this instead of synchronizing. A synchronize is
+    exactly the unbounded wait abort must not do, and the whole point of the
+    abort word is that the spin kernels are already leaving; a poll turns
+    "quiesced" into something abort can put a deadline on. Anything but
+    success (`CUDA_ERROR_NOT_READY`, or a sticky error from a launch that
+    faulted) reads as not-done and the caller's deadline ends the wait.
+    """
+    try:
+        return lib.get_function[Int32](FN_STREAM_QUERY)(stream) == 0
+    except:
+        return False
 
 
 def device_pci_bus_id(lib: OwnedDLHandle, ordinal: Int) raises -> String:

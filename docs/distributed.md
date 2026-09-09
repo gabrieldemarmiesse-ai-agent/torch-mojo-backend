@@ -298,8 +298,20 @@ NCCL-class collectives, not a general library:
   pull design makes the staging free. The region is either a `cuMemAlloc`
   block shared with legacy IPC or, where NVSwitch multicast is available,
   VMM memory bound to a multicast object — see "NVLS" below;
-- a rank that stops responding makes its peers time out after 60 s inside the
-  kernel and `ncclCommGetAsyncError` reports it; there is no abort path.
+- a rank that stops responding makes its peers time out after
+  `MOJOCCL_IB_TIMEOUT_S` (60 s) inside the kernel and
+  `ncclCommGetAsyncError` reports it. `ncclCommAbort` implements nccl.h's
+  contract: it stops submissions (later collectives return
+  `ncclInvalidUsage`), raises a pinned abort word every device spin polls —
+  the intra-node barriers, the NVLS barrier and the inter-node wait kernel
+  all leave within a millisecond with their region's error word set, instead
+  of running to that deadline — stops the progress thread, and then, once
+  the local streams have gone idle (polled with `cuStreamQuery` under a 5 s
+  bound, never a wait on a peer), releases the region, the peer mappings,
+  the IB resources and the pinned memory. `ncclCommDestroy` on an aborted
+  communicator is a no-op. If the device does not go idle inside that bound
+  the memory is deliberately kept — freeing a region a kernel may still read
+  faults the process — and abort says so on stderr.
 
 Measured on 8×H100 SXM through the process group (wall over 20 launches,
 median of 5, interleaved legs; NCCL 2.31.2 NVLS for comparison), **unicast

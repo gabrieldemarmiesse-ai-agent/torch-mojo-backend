@@ -75,10 +75,13 @@
 # 3.6x slower.  Allgather is a local stage + a peer gather, which is already
 # the unicast minimum.
 #
-# Every spin is bounded (default 60 s, measured with the GPU's own timer --
-# never compared across GPUs).  On timeout the kernel stores a nonzero code
-# into its own region's error word (byte `error_offset()`) and returns instead
-# of hanging the node.
+# Every spin is bounded (`MOJOCCL_IB_TIMEOUT_S`, default 60 s, measured with
+# the GPU's own timer -- never compared across GPUs).  On timeout the kernel
+# stores a nonzero code into its own region's error word (byte
+# `error_offset()`) and returns instead of hanging the node.  The same spins
+# also leave early when the host raises the communicator's abort word
+# (`install_abort_word`, `ncclCommAbort`), which is what makes abort prompt
+# instead of costing a full deadline.
 #
 # Portability: NVIDIA and AMD share every line of the device code.  Ordering is
 # `Atomic[...].store[RELEASE]` / `load[ACQUIRE]` at default (system) scope,
@@ -133,7 +136,13 @@ comptime MAX_BLOCKS = 1024
 
 comptime _FLAG_BYTE_OFFSET = 4096
 """Start of the flag matrix inside the signal area (the first page holds the
-error word and stays free for future host-visible state)."""
+error word, the NVLS barrier counters and the abort-word pointer)."""
+
+comptime _ABORT_PTR_OFFSET = 256
+"""Header slot holding the DEVICE address of the communicator's pinned host
+abort word. Zero until `install_abort_word` publishes one, and every spin
+reads zero as "this region has no abort word". 64/128/192 are the NVLS
+barrier counters (nvls_kernels.mojo), so 256 is the first free line."""
 
 comptime _SIGNAL_BYTES = 128 * 1024
 """Signal-area size: 4 KiB header + MAX_BLOCKS*MAX_WORLD*8 B of flags = 68 KiB,
@@ -222,6 +231,14 @@ def error_offset() -> Int:
     return 0
 
 
+def abort_ptr_offset() -> Int:
+    """Byte offset, inside the signal area, of the abort-word pointer slot."""
+    comptime assert (
+        _ABORT_PTR_OFFSET + 8 <= _FLAG_BYTE_OFFSET
+    ), "the abort pointer must fit the header page"
+    return _ABORT_PTR_OFFSET
+
+
 @always_inline
 def _align_up(x: Int, a: Int) -> Int:
     return (x + a - 1) // a * a
@@ -248,6 +265,31 @@ def _flags(
 ) -> Pointer[UInt64, MutAnyOrigin]:
     """flags[block][writer_rank], row-major, MAX_WORLD columns."""
     return region.unsafe_offset(_FLAG_BYTE_OFFSET).unsafe_bitcast[UInt64]()
+
+
+@always_inline
+def _abort_raised(region: Pointer[UInt8, MutAnyOrigin]) -> Bool:
+    """Whether the host has raised this communicator's abort word.
+
+    Two dependent loads, and only from the slow path of a spin: the pinned
+    word's device address out of my own region's header (written once at
+    communicator init, never again) and then the word itself, which lives in
+    host memory and is where `ncclCommAbort` stores. A region with no abort
+    word installed reads address zero and never probes further.
+    """
+    var addr = Int(
+        region.unsafe_offset(_ABORT_PTR_OFFSET).unsafe_bitcast[UInt64]()[
+            unsafe_offset=0
+        ]
+    )
+    if addr == 0:
+        return False
+    return (
+        Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
+        )
+        != 0
+    )
 
 
 @always_inline
@@ -321,6 +363,9 @@ def _sync(
             spins += 1
             if spins >= _SPIN_CHECK:
                 spins = 0
+                if _abort_raised(regions[rank]):
+                    failed[unsafe_offset=0] = 1
+                    break
                 # Same-GPU timer difference only; never compared across GPUs.
                 if global_perf_counter_ns() - t0 > timeout_ns:
                     failed[unsafe_offset=0] = 1
@@ -1261,6 +1306,15 @@ def _zero_kernel(ptr: Pointer[UInt32, MutAnyOrigin], nwords: Int32):
         ptr[unsafe_offset=i] = 0
 
 
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_store_u64")
+def _store_u64_kernel(dst: Pointer[UInt64, MutAnyOrigin], value: UInt64):
+    if global_idx.x == 0:
+        dst[unsafe_offset=0] = value
+
+
 # ===-------------------------------------------------------------------=== #
 # Cached launch (compile_function costs ~180 us per call; do it once)
 # ===-------------------------------------------------------------------=== #
@@ -1354,6 +1408,29 @@ def region_init(ctx: DeviceContext, region: Int) raises:
         (words + BLOCK - 1) // BLOCK,
         Pointer[UInt32, MutAnyOrigin](unsafe_from_address=region),
         Int32(words),
+    )
+    ctx.synchronize()
+
+
+def install_abort_word(ctx: DeviceContext, region: Int, dev_addr: Int) raises:
+    """Publish the device mapping of the communicator's pinned abort word in
+    this region's header, and block until it has landed.
+
+    The spins read it out of the region rather than take it as a kernel
+    argument because the launcher signatures below are fixed; the region is
+    raw driver memory, so the host cannot poke the slot directly. Called once
+    per arena, right after `region_init` zeroed it and before any peer can
+    reach the region.
+    """
+    _enqueue_cached[_store_u64_kernel](
+        ctx,
+        ctx.stream(),
+        "abortptr",
+        1,
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=region + _ABORT_PTR_OFFSET
+        ),
+        UInt64(dev_addr),
     )
     ctx.synchronize()
 

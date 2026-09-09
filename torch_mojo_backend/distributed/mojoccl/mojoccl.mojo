@@ -69,18 +69,23 @@ from std.gpu import global_idx
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
 from std.sys import size_of
+from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceStream
 
 from driver import (
     HANDLE_BYTES,
+    alloc_host,
     alloc_region,
     close_handle,
     current_device_ordinal,
+    free_host,
     free_region,
     get_handle,
+    host_device_ptr,
     open_driver,
     open_handle,
+    stream_done,
 )
 from bootstrap import (
     UID_BYTES,
@@ -100,6 +105,7 @@ from collectives_kernels import (
     allreduce,
     broadcast,
     error_offset,
+    install_abort_word,
     region_init,
     reduce_scatter_stage,
     shard_range,
@@ -120,6 +126,7 @@ from internode import (
     ib_npeers,
     ib_port_lid,
     ib_port_mtu,
+    ib_set_abort_word,
     ib_setup,
     ib_signal_abort,
     ib_teardown,
@@ -235,6 +242,22 @@ descriptors are bound (`MOJOCCL_SOCKET_DIR`). Node-local by definition -- a
 shared filesystem would work too but buys nothing, since the ranks that talk
 over it are on one host. NCCL puts its own at /tmp as well
 (nccl:src/os/linux_ipcsocket.cc)."""
+
+comptime ABORT_QUIESCE_TIMEOUT_S: Float64 = 5.0
+"""How long `ncclCommAbort` polls for local work to stop before it gives up on
+reclaiming the region and the IB state.
+
+Deliberately not `MOJOCCL_IB_TIMEOUT_S`: raising the abort word releases every
+device spin within about a millisecond, so this bounds only the tail of what
+was already running -- a large copy kernel, a launch queue draining -- and
+abort's contract is not to wait. Past it the resources are left allocated,
+which is a leak until the process exits and is the safe half of the trade:
+freeing a region a kernel may still be reading is a fault.
+"""
+
+comptime ABORT_WORD_BYTES = 64
+"""Pinned host bytes per communicator for the abort word (a whole cache line,
+so raising it cannot invalidate anything else a spin is reading)."""
 
 comptime NVLS_FD_TIMEOUT_S: Float64 = 30.0
 """Bound on one fd hand-off. The whole bring-up is 150-230 ms when it works,
@@ -356,6 +379,14 @@ struct CommState(Movable):
     var generation: Int
     var last_stream: Int64
     var aborted: Bool
+    # Set once every resource below has been released (by destroy, or by an
+    # abort that reached quiescence); makes the other one a no-op.
+    var released: Bool
+    # The abort word: pinned host memory the device spins poll through
+    # `install_abort_word`'s slot in each arena header. `abort_host` is what
+    # `ncclCommAbort` stores into, `abort_dev` what a kernel addresses.
+    var abort_host: Int
+    var abort_dev: Int
     var stream_cache: Dict[Int64, DeviceStream]
     var local_rank: Int
     var local_world: Int
@@ -401,6 +432,8 @@ struct CommState(Movable):
         nvls_on: Bool,
         nvls_grid: Int,
         nvls_min: Int,
+        abort_host: Int,
+        abort_dev: Int,
     ):
         self.rank = rank
         self.world = world
@@ -413,6 +446,9 @@ struct CommState(Movable):
         self.generation = 0
         self.last_stream = 0
         self.aborted = False
+        self.released = False
+        self.abort_host = abort_host
+        self.abort_dev = abort_dev
         self.stream_cache = Dict[Int64, DeviceStream]()
         self.local_rank = local_rank
         self.local_world = local_world
@@ -464,9 +500,44 @@ def _lock(mut state: CommState):
         _ = external_call["sched_yield", Int32]()
 
 
+def _try_lock(mut state: CommState, deadline_ns: Int) -> Bool:
+    """`_lock` with a deadline, for `ncclCommAbort`.
+
+    Abort must never block behind a submitter, but it does have to own the
+    communicator before it frees anything under one. The submitter it can be
+    waiting for is running host code only -- a few launches -- and the abort
+    word has already released whatever the GPU was spinning on, so this
+    normally takes microseconds; the deadline is what keeps the promise if it
+    does not.
+    """
+    var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
+    while True:
+        var expected: Int64 = 0
+        if Atomic[DType.int64].compare_exchange[
+            success_ordering = Ordering.ACQUIRE,
+            failure_ordering = Ordering.RELAXED,
+        ](p, expected, 1):
+            return True
+        if perf_counter_ns() > deadline_ns:
+            return False
+        _ = external_call["sched_yield", Int32]()
+
+
 def _unlock(mut state: CommState):
     Atomic[DType.int64].store[ordering = Ordering.RELEASE](
         Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin](), 0
+    )
+
+
+@always_inline
+def _raise_abort_word(state: CommState):
+    """Store 1 into the pinned abort word: every device spin leaves at its
+    next check, and no driver call is needed to do it."""
+    if state.abort_host == 0:
+        return
+    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=state.abort_host),
+        UInt64(1),
     )
 
 
@@ -795,12 +866,18 @@ def _unwind_init(
     regions: StaticTuple[Int, MAX_WORLD],
     local_world: Int,
     local_rank: Int,
+    abort_host: Int,
 ):
     """Release what `_bootstrap` acquired before it failed: the IB state
     (progress thread, QPs, MRs, pinned mailbox), the peer mappings opened so
-    far, and the region itself. Best effort -- the error that got us here is
-    the one worth reporting."""
+    far, the pinned abort word, and the region itself. Best effort -- the
+    error that got us here is the one worth reporting."""
     ib_teardown(ib)
+    try:
+        if abort_host != 0:
+            free_host(lib, abort_host)
+    except:
+        pass
     try:
         if use_nvls:
             nvls_teardown(nvls, lib, ordinal)
@@ -1032,9 +1109,24 @@ def _bootstrap(
     var ib = 0
     var regions = StaticTuple[Int, MAX_WORLD](fill=0)
     var nvls_min = _nvls_min_bytes()
+    var abort_host = 0
+    var abort_dev = 0
     try:
+        # The abort word, before any spin can start: pinned host memory, so
+        # `ncclCommAbort` raises it with one store and no driver call, and
+        # device-mapped, so a spinning kernel can read it. Its device address
+        # goes in every arena's header -- the six launcher signatures in
+        # collectives_kernels.mojo are fixed, so that slot is how the kernels
+        # find it.
+        abort_host = alloc_host(lib, ABORT_WORD_BYTES)
+        for i in range(ABORT_WORD_BYTES // 8):
+            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=abort_host)[
+                unsafe_offset=i
+            ] = 0
+        abort_dev = host_device_ptr(lib, abort_host)
         for a in range(narenas):
             region_init(ctx, base + a * arena_stride)
+            install_abort_word(ctx, base + a * arena_stride, abort_dev)
 
         if topo.nnodes > 1:
             ib = ib_setup(
@@ -1048,6 +1140,7 @@ def _bootstrap(
                 INBOX_SLOTS,
                 net_off,
             )
+            ib_set_abort_word(ib, abort_dev)
 
         # Round 2: IPC handle + IB connection data + the geometry every rank has
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
@@ -1165,6 +1258,7 @@ def _bootstrap(
             regions,
             topo.local_world,
             topo.my_local_rank,
+            abort_host,
         )
         raise e
 
@@ -1199,6 +1293,8 @@ def _bootstrap(
         nvls_on=use_nvls,
         nvls_grid=nvls_grid,
         nvls_min=nvls_min,
+        abort_host=abort_host,
+        abort_dev=abort_dev,
     )
     var handle_ptr = unsafe_alloc[CommState](1)
     handle_ptr.unsafe_write(state^)
@@ -1248,45 +1344,118 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
     return rc
 
 
+def _release_resources(mut state: CommState) raises:
+    """Give every resource this communicator owns back, once nothing can be
+    using it. Shared by `ncclCommDestroy` and by an abort that reached
+    quiescence, and it is the same unwind `_unwind_init` runs on a failed
+    bring-up.
+    """
+    ib_teardown(state.ib)
+    state.ib = 0
+    if state.nvls_on:
+        # One call releases the peer mappings, both of my own, the multicast
+        # binding and every handle; there is no cuIpc mapping and no
+        # cuMemAlloc block to free.
+        nvls_teardown(state.nvls, state.driver, state.ordinal)
+    else:
+        for r in range(state.local_world):
+            if r != state.local_rank:
+                close_handle(state.driver, state.regions[r])
+        free_region(state.driver, state.owned_base)
+    if state.abort_host != 0:
+        free_host(state.driver, state.abort_host)
+        state.abort_host = 0
+        state.abort_dev = 0
+    state.released = True
+
+
 def _destroy_locked(comm: Int64) -> Int32:
     try:
         ref state = _comm_ptr(comm)[]
-        if not state.aborted:
-            # The inter-node callbacks were enqueued on the CALLER's stream(s),
-            # not on the context's own, and they dereference the IbState this
-            # tears down -- so drain every cached stream too before touching
-            # it, not just the last one used (see `_drain_all_streams`).
-            _drain_all_streams(state)
-            state.ctx.synchronize()
-            ib_teardown(state.ib)
-            if state.nvls_on:
-                # One call releases the peer mappings, both of my own, the
-                # multicast binding and every handle; there is no cuIpc
-                # mapping and no cuMemAlloc block to free.
-                nvls_teardown(state.nvls, state.driver, state.ordinal)
-            else:
-                for r in range(state.local_world):
-                    if r != state.local_rank:
-                        close_handle(state.driver, state.regions[r])
-                free_region(state.driver, state.owned_base)
+        # Destroy after abort is legal (nccl.h.in) and has nothing left to do:
+        # abort either ran this same unwind or decided it could not safely.
+        if state.released or state.aborted:
+            return NCCL_SUCCESS
+        # The inter-node callbacks were enqueued on the CALLER's stream(s),
+        # not on the context's own, and they dereference the IbState this
+        # tears down -- so drain every cached stream too before touching
+        # it, not just the last one used (see `_drain_all_streams`).
+        _drain_all_streams(state)
+        state.ctx.synchronize()
+        _release_resources(state)
         return NCCL_SUCCESS
     except:
         return NCCL_INTERNAL_ERROR
 
 
+def _abort_quiesced(state: CommState, deadline_ns: Int) -> Bool:
+    """Poll every stream a collective ran on until all are idle, or the
+    deadline passes.
+
+    `cuStreamQuery`, not `cuStreamSynchronize`: the point of the abort word is
+    that the spin kernels are already on their way out, and a synchronize
+    would be exactly the unbounded wait abort promises not to do.
+    """
+    var handles = _cached_stream_handles(state)
+    while True:
+        var pending = False
+        for i in range(len(handles)):
+            if not stream_done(state.driver, Int(handles[i])):
+                pending = True
+                break
+        if not pending:
+            return True
+        if perf_counter_ns() > deadline_ns:
+            return False
+        sleep(0.001)
+
+
 @export
 def ncclCommAbort(comm: Int64) abi("C") -> Int32:
     ref state = _comm_ptr(comm)[]
-    # No wait, no cleanup of GPU or IB resources here (a dead peer may hang
-    # forever inside its own barrier spin, and a queue pair torn down under
-    # an in-flight RDMA write is worse than one left alone) -- matches
-    # ncclCommAbort's documented "don't wait" contract. ncclCommDestroy is
-    # never called after abort() by nccl.py's NcclComm. The progress thread
-    # is the one thing still stopped here: left running it spins a CPU core
-    # for the rest of the process, and `ib_signal_abort`'s join is bounded so
-    # this still does not wait in the way the contract forbids.
+    if state.released:
+        return NCCL_SUCCESS
+    # nccl.h.in's contract: stop submissions, abort the device operations, and
+    # free the communicator's resources -- without waiting on peers, which may
+    # be dead. All three, in that order.
+    #
+    #   1. `aborted` makes every later collective return ncclInvalidUsage and
+    #      `ncclCommGetAsyncError` report ncclSystemError.
+    #   2. the abort word releases the device spins (the intra-node barriers,
+    #      the NVLS barrier, the proxy wait kernel) within a check interval,
+    #      each with its region's error word set, instead of holding the
+    #      stream to a 60 s deadline; the progress thread stops too.
+    #   3. once nothing local is running any more -- polled, with a bound, and
+    #      never a wait on a peer -- the region, the peer mappings, the IB
+    #      state and the pinned word go back.
+    #
+    # Step 3 is best effort by construction: a local kernel that will not
+    # quiesce inside `ABORT_QUIESCE_TIMEOUT_S` keeps its memory, because
+    # freeing a region a kernel is still reading faults the process.
     state.aborted = True
+    _raise_abort_word(state)
     ib_signal_abort(state.ib)
+    var deadline = perf_counter_ns() + Int(ABORT_QUIESCE_TIMEOUT_S * 1.0e9)
+    if not _try_lock(state, deadline):
+        print(
+            "mojoccl: ncclCommAbort left the region allocated -- another"
+            " thread still holds the submission lock"
+        )
+        return NCCL_SUCCESS
+    var quiesced = _abort_quiesced(state, deadline)
+    if quiesced:
+        try:
+            _release_resources(state)
+        except e:
+            print("mojoccl: ncclCommAbort could not release cleanly:", e)
+    else:
+        print(
+            "mojoccl: ncclCommAbort left the region allocated -- the device"
+            " was still busy after",
+            ABORT_QUIESCE_TIMEOUT_S,
+            "s",
+        )
+    _unlock(state)
     return NCCL_SUCCESS
 
 

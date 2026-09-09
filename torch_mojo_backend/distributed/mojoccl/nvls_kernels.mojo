@@ -63,6 +63,7 @@ from max.gpu.sync import barrier
 from collectives_kernels import (
     BLOCK,
     DEFAULT_TIMEOUT_NS,
+    _abort_raised,
     _enqueue_cached,
     signal_bytes,
 )
@@ -255,9 +256,10 @@ def _nvls_sync(
     and releases the local blocks. Targets advance by `world` per barrier and
     are never reset, so a rank a whole call ahead cannot deadlock one behind.
 
-    Returns False if the deadline passed. The whole block learns that through
-    shared memory so no thread is stuck inside a `barrier()`, and the local
-    release is published anyway so the other blocks are not wedged either.
+    Returns False if the deadline passed or the host raised the abort word.
+    The whole block learns that through shared memory so no thread is stuck
+    inside a `barrier()`, and the local release is published anyway so the
+    other blocks are not wedged either.
     """
     var failed = stack_allocation[
         1, DType.uint32, address_space=AddressSpace.SHARED
@@ -290,6 +292,9 @@ def _nvls_sync(
                 spins += 1
                 if spins >= _SPIN_CHECK:
                     spins = 0
+                    if _abort_raised(uc):
+                        failed[unsafe_offset=0] = 1
+                        break
                     # Same-GPU timer difference only, never across GPUs.
                     if global_perf_counter_ns() - t0 > timeout_ns:
                         failed[unsafe_offset=0] = 1
@@ -305,6 +310,9 @@ def _nvls_sync(
                 spins += 1
                 if spins >= _SPIN_CHECK:
                     spins = 0
+                    if _abort_raised(uc):
+                        failed[unsafe_offset=0] = 1
+                        break
                     if global_perf_counter_ns() - t0 > timeout_ns:
                         failed[unsafe_offset=0] = 1
                         break

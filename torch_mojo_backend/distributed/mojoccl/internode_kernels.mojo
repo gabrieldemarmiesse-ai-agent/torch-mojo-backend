@@ -18,6 +18,10 @@ from collectives_kernels import BLOCK, MAX_WORLD, _copy_bytes, _enqueue_cached
 
 comptime _UNROLL = 4
 comptime _MAX_BLOCKS = 432
+comptime _ABORT_CHECK = 256
+"""Mailbox reads between two probes of the abort word. Both are host memory
+across PCIe, so probing every iteration would double the wait kernel's traffic
+for no gain: 256 iterations is well under a millisecond."""
 
 
 @__llvm_metadata(
@@ -90,6 +94,7 @@ def _proxy_request_kernel(
 def _proxy_wait_kernel(
     mailbox: Pointer[UInt64, MutAnyOrigin],
     error_word: Pointer[UInt64, MutAnyOrigin],
+    abort_word: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
     timeout_ns: UInt64,
 ):
@@ -102,16 +107,33 @@ def _proxy_wait_kernel(
     stop the stream, wake a thread and restart it. A spin kernel and a
     spinning CPU thread cost a launch each.
 
-    On the deadline it writes the region's error word and gives up rather
-    than hanging the stream forever; the add kernel then runs on stale
-    inbox bytes, which `ncclCommGetAsyncError` reports.
+    On the deadline -- or as soon as `ncclCommAbort` raises `abort_word`,
+    which is why abort does not cost a full deadline -- it writes the region's
+    error word and gives up rather than hanging the stream forever; the add
+    kernel then runs on stale inbox bytes, which `ncclCommGetAsyncError`
+    reports.
     """
     if global_idx.x == 0:
         var t0 = global_perf_counter_ns()
+        var spins = 0
         while (
             Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](mailbox)
             < seq
         ):
+            spins += 1
+            if spins >= _ABORT_CHECK:
+                spins = 0
+                if (
+                    Int(abort_word) != 0
+                    and Atomic[DType.uint64].load[
+                        ordering = Ordering.ACQUIRE
+                    ](abort_word)
+                    != 0
+                ):
+                    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+                        error_word, UInt64(9) * 1_000_000
+                    )
+                    return
             if global_perf_counter_ns() - t0 > timeout_ns:
                 Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
                     error_word, UInt64(9) * 1_000_000
@@ -266,6 +288,7 @@ def proxy_wait(
     stream: DeviceStream,
     mailbox: Int,
     error_word: Int,
+    abort_word: Int,
     seq: Int,
     timeout_ns: Int,
 ) raises:
@@ -276,6 +299,7 @@ def proxy_wait(
         1,
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=error_word),
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=abort_word),
         UInt64(seq),
         UInt64(timeout_ns),
     )
