@@ -314,6 +314,7 @@ struct IbState(Movable):
     var rwr: Int
     var bad: Int
     var wc: Int
+    var ts: Int  # struct timespec scratch for the idle nanosleep
     var works: Int
     var work_next: Int
     var mailbox: Int  # pinned host address
@@ -379,6 +380,7 @@ struct IbState(Movable):
         self.rwr = Int(alloc_bytes(SZ_RECV_WR))
         self.bad = Int(alloc_bytes(16))
         self.wc = Int(alloc_bytes(SZ_WC * 16))
+        self.ts = Int(alloc_bytes(16))
         self.works = Int(unsafe_alloc[IbWork](WORK_SLOTS))
         var wp = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=self.works)
         for i in range(WORK_SLOTS):
@@ -832,7 +834,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) <= UInt64(st.request_seq):
-            _nanosleep_ns(idle_ns)
+            _nanosleep_ns(st.ts, idle_ns)
 
 
 def _proxy_address() -> Int:
@@ -919,8 +921,8 @@ def ib_signal_abort(ib: Int):
     )
     var tid = st.thread_id
     var deadline = perf_counter_ns() + Int(IB_ABORT_JOIN_TIMEOUT_S * 1.0e9)
+    var retval = unsafe_alloc[Int64](1)
     while perf_counter_ns() < deadline:
-        var retval = unsafe_alloc[Int64](1)
         var rc = external_call["pthread_tryjoin_np", Int32](tid, retval)
         if rc == 0:
             st.thread_id = 0
@@ -1176,11 +1178,13 @@ def _proxy_idle_ns() -> Int:
     return us * 1000
 
 
-def _nanosleep_ns(ns: Int):
+def _nanosleep_ns(ts_addr: Int, ns: Int):
     """`nanosleep(2)` for `ns` nanoseconds; `struct timespec{tv_sec,tv_nsec}`,
-    16 bytes on this ABI. Best-effort: an interrupted sleep just returns
-    early, which only means the next mailbox check happens a bit sooner."""
-    var ts = unsafe_alloc[Int64](2)
+    16 bytes on this ABI, in the caller-owned scratch at `ts_addr` (an
+    allocation per call here leaked 16 bytes per idle iteration, ~3 GB/h at
+    the 20 us quantum). Best-effort: an interrupted sleep just returns early,
+    which only means the next mailbox check happens a bit sooner."""
+    var ts = Pointer[Int64, MutAnyOrigin](unsafe_from_address=ts_addr)
     ts[unsafe_offset=0] = 0
     ts[unsafe_offset=1] = Int64(ns)
     _ = external_call["nanosleep", Int32](ts, Int64(0))
