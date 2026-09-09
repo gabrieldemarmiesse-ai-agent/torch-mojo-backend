@@ -318,7 +318,10 @@ most `MOJOCCL_REGION_MB`: the intra-node reduce-scatter
 (`reduce_scatter_stage`) leaves every rank its shard of the node-reduced
 bucket in its own `stage_out`; each rank RDMA-writes that shard to the
 counterpart rank (same `local_rank`) on every other node and receives theirs
-into a third, cap-sized `network` area of its region; a small kernel sums the
+into a third, cap-sized `network` area of its region, carved once as
+`[staging cap/2 | inbox half 0 cap/4 | inbox half 1 cap/4]` so every exchange
+uses the same byte ranges (this caps one multi-node allreduce chunk at 256 MiB
+for 2 nodes and 73 MiB for 8); a small kernel sums the
 N−1 inbox shards into the shard; the intra-node all-gather
 (`allgather_finish`) then pulls the globally reduced shards into the user
 output, scaled for AVG. Broadcast and all-gather use the same RDMA path with
@@ -341,10 +344,13 @@ memory. The inbox is double-buffered by the exchange counter's parity
 carried in the immediate, which is sound only because every exchange is
 all-to-all: a rank whose shard is empty (7 of 8 ranks on DDP's 4-byte AVG
 allreduce) still posts a 16-byte credit. The GPU/network hand-off is a
-spinning progress thread per rank (one core) driven through a pinned,
-device-mapped mailbox: a one-thread kernel releases the exchange, the thread
-posts, waits for the N−1 arrivals and flushes, a second one-thread kernel
-spins until it is done. A `cuLaunchHostFunc`/`hipLaunchHostFunc` stream
+progress thread per rank driven through a pinned, device-mapped mailbox: a
+one-thread kernel releases the exchange, the thread posts, waits for the N−1
+arrivals and flushes, a second one-thread kernel spins until it is done. The
+thread spins only while an exchange is in flight; idle, it yields and then
+sleeps in `MOJOCCL_IB_PROXY_IDLE_US` steps, because a thread spinning between
+exchanges competed with the host-bound Python dispatch thread and cost ~20%
+of end-to-end training throughput at 16 ranks. A `cuLaunchHostFunc`/`hipLaunchHostFunc` stream
 callback does the same job behind `MOJOCCL_IB_PROXY=0` and costs about
 480 µs of fixed driver latency per exchange on this cluster (2.6× slower at
 the DDP bucket), which is why the thread is the default. HCA choice: the
@@ -359,6 +365,8 @@ are skipped). Addressing is LID-only, so one IB subnet.
 | `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
 | `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for its peers' shards before latching an error |
 | `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread |
+| `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
+| `MOJOCCL_IB_PROXY_CPU` | unset | pin the progress thread to this CPU |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
 | `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, exchanges, mean µs posting / waiting / flushing |
 | `MOJOCCL_REGION_MB` | 256 | region area size; a multi-node communicator has three areas (`signal, stage_in, stage_out, network`) |
@@ -381,23 +389,26 @@ is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
 allreduce device-time bench (`ar_bench_gpt2.py`) in ABBA order, and a
 40-step nanoGPT DDP run under both. `RUN_MOJO=0` keeps only the NCCL legs.
 `tests/multinode/summarize.py <job log>` turns a log into the tables below.
-`/home/gabriel/ddp_work/ib_selftest/` holds two GPU-free self-tests of the
-bootstrap and of the RDMA transport between processes (they run on the
-login node, which has IB HCAs; set `MOJOCCL_IB_PROXY=0` there).
+`tests/multinode/selftest/` holds two GPU-free self-tests of the bootstrap
+and of the RDMA transport between processes (they run on a host with IB HCAs
+and no GPU, such as the login node; set `MOJOCCL_IB_PROXY=0` there); they
+caught six bugs before any GPU time was spent.
 
-**Results**, 16 ranks on 2×8 H100 (job 234040, nodes cl02s02dgx26 +
-cl02s04dgx01), `ar_bench_gpt2.py` through the process group, ABBA legs,
-medians in µs; NCCL 2.31.2 picks `NVLS_TREE/SIMPLE` from 9 MiB up:
+**Results**, 16 ranks on 2×8 H100 (`tests/multinode/run_two_node_checks.sbatch`,
+job 234072), `ar_bench_gpt2.py` through the process group, ABBA legs within
+1% of each other, medians in µs; NCCL 2.31.2 picks `NVLS_TREE/SIMPLE` from
+9 MiB up:
 
 | MiB | mojo fp32 | NCCL fp32 | ratio | mojo bf16 | NCCL bf16 | ratio |
 |---|---|---|---|---|---|---|
-| 1 | 52–81 | 87–117 | 0.6–0.9 | 52–57 | 86 | 0.60 |
-| 9 | 119 | 174 | 0.68 | 120 | 167 | 0.72 |
-| 27 (DDP bucket) | 278 | 264 | 1.05 | 279 | 262 | 1.06 |
-| 168 (tail bucket) | 1527 | 939 | 1.63 | 1522 | 947 | 1.61 |
-| 512 | 4619 | 2366 | 1.95 | 4622 | 2385 | 1.94 |
+| 1 | 60 | 153 | 0.39 | 51 | 86 | 0.60 |
+| 9 | 119 | 174 | 0.69 | 119 | 167 | 0.72 |
+| 27 (DDP bucket) | 278 | 266 | 1.04 | 277 | 262 | 1.06 |
+| 168 (tail bucket) | 1532 | 939 | 1.63 | 1526 | 947 | 1.61 |
+| 512 | 4635 | 2363 | 1.96 | 4618 | 2380 | 1.94 |
 
-`collectives`, `ddp_parity` and `stress` pass at 16 ranks. With
+`collectives`, `ddp_parity` and `stress` pass at 16 ranks under both
+libraries, and nanoGPT-124M DDP at 16 ranks reaches the same losses. With
 `MOJOCCL_IB_TRACE=1` the RDMA itself runs at 40–45 GB/s per rank, near line
 rate for one 400 Gb/s HCA; at the bucket the mean split is 0.05 µs posting,
 ~330 µs waiting (the transfer), 2.3 µs flushing. Above 27 MiB the gap is the
