@@ -409,7 +409,8 @@ def _map(
     lib: OwnedDLHandle, handle: UInt64, size: Int, gran: Int, ordinal: Int
 ) raises -> Int:
     """Reserve a VA range, map `handle` into it, and grant this device
-    read/write."""
+    read/write. A step that fails releases what the earlier steps took, so
+    the caller only ever owns a fully mapped VA or nothing."""
     var va: Int = 0
     _cu(
         lib,
@@ -418,20 +419,18 @@ def _map(
         ),
         "cuMemAddressReserve",
     )
-    _cu(
-        lib,
-        lib.get_function[Int32]("cuMemMap")(
-            va, size, Int(0), handle, UInt64(0)
-        ),
-        "cuMemMap",
+    var rc = lib.get_function[Int32]("cuMemMap")(
+        va, size, Int(0), handle, UInt64(0)
     )
-    _cu(
-        lib,
-        lib.get_function[Int32]("cuMemSetAccess")(
-            va, size, _access_desc(ordinal), Int(1)
-        ),
-        "cuMemSetAccess",
+    if rc != 0:
+        _ = lib.get_function[Int32]("cuMemAddressFree")(va, size)
+        _cu(lib, rc, "cuMemMap")
+    rc = lib.get_function[Int32]("cuMemSetAccess")(
+        va, size, _access_desc(ordinal), Int(1)
     )
+    if rc != 0:
+        _unmap(lib, va, size)
+        _cu(lib, rc, "cuMemSetAccess")
     return va
 
 
@@ -506,6 +505,9 @@ def nvls_create_and_share(
             ),
             "cuMulticastCreate",
         )
+        # Owned by the region from this line on, so a failure in the export
+        # or the fd hand-off below is released by `nvls_teardown`.
+        region.mc_handle = mch
         var fd: Int32 = -1
         _cu(
             lib,
@@ -517,33 +519,35 @@ def nvls_create_and_share(
             ),
             "cuMemExportToShareableHandle(multicast)",
         )
-        for r in range(1, local_world):
-            scm_send(
-                libc,
-                socket_path(dir, magic, r),
-                Int(fd),
-                MSG_KIND_MC,
-                0,
-                timeout_s,
-            )
+        try:
+            for r in range(1, local_world):
+                scm_send(
+                    libc,
+                    socket_path(dir, magic, r),
+                    Int(fd),
+                    MSG_KIND_MC,
+                    0,
+                    timeout_s,
+                )
+        except e:
+            _ = libc.get_function[Int32]("close")(fd)
+            raise e
         _ = libc.get_function[Int32]("close")(fd)
     else:
         var got = scm_recv(libc, sock)
         if got[1] != MSG_KIND_MC:
+            _ = libc.get_function[Int32]("close")(Int32(got[0]))
             raise Error(
                 "mojoccl: expected the multicast fd, got kind " + String(got[1])
             )
-        _cu(
-            lib,
-            lib.get_function[Int32]("cuMemImportFromShareableHandle")(
-                Pointer(to=mch),
-                got[0],
-                Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-            ),
-            "cuMemImportFromShareableHandle(multicast)",
+        var rc = lib.get_function[Int32]("cuMemImportFromShareableHandle")(
+            Pointer(to=mch),
+            got[0],
+            Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
         )
         _ = libc.get_function[Int32]("close")(Int32(got[0]))
-    region.mc_handle = mch
+        _cu(lib, rc, "cuMemImportFromShareableHandle(multicast)")
+        region.mc_handle = mch
     _cu(
         lib,
         lib.get_function[Int32]("cuMulticastAddDevice")(mch, Int32(ordinal)),
@@ -611,18 +615,23 @@ def nvls_bind_and_map(
             ),
             "cuMemExportToShareableHandle(unicast)",
         )
-        scm_send(
-            libc,
-            socket_path(dir, magic, r),
-            Int(fd),
-            MSG_KIND_UC,
-            local_rank,
-            timeout_s,
-        )
+        try:
+            scm_send(
+                libc,
+                socket_path(dir, magic, r),
+                Int(fd),
+                MSG_KIND_UC,
+                local_rank,
+                timeout_s,
+            )
+        except e:
+            _ = libc.get_function[Int32]("close")(fd)
+            raise e
         _ = libc.get_function[Int32]("close")(fd)
     for _ in range(local_world - 1):
         var got = scm_recv(libc, sock)
         if got[1] != MSG_KIND_UC or got[2] < 0 or got[2] >= local_world:
+            _ = libc.get_function[Int32]("close")(Int32(got[0]))
             raise Error(
                 "mojoccl: unexpected datagram on the fd socket, kind "
                 + String(got[1])
@@ -630,16 +639,14 @@ def nvls_bind_and_map(
                 + String(got[2])
             )
         var ph: UInt64 = 0
-        _cu(
-            lib,
-            lib.get_function[Int32]("cuMemImportFromShareableHandle")(
-                Pointer(to=ph),
-                got[0],
-                Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-            ),
-            "cuMemImportFromShareableHandle(peer)",
+        var rc = lib.get_function[Int32]("cuMemImportFromShareableHandle")(
+            Pointer(to=ph),
+            got[0],
+            Int32(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
         )
         _ = libc.get_function[Int32]("close")(Int32(got[0]))
+        _cu(lib, rc, "cuMemImportFromShareableHandle(peer)")
+        # Recorded before `_map` can raise, so `nvls_teardown` releases it.
         region.peer_handle[got[2]] = ph
         region.peer_va[got[2]] = _map(
             lib, ph, size, region.granularity, ordinal
