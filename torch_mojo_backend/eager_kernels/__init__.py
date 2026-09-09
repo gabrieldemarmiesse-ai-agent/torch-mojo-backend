@@ -530,7 +530,16 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                     f"mojo build failed for {src.stem} "
                     f"({_defines_tag(defines)}):\n{proc.stderr}"
                 )
-            os.replace(tmp, out)
+            if out.is_file():
+                # Another builder installed this immutable output while ours
+                # ran (the lock was unavailable, or it was another node).
+                # Keep theirs: a second os.replace over a path a reader has
+                # already resolved hands that reader a stale NFS handle
+                # (`cannot stat shared object: Stale file handle` on dlopen,
+                # seen once per 24-rank cold start over three nodes).
+                _trace(f"{label} was installed concurrently; reusing it")
+            else:
+                os.replace(tmp, out)
             _trace(f"built {label} in {elapsed:.2f}s")
         finally:
             tmp.unlink(missing_ok=True)
