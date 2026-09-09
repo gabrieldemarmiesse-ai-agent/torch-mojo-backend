@@ -214,6 +214,60 @@ Verified on CINES's Adastra (4 × MI300A per node, ROCm 6.4.3, RCCL 2.22.3).
   (`--nproc-per-node=1`, a couple of steps) and expect the bimodal first
   step. Capping the HIP heap instead (`GPU_MAX_HEAP_SIZE=30`) is not an
   option: MAX's allocator becomes ~40x slower.
+- **But do NOT set that knob for a MULTI-NODE mojoccl run.** With
+  `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` a two-node DDP step costs
+  ~26x what it should. nanoGPT-124M, 2 nodes x 4 MI300A over cxi, batch 12,
+  everything else identical (same region size, same build, same job):
+
+  | | steady-state tok/s | ms/step |
+  |---|---|---|
+  | RCCL over the same NICs (reference), 20 steps | 1317.0k | 75 |
+  | **knob unset, `MOJOCCL_REGION_MB=64`**, 20 steps x3 | **1150.7k / 1189.0k / 1186.3k** | **83 / 81 / 81** |
+  | knob set, same region, 11 steps | 45.4k | 2160 |
+  | knob set, default 256 MiB region, 20 steps | 35.2k | 2790 |
+
+  Unset, mojoccl lands within 11-14% of RCCL end to end; set, it is 26-37x
+  slower. The same A/B at 2 ranks per node, identical losses either way:
+  20.3k against 537.8k tok/s at step 10, a 30x gap. Single-node runs are
+  unaffected, which is why this hid for so long.
+
+  **Why.** `py-spy dump --native` of a stalled 8-rank run caught it: the one
+  rank that was not waiting had its autograd worker inside
+
+      Engine::evaluate_function -> ~vector<at::Tensor> -> decref_pyobject
+        -> TensorHolder tp_dealloc -> AsyncRT_DeviceBuffer_release
+          -> M::Driver::DeviceBuffer::~DeviceBuffer -> libamdhip64 -> sched_yield
+
+  i.e. backward blocked *freeing a device buffer*, spinning in the HIP
+  runtime; the other seven were parked in the next step's blocking H2D
+  (`_record_h2d_source`'s `event.synchronize()`), which cannot complete until
+  their own device drains. The VMM allocator's release is a real unmap rather
+  than a return to a cache, so it waits on the device -- and a multi-node
+  collective keeps an item on that device for milliseconds while it waits for
+  a remote peer. DDP frees intermediates continuously during backward, so
+  every free lands on a busy device and backward serialises behind the
+  network. Nothing in mojoccl fixes this; the release has to become
+  stream-ordered in MAX.
+
+  **What to do instead.** Leave the knob unset and shrink the communicator's
+  region so four ranks still fit: `MOJOCCL_REGION_MB=64` gives a 192 MiB
+  region per rank against 768 MiB at the default, and that is what the
+  numbers above were taken with. At the default 256 MiB, four ranks per node
+  without the knob leave too little to pin and every rank dies in
+  `fi_mr_regattr` with `-FI_ENOMEM` (measured: node at 485 of 501 GB).
+  Ruled out as explanations, each with its own run: the comm stream
+  (`TORCH_MOJO_BACKEND_COMM_STREAM=0` is just as slow), the collective
+  kernels' grid (capping them to 8 blocks changes nothing), the pipeline
+  chunk count (forcing K=1 changes nothing), and the transport itself (its
+  own blocking totals 42 ms of a 31 s run).
+
+  The smaller region costs the collectives nothing, which is the thing to
+  check before recommending it: the 8-rank allreduce at `MOJOCCL_REGION_MB=64`
+  measures 793 us at 27 MiB (busbw 62.5 GB/s) and 10509 us at 512 MiB (89.4
+  GB/s), against 10568 us at 512 MiB with the default 256 MiB region. The 27
+  MiB figure is at parity with RCCL's 794 us; the 512 MiB one is still 1.49x
+  RCCL's 7072 us, which is the separate transport-level gap analysed below and
+  is unrelated to the allocator.
 
 ### Measured: nanoGPT 124M, bf16 autocast, batch 12×1024 per rank, 20 steps
 
@@ -258,7 +312,9 @@ module load aws-ofi-rccl   # multi-node only
 export ROCM_PATH=/opt/rocm
 export LD_LIBRARY_PATH=/opt/cray/pe/gcc-libs:/opt/rocm/lib:${LD_LIBRARY_PATH}
 export NCCL_DEBUG=WARN
-export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1   # APU: see the memory paragraph
+# NO MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM here: on two nodes that knob
+# costs 26x (see the memory paragraph). A single-node job still wants it.
+export MOJOCCL_REGION_MB=64   # what makes four ranks per node fit without it
 MASTER_ADDR=$(scontrol show hostname "$SLURM_JOB_NODELIST" | head -n 1)
 srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     uv run torchrun --nnodes="$SLURM_JOB_NUM_NODES" --nproc-per-node=4 \
