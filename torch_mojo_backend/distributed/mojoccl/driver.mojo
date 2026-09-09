@@ -41,7 +41,7 @@ comptime HOST_ALLOC_FLAGS: UInt32 = 3
 comptime IPC_LAZY_PEER: UInt32 = 1
 # hipDeviceMallocUncached: cross-agent flag buffers must be uncached on AMD
 # (RCCL's own precondition for polled P2P flags); NVIDIA needs no such flag.
-comptime HIP_DEVICE_MALLOC_UNCACHED: UInt32 = 0x2
+comptime HIP_DEVICE_MALLOC_UNCACHED: UInt32 = 0x3
 
 comptime HANDLE_BYTES = 64
 
