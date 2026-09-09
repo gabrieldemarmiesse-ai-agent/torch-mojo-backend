@@ -820,6 +820,7 @@ any bug currently open.
 | `MOJOCCL_FABRIC_DOMAIN` | affinity choice among the provider's domains (PCI proximity to the GPU, then `local_rank % n`) | exact domain to use instead (`cxi2`) — the libfabric analogue of `MOJOCCL_IB_HCA` |
 | `MOJOCCL_FABRIC_HMEM` | `auto`: FI_HMEM_ROCR, then FI_HMEM_CUDA, then FI_HMEM_SYSTEM, first one the provider accepts | `system`, `rocr` or `cuda`, forcing the `fi_mr_attr.iface` the region registers under |
 | `MOJOCCL_FABRIC_FLUSH` | 1 | `0`: skip the `fi_read` flush after an exchange (libfabric backend only) |
+| `MOJOCCL_FABRIC_SETUP_RETRY_S` | 30 | how long `fab_setup` keeps retrying an endpoint bring-up that fails with `-FI_ENOMEM` (see the fragmentation note below); `0` fails on the first attempt |
 | `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
 | `MOJOCCL_NVLS` | 1 | `0`: no multicast region and no NVLS kernel, on every rank of the communicator (it is ANDed across ranks) |
 | `MOJOCCL_NVLS_MIN_MB` | 48 | single-node allreduces at or above this go through the switch; below it the unicast kernels keep the traffic. The default is the measured crossover. Must match on every rank — `ncclCommInitRank` checks it |
@@ -872,19 +873,106 @@ serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
 floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
 floor and mojoccl at 1.8x.
 
-**One unresolved flake on Slingshot.** `fi_enable` intermittently returns
-`-FI_ENOMEM` when several ranks come up on one busy node — every rank of a
-batch fails, then minutes later the identical batch passes, in windows of
-minutes. `FI_LOG_LEVEL=warn` shows the provider's own view: `cxil_map: write
-error`, then "Failed to allocate TX EQ resources, ret: -12" — the kernel
-driver refused to map the control event queue. Measured during a failing
-window and ruled out: NIC resources (`cxi_service list -d cxi0 -v`: 0 of 2047
-EQs, 0 of 1024 TXQs in use), node memory (500 GB of 526 GB free),
-`RLIMIT_MEMLOCK` (unlimited), and the hugetlbfs knobs (a failing batch stayed
-failing with `FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1` set, a
-passing one stayed passing without them). It reads as contention with
-something else on the node. Retrying has always worked, and
-`ncclCommInitRank` prints all of that in the error.
+**`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
+memory.** Several ranks of one node fail `ncclCommInitRank` with
+`fi_enable failed, rc=-12`, the identical batch passes on other nodes or
+later, and the provider says `cxil_map: write error` then "Failed to allocate
+TX EQ resources, ret: -12". This was carried for a while as an unresolved
+flake, described as contention with something else on the node, after
+`cxi_service list` (0 of 2047 EQs in use), `RLIMIT_MEMLOCK` (unlimited), the
+hugetlbfs knobs and an idle `free -g` (500 of 526 GB) had each been ruled out.
+
+It is none of those. The kernel says what it is, in `dmesg` on the failing
+node:
+
+    python: page allocation failure: order:7,
+            mode:0x40dc0(GFP_KERNEL|__GFP_COMP|__GFP_ZERO)
+      cass_nta_alloc / cass_nta_init / cass_ac_alloc   [cxi_ss1]
+      cxi_map / cxi_user_atu_map / ucxi_write          [cxi_user]
+
+The cxi driver needs **512 KiB of physically contiguous kernel memory**
+(order 7) for an address context's translation table, and the Mem-Info dump
+printed with that failure showed no NUMA node had a single free block that
+big: `0*64kB 0*128kB 0*256kB ...` on node 0, whose free total was 355 MB
+against a watermark min of 353 MB.
+
+Two measurements separate the causes:
+
+* **Not the ranks racing.** Staggering a node's four ranks 2 s apart left 5
+  runs in 8 failing, the same as unstaggered. `ib_bringup` at 8 simultaneous
+  processes on the fabric path passes.
+* **Not how much memory the job uses.** On a healthy node pair a nanoGPT
+  2n x 4r run drives MemFree to ~14 GB of 501 — the same near-full state as
+  the failing node — and initialises every time, because that node still has
+  450-2350 free blocks at order >= 7 per NUMA node. The failing node had
+  zero.
+
+So it is the **node's physical fragmentation**, exposed by a workload that
+legitimately uses ~97% of RAM because on an APU the GPU's memory IS system
+memory. The failing node had 72 days of uptime; the pair that never failed
+had been rebooted (with `drop_caches` and GPU resets) four hours earlier.
+
+The difference is whether the fragmentation *persists*. Sampling
+`/proc/buddyinfo` every 5 s through a nanoGPT run on the freshly booted pair,
+with 6 GiB of ballast on top to push it further, the run does reach the same
+state -- MemFree 9.3 GB, order >= 7 blocks down to 0-160 per NUMA node -- and
+then comes all the way back to 29k-32k blocks at 505 GB free the moment it
+exits, run after run. On a fresh node the kernel compacts what the job took;
+on a node that has been up for months it does not, and `ncclCommInitRank`
+finds nothing to map. That is also why the failure could not be reproduced on
+demand once the fragmented node went out of allocation.
+
+What this repo does about it: `fab_setup` retries the endpoint bring-up while
+the provider says `-FI_ENOMEM`, for `MOJOCCL_FABRIC_SETUP_RETRY_S` (30 s).
+That is a mitigation, not a fix — fragmentation does not clear in 30 s — but
+the pressure does ease as ranks free staging buffers, and ranks were measured
+recovering on a later attempt. What actually fixes it is leaving the node
+memory (`MOJOCCL_REGION_MB=64`, a smaller batch) or getting a node whose
+memory is not fragmented.
+
+**The intermittent 8-rank DDP stall: not reproduced, and what the engine now
+says about it.** Roughly one nanoGPT DDP run in four at 2 nodes x 4 ranks was
+seen to hang, never at 2n x 1r and never in the self-tests. One captured hang
+(`repo` HEAD f0fe8ad, MI300A pair a1001/a1007) looked like this: all four
+ranks of node 1 printed
+
+    inter-node engine gave up after 60 s with no progress, at exchange 81
+    (ring slot 80 of 512); engine at request 81, posted 81, done 77; ...
+    credits sent 77, received 76 | blocked ms: ... arrival ~77600 ...
+
+and all four ranks of **node 0 printed nothing at all**, with their engines
+idle (`request == done`). So node 0's GPUs never reached `proxy_request(78)`:
+they were stuck before it, in something with no deadline, while node 1 waited
+77 s for their data. The transport on both sides was healthy.
+
+Two things came out of chasing it:
+
+* **Instrumentation, so the silent side speaks.** The give-up message only
+  arms when `request_seq > done_seq` — i.e. only on the side that is
+  *waiting* — which is why the node that was actually stuck said nothing.
+  `ib_drive` now also watches for the opposite shape: nothing outstanding
+  here, yet a peer has already sent data for a later exchange
+  (`peer_seq_seen > request_seq`, tracked in `_consume_wc`). After the same
+  `MOJOCCL_IB_TIMEOUT_S` it prints, once per episode, "THIS rank's GPU has
+  not released exchange N". It is **diagnostic only** — it never touches the
+  error word, because a rank whose host legitimately spends a minute between
+  collectives is behind its peers for a good reason. Every exchange also
+  carries which collective and which chunk it belongs to
+  (`IbWork.op_kind/op_chunk/op_nchunks/op_numel`, set by `mojoccl.mojo`), so
+  both messages now read "exchange 78 (allreduce chunk 3 of 14, 1703936
+  elements)" instead of a bare number. Both were verified to fire and to name
+  the right side by running with `MOJOCCL_IB_TIMEOUT_S=0.05`.
+
+* **It did not reproduce on a healthy node pair.** 54 consecutive 40-step
+  nanoGPT 2n x 4r runs on a1003/a1019 (24 before the instrumentation, 30
+  after), plus `ddp_worker.py collectives`/`ddp_parity`/`stress` at 8 ranks
+  and the whole self-test suite on both nodes: no stall. The pair on which
+  the hangs were seen is also the pair whose `fi_enable` failures are
+  explained above by node memory fragmentation, and a stalled rank had
+  previously been caught in MAX's `DeviceBuffer` release (the same place the
+  VMM-allocator slowdown lives), so "the node's memory state" is the open
+  suspect rather than anything found in the transport. **Unresolved**: the
+  mechanism is not known, and no fix for it is claimed here.
 
 **Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
 is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`

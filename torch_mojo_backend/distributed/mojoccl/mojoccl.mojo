@@ -117,6 +117,9 @@ from internode import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     MAX_NODES,
+    OP_ALLGATHER,
+    OP_ALLREDUCE,
+    OP_BROADCAST,
     PIPE_MAX_SLOTS,
     ib_connect,
     ib_enqueue_request,
@@ -1681,9 +1684,16 @@ def _exchange_release[
     raw_stream: Int64,
     arena: Int,
     numel: Int,
+    chunk_index: Int,
+    nchunks: Int,
 ) raises -> Int:
     """Release one chunk's shard to the network and return its exchange
     counter.
+
+    `chunk_index` / `nchunks` are carried into the work item for the stall
+    messages only (`internode._ring_state`): they cost nothing and turn "the
+    GPU has not released exchange 78" into a sentence naming the collective
+    and the chunk.
 
     On entry this rank's node-local sum of the chunk's shard sits in arena
     `arena`'s stage_out (that is `reduce_scatter_stage`'s contract). This
@@ -1729,6 +1739,10 @@ def _exchange_release[
         npeers,
         state.owned_base + inbox_base if cnt_e > 0 else 0,
         seq,
+        OP_ALLREDUCE,
+        chunk_index,
+        nchunks,
+        numel,
     )
     return seq
 
@@ -1911,7 +1925,7 @@ def _do_allreduce[
                 scale,
             )
             seqs[k] = _exchange_release[dtype](
-                state, stream, raw_stream, k % state.narenas, cnt
+                state, stream, raw_stream, k % state.narenas, cnt, k, nchunks
             )
         var j = k - (depth - 1)
         if j >= 0:
@@ -2177,6 +2191,8 @@ def _broadcast_multinode(
         * 4096,
     )
     var done = 0
+    var chunk_index = 0
+    var nchunks = (total_bytes + max_bytes - 1) // max_bytes
     while done < total_bytes:
         var chunk = min(max_bytes, total_bytes - done)
         var seq = ib_next_seq(state.ib)
@@ -2225,6 +2241,10 @@ def _broadcast_multinode(
             npeers,
             flush_addr,
             seq,
+            OP_BROADCAST,
+            chunk_index,
+            nchunks,
+            chunk,
         )
         # Unpipelined on purpose: one exchange at a time, waited for right
         # where it is released. Broadcast's fan-out is a different shape from
@@ -2249,6 +2269,7 @@ def _broadcast_multinode(
         # credit is only due now.
         ib_note_consumed(state.ib, seq)
         done += chunk
+        chunk_index += 1
 
 
 @export
@@ -2356,6 +2377,8 @@ def _allgather_multinode(
     )
     var max_bytes = max(16, ((max_block - 8192) // lw) // 16 * 16)
     var done = 0
+    var ag_chunk_index = 0
+    var ag_nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
     while done < per_rank_bytes:
         var chunk = min(max_bytes, per_rank_bytes - done)
         state.generation += 1
@@ -2392,6 +2415,10 @@ def _allgather_multinode(
             npeers,
             state.owned_base + inbox_base,
             seq,
+            OP_ALLGATHER,
+            ag_chunk_index,
+            ag_nchunks,
+            block,
         )
         # Unpipelined, like broadcast: one exchange, waited for in place.
         ib_enqueue_wait(state.ib, state.ctx, stream, seq)
@@ -2423,6 +2450,7 @@ def _allgather_multinode(
         # `place_blocks` above is what read the inbox slots.
         ib_note_consumed(state.ib, seq)
         done += chunk
+        ag_chunk_index += 1
 
 
 def _place_node_block(

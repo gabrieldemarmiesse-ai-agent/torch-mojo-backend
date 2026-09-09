@@ -199,6 +199,24 @@ comptime CREDIT_SLOT_BYTES = 64
 comptime CREDIT_AREA_BYTES = 4096
 comptime CREDIT_PAYLOAD_BYTES = 4
 
+comptime OP_UNKNOWN = 0
+comptime OP_ALLREDUCE = 1
+comptime OP_BROADCAST = 2
+comptime OP_ALLGATHER = 3
+"""Which collective an exchange belongs to, carried in its work item for the
+stall messages only. `mojoccl.mojo` passes it to `ib_enqueue_request`."""
+
+
+def _op_name(kind: Int) -> String:
+    if kind == OP_ALLREDUCE:
+        return String("allreduce")
+    if kind == OP_BROADCAST:
+        return String("broadcast")
+    if kind == OP_ALLGATHER:
+        return String("allgather")
+    return String("?")
+
+
 # The proxy mailbox: two 64-bit words the GPU and the progress thread
 # pass the exchange counter through, plus a stop word the host sets at
 # teardown. A cache line apart so the GPU's writes to REQUEST never
@@ -260,6 +278,15 @@ struct IbWork(Copyable, Movable):
     # the NIC is still reading for a slower peer.
     var sent: Int
     var t0: Int  # perf_counter_ns when it was posted, for the trace
+    # What the host was issuing when it filled this slot -- kind (see
+    # `_op_name`), which chunk of how many, and the chunk's element count.
+    # Diagnostics only: when a stall is reported, "the GPU has not released
+    # exchange 78" is a lot more useful as "exchange 78, allreduce chunk 3 of
+    # 14, 1703936 elements", and the two ends of a stall can be compared.
+    var op_kind: Int
+    var op_chunk: Int
+    var op_nchunks: Int
+    var op_numel: Int
 
     def __init__(out self):
         self.state = 0
@@ -275,6 +302,10 @@ struct IbWork(Copyable, Movable):
         self.credit_upto = 0
         self.sent = 0
         self.t0 = 0
+        self.op_kind = OP_UNKNOWN
+        self.op_chunk = 0
+        self.op_nchunks = 0
+        self.op_numel = 0
 
 
 struct IbState(Movable):
@@ -362,6 +393,15 @@ struct IbState(Movable):
     var t_wait_ns: Int
     var t_flush_ns: Int
     var n_exchanges: Int
+    # Highest exchange a PEER has sent data for. A peer only sends
+    # exchange e once its own GPU released e, and every rank of a
+    # communicator calls `ib_next_seq` the same number of times in the
+    # same order, so `peer_seq_seen > request_seq` means MY GPU is the
+    # one that has not got there. That is the only thing the silent side
+    # of a stall knows about it, and without it only the noticing side
+    # ever prints (see the watchdog in `ib_drive`).
+    var peer_seq_seen: Int
+    var watchdog_said: Int
 
     def __init__(
         out self,
@@ -427,6 +467,8 @@ struct IbState(Movable):
         self.t_wait_ns = 0
         self.t_flush_ns = 0
         self.n_exchanges = 0
+        self.peer_seq_seen = 0
+        self.watchdog_said = 0
 
 
 @always_inline
@@ -678,6 +720,8 @@ def _consume_wc(mut st: IbState, c: NetCompletion) -> Int:
                 st.credit_recv[c.peer] = seq
         else:
             st.tally[seq % st.nslots] += 1
+            if seq > st.peer_seq_seen:
+                st.peer_seq_seen = seq
         return 0
     if c.kind == NC_SEND:
         # The wr_id / context of a data write is the exchange number, dense
@@ -836,6 +880,7 @@ def ib_drive(mut st: IbState) -> Bool:
     if moved:
         st.last_progress_ns = perf_counter_ns()
         st.t_last_sample_ns = st.last_progress_ns
+        st.watchdog_said = 0
     elif st.request_seq > st.done_seq:
         # Nothing outstanding can move and nothing has moved for a whole
         # timeout: a peer is gone, or a credit was lost.
@@ -861,6 +906,33 @@ def ib_drive(mut st: IbState) -> Bool:
             )
             _store_atomic_i(_err_ptr(st), 3)
             _release_on_error(st)
+    elif st.peer_seq_seen > st.request_seq:
+        # THE SILENT SIDE OF A STALL. Nothing is outstanding here -- every
+        # exchange this rank's GPU asked for is retired -- yet a peer has
+        # already sent data for a LATER exchange, so the peer's GPU got
+        # somewhere mine has not. Without this the branch above never arms
+        # (it needs `request_seq > done_seq`), so the node that is actually
+        # stuck says nothing and only its peers time out and print, which is
+        # the wrong half of the picture.
+        #
+        # DIAGNOSTIC ONLY: it prints once per stall episode and never touches
+        # the error word. A rank whose host legitimately spends a minute
+        # between collectives is behind its peers for a good reason, and
+        # failing it here would turn a slow run into a broken one.
+        if (
+            st.watchdog_said == 0
+            and perf_counter_ns() - st.last_progress_ns > st.timeout_ns
+        ):
+            st.watchdog_said = 1
+            print(
+                "mojoccl: inter-node engine idle for",
+                st.timeout_ns // 1_000_000_000,
+                "s while peers ran ahead -- THIS rank's GPU has not released",
+                _ring_state(st, st.request_seq + 1),
+                "| the stream is stuck in a kernel before this exchange's"
+                " request (an intra-node barrier, a wait for an earlier"
+                " exchange, or work the host has not enqueued yet)",
+            )
     return moved
 
 
@@ -1470,6 +1542,12 @@ def _ring_state(st: IbState, seq: Int) -> String:
     """
     var s = String("")
     s += "exchange " + String(seq)
+    ref w = _work(st, seq)[]
+    if w.seq == seq and w.op_kind != OP_UNKNOWN:
+        s += " (" + _op_name(w.op_kind)
+        s += " chunk " + String(w.op_chunk + 1)
+        s += " of " + String(w.op_nchunks)
+        s += ", " + String(w.op_numel) + " elements)"
     s += " (ring slot " + String((seq - 1) % WORK_SLOTS) + " of "
     s += String(WORK_SLOTS) + "); engine at request "
     s += String(st.request_seq) + ", posted " + String(st.posted_seq)
@@ -1482,6 +1560,7 @@ def _ring_state(st: IbState, seq: Int) -> String:
     for i in range(len(st.send_done)):
         s += " " + String(st.send_done[i])
     s += "; stalls " + String(st.n_credit_stalls)
+    s += "; peers have sent through " + String(st.peer_seq_seen)
     return s^
 
 
@@ -1550,6 +1629,10 @@ def _fill_work(
     seq: Int,
     credit_upto: Int,
     may_wait: Bool,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
 ) raises:
     ref w = _work(st, seq)[]
     if may_wait:
@@ -1574,6 +1657,10 @@ def _fill_work(
     w.credit_upto = credit_upto
     w.sent = 0
     w.t0 = 0
+    w.op_kind = op_kind
+    w.op_chunk = op_chunk
+    w.op_nchunks = op_nchunks
+    w.op_numel = op_numel
     _store_atomic_i(_status_ptr(w), 0)
 
 
@@ -1591,6 +1678,10 @@ def ib_enqueue_request(
     nrecv: Int,
     flush_addr: Int,
     seq: Int,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
 ) raises:
     """Release exchange `seq` to the network, at this point in stream order.
 
@@ -1617,6 +1708,10 @@ def ib_enqueue_request(
         seq,
         st.consumed_enqueued,
         True,
+        op_kind,
+        op_chunk,
+        op_nchunks,
+        op_numel,
     )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)

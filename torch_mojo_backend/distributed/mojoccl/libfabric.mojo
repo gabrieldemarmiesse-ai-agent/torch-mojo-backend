@@ -61,6 +61,7 @@
 from std.ffi import OwnedDLHandle
 from std.os import getenv
 from std.sys import size_of
+from std.time import perf_counter_ns, sleep
 
 from netutil import (
     P8,
@@ -242,6 +243,21 @@ comptime FI_EAGAIN = 11
 comptime FI_ENOMEM = 12
 comptime FI_EAVAIL = 259
 comptime FI_ENOSYS = 38
+
+comptime FAB_SETUP_RETRY_S: Float64 = 30.0
+"""How long to keep asking when the endpoint bring-up says -FI_ENOMEM.
+
+A budget rather than a try count, because the condition this covers is a
+node-wide window rather than a collision between the ranks: measured on
+Adastra, eight tries over 2.5 s all failed on all four of a node's ranks,
+and the same batch passed a run later. 30 s is under the bootstrap's own
+deadline, so a node that spends its whole budget retrying still meets its
+peers rather than timing the job out."""
+
+comptime FAB_SETUP_BACKOFF_US = 20_000
+comptime FAB_SETUP_BACKOFF_MAX_US = 1_000_000
+"""Doubling backoff, 20 ms .. 1 s. Nothing here is fitted to a measurement;
+it is only "ask often at first, then stop burning a core"."""
 
 comptime FI_VERSION_2_2: UInt32 = (2 << 16) | 2
 comptime FI_VERSION_1_5: UInt32 = (1 << 16) | 5
@@ -825,32 +841,52 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
         pass
     var hint = String("")
     if rc == -FI_ENOMEM:
-        # Two different things reach here and they need different answers.
+        # This is memory pressure on the NODE, essentially always, and the
+        # kernel says so if you ask it. Traced on Adastra (2x4 MI300A,
+        # Slingshot/cxi) from `fi_enable failed, rc=-12` all the way down:
         #
-        # A real shortage: on an APU the GPU's allocations ARE system memory,
-        # so a node at 485 of 501 GB has nothing left to pin, and registering
-        # a region needs it contiguous and unswappable. Measured: with MAX's
-        # VMM allocator off, four ranks per node left too little for
-        # `fi_mr_regattr` of the 768 MiB region and every rank failed here.
+        #   cxil_map: write error                       (libcxi, to /dev/cxi)
+        #   cxip_ep_ctrl_init: Failed to allocate TX EQ resources, ret: -12
+        #   python: page allocation failure: order:7,
+        #           mode:GFP_KERNEL|__GFP_COMP|__GFP_ZERO
+        #     cass_nta_alloc / cass_nta_init / cass_ac_alloc [cxi_ss1]
+        #     cxi_map / cxi_user_atu_map / ucxi_write      [cxi_user]
         #
-        # And an intermittent condition, seen on Adastra in windows of
-        # minutes: every rank of a batch fails `fi_enable` with -FI_ENOMEM,
-        # then the identical batch passes. Under `FI_LOG_LEVEL=warn` the
-        # provider says `cxil_map: write error` and then "Failed to allocate
-        # TX EQ resources, ret: -12" (prov/cxi/src/cxip_ep.c). Ruled out
-        # during a failing window: NIC resources (`cxi_service list -d cxi0
-        # -v` showed 0 of 2047 EQs and 0 of 1024 TXQs in use), node memory
-        # (500 GB of 526 GB free), RLIMIT_MEMLOCK (unlimited), and the
-        # hugetlbfs knobs (a failing batch stayed failing with them set, a
-        # passing one stayed passing without). Retrying has always worked.
+        # The driver needs 512 KiB (order 7) of PHYSICALLY CONTIGUOUS kernel
+        # memory for the address context's translation table, and the
+        # kernel's own Mem-Info at the failure showed why it could not have
+        # it: of the four NUMA nodes, none had a single free block at order 7
+        # -- "0*64kB 0*128kB ..." on node 0, whose free total was 355 MB
+        # against a watermark min of 353 MB. On an APU the GPU's memory IS
+        # system memory, so four ranks of MAX and torch had taken essentially
+        # all of it.
+        #
+        # So `free -g` DURING the run is the check, not before it: the same
+        # node reads 480 of 501 GB free when idle. Earlier work here recorded
+        # this as an "intermittent cxi condition" on those idle readings and
+        # ruled out NIC objects (`cxi_service list` showed 0 of 2047 EQs in
+        # use), RLIMIT_MEMLOCK and the hugetlb knobs -- all correctly, none
+        # of them was it -- and also measured that it is NOT the node's four
+        # ranks racing (staggering them 2 s apart left 5 runs in 8 failing,
+        # the same as unstaggered) and that it follows the NODE (four
+        # consecutive failures on one node while its partner passed every
+        # time, and both fresh nodes passing).
+        #
+        # `fab_setup` retries for a while because the pressure does ease as
+        # ranks free their staging buffers, and some ranks do get through on
+        # a later try. It is a mitigation, not a fix: the fix is to leave the
+        # node some memory.
         hint = String(
-            "; check `free -g` first -- on an APU the GPU's memory IS system"
-            " memory, and a region has to be pinned contiguously, so a nearly"
-            " full node fails here for real. If the node has room, this is"
-            " the intermittent cxi condition instead: run with"
-            " FI_LOG_LEVEL=warn to see whether the provider says `cxil_map:"
-            " write error`, check `cxi_service list -d <dev> -v` and"
-            " HugePages_Free in /proc/meminfo, and retry"
+            "; this is almost always node memory pressure rather than a NIC"
+            " or provider fault -- on an APU the GPU's memory IS system"
+            " memory, so check free memory DURING the run (an idle reading"
+            " proves nothing) and look in dmesg for `page allocation"
+            " failure: order:7 ... cass_nta_alloc [cxi_ss1]`, which is the"
+            " cxi driver failing to find 512 KiB of contiguous kernel memory"
+            " for an address context. /proc/buddyinfo and the kernel's"
+            " Mem-Info dump show the per-NUMA high-order counts that decide"
+            " it. MOJOCCL_FABRIC_SETUP_RETRY_S sets how long this waits for"
+            " the pressure to ease"
         )
     raise Error(
         "mojoccl: "
@@ -924,7 +960,7 @@ def _reg_mr(
     return mr
 
 
-def fab_setup(
+def _fab_setup_once(
     gpu_bdf: String,
     local_rank: Int,
     my_node: Int,
@@ -932,7 +968,9 @@ def fab_setup(
     region: Int,
     region_bytes: Int,
 ) raises -> FabricNet:
-    """Open one NIC, register the region, bring the endpoint up.
+    """One attempt at `fab_setup`; see it for the retry this sits inside.
+
+    Open one NIC, register the region, bring the endpoint up.
 
     Unlike the verbs path there is no connection to establish: an FI_EP_RDM
     endpoint is connectionless, so everything except "where are the peers"
@@ -1148,6 +1186,89 @@ def fab_setup(
         fab_teardown(st)
         raise e
     return st^
+
+
+def _fab_setup_retry_s() -> Float64:
+    """`MOJOCCL_FABRIC_SETUP_RETRY_S`: the -FI_ENOMEM retry budget, seconds.
+    Zero fails on the first attempt, which is what a test that WANTS to see
+    the error asks for."""
+    var s = getenv("MOJOCCL_FABRIC_SETUP_RETRY_S", String(FAB_SETUP_RETRY_S))
+    try:
+        var v = Float64(s)
+        return v if v > 0.0 else 0.0
+    except:
+        return FAB_SETUP_RETRY_S
+
+
+def _is_enomem(e: Error) -> Bool:
+    """Whether an error out of `_fab_setup_once` is libfabric's -FI_ENOMEM.
+
+    Matched on the message rather than on a returned code because every
+    failure in the bring-up comes out of `_check`, which has already turned
+    the code into a String. `_check` writes exactly one "rc=<n>" per message
+    and -12 is FI_ENOMEM, so the token is unambiguous; it is spelled here
+    once so that changing `_check`'s wording breaks in one place.
+    """
+    return String(e).find("rc=" + String(-FI_ENOMEM)) >= 0
+
+
+def fab_setup(
+    gpu_bdf: String,
+    local_rank: Int,
+    my_node: Int,
+    nnodes: Int,
+    region: Int,
+    region_bytes: Int,
+) raises -> FabricNet:
+    """`_fab_setup_once`, retried while the provider says -FI_ENOMEM.
+
+    What that error means is in `_check`: the node has run out of high-order
+    contiguous kernel memory and the cxi driver cannot build an address
+    context. Measured on Adastra with four MI300A ranks per node, it hit one
+    node in 5 runs of 8 while its partner passed every time.
+
+    Retrying is worth doing because the pressure eases -- ranks free staging
+    buffers as they go, and in two of four failing runs some of the ranks
+    that failed the first attempt got through a later one. It is not a fast
+    flap, though: eight tries over 2.5 s all failed on all four ranks of a
+    node, so the budget is a wall-clock one (`MOJOCCL_FABRIC_SETUP_RETRY_S`,
+    30 s) rather than a try count, and it sits inside the bootstrap's own
+    120 s deadline so a node that spends it all still meets its peers.
+
+    `_fab_setup_once` unwinds its own resources on the way out
+    (`fab_teardown` in its except), so each try starts from nothing --
+    including a fresh `fi_getinfo`, since the teardown frees the info list.
+
+    UNVERIFIED: how often 30 s is enough. The retry was written after the
+    only node that reproduced the failure went out of allocation, so what is
+    measured is the 2.5 s version (partial recoveries, above); the 30 s
+    budget is an extrapolation from it.
+    """
+    var budget_ns = Int(_fab_setup_retry_s() * 1.0e9)
+    var deadline = perf_counter_ns() + budget_ns
+    var backoff_us = FAB_SETUP_BACKOFF_US
+    var attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _fab_setup_once(
+                gpu_bdf, local_rank, my_node, nnodes, region, region_bytes
+            )
+        except e:
+            if perf_counter_ns() >= deadline or not _is_enomem(e):
+                raise e
+            print(
+                "mojoccl: libfabric endpoint bring-up failed with -FI_ENOMEM"
+                " (attempt",
+                attempt,
+                "), retrying for up to",
+                budget_ns // 1_000_000_000,
+                "s more --",
+                e,
+            )
+            sleep(Float64(backoff_us) / 1.0e6)
+            backoff_us = min(backoff_us * 2, FAB_SETUP_BACKOFF_MAX_US)
+    # Unreachable: the loop only leaves by returning or by re-raising.
 
 
 # ===-------------------------------------------------------------------=== #
