@@ -655,10 +655,9 @@ struct FabricNet(Movable):
         self.cqerr = Int(alloc_bytes(SZ_CQ_ERR))
         self.lenbuf = Int(alloc_bytes(8))
         self.addrbuf = Int(alloc_bytes(8))
-        self.backlog = Int(alloc_bytes(0))  # replaced below
+        self.backlog = Int(alloc_bytes(BACKLOG_CAP * _size_of_completion()))
         self.bl_head = 0
         self.bl_count = 0
-        self.backlog = Int(alloc_bytes(BACKLOG_CAP * _size_of_completion()))
 
 
 @always_inline
