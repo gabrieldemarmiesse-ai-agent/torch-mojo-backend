@@ -342,7 +342,9 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize("comm_stream", ["1", "0"], ids=["side-stream", "same-stream"])
-@pytest.mark.parametrize("mode", ["collectives", "ddp_parity", "lazy_fence", "stress"])
+@pytest.mark.parametrize(
+    "mode", ["collectives", "ddp_parity", "lazy_fence", "stress", "abort"]
+)
 def test_two_rank_nccl(mode: str, comm_stream: str, ccl: str):
     """`ccl="mojo"` runs the same workers against mojoccl
     (torch_mojo_backend/distributed/mojoccl), the in-repo NCCL-API library,
@@ -358,11 +360,15 @@ def test_two_rank_nccl(mode: str, comm_stream: str, ccl: str):
     NCCL/RCCL doesn't already cover elsewhere, so it only runs for
     `ccl="mojo"`. MOJOCCL_REGION_MB is pinned small so its "past the region
     cap" cases stay cheap tensors instead of needing a real 256 MiB region.
+
+    `mode="abort"` is likewise mojoccl-only: it asserts that ncclCommAbort
+    releases the spinning kernels and the region in a fraction of the
+    barrier deadline, which is a timing claim about this library.
     """
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
-    if mode == "stress" and ccl != "mojo":
-        pytest.skip("stress is mojoccl-only regression coverage")
+    if mode in ("stress", "abort") and ccl != "mojo":
+        pytest.skip(f"{mode} is mojoccl-only regression coverage")
     extra_env = {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream}
     if ccl == "mojo":
         extra_env["TORCH_MOJO_BACKEND_CCL"] = "mojo"

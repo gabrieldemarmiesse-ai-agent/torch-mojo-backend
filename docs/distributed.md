@@ -605,14 +605,16 @@ between every pair of nodes, a routable interface for the TCP bootstrap.
 
 **Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
 is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
-(`collectives`/`ddp_parity`/`stress`) under NCCL and under mojoccl, the
+(`collectives`/`ddp_parity`/`stress`; `abort` is single-node in
+`tests/test_distributed.py`) under NCCL and under mojoccl, the
 allreduce device-time bench (`ar_bench_gpt2.py`) in ABBA order, and a
 40-step nanoGPT DDP run under both. `RUN_MOJO=0` keeps only the NCCL legs.
 `tests/multinode/summarize.py <job log>` turns a log into the tables below.
-`tests/multinode/selftest/` holds five GPU-free self-tests — the bootstrap,
+`tests/multinode/selftest/` holds six GPU-free self-tests — the bootstrap,
 the RDMA transport, the pipelined transport with its credit protocol, the
-region geometry, and the `SCM_RIGHTS` fd transport the NVLS bring-up uses
-(the last two need no IB either). The first three run on a host with IB HCAs
+region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, and
+the socket deadlines (the last three need no IB either, and the last needs
+no peers). The first three run on a host with IB HCAs
 and no GPU, such as the login node, with `MOJOCCL_IB_PROXY=0`; they caught
 six bugs before any GPU time was spent.
 

@@ -1,12 +1,13 @@
 # mojoccl transport self-tests that need no GPU
 
-Five standalone Mojo programs that exercise
+Six standalone Mojo programs that exercise
 `torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode,vmm}.mojo`
 on any host with InfiniBand — the SLURM **login node** included, which is
 what makes them cheap enough to run on every change. They caught six real
 bugs (bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`,
 a silently-misread port LID) before any GPU time was spent chasing them.
-`geometry_test` and `fd_exchange` need no InfiniBand either.
+`geometry_test`, `fd_exchange` and `sock_deadline` need no InfiniBand
+either, and `sock_deadline` needs no peer processes at all.
 
 Build (from a checkout of this repo, no accelerator needed):
 
@@ -20,6 +21,8 @@ Build (from a checkout of this repo, no accelerator needed):
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/geometry_test
     uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
+    uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/sock_deadline
 
 ## `bs_test.mojo` — the TCP bootstrap
 
@@ -99,18 +102,35 @@ sockaddr_un structs laid out by hand over `UInt64` words because `std.ffi`
 has no C-struct ABI. A wrong offset there does not fail loudly — `sendmsg`
 succeeds and the control message is silently dropped, or a descriptor arrives
 that belongs to something else — so this runs the shipped functions
-(`socket_path`, `scm_bind`, `scm_send`, `scm_recv`, `scm_unbind`) over
-ordinary file descriptors and checks that what the receiver reads *through*
+(`socket_path`, `scm_bind`, `scm_send`, `scm_recv`, `scm_exchange_fds`,
+`scm_unbind`) over ordinary file descriptors and checks that what the receiver reads *through*
 the descriptor is what the sender wrote.
 
     rm -rf /tmp/fdx && mkdir -p /tmp/fdx
     for r in $(seq 0 7); do /tmp/fd_exchange $r 8 /tmp/fdx 987654321 & done; wait
 
-Same two rounds and the same `(kind, tag)` dispatch as production: rank 0's
+The same `(kind, tag)` dispatch as production, in three rounds: rank 0's
 "multicast" descriptor one-to-all, then every rank's own descriptor
-all-to-all, where datagrams from several senders arrive in an arbitrary order
-and the tag is the only thing that says whose region one is. No GPU, no
-InfiniBand, no multicast hardware. Exercised at 2 and 8 ranks.
+all-to-all sending everything before receiving anything, then that same
+all-to-all through `scm_exchange_fds`, which interleaves the two halves and
+is what `nvls_bind_and_map` calls. Datagrams from several senders arrive in
+an arbitrary order, so the tag is the only thing that says whose region one
+is. No GPU, no InfiniBand, no multicast hardware. Exercised at 2 and 8 ranks.
+
+## `sock_deadline.mojo` — the deadlines, with the peers deliberately absent
+
+`sock_deadline`, no arguments, no peers, no IB, ~8 s. Five calls that must
+FAIL, each near its 1.5 s deadline: the bootstrap root with a rank that never
+connects, a connect to a port nothing listens on, a connect to an unroutable
+address (TEST-NET-3), `scm_send` into an AF_UNIX datagram queue filled to
+`net.unix.max_dgram_qlen`, and `scm_exchange_fds` with a peer that never
+binds. Coming back too early fails the case (the deadline is not being
+honoured) and so does taking much longer — the second is the bug it exists
+for: against the code before it, the unroutable connect returned after
+**129.5 s** on a 1.5 s deadline, because `connect` blocked in the kernel and
+the deadline was only read after it came back. It is 1.50 s now.
+
+    /tmp/sock_deadline
 
 Covered by these and NOT by anything that needs a GPU: interface selection,
 the unique-id encoding, the two-round rendezvous, topology derivation, HCA
@@ -118,7 +138,8 @@ and port selection, `ibv_reg_mr`, QP INIT/RTR/RTS with NCCL's attribute
 values, the ops-table dispatch for post_send/post_recv/poll_cq, the
 immediate's sequence and credit tagging, recv reposting, the self-QP
 GPUDirect flush, the credit-based flow control with several exchanges in
-flight, the region geometry, the SCM_RIGHTS fd transport, and `ib_setup`'s
+flight, the region geometry, the SCM_RIGHTS fd transport (both its shapes),
+the socket deadlines, and `ib_setup`'s
 unwind of partially-created resources on a failure path. NOT covered: registration of *device* memory
 (needs nvidia_peermem and a GPU), the progress thread and its two spin
 kernels (they need pinned host memory and a stream), and everything in

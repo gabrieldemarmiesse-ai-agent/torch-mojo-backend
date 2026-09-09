@@ -6,8 +6,10 @@ without a GPU: everything device-touching happens inside main().
 """
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
+import ctypes
 import os
 import sys
+import time
 
 # One GPU per rank, decided before anything can initialize CUDA/MAX.
 from torch_mojo_backend.distributed import use_local_rank_gpu
@@ -505,6 +507,109 @@ def run_stress(failures: list[str]):
     _stress_avg_overflow(failures, rank, world)
 
 
+# ncclResult_t values ncclCommAbort's contract is asserted against.
+_NCCL_SUCCESS = 0
+_NCCL_INVALID_USAGE = 5
+
+# What abort is allowed to take. mojoccl's ABORT_QUIESCE_TIMEOUT_S is 5 s: if
+# the spinning kernels had NOT left, abort would poll the streams for the
+# whole 5 s and then keep the region, so landing under 4 s is itself the
+# evidence that the device really quiesced -- and it is far under the 60 s
+# barrier deadline that would otherwise have released those kernels.
+_ABORT_BOUND_S = 4.0
+
+
+def run_abort(failures: list[str]):
+    """`ncclCommAbort`'s contract, from the outside.
+
+    Rank 0 stays out of a 27 MiB allreduce every other rank enqueues, so their
+    start barrier waits on a flag nobody will ever publish -- the shape of a
+    rank that died mid-step. Every rank then aborts. A pass is: abort returns,
+    the device is idle, and both happen in a fraction of the barrier's own
+    `MOJOCCL_IB_TIMEOUT_S` deadline, which only the abort word can do. The
+    aborted communicator must then report an error, refuse further
+    collectives, and survive a `ncclCommDestroy`.
+
+    Vendor NCCL/RCCL is skipped: same contract, different timing, and this
+    asserts on timing.
+    """
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    if not _MOJO_CCL:
+        print(f"[rank {rank}] SKIP abort (mojoccl-only timing)", flush=True)
+        return
+    if world < 2:
+        print(f"[rank {rank}] SKIP abort (needs 2+ ranks)", flush=True)
+        return
+    spin_deadline = float(os.environ.get("MOJOCCL_IB_TIMEOUT_S", "60"))
+
+    pg = dist.group.WORLD
+    assert isinstance(pg, MojoProcessGroup)
+    n = (27 * 1024 * 1024) // 4
+    x = torch.full((n,), float(rank + 1), device="mojo")
+    comm, stream = _pg_comm(x)
+    lib = comm._ccl._lib
+    handle = comm._handle
+    torch_mojo_device_module.synchronize()
+
+    dist.barrier()
+    if rank != 0:
+        comm.all_reduce(
+            _ptr_of(x),
+            _ptr_of(x),
+            n,
+            _nccl_dtype(torch.float32),
+            _nccl_red_op(dist.ReduceOp.SUM),
+            stream,
+        )
+    # Long enough that the kernels are certainly spinning, and the gloo
+    # barrier after it puts every rank's abort within milliseconds of every
+    # other's -- so no rank frees its region while a peer still reads it.
+    time.sleep(2.0)
+    dist.barrier()
+
+    t0 = time.monotonic()
+    pg.abort()
+    torch_mojo_device_module.synchronize()
+    elapsed = time.monotonic() - t0
+    print(f"[rank {rank}] abort released the device in {elapsed:.3f}s", flush=True)
+    _check(
+        failures,
+        "abort.releases_the_device_promptly",
+        elapsed < min(_ABORT_BOUND_S, spin_deadline / 4.0),
+    )
+
+    err = ctypes.c_int(0)
+    rc = lib.ncclCommGetAsyncError(ctypes.c_void_p(handle), ctypes.byref(err))
+    _check(
+        failures,
+        "abort.async_error_reports_failure",
+        rc == _NCCL_SUCCESS and err.value != _NCCL_SUCCESS,
+    )
+
+    _check(
+        failures,
+        "abort.refuses_further_collectives",
+        lib.ncclAllReduce(
+            _ptr_of(x),
+            _ptr_of(x),
+            n,
+            _nccl_dtype(torch.float32),
+            _nccl_red_op(dist.ReduceOp.SUM),
+            handle,
+            stream,
+        )
+        == _NCCL_INVALID_USAGE,
+    )
+
+    _check(
+        failures,
+        "abort.destroy_after_abort_is_a_no_op",
+        lib.ncclCommDestroy(ctypes.c_void_p(handle)) == _NCCL_SUCCESS,
+    )
+    dist.barrier()
+
+
 def main():
     mode = sys.argv[1]
 
@@ -519,6 +624,8 @@ def main():
         run_lazy_fence(failures)
     elif mode == "stress":
         run_stress(failures)
+    elif mode == "abort":
+        run_abort(failures)
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()

@@ -9,10 +9,16 @@
 # test that needs neither CUDA nor a multicast-capable machine.
 #
 # This runs the shipped functions (`socket_path`, `scm_bind`, `scm_send`,
-# `scm_recv`, `scm_unbind`) over ordinary file descriptors and checks that what
-# the receiver reads THROUGH the descriptor is what the sender wrote, in the
-# same two rounds and with the same (kind, tag) dispatch production uses:
-# one-to-all for the multicast handle, then all-to-all for the unicast ones.
+# `scm_recv`, `scm_exchange_fds`, `scm_unbind`) over ordinary file descriptors
+# and checks that what the receiver reads THROUGH the descriptor is what the
+# sender wrote, in the same rounds and with the same (kind, tag) dispatch
+# production uses: one-to-all for the multicast handle, then all-to-all for
+# the unicast ones -- round 2 sending everything before receiving anything,
+# round 3 through `scm_exchange_fds`, which interleaves the two and is what
+# `nvls_bind_and_map` actually calls. Round 3 is the shape that survives a
+# host whose `net.unix.max_dgram_qlen` is smaller than `local_world`; that a
+# full queue makes the send fail rather than block is checked, deterministic
+# and peer-free, by sock_deadline.mojo.
 #
 #   uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
 #       -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
@@ -28,6 +34,7 @@ from vmm import (
     MSG_KIND_MC,
     MSG_KIND_UC,
     scm_bind,
+    scm_exchange_fds,
     scm_recv,
     scm_send,
     scm_unbind,
@@ -145,6 +152,41 @@ def main() raises:
         if seen[r] != want:
             print("rank", rank, "saw", seen[r], "descriptors from", r)
             bad += 1
+    _barrier(dir, "round2", rank, world)
+
+    # Round 3: the same all-to-all through the shipped helper, which sends and
+    # receives at the same time. `_barrier` first, so every rank is listening
+    # before any starts -- the helper's own deadline is what covers a peer
+    # that never binds, and that case belongs to sock_deadline.mojo, not here.
+    var paths = List[String]()
+    for r in range(world):
+        if r != rank:
+            paths.append(socket_path(dir, magic, r))
+    var got3 = scm_exchange_fds(
+        libc, sock, paths, mine, MSG_KIND_UC, rank, TIMEOUT_S
+    )
+    if len(got3) != world - 1:
+        print("rank", rank, "round 3 got", len(got3), "want", world - 1)
+        bad += 1
+    var seen3 = List[Int](length=world, fill=0)
+    for i in range(len(got3)):
+        var g = got3[i]
+        if g[1] != MSG_KIND_UC or g[2] < 0 or g[2] >= world:
+            print("rank", rank, "round 3 kind", g[1], "tag", g[2])
+            bad += 1
+            continue
+        var v = _read_fd(libc, g[0])
+        if v != 0x41 + g[2]:
+            print("rank", rank, "round 3 got", v, "from tag", g[2])
+            bad += 1
+        seen3[g[2]] += 1
+        _ = libc.get_function[Int32]("close")(Int32(g[0]))
+    for r in range(world):
+        var want3 = 0 if r == rank else 1
+        if seen3[r] != want3:
+            print("rank", rank, "round 3 saw", seen3[r], "from", r)
+            bad += 1
+
     _ = libc.get_function[Int32]("close")(Int32(mine))
 
     scm_unbind(libc, sock, spath)
