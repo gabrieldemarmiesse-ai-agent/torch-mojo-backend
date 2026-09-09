@@ -669,6 +669,21 @@ the thread unpinned rather than fight Python for a scarce core.
 `MOJOCCL_IB_PROXY_CPU=none` opts out of pinning entirely.
 `MOJOCCL_IB_TRACE=1` prints the chosen CPU (or why none was chosen).
 
+**Follow-up, unfixed: the sibling check does not catch the common case.**
+Measured on Adastra (`taskset -pc` of every rank of a 2x4 job): each rank's
+affinity mask is `0-47,96-143`, which is 48 physical cores with BOTH their
+SMT threads -- `96+c` is the sibling of `c`. Taking the mask's CPUs in
+descending order therefore pins the four progress threads to 143, 142, 141,
+140, which are the siblings of cores 47, 46, 45, 44 -- cores the ranks' own
+Python and autograd threads run on. `_smt_sibling_free` accepts them because
+it only rejects a CPU whose sibling is ANOTHER RANK'S PIN, and 44-47 are not
+pins. So on any node whose mask is a full-SMT range the policy reliably puts
+every progress thread on a busy core's sibling, which is the placement it
+exists to avoid; the ~20% this cost on H100 is the size of the effect.
+A fix would prefer, among the mask's CPUs, ones whose sibling is not also in
+the mask, and only then fall back to the descending rule. Not the cause of
+any bug currently open.
+
 | variable | default | controls |
 |---|---|---|
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |

@@ -42,6 +42,13 @@ steps = int(os.environ.get("STEPS", "10"))
 alloc = os.environ.get("ALLOC", "once")
 mm = int(os.environ.get("MM", "0"))
 skew = int(os.environ.get("SKEW", "0"))
+# Tensors allocated and dropped BETWEEN buckets, i.e. while the previous
+# bucket's collective is still outstanding. `ALLOC=each` does not test this:
+# the loop synchronizes once per step, so its frees all land on an idle
+# device. DDP's backward frees intermediates continuously with collectives in
+# flight, which is the thing worth reproducing.
+free_n = int(os.environ.get("FREE", "0"))
+free_mib = float(os.environ.get("FREE_MIB", "8"))
 mmdim = int(os.environ.get("MMDIM", "4096"))
 dev = torch.device("mojo")
 dt = torch.float32
@@ -73,13 +80,16 @@ for s in range(steps):
         for _ in range(mm + extra):
             w = w @ w
         dist.all_reduce(t)
+        for _ in range(free_n):
+            tmp = torch.empty(int(free_mib * 2**20) // 4, dtype=dt, device=dev)
+            del tmp
     torch.mojo.synchronize()
     per_step.append((time.perf_counter() - t0) * 1e3)
 total_mib = sum(buckets)
 med = sorted(per_step)[len(per_step) // 2]
 print(
     f"[rank {rank}] {len(buckets)} buckets, {total_mib:g} MiB/step, alloc={alloc}, "
-    f"mm={mm}+skew{skew}x{mmdim}: median {med:.1f} ms/step (first {per_step[0]:.1f}, "
+    f"mm={mm}+skew{skew}x{mmdim} free={free_n}x{free_mib:g}MiB: median {med:.1f} ms/step (first {per_step[0]:.1f}, "
     f"last {per_step[-1]:.1f})",
     flush=True,
 )
