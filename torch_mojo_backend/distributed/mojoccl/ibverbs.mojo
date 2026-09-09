@@ -305,8 +305,9 @@ struct Ibv(Movable):
         internode.mojo is what makes the payload visible, and it is posted
         after the completion either way.
         """
+        var mr: Int
         try:
-            var mr = Int(
+            mr = Int(
                 self.lib.get_function[Int64]("ibv_reg_mr_iova2")(
                     pd,
                     addr,
@@ -315,10 +316,11 @@ struct Ibv(Movable):
                     UInt32(access | IBV_ACCESS_RELAXED_ORDERING),
                 )
             )
-            if mr != 0:
-                return mr
         except:
-            pass  # IBVERBS_1.8 absent: an old rdma-core, RO simply unavailable
+            # IBVERBS_1.8 absent: an old rdma-core, RO simply unavailable
+            mr = 0
+        if mr != 0:
+            return mr
         return self.reg_mr(pd, addr, length, access)
 
     def dereg_mr(self, mr: Int) raises:

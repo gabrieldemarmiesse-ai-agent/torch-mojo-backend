@@ -271,7 +271,7 @@ def spin_timeout_ns() -> UInt64:
             if seconds > 0.0:
                 ns = UInt64(seconds * 1.0e9)
         except:
-            pass
+            ns = UInt64(DEFAULT_TIMEOUT_NS)  # unparsable: keep the default
     var slot = unsafe_alloc[UInt64](1)
     slot[unsafe_offset=0] = ns
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](

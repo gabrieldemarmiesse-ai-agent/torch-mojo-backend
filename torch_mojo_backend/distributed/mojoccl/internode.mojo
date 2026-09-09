@@ -89,6 +89,7 @@ from driver import (
     host_device_ptr,
     launch_host_func,
     open_driver,
+    warn_teardown,
 )
 from internode_kernels import proxy_request, proxy_wait
 from ibverbs import (
@@ -1202,11 +1203,11 @@ def ib_setup(
         )
     # Only a hint for HCA affinity: a driver without the symbol, or a
     # device that will not report one, falls back to round-robin.
-    var gpu_bdf = String("")
+    var gpu_bdf: String
     try:
         gpu_bdf = device_pci_bus_id(driver, ordinal)
     except:
-        pass
+        gpu_bdf = String("")  # no PCI id: round-robin HCA choice
     var pick = _choose_port(ports, gpu_bdf, local_rank)
     ref port = ports[pick]
     # These nodes carry ~10 IB HCAs and every rank opened all of them to
@@ -1325,7 +1326,7 @@ def _proxy_idle_ns() -> Int:
         if parsed > 0:
             us = parsed
     except:
-        pass
+        us = DEFAULT_IB_PROXY_IDLE_US  # unparsable: keep the default
     return us * 1000
 
 
@@ -1748,8 +1749,8 @@ def _teardown_ib_resources(mut st: IbState):
         # costs a refcount.
         try:
             free_host(open_driver(), st.mailbox)
-        except:
-            pass
+        except e:
+            warn_teardown("freeing the pinned mailbox", e)
         st.mailbox = 0
         st.mailbox_dev = 0
     try:
@@ -1767,8 +1768,8 @@ def _teardown_ib_resources(mut st: IbState):
             st.ibv.dealloc_pd(st.pd)
         if st.ctx != 0:
             st.ibv.close_device(st.ctx)
-    except:
-        pass
+    except e:
+        warn_teardown("releasing the IB resources", e)
 
 
 def ib_teardown(ib: Int):

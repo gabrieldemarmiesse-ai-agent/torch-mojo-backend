@@ -86,6 +86,7 @@ from driver import (
     open_driver,
     open_handle,
     stream_done,
+    warn_teardown,
 )
 from bootstrap import (
     UID_BYTES,
@@ -890,8 +891,8 @@ def _unwind_init(
     try:
         if abort_host != 0:
             free_host(lib, abort_host)
-    except:
-        pass
+    except e:
+        warn_teardown("freeing the abort word", e)
     try:
         if use_nvls:
             nvls_teardown(nvls, lib, ordinal)
@@ -900,8 +901,8 @@ def _unwind_init(
                 if r != local_rank and regions[r] != 0:
                     close_handle(lib, regions[r])
             free_region(lib, base)
-    except:
-        pass
+    except e:
+        warn_teardown("releasing the region", e)
 
 
 def _bootstrap(
@@ -1101,8 +1102,8 @@ def _bootstrap(
             try:
                 nvls_teardown(nvls, lib, ordinal)
                 scm_unbind(libc, sock, spath)
-            except:
-                pass
+            except e2:
+                warn_teardown("tearing down the multicast region", e2)
             raise Error(
                 "mojoccl: the NVSwitch-multicast region failed to come up ("
                 + String(e)
@@ -1350,7 +1351,7 @@ def _async_error_stream(state: CommState) -> DeviceStream:
         if state.last_stream != 0 and state.last_stream in state.stream_cache:
             return state.stream_cache[state.last_stream]
     except:
-        pass
+        return state.own_stream  # the lookup raced a concurrent insert
     return state.own_stream
 
 

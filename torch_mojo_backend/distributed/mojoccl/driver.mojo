@@ -11,7 +11,7 @@
 from std.ffi import OwnedDLHandle
 from std.memory.alloc import unsafe_alloc
 from max.gpu.host import DeviceContext, DeviceBuffer
-from std.sys import has_amd_gpu_accelerator
+from std.sys import has_amd_gpu_accelerator, stderr
 
 comptime AMD = has_amd_gpu_accelerator()
 comptime DRIVER_LIB = "libamdhip64.so" if AMD else "libcuda.so.1"
@@ -269,3 +269,13 @@ def host_device_ptr(lib: OwnedDLHandle, host_addr: Int) raises -> Int:
 
 def free_host(lib: OwnedDLHandle, addr: Int) raises:
     _check(lib.get_function[Int32](FN_HOST_FREE)(addr), FN_HOST_FREE)
+
+
+def warn_teardown(what: String, e: Error):
+    """Best-effort cleanup that failed: say so on stderr rather than hide it.
+    The error that started the teardown is the one propagating; this one only
+    needs to be visible."""
+    print(
+        "mojoccl: " + what + " failed during teardown: " + String(e),
+        file=stderr,
+    )
