@@ -552,6 +552,19 @@ def run_abort(failures: list[str]):
     handle = comm._handle
     torch_mojo_device_module.synchronize()
 
+    # The healthy path of the poll first -- one device read per pipeline
+    # arena through the communicator's cached scratch, which nothing else in
+    # the suite exercises.
+    dist.all_reduce(torch.ones(1024, device="mojo"))
+    torch_mojo_device_module.synchronize()
+    clean = ctypes.c_int(-1)
+    clean_rc = lib.ncclCommGetAsyncError(ctypes.c_void_p(handle), ctypes.byref(clean))
+    _check(
+        failures,
+        "abort.async_error_clean_before_abort",
+        clean_rc == _NCCL_SUCCESS and clean.value == _NCCL_SUCCESS,
+    )
+
     dist.barrier()
     if rank != 0:
         comm.all_reduce(

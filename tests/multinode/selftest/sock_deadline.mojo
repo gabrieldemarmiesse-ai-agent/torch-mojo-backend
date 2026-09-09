@@ -138,7 +138,9 @@ def _case_root_never_reached(mut bad: Int) raises:
     _check_bounded(bad, "root: peer never connects", _elapsed_s(t0))
 
 
-def _case_connect(mut bad: Int, name: String, addr_be: UInt32, port: UInt16) raises:
+def _case_connect(
+    mut bad: Int, name: String, addr_be: UInt32, port: UInt16
+) raises:
     var p = Pointer[UInt8, MutAnyOrigin](
         unsafe_from_address=_uid_pointing_at(addr_be, port)
     )
@@ -226,7 +228,9 @@ def _case_exchange_no_peer(mut bad: Int) raises:
         print("FAIL exchange-no-peer returned", len(got), "descriptors")
         bad += 1
     except:
-        _check_bounded(bad, "scm_exchange_fds: peer never binds", _elapsed_s(t0))
+        _check_bounded(
+            bad, "scm_exchange_fds: peer never binds", _elapsed_s(t0)
+        )
     _ = libc.get_function[Int32]("close")(fd)
     scm_unbind(libc, sock, path)
 

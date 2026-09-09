@@ -909,9 +909,13 @@ def ib_set_abort_word(ib: Int, abort_dev: Int):
     _st(ib)[].abort_dev = abort_dev
 
 
-def ib_signal_abort(ib: Int):
+def ib_signal_abort(ib: Int) -> Bool:
     """`ncclCommAbort`'s hook: raise MB_STOP and reclaim the progress thread
-    without ncclCommDestroy's unbounded wait.
+    without ncclCommDestroy's unbounded wait. True once the thread is gone
+    (or there never was one), which is the caller's licence to tear the
+    transport down: `ib_teardown` joins unconditionally, so releasing the
+    queue pairs while this thread is still running would both reintroduce the
+    unbounded wait and pull memory out from under it.
 
     Left unsignaled, the thread spins on the mailbox forever (nothing else
     ever sets MB_STOP for it) and burns one CPU core for the rest of the
@@ -926,10 +930,10 @@ def ib_signal_abort(ib: Int):
     way.
     """
     if ib == 0:
-        return
+        return True
     ref st = _st(ib)[]
     if st.thread_id == 0:
-        return
+        return True
     Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
         _mb(st, MB_STOP), 1
     )
@@ -940,8 +944,9 @@ def ib_signal_abort(ib: Int):
         var rc = external_call["pthread_tryjoin_np", Int32](tid, retval)
         if rc == 0:
             st.thread_id = 0
-            return
+            return True
         sleep(0.001)
+    return False
 
 
 def _callback_address() -> Int:

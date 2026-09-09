@@ -676,24 +676,29 @@ def _copy_error_word(
         dst[unsafe_offset=0] = src[unsafe_offset=0]
 
 
-def _read_error_word(
-    mut state: CommState, stream: DeviceStream, region: Int
-) raises -> UInt64:
+def _read_error_word(mut state: CommState, region: Int) raises -> UInt64:
     """The UInt64 error word at `region + error_offset()`, fetched to the
     host via a real device-to-host copy (see `_copy_error_word`).
 
-    Enqueues the copy kernel on `stream` -- ordered after whatever
-    collective on it last wrote the word -- then a D2H `enqueue_copy`, then
-    blocks for both. Callers that need the fully up-to-date word (a peer's
-    in-flight barrier timeout, not just what already landed) must
-    synchronize `stream` themselves first, as `ncclCommGetAsyncError` does.
+    Kernel and D2H copy both run on the context's own stream, so the copy is
+    ordered after the read that fills the buffer. Putting the kernel on the
+    caller's stream and the copy on the context's -- which is what
+    `enqueue_copy` uses -- left them on two streams with nothing between
+    them, and the copy could win. Nothing is lost by not touching the
+    caller's stream: the caller has already synchronized it, which is what
+    makes the word final (`ncclCommGetAsyncError` does exactly that).
     Kernel, device word and host word are all cached on the communicator.
     """
     var src = Pointer[UInt64, MutAnyOrigin](
         unsafe_from_address=region + error_offset()
     )
     _enqueue_cached[_copy_error_word](
-        state.ctx, stream, "errword", 1, state.err_buf.unsafe_ptr(), src
+        state.ctx,
+        state.ctx.stream(),
+        "errword",
+        1,
+        state.err_buf.unsafe_ptr(),
+        src,
     )
     var host_word = Pointer[UInt64, MutUntrackedOrigin](
         unsafe_from_address=state.err_host
@@ -1463,7 +1468,7 @@ def ncclCommAbort(comm: Int64) abi("C") -> Int32:
     # freeing a region a kernel is still reading faults the process.
     state.aborted = True
     _raise_abort_word(state)
-    ib_signal_abort(state.ib)
+    var proxy_stopped = ib_signal_abort(state.ib)
     var deadline = perf_counter_ns() + Int(ABORT_QUIESCE_TIMEOUT_S * 1.0e9)
     if not _try_lock(state, deadline):
         print(
@@ -1472,11 +1477,19 @@ def ncclCommAbort(comm: Int64) abi("C") -> Int32:
         )
         return NCCL_SUCCESS
     var quiesced = _abort_quiesced(state, deadline)
-    if quiesced:
+    if quiesced and proxy_stopped:
         try:
             _release_resources(state)
         except e:
             print("mojoccl: ncclCommAbort could not release cleanly:", e)
+    elif not proxy_stopped:
+        # `ib_teardown` joins the progress thread unconditionally, so
+        # reclaiming here would be both an unbounded wait and a free under a
+        # thread still reading the state.
+        print(
+            "mojoccl: ncclCommAbort left the resources allocated -- the"
+            " progress thread did not stop"
+        )
     else:
         print(
             "mojoccl: ncclCommAbort left the region allocated -- the device"
@@ -1526,7 +1539,6 @@ def ncclCommGetAsyncError(
         for a in range(state.narenas):
             var word = _read_error_word(
                 state,
-                s,
                 state.regions[state.local_rank] + a * state.arena_stride,
             )
             if Int(word) != 0:
