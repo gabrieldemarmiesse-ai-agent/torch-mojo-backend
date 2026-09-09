@@ -39,10 +39,14 @@
 # cannot reach e+2 before receiving my e+1 data, which I send only after my
 # own stream ran the add kernel of exchange e. Single buffering would leave
 # B's e+1 write racing my e add kernel with nothing but timing in between.
-# The argument needs every exchange to be all-to-all, which is why a rank
-# with nothing to contribute still sends CREDIT_BYTES (mojoccl.mojo). The
-# immediate carries the exchange counter, so an arrival belonging to e+1 is
-# counted into the other parity's tally instead of satisfying e.
+# The argument needs two things. Every exchange must be all-to-all, which is
+# why a rank with nothing to contribute still sends CREDIT_BYTES
+# (mojoccl.mojo); and the two halves must be DISJOINT ADDRESSES for every
+# exchange alike, which is why `_inbox_base` carves them out of the region
+# once instead of sizing them from the message in flight (mojoccl.mojo has
+# the case that broke). The immediate carries the exchange counter, so an
+# arrival belonging to e+1 is counted into the other parity's tally instead
+# of satisfying e.
 #
 # The inbox lives in the region's own network area, never aliased onto the
 # intra-node staging: a peer node writes it as soon as ITS reduce-scatter is
@@ -53,7 +57,7 @@ from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
 from std.os import getenv
-from std.time import perf_counter_ns
+from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext, DeviceStream
 
 from std.atomic import Atomic, Ordering
@@ -61,8 +65,10 @@ from std.atomic import Atomic, Ordering
 from driver import (
     alloc_host,
     device_pci_bus_id,
+    free_host,
     host_device_ptr,
     launch_host_func,
+    open_driver,
 )
 from internode_kernels import proxy_request, proxy_wait
 from ibverbs import (
@@ -115,6 +121,19 @@ comptime SEND_WR_DEPTH = 64
 comptime WORK_SLOTS = 512
 comptime MAX_NODES = 16
 comptime DEFAULT_IB_TIMEOUT_S: Float64 = 60.0
+# ncclCommAbort's bound on waiting for the progress thread: long enough for
+# it to notice MB_STOP (at most one idle-backoff quantum plus one poll_cq
+# when inside `_run_exchange` -- see `_stop_requested`), short enough that
+# abort's documented "don't wait" contract still holds even if the thread is
+# wedged somewhere this bound does not anticipate.
+comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
+# Default idle-wait quantum for the progress thread between exchanges (see
+# `_proxy_main`). An exchange takes ~280 us at the DDP bucket, so a few tens
+# of us of wake-up latency between exchanges is cheap; measured end to end
+# (job 234072, 2x8 H100) an unconditional hot spin here cost nanoGPT DDP
+# ~20% of its steady-state tok/s against real NCCL, competing for a core/SMT
+# sibling with the ~760-aten-op-per-step host dispatch of the training loop.
+comptime DEFAULT_IB_PROXY_IDLE_US: Int = 20
 # Bytes of the inbox read back by the flush; any read of the destination
 # device flushes the writes ahead of it, the size is irrelevant.
 comptime FLUSH_BYTES = 4
@@ -284,6 +303,39 @@ def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
     return Pointer[IbState, MutAnyOrigin](unsafe_from_address=ib)
 
 
+# `IbState.error` and `IbWork.status` are written by the proxy thread (or the
+# `MOJOCCL_IB_PROXY=0` callback thread) inside `_run_exchange` and read by
+# the calling thread -- `ib_error` from the torch-facing calling thread,
+# `ib_enqueue`'s ring-reuse check from the same -- with no other
+# synchronization between the two. Every access goes through these two
+# helpers rather than a plain field read/write so that relationship is a
+# real release/acquire pair, not two threads racing a plain `Int`.
+@always_inline
+def _load_atomic_i(p: Pointer[Int, MutAnyOrigin]) -> Int:
+    return Int(
+        Atomic[DType.int64].load[ordering = Ordering.ACQUIRE](
+            p.unsafe_bitcast[Int64]()
+        )
+    )
+
+
+@always_inline
+def _store_atomic_i(p: Pointer[Int, MutAnyOrigin], v: Int):
+    Atomic[DType.int64].store[ordering = Ordering.RELEASE](
+        p.unsafe_bitcast[Int64](), Int64(v)
+    )
+
+
+@always_inline
+def _err_ptr(mut st: IbState) -> Pointer[Int, MutAnyOrigin]:
+    return Pointer(to=st.error).unsafe_origin_cast[MutAnyOrigin]()
+
+
+@always_inline
+def _status_ptr(mut w: IbWork) -> Pointer[Int, MutAnyOrigin]:
+    return Pointer(to=w.status).unsafe_origin_cast[MutAnyOrigin]()
+
+
 # ===-------------------------------------------------------------------=== #
 # The host callback
 # ===-------------------------------------------------------------------=== #
@@ -299,7 +351,10 @@ def _consume_wc(mut st: IbState, c: P8, npeers: Int) -> Int:
     on, and a recv WR nobody reposts.
     """
     if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
-        st.error = 1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR)
+        _store_atomic_i(
+            _err_ptr(st),
+            1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR),
+        )
         return -1
     var op = Int32(ld32(c, WC_OPCODE))
     if op == IBV_WC_RECV_RDMA_WITH_IMM:
@@ -339,8 +394,8 @@ def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
 
 def _run_exchange(mut st: IbState, mut w: IbWork):
     """Post this exchange's RDMA writes, wait for the peers', flush."""
-    if st.error != 0:
-        w.status = 2
+    if _load_atomic_i(_err_ptr(st)) != 0:
+        _store_atomic_i(_status_ptr(w), 2)
         return
     var npeers = len(st.peers)
     var parity = w.seq & 1
@@ -368,31 +423,35 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
                 True,
             )
             if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
-                st.error = 1
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 1)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             nsend += 1
     var t1 = perf_counter_ns()
 
     var sends_done = 0
     while sends_done < nsend or _arrivals(st, parity) < w.nrecv:
+        if _stop_requested(st):
+            _store_atomic_i(_err_ptr(st), 6)
+            _store_atomic_i(_status_ptr(w), 2)
+            return
         var n = poll_cq(st.cq, 16, _b(st.wc))
         if n < 0:
-            st.error = 2
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 2)
+            _store_atomic_i(_status_ptr(w), 2)
             return
         for i in range(Int(n)):
             var kind = _consume_wc(
                 st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
             )
             if kind < 0:
-                w.status = 2
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             if kind == 1:
                 sends_done += 1
         if perf_counter_ns() > deadline:
-            st.error = 3
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 3)
+            _store_atomic_i(_status_ptr(w), 2)
             return
     if parity == 0:
         st.arrivals0 -= w.nrecv
@@ -412,28 +471,32 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
             st.rkey,
         )
         if post_send(st.flush_qp, _b(st.wr), _b(st.bad)) != 0:
-            st.error = 4
-            w.status = 2
+            _store_atomic_i(_err_ptr(st), 4)
+            _store_atomic_i(_status_ptr(w), 2)
             return
         var flushed = False
         while not flushed:
+            if _stop_requested(st):
+                _store_atomic_i(_err_ptr(st), 6)
+                _store_atomic_i(_status_ptr(w), 2)
+                return
             var n = poll_cq(st.cq, 16, _b(st.wc))
             if n < 0:
-                st.error = 5
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 5)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
             for i in range(Int(n)):
                 var kind = _consume_wc(
                     st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
                 )
                 if kind < 0:
-                    w.status = 2
+                    _store_atomic_i(_status_ptr(w), 2)
                     return
                 if kind == 2:
                     flushed = True
             if perf_counter_ns() > deadline:
-                st.error = 7
-                w.status = 2
+                _store_atomic_i(_err_ptr(st), 7)
+                _store_atomic_i(_status_ptr(w), 2)
                 return
     var t3 = perf_counter_ns()
 
@@ -441,7 +504,7 @@ def _run_exchange(mut st: IbState, mut w: IbWork):
     st.t_wait_ns += t2 - t1
     st.t_flush_ns += t3 - t2
     st.n_exchanges += 1
-    w.status = 1
+    _store_atomic_i(_status_ptr(w), 1)
 
 
 @always_inline
@@ -454,21 +517,51 @@ def _mb(st: IbState, off: Int) -> Pointer[UInt64, MutAnyOrigin]:
     return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox + off)
 
 
+@always_inline
+def _stop_requested(st: IbState) -> Bool:
+    """True once `ncclCommAbort` (or teardown) has raised MB_STOP.
+
+    Checked inside `_run_exchange`'s two poll loops so a stop request ends a
+    stuck exchange (a dead peer, nothing left to poll) promptly instead of
+    making `_stop_proxy`'s `pthread_join` wait out the rest of
+    `MOJOCCL_IB_TIMEOUT_S`. Only meaningful under the proxy -- the mailbox is
+    allocated only when `st.proxy`, so the `MOJOCCL_IB_PROXY=0` callback path
+    and the self-test's `ib_exchange_now` (no mailbox, no thread) never see
+    it set.
+    """
+    return (
+        st.mailbox != 0
+        and Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+            _mb(st, MB_STOP)
+        )
+        != 0
+    )
+
+
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     """The progress thread: one exchange at a time, in stream order.
 
-    Spins on the mailbox word a one-thread kernel releases after the
+    Waits on the mailbox word a one-thread kernel releases after the
     reduce-scatter, runs the exchange, releases the done word the matching
     spin kernel is waiting on. Exchanges are strictly ordered on the
     communicator's stream and the counter is dense, so slot `(seq-1) mod
     WORK_SLOTS` is this exchange's work item and no queue is needed.
 
-    A pure spin, like NCCL's proxy: the whole point is that neither side
-    ever sleeps. One core per rank, and `MOJOCCL_IB_PROXY=0` gives it back
-    at the cost of the host-callback latency.
+    Hard-spins like NCCL's proxy only WHILE AN EXCHANGE IS IN FLIGHT
+    (`_run_exchange`'s own poll loops) -- between exchanges, this loop backs
+    off (`sched_yield` once, then a short `nanosleep`) instead of burning a
+    full core on a mailbox word that is not going to change for a while. A
+    training step's host-side dispatch (hundreds of aten launches on the
+    Python main thread) shares this core's SMT sibling, and measured end to
+    end (job 234072, 2x8 H100) an unconditional hot spin here cost nanoGPT
+    DDP ~20% of its steady-state tok/s against real NCCL even though the
+    per-bucket allreduce itself was within 5%. `MOJOCCL_IB_PROXY_IDLE_US`
+    tunes the backoff quantum; `MOJOCCL_IB_PROXY=0` gives the core back
+    entirely, at the cost of the host-callback latency.
     """
     ref st = _st(Int(arg))[]
     var next_seq = 1
+    var idle_ns = _proxy_idle_ns()
     while True:
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_STOP)
@@ -477,6 +570,13 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
         ) < UInt64(next_seq):
+            # Idle: yield once (catches a request that lands right away for
+            # free) and only pay for a sleep if that didn't help.
+            _ = external_call["sched_yield", Int32]()
+            if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+                _mb(st, MB_REQUEST)
+            ) < UInt64(next_seq):
+                _nanosleep_ns(idle_ns)
             continue
         ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
             unsafe_offset = (next_seq - 1) % WORK_SLOTS
@@ -497,6 +597,26 @@ def _proxy_address() -> Int:
     return Pointer(to=f).unsafe_bitcast[Int]()[]
 
 
+def _set_thread_affinity(tid: Int, cpu: Int) raises:
+    """`pthread_setaffinity_np` to a single CPU. `cpu_set_t` is a 128-byte
+    (1024-bit) bitmask on this ABI; only the one bit for `cpu` is set."""
+    comptime CPU_SET_BYTES = 128
+    var byte_idx = cpu // 8
+    if cpu < 0 or byte_idx >= CPU_SET_BYTES:
+        raise Error(
+            "mojoccl: MOJOCCL_IB_PROXY_CPU=" + String(cpu) + " out of range"
+        )
+    var mask = alloc_bytes(CPU_SET_BYTES)
+    mask[unsafe_offset=byte_idx] = UInt8(1) << UInt8(cpu % 8)
+    var rc = external_call["pthread_setaffinity_np", Int32](
+        Int64(tid), UInt64(CPU_SET_BYTES), mask
+    )
+    if rc != 0:
+        raise Error(
+            "mojoccl: pthread_setaffinity_np failed, rc=" + String(rc)
+        )
+
+
 def _start_proxy(ib: Int) raises:
     ref st = _st(ib)[]
     var tid = unsafe_alloc[Int64](1)
@@ -507,6 +627,15 @@ def _start_proxy(ib: Int) raises:
     if rc != 0:
         raise Error("mojoccl: pthread_create failed, rc=" + String(rc))
     st.thread_id = Int(tid[unsafe_offset=0])
+    # Opt-in only (default: no pinning) -- a best-effort placement hint, not
+    # load-bearing for correctness, so a bad CPU index or a failed syscall
+    # only prints rather than failing communicator init.
+    var cpu_s = getenv("MOJOCCL_IB_PROXY_CPU", "")
+    if cpu_s.byte_length() > 0:
+        try:
+            _set_thread_affinity(st.thread_id, Int(cpu_s))
+        except e:
+            print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
 
 
 def _stop_proxy(mut st: IbState):
@@ -517,6 +646,41 @@ def _stop_proxy(mut st: IbState):
     )
     _ = external_call["pthread_join", Int32](st.thread_id, Int64(0))
     st.thread_id = 0
+
+
+def ib_signal_abort(ib: Int):
+    """`ncclCommAbort`'s hook: raise MB_STOP and reclaim the progress thread
+    without ncclCommDestroy's unbounded wait.
+
+    Left unsignaled, the thread spins on the mailbox forever (nothing else
+    ever sets MB_STOP for it) and burns one CPU core for the rest of the
+    process. Unlike `_stop_proxy`, the join here is bounded
+    (`IB_ABORT_JOIN_TIMEOUT_S`) with `pthread_tryjoin_np`, polled rather than
+    blocking: abort must not hang because a dead peer left this rank's
+    thread waiting inside `_run_exchange` for a completion that will never
+    come -- `_stop_requested` is what actually gets it out of there quickly;
+    this bound is only insurance against the case that doesn't anticipate.
+    A thread this gives up on is simply left running; it exits on its own
+    once it next checks MB_STOP, and the process exiting reclaims it either
+    way.
+    """
+    if ib == 0:
+        return
+    ref st = _st(ib)[]
+    if st.thread_id == 0:
+        return
+    Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+        _mb(st, MB_STOP), 1
+    )
+    var tid = st.thread_id
+    var deadline = perf_counter_ns() + Int(IB_ABORT_JOIN_TIMEOUT_S * 1.0e9)
+    while perf_counter_ns() < deadline:
+        var retval = unsafe_alloc[Int64](1)
+        var rc = external_call["pthread_tryjoin_np", Int32](tid, retval)
+        if rc == 0:
+            st.thread_id = 0
+            return
+        sleep(0.001)
 
 
 def _callback_address() -> Int:
@@ -652,63 +816,70 @@ def ib_setup(
     st.port = port.port
     st.timeout_ns = Int(_ib_timeout_s() * 1.0e9)
 
-    st.pd = st.ibv.alloc_pd(st.ctx)
-    if st.pd == 0:
-        raise Error("mojoccl: ibv_alloc_pd failed on " + st.hca)
-    var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
-    var acc = (
-        IBV_ACCESS_LOCAL_WRITE
-        | IBV_ACCESS_REMOTE_WRITE
-        | IBV_ACCESS_REMOTE_READ
-    )
-    st.mr = (
-        st.ibv.reg_mr_relaxed(st.pd, region, region_bytes, acc)
-        if ro
-        else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
-    )
-    if st.mr == 0:
-        raise Error(
-            "mojoccl: ibv_reg_mr of the "
-            + String(region_bytes // (1024 * 1024))
-            + " MiB device region failed on "
-            + st.hca
-            + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+    # Every step below can raise after an earlier one already allocated a
+    # real ibverbs/host resource (pd, mr, cq, QPs, the pinned mailbox) --
+    # unwind whatever got that far instead of leaking it.
+    try:
+        st.pd = st.ibv.alloc_pd(st.ctx)
+        if st.pd == 0:
+            raise Error("mojoccl: ibv_alloc_pd failed on " + st.hca)
+        var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
+        var acc = (
+            IBV_ACCESS_LOCAL_WRITE
+            | IBV_ACCESS_REMOTE_WRITE
+            | IBV_ACCESS_REMOTE_READ
         )
-    var mrp = P8(unsafe_from_address=st.mr)
-    st.lkey = ldu32(mrp, MR_LKEY)
-    st.rkey = ldu32(mrp, MR_RKEY)
-
-    # Host landing pad for the flush read.
-    st.flush_host = Int(alloc_bytes(4096))
-    st.flush_mr = st.ibv.reg_mr(
-        st.pd, st.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
-    )
-    if st.flush_mr == 0:
-        raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
-    st.flush_lkey = ldu32(P8(unsafe_from_address=st.flush_mr), MR_LKEY)
-
-    st.cq = st.ibv.create_cq(st.ctx, CQ_SIZE)
-    if st.cq == 0:
-        raise Error("mojoccl: ibv_create_cq failed")
-
-    for j in range(nnodes):
-        if j == my_node:
-            continue
-        var qp = create_rc_qp(
-            st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
+        st.mr = (
+            st.ibv.reg_mr_relaxed(st.pd, region, region_bytes, acc)
+            if ro
+            else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
         )
-        qp_to_init(st.ibv, qp, st.port)
-        st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
-    st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
-    qp_to_init(st.ibv, st.flush_qp, st.port)
+        if st.mr == 0:
+            raise Error(
+                "mojoccl: ibv_reg_mr of the "
+                + String(region_bytes // (1024 * 1024))
+                + " MiB device region failed on "
+                + st.hca
+                + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+            )
+        var mrp = P8(unsafe_from_address=st.mr)
+        st.lkey = ldu32(mrp, MR_LKEY)
+        st.rkey = ldu32(mrp, MR_RKEY)
 
-    if st.proxy:
-        st.mailbox = alloc_host(driver, MB_BYTES)
-        st.mailbox_dev = host_device_ptr(driver, st.mailbox)
-        for i in range(MB_BYTES // 8):
-            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox)[
-                unsafe_offset=i
-            ] = 0
+        # Host landing pad for the flush read.
+        st.flush_host = Int(alloc_bytes(4096))
+        st.flush_mr = st.ibv.reg_mr(
+            st.pd, st.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
+        )
+        if st.flush_mr == 0:
+            raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
+        st.flush_lkey = ldu32(P8(unsafe_from_address=st.flush_mr), MR_LKEY)
+
+        st.cq = st.ibv.create_cq(st.ctx, CQ_SIZE)
+        if st.cq == 0:
+            raise Error("mojoccl: ibv_create_cq failed")
+
+        for j in range(nnodes):
+            if j == my_node:
+                continue
+            var qp = create_rc_qp(
+                st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
+            )
+            qp_to_init(st.ibv, qp, st.port)
+            st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
+        st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
+        qp_to_init(st.ibv, st.flush_qp, st.port)
+
+        if st.proxy:
+            st.mailbox = alloc_host(driver, MB_BYTES)
+            st.mailbox_dev = host_device_ptr(driver, st.mailbox)
+            for i in range(MB_BYTES // 8):
+                Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox)[
+                    unsafe_offset=i
+                ] = 0
+    except e:
+        _teardown_ib_resources(st)
+        raise e
 
     var holder = unsafe_alloc[IbState](1)
     holder.unsafe_write(st^)
@@ -723,6 +894,33 @@ def _ib_timeout_s() -> Float64:
         return Float64(s)
     except:
         return DEFAULT_IB_TIMEOUT_S
+
+
+def _proxy_idle_ns() -> Int:
+    """`MOJOCCL_IB_PROXY_IDLE_US`, read once at thread start (not from inside
+    the progress-thread loop -- a `getenv` per idle iteration would defeat
+    the point of backing off)."""
+    var s = getenv(
+        "MOJOCCL_IB_PROXY_IDLE_US", String(DEFAULT_IB_PROXY_IDLE_US)
+    )
+    var us = DEFAULT_IB_PROXY_IDLE_US
+    try:
+        var parsed = Int(s)
+        if parsed > 0:
+            us = parsed
+    except:
+        pass
+    return us * 1000
+
+
+def _nanosleep_ns(ns: Int):
+    """`nanosleep(2)` for `ns` nanoseconds; `struct timespec{tv_sec,tv_nsec}`,
+    16 bytes on this ABI. Best-effort: an interrupted sleep just returns
+    early, which only means the next mailbox check happens a bit sooner."""
+    var ts = unsafe_alloc[Int64](2)
+    ts[unsafe_offset=0] = 0
+    ts[unsafe_offset=1] = Int64(ns)
+    _ = external_call["nanosleep", Int32](ts, Int64(0))
 
 
 def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
@@ -752,23 +950,33 @@ def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
 comptime IB_BLOB_BYTES = 24 + 4 * MAX_NODES + 16
 
 
-def ib_port_lid(ib: Int) -> Int:
+def ib_port_lid(ib: Int) raises -> Int:
+    """The port's LID, straight from `ibv_query_port`.
+
+    A nonzero return code (not the same thing as the `try/except` this used
+    to have -- `query_port`'s own C call never raises, it returns an errno)
+    used to be silently discarded, reading LID 0 out of `pa`'s zeroed
+    scratch. For the self-connected flush QP that 0 is not a sentinel
+    anyone downstream checks; it just quietly modifies the flush QP with the
+    wrong address. Raise instead.
+    """
     ref st = _st(ib)[]
     var pa = alloc_bytes(56)
-    try:
-        _ = st.ibv.query_port(st.ctx, st.port, pa)
-    except:
-        return 0
+    var rc = st.ibv.query_port(st.ctx, st.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
     return Int(pa.unsafe_bitcast[UInt16]()[unsafe_offset=17])
 
 
-def ib_port_mtu(ib: Int) -> Int:
+def ib_port_mtu(ib: Int) raises -> Int:
+    """The port's active MTU, straight from `ibv_query_port` (see
+    `ib_port_lid` for why a failed query now raises instead of reading 0 out
+    of zeroed scratch)."""
     ref st = _st(ib)[]
     var pa = alloc_bytes(56)
-    try:
-        _ = st.ibv.query_port(st.ctx, st.port, pa)
-    except:
-        return 0
+    var rc = st.ibv.query_port(st.ctx, st.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
     return ld32(pa, 8)
 
 
@@ -849,7 +1057,8 @@ def ib_npeers(ib: Int) -> Int:
 
 
 def ib_error(ib: Int) -> Int:
-    return _st(ib)[].error
+    ref st = _st(ib)[]
+    return _load_atomic_i(_err_ptr(st))
 
 
 def ib_next_seq(ib: Int) -> Int:
@@ -892,7 +1101,7 @@ def ib_enqueue(
     ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
         unsafe_offset=slot
     ]
-    if w.status == 0:
+    if _load_atomic_i(_status_ptr(w)) == 0:
         raise Error(
             "mojoccl: the inter-node work ring wrapped with an exchange still"
             " in flight; MOJOCCL_IB_TRACE=1 to see how far behind the network"
@@ -907,7 +1116,7 @@ def ib_enqueue(
     w.nrecv = nrecv
     w.flush_addr = flush_addr
     w.seq = seq
-    w.status = 0
+    _store_atomic_i(_status_ptr(w), 0)
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
         proxy_wait(
@@ -959,11 +1168,12 @@ def ib_exchange_now(
     w.nrecv = nrecv
     w.flush_addr = flush_addr
     w.seq = seq
-    w.status = 0
+    _store_atomic_i(_status_ptr(w), 0)
     _run_exchange(st, w)
-    if w.status != 1:
+    if _load_atomic_i(_status_ptr(w)) != 1:
         raise Error(
-            "mojoccl: inline exchange failed, ib error " + String(st.error)
+            "mojoccl: inline exchange failed, ib error "
+            + String(_load_atomic_i(_err_ptr(st)))
         )
 
 
@@ -989,12 +1199,29 @@ def ib_report(ib: Int):
     )
 
 
-def ib_teardown(ib: Int):
-    if ib == 0:
-        return
-    ref st = _st(ib)[]
-    _stop_proxy(st)
-    ib_report(ib)
+def _teardown_ib_resources(mut st: IbState):
+    """Release every ibverbs/host resource `ib_setup` may have created.
+
+    Shared by `ib_teardown` (a live communicator) and `ib_setup`'s own
+    failure path (a later step raised after an earlier one already
+    succeeded) -- both leave `st` in the same "some fields non-zero, some
+    still their zero default" shape, and every field here is zero-guarded
+    for exactly that reason.
+    """
+    if st.mailbox != 0:
+        # Pinned, device-mapped host memory: a scarce OS resource, unlike the
+        # few hundred bytes of plain heap this struct also holds. Safe here
+        # and only here -- the progress thread is joined (or, from
+        # `ib_setup`'s failure path, never started) and, for a live
+        # communicator, the caller synchronized the stream the spin kernels
+        # were on. `open_driver` re-opens an already-loaded library, so it
+        # costs a refcount.
+        try:
+            free_host(open_driver(), st.mailbox)
+        except:
+            pass
+        st.mailbox = 0
+        st.mailbox_dev = 0
     try:
         for i in range(len(st.peers)):
             st.ibv.destroy_qp(st.peers[i].qp)
@@ -1012,3 +1239,12 @@ def ib_teardown(ib: Int):
             st.ibv.close_device(st.ctx)
     except:
         pass
+
+
+def ib_teardown(ib: Int):
+    if ib == 0:
+        return
+    ref st = _st(ib)[]
+    _stop_proxy(st)
+    ib_report(ib)
+    _teardown_ib_resources(st)

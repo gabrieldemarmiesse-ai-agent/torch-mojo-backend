@@ -91,6 +91,7 @@ from internode import (
     ib_port_lid,
     ib_port_mtu,
     ib_setup,
+    ib_signal_abort,
     ib_teardown,
 )
 from internode_kernels import copy_bytes, inbox_add, place_blocks
@@ -129,13 +130,13 @@ comptime NCCL_AVG: Int32 = 4
 # Every exchange is all-to-all among the ranks sharing a local_rank, even
 # when only one of them has data (a broadcast, or an allreduce whose shard
 # table leaves this rank empty), and that is a correctness requirement, not
-# tidiness. The inbox is double buffered by the exchange counter's parity,
-# so what has to be true is: peer B's write for exchange e+2 lands after MY
-# add kernel for exchange e has read that half. All-to-all makes it a proof
-# -- B cannot post e+2 before its callback for e+1 returned, which needed MY
-# e+1 message, which my stream sent only after running my add kernel for e.
-# Let one exchange be one-directional and that chain breaks, leaving nothing
-# but a timing margin between B's write and my read.
+# tidiness. The inbox is double buffered by the exchange counter's parity
+# (`_inbox_base`), so what has to be true is: peer B's write for exchange
+# e+2 lands after MY add kernel for exchange e has read that half. All-to-all
+# makes it a proof -- B cannot post e+2 before its callback for e+1 returned,
+# which needed MY e+1 message, which my stream sent only after running my add
+# kernel for e. Let one exchange be one-directional and that chain breaks,
+# leaving nothing but a timing margin between B's write and my read.
 comptime CREDIT_BYTES = 16
 
 comptime DEFAULT_REGION_MB = 256
@@ -490,6 +491,32 @@ def _init_rank(
     nranks: Int,
     comm_out: Pointer[Int64, MutAnyOrigin],
 ) raises -> Int32:
+    """Bring the rendezvous up, run init under it, and always hand it back.
+
+    `BootstrapConn` has no destructor, so every path out of `_bootstrap`
+    has to close its sockets explicitly: a leaked root listener keeps the
+    unique id's port bound for the life of the process, and a leaked
+    per-rank socket leaves the peers blocked in `_recv_all` until their own
+    deadline instead of failing fast on a closed connection.
+    """
+    var timeout_s = _bootstrap_timeout_s()
+    var conn = bootstrap_connect(uid, rank, nranks, timeout_s)
+    try:
+        var rc = _bootstrap(conn, rank, nranks, comm_out, timeout_s)
+        conn.close()
+        return rc
+    except e:
+        conn.close()
+        raise e
+
+
+def _bootstrap(
+    mut conn: BootstrapConn,
+    rank: Int,
+    nranks: Int,
+    comm_out: Pointer[Int64, MutAnyOrigin],
+    timeout_s: Float64,
+) raises -> Int32:
     """Three bootstrap rounds and everything they gate.
 
     Round 1 gathers host identity, from which every rank derives the same
@@ -499,9 +526,6 @@ def _init_rank(
     and its queue pairs are in RTS, so the first collective may write into
     it.
     """
-    var timeout_s = _bootstrap_timeout_s()
-    var conn = bootstrap_connect(uid, rank, nranks, timeout_s)
-
     # Round 1: host identity.
     var b1 = unsafe_alloc[UInt8](16)
     var b1w = b1.unsafe_bitcast[UInt64]()
@@ -515,7 +539,6 @@ def _init_rank(
         hashes.append(t1w[unsafe_offset = 2 * r])
     var topo = derive_topology(hashes, rank)
     if topo.local_world > MAX_WORLD:
-        conn.close()
         raise Error(
             "mojoccl: "
             + String(topo.local_world)
@@ -524,10 +547,10 @@ def _init_rank(
             + String(MAX_WORLD)
         )
     if topo.nnodes > MAX_NODES:
-        conn.close()
         raise Error(
             "mojoccl: " + String(topo.nnodes) + " nodes exceeds the "
-            + String(MAX_NODES) + "-node limit of the inbox layout"
+            + String(MAX_NODES)
+            + "-node limit of the per-node QPN table in the bootstrap blob"
         )
 
     var lib = open_driver()
@@ -538,17 +561,18 @@ def _init_rank(
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
     if cap_bytes <= 0 or cap_bytes % 4096 != 0:
-        conn.close()
         raise Error("mojoccl: MOJOCCL_REGION_MB must be a positive 4 KiB multiple")
     # A multi-node communicator gets a third cap-sized area on top of
     # [signal | stage_in | stage_out]: everything the network touches --
     # the inbox the peers RDMA into, and the staging broadcast and
     # allgather need because user buffers are not registered -- lives
-    # there and nowhere else. Aliasing it onto stage_in would have been
-    # free in memory and wrong in fact: a peer node writes my inbox as
-    # soon as ITS reduce-scatter is done, which is not ordered against
-    # MY reduce-scatter still using stage_in, nor against a local peer
-    # still reading the previous generation's staging. A single-node
+    # there and nowhere else, carved as
+    # [staging: cap/2 | inbox half0: cap/4 | inbox half1: cap/4]
+    # (`_inbox_base`). Aliasing it onto stage_in would have been free in
+    # memory and wrong in fact: a peer node writes my inbox as soon as ITS
+    # reduce-scatter is done, which is not ordered against MY
+    # reduce-scatter still using stage_in, nor against a local peer still
+    # reading the previous generation's staging. A single-node
     # communicator allocates none of it and keeps exactly the old
     # region.
     var net_bytes = cap_bytes if topo.nnodes > 1 else 0
@@ -622,7 +646,6 @@ def _init_rank(
         )
 
     bootstrap_barrier(conn, timeout_s)
-    conn.close()
 
     var rank_at = List[Int]()
     for i in range(len(topo.rank_at)):
@@ -650,6 +673,34 @@ def _init_rank(
     return NCCL_SUCCESS
 
 
+def _cached_stream_handles(state: CommState) -> List[Int64]:
+    """Every raw stream handle wrapped in `state.stream_cache`, copied into a
+    plain List.
+
+    Kept to exactly this -- iterating `Dict.keys()` inside a `raises`
+    function narrows the function's inferred error type to `DictKeyError`,
+    which then rejects every unrelated `raise Error(...)` still in scope. A
+    helper doing nothing else keeps that narrowing from leaking into
+    `_drain_all_streams` or its callers.
+    """
+    var handles = List[Int64]()
+    for h in state.stream_cache.keys():
+        handles.append(h)
+    return handles^
+
+
+def _drain_all_streams(mut state: CommState) raises:
+    """Synchronize every stream a collective has ever run on.
+
+    `state.last_stream` is only the MOST RECENT one: `stream_cache` can hold
+    several (the side-stream test in the suite uses two), and an exchange
+    still in flight on a stream that isn't the last one used would otherwise
+    find its QPs destroyed out from under it by `ncclCommDestroy`.
+    """
+    for h in _cached_stream_handles(state):
+        state.stream_cache[h].synchronize()
+
+
 # ---------------------------------------------------------------------------
 # Communicator lifecycle
 # ---------------------------------------------------------------------------
@@ -661,12 +712,11 @@ def ncclCommDestroy(comm: Int64) abi("C") -> Int32:
         var ptr = _comm_ptr(comm)
         ref state = ptr[]
         if not state.aborted:
-            # The inter-node callbacks were enqueued on the CALLER's stream,
+            # The inter-node callbacks were enqueued on the CALLER's stream(s),
             # not on the context's own, and they dereference the IbState this
-            # tears down -- so drain that stream too before touching it.
-            if state.last_stream != 0:
-                _ensure_stream_cached(state, state.last_stream)
-                state.stream_cache[state.last_stream].synchronize()
+            # tears down -- so drain every cached stream too before touching
+            # it, not just the last one used (see `_drain_all_streams`).
+            _drain_all_streams(state)
             state.ctx.synchronize()
             ib_teardown(state.ib)
             for r in range(state.local_world):
@@ -685,8 +735,12 @@ def ncclCommAbort(comm: Int64) abi("C") -> Int32:
     # forever inside its own barrier spin, and a queue pair torn down under
     # an in-flight RDMA write is worse than one left alone) -- matches
     # ncclCommAbort's documented "don't wait" contract. ncclCommDestroy is
-    # never called after abort() by nccl.py's NcclComm.
+    # never called after abort() by nccl.py's NcclComm. The progress thread
+    # is the one thing still stopped here: left running it spins a CPU core
+    # for the rest of the process, and `ib_signal_abort`'s join is bounded so
+    # this still does not wait in the way the contract forbids.
     state.aborted = True
+    ib_signal_abort(state.ib)
     return NCCL_SUCCESS
 
 
@@ -788,11 +842,10 @@ def _inter_node_exchange[
     kernel that adds what arrived. On exit the shard holds the sum over the
     WHOLE communicator, ready for `allgather_finish`.
 
-    Inbox geometry is derived from `(numel, local_world, item)` alone so that
-    a sender computes the same addresses as its receiver: `net_off` holds two
-    halves of `(nnodes-1)` slots of one shard each, and the exchange
-    counter's parity picks the half. `_max_chunk_bytes` keeps both halves
-    inside the area.
+    Slot geometry is derived from `(numel, local_world, item)` alone so that
+    a sender computes the same addresses as its receiver: a half holds
+    `(nnodes-1)` slots of one shard each, at the fixed base `_inbox_base`
+    picks by parity. `_max_chunk_bytes` keeps a half inside its quarter.
     """
     comptime item = size_of[dtype]()
     var sr = shard_range(numel, state.local_world, state.local_rank, item)
@@ -802,13 +855,12 @@ def _inter_node_exchange[
     var npeers = ib_npeers(state.ib)
     var nbytes = cnt_e * item
     var slot_bytes = _align_up(max(nbytes, CREDIT_BYTES), 16)
-    var half = npeers * slot_bytes
-    if 2 * half > state.cap_bytes:
+    if npeers * slot_bytes > _inbox_half_bytes(state):
         raise Error(
             "mojoccl: the inter-node inbox overflows the network area; this"
             " is a chunking bug"
         )
-    var inbox_base = state.net_off + (seq & 1) * half
+    var inbox_base = _inbox_base(state, seq)
     var shard = (
         state.owned_base + signal_bytes() + state.cap_bytes + off_e * item
     )
@@ -843,19 +895,52 @@ def _inter_node_exchange[
         )
 
 
-def _max_chunk_bytes(state: CommState) -> Int:
-    """Largest chunk whose staging and inbox both fit in stage_in.
+def _inbox_half_bytes(state: CommState) -> Int:
+    """Bytes each parity half of the inbox may hold. See `_inbox_base`."""
+    return state.cap_bytes // 4
 
-    A chunk of `B` bytes puts `B/L` bytes in each of the `2(N-1)` inbox
-    slots, so `B <= cap * L / (2(N-1))`, less a page of alignment slop --
+
+def _inbox_base(state: CommState, seq: Int) -> Int:
+    """Region offset of exchange `seq`'s inbox half.
+
+    FIXED, not derived from the message: the network area is carved once as
+    `[staging: cap/2 | half0: cap/4 | half1: cap/4]` and the exchange
+    counter's parity picks a half.
+
+    That the halves do not move is what makes the double buffer a proof
+    rather than a timing margin. Sizing a half from the current message --
+    which is what this used to do -- kept e and e+2 apart but let e and e+1
+    OVERLAP whenever consecutive exchanges had different geometry, and DDP
+    produces exactly that: a 4-byte AVG allreduce (slot 16 B, half 16 B)
+    next to a 27 MiB bucket (half 3.4 MiB) put the small exchange's half 1
+    at `net_off+16` and the big one's half 0 at `net_off+0`. Nothing orders
+    a peer's e+1 write against MY e add kernel -- the peer's e+1 send is
+    gated on its own e completing, not on my consumption -- so the overlap
+    is a silent data race on the inbox, and mixing collectives (an
+    allreduce's half 0 at `net_off` against a broadcast's staged chunk,
+    also at `net_off`) is the same bug once more.
+    """
+    return (
+        state.net_off
+        + state.cap_bytes // 2
+        + (seq & 1) * _inbox_half_bytes(state)
+    )
+
+
+def _max_chunk_bytes(state: CommState) -> Int:
+    """Largest allreduce chunk whose inbox half fits.
+
+    A chunk of `B` bytes puts `B/L` bytes in each of the `N-1` slots of one
+    half, so `B <= (cap/4) * L / (N-1)`, less a page of alignment slop --
     and never more than `cap`, which the intra-node kernels require anyway.
     At the shapes DDP produces (27 MiB buckets against a 256 MiB region)
-    the cap never binds: 256 MiB at 2 nodes, 146 MiB at 8.
+    the cap never binds: 256 MiB at 2 nodes, 73 MiB at 8.
     """
     if state.nnodes <= 1:
         return state.cap_bytes
-    var denom = 2 * (state.nnodes - 1)
-    var b = (state.cap_bytes * state.local_world // denom) - 2 * 4096
+    var b = (
+        _inbox_half_bytes(state) * state.local_world // (state.nnodes - 1)
+    ) - 2 * 4096
     b = min(b, state.cap_bytes)
     if b < 4096:
         return 4096
@@ -1069,23 +1154,27 @@ def _broadcast_multinode(
     var i_am_root = state.rank == root
     var i_am_local_root = state.local_rank == root_lr
     var receives = i_am_local_root and state.my_node != root_node
-    # The network area holds the root's staged chunk plus both inbox halves,
-    # and a half is one slot PER PEER now that the exchange is all-to-all.
+    # The root's staged chunk goes in the network area's staging half; a
+    # peer slot has to fit an inbox quarter, one slot PER PEER now that the
+    # exchange is all-to-all.
     var npeers = ib_npeers(state.ib)
     var max_bytes = max(
         4096,
-        (state.cap_bytes // (1 + 2 * npeers) - 2 * 4096) // 4096 * 4096,
+        (
+            min(state.cap_bytes // 2, _inbox_half_bytes(state) // npeers)
+            - 2 * 4096
+        )
+        // 4096
+        * 4096,
     )
     var done = 0
     while done < total_bytes:
         var chunk = min(max_bytes, total_bytes - done)
         var seq = ib_next_seq(state.ib)
         var slot_bytes = _align_up(chunk, 16)
-        var inbox_off = state.net_off + _align_up(chunk, 4096)
-        var half = npeers * slot_bytes
-        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+        if npeers * slot_bytes > _inbox_half_bytes(state):
             raise Error("mojoccl: broadcast inbox does not fit; chunking bug")
-        var inbox_base = inbox_off + (seq & 1) * half
+        var inbox_base = _inbox_base(state, seq)
         var recv_slot = 0
         if receives:
             recv_slot = root_node if root_node < state.my_node else root_node - 1
@@ -1217,10 +1306,12 @@ def _allgather_multinode(
     var lw = state.local_world
     var npeers = ib_npeers(state.ib)
     var block_stage = state.owned_base + state.net_off
-    # The network area holds one node block (lw * chunk) plus both inbox
-    # halves (npeers node blocks each).
-    var denom = lw * (1 + 2 * npeers)
-    var max_bytes = max(16, (state.cap_bytes // denom - 8192) // 16 * 16)
+    # One node block (lw * chunk) in the staging half; an inbox quarter has
+    # to hold npeers of them.
+    var max_block = min(
+        state.cap_bytes // 2, _inbox_half_bytes(state) // npeers
+    )
+    var max_bytes = max(16, ((max_block - 8192) // lw) // 16 * 16)
     var done = 0
     while done < per_rank_bytes:
         var chunk = min(max_bytes, per_rank_bytes - done)
@@ -1241,11 +1332,9 @@ def _allgather_multinode(
         var seq = ib_next_seq(state.ib)
         var block = lw * chunk
         var slot_bytes = _align_up(block, 16)
-        var inbox_off = state.net_off + _align_up(block, 4096)
-        var half = npeers * slot_bytes
-        if inbox_off + 2 * half > state.net_off + state.cap_bytes:
+        if npeers * slot_bytes > _inbox_half_bytes(state):
             raise Error("mojoccl: allgather inbox does not fit; chunking bug")
-        var inbox_base = inbox_off + (seq & 1) * half
+        var inbox_base = _inbox_base(state, seq)
         ib_enqueue(
             state.ib,
             state.driver,

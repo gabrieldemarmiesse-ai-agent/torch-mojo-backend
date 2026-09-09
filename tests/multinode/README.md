@@ -57,14 +57,30 @@ iteration is skipped outright, and phases B and C run their vendor leg(s)
 only (no ABBA — there is nothing to interleave against). Default
 (`RUN_MOJO=1` or unset) attempts every leg.
 
-As of this writing `torch_mojo_backend/distributed/mojoccl/` is intra-node
-only (its rendezvous is a `/dev/shm` directory, `MAX_WORLD = 8`) — multi-node
-transport is being implemented on this same branch
-(`mojo-collectives-multinode`) in parallel. **Use `RUN_MOJO=0` until that
-lands**: without it, every mojo leg at 16 ranks will fail or hang up to
-`ddp_worker.py`'s 300 s `init_process_group` timeout, burning the job's time
-budget for no signal. Once the transport lands, drop `RUN_MOJO=0` (or set
-`RUN_MOJO=1`) to exercise it end to end.
+`torch_mojo_backend/distributed/mojoccl/` supports multiple nodes:
+`ncclGetUniqueId` encodes a TCP rendezvous (`{ipv4, port, magic}` of a
+listening socket this library opens itself, not a `/dev/shm` path), and the
+inter-node hop is GPUDirect RDMA written directly over libibverbs
+(`bootstrap.mojo`/`ibverbs.mojo`/`internode.mojo`) — no vendor collective
+library at any level. See the "Multi-node" subsection of
+`docs/distributed.md` for the design. `RUN_MOJO` therefore **defaults to
+`1`**: leave it unset to exercise the mojo legs end to end at 16 ranks.
+`RUN_MOJO=0` still exists to get a vendor-only NCCL reference run without
+spending the job's time budget on the mojo legs (useful when only NCCL's
+numbers are wanted, or while iterating on something unrelated to mojoccl).
+
+## GPU-free self-tests
+
+`tests/multinode/selftest/` holds two standalone Mojo programs
+(`bs_test.mojo`, `ib_bringup.mojo`) that exercise the TCP bootstrap and the
+whole libibverbs RDMA transport between processes on any host with
+InfiniBand — the SLURM **login node** included, so they run in seconds
+without a GPU or a job allocation. They caught six real bugs (bootstrap/QP
+wiring, resource leaks on a failed `ib_setup`, a silently-misread port LID)
+before any GPU time was spent chasing them; run them before and after any
+change to `torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,
+internode}.mojo`. See `tests/multinode/selftest/README.md` for build and run
+commands.
 
 ## Output
 
