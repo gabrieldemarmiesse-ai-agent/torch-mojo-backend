@@ -385,6 +385,14 @@ Everything above is behind `has_amd_gpu_accelerator()` at compile time, and
 the sm_90a device code is byte-identical to the tree before this work (97
 kernels, PTX compared with the mangling hash masked).
 
+**One known flake, unresolved.** A *one-element* int64 allreduce at **2 ranks**
+fails intermittently — 2 runs in 14 of `tests/ddp_worker.py collectives`;
+every 4-rank run of every mode passed. It is the smallest collective in the
+suite (one 8-byte store, one 8-byte load, one active thread) and the one-shot
+kernel under it is unchanged by the MI300A work, so the suspect is the
+barrier's cheapened acquire. Whether the pre-MI300A tree flakes the same way
+was not established. See `docs/mojo_collectives_kernel_results.md` §7.
+
 ### NVLS: the large sizes go through the switch
 
 The 168 and 512 MiB rows above are the **unicast** ceiling (~310 GB/s per
