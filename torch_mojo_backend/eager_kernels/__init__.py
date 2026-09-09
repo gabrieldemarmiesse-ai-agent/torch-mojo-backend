@@ -50,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -502,7 +503,18 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
         # runs WITHOUT the lock — a reader must never see a partial .so.
         # The temp name keeps the .so suffix (mojo normalizes others) and a
         # leading dot so no cache scan ever picks it up.
-        tmp = out.with_name(f".tmp{os.getpid()}.{out.name}")
+        #
+        # A random suffix, not the pid: the flock above is on the NFS home,
+        # which does not serialize two NODES, so a cold build under a
+        # multi-node job runs concurrently on each of them — and two hosts
+        # hand out the same pid all the time. Both then built to the same
+        # temp path and the first one's `finally` unlinked the other's output
+        # mid-compile, which surfaces as `mojo: error: failed to produce an
+        # archive for the module: No such file or directory` on one node and
+        # `ncclCommInitRank failed: internal error` on the other (its peers
+        # never came up). Seen at 2x8 ranks; the builds are idempotent, so
+        # letting them race to distinct temp paths is the whole fix.
+        tmp = out.with_name(f".tmp{uuid.uuid4().hex}.{out.name}")
         started = time.monotonic()
         try:
             proc = subprocess.run(
@@ -518,7 +530,16 @@ def _build_extension(src: Path, defines: CanonicalDefines | None) -> Path:
                     f"mojo build failed for {src.stem} "
                     f"({_defines_tag(defines)}):\n{proc.stderr}"
                 )
-            os.replace(tmp, out)
+            if out.is_file():
+                # Another builder installed this immutable output while ours
+                # ran (the lock was unavailable, or it was another node).
+                # Keep theirs: a second os.replace over a path a reader has
+                # already resolved hands that reader a stale NFS handle
+                # (`cannot stat shared object: Stale file handle` on dlopen,
+                # seen once per 24-rank cold start over three nodes).
+                _trace(f"{label} was installed concurrently; reusing it")
+            else:
+                os.replace(tmp, out)
             _trace(f"built {label} in {elapsed:.2f}s")
         finally:
             tmp.unlink(missing_ok=True)

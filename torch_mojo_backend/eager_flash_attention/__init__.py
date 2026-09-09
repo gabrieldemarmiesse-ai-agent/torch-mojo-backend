@@ -4,13 +4,14 @@ The large vendored kernels deliberately live outside ``eager_kernels`` so a
 FlashAttention change does not invalidate every ordinary eager extension.
 """
 
-import fcntl
 import hashlib
 import importlib
 from pathlib import Path
 from types import ModuleType
 
 import mojo.importer  # noqa: F401 - installs the .mojo import hook
+
+from torch_mojo_backend import eager_kernels
 
 _PACKAGE_DIR = Path(__file__).parent
 _CACHE_DIR = _PACKAGE_DIR / "__mojocache__"
@@ -40,7 +41,9 @@ def load_fa4_ops() -> ModuleType:
 
     _CACHE_DIR.mkdir(exist_ok=True)
     with open(_CACHE_DIR / ".compile.lock", "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        # Dedupes concurrent builds only; NFS homes without a lock manager
+        # raise ENOLCK, and building redundantly is the right fallback there.
+        eager_kernels._flock_or_none(lock_file)
         _MODULE = importlib.import_module(
             "torch_mojo_backend.eager_flash_attention.fa4_ops"
         )
