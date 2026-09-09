@@ -33,20 +33,40 @@
 # the inbox over a self-connected QP -- exactly NCCL's `gpuFlush` QP
 # (nccl:src/transport/net_ib/p2p.cc:589-602). Measured 1.9 us.
 #
-# Flow control. The inbox is DOUBLE BUFFERED by the parity of a
-# per-communicator exchange counter, and that is not an optimization, it is
-# the proof of safety: peer B writes half `p` at exchanges e and e+2, and B
-# cannot reach e+2 before receiving my e+1 data, which I send only after my
-# own stream ran the add kernel of exchange e. Single buffering would leave
-# B's e+1 write racing my e add kernel with nothing but timing in between.
-# The argument needs two things. Every exchange must be all-to-all, which is
-# why a rank with nothing to contribute still sends CREDIT_BYTES
-# (mojoccl.mojo); and the two halves must be DISJOINT ADDRESSES for every
-# exchange alike, which is why `_inbox_base` carves them out of the region
-# once instead of sizing them from the message in flight (mojoccl.mojo has
-# the case that broke). The immediate carries the exchange counter, so an
-# arrival belonging to e+1 is counted into the other parity's tally instead
-# of satisfying e.
+# Flow control: EXPLICIT CREDITS. The inbox is carved once into `nslots`
+# fixed slot groups and exchange e lands in group `e % nslots`, so peer B
+# writes the same bytes at e and e+nslots. What makes reuse safe is a credit,
+# not stream order: after my consumer kernel has read group g, my proxy
+# RDMA-writes every peer a cumulative "I have consumed through exchange c"
+# counter, and a peer may post exchange e only once every receiver has
+# released the group e will land in (`c >= e - nslots`). That is NCCL's
+# head/tail pair in miniature (nccl:src/transport/net.cc, the
+# recvNetHead/step counters; nccl:src/device/prims_simple.h for the device
+# side of the same idea).
+#
+# It replaces an earlier double-buffer-by-parity argument that derived
+# reuse safety from stream order -- "B cannot reach e+2 before receiving my
+# e+1 data, which I send only after my own add kernel for e". That chain
+# holds only when exactly one exchange is in flight; the pipelined schedule
+# (mojoccl.mojo `_do_allreduce`) issues the reduce-scatter of later chunks
+# before the add of earlier ones and breaks it. The credit is the
+# replacement proof, and it is a proof rather than a timing margin.
+#
+# Two things survive from the old argument unchanged. Every exchange must
+# still be all-to-all, because an arrival tally of `nrecv` is what completes
+# one -- a rank with nothing to contribute sends EMPTY_SHARD_BYTES
+# (mojoccl.mojo). And every slot group must be a FIXED byte range for every
+# exchange alike, never sized from the message in flight (`_inbox_base` in
+# mojoccl.mojo carries the case that broke). The immediate carries the
+# exchange counter and a credit bit, so an arrival is tallied against its own
+# exchange and a credit is never mistaken for data.
+#
+# `credit_upto` is how the host tells the engine what has been consumed
+# without a further kernel: it is the number of consumer kernels already
+# enqueued on the stream ahead of this exchange's request kernel. When the
+# proxy observes the request, that kernel has run, so every kernel enqueued
+# before it has completed -- the same stream-order argument that makes the
+# shard final at that point.
 #
 # The inbox lives in the region's own network area, never aliased onto the
 # intra-node staging: a peer node writes it as soon as ITS reduce-scatter is
@@ -111,10 +131,11 @@ from ibverbs import (
     qp_to_rts,
 )
 
-# Recv WRs kept posted per peer QP. Each RDMA_WRITE_WITH_IMM consumes one;
-# the callback reposts every one it consumes, so the depth only has to cover
-# the burst a peer can produce while this rank is elsewhere -- two exchanges
-# by the double-buffer argument above, times a wide margin.
+# Recv WRs kept posted per peer QP. Each RDMA_WRITE_WITH_IMM consumes one --
+# data and credits alike; the engine reposts every one it consumes, so the
+# depth only has to cover the burst a peer can produce while this rank is
+# elsewhere: `nslots` data messages plus `nslots` credits, times a wide
+# margin.
 comptime RECV_DEPTH = 64
 comptime CQ_SIZE = 1024
 comptime SEND_WR_DEPTH = 64
@@ -122,10 +143,10 @@ comptime WORK_SLOTS = 512
 comptime MAX_NODES = 16
 comptime DEFAULT_IB_TIMEOUT_S: Float64 = 60.0
 # ncclCommAbort's bound on waiting for the progress thread: long enough for
-# it to notice MB_STOP (at most one idle-backoff quantum plus one poll_cq
-# when inside `_run_exchange` -- see `_stop_requested`), short enough that
-# abort's documented "don't wait" contract still holds even if the thread is
-# wedged somewhere this bound does not anticipate.
+# it to notice MB_STOP (at most one idle-backoff quantum plus one engine
+# step -- `ib_drive` never blocks), short enough that abort's documented
+# "don't wait" contract still holds even if the thread is wedged somewhere
+# this bound does not anticipate.
 comptime IB_ABORT_JOIN_TIMEOUT_S: Float64 = 2.0
 # Default idle-wait quantum for the progress thread between exchanges (see
 # `_proxy_main`). An exchange takes ~280 us at the DDP bucket, so a few tens
@@ -137,6 +158,22 @@ comptime DEFAULT_IB_PROXY_IDLE_US: Int = 20
 # Bytes of the inbox read back by the flush; any read of the destination
 # device flushes the writes ahead of it, the size is irrelevant.
 comptime FLUSH_BYTES = 4
+
+# Largest inbox slot-group count the engine will accept; bounds the arrival
+# tally and, through it, how many exchanges may be outstanding at once.
+comptime PIPE_MAX_SLOTS = 16
+# Immediate layout: bit 31 marks a credit, bits 0..30 carry the exchange
+# counter. 2^31 exchanges is ~10^4 DDP training runs, and the counter never
+# wraps within one communicator.
+comptime IMM_CREDIT_BIT: UInt32 = 0x8000_0000
+comptime IMM_SEQ_MASK: UInt32 = 0x7FFF_FFFF
+# Credit landing pad: one 64-byte line per sender in the region's credit
+# area, so two peers' credits never share a cache line. The bytes are never
+# read -- the immediate is the message -- but a real address is needed
+# because a zero-length RDMA write is not worth relying on across HCAs.
+comptime CREDIT_SLOT_BYTES = 64
+comptime CREDIT_AREA_BYTES = 4096
+comptime CREDIT_PAYLOAD_BYTES = 4
 
 # The proxy mailbox: two 64-bit words the GPU and the progress thread
 # pass the exchange counter through, plus a stop word the host sets at
@@ -171,22 +208,33 @@ struct IbPeer(Copyable, Movable):
 
 
 struct IbWork(Copyable, Movable):
-    """One inter-node exchange, handed to the host callback by address.
+    """One inter-node exchange, described by the host for the engine.
 
-    Lives in a ring inside `IbState` so the host can enqueue ahead; a slot
-    is reused only once its callback has set `status`.
+    Lives in a ring inside `IbState` indexed by `(seq-1) % WORK_SLOTS`: the
+    counter is dense and starts at 1, so a slot is implied by the sequence
+    number and no queue is needed. A slot is refilled only once the engine
+    has set `status` away from 0.
     """
 
     var state: Int
     var send_addr: Int
     var send_bytes: Int
-    var inbox_base: Int  # absolute VA offset from a region base, parity folded in
+    var inbox_base: Int  # region offset of this exchange's inbox slot group
     var slot_bytes: Int
     var do_send: Int
     var nrecv: Int
     var flush_addr: Int
     var seq: Int
     var status: Int  # 0 running, 1 done, 2 failed
+    # Highest exchange whose consumer kernel is already enqueued ahead of
+    # this one's request on the stream -- the credit the engine publishes
+    # when it picks this exchange up. See the header's flow-control note.
+    var credit_upto: Int
+    # Data sends posted, cumulatively, once this exchange is on the wire:
+    # the exchange is not done until that many send completions are in, or
+    # the next reduce-scatter could overwrite a buffer the NIC still reads.
+    var sends_cum: Int
+    var t0: Int  # perf_counter_ns when it was posted, for the trace
 
     def __init__(out self):
         self.state = 0
@@ -199,6 +247,9 @@ struct IbWork(Copyable, Movable):
         self.flush_addr = 0
         self.seq = 0
         self.status = 1
+        self.credit_upto = 0
+        self.sends_cum = 0
+        self.t0 = 0
 
 
 struct IbState(Movable):
@@ -222,10 +273,29 @@ struct IbState(Movable):
     var my_node: Int
     var nnodes: Int
     var exchanges: Int
-    var arrivals0: Int
-    var arrivals1: Int
     var error: Int
     var timeout_ns: Int
+    # --- the progress engine (see `ib_drive`) ---
+    var nslots: Int  # inbox slot groups; exchange e lands in `e % nslots`
+    var credit_off: Int  # region offset of the credit landing pad
+    var request_seq: Int  # highest exchange handed to the engine
+    var posted_seq: Int  # highest exchange whose data writes are posted
+    var done_seq: Int  # highest exchange fully arrived, sent and flushed
+    var flush_seq: Int  # exchange whose flush read is outstanding (0: none)
+    var flush_done: Int  # flush-read completions seen and not yet consumed
+    var flush_t0: Int
+    var sends_posted: Int
+    var sends_completed: Int
+    var credit_sent: Int  # highest credit published to the peers
+    var tally: List[Int]  # arrivals, indexed by `seq % nslots`
+    var credit_recv: List[Int]  # per peer, highest credit it published
+    var last_progress_ns: Int
+    var stall_seq: Int  # exchange the last credit stall was counted against
+    var n_credit_stalls: Int
+    # Host-side: highest exchange whose consumer kernel has been ENQUEUED.
+    # Snapshotted into each work item as `credit_upto` (see
+    # `ib_note_consumed`); never touched by the engine thread.
+    var consumed_enqueued: Int
     # Scratch buffers and the work ring are held as raw addresses: a
     # `Pointer[..., MutAnyOrigin]` cannot be a struct field, and these
     # outlive every borrow anyway (allocated once, freed never -- a few
@@ -248,7 +318,15 @@ struct IbState(Movable):
     var t_flush_ns: Int
     var n_exchanges: Int
 
-    def __init__(out self, var ibv: Ibv, region: Int, my_node: Int, nnodes: Int):
+    def __init__(
+        out self,
+        var ibv: Ibv,
+        region: Int,
+        my_node: Int,
+        nnodes: Int,
+        nslots: Int,
+        credit_off: Int,
+    ):
         self.ibv = ibv^
         self.hca = String("")
         self.ctx = 0
@@ -267,10 +345,27 @@ struct IbState(Movable):
         self.my_node = my_node
         self.nnodes = nnodes
         self.exchanges = 0
-        self.arrivals0 = 0
-        self.arrivals1 = 0
         self.error = 0
         self.timeout_ns = Int(DEFAULT_IB_TIMEOUT_S * 1.0e9)
+        self.nslots = nslots
+        self.credit_off = credit_off
+        self.request_seq = 0
+        self.posted_seq = 0
+        self.done_seq = 0
+        self.flush_seq = 0
+        self.flush_done = 0
+        self.flush_t0 = 0
+        self.sends_posted = 0
+        self.sends_completed = 0
+        self.credit_sent = 0
+        self.tally = List[Int]()
+        for _ in range(nslots):
+            self.tally.append(0)
+        self.credit_recv = List[Int]()
+        self.last_progress_ns = 0
+        self.stall_seq = 0
+        self.n_credit_stalls = 0
+        self.consumed_enqueued = 0
         self.wr = Int(alloc_bytes(SZ_SEND_WR))
         self.sge = Int(alloc_bytes(SZ_SGE))
         self.rwr = Int(alloc_bytes(SZ_RECV_WR))
@@ -304,7 +399,7 @@ def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
 
 
 # `IbState.error` and `IbWork.status` are written by the proxy thread (or the
-# `MOJOCCL_IB_PROXY=0` callback thread) inside `_run_exchange` and read by
+# `MOJOCCL_IB_PROXY=0` callback thread) inside `ib_drive` and read by
 # the calling thread -- `ib_error` from the torch-facing calling thread,
 # `ib_enqueue`'s ring-reuse check from the same -- with no other
 # synchronization between the two. Every access goes through these two
@@ -337,18 +432,135 @@ def _status_ptr(mut w: IbWork) -> Pointer[Int, MutAnyOrigin]:
 
 
 # ===-------------------------------------------------------------------=== #
-# The host callback
+# The progress engine
 # ===-------------------------------------------------------------------=== #
+#
+# One non-blocking step function, `ib_drive`, shared by all three drivers:
+# the progress thread, the `MOJOCCL_IB_PROXY=0` stream callback and the
+# GPU-free self-tests. They differ only in who advances `request_seq` (the
+# mailbox, the callback, the calling thread) and who reads `done_seq`.
+#
+# The engine keeps several exchanges in flight. Per step it publishes any
+# credit the next exchange carries, posts that exchange if flow control
+# allows, drains the completion queue, and retires exchanges in sequence
+# order. Retiring is strictly in order even though arrivals are not: RC
+# ordering is per queue pair, so peer B's message for e+1 can overtake peer
+# C's for e, and `done_seq` is what the GPU waits on.
 
 
-def _consume_wc(mut st: IbState, c: P8, npeers: Int) -> Int:
-    """Classify one completion; returns 1 for a send, 2 for the flush read,
-    0 for anything else, -1 for a failed completion (error recorded).
+@always_inline
+def _work(st: IbState, seq: Int) -> Pointer[IbWork, MutAnyOrigin]:
+    """The ring slot exchange `seq` lives in."""
+    return Pointer[IbWork, MutAnyOrigin](
+        unsafe_from_address=st.works
+        + ((seq - 1) % WORK_SLOTS) * size_of[IbWork]()
+    )
 
-    Shared by both poll loops on purpose. An arrival for the NEXT exchange
-    can land while this one is flushing, and a loop that only looked for its
-    own opcode would drop it -- losing a tally the next callback is waiting
-    on, and a recv WR nobody reposts.
+
+@always_inline
+def _sender_slot(st: IbState, peer_node: Int) -> Int:
+    """Where MY message sits among the receiver's per-sender slots: senders
+    are indexed by node, compacted past the receiver's own node."""
+    return st.my_node if st.my_node < peer_node else st.my_node - 1
+
+
+def _release_on_error(mut st: IbState):
+    """An exchange failed: release everything outstanding rather than leave
+    the GPU's spin kernels (or a host waiter) hanging past the point where
+    `ncclCommGetAsyncError` could report it."""
+    while st.done_seq < st.request_seq:
+        st.done_seq += 1
+        ref w = _work(st, st.done_seq)[]
+        _store_atomic_i(_status_ptr(w), 2)
+    st.flush_seq = 0
+
+
+def _send_credits(mut st: IbState, upto: Int) -> Bool:
+    """Publish "I have consumed through exchange `upto`" to every peer.
+
+    Credits are cumulative, so only the newest is ever on the wire: one
+    unsignaled 4-byte RDMA_WRITE_WITH_IMM per peer, the immediate carrying
+    the credit bit and the number. Unsignaled because a completion here
+    would be indistinguishable from a data send, and the data sends -- which
+    ARE counted, `IbWork.sends_cum` -- are what reclaims the send queue.
+    A failed credit still raises a completion with a bad status.
+    """
+    if upto <= st.credit_sent:
+        return False
+    for i in range(len(st.peers)):
+        ref p = st.peers[i]
+        build_write_wr(
+            _b(st.wr),
+            _b(st.sge),
+            upto,
+            st.flush_host,
+            st.flush_lkey,
+            CREDIT_PAYLOAD_BYTES,
+            p.remote_base
+            + st.credit_off
+            + _sender_slot(st, p.node) * CREDIT_SLOT_BYTES,
+            p.remote_rkey,
+            IMM_CREDIT_BIT | (UInt32(upto) & IMM_SEQ_MASK),
+            True,
+            False,
+        )
+        if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
+            _store_atomic_i(_err_ptr(st), 8)
+            return False
+    st.credit_sent = upto
+    return True
+
+
+@always_inline
+def _can_post(st: IbState, seq: Int) -> Bool:
+    """Flow control: exchange `seq` lands in slot group `seq % nslots`, whose
+    previous occupant was `seq - nslots`, so every peer must have released
+    that one first."""
+    var need = seq - st.nslots
+    if need <= 0:
+        return True
+    for i in range(len(st.credit_recv)):
+        if st.credit_recv[i] < need:
+            return False
+    return True
+
+
+def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
+    """Post this exchange's payload to every peer, one
+    RDMA_WRITE_WITH_IMM each."""
+    if w.do_send != 0 and w.send_bytes > 0:
+        for i in range(len(st.peers)):
+            ref p = st.peers[i]
+            build_write_wr(
+                _b(st.wr),
+                _b(st.sge),
+                w.seq,
+                w.send_addr,
+                st.lkey,
+                w.send_bytes,
+                p.remote_base
+                + w.inbox_base
+                + _sender_slot(st, p.node) * w.slot_bytes,
+                p.remote_rkey,
+                UInt32(w.seq) & IMM_SEQ_MASK,
+                True,
+                True,
+            )
+            if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
+                _store_atomic_i(_err_ptr(st), 1)
+                return False
+            st.sends_posted += 1
+    w.sends_cum = st.sends_posted
+    return True
+
+
+def _consume_wc(mut st: IbState, c: P8) -> Int:
+    """Account for one completion; -1 for a failed one (error recorded).
+
+    Every completion is classified here, never "the one this exchange is
+    waiting for": an arrival for a later exchange can land at any time, and
+    a loop that dropped it would lose a tally somebody is waiting on and a
+    receive WR nobody reposts.
     """
     if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
         _store_atomic_i(
@@ -358,158 +570,178 @@ def _consume_wc(mut st: IbState, c: P8, npeers: Int) -> Int:
         return -1
     var op = Int32(ld32(c, WC_OPCODE))
     if op == IBV_WC_RECV_RDMA_WITH_IMM:
-        if Int(be32(ldu32(c, WC_IMM_DATA))) & 1 == 0:
-            st.arrivals0 += 1
-        else:
-            st.arrivals1 += 1
+        var imm = be32(ldu32(c, WC_IMM_DATA))
         var qpn = ldu32(c, WC_QP_NUM)
-        for k in range(npeers):
+        var pi = -1
+        for k in range(len(st.peers)):
             if st.peers[k].qpn == qpn:
-                build_recv_wr(_b(st.rwr), 0)
-                _ = post_recv(st.peers[k].qp, _b(st.rwr), _b(st.bad))
+                pi = k
                 break
+        if pi >= 0:
+            build_recv_wr(_b(st.rwr), 0)
+            _ = post_recv(st.peers[pi].qp, _b(st.rwr), _b(st.bad))
+        var seq = Int(imm & IMM_SEQ_MASK)
+        if (imm & IMM_CREDIT_BIT) != 0:
+            if pi >= 0 and st.credit_recv[pi] < seq:
+                st.credit_recv[pi] = seq
+        else:
+            st.tally[seq % st.nslots] += 1
         return 0
     if op == IBV_WC_RDMA_WRITE:
-        return 1
+        st.sends_completed += 1
+        return 0
     if op == IBV_WC_RDMA_READ:
-        return 2
+        st.flush_done += 1
+        return 0
     return 0
+
+
+def _advance(mut st: IbState) -> Bool:
+    """Retire every exchange that is complete, in sequence order.
+
+    An exchange is complete when all `nrecv` peers' messages for it have
+    arrived, its own sends have completed (the NIC is done reading the
+    buffer the next reduce-scatter will overwrite) and its GPUDirect flush
+    read has come back.
+    """
+    var moved = False
+    while True:
+        if st.flush_seq != 0:
+            if st.flush_done <= 0:
+                break
+            st.flush_done -= 1
+            st.t_flush_ns += perf_counter_ns() - st.flush_t0
+            st.done_seq = st.flush_seq
+            st.flush_seq = 0
+            _retire(st, st.done_seq)
+            moved = True
+            continue
+        if st.done_seq >= st.posted_seq:
+            break
+        var e = st.done_seq + 1
+        ref w = _work(st, e)[]
+        var idx = e % st.nslots
+        if st.tally[idx] < w.nrecv or st.sends_completed < w.sends_cum:
+            break
+        st.tally[idx] -= w.nrecv
+        if w.nrecv > 0 and w.flush_addr != 0:
+            # Seeing the arrivals does NOT mean the payload is visible in GPU
+            # memory: the completion lands in host memory and the payload in
+            # the GPU's BAR. A read of the destination flushes the writes
+            # ahead of it -- NCCL's gpuFlush QP,
+            # nccl:src/transport/net_ib/p2p.cc:589-602.
+            build_read_wr(
+                _b(st.wr),
+                _b(st.sge),
+                e,
+                st.flush_host,
+                st.flush_lkey,
+                FLUSH_BYTES,
+                w.flush_addr,
+                st.rkey,
+            )
+            if post_send(st.flush_qp, _b(st.wr), _b(st.bad)) != 0:
+                _store_atomic_i(_err_ptr(st), 4)
+                return moved
+            st.flush_seq = e
+            st.flush_t0 = perf_counter_ns()
+            moved = True
+            continue
+        st.done_seq = e
+        _retire(st, e)
+        moved = True
+    return moved
+
+
+def _retire(mut st: IbState, seq: Int):
+    ref w = _work(st, seq)[]
+    st.t_wait_ns += perf_counter_ns() - w.t0
+    st.n_exchanges += 1
+    _store_atomic_i(_status_ptr(w), 1)
+
+
+def ib_drive(mut st: IbState) -> Bool:
+    """One non-blocking step of the progress engine; True if anything moved.
+
+    Order matters: credits go out BEFORE this step's own flow-control check,
+    or two ranks that arrive at the same exchange together would each wait
+    for a credit the other is holding back.
+    """
+    if _load_atomic_i(_err_ptr(st)) != 0:
+        _release_on_error(st)
+        return False
+    var moved = False
+    if st.posted_seq < st.request_seq:
+        var e = st.posted_seq + 1
+        ref w = _work(st, e)[]
+        if _send_credits(st, w.credit_upto):
+            moved = True
+        if _can_post(st, e):
+            var t0 = perf_counter_ns()
+            if not _post_data(st, w):
+                _release_on_error(st)
+                return False
+            w.t0 = t0
+            st.posted_seq = e
+            st.t_post_ns += perf_counter_ns() - t0
+            moved = True
+        elif st.stall_seq != e:
+            # Counted once per exchange, not once per spin: a nonzero number
+            # in the trace means flow control, not the network, held a chunk
+            # back, which is the knob INBOX_SLOTS turns.
+            st.stall_seq = e
+            st.n_credit_stalls += 1
+    var n = poll_cq(st.cq, 16, _b(st.wc))
+    if n < 0:
+        _store_atomic_i(_err_ptr(st), 2)
+        _release_on_error(st)
+        return False
+    for i in range(Int(n)):
+        if _consume_wc(st, P8(unsafe_from_address=st.wc + i * SZ_WC)) < 0:
+            _release_on_error(st)
+            return False
+        moved = True
+    if _advance(st):
+        moved = True
+    if moved:
+        st.last_progress_ns = perf_counter_ns()
+    elif st.request_seq > st.done_seq:
+        # Nothing outstanding can move and nothing has moved for a whole
+        # timeout: a peer is gone, or a credit was lost.
+        if perf_counter_ns() - st.last_progress_ns > st.timeout_ns:
+            _store_atomic_i(_err_ptr(st), 3)
+            _release_on_error(st)
+    return moved
 
 
 def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
     """`cuLaunchHostFunc` entry point -- the MOJOCCL_IB_PROXY=0 path.
 
     Runs on a driver-owned thread with the stream stalled behind it, so it
-    must never call the CUDA/HIP driver. Kept as a fallback, and as the
-    thing the proxy thread is measured against: on this cluster the
+    must never call the CUDA/HIP driver, and it cannot pipeline: it drives
+    the engine until its own exchange is done. Kept as a fallback, and as
+    the thing the proxy thread is measured against: on this cluster the
     driver's stop-the-stream / wake-a-thread / restart round trip costs
     about 480 us per exchange (job 234035: a 1 MiB two-node allreduce took
-    496 us against 24 us on one node, and the transfer in it is 3 us),
-    which at the 27 MiB DDP bucket is several times the transfer it waits
-    for.
+    496 us against 24 us on one node, and the transfer in it is 3 us).
     """
     ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=Int(user))[]
-    _run_exchange(_st(w.state)[], w)
+    ref st = _st(w.state)[]
+    _drive_until(st, w.seq)
 
 
-def _run_exchange(mut st: IbState, mut w: IbWork):
-    """Post this exchange's RDMA writes, wait for the peers', flush."""
-    if _load_atomic_i(_err_ptr(st)) != 0:
-        _store_atomic_i(_status_ptr(w), 2)
-        return
-    var npeers = len(st.peers)
-    var parity = w.seq & 1
-    var t0 = perf_counter_ns()
-    var deadline = t0 + st.timeout_ns
-    var nsend = 0
-
-    if w.do_send != 0 and w.send_bytes > 0:
-        for i in range(npeers):
-            ref p = st.peers[i]
-            # Where MY shard sits in the peer's inbox: senders are indexed by
-            # node, compacted past the receiver's own node.
-            var slot = st.my_node if st.my_node < p.node else st.my_node - 1
-            build_write_wr(
-                _b(st.wr),
-                _b(st.sge),
-                w.seq,
-                w.send_addr,
-                st.lkey,
-                w.send_bytes,
-                p.remote_base + w.inbox_base + slot * w.slot_bytes,
-                p.remote_rkey,
-                UInt32(w.seq & 0x7FFFFFFF),
-                True,
-                True,
-            )
-            if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
-                _store_atomic_i(_err_ptr(st), 1)
-                _store_atomic_i(_status_ptr(w), 2)
-                return
-            nsend += 1
-    var t1 = perf_counter_ns()
-
-    var sends_done = 0
-    while sends_done < nsend or _arrivals(st, parity) < w.nrecv:
-        if _stop_requested(st):
-            _store_atomic_i(_err_ptr(st), 6)
-            _store_atomic_i(_status_ptr(w), 2)
+def _drive_until(mut st: IbState, seq: Int):
+    """Run the engine until exchange `seq` is retired (or the engine fails).
+    The stall deadline inside `ib_drive` is what ends this if a peer never
+    answers."""
+    if seq > st.request_seq:
+        st.request_seq = seq
+        st.last_progress_ns = perf_counter_ns()
+    while st.done_seq < seq:
+        if _load_atomic_i(_err_ptr(st)) != 0:
+            _release_on_error(st)
             return
-        var n = poll_cq(st.cq, 16, _b(st.wc))
-        if n < 0:
-            _store_atomic_i(_err_ptr(st), 2)
-            _store_atomic_i(_status_ptr(w), 2)
-            return
-        for i in range(Int(n)):
-            var kind = _consume_wc(
-                st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
-            )
-            if kind < 0:
-                _store_atomic_i(_status_ptr(w), 2)
-                return
-            if kind == 1:
-                sends_done += 1
-        if perf_counter_ns() > deadline:
-            _store_atomic_i(_err_ptr(st), 3)
-            _store_atomic_i(_status_ptr(w), 2)
-            return
-    if parity == 0:
-        st.arrivals0 -= w.nrecv
-    else:
-        st.arrivals1 -= w.nrecv
-    var t2 = perf_counter_ns()
-
-    if w.nrecv > 0 and w.flush_addr != 0:
-        build_read_wr(
-            _b(st.wr),
-            _b(st.sge),
-            0,
-            st.flush_host,
-            st.flush_lkey,
-            FLUSH_BYTES,
-            w.flush_addr,
-            st.rkey,
-        )
-        if post_send(st.flush_qp, _b(st.wr), _b(st.bad)) != 0:
-            _store_atomic_i(_err_ptr(st), 4)
-            _store_atomic_i(_status_ptr(w), 2)
-            return
-        var flushed = False
-        while not flushed:
-            if _stop_requested(st):
-                _store_atomic_i(_err_ptr(st), 6)
-                _store_atomic_i(_status_ptr(w), 2)
-                return
-            var n = poll_cq(st.cq, 16, _b(st.wc))
-            if n < 0:
-                _store_atomic_i(_err_ptr(st), 5)
-                _store_atomic_i(_status_ptr(w), 2)
-                return
-            for i in range(Int(n)):
-                var kind = _consume_wc(
-                    st, P8(unsafe_from_address=st.wc + i * SZ_WC), npeers
-                )
-                if kind < 0:
-                    _store_atomic_i(_status_ptr(w), 2)
-                    return
-                if kind == 2:
-                    flushed = True
-            if perf_counter_ns() > deadline:
-                _store_atomic_i(_err_ptr(st), 7)
-                _store_atomic_i(_status_ptr(w), 2)
-                return
-    var t3 = perf_counter_ns()
-
-    st.t_post_ns += t1 - t0
-    st.t_wait_ns += t2 - t1
-    st.t_flush_ns += t3 - t2
-    st.n_exchanges += 1
-    _store_atomic_i(_status_ptr(w), 1)
-
-
-@always_inline
-def _arrivals(st: IbState, parity: Int) -> Int:
-    return st.arrivals0 if parity == 0 else st.arrivals1
+        _ = ib_drive(st)
 
 
 @always_inline
@@ -517,78 +749,57 @@ def _mb(st: IbState, off: Int) -> Pointer[UInt64, MutAnyOrigin]:
     return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox + off)
 
 
-@always_inline
-def _stop_requested(st: IbState) -> Bool:
-    """True once `ncclCommAbort` (or teardown) has raised MB_STOP.
-
-    Checked inside `_run_exchange`'s two poll loops so a stop request ends a
-    stuck exchange (a dead peer, nothing left to poll) promptly instead of
-    making `_stop_proxy`'s `pthread_join` wait out the rest of
-    `MOJOCCL_IB_TIMEOUT_S`. Only meaningful under the proxy -- the mailbox is
-    allocated only when `st.proxy`, so the `MOJOCCL_IB_PROXY=0` callback path
-    and the self-test's `ib_exchange_now` (no mailbox, no thread) never see
-    it set.
-    """
-    return (
-        st.mailbox != 0
-        and Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
-            _mb(st, MB_STOP)
-        )
-        != 0
-    )
-
-
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
-    """The progress thread: one exchange at a time, in stream order.
+    """The progress thread: `ib_drive` in a loop, with the mailbox on both
+    ends.
 
-    Waits on the mailbox word a one-thread kernel releases after the
-    reduce-scatter, runs the exchange, releases the done word the matching
-    spin kernel is waiting on. Exchanges are strictly ordered on the
-    communicator's stream and the counter is dense, so slot `(seq-1) mod
-    WORK_SLOTS` is this exchange's work item and no queue is needed.
+    `MB_REQUEST` is the highest exchange the stream has released (a
+    one-thread kernel's release store); `MB_DONE` is the highest one
+    retired, which the matching spin kernel waits for. Several exchanges may
+    be in flight between the two.
 
-    Hard-spins like NCCL's proxy only WHILE AN EXCHANGE IS IN FLIGHT
-    (`_run_exchange`'s own poll loops) -- between exchanges, this loop backs
-    off (`sched_yield` once, then a short `nanosleep`) instead of burning a
-    full core on a mailbox word that is not going to change for a while. A
-    training step's host-side dispatch (hundreds of aten launches on the
-    Python main thread) shares this core's SMT sibling, and measured end to
-    end (job 234072, 2x8 H100) an unconditional hot spin here cost nanoGPT
-    DDP ~20% of its steady-state tok/s against real NCCL even though the
-    per-bucket allreduce itself was within 5%. `MOJOCCL_IB_PROXY_IDLE_US`
-    tunes the backoff quantum; `MOJOCCL_IB_PROXY=0` gives the core back
-    entirely, at the cost of the host-callback latency.
+    Hard-spins like NCCL's proxy only WHILE SOMETHING IS OUTSTANDING --
+    otherwise it backs off (`sched_yield` once, then a short `nanosleep`)
+    instead of burning a full core on a mailbox word that is not going to
+    change for a while. A training step's host-side dispatch (hundreds of
+    aten launches on the Python main thread) shares this core's SMT sibling,
+    and measured end to end (job 234072, 2x8 H100) an unconditional hot spin
+    here cost nanoGPT DDP ~20% of its steady-state tok/s against real NCCL.
+    `MOJOCCL_IB_PROXY_IDLE_US` tunes the backoff quantum.
     """
     ref st = _st(Int(arg))[]
-    var next_seq = 1
     var idle_ns = _proxy_idle_ns()
+    var published = 0
+    st.last_progress_ns = perf_counter_ns()
     while True:
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_STOP)
         ) != 0:
             return
+        var req = Int(
+            Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
+                _mb(st, MB_REQUEST)
+            )
+        )
+        if req > st.request_seq:
+            st.request_seq = req
+            st.last_progress_ns = perf_counter_ns()
+        var moved = ib_drive(st)
+        if st.done_seq > published:
+            # Published even on failure: the spin kernels must be released or
+            # the stream hangs past the point where the error can be
+            # reported.
+            published = st.done_seq
+            Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
+                _mb(st, MB_DONE), UInt64(published)
+            )
+        if moved or st.done_seq < st.request_seq:
+            continue
+        _ = external_call["sched_yield", Int32]()
         if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
             _mb(st, MB_REQUEST)
-        ) < UInt64(next_seq):
-            # Idle: yield once (catches a request that lands right away for
-            # free) and only pay for a sleep if that didn't help.
-            _ = external_call["sched_yield", Int32]()
-            if Atomic[DType.uint64].load[ordering = Ordering.ACQUIRE](
-                _mb(st, MB_REQUEST)
-            ) < UInt64(next_seq):
-                _nanosleep_ns(idle_ns)
-            continue
-        ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
-            unsafe_offset = (next_seq - 1) % WORK_SLOTS
-        ]
-        _run_exchange(st, w)
-        # Published even on failure: the spin kernel must be released or the
-        # stream hangs past the point where the error can be reported.
-        Atomic[DType.uint64].store[ordering = Ordering.RELEASE](
-            _mb(st, MB_DONE), UInt64(next_seq)
-        )
-        next_seq += 1
-
+        ) <= UInt64(st.request_seq):
+            _nanosleep_ns(idle_ns)
 
 def _proxy_address() -> Int:
     var f: def (
@@ -657,9 +868,9 @@ def ib_signal_abort(ib: Int):
     process. Unlike `_stop_proxy`, the join here is bounded
     (`IB_ABORT_JOIN_TIMEOUT_S`) with `pthread_tryjoin_np`, polled rather than
     blocking: abort must not hang because a dead peer left this rank's
-    thread waiting inside `_run_exchange` for a completion that will never
-    come -- `_stop_requested` is what actually gets it out of there quickly;
-    this bound is only insurance against the case that doesn't anticipate.
+    thread waiting for a completion that will never come -- `ib_drive` never
+    blocks, so the loop notices MB_STOP within one step; this bound is only
+    insurance against the case that doesn't anticipate.
     A thread this gives up on is simply left running; it exits on its own
     once it next checks MB_STOP, and the process exiting reclaims it either
     way.
@@ -779,12 +990,19 @@ def ib_setup(
     nnodes: Int,
     region: Int,
     region_bytes: Int,
+    nslots: Int,
+    credit_off: Int,
 ) raises -> Int:
     """Open an HCA, register the region, create the QPs (still in INIT).
 
     Returns the address of a heap `IbState`. The QPs cannot reach RTR until
     the peers' `(qpn, lid, gid)` have been gathered, so bring-up is split:
     this, then `ib_local_info` / `ib_connect`.
+
+    `nslots` is how many fixed inbox slot groups the caller carved out of the
+    region and therefore how many exchanges may be outstanding; `credit_off`
+    is the region offset of the credit landing pad. Both must be identical on
+    every rank -- they are part of the wire layout.
     """
     var ibv = Ibv()
     var want = getenv("MOJOCCL_IB_HCA", "")
@@ -810,7 +1028,14 @@ def ib_setup(
         if ports[i].ctx != port.ctx:
             ibv.close_device(ports[i].ctx)
 
-    var st = IbState(ibv^, region, my_node, nnodes)
+    if nslots < 1 or nslots > PIPE_MAX_SLOTS:
+        raise Error(
+            "mojoccl: nslots must be in 1.."
+            + String(PIPE_MAX_SLOTS)
+            + ", got "
+            + String(nslots)
+        )
+    var st = IbState(ibv^, region, my_node, nnodes, nslots, credit_off)
     st.hca = String(port.name)
     st.ctx = port.ctx
     st.port = port.port
@@ -867,6 +1092,7 @@ def ib_setup(
             )
             qp_to_init(st.ibv, qp, st.port)
             st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
+            st.credit_recv.append(0)
         st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
         qp_to_init(st.ibv, st.flush_qp, st.port)
 
@@ -1063,20 +1289,33 @@ def ib_error(ib: Int) -> Int:
 
 def ib_next_seq(ib: Int) -> Int:
     """Consume one exchange counter. Every rank of the communicator calls
-    this the same number of times in the same order, so the parity that
-    selects the inbox half and the immediate that tags an arrival agree
-    across nodes."""
+    this the same number of times in the same order, so the slot group an
+    exchange lands in, the credit window and the immediate that tags an
+    arrival all agree across nodes."""
     ref st = _st(ib)[]
     st.exchanges += 1
     return st.exchanges
 
 
-def ib_enqueue(
+def ib_note_consumed(ib: Int, seq: Int):
+    """Record that the consumer kernel for exchange `seq` has just been
+    ENQUEUED on the stream.
+
+    The number is carried into the next exchange's work item as
+    `credit_upto` and published to the peers when the engine picks that
+    exchange up -- at which point the request kernel has run and therefore
+    every kernel enqueued before it, this consumer included, has completed.
+    Callers must enqueue the consumer first and call this second, on the
+    stream the exchanges run on.
+    """
+    ref st = _st(ib)[]
+    if seq > st.consumed_enqueued:
+        st.consumed_enqueued = seq
+
+
+def _fill_work(
+    mut st: IbState,
     ib: Int,
-    driver: OwnedDLHandle,
-    ctx: DeviceContext,
-    stream: DeviceStream,
-    raw_stream: Int,
     send_addr: Int,
     send_bytes: Int,
     inbox_base: Int,
@@ -1085,22 +1324,9 @@ def ib_enqueue(
     nrecv: Int,
     flush_addr: Int,
     seq: Int,
+    credit_upto: Int,
 ) raises:
-    """Put one exchange on `stream`, between the kernel that produced its
-    payload and the kernel that consumes what arrives.
-
-    Two shapes, same ordering guarantee. With the proxy thread (default): a
-    one-thread kernel releases `seq` into the pinned mailbox and a second
-    one spins until the thread reports it done. Without it
-    (`MOJOCCL_IB_PROXY=0`): a `cuLaunchHostFunc` that does the exchange
-    inline, which is simpler and several hundred microseconds slower per
-    exchange.
-    """
-    ref st = _st(ib)[]
-    var slot = (seq - 1) % WORK_SLOTS
-    ref w = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=st.works)[
-        unsafe_offset=slot
-    ]
+    ref w = _work(st, seq)[]
     if _load_atomic_i(_status_ptr(w)) == 0:
         raise Error(
             "mojoccl: the inter-node work ring wrapped with an exchange still"
@@ -1116,24 +1342,131 @@ def ib_enqueue(
     w.nrecv = nrecv
     w.flush_addr = flush_addr
     w.seq = seq
+    w.credit_upto = credit_upto
+    w.sends_cum = 0
+    w.t0 = 0
     _store_atomic_i(_status_ptr(w), 0)
+
+
+def ib_enqueue_request(
+    ib: Int,
+    driver: OwnedDLHandle,
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    raw_stream: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+) raises:
+    """Release exchange `seq` to the network, at this point in stream order.
+
+    Enqueued right after the kernel that produced its payload. With the
+    proxy thread (default) it is a one-thread kernel storing `seq` into the
+    pinned mailbox, and the stream runs on: several exchanges may be in
+    flight, and `ib_enqueue_wait` is what eventually stops the stream.
+    Without the proxy (`MOJOCCL_IB_PROXY=0`) it is a `cuLaunchHostFunc` that
+    runs the whole exchange inline -- correct with the same schedule, but
+    with no overlap and several hundred microseconds of driver latency per
+    exchange.
+    """
+    ref st = _st(ib)[]
+    _fill_work(
+        st,
+        ib,
+        send_addr,
+        send_bytes,
+        inbox_base,
+        slot_bytes,
+        do_send,
+        nrecv,
+        flush_addr,
+        seq,
+        st.consumed_enqueued,
+    )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
-        proxy_wait(
-            ctx,
-            stream,
-            st.mailbox_dev + MB_DONE,
-            st.error_word,
-            seq,
-            st.timeout_ns,
-        )
         return
     launch_host_func(
         driver,
         raw_stream,
         _callback_address(),
-        st.works + slot * size_of[IbWork](),
+        st.works + ((seq - 1) % WORK_SLOTS) * size_of[IbWork](),
     )
+
+
+def ib_enqueue_wait(
+    ib: Int, ctx: DeviceContext, stream: DeviceStream, seq: Int
+) raises:
+    """Hold the stream until exchange `seq` has been retired, so the kernel
+    enqueued next may read the inbox. A no-op on the `MOJOCCL_IB_PROXY=0`
+    path, where `ib_enqueue_request`'s callback already waited."""
+    ref st = _st(ib)[]
+    if not st.proxy:
+        return
+    proxy_wait(
+        ctx,
+        stream,
+        st.mailbox_dev + MB_DONE,
+        st.error_word,
+        seq,
+        st.timeout_ns,
+    )
+
+
+def ib_submit_now(
+    ib: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+    credit_upto: Int,
+) raises:
+    """Hand one exchange to the engine from the calling thread, without
+    waiting for it.
+
+    The GPU-free self-tests use this (with `ib_wait_now`) to keep several
+    exchanges in flight and exercise the credit protocol past the slot
+    count, which is the case a leaked credit turns into a hang. Never
+    correct inside a collective: there the exchange's position in stream
+    order is the whole ordering argument.
+    """
+    ref st = _st(ib)[]
+    _fill_work(
+        st,
+        ib,
+        send_addr,
+        send_bytes,
+        inbox_base,
+        slot_bytes,
+        do_send,
+        nrecv,
+        flush_addr,
+        seq,
+        credit_upto,
+    )
+    if seq > st.request_seq:
+        st.request_seq = seq
+        st.last_progress_ns = perf_counter_ns()
+
+
+def ib_wait_now(ib: Int, seq: Int) raises:
+    """Drive the engine on the calling thread until exchange `seq` is done."""
+    ref st = _st(ib)[]
+    _drive_until(st, seq)
+    if _load_atomic_i(_err_ptr(st)) != 0:
+        raise Error(
+            "mojoccl: inline exchange failed, ib error "
+            + String(_load_atomic_i(_err_ptr(st)))
+        )
 
 
 def ib_exchange_now(
@@ -1146,35 +1479,29 @@ def ib_exchange_now(
     nrecv: Int,
     flush_addr: Int,
     seq: Int,
+    credit_upto: Int,
 ) raises:
-    """Run one exchange inline on the calling thread.
+    """One exchange, submitted and waited for on the calling thread.
 
     The bring-up self-test uses it: the transport can then be exercised on
     a host with InfiniBand but no GPU (registered host memory, no stream to
     hang kernels on), which is where the bootstrap/QP/immediate wiring is
     cheapest to debug -- run it with `MOJOCCL_IB_PROXY=0`, since the proxy
-    mailbox needs a driver that can pin host memory. Never correct inside a
-    collective: there the exchange's position in stream order is the whole
-    ordering argument.
+    mailbox needs a driver that can pin host memory.
     """
-    ref st = _st(ib)[]
-    var w = IbWork()
-    w.state = ib
-    w.send_addr = send_addr
-    w.send_bytes = send_bytes
-    w.inbox_base = inbox_base
-    w.slot_bytes = slot_bytes
-    w.do_send = 1 if do_send else 0
-    w.nrecv = nrecv
-    w.flush_addr = flush_addr
-    w.seq = seq
-    _store_atomic_i(_status_ptr(w), 0)
-    _run_exchange(st, w)
-    if _load_atomic_i(_status_ptr(w)) != 1:
-        raise Error(
-            "mojoccl: inline exchange failed, ib error "
-            + String(_load_atomic_i(_err_ptr(st)))
-        )
+    ib_submit_now(
+        ib,
+        send_addr,
+        send_bytes,
+        inbox_base,
+        slot_bytes,
+        do_send,
+        nrecv,
+        flush_addr,
+        seq,
+        credit_upto,
+    )
+    ib_wait_now(ib, seq)
 
 
 def ib_report(ib: Int):
@@ -1188,11 +1515,15 @@ def ib_report(ib: Int):
         st.port,
         "peers",
         len(st.peers),
+        "slots",
+        st.nslots,
         "exchanges",
         st.n_exchanges,
+        "credit stalls",
+        st.n_credit_stalls,
         "| mean us post",
         Float64(st.t_post_ns) / Float64(st.n_exchanges) / 1000.0,
-        "wait",
+        "in flight",
         Float64(st.t_wait_ns) / Float64(st.n_exchanges) / 1000.0,
         "flush",
         Float64(st.t_flush_ns) / Float64(st.n_exchanges) / 1000.0,
