@@ -439,8 +439,8 @@ thermal ramp cancels to first order; each column is the mean of its two legs:
 | bf16 | 168 | 994 | **798** | 745 | **0.80** | 1.07 |
 | bf16 | 512 | 2988 | **2213** | 2126 | **0.74** | 1.04 |
 
-Everything at or below 27 MiB is byte-identical code and reads identical,
-which is the point of the crossover: the dispatch buys the tail bucket 19%
+At and below 27 MiB the two mojo columns run the same unicast kernel over the
+same layout and read the same, which is the point of the crossover: the dispatch buys the tail bucket 19%
 and the 512 MiB bucket 26% and costs the DDP bucket nothing. Against NCCL the
 tail bucket goes from 1.31× to 1.06× and 512 MiB from 1.39× to 1.03×. 1 MiB
 is below this bench's noise floor (per-leg medians 27–59 µs on every
