@@ -60,9 +60,12 @@ only (no ABBA — there is nothing to interleave against). Default
 `torch_mojo_backend/distributed/mojoccl/` supports multiple nodes:
 `ncclGetUniqueId` encodes a TCP rendezvous (`{ipv4, port, magic}` of a
 listening socket this library opens itself, not a `/dev/shm` path), and the
-inter-node hop is GPUDirect RDMA written directly over libibverbs
-(`bootstrap.mojo`/`ibverbs.mojo`/`internode.mojo`) — no vendor collective
-library at any level. See the "Multi-node" subsection of
+inter-node hop is GPUDirect RDMA written directly over the fabric —
+`bootstrap.mojo` plus one transport-neutral engine (`internode.mojo`) on
+either libibverbs (`ibverbs.mojo`, InfiniBand) or libfabric
+(`libfabric.mojo`, HPE Slingshot / `cxi`), chosen at `ncclCommInitRank` time
+or forced with `MOJOCCL_NET=verbs|fabric` — no vendor collective library at
+any level. See the "Multi-node" subsection of
 `docs/distributed.md` for the design. `RUN_MOJO` therefore **defaults to
 `1`**: leave it unset to exercise the mojo legs end to end at 16 ranks.
 `RUN_MOJO=0` still exists to get a vendor-only NCCL reference run without
@@ -71,18 +74,25 @@ numbers are wanted, or while iterating on something unrelated to mojoccl).
 
 ## GPU-free self-tests
 
-`tests/multinode/selftest/` holds four standalone Mojo programs that
-exercise the TCP bootstrap (`bs_test.mojo`), the libibverbs RDMA transport
+`tests/multinode/selftest/` holds seven standalone Mojo programs that
+exercise the TCP bootstrap (`bs_test.mojo`), the RDMA transport
 (`ib_bringup.mojo`), the pipelined transport and its credit-based flow
-control (`ib_pipeline.mojo`) and the region geometry
-(`geometry_test.mojo`) — the first three between processes on any host with
-InfiniBand, the SLURM **login node** included, and the last one needing
-nothing at all, so they run in seconds without a GPU or a job allocation.
-They caught six real bugs (bootstrap/QP wiring, resource leaks on a failed
-`ib_setup`, a silently-misread port LID) before any GPU time was spent
-chasing them; run them before and after any change to
-`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode}.mojo`
-or to the region layout in `mojoccl.mojo`. See
+control (`ib_pipeline.mojo`), the region geometry (`geometry_test.mojo`),
+the `SCM_RIGHTS` fd transport (`fd_exchange.mojo`), the socket deadlines
+(`sock_deadline.mojo`) and the libfabric ABI (`fabric_abi.mojo`, against
+`fabric_abi.c` compiled by gcc). The two transport ones run against either
+backend — `MOJOCCL_NET=verbs` between processes on any host with an ACTIVE
+InfiniBand port (the SLURM login node included, where there is one),
+`MOJOCCL_NET=fabric` between processes on any host with a libfabric RMA
+provider (an Adastra **compute node**, which has four Slingshot NICs and no
+InfiniBand at all) — and the rest need no NIC, so they all run in seconds
+without a GPU. They caught six real bugs (bootstrap/QP wiring, resource
+leaks on a failed `ib_setup`, a silently-misread port LID) before any GPU
+time was spent chasing them; run them before and after any change to
+`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,libfabric,netutil,internode}.mojo`
+or to the region layout in `mojoccl.mojo`. `fabric_hmem.mojo` is the one
+self-test that does need a GPU: it is the only place the FI_HMEM_ROCR
+registration of a `driver.alloc_region` allocation is exercised. See
 `tests/multinode/selftest/README.md` for build and run commands.
 
 ## Output

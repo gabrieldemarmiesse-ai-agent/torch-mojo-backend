@@ -522,7 +522,21 @@ region, so the large sizes are chunked by geometry as well as by choice.
 `tests/multinode/selftest/geometry_test.mojo` sweeps that arithmetic over
 regions of 1 MiB–1 GiB, `local_world` 1–8 and 2–16 nodes.
 
-**Transport** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
+**Two transports, one engine.** `internode.mojo` is the transport-neutral
+progress engine (work ring, credits, arrival tally, flush, abort,
+teardown); the six operations it needs -- post a payload, post an
+immediate, post the flush read, poll completions, fill the bootstrap blob,
+attach a peer -- are implemented twice, in `ibverbs.mojo` (InfiniBand) and
+`libfabric.mojo` (HPE Slingshot through the `cxi` provider). `ib_setup`
+picks one at run time: `MOJOCCL_NET=verbs|fabric` wins outright, otherwise
+verbs if libibverbs opens and lists an ACTIVE InfiniBand port, else
+libfabric if `libfabric.so.1` opens and `fi_getinfo` finds an FI_EP_RDM
+provider with FI_RMA|FI_MSG|FI_HMEM, else the same clear error as before.
+The engine's dispatch is one `st.net == NET_VERBS` branch per post and one
+per poll batch -- loop-invariant and perfectly predicted -- so the verbs
+path costs what it always did.
+
+**Transport A, InfiniBand** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
 internode_kernels,bootstrap}.mojo`): libibverbs is dlopened; setup calls are
 symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
 through the `ibv_context_ops` table at the header's offsets, as NCCL's
@@ -536,6 +550,66 @@ orders the payload in GPU memory behind the completion that landed in host
 memory. Every exchange is all-to-all — a rank whose shard is empty (7 of 8
 ranks on DDP's 4-byte AVG allreduce) still posts a 16-byte placeholder — so
 that an arrival tally of N−1 is what completes one.
+
+**Transport B, Slingshot / libfabric** (`libfabric.mojo`): `libfabric.so.1`
+is dlopened; `fi_getinfo`/`fi_freeinfo`/`fi_fabric`/`fi_version`/`fi_strerror`
+are symbols and the whole data path (`fi_writemsg`, `fi_sendmsg`, `fi_recv`,
+`fi_read`, `fi_cq_read`, `fi_mr_regattr`, `fi_ep_bind`, `fi_close`, …) is
+`static inline` in the headers and is reached through the `fid_*` ops tables
+(`ep->rma->writemsg`, `cq->ops->read`, `domain->mr->regattr`,
+`fid->ops->bind`) exactly as the verbs path reaches `ibv_context_ops`. One
+connectionless FI_EP_RDM endpoint per rank, one FI_CQ_FORMAT_DATA completion
+queue bound for both directions, one FI_AV_TABLE address vector holding every
+peer's `fi_getname` address plus this rank's own (the flush reads from
+itself), and one `fi_mr_regattr` of the whole region with `iface =
+FI_HMEM_ROCR`.
+
+Four differences from the verbs semantics, forced by what the cxi provider
+implements:
+
+- **No write-with-immediate.** cxi's `fi_ops_rma.writedata` is
+  `fi_no_rma_writedata` and `cxip_rma_writemsg` rejects `FI_REMOTE_CQ_DATA`
+  (it is not in `CXIP_WRITEMSG_ALLOWED_FLAGS`); measured, `fi_writedata`
+  returns `-FI_ENOSYS`. One shard is therefore an `fi_writemsg` of the
+  payload followed by a **zero-length `fi_sendmsg`** whose 64-bit remote CQ
+  data carries the immediate. cxi does support `FI_REMOTE_CQ_DATA` on the
+  message path and reports `cq_data_size` 8.
+- **Ordering between the two** is `FI_FENCE` on the first notification of an
+  exchange, after all of that exchange's payload writes have been posted:
+  fi_endpoint(3) defers a fenced operation until previous operations to that
+  peer have completed, and cxi implements it as a hardware `C_CMD_CQ_FENCE`
+  that drains the transmit command queue, so the exchange's remaining
+  notifications are ordered by queue position alone — one fence per
+  exchange, not one per peer. `FI_FENCE` must be named in `caps` or cxi
+  returns `-FI_EINVAL`. A credit carries no fence: it announces nothing that
+  was written.
+- **No `FI_SOURCE`**, so a completion does not say who sent it: the CQ data
+  is `(sender node index << 32) | immediate`, and the 32-bit immediate keeps
+  exactly the meaning it has on the verbs path (bit 31 credit, bits 0..30
+  the exchange counter), so the credit protocol and the pipeline are
+  untouched.
+- **`mr_mode` is FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT with no
+  FI_MR_VIRT_ADDR**: RMA targets are OFFSETS into the peer's region, the key
+  comes from `fi_mr_key` after the MR is `fi_mr_bind`-ed to the endpoint and
+  `fi_mr_enable`-d, and the engine's region-relative offsets go on the wire
+  unchanged. Both addressing modes are handled at run time
+  (`FabricNet.virt_addr`), not assumed.
+
+Receives are posted to the endpoint rather than per peer (an RDM endpoint has
+one receive queue), `max(64, 32 × peers)` of them, and every one consumed is
+reposted from the poll. The flush read stays: it is a short `fi_read` of this
+rank's own region through its own address-vector entry, in the same role as
+the verbs self-QP read. The fence argument probably already covers it and
+MI300A's "device memory" is host-attached HBM anyway, but no cxi
+documentation was found that promises the ordering, it costs ~3.6 µs, and
+`MOJOCCL_FABRIC_FLUSH=0` turns it off for measurement.
+
+Every struct offset, size and constant `libfabric.mojo` hard-codes is dumped
+by `tests/multinode/selftest/fabric_abi.c` (gcc, against the installed
+`<libfabric>/include`) and cross-checked by
+`tests/multinode/selftest/fabric_abi.mojo`; 135 of them, and that self-test
+is the only thing standing between a wrong offset and a garbage pointer
+handed to the NIC.
 
 **Flow control is explicit credits.** The second half of the network area is
 carved once into `INBOX_SLOTS` fixed groups and exchange `e` lands in
@@ -605,25 +679,49 @@ the thread unpinned rather than fight Python for a scarce core.
 | `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
 | `MOJOCCL_IB_PROXY_CPU` | unset: auto-pin (mask permitting), see above | an exact CPU to pin the progress thread to; `none` disables pinning |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
-| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing |
+| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — backend and device, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing; on libfabric a second line with the negotiated FI_HMEM interface, memory key, addressing mode, address length and receive depth |
+| `MOJOCCL_NET` | unset: verbs if an ACTIVE IB port exists, else libfabric | `verbs` or `fabric`, forcing the transport |
+| `MOJOCCL_LIBFABRIC` | unset: `libfabric.so.1`, then `/opt/cray/libfabric/2.2.0rc1/lib64/libfabric.so.1` | an exact `libfabric.so.1` to dlopen |
+| `MOJOCCL_FABRIC_PROVIDER` | `cxi` | provider name asked of `fi_getinfo`; if it finds none, any provider satisfying the same hints is accepted |
+| `MOJOCCL_FABRIC_DOMAIN` | affinity choice among the provider's domains (PCI proximity to the GPU, then `local_rank % n`) | exact domain to use instead (`cxi2`) — the libfabric analogue of `MOJOCCL_IB_HCA` |
+| `MOJOCCL_FABRIC_HMEM` | `auto`: FI_HMEM_ROCR, then FI_HMEM_CUDA, then FI_HMEM_SYSTEM, first one the provider accepts | `system`, `rocr` or `cuda`, forcing the `fi_mr_attr.iface` the region registers under |
+| `MOJOCCL_FABRIC_FLUSH` | 1 | `0`: skip the `fi_read` flush after an exchange (libfabric backend only) |
 | `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
 | `MOJOCCL_NVLS` | 1 | `0`: no multicast region and no NVLS kernel, on every rank of the communicator (it is ANDed across ranks) |
 | `MOJOCCL_NVLS_MIN_MB` | 48 | single-node allreduces at or above this go through the switch; below it the unicast kernels keep the traffic. The default is the measured crossover. Must match on every rank — `ncclCommInitRank` checks it |
 | `MOJOCCL_NVLS_GRANULARITY` | `min` | `rec`: size the multicast object with `CU_MULTICAST_GRANULARITY_RECOMMENDED` (NCCL's choice, 512 MiB objects on H100) instead of `MINIMUM` (2 MiB) |
 | `MOJOCCL_SOCKET_DIR` | `/tmp` | where the node-local AF_UNIX sockets that carry the VMM/multicast file descriptors are bound |
 
-Limits and failure modes: 8 ranks per node, 16 nodes; more than one node
-with no ACTIVE InfiniBand port fails `ncclCommInitRank` with "no ACTIVE
-InfiniBand port found" (so Slingshot on Adastra is not covered; a
-libfabric/cxi transport would be a second backend); a peer that stops
+Limits and failure modes: 8 ranks per node, 16 nodes; a multi-node
+communicator on a machine with neither an ACTIVE InfiniBand port nor a
+libfabric RMA provider fails `ncclCommInitRank` with a message naming both
+and pointing at `MOJOCCL_NET`; a peer that stops
 responding is reported through `ncclCommGetAsyncError` after
 `MOJOCCL_IB_TIMEOUT_S` (one variable for every spin, intra-node and
 inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
 a clear message.
 
-**Requirements.** rdma-core/libibverbs on the nodes (here MLNX OFED 24.10),
-GPUDirect RDMA through `nvidia_peermem`, active InfiniBand ports reachable
-between every pair of nodes, a routable interface for the TCP bootstrap.
+**Requirements.** Either rdma-core/libibverbs with active InfiniBand ports
+reachable between every pair of nodes (here MLNX OFED 24.10) and GPUDirect
+RDMA through `nvidia_peermem`, **or** a libfabric with an FI_EP_RDM provider
+offering FI_RMA|FI_MSG|FI_HMEM and built with FI_HMEM support for the
+accelerator (Adastra: `libfabric/2.2.0rc1`, provider `cxi`, four
+`/dev/cxi[0-3]` NICs, ROCr HMEM). Either way: a routable interface for the
+TCP bootstrap.
+
+**One unresolved flake on Slingshot.** `fi_enable` intermittently returns
+`-FI_ENOMEM` when several ranks come up on one busy node — every rank of a
+batch fails, then minutes later the identical batch passes, in windows of
+minutes. `FI_LOG_LEVEL=warn` shows the provider's own view: `cxil_map: write
+error`, then "Failed to allocate TX EQ resources, ret: -12" — the kernel
+driver refused to map the control event queue. Measured during a failing
+window and ruled out: NIC resources (`cxi_service list -d cxi0 -v`: 0 of 2047
+EQs, 0 of 1024 TXQs in use), node memory (500 GB of 526 GB free),
+`RLIMIT_MEMLOCK` (unlimited), and the hugetlbfs knobs (a failing batch stayed
+failing with `FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1` set, a
+passing one stayed passing without them). It reads as contention with
+something else on the node. Retrying has always worked, and
+`ncclCommInitRank` prints all of that in the error.
 
 **Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
 is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
@@ -632,12 +730,16 @@ is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
 allreduce device-time bench (`ar_bench_gpt2.py`) in ABBA order, and a
 40-step nanoGPT DDP run under both. `RUN_MOJO=0` keeps only the NCCL legs.
 `tests/multinode/summarize.py <job log>` turns a log into the tables below.
-`tests/multinode/selftest/` holds six GPU-free self-tests — the bootstrap,
+`tests/multinode/selftest/` holds seven GPU-free self-tests — the bootstrap,
 the RDMA transport, the pipelined transport with its credit protocol, the
-region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, and
-the socket deadlines (the last three need no IB either, and the last needs
-no peers). The first three run on a host with IB HCAs
-and no GPU, such as the login node, with `MOJOCCL_IB_PROXY=0`; they caught
+region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, the
+socket deadlines and the libfabric ABI cross-check (the last four need no
+NIC either, and the last two need no peers) — plus one that does need a GPU,
+`fabric_hmem`, which registers a `driver.alloc_region` allocation with
+FI_HMEM_ROCR and exchanges into it. The transport ones run against either
+backend (`MOJOCCL_NET`) on a host with a NIC and no GPU — the login node
+under InfiniBand, a compute node under Slingshot — with
+`MOJOCCL_IB_PROXY=0`; they caught
 six bugs before any GPU time was spent.
 
 **Results**, 16 ranks on 2×8 H100, `ar_bench_gpt2.py` through the process
