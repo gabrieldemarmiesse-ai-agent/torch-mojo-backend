@@ -586,6 +586,25 @@ never been measured before (the prototype only ever used RECOMMENDED).
 
 ### Multi-node
 
+**A stdlib clock bug on AMD, worked around here.** Mojo's
+`global_perf_counter_ns()` on AMD computes `(s_memrealtime ticks * 1e9) //
+1e8` in 64 bits: the product overflows 184 s after the GPU's counter started,
+so on any node up for more than three minutes the "clock" is a saw-tooth of
+period 184.47 s. Every device spin in this library bounds itself with
+`now - t0 > timeout`, and a spin that straddles a wrap sees an enormous
+unsigned difference and fires its 60 s deadline at once: the block records
+the error word (which nothing reads yet) and returns, its node-mates wait a
+real 60 s for flags it never publishes, and the collective completes with
+garbage on that node. Measured on 2x4 MI300A: about one 40 s `stress` run in
+five corrupted a check, always a run 60-120 s longer than a clean one, and
+the same event is what hung DDP runs. `device_now_ns` in
+`collectives_kernels.mojo` reads the 100 MHz counter directly on AMD (with a
+volatile intrinsic -- a side-effect-free read is hoisted out of the spin
+loop and the deadline never fires); after it, 0 of 15 stress runs at 8 ranks
+failed. NVIDIA's `globaltimer` is nanoseconds and unchanged (sm_90a device
+code byte-identical). Report the stdlib bug upstream.
+
+
 The inter-node hop is Mojo too: no vendor collective library anywhere.
 An allreduce on a communicator spanning N nodes runs, per chunk: the
 intra-node reduce-scatter (`reduce_scatter_stage`) leaves every rank its

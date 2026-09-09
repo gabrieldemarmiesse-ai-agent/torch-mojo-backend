@@ -9,7 +9,7 @@
 
 from std.atomic import Atomic, Ordering
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
-from std.time import global_perf_counter_ns
+from collectives_kernels import device_now_ns
 from std.sys import size_of
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
@@ -141,7 +141,7 @@ def _proxy_wait_kernel(
     reports.
     """
     if global_idx.x == 0:
-        var t0 = global_perf_counter_ns()
+        var t0 = device_now_ns()
         var spins = 0
         while (
             Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mailbox) < seq
@@ -160,7 +160,7 @@ def _proxy_wait_kernel(
                         error_word, UInt64(9) * 1_000_000
                     )
                     return
-            if global_perf_counter_ns() - t0 > timeout_ns:
+            if device_now_ns() - t0 > timeout_ns:
                 Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
                     error_word, UInt64(9) * 1_000_000
                 )

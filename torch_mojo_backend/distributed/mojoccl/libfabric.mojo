@@ -215,6 +215,7 @@ comptime FI_REMOTE_WRITE: UInt64 = 1 << 13
 comptime FI_REMOTE_CQ_DATA: UInt64 = 1 << 17
 comptime FI_FENCE: UInt64 = 1 << 21
 comptime FI_COMPLETION: UInt64 = 1 << 24
+comptime FI_DELIVERY_COMPLETE: UInt64 = 1 << 28
 comptime FI_CONTEXT: UInt64 = 1 << 59
 comptime FI_CONTEXT2: UInt64 = 1 << 52
 comptime FI_LOCAL_COMM: UInt64 = 1 << 51
@@ -1258,8 +1259,10 @@ def fab_setup(
             if perf_counter_ns() >= deadline or not _is_enomem(e):
                 raise e
             print(
-                "mojoccl: libfabric endpoint bring-up failed with -FI_ENOMEM"
-                " (attempt",
+                (
+                    "mojoccl: libfabric endpoint bring-up failed with"
+                    " -FI_ENOMEM (attempt"
+                ),
                 attempt,
                 "), retrying for up to",
                 budget_ns // 1_000_000_000,
@@ -1485,7 +1488,13 @@ def fab_post_write(
     st64(m, MSGRMA_RMA_IOV_COUNT, 1)
     st64(m, MSGRMA_CONTEXT, _pack_ctx(NC_SEND, peer, seq))
     for _ in range(EAGAIN_SPINS):
-        var rc = fi_writemsg(f.ep, m, FI_COMPLETION)
+        # FI_DELIVERY_COMPLETE, not cxi's default transmit-complete: the
+        # notification that follows is FI_FENCEd behind THIS operation's
+        # completion, and a transmit-complete write has only left the
+        # initiator; cxi sets the target-side flush bit only under
+        # delivery-complete (prov/cxi/src/cxip_rma.c). Without it the peer can
+        # see the immediate before the payload is in its memory.
+        var rc = fi_writemsg(f.ep, m, FI_COMPLETION | FI_DELIVERY_COMPLETE)
         if rc == 0:
             return 0
         if not _retry(f, rc):

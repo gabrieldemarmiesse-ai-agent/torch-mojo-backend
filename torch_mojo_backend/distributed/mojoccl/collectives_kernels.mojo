@@ -159,6 +159,7 @@ from std.sys import (
     has_amd_gpu_accelerator,
     size_of,
 )
+from std.sys import llvm_intrinsic
 from std.time import global_perf_counter_ns
 from std.utils import StaticTuple
 
@@ -496,7 +497,7 @@ def _sync(
                     failed[unsafe_offset=0] = 1
                     break
                 # Same-GPU timer difference only; never compared across GPUs.
-                if global_perf_counter_ns() - t0 > timeout_ns:
+                if device_now_ns() - t0 > timeout_ns:
                     failed[unsafe_offset=0] = 1
                     break
     barrier()
@@ -543,6 +544,34 @@ def _gather_slot(writer: Int, owner: Int) -> Int:
     even when the message is exactly `cap` bytes.
     """
     return writer if writer < owner else writer - 1
+
+
+@always_inline
+def device_now_ns() -> UInt64:
+    """Device-side clock for the spin deadlines, wrap-safe on AMD.
+
+    The stdlib's `global_perf_counter_ns` on AMD returns
+    `(s_memrealtime_ticks * 1_000_000_000) // 100_000_000` in UInt64: the
+    product overflows 184 s after the GPU's counter started, and from then on
+    the value is a saw-tooth with a 184.47 s period. A spin whose start and
+    poll straddle a wrap computes `now - t0` as an enormous unsigned number
+    and fires its deadline at once -- the block records the error word and
+    returns while its peers wait a real 60 s for flags it never publishes,
+    and the collective completes with garbage on that node. Measured on
+    Adastra (2x4 MI300A): about one 40 s stress run in five corrupted, always
+    a run 60-120 s longer than a clean one. Reading the 100 MHz counter
+    directly and scaling by 10 keeps differences exact for centuries. NVIDIA's
+    `globaltimer` is nanoseconds already and is left as it was.
+    """
+    comptime if has_amd_gpu_accelerator():
+        return (
+            llvm_intrinsic[
+                "llvm.amdgcn.s.memrealtime", UInt64, has_side_effect=True
+            ]()
+            * 10
+        )
+    else:
+        return global_perf_counter_ns()
 
 
 @always_inline
@@ -836,7 +865,7 @@ def _ar_twoshot_kernel[
     comptime accum = DType.float32 if (
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1062,7 +1091,7 @@ def _ar_oneshot_kernel[
     comptime accum = DType.float32 if (
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1224,7 +1253,7 @@ def _rs_stage_kernel[
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
     comptime esize = size_of[dtype]()
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1355,7 +1384,7 @@ def _ag_finish_kernel[
     timeout_ns: UInt64,
 ):
     comptime esize = size_of[dtype]()
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1434,7 +1463,7 @@ def _bcast_kernel[
     writes `recv`, and the root copies `send` to `recv` locally when they
     differ (cheaper than gathering its own message back over NVLink).
     """
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = Int(world_i)
     var rank = Int(rank_i)
     var root = Int(root_i)
@@ -1566,7 +1595,7 @@ def _allgather_kernel[
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
     """
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
