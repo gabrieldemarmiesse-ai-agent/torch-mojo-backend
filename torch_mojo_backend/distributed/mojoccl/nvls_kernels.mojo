@@ -190,10 +190,10 @@ def nvls_padded_vecs(numel: Int, world: Int, esize: Int) -> Int:
 
 
 def nvls_barriers_per_call(numel: Int, world: Int, esize: Int, cv: Int) -> Int:
-    """How far the host must advance the flag target for one call: one barrier
-    before the pipeline and one per chunk."""
+    """How far the host must advance the flag target for one call: the start
+    barrier, the one that publishes the first chunk, and one per chunk."""
     var nvec = nvls_padded_vecs(numel, world, esize)
-    return (nvec + cv - 1) // cv + 1
+    return (nvec + cv - 1) // cv + 2
 
 
 # ===-------------------------------------------------------------------=== #
@@ -551,12 +551,27 @@ def _nvls_ar_kernel[
     var nch = (nvec + cv - 1) // cv
     var bar = target
 
+    # Start barrier, before a single byte of staging is written.
+    #
+    # The whole `2 * cap` arena is shared scratch, and the one rule that keeps
+    # collectives of different shapes and sizes from colliding in it is that
+    # every kernel opens with a barrier: no generation writes the arena until
+    # every rank has finished READING it for the previous one. This kernel
+    # needs that rule for the same reason the unicast ones do -- a broadcast or
+    # an all-gather retiring just before it has its peers reading my staging,
+    # which is exactly where the copy-in below writes. It is one barrier
+    # (~8 us) per call, not per chunk.
+    if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
+        _record_error(uc, 0)
+        return
+    bar += UInt64(world)
+
     if not is_reducer:
         _copy_in_span[dtype, W](
             uc_pay, in_ptr, 0, min(cv, nvec), n, ctid, cstride
         )
     if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
-        _record_error(uc, 0)
+        _record_error(uc, 1)
         return
     bar += UInt64(world)
 
@@ -583,7 +598,7 @@ def _nvls_ar_kernel[
                     out_ptr, uc_pay, (c - 1) * cv, s0, n, ctid, cstride
                 )
         if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
-            _record_error(uc, c + 1)
+            _record_error(uc, c + 2)
             return
         bar += UInt64(world)
 
@@ -610,7 +625,7 @@ def nvls_allreduce[
     in_ptr: Int,
     out_ptr: Int,
     numel: Int,
-    cap_bytes: Int,
+    payload_bytes: Int,
     scale: Float32,
     target: Int,
     blocks: Int,
@@ -620,10 +635,13 @@ def nvls_allreduce[
     NVSwitch, on `stream`. `in_ptr` may equal `out_ptr`.
 
     `mc_base`/`uc_base` are this rank's multicast and unicast mappings of the
-    same region; the payload lives in the region's first staging half
-    (`signal_bytes()`, `cap_bytes` long) and the counters in its signal area.
-    `target` is the flag value the FIRST of this call's barriers waits for; the
-    caller advances its own counter by `world * nvls_barriers_per_call(...)`.
+    same region; the payload starts at `signal_bytes()` and may use
+    `payload_bytes`, which is the WHOLE `2 * cap` arena -- this kernel needs
+    one buffer, not two, and the start barrier above is what lets it spread
+    over the same bytes a broadcast or a one-shot allreduce uses. The counters
+    live in the signal area. `target` is the flag value the FIRST of this
+    call's barriers waits for; the caller advances its own counter by
+    `world * nvls_barriers_per_call(...)`.
     """
     comptime if not NVLS_ARCH:
         raise Error("collectives: this build has no NVLS path (needs sm_90+)")
@@ -643,8 +661,8 @@ def nvls_allreduce[
     var nvec = nvls_padded_vecs(numel, world, size_of[dtype]())
     # The pad rounds the payload up to a whole per-rank slice, so the region
     # has to hold slightly more than the message.
-    if nvec * 16 > cap_bytes:
-        raise Error("collectives: NVLS message exceeds cap_bytes")
+    if nvec * 16 > payload_bytes:
+        raise Error("collectives: NVLS message exceeds the staging arena")
     if chunk_vecs < world or chunk_vecs % world != 0:
         raise Error("collectives: NVLS chunk must be whole per-rank slices")
     var rb = max(1, min(blocks - 1, blocks * NVLS_REDUCE_PCT // 100))

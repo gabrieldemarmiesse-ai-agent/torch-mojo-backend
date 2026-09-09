@@ -12,12 +12,26 @@
 # TORCH_MOJO_BACKEND_CCL=mojo is set).
 #
 # One process per GPU. Within a node, one region per rank of raw
-# driver-owned memory shared with legacy IPC (driver.mojo) -- MAX's own
-# allocator memory cannot be exported that way (see
-# docs/mojo_collectives_feasibility.md, section 5.6) -- and the collectives
-# of collectives_kernels.mojo run over the peer mappings. Across nodes,
-# GPUDirect RDMA written here over libibverbs (ibverbs.mojo,
+# driver-owned memory -- MAX's own allocator memory cannot be shared across
+# processes at all (see docs/mojo_collectives_feasibility.md, section 5.6) --
+# and the collectives of collectives_kernels.mojo run over the peer mappings.
+# Across nodes, GPUDirect RDMA written here over libibverbs (ibverbs.mojo,
 # internode.mojo): no vendor collective library takes part at any level.
+#
+# That region comes in two shapes, chosen once per communicator in round 1 of
+# the bootstrap and identical on every rank:
+#
+#   default   `cuMemAlloc` / `hipExtMallocWithFlags`, shared with legacy IPC
+#             (driver.mojo). Every node count, every vendor.
+#   NVLS      single node, every local device reporting
+#             CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED: VMM memory bound to a
+#             per-node multicast object and mapped twice (vmm.mojo), so that
+#             allreduces of MOJOCCL_NVLS_MIN_MB or more can go through the
+#             NVSwitch's own reduction engine (nvls_kernels.mojo) instead of
+#             over unicast NVLink. Peers are imported through the same
+#             file-descriptor exchange rather than with cuIpcOpenMemHandle,
+#             which cannot open VMM memory. The unicast kernels see no
+#             difference: same layout, same offsets, the plain mapping.
 #
 # A multi-node communicator runs each collective hierarchically:
 #
@@ -125,7 +139,6 @@ from vmm import (
     multicast_granularity,
     nvls_bind_and_map,
     nvls_create_and_share,
-    nvls_fit_cap,
     nvls_teardown,
     scm_bind,
     scm_unbind,
@@ -268,6 +281,14 @@ def _nvls_min_bytes() -> Int:
         return Int(s) * 1024 * 1024
     except:
         return nvls_min_bytes()
+
+
+def _nvls_recommended_granularity() -> Bool:
+    """`MOJOCCL_NVLS_GRANULARITY=rec` sizes the multicast object with
+    `CU_MULTICAST_GRANULARITY_RECOMMENDED`, which is what NCCL does and what
+    the prototype measured; the default `min` allocates what the region asked
+    for. The two measured the same on H100 -- see docs/distributed.md."""
+    return getenv("MOJOCCL_NVLS_GRANULARITY", String("min")) == String("rec")
 
 
 def _socket_dir() -> String:
@@ -854,14 +875,18 @@ def _bootstrap(
     var use_nvls = all_caps and topo.nnodes == 1 and topo.local_world >= 2
     var granularity = 0
     if use_nvls:
+        # The region is rounded up to this. `MOJOCCL_REGION_MB` still means
+        # what it says because vmm.mojo asks for the MINIMUM granularity
+        # (2 MiB on H100) rather than NCCL's RECOMMENDED (512 MiB); every rank
+        # derives the same number from the same device property, and round 2
+        # checks that they agree.
         granularity = multicast_granularity(
-            lib, topo.local_world, ordinal, signal_bytes() + 2 * cap_bytes
+            lib,
+            topo.local_world,
+            ordinal,
+            signal_bytes() + 2 * cap_bytes,
+            _nvls_recommended_granularity(),
         )
-        # The multicast object can only be a multiple of the granularity, so
-        # the rounding is paid either way; spend it on the staging halves
-        # rather than waste it. Every rank derives the same number from the
-        # same device property, and round 2 checks that.
-        cap_bytes = nvls_fit_cap(signal_bytes(), cap_bytes, granularity)
 
     var layout = region_layout(cap_bytes, topo.nnodes)
     var narenas = layout[0]
@@ -1459,9 +1484,13 @@ def _do_allreduce_nvls[
     """
     comptime item = size_of[dtype]()
     var world = state.local_world
-    # A chunk is padded up to whole per-rank 16-byte slices, so the largest
-    # message a staging half holds is a whole number of them.
-    var max_elems = (state.cap_bytes // 16) // world * world * (16 // item)
+    # The whole `2 * cap` arena, not one half: this kernel stages one buffer
+    # and no other collective is live while it runs (its start barrier is what
+    # guarantees that), so a 512 MiB allreduce is one launch on the default
+    # 256 MiB region. Rounded down to whole per-rank 16-byte slices, which is
+    # what the padding rule needs.
+    var payload = 2 * state.cap_bytes
+    var max_elems = (payload // 16) // world * world * (16 // item)
     var done = 0
     while done < count:
         var chunk = min(max_elems, count - done)
@@ -1478,7 +1507,7 @@ def _do_allreduce_nvls[
             sendbuff + done * item,
             recvbuff + done * item,
             chunk,
-            state.cap_bytes,
+            payload,
             scale,
             target,
             state.nvls_grid,

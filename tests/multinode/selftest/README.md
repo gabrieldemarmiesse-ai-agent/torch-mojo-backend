@@ -1,11 +1,12 @@
 # mojoccl transport self-tests that need no GPU
 
-Four standalone Mojo programs that exercise
-`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode}.mojo`
+Five standalone Mojo programs that exercise
+`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode,vmm}.mojo`
 on any host with InfiniBand — the SLURM **login node** included, which is
 what makes them cheap enough to run on every change. They caught six real
 bugs (bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`,
 a silently-misread port LID) before any GPU time was spent chasing them.
+`geometry_test` and `fd_exchange` need no InfiniBand either.
 
 Build (from a checkout of this repo, no accelerator needed):
 
@@ -17,6 +18,8 @@ Build (from a checkout of this repo, no accelerator needed):
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_pipeline
     uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
         -I torch_mojo_backend/distributed/mojoccl -o /tmp/geometry_test
+    uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
 
 ## `bs_test.mojo` — the TCP bootstrap
 
@@ -87,14 +90,36 @@ inside stage_in, chunk offsets 16-byte aligned, the staging total not
 growing, and a single-node region byte-identical to the pre-pipeline one.
 ~99k cases, under a second.
 
+## `fd_exchange.mojo` — the SCM_RIGHTS fd transport of the NVLS bring-up
+
+`fd_exchange <local_rank> <local_world> <dir> <magic>`. `vmm.mojo` hands the
+multicast object and every rank's own VMM handle to its node-mates as file
+descriptors over an AF_UNIX `SOCK_DGRAM` socket, with the msghdr / cmsghdr /
+sockaddr_un structs laid out by hand over `UInt64` words because `std.ffi`
+has no C-struct ABI. A wrong offset there does not fail loudly — `sendmsg`
+succeeds and the control message is silently dropped, or a descriptor arrives
+that belongs to something else — so this runs the shipped functions
+(`socket_path`, `scm_bind`, `scm_send`, `scm_recv`, `scm_unbind`) over
+ordinary file descriptors and checks that what the receiver reads *through*
+the descriptor is what the sender wrote.
+
+    rm -rf /tmp/fdx && mkdir -p /tmp/fdx
+    for r in $(seq 0 7); do /tmp/fd_exchange $r 8 /tmp/fdx 987654321 & done; wait
+
+Same two rounds and the same `(kind, tag)` dispatch as production: rank 0's
+"multicast" descriptor one-to-all, then every rank's own descriptor
+all-to-all, where datagrams from several senders arrive in an arbitrary order
+and the tag is the only thing that says whose region one is. No GPU, no
+InfiniBand, no multicast hardware. Exercised at 2 and 8 ranks.
+
 Covered by these and NOT by anything that needs a GPU: interface selection,
 the unique-id encoding, the two-round rendezvous, topology derivation, HCA
 and port selection, `ibv_reg_mr`, QP INIT/RTR/RTS with NCCL's attribute
 values, the ops-table dispatch for post_send/post_recv/poll_cq, the
 immediate's sequence and credit tagging, recv reposting, the self-QP
 GPUDirect flush, the credit-based flow control with several exchanges in
-flight, the region geometry, and `ib_setup`'s unwind of partially-created
-resources on a failure path. NOT covered: registration of *device* memory
+flight, the region geometry, the SCM_RIGHTS fd transport, and `ib_setup`'s
+unwind of partially-created resources on a failure path. NOT covered: registration of *device* memory
 (needs nvidia_peermem and a GPU), the progress thread and its two spin
 kernels (they need pinned host memory and a stream), and everything in
 `mojoccl.mojo` above the transport.

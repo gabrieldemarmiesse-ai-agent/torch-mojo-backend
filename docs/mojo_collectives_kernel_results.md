@@ -118,7 +118,12 @@ the region would have to be allocated with `cuMemCreate`/`cuMemMap` instead of
 `cuMemAlloc` so it can be bound to the multicast object. MAX's
 `DeviceMulticastBuffer` is single-process and cannot be reused across processes.
 That is the exact gap; it was not attempted here because the region allocator
-belongs to the plumbing layer.
+belongs to the plumbing layer. **It has since been closed exactly along those
+lines** — `nvls_kernels.mojo` and `vmm.mojo`, dispatched above 48 MiB, taking
+168 MiB from 990 to 790 us and 512 MiB from 2988 to 2226. Nothing in this file
+changed: the six exported names below are untouched and the unicast kernels
+still carry everything below the crossover. See the "NVLS" subsection of
+docs/distributed.md.
 
 Consequences for GPT-2 DDP: buckets 0-11 (9 and 27 MiB) are faster than NCCL and
 overlapped with backward anyway; the exposed 168 MiB tail bucket costs

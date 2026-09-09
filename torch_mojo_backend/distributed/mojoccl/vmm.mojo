@@ -30,11 +30,14 @@
 # `std.ffi` has no C-struct ABI, so msghdr/cmsghdr/sockaddr_un are written out
 # over UInt64 words, field offsets from the glibc headers.
 #
-# Granularity: `cuMulticastGetGranularity(RECOMMENDED)` is 512 MiB on H100 and
-# the bound size must be a multiple of it, so the region is rounded up and the
-# caller is told to spend the rounding rather than waste it (see
-# `nvls_fit_cap`). MINIMUM is 2 MiB there and was never measured; NCCL uses
-# RECOMMENDED and so does this.
+# Granularity: the bound size must be a multiple of what
+# `cuMulticastGetGranularity` reports, and on H100 that is 512 MiB for
+# RECOMMENDED against 2 MiB for MINIMUM. This asks for MINIMUM, unlike NCCL,
+# so that `MOJOCCL_REGION_MB` keeps meaning what it says -- at RECOMMENDED the
+# default 256 MiB region (128 KiB + 2 x 256 MiB) rounds up to a 1 GiB
+# allocation per rank, and even a deliberately tiny test region costs 512 MiB.
+# `MOJOCCL_NVLS_GRANULARITY=rec` asks for NCCL's choice back; the two measured
+# the same on H100 (docs/distributed.md).
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc
@@ -55,6 +58,7 @@ comptime CU_MEM_LOCATION_TYPE_DEVICE = 1
 # CUmemAccess_flags
 comptime CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
 # CUmulticastGranularity_flags / CUmemAllocationGranularity_flags
+comptime GRANULARITY_MINIMUM = 0
 comptime GRANULARITY_RECOMMENDED = 1
 # CUdevice_attribute
 comptime ATTR_MULTIPROCESSOR_COUNT = 16
@@ -161,16 +165,25 @@ def _access_desc(ordinal: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
 
 
 def multicast_granularity(
-    lib: OwnedDLHandle, world: Int, ordinal: Int, want_bytes: Int
+    lib: OwnedDLHandle,
+    world: Int,
+    ordinal: Int,
+    want_bytes: Int,
+    recommended: Bool,
 ) raises -> Int:
     """The alignment both the multicast object and the physical allocation
-    need; the region is rounded up to a multiple of it."""
+    need; the region is rounded up to a multiple of it. See the header for why
+    `recommended` defaults to False."""
     var probe = _mc_prop(world, max(want_bytes, 1))
     var g_mc: Int = 0
     _cu(
         lib,
         lib.get_function[Int32]("cuMulticastGetGranularity")(
-            Pointer(to=g_mc), probe, Int32(GRANULARITY_RECOMMENDED)
+            Pointer(to=g_mc),
+            probe,
+            Int32(
+                GRANULARITY_RECOMMENDED if recommended else GRANULARITY_MINIMUM
+            ),
         ),
         "cuMulticastGetGranularity",
     )
@@ -211,7 +224,7 @@ def multicast_capable(
             return False
         if not probe_create:
             return True
-        var g = multicast_granularity(lib, world, ordinal, 1)
+        var g = multicast_granularity(lib, world, ordinal, 1, False)
         var h: UInt64 = 0
         var rc = lib.get_function[Int32]("cuMulticastCreate")(
             Pointer(to=h), _mc_prop(world, g)
@@ -222,22 +235,6 @@ def multicast_capable(
         return True
     except:
         return False
-
-
-def nvls_fit_cap(region_overhead: Int, cap_bytes: Int, granularity: Int) -> Int:
-    """Payload cap to use once the region is rounded to `granularity`.
-
-    A region is `region_overhead + 2 * cap` bytes and the multicast object can
-    only be a multiple of the granularity (512 MiB on H100), so the rounding is
-    paid whether or not it is used. Spending it on the staging halves instead
-    of wasting it is free and strictly better: the single-node allreduce is cut
-    into `ceil(bytes / cap)` chunks, so a bigger cap is fewer launches and
-    fewer barriers. Never returns less than the caller asked for.
-    """
-    var want = region_overhead + 2 * cap_bytes
-    var rounded = _align_up(want, granularity)
-    var fitted = (rounded - region_overhead) // 2 // 4096 * 4096
-    return max(cap_bytes, fitted)
 
 
 # ===-------------------------------------------------------------------=== #
