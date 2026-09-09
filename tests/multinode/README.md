@@ -92,6 +92,23 @@ It passes when every rank prints `payload=OK`; the trace line then says how
 far the host ran ahead and how many times it waited for a ring slot. Needs
 two nodes and takes a second.
 
+## bucket_loop.py
+
+`bucket_loop.py` issues DDP's gradient buckets as plain allreduces -- same
+sizes, same order, one synchronize per step -- with optional concurrent
+compute (`MM`) and rank skew (`SKEW`). It is the harness for separating "the
+collectives are slow" from "something around the collectives is slow", which
+a size sweep cannot do:
+
+```bash
+BUCKETS=1,25,25,25,25,25,90 STEPS=10 MM=1 SKEW=3 torchrun --nnodes=2 \
+    --nproc-per-node=4 ... tests/multinode/bucket_loop.py
+```
+
+Measured on 2 nodes x 4 MI300A over cxi (216 MiB of buckets per step): 6.0
+ms/step plain, 8.8 with one matmul per bucket, 36.8 with a rank-skewed three
+-- against 2800 ms/step for a nanoGPT DDP step moving the same bytes.
+
 ## GPU-free self-tests
 
 `tests/multinode/selftest/` holds seven standalone Mojo programs that

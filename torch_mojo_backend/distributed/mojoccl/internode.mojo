@@ -324,6 +324,14 @@ struct IbState(Movable):
     # calling thread.
     var max_ahead: Int
     var n_ring_waits: Int
+    # Time-weighted breakdown of what the engine is waiting on, sampled once
+    # per `ib_drive` step: the head exchange is blocked by flow control, by
+    # the peer's data not having arrived, or by this rank's own writes not
+    # having completed. Engine-thread only.
+    var t_blocked_credit_ns: Int
+    var t_blocked_arrive_ns: Int
+    var t_blocked_sends_ns: Int
+    var t_last_sample_ns: Int
     # Host-side: highest exchange whose consumer kernel has been ENQUEUED.
     # Snapshotted into each work item as `credit_upto` (see
     # `ib_note_consumed`); never touched by the engine thread.
@@ -395,6 +403,10 @@ struct IbState(Movable):
         self.n_credit_stalls = 0
         self.max_ahead = 0
         self.n_ring_waits = 0
+        self.t_blocked_credit_ns = 0
+        self.t_blocked_arrive_ns = 0
+        self.t_blocked_sends_ns = 0
+        self.t_last_sample_ns = 0
         self.consumed_enqueued = 0
         self.comps = Int(alloc_bytes(COMP_BATCH * size_of[NetCompletion]()))
         self.ts = Int(alloc_bytes(16))
@@ -693,6 +705,35 @@ def _post_flush(mut st: IbState, seq: Int, flush_addr: Int) -> Int:
     return fab_post_flush(_fn(st)[], flush_addr - st.region, FLUSH_BYTES, seq)
 
 
+comptime BLOCK_CREDIT = 0
+comptime BLOCK_ARRIVE = 1
+comptime BLOCK_SENDS = 2
+
+
+def _sample_block(mut st: IbState, reason: Int):
+    """Attribute the time since the previous engine step to what is blocking.
+
+    Time-weighted rather than counted: "122 credit stalls" says flow control
+    held something back 122 times, not whether that cost a microsecond or a
+    tenth of a second, and the two look identical in a counter. Sampled at
+    the top of each step and charged to whatever the head exchange was
+    waiting for -- the engine spins, so the samples are dense.
+    """
+    var now = perf_counter_ns()
+    var dt = now - st.t_last_sample_ns
+    st.t_last_sample_ns = now
+    # A first sample, or one across an idle gap where the engine slept, says
+    # nothing about a wait; only charge plausible spin intervals.
+    if dt <= 0 or dt > 1_000_000:
+        return
+    if reason == BLOCK_CREDIT:
+        st.t_blocked_credit_ns += dt
+    elif reason == BLOCK_ARRIVE:
+        st.t_blocked_arrive_ns += dt
+    else:
+        st.t_blocked_sends_ns += dt
+
+
 def _advance(mut st: IbState) -> Bool:
     """Retire every exchange that is complete, in sequence order.
 
@@ -718,7 +759,11 @@ def _advance(mut st: IbState) -> Bool:
         var e = st.done_seq + 1
         ref w = _work(st, e)[]
         var idx = e % st.nslots
-        if st.tally[idx] < w.nrecv or not _sends_done(st, w):
+        if st.tally[idx] < w.nrecv:
+            _sample_block(st, BLOCK_ARRIVE)
+            break
+        if not _sends_done(st, w):
+            _sample_block(st, BLOCK_SENDS)
             break
         st.tally[idx] -= w.nrecv
         if w.nrecv > 0 and w.flush_addr != 0 and st.do_flush:
@@ -772,12 +817,14 @@ def ib_drive(mut st: IbState) -> Bool:
             st.posted_seq = e
             st.t_post_ns += perf_counter_ns() - t0
             moved = True
-        elif st.stall_seq != e:
-            # Counted once per exchange, not once per spin: a nonzero number
-            # in the trace means flow control, not the network, held a chunk
-            # back, which is the knob INBOX_SLOTS turns.
-            st.stall_seq = e
-            st.n_credit_stalls += 1
+        else:
+            _sample_block(st, BLOCK_CREDIT)
+            if st.stall_seq != e:
+                # Counted once per exchange, not once per spin: a nonzero
+                # number in the trace means flow control, not the network,
+                # held a chunk back, which is the knob INBOX_SLOTS turns.
+                st.stall_seq = e
+                st.n_credit_stalls += 1
     var n = _net_poll(st)
     for i in range(n):
         if _consume_wc(st, _comp(st, i)[]) < 0:
@@ -788,6 +835,7 @@ def ib_drive(mut st: IbState) -> Bool:
         moved = True
     if moved:
         st.last_progress_ns = perf_counter_ns()
+        st.t_last_sample_ns = st.last_progress_ns
     elif st.request_seq > st.done_seq:
         # Nothing outstanding can move and nothing has moved for a whole
         # timeout: a peer is gone, or a credit was lost.
@@ -1690,6 +1738,12 @@ def ib_report(ib: Int):
         "exchanges ahead, waited for a ring slot",
         st.n_ring_waits,
         "times",
+        "| blocked ms: credit",
+        Float64(st.t_blocked_credit_ns) / 1.0e6,
+        "arrival",
+        Float64(st.t_blocked_arrive_ns) / 1.0e6,
+        "own sends",
+        Float64(st.t_blocked_sends_ns) / 1.0e6,
         "| mean us post",
         Float64(st.t_post_ns) / Float64(st.n_exchanges) / 1000.0,
         "in flight",
