@@ -573,6 +573,27 @@ longest common `/sys/devices` prefix between the GPU's and the HCA's PCI
 paths, ties by `local_rank`; only ACTIVE InfiniBand ports (the RoCE ports
 are skipped). Addressing is LID-only, so one IB subnet.
 
+Unpinned, the OS scheduler can still park the progress thread on the same
+CPU as this rank's busy Python dispatch thread and leave it there — measured
+end to end (job 234455, 16 ranks/2×8 H100, nanoGPT DDP) as a mode in one of
+three ABBA runs: steps 4–11 at 45–46 ms (within 2% of NCCL's steady 44.6–44.9
+ms), steps 12–35 at a sustained 51 ms (~13% slower), then back to 46 ms —
+the scheduler leaving the progress thread on a shared core for a stretch of
+the run, not throughout it. `MOJOCCL_IB_PROXY_CPU` unset therefore pins by
+default:
+`sched_getaffinity` reads this process's mask, and if it holds at least
+`2 × local_world` CPUs (torchrun gives every rank of a node the same mask),
+the thread goes on that mask's CPUs taken in descending order, indexed by
+`local_rank` — the top `local_world` CPUs, distinct per rank, Python's
+threads left wherever the scheduler already put them. Within that, a
+candidate whose SMT sibling is itself another rank's pin is deprioritized in
+favor of one that isn't (`topology/thread_siblings_list`, best-effort — read
+failures just skip the check). A mask smaller than `2 × local_world` leaves
+the thread unpinned rather than fight Python for a scarce core.
+`MOJOCCL_IB_PROXY_CPU=<n>` overrides with an exact CPU;
+`MOJOCCL_IB_PROXY_CPU=none` opts out of pinning entirely.
+`MOJOCCL_IB_TRACE=1` prints the chosen CPU (or why none was chosen).
+
 | variable | default | controls |
 |---|---|---|
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
@@ -581,7 +602,7 @@ are skipped). Addressing is LID-only, so one IB subnet.
 | `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for a peer that stopped answering before latching an error — **every** wait: the inter-node exchange, its wait kernel, and the intra-node and NVLS barrier spins, which read it once per process |
 | `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread |
 | `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
-| `MOJOCCL_IB_PROXY_CPU` | unset | pin the progress thread to this CPU |
+| `MOJOCCL_IB_PROXY_CPU` | unset: auto-pin (mask permitting), see above | an exact CPU to pin the progress thread to; `none` disables pinning |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
 | `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing |
 | `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
