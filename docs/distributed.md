@@ -351,7 +351,8 @@ POSIX file descriptor; the fd travels to its node-mates over an AF_UNIX
 does and, unlike `pidfd_getfd`, works whatever
 `/proc/sys/kernel/yama/ptrace_scope` says. Every rank then
 `cuMulticastAddDevice`s its own device, **barrier**, `cuMemCreate`s its
-physical memory and `cuMulticastBindMem`s it at multicast offset 0 — so one
+physical memory (GPUDirect-RDMA-capable, so an HCA can register it) and
+`cuMulticastBindMem`s it at multicast offset 0 — so one
 multicast address covers the node's eight distinct allocations — and maps it
 **twice**: a multicast VA that only `multimem.*` may touch, and a plain VA
 that the unicast kernels, the staging copies and the flag spin use. Peers are
@@ -722,16 +723,19 @@ weight:
    1192. At 8 nodes the geometry caps a chunk at 36 MiB, so the question does
    not even arise. Only 512 MiB at 2 nodes (K = 10, chunks of 51.2 MiB, just
    over the crossover) would gain, and only ~4%.
-2. *It would need RDMA out of VMM memory.* The inter-node write reads
-   straight out of an arena's `stage_out`, so the staging has to be inside
-   the registered MR — and `ibv_reg_mr` on a `cuMemMap`'d VA returned NULL on
-   this cluster, with no dmabuf fallback
-   (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0 on every device, so
-   `ibv_reg_dmabuf_mr` is unavailable). That probe deserves one more careful
-   look (it used `ibv_get_device_list()[0]` rather than the affine HCA and
-   never read `errno`) before anything leans on it.
-3. Consequently a multi-node communicator would pay 150–230 ms of multicast
-   bring-up for nothing, so it does not build a multicast region at all:
+2. *It would need RDMA out of VMM memory*, which works but had to be
+   proven. The inter-node write reads straight out of an arena's
+   `stage_out`, so the staging has to be inside the registered MR.
+   `ibv_reg_mr` on a `cuMemMap`'d VA first returned NULL on this cluster; the
+   cause was the `cuMemCreate` prop, not the kind of memory: `nvidia_peermem`
+   refuses (EFAULT) a chunk created without `allocFlags.gpuDirectRDMACapable`,
+   which NCCL sets and `vmm.mojo` now sets too, after which all 12 HCAs
+   register it (`docs/mojo_collectives_nvls_results.md` §4). There is still
+   no dmabuf fallback (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0 on every
+   device).
+3. So, on the first reason alone, a multi-node communicator would pay
+   150–230 ms of multicast bring-up for nothing, and it does not build a
+   multicast region at all:
    multi-node allocation is byte for byte what it was, which the numbers
    confirm. Re-running this bench at 16 ranks after the NVLS work landed
    (job 234315, `cl02s01dgx24` + `cl02s02dgx23`, the same ABBA design) reads

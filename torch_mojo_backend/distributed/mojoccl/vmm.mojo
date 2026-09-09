@@ -10,7 +10,8 @@
 #                  a POSIX fd, send it to the node's other ranks
 #   all          : cuMemImportFromShareableHandle, cuMulticastAddDevice(mine)
 #   BARRIER        (every device must be in the team before any memory binds)
-#   all          : cuMemCreate(own physical memory, POSIX-fd handle type)
+#   all          : cuMemCreate(own physical memory, POSIX-fd handle type,
+#                  GPUDirect-RDMA-capable so an HCA can register it)
 #                  cuMulticastBindMem(mc, 0, mine, 0, size)  -- every rank at
 #                  multicast offset 0, so ONE multicast address covers the
 #                  node's eight distinct physical allocations
@@ -63,6 +64,7 @@ comptime GRANULARITY_RECOMMENDED = 1
 # CUdevice_attribute
 comptime ATTR_MULTIPROCESSOR_COUNT = 16
 comptime ATTR_MULTICAST_SUPPORTED = 132
+comptime ATTR_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 110
 
 # libc / linux
 comptime AF_UNIX: Int32 = 1
@@ -149,8 +151,16 @@ def _mc_prop(world: Int, size: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
     return p
 
 
-def _mem_prop(ordinal: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
+def _mem_prop(
+    lib: OwnedDLHandle, ordinal: Int
+) raises -> Pointer[UInt64, MutUntrackedOrigin]:
     """CUmemAllocationProp{type, requestedHandleTypes, location, win32, flags}.
+
+    `allocFlags.gpuDirectRDMACapable` is set whenever the device supports it,
+    as NCCL does (nccl:src/include/alloc.h:329) and as MAX's own arena does:
+    nvidia_peermem refuses to pin a VMM chunk created without it, so
+    `ibv_reg_mr` on the unicast mapping returned NULL (EFAULT) until this was
+    set (docs/mojo_collectives_nvls_results.md §4).
     """
     var p = unsafe_alloc[UInt64](4)
     p[unsafe_offset=0] = UInt64(CU_MEM_ALLOCATION_TYPE_PINNED) | (
@@ -160,7 +170,14 @@ def _mem_prop(ordinal: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
         UInt64(UInt32(ordinal)) << 32
     )
     p[unsafe_offset=2] = 0
-    p[unsafe_offset=3] = 0
+    # CUmemAllocationFlags{compressionType: u8, gpuDirectRDMACapable: u8, usage: u16}
+    var rdma = (
+        device_attribute(
+            lib, ATTR_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, ordinal
+        )
+        == 1
+    )
+    p[unsafe_offset=3] = UInt64(1) << 8 if rdma else UInt64(0)
     return p
 
 
@@ -207,7 +224,7 @@ def multicast_granularity(
         lib,
         lib.get_function[Int32]("cuMemGetAllocationGranularity")(
             Pointer(to=g_mem),
-            _mem_prop(ordinal),
+            _mem_prop(lib, ordinal),
             Int32(GRANULARITY_RECOMMENDED),
         ),
         "cuMemGetAllocationGranularity",
@@ -705,7 +722,7 @@ def nvls_bind_and_map(
     _cu(
         lib,
         lib.get_function[Int32]("cuMemCreate")(
-            Pointer(to=memh), size, _mem_prop(ordinal), UInt64(0)
+            Pointer(to=memh), size, _mem_prop(lib, ordinal), UInt64(0)
         ),
         "cuMemCreate",
     )

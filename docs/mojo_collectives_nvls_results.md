@@ -29,9 +29,10 @@ kernels of `../kernel`, which are snapshotted read-only in `ref/`),
 * **Crossover 48 MiB.** Below it the unicast push/reduce/pull kernels win and
   must keep the traffic; above it NVLS wins and the margin grows with size.
   GPT-2 DDP's 27 MiB bucket stays unicast, its 168 MiB tail bucket moves.
-* **RDMA registration of the region did not work first try** and there is no
-  dmabuf fallback on this driver -- see §4, it needs one more look before the
-  multi-node path leans on it.
+* **RDMA registration of the region failed for a reason that is now fixed**:
+  the `cuMemCreate` prop lacked `allocFlags.gpuDirectRDMACapable`, which
+  `nvidia_peermem` requires on VMM memory; there is still no dmabuf fallback
+  on this driver -- see §4.
 * **AMD keeps the unicast kernels**: `multimem` is sm_90+ and RCCL has no
   equivalent.
 
@@ -139,15 +140,16 @@ cuMemMap'd unicast mapping:
   loaded on the compute nodes and `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED
   = 1`.
 
-The second result is the load-bearing one and it is worth repeating with more
-care before acting on it: the probe registers 512 MiB on `ibv_get_device_list()[0]`,
-which on these nodes is not necessarily the HCA closest to GPU 0, and it does
-not read `errno`. Treat it as "GPUDirect registration of a VMM mapping did not
-work first try on this box", not as a proof that it cannot work. What is solid
-is the dmabuf half: with `DMA_BUF_SUPPORTED = 0` there is no dmabuf fallback,
-so the multi-node path has to make `ibv_reg_mr` work on this mapping — or keep
-the inter-node staging buffer in `cuMemAlloc` memory, which the current
-hierarchical design (`../kernel` §10) already does.
+Resolved (2026-09-09, `issue_repro/gdr_probe.mojo`: H100 node, all 12 mlx5
+HCAs, 64 MiB per buffer): the NULL came from the allocation, not from the HCA
+choice. `nvidia_peermem` only pins a `cuMemCreate` chunk whose prop set
+`allocFlags.gpuDirectRDMACapable = 1`. Without it every HCA returns NULL with
+`errno 14` (EFAULT); with it all 12 register. NCCL sets the flag whenever
+`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED` (110) is 1
+(`nccl:src/include/alloc.h:329`), `vmm.mojo` now does the same, and MAX's own
+arena chunks already carry it: a `DeviceContext` buffer registers on 12/12
+HCAs too. So the multi-node path can register a VMM region; only the dmabuf
+half stays closed on this driver.
 
 ## 5. One kernel, three schedules, and the traffic that decides against unicast
 
@@ -466,7 +468,8 @@ Recorded so the next agent does not re-explore them.
    copy loop).
 7. **`cuMemGetHandleForAddressRange(DMA_BUF_FD)`**: `CUDA_ERROR_NOT_SUPPORTED`
    (801), and `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0 on all 8 devices.
-   **`ibv_reg_mr` on the cuMemMap'd unicast mapping**: NULL. §4.
+   **`ibv_reg_mr` on the cuMemMap'd unicast mapping**: NULL until the prop
+   sets `gpuDirectRDMACapable`; fixed. §4.
 8. **The multicast object cannot be small.** `CU_MULTICAST_GRANULARITY_RECOMMENDED`
    is 512 MiB on this hardware, so a 512 MiB payload plus a 4 KiB header
    allocates 1 GiB per rank. `MINIMUM` is 2 MiB and was not measured.
