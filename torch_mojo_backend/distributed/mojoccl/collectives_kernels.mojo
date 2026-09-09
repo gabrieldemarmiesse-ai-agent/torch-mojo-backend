@@ -466,14 +466,29 @@ def _sync(
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x)
-        comptime obs = Ordering.RELAXED if _AMD else Ordering.ACQUIRE
+        # The acquire stays an acquire *load*, per iteration. Spinning on a
+        # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
+        # invalidating once after the wait looks exactly as strong, is worth
+        # a lot -- it is the difference between 243 us and 465 us at 27 MiB
+        # when the grid is 1024 blocks, because `buffer_inv sc0 sc1` throws
+        # the payload out of L2 for every block still working -- and was
+        # measured to leave a one-element allreduce at 2 ranks failing 2 runs
+        # in 13, against 0 in 12 with this spelling. Neither sample proves
+        # anything on its own (Fisher p ~ 0.5), but there is no argument for
+        # why the cheap version is sound on this hardware, and two cheaper
+        # release spellings already turned out unsound here in exactly this
+        # way -- small payloads only. So: correctness, and the large messages
+        # pay for it. See docs/mojo_collectives_kernel_results.md section 7
+        # for the experiment that would settle it.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer]).unsafe_offset(bid * MAX_WORLD + rank),
             target,
         )
         var mine = _flags(regions[rank]).unsafe_offset(bid * MAX_WORLD + peer)
         var spins = 0
-        while Atomic[DType.uint64].load[ordering=obs](mine) < target:
+        while (
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
+        ):
             spins += 1
             if spins >= _SPIN_CHECK:
                 spins = 0
@@ -484,20 +499,6 @@ def _sync(
                 if global_perf_counter_ns() - t0 > timeout_ns:
                     failed[unsafe_offset=0] = 1
                     break
-        comptime if _AMD:
-            # The one thing that IS safe to make cheaper. An acquire *load*
-            # compiles to `buffer_inv sc0 sc1` after every load, i.e. a
-            # whole-L1-and-L2 invalidate on every iteration of the spin, which
-            # throws the payload out of L2 for every other block still
-            # working and costs more the larger the grid: 27 MiB measured 243
-            # us at 128 blocks and 465 at 1024 with that spelling. Spinning on
-            # a relaxed load (still `sc0 sc1`, so it bypasses the caches and
-            # cannot go stale) and invalidating once after the wait is exactly
-            # as strong at the point it matters -- the trailing barrier then
-            # publishes it to the whole block, `buffer_inv` being a whole-L1
-            # (per CU, shared by the block) and whole-L2 (per device)
-            # operation.
-            fence[ordering=Ordering.ACQUIRE]()
     barrier()
     return failed[unsafe_offset=0] == 0
 
