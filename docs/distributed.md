@@ -669,9 +669,14 @@ collectives and its 256 MiB messages, which the pipeline cuts into 7 chunks.
 The `MOJOCCL_IB_PROXY=0` fallback passes `collectives` too: it cannot
 overlap (the callback blocks the stream) but the schedule and the credit
 protocol are correct on it. nanoGPT-124M DDP at 16 ranks reaches the same
-losses; end to end its median step throughput was 4173k tok/s against NCCL's
-4230k in the same job, with a second mojoccl leg at 3704k — the run-to-run
-noise on these shared nodes is still as large as the gap.
+losses. End to end, six 40-step runs alternating NCCL and mojoccl on one
+node pair (median step time over steps 3–40): on shared nodes (job 234185)
+NCCL 49.7 ms vs mojoccl 51.4 ms with adjacent pairs at 1.035, 1.084 and
+0.996, inside those nodes' noise; on `--exclusive` nodes (job 234455) NCCL is
+tight at 44.6–44.9 ms and mojoccl reads 45.1, 45.7 and 50.1 ms — the
+best-decile steps are within 1.7% of NCCL, and the slow run is a mode (steps
+12–35 at a steady 51 ms, 45–46 before and after): the progress thread sharing
+a core with the rank's Python thread. Pinning it by default is the follow-up.
 
 What is left at the large sizes is the intra-node half, not the network: the
 split reduce-scatter/all-gather pair is ~1004 µs at 168 MiB on one node
