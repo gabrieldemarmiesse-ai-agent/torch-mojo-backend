@@ -101,6 +101,7 @@ from bootstrap import (
 from collectives_kernels import (
     MAX_WORLD,
     allgather,
+    allgather_max_bytes,
     allgather_finish,
     allreduce,
     broadcast,
@@ -2305,7 +2306,12 @@ def _allgather_locked(
     _ensure_stream_cached(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
-        var max_bytes = max(1, state.cap_bytes)
+        # AMD's push all-gather stages `world-1` slots, so its chunk is
+        # smaller than the region cap; `allgather_max_bytes` is the identity
+        # on NVIDIA.
+        var max_bytes = max(
+            1, allgather_max_bytes(state.cap_bytes, state.local_world)
+        )
         var done = 0
         while done < per_rank_bytes:
             var chunk = min(max_bytes, per_rank_bytes - done)
