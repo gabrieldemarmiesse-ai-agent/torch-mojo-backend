@@ -22,8 +22,6 @@ from internode import (
     ib_exchange_now,
     ib_local_info,
     ib_npeers,
-    ib_port_lid,
-    ib_port_mtu,
     ib_setup,
     ib_teardown,
 )
@@ -105,18 +103,16 @@ def main() raises:
         2,
         net_off,
     )
-    var lid = ib_port_lid(ib)
-    var mtu = ib_port_mtu(ib)
     var b2 = _p(IB_BLOB_BYTES)
-    ib_local_info(ib, b2, lid, mtu)
+    ib_local_info(ib, b2)
     var t2 = _p(IB_BLOB_BYTES * nranks)
     bootstrap_allgather(conn, b2, IB_BLOB_BYTES, t2, 30.0)
     var peer_rank_of_node = List[Int]()
     for j in range(topo.nnodes):
         peer_rank_of_node.append(topo.rank_at[j * topo.local_world])
-    ib_connect(ib, t2, IB_BLOB_BYTES, peer_rank_of_node, mtu)
+    ib_connect(ib, t2, IB_BLOB_BYTES, peer_rank_of_node)
     bootstrap_barrier(conn, 30.0)
-    print("rank", rank, "lid", lid, "mtu", mtu, "peers", ib_npeers(ib), "RTS")
+    print("rank", rank, "peers", ib_npeers(ib), "connected")
 
     # Many exchanges, alternating inbox halves and payload sizes, well past
     # RECV_DEPTH so a leaked recv WR would show up as a hang.
