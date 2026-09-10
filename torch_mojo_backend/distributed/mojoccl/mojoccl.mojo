@@ -1042,8 +1042,11 @@ def _unwind_init(
     try:
         if abort_host != 0:
             free_host(lib, abort_host)
-    except:
-        pass
+    except e:
+        # Best effort: the error that got us here is the one worth reporting.
+        print(
+            "mojoccl: init unwind: freeing the status page failed (ignored):", e
+        )
     try:
         if use_nvls:
             nvls_teardown(nvls, lib, ordinal)
@@ -1052,8 +1055,9 @@ def _unwind_init(
                 if r != local_rank and regions[r] != 0:
                     close_handle(lib, regions[r])
             free_region(lib, base)
-    except:
-        pass
+    except e:
+        # Best effort: the error that got us here is the one worth reporting.
+        print("mojoccl: init unwind: releasing the region failed (ignored):", e)
 
 
 def _bootstrap(
@@ -1253,8 +1257,9 @@ def _bootstrap(
             try:
                 nvls_teardown(nvls, lib, ordinal)
                 scm_unbind(libc, sock, spath)
-            except:
-                pass
+            except e2:
+                # Best effort: the bring-up error below is the one to report.
+                print("mojoccl: NVLS unwind failed (ignored):", e2)
             raise Error(
                 "mojoccl: the NVSwitch-multicast region failed to come up ("
                 + String(e)
@@ -1497,7 +1502,9 @@ def _async_error_stream(state: CommState) -> DeviceStream:
         if state.last_stream != 0 and state.last_stream in state.stream_cache:
             return state.stream_cache[state.last_stream]
     except:
-        pass
+        # Lost the race with a concurrent insert: the communicator's own
+        # stream is always a valid answer.
+        return state.own_stream
     return state.own_stream
 
 

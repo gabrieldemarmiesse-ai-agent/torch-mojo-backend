@@ -1341,11 +1341,12 @@ def ib_setup(
         )
     # Only a hint for NIC affinity: a driver without the symbol, or a device
     # that will not report one, falls back to round-robin.
-    var gpu_bdf = String("")
+    var gpu_bdf: String
     try:
         gpu_bdf = device_pci_bus_id(driver, ordinal)
     except:
-        pass
+        # No PCI hint from this driver: NIC affinity falls back to round-robin.
+        gpu_bdf = String("")
 
     var st = IbState(
         _select_backend(), region, my_node, nnodes, nslots, credit_off
@@ -1418,7 +1419,8 @@ def _proxy_idle_ns() -> Int:
         if parsed > 0:
             us = parsed
     except:
-        pass
+        # Unparseable value: keep the default quantum.
+        us = DEFAULT_IB_PROXY_IDLE_US
     return us * 1000
 
 
@@ -1895,8 +1897,9 @@ def _teardown_ib_resources(mut st: IbState):
         # costs a refcount.
         try:
             free_host(open_driver(), st.mailbox)
-        except:
-            pass
+        except e:
+            # Best effort on a teardown path; the mailbox is dropped either way.
+            print("mojoccl: freeing the proxy mailbox failed (ignored):", e)
         st.mailbox = 0
         st.mailbox_dev = 0
     if st.vrb != 0:

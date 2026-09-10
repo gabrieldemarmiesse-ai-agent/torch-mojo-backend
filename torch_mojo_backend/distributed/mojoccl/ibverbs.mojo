@@ -269,7 +269,9 @@ struct Ibv(Movable):
             if mr != 0:
                 return mr
         except:
-            pass  # IBVERBS_1.8 absent: an old rdma-core, RO simply unavailable
+            # IBVERBS_1.8 absent (an old rdma-core): relaxed ordering is simply
+            # unavailable, so register without it.
+            return self.reg_mr(pd, addr, length, access)
         return self.reg_mr(pd, addr, length, access)
 
     def dereg_mr(self, mr: Int) raises:
@@ -1090,5 +1092,6 @@ def vrb_teardown(mut v: VerbsNet):
         if v.ctx != 0:
             v.ibv.close_device(v.ctx)
             v.ctx = 0
-    except:
-        pass
+    except e:
+        # Best-effort teardown: nothing is left to undo, but say what failed.
+        print("mojoccl: verbs teardown step failed (ignored):", e)

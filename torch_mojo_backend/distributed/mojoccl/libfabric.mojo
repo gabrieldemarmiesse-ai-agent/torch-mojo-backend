@@ -835,11 +835,12 @@ def _api_version(fab: Fab) raises -> UInt32:
 def _check(f: FabricNet, rc: Int, what: String) raises:
     if rc == 0:
         return
-    var msg = String("")
+    var msg: String
     try:
         msg = f.fab.strerror(-rc if rc < 0 else rc)
     except:
-        pass
+        # No text for this code: the numeric rc below is the message.
+        msg = String("")
     var hint = String("")
     if rc == -FI_ENOMEM:
         # This is memory pressure on the NODE, essentially always, and the
@@ -1646,7 +1647,8 @@ def fab_teardown(mut f: FabricNet):
     if f.info_list != 0:
         try:
             f.fab.freeinfo(f.info_list)
-        except:
-            pass
+        except e:
+            # Best-effort teardown; the pointer is dropped either way.
+            print("mojoccl: fi_freeinfo failed (ignored):", e)
         f.info_list = 0
         f.info = 0
