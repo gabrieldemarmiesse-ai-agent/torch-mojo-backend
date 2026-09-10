@@ -173,3 +173,28 @@ NCCL reference numbers at 16 ranks before the mojoccl transport exists —
 see `/home/gabriel/ddp_work/mojo_collectives/mn/NCCL_REFERENCE_16.md` for
 node names, SM clock, NCCL algo/protocol choices and the resulting numbers
 from that run.
+
+## e2e_three_stacks on Adastra (2 x 4 MI300A, Slingshot)
+
+`e2e_three_stacks_adastra.sh` is the same protocol as `e2e_three_stacks.sbatch`
+(discarded warm-up, five interleaved rounds per batch size, the evidence lines
+the summariser checks) for the CINES Adastra MI300A partition: 8 ranks on two
+4-APU nodes, RCCL through the site's `aws-ofi-rccl` plugin over libfabric
+`cxi`, mojoccl over its own libfabric transport. It runs as a batch script
+(`sbatch --nodes=2 --exclusive ... e2e_three_stacks_adastra.sh`) or from a
+login node against an existing allocation (`J=<jobid> ...`). `E2E_ROOT` points
+at the scratch tree holding the checkout, the two venvs (`venv-cpu` with the
+CPU torch wheel for the mojo stacks, `torch-rocm` for stock) and nanoGPT;
+`ENDURANCE=1` adds one 1500-step run per stack at batch 32. Two AMD facts it
+encodes: RCCL inside the mojo backend needs
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` on two MI300A nodes (without it
+`ncclCommInitRank` fails in the OFI plugin's memory registration), and the
+`srun` step must expose the whole node (`--cpus-per-task=192`) or
+`rank_bind.py` cannot reach the NUMA nodes of GPUs 2 and 3.
+
+Summarise with the log directory, world size and labels of that cluster:
+
+```bash
+E2E_STOCK_NAME="stock ROCm torch 2.9.1 + RCCL" E2E_SETUP="8 ranks on 2x4 MI300A" \
+  uv run --no-sync python tests/multinode/summarize_three_stacks.py <jobid> $E2E_ROOT/logs 8
+```

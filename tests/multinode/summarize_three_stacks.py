@@ -1,23 +1,34 @@
-"""Tables from e2e_honest logs. Every run is verified before it counts: the library that ran
-(loader trace line for mojo stacks), the network transport (NCCL NET/IB lines for NCCL
-stacks; mojoccl has no TCP data path, its transport is verified by a separate job), and
-the NUMA binding. Warm-up runs are discarded. Mean +- 95% CI over rounds (t, n-1 dof)."""
+"""Tables from e2e_three_stacks logs. Every run is verified before it counts: the library
+that ran (loader trace line for mojo stacks), the network transport (NCCL's NET/IB line, or
+the OFI plugin's "Selected provider is <cxi|efa|...>" line on libfabric fabrics such as
+Slingshot, for the NCCL/RCCL stacks; mojoccl has no TCP data path, its transport is verified
+by a separate job), and the NUMA binding. Warm-up runs are discarded. Mean +- 95% CI over
+rounds (t, n-1 dof).
+
+usage: summarize_three_stacks.py JOB [LOGDIR] [WORLD]
+env: E2E_STOCK_NAME (row label of the stock stack), E2E_SETUP (the "16 ranks on 2x8 H100"
+phrase of the table caption).
+"""
 
 import glob
+import os
 import re
 import statistics
 import sys
 
 job = sys.argv[1]
+LOGDIR = sys.argv[2] if len(sys.argv) > 2 else "/home/gabriel/ddp_work/logs"
+WORLD = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+SETUP = os.environ.get("E2E_SETUP", "16 ranks on 2x8 H100")
 T = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776}
 NAMES = {
-    "stock": "stock CUDA torch 2.11 + NCCL",
+    "stock": os.environ.get("E2E_STOCK_NAME", "stock CUDA torch 2.11 + NCCL"),
     "mojo_nccl": "mojo backend + NCCL",
     "mojo_mojoccl": "mojo backend + mojoccl (all Mojo)",
 }
 runs, problems = {}, []
 for f in sorted(
-    glob.glob(f"/home/gabriel/ddp_work/logs/e2e_three_stacks_{job}_bs*_*_*.log")
+    glob.glob(f"{LOGDIR}/e2e_three_stacks_{job}_bs*_*_*.log")
 ):
     m = re.search(rf"{job}_bs(\d+)_(\d+)_(\w+)\.log", f)
     assert m is not None, f
@@ -37,7 +48,9 @@ for f in sorted(
         problems.append(f"{tag}: incomplete")
         continue
     lib = re.findall(r"collectives via (\S+) \(([^)]*)\)", text)
-    ib = len(re.findall(r"NET/IB", text))
+    ib = len(re.findall(r"NET/IB", text)) + len(
+        re.findall(r"NET/OFI Selected provider is \w+", text)
+    )
     sock = len(re.findall(r"NET/Socket", text))
     numa = len(re.findall(r"rank_bind\[numa\]", text))
     compact = len(re.findall(r"rank_bind\[compact\]", text))
@@ -45,18 +58,18 @@ for f in sorted(
         if lib:
             problems.append(f"{tag}: the package was importable in the stock run")
         if ib == 0:
-            problems.append(f"{tag}: no NET/IB line from NCCL")
+            problems.append(f"{tag}: no NET/IB or NET/OFI provider line from NCCL")
     elif cfg == "mojo_nccl":
-        if not lib or "libnccl" not in lib[0][0]:
+        if not lib or not re.search(r"lib[nr]ccl", lib[0][0]):
             problems.append(f"{tag}: library line says {lib[:1]}")
         if ib == 0:
-            problems.append(f"{tag}: no NET/IB line from NCCL")
+            problems.append(f"{tag}: no NET/IB or NET/OFI provider line from NCCL")
     elif cfg == "mojo_mojoccl":
         if not lib or "mojoccl" not in lib[0][1]:
             problems.append(f"{tag}: library line says {lib[:1]}")
     if sock:
         problems.append(f"{tag}: NCCL reports NET/Socket ({sock} lines)")
-    if numa < 16 or compact:
+    if numa < WORLD or compact:
         problems.append(f"{tag}: binding numa={numa} compact={compact}")
     runs.setdefault((bs, cfg), []).append(
         (
@@ -84,10 +97,10 @@ for bs in sorted({b for b, _ in runs}, reverse=True):
     rm, rc = statistics.mean(ref), ci(ref)
     n = len(ref)
     print(
-        f"\nBatch {bs}x1024 per rank, 16 ranks on 2x8 H100, nanoGPT-124M, bf16 autocast, 30 steps, {n} interleaved rounds after a discarded warm-up; +- is a 95% CI over rounds:\n"
+        f"\nBatch {bs}x1024 per rank, {SETUP}, nanoGPT-124M, bf16 autocast, 30 steps, {n} interleaved rounds after a discarded warm-up; +- is a 95% CI over rounds:\n"
     )
     print(
-        "| stack | mean tokens/s, steps 20-30 | ratio vs stock CUDA torch + NCCL | step 1 (init) |"
+        f"| stack | mean tokens/s, steps 20-30 | ratio vs {NAMES['stock']} | step 1 (init) |"
     )
     print("|---|---|---|---|")
     for cfg in ("stock", "mojo_nccl", "mojo_mojoccl"):
