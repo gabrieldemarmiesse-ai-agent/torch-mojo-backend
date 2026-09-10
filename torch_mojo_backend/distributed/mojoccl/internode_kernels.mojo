@@ -22,7 +22,6 @@ from collectives_kernels import (
     _copy_bytes,
     _enqueue_cached,
     abort_raised,
-    fault_latched,
     latch_arena_error,
     publish_fault,
 )
@@ -135,20 +134,18 @@ def _proxy_request_kernel(
     so on its own deadline, which is a message rather than a wrong number. The
     same applies after `ncclCommAbort` -- there is nothing left to send.
 
-    Two loads from the status page, in a kernel whose entire body is already a
-    store to that same pinned page -- but they are not free, because there is
-    one of these per EXCHANGE. Measured at 8 ranks over two MI300A nodes, a
-    27 MiB fp32 allreduce forced into ~27 exchanges (`MOJOCCL_REGION_MB=4`):
-    1286 us before, 1306 us after, the same sign in all four ABBA pairs, so
-    about +1.6% for that many exchanges and proportionally less for fewer --
-    with the default 256 MiB region the same allreduce is ONE exchange. If it
-    ever matters, the fix is to make `publish_fault` raise the abort word too
-    and check only that: one load here, and every other spin on the rank would
-    leave promptly as a bonus.
+    ONE load from the status page, which is the most this kernel can afford:
+    the page is pinned host memory, so the load is a PCIe round trip, it sits
+    between the reduce-scatter and the network post, and there is one of these
+    per EXCHANGE. It used to be two dependent loads (abort word, then fault
+    code, on separate cache lines and serialized by `or`); `publish_fault` now
+    raises the abort word as well, so `abort_raised` alone answers both
+    questions. On two MI300A nodes with `MOJOCCL_REGION_MB=4` the two-load
+    version cost ~1.6% of a 27-exchange allreduce; on two H100 nodes (16
+    ranks, IB) the whole release-path check cost ~1 us per exchange.
     """
     if global_idx.x == 0:
-        var page = Int(status)
-        if abort_raised(page) or fault_latched(page):
+        if abort_raised(Int(status)):
             return
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
 
@@ -181,16 +178,24 @@ def _proxy_wait_kernel(
     successful exchange: the host's next collective returns
     NCCL_REMOTE_ERROR instead of the sum of an inbox nobody filled.
 
-    An already-latched fault is treated exactly like the abort word, at the
-    top and inside the spin: after the first failure `proxy_request` no longer
-    advances any mailbox, so every wait still queued behind it is waiting for
-    an exchange that will never be asked for. Waiting a full deadline each
-    would turn one 60 s stall into as many, one per chunk.
+    An already-latched fault leaves the same way an abort does -- it raises
+    the same word (`publish_fault`) -- and for the same reason: after the
+    first failure `proxy_request` no longer advances any mailbox, so every
+    wait still queued behind it is waiting for an exchange that will never be
+    asked for, and waiting a full deadline each would turn one 60 s stall
+    into as many, one per chunk.
+
+    Nothing is checked BEFORE the spin. The status page is pinned host
+    memory, so a check there is a PCIe round trip in a kernel that runs once
+    per exchange; the spin's own check, every `_ABORT_CHECK` iterations,
+    already bounds how long a stopped communicator holds the stream (a few
+    hundred microseconds, against a 60 s deadline), and an exchange that is
+    already done must not pay for the failure path at all. A wait that finds
+    the mailbox already at `seq` therefore touches the page exactly as often
+    as it did before any of this existed: never.
     """
     if global_idx.x == 0:
         var page = Int(status)
-        if abort_raised(page) or fault_latched(page):
-            return
         var t0 = device_now_ns()
         var spins = 0
         while (
@@ -200,11 +205,11 @@ def _proxy_wait_kernel(
             if spins >= _ABORT_CHECK:
                 spins = 0
                 if abort_raised(page):
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        error_word, UInt64(ERR_PROXY_WAIT) * 1_000_000
-                    )
-                    return
-                if fault_latched(page):
+                    # First writer wins, as everywhere else: an abort or a
+                    # fault that arrived from elsewhere already has a better
+                    # explanation in this word than "the exchange wait gave
+                    # up because of it".
+                    _ = latch_arena_error(error_word, ERR_PROXY_WAIT, 0)
                     return
             if device_now_ns() - t0 > timeout_ns:
                 # The peer of this wait is my own progress thread, not another

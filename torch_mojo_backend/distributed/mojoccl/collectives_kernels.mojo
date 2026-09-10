@@ -451,7 +451,13 @@ def status_word(page: Int, index: Int) -> Pointer[UInt64, MutAnyOrigin]:
 
 @always_inline
 def abort_raised(page: Int) -> Bool:
-    """Whether the host has raised this communicator's abort word."""
+    """Whether this communicator has stopped -- by `ncclCommAbort`, or by a
+    device deadline (`publish_fault` raises the same word).
+
+    The one predicate a kernel needs before it does anything irreversible,
+    and deliberately one word: a reader on the device pays a PCIe round trip
+    per load of this page.
+    """
     if page == 0:
         return False
     return (
@@ -468,6 +474,11 @@ def fault_latched(page: Int) -> Bool:
 
     Once it has, nothing this communicator does is trustworthy any more: some
     block gave up waiting for a peer, so an arena holds bytes nobody produced.
+
+    Distinguishes a deadline from an abort, which `abort_raised` does not (a
+    deadline raises the abort word too). Only `publish_fault`'s own guard
+    needs the distinction on the device; every other device reader wants
+    `abort_raised`, which is half the loads.
     """
     if page == 0:
         return False
@@ -552,6 +563,14 @@ def publish_fault(
     # Last, and with release: a nonzero code promises the six words above.
     Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
         status_word(page, STATUS_FAULT_WORD + FAULT_CODE), UInt64(code)
+    )
+    # And raise the abort word: "this communicator has failed" is then ONE
+    # word for every device reader, which matters on the inter-node release
+    # path, where each load of this pinned page is a PCIe round trip per
+    # exchange (see `internode._proxy_main`). Ordered after the code, so a
+    # reader that sees the word raised finds a complete record.
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        status_word(page, STATUS_ABORT_WORD), UInt64(1)
     )
 
 
