@@ -22,9 +22,32 @@
 # std.ffi still has no C-struct ABI (MOCO-3692).
 
 from std.ffi import OwnedDLHandle
-from std.memory.alloc import unsafe_alloc
+from std.os import getenv
+from std.sys import size_of
 
-comptime P8 = Pointer[UInt8, MutAnyOrigin]
+from netutil import (
+    MAX_NODES,
+    NC_FLUSH,
+    NC_OTHER,
+    NC_RECV,
+    NC_SEND,
+    NetCompletion,
+    P8,
+    alloc_bytes,
+    as_fn,
+    ld8,
+    ld16,
+    ld32,
+    ld64,
+    ldu32,
+    pci_pick,
+    st8,
+    st16,
+    st32,
+    st64,
+    stu32,
+    stu64,
+)
 
 # ---- enum values ---------------------------------------------------------
 comptime IBV_QPS_INIT: Int32 = 1
@@ -150,78 +173,6 @@ comptime IB_RNR_RETRY: UInt8 = 7  # connect.cc:498, hardcoded (= infinite)
 comptime IB_HOP_LIMIT: UInt8 = 255  # connect.cc:452,:476
 
 
-@always_inline
-def alloc_bytes(n: Int) -> P8:
-    var p = P8(unsafe_from_address=Int(unsafe_alloc[UInt8](n)))
-    for i in range(n):
-        p[unsafe_offset=i] = 0
-    return p
-
-
-@always_inline
-def _st8(p: P8, off: Int, v: UInt8):
-    p[unsafe_offset=off] = v
-
-
-@always_inline
-def _st16(p: P8, off: Int, v: UInt16):
-    p.unsafe_bitcast[UInt16]()[unsafe_offset=off // 2] = v
-
-
-@always_inline
-def _st32(p: P8, off: Int, v: Int32):
-    p.unsafe_bitcast[Int32]()[unsafe_offset=off // 4] = v
-
-
-@always_inline
-def _stu32(p: P8, off: Int, v: UInt32):
-    p.unsafe_bitcast[UInt32]()[unsafe_offset=off // 4] = v
-
-
-@always_inline
-def _st64(p: P8, off: Int, v: Int):
-    p.unsafe_bitcast[Int64]()[unsafe_offset=off // 8] = Int64(v)
-
-
-@always_inline
-def ld8(p: P8, off: Int) -> Int:
-    return Int(p[unsafe_offset=off])
-
-
-@always_inline
-def ld16(p: P8, off: Int) -> Int:
-    return Int(p.unsafe_bitcast[UInt16]()[unsafe_offset=off // 2])
-
-
-@always_inline
-def ld32(p: P8, off: Int) -> Int:
-    return Int(p.unsafe_bitcast[Int32]()[unsafe_offset=off // 4])
-
-
-@always_inline
-def ldu32(p: P8, off: Int) -> UInt32:
-    return p.unsafe_bitcast[UInt32]()[unsafe_offset=off // 4]
-
-
-@always_inline
-def ld64(p: P8, off: Int) -> Int:
-    return Int(p.unsafe_bitcast[Int64]()[unsafe_offset=off // 8])
-
-
-@always_inline
-def _as_fn[F: TrivialRegisterPassable](addr: Int) -> F:
-    """A callable from a raw function address.
-
-    Same shape as `std.ffi._get_dylib_function`'s cache hit: bitcast a
-    pointer TO the address variable, then load. A `Pointer.unsafe_bitcast`
-    straight to a function type is rejected (function types are not
-    `AnyType`), and the type must be `thin` -- a plain `def(...)` type is a
-    closure trait, not a function pointer.
-    """
-    var a = addr
-    return Pointer(to=a).unsafe_bitcast[F]()[]
-
-
 # ===-------------------------------------------------------------------=== #
 # The library handle (control path)
 # ===-------------------------------------------------------------------=== #
@@ -305,9 +256,8 @@ struct Ibv(Movable):
         internode.mojo is what makes the payload visible, and it is posted
         after the completion either way.
         """
-        var mr: Int
         try:
-            mr = Int(
+            var mr = Int(
                 self.lib.get_function[Int64]("ibv_reg_mr_iova2")(
                     pd,
                     addr,
@@ -316,11 +266,12 @@ struct Ibv(Movable):
                     UInt32(access | IBV_ACCESS_RELAXED_ORDERING),
                 )
             )
+            if mr != 0:
+                return mr
         except:
-            # IBVERBS_1.8 absent: an old rdma-core, RO simply unavailable
-            mr = 0
-        if mr != 0:
-            return mr
+            # IBVERBS_1.8 absent (an old rdma-core): relaxed ordering is simply
+            # unavailable, so register without it.
+            return self.reg_mr(pd, addr, length, access)
         return self.reg_mr(pd, addr, length, access)
 
     def dereg_mr(self, mr: Int) raises:
@@ -354,7 +305,7 @@ struct Ibv(Movable):
 @always_inline
 def post_send(qp: Int, wr: P8, bad_wr: P8) -> Int32:
     """`qp->context->ops.post_send(qp, wr, &bad_wr)`; 0 or an errno."""
-    var f = _as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
+    var f = as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
         ld64(
             P8(
                 unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)
@@ -367,7 +318,7 @@ def post_send(qp: Int, wr: P8, bad_wr: P8) -> Int32:
 
 @always_inline
 def post_recv(qp: Int, wr: P8, bad_wr: P8) -> Int32:
-    var f = _as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
+    var f = as_fn[def(Int, P8, P8) thin abi("C") -> Int32](
         ld64(
             P8(
                 unsafe_from_address=ld64(P8(unsafe_from_address=qp), QP_CONTEXT)
@@ -381,7 +332,7 @@ def post_recv(qp: Int, wr: P8, bad_wr: P8) -> Int32:
 @always_inline
 def poll_cq(cq: Int, num_entries: Int, wc: P8) -> Int32:
     """Number of completions written into `wc`, or negative on error."""
-    var f = _as_fn[def(Int, Int32, P8) thin abi("C") -> Int32](
+    var f = as_fn[def(Int, Int32, P8) thin abi("C") -> Int32](
         ld64(
             P8(
                 unsafe_from_address=ld64(P8(unsafe_from_address=cq), QP_CONTEXT)
@@ -413,26 +364,26 @@ def build_write_wr(
     """One unchained RDMA_WRITE[_WITH_IMM]. `wr`/`sge` are caller-owned
     scratch reused across calls, so every field is written every time
     rather than relying on what was there before."""
-    _st64(sge, SGE_ADDR, local_addr)
-    _stu32(sge, SGE_LENGTH, UInt32(nbytes))
-    _stu32(sge, SGE_LKEY, lkey)
+    st64(sge, SGE_ADDR, local_addr)
+    stu32(sge, SGE_LENGTH, UInt32(nbytes))
+    stu32(sge, SGE_LKEY, lkey)
     for i in range(SZ_SEND_WR):
         wr[unsafe_offset=i] = 0
-    _st64(wr, WR_ID, wr_id)
-    _st64(wr, WR_NEXT, 0)
-    _st64(wr, WR_SG_LIST, Int(sge))
-    _st32(wr, WR_NUM_SGE, 1)
-    _st32(
+    st64(wr, WR_ID, wr_id)
+    st64(wr, WR_NEXT, 0)
+    st64(wr, WR_SG_LIST, Int(sge))
+    st32(wr, WR_NUM_SGE, 1)
+    st32(
         wr,
         WR_OPCODE,
         IBV_WR_RDMA_WRITE_WITH_IMM if with_imm else IBV_WR_RDMA_WRITE,
     )
-    _st32(wr, WR_SEND_FLAGS, IBV_SEND_SIGNALED if signaled else 0)
+    st32(wr, WR_SEND_FLAGS, IBV_SEND_SIGNALED if signaled else 0)
     # imm_data is __be32 on both sides (nccl:...:p2p.cc:157 htobe32, :653
     # be32toh). Byte-swapped here so the receiver's plain load reads it back.
-    _stu32(wr, WR_IMM_DATA, _bswap32(immediate))
-    _st64(wr, WR_RDMA_REMOTE_ADDR, remote_addr)
-    _stu32(wr, WR_RDMA_RKEY, rkey)
+    stu32(wr, WR_IMM_DATA, _bswap32(immediate))
+    st64(wr, WR_RDMA_REMOTE_ADDR, remote_addr)
+    stu32(wr, WR_RDMA_RKEY, rkey)
 
 
 def build_read_wr(
@@ -446,18 +397,18 @@ def build_read_wr(
     rkey: UInt32,
 ):
     """A signaled RDMA_READ -- the GPUDirect flush (see internode.mojo)."""
-    _st64(sge, SGE_ADDR, local_addr)
-    _stu32(sge, SGE_LENGTH, UInt32(nbytes))
-    _stu32(sge, SGE_LKEY, lkey)
+    st64(sge, SGE_ADDR, local_addr)
+    stu32(sge, SGE_LENGTH, UInt32(nbytes))
+    stu32(sge, SGE_LKEY, lkey)
     for i in range(SZ_SEND_WR):
         wr[unsafe_offset=i] = 0
-    _st64(wr, WR_ID, wr_id)
-    _st64(wr, WR_SG_LIST, Int(sge))
-    _st32(wr, WR_NUM_SGE, 1)
-    _st32(wr, WR_OPCODE, IBV_WR_RDMA_READ)
-    _st32(wr, WR_SEND_FLAGS, IBV_SEND_SIGNALED)
-    _st64(wr, WR_RDMA_REMOTE_ADDR, remote_addr)
-    _stu32(wr, WR_RDMA_RKEY, rkey)
+    st64(wr, WR_ID, wr_id)
+    st64(wr, WR_SG_LIST, Int(sge))
+    st32(wr, WR_NUM_SGE, 1)
+    st32(wr, WR_OPCODE, IBV_WR_RDMA_READ)
+    st32(wr, WR_SEND_FLAGS, IBV_SEND_SIGNALED)
+    st64(wr, WR_RDMA_REMOTE_ADDR, remote_addr)
+    stu32(wr, WR_RDMA_RKEY, rkey)
 
 
 def build_recv_wr(wr: P8, wr_id: Int):
@@ -468,7 +419,7 @@ def build_recv_wr(wr: P8, wr_id: Int):
     registered region."""
     for i in range(SZ_RECV_WR):
         wr[unsafe_offset=i] = 0
-    _st64(wr, WR_ID, wr_id)
+    st64(wr, WR_ID, wr_id)
 
 
 @always_inline
@@ -496,13 +447,13 @@ def create_rc_qp(
     ibv: Ibv, pd: Int, cq: Int, max_send_wr: Int, max_recv_wr: Int
 ) raises -> Int:
     var ia = alloc_bytes(SZ_QP_INIT_ATTR)
-    _st64(ia, QIA_SEND_CQ, cq)
-    _st64(ia, QIA_RECV_CQ, cq)
-    _st32(ia, QIA_MAX_SEND_WR, Int32(max_send_wr))
-    _st32(ia, QIA_MAX_RECV_WR, Int32(max_recv_wr))
-    _st32(ia, QIA_MAX_SEND_SGE, 1)
-    _st32(ia, QIA_MAX_RECV_SGE, 1)
-    _st32(ia, QIA_QP_TYPE, IBV_QPT_RC)
+    st64(ia, QIA_SEND_CQ, cq)
+    st64(ia, QIA_RECV_CQ, cq)
+    st32(ia, QIA_MAX_SEND_WR, Int32(max_send_wr))
+    st32(ia, QIA_MAX_RECV_WR, Int32(max_recv_wr))
+    st32(ia, QIA_MAX_SEND_SGE, 1)
+    st32(ia, QIA_MAX_RECV_SGE, 1)
+    st32(ia, QIA_QP_TYPE, IBV_QPT_RC)
     var qp = ibv.create_qp(pd, ia)
     if qp == 0:
         raise Error("mojoccl: ibv_create_qp failed")
@@ -515,13 +466,13 @@ def qp_number(qp: Int) -> UInt32:
 
 def qp_to_init(ibv: Ibv, qp: Int, port: Int) raises:
     var a = alloc_bytes(SZ_QP_ATTR)
-    _st32(a, QA_QP_STATE, IBV_QPS_INIT)
-    _st16(a, QA_PKEY_INDEX, 0)
-    _st8(a, QA_PORT_NUM, UInt8(port))
+    st32(a, QA_QP_STATE, IBV_QPS_INIT)
+    st16(a, QA_PKEY_INDEX, 0)
+    st8(a, QA_PORT_NUM, UInt8(port))
     # Both directions on one QP pair: this rank writes into the peer's
     # region and the peer writes into this one, so REMOTE_WRITE is needed
     # on both ends (NCCL splits it because its QPs are one-directional).
-    _st32(
+    st32(
         a,
         QA_ACCESS_FLAGS,
         IBV_ACCESS_LOCAL_WRITE
@@ -545,23 +496,23 @@ def qp_to_rtr(
     global_route: Bool,
 ) raises:
     var a = alloc_bytes(SZ_QP_ATTR)
-    _st32(a, QA_QP_STATE, IBV_QPS_RTR)
-    _st32(a, QA_PATH_MTU, Int32(mtu))
-    _stu32(a, QA_DEST_QP_NUM, dest_qpn)
-    _st32(a, QA_RQ_PSN, IB_PSN)
-    _st8(a, QA_MAX_DEST_RD_ATOMIC, 1)
-    _st8(a, QA_MIN_RNR_TIMER, IB_MIN_RNR_TIMER)
-    _st16(a, QA_AH_DLID, UInt16(dlid))
-    _st8(a, QA_AH_SL, 0)
-    _st8(a, QA_AH_PORT_NUM, UInt8(port))
+    st32(a, QA_QP_STATE, IBV_QPS_RTR)
+    st32(a, QA_PATH_MTU, Int32(mtu))
+    stu32(a, QA_DEST_QP_NUM, dest_qpn)
+    st32(a, QA_RQ_PSN, IB_PSN)
+    st8(a, QA_MAX_DEST_RD_ATOMIC, 1)
+    st8(a, QA_MIN_RNR_TIMER, IB_MIN_RNR_TIMER)
+    st16(a, QA_AH_DLID, UInt16(dlid))
+    st8(a, QA_AH_SL, 0)
+    st8(a, QA_AH_PORT_NUM, UInt8(port))
     if global_route:
         # Only when the two ports are on different IB subnets -- NCCL's rule
         # (connect.cc:456-458); a single-subnet fabric never takes this.
-        _st8(a, QA_AH_IS_GLOBAL, 1)
+        st8(a, QA_AH_IS_GLOBAL, 1)
         for i in range(16):
             a[unsafe_offset=QA_AH_DGID + i] = remote_gid[unsafe_offset=i]
-        _st8(a, QA_AH_SGID_INDEX, UInt8(local_gid_index))
-        _st8(a, QA_AH_HOP_LIMIT, IB_HOP_LIMIT)
+        st8(a, QA_AH_SGID_INDEX, UInt8(local_gid_index))
+        st8(a, QA_AH_HOP_LIMIT, IB_HOP_LIMIT)
     var rc = ibv.modify_qp(qp, a, QP_MASK_RTR)
     if rc != 0:
         raise Error("mojoccl: ibv_modify_qp(RTR) failed, rc=" + String(rc))
@@ -569,12 +520,12 @@ def qp_to_rtr(
 
 def qp_to_rts(ibv: Ibv, qp: Int) raises:
     var a = alloc_bytes(SZ_QP_ATTR)
-    _st32(a, QA_QP_STATE, IBV_QPS_RTS)
-    _st32(a, QA_SQ_PSN, IB_PSN)
-    _st8(a, QA_TIMEOUT, IB_TIMEOUT)
-    _st8(a, QA_RETRY_CNT, IB_RETRY_CNT)
-    _st8(a, QA_RNR_RETRY, IB_RNR_RETRY)
-    _st8(a, QA_MAX_RD_ATOMIC, 1)
+    st32(a, QA_QP_STATE, IBV_QPS_RTS)
+    st32(a, QA_SQ_PSN, IB_PSN)
+    st8(a, QA_TIMEOUT, IB_TIMEOUT)
+    st8(a, QA_RETRY_CNT, IB_RETRY_CNT)
+    st8(a, QA_RNR_RETRY, IB_RNR_RETRY)
+    st8(a, QA_MAX_RD_ATOMIC, 1)
     var rc = ibv.modify_qp(qp, a, QP_MASK_RTS)
     if rc != 0:
         raise Error("mojoccl: ibv_modify_qp(RTS) failed, rc=" + String(rc))
@@ -682,3 +633,465 @@ def list_ib_ports(ibv: Ibv, want: String) raises -> List[IbPort]:
             ibv.close_device(ctx)
     ibv.free_device_list(lst)
     return out^
+
+
+# ===-------------------------------------------------------------------=== #
+# The transport, in the shape `internode.mojo`'s engine drives
+# ===-------------------------------------------------------------------=== #
+#
+# `libfabric.mojo` offers the same six operations over a completely
+# different API (post payload, post immediate, post flush, poll, local info,
+# add peer); the engine calls one or the other and never learns which
+# library is underneath. Everything below is the verbs half, moved here
+# unchanged from the engine when the second transport arrived -- it is the
+# code the two-node H100 + InfiniBand measurements were taken with.
+
+# Recv WRs kept posted per peer QP. Each RDMA_WRITE_WITH_IMM consumes one --
+# data and credits alike; the engine reposts every one it consumes, so the
+# depth only has to cover the burst a peer can produce while this rank is
+# elsewhere: `nslots` data messages plus `nslots` credits, times a wide
+# margin.
+comptime RECV_DEPTH = 64
+comptime CQ_SIZE = 1024
+comptime SEND_WR_DEPTH = 64
+
+
+struct VerbsNet(Movable):
+    """Everything the libibverbs transport owns, per communicator."""
+
+    var ibv: Ibv
+    var hca: String
+    var ctx: Int
+    var port: Int
+    var pd: Int
+    var mr: Int
+    var lkey: UInt32
+    var rkey: UInt32
+    var cq: Int
+    var qps: List[Int]  # one RC queue pair per peer, indexed as IbState.peers
+    var qpns: List[UInt32]
+    var flush_qp: Int
+    var flush_mr: Int
+    var flush_host: Int
+    var flush_lkey: UInt32
+    # Scratch the work-request builders write into, reused across posts.
+    var wr: Int
+    var sge: Int
+    var rwr: Int
+    var bad: Int
+    var wc: Int
+
+    def __init__(out self, var ibv: Ibv):
+        self.ibv = ibv^
+        self.hca = String("")
+        self.ctx = 0
+        self.port = 0
+        self.pd = 0
+        self.mr = 0
+        self.lkey = 0
+        self.rkey = 0
+        self.cq = 0
+        self.qps = List[Int]()
+        self.qpns = List[UInt32]()
+        self.flush_qp = 0
+        self.flush_mr = 0
+        self.flush_host = 0
+        self.flush_lkey = 0
+        self.wr = Int(alloc_bytes(SZ_SEND_WR))
+        self.sge = Int(alloc_bytes(SZ_SGE))
+        self.rwr = Int(alloc_bytes(SZ_RECV_WR))
+        self.bad = Int(alloc_bytes(16))
+        self.wc = Int(alloc_bytes(SZ_WC * 16))
+
+
+@always_inline
+def _b(addr: Int) -> P8:
+    return P8(unsafe_from_address=addr)
+
+
+def verbs_available() -> Bool:
+    """True if libibverbs opens and lists at least one usable port. Used by
+    the backend auto-selection in `internode.mojo`; every context it opens is
+    closed again before it returns."""
+    try:
+        var ibv = Ibv()
+        var ports = list_ib_ports(ibv, getenv("MOJOCCL_IB_HCA", ""))
+        var n = len(ports)
+        for i in range(n):
+            ibv.close_device(ports[i].ctx)
+        return n > 0
+    except:
+        return False
+
+
+def vrb_setup(
+    gpu_bdf: String,
+    local_rank: Int,
+    nnodes: Int,
+    region: Int,
+    region_bytes: Int,
+) raises -> VerbsNet:
+    """Open an HCA, register the region, create every queue pair (in INIT).
+
+    The QPs cannot reach RTR until the peers' `(qpn, lid, gid)` have been
+    gathered, so `vrb_connect_peer` finishes the job.
+    """
+    var ibv = Ibv()
+    var want = getenv("MOJOCCL_IB_HCA", "")
+    var ports = list_ib_ports(ibv, want)
+    if len(ports) == 0:
+        raise Error(
+            "mojoccl: no ACTIVE InfiniBand port found"
+            + (
+                " matching MOJOCCL_IB_HCA=" + want if want.byte_length()
+                > 0 else ""
+            )
+            + "; a multi-node communicator needs one"
+        )
+    var paths = List[String]()
+    for i in range(len(ports)):
+        paths.append("/sys/class/infiniband/" + ports[i].name + "/device")
+    var pick = pci_pick(paths, gpu_bdf, local_rank)
+    ref port = ports[pick]
+    # These nodes carry ~10 IB HCAs and every rank opened all of them to
+    # read their ports; hold only the one this rank will use.
+    for i in range(len(ports)):
+        if ports[i].ctx != port.ctx:
+            ibv.close_device(ports[i].ctx)
+
+    var v = VerbsNet(ibv^)
+    v.hca = String(port.name)
+    v.ctx = port.ctx
+    v.port = port.port
+    try:
+        v.pd = v.ibv.alloc_pd(v.ctx)
+        if v.pd == 0:
+            raise Error("mojoccl: ibv_alloc_pd failed on " + v.hca)
+        var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
+        var acc = (
+            IBV_ACCESS_LOCAL_WRITE
+            | IBV_ACCESS_REMOTE_WRITE
+            | IBV_ACCESS_REMOTE_READ
+        )
+        v.mr = v.ibv.reg_mr_relaxed(
+            v.pd, region, region_bytes, acc
+        ) if ro else v.ibv.reg_mr(v.pd, region, region_bytes, acc)
+        if v.mr == 0:
+            raise Error(
+                "mojoccl: ibv_reg_mr of the "
+                + String(region_bytes // (1024 * 1024))
+                + " MiB device region failed on "
+                + v.hca
+                + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+            )
+        var mrp = _b(v.mr)
+        v.lkey = ldu32(mrp, MR_LKEY)
+        v.rkey = ldu32(mrp, MR_RKEY)
+
+        # Host landing pad for the flush read, and the source of the 4-byte
+        # credit writes.
+        v.flush_host = Int(alloc_bytes(4096))
+        v.flush_mr = v.ibv.reg_mr(
+            v.pd, v.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
+        )
+        if v.flush_mr == 0:
+            raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
+        v.flush_lkey = ldu32(_b(v.flush_mr), MR_LKEY)
+
+        v.cq = v.ibv.create_cq(v.ctx, CQ_SIZE)
+        if v.cq == 0:
+            raise Error("mojoccl: ibv_create_cq failed")
+
+        for _ in range(nnodes - 1):
+            var qp = create_rc_qp(
+                v.ibv, v.pd, v.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
+            )
+            # Recorded before `qp_to_init` can raise, so the unwind below
+            # destroys it.
+            v.qps.append(qp)
+            v.qpns.append(qp_number(qp))
+            qp_to_init(v.ibv, qp, v.port)
+        v.flush_qp = create_rc_qp(v.ibv, v.pd, v.cq, SEND_WR_DEPTH, 8)
+        qp_to_init(v.ibv, v.flush_qp, v.port)
+    except e:
+        vrb_teardown(v)
+        raise e
+    return v^
+
+
+def vrb_port_lid(v: VerbsNet) raises -> Int:
+    """The port's LID, straight from `ibv_query_port`.
+
+    A nonzero return code (not the same thing as a `try/except` --
+    `query_port`'s own C call never raises, it returns an errno) used to be
+    silently discarded, reading LID 0 out of `pa`'s zeroed scratch. For the
+    self-connected flush QP that 0 is not a sentinel anyone downstream
+    checks; it just quietly modifies the flush QP with the wrong address.
+    Raise instead.
+    """
+    var pa = alloc_bytes(SZ_PORT_ATTR)
+    var rc = v.ibv.query_port(v.ctx, v.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
+    return ld16(pa, PA_LID)
+
+
+def vrb_port_mtu(v: VerbsNet) raises -> Int:
+    """The port's active MTU (see `vrb_port_lid` for why a failed query
+    raises rather than reading 0 out of zeroed scratch)."""
+    var pa = alloc_bytes(SZ_PORT_ATTR)
+    var rc = v.ibv.query_port(v.ctx, v.port, pa)
+    if rc != 0:
+        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
+    return ld32(pa, PA_ACTIVE_MTU)
+
+
+# ---- the bootstrap blob --------------------------------------------------
+#
+#   +0   u64 region base VA
+#   +8   u32 rkey
+#   +12  u32 lid
+#   +16  u32 active_mtu (ibv_mtu enum)
+#   +20  u32 number of QPs that follow
+#   +24  u32 qpn[MAX_NODES]     -- indexed by the PEER's node
+#   +24+4*MAX_NODES  u8 gid[16]
+
+comptime VRB_BLOB_QPN = 24
+comptime VRB_BLOB_GID = 24 + 4 * MAX_NODES
+
+
+def vrb_local_info(v: VerbsNet, blob: P8, nodes: List[Int], region: Int) raises:
+    """Fill this rank's half of the bootstrap blob. `nodes[i]` is the node
+    queue pair `i` was created for; `region` is the virtual address peers
+    write into (InfiniBand RMA always addresses by virtual address)."""
+    stu64(blob, 0, UInt64(region))
+    stu32(blob, 8, v.rkey)
+    stu32(blob, 12, UInt32(vrb_port_lid(v)))
+    stu32(blob, 16, UInt32(vrb_port_mtu(v)))
+    stu32(blob, 20, UInt32(len(v.qps)))
+    for i in range(len(v.qps)):
+        stu32(blob, VRB_BLOB_QPN + 4 * nodes[i], v.qpns[i])
+
+
+def vrb_blob_base(blob: P8) -> Int:
+    return Int(blob.unsafe_bitcast[UInt64]()[unsafe_offset=0])
+
+
+def vrb_blob_key(blob: P8) -> UInt64:
+    return UInt64(ldu32(blob, 8))
+
+
+def vrb_connect_peer(
+    mut v: VerbsNet, peer_index: Int, node: Int, my_node: Int, blob: P8
+) raises:
+    """Move peer `peer_index`'s queue pair to RTS from its blob, then
+    pre-post its receive work requests."""
+    var lid = ld32(blob, 12)
+    var mtu = ld32(blob, 16)
+    # The peer's QP for MY node, not for its own.
+    var dest_qpn = ldu32(blob, VRB_BLOB_QPN + 4 * my_node)
+    var gid = _b(Int(blob) + VRB_BLOB_GID)
+    if lid == 0:
+        raise Error(
+            "mojoccl: peer on node "
+            + String(node)
+            + " reported LID 0 -- its HCA port is not on an InfiniBand"
+            " fabric this library can address"
+        )
+    qp_to_rtr(
+        v.ibv,
+        v.qps[peer_index],
+        dest_qpn,
+        lid,
+        min(vrb_port_mtu(v), mtu),
+        v.port,
+        gid,
+        0,
+        False,
+    )
+    qp_to_rts(v.ibv, v.qps[peer_index])
+    for _ in range(RECV_DEPTH):
+        build_recv_wr(_b(v.rwr), 0)
+        if post_recv(v.qps[peer_index], _b(v.rwr), _b(v.bad)) != 0:
+            raise Error("mojoccl: ibv_post_recv failed while pre-posting")
+
+
+def vrb_connect_flush(mut v: VerbsNet) raises:
+    """The flush queue pair talks to itself."""
+    var gid0 = alloc_bytes(16)
+    qp_to_rtr(
+        v.ibv,
+        v.flush_qp,
+        qp_number(v.flush_qp),
+        vrb_port_lid(v),
+        vrb_port_mtu(v),
+        v.port,
+        gid0,
+        0,
+        False,
+    )
+    qp_to_rts(v.ibv, v.flush_qp)
+
+
+# ---- the data path -------------------------------------------------------
+
+
+def vrb_post_payload(
+    mut v: VerbsNet,
+    peer: Int,
+    local_addr: Int,
+    nbytes: Int,
+    remote_addr: Int,
+    remote_key: UInt64,
+    immediate: UInt32,
+    seq: Int,
+) -> Int:
+    """One signaled RDMA_WRITE_WITH_IMM: payload and immediate in a single
+    operation, which is the thing the libfabric transport has to build out
+    of two."""
+    build_write_wr(
+        _b(v.wr),
+        _b(v.sge),
+        seq,
+        local_addr,
+        v.lkey,
+        nbytes,
+        remote_addr,
+        UInt32(remote_key),
+        immediate,
+        True,
+        True,
+    )
+    return Int(post_send(v.qps[peer], _b(v.wr), _b(v.bad)))
+
+
+def vrb_post_imm(
+    mut v: VerbsNet,
+    peer: Int,
+    remote_addr: Int,
+    remote_key: UInt64,
+    nbytes: Int,
+    immediate: UInt32,
+    seq: Int,
+) -> Int:
+    """An immediate with nothing to say: an UNSIGNALED short write into the
+    peer's credit landing pad. The bytes are never read -- the immediate is
+    the message -- but a real address is needed because a zero-length RDMA
+    write is not worth relying on across HCAs. Unsignaled because a
+    completion here would be indistinguishable from a data send, and the
+    data sends are what reclaims the send queue; a failed credit still
+    raises a completion with a bad status."""
+    build_write_wr(
+        _b(v.wr),
+        _b(v.sge),
+        seq,
+        v.flush_host,
+        v.flush_lkey,
+        nbytes,
+        remote_addr,
+        UInt32(remote_key),
+        immediate,
+        True,
+        False,
+    )
+    return Int(post_send(v.qps[peer], _b(v.wr), _b(v.bad)))
+
+
+def vrb_post_flush(
+    mut v: VerbsNet, remote_addr: Int, nbytes: Int, seq: Int
+) -> Int:
+    build_read_wr(
+        _b(v.wr),
+        _b(v.sge),
+        seq,
+        v.flush_host,
+        v.flush_lkey,
+        nbytes,
+        remote_addr,
+        v.rkey,
+    )
+    return Int(post_send(v.flush_qp, _b(v.wr), _b(v.bad)))
+
+
+def _peer_of_qpn(v: VerbsNet, qpn: UInt32) -> Int:
+    for k in range(len(v.qpns)):
+        if v.qpns[k] == qpn:
+            return k
+    return -1
+
+
+def vrb_poll(mut v: VerbsNet, comps: Int, max_comps: Int) -> Int:
+    """Up to `max_comps` completions, translated into `NetCompletion`s.
+
+    Reposting a consumed receive work request happens here rather than in
+    the engine: it is the one piece of per-completion bookkeeping that is
+    purely about verbs. A receive slot lost is a later RNR the peer retries
+    forever (IB_RNR_RETRY = 7), i.e. a silent hang, so a failed repost is
+    reported as a failed completion.
+    """
+    var n = Int(poll_cq(v.cq, min(max_comps, 16), _b(v.wc)))
+    if n < 0:
+        var c = NetCompletion()
+        c.status = 2000 - n
+        Pointer[NetCompletion, MutAnyOrigin](unsafe_from_address=comps)[] = c^
+        return 1
+    for i in range(n):
+        var w = _b(v.wc + i * SZ_WC)
+        var c = NetCompletion()
+        if Int32(ld32(w, WC_STATUS)) != IBV_WC_SUCCESS:
+            c.status = 1000 + ld32(w, WC_STATUS) * 1000 + ld32(w, WC_VENDOR_ERR)
+        else:
+            var op = Int32(ld32(w, WC_OPCODE))
+            c.peer = _peer_of_qpn(v, ldu32(w, WC_QP_NUM))
+            if op == IBV_WC_RECV_RDMA_WITH_IMM:
+                c.kind = NC_RECV
+                c.imm = be32(ldu32(w, WC_IMM_DATA))
+                if c.peer >= 0:
+                    build_recv_wr(_b(v.rwr), 0)
+                    if post_recv(v.qps[c.peer], _b(v.rwr), _b(v.bad)) != 0:
+                        c.status = 5
+            elif op == IBV_WC_RDMA_WRITE:
+                # Only data writes are signaled (credits are not), and their
+                # wr_id is the exchange number.
+                c.kind = NC_SEND
+                c.wr_id = ld64(w, WC_WR_ID)
+            elif op == IBV_WC_RDMA_READ:
+                c.kind = NC_FLUSH
+            else:
+                c.kind = NC_OTHER
+        Pointer[NetCompletion, MutAnyOrigin](
+            unsafe_from_address=comps + i * size_of[NetCompletion]()
+        )[] = (c^)
+    return n
+
+
+def vrb_teardown(mut v: VerbsNet):
+    """Release every ibverbs resource `vrb_setup` may have created -- shared
+    by teardown of a live communicator and by `vrb_setup`'s own failure path
+    (a later step raised after an earlier one succeeded), which is why every
+    field is zero-guarded."""
+    try:
+        for i in range(len(v.qps)):
+            v.ibv.destroy_qp(v.qps[i])
+        v.qps.clear()
+        if v.flush_qp != 0:
+            v.ibv.destroy_qp(v.flush_qp)
+            v.flush_qp = 0
+        if v.cq != 0:
+            v.ibv.destroy_cq(v.cq)
+            v.cq = 0
+        if v.flush_mr != 0:
+            v.ibv.dereg_mr(v.flush_mr)
+            v.flush_mr = 0
+        if v.mr != 0:
+            v.ibv.dereg_mr(v.mr)
+            v.mr = 0
+        if v.pd != 0:
+            v.ibv.dealloc_pd(v.pd)
+            v.pd = 0
+        if v.ctx != 0:
+            v.ibv.close_device(v.ctx)
+            v.ctx = 0
+    except e:
+        # Best-effort teardown: nothing is left to undo, but say what failed.
+        print("mojoccl: verbs teardown step failed (ignored):", e)

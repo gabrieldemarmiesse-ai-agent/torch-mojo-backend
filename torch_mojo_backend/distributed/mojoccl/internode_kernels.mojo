@@ -9,12 +9,22 @@
 
 from std.atomic import Atomic, Ordering
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
-from std.time import global_perf_counter_ns
+from collectives_kernels import device_now_ns
 from std.sys import size_of
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
-from collectives_kernels import BLOCK, MAX_WORLD, _copy_bytes, _enqueue_cached
+from collectives_kernels import (
+    BLOCK,
+    ERR_PROXY_WAIT,
+    FAULT_NO_PEER,
+    MAX_WORLD,
+    _copy_bytes,
+    _enqueue_cached,
+    abort_raised,
+    latch_arena_error,
+    publish_fault,
+)
 
 comptime _UNROLL = 4
 comptime _MAX_BLOCKS = 432
@@ -22,6 +32,31 @@ comptime _ABORT_CHECK = 256
 """Mailbox reads between two probes of the abort word. Both are host memory
 across PCIe, so probing every iteration would double the wait kernel's traffic
 for no gain: 256 iterations is well under a millisecond."""
+
+# REVERTED: polling the mailbox with a relaxed load and one acquire fence at
+# the end.
+#
+# The measurement that motivated it is real. On gfx942 an acquire load at
+# system scope lowers to `global_load ... sc0 sc1` followed by `buffer_inv sc0
+# sc1`, a whole L1 AND L2 invalidate, and this kernel spins for as long as an
+# exchange takes -- so every other kernel resident on the GPU loses its L2,
+# millions of times a second. The relaxed spelling removed every invalidate
+# from the loop (verified in the assembly: 0 in the loop, 1 for the fence
+# after it) and left the sm_90a PTX byte-identical.
+#
+# It is reverted anyway, for the reason the same change was reverted in
+# `collectives_kernels.mojo`'s barrier (see that file's history): there is no
+# argument for why the cheap version is sound on this hardware, only a
+# symmetry that looks right -- the spin load still carries `sc0 sc1`, so it
+# cannot read a stale flag, and the payload ordering is provided once by the
+# fence. A one-element allreduce at 2 ranks flaked 2 runs in 13 with the
+# barrier's version and 0 in 12 without. And the benefit here was never
+# measured on a workload: nanoGPT's throughput was identical with and without
+# it, because what actually cost 26x was MAX's VMM allocator, not this.
+#
+# Unmeasured benefit plus an unexplained multi-node stall in the same
+# neighbourhood is not a trade worth making. If it comes back it should come
+# back with a soundness argument and a workload that shows the win.
 
 
 @__llvm_metadata(
@@ -84,6 +119,11 @@ def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
     A release store into pinned host memory, so everything the stream did
     before this kernel -- the reduce-scatter that produced the shard the
     thread is about to send -- is visible to the CPU that acquires it.
+
+    One store and nothing else: the stopped-communicator guard lives on the
+    thread that acquires this store (`internode._proxy_main`, which says why
+    that is the stronger place), not in front of it, where each load of the
+    pinned status page cost a PCIe round trip per exchange.
     """
     if global_idx.x == 0:
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
@@ -96,7 +136,7 @@ def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
 def _proxy_wait_kernel(
     mailbox: Pointer[UInt64, MutAnyOrigin],
     error_word: Pointer[UInt64, MutAnyOrigin],
-    abort_word: Pointer[UInt64, MutAnyOrigin],
+    status: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
     timeout_ns: UInt64,
 ):
@@ -109,14 +149,31 @@ def _proxy_wait_kernel(
     stop the stream, wake a thread and restart it. A spin kernel and a
     spinning CPU thread cost a launch each.
 
-    On the deadline -- or as soon as `ncclCommAbort` raises `abort_word`,
-    which is why abort does not cost a full deadline -- it writes the region's
-    error word and gives up rather than hanging the stream forever; the add
-    kernel then runs on stale inbox bytes, which `ncclCommGetAsyncError`
-    reports.
+    On the deadline -- or as soon as `ncclCommAbort` raises the abort word,
+    which is why abort does not cost a full deadline -- it records the failure
+    and gives up rather than hanging the stream forever. A deadline also
+    latches the communicator's fault (`publish_fault`), which is what stops
+    the queued `inbox_add` behind this kernel from being treated as a
+    successful exchange: the host's next collective returns
+    NCCL_REMOTE_ERROR instead of the sum of an inbox nobody filled.
+
+    An already-latched fault leaves the same way an abort does -- it raises
+    the same word (`publish_fault`) -- and for the same reason: after the
+    first failure the progress thread stops honouring the mailbox
+    (`internode._proxy_main`), so every wait still queued behind it is
+    waiting for an exchange that will never be asked for, and waiting a full
+    deadline each would turn one 60 s stall into as many, one per chunk.
+
+    Nothing is checked BEFORE the spin: a load of the pinned status page is
+    a PCIe round trip in a kernel that runs once per exchange, and the spin's
+    own check every `_ABORT_CHECK` iterations already bounds how long a
+    stopped communicator holds the stream (a few hundred microseconds
+    against a 60 s deadline). A wait that finds the mailbox already at `seq`
+    never touches the page, as before.
     """
     if global_idx.x == 0:
-        var t0 = global_perf_counter_ns()
+        var page = Int(status)
+        var t0 = device_now_ns()
         var spins = 0
         while (
             Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mailbox) < seq
@@ -124,21 +181,30 @@ def _proxy_wait_kernel(
             spins += 1
             if spins >= _ABORT_CHECK:
                 spins = 0
-                if (
-                    Int(abort_word) != 0
-                    and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-                        abort_word
-                    )
-                    != 0
-                ):
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        error_word, UInt64(9) * 1_000_000
-                    )
+                if abort_raised(page):
+                    # First writer wins, as everywhere else: an abort or a
+                    # fault that arrived from elsewhere already has a better
+                    # explanation in this word than "the exchange wait gave
+                    # up because of it".
+                    _ = latch_arena_error(error_word, ERR_PROXY_WAIT, 0)
                     return
-            if global_perf_counter_ns() - t0 > timeout_ns:
-                Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                    error_word, UInt64(9) * 1_000_000
-                )
+            if device_now_ns() - t0 > timeout_ns:
+                # The peer of this wait is my own progress thread, not another
+                # rank, so there is no flag and no peer to name: `seen` is how
+                # far the engine had got, `target` the exchange asked for.
+                if latch_arena_error(error_word, ERR_PROXY_WAIT, 0):
+                    publish_fault(
+                        page,
+                        ERR_PROXY_WAIT,
+                        0,
+                        0,
+                        FAULT_NO_PEER,
+                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                            mailbox
+                        ),
+                        seq,
+                        Int(error_word),
+                    )
                 return
 
 
@@ -289,7 +355,7 @@ def proxy_wait(
     stream: DeviceStream,
     mailbox: Int,
     error_word: Int,
-    abort_word: Int,
+    status: Int,
     seq: Int,
     timeout_ns: Int,
 ) raises:
@@ -300,7 +366,7 @@ def proxy_wait(
         1,
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=error_word),
-        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=abort_word),
+        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=status),
         UInt64(seq),
         UInt64(timeout_ns),
     )

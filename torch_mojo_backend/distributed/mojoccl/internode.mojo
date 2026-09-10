@@ -1,7 +1,27 @@
-# The inter-node hop: GPUDirect RDMA over libibverbs, no vendor collective
-# library. One RC queue pair per remote node, to the rank holding the SAME
-# local_rank there -- so the 8 ranks of a node drive 8 independent NICs and
-# each rank only ever exchanges its own 1/local_world shard.
+# The inter-node hop: GPUDirect RDMA, no vendor collective library. One
+# connection per remote node, to the rank holding the SAME local_rank there
+# -- so the 8 ranks of a node drive 8 independent NICs and each rank only
+# ever exchanges its own 1/local_world shard.
+#
+# TWO TRANSPORTS, ONE ENGINE. Everything below the "progress engine" heading
+# is transport-independent; the six operations it needs (post a payload,
+# post an immediate, post the flush read, poll completions, fill the
+# bootstrap blob, attach a peer) are implemented twice:
+#
+#   * `ibverbs.mojo` -- InfiniBand, an RC queue pair per peer, one
+#     RDMA_WRITE_WITH_IMM per shard. This is the path the two-node H100
+#     numbers were measured on and it is unchanged.
+#   * `libfabric.mojo` -- HPE Slingshot through the `cxi` provider (Adastra
+#     nodes have four /dev/cxi NICs and no InfiniBand at all). One
+#     connectionless RDM endpoint; since cxi implements no
+#     write-with-immediate, a shard is an RMA write followed by a FENCED
+#     zero-length message carrying the immediate as remote CQ data. See that
+#     file's header.
+#
+# Which one is used is decided at `ib_setup` time by `MOJOCCL_NET`, or by
+# what the machine actually has. The names in this file kept their `ib_`
+# prefix: they are the transport's API to `mojoccl.mojo` and renaming them
+# would have churned every call site for nothing.
 #
 # Ordering. The GPU cannot post verbs and the NIC cannot wait on a kernel,
 # so a CPU thread stands between them and the stream is what sequences it:
@@ -89,61 +109,58 @@ from driver import (
     host_device_ptr,
     launch_host_func,
     open_driver,
-    warn_teardown,
 )
 from internode_kernels import proxy_request, proxy_wait
 from ibverbs import (
-    IbPort,
-    IBV_ACCESS_LOCAL_WRITE,
-    IBV_ACCESS_REMOTE_READ,
-    IBV_ACCESS_REMOTE_WRITE,
-    IBV_WC_RDMA_READ,
-    IBV_WC_RDMA_WRITE,
-    IBV_WC_RECV_RDMA_WITH_IMM,
-    IBV_WC_SUCCESS,
-    MR_LKEY,
-    MR_RKEY,
+    VerbsNet,
+    verbs_available,
+    vrb_blob_base,
+    vrb_blob_key,
+    vrb_connect_flush,
+    vrb_connect_peer,
+    vrb_local_info,
+    vrb_poll,
+    vrb_post_flush,
+    vrb_post_imm,
+    vrb_post_payload,
+    vrb_setup,
+    vrb_teardown,
+)
+from libfabric import (
+    FabricNet,
+    fab_add_peer,
+    fab_blob_base,
+    fab_blob_key,
+    fab_describe,
+    fab_local_info,
+    fab_poll,
+    fab_post_flush,
+    fab_post_imm,
+    fab_post_recvs,
+    fab_post_write,
+    fab_setup,
+    fab_teardown,
+    fabric_available,
+)
+from netutil import (
+    MAX_NODES,
+    NC_FLUSH,
+    NC_RECV,
+    NC_SEND,
+    NetCompletion,
     P8,
-    SZ_RECV_WR,
-    SZ_SEND_WR,
-    SZ_SGE,
-    SZ_WC,
-    WC_IMM_DATA,
-    WC_OPCODE,
-    WC_QP_NUM,
-    WC_STATUS,
-    WC_VENDOR_ERR,
-    WC_WR_ID,
-    Ibv,
     alloc_bytes,
-    be32,
-    build_read_wr,
-    build_recv_wr,
-    build_write_wr,
-    create_rc_qp,
-    ld32,
-    ld64,
-    ldu32,
-    list_ib_ports,
-    poll_cq,
-    post_recv,
-    post_send,
-    qp_number,
-    qp_to_init,
-    qp_to_rtr,
-    qp_to_rts,
 )
 
-# Recv WRs kept posted per peer QP. Each RDMA_WRITE_WITH_IMM consumes one --
-# data and credits alike; the engine reposts every one it consumes, so the
-# depth only has to cover the burst a peer can produce while this rank is
-# elsewhere: `nslots` data messages plus `nslots` credits, times a wide
-# margin.
-comptime RECV_DEPTH = 64
-comptime CQ_SIZE = 1024
-comptime SEND_WR_DEPTH = 64
+# Which transport `ib_setup` opened. Runtime rather than comptime: one
+# build of libmojoccl.so has to run on an InfiniBand cluster and on a
+# Slingshot one, and `MOJOCCL_NET` has to be able to force either.
+comptime NET_VERBS = 0
+comptime NET_FABRIC = 1
+
 comptime WORK_SLOTS = 512
-comptime MAX_NODES = 16
+# Completions pulled out of the transport per engine step.
+comptime COMP_BATCH = 16
 comptime DEFAULT_IB_TIMEOUT_S: Float64 = 60.0
 # ncclCommAbort's bound on waiting for the progress thread: long enough for
 # it to notice MB_STOP (at most one idle-backoff quantum plus one engine
@@ -182,6 +199,24 @@ comptime CREDIT_SLOT_BYTES = 64
 comptime CREDIT_AREA_BYTES = 4096
 comptime CREDIT_PAYLOAD_BYTES = 4
 
+comptime OP_UNKNOWN = 0
+comptime OP_ALLREDUCE = 1
+comptime OP_BROADCAST = 2
+comptime OP_ALLGATHER = 3
+"""Which collective an exchange belongs to, carried in its work item for the
+stall messages only. `mojoccl.mojo` passes it to `ib_enqueue_request`."""
+
+
+def _op_name(kind: Int) -> String:
+    if kind == OP_ALLREDUCE:
+        return String("allreduce")
+    if kind == OP_BROADCAST:
+        return String("broadcast")
+    if kind == OP_ALLGATHER:
+        return String("allgather")
+    return String("?")
+
+
 # The proxy mailbox: two 64-bit words the GPU and the progress thread
 # pass the exchange counter through, plus a stop word the host sets at
 # teardown. A cache line apart so the GPU's writes to REQUEST never
@@ -193,25 +228,25 @@ comptime MB_BYTES = 192
 
 
 struct IbPeer(Copyable, Movable):
-    var node: Int
-    var qp: Int
-    var qpn: UInt32
-    var remote_base: Int
-    var remote_rkey: UInt32
+    """One remote node, as the engine sees it.
 
-    def __init__(
-        out self,
-        node: Int,
-        qp: Int,
-        qpn: UInt32,
-        remote_base: Int,
-        remote_rkey: UInt32,
-    ):
+    Deliberately transport-free: the queue pair (verbs) or address-vector
+    entry (libfabric) that actually reaches this peer lives in the
+    transport's own state, indexed by this peer's position in
+    `IbState.peers`. `remote_base` is what a region offset is measured from
+    on the wire -- the peer's virtual address under InfiniBand and under a
+    FI_MR_VIRT_ADDR provider, and 0 under a provider whose RMA targets are
+    offsets into the registered region (what cxi reports).
+    """
+
+    var node: Int
+    var remote_base: Int
+    var remote_key: UInt64
+
+    def __init__(out self, node: Int, remote_base: Int, remote_key: UInt64):
         self.node = node
-        self.qp = qp
-        self.qpn = qpn
         self.remote_base = remote_base
-        self.remote_rkey = remote_rkey
+        self.remote_key = remote_key
 
 
 struct IbWork(Copyable, Movable):
@@ -243,6 +278,15 @@ struct IbWork(Copyable, Movable):
     # the NIC is still reading for a slower peer.
     var sent: Int
     var t0: Int  # perf_counter_ns when it was posted, for the trace
+    # What the host was issuing when it filled this slot -- kind (see
+    # `_op_name`), which chunk of how many, and the chunk's element count.
+    # Diagnostics only: when a stall is reported, "the GPU has not released
+    # exchange 78" is a lot more useful as "exchange 78, allreduce chunk 3 of
+    # 14, 1703936 elements", and the two ends of a stall can be compared.
+    var op_kind: Int
+    var op_chunk: Int
+    var op_nchunks: Int
+    var op_numel: Int
 
     def __init__(out self):
         self.state = 0
@@ -258,25 +302,25 @@ struct IbWork(Copyable, Movable):
         self.credit_upto = 0
         self.sent = 0
         self.t0 = 0
+        self.op_kind = OP_UNKNOWN
+        self.op_chunk = 0
+        self.op_nchunks = 0
+        self.op_numel = 0
 
 
 struct IbState(Movable):
     """Everything the inter-node hop owns, per communicator."""
 
-    var ibv: Ibv
-    var hca: String
-    var ctx: Int
-    var port: Int
-    var pd: Int
-    var mr: Int
-    var lkey: UInt32
-    var rkey: UInt32
-    var cq: Int
+    # Exactly one of `vrb` / `fab` is non-zero: the address of a heap
+    # `VerbsNet` or `FabricNet`. Held as raw addresses rather than as two
+    # struct fields because constructing either one dlopens its library, and
+    # on a Slingshot node there is no libibverbs to dlopen at all.
+    var net: Int
+    var vrb: Int
+    var fab: Int
+    var netdev: String  # the HCA name, or "<provider>:<domain>"
     var peers: List[IbPeer]
-    var flush_qp: Int
-    var flush_mr: Int
-    var flush_host: Int
-    var flush_lkey: UInt32
+    var do_flush: Bool
     var region: Int
     var my_node: Int
     var nnodes: Int
@@ -306,6 +350,19 @@ struct IbState(Movable):
     var last_progress_ns: Int
     var stall_seq: Int  # exchange the last credit stall was counted against
     var n_credit_stalls: Int
+    # How far the calling thread got ahead of the engine, and how often it
+    # had to wait for a ring slot (`_await_ring_slot`). Written only by the
+    # calling thread.
+    var max_ahead: Int
+    var n_ring_waits: Int
+    # Time-weighted breakdown of what the engine is waiting on, sampled once
+    # per `ib_drive` step: the head exchange is blocked by flow control, by
+    # the peer's data not having arrived, or by this rank's own writes not
+    # having completed. Engine-thread only.
+    var t_blocked_credit_ns: Int
+    var t_blocked_arrive_ns: Int
+    var t_blocked_sends_ns: Int
+    var t_last_sample_ns: Int
     # Host-side: highest exchange whose consumer kernel has been ENQUEUED.
     # Snapshotted into each work item as `credit_upto` (see
     # `ib_note_consumed`); never touched by the engine thread.
@@ -314,20 +371,24 @@ struct IbState(Movable):
     # `Pointer[..., MutAnyOrigin]` cannot be a struct field, and these
     # outlive every borrow anyway (allocated once, freed never -- a few
     # hundred bytes per communicator).
-    var wr: Int
-    var sge: Int
-    var rwr: Int
-    var bad: Int
-    var wc: Int
+    var comps: Int  # NetCompletion[COMP_BATCH], filled by the transport
     var ts: Int  # struct timespec scratch for the idle nanosleep
+    # A second timespec, for the calling thread's back-off in
+    # `_await_ring_slot`: `ts` belongs to the progress thread and the two
+    # would otherwise write the same 16 bytes.
+    var ts_host: Int
     var works: Int
     var work_next: Int
     var mailbox: Int  # pinned host address
     var mailbox_dev: Int  # the same memory as a kernel addresses it
     var error_word: Int  # region + error_offset, for the wait kernel
-    # Device mapping of the communicator's pinned abort word, so the wait
-    # kernel leaves as soon as `ncclCommAbort` raises it instead of holding
-    # the stream to its own deadline. 0 until `ib_set_abort_word` runs.
+    # The communicator's pinned STATUS PAGE (the abort word is its first
+    # word), twice: as the progress thread addresses it, and as a kernel
+    # does. The device mapping is for `proxy_wait`, which has to leave a spin
+    # the host cannot interrupt any other way; the host address is what stops
+    # this rank putting an unproduced shard on the wire (`_comm_stopped`).
+    # Both 0 until `ib_set_abort_word` runs.
+    var status_host: Int
     var abort_dev: Int
     var proxy: Bool
     var thread_id: Int
@@ -336,30 +397,31 @@ struct IbState(Movable):
     var t_wait_ns: Int
     var t_flush_ns: Int
     var n_exchanges: Int
+    # Highest exchange a PEER has sent data for. A peer only sends
+    # exchange e once its own GPU released e, and every rank of a
+    # communicator calls `ib_next_seq` the same number of times in the
+    # same order, so `peer_seq_seen > request_seq` means MY GPU is the
+    # one that has not got there. That is the only thing the silent side
+    # of a stall knows about it, and without it only the noticing side
+    # ever prints (see the watchdog in `ib_drive`).
+    var peer_seq_seen: Int
+    var watchdog_said: Int
 
     def __init__(
         out self,
-        var ibv: Ibv,
+        net: Int,
         region: Int,
         my_node: Int,
         nnodes: Int,
         nslots: Int,
         credit_off: Int,
     ):
-        self.ibv = ibv^
-        self.hca = String("")
-        self.ctx = 0
-        self.port = 0
-        self.pd = 0
-        self.mr = 0
-        self.lkey = 0
-        self.rkey = 0
-        self.cq = 0
+        self.net = net
+        self.vrb = 0
+        self.fab = 0
+        self.netdev = String("")
         self.peers = List[IbPeer]()
-        self.flush_qp = 0
-        self.flush_mr = 0
-        self.flush_host = 0
-        self.flush_lkey = 0
+        self.do_flush = getenv("MOJOCCL_FABRIC_FLUSH", "1") != "0"
         self.region = region
         self.my_node = my_node
         self.nnodes = nnodes
@@ -383,13 +445,16 @@ struct IbState(Movable):
         self.last_progress_ns = 0
         self.stall_seq = 0
         self.n_credit_stalls = 0
+        self.max_ahead = 0
+        self.n_ring_waits = 0
+        self.t_blocked_credit_ns = 0
+        self.t_blocked_arrive_ns = 0
+        self.t_blocked_sends_ns = 0
+        self.t_last_sample_ns = 0
         self.consumed_enqueued = 0
-        self.wr = Int(alloc_bytes(SZ_SEND_WR))
-        self.sge = Int(alloc_bytes(SZ_SGE))
-        self.rwr = Int(alloc_bytes(SZ_RECV_WR))
-        self.bad = Int(alloc_bytes(16))
-        self.wc = Int(alloc_bytes(SZ_WC * 16))
+        self.comps = Int(alloc_bytes(COMP_BATCH * size_of[NetCompletion]()))
         self.ts = Int(alloc_bytes(16))
+        self.ts_host = Int(alloc_bytes(16))
         self.works = Int(unsafe_alloc[IbWork](WORK_SLOTS))
         var wp = Pointer[IbWork, MutAnyOrigin](unsafe_from_address=self.works)
         for i in range(WORK_SLOTS):
@@ -398,6 +463,7 @@ struct IbState(Movable):
         self.mailbox = 0
         self.mailbox_dev = 0
         self.error_word = region
+        self.status_host = 0
         self.abort_dev = 0
         self.proxy = getenv("MOJOCCL_IB_PROXY", "1") != "0"
         self.thread_id = 0
@@ -406,16 +472,32 @@ struct IbState(Movable):
         self.t_wait_ns = 0
         self.t_flush_ns = 0
         self.n_exchanges = 0
-
-
-@always_inline
-def _b(addr: Int) -> P8:
-    return P8(unsafe_from_address=addr)
+        self.peer_seq_seen = 0
+        self.watchdog_said = 0
 
 
 @always_inline
 def _st(ib: Int) -> Pointer[IbState, MutAnyOrigin]:
     return Pointer[IbState, MutAnyOrigin](unsafe_from_address=ib)
+
+
+@always_inline
+def _vn(st: IbState) -> Pointer[VerbsNet, MutAnyOrigin]:
+    """The libibverbs transport. Only valid when `st.net == NET_VERBS`."""
+    return Pointer[VerbsNet, MutAnyOrigin](unsafe_from_address=st.vrb)
+
+
+@always_inline
+def _fn(st: IbState) -> Pointer[FabricNet, MutAnyOrigin]:
+    """The libfabric transport. Only valid when `st.net == NET_FABRIC`."""
+    return Pointer[FabricNet, MutAnyOrigin](unsafe_from_address=st.fab)
+
+
+@always_inline
+def _comp(st: IbState, i: Int) -> Pointer[NetCompletion, MutAnyOrigin]:
+    return Pointer[NetCompletion, MutAnyOrigin](
+        unsafe_from_address=st.comps + i * size_of[NetCompletion]()
+    )
 
 
 # `IbState.error` and `IbWork.status` are written by the proxy thread (or the
@@ -499,32 +581,34 @@ def _send_credits(mut st: IbState, upto: Int) -> Bool:
     """Publish "I have consumed through exchange `upto`" to every peer.
 
     Credits are cumulative, so only the newest is ever on the wire: one
-    unsignaled 4-byte RDMA_WRITE_WITH_IMM per peer, the immediate carrying
-    the credit bit and the number. Unsignaled because a completion here
-    would be indistinguishable from a data send, and the data sends -- which
-    ARE counted, `IbWork.sends_cum` -- are what reclaims the send queue.
-    A failed credit still raises a completion with a bad status.
+    immediate per peer, carrying the credit bit and the number. On the verbs
+    path that immediate rides an unsignaled 4-byte write into the peer's
+    credit landing pad, because RDMA_WRITE_WITH_IMM is the only way to send
+    one; on the libfabric path it is a zero-length message and the landing
+    pad goes unused. Unlike a data write, a credit needs no fence: it
+    announces nothing that was written.
     """
     if upto <= st.credit_sent:
         return False
+    var imm = IMM_CREDIT_BIT | (UInt32(upto) & IMM_SEQ_MASK)
     for i in range(len(st.peers)):
         ref p = st.peers[i]
-        build_write_wr(
-            _b(st.wr),
-            _b(st.sge),
-            upto,
-            st.flush_host,
-            st.flush_lkey,
-            CREDIT_PAYLOAD_BYTES,
-            p.remote_base
-            + st.credit_off
-            + _sender_slot(st, p.node) * CREDIT_SLOT_BYTES,
-            p.remote_rkey,
-            IMM_CREDIT_BIT | (UInt32(upto) & IMM_SEQ_MASK),
-            True,
-            False,
-        )
-        if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
+        var rc = 0
+        if st.net == NET_VERBS:
+            rc = vrb_post_imm(
+                _vn(st)[],
+                i,
+                p.remote_base
+                + st.credit_off
+                + _sender_slot(st, p.node) * CREDIT_SLOT_BYTES,
+                p.remote_key,
+                CREDIT_PAYLOAD_BYTES,
+                imm,
+                upto,
+            )
+        else:
+            rc = fab_post_imm(_fn(st)[], i, imm, False, upto)
+        if rc != 0:
             _store_atomic_i(_err_ptr(st), 8)
             return False
     st.credit_sent = upto
@@ -546,48 +630,73 @@ def _can_post(st: IbState, seq: Int) -> Bool:
 
 
 def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
-    """Post this exchange's payload to every peer, one
-    RDMA_WRITE_WITH_IMM each."""
-    if w.do_send != 0 and w.send_bytes > 0:
-        for i in range(len(st.peers)):
-            ref p = st.peers[i]
-            build_write_wr(
-                _b(st.wr),
-                _b(st.sge),
-                w.seq,
+    """Post this exchange's payload, plus its immediate, to every peer.
+
+    One operation per peer on verbs (RDMA_WRITE_WITH_IMM); two on
+    libfabric, and in two separate passes rather than interleaved: the cxi
+    provider has no write-with-immediate, so the immediate is a message that
+    must not overtake the payload it announces, and the fence that orders it
+    (`FI_FENCE` on the first one) drains everything already posted. Writes
+    first, then notifications, means one fence per exchange instead of one
+    per peer -- with the fence between the two passes the remaining
+    notifications are ordered by command-queue position alone.
+    """
+    if w.do_send == 0 or w.send_bytes <= 0:
+        return True
+    var imm = UInt32(w.seq) & IMM_SEQ_MASK
+    for i in range(len(st.peers)):
+        ref p = st.peers[i]
+        var raddr = (
+            p.remote_base
+            + w.inbox_base
+            + _sender_slot(st, p.node) * w.slot_bytes
+        )
+        var rc = 0
+        if st.net == NET_VERBS:
+            rc = vrb_post_payload(
+                _vn(st)[],
+                i,
                 w.send_addr,
-                st.lkey,
                 w.send_bytes,
-                p.remote_base
-                + w.inbox_base
-                + _sender_slot(st, p.node) * w.slot_bytes,
-                p.remote_rkey,
-                UInt32(w.seq) & IMM_SEQ_MASK,
-                True,
-                True,
+                raddr,
+                p.remote_key,
+                imm,
+                w.seq,
             )
-            if post_send(p.qp, _b(st.wr), _b(st.bad)) != 0:
+        else:
+            rc = fab_post_write(
+                _fn(st)[],
+                i,
+                w.send_addr,
+                w.send_bytes,
+                raddr,
+                p.remote_key,
+                w.seq,
+            )
+        if rc != 0:
+            _store_atomic_i(_err_ptr(st), 1)
+            return False
+    if st.net == NET_FABRIC:
+        for i in range(len(st.peers)):
+            if fab_post_imm(_fn(st)[], i, imm, i == 0, w.seq) != 0:
                 _store_atomic_i(_err_ptr(st), 1)
                 return False
-        w.sent = 1
+    w.sent = 1
     return True
 
 
 @always_inline
-def _peer_index(st: IbState, qpn: UInt32) -> Int:
-    """Index into `st.peers` of the queue pair a completion came from, or -1
-    (the flush QP, whose completions are classified by opcode instead)."""
-    for k in range(len(st.peers)):
-        if st.peers[k].qpn == qpn:
-            return k
-    return -1
-
-
-@always_inline
 def _sends_done(st: IbState, mut w: IbWork) -> Bool:
-    """Every peer's queue pair has completed this exchange's data write.
-    Completions on one RC queue pair are in order, so `send_done[i] >= seq`
-    covers every earlier send on that pair too."""
+    """Every peer has completed this exchange's data write.
+
+    `send_done[i]` is a running maximum, so `>= seq` is only a valid test if
+    a LATER exchange's completion cannot arrive before this one's. On verbs
+    that is RC ordering: completions on one queue pair are in order. On
+    libfabric completion order is not promised in general, but the fence
+    that separates exchange e's notifications from everything posted after
+    them also separates e's writes from e+1's -- e+1's write command does
+    not start until e's writes have completed -- so the same property holds,
+    and `fab_setup` refuses a provider that will not honour FI_FENCE."""
     if w.sent == 0:
         return True
     for i in range(len(st.send_done)):
@@ -596,49 +705,82 @@ def _sends_done(st: IbState, mut w: IbWork) -> Bool:
     return True
 
 
-def _consume_wc(mut st: IbState, c: P8) -> Int:
+def _consume_wc(mut st: IbState, c: NetCompletion) -> Int:
     """Account for one completion; -1 for a failed one (error recorded).
 
     Every completion is classified here, never "the one this exchange is
     waiting for": an arrival for a later exchange can land at any time, and
-    a loop that dropped it would lose a tally somebody is waiting on and a
-    receive WR nobody reposts.
+    a loop that dropped it would lose a tally somebody is waiting on. The
+    transport has already normalized it -- which peer, which immediate,
+    which exchange -- and has already reposted whatever receive resource the
+    completion consumed.
     """
-    if Int32(ld32(c, WC_STATUS)) != IBV_WC_SUCCESS:
-        _store_atomic_i(
-            _err_ptr(st),
-            1000 + ld32(c, WC_STATUS) * 1000 + ld32(c, WC_VENDOR_ERR),
-        )
+    if c.status != 0:
+        _store_atomic_i(_err_ptr(st), c.status)
         return -1
-    var op = Int32(ld32(c, WC_OPCODE))
-    var pi = _peer_index(st, ldu32(c, WC_QP_NUM))
-    if op == IBV_WC_RECV_RDMA_WITH_IMM:
-        var imm = be32(ldu32(c, WC_IMM_DATA))
-        if pi >= 0:
-            build_recv_wr(_b(st.rwr), 0)
-            if post_recv(st.peers[pi].qp, _b(st.rwr), _b(st.bad)) != 0:
-                # A receive slot lost here is a later RNR the peer retries
-                # forever (IB_RNR_RETRY = 7), i.e. a silent hang; latch it.
-                _store_atomic_i(_err_ptr(st), 5)
-                return -1
-        var seq = Int(imm & IMM_SEQ_MASK)
-        if (imm & IMM_CREDIT_BIT) != 0:
-            if pi >= 0 and st.credit_recv[pi] < seq:
-                st.credit_recv[pi] = seq
+    if c.kind == NC_RECV:
+        var seq = Int(c.imm & IMM_SEQ_MASK)
+        if (c.imm & IMM_CREDIT_BIT) != 0:
+            if c.peer >= 0 and st.credit_recv[c.peer] < seq:
+                st.credit_recv[c.peer] = seq
         else:
             st.tally[seq % st.nslots] += 1
+            if seq > st.peer_seq_seen:
+                st.peer_seq_seen = seq
         return 0
-    if op == IBV_WC_RDMA_WRITE:
-        # Only data writes are signaled (credits are not), and their wr_id
-        # is the exchange number, dense and increasing per queue pair.
-        var seq = ld64(c, WC_WR_ID)
-        if pi >= 0 and st.send_done[pi] < seq:
-            st.send_done[pi] = seq
+    if c.kind == NC_SEND:
+        # The wr_id / context of a data write is the exchange number, dense
+        # and increasing per peer.
+        if c.peer >= 0 and st.send_done[c.peer] < c.wr_id:
+            st.send_done[c.peer] = c.wr_id
         return 0
-    if op == IBV_WC_RDMA_READ:
+    if c.kind == NC_FLUSH:
         st.flush_done += 1
-        return 0
     return 0
+
+
+def _net_poll(mut st: IbState) -> Int:
+    """Up to COMP_BATCH completions from whichever transport is open."""
+    if st.net == NET_VERBS:
+        return vrb_poll(_vn(st)[], st.comps, COMP_BATCH)
+    return fab_poll(_fn(st)[], st.comps, COMP_BATCH)
+
+
+def _post_flush(mut st: IbState, seq: Int, flush_addr: Int) -> Int:
+    if st.net == NET_VERBS:
+        return vrb_post_flush(_vn(st)[], flush_addr, FLUSH_BYTES, seq)
+    # libfabric reads this rank's own region through its own address vector
+    # entry, and (unless the provider uses virtual addressing) by offset.
+    return fab_post_flush(_fn(st)[], flush_addr - st.region, FLUSH_BYTES, seq)
+
+
+comptime BLOCK_CREDIT = 0
+comptime BLOCK_ARRIVE = 1
+comptime BLOCK_SENDS = 2
+
+
+def _sample_block(mut st: IbState, reason: Int):
+    """Attribute the time since the previous engine step to what is blocking.
+
+    Time-weighted rather than counted: "122 credit stalls" says flow control
+    held something back 122 times, not whether that cost a microsecond or a
+    tenth of a second, and the two look identical in a counter. Sampled at
+    the top of each step and charged to whatever the head exchange was
+    waiting for -- the engine spins, so the samples are dense.
+    """
+    var now = perf_counter_ns()
+    var dt = now - st.t_last_sample_ns
+    st.t_last_sample_ns = now
+    # A first sample, or one across an idle gap where the engine slept, says
+    # nothing about a wait; only charge plausible spin intervals.
+    if dt <= 0 or dt > 1_000_000:
+        return
+    if reason == BLOCK_CREDIT:
+        st.t_blocked_credit_ns += dt
+    elif reason == BLOCK_ARRIVE:
+        st.t_blocked_arrive_ns += dt
+    else:
+        st.t_blocked_sends_ns += dt
 
 
 def _advance(mut st: IbState) -> Bool:
@@ -666,26 +808,20 @@ def _advance(mut st: IbState) -> Bool:
         var e = st.done_seq + 1
         ref w = _work(st, e)[]
         var idx = e % st.nslots
-        if st.tally[idx] < w.nrecv or not _sends_done(st, w):
+        if st.tally[idx] < w.nrecv:
+            _sample_block(st, BLOCK_ARRIVE)
+            break
+        if not _sends_done(st, w):
+            _sample_block(st, BLOCK_SENDS)
             break
         st.tally[idx] -= w.nrecv
-        if w.nrecv > 0 and w.flush_addr != 0:
+        if w.nrecv > 0 and w.flush_addr != 0 and st.do_flush:
             # Seeing the arrivals does NOT mean the payload is visible in GPU
             # memory: the completion lands in host memory and the payload in
             # the GPU's BAR. A read of the destination flushes the writes
             # ahead of it -- NCCL's gpuFlush QP,
             # nccl:src/transport/net_ib/p2p.cc:589-602.
-            build_read_wr(
-                _b(st.wr),
-                _b(st.sge),
-                e,
-                st.flush_host,
-                st.flush_lkey,
-                FLUSH_BYTES,
-                w.flush_addr,
-                st.rkey,
-            )
-            if post_send(st.flush_qp, _b(st.wr), _b(st.bad)) != 0:
+            if _post_flush(st, e, w.flush_addr) != 0:
                 _store_atomic_i(_err_ptr(st), 4)
                 return moved
             st.flush_seq = e
@@ -730,19 +866,17 @@ def ib_drive(mut st: IbState) -> Bool:
             st.posted_seq = e
             st.t_post_ns += perf_counter_ns() - t0
             moved = True
-        elif st.stall_seq != e:
-            # Counted once per exchange, not once per spin: a nonzero number
-            # in the trace means flow control, not the network, held a chunk
-            # back, which is the knob INBOX_SLOTS turns.
-            st.stall_seq = e
-            st.n_credit_stalls += 1
-    var n = poll_cq(st.cq, 16, _b(st.wc))
-    if n < 0:
-        _store_atomic_i(_err_ptr(st), 2)
-        _release_on_error(st)
-        return False
-    for i in range(Int(n)):
-        if _consume_wc(st, P8(unsafe_from_address=st.wc + i * SZ_WC)) < 0:
+        else:
+            _sample_block(st, BLOCK_CREDIT)
+            if st.stall_seq != e:
+                # Counted once per exchange, not once per spin: a nonzero
+                # number in the trace means flow control, not the network,
+                # held a chunk back, which is the knob INBOX_SLOTS turns.
+                st.stall_seq = e
+                st.n_credit_stalls += 1
+    var n = _net_poll(st)
+    for i in range(n):
+        if _consume_wc(st, _comp(st, i)[]) < 0:
             _release_on_error(st)
             return False
         moved = True
@@ -750,12 +884,62 @@ def ib_drive(mut st: IbState) -> Bool:
         moved = True
     if moved:
         st.last_progress_ns = perf_counter_ns()
+        st.t_last_sample_ns = st.last_progress_ns
+        st.watchdog_said = 0
     elif st.request_seq > st.done_seq:
         # Nothing outstanding can move and nothing has moved for a whole
         # timeout: a peer is gone, or a credit was lost.
         if perf_counter_ns() - st.last_progress_ns > st.timeout_ns:
+            # Say where the engine got to before giving up. This costs one
+            # print on a path that ends the communicator anyway, and it is
+            # the only chance to see the state: `ib_report` runs at teardown,
+            # which a rank that dies on `ncclCommGetAsyncError` never reaches.
+            # The reader wants to know WHICH side stopped -- an engine with
+            # everything posted and nothing arrived is waiting for a peer's
+            # GPU, one short of credits is waiting for a peer's consumer.
+            print(
+                "mojoccl: inter-node engine gave up after",
+                st.timeout_ns // 1_000_000_000,
+                "s with no progress, at",
+                _ring_state(st, st.request_seq),
+                "| blocked ms: credit",
+                Float64(st.t_blocked_credit_ns) / 1.0e6,
+                "arrival",
+                Float64(st.t_blocked_arrive_ns) / 1.0e6,
+                "own sends",
+                Float64(st.t_blocked_sends_ns) / 1.0e6,
+            )
             _store_atomic_i(_err_ptr(st), 3)
             _release_on_error(st)
+    elif st.peer_seq_seen > st.request_seq:
+        # THE SILENT SIDE OF A STALL. Nothing is outstanding here -- every
+        # exchange this rank's GPU asked for is retired -- yet a peer has
+        # already sent data for a LATER exchange, so the peer's GPU got
+        # somewhere mine has not. Without this the branch above never arms
+        # (it needs `request_seq > done_seq`), so the node that is actually
+        # stuck says nothing and only its peers time out and print, which is
+        # the wrong half of the picture.
+        #
+        # DIAGNOSTIC ONLY: it prints once per stall episode and never touches
+        # the error word. A rank whose host legitimately spends a minute
+        # between collectives is behind its peers for a good reason, and
+        # failing it here would turn a slow run into a broken one.
+        if (
+            st.watchdog_said == 0
+            and perf_counter_ns() - st.last_progress_ns > st.timeout_ns
+        ):
+            st.watchdog_said = 1
+            print(
+                "mojoccl: inter-node engine idle for",
+                st.timeout_ns // 1_000_000_000,
+                "s while peers ran ahead -- THIS rank's GPU has not released",
+                _ring_state(st, st.request_seq + 1),
+                (
+                    "| the stream is stuck in a kernel before this exchange's"
+                    " request (an intra-node barrier, a wait for an earlier"
+                    " exchange, or work the host has not enqueued yet)"
+                ),
+            )
     return moved
 
 
@@ -779,7 +963,7 @@ def _drive_until(mut st: IbState, seq: Int):
     """Run the engine until exchange `seq` is retired (or the engine fails).
     The stall deadline inside `ib_drive` is what ends this if a peer never
     answers."""
-    if seq > st.request_seq:
+    if seq > st.request_seq and not _comm_stopped(st):
         st.request_seq = seq
         st.last_progress_ns = perf_counter_ns()
     while st.done_seq < seq:
@@ -792,6 +976,20 @@ def _drive_until(mut st: IbState, seq: Int):
 @always_inline
 def _mb(st: IbState, off: Int) -> Pointer[UInt64, MutAnyOrigin]:
     return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox + off)
+
+
+@always_inline
+def _comm_stopped(st: IbState) -> Bool:
+    """The word `collectives_kernels.abort_raised` tests, read from the host:
+    a cache line here, a PCIe round trip from a kernel (see `_proxy_main`)."""
+    if st.status_host == 0:
+        return False
+    return (
+        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.status_host)
+        )
+        != 0
+    )
 
 
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
@@ -811,6 +1009,21 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     and measured end to end (job 234072, 2x8 H100) an unconditional hot spin
     here cost nanoGPT DDP ~20% of its steady-state tok/s against real NCCL.
     `MOJOCCL_IB_PROXY_IDLE_US` tunes the backoff quantum.
+
+    THE STOPPED-COMMUNICATOR GUARD LIVES HERE, not in the request kernel.
+    Once a kernel on this communicator has given up (`publish_fault` raises
+    the abort word) the reduce-scatter behind `req` may never have run, and
+    posting it would ship whatever the arena holds as data. Refusing to
+    advance `request_seq` sends nothing: the peer's engine times out with a
+    message instead of a wrong number. `ncclCommAbort` is the same case.
+
+    Checking here is STRICTLY STRONGER than in the kernel: the request kernel
+    publishes `seq` with a release store into pinned memory and the load
+    above acquires it, so everything the stream did before that kernel is
+    visible by the time `req` is read, including any fault latched before
+    the payload existed. And it is a cache line here, against a PCIe round
+    trip per exchange on the device, on the critical path between the
+    reduce-scatter and the network post.
     """
     ref st = _st(Int(arg))[]
     var idle_ns = _proxy_idle_ns()
@@ -829,7 +1042,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
                 _mb(st, MB_REQUEST)
             )
         )
-        if req > st.request_seq:
+        if req > st.request_seq and not _comm_stopped(st):
             st.request_seq = req
             st.last_progress_ns = perf_counter_ns()
         var moved = ib_drive(st)
@@ -1030,13 +1243,15 @@ def _stop_proxy(mut st: IbState):
     st.thread_id = 0
 
 
-def ib_set_abort_word(ib: Int, abort_dev: Int):
-    """Hand the transport the device address of the communicator's pinned
-    abort word (mojoccl.mojo owns it -- a single-node communicator has one
+def ib_set_abort_word(ib: Int, abort_dev: Int, abort_host: Int):
+    """Hand the transport the communicator's pinned status page, whose first
+    word is the abort word -- once as a kernel addresses it and once as this
+    process does (mojoccl.mojo owns it: a single-node communicator has one
     too, and there is no IB state there to hold it)."""
     if ib == 0:
         return
     _st(ib)[].abort_dev = abort_dev
+    _st(ib)[].status_host = abort_host
 
 
 def ib_signal_abort(ib: Int) -> Bool:
@@ -1087,82 +1302,35 @@ def _callback_address() -> Int:
 # ===-------------------------------------------------------------------=== #
 
 
-def _realpath(path: String) -> String:
-    """realpath(3): the ABSOLUTE /sys/devices path behind a sysfs symlink.
+def _select_backend() raises -> Int:
+    """Which transport to open: `MOJOCCL_NET` wins, else what is present.
 
-    `readlink` would return the stored relative target (`../../..0000:18:00.0`),
-    and two of those share no comparable prefix -- the whole point here is to
-    compare where a GPU and an HCA sit in one PCI tree.
+    "Present" means the library opens AND has something usable behind it --
+    a login node with a Mellanox card and a compute node with four Slingshot
+    NICs and no /dev/infiniband both give an unambiguous answer, and a
+    machine with neither gets the same error message this library has always
+    given. Verbs is tried first because it is the measured path.
     """
-    var buf = alloc_bytes(4096)
-    var cpath = alloc_bytes(path.byte_length() + 1)
-    var pb = path.as_bytes()
-    for i in range(len(pb)):
-        cpath[unsafe_offset=i] = pb[i]
-    var rc = Int(external_call["realpath", Int64](cpath, buf))
-    if rc == 0:
-        return String("")
-    var s = String("")
-    var i = 0
-    while i < 4095 and buf[unsafe_offset=i] != 0:
-        s += chr(Int(buf[unsafe_offset=i]))
-        i += 1
-    return s^
-
-
-def _common_prefix(a: String, b: String) -> Int:
-    var ab = a.as_bytes()
-    var bb = b.as_bytes()
-    var n = min(len(ab), len(bb))
-    var i = 0
-    while i < n and ab[i] == bb[i]:
-        i += 1
-    return i
-
-
-def _choose_port(
-    ports: List[IbPort], gpu_bdf: String, local_rank: Int
-) raises -> Int:
-    """Index of the HCA this rank should use.
-
-    Preference is PCI proximity, measured the cheap way NCCL's topology
-    measures it in spirit: both the GPU and the HCA are PCI devices, so the
-    longer the shared prefix of their /sys/devices paths, the fewer switch
-    hops between them. Ranks that tie fall back to `local_rank % n`, which
-    on these nodes (10 IB HCAs, 8 GPUs) already hands every rank its own
-    NIC. MOJOCCL_IB_HCA short-circuits all of it upstream, in list_ib_ports.
-    """
-    if len(ports) == 1 or gpu_bdf.byte_length() == 0:
-        return local_rank % len(ports)
-    var gpu_path = _realpath("/sys/bus/pci/devices/" + gpu_bdf)
-    if gpu_path.byte_length() == 0:
-        return local_rank % len(ports)
-    var best = -1
-    var best_score = -1
-    var ties = 0
-    for i in range(len(ports)):
-        var hca_path = _realpath(
-            "/sys/class/infiniband/" + ports[i].name + "/device"
+    var want = getenv("MOJOCCL_NET", "")
+    if want == "verbs":
+        return NET_VERBS
+    if want == "fabric":
+        return NET_FABRIC
+    if want.byte_length() > 0:
+        raise Error(
+            "mojoccl: MOJOCCL_NET must be `verbs` or `fabric`, got " + want
         )
-        var score = _common_prefix(gpu_path, hca_path)
-        if score > best_score:
-            best_score = score
-            best = i
-            ties = 1
-        elif score == best_score:
-            ties += 1
-    if ties > 1 or best < 0:
-        # Several NICs are equally close (the common case: one PCI switch per
-        # pair of GPUs). Spread ranks over them deterministically.
-        var chosen = List[Int]()
-        for i in range(len(ports)):
-            var hca_path = _realpath(
-                "/sys/class/infiniband/" + ports[i].name + "/device"
-            )
-            if _common_prefix(gpu_path, hca_path) == best_score:
-                chosen.append(i)
-        return chosen[local_rank % len(chosen)]
-    return best
+    if verbs_available():
+        return NET_VERBS
+    if fabric_available():
+        return NET_FABRIC
+    raise Error(
+        "mojoccl: no ACTIVE InfiniBand port found (libibverbs) and no"
+        " libfabric provider offering FI_RMA|FI_MSG|FI_HMEM on an FI_EP_RDM"
+        " endpoint; a multi-node communicator needs one of the two."
+        " MOJOCCL_NET=verbs|fabric forces a choice, MOJOCCL_LIBFABRIC points"
+        " at a libfabric.so.1 that is not on the loader path"
+    )
 
 
 def ib_setup(
@@ -1177,11 +1345,12 @@ def ib_setup(
     nslots: Int,
     credit_off: Int,
 ) raises -> Int:
-    """Open an HCA, register the region, create the QPs (still in INIT).
+    """Open a NIC and register the region on whichever transport this
+    machine has.
 
-    Returns the address of a heap `IbState`. The QPs cannot reach RTR until
-    the peers' `(qpn, lid, gid)` have been gathered, so bring-up is split:
-    this, then `ib_local_info` / `ib_connect`.
+    Returns the address of a heap `IbState`. The peers cannot be reached
+    until their blobs have been gathered, so bring-up is split: this, then
+    `ib_local_info` / `ib_connect`.
 
     `nslots` is how many fixed inbox slot groups the caller carved out of the
     region and therefore how many exchanges may be outstanding; `credit_off`
@@ -1189,33 +1358,6 @@ def ib_setup(
     every rank -- they are part of the wire layout. `local_world` only feeds
     the progress thread's default CPU pin (`_default_proxy_cpu`).
     """
-    var ibv = Ibv()
-    var want = getenv("MOJOCCL_IB_HCA", "")
-    var ports = list_ib_ports(ibv, want)
-    if len(ports) == 0:
-        raise Error(
-            "mojoccl: no ACTIVE InfiniBand port found"
-            + (
-                " matching MOJOCCL_IB_HCA=" + want if want.byte_length()
-                > 0 else ""
-            )
-            + "; a multi-node communicator needs one"
-        )
-    # Only a hint for HCA affinity: a driver without the symbol, or a
-    # device that will not report one, falls back to round-robin.
-    var gpu_bdf: String
-    try:
-        gpu_bdf = device_pci_bus_id(driver, ordinal)
-    except:
-        gpu_bdf = String("")  # no PCI id: round-robin HCA choice
-    var pick = _choose_port(ports, gpu_bdf, local_rank)
-    ref port = ports[pick]
-    # These nodes carry ~10 IB HCAs and every rank opened all of them to
-    # read their ports; hold only the one this rank will use.
-    for i in range(len(ports)):
-        if ports[i].ctx != port.ctx:
-            ibv.close_device(ports[i].ctx)
-
     if nslots < 1 or nslots > PIPE_MAX_SLOTS:
         raise Error(
             "mojoccl: nslots must be in 1.."
@@ -1223,67 +1365,51 @@ def ib_setup(
             + ", got "
             + String(nslots)
         )
-    var st = IbState(ibv^, region, my_node, nnodes, nslots, credit_off)
-    st.hca = String(port.name)
-    st.ctx = port.ctx
-    st.port = port.port
+    if nnodes > MAX_NODES:
+        raise Error(
+            "mojoccl: this transport addresses at most "
+            + String(MAX_NODES)
+            + " nodes, got "
+            + String(nnodes)
+        )
+    # Only a hint for NIC affinity: a driver without the symbol, or a device
+    # that will not report one, falls back to round-robin.
+    var gpu_bdf: String
+    try:
+        gpu_bdf = device_pci_bus_id(driver, ordinal)
+    except:
+        # No PCI hint from this driver: NIC affinity falls back to round-robin.
+        gpu_bdf = String("")
+
+    var st = IbState(
+        _select_backend(), region, my_node, nnodes, nslots, credit_off
+    )
     st.timeout_ns = Int(_ib_timeout_s() * 1.0e9)
 
     # Every step below can raise after an earlier one already allocated a
-    # real ibverbs/host resource (pd, mr, cq, QPs, the pinned mailbox) --
-    # unwind whatever got that far instead of leaking it.
+    # real transport or host resource -- unwind whatever got that far
+    # instead of leaking it.
     try:
-        st.pd = st.ibv.alloc_pd(st.ctx)
-        if st.pd == 0:
-            raise Error("mojoccl: ibv_alloc_pd failed on " + st.hca)
-        var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
-        var acc = (
-            IBV_ACCESS_LOCAL_WRITE
-            | IBV_ACCESS_REMOTE_WRITE
-            | IBV_ACCESS_REMOTE_READ
-        )
-        st.mr = st.ibv.reg_mr_relaxed(
-            st.pd, region, region_bytes, acc
-        ) if ro else st.ibv.reg_mr(st.pd, region, region_bytes, acc)
-        if st.mr == 0:
-            raise Error(
-                "mojoccl: ibv_reg_mr of the "
-                + String(region_bytes // (1024 * 1024))
-                + " MiB device region failed on "
-                + st.hca
-                + "; is nvidia_peermem (or the ROCm equivalent) loaded?"
+        if st.net == NET_VERBS:
+            var v = vrb_setup(gpu_bdf, local_rank, nnodes, region, region_bytes)
+            st.netdev = String(v.hca)
+            var vh = unsafe_alloc[VerbsNet](1)
+            vh.unsafe_write(v^)
+            st.vrb = Int(vh)
+        else:
+            var f = fab_setup(
+                gpu_bdf, local_rank, my_node, nnodes, region, region_bytes
             )
-        var mrp = P8(unsafe_from_address=st.mr)
-        st.lkey = ldu32(mrp, MR_LKEY)
-        st.rkey = ldu32(mrp, MR_RKEY)
-
-        # Host landing pad for the flush read.
-        st.flush_host = Int(alloc_bytes(4096))
-        st.flush_mr = st.ibv.reg_mr(
-            st.pd, st.flush_host, 4096, IBV_ACCESS_LOCAL_WRITE
-        )
-        if st.flush_mr == 0:
-            raise Error("mojoccl: ibv_reg_mr of the flush buffer failed")
-        st.flush_lkey = ldu32(P8(unsafe_from_address=st.flush_mr), MR_LKEY)
-
-        st.cq = st.ibv.create_cq(st.ctx, CQ_SIZE)
-        if st.cq == 0:
-            raise Error("mojoccl: ibv_create_cq failed")
-
+            st.netdev = f.prov_name + ":" + f.domain_name
+            var fh = unsafe_alloc[FabricNet](1)
+            fh.unsafe_write(f^)
+            st.fab = Int(fh)
         for j in range(nnodes):
             if j == my_node:
                 continue
-            var qp = create_rc_qp(
-                st.ibv, st.pd, st.cq, SEND_WR_DEPTH, RECV_DEPTH + 8
-            )
-            # Recorded before `qp_to_init` can raise, so the unwind below
-            # destroys it.
-            st.peers.append(IbPeer(j, qp, qp_number(qp), 0, 0))
+            st.peers.append(IbPeer(j, 0, 0))
             st.credit_recv.append(0)
             st.send_done.append(0)
-            qp_to_init(st.ibv, qp, st.port)
-        st.flush_qp = create_rc_qp(st.ibv, st.pd, st.cq, SEND_WR_DEPTH, 8)
-        qp_to_init(st.ibv, st.flush_qp, st.port)
 
         if st.proxy:
             st.mailbox = alloc_host(driver, MB_BYTES)
@@ -1326,7 +1452,8 @@ def _proxy_idle_ns() -> Int:
         if parsed > 0:
             us = parsed
     except:
-        us = DEFAULT_IB_PROXY_IDLE_US  # unparsable: keep the default
+        # Unparseable value: keep the default quantum.
+        us = DEFAULT_IB_PROXY_IDLE_US
     return us * 1000
 
 
@@ -1342,61 +1469,29 @@ def _nanosleep_ns(ts_addr: Int, ns: Int):
     _ = external_call["nanosleep", Int32](ts, Int64(0))
 
 
-def ib_local_info(ib: Int, out_blob: P8, port_lid: Int, port_mtu: Int):
-    """Fill this rank's IB half of the bootstrap blob.
+def ib_local_info(ib: Int, out_blob: P8) raises:
+    """Fill this rank's transport half of the bootstrap blob.
 
-    Layout (little-endian, matches `ib_connect`'s reader):
-      +0   u64 region base VA
-      +8   u32 rkey
-      +12  u32 lid
-      +16  u32 active_mtu (ibv_mtu enum)
-      +20  u32 number of QPs that follow
-      +24  u32 qpn[MAX_NODES]     -- indexed by the PEER's node
-      +24+4*MAX_NODES  u8 gid[16]
+    The two transports need different things on the wire (queue-pair
+    numbers, LID and MTU for verbs; an endpoint address, a memory key and
+    the addressing mode for libfabric) and only one of them is ever active
+    in a job, so they share the fixed-size slot rather than coexisting in
+    it. Each layout is documented next to its writer, in `ibverbs.mojo` and
+    `libfabric.mojo`.
     """
     ref st = _st(ib)[]
-    out_blob.unsafe_bitcast[UInt64]()[unsafe_offset=0] = UInt64(st.region)
-    out_blob.unsafe_bitcast[UInt32]()[unsafe_offset=2] = st.rkey
-    out_blob.unsafe_bitcast[UInt32]()[unsafe_offset=3] = UInt32(port_lid)
-    out_blob.unsafe_bitcast[UInt32]()[unsafe_offset=4] = UInt32(port_mtu)
-    out_blob.unsafe_bitcast[UInt32]()[unsafe_offset=5] = UInt32(len(st.peers))
-    for i in range(len(st.peers)):
-        out_blob.unsafe_bitcast[UInt32]()[
-            unsafe_offset=6 + st.peers[i].node
-        ] = st.peers[i].qpn
+    if st.net == NET_VERBS:
+        var nodes = List[Int]()
+        for i in range(len(st.peers)):
+            nodes.append(st.peers[i].node)
+        vrb_local_info(_vn(st)[], out_blob, nodes, st.region)
+    else:
+        fab_local_info(_fn(st)[], out_blob)
 
 
+# 24 bytes of header, one queue-pair number per node, one GID: the larger of
+# the two layouts, and what every rank's slot in the round-2 all-gather is.
 comptime IB_BLOB_BYTES = 24 + 4 * MAX_NODES + 16
-
-
-def ib_port_lid(ib: Int) raises -> Int:
-    """The port's LID, straight from `ibv_query_port`.
-
-    A nonzero return code (not the same thing as the `try/except` this used
-    to have -- `query_port`'s own C call never raises, it returns an errno)
-    used to be silently discarded, reading LID 0 out of `pa`'s zeroed
-    scratch. For the self-connected flush QP that 0 is not a sentinel
-    anyone downstream checks; it just quietly modifies the flush QP with the
-    wrong address. Raise instead.
-    """
-    ref st = _st(ib)[]
-    var pa = alloc_bytes(56)
-    var rc = st.ibv.query_port(st.ctx, st.port, pa)
-    if rc != 0:
-        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
-    return Int(pa.unsafe_bitcast[UInt16]()[unsafe_offset=17])
-
-
-def ib_port_mtu(ib: Int) raises -> Int:
-    """The port's active MTU, straight from `ibv_query_port` (see
-    `ib_port_lid` for why a failed query now raises instead of reading 0 out
-    of zeroed scratch)."""
-    ref st = _st(ib)[]
-    var pa = alloc_bytes(56)
-    var rc = st.ibv.query_port(st.ctx, st.port, pa)
-    if rc != 0:
-        raise Error("mojoccl: ibv_query_port failed, rc=" + String(rc))
-    return ld32(pa, 8)
 
 
 def ib_connect(
@@ -1404,13 +1499,15 @@ def ib_connect(
     blobs: P8,
     blob_stride: Int,
     peer_rank_of_node: List[Int],
-    my_mtu: Int,
 ) raises:
-    """Move every QP to RTS from the gathered table, then pre-post recvs.
+    """Attach every peer from the gathered table.
 
     `peer_rank_of_node[j]` is the global rank on node j holding this rank's
-    local_rank -- the one this rank's QP j is paired with. `blobs` is the
-    whole round-2 table; `blob_stride` its per-rank size.
+    local_rank -- the one this rank pairs with. `blobs` is the whole round-2
+    table; `blob_stride` its per-rank size. On verbs this drives each queue
+    pair to RTS and pre-posts its receives; on libfabric, where an FI_EP_RDM
+    endpoint is connectionless, it inserts each peer into the address vector
+    and posts the shared receive buffers once at the end.
     """
     ref st = _st(ib)[]
     for i in range(len(st.peers)):
@@ -1418,54 +1515,18 @@ def ib_connect(
         var b = P8(
             unsafe_from_address=Int(blobs) + peer_rank_of_node[j] * blob_stride
         )
-        var base = Int(b.unsafe_bitcast[UInt64]()[unsafe_offset=0])
-        var rkey = b.unsafe_bitcast[UInt32]()[unsafe_offset=2]
-        var lid = Int(b.unsafe_bitcast[UInt32]()[unsafe_offset=3])
-        var mtu = Int(b.unsafe_bitcast[UInt32]()[unsafe_offset=4])
-        # The peer's QP for MY node, not for its own.
-        var dest_qpn = b.unsafe_bitcast[UInt32]()[unsafe_offset=6 + st.my_node]
-        var gid = P8(unsafe_from_address=Int(b) + 24 + 4 * MAX_NODES)
-        if lid == 0:
-            raise Error(
-                "mojoccl: peer on node "
-                + String(j)
-                + " reported LID 0 -- its HCA port is not on an InfiniBand"
-                " fabric this library can address"
-            )
-        st.peers[i].remote_base = base
-        st.peers[i].remote_rkey = rkey
-        qp_to_rtr(
-            st.ibv,
-            st.peers[i].qp,
-            dest_qpn,
-            lid,
-            min(my_mtu, mtu),
-            st.port,
-            gid,
-            0,
-            False,
-        )
-        qp_to_rts(st.ibv, st.peers[i].qp)
-        for _ in range(RECV_DEPTH):
-            build_recv_wr(_b(st.rwr), 0)
-            if post_recv(st.peers[i].qp, _b(st.rwr), _b(st.bad)) != 0:
-                raise Error("mojoccl: ibv_post_recv failed while pre-posting")
-
-    # The flush QP talks to itself.
-    var self_lid = ib_port_lid(ib)
-    var gid0 = alloc_bytes(16)
-    qp_to_rtr(
-        st.ibv,
-        st.flush_qp,
-        qp_number(st.flush_qp),
-        self_lid,
-        my_mtu,
-        st.port,
-        gid0,
-        0,
-        False,
-    )
-    qp_to_rts(st.ibv, st.flush_qp)
+        if st.net == NET_VERBS:
+            st.peers[i].remote_base = vrb_blob_base(b)
+            st.peers[i].remote_key = vrb_blob_key(b)
+            vrb_connect_peer(_vn(st)[], i, j, st.my_node, b)
+        else:
+            st.peers[i].remote_base = fab_blob_base(_fn(st)[], b)
+            st.peers[i].remote_key = fab_blob_key(b)
+            fab_add_peer(_fn(st)[], i, j, b)
+    if st.net == NET_VERBS:
+        vrb_connect_flush(_vn(st)[])
+    else:
+        fab_post_recvs(_fn(st)[])
 
 
 # ===-------------------------------------------------------------------=== #
@@ -1512,6 +1573,89 @@ def ib_note_consumed(ib: Int, seq: Int):
         st.consumed_enqueued = seq
 
 
+def _ring_state(st: IbState, seq: Int) -> String:
+    """How far behind the engine is, for the ring-pressure messages.
+
+    Every number but the work item's status is engine-owned and read here
+    without synchronisation: this only ever builds a diagnostic string, and a
+    counter that is one step stale in an error message costs nothing.
+    """
+    var s = String("")
+    s += "exchange " + String(seq)
+    ref w = _work(st, seq)[]
+    if w.seq == seq and w.op_kind != OP_UNKNOWN:
+        s += " (" + _op_name(w.op_kind)
+        s += " chunk " + String(w.op_chunk + 1)
+        s += " of " + String(w.op_nchunks)
+        s += ", " + String(w.op_numel) + " elements)"
+    s += " (ring slot " + String((seq - 1) % WORK_SLOTS) + " of "
+    s += String(WORK_SLOTS) + "); engine at request "
+    s += String(st.request_seq) + ", posted " + String(st.posted_seq)
+    s += ", done " + String(st.done_seq)
+    s += "; host is " + String(seq - st.done_seq) + " exchanges ahead"
+    s += "; credits sent " + String(st.credit_sent) + ", received"
+    for i in range(len(st.credit_recv)):
+        s += " " + String(st.credit_recv[i])
+    s += "; sends done"
+    for i in range(len(st.send_done)):
+        s += " " + String(st.send_done[i])
+    s += "; stalls " + String(st.n_credit_stalls)
+    s += "; peers have sent through " + String(st.peer_seq_seen)
+    return s^
+
+
+def _await_ring_slot(mut st: IbState, seq: Int) raises:
+    """Back-pressure: wait until exchange `seq - WORK_SLOTS` has retired.
+
+    The work ring is `WORK_SLOTS` deep and the calling thread fills it
+    without ever touching the GPU, so how far ahead of the network it can get
+    is bounded by nothing but how fast torch enqueues. One rank of a
+    broadcast receives every byte while its node-mates receive sixteen, so on
+    a slow-enough fabric the receiver's host reaches slot `seq % WORK_SLOTS`
+    while the exchange that used it last is still on the wire. That is
+    ordinary back-pressure, not an error: wait for the slot.
+
+    Waiting here cannot deadlock. The engine is driven by the progress thread
+    (default) or, under `MOJOCCL_IB_PROXY=0`, by a stream callback -- neither
+    needs this thread, and the stream already holds every kernel the
+    outstanding exchanges need. The inline self-test path is the one caller
+    that drives the engine itself, and it does not come through here (see
+    `ib_submit_now`).
+
+    Bounded by `MOJOCCL_IB_TIMEOUT_S`, the same deadline every other wait in
+    this library uses: a slot that never frees is a peer that stopped
+    answering, and the message says how far behind the engine got.
+    """
+    ref w = _work(st, seq)[]
+    var ahead = seq - st.done_seq
+    if ahead > st.max_ahead:
+        st.max_ahead = ahead
+    if _load_atomic_i(_status_ptr(w)) != 0:
+        return
+    st.n_ring_waits += 1
+    var deadline = perf_counter_ns() + st.timeout_ns
+    while _load_atomic_i(_status_ptr(w)) == 0:
+        var err = _load_atomic_i(_err_ptr(st))
+        if err != 0:
+            raise Error(
+                "mojoccl: the inter-node transport failed (error "
+                + String(err)
+                + ") while the host waited for a work-ring slot at "
+                + _ring_state(st, seq)
+            )
+        if perf_counter_ns() > deadline:
+            raise Error(
+                "mojoccl: waited "
+                + String(st.timeout_ns // 1_000_000_000)
+                + "s for the inter-node work ring to free a slot and it never"
+                " did, at "
+                + _ring_state(st, seq)
+                + "; MOJOCCL_IB_TRACE=1 for the per-exchange timings"
+            )
+        _ = external_call["sched_yield", Int32]()
+        _nanosleep_ns(st.ts_host, 20_000)
+
+
 def _fill_work(
     mut st: IbState,
     ib: Int,
@@ -1524,13 +1668,22 @@ def _fill_work(
     flush_addr: Int,
     seq: Int,
     credit_upto: Int,
+    may_wait: Bool,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
 ) raises:
     ref w = _work(st, seq)[]
-    if _load_atomic_i(_status_ptr(w)) == 0:
+    if may_wait:
+        _await_ring_slot(st, seq)
+    elif _load_atomic_i(_status_ptr(w)) == 0:
+        # `ib_submit_now`: the caller is the only thing driving the engine, so
+        # blocking here would deadlock rather than back off.
         raise Error(
             "mojoccl: the inter-node work ring wrapped with an exchange still"
-            " in flight; MOJOCCL_IB_TRACE=1 to see how far behind the network"
-            " is"
+            " in flight at "
+            + _ring_state(st, seq)
         )
     w.state = ib
     w.send_addr = send_addr
@@ -1544,6 +1697,10 @@ def _fill_work(
     w.credit_upto = credit_upto
     w.sent = 0
     w.t0 = 0
+    w.op_kind = op_kind
+    w.op_chunk = op_chunk
+    w.op_nchunks = op_nchunks
+    w.op_numel = op_numel
     _store_atomic_i(_status_ptr(w), 0)
 
 
@@ -1561,13 +1718,20 @@ def ib_enqueue_request(
     nrecv: Int,
     flush_addr: Int,
     seq: Int,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
 ) raises:
     """Release exchange `seq` to the network, at this point in stream order.
 
     Enqueued right after the kernel that produced its payload. With the
     proxy thread (default) it is a one-thread kernel storing `seq` into the
-    pinned mailbox, and the stream runs on: several exchanges may be in
-    flight, and `ib_enqueue_wait` is what eventually stops the stream.
+    pinned mailbox -- nothing else, no status check: `_proxy_main` holds the
+    guard against releasing a shard nobody produced, and says there why that
+    is the stronger place for it -- and the stream runs on: several exchanges
+    may be in flight, and `ib_enqueue_wait` is what eventually stops the
+    stream.
     Without the proxy (`MOJOCCL_IB_PROXY=0`) it is a `cuLaunchHostFunc` that
     runs the whole exchange inline -- correct with the same schedule, but
     with no overlap and several hundred microseconds of driver latency per
@@ -1586,6 +1750,11 @@ def ib_enqueue_request(
         flush_addr,
         seq,
         st.consumed_enqueued,
+        True,
+        op_kind,
+        op_chunk,
+        op_nchunks,
+        op_numel,
     )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
@@ -1652,6 +1821,7 @@ def ib_submit_now(
         flush_addr,
         seq,
         credit_upto,
+        False,
     )
     if seq > st.request_seq:
         st.request_seq = seq
@@ -1709,10 +1879,9 @@ def ib_report(ib: Int):
     if not st.trace or st.n_exchanges == 0:
         return
     print(
-        "mojoccl ib:",
-        st.hca,
-        "port",
-        st.port,
+        "mojoccl net:",
+        "verbs" if st.net == NET_VERBS else "fabric",
+        st.netdev,
         "peers",
         len(st.peers),
         "slots",
@@ -1721,6 +1890,17 @@ def ib_report(ib: Int):
         st.n_exchanges,
         "credit stalls",
         st.n_credit_stalls,
+        "| host ran up to",
+        st.max_ahead,
+        "exchanges ahead, waited for a ring slot",
+        st.n_ring_waits,
+        "times",
+        "| blocked ms: credit",
+        Float64(st.t_blocked_credit_ns) / 1.0e6,
+        "arrival",
+        Float64(st.t_blocked_arrive_ns) / 1.0e6,
+        "own sends",
+        Float64(st.t_blocked_sends_ns) / 1.0e6,
         "| mean us post",
         Float64(st.t_post_ns) / Float64(st.n_exchanges) / 1000.0,
         "in flight",
@@ -1728,10 +1908,12 @@ def ib_report(ib: Int):
         "flush",
         Float64(st.t_flush_ns) / Float64(st.n_exchanges) / 1000.0,
     )
+    if st.net == NET_FABRIC:
+        print("mojoccl net:", fab_describe(_fn(st)[]))
 
 
 def _teardown_ib_resources(mut st: IbState):
-    """Release every ibverbs/host resource `ib_setup` may have created.
+    """Release every transport and host resource `ib_setup` may have created.
 
     Shared by `ib_teardown` (a live communicator) and `ib_setup`'s own
     failure path (a later step raised after an earlier one already
@@ -1750,26 +1932,16 @@ def _teardown_ib_resources(mut st: IbState):
         try:
             free_host(open_driver(), st.mailbox)
         except e:
-            warn_teardown("freeing the pinned mailbox", e)
+            # Best effort on a teardown path; the mailbox is dropped either way.
+            print("mojoccl: freeing the proxy mailbox failed (ignored):", e)
         st.mailbox = 0
         st.mailbox_dev = 0
-    try:
-        for i in range(len(st.peers)):
-            st.ibv.destroy_qp(st.peers[i].qp)
-        if st.flush_qp != 0:
-            st.ibv.destroy_qp(st.flush_qp)
-        if st.cq != 0:
-            st.ibv.destroy_cq(st.cq)
-        if st.flush_mr != 0:
-            st.ibv.dereg_mr(st.flush_mr)
-        if st.mr != 0:
-            st.ibv.dereg_mr(st.mr)
-        if st.pd != 0:
-            st.ibv.dealloc_pd(st.pd)
-        if st.ctx != 0:
-            st.ibv.close_device(st.ctx)
-    except e:
-        warn_teardown("releasing the IB resources", e)
+    if st.vrb != 0:
+        vrb_teardown(_vn(st)[])
+        st.vrb = 0
+    if st.fab != 0:
+        fab_teardown(_fn(st)[])
+        st.fab = 0
 
 
 def ib_teardown(ib: Int):

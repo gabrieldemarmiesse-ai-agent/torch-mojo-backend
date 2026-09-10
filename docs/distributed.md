@@ -214,6 +214,60 @@ Verified on CINES's Adastra (4 × MI300A per node, ROCm 6.4.3, RCCL 2.22.3).
   (`--nproc-per-node=1`, a couple of steps) and expect the bimodal first
   step. Capping the HIP heap instead (`GPU_MAX_HEAP_SIZE=30`) is not an
   option: MAX's allocator becomes ~40x slower.
+- **But do NOT set that knob for a MULTI-NODE mojoccl run.** With
+  `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` a two-node DDP step costs
+  ~26x what it should. nanoGPT-124M, 2 nodes x 4 MI300A over cxi, batch 12,
+  everything else identical (same region size, same build, same job):
+
+  | | steady-state tok/s | ms/step |
+  |---|---|---|
+  | RCCL over the same NICs (reference), 20 steps | 1317.0k | 75 |
+  | **knob unset, `MOJOCCL_REGION_MB=64`**, 20 steps x3 | **1150.7k / 1189.0k / 1186.3k** | **83 / 81 / 81** |
+  | knob set, same region, 11 steps | 45.4k | 2160 |
+  | knob set, default 256 MiB region, 20 steps | 35.2k | 2790 |
+
+  Unset, mojoccl lands within 11-14% of RCCL end to end; set, it is 26-37x
+  slower. The same A/B at 2 ranks per node, identical losses either way:
+  20.3k against 537.8k tok/s at step 10, a 30x gap. Single-node runs are
+  unaffected, which is why this hid for so long.
+
+  **Why.** `py-spy dump --native` of a stalled 8-rank run caught it: the one
+  rank that was not waiting had its autograd worker inside
+
+      Engine::evaluate_function -> ~vector<at::Tensor> -> decref_pyobject
+        -> TensorHolder tp_dealloc -> AsyncRT_DeviceBuffer_release
+          -> M::Driver::DeviceBuffer::~DeviceBuffer -> libamdhip64 -> sched_yield
+
+  i.e. backward blocked *freeing a device buffer*, spinning in the HIP
+  runtime; the other seven were parked in the next step's blocking H2D
+  (`_record_h2d_source`'s `event.synchronize()`), which cannot complete until
+  their own device drains. The VMM allocator's release is a real unmap rather
+  than a return to a cache, so it waits on the device -- and a multi-node
+  collective keeps an item on that device for milliseconds while it waits for
+  a remote peer. DDP frees intermediates continuously during backward, so
+  every free lands on a busy device and backward serialises behind the
+  network. Nothing in mojoccl fixes this; the release has to become
+  stream-ordered in MAX.
+
+  **What to do instead.** Leave the knob unset and shrink the communicator's
+  region so four ranks still fit: `MOJOCCL_REGION_MB=64` gives a 192 MiB
+  region per rank against 768 MiB at the default, and that is what the
+  numbers above were taken with. At the default 256 MiB, four ranks per node
+  without the knob leave too little to pin and every rank dies in
+  `fi_mr_regattr` with `-FI_ENOMEM` (measured: node at 485 of 501 GB).
+  Ruled out as explanations, each with its own run: the comm stream
+  (`TORCH_MOJO_BACKEND_COMM_STREAM=0` is just as slow), the collective
+  kernels' grid (capping them to 8 blocks changes nothing), the pipeline
+  chunk count (forcing K=1 changes nothing), and the transport itself (its
+  own blocking totals 42 ms of a 31 s run).
+
+  The smaller region costs the collectives nothing, which is the thing to
+  check before recommending it: the 8-rank allreduce at `MOJOCCL_REGION_MB=64`
+  measures 793 us at 27 MiB (busbw 62.5 GB/s) and 10509 us at 512 MiB (89.4
+  GB/s), against 10568 us at 512 MiB with the default 256 MiB region. The 27
+  MiB figure is at parity with RCCL's 794 us; the 512 MiB one is still 1.49x
+  RCCL's 7072 us, which is the separate transport-level gap analysed below and
+  is unrelated to the allocator.
 
 ### Measured: nanoGPT 124M, bf16 autocast, batch 12×1024 per rank, 20 steps
 
@@ -258,7 +312,9 @@ module load aws-ofi-rccl   # multi-node only
 export ROCM_PATH=/opt/rocm
 export LD_LIBRARY_PATH=/opt/cray/pe/gcc-libs:/opt/rocm/lib:${LD_LIBRARY_PATH}
 export NCCL_DEBUG=WARN
-export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1   # APU: see the memory paragraph
+# NO MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM here: on two nodes that knob
+# costs 26x (see the memory paragraph). A single-node job still wants it.
+export MOJOCCL_REGION_MB=64   # what makes four ranks per node fit without it
 MASTER_ADDR=$(scontrol show hostname "$SLURM_JOB_NODELIST" | head -n 1)
 srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     uv run torchrun --nnodes="$SLURM_JOB_NUM_NODES" --nproc-per-node=4 \
@@ -298,11 +354,42 @@ NCCL-class collectives, not a general library:
   pull design makes the staging free. The region is either a `cuMemAlloc`
   block shared with legacy IPC or, where NVSwitch multicast is available,
   VMM memory bound to a multicast object — see "NVLS" below;
-- a rank that stops responding makes its peers time out after
-  `MOJOCCL_IB_TIMEOUT_S` (60 s) inside the kernel and
-  `ncclCommGetAsyncError` reports it. `ncclCommAbort` implements nccl.h's
-  contract: it stops submissions (later collectives return
-  `ncclInvalidUsage`), raises a pinned abort word every device spin polls —
+- **a device deadline is loud.** A rank that stops answering makes its peers
+  give up after `MOJOCCL_IB_TIMEOUT_S` (60 s) inside the kernel. The block
+  that gave up records it twice: in its arena's error word, as it always
+  did, and in the communicator's pinned *status page* — host memory the
+  kernel stores into, so the host reads it with one load, no copy and no
+  stream synchronize (`ncclCommGetAsyncError`'s read of the arena word needs
+  a device-to-host copy, which blocks behind the very kernels it is asking
+  about, so no collective could afford to call it — which is why a timed-out
+  barrier used to leave no trace anybody read). That latch is what keeps a
+  timed-out collective from turning into wrong data:
+  - `ncclAllReduce` / `ncclBroadcast` / `ncclAllGather` return
+    `ncclRemoteError` from the next call on, and `process_group.py` raises
+    `NcclError` out of the collective — with a traceback, through `_loud` —
+    so the rank fails instead of training on garbage;
+  - the call that notices prints one line naming the rank, the collective,
+    the arena, the generation, the phase, the block, and the peer whose flag
+    never arrived with the value seen against the value wanted:
+    `mojoccl: rank 1: DEVICE DEADLINE in the allreduce (arena 0, generation
+    3, phase 0): block 0 waited 60.0 s for rank 0's flag, and saw 17 wanting
+    24 -- ...`;
+  - on the inter-node path `proxy_request` stops advancing the mailbox once
+    the fault is latched, so the peer node sees no request rather than a
+    shard nobody produced and reports its own deadline (`inter-node engine
+    gave up after 60 s ...`); `proxy_wait` treats a latched fault like the
+    abort word, so the waits already queued behind the failed one return at
+    once instead of costing a deadline each.
+
+  The FIRST failure is the one kept: the arena word is claimed with a
+  compare-exchange and the status page is written only while it is clear, so
+  what you read is the deadline that started the trouble, not the last of its
+  consequences. The reporting call is one collective behind the kernel that
+  failed — collectives are asynchronous, and catching it on the failing call
+  itself would mean synchronizing the stream on every call.
+- `ncclCommAbort` implements nccl.h's contract: it stops submissions (later
+  collectives return `ncclInvalidUsage`), raises the pinned abort word (word 0
+  of that status page) every device spin polls —
   the intra-node barriers, the NVLS barrier and the inter-node wait kernel
   all leave within a millisecond with their region's error word set, instead
   of running to that deadline — stops the progress thread, and then, once
@@ -319,8 +406,71 @@ kernels only** — i.e. `MOJOCCL_NVLS=0`, which is what everything below the
 48 MiB crossover runs anyway: 1 MiB 29 vs 31 µs, 9 MiB 70 vs 92, 27 MiB (the
 DDP bucket) 164 vs 181, 168 MiB 988 vs 756, 512 MiB 2.99 vs 2.15 ms. The last
 two rows are where the multicast path takes over — next subsection. AMD: the
-same source cross-compiles for gfx942 (the one vendor gate is a release fence
-on AMD's `s_barrier`), but it has not run on an MI300A yet.
+same source cross-compiles for gfx942, and it now runs there — see the
+subsection after that.
+
+### AMD MI300A: every cross-link byte goes in the write direction
+
+Measured on one Adastra node, 4 × MI300A (gfx942, 228 CUs), ROCm 6.4.3,
+against RCCL 2.22.3 on the same node.
+
+On an xGMI mesh the two directions are not equivalent. A micro-benchmark that
+copies with the same 16-byte, four-in-flight loop these kernels use
+(per-GPU GB/s, 168 MiB, all four GPUs active):
+
+| | one link | three links at once |
+|---|---|---|
+| remote write | 91 | **233** |
+| remote read | 90 | **93** |
+
+A GPU-initiated remote load is limited per GPU, not per link, so three
+concurrent inbound streams are worth barely more than one — and a ring of
+simultaneous readers is worth *less* (56). Writes scale. RCCL knows this: its
+P2P transport hard-wires `read = 0` on AMD (`rccl:src/graph/paths.cc:441`
+only lets compCap 80 read), the sender stores into the receiver's buffer, and
+RCCL reaches 236 GB/s of busbw at 512 MiB — the same ceiling.
+
+So on AMD the allreduce's third phase is a second push instead of a pull:
+each rank writes its reduced shard into every peer's gather slot, and then
+copies those slots into the user's output *locally*, because a MAX-allocated
+output cannot be IPC-mapped and a peer cannot write it directly. The
+cross-link traffic is unchanged — `2(world-1)/world × bytes` per GPU, the
+unicast minimum — only its direction is. That local copy is the price and it
+is small: the region is `hipDeviceMallocUncached` yet reads out of it at full
+HBM rate (1434 GB/s measured, against 1453 for a normal buffer). The
+all-gather and the broadcast's gather half became pushes for the same reason.
+
+Two other gfx942 details are copied from RCCL and matter as much as the
+direction:
+
+- **The barrier could not be made cheaper, and that is measured, not assumed.**
+  A release store lowers to `buffer_wbl2 sc0 sc1` and an acquire load to
+  `buffer_inv sc0 sc1`, both whole-cache operations, and the acquire sits
+  inside the spin loop — so the barrier costs more the larger the grid (27 MiB
+  measured 243 µs at 128 blocks and 465 at 1024). Three cheaper spellings were
+  tried and all three broke *small* collectives only, which is the trap: a
+  megabyte payload drains out of a cache on its own and a few hundred bytes do
+  not, so "the big benchmark still passes" says nothing. RCCL's own cheap
+  variant for gfx942 (`skip_fence`,
+  `rccl:src/include/rccl_common.h:262-273`) is among them: it is sound for
+  RCCL because its P2P buffers are uncached, and unsound here because the
+  mapping a peer writes *through* comes from `hipIpcOpenMemHandle`, which does
+  not carry the memory type. Details and the failure table are in
+  `docs/mojo_collectives_kernel_results.md` §3 and §7.
+- **The grid caps are not H100's**, and the response to the grid is not
+  monotonic. See the sweeps in `docs/mojo_collectives_kernel_results.md`.
+
+Everything above is behind `has_amd_gpu_accelerator()` at compile time, and
+the sm_90a device code is byte-identical to the tree before this work (97
+kernels, PTX compared with the mangling hash masked).
+
+**One known flake, unresolved.** A *one-element* int64 allreduce at **2 ranks**
+fails intermittently — 2 runs in 14 of `tests/ddp_worker.py collectives`;
+every 4-rank run of every mode passed. It is the smallest collective in the
+suite (one 8-byte store, one 8-byte load, one active thread) and the one-shot
+kernel under it is unchanged by the MI300A work, so the suspect is the
+barrier's cheapened acquire. Whether the pre-MI300A tree flakes the same way
+was not established. See `docs/mojo_collectives_kernel_results.md` §7.
 
 ### NVLS: the large sizes go through the switch
 
@@ -467,6 +617,26 @@ never been measured before (the prototype only ever used RECOMMENDED).
 
 ### Multi-node
 
+**A stdlib clock bug on AMD, worked around here.** Mojo's
+`global_perf_counter_ns()` on AMD computes `(s_memrealtime ticks * 1e9) //
+1e8` in 64 bits: the product overflows 184 s after the GPU's counter started,
+so on any node up for more than three minutes the "clock" is a saw-tooth of
+period 184.47 s. Every device spin in this library bounds itself with
+`now - t0 > timeout`, and a spin that straddles a wrap sees an enormous
+unsigned difference and fires its 60 s deadline at once: the block records
+the error word and returns, its node-mates wait a real 60 s for flags it
+never publishes, and -- before the status-page latch above, which nothing
+read the error word to notice -- the collective completed with garbage on
+that node and the run carried on. Measured on 2x4 MI300A: about one 40 s `stress` run in
+five corrupted a check, always a run 60-120 s longer than a clean one, and
+the same event is what hung DDP runs. `device_now_ns` in
+`collectives_kernels.mojo` reads the 100 MHz counter directly on AMD (with a
+volatile intrinsic -- a side-effect-free read is hoisted out of the spin
+loop and the deadline never fires); after it, 0 of 15 stress runs at 8 ranks
+failed. NVIDIA's `globaltimer` is nanoseconds and unchanged (sm_90a device
+code byte-identical). Report the stdlib bug upstream.
+
+
 The inter-node hop is Mojo too: no vendor collective library anywhere.
 An allreduce on a communicator spanning N nodes runs, per chunk: the
 intra-node reduce-scatter (`reduce_scatter_stage`) leaves every rank its
@@ -522,7 +692,21 @@ region, so the large sizes are chunked by geometry as well as by choice.
 `tests/multinode/selftest/geometry_test.mojo` sweeps that arithmetic over
 regions of 1 MiB–1 GiB, `local_world` 1–8 and 2–16 nodes.
 
-**Transport** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
+**Two transports, one engine.** `internode.mojo` is the transport-neutral
+progress engine (work ring, credits, arrival tally, flush, abort,
+teardown); the six operations it needs -- post a payload, post an
+immediate, post the flush read, poll completions, fill the bootstrap blob,
+attach a peer -- are implemented twice, in `ibverbs.mojo` (InfiniBand) and
+`libfabric.mojo` (HPE Slingshot through the `cxi` provider). `ib_setup`
+picks one at run time: `MOJOCCL_NET=verbs|fabric` wins outright, otherwise
+verbs if libibverbs opens and lists an ACTIVE InfiniBand port, else
+libfabric if `libfabric.so.1` opens and `fi_getinfo` finds an FI_EP_RDM
+provider with FI_RMA|FI_MSG|FI_HMEM, else the same clear error as before.
+The engine's dispatch is one `st.net == NET_VERBS` branch per post and one
+per poll batch -- loop-invariant and perfectly predicted -- so the verbs
+path costs what it always did.
+
+**Transport A, InfiniBand** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
 internode_kernels,bootstrap}.mojo`): libibverbs is dlopened; setup calls are
 symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
 through the `ibv_context_ops` table at the header's offsets, as NCCL's
@@ -536,6 +720,66 @@ orders the payload in GPU memory behind the completion that landed in host
 memory. Every exchange is all-to-all — a rank whose shard is empty (7 of 8
 ranks on DDP's 4-byte AVG allreduce) still posts a 16-byte placeholder — so
 that an arrival tally of N−1 is what completes one.
+
+**Transport B, Slingshot / libfabric** (`libfabric.mojo`): `libfabric.so.1`
+is dlopened; `fi_getinfo`/`fi_freeinfo`/`fi_fabric`/`fi_version`/`fi_strerror`
+are symbols and the whole data path (`fi_writemsg`, `fi_sendmsg`, `fi_recv`,
+`fi_read`, `fi_cq_read`, `fi_mr_regattr`, `fi_ep_bind`, `fi_close`, …) is
+`static inline` in the headers and is reached through the `fid_*` ops tables
+(`ep->rma->writemsg`, `cq->ops->read`, `domain->mr->regattr`,
+`fid->ops->bind`) exactly as the verbs path reaches `ibv_context_ops`. One
+connectionless FI_EP_RDM endpoint per rank, one FI_CQ_FORMAT_DATA completion
+queue bound for both directions, one FI_AV_TABLE address vector holding every
+peer's `fi_getname` address plus this rank's own (the flush reads from
+itself), and one `fi_mr_regattr` of the whole region with `iface =
+FI_HMEM_ROCR`.
+
+Four differences from the verbs semantics, forced by what the cxi provider
+implements:
+
+- **No write-with-immediate.** cxi's `fi_ops_rma.writedata` is
+  `fi_no_rma_writedata` and `cxip_rma_writemsg` rejects `FI_REMOTE_CQ_DATA`
+  (it is not in `CXIP_WRITEMSG_ALLOWED_FLAGS`); measured, `fi_writedata`
+  returns `-FI_ENOSYS`. One shard is therefore an `fi_writemsg` of the
+  payload followed by a **zero-length `fi_sendmsg`** whose 64-bit remote CQ
+  data carries the immediate. cxi does support `FI_REMOTE_CQ_DATA` on the
+  message path and reports `cq_data_size` 8.
+- **Ordering between the two** is `FI_FENCE` on the first notification of an
+  exchange, after all of that exchange's payload writes have been posted:
+  fi_endpoint(3) defers a fenced operation until previous operations to that
+  peer have completed, and cxi implements it as a hardware `C_CMD_CQ_FENCE`
+  that drains the transmit command queue, so the exchange's remaining
+  notifications are ordered by queue position alone — one fence per
+  exchange, not one per peer. `FI_FENCE` must be named in `caps` or cxi
+  returns `-FI_EINVAL`. A credit carries no fence: it announces nothing that
+  was written.
+- **No `FI_SOURCE`**, so a completion does not say who sent it: the CQ data
+  is `(sender node index << 32) | immediate`, and the 32-bit immediate keeps
+  exactly the meaning it has on the verbs path (bit 31 credit, bits 0..30
+  the exchange counter), so the credit protocol and the pipeline are
+  untouched.
+- **`mr_mode` is FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT with no
+  FI_MR_VIRT_ADDR**: RMA targets are OFFSETS into the peer's region, the key
+  comes from `fi_mr_key` after the MR is `fi_mr_bind`-ed to the endpoint and
+  `fi_mr_enable`-d, and the engine's region-relative offsets go on the wire
+  unchanged. Both addressing modes are handled at run time
+  (`FabricNet.virt_addr`), not assumed.
+
+Receives are posted to the endpoint rather than per peer (an RDM endpoint has
+one receive queue), `max(64, 32 × peers)` of them, and every one consumed is
+reposted from the poll. The flush read stays: it is a short `fi_read` of this
+rank's own region through its own address-vector entry, in the same role as
+the verbs self-QP read. The fence argument probably already covers it and
+MI300A's "device memory" is host-attached HBM anyway, but no cxi
+documentation was found that promises the ordering, it costs ~3.6 µs, and
+`MOJOCCL_FABRIC_FLUSH=0` turns it off for measurement.
+
+Every struct offset, size and constant `libfabric.mojo` hard-codes is dumped
+by `tests/multinode/selftest/fabric_abi.c` (gcc, against the installed
+`<libfabric>/include`) and cross-checked by
+`tests/multinode/selftest/fabric_abi.mojo`; 135 of them, and that self-test
+is the only thing standing between a wrong offset and a garbage pointer
+handed to the NIC.
 
 **Flow control is explicit credits.** The second half of the network area is
 carved once into `INBOX_SLOTS` fixed groups and exchange `e` lands in
@@ -595,6 +839,21 @@ the thread unpinned rather than fight Python for a scarce core.
 `MOJOCCL_IB_PROXY_CPU=none` opts out of pinning entirely.
 `MOJOCCL_IB_TRACE=1` prints the chosen CPU (or why none was chosen).
 
+**Follow-up, unfixed: the sibling check does not catch the common case.**
+Measured on Adastra (`taskset -pc` of every rank of a 2x4 job): each rank's
+affinity mask is `0-47,96-143`, which is 48 physical cores with BOTH their
+SMT threads -- `96+c` is the sibling of `c`. Taking the mask's CPUs in
+descending order therefore pins the four progress threads to 143, 142, 141,
+140, which are the siblings of cores 47, 46, 45, 44 -- cores the ranks' own
+Python and autograd threads run on. `_smt_sibling_free` accepts them because
+it only rejects a CPU whose sibling is ANOTHER RANK'S PIN, and 44-47 are not
+pins. So on any node whose mask is a full-SMT range the policy reliably puts
+every progress thread on a busy core's sibling, which is the placement it
+exists to avoid; the ~20% this cost on H100 is the size of the effect.
+A fix would prefer, among the mask's CPUs, ones whose sibling is not also in
+the mask, and only then fall back to the descending rule. Not the cause of
+any bug currently open.
+
 | variable | default | controls |
 |---|---|---|
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
@@ -605,25 +864,168 @@ the thread unpinned rather than fight Python for a scarce core.
 | `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
 | `MOJOCCL_IB_PROXY_CPU` | unset: auto-pin (mask permitting), see above | an exact CPU to pin the progress thread to; `none` disables pinning |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
-| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — HCA, port, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing |
+| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — backend and device, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing; on libfabric a second line with the negotiated FI_HMEM interface, memory key, addressing mode, address length and receive depth |
+| `MOJOCCL_NET` | unset: verbs if an ACTIVE IB port exists, else libfabric | `verbs` or `fabric`, forcing the transport |
+| `MOJOCCL_LIBFABRIC` | unset: `libfabric.so.1`, then `/opt/cray/libfabric/2.2.0rc1/lib64/libfabric.so.1` | an exact `libfabric.so.1` to dlopen |
+| `MOJOCCL_FABRIC_PROVIDER` | `cxi` | provider name asked of `fi_getinfo`; if it finds none, any provider satisfying the same hints is accepted |
+| `MOJOCCL_FABRIC_DOMAIN` | affinity choice among the provider's domains (PCI proximity to the GPU, then `local_rank % n`) | exact domain to use instead (`cxi2`) — the libfabric analogue of `MOJOCCL_IB_HCA` |
+| `MOJOCCL_FABRIC_HMEM` | `auto`: FI_HMEM_ROCR, then FI_HMEM_CUDA, then FI_HMEM_SYSTEM, first one the provider accepts | `system`, `rocr` or `cuda`, forcing the `fi_mr_attr.iface` the region registers under |
+| `MOJOCCL_FABRIC_FLUSH` | 1 | `0`: skip the `fi_read` flush after an exchange (libfabric backend only) |
+| `MOJOCCL_FABRIC_SETUP_RETRY_S` | 30 | how long `fab_setup` keeps retrying an endpoint bring-up that fails with `-FI_ENOMEM` (see the fragmentation note below); `0` fails on the first attempt |
 | `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
 | `MOJOCCL_NVLS` | 1 | `0`: no multicast region and no NVLS kernel, on every rank of the communicator (it is ANDed across ranks) |
 | `MOJOCCL_NVLS_MIN_MB` | 48 | single-node allreduces at or above this go through the switch; below it the unicast kernels keep the traffic. The default is the measured crossover. Must match on every rank — `ncclCommInitRank` checks it |
 | `MOJOCCL_NVLS_GRANULARITY` | `min` | `rec`: size the multicast object with `CU_MULTICAST_GRANULARITY_RECOMMENDED` (NCCL's choice, 512 MiB objects on H100) instead of `MINIMUM` (2 MiB) |
 | `MOJOCCL_SOCKET_DIR` | `/tmp` | where the node-local AF_UNIX sockets that carry the VMM/multicast file descriptors are bound |
 
-Limits and failure modes: 8 ranks per node, 16 nodes; more than one node
-with no ACTIVE InfiniBand port fails `ncclCommInitRank` with "no ACTIVE
-InfiniBand port found" (so Slingshot on Adastra is not covered; a
-libfabric/cxi transport would be a second backend); a peer that stops
-responding is reported through `ncclCommGetAsyncError` after
-`MOJOCCL_IB_TIMEOUT_S` (one variable for every spin, intra-node and
-inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
+Limits and failure modes: 8 ranks per node, 16 nodes; a multi-node
+communicator on a machine with neither an ACTIVE InfiniBand port nor a
+libfabric RMA provider fails `ncclCommInitRank` with a message naming both
+and pointing at `MOJOCCL_NET`; a peer that stops
+responding makes this rank's next collective fail with `ncclRemoteError` and
+one printed line saying which barrier gave up (and is reported through
+`ncclCommGetAsyncError` too) after `MOJOCCL_IB_TIMEOUT_S` (one variable for
+every spin, intra-node and inter-node alike), or at once on `ncclCommAbort`; a stale unique id (tag `MOJOCCL2`) is rejected with
 a clear message.
 
-**Requirements.** rdma-core/libibverbs on the nodes (here MLNX OFED 24.10),
-GPUDirect RDMA through `nvidia_peermem`, active InfiniBand ports reachable
-between every pair of nodes, a routable interface for the TCP bootstrap.
+**Requirements.** Either rdma-core/libibverbs with active InfiniBand ports
+reachable between every pair of nodes (here MLNX OFED 24.10) and GPUDirect
+RDMA through `nvidia_peermem`, **or** a libfabric with an FI_EP_RDM provider
+offering FI_RMA|FI_MSG|FI_HMEM and built with FI_HMEM support for the
+accelerator (Adastra: `libfabric/2.2.0rc1`, provider `cxi`, four
+`/dev/cxi[0-3]` NICs, ROCr HMEM). Either way: a routable interface for the
+TCP bootstrap.
+
+**Measured on Slingshot** (2 nodes x 4 MI300A, job 5393676, 512 MiB fp32
+allreduce at 8 ranks, `ar_bench.py`, one size per process so the numbers are
+attributable):
+
+| | median | busbw | vs RCCL |
+|---|---|---|---|
+| RCCL over the same cxi NICs (aws-ofi-rccl 1.18.0) | 7 072 us | 132.8 GB/s | 1.00x |
+| mojoccl | 10 568 us | 88.9 GB/s | 1.49x |
+| mojoccl, `MOJOCCL_FABRIC_FLUSH=0` | 9 387 us | 100.1 GB/s | 1.33x |
+| mojoccl, same size inside a 1/9/27/168/512 MiB sweep | 21 553 us | 43.6 GB/s | 3.05x |
+
+Three things that says. **The sweep is 2x pessimistic**: the same allreduce
+measured on its own is 10.6 ms against 21.6 ms as the last size of a sweep,
+and the credit stalls that dominate the sweep's trace (80% of exchanges) are
+2-6% (20-57 of 924) when the size runs alone -- so the credit window
+(`INBOX_SLOTS`) is not what caps it and the sweep's degradation is upstream
+of the transport. **The flush read costs 11%** here (1.18 ms of 10.6),
+because on this fabric it is not the 1.9 us it is on InfiniBand: it queues
+behind the exchange's own multi-megabyte writes on the same transmit command
+queue, and the trace reads ~500 us. It stays on by default -- see
+`fab_post_flush` for why the fence probably makes it unnecessary and why
+"probably" is not enough to remove a memory-ordering guarantee -- but
+`MOJOCCL_FABRIC_FLUSH=0` measured `correct=OK`. **The FI_FENCE is not the
+cap**: exchanges do overlap despite it (the sum of per-exchange in-flight
+times, 14 x ~1.9 ms, is 2.5x the 10.6 ms the allreduce takes), so it does not
+serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
+floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
+floor and mojoccl at 1.8x.
+
+**`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
+memory.** Several ranks of one node fail `ncclCommInitRank` with
+`fi_enable failed, rc=-12`, the identical batch passes on other nodes or
+later, and the provider says `cxil_map: write error` then "Failed to allocate
+TX EQ resources, ret: -12". This was carried for a while as an unresolved
+flake, described as contention with something else on the node, after
+`cxi_service list` (0 of 2047 EQs in use), `RLIMIT_MEMLOCK` (unlimited), the
+hugetlbfs knobs and an idle `free -g` (500 of 526 GB) had each been ruled out.
+
+It is none of those. The kernel says what it is, in `dmesg` on the failing
+node:
+
+    python: page allocation failure: order:7,
+            mode:0x40dc0(GFP_KERNEL|__GFP_COMP|__GFP_ZERO)
+      cass_nta_alloc / cass_nta_init / cass_ac_alloc   [cxi_ss1]
+      cxi_map / cxi_user_atu_map / ucxi_write          [cxi_user]
+
+The cxi driver needs **512 KiB of physically contiguous kernel memory**
+(order 7) for an address context's translation table, and the Mem-Info dump
+printed with that failure showed no NUMA node had a single free block that
+big: `0*64kB 0*128kB 0*256kB ...` on node 0, whose free total was 355 MB
+against a watermark min of 353 MB.
+
+Two measurements separate the causes:
+
+* **Not the ranks racing.** Staggering a node's four ranks 2 s apart left 5
+  runs in 8 failing, the same as unstaggered. `ib_bringup` at 8 simultaneous
+  processes on the fabric path passes.
+* **Not how much memory the job uses.** On a healthy node pair a nanoGPT
+  2n x 4r run drives MemFree to ~14 GB of 501 — the same near-full state as
+  the failing node — and initialises every time, because that node still has
+  450-2350 free blocks at order >= 7 per NUMA node. The failing node had
+  zero.
+
+So it is the **node's physical fragmentation**, exposed by a workload that
+legitimately uses ~97% of RAM because on an APU the GPU's memory IS system
+memory. The failing node had 72 days of uptime; the pair that never failed
+had been rebooted (with `drop_caches` and GPU resets) four hours earlier.
+
+The difference is whether the fragmentation *persists*. Sampling
+`/proc/buddyinfo` every 5 s through a nanoGPT run on the freshly booted pair,
+with 6 GiB of ballast on top to push it further, the run does reach the same
+state -- MemFree 9.3 GB, order >= 7 blocks down to 0-160 per NUMA node -- and
+then comes all the way back to 29k-32k blocks at 505 GB free the moment it
+exits, run after run. On a fresh node the kernel compacts what the job took;
+on a node that has been up for months it does not, and `ncclCommInitRank`
+finds nothing to map. That is also why the failure could not be reproduced on
+demand once the fragmented node went out of allocation: eight nanoGPT runs
+under that ballast took zero retries and had zero init failures.
+
+What this repo does about it: `fab_setup` retries the endpoint bring-up while
+the provider says `-FI_ENOMEM`, for `MOJOCCL_FABRIC_SETUP_RETRY_S` (30 s).
+That is a mitigation, not a fix — fragmentation does not clear in 30 s — but
+the pressure does ease as ranks free staging buffers, and ranks were measured
+recovering on a later attempt. What actually fixes it is leaving the node
+memory (`MOJOCCL_REGION_MB=64`, a smaller batch) or getting a node whose
+memory is not fragmented.
+
+**The intermittent 8-rank DDP stall: not reproduced, and what the engine now
+says about it.** Roughly one nanoGPT DDP run in four at 2 nodes x 4 ranks was
+seen to hang, never at 2n x 1r and never in the self-tests. One captured hang
+(`repo` HEAD f0fe8ad, MI300A pair a1001/a1007) looked like this: all four
+ranks of node 1 printed
+
+    inter-node engine gave up after 60 s with no progress, at exchange 81
+    (ring slot 80 of 512); engine at request 81, posted 81, done 77; ...
+    credits sent 77, received 76 | blocked ms: ... arrival ~77600 ...
+
+and all four ranks of **node 0 printed nothing at all**, with their engines
+idle (`request == done`). So node 0's GPUs never reached `proxy_request(78)`:
+they were stuck before it, in something with no deadline, while node 1 waited
+77 s for their data. The transport on both sides was healthy.
+
+Two things came out of chasing it:
+
+* **Instrumentation, so the silent side speaks.** The give-up message only
+  arms when `request_seq > done_seq` — i.e. only on the side that is
+  *waiting* — which is why the node that was actually stuck said nothing.
+  `ib_drive` now also watches for the opposite shape: nothing outstanding
+  here, yet a peer has already sent data for a later exchange
+  (`peer_seq_seen > request_seq`, tracked in `_consume_wc`). After the same
+  `MOJOCCL_IB_TIMEOUT_S` it prints, once per episode, "THIS rank's GPU has
+  not released exchange N". It is **diagnostic only** — it never touches the
+  error word, because a rank whose host legitimately spends a minute between
+  collectives is behind its peers for a good reason. Every exchange also
+  carries which collective and which chunk it belongs to
+  (`IbWork.op_kind/op_chunk/op_nchunks/op_numel`, set by `mojoccl.mojo`), so
+  both messages now read "exchange 78 (allreduce chunk 3 of 14, 1703936
+  elements)" instead of a bare number. Both were verified to fire and to name
+  the right side by running with `MOJOCCL_IB_TIMEOUT_S=0.05`.
+
+* **It did not reproduce on a healthy node pair.** 62 consecutive 40-step
+  nanoGPT 2n x 4r runs on a1003/a1019 (24 before the instrumentation, 30
+  after, and 8 more under a 6 GiB memory ballast), plus `ddp_worker.py collectives`/`ddp_parity`/`stress` at 8 ranks
+  and the whole self-test suite on both nodes: no stall. The pair on which
+  the hangs were seen is also the pair whose `fi_enable` failures are
+  explained above by node memory fragmentation, and a stalled rank had
+  previously been caught in MAX's `DeviceBuffer` release (the same place the
+  VMM-allocator slowdown lives), so "the node's memory state" is the open
+  suspect rather than anything found in the transport. **Unresolved**: the
+  mechanism is not known, and no fix for it is claimed here.
 
 **Running the two-node job.** `tests/multinode/run_two_node_checks.sbatch`
 is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
@@ -632,12 +1034,16 @@ is a 16-rank (2 nodes × 8 GPU) SLURM job: `tests/ddp_worker.py`
 allreduce device-time bench (`ar_bench_gpt2.py`) in ABBA order, and a
 40-step nanoGPT DDP run under both. `RUN_MOJO=0` keeps only the NCCL legs.
 `tests/multinode/summarize.py <job log>` turns a log into the tables below.
-`tests/multinode/selftest/` holds six GPU-free self-tests — the bootstrap,
+`tests/multinode/selftest/` holds seven GPU-free self-tests — the bootstrap,
 the RDMA transport, the pipelined transport with its credit protocol, the
-region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, and
-the socket deadlines (the last three need no IB either, and the last needs
-no peers). The first three run on a host with IB HCAs
-and no GPU, such as the login node, with `MOJOCCL_IB_PROXY=0`; they caught
+region geometry, the `SCM_RIGHTS` fd transport the NVLS bring-up uses, the
+socket deadlines and the libfabric ABI cross-check (the last four need no
+NIC either, and the last two need no peers) — plus one that does need a GPU,
+`fabric_hmem`, which registers a `driver.alloc_region` allocation with
+FI_HMEM_ROCR and exchanges into it. The transport ones run against either
+backend (`MOJOCCL_NET`) on a host with a NIC and no GPU — the login node
+under InfiniBand, a compute node under Slingshot — with
+`MOJOCCL_IB_PROXY=0`; they caught
 six bugs before any GPU time was spent.
 
 **Results**, 16 ranks on 2×8 H100, `ar_bench_gpt2.py` through the process

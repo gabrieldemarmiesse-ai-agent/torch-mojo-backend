@@ -62,10 +62,15 @@ from max.gpu.sync import barrier
 
 from collectives_kernels import (
     BLOCK,
+    FAULT_NO_PEER,
     _abort_raised,
     _enqueue_cached,
+    abort_raised,
+    latch_arena_error,
+    publish_fault,
     signal_bytes,
     spin_timeout_ns,
+    status_page,
 )
 
 
@@ -222,11 +227,33 @@ def _mm_red_add_u64(
 
 
 @always_inline
-def _record_error(uc: Pointer[UInt8, MutAnyOrigin], phase: Int):
+def _record_error(uc: Pointer[UInt8, MutAnyOrigin], phase: Int, target: UInt64):
+    """Record a multicast-barrier failure the way the unicast kernels do.
+
+    The arena word for `ncclCommGetAsyncError`, and -- unless the host asked
+    for this by raising the abort word -- the communicator's status page, so
+    the next collective fails loudly instead of returning the reduction of an
+    arena a peer never finished writing. There is no peer to name here: the
+    barrier is a multicast counter, so what a reader gets is the block and the
+    counter value it was waiting for.
+    """
     if thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-            uc.unsafe_bitcast[UInt64](),
-            UInt64(ERR_NVLS_SYNC) * 1_000_000 + UInt64(phase),
+        if not latch_arena_error(
+            uc.unsafe_bitcast[UInt64](), ERR_NVLS_SYNC, phase
+        ):
+            return
+        var page = status_page(uc)
+        if abort_raised(page):
+            return
+        publish_fault(
+            page,
+            ERR_NVLS_SYNC,
+            phase,
+            Int(block_idx.x),
+            FAULT_NO_PEER,
+            UInt64(0),
+            target,
+            Int(uc),
         )
 
 
@@ -622,7 +649,7 @@ def _nvls_ar_kernel[
     # which is exactly where the copy-in below writes. It is one barrier
     # (~8 us) per call, not per chunk.
     if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
-        _record_error(uc, 0)
+        _record_error(uc, 0, bar)
         return
     bar += UInt64(world)
 
@@ -631,7 +658,7 @@ def _nvls_ar_kernel[
             uc_pay, in_ptr, 0, min(cv, nvec), n, ctid, cstride, scale
         )
     if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
-        _record_error(uc, 1)
+        _record_error(uc, 1, bar)
         return
     bar += UInt64(world)
 
@@ -664,7 +691,7 @@ def _nvls_ar_kernel[
                     out_ptr, uc_pay, (c - 1) * cv, s0, n, ctid, cstride
                 )
         if not _nvls_sync(mc, uc, bar, t0, timeout_ns):
-            _record_error(uc, c + 2)
+            _record_error(uc, c + 2, bar)
             return
         bar += UInt64(world)
 

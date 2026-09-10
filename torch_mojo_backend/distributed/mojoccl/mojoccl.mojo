@@ -86,7 +86,6 @@ from driver import (
     open_driver,
     open_handle,
     stream_done,
-    warn_teardown,
 )
 from bootstrap import (
     UID_BYTES,
@@ -100,23 +99,45 @@ from bootstrap import (
     make_unique_id,
 )
 from collectives_kernels import (
+    ERR_ALLGATHER_SYNC,
+    ERR_ALLREDUCE_SYNC,
+    ERR_AG_FINISH_SYNC,
+    ERR_BROADCAST_SYNC,
+    ERR_PROXY_WAIT,
+    ERR_RS_STAGE_SYNC,
+    FAULT_ARENA,
+    FAULT_BLOCK,
+    FAULT_CODE,
+    FAULT_NO_PEER,
+    FAULT_PEER,
+    FAULT_PHASE,
+    FAULT_SEEN,
+    FAULT_TARGET,
     MAX_WORLD,
+    PHASES_PER_GEN,
+    STATUS_FAULT_WORD,
+    STATUS_PAGE_BYTES,
     allgather,
+    allgather_max_bytes,
     allgather_finish,
     allreduce,
     broadcast,
     _enqueue_cached,
     error_offset,
-    install_abort_word,
+    install_status_page,
     region_init,
     reduce_scatter_stage,
     shard_range,
     signal_bytes,
+    spin_timeout_ns,
 )
 from internode import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     MAX_NODES,
+    OP_ALLGATHER,
+    OP_ALLREDUCE,
+    OP_BROADCAST,
     PIPE_MAX_SLOTS,
     ib_connect,
     ib_enqueue_request,
@@ -126,8 +147,6 @@ from internode import (
     ib_next_seq,
     ib_note_consumed,
     ib_npeers,
-    ib_port_lid,
-    ib_port_mtu,
     ib_set_abort_word,
     ib_setup,
     ib_signal_abort,
@@ -135,6 +154,7 @@ from internode import (
 )
 from internode_kernels import copy_bytes, inbox_add, place_blocks
 from nvls_kernels import (
+    ERR_NVLS_SYNC,
     nvls_allreduce,
     nvls_available,
     nvls_barriers_per_call,
@@ -256,10 +276,6 @@ abort's contract is not to wait. Past it the resources are left allocated,
 which is a leak until the process exits and is the safe half of the trade:
 freeing a region a kernel may still be reading is a fault.
 """
-
-comptime ABORT_WORD_BYTES = 64
-"""Pinned host bytes per communicator for the abort word (a whole cache line,
-so raising it cannot invalidate anything else a spin is reading)."""
 
 comptime NVLS_FD_TIMEOUT_S: Float64 = 30.0
 """Bound on one fd hand-off. The whole bring-up is 150-230 ms when it works,
@@ -384,11 +400,17 @@ struct CommState(Movable):
     # Set once every resource below has been released (by destroy, or by an
     # abort that reached quiescence); makes the other one a no-op.
     var released: Bool
-    # The abort word: pinned host memory the device spins poll through
-    # `install_abort_word`'s slot in each arena header. `abort_host` is what
-    # `ncclCommAbort` stores into, `abort_dev` what a kernel addresses.
+    # The status page: pinned host memory the device spins poll through
+    # `install_status_page`'s slot in each arena header. `abort_host` is the
+    # page's host address -- word 0 is what `ncclCommAbort` stores into, the
+    # second cache line is the fault record a timed-out kernel latches --
+    # and `abort_dev` is the same page as a kernel addresses it.
     var abort_host: Int
     var abort_dev: Int
+    # Whether the latched fault has already been printed. The record is
+    # permanent, and every later collective on the communicator reads it; the
+    # message is worth one line, not one per call.
+    var fault_said: Bool
     var stream_cache: Dict[Int64, DeviceStream]
     var local_rank: Int
     var local_world: Int
@@ -459,6 +481,7 @@ struct CommState(Movable):
         self.released = False
         self.abort_host = abort_host
         self.abort_dev = abort_dev
+        self.fault_said = False
         self.stream_cache = Dict[Int64, DeviceStream]()
         self.local_rank = local_rank
         self.local_world = local_world
@@ -710,6 +733,134 @@ def _read_error_word(mut state: CommState, region: Int) raises -> UInt64:
 
 
 # ---------------------------------------------------------------------------
+# The latched device fault. A kernel that gives up on a peer records it in the
+# communicator's pinned status page (`publish_fault`,
+# collectives_kernels.mojo); this is the host half -- read it for the price of
+# a load, say what happened once, and fail every later collective.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _fault_field(state: CommState, index: Int) -> UInt64:
+    """One word of the fault record, by its `FAULT_*` index."""
+    return Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=state.abort_host
+            + (STATUS_FAULT_WORD + index) * 8
+        )
+    )
+
+
+@always_inline
+def _fault_code(state: CommState) -> UInt64:
+    """The code of this communicator's latched device deadline, 0 if none.
+
+    One acquire load of pinned host memory: no stream synchronized, no device
+    memory copied, no lock taken -- which is the whole reason the record lives
+    there. `ncclCommGetAsyncError`'s D2H read of the arena error word blocks
+    behind the very kernels it is asking about (`_read_error_word`), so no
+    collective could afford to call it, so nothing ever read the only record a
+    timed-out barrier used to leave, and the run continued on garbage.
+    """
+    if state.abort_host == 0:
+        return UInt64(0)
+    return _fault_field(state, FAULT_CODE)
+
+
+def _fault_kind(code: UInt64) -> String:
+    """The collective a fault code names, for the message."""
+    var c = Int(code)
+    if c == ERR_ALLREDUCE_SYNC:
+        return String("the allreduce")
+    if c == ERR_BROADCAST_SYNC:
+        return String("the broadcast")
+    if c == ERR_ALLGATHER_SYNC:
+        return String("the allgather")
+    if c == ERR_RS_STAGE_SYNC:
+        return String("the multi-node allreduce's reduce-scatter stage")
+    if c == ERR_AG_FINISH_SYNC:
+        return String("the multi-node allreduce's allgather stage")
+    if c == ERR_NVLS_SYNC:
+        return String("the NVLS allreduce")
+    if c == ERR_PROXY_WAIT:
+        return String("the inter-node exchange wait")
+    return String("an unknown collective (code " + String(c) + ")")
+
+
+def _report_fault(mut state: CommState):
+    """Print the latched deadline, once per communicator.
+
+    Once, because the record is permanent and every later collective reads it:
+    the reader wants one line saying which barrier gave up and what it was
+    waiting for, not one per call for the rest of the run. Everything printed
+    comes from the record itself except the rank, which the process knows, and
+    the deadline, which is this process's own `MOJOCCL_IB_TIMEOUT_S`.
+    """
+    if state.fault_said:
+        return
+    var code = _fault_code(state)
+    if code == 0:
+        return
+    state.fault_said = True
+    var phase = _fault_field(state, FAULT_PHASE)
+    var block = _fault_field(state, FAULT_BLOCK)
+    var peer = _fault_field(state, FAULT_PEER)
+    var seen = _fault_field(state, FAULT_SEEN)
+    var target = _fault_field(state, FAULT_TARGET)
+    var arena_base = Int(_fault_field(state, FAULT_ARENA))
+    var mine = state.regions[state.local_rank]
+    var arena = 0
+    if state.arena_stride > 0 and arena_base >= mine:
+        arena = (arena_base - mine) // state.arena_stride
+    var secs = Float64(spin_timeout_ns()) / 1.0e9
+    var what = String("mojoccl: rank ") + String(state.rank)
+    what += String(": DEVICE DEADLINE in ") + _fault_kind(code)
+    if Int(code) == ERR_PROXY_WAIT:
+        what += String(" (arena ") + String(arena) + String("): waited ")
+        what += String(secs) + String(" s for this rank's progress thread to")
+        what += String(" retire exchange ") + String(target)
+        what += String(", and it had retired ") + String(seen)
+    elif peer == FAULT_NO_PEER:
+        # The NVLS barrier is a multicast counter, not a per-peer flag.
+        what += String(" (arena ") + String(arena) + String(", phase ")
+        what += String(phase) + String("): block ") + String(block)
+        what += String(" waited ") + String(secs)
+        what += String(" s for the multicast barrier to reach ")
+        what += String(target)
+    else:
+        what += String(" (arena ") + String(arena) + String(", generation ")
+        what += String(target // UInt64(PHASES_PER_GEN))
+        what += String(", phase ") + String(phase) + String("): block ")
+        what += String(block) + String(" waited ") + String(secs)
+        what += String(" s for rank ") + String(peer) + String("'s flag")
+        what += String(", and saw ") + String(seen) + String(" wanting ")
+        what += String(target)
+    what += String(
+        " -- the result of that collective is undefined, so every later"
+        " collective on this communicator fails with ncclRemoteError. The peer"
+        " it waited for either died, timed out itself, or never reached the"
+        " same collective."
+    )
+    print(what)
+
+
+def _latched_error(mut state: CommState) -> Int32:
+    """NCCL_SUCCESS, or the error this communicator has already suffered.
+
+    Called at the head of every collective. `ib_error` is the transport's own
+    give-up (host state, no read at all); the fault word is the device's, and
+    checking it is what turned a timed-out barrier from a silently wrong
+    result into a failed call. Neither check touches a stream.
+    """
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    if _fault_code(state) != 0:
+        _report_fault(state)
+        return NCCL_REMOTE_ERROR
+    return NCCL_SUCCESS
+
+
+# ---------------------------------------------------------------------------
 # Version / error string / unique id
 # ---------------------------------------------------------------------------
 
@@ -892,7 +1043,10 @@ def _unwind_init(
         if abort_host != 0:
             free_host(lib, abort_host)
     except e:
-        warn_teardown("freeing the abort word", e)
+        # Best effort: the error that got us here is the one worth reporting.
+        print(
+            "mojoccl: init unwind: freeing the status page failed (ignored):", e
+        )
     try:
         if use_nvls:
             nvls_teardown(nvls, lib, ordinal)
@@ -902,7 +1056,8 @@ def _unwind_init(
                     close_handle(lib, regions[r])
             free_region(lib, base)
     except e:
-        warn_teardown("releasing the region", e)
+        # Best effort: the error that got us here is the one worth reporting.
+        print("mojoccl: init unwind: releasing the region failed (ignored):", e)
 
 
 def _bootstrap(
@@ -1103,7 +1258,8 @@ def _bootstrap(
                 nvls_teardown(nvls, lib, ordinal)
                 scm_unbind(libc, sock, spath)
             except e2:
-                warn_teardown("tearing down the multicast region", e2)
+                # Best effort: the bring-up error below is the one to report.
+                print("mojoccl: NVLS unwind failed (ignored):", e2)
             raise Error(
                 "mojoccl: the NVSwitch-multicast region failed to come up ("
                 + String(e)
@@ -1127,21 +1283,23 @@ def _bootstrap(
     var abort_host = 0
     var abort_dev = 0
     try:
-        # The abort word, before any spin can start: pinned host memory, so
-        # `ncclCommAbort` raises it with one store and no driver call, and
-        # device-mapped, so a spinning kernel can read it. Its device address
-        # goes in every arena's header -- the six launcher signatures in
+        # The status page, before any spin can start: pinned host memory, so
+        # `ncclCommAbort` raises the abort word with one store and no driver
+        # call, and device-mapped, so a spinning kernel can read it -- and so
+        # a kernel that gives up can latch its fault where the host reads it
+        # without synchronizing a stream. Its device address goes in every
+        # arena's header -- the six launcher signatures in
         # collectives_kernels.mojo are fixed, so that slot is how the kernels
         # find it.
-        abort_host = alloc_host(lib, ABORT_WORD_BYTES)
-        for i in range(ABORT_WORD_BYTES // 8):
+        abort_host = alloc_host(lib, STATUS_PAGE_BYTES)
+        for i in range(STATUS_PAGE_BYTES // 8):
             Pointer[UInt64, MutAnyOrigin](unsafe_from_address=abort_host)[
                 unsafe_offset=i
             ] = 0
         abort_dev = host_device_ptr(lib, abort_host)
         for a in range(narenas):
             region_init(ctx, base + a * arena_stride)
-            install_abort_word(ctx, base + a * arena_stride, abort_dev)
+            install_status_page(ctx, base + a * arena_stride, abort_dev)
 
         if topo.nnodes > 1:
             ib = ib_setup(
@@ -1156,7 +1314,7 @@ def _bootstrap(
                 INBOX_SLOTS,
                 net_off,
             )
-            ib_set_abort_word(ib, abort_dev)
+            ib_set_abort_word(ib, abort_dev, abort_host)
 
         # Round 2: IPC handle + IB connection data + the geometry every rank has
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
@@ -1175,18 +1333,12 @@ def _bootstrap(
             # already have this region through the fd exchange above, and these
             # 64 bytes stay zero.
             get_handle(lib, base, _any(b2))
-        var my_lid = 0
-        var my_mtu = 0
         if ib != 0:
-            my_lid = ib_port_lid(ib)
-            my_mtu = ib_port_mtu(ib)
             ib_local_info(
                 ib,
                 Pointer[UInt8, MutAnyOrigin](
                     unsafe_from_address=Int(b2) + HANDLE_BYTES
                 ),
-                my_lid,
-                my_mtu,
             )
         var cfg = Pointer[Int64, MutAnyOrigin](
             unsafe_from_address=Int(b2) + HANDLE_BYTES + IB_BLOB_BYTES
@@ -1260,7 +1412,6 @@ def _bootstrap(
                 ),
                 BLOB2,
                 peer_rank_of_node,
-                my_mtu,
             )
 
         bootstrap_barrier(conn, timeout_s)
@@ -1351,7 +1502,9 @@ def _async_error_stream(state: CommState) -> DeviceStream:
         if state.last_stream != 0 and state.last_stream in state.stream_cache:
             return state.stream_cache[state.last_stream]
     except:
-        return state.own_stream  # the lookup raced a concurrent insert
+        # Lost the race with a concurrent insert: the communicator's own
+        # stream is always a valid answer.
+        return state.own_stream
     return state.own_stream
 
 
@@ -1519,6 +1672,14 @@ def ncclCommGetAsyncError(
             # A host callback gave up (post failed, a completion came back
             # with a bad status, or nothing arrived inside the deadline).
             # Host-side state, so it needs no device read.
+            err_out[] = NCCL_REMOTE_ERROR
+            return NCCL_SUCCESS
+        if _fault_code(state) != 0:
+            # A device deadline, latched in the status page. Also host memory,
+            # so a watchdog polling this function pays nothing for it and --
+            # unlike the arena read below -- does not block behind the kernel
+            # it is asking about.
+            _report_fault(state)
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
         # Synchronize first: the freshest read this cheaply-checkable word
@@ -1690,9 +1851,16 @@ def _exchange_release[
     raw_stream: Int64,
     arena: Int,
     numel: Int,
+    chunk_index: Int,
+    nchunks: Int,
 ) raises -> Int:
     """Release one chunk's shard to the network and return its exchange
     counter.
+
+    `chunk_index` / `nchunks` are carried into the work item for the stall
+    messages only (`internode._ring_state`): they cost nothing and turn "the
+    GPU has not released exchange 78" into a sentence naming the collective
+    and the chunk.
 
     On entry this rank's node-local sum of the chunk's shard sits in arena
     `arena`'s stage_out (that is `reduce_scatter_stage`'s contract). This
@@ -1738,6 +1906,10 @@ def _exchange_release[
         npeers,
         state.owned_base + inbox_base if cnt_e > 0 else 0,
         seq,
+        OP_ALLREDUCE,
+        chunk_index,
+        nchunks,
+        numel,
     )
     return seq
 
@@ -1920,7 +2092,7 @@ def _do_allreduce[
                 scale,
             )
             seqs[k] = _exchange_release[dtype](
-                state, stream, raw_stream, k % state.narenas, cnt
+                state, stream, raw_stream, k % state.narenas, cnt, k, nchunks
             )
         var j = k - (depth - 1)
         if j >= 0:
@@ -1997,8 +2169,9 @@ def _allreduce_locked(
     ref state = _comm_ptr(comm)[]
     if state.aborted:
         return NCCL_INVALID_USAGE
-    if state.ib != 0 and ib_error(state.ib) != 0:
-        return NCCL_REMOTE_ERROR
+    var latched = _latched_error(state)
+    if latched != NCCL_SUCCESS:
+        return latched
     state.last_stream = stream
     _ensure_stream_cached(state, stream)
     ref s = state.stream_cache[stream]
@@ -2102,8 +2275,9 @@ def _broadcast_locked(
         return NCCL_INVALID_USAGE
     if Int(root) < 0 or Int(root) >= state.world:
         return NCCL_INVALID_ARGUMENT
-    if state.ib != 0 and ib_error(state.ib) != 0:
-        return NCCL_REMOTE_ERROR
+    var latched = _latched_error(state)
+    if latched != NCCL_SUCCESS:
+        return latched
     state.last_stream = stream
     _ensure_stream_cached(state, stream)
     ref s = state.stream_cache[stream]
@@ -2186,6 +2360,8 @@ def _broadcast_multinode(
         * 4096,
     )
     var done = 0
+    var chunk_index = 0
+    var nchunks = (total_bytes + max_bytes - 1) // max_bytes
     while done < total_bytes:
         var chunk = min(max_bytes, total_bytes - done)
         var seq = ib_next_seq(state.ib)
@@ -2234,6 +2410,10 @@ def _broadcast_multinode(
             npeers,
             flush_addr,
             seq,
+            OP_BROADCAST,
+            chunk_index,
+            nchunks,
+            chunk,
         )
         # Unpipelined on purpose: one exchange at a time, waited for right
         # where it is released. Broadcast's fan-out is a different shape from
@@ -2258,6 +2438,7 @@ def _broadcast_multinode(
         # credit is only due now.
         ib_note_consumed(state.ib, seq)
         done += chunk
+        chunk_index += 1
 
 
 @export
@@ -2300,13 +2481,19 @@ def _allgather_locked(
     ref state = _comm_ptr(comm)[]
     if state.aborted:
         return NCCL_INVALID_USAGE
-    if state.ib != 0 and ib_error(state.ib) != 0:
-        return NCCL_REMOTE_ERROR
+    var latched = _latched_error(state)
+    if latched != NCCL_SUCCESS:
+        return latched
     state.last_stream = stream
     _ensure_stream_cached(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
-        var max_bytes = max(1, state.cap_bytes)
+        # AMD's push all-gather stages `world-1` slots, so its chunk is
+        # smaller than the region cap; `allgather_max_bytes` is the identity
+        # on NVIDIA.
+        var max_bytes = max(
+            1, allgather_max_bytes(state.cap_bytes, state.local_world)
+        )
         var done = 0
         while done < per_rank_bytes:
             var chunk = min(max_bytes, per_rank_bytes - done)
@@ -2360,6 +2547,8 @@ def _allgather_multinode(
     )
     var max_bytes = max(16, ((max_block - 8192) // lw) // 16 * 16)
     var done = 0
+    var ag_chunk_index = 0
+    var ag_nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
     while done < per_rank_bytes:
         var chunk = min(max_bytes, per_rank_bytes - done)
         state.generation += 1
@@ -2396,6 +2585,10 @@ def _allgather_multinode(
             npeers,
             state.owned_base + inbox_base,
             seq,
+            OP_ALLGATHER,
+            ag_chunk_index,
+            ag_nchunks,
+            block,
         )
         # Unpipelined, like broadcast: one exchange, waited for in place.
         ib_enqueue_wait(state.ib, state.ctx, stream, seq)
@@ -2427,6 +2620,7 @@ def _allgather_multinode(
         # `place_blocks` above is what read the inbox slots.
         ib_note_consumed(state.ib, seq)
         done += chunk
+        ag_chunk_index += 1
 
 
 def _place_node_block(

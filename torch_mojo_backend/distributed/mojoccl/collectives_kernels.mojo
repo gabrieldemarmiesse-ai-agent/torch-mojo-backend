@@ -15,7 +15,11 @@
 #   allreduce two-shot: `world` push slots of max-shard size, then the reduced
 #                       shard (`_launch_allreduce`, which raises if that ever
 #                       fails to fit -- it cannot, since world*shard ~ numel
-#                       <= cap and the arena is 2*cap);
+#                       <= cap and the arena is 2*cap).  On AMD that last area
+#                       is `world-1` slots instead of one -- the gather slots
+#                       peers push their reduced shards into -- at the same
+#                       base offset, so the NVIDIA layout is byte for byte
+#                       what it was;
 #   allreduce one-shot: two generation-parity halves of `world` whole-message
 #                       slots (used only when they fit);
 #   broadcast/allgather: the base of the arena, one message-sized stage per
@@ -50,6 +54,39 @@
 # the same as a direct reduce-scatter + all-gather -- and no byte is copied
 # locally that the direct kernel would not also copy.  The staging is free.
 #
+# Link direction: AMD (gfx942 / MI300A) takes a different phase 3
+# ------------------------------------------------------------------
+# On an xGMI mesh a GPU-initiated remote *read* does not scale across links
+# while a remote *write* does.  Measured on a 4x MI300A node with the copy
+# loop below (perf-work/linkbw.mojo, 168 MiB, per-GPU GB/s): one link 91
+# either way; three peers written at once 233; three peers read at once 93,
+# and a ring of simultaneous readers 56.  RCCL reaches the same 236 GB/s at
+# 512 MiB and gets there the same way -- its P2P transport hard-wires
+# `read = 0` on AMD (rccl:src/graph/paths.cc:441 only lets compCap 80 read),
+# so the sender stores into the receiver's buffer and no rank ever loads
+# across a link.
+#
+# So on AMD phase 3 is a second push instead of a pull:
+#
+#   phase 2' each rank writes its reduced shard into EVERY peer's gather slot
+#            (and into its own slice of the user output),
+#   phase 3' each rank copies the `world-1` gather slots of its OWN region
+#            into the user output -- a local HBM copy, because the user's
+#            output cannot be IPC-mapped and so a peer cannot write it
+#            directly.
+#
+# The cross-link traffic is bit for bit the same 2*(world-1)/world * bytes; it
+# has only changed direction.  The price is that local copy, and it is small:
+# the region is `hipDeviceMallocUncached` but reads out of it at full HBM rate
+# (1434 GB/s measured against 1453 for a normal buffer), so 0.75 * message
+# costs ~90 us at 168 MiB against the ~1130 us the wire needs.
+#
+# NVIDIA keeps the pull: behind a switch every direction is equivalent, the
+# pull needs no gather slots and no local copy, and the H100 numbers in
+# docs/mojo_collectives_kernel_results.md were measured with it.  The split is
+# a `comptime if has_amd_gpu_accelerator()` in the kernel and in the one host
+# line that sizes the arena, so NVIDIA device code is unchanged.
+#
 # Synchronisation
 # ---------------
 # The signal area holds one UInt64 flag per (block, writer rank).  Rank r's
@@ -78,17 +115,22 @@
 # Every spin is bounded (`MOJOCCL_IB_TIMEOUT_S`, default 60 s, measured with
 # the GPU's own timer -- never compared across GPUs).  On timeout the kernel
 # stores a nonzero code into its own region's error word (byte
-# `error_offset()`) and returns instead of hanging the node.  The same spins
-# also leave early when the host raises the communicator's abort word
-# (`install_abort_word`, `ncclCommAbort`), which is what makes abort prompt
+# `error_offset()`), latches the failure in the communicator's pinned status
+# page (`publish_fault`, so the host can see it without synchronizing a
+# stream) and returns instead of hanging the node.  The same spins also leave
+# early when the host raises the communicator's abort word
+# (`install_status_page`, `ncclCommAbort`), which is what makes abort prompt
 # instead of costing a full deadline.
 #
-# Portability: NVIDIA and AMD share every line of the device code.  Ordering is
-# `Atomic[...].store[RELEASE]` / `load[ACQUIRE]` at default (system) scope,
-# which lowers to `st.release.sys.global` / `ld.acquire.sys.global` on sm_90a
-# and to `global_store/load ... sc0 sc1` + `buffer_wbl2 sc0 sc1` / `buffer_inv
-# sc0 sc1` on gfx942 -- exactly the instructions RCCL relies on.  Blocks are
-# 256 threads (RCCL's gfx942 maximum) and every layout is wave-64 safe.
+# Portability: NVIDIA and AMD share every line of the device code except the
+# two places the header calls out (phase 3 of the allreduce, and the fence
+# discipline).  On NVIDIA ordering is `Atomic[...].store[RELEASE]` /
+# `load[ACQUIRE]` at default (system) scope, which lowers to
+# `st.release.sys.global` / `ld.acquire.sys.global` on sm_90a.  On gfx942 the
+# region is uncached and the flags are published with `s_waitcnt lgkmcnt(0)
+# vmcnt(0)` plus a relaxed store -- RCCL's "cheap post-send fence", see
+# `_sync`.  Blocks are 256 threads (RCCL's gfx942 maximum) and every layout is
+# wave-64 safe.
 #
 # Every host function takes the DeviceStream to enqueue on (production wraps
 # the caller's foreign cudaStream_t with `DeviceContext.create_external_stream`);
@@ -119,12 +161,18 @@ from std.sys import (
     has_amd_gpu_accelerator,
     size_of,
 )
+from std.sys import llvm_intrinsic
 from std.time import global_perf_counter_ns
 from std.utils import StaticTuple
 
 # ===-------------------------------------------------------------------=== #
 # Compile-time configuration
 # ===-------------------------------------------------------------------=== #
+
+comptime _AMD = has_amd_gpu_accelerator()
+"""Whether this build targets AMD.  Every behavioural difference in this file
+is behind it, so the NVIDIA path is exactly what it was before the MI300A work
+(see the "Link direction" note in the module header)."""
 
 comptime MAX_WORLD = 8
 """Largest world size a single region can address (one flag column per rank)."""
@@ -139,10 +187,10 @@ comptime _FLAG_BYTE_OFFSET = 4096
 """Start of the flag matrix inside the signal area (the first page holds the
 error word, the NVLS barrier counters and the abort-word pointer)."""
 
-comptime _ABORT_PTR_OFFSET = 256
+comptime _STATUS_PTR_OFFSET = 256
 """Header slot holding the DEVICE address of the communicator's pinned host
-abort word. Zero until `install_abort_word` publishes one, and every spin
-reads zero as "this region has no abort word". 64/128/192 are the NVLS
+status page (below). Zero until `install_status_page` publishes one, and every
+spin reads zero as "this region has no status page". 64/128/192 are the NVLS
 barrier counters (nvls_kernels.mojo), so 256 is the first free line."""
 
 comptime _SIGNAL_BYTES = 128 * 1024
@@ -181,19 +229,38 @@ two-shot): 128 KiB 9.3/19.0, 256 KiB 12.3/19.3, 512 KiB 18.1/19.8,
 1 MiB 30.0/20.5 -- so the crossover sits just above 512 KiB. The path is taken
 only if 2*world message-sized slots also fit the region."""
 
-comptime _AR_MAX_BLOCKS = get_defined_int["ccl_ar_blocks", 216]()
+comptime _AR_MAX_BLOCKS = get_defined_int[
+    "ccl_ar_blocks", 128 if has_amd_gpu_accelerator() else 216
+]()
 """Grid cap for allreduce, fitted on H100 (132 SMs) / NVSwitch; see the block
-sweep in RESULTS.md. Not portable: re-fit it on another card."""
+sweep in RESULTS.md. Not portable: re-fit it on another card. The AMD value
+was swept on one 4x MI300A node (228 CUs) with the push/reduce/push-back
+schedule and the barrier this file uses there, fp32, 4 ranks, us at
+9 / 27 MiB: 64 -> 118 / 285, **128 -> 121 / 254**, 224 -> 144 / 258. The cost
+of the grid here is the barrier's `buffer_wbl2` per thread, which is why the
+best value moved down from 224 once the release fence went back to every
+thread; 64 starves the 27 MiB transfer. Re-fit it on another card, and re-fit
+it if the barrier changes."""
 
 comptime _AR_BIG_BYTES = get_defined_int["ccl_ar_big_bytes", 64 * 1024 * 1024]()
 """Above this message size the allreduce grid drops to `_AR_BIG_BLOCKS`."""
 
-comptime _AR_BIG_BLOCKS = get_defined_int["ccl_ar_big_blocks", 128]()
+comptime _AR_BIG_BLOCKS = get_defined_int[
+    "ccl_ar_big_blocks", 912 if has_amd_gpu_accelerator() else 128
+]()
 """Grid cap for large allreduces. A grid that fits in one wave of an H100's
 132 SMs measured 8% faster at 512 MiB than 216 blocks (2825 vs 3065 us) and
 the same at 168 MiB, because the barrier is per block index: with more blocks
 than SMs the second wave runs the whole collective after the first, on fewer
-SMs. Fitted on H100 (132 SMs); re-fit on another card."""
+SMs. Fitted on H100 (132 SMs); re-fit on another card.
+
+MI300A wants the opposite, and not gently. Swept on one 4x MI300A node with
+the push/reduce/push-back schedule, fp32, 4 ranks, us at 168 / 512 MiB:
+64 -> 1987 / 6638, 96 -> 1393 / 5465, 128 -> 1886 / 5381, 160 -> 1302 / 4804,
+224 -> 2224 / 6053, 456 -> 1262 / 5093, **912 -> 1196 / 3705**. 912 is four
+waves of the 228 CUs and is the only value that is best at both sizes; the
+response in between is not monotonic (224, one block per CU, is the worst
+point measured) so do not interpolate -- re-sweep."""
 
 comptime _COPY_MAX_BLOCKS = get_defined_int["ccl_copy_blocks", 432]()
 """Grid cap for the pure-copy collectives (broadcast / allgather)."""
@@ -204,6 +271,10 @@ comptime ERR_BROADCAST_SYNC = 2
 comptime ERR_ALLGATHER_SYNC = 3
 comptime ERR_RS_STAGE_SYNC = 4
 comptime ERR_AG_FINISH_SYNC = 5
+# 6 is nvls_kernels.mojo's ERR_NVLS_SYNC; 7 and 8 are free.
+comptime ERR_PROXY_WAIT = 9
+"""`internode_kernels.mojo`'s wait for the inter-node progress thread. The
+value is what that kernel has always written, so old logs still decode."""
 
 
 # ===-------------------------------------------------------------------=== #
@@ -236,12 +307,69 @@ def error_offset() -> Int:
     return 0
 
 
-def abort_ptr_offset() -> Int:
-    """Byte offset, inside the signal area, of the abort-word pointer slot."""
+def status_ptr_offset() -> Int:
+    """Byte offset, inside the signal area, of the status-page pointer slot."""
     comptime assert (
-        _ABORT_PTR_OFFSET + 8 <= _FLAG_BYTE_OFFSET
-    ), "the abort pointer must fit the header page"
-    return _ABORT_PTR_OFFSET
+        _STATUS_PTR_OFFSET + 8 <= _FLAG_BYTE_OFFSET
+    ), "the status pointer must fit the header page"
+    return _STATUS_PTR_OFFSET
+
+
+# ===-------------------------------------------------------------------=== #
+# The communicator's status page: pinned host memory, mapped on the device
+# ===-------------------------------------------------------------------=== #
+#
+# One page per communicator, allocated by mojoccl.mojo and published in every
+# arena header (`install_status_page`). Two cache lines, and the split is the
+# point: line 0 is the abort word the HOST writes and every device spin reads,
+# line 1 is the fault record the DEVICE writes and the host reads.
+#
+# The fault record is what makes a device deadline loud. Before it, the only
+# trace a timed-out barrier left was the arena's error word -- device memory,
+# which the host can only read by launching a copy kernel and synchronizing
+# the stream (`_read_error_word`), i.e. by blocking behind the very kernels it
+# wants to report. Nobody could afford that per collective, so nobody read it,
+# so a rank that gave up after 60 s went on to run every later kernel of the
+# run and the collective completed with whatever the arena happened to hold.
+# Pinned host memory a kernel stores into needs no copy and no synchronize:
+# every collective entry point can test one word for a few nanoseconds, and
+# `proxy_request` / `proxy_wait` can test it on the device for the price of a
+# load in a kernel that already touches this page.
+
+comptime STATUS_PAGE_BYTES = 128
+"""Two cache lines: the abort word must stay on a line of its own, or raising
+it would invalidate the line a spin is reading the fault record from."""
+
+comptime STATUS_ABORT_WORD = 0
+"""Word index of the abort word. `ncclCommAbort` stores 1 into it."""
+
+comptime STATUS_FAULT_WORD = 8
+"""Word index of the first word of the fault record (second cache line)."""
+
+# Fault record layout, as word offsets from `STATUS_FAULT_WORD`. `FAULT_CODE`
+# is written LAST, with a release store, so a nonzero code also means the six
+# detail words are final; it is the "has this communicator failed" predicate
+# the host and the inter-node kernels test. There is no rank field: the page
+# belongs to one process, and that process knows its own rank.
+comptime FAULT_CODE = 0
+"""One of the `ERR_*` codes -- which collective, i.e. which kernel."""
+comptime FAULT_PHASE = 1
+"""Which barrier inside that collective (`_flag_target`'s phase)."""
+comptime FAULT_BLOCK = 2
+"""The block that gave up. Barriers here are matched by block index."""
+comptime FAULT_PEER = 3
+"""The peer whose flag never arrived, or `FAULT_NO_PEER`."""
+comptime FAULT_SEEN = 4
+"""The value that peer's flag actually held when the deadline fired."""
+comptime FAULT_TARGET = 5
+"""The value it was waited for: `generation * PHASES_PER_GEN + phase`."""
+comptime FAULT_ARENA = 6
+"""Base ADDRESS of the arena, which the host turns into an arena index (it is
+the only party that knows the stride)."""
+
+comptime FAULT_NO_PEER = UInt64(0xFFFF_FFFF_FFFF_FFFF)
+"""`FAULT_PEER` for a wait that is not on a peer's flag -- the inter-node
+exchange wait, whose counterpart is this rank's own progress thread."""
 
 
 @always_inline
@@ -271,7 +399,8 @@ def spin_timeout_ns() -> UInt64:
             if seconds > 0.0:
                 ns = UInt64(seconds * 1.0e9)
         except:
-            ns = UInt64(DEFAULT_TIMEOUT_NS)  # unparsable: keep the default
+            # Unparseable value: keep the 60 s default rather than a silent 0.
+            ns = UInt64(DEFAULT_TIMEOUT_NS)
     var slot = unsafe_alloc[UInt64](1)
     slot[unsafe_offset=0] = ns
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
@@ -304,43 +433,179 @@ def _flags(
 
 
 @always_inline
-def _abort_raised(region: Pointer[UInt8, MutAnyOrigin]) -> Bool:
-    """Whether the host has raised this communicator's abort word.
-
-    Two dependent loads, and only from the slow path of a spin: the pinned
-    word's device address out of my own region's header (written once at
-    communicator init, never again) and then the word itself, which lives in
-    host memory and is where `ncclCommAbort` stores. A region with no abort
-    word installed reads address zero and never probes further.
-    """
-    var addr = Int(
-        region.unsafe_offset(_ABORT_PTR_OFFSET).unsafe_bitcast[UInt64]()[
+def status_page(region: Pointer[UInt8, MutAnyOrigin]) -> Int:
+    """Device address of this communicator's status page, or 0 if none was
+    installed (a region built by a test harness, or one whose header has not
+    been published yet)."""
+    return Int(
+        region.unsafe_offset(_STATUS_PTR_OFFSET).unsafe_bitcast[UInt64]()[
             unsafe_offset=0
         ]
     )
-    if addr == 0:
+
+
+@always_inline
+def status_word(page: Int, index: Int) -> Pointer[UInt64, MutAnyOrigin]:
+    return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=page + index * 8)
+
+
+@always_inline
+def abort_raised(page: Int) -> Bool:
+    """Whether this communicator has stopped -- by `ncclCommAbort`, or by a
+    device deadline (`publish_fault` raises the same word).
+
+    The one predicate a kernel needs before it does anything irreversible,
+    and deliberately one word: a reader on the device pays a PCIe round trip
+    per load of this page.
+    """
+    if page == 0:
         return False
     return (
         Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
-            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
+            status_word(page, STATUS_ABORT_WORD)
         )
         != 0
     )
 
 
 @always_inline
-def _record_error(
+def fault_latched(page: Int) -> Bool:
+    """Whether a device deadline has already been latched here.
+
+    Once it has, nothing this communicator does is trustworthy any more: some
+    block gave up waiting for a peer, so an arena holds bytes nobody produced.
+
+    Distinguishes a deadline from an abort, which `abort_raised` does not (a
+    deadline raises the abort word too). Only `publish_fault`'s own guard
+    needs the distinction on the device; every other device reader wants
+    `abort_raised`, which is half the loads.
+    """
+    if page == 0:
+        return False
+    return (
+        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            status_word(page, STATUS_FAULT_WORD + FAULT_CODE)
+        )
+        != 0
+    )
+
+
+@always_inline
+def _abort_raised(region: Pointer[UInt8, MutAnyOrigin]) -> Bool:
+    """`abort_raised` for a caller that has a region rather than a page.
+
+    Two dependent loads, and only from the slow path of a spin: the page's
+    device address out of my own region's header (written once at communicator
+    init, never again) and then the abort word itself, which lives in host
+    memory and is where `ncclCommAbort` stores.
+    """
+    return abort_raised(status_page(region))
+
+
+@always_inline
+def latch_arena_error(
+    err_word: Pointer[UInt64, MutAnyOrigin], code: Int, phase: Int
+) -> Bool:
+    """Store `code * 1_000_000 + phase` into an arena's error word if it is
+    still clear; True if this thread is the one that did it.
+
+    First writer wins, deliberately. The first deadline is the one that
+    explains the run: once a rank stops publishing flags, every later
+    collective on that arena times out too, and overwriting would leave only
+    the last consequence. Device memory, so this is an ordinary global atomic.
+    """
+    var expected = UInt64(0)
+    return Atomic[DType.uint64].compare_exchange[
+        success_ordering=Ordering.RELEASE,
+        failure_ordering=Ordering.RELAXED,
+    ](err_word, expected, UInt64(code) * 1_000_000 + UInt64(phase))
+
+
+@always_inline
+def publish_fault(
+    page: Int,
+    code: Int,
+    phase: Int,
+    block: Int,
+    peer: UInt64,
+    seen: UInt64,
+    target: UInt64,
+    arena: Int,
+):
+    """Latch a device deadline in the status page, for the host to print.
+
+    Plain stores for the detail words and one release store for the code --
+    the same kind of write `_proxy_request_kernel` has always made into pinned
+    host memory, so this needs nothing of the hardware that the transport does
+    not already need. The guard is a read of the code word rather than a
+    compare-exchange: host-memory atomics are a portability question this
+    library does not have to open, and the caller has already won a
+    compare-exchange on its arena's error word, so the only race left is two
+    ARENAS failing within the same microsecond -- two descriptions of one
+    episode, not two episodes.
+    """
+    if page == 0 or fault_latched(page):
+        return
+    status_word(page, STATUS_FAULT_WORD + FAULT_PHASE)[
+        unsafe_offset=0
+    ] = UInt64(phase)
+    status_word(page, STATUS_FAULT_WORD + FAULT_BLOCK)[
+        unsafe_offset=0
+    ] = UInt64(block)
+    status_word(page, STATUS_FAULT_WORD + FAULT_PEER)[unsafe_offset=0] = peer
+    status_word(page, STATUS_FAULT_WORD + FAULT_SEEN)[unsafe_offset=0] = seen
+    status_word(page, STATUS_FAULT_WORD + FAULT_TARGET)[
+        unsafe_offset=0
+    ] = target
+    status_word(page, STATUS_FAULT_WORD + FAULT_ARENA)[
+        unsafe_offset=0
+    ] = UInt64(arena)
+    # Last, and with release: a nonzero code promises the six words above.
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        status_word(page, STATUS_FAULT_WORD + FAULT_CODE), UInt64(code)
+    )
+    # And raise the abort word: "this communicator has failed" is then ONE
+    # word for every device reader, which matters on the inter-node release
+    # path, where each load of this pinned page is a PCIe round trip per
+    # exchange (see `internode._proxy_main`). Ordered after the code, so a
+    # reader that sees the word raised finds a complete record.
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        status_word(page, STATUS_ABORT_WORD), UInt64(1)
+    )
+
+
+@always_inline
+def _record_deadline(
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     rank: Int,
     code: Int,
-    phase: Int,
+    target: UInt64,
+    peer: UInt64,
+    seen: UInt64,
 ):
-    """Publish a failure in my own region's error word (host-readable)."""
-    if thread_idx.x == 0:
-        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-            regions[rank].unsafe_bitcast[UInt64](),
-            UInt64(code) * 1_000_000 + UInt64(phase),
-        )
+    """A barrier gave up: record it in the arena and latch it for the host.
+
+    Called by the thread that hit the deadline, which is the only one that
+    knows which peer it was waiting for and what that peer's flag held. The
+    arena word is what it always was (`ncclCommGetAsyncError` reads it); the
+    status page is what makes the next collective on this communicator fail
+    loudly instead of returning garbage.
+    """
+    var region = regions[rank]
+    var phase = Int(target % UInt64(PHASES_PER_GEN))
+    # `error_offset()` is 0: the error word is the first word of the region.
+    if not latch_arena_error(region.unsafe_bitcast[UInt64](), code, phase):
+        return
+    publish_fault(
+        status_page(region),
+        code,
+        phase,
+        Int(block_idx.x),
+        peer,
+        seen,
+        target,
+        Int(region),
+    )
 
 
 @always_inline
@@ -348,6 +613,7 @@ def _sync(
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     world: Int,
     rank: Int,
+    code: Int,
     target: UInt64,
     t0: UInt64,
     timeout_ns: UInt64,
@@ -355,9 +621,9 @@ def _sync(
     """Block-scoped barrier across the same block index on every rank.
 
     Thread `p` (p < world) publishes `target` into peer p's flags[bid][rank]
-    with a release store -- which orders every payload write this block made
-    into peer memory before the flag becomes visible -- then waits for peer p's
-    flag in my own region to reach `target`.
+    -- after every payload write this block made into peer memory has landed,
+    which is what the fence below is for -- then waits for peer p's flag in my
+    own region to reach `target`.
 
     Blocks are matched by index: every collective in this file gives block b of
     every rank exactly the same grid-stride slice of the index space, so block b
@@ -365,27 +631,64 @@ def _sync(
 
     Returns False if any participating thread hit the deadline; the whole block
     learns that through shared memory so no thread is left inside a `barrier()`.
+
+    `code` is the caller's `ERR_*` constant, and recording the failure is this
+    function's job rather than the caller's: only the thread that gave up knows
+    which peer it was waiting for and what that peer's flag held, and that is
+    most of what a reader of the message needs. Every caller used to follow a
+    False with the same two lines; folding them in is also how a new caller
+    stops being able to forget them.
     """
     var failed = stack_allocation[
         1, DType.uint32, address_space=AddressSpace.SHARED
     ]()
     if thread_idx.x == 0:
         failed[unsafe_offset=0] = 0
-    comptime if has_amd_gpu_accelerator():
+    comptime if _AMD:
         # gfx942's `s_barrier` is emitted with `s_waitcnt lgkmcnt(0)` only, so
         # another wave's payload stores can still be in flight when one thread
         # publishes the flag; RCCL puts `vmcnt(0)` inside its block barrier for
-        # exactly this reason (rccl:src/device/prims_simple.h:193-210), and a
-        # release fence in every thread is the portable spelling (it lowers to
-        # `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`). NVIDIA needs nothing:
-        # `bar.sync` is a CTA-scope fence and the release store below is
-        # cumulative over it, which is what NCCL's postPeer relies on.
+        # exactly this reason (rccl:src/device/prims_simple.h:193-210). A
+        # release fence in every thread is the portable spelling and lowers to
+        # `s_waitcnt vmcnt(0)` + `buffer_wbl2 sc0 sc1`, i.e. the writeback that
+        # makes this block's payload stores visible to the peer that is about
+        # to be told they are there.
+        #
+        # Both cheaper spellings were tried and both are wrong on this box, in
+        # the same way and only for small payloads:
+        #   * no writeback at all (RCCL's `skip_fence` for cudaArch 940, which
+        #     is sound for RCCL because its P2P buffers are uncached) --
+        #     broke every broadcast;
+        #   * the writeback moved after the barrier into the `world` threads
+        #     that publish flags -- fixed the broadcast at 4 ranks but still
+        #     failed a 1-element allreduce and a broadcast at 2 ranks.
+        # Our region is `hipDeviceMallocUncached`, but the mapping a peer
+        # writes *through* comes from `hipIpcOpenMemHandle` and does not carry
+        # that memory type, so a few bytes can still be sitting in the writer's
+        # cache. Megabyte payloads drain on their own, which is why only the
+        # small collectives ever failed. NVIDIA needs nothing: `bar.sync` is a
+        # CTA-scope fence and the release store below is cumulative over it,
+        # which is what NCCL's postPeer relies on.
         fence[ordering=Ordering.RELEASE]()
     barrier()
 
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x)
+        # The acquire stays an acquire *load*, per iteration. Spinning on a
+        # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
+        # invalidating once after the wait looks exactly as strong, is worth
+        # a lot -- it is the difference between 243 us and 465 us at 27 MiB
+        # when the grid is 1024 blocks, because `buffer_inv sc0 sc1` throws
+        # the payload out of L2 for every block still working -- and was
+        # measured to leave a one-element allreduce at 2 ranks failing 2 runs
+        # in 13, against 0 in 12 with this spelling. Neither sample proves
+        # anything on its own (Fisher p ~ 0.5), but there is no argument for
+        # why the cheap version is sound on this hardware, and two cheaper
+        # release spellings already turned out unsound here in exactly this
+        # way -- small payloads only. So: correctness, and the large messages
+        # pay for it. See docs/mojo_collectives_kernel_results.md section 7
+        # for the experiment that would settle it.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer]).unsafe_offset(bid * MAX_WORLD + rank),
             target,
@@ -399,14 +702,105 @@ def _sync(
             if spins >= _SPIN_CHECK:
                 spins = 0
                 if _abort_raised(regions[rank]):
+                    # Abort is a request, not a failure: record it in the
+                    # arena word the way this file always has, but do not
+                    # latch a fault. `ncclCommAbort` already told the host
+                    # what happened, and an aborted communicator has to keep
+                    # answering NCCL_INVALID_USAGE rather than start
+                    # answering NCCL_REMOTE_ERROR.
+                    _ = latch_arena_error(
+                        regions[rank].unsafe_bitcast[UInt64](),
+                        code,
+                        Int(target % UInt64(PHASES_PER_GEN)),
+                    )
                     failed[unsafe_offset=0] = 1
                     break
                 # Same-GPU timer difference only; never compared across GPUs.
-                if global_perf_counter_ns() - t0 > timeout_ns:
+                if device_now_ns() - t0 > timeout_ns:
+                    _record_deadline(
+                        regions,
+                        rank,
+                        code,
+                        target,
+                        UInt64(peer),
+                        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                            mine
+                        ),
+                    )
                     failed[unsafe_offset=0] = 1
                     break
     barrier()
     return failed[unsafe_offset=0] == 0
+
+
+@always_inline
+def _peer_step(i: Int, world: Int) -> Int:
+    """Peer offset for loop index `i` (1 <= i < world), rotated by block index.
+
+    Every block still touches exactly the same bytes for every peer -- only
+    the order of the peers differs -- so the block-matched sync invariant is
+    untouched. What changes is link usage on a point-to-point topology such
+    as the MI300A's xGMI mesh (one link per GPU pair): with the plain order
+    the whole grid queues on one peer's link at a time and the other
+    `world-2` links sit idle; rotated, the blocks spread over all of them at
+    once. Behind a switch (NVSwitch) the order is irrelevant. Measured on
+    4x MI300A: see docs/distributed.md, "Cluster notes (AMD MI300A)".
+    """
+    comptime if has_amd_gpu_accelerator():
+        return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
+    else:
+        # Behind NVSwitch the order is irrelevant; keep the H100-measured
+        # device code byte-identical.
+        return i
+
+
+@always_inline
+def _peer_step0(i: Int, world: Int) -> Int:
+    """`_peer_step` for loops that include the rank itself (0 <= i < world)."""
+    comptime if has_amd_gpu_accelerator():
+        return (i + Int(block_idx.x)) % world
+    else:
+        return i
+
+
+@always_inline
+def _gather_slot(writer: Int, owner: Int) -> Int:
+    """Index of `writer`'s slot inside `owner`'s gather area (AMD phase 3').
+
+    Compacted, exactly like the split allreduce's push slots: `owner` never
+    writes its own slot (its own reduced shard goes straight to the user
+    output), so `world-1` slots suffice and the area stays inside the arena
+    even when the message is exactly `cap` bytes.
+    """
+    return writer if writer < owner else writer - 1
+
+
+@always_inline
+def device_now_ns() -> UInt64:
+    """Device-side clock for the spin deadlines, wrap-safe on AMD.
+
+    The stdlib's `global_perf_counter_ns` on AMD returns
+    `(s_memrealtime_ticks * 1_000_000_000) // 100_000_000` in UInt64: the
+    product overflows 184 s after the GPU's counter started, and from then on
+    the value is a saw-tooth with a 184.47 s period. A spin whose start and
+    poll straddle a wrap computes `now - t0` as an enormous unsigned number
+    and fires its deadline at once -- the block records the error word and
+    returns while its peers wait a real 60 s for flags it never publishes,
+    and the collective completes with garbage on that node. Measured on
+    Adastra (2x4 MI300A): about one 40 s stress run in five corrupted, always
+    a run 60-120 s longer than a clean one. Reading the 100 MHz counter
+    directly and scaling by 10 keeps differences exact for centuries. NVIDIA's
+    `globaltimer` is nanoseconds already and is left as it was.
+    """
+    comptime if has_amd_gpu_accelerator():
+        return (
+            llvm_intrinsic[
+                "llvm.amdgcn.s.memrealtime", UInt64, has_side_effect=True
+            ]()
+            * 10
+        )
+    else:
+        return global_perf_counter_ns()
 
 
 @always_inline
@@ -670,9 +1064,11 @@ def shard_range(
 #
 # Within a call the two data syncs order the three phases:
 #     start(g) < push(g) < A(g) < reduce(g) < B(g) < pull(g) < start(g+1)
-# and a sync is a full N-way rendezvous of matching block indices. In-place
-# (in_ptr == out_ptr) is safe because the phases are block-matched: block b
-# writes exactly the elements block b read.
+# (on AMD: reduce-and-push-back instead of reduce, local gather instead of
+# pull -- same three phases, same two data syncs) and a sync is a full N-way
+# rendezvous of matching block indices. In-place (in_ptr == out_ptr) is safe
+# because the phases are block-matched: block b writes exactly the elements
+# block b read.
 
 
 @__llvm_metadata(
@@ -698,7 +1094,7 @@ def _ar_twoshot_kernel[
     comptime accum = DType.float32 if (
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -714,13 +1110,14 @@ def _ar_twoshot_kernel[
 
     # --- phase 0: start barrier -- nobody writes the arena for generation g
     # until every rank has finished reading it for generation g-1 ------------
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 0)
+    if not _sync(
+        regions, world, rank, ERR_ALLREDUCE_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     # --- phase 1: push shard s of my input into peer s's slot `rank` --------
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var src = in_ptr.unsafe_offset(_vstart(s, q, rem) * W)
@@ -734,8 +1131,9 @@ def _ar_twoshot_kernel[
         if tail > 0 and s == world - 1:
             _copy_scalar_tail(dst, src, vc * W, tail, tid, stride)
 
-    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 1)
+    if not _sync(
+        regions, world, rank, ERR_ALLREDUCE_SYNC, flag_base + 1, t0, timeout_ns
+    ):
         return
 
     # --- phase 2: reduce my shard, to the arena and to the user output ------
@@ -744,8 +1142,14 @@ def _ar_twoshot_kernel[
     var my_tail = tail if rank == world - 1 else 0
     var uin = in_ptr.unsafe_offset(my_vs * W)
     var uout = out_ptr.unsafe_offset(my_vs * W)
+    # NVIDIA publishes the reduced shard in its own region for the peers to
+    # pull.  AMD pushes it into theirs instead (phase 2b below), so there is
+    # nothing to publish locally; `shard` then aliases `uout` and the store to
+    # it is elided at compile time.
     var shard = (
-        regions[rank].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
+        uout if _AMD else regions[rank]
+        .unsafe_offset(shard_off)
+        .unsafe_bitcast[Scalar[dtype]]()
     )
 
     # Slot pointers are formed by arithmetic inside the unrolled loop, never
@@ -753,6 +1157,27 @@ def _ar_twoshot_kernel[
     # memory (MOCO-1431) and turns every payload load into a generic-address
     # `ld.v4.b32` plus an `ld.local.b64` of the pointer itself.
     var slots = regions[rank].unsafe_offset(push_off)
+
+    # AMD only: the peers' gather slots this rank pushes its reduced shard
+    # into, hoisted out of the element loop.  A `comptime for` writes and
+    # reads this array at constant indices only, so SROA keeps the `world-1`
+    # pointers in registers -- the MOCO-1431 demotion above bites when the
+    # index is a runtime value, which is why the reduce's own source pointers
+    # are still formed by arithmetic.  `NW == 0` (world 3, 5, 6, 7) has no
+    # comptime bound and falls back to a second pass over the shard.
+    var gout = InlineArray[Pointer[Scalar[dtype], MutAnyOrigin], MAX_WORLD](
+        uninitialized=True
+    )
+    comptime if _AMD and NW > 0:
+        comptime for j in range(1, NW):
+            var pj = rank + _peer_step(j, NW)
+            if pj >= NW:
+                pj -= NW
+            gout[j] = (
+                regions[pj]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(rank, pj))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
 
     for v in range(tid, my_vc, stride):
         var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
@@ -781,8 +1206,17 @@ def _ar_twoshot_kernel[
         comptime if accum.is_floating_point():
             acc *= SIMD[accum, W](scale.cast[accum]())
         var res = acc.cast[dtype]()
-        shard.unsafe_store[width=W, alignment=16](v * W, res)
+        comptime if not _AMD:
+            shard.unsafe_store[width=W, alignment=16](v * W, res)
         uout.unsafe_store[width=W, alignment=16](v * W, res)
+        # One reduce, `world` stores: my output slice and every peer's gather
+        # slot.  This is NCCL's MULTIDSTS shape (rccl:src/device/
+        # common_kernel.h reduceCopyPacks stores to all destinations from one
+        # accumulator) and it keeps the local reduce traffic inside the wire
+        # transfer instead of adding a pass in front of it.
+        comptime if _AMD and NW > 0:
+            comptime for j in range(1, NW):
+                gout[j].unsafe_store[width=W, alignment=16](v * W, res)
 
     for i in range(tid, my_tail, stride):
         var k = my_vc * W + i
@@ -798,23 +1232,60 @@ def _ar_twoshot_kernel[
             )
         comptime if accum.is_floating_point():
             a *= scale.cast[accum]()
-        shard[unsafe_offset=k] = a.cast[dtype]()
+        comptime if not _AMD:
+            shard[unsafe_offset=k] = a.cast[dtype]()
         uout[unsafe_offset=k] = a.cast[dtype]()
+        comptime if _AMD and NW > 0:
+            comptime for j in range(1, NW):
+                gout[j][unsafe_offset=k] = a.cast[dtype]()
 
-    if not _sync(regions, world, rank, flag_base + 2, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 2)
+    comptime if _AMD and NW == 0:
+        # --- phase 2b (AMD, generic world): push my reduced shard into every
+        # peer's gather slot in a second pass.  Only worlds 3, 5, 6 and 7 come
+        # here; 2, 4 and 8 fuse the stores into the reduce above.  Thread
+        # `tid` reads back only the elements thread `tid` just wrote (both
+        # loops walk `{tid, tid+stride, ...}`), so no fence is involved.
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            var dst = (
+                regions[p]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(rank, p))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
+            _copy_vec[dtype, W, U](dst, uout, my_vc, tid, stride)
+            if my_tail > 0:
+                _copy_scalar_tail(dst, uout, my_vc * W, my_tail, tid, stride)
+
+    if not _sync(
+        regions, world, rank, ERR_ALLREDUCE_SYNC, flag_base + 2, t0, timeout_ns
+    ):
         return
 
-    # --- phase 3: pull the peers' reduced shards into the user output -------
+    # --- phase 3: the peers' reduced shards into the user output ------------
+    # NVIDIA reads them across the fabric; AMD reads them out of its own
+    # region, where phase 2b's pushes left them (module header, "Link
+    # direction").
     for i in range(1, world):
-        var p = rank + i
+        var p = rank + _peer_step(i, world)
         if p >= world:
             p -= world
         var vs = _vstart(p, q, rem)
         var vc = _vcount(p, q, rem)
-        var src = (
-            regions[p].unsafe_offset(shard_off).unsafe_bitcast[Scalar[dtype]]()
-        )
+        var src: Pointer[Scalar[dtype], MutAnyOrigin]
+        comptime if _AMD:
+            src = (
+                regions[rank]
+                .unsafe_offset(shard_off + slot_stride * _gather_slot(p, rank))
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
+        else:
+            src = (
+                regions[p]
+                .unsafe_offset(shard_off)
+                .unsafe_bitcast[Scalar[dtype]]()
+            )
         var dst = out_ptr.unsafe_offset(vs * W)
         _copy_vec[dtype, W, U](dst, src, vc, tid, stride)
         if tail > 0 and p == world - 1:
@@ -852,7 +1323,7 @@ def _ar_oneshot_kernel[
     comptime accum = DType.float32 if (
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -863,12 +1334,13 @@ def _ar_oneshot_kernel[
     var slot_stride = Int(slot_stride_b)
     var push_off = Int(push_off_b)
 
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 0)
+    if not _sync(
+        regions, world, rank, ERR_ALLREDUCE_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var dst = (
@@ -880,8 +1352,9 @@ def _ar_oneshot_kernel[
         if tail > 0:
             _copy_scalar_tail(dst, in_ptr, nvec * W, tail, tid, stride)
 
-    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLREDUCE_SYNC, 1)
+    if not _sync(
+        regions, world, rank, ERR_ALLREDUCE_SYNC, flag_base + 1, t0, timeout_ns
+    ):
         return
 
     var slots = regions[rank].unsafe_offset(push_off)
@@ -1014,7 +1487,7 @@ def _rs_stage_kernel[
         dtype == DType.bfloat16 or dtype == DType.float16
     ) else dtype
     comptime esize = size_of[dtype]()
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1026,13 +1499,14 @@ def _rs_stage_kernel[
     var out_off = Int(out_off_b)
 
     # --- phase 0: start barrier (the arena-reuse invariant) -----------------
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_RS_STAGE_SYNC, 0)
+    if not _sync(
+        regions, world, rank, ERR_RS_STAGE_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     # --- phase 1: push shard s of my input into peer s's slot for me --------
     for i in range(1, world):
-        var s = rank + i
+        var s = rank + _peer_step(i, world)
         if s >= world:
             s -= world
         var off = _shard_off(n, per, s)
@@ -1050,8 +1524,9 @@ def _rs_stage_kernel[
             dst, in_ptr.unsafe_offset(off), cnt, tid, stride
         )
 
-    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
-        _record_error(regions, rank, ERR_RS_STAGE_SYNC, 1)
+    if not _sync(
+        regions, world, rank, ERR_RS_STAGE_SYNC, flag_base + 1, t0, timeout_ns
+    ):
         return
 
     # --- phase 2: sum the `world` contributions to my shard into stage_out --
@@ -1145,7 +1620,7 @@ def _ag_finish_kernel[
     timeout_ns: UInt64,
 ):
     comptime esize = size_of[dtype]()
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = NW if NW > 0 else Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1157,15 +1632,16 @@ def _ag_finish_kernel[
     # Start barrier. Doubles as the wait for every peer's inter-node step: a
     # peer publishes this flag from inside this kernel, which its stream runs
     # after that step.
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_AG_FINISH_SYNC, 0)
+    if not _sync(
+        regions, world, rank, ERR_AG_FINISH_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     # My own shard is pulled out of my own stage_out like everyone else's: the
     # inter-node step rewrote it, so the reduce-scatter's result in the user
     # buffer would be stale even if it had been written there.
     for i in range(world):
-        var p = rank + i
+        var p = rank + _peer_step0(i, world)
         if p >= world:
             p -= world
         var off = _shard_off(n, per, p)
@@ -1224,7 +1700,7 @@ def _bcast_kernel[
     writes `recv`, and the root copies `send` to `recv` locally when they
     differ (cheaper than gathering its own message back over NVLink).
     """
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = Int(world_i)
     var rank = Int(rank_i)
     var root = Int(root_i)
@@ -1237,8 +1713,9 @@ def _bcast_kernel[
     var rem = nv % world
     var mtail = n - nv * 16
 
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_BROADCAST_SYNC, 0)
+    if not _sync(
+        regions, world, rank, ERR_BROADCAST_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     if rank == root:
@@ -1257,13 +1734,76 @@ def _bcast_kernel[
         if Int(send) != Int(recv):
             _copy_bytes[U](recv, send, n, tid, stride)
 
-    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
-        _record_error(regions, rank, ERR_BROADCAST_SYNC, 1)
+    if not _sync(
+        regions, world, rank, ERR_BROADCAST_SYNC, flag_base + 1, t0, timeout_ns
+    ):
+        return
+
+    comptime if _AMD:
+        # The gather half is a push too (module header, "Link direction").
+        # After the scatter every rank holds its own shard in the scatter area
+        # at `stage_off`; each then writes that shard into every OTHER
+        # non-root rank's gather slot, and everyone assembles locally.  The
+        # root needs nothing back -- it copied `send` to `recv` above -- so it
+        # is skipped as a destination, which is also why `world-1` compacted
+        # slots are enough.  The whole staging is `world` shard slots, i.e.
+        # about `nbytes`, so the caller's chunking is unchanged.
+        var sslot = (_vcount(0, q, rem) * 16 + mtail + 15) // 16 * 16
+        var gbase = stage_off + sslot
+        var my_vc = _vcount(rank, q, rem)
+        var my_bytes = my_vc * 16 + (mtail if rank == world - 1 else 0)
+        var mine = regions[rank].unsafe_offset(stage_off)
+        if rank != root:
+            _copy_bytes[U](
+                recv.unsafe_offset(_vstart(rank, q, rem) * 16),
+                mine,
+                my_bytes,
+                tid,
+                stride,
+            )
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            if p == root:
+                continue
+            _copy_bytes[U](
+                regions[p].unsafe_offset(gbase + sslot * _gather_slot(rank, p)),
+                mine,
+                my_bytes,
+                tid,
+                stride,
+            )
+        if not _sync(
+            regions,
+            world,
+            rank,
+            ERR_BROADCAST_SYNC,
+            flag_base + 2,
+            t0,
+            timeout_ns,
+        ):
+            return
+        if rank != root:
+            for i in range(1, world):
+                var p = rank + _peer_step(i, world)
+                if p >= world:
+                    p -= world
+                var vc = _vcount(p, q, rem)
+                _copy_bytes[U](
+                    recv.unsafe_offset(_vstart(p, q, rem) * 16),
+                    regions[rank].unsafe_offset(
+                        gbase + sslot * _gather_slot(p, rank)
+                    ),
+                    vc * 16 + (mtail if p == world - 1 else 0),
+                    tid,
+                    stride,
+                )
         return
 
     if rank != root:
         for i in range(world):
-            var p = rank + i
+            var p = rank + _peer_step0(i, world)
             if p >= world:
                 p -= world
             var vc = _vcount(p, q, rem)
@@ -1301,7 +1841,7 @@ def _allgather_kernel[
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
     """
-    var t0 = global_perf_counter_ns()
+    var t0 = device_now_ns()
     var world = Int(world_i)
     var rank = Int(rank_i)
     var tid = Int(global_idx.x)
@@ -1310,8 +1850,62 @@ def _allgather_kernel[
     var out_stride = Int(stride_b)
     var stage_off = Int(stage_off_b)
 
-    if not _sync(regions, world, rank, flag_base, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLGATHER_SYNC, 0)
+    comptime if _AMD:
+        # Push instead of pull (module header, "Link direction"): my
+        # contribution goes into every peer's slot for me and straight into my
+        # own output slice, and the gather is then a local copy out of my own
+        # region.  `world-1` compacted slots, addressed by `_gather_slot`, so
+        # the staging is `(world-1) * nbytes` -- which is why
+        # `allgather_max_bytes` chunks smaller here than on NVIDIA.
+        var slot = (n + 15) // 16 * 16
+        if not _sync(
+            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+        ):
+            return
+        _copy_bytes[U](
+            out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
+        )
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            _copy_bytes[U](
+                regions[p].unsafe_offset(
+                    stage_off + slot * _gather_slot(rank, p)
+                ),
+                in_ptr,
+                n,
+                tid,
+                stride,
+            )
+        if not _sync(
+            regions,
+            world,
+            rank,
+            ERR_ALLGATHER_SYNC,
+            flag_base + 1,
+            t0,
+            timeout_ns,
+        ):
+            return
+        for i in range(1, world):
+            var p = rank + _peer_step(i, world)
+            if p >= world:
+                p -= world
+            _copy_bytes[U](
+                out_ptr.unsafe_offset(p * out_stride),
+                regions[rank].unsafe_offset(
+                    stage_off + slot * _gather_slot(p, rank)
+                ),
+                n,
+                tid,
+                stride,
+            )
+        return
+
+    if not _sync(
+        regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+    ):
         return
 
     _copy_bytes[U](
@@ -1321,12 +1915,13 @@ def _allgather_kernel[
         out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
     )
 
-    if not _sync(regions, world, rank, flag_base + 1, t0, timeout_ns):
-        _record_error(regions, rank, ERR_ALLGATHER_SYNC, 1)
+    if not _sync(
+        regions, world, rank, ERR_ALLGATHER_SYNC, flag_base + 1, t0, timeout_ns
+    ):
         return
 
     for i in range(1, world):
-        var p = rank + i
+        var p = rank + _peer_step(i, world)
         if p >= world:
             p -= world
         _copy_bytes[U](
@@ -1460,8 +2055,8 @@ def region_init(ctx: DeviceContext, region: Int) raises:
     ctx.synchronize()
 
 
-def install_abort_word(ctx: DeviceContext, region: Int, dev_addr: Int) raises:
-    """Publish the device mapping of the communicator's pinned abort word in
+def install_status_page(ctx: DeviceContext, region: Int, dev_addr: Int) raises:
+    """Publish the device mapping of the communicator's pinned status page in
     this region's header, and block until it has landed.
 
     The spins read it out of the region rather than take it as a kernel
@@ -1473,10 +2068,10 @@ def install_abort_word(ctx: DeviceContext, region: Int, dev_addr: Int) raises:
     _enqueue_cached[_store_u64_kernel](
         ctx,
         ctx.stream(),
-        "abortptr",
+        "statusptr",
         1,
         Pointer[UInt64, MutAnyOrigin](
-            unsafe_from_address=region + _ABORT_PTR_OFFSET
+            unsafe_from_address=region + _STATUS_PTR_OFFSET
         ),
         UInt64(dev_addr),
     )
@@ -1543,7 +2138,15 @@ def _launch_allreduce[
     var slot = _align_up(max_shard_elems * esize, 16)
     var push_off = arena
     var shard_off = arena + world * slot
-    if shard_off + slot > arena_end:
+    # NVIDIA parks one reduced shard at `shard_off` for the peers to pull;
+    # AMD parks `world-1` gather slots there for the peers to push into
+    # (module header, "Link direction").  `world*slot` is already about
+    # `numel*esize` <= cap, so `world` more slots would not fit an arena of
+    # 2*cap when the message is exactly cap bytes -- hence the compacted
+    # `world-1`, whose worst case is cap*(2 - 1/world) plus alignment.
+    comptime tail_slots = 1
+    var end = shard_off + (max(world - 1, 1) if _AMD else tail_slots) * slot
+    if end > arena_end:
         raise Error("collectives: allreduce staging exceeds the region")
     var cap_blocks = (
         _AR_BIG_BLOCKS if numel * esize >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
@@ -2035,6 +2638,21 @@ def broadcast(
     )
 
 
+def allgather_max_bytes(cap_bytes: Int, world: Int) -> Int:
+    """Largest per-rank contribution one `allgather` call may carry.
+
+    NVIDIA stages one message-sized buffer per rank in its own region and
+    reads the peers', so `cap_bytes` is the bound and this is the identity.
+    AMD pushes instead, which needs `world-1` message-sized slots inside the
+    `2*cap_bytes` arena; the caller chunks to that.
+    """
+    comptime if _AMD:
+        if world <= 2:
+            return cap_bytes
+        return min(cap_bytes, (2 * cap_bytes // (world - 1)) // 16 * 16)
+    return cap_bytes
+
+
 def allgather(
     ctx: DeviceContext,
     stream: DeviceStream,
@@ -2060,7 +2678,7 @@ def allgather(
         return
     if nbytes_per_rank < 0:
         raise Error("collectives: nbytes_per_rank must be >= 0")
-    if nbytes_per_rank > cap_bytes:
+    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
         raise Error("collectives: allgather message exceeds cap_bytes")
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:
