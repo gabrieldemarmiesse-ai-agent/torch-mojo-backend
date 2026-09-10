@@ -23,8 +23,7 @@ import argparse
 import statistics
 import sys
 from pathlib import Path
-from re import Pattern
-from re import compile as re_compile
+from re import Pattern, compile as re_compile
 
 _RESULT_RE: Pattern[str] = re_compile(
     r"^RESULT ccl=(?P<ccl>\S+) dtype=(?P<dtype>\S+) size_mib=\s*(?P<mib>\d+) "

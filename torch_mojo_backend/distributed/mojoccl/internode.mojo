@@ -931,9 +931,11 @@ def ib_drive(mut st: IbState) -> Bool:
                 st.timeout_ns // 1_000_000_000,
                 "s while peers ran ahead -- THIS rank's GPU has not released",
                 _ring_state(st, st.request_seq + 1),
-                "| the stream is stuck in a kernel before this exchange's"
-                " request (an intra-node barrier, a wait for an earlier"
-                " exchange, or work the host has not enqueued yet)",
+                (
+                    "| the stream is stuck in a kernel before this exchange's"
+                    " request (an intra-node barrier, a wait for an earlier"
+                    " exchange, or work the host has not enqueued yet)"
+                ),
             )
     return moved
 
