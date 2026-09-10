@@ -382,11 +382,13 @@ struct IbState(Movable):
     var mailbox: Int  # pinned host address
     var mailbox_dev: Int  # the same memory as a kernel addresses it
     var error_word: Int  # region + error_offset, for the wait kernel
-    # Device mapping of the communicator's pinned STATUS PAGE (the abort word
-    # is its first word), so the request and wait kernels see both an abort
-    # and an already-latched device deadline instead of holding the stream to
-    # their own deadline or shipping a shard nobody produced. 0 until
-    # `ib_set_abort_word` runs.
+    # The communicator's pinned STATUS PAGE (the abort word is its first
+    # word), twice: as the progress thread addresses it, and as a kernel
+    # does. The device mapping is for `proxy_wait`, which has to leave a spin
+    # the host cannot interrupt any other way; the host address is what stops
+    # this rank putting an unproduced shard on the wire (`_comm_stopped`).
+    # Both 0 until `ib_set_abort_word` runs.
+    var status_host: Int
     var abort_dev: Int
     var proxy: Bool
     var thread_id: Int
@@ -461,6 +463,7 @@ struct IbState(Movable):
         self.mailbox = 0
         self.mailbox_dev = 0
         self.error_word = region
+        self.status_host = 0
         self.abort_dev = 0
         self.proxy = getenv("MOJOCCL_IB_PROXY", "1") != "0"
         self.thread_id = 0
@@ -960,7 +963,7 @@ def _drive_until(mut st: IbState, seq: Int):
     """Run the engine until exchange `seq` is retired (or the engine fails).
     The stall deadline inside `ib_drive` is what ends this if a peer never
     answers."""
-    if seq > st.request_seq:
+    if seq > st.request_seq and not _comm_stopped(st):
         st.request_seq = seq
         st.last_progress_ns = perf_counter_ns()
     while st.done_seq < seq:
@@ -973,6 +976,20 @@ def _drive_until(mut st: IbState, seq: Int):
 @always_inline
 def _mb(st: IbState, off: Int) -> Pointer[UInt64, MutAnyOrigin]:
     return Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.mailbox + off)
+
+
+@always_inline
+def _comm_stopped(st: IbState) -> Bool:
+    """The word `collectives_kernels.abort_raised` tests, read from the host:
+    a cache line here, a PCIe round trip from a kernel (see `_proxy_main`)."""
+    if st.status_host == 0:
+        return False
+    return (
+        Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+            Pointer[UInt64, MutAnyOrigin](unsafe_from_address=st.status_host)
+        )
+        != 0
+    )
 
 
 def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
@@ -992,6 +1009,21 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     and measured end to end (job 234072, 2x8 H100) an unconditional hot spin
     here cost nanoGPT DDP ~20% of its steady-state tok/s against real NCCL.
     `MOJOCCL_IB_PROXY_IDLE_US` tunes the backoff quantum.
+
+    THE STOPPED-COMMUNICATOR GUARD LIVES HERE, not in the request kernel.
+    Once a kernel on this communicator has given up (`publish_fault` raises
+    the abort word) the reduce-scatter behind `req` may never have run, and
+    posting it would ship whatever the arena holds as data. Refusing to
+    advance `request_seq` sends nothing: the peer's engine times out with a
+    message instead of a wrong number. `ncclCommAbort` is the same case.
+
+    Checking here is STRICTLY STRONGER than in the kernel: the request kernel
+    publishes `seq` with a release store into pinned memory and the load
+    above acquires it, so everything the stream did before that kernel is
+    visible by the time `req` is read, including any fault latched before
+    the payload existed. And it is a cache line here, against a PCIe round
+    trip per exchange on the device, on the critical path between the
+    reduce-scatter and the network post.
     """
     ref st = _st(Int(arg))[]
     var idle_ns = _proxy_idle_ns()
@@ -1010,7 +1042,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
                 _mb(st, MB_REQUEST)
             )
         )
-        if req > st.request_seq:
+        if req > st.request_seq and not _comm_stopped(st):
             st.request_seq = req
             st.last_progress_ns = perf_counter_ns()
         var moved = ib_drive(st)
@@ -1211,14 +1243,15 @@ def _stop_proxy(mut st: IbState):
     st.thread_id = 0
 
 
-def ib_set_abort_word(ib: Int, abort_dev: Int):
-    """Hand the transport the device address of the communicator's pinned
-    status page, whose first word is the abort word (mojoccl.mojo owns it --
-    a single-node communicator has one too, and there is no IB state there to
-    hold it)."""
+def ib_set_abort_word(ib: Int, abort_dev: Int, abort_host: Int):
+    """Hand the transport the communicator's pinned status page, whose first
+    word is the abort word -- once as a kernel addresses it and once as this
+    process does (mojoccl.mojo owns it: a single-node communicator has one
+    too, and there is no IB state there to hold it)."""
     if ib == 0:
         return
     _st(ib)[].abort_dev = abort_dev
+    _st(ib)[].status_host = abort_host
 
 
 def ib_signal_abort(ib: Int) -> Bool:
@@ -1694,8 +1727,11 @@ def ib_enqueue_request(
 
     Enqueued right after the kernel that produced its payload. With the
     proxy thread (default) it is a one-thread kernel storing `seq` into the
-    pinned mailbox, and the stream runs on: several exchanges may be in
-    flight, and `ib_enqueue_wait` is what eventually stops the stream.
+    pinned mailbox -- nothing else, no status check: `_proxy_main` holds the
+    guard against releasing a shard nobody produced, and says there why that
+    is the stronger place for it -- and the stream runs on: several exchanges
+    may be in flight, and `ib_enqueue_wait` is what eventually stops the
+    stream.
     Without the proxy (`MOJOCCL_IB_PROXY=0`) it is a `cuLaunchHostFunc` that
     runs the whole exchange inline -- correct with the same schedule, but
     with no overlap and several hundred microseconds of driver latency per
@@ -1721,9 +1757,7 @@ def ib_enqueue_request(
         op_numel,
     )
     if st.proxy:
-        proxy_request(
-            ctx, stream, st.mailbox_dev + MB_REQUEST, st.abort_dev, seq
-        )
+        proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
         return
     launch_host_func(
         driver,

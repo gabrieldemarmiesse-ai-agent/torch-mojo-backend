@@ -113,40 +113,19 @@ def _inbox_add_kernel[
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
 )
 @__name("ccl_internode_proxy_request")
-def _proxy_request_kernel(
-    mailbox: Pointer[UInt64, MutAnyOrigin],
-    status: Pointer[UInt64, MutAnyOrigin],
-    seq: UInt64,
-):
-    """Hand exchange `seq` to the progress thread, unless this communicator
-    has already failed.
+def _proxy_request_kernel(mailbox: Pointer[UInt64, MutAnyOrigin], seq: UInt64):
+    """Hand exchange `seq` to the progress thread.
 
     A release store into pinned host memory, so everything the stream did
     before this kernel -- the reduce-scatter that produced the shard the
     thread is about to send -- is visible to the CPU that acquires it.
 
-    The guard is the reason a device deadline can no longer corrupt a run.
-    Once any kernel on this communicator has given up (`publish_fault`), the
-    reduce-scatter that was supposed to fill this shard may never have run, so
-    advancing the mailbox would send the peer node whatever the arena happened
-    to hold and it would reduce it as data. Leaving the mailbox alone sends
-    nothing: the peer's engine waits for a request that never comes and says
-    so on its own deadline, which is a message rather than a wrong number. The
-    same applies after `ncclCommAbort` -- there is nothing left to send.
-
-    ONE load from the status page, which is the most this kernel can afford:
-    the page is pinned host memory, so the load is a PCIe round trip, it sits
-    between the reduce-scatter and the network post, and there is one of these
-    per EXCHANGE. It used to be two dependent loads (abort word, then fault
-    code, on separate cache lines and serialized by `or`); `publish_fault` now
-    raises the abort word as well, so `abort_raised` alone answers both
-    questions. On two MI300A nodes with `MOJOCCL_REGION_MB=4` the two-load
-    version cost ~1.6% of a 27-exchange allreduce; on two H100 nodes (16
-    ranks, IB) the whole release-path check cost ~1 us per exchange.
+    One store and nothing else: the stopped-communicator guard lives on the
+    thread that acquires this store (`internode._proxy_main`, which says why
+    that is the stronger place), not in front of it, where each load of the
+    pinned status page cost a PCIe round trip per exchange.
     """
     if global_idx.x == 0:
-        if abort_raised(Int(status)):
-            return
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mailbox, seq)
 
 
@@ -180,19 +159,17 @@ def _proxy_wait_kernel(
 
     An already-latched fault leaves the same way an abort does -- it raises
     the same word (`publish_fault`) -- and for the same reason: after the
-    first failure `proxy_request` no longer advances any mailbox, so every
-    wait still queued behind it is waiting for an exchange that will never be
-    asked for, and waiting a full deadline each would turn one 60 s stall
-    into as many, one per chunk.
+    first failure the progress thread stops honouring the mailbox
+    (`internode._proxy_main`), so every wait still queued behind it is
+    waiting for an exchange that will never be asked for, and waiting a full
+    deadline each would turn one 60 s stall into as many, one per chunk.
 
-    Nothing is checked BEFORE the spin. The status page is pinned host
-    memory, so a check there is a PCIe round trip in a kernel that runs once
-    per exchange; the spin's own check, every `_ABORT_CHECK` iterations,
-    already bounds how long a stopped communicator holds the stream (a few
-    hundred microseconds, against a 60 s deadline), and an exchange that is
-    already done must not pay for the failure path at all. A wait that finds
-    the mailbox already at `seq` therefore touches the page exactly as often
-    as it did before any of this existed: never.
+    Nothing is checked BEFORE the spin: a load of the pinned status page is
+    a PCIe round trip in a kernel that runs once per exchange, and the spin's
+    own check every `_ABORT_CHECK` iterations already bounds how long a
+    stopped communicator holds the stream (a few hundred microseconds
+    against a 60 s deadline). A wait that finds the mailbox already at `seq`
+    never touches the page, as before.
     """
     if global_idx.x == 0:
         var page = Int(status)
@@ -361,11 +338,7 @@ def place_blocks(
 
 
 def proxy_request(
-    ctx: DeviceContext,
-    stream: DeviceStream,
-    mailbox: Int,
-    status: Int,
-    seq: Int,
+    ctx: DeviceContext, stream: DeviceStream, mailbox: Int, seq: Int
 ) raises:
     _enqueue_cached[_proxy_request_kernel](
         ctx,
@@ -373,7 +346,6 @@ def proxy_request(
         "ib_req",
         1,
         Pointer[UInt64, MutAnyOrigin](unsafe_from_address=mailbox),
-        Pointer[UInt64, MutAnyOrigin](unsafe_from_address=status),
         UInt64(seq),
     )
 

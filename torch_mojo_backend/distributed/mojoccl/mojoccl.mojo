@@ -1314,7 +1314,7 @@ def _bootstrap(
                 INBOX_SLOTS,
                 net_off,
             )
-            ib_set_abort_word(ib, abort_dev)
+            ib_set_abort_word(ib, abort_dev, abort_host)
 
         # Round 2: IPC handle + IB connection data + the geometry every rank has
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
