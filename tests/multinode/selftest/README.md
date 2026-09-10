@@ -1,0 +1,146 @@
+# mojoccl transport self-tests that need no GPU
+
+Six standalone Mojo programs that exercise
+`torch_mojo_backend/distributed/mojoccl/{bootstrap,ibverbs,internode,vmm}.mojo`
+on any host with InfiniBand — the SLURM **login node** included, which is
+what makes them cheap enough to run on every change. They caught six real
+bugs (bootstrap/QP/immediate wiring, resource leaks on a failed `ib_setup`,
+a silently-misread port LID) before any GPU time was spent chasing them.
+`geometry_test`, `fd_exchange` and `sock_deadline` need no InfiniBand
+either, and `sock_deadline` needs no peer processes at all.
+
+Build (from a checkout of this repo, no accelerator needed):
+
+    uv run --no-sync mojo build tests/multinode/selftest/bs_test.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/bs_test
+    uv run --no-sync mojo build tests/multinode/selftest/ib_bringup.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_bringup
+    uv run --no-sync mojo build tests/multinode/selftest/ib_pipeline.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_pipeline
+    uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/geometry_test
+    uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
+    uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \
+        -I torch_mojo_backend/distributed/mojoccl -o /tmp/sock_deadline
+
+## `bs_test.mojo` — the TCP bootstrap
+
+`bs_test <rank> <nranks> <uid-file> <fake-host-index>`. Rank 0 writes the
+128-byte unique id to `<uid-file>`; the rest poll for it. Each rank adds
+`<fake-host-index>` to its host hash, so one box can pretend to be several
+nodes and the derived node/local_rank table can be checked against a known
+answer. Runs both blob rounds (16-byte and 256-byte, payload verified) and
+the closing barrier.
+
+    for r in $(seq 0 15); do /tmp/bs_test $r 16 /tmp/uid.txt $((r/8)) & done; wait
+
+Exercised: 8 ranks/1 node, 16/2, 6/3.
+
+## `ib_bringup.mojo` — the RDMA transport
+
+`ib_bringup <rank> <nranks> <uid-file>`. Every rank is its own "node"
+(local_world 1), so `nranks-1` queue pairs are created per rank. Registers
+host memory as the region, runs the bootstrap, moves every QP to RTS, then
+runs 400 exchanges through `internode.ib_exchange_now` — the inline
+equivalent of the stream callback — alternating inbox halves and verifying
+every peer's slot against a rank/sequence-derived pattern.
+
+    for r in 0 1 2 3; do
+        MOJOCCL_IB_PROXY=0 /tmp/ib_bringup $r 4 /tmp/uid4.txt &
+    done; wait
+
+`MOJOCCL_IB_PROXY=0` is required here and only here: the progress thread's
+mailbox is pinned, device-mapped host memory, which needs a driver that can
+allocate it, and this host has no GPU. Without it `ib_setup` fails with
+"symbol not found: cuMemHostAlloc" -- which is the honest answer, not
+something to paper over, since on a real node that symbol is always there.
+
+400 exchanges is deliberately past `RECV_DEPTH` (64): a receive WR that is
+consumed and not reposted shows up as a hang rather than as wrong data.
+
+## `ib_pipeline.mojo` — several exchanges in flight, and the credits
+
+`ib_pipeline <rank> <nranks> <uid-file> [nslots] [depth] [nexchanges]`
+(defaults 5, 4, 200 — the shipped `INBOX_SLOTS` and `PIPE_ARENAS`).
+Reproduces the GPU schedule of `mojoccl._do_allreduce` exactly — submit
+chunk k, consume chunk k-(depth-1) — with the calling thread standing in
+for the stream, so `credit_upto` takes the values it takes in production.
+
+    for r in 0 1 2 3; do
+        MOJOCCL_IB_PROXY=0 /tmp/ib_pipeline $r 4 /tmp/uidp.txt 5 4 200 &
+    done; wait
+
+It catches the two failures the credit protocol can have, and they look
+different: a slot group rewritten before its consumer read it is wrong bytes
+(the payload pattern carries the sequence number), while a credit never sent
+or never counted is a **hang**, which is why the run goes well past
+`nslots` exchanges. Exercised at `nslots depth` of `5 4` (shipped), `5 5`
+and `2 2` (the tight window, where a rank blocks until a peer's credit
+arrives), `1 1` (fully serial) and `8 4`, at 4 and 6 ranks.
+
+## `geometry_test.mojo` — the region carving, GPU-free and peer-free
+
+`geometry_test`, no arguments. Sweeps `mojoccl`'s own layout arithmetic
+(`region_layout`, `inbox_group_bytes`, `max_chunk_bytes`,
+`pipeline_chunk_bytes` — the communicator calls these through one-line
+wrappers, so this checks the shipped code and not a copy) over region sizes
+1 MiB–1 GiB, `local_world` 1–8, 2–16 nodes, every allreduce dtype width and
+message sizes from one element to four chunk caps, and asserts that every
+address a collective forms stays inside the area it belongs to: inbox slots
+inside their group, the shard inside stage_out, the compacted push slots
+inside stage_in, chunk offsets 16-byte aligned, the staging total not
+growing, and a single-node region byte-identical to the pre-pipeline one.
+~99k cases, under a second.
+
+## `fd_exchange.mojo` — the SCM_RIGHTS fd transport of the NVLS bring-up
+
+`fd_exchange <local_rank> <local_world> <dir> <magic>`. `vmm.mojo` hands the
+multicast object and every rank's own VMM handle to its node-mates as file
+descriptors over an AF_UNIX `SOCK_DGRAM` socket, with the msghdr / cmsghdr /
+sockaddr_un structs laid out by hand over `UInt64` words because `std.ffi`
+has no C-struct ABI. A wrong offset there does not fail loudly — `sendmsg`
+succeeds and the control message is silently dropped, or a descriptor arrives
+that belongs to something else — so this runs the shipped functions
+(`socket_path`, `scm_bind`, `scm_send`, `scm_recv`, `scm_exchange_fds`,
+`scm_unbind`) over ordinary file descriptors and checks that what the receiver reads *through*
+the descriptor is what the sender wrote.
+
+    rm -rf /tmp/fdx && mkdir -p /tmp/fdx
+    for r in $(seq 0 7); do /tmp/fd_exchange $r 8 /tmp/fdx 987654321 & done; wait
+
+The same `(kind, tag)` dispatch as production, in three rounds: rank 0's
+"multicast" descriptor one-to-all, then every rank's own descriptor
+all-to-all sending everything before receiving anything, then that same
+all-to-all through `scm_exchange_fds`, which interleaves the two halves and
+is what `nvls_bind_and_map` calls. Datagrams from several senders arrive in
+an arbitrary order, so the tag is the only thing that says whose region one
+is. No GPU, no InfiniBand, no multicast hardware. Exercised at 2 and 8 ranks.
+
+## `sock_deadline.mojo` — the deadlines, with the peers deliberately absent
+
+`sock_deadline`, no arguments, no peers, no IB, ~8 s. Five calls that must
+FAIL, each near its 1.5 s deadline: the bootstrap root with a rank that never
+connects, a connect to a port nothing listens on, a connect to an unroutable
+address (TEST-NET-3), `scm_send` into an AF_UNIX datagram queue filled to
+`net.unix.max_dgram_qlen`, and `scm_exchange_fds` with a peer that never
+binds. Coming back too early fails the case (the deadline is not being
+honoured) and so does taking much longer — the second is the bug it exists
+for: against the code before it, the unroutable connect returned after
+**129.5 s** on a 1.5 s deadline, because `connect` blocked in the kernel and
+the deadline was only read after it came back. It is 1.50 s now.
+
+    /tmp/sock_deadline
+
+Covered by these and NOT by anything that needs a GPU: interface selection,
+the unique-id encoding, the two-round rendezvous, topology derivation, HCA
+and port selection, `ibv_reg_mr`, QP INIT/RTR/RTS with NCCL's attribute
+values, the ops-table dispatch for post_send/post_recv/poll_cq, the
+immediate's sequence and credit tagging, recv reposting, the self-QP
+GPUDirect flush, the credit-based flow control with several exchanges in
+flight, the region geometry, the SCM_RIGHTS fd transport (both its shapes),
+the socket deadlines, and `ib_setup`'s
+unwind of partially-created resources on a failure path. NOT covered: registration of *device* memory
+(needs nvidia_peermem and a GPU), the progress thread and its two spin
+kernels (they need pinned host memory and a stream), and everything in
+`mojoccl.mojo` above the transport.

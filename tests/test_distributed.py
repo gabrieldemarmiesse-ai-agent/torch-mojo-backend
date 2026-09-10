@@ -340,12 +340,41 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
         )
 
 
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize("comm_stream", ["1", "0"], ids=["side-stream", "same-stream"])
-@pytest.mark.parametrize("mode", ["collectives", "ddp_parity", "lazy_fence"])
-def test_two_rank_nccl(mode: str, comm_stream: str):
+@pytest.mark.parametrize(
+    "mode", ["collectives", "ddp_parity", "lazy_fence", "stress", "abort"]
+)
+def test_two_rank_nccl(mode: str, comm_stream: str, ccl: str):
+    """`ccl="mojo"` runs the same workers against mojoccl
+    (torch_mojo_backend/distributed/mojoccl), the in-repo NCCL-API library,
+    instead of vendor NCCL/RCCL -- same process_group.py, same ddp_worker.py,
+    only the loaded .so differs (nccl.py's `load()`). ddp_worker.py itself
+    skips the two collectives mojoccl does not implement yet
+    (ReduceScatter, Send/Recv) when this is set.
+
+    `mode="stress"` is mojoccl-specific regression coverage ported from the
+    kernel harness (docs/mojo_collectives_kernel_results.md §6-7): the
+    interleaving pattern that found a silent-corruption bug, plus a
+    dtype/size/op/placement verify matrix. It exercises nothing vendor
+    NCCL/RCCL doesn't already cover elsewhere, so it only runs for
+    `ccl="mojo"`. MOJOCCL_REGION_MB is pinned small so its "past the region
+    cap" cases stay cheap tensors instead of needing a real 256 MiB region.
+
+    `mode="abort"` is likewise mojoccl-only: it asserts that ncclCommAbort
+    releases the spinning kernels and the region in a fraction of the
+    barrier deadline, which is a timing claim about this library.
+    """
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
-    _run_torchrun(2, mode, {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream})
+    if mode in ("stress", "abort") and ccl != "mojo":
+        pytest.skip(f"{mode} is mojoccl-only regression coverage")
+    extra_env = {"TORCH_MOJO_BACKEND_COMM_STREAM": comm_stream}
+    if ccl == "mojo":
+        extra_env["TORCH_MOJO_BACKEND_CCL"] = "mojo"
+    if mode == "stress":
+        extra_env["MOJOCCL_REGION_MB"] = "4"
+    _run_torchrun(2, mode, extra_env)
 
 
 def _measure_overhead_microseconds(no_hook: bool) -> dict[str, float]:
