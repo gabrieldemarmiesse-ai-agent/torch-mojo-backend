@@ -3,7 +3,11 @@
 PyTorch lets a private backend advertise supported AMP dtypes, but it does not
 install any operator policies for that backend. These wrappers mirror the CUDA
 policies needed by nanoGPT: matmul/attention run in the active lower precision,
-while normalization and NLL run in FP32. Unlisted operations fall through.
+normalization and NLL run in FP32, and the reductions CUDA lists under
+`fp32_set_opt_dtype` (softmax, log_softmax, sum, prod) produce FP32 when the
+caller left `dtype` unspecified. (`F.cross_entropy` is not such a caller: it
+passes the input's own dtype to log_softmax, so that stage stays bf16 under
+autocast on CUDA and here alike.) Unlisted operations fall through.
 """
 
 import functools
@@ -68,6 +72,45 @@ def _fp32_wrapper(op: torch._ops.OpOverload) -> Callable[..., object]:
     return _policy_wrapper(op, lambda: torch.float32)
 
 
+def _is_eligible(value: object) -> bool:
+    """CUDA's `firstarg_is_eligible`: a floating, non-double tensor on the device."""
+    return (
+        isinstance(value, torch.Tensor)
+        and value.device.type == "mojo"
+        and value.is_floating_point()
+        and value.dtype != torch.float64
+    )
+
+
+def _set_opt_dtype_wrapper(op: torch._ops.OpOverload) -> Callable[..., object]:
+    """CUDA's `fp32_set_opt_dtype` policy: run in FP32 unless the caller chose a
+    dtype (`aten/src/ATen/autocast_mode.h`). Implemented the way ATen
+    implements a `dtype` argument on these ops, by casting the input first,
+    which keeps the eager fast paths on their dtype-less signatures."""
+    dtype_index = [arg.name for arg in op._schema.arguments].index("dtype")
+
+    @functools.wraps(op)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        with torch._C._ExcludeDispatchKeyGuard(_AUTOCAST_KEYSET):
+            given = (
+                args[dtype_index] if len(args) > dtype_index else kwargs.get("dtype")
+            )
+            first = args[0] if args else kwargs.get("self")
+            if (
+                given is None
+                and isinstance(first, torch.Tensor)
+                and _is_eligible(first)
+            ):
+                upcast = first.to(dtype=torch.float32)
+                if args:
+                    args = (upcast, *args[1:])
+                else:
+                    kwargs = {**kwargs, "self": upcast}
+            return op(*args, **kwargs)
+
+    return wrapper
+
+
 def register_autocast_ops():
     """Install fallthrough plus the explicit CUDA-matching GPT policies."""
     global _registered, _fallback_library, _aten_library
@@ -93,10 +136,25 @@ def register_autocast_ops():
         torch.ops.aten.nll_loss.default,
         torch.ops.aten.nll_loss_forward.default,
     )
+    fp32_set_opt_dtype_ops = (
+        torch.ops.aten.log_softmax.int,
+        torch.ops.aten.softmax.int,
+        torch.ops.aten.sum.default,
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.prod.default,
+        torch.ops.aten.prod.dim_int,
+    )
     for op in lower_precision_ops:
         _aten_library.impl(op._schema.name, _lower_precision_wrapper(op))
     for op in fp32_ops:
         _aten_library.impl(op._schema.name, _fp32_wrapper(op))
+    for op in fp32_set_opt_dtype_ops:
+        # The default overload is addressed by the bare name; only named
+        # overloads take the ".overload" suffix.
+        name = op._schema.name
+        if op._overloadname != "default":
+            name = f"{name}.{op._overloadname}"
+        _aten_library.impl(name, _set_opt_dtype_wrapper(op))
 
     _registered = True
 
