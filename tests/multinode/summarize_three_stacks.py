@@ -27,9 +27,7 @@ NAMES = {
     "mojo_mojoccl": "mojo backend + mojoccl (all Mojo)",
 }
 runs, problems = {}, []
-for f in sorted(
-    glob.glob(f"{LOGDIR}/e2e_three_stacks_{job}_bs*_*_*.log")
-):
+for f in sorted(glob.glob(f"{LOGDIR}/e2e_three_stacks_{job}_bs*_*_*.log")):
     m = re.search(rf"{job}_bs(\d+)_(\d+)_(\w+)\.log", f)
     assert m is not None, f
     bs, i, cfg = int(m.group(1)), int(m.group(2)), m.group(3)

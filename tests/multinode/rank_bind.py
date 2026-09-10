@@ -48,11 +48,18 @@ def _gpu_bus_ids() -> dict[int, str] | None:
     )
     try:
         out = subprocess.run(
-            [rocm_smi, "--showbus"], capture_output=True, text=True, timeout=20, check=True
+            [rocm_smi, "--showbus"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
         ).stdout
     except Exception:
         return None
-    for m in re.finditer(r"GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+\.[0-9a-fA-F])", out):
+    for m in re.finditer(
+        r"GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9a-fA-F]+:[0-9a-fA-F]+:[0-9a-fA-F]+\.[0-9a-fA-F])",
+        out,
+    ):
         ids[int(m.group(1))] = _sysfs_bdf(m.group(2))
     return ids or None
 
