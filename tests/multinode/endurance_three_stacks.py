@@ -4,10 +4,10 @@ Per-step times come from the tok/s lines of e2e_endurance_<job>_<cfg>.log.
 Prints tokens/time throughput, drift (first vs last fifth), and pause statistics (steps slower than 2x the median):
 count, share of wall time, and which step indices."""
 
-import re
-import sys
 import glob
+import re
 import statistics as st
+import sys
 
 TOK = 8 * 32 * 1024
 STEP = re.compile(r"(?:\d+: )?step\s+(\d+) \| loss (\S+) \|\s+([\d.]+)k tok/s")
