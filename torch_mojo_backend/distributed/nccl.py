@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 
 from torch_mojo_backend.distributed import mojoccl_build
+from torch_mojo_backend.eager_kernels import _trace
 from torch_mojo_backend.mojo_device import cuda_peer, hip_peer
 
 # nccl.h: ncclResult_t
@@ -262,7 +263,9 @@ def load(api: str) -> CclLibrary:
         path = mojoccl_build.ensure_built()
         lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         _declare(lib)
-        return CclLibrary(lib, path, "mojoccl")
+        ccl = CclLibrary(lib, path, "mojoccl")
+        _trace(f"collectives via {path} (mojoccl, NCCL ABI version {ccl.version()})")
+        return ccl
     paths = _candidate_librccl_paths() if api == "hip" else _candidate_libnccl_paths()
     errors = []
     for path in paths:
@@ -275,7 +278,9 @@ def load(api: str) -> CclLibrary:
             errors.append(f"{path}: {e}")
             continue
         _declare(lib)
-        return CclLibrary(lib, path, name)
+        ccl = CclLibrary(lib, path, name)
+        _trace(f"collectives via {path} ({name} version {ccl.version()})")
+        return ccl
     raise RuntimeError(_install_help(api) + ". Tried:\n  " + "\n  ".join(errors))
 
 
