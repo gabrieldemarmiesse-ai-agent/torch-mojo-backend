@@ -26,6 +26,9 @@ and multi-node under torchrun, over NCCL or RCCL — see
 wheel of torch (`--index-url https://download.pytorch.org/whl/cpu`): the
 CUDA wheel makes every first-use kernel load on HIP about 10x slower, and a
 ROCm wheel brings a second HIP runtime the collectives cannot serve.
+Who talks to whom in that stack, from your code down to the GPUs and the
+network, is drawn for NVIDIA and AMD in
+[docs/call_graph.html](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/call_graph.html).
 
 We don't support yet:
 * Using `torch.compile` with the mojo device, only the cuda device is supported for now. 
