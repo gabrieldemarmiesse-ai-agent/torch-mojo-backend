@@ -1,0 +1,389 @@
+"""Core aten ops: factories, transfers, views, scalar readback, fills.
+
+Each op takes the record stack of its schema (abi.mojo) and writes its
+result records. Views and factories never launch a kernel; transfers are
+MAX copies; fills are memsets on contiguous memory.
+"""
+from std.utils import IndexList
+
+from abi import (
+    Values,
+    Value,
+    T,
+    IntList,
+    DoubleList,
+    v_is_none,
+    v_int,
+    v_int_or,
+    v_f64,
+    v_f64_or,
+    v_bool,
+    v_bool_or,
+    v_scalar_is_integral,
+    v_scalar_is_bool,
+    v_dtype_or,
+    v_device_index,
+    v_memory_format_or,
+    v_generator,
+    v_string,
+    v_tensor,
+    v_opt_tensor,
+    v_tensor_list,
+    ret_tensor,
+    ret_ref,
+    ret_int,
+    ret_bool,
+    ret_f64,
+    ret_scalar_int,
+    ret_scalar_f64,
+    ret_scalar_bool,
+    ret_tensor_list,
+    contiguous_strides,
+    new_strided,
+    new_tensor,
+    new_like,
+    new_like_dtype,
+    new_scalar,
+    view_strided,
+    set_sizes_strides,
+    retain,
+    release,
+    cpu_empty,
+    default_dtype,
+    unsupported,
+    check,
+    max_dtype,
+    torch_dtype,
+    is_floating,
+    MEMORY_FORMAT_CONTIGUOUS,
+    MEMORY_FORMAT_CHANNELS_LAST,
+    TAG_NONE,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
+)
+from device import (
+    copy_d2d,
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+    current_device,
+    dev,
+    memset_bytes,
+    memset_typed,
+    read_bytes_sync,
+)
+from op_utils import MAX_RANK
+
+
+def _target_device(v: Value) -> Int:
+    """Device? argument of a factory: its index, else the current device."""
+    var i = v_device_index(v)
+    return i if i >= 0 else current_device()
+
+
+def _shape_of(sizes: IntList) raises -> IndexList[MAX_RANK]:
+    if len(sizes) > MAX_RANK:
+        raise Error(
+            "tensor rank ",
+            len(sizes),
+            " exceeds the mojo device limit of ",
+            MAX_RANK,
+        )
+    var shape = IndexList[MAX_RANK](1)
+    var pad = MAX_RANK - len(sizes)
+    for i in range(len(sizes)):
+        if sizes[i] < 0:
+            raise Error("negative dimension ", sizes[i])
+        shape[pad + i] = sizes[i]
+    return shape
+
+
+# aten::empty.memory_format(SymInt[] size, *, ScalarType? dtype, Layout? layout,
+#   Device? device, bool? pin_memory, MemoryFormat? memory_format) -> Tensor
+def op_empty_memory_format(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var sizes = IntList(args[unsafe_offset=0])
+    var stype = v_dtype_or(args[unsafe_offset=1], default_dtype())
+    var device = _target_device(args[unsafe_offset=3])
+    var mf = v_memory_format_or(args[unsafe_offset=5], MEMORY_FORMAT_CONTIGUOUS)
+    if mf == MEMORY_FORMAT_CHANNELS_LAST:
+        unsupported("channels_last memory format")
+    ret_tensor(rets, 0, new_tensor(_shape_of(sizes), len(sizes), stype, device))
+
+
+# aten::empty_strided(SymInt[] size, SymInt[] stride, *, ScalarType? dtype,
+#   Layout? layout, Device? device, bool? pin_memory) -> Tensor
+def op_empty_strided(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var sizes = IntList(args[unsafe_offset=0])
+    var strides = IntList(args[unsafe_offset=1])
+    var stype = v_dtype_or(args[unsafe_offset=2], default_dtype())
+    var device = _target_device(args[unsafe_offset=4])
+    var shape = _shape_of(sizes)
+    var strd = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - len(sizes)
+    for i in range(len(strides)):
+        strd[pad + i] = strides[i]
+    ret_tensor(rets, 0, new_strided(shape, strd, len(sizes), stype, device))
+
+
+def _is_dense_same_layout(a: T, b: T) -> Bool:
+    """Both contiguous with identical logical shapes: a flat byte copy is exact.
+    """
+    return a.contig and b.contig and a.same_shape(b)
+
+
+# aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
+def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var src = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    if src.numel != dst.numel:
+        raise Error(
+            "_copy_from: element count mismatch (",
+            src.numel,
+            " vs ",
+            dst.numel,
+            ")",
+        )
+    if src.stype != dst.stype:
+        unsupported(
+            "_copy_from with a dtype change ("
+            + String(src.stype)
+            + " -> "
+            + String(dst.stype)
+            + ")"
+        )
+    if not _is_dense_same_layout(src, dst):
+        unsupported("_copy_from between non-contiguous tensors")
+    var nbytes = dst.numel * dst.itemsize
+    if dst.on_mojo() and src.on_mojo():
+        if dst.device != src.device:
+            unsupported("copy between two mojo devices")
+        copy_d2d(ctx_for(dst.device), dst.ptr, src.ptr, nbytes)
+    elif dst.on_mojo():
+        copy_from_host(
+            dst.device, ctx_for(dst.device), dst.ptr, src.ptr, nbytes
+        )
+    elif src.on_mojo():
+        copy_to_host(ctx_for(src.device), src.ptr, dst.ptr, nbytes)
+    else:
+        raise Error("_copy_from: neither tensor is on the mojo device")
+    ret_ref(rets, 0, dst)
+
+
+def _infer_view_shape(t: T, sizes: IntList) raises -> IndexList[MAX_RANK]:
+    var shape = IndexList[MAX_RANK](1)
+    var pad = MAX_RANK - len(sizes)
+    var known = 1
+    var infer = -1
+    for i in range(len(sizes)):
+        if sizes[i] == -1:
+            if infer >= 0:
+                raise Error("only one dimension can be inferred")
+            infer = i
+        else:
+            known *= sizes[i]
+            shape[pad + i] = sizes[i]
+    if infer >= 0:
+        if known == 0 or t.numel % known != 0:
+            raise Error("shape is invalid for input of size ", t.numel)
+        shape[pad + infer] = t.numel // known
+    elif known != t.numel:
+        raise Error("shape is invalid for input of size ", t.numel)
+    return shape
+
+
+def _view_strides(
+    t: T, shape: IndexList[MAX_RANK], rank: Int
+) raises -> IndexList[MAX_RANK]:
+    """Strides of `view(shape)` over t, per at::detail::computeStride; the
+    contiguous case is the common one and handled first."""
+    if t.contig:
+        return contiguous_strides(shape, rank)
+    # Non-contiguous: only shapes that keep every stride group intact are views.
+    var out = IndexList[MAX_RANK](0)
+    var tensor_d = t.rank - 1
+    var view_d = rank - 1
+    var chunk_base_stride = t.stride(tensor_d) if t.rank > 0 else 1
+    var tensor_numel = 1
+    var view_numel = 1
+    while tensor_d >= 0:
+        tensor_numel *= t.dim(tensor_d)
+        if tensor_d == 0 or (
+            t.dim(tensor_d - 1) != 1
+            and t.stride(tensor_d - 1) != tensor_numel * chunk_base_stride
+        ):
+            while view_d >= 0 and (
+                view_numel < tensor_numel
+                or shape[MAX_RANK - rank + view_d] == 1
+            ):
+                out[MAX_RANK - rank + view_d] = view_numel * chunk_base_stride
+                view_numel *= shape[MAX_RANK - rank + view_d]
+                view_d -= 1
+            if view_numel != tensor_numel:
+                unsupported(
+                    "view of a non-contiguous tensor with incompatible size and"
+                    " stride; use reshape"
+                )
+            if tensor_d > 0:
+                chunk_base_stride = t.stride(tensor_d - 1)
+                tensor_numel = 1
+                view_numel = 1
+        tensor_d -= 1
+    if view_d != -1:
+        unsupported(
+            "view of a non-contiguous tensor with incompatible size and stride;"
+            " use reshape"
+        )
+    return out
+
+
+# aten::view(Tensor(a) self, SymInt[] size) -> Tensor(a)
+def op_view(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    if len(sizes) > MAX_RANK:
+        raise Error("rank ", len(sizes), " exceeds the mojo device limit")
+    var shape = _infer_view_shape(t, sizes)
+    ret_tensor(
+        rets,
+        0,
+        view_strided(
+            t, shape, _view_strides(t, shape, len(sizes)), len(sizes), t.offset
+        ),
+    )
+
+
+# aten::_reshape_alias(Tensor(a) self, SymInt[] size, SymInt[] stride) -> Tensor(a)
+def op_reshape_alias(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var strides = IntList(args[unsafe_offset=2])
+    var shape = _shape_of(sizes)
+    var strd = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - len(sizes)
+    for i in range(len(strides)):
+        strd[pad + i] = strides[i]
+    ret_tensor(rets, 0, view_strided(t, shape, strd, len(sizes), t.offset))
+
+
+# aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
+def op_as_strided(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var strides = IntList(args[unsafe_offset=2])
+    var offset = v_int_or(args[unsafe_offset=3], t.offset)
+    var shape = _shape_of(sizes)
+    var strd = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - len(sizes)
+    for i in range(len(strides)):
+        strd[pad + i] = strides[i]
+    ret_tensor(rets, 0, view_strided(t, shape, strd, len(sizes), offset))
+
+
+# aten::_local_scalar_dense(Tensor self) -> Scalar
+def op_local_scalar_dense(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    if t.numel != 1:
+        raise Error(
+            "a Tensor with ", t.numel, " elements cannot be converted to Scalar"
+        )
+    var buf = InlineArray[UInt8, 16](fill=0)
+    read_bytes_sync(ctx_for(t.device), t.ptr, Int(buf.unsafe_ptr()), t.itemsize)
+    var p = buf.unsafe_ptr()
+    if t.dtype == DType.bool:
+        ret_scalar_bool(rets, 0, p[] != 0)
+    elif t.dtype.is_floating_point():
+        var v: Float64 = 0
+        if t.dtype == DType.float32:
+            v = Float64(p.unsafe_bitcast[Float32]()[])
+        elif t.dtype == DType.bfloat16:
+            v = Float64(p.unsafe_bitcast[BFloat16]()[])
+        elif t.dtype == DType.float16:
+            v = Float64(p.unsafe_bitcast[Float16]()[])
+        else:
+            v = p.unsafe_bitcast[Float64]()[]
+        ret_scalar_f64(rets, 0, v)
+    else:
+        var v: Int = 0
+        if t.dtype == DType.int64:
+            v = Int(p.unsafe_bitcast[Int64]()[])
+        elif t.dtype == DType.int32:
+            v = Int(p.unsafe_bitcast[Int32]()[])
+        elif t.dtype == DType.int16:
+            v = Int(p.unsafe_bitcast[Int16]()[])
+        elif t.dtype == DType.int8:
+            v = Int(p.unsafe_bitcast[Int8]()[])
+        elif t.dtype == DType.uint8:
+            v = Int(p[])
+        elif t.dtype == DType.uint16:
+            v = Int(p.unsafe_bitcast[UInt16]()[])
+        elif t.dtype == DType.uint32:
+            v = Int(p.unsafe_bitcast[UInt32]()[])
+        else:
+            v = Int(p.unsafe_bitcast[UInt64]()[])
+        ret_scalar_int(rets, 0, v)
+
+
+def fill_contiguous(t: T, value: Float64) raises:
+    """Constant fill of a contiguous tensor with a memset (typed for the
+    element size, bytes when every byte of the pattern is equal)."""
+    if t.numel == 0:
+        return
+    var ctx = ctx_for(t.device)
+    if value == 0.0:
+        memset_bytes(ctx, t.ptr, 0, t.numel * t.itemsize)
+        return
+    if t.dtype == DType.float32:
+        memset_typed[DType.float32](ctx, t.ptr, Float32(value), t.numel)
+    elif t.dtype == DType.bfloat16:
+        memset_typed[DType.bfloat16](ctx, t.ptr, BFloat16(value), t.numel)
+    elif t.dtype == DType.float16:
+        memset_typed[DType.float16](ctx, t.ptr, Float16(value), t.numel)
+    elif t.dtype == DType.float64:
+        memset_typed[DType.float64](ctx, t.ptr, value, t.numel)
+    elif t.dtype == DType.int64:
+        memset_typed[DType.int64](ctx, t.ptr, Int64(Int(value)), t.numel)
+    elif t.dtype == DType.int32:
+        memset_typed[DType.int32](ctx, t.ptr, Int32(Int(value)), t.numel)
+    elif t.dtype == DType.int16:
+        memset_typed[DType.int16](ctx, t.ptr, Int16(Int(value)), t.numel)
+    elif t.dtype == DType.int8:
+        memset_typed[DType.int8](ctx, t.ptr, Int8(Int(value)), t.numel)
+    elif t.dtype == DType.uint8 or t.dtype == DType.bool:
+        memset_bytes(ctx, t.ptr, UInt8(Int(value)), t.numel)
+    elif t.dtype == DType.uint16:
+        memset_typed[DType.uint16](ctx, t.ptr, UInt16(Int(value)), t.numel)
+    elif t.dtype == DType.uint32:
+        memset_typed[DType.uint32](ctx, t.ptr, UInt32(Int(value)), t.numel)
+    elif t.dtype == DType.uint64:
+        memset_typed[DType.uint64](ctx, t.ptr, UInt64(Int(value)), t.numel)
+    else:
+        unsupported("fill of dtype " + String(t.dtype))
+
+
+# aten::fill_.Scalar(Tensor(a!) self, Scalar value) -> Tensor(a!)
+def op_fill_scalar_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var value = v_f64(args[unsafe_offset=1])
+    if not t.contig:
+        unsupported("fill_ of a non-contiguous tensor")
+    fill_contiguous(t, value)
+    ret_ref(rets, 0, t)
+
+
+# aten::zero_(Tensor(a!) self) -> Tensor(a!)
+def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    if not t.contig:
+        unsupported("zero_ of a non-contiguous tensor")
+    fill_contiguous(t, 0.0)
+    ret_ref(rets, 0, t)
