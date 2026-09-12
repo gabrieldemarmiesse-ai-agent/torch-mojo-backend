@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import re
 import fcntl
 import hashlib
 import importlib.metadata
@@ -97,10 +98,39 @@ def _cxx() -> list[str]:
     )
 
 
-def _torch_include_flags() -> list[str]:
-    from torch.utils.cpp_extension import include_paths  # noqa: PLC0415 -- pulls in ninja probing; keep it off the import path
+def _torch_include_dir() -> Path:
+    return Path(torch.__file__).parent / "include"
 
-    return [f"-I{p}" for p in include_paths()]
+
+def _torch_include_flags() -> list[str]:
+    inc = _torch_include_dir()
+    return [f"-I{inc}", f"-I{inc / 'torch' / 'csrc' / 'api' / 'include'}"]
+
+
+_AUTOCAST_LISTS = {
+    "AT_FORALL_LOWER_PRECISION_FP": 1,
+    "AT_FORALL_FP32": 2,
+    "AT_FORALL_FP32_SET_OPT_DTYPE": 3,
+    "AT_FORALL_PROMOTE": 4,
+}
+
+
+def autocast_policy_table() -> str:
+    """The CUDA autocast op lists of the installed torch, read from
+    ATen/autocast_mode.h's AT_FORALL_* macros, as C initializers
+    `{"aten::op.overload", policy},` (see csrc/shim_autocast.cpp)."""
+    header = (_torch_include_dir() / "ATen" / "autocast_mode.h").read_text()
+    lines = []
+    for macro, policy in _AUTOCAST_LISTS.items():
+        start = header.find(f"#define {macro}(_)")
+        if start < 0:
+            raise RuntimeError(f"{macro} not found in ATen/autocast_mode.h")
+        end = header.find("\n\n", start)
+        block = header[start:end].replace("\\\n", " ")
+        for m in re.finditer(r"_\(\s*([A-Za-z0-9_]+)\s*(?:,\s*([A-Za-z0-9_]+))?\s*\)", block):
+            name = f"aten::{m.group(1)}" + (f".{m.group(2)}" if m.group(2) else "")
+            lines.append(f'{{"{name}", {policy}}},')
+    return "\n".join(lines) + "\n"
 
 
 def _cxx_identity(cxx: list[str]) -> str:
