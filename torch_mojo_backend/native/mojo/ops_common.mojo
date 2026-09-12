@@ -12,6 +12,7 @@ from abi import (
     new_like,
     new_like_dtype,
     new_tensor,
+    release,
     unsupported,
 )
 from device import ctx_for, ctx_ptr, memset_bytes, memset_typed
@@ -53,10 +54,10 @@ def contiguous(t: T) raises -> T:
     """`t` itself when already contiguous, else a fresh contiguous copy
     (an owned handle: release it or return it)."""
     if t.contig:
-        return t
+        return t.copy()
     var out = new_like(t)
     copy_strided_into(out, t)
-    return out
+    return out^
 
 
 def fill_value(t: T, value: Float64) raises:
@@ -133,7 +134,10 @@ def cast_into(dst: T, src: T) raises:
 def cast_to(t: T, stype: Int32) raises -> T:
     """A contiguous copy of `t` in dtype `stype` (t itself when unchanged)."""
     if t.stype == stype:
-        return t
+        return t.copy()
     var out = new_like_dtype(t, stype)
-    cast_into(out, contiguous(t))
-    return out
+    var src = contiguous(t)
+    cast_into(out, src)
+    if src.h != t.h:
+        release(src.h)
+    return out^

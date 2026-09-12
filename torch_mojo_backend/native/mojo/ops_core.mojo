@@ -43,6 +43,7 @@ from abi import (
     new_strided,
     new_tensor,
     new_like,
+    own,
     new_like_dtype,
     new_scalar,
     view_strided,
@@ -148,6 +149,30 @@ def _is_dense_same_layout(a: T, b: T) -> Bool:
     return a.contig and b.contig and a.same_shape(b)
 
 
+def _device_copy(dst: T, src: T) raises:
+    """mojo -> mojo, same device: any layouts, any dtype pair."""
+    if src.stype != dst.stype:
+        var tmp = own(
+            cast_to(contiguous(src), dst.stype)
+        )  # contiguous, dst dtype
+        if dst.contig:
+            copy_d2d(
+                ctx_for(dst.device),
+                dst.ptr,
+                tmp.t.ptr,
+                dst.numel * dst.itemsize,
+            )
+        else:
+            copy_strided_into(dst, tmp.t)
+        return
+    if _is_dense_same_layout(src, dst):
+        copy_d2d(
+            ctx_for(dst.device), dst.ptr, src.ptr, dst.numel * dst.itemsize
+        )
+    else:
+        copy_strided_into(dst, src)
+
+
 # aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
 def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var src = v_tensor(args[unsafe_offset=0])
@@ -160,27 +185,55 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             dst.numel,
             ")",
         )
-    if src.stype != dst.stype:
-        unsupported(
-            "_copy_from with a dtype change ("
-            + String(src.stype)
-            + " -> "
-            + String(dst.stype)
-            + ")"
-        )
-    if not _is_dense_same_layout(src, dst):
-        unsupported("_copy_from between non-contiguous tensors")
+    if dst.numel == 0:
+        ret_ref(rets, 0, dst)
+        return
     var nbytes = dst.numel * dst.itemsize
     if dst.on_mojo() and src.on_mojo():
         if dst.device != src.device:
             unsupported("copy between two mojo devices")
-        copy_d2d(ctx_for(dst.device), dst.ptr, src.ptr, nbytes)
+        _device_copy(dst, src)
     elif dst.on_mojo():
-        copy_from_host(
-            dst.device, ctx_for(dst.device), dst.ptr, src.ptr, nbytes
-        )
+        # host -> device: the host side must be dense and of dst's dtype
+        # (torch's copy_ casts on the host first when dtypes differ)
+        if not src.on_cpu():
+            unsupported(
+                "copy from a device "
+                + String(src.device_type)
+                + " tensor to the mojo device"
+            )
+        if src.stype != dst.stype or not src.contig:
+            unsupported(
+                "_copy_from host->mojo with a dtype change or a strided host"
+                " tensor"
+            )
+        if dst.contig and dst.same_shape(src):
+            copy_from_host(
+                dst.device, ctx_for(dst.device), dst.ptr, src.ptr, nbytes
+            )
+        else:
+            var tmp = own(new_like(dst))
+            copy_from_host(
+                dst.device, ctx_for(dst.device), tmp.t.ptr, src.ptr, nbytes
+            )
+            copy_strided_into(dst, tmp.t)
     elif src.on_mojo():
-        copy_to_host(ctx_for(src.device), src.ptr, dst.ptr, nbytes)
+        if not dst.on_cpu():
+            unsupported(
+                "copy from the mojo device to a device "
+                + String(dst.device_type)
+                + " tensor"
+            )
+        if src.stype != dst.stype or not dst.contig:
+            unsupported(
+                "_copy_from mojo->host with a dtype change or a strided host"
+                " tensor"
+            )
+        if src.contig and src.same_shape(dst):
+            copy_to_host(ctx_for(src.device), src.ptr, dst.ptr, nbytes)
+        else:
+            var tmp = own(contiguous(src))
+            copy_to_host(ctx_for(src.device), tmp.t.ptr, dst.ptr, nbytes)
     else:
         raise Error("_copy_from: neither tensor is on the mojo device")
     ret_ref(rets, 0, dst)
