@@ -12,7 +12,7 @@ import max.driver
 import pytest
 import torch
 
-from torch_mojo_backend import TorchMojoTensor, mojo_backend, register_mojo_devices
+from torch_mojo_backend import mojo_backend, register_mojo_devices
 
 pytestmark = pytest.mark.xdist_group(name="group1")
 
@@ -23,7 +23,7 @@ def setup_max_device():
 
 
 def assert_close_cpu(out, ref, rtol=1e-4, atol=1e-4):
-    assert isinstance(out, TorchMojoTensor)
+    assert out.device.type == "mojo"
     assert out.device.type == "mojo"
     assert out.dtype == ref.dtype
     torch.testing.assert_close(out.cpu(), ref, rtol=rtol, atol=atol)
@@ -215,7 +215,7 @@ def test_compile_backward(mojo_device):
     w = torch.randn(8, 3, device=mojo_device, requires_grad=True)
     loss = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x, w)
     loss.backward()
-    assert isinstance(w.grad, TorchMojoTensor)
+    assert w.grad.device.type == "mojo"
     assert w.grad.device.type == "mojo"
 
     x_cpu = x.cpu().detach()
@@ -234,8 +234,8 @@ def test_compile_recompiles_for_cpu_inputs(mojo_device):
     x = torch.randn(4, 8)
     out_mojo = compiled(x.to(mojo_device))
     out_cpu = compiled(x)
-    assert isinstance(out_mojo, TorchMojoTensor)
-    assert not isinstance(out_cpu, TorchMojoTensor)
+    assert out_mojo.device.type == "mojo"
+    assert out_cpu.device.type != "mojo"
     assert out_cpu.device.type == "cpu"
     torch.testing.assert_close(out_mojo.cpu(), out_cpu)
 

@@ -34,6 +34,7 @@ comptime TAG_GENERATOR = 17
 comptime TAG_SCALAR_INT = 18
 comptime TAG_SCALAR_DOUBLE = 19
 comptime TAG_SCALAR_BOOL = 20
+comptime TAG_STREAM = 21
 
 # --- torch ScalarType values (c10/core/ScalarType.h) ------------------------
 comptime ST_UINT8 = Int32(0)
@@ -124,6 +125,36 @@ def torch_dtype(dt: DType) raises -> Int32:
     if dt == DType.uint64:
         return ST_UINT64
     raise Error("no torch dtype for ", dt)
+
+
+def dtype_code(dt: DType) -> Int:
+    """The numeric value of `max.dtype.DType` (what kernels decode with
+    `_raw_dtype_int` / `DType._from_ui8`)."""
+    if dt == DType.float32:
+        return 81
+    if dt == DType.bfloat16:
+        return 80
+    if dt == DType.float16:
+        return 79
+    if dt == DType.float64:
+        return 82
+    if dt == DType.bool:
+        return 1
+    if dt == DType.uint8:
+        return 134
+    if dt == DType.int8:
+        return 135
+    if dt == DType.uint16:
+        return 136
+    if dt == DType.int16:
+        return 137
+    if dt == DType.uint32:
+        return 138
+    if dt == DType.int32:
+        return 139
+    if dt == DType.uint64:
+        return 140
+    return 141  # int64
 
 
 def dtype_itemsize(dt: DType) -> Int:
@@ -309,6 +340,13 @@ def v_memory_format_or(v: Value, default: Int) raises -> Int:
     return Int(v.a)
 
 
+def v_stream(v: Value) raises -> Tuple[Int, Int]:
+    """A torch.Stream argument: (device index, stream id)."""
+    if v.tag != TAG_STREAM:
+        raise Error("expected a Stream argument, got record tag ", v.tag)
+    return (Int(v.a), Int(v.b))
+
+
 def v_generator(v: Value) -> Int:
     """`at::Generator*` or 0 for None."""
     if v.tag != TAG_GENERATOR:
@@ -414,6 +452,7 @@ struct T(Copyable, Movable):
     var itemsize: Int
     var contig: Bool
     var device: Int
+    var device_type: Int  # torch DeviceType (DEVICE_TYPE_PRIVATEUSE1, DEVICE_TYPE_CPU, ...)
 
     def __init__(out self, h: Int) raises:
         self.h = h
@@ -446,6 +485,9 @@ struct T(Copyable, Movable):
         self.itemsize = dtype_itemsize(self.dtype)
         self.contig = external_call["tmb_tensor_is_contiguous", Int32](h) != 0
         self.device = Int(external_call["tmb_tensor_device_index", Int32](h))
+        self.device_type = Int(
+            external_call["tmb_tensor_device_type", Int32](h)
+        )
 
     @always_inline
     def dim(self, i: Int) -> Int:
@@ -473,7 +515,14 @@ struct T(Copyable, Movable):
         )
 
     def on_mojo(self) -> Bool:
-        return self.device >= 0
+        return self.device_type == DEVICE_TYPE_PRIVATEUSE1
+
+    def on_cpu(self) -> Bool:
+        return self.device_type == DEVICE_TYPE_CPU
+
+    def storage_ctx(self) -> Int:
+        """The allocation handle behind the storage (0 if not ours)."""
+        return external_call["tmb_tensor_storage_ctx", Int](self.h)
 
     def requires_grad(self) -> Bool:
         return external_call["tmb_tensor_requires_grad", Int32](self.h) != 0
@@ -544,6 +593,10 @@ def v_opt_tensor_list_present(v: Value) -> List[Bool]:
 def ret_tensor(rets: Values, i: Int, t: T):
     """Hand an owned handle (from new_tensor/view) back as result i."""
     rets[unsafe_offset=i] = Value(TAG_TENSOR, 0, Int64(t.h), 0)
+
+
+def ret_owned(rets: Values, i: Int, mut o: Owned):
+    rets[unsafe_offset=i] = Value(TAG_TENSOR, 0, Int64(o.take().h), 0)
 
 
 def ret_ref(rets: Values, i: Int, t: T):
@@ -704,6 +757,30 @@ def set_sizes_strides(
         ),
         "tmb_tensor_set_sizes_strides",
     )
+
+
+struct Owned(Movable):
+    """An output tensor until it is handed to torch: released on every path
+    that does not `take()` it (a declined route, a failed kernel build)."""
+
+    var t: T
+    var live: Bool
+
+    def __init__(out self, var t: T):
+        self.t = t^
+        self.live = True
+
+    def take(mut self) -> T:
+        self.live = False
+        return self.t.copy()
+
+    def __deinit__(deinit self):
+        if self.live:
+            release(self.t.h)
+
+
+def own(var t: T) -> Owned:
+    return Owned(t^)
 
 
 def retain(t: T) -> Int:

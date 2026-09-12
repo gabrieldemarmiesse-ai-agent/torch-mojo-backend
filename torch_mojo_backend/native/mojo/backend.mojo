@@ -6,9 +6,12 @@ Build: `mojo build backend.mojo --emit shared-lib -I native/mojo -I eager_kernel
 """
 from std.ffi import c_char, external_call
 
-from abi import op_address, set_shim_error
+from abi import set_shim_error
 from device import hooks_table, init_backend
-from loader import Loader
+from kernels import init_loader
+from ops_attention import register_attention
+from ops_binary import register_binary
+from ops_compare import register_compare
 from ops_core import (
     op_as_strided,
     op_copy_from,
@@ -16,38 +19,45 @@ from ops_core import (
     op_empty_strided,
     op_fill_scalar_,
     op_local_scalar_dense,
+    op_record_stream,
     op_reshape_alias,
     op_view,
     op_zero_,
 )
-from ops_binary import op_add_tensor, op_mul_tensor
-from kernels import init_loader
+from ops_data_movement import register_data_movement
+from ops_factories import register_factories
+from ops_foreach import register_foreach
+from ops_matmul import register_matmul
+from ops_nn import register_nn
+from ops_reductions import register_reductions
+from ops_unary import register_unary
+from registry import Lib, impl
 
 
-def _impl(
-    lib: OpaquePointer[MutUntrackedOrigin], name: StaticString, addr: Int
-) raises:
-    var s = String(name)
-    var rc = external_call["tmb_library_impl", Int32](
-        lib, s.as_c_string_slice().unsafe_ptr(), addr, 0
-    )
-    if rc != 0:
-        raise Error("registering ", name, " failed")
-
-
-def _register_ops(lib: OpaquePointer[MutUntrackedOrigin]) raises:
-    _impl(lib, "empty.memory_format", op_address[op_empty_memory_format]())
-    _impl(lib, "empty_strided", op_address[op_empty_strided]())
-    _impl(lib, "_copy_from", op_address[op_copy_from]())
-    _impl(lib, "view", op_address[op_view]())
-    _impl(lib, "_unsafe_view", op_address[op_view]())
-    _impl(lib, "_reshape_alias", op_address[op_reshape_alias]())
-    _impl(lib, "as_strided", op_address[op_as_strided]())
-    _impl(lib, "_local_scalar_dense", op_address[op_local_scalar_dense]())
-    _impl(lib, "fill_.Scalar", op_address[op_fill_scalar_]())
-    _impl(lib, "zero_", op_address[op_zero_]())
-    _impl(lib, "add.Tensor", op_address[op_add_tensor]())
-    _impl(lib, "mul.Tensor", op_address[op_mul_tensor]())
+def _register_ops(lib: Lib) raises:
+    # core (ops_core.mojo)
+    impl[op_empty_memory_format](lib, "empty.memory_format")
+    impl[op_empty_strided](lib, "empty_strided")
+    impl[op_copy_from](lib, "_copy_from")
+    impl[op_view](lib, "view")
+    impl[op_view](lib, "_unsafe_view")
+    impl[op_reshape_alias](lib, "_reshape_alias")
+    impl[op_as_strided](lib, "as_strided")
+    impl[op_local_scalar_dense](lib, "_local_scalar_dense")
+    impl[op_fill_scalar_](lib, "fill_.Scalar")
+    impl[op_zero_](lib, "zero_")
+    impl[op_record_stream](lib, "record_stream")
+    # one file per group; each group registers its own ops
+    register_unary(lib)
+    register_binary(lib)
+    register_compare(lib)
+    register_data_movement(lib)
+    register_factories(lib)
+    register_reductions(lib)
+    register_matmul(lib)
+    register_nn(lib)
+    register_attention(lib)
+    register_foreach(lib)
 
 
 @export
@@ -73,9 +83,7 @@ def tmb_native_init(
             raise Error("tmb_backend_register failed")
         var ns = String("aten")
         var key = String("PrivateUse1")
-        var lib = external_call[
-            "tmb_library_new", OpaquePointer[MutUntrackedOrigin]
-        ](
+        var lib = external_call["tmb_library_new", Lib](
             ns.as_c_string_slice().unsafe_ptr(),
             key.as_c_string_slice().unsafe_ptr(),
         )

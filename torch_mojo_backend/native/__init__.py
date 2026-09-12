@@ -14,7 +14,9 @@ Nothing on the op path goes through Python.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import fcntl
 import hashlib
 import importlib.metadata
 import os
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -33,7 +36,10 @@ _PACKAGE = _HERE.parent
 _KERNELS_DIR = _PACKAGE / "eager_kernels"
 # One cache for every checkout on a box (contents-addressed: every build is
 # keyed by its sources and toolchain), overridable for shared scratch space.
-_CACHE_DIR = Path(os.environ.get("TORCH_MOJO_BACKEND_CACHE_DIR") or (_KERNELS_DIR / "__mojocache__" / "native"))
+_CACHE_DIR = Path(
+    os.environ.get("TORCH_MOJO_BACKEND_CACHE_DIR")
+    or (_KERNELS_DIR / "__mojocache__" / "native")
+)
 _CSRC = _HERE / "csrc"
 _MOJO_SRC = _HERE / "mojo"
 
@@ -76,7 +82,9 @@ def _find_mojo() -> str:
     if exe is None:
         exe = shutil.which("mojo")
     if exe is None:
-        raise RuntimeError("the `mojo` compiler was not found (is the max package installed?)")
+        raise RuntimeError(
+            "the `mojo` compiler was not found (is the max package installed?)"
+        )
     return exe
 
 
@@ -84,13 +92,46 @@ def _cxx() -> list[str]:
     for cand in (os.environ.get("CXX"), "c++", "g++", "clang++"):
         if cand and shutil.which(cand):
             return [cand]
-    raise RuntimeError("no C++ compiler found: install g++ or clang++ (only the shim needs it)")
+    raise RuntimeError(
+        "no C++ compiler found: install g++ or clang++ (only the shim needs it)"
+    )
 
 
 def _torch_include_flags() -> list[str]:
     from torch.utils.cpp_extension import include_paths  # noqa: PLC0415 -- pulls in ninja probing; keep it off the import path
 
     return [f"-I{p}" for p in include_paths()]
+
+
+def _cxx_identity(cxx: list[str]) -> str:
+    try:
+        out = subprocess.run(
+            [*cxx, "--version"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = "unknown"
+    return " ".join(cxx) + "|" + out.splitlines()[0] if out else " ".join(cxx)
+
+
+@contextlib.contextmanager
+def _build_lock(name: str):
+    """Cross-process dedupe of one build (best effort: a filesystem without
+    locks just builds twice; the atomic install keeps that harmless)."""
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _CACHE_DIR / f".{name}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def _hash_files(paths: list[Path], extra: str) -> str:
@@ -114,21 +155,45 @@ def build_shim() -> Path:
     sources = sorted(_CSRC.glob("*.cpp"))
     headers = sorted(_CSRC.glob("*.h"))
     cxx = _cxx()
-    key = _hash_files(sources + headers, toolchain_identity() + "|" + " ".join(cxx))
-    out = _CACHE_DIR / f"libtmb_shim.hash-{key}{'.dylib' if sys.platform == 'darwin' else '.so'}"
-    if out.exists():
-        return out
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    t0 = time.monotonic()
-    torch_lib = Path(torch.__file__).parent / "lib"
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
     cflags = ["-O1", "-std=c++17", "-fPIC", "-c", abi, *_torch_include_flags()]
+    key = _hash_files(
+        sources + headers,
+        toolchain_identity() + "|" + _cxx_identity(cxx) + "|" + " ".join(cflags),
+    )
+    out = (
+        _CACHE_DIR
+        / f"libtmb_shim.hash-{key}{'.dylib' if sys.platform == 'darwin' else '.so'}"
+    )
+    if out.exists():
+        return out
+    with _build_lock(out.name):
+        if out.exists():
+            return out
+        return _build_shim_locked(sources, cxx, cflags, out)
+
+
+def _build_shim_locked(
+    sources: list[Path], cxx: list[str], cflags: list[str], out: Path
+) -> Path:
+    key = out.stem.split("hash-")[-1]
+    t0 = time.monotonic()
+    torch_lib = Path(torch.__file__).parent / "lib"
     tmpdir = _CACHE_DIR / f".shim-{os.getpid()}-{key}"
     tmpdir.mkdir(exist_ok=True)
     procs = []
     for src in sources:
         obj = tmpdir / (src.stem + ".o")
-        procs.append((src, subprocess.Popen([*cxx, *cflags, str(src), "-o", str(obj)], stderr=subprocess.PIPE, text=True)))
+        procs.append(
+            (
+                src,
+                subprocess.Popen(
+                    [*cxx, *cflags, str(src), "-o", str(obj)],
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ),
+            )
+        )
     errors = []
     for src, proc in procs:
         _, err = proc.communicate()
@@ -138,7 +203,16 @@ def build_shim() -> Path:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError("building the C++ shim failed:\n" + "\n".join(errors))
     tmp = tmpdir / out.name
-    link = [*cxx, "-shared", "-o", str(tmp), *[str(tmpdir / (s.stem + ".o")) for s in sources], f"-L{torch_lib}", "-ltorch_cpu", "-lc10"]
+    link = [
+        *cxx,
+        "-shared",
+        "-o",
+        str(tmp),
+        *[str(tmpdir / (s.stem + ".o")) for s in sources],
+        f"-L{torch_lib}",
+        "-ltorch_cpu",
+        "-lc10",
+    ]
     if sys.platform == "darwin":
         link += ["-undefined", "dynamic_lookup"]
     else:
@@ -168,14 +242,34 @@ def build_backend() -> Path:
     out = _CACHE_DIR / f"libtmb_backend.hash-{key}.so"
     if out.exists():
         return out
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with _build_lock(out.name):
+        if out.exists():
+            return out
+        return _build_backend_locked(key, out)
+
+
+def _build_backend_locked(key: str, out: Path) -> Path:
     t0 = time.monotonic()
     tmp = _CACHE_DIR / f".backend-{os.getpid()}-{key}.so"
-    cmd = [_find_mojo(), "build", str(_MOJO_SRC / "backend.mojo"), "--emit", "shared-lib", "-I", str(_MOJO_SRC), "-I", str(_KERNELS_DIR), "-o", str(tmp)]
+    cmd = [
+        _find_mojo(),
+        "build",
+        str(_MOJO_SRC / "backend.mojo"),
+        "--emit",
+        "shared-lib",
+        "-I",
+        str(_MOJO_SRC),
+        "-I",
+        str(_KERNELS_DIR),
+        "-o",
+        str(tmp),
+    ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError("building the Mojo backend failed:\n" + proc.stdout + proc.stderr)
+        raise RuntimeError(
+            "building the Mojo backend failed:\n" + proc.stdout + proc.stderr
+        )
     _atomic_install(tmp, out)
     _trace(f"built Mojo backend in {time.monotonic() - t0:.2f}s")
     return out
@@ -237,16 +331,31 @@ def register():
         if _state.get("registered"):
             return
         t0 = time.monotonic()
-        shim_path = build_shim()
-        backend_path = build_backend()
+        with ThreadPoolExecutor(
+            max_workers=2
+        ) as pool:  # the two builds are independent
+            shim_future = pool.submit(build_shim)
+            backend_future = pool.submit(build_backend)
+            shim_path = shim_future.result()
+            backend_path = backend_future.result()
         # libtorch's symbols must be visible to the Mojo library (external_call),
         # and the shim's to the kernel families it will dlopen.
         torch_lib = Path(torch.__file__).parent / "lib"
-        _load(torch_lib / ("libtorch_cpu.dylib" if sys.platform == "darwin" else "libtorch_cpu.so"), ctypes.RTLD_GLOBAL)
+        _load(
+            torch_lib
+            / ("libtorch_cpu.dylib" if sys.platform == "darwin" else "libtorch_cpu.so"),
+            ctypes.RTLD_GLOBAL,
+        )
         shim_lib = _load(shim_path, ctypes.RTLD_GLOBAL)
         backend = _load(backend_path, ctypes.RTLD_GLOBAL)
         backend.tmb_native_init.restype = ctypes.c_int32
-        backend.tmb_native_init.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32]
+        backend.tmb_native_init.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int32,
+        ]
         shim_lib.tmb_get_error.restype = ctypes.c_char_p
         n = backend.tmb_native_init(
             str(_KERNELS_DIR).encode(),
@@ -256,7 +365,12 @@ def register():
             1 if _trace_enabled() else 0,
         )
         if n < 0:
-            raise RuntimeError("mojo backend initialisation failed: " + (shim_lib.tmb_get_error() or b"").decode())
+            raise RuntimeError(
+                "mojo backend initialisation failed: "
+                + (shim_lib.tmb_get_error() or b"").decode()
+            )
         shim_lib.tmb_autocast_install_cuda_policies()
         _state.update(shim=shim_lib, backend=backend, device_count=n, registered=True)
-        _trace(f"native mojo backend ready in {time.monotonic() - t0:.2f}s ({n} devices)")
+        _trace(
+            f"native mojo backend ready in {time.monotonic() - t0:.2f}s ({n} devices)"
+        )

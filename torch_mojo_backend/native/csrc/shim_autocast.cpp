@@ -16,24 +16,36 @@
 
 namespace {
 
-enum Policy : int32_t { NONE = 0, LOWER_PRECISION_FP = 1, FP32 = 2, FP32_SET_OPT_DTYPE = 3, PROMOTE = 4 };
+enum Policy : int32_t { NONE = 0, LOWER_PRECISION_FP = 1, FP32 = 2, FP32_SET_OPT_DTYPE = 3, PROMOTE = 4, BANNED = 5 };
 
 std::mutex g_policy_mutex;
 std::unordered_map<std::string, int32_t> g_policies;
+constexpr auto kDevice = c10::DeviceType::PrivateUse1;
 
+// Exact overload keys, like torch's own registrations: "aten::mm" names
+// the default overload only, never mm.out.
 int32_t lookup_policy(const c10::FunctionSchema& schema) {
   std::lock_guard<std::mutex> g(g_policy_mutex);
-  const auto& name = schema.name();
   const auto& overload = schema.overload_name();
-  if (!overload.empty()) {
-    auto it = g_policies.find(name + "." + overload);
-    if (it != g_policies.end()) return it->second;
-  }
-  auto it = g_policies.find(name);
+  auto it = g_policies.find(overload.empty() ? schema.name() : schema.name() + "." + overload);
   return it == g_policies.end() ? NONE : it->second;
 }
 
-constexpr auto kDevice = c10::DeviceType::PrivateUse1;
+bool eligible(const c10::IValue& v) {
+  return v.isTensor() && at::autocast::is_eligible(v.toTensor(), kDevice);
+}
+
+// The first Tensor argument decides fp32_set_opt_dtype, as in torch's CUDA kernels.
+bool first_arg_eligible(const c10::IValue* args, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    if (args[i].isTensor()) return eligible(args[i]);
+    if (args[i].isTensorList()) {
+      auto list = args[i].toTensorList();
+      return list.size() > 0 && at::autocast::is_eligible(list[0], kDevice);
+    }
+  }
+  return false;
+}
 
 c10::IValue cast_value(const c10::IValue& v, c10::ScalarType to) {
   if (v.isTensor()) return at::autocast::cached_cast(to, v.toTensor(), kDevice);
@@ -64,20 +76,28 @@ void autocast_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet ks, to
   if (policy != NONE) {
     const size_t n = schema.arguments().size();
     c10::IValue* args = stack->data() + (stack->size() - n);
-    if (policy == LOWER_PRECISION_FP || policy == FP32) {
+    if (policy == BANNED) {
+      TORCH_CHECK(false, schema.name(), " is unsafe to autocast. Run it in float32 outside the autocast region.");
+    } else if (policy == LOWER_PRECISION_FP || policy == FP32) {
       const auto to = policy == FP32 ? at::kFloat : at::autocast::get_lower_precision_fp_from_device_type(kDevice);
       for (size_t i = 0; i < n; ++i) args[i] = cast_value(args[i], to);
     } else if (policy == PROMOTE) {
-      auto widest = at::ScalarType::Undefined;
+      // torch starts from the lower-precision type and widens to float32 when
+      // any eligible operand is float32 (never to double).
+      auto widest = at::autocast::get_lower_precision_fp_from_device_type(kDevice);
       for (size_t i = 0; i < n; ++i) {
-        if (args[i].isTensor()) widest = at::autocast::prioritize(widest, args[i].toTensor(), kDevice);
+        if (args[i].isTensor()) {
+          widest = at::autocast::prioritize(widest, args[i].toTensor(), kDevice);
+        } else if (args[i].isTensorList()) {
+          for (const at::Tensor t : args[i].toTensorList()) widest = at::autocast::prioritize(widest, t, kDevice);
+        }
       }
-      if (widest != at::ScalarType::Undefined) {
-        for (size_t i = 0; i < n; ++i) args[i] = cast_value(args[i], widest);
-      }
+      for (size_t i = 0; i < n; ++i) args[i] = cast_value(args[i], widest);
     } else if (policy == FP32_SET_OPT_DTYPE) {
-      for (size_t i = 0; i < n; ++i) {
-        if (schema.arguments()[i].name() == "dtype" && args[i].isNone()) args[i] = c10::IValue(at::kFloat);
+      if (first_arg_eligible(args, n)) {
+        for (size_t i = 0; i < n; ++i) {
+          if (schema.arguments()[i].name() == "dtype" && args[i].isNone()) args[i] = c10::IValue(at::kFloat);
+        }
       }
     }
   }
@@ -110,6 +130,7 @@ int32_t tmb_autocast_install_cuda_policies(void) {
   AT_FORALL_FP32(TMB_FP32)
   AT_FORALL_FP32_SET_OPT_DTYPE(TMB_SET)
   AT_FORALL_PROMOTE(TMB_PROMOTE)
+  g_policies["aten::binary_cross_entropy"] = BANNED;
   return 0;
 }
 

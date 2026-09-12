@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch.optim.optimizer import _default_to_fused_or_foreach
 
-from torch_mojo_backend import TorchMojoTensor, mojo_backend, register_mojo_devices
+from torch_mojo_backend import mojo_backend, register_mojo_devices
 from torch_mojo_backend.eager_kernels import aten_fast
 from torch_mojo_backend.mojo_device import (
     cuda_peer,
@@ -84,7 +84,7 @@ def test_tensor_to_max_device(mojo_device):
     mojo_tensor = cpu_tensor.to(mojo_device)
 
     # Check type and properties
-    assert isinstance(mojo_tensor, TorchMojoTensor)
+    assert mojo_tensor.device.type == "mojo"
     assert mojo_tensor.shape == (3,)
     assert mojo_tensor.dtype == torch.float32
 
@@ -107,7 +107,7 @@ def test_factory_arange(mojo_device):
     """Test torch.arange with mojo_device"""
     tensor = torch.arange(5, device=mojo_device)
 
-    assert isinstance(tensor, TorchMojoTensor)
+    assert tensor.device.type == "mojo"
     assert tensor.shape == (5,)
 
     # Convert to CPU to check values
@@ -121,7 +121,7 @@ def test_factory_rand(mojo_device):
     """Test torch.rand with mojo_device"""
     tensor = torch.rand(3, 4, device=mojo_device)
 
-    assert isinstance(tensor, TorchMojoTensor)
+    assert tensor.device.type == "mojo"
     assert tensor.shape == (3, 4)
 
     # Check that values are in [0, 1] range when converted to CPU
@@ -134,7 +134,7 @@ def test_factory_empty(mojo_device):
     """Test torch.empty with mojo_device"""
     tensor = torch.empty(2, 3, device=mojo_device)
 
-    assert isinstance(tensor, TorchMojoTensor)
+    assert tensor.device.type == "mojo"
     assert tensor.shape == (2, 3)
 
 
@@ -142,11 +142,11 @@ def test_device_string_variations():
     """Test different mojo device string formats"""
     # Basic mojo device
     t1 = torch.tensor([1.0]).to("mojo")
-    assert isinstance(t1, TorchMojoTensor)
+    assert t1.device.type == "mojo"
 
     # With index (should also work)
     t2 = torch.tensor([1.0]).to("mojo:0")
-    assert isinstance(t2, TorchMojoTensor)
+    assert t2.device.type == "mojo"
 
 
 def test_indexless_mojo_device_uses_and_restores_current_device():
@@ -165,7 +165,7 @@ def test_indexless_mojo_device_uses_and_restores_current_device():
             == accelerators[alternate_index]
         )
         empty_tensor = torch.empty(1, device="mojo")
-        assert isinstance(empty_tensor, TorchMojoTensor)
+        assert empty_tensor.device.type == "mojo"
         assert empty_tensor._device == accelerators[alternate_index]
     finally:
         torch_mojo_device_module.set_device(original_index)
@@ -222,7 +222,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
     source = torch.arange(1 << 20, dtype=torch.int32)
     expected = source.clone()
     uploaded = source.to(mojo_device, non_blocking=True)
-    assert isinstance(uploaded, TorchMojoTensor)
+    assert uploaded.device.type == "mojo"
     if uploaded._device.label == "gpu":
         assert uploaded._device in _PENDING_H2D
 
@@ -240,12 +240,12 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
 def test_synchronized_transfers_reap_completed_cpu_sources(mojo_device):
     """Later blocking H2D/D2H operations release completed async sources."""
     first = torch.arange(4096).to(mojo_device, non_blocking=True)
-    assert isinstance(first, TorchMojoTensor)
+    assert first.device.type == "mojo"
     torch.zeros(4096).to(mojo_device)
     assert first._device not in _PENDING_H2D
 
     second = torch.arange(4096).to(mojo_device, non_blocking=True)
-    assert isinstance(second, TorchMojoTensor)
+    assert second.device.type == "mojo"
     torch.testing.assert_close(second.cpu(), torch.arange(4096))
     assert second._device not in _PENDING_H2D
 
@@ -297,7 +297,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_device):
     # CPU source must stay alive while both operations wait behind prior work.
     destination_storage = torch.empty((elements, 2), device=mojo_device)
     destination = destination_storage[:, 1]
-    assert isinstance(destination, TorchMojoTensor)
+    assert destination.device.type == "mojo"
     destination.copy_(torch.zeros(elements), non_blocking=True)
     torch_mojo_device_module.synchronize(mojo_device)
 
@@ -749,8 +749,8 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
     assert module.embedding.weight is module.projection.weight
     embedding_weight = module.embedding.weight
     projection_weight = module.projection.weight
-    assert isinstance(embedding_weight, TorchMojoTensor)
-    assert isinstance(projection_weight, TorchMojoTensor)
+    assert embedding_weight.device.type == "mojo"
+    assert projection_weight.device.type == "mojo"
     assert embedding_weight._holder is projection_weight._holder
     assert embedding_weight._ptr == projection_weight._ptr
     assert len(list(module.parameters())) == 1
@@ -966,12 +966,12 @@ def test_gpu_first_cpu_last_convention():
 
         # Test that mojo (index 0) goes to GPU
         t_gpu = torch.tensor([1.0]).to("mojo")
-        assert isinstance(t_gpu, TorchMojoTensor)
+        assert t_gpu.device.type == "mojo"
 
         # Test that highest index goes to CPU
         cpu_index = len(ordered_accelerators) - 1
         t_cpu = torch.tensor([1.0]).to(f"mojo:{cpu_index}")
-        assert isinstance(t_cpu, TorchMojoTensor)
+        assert t_cpu.device.type == "mojo"
 
 
 # Original tests from the existing file
@@ -1165,7 +1165,7 @@ def test_copy_into_mojo_from_another_backend(mojo_gpu):
 def test_from_cpu_rejects_a_device_source(mojo_gpu):
     """The guard behind both call sites: a message, never a fault."""
     on_device = torch.zeros(4, device=mojo_gpu)
-    assert isinstance(on_device, TorchMojoTensor)
+    assert on_device.device.type == "mojo"
     with pytest.raises(RuntimeError, match="requires a CPU source"):
         TorchMojoTensor._from_cpu(on_device, on_device._device)
 
@@ -1210,7 +1210,7 @@ def test_pointer_ordinal_identifies_the_owning_gpu(mojo_gpu):
     driver who owns each allocation is a fact rather than an assumption.
     """
     on_mojo = torch.zeros(8, device=mojo_gpu)
-    assert isinstance(on_mojo, TorchMojoTensor)
+    assert on_mojo.device.type == "mojo"
     if on_mojo._device.api != "cuda":
         # tests/test_distributed.py covers hip_peer, the AMD counterpart.
         pytest.skip("cuda_peer speaks the CUDA driver API only")
@@ -1241,7 +1241,7 @@ def test_library_attributes_do_not_clobber_the_payload(mojo_gpu_available):
     if not mojo_gpu_available:
         pytest.skip("requires a MAX GPU")
     tensor = torch.arange(8, dtype=torch.float32, device="mojo:0")
-    assert isinstance(tensor, TorchMojoTensor)
+    assert tensor.device.type == "mojo"
     strides = tensor._mojo_strides
     # Simulates FSDP1 writing its own bookkeeping onto the wrapper instance;
     # these names are deliberately not part of TorchMojoTensor's declared

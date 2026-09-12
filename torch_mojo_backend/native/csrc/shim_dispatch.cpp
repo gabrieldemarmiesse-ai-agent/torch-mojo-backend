@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -34,19 +35,17 @@ void count_call(const c10::FunctionSchema& schema) {
   ++g_counts[key];
 }
 
-// Backing store for list arguments; pointer-stable because the outer vectors
-// are reserved once for the whole call.
+// Backing store for list arguments. Nothing is allocated until a list
+// argument appears; inner buffers keep their address when an outer vector
+// grows (a moved std::vector keeps its heap block), generators live in a deque.
 struct Arena {
   std::vector<std::vector<int64_t>> ints;
   std::vector<std::vector<double>> doubles;
   std::vector<std::vector<uint8_t>> bools;
   std::vector<std::vector<at::Tensor>> tensors;
   std::vector<std::vector<const at::Tensor*>> tensor_ptrs;
-  std::vector<at::Generator> generators;
-  explicit Arena(size_t n) {
-    ints.reserve(n); doubles.reserve(n); bools.reserve(n);
-    tensors.reserve(n); tensor_ptrs.reserve(n); generators.reserve(n);
-  }
+  std::deque<at::Generator> generators;
+  explicit Arena(size_t) {}
 };
 
 inline int64_t double_bits(double d) { int64_t r; std::memcpy(&r, &d, 8); return r; }
@@ -94,6 +93,10 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
     case c10::TypeKind::GeneratorType:
       arena.generators.push_back(v.toGenerator());
       out.tag = TMB_GENERATOR; out.a = reinterpret_cast<int64_t>(&arena.generators.back()); return;
+    case c10::TypeKind::StreamObjType: {
+      auto st = v.toStream();
+      out.tag = TMB_STREAM; out.a = st.device_index(); out.b = static_cast<int64_t>(st.id()); return;
+    }
     case c10::TypeKind::ListType: {
       auto inner = type->castRaw<c10::ListType>()->getElementType();
       auto ik = inner->kind();
@@ -277,6 +280,23 @@ void result_to_record(const c10::IValue& v, TmbValue& out) {
   TORCH_CHECK(false, "mojo backend: unsupported result of tmb_call_op: ", v.tagKind());
 }
 
+// Owned handles a kernel already placed in its result records must not leak
+// when the call fails afterwards.
+void release_records(TmbValue* rets, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    if (rets[i].tag == TMB_TENSOR) {
+      delete reinterpret_cast<at::Tensor*>(rets[i].a);
+    } else if (rets[i].tag == TMB_TENSOR_LIST) {
+      auto** ps = reinterpret_cast<at::Tensor**>(rets[i].a);
+      for (int32_t k = 0; k < rets[i].len; ++k) delete ps[k];
+      std::free(ps);
+    } else if (rets[i].tag == TMB_INT_LIST) {
+      std::free(reinterpret_cast<void*>(rets[i].a));
+    }
+    rets[i].tag = TMB_NONE;
+  }
+}
+
 void raise_from_kernel(int32_t rc, const char* op, const char* overload) {
   std::string msg = tmb_thread_error();
   tmb_thread_error().clear();
@@ -319,11 +339,26 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
       std::lock_guard<std::recursive_mutex> g(tmb_mutex);
       rc = fn_(ctx_, name, overload, args, static_cast<int32_t>(n_args), rets, static_cast<int32_t>(n_rets));
     }
-    if (rc != 0) raise_from_kernel(rc, name, overload);
-    torch::jit::drop(*stack, n_args);
-    for (size_t i = 0; i < n_rets; ++i) {
-      stack->push_back(from_record(returns[i].real_type(), rets[i]));
+    if (rc != 0) {
+      release_records(rets, n_rets);
+      raise_from_kernel(rc, name, overload);
     }
+    // Convert the results BEFORE dropping the inputs: a TENSOR_REF points at
+    // a tensor inside the input IValues.
+    c10::IValue out_buf[8];
+    std::vector<c10::IValue> out_heap;
+    c10::IValue* outs = out_buf;
+    if (n_rets > 8) { out_heap.resize(n_rets); outs = out_heap.data(); }
+    for (size_t i = 0; i < n_rets; ++i) {
+      try {
+        outs[i] = from_record(returns[i].real_type(), rets[i]);
+      } catch (...) {
+        release_records(rets + i + 1, n_rets - i - 1);
+        throw;
+      }
+    }
+    torch::jit::drop(*stack, n_args);
+    for (size_t i = 0; i < n_rets; ++i) stack->push_back(std::move(outs[i]));
   }
 
  private:

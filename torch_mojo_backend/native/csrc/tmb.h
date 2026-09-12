@@ -38,6 +38,7 @@ enum TmbTag : int32_t {
   TMB_SCALAR_INT = 18,     // Scalar-typed argument: a = int64
   TMB_SCALAR_DOUBLE = 19,  // Scalar-typed argument: a = double bits
   TMB_SCALAR_BOOL = 20,    // Scalar-typed argument: a = 0/1
+  TMB_STREAM = 21,         // torch.Stream argument: a = device index, b = stream id
 };
 
 typedef struct TmbValue {
@@ -120,8 +121,10 @@ int64_t tmb_tensor_storage_offset(TmbTensor t);
 int64_t tmb_tensor_numel(TmbTensor t);
 int32_t tmb_tensor_dtype(TmbTensor t);
 int32_t tmb_tensor_device_index(TmbTensor t);  // -1 when not on PrivateUse1
+int32_t tmb_tensor_device_type(TmbTensor t);   // c10::DeviceType
 int32_t tmb_tensor_is_privateuse1(TmbTensor t);
 void* tmb_tensor_storage_data_ptr(TmbTensor t);
+void* tmb_tensor_storage_ctx(TmbTensor t);  // the allocation handle Mojo returned from alloc (NULL if not ours)
 int64_t tmb_tensor_storage_nbytes(TmbTensor t);
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_requires_grad(TmbTensor t);

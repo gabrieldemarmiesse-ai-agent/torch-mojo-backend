@@ -9,7 +9,7 @@ import max.driver
 import pytest
 import torch
 
-from torch_mojo_backend import TorchMojoTensor, register_mojo_devices
+from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.mojo_device import (
     torch_mojo_device_module,
     torch_mojo_tensor as mojo_tensor_module,
@@ -72,7 +72,7 @@ def test_indexless_mojo_device_uses_current_device():
             == accelerators[alternate_index]
         )
         empty_tensor = torch.empty(1, device="mojo")
-        assert isinstance(empty_tensor, TorchMojoTensor)
+        assert empty_tensor.device.type == "mojo"
         assert empty_tensor._device == accelerators[alternate_index]
     finally:
         torch_mojo_device_module.set_device(original_index)
@@ -93,7 +93,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
     source = torch.arange(1 << 20, dtype=torch.int32)
     expected = source.clone()
     uploaded = source.to(mojo_device, non_blocking=True)
-    assert isinstance(uploaded, TorchMojoTensor)
+    assert uploaded.device.type == "mojo"
     del source
     for _ in range(8):
         torch.empty_like(expected).fill_(-1)
@@ -106,7 +106,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
 def test_non_blocking_mojo_to_cpu_transfer(mojo_device):
     expected = torch.arange(1 << 16, dtype=torch.float32)
     source = expected.to(mojo_device)
-    assert isinstance(source, TorchMojoTensor)
+    assert source.device.type == "mojo"
     downloaded = source.to("cpu", non_blocking=True)
 
     torch.accelerator.synchronize(mojo_device)

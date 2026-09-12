@@ -22,7 +22,7 @@ from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
 
 
 def _mt(tensor: torch.Tensor) -> TorchMojoTensor:
-    assert isinstance(tensor, TorchMojoTensor)
+    assert tensor.device.type == "mojo"
     return tensor
 
 

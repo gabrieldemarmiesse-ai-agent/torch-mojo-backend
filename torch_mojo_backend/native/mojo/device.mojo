@@ -10,6 +10,7 @@ from std.ffi import _get_global_or_null, c_char, external_call
 from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
 from std.sys.info import has_apple_gpu_accelerator
+from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
 
 from max.gpu.host import (
@@ -137,9 +138,8 @@ def init_backend() raises -> Int:
 struct Buf(Movable):
     var buf: DeviceBuffer[DType.uint8]
     var device: Int
-    var stream: Int
-    var fence_streams: List[Int]
-    var fences: List[DeviceEvent]
+    var stream: Int  # owner stream: where MAX orders the release
+    var users: List[Int]  # other streams that used the buffer (record_stream)
 
 
 def _create(
@@ -173,11 +173,7 @@ def h_alloc(
         var buf = _create_retry(d, ctx, nbytes)
         data[] = Int(buf.unsafe_ptr())
         var box = unsafe_alloc[Buf](1)
-        box.unsafe_write(
-            Buf(
-                buf^, Int(device), Int(stream), List[Int](), List[DeviceEvent]()
-            )
-        )
+        box.unsafe_write(Buf(buf^, Int(device), Int(stream), List[Int]()))
         return Int(box)
     except e:
         set_error(String(e))
@@ -188,14 +184,20 @@ def h_free(handle: Int) abi("C"):
     if handle == 0:
         return
     var box = BufP(unsafe_from_address=handle)
-    try:
-        var d = dev(box[].device)
-        if len(box[].fences) > 0:
+    # MAX releases the block stream-ordered on the OWNER stream only. Every
+    # other stream that used it (torch.Tensor.record_stream) gets fenced now,
+    # at release time: the owner waits for all of that stream's work so far.
+    if len(box[].users) > 0:
+        try:
+            var d = dev(box[].device)
             var owner = d[].view(box[].stream)
-            for i in range(len(box[].fences)):
-                owner.stream().enqueue_wait_for(box[].fences[i])
-    except e:
-        _warn("free fence", e)
+            for i in range(len(box[].users)):
+                owner.enqueue_wait_for(d[].view(box[].users[i]))
+        except e:
+            # Ordering could not be established: leak the block rather than
+            # let MAX reuse memory another stream may still be reading.
+            set_error(String(e))
+            return
     var moved = box.unsafe_take_pointee()
     box.unsafe_free()
     _ = moved^
@@ -215,26 +217,21 @@ def h_device_of_ptr(ptr: Int) abi("C") -> Int32:
 
 
 def h_record_stream(handle: Int, device: Int32, stream: Int64) abi("C"):
-    """A side stream touched the buffer: its owner stream must wait for that
-    use before MAX may reuse the memory (MAX frees stream-ordered on the
-    owner only). One event per (buffer, stream), re-recorded on repeats."""
+    """torch.Tensor.record_stream: remember that `stream` uses the buffer; the
+    fence happens when the buffer is released (h_free), covering every use
+    enqueued on that stream up to then, as CUDA's caching allocator does."""
     if handle == 0:
         return
     var box = BufP(unsafe_from_address=handle)
+    if Int(device) != box[].device:
+        set_error("record_stream: stream of another device")
+        return
     if Int(stream) == box[].stream:
         return
-    try:
-        var ctx = stream_ctx(Int(device), Int(stream))
-        for i in range(len(box[].fence_streams)):
-            if box[].fence_streams[i] == Int(stream):
-                ctx.stream().record_event(box[].fences[i])
-                return
-        var ev = ctx.create_event()
-        ctx.stream().record_event(ev)
-        box[].fence_streams.append(Int(stream))
-        box[].fences.append(ev^)
-    except e:
-        set_error(String(e))
+    for i in range(len(box[].users)):
+        if box[].users[i] == Int(stream):
+            return
+    box[].users.append(Int(stream))
 
 
 def wrap_raw(
@@ -271,18 +268,18 @@ def copy_to_host(
 @fieldwise_init
 struct Staging(Movable):
     var buf: HostBuffer[DType.uint8]
-    var done: Bool
+    var done: Atomic[DType.int32]  # set from the driver's callback thread
 
 
 def _staging_done(p: Pointer[NoneType, MutAnyOrigin]):
-    p.unsafe_bitcast[Staging]()[].done = True
+    p.unsafe_bitcast[Staging]()[].done.store(1)
 
 
 def _drain_staging(d: Pointer[Dev, MutUntrackedOrigin]):
     var keep = List[Int]()
     for i in range(len(d[].staging)):
         var box = StagingP(unsafe_from_address=d[].staging[i])
-        if box[].done:
+        if box[].done.load() != 0:
             var moved = box.unsafe_take_pointee()
             box.unsafe_free()
             _ = moved^
@@ -315,7 +312,7 @@ def copy_from_host(
     )
     dst.enqueue_copy_from(host)
     var box = unsafe_alloc[Staging](1)
-    box.unsafe_write(Staging(host^, False))
+    box.unsafe_write(Staging(host^, Atomic[DType.int32](0)))
     ctx.stream().enqueue_host_func(
         _staging_done,
         box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
@@ -504,9 +501,11 @@ def h_event_record(ev: Int, device: Int32, stream: Int64) abi("C"):
         var box = EvP(unsafe_from_address=ev)
         var d = dev(Int(device))
         var ctx = d[].view(Int(stream))
-        ctx.stream().record_event(box[].max_ev)
         if box[].raw != 0:
             be()[].vendor.value().event_record(box[].raw, d[].raw[Int(stream)])
+        ctx.stream().record_event(
+            box[].max_ev
+        )  # after the vendor event: waiting on it covers both
         box[].host_ns = perf_counter_ns()
         box[].recorded = True
     except e:
@@ -544,6 +543,8 @@ def h_event_synchronize(ev: Int) abi("C"):
         var box = EvP(unsafe_from_address=ev)
         if box[].recorded:
             box[].max_ev.synchronize()
+            if box[].raw != 0:
+                be()[].vendor.value().event_synchronize(box[].raw)
     except e:
         set_error(String(e))
 
@@ -558,6 +559,11 @@ def h_event_elapsed_ms(start: Int, end: Int) abi("C") -> Float64:
             )
         if a[].raw != 0 and b[].raw != 0:
             return be()[].vendor.value().event_elapsed_ms(a[].raw, b[].raw)
+        if not dev(a[].device)[].is_cpu:
+            raise Error(
+                "elapsed_time: device timing needs the vendor driver (not"
+                " available on this device)"
+            )
         a[].max_ev.synchronize()
         b[].max_ev.synchronize()
         return Float64(b[].host_ns - a[].host_ns) / 1.0e6
@@ -655,3 +661,16 @@ def ctx_ptr(ctx: DeviceContext) -> Int:
     (TensorSpec.ctx_ptr / the trailing ctx slot): the same pointer
     `Device._device_context_ptr()` handed the old Python path."""
     return Int(ctx._handle.value())
+
+
+def record_stream(handle: Int, device: Int, stream: Int) raises:
+    """Op-side twin of h_record_stream."""
+    var box = BufP(unsafe_from_address=handle)
+    if device != box[].device:
+        raise Error("record_stream: stream of another device")
+    if stream == box[].stream:
+        return
+    for i in range(len(box[].users)):
+        if box[].users[i] == stream:
+            return
+    box[].users.append(stream)

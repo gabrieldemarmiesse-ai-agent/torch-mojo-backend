@@ -1,65 +1,22 @@
-"""add.Tensor / mul.Tensor through the logic_ops spec kernels (bring-up set;
-the full dispatch cascade of the old fast path follows)."""
+"""aten ops: binary arithmetic (add/sub/mul/div/... and their in-place and
+out= variants). The bring-up add/mul below go through the logic_ops spec
+kernels; the full dispatch cascade of the old fast path follows."""
 from std.utils import IndexList
 
 from abi import (
-    Values,
-    Value,
     T,
-    IntList,
-    DoubleList,
-    v_is_none,
-    v_int,
-    v_int_or,
-    v_f64,
-    v_f64_or,
-    v_bool,
-    v_bool_or,
-    v_scalar_is_integral,
-    v_scalar_is_bool,
-    v_dtype_or,
-    v_device_index,
-    v_memory_format_or,
-    v_generator,
-    v_string,
-    v_tensor,
-    v_opt_tensor,
-    v_tensor_list,
-    ret_tensor,
-    ret_ref,
-    ret_int,
-    ret_bool,
-    ret_f64,
-    ret_scalar_int,
-    ret_scalar_f64,
-    ret_scalar_bool,
-    ret_tensor_list,
-    contiguous_strides,
-    new_strided,
+    Values,
     new_tensor,
-    new_like,
-    new_like_dtype,
-    new_scalar,
-    view_strided,
-    set_sizes_strides,
-    retain,
-    release,
-    cpu_empty,
-    default_dtype,
+    own,
+    ret_owned,
     unsupported,
-    check,
-    max_dtype,
-    torch_dtype,
-    is_floating,
-    MEMORY_FORMAT_CONTIGUOUS,
-    MEMORY_FORMAT_CHANNELS_LAST,
-    TAG_NONE,
-    TAG_TENSOR,
-    TAG_TENSOR_REF,
+    v_f64,
+    v_tensor,
 )
 from device import ctx_for, ctx_ptr
 from kernels import KernelCall
-from op_utils import MAX_RANK, Arg, TensorSpec
+from op_utils import MAX_RANK
+from registry import Lib, impl
 
 
 def _binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
@@ -99,11 +56,13 @@ def _binary(
         unsupported("alpha != 1")
     if a.stype != b.stype:
         unsupported("mixed dtypes")
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected both operands on the same mojo device")
     var shape = _broadcast_shape(a, b)
     var rank = max(a.rank, b.rank)
-    var out = new_tensor(shape, rank, a.stype, a.device)
-    _binary_spec(op, a, b, out)
-    ret_tensor(rets, 0, out)
+    var out = own(new_tensor(shape, rank, a.stype, a.device))
+    _binary_spec(op, a, b, out.t)
+    ret_owned(rets, 0, out)
 
 
 # aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
@@ -114,3 +73,8 @@ def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
 def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _binary("MulSpec", args, rets, False)
+
+
+def register_binary(lib: Lib) raises:
+    impl[op_add_tensor](lib, "add.Tensor")
+    impl[op_mul_tensor](lib, "mul.Tensor")

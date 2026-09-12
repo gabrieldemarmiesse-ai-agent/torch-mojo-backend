@@ -25,6 +25,7 @@ from abi import (
     v_device_index,
     v_memory_format_or,
     v_generator,
+    v_stream,
     v_string,
     v_tensor,
     v_opt_tensor,
@@ -68,11 +69,11 @@ from device import (
     ctx_for,
     current_device,
     dev,
-    memset_bytes,
-    memset_typed,
     read_bytes_sync,
+    record_stream,
 )
 from op_utils import MAX_RANK
+from ops_common import cast_to, contiguous, copy_strided_into, fill_value
 
 
 def _target_device(v: Value) -> Int:
@@ -122,11 +123,23 @@ def op_empty_strided(
     var stype = v_dtype_or(args[unsafe_offset=2], default_dtype())
     var device = _target_device(args[unsafe_offset=4])
     var shape = _shape_of(sizes)
+    ret_tensor(
+        rets,
+        0,
+        new_strided(
+            shape, _strides_of(strides, len(sizes)), len(sizes), stype, device
+        ),
+    )
+
+
+def _strides_of(strides: IntList, rank: Int) raises -> IndexList[MAX_RANK]:
+    if len(strides) != rank:
+        raise Error("expected ", rank, " strides, got ", len(strides))
     var strd = IndexList[MAX_RANK](0)
-    var pad = MAX_RANK - len(sizes)
-    for i in range(len(strides)):
+    var pad = MAX_RANK - rank
+    for i in range(rank):
         strd[pad + i] = strides[i]
-    ret_tensor(rets, 0, new_strided(shape, strd, len(sizes), stype, device))
+    return strd
 
 
 def _is_dense_same_layout(a: T, b: T) -> Bool:
@@ -264,11 +277,13 @@ def op_reshape_alias(
     var sizes = IntList(args[unsafe_offset=1])
     var strides = IntList(args[unsafe_offset=2])
     var shape = _shape_of(sizes)
-    var strd = IndexList[MAX_RANK](0)
-    var pad = MAX_RANK - len(sizes)
-    for i in range(len(strides)):
-        strd[pad + i] = strides[i]
-    ret_tensor(rets, 0, view_strided(t, shape, strd, len(sizes), t.offset))
+    ret_tensor(
+        rets,
+        0,
+        view_strided(
+            t, shape, _strides_of(strides, len(sizes)), len(sizes), t.offset
+        ),
+    )
 
 
 # aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
@@ -278,11 +293,13 @@ def op_as_strided(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var strides = IntList(args[unsafe_offset=2])
     var offset = v_int_or(args[unsafe_offset=3], t.offset)
     var shape = _shape_of(sizes)
-    var strd = IndexList[MAX_RANK](0)
-    var pad = MAX_RANK - len(sizes)
-    for i in range(len(strides)):
-        strd[pad + i] = strides[i]
-    ret_tensor(rets, 0, view_strided(t, shape, strd, len(sizes), offset))
+    ret_tensor(
+        rets,
+        0,
+        view_strided(
+            t, shape, _strides_of(strides, len(sizes)), len(sizes), offset
+        ),
+    )
 
 
 # aten::_local_scalar_dense(Tensor self) -> Scalar
@@ -331,59 +348,29 @@ def op_local_scalar_dense(
         ret_scalar_int(rets, 0, v)
 
 
-def fill_contiguous(t: T, value: Float64) raises:
-    """Constant fill of a contiguous tensor with a memset (typed for the
-    element size, bytes when every byte of the pattern is equal)."""
-    if t.numel == 0:
-        return
-    var ctx = ctx_for(t.device)
-    if value == 0.0:
-        memset_bytes(ctx, t.ptr, 0, t.numel * t.itemsize)
-        return
-    if t.dtype == DType.float32:
-        memset_typed[DType.float32](ctx, t.ptr, Float32(value), t.numel)
-    elif t.dtype == DType.bfloat16:
-        memset_typed[DType.bfloat16](ctx, t.ptr, BFloat16(value), t.numel)
-    elif t.dtype == DType.float16:
-        memset_typed[DType.float16](ctx, t.ptr, Float16(value), t.numel)
-    elif t.dtype == DType.float64:
-        memset_typed[DType.float64](ctx, t.ptr, value, t.numel)
-    elif t.dtype == DType.int64:
-        memset_typed[DType.int64](ctx, t.ptr, Int64(Int(value)), t.numel)
-    elif t.dtype == DType.int32:
-        memset_typed[DType.int32](ctx, t.ptr, Int32(Int(value)), t.numel)
-    elif t.dtype == DType.int16:
-        memset_typed[DType.int16](ctx, t.ptr, Int16(Int(value)), t.numel)
-    elif t.dtype == DType.int8:
-        memset_typed[DType.int8](ctx, t.ptr, Int8(Int(value)), t.numel)
-    elif t.dtype == DType.uint8 or t.dtype == DType.bool:
-        memset_bytes(ctx, t.ptr, UInt8(Int(value)), t.numel)
-    elif t.dtype == DType.uint16:
-        memset_typed[DType.uint16](ctx, t.ptr, UInt16(Int(value)), t.numel)
-    elif t.dtype == DType.uint32:
-        memset_typed[DType.uint32](ctx, t.ptr, UInt32(Int(value)), t.numel)
-    elif t.dtype == DType.uint64:
-        memset_typed[DType.uint64](ctx, t.ptr, UInt64(Int(value)), t.numel)
-    else:
-        unsupported("fill of dtype " + String(t.dtype))
-
-
 # aten::fill_.Scalar(Tensor(a!) self, Scalar value) -> Tensor(a!)
 def op_fill_scalar_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var value = v_f64(args[unsafe_offset=1])
-    if not t.contig:
-        unsupported("fill_ of a non-contiguous tensor")
-    fill_contiguous(t, value)
+    fill_value(t, value)
     ret_ref(rets, 0, t)
 
 
 # aten::zero_(Tensor(a!) self) -> Tensor(a!)
 def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    if not t.contig:
-        unsupported("zero_ of a non-contiguous tensor")
-    fill_contiguous(t, 0.0)
+    fill_value(t, 0.0)
     ret_ref(rets, 0, t)
+
+
+# aten::record_stream(Tensor(a!) self, Stream s) -> ()
+def op_record_stream(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var st = v_stream(args[unsafe_offset=1])
+    var handle = t.storage_ctx()
+    if handle != 0:
+        record_stream(handle, st[0], st[1])

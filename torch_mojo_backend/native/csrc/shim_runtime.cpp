@@ -14,6 +14,7 @@
 #include <torch/csrc/profiler/stubs/base.h>
 
 #include <chrono>
+#include <exception>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -54,9 +55,32 @@ using Lock = std::lock_guard<std::recursive_mutex>;
 #define H tmb_hooks
 #define REQUIRE_READY() TORCH_CHECK(tmb_ready, "mojo backend: tmb_backend_register() has not run")
 
+// Void hooks report failure through the thread-local message: clear it
+// before the call, raise if the hook left one.
+struct HookCall {
+  HookCall() { tmb_thread_error().clear(); }
+  ~HookCall() noexcept(false) {
+    if (!tmb_thread_error().empty() && !std::uncaught_exceptions()) {
+      std::string msg = tmb_thread_error();
+      tmb_thread_error().clear();
+      TORCH_CHECK(false, "mojo backend: ", msg);
+    }
+  }
+};
+#define HOOK(expr) do { Lock g(tmb_mutex); HookCall hc; expr; } while (0)
+
+// The device tmb_empty_strided asked for, restored on every exit path.
+struct AllocDeviceScope {
+  int32_t saved;
+  explicit AllocDeviceScope(int32_t d);
+  ~AllocDeviceScope();
+};
+
 // Device index tmb_empty_strided asked for; the allocator has no device
 // parameter so the request travels through this thread-local.
 thread_local int32_t tls_alloc_device = -1;
+AllocDeviceScope::AllocDeviceScope(int32_t d) : saved(tls_alloc_device) { tls_alloc_device = d; }
+AllocDeviceScope::~AllocDeviceScope() { tls_alloc_device = saved; }
 
 int32_t alloc_device() {
   if (tls_alloc_device >= 0) return tls_alloc_device;
@@ -75,15 +99,16 @@ struct MojoAllocator final : c10::Allocator {
     Lock g(tmb_mutex);
     const int32_t dev = alloc_device();
     void* data = nullptr;
+    tmb_thread_error().clear();
     void* handle = n ? H.alloc(n, dev, tls_stream_slot(dev), &data) : nullptr;
     TORCH_CHECK_WITH(OutOfMemoryError, handle || n == 0, "mojo backend: out of memory allocating ", n,
                      " bytes on mojo:", dev, " (", tmb_thread_error(), ")");
     return {data, handle, &deleter, c10::Device(c10::DeviceType::PrivateUse1, static_cast<c10::DeviceIndex>(dev))};
   }
-  c10::DeleterFnPtr raw_deleter() const override { return &deleter; }
+  // data != context here, which raw_allocate/raw_deallocate cannot express.
+  c10::DeleterFnPtr raw_deleter() const override { return nullptr; }
   void copy_data(void* dst, const void* src, size_t n) const override {
-    Lock g(tmb_mutex);
-    H.copy_data(dst, src, n, tls_device, tls_stream_slot(tls_device));
+    HOOK(H.copy_data(dst, src, n, tls_device, tls_stream_slot(tls_device)));
   }
 };
 MojoAllocator g_allocator;
@@ -104,8 +129,9 @@ struct MojoGeneratorImpl final : c10::GeneratorImpl {
   }
   // 16 bytes little-endian: seed then offset -- the wire format torch.mojo.get_rng_state() kept.
   void set_state(const c10::TensorImpl& new_state) override {
-    TORCH_CHECK(new_state.numel() == 16 && new_state.dtype() == caffe2::TypeMeta::Make<uint8_t>(),
-                "mojo backend: RNG state must be a 16-byte uint8 tensor");
+    TORCH_CHECK(new_state.numel() == 16 && new_state.dtype() == caffe2::TypeMeta::Make<uint8_t>() &&
+                    new_state.device().is_cpu() && new_state.is_contiguous(),
+                "mojo backend: RNG state must be a contiguous 16-byte uint8 CPU tensor");
     const auto* p = static_cast<const uint8_t*>(new_state.data());
     std::memcpy(&seed_, p, 8);
     std::memcpy(&offset_, p + 8, 8);
@@ -130,6 +156,12 @@ struct MojoGeneratorImpl final : c10::GeneratorImpl {
 
 std::mutex g_generators_mutex;
 std::vector<at::Generator> g_default_generators;
+
+MojoGeneratorImpl* mojo_impl(const at::Generator& g) {
+  auto* impl = dynamic_cast<MojoGeneratorImpl*>(g.unsafeGetGeneratorImpl());
+  TORCH_CHECK(impl, "mojo backend: expected a generator of the mojo device, got ", g.device());
+  return impl;
+}
 
 at::Generator& default_generator(c10::DeviceIndex index) {
   std::lock_guard<std::mutex> g(g_generators_mutex);
@@ -176,12 +208,14 @@ struct MojoHooks final : at::PrivateUse1HooksInterface {
     Lock g(tmb_mutex);
     auto* impl = storage.unsafeGetStorageImpl();
     const auto dev = impl->device().index();
-    tls_alloc_device = dev;
-    c10::DataPtr fresh = g_allocator.allocate(new_bytes);
-    tls_alloc_device = -1;
+    c10::DataPtr fresh;
+    {
+      AllocDeviceScope scope(dev);
+      fresh = g_allocator.allocate(new_bytes);
+    }
     const size_t keep = std::min(new_bytes, impl->nbytes());
-    if (keep && impl->data()) H.copy_data(fresh.get(), impl->data(), keep, dev, tls_stream_slot(dev));
-    impl->set_data_ptr_noswap(std::move(fresh));
+    if (keep && impl->data()) { HookCall hc; H.copy_data(fresh.get(), impl->data(), keep, dev, tls_stream_slot(dev)); }
+    impl->set_data_ptr_noswap(std::move(fresh));  // the old block's release is stream-ordered after the copy
     impl->set_nbytes(new_bytes);
   }
 };
@@ -220,14 +254,16 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     return mk_stream(c10::Device(c10::DeviceType::PrivateUse1, idx_or_current(d)), 0);
   }
   c10::Stream getStreamFromGlobalPool(c10::Device d, bool high) const override {
-    Lock g(tmb_mutex);
     auto i = idx_or_current(d);
-    return mk_stream(c10::Device(c10::DeviceType::PrivateUse1, i), H.stream_from_pool(i, high ? 1 : 0));
+    int64_t id = 0;
+    HOOK(id = H.stream_from_pool(i, high ? 1 : 0));
+    return mk_stream(c10::Device(c10::DeviceType::PrivateUse1, i), id);
   }
   c10::Stream getNewStream(c10::Device d, int priority) const override {
-    Lock g(tmb_mutex);
     auto i = idx_or_current(d);
-    return mk_stream(c10::Device(c10::DeviceType::PrivateUse1, i), H.new_stream(i, priority));
+    int64_t id = 0;
+    HOOK(id = H.new_stream(i, priority));
+    return mk_stream(c10::Device(c10::DeviceType::PrivateUse1, i), id);
   }
   c10::Stream exchangeStream(c10::Stream s) const override {
     auto i = s.device_index();
@@ -248,47 +284,47 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     H.event_destroy(ev, di);
   }
   void record(void** event, const c10::Stream& stream, const c10::DeviceIndex di, const c10::EventFlag flag) const override {
-    Lock g(tmb_mutex);
     const auto dev = stream.device_index();
-    if (!*event) *event = H.event_create(dev, flag == c10::EventFlag::BACKEND_DEFAULT ? 1 : 0);
-    H.event_record(*event, dev, stream.id());
+    if (!*event) {
+      HOOK(*event = H.event_create(dev, flag == c10::EventFlag::BACKEND_DEFAULT ? 1 : 0));
+      TORCH_CHECK(*event, "mojo backend: event creation failed");
+    }
+    HOOK(H.event_record(*event, dev, stream.id()));
     (void)di;
   }
   void block(void* ev, const c10::Stream& s) const override {
     if (!ev) return;
-    Lock g(tmb_mutex);
-    H.event_block(ev, s.device_index(), s.id());
+    HOOK(H.event_block(ev, s.device_index(), s.id()));
   }
   bool queryEvent(void* ev) const override {
     if (!ev) return true;
-    Lock g(tmb_mutex);
-    return H.event_query(ev) != 0;
+    int32_t r = 1;
+    HOOK(r = H.event_query(ev));
+    return r != 0;
   }
   void synchronizeEvent(void* ev) const override {
     if (!ev) return;
-    Lock g(tmb_mutex);
-    H.event_synchronize(ev);
+    HOOK(H.event_synchronize(ev));
   }
   bool queryStream(const c10::Stream& s) const override {
-    Lock g(tmb_mutex);
-    return H.query_stream(s.device_index(), s.id()) != 0;
+    int32_t r = 1;
+    HOOK(r = H.query_stream(s.device_index(), s.id()));
+    return r != 0;
   }
   void synchronizeStream(const c10::Stream& s) const override {
-    Lock g(tmb_mutex);
-    H.synchronize_stream(s.device_index(), s.id());
+    HOOK(H.synchronize_stream(s.device_index(), s.id()));
   }
   void synchronizeDevice(const c10::DeviceIndex di) const override {
-    Lock g(tmb_mutex);
-    H.synchronize_device(di);
+    HOOK(H.synchronize_device(di));
   }
   void recordDataPtrOnStream(const c10::DataPtr& p, const c10::Stream& s) const override {
     if (!p.get_context() || p.get_deleter() != &MojoAllocator::deleter) return;  // not ours (e.g. from_blob)
-    Lock g(tmb_mutex);
-    H.record_stream(p.get_context(), s.device_index(), s.id());
+    HOOK(H.record_stream(p.get_context(), s.device_index(), s.id()));
   }
   double elapsedTime(void* e1, void* e2, const c10::DeviceIndex) const override {
-    Lock g(tmb_mutex);
-    return H.event_elapsed_ms(e1, e2);
+    double ms = 0;
+    HOOK(ms = H.event_elapsed_ms(e1, e2));
+    return ms;
   }
 };
 C10_REGISTER_GUARD_IMPL(PrivateUse1, MojoGuardImpl);
@@ -372,8 +408,13 @@ int32_t tmb_tensor_device_index(TmbTensor t) {
   const auto& x = T(t);
   return x.device().type() == c10::DeviceType::PrivateUse1 ? x.device().index() : -1;
 }
+int32_t tmb_tensor_device_type(TmbTensor t) { return static_cast<int32_t>(T(t).device().type()); }
 int32_t tmb_tensor_is_privateuse1(TmbTensor t) { return T(t).device().type() == c10::DeviceType::PrivateUse1; }
 void* tmb_tensor_storage_data_ptr(TmbTensor t) { return T(t).storage().mutable_data(); }
+void* tmb_tensor_storage_ctx(TmbTensor t) {
+  const auto& dp = T(t).storage().data_ptr();
+  return dp.get_deleter() == &MojoAllocator::deleter ? dp.get_context() : nullptr;
+}
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
@@ -383,24 +424,39 @@ void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); 
 int32_t tmb_empty_strided(int64_t ndim, const int64_t* sizes, const int64_t* strides, int32_t dtype,
                           int32_t device, TmbTensor* ret) {
   try {
-    tls_alloc_device = device;
+    AllocDeviceScope scope(device);
     auto t = at::detail::empty_strided_generic(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                &g_allocator, c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
                                                static_cast<c10::ScalarType>(dtype));
-    tls_alloc_device = -1;
     *ret = new at::Tensor(std::move(t));
     return 0;
   } catch (const std::exception& e) {
-    tls_alloc_device = -1;
     tmb_set_error(e.what());
     return 1;
   }
+}
+
+// The view must stay inside its storage (at::native::checkInBoundsForStorage).
+void check_in_bounds(const c10::Storage& storage, int64_t ndim, const int64_t* sizes, const int64_t* strides,
+                     int64_t storage_offset, size_t itemsize) {
+  TORCH_CHECK(storage_offset >= 0, "negative storage offset ", storage_offset);
+  int64_t last = 0;  // offset of the last element, in elements
+  for (int64_t i = 0; i < ndim; ++i) {
+    TORCH_CHECK(sizes[i] >= 0, "negative size ", sizes[i]);
+    if (sizes[i] == 0) return;
+    if (strides[i] > 0) last += (sizes[i] - 1) * strides[i];
+    else TORCH_CHECK(strides[i] == 0 || (sizes[i] - 1) * strides[i] + storage_offset >= 0, "negative stride reaches before the storage");
+  }
+  const int64_t needed = (storage_offset + last + 1) * static_cast<int64_t>(itemsize);
+  TORCH_CHECK(needed <= static_cast<int64_t>(storage.nbytes()), "setStorage: sizes/strides reach ", needed,
+              " bytes but the storage has ", storage.nbytes());
 }
 
 int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const int64_t* strides,
                        int64_t storage_offset, TmbTensor* ret) {
   try {
     const at::Tensor& b = T(base);
+    check_in_bounds(b.storage(), ndim, sizes, strides, storage_offset, b.itemsize());
     auto t = at::detail::make_tensor<c10::TensorImpl>(c10::TensorImpl::VIEW, c10::Storage(b.storage()),
                                                       b.key_set(), b.dtype());
     t.unsafeGetTensorImpl()->set_sizes_and_strides(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
@@ -416,6 +472,7 @@ int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const
 int32_t tmb_tensor_set_sizes_strides(TmbTensor t, int64_t ndim, const int64_t* sizes, const int64_t* strides,
                                      int64_t storage_offset) {
   try {
+    check_in_bounds(T(t).storage(), ndim, sizes, strides, storage_offset, T(t).itemsize());
     T(t).unsafeGetTensorImpl()->set_sizes_and_strides(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                       storage_offset);
     return 0;
@@ -459,10 +516,11 @@ int32_t tmb_philox_reserve(TmbGenerator gen, int32_t device, uint64_t increment,
   try {
     at::Generator g = gen ? *reinterpret_cast<at::Generator*>(gen) : default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
-    auto* impl = g.get<MojoGeneratorImpl>();
+    auto* impl = mojo_impl(g);
     *seed = impl->seed_;
     *offset = impl->offset_;
-    impl->offset_ += (increment + 3) & ~uint64_t(3);
+    TORCH_CHECK(increment <= UINT64_MAX - impl->offset_, "mojo backend: Philox counter reservation would wrap");
+    impl->offset_ += increment;  // the kernels' own unit (same contract as the old _reserve_philox_state)
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
@@ -472,11 +530,12 @@ int32_t tmb_philox_reserve(TmbGenerator gen, int32_t device, uint64_t increment,
 
 int32_t tmb_rng_manual_seed(int32_t device, uint64_t seed) {
   try {
-    if (device < 0) {
-      const int32_t n = H.device_count();
-      for (int32_t i = 0; i < n; ++i) default_generator(static_cast<c10::DeviceIndex>(i)).set_current_seed(seed);
-    } else {
-      default_generator(static_cast<c10::DeviceIndex>(device)).set_current_seed(seed);
+    const int32_t n = H.device_count();
+    for (int32_t i = 0; i < n; ++i) {
+      if (device >= 0 && i != device) continue;
+      auto& g = default_generator(static_cast<c10::DeviceIndex>(i));
+      std::lock_guard<std::mutex> lock(g.mutex());
+      g.set_current_seed(seed);
     }
     return 0;
   } catch (const std::exception& e) {
@@ -489,7 +548,7 @@ int32_t tmb_rng_get_state(int32_t device, uint8_t* out16) {
   try {
     auto g = default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
-    auto* impl = g.get<MojoGeneratorImpl>();
+    auto* impl = mojo_impl(g);
     std::memcpy(out16, &impl->seed_, 8);
     std::memcpy(out16 + 8, &impl->offset_, 8);
     return 0;
@@ -503,7 +562,7 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
   try {
     auto g = default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
-    auto* impl = g.get<MojoGeneratorImpl>();
+    auto* impl = mojo_impl(g);
     std::memcpy(&impl->seed_, in16, 8);
     std::memcpy(&impl->offset_, in16 + 8, 8);
     return 0;

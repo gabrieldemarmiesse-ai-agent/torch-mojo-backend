@@ -16,7 +16,7 @@ from torch_mojo_backend import native
 DeviceLike = "int | str | torch.device | None"
 
 
-def _index(device: "int | str | torch.device | None") -> int:
+def _index(device: int | str | torch.device | None) -> int:
     if device is None:
         return current_device()
     if isinstance(device, int):
@@ -52,7 +52,7 @@ def current_device() -> int:
     return int(native.shim().tmb_current_device())
 
 
-def set_device(device: "int | str | torch.device"):
+def set_device(device: int | str | torch.device):
     idx = _index(device)
     if idx < 0 or idx >= device_count():
         raise ValueError(f"Invalid device index {idx}")
@@ -63,7 +63,7 @@ class device:
     """Context manager swapping the current device (torch.serialization needs
     it on the backend module for map_location="mojo")."""
 
-    def __init__(self, device: "int | str | torch.device | None"):
+    def __init__(self, device: int | str | torch.device | None):
         self.idx = -1 if device is None else _index(device)
         self.prev = -1
 
@@ -78,38 +78,48 @@ class device:
         return False
 
 
-def synchronize(device: "int | str | torch.device | None" = None):
+def synchronize(device: int | str | torch.device | None = None):
     torch._C._accelerator_synchronizeDevice(_index(device))
 
 
 def manual_seed(seed: int):
-    native.shim().tmb_rng_manual_seed(ctypes.c_int32(current_device()), ctypes.c_uint64(seed & ((1 << 64) - 1)))
+    native.shim().tmb_rng_manual_seed(
+        ctypes.c_int32(current_device()), ctypes.c_uint64(seed & ((1 << 64) - 1))
+    )
 
 
 def manual_seed_all(seed: int):
-    native.shim().tmb_rng_manual_seed(ctypes.c_int32(-1), ctypes.c_uint64(seed & ((1 << 64) - 1)))
+    native.shim().tmb_rng_manual_seed(
+        ctypes.c_int32(-1), ctypes.c_uint64(seed & ((1 << 64) - 1))
+    )
 
 
 def seed():
-    manual_seed(int.from_bytes(torch.randint(0, 2**62, (1,)).numpy().tobytes(), "little"))
+    manual_seed(
+        int.from_bytes(torch.randint(0, 2**62, (1,)).numpy().tobytes(), "little")
+    )
 
 
 def seed_all():
-    manual_seed_all(int.from_bytes(torch.randint(0, 2**62, (1,)).numpy().tobytes(), "little"))
+    manual_seed_all(
+        int.from_bytes(torch.randint(0, 2**62, (1,)).numpy().tobytes(), "little")
+    )
 
 
 def initial_seed() -> int:
     return int.from_bytes(bytes(get_rng_state().tolist()[:8]), "little")
 
 
-def get_rng_state(device: "int | str | torch.device | None" = None) -> torch.Tensor:
+def get_rng_state(device: int | str | torch.device | None = None) -> torch.Tensor:
     """16 bytes: Philox seed then counter, little-endian."""
     buf = (ctypes.c_uint8 * 16)()
     native.shim().tmb_rng_get_state(ctypes.c_int32(_index(device)), buf)
     return torch.tensor(list(buf), dtype=torch.uint8)
 
 
-def set_rng_state(new_state: torch.Tensor, device: "int | str | torch.device | None" = None):
+def set_rng_state(
+    new_state: torch.Tensor, device: int | str | torch.device | None = None
+):
     if not isinstance(new_state, torch.Tensor):
         raise TypeError("Mojo RNG state must be a torch.Tensor")
     state = new_state.detach().cpu().contiguous()
@@ -136,12 +146,16 @@ def is_bf16_supported() -> bool:
     return True
 
 
-def current_stream(device: "int | str | torch.device | None" = None) -> torch.Stream:
+def current_stream(device: int | str | torch.device | None = None) -> torch.Stream:
     return torch.accelerator.current_stream(_index(device))
 
 
-def default_stream(device: "int | str | torch.device | None" = None) -> torch.Stream:
-    return torch.Stream(device=torch.device(f"mojo:{_index(device)}"), stream_id=0) if hasattr(torch.Stream, "stream_id") else current_stream(device)
+def default_stream(device: int | str | torch.device | None = None) -> torch.Stream:
+    return (
+        torch.Stream(device=torch.device(f"mojo:{_index(device)}"), stream_id=0)
+        if hasattr(torch.Stream, "stream_id")
+        else current_stream(device)
+    )
 
 
 def set_stream(stream: torch.Stream):

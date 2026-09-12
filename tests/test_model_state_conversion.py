@@ -5,7 +5,7 @@ import io
 import pytest
 import torch
 
-from torch_mojo_backend import TorchMojoTensor, register_mojo_devices
+from torch_mojo_backend import register_mojo_devices
 
 
 @pytest.fixture(autouse=True)
@@ -29,8 +29,8 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
     assert module.embedding.weight is module.projection.weight
     embedding_weight = module.embedding.weight
     projection_weight = module.projection.weight
-    assert isinstance(embedding_weight, TorchMojoTensor)
-    assert isinstance(projection_weight, TorchMojoTensor)
+    assert embedding_weight.device.type == "mojo"
+    assert projection_weight.device.type == "mojo"
     assert embedding_weight._holder is projection_weight._holder
     assert embedding_weight._ptr == projection_weight._ptr
     assert len(list(module.parameters())) == 1
