@@ -8,6 +8,7 @@ family's C entry through the loader.
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import unsafe_alloc
 
+from abi import dtype_code
 from loader import Loader, call_family
 from op_utils import Arg, Argv, TensorSpec, _f64_slot
 
@@ -66,27 +67,53 @@ def dtype_name(dt: DType) -> String:
     return String(dt)
 
 
+@always_inline
+def _mix(mut h: UInt64, x: UInt64):
+    h ^= x
+    h *= 1099511628211
+
+
+@always_inline
+def _mix_bytes(mut h: UInt64, s: String):
+    for b in s.as_bytes():
+        _mix(h, UInt64(b))
+
+
 struct Defines(Movable):
     """The -D set of one specialization, in the canonical (sorted) order the
-    cache key uses."""
+    cache key uses. `key` is a running hash of the same information so the
+    loader's hot path never builds a string: the strings are only produced
+    on a miss (`sorted()`)."""
 
     var items: List[String]
+    var key: UInt64
 
     def __init__(out self, op: String):
         self.items = List[String]()
         self.items.append("OP=" + op)
+        self.key = 14695981039346656037
+        _mix_bytes(self.key, op)
 
     def arg(mut self, i: Int, dt: DType):
         self.items.append("DTYPE_ARG_" + String(i) + "=" + dtype_name(dt))
+        _mix(self.key, UInt64(0x1000 + i))
+        _mix(self.key, UInt64(dtype_code(dt)))
 
     def out(mut self, dt: DType):
         self.items.append("DTYPE_OUT=" + dtype_name(dt))
+        _mix(self.key, UInt64(0x2000))
+        _mix(self.key, UInt64(dtype_code(dt)))
 
     def out_i(mut self, i: Int, dt: DType):
         self.items.append("DTYPE_OUT_" + String(i) + "=" + dtype_name(dt))
+        _mix(self.key, UInt64(0x3000 + i))
+        _mix(self.key, UInt64(dtype_code(dt)))
 
     def flag(mut self, name: String, value: Int):
         self.items.append(name + "=" + String(value))
+        _mix(self.key, UInt64(0x4000))
+        _mix_bytes(self.key, name)
+        _mix(self.key, UInt64(value))
 
     def sorted(self) -> List[String]:
         var out = self.items.copy()
@@ -156,10 +183,24 @@ struct KernelCall(Movable):
         self.slots.append(Int(self.tuples[len(self.tuples) - 1].unsafe_ptr()))
 
     def run(self) raises:
-        call_family(
-            loader()[],
-            self.family,
-            self.defines.sorted(),
-            Argv(unsafe_from_address=Int(self.slots.unsafe_ptr())),
-            len(self.slots),
-        )
+        var key = self.defines.key
+        _mix_bytes(key, self.family)
+        var l = loader()
+        if l[].fast.find(key):
+            call_family(
+                l[],
+                self.family,
+                key,
+                List[String](),
+                Argv(unsafe_from_address=Int(self.slots.unsafe_ptr())),
+                len(self.slots),
+            )
+        else:
+            call_family(
+                l[],
+                self.family,
+                key,
+                self.defines.sorted(),
+                Argv(unsafe_from_address=Int(self.slots.unsafe_ptr())),
+                len(self.slots),
+            )
