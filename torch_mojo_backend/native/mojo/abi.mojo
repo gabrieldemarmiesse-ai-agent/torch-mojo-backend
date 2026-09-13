@@ -998,10 +998,10 @@ def call_op(
     call_op_raw(
         op,
         overload,
-        Values(unsafe_from_address=Int(args.unsafe_ptr())),
+        args.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
         n_args,
-        Values(unsafe_from_address=Int(rets.unsafe_ptr())),
+        rets.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
         n_rets,
     )
-    _ = args^
+    _ = args^  # the records are read by the call; keep them alive across it
     return Results(rets^)
