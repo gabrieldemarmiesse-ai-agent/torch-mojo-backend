@@ -291,6 +291,72 @@ bind to the CPU device type because it infers the device from
 `torch.cuda.is_available()`). With a CUDA build of torch, the installed
 driver still routes every Triton launch to the mojo current stream.
 
+## Compiled CUDA extensions
+
+A package that ships its own compiled kernels — causal-conv1d, mamba-ssm,
+apex — is the opposite case from Triton: it does not launch through a driver
+of its own, it calls into libtorch. `causal_conv1d_cuda.so` links
+`libc10_cuda.so` and `libcudart.so.12`, its C++ opens with
+`TORCH_CHECK(x.is_cuda())` and it launches on
+`at::cuda::getCurrentCUDAStream()`. So it needs a **CUDA build of torch** —
+on a CPU wheel `import causal_conv1d` fails at the loader, and there is no
+way around that from here — and once that exists, it needs to be handed CUDA
+tensors and a CUDA stream. `torch_mojo_backend/cuda_interop.py` hands it
+both, as aliases rather than copies:
+
+* **Memory.** MAX allocates on the device's *primary* CUDA context, the same
+  one `torch.cuda` uses (checked: `cuStreamGetCtx` of a mojo stream equals
+  `cuDevicePrimaryCtxRetain` of that device), so one device pointer is valid
+  in both worlds. `as_cuda(t)` / `as_mojo(t)` take torch's own DLPack export
+  and rewrite the device code in the capsule (`mojo_device/dlpack.py`'s
+  `retag_capsule`: `kDLExtDev` ⟷ `kDLCUDA`), which keeps shape, strides,
+  storage offset and dtype exactly and leaves the source tensor pinned by the
+  capsule's deleter. `data_ptr()` is equal on both sides; nothing is copied.
+  The mojo device index is the CUDA ordinal, as for Triton (checked on a
+  second GPU: `mojo:1` aliases to `cuda:1`).
+* **Ordering.** `on_mojo_stream()` installs a `torch.cuda.ExternalStream`
+  over the mojo current stream's vendor handle, so the package's launches and
+  ours queue on one stream and neither side synchronizes. Like `torch.cuda`'s
+  own stream context it makes that device current, and restores the previous
+  one on exit.
+
+`call_cuda(fn, *args)` is the two together — convert, call under the stream,
+convert back — and in-place mutation needs no conversion back, since the
+alias *is* the memory. Gradients do not cross an alias (DLPack carries no
+autograd history), so `cuda_autograd(fwd, bwd)` wraps a package's two entry
+points as one differentiable mojo-level op; the autograd graph then stays on
+mojo tensors, which matters because a CUDA backward cannot run at all once a
+PrivateUse1 backend is registered (see `require_cuda_autograd` in
+tests/conftest.py).
+
+`enable_cuda_fallback()` (or `cuda_fallback()` for one block) installs the
+same conversion as a `PrivateUse1` dispatcher fallback, so every op with a
+CUDA kernel and no Mojo op runs this way — `index_select`, `sort`, `topk`,
+… forward and backward. Two ops it cannot reach, both because the fallback
+only fires where *no* kernel is registered:
+
+* an op the backend registers and then declines at run time
+  (`aten::convolution` with `transposed=True`) still raises — the dispatcher
+  already found a kernel;
+* `aten::convolution_backward` is CompositeExplicitAutograd and branches on
+  the backend itself, sending everything that is not CPU/CUDA/MKLDNN to the
+  `convolution_backward_overrideable` stub, which carries its own raising
+  CompositeExplicitAutograd kernel. `_EXPLICIT_ROUTES` registers that one by
+  hand, which is what makes a convolution trainable here.
+
+Measured on an H100 (torch 2.11+cu128, causal-conv1d 1.7.0): `as_cuda` 3.6 µs,
+`as_mojo` 3.5 µs, the stream context 7.4 µs, so `call_cuda` adds ~36 µs to a
+three-tensor forward and ~31 µs to one op under the fallback. That is host
+time only — the kernel is the package's own, unchanged — but it is larger
+than a small kernel's device time, so the fallback is a correctness tool,
+not a performance one.
+
+ROCm is untested here (no AMD GPU): `torch.cuda.ExternalStream` is the same
+class on a ROCm build, `retag_capsule` needs `kDLROCM` (10) instead of
+`kDLCUDA` — `_vendor_dlpack_code()` already picks it off `torch.version.hip`
+— and causal-conv1d publishes no ROCm wheel, so it would be built from
+source with `HIP_ARCHITECTURES`.
+
 ## Profiling
 
 The shim registers torch's PrivateUse1 `ProfilerStubs` over the backend's
