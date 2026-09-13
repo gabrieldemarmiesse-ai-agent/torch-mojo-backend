@@ -1,7 +1,9 @@
 """Helpers every op group shares: materializing a contiguous copy, strided
-copies and fills, dtype casts, and two generic device-level primitives
-(Philox reservation, calling any aten op through the real dispatcher) that
-more than one group's RNG/host-fallback ops need."""
+copies and fills, dtype casts (through the memory_ops / data_movement_ops
+families on the tensor's current stream), scalar embedding and binary type
+promotion, `out=` resizing, and two device-level primitives (Philox
+reservation, calling any aten op through the real dispatcher) that more than
+one group needs."""
 from std.ffi import external_call
 from std.utils import IndexList
 
@@ -17,8 +19,13 @@ from abi import (
     new_like_dtype,
     new_tensor,
     release,
+    set_sizes_strides,
+    torch_dtype,
     unsupported,
     TAG_NONE,
+    v_f64,
+    v_scalar_is_integral,
+    v_int,
 )
 from device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from kernels import KernelCall
@@ -53,6 +60,34 @@ def copy_strided_into(dst: T, src: T) raises:
     call.int(cp)
     call.run()
     _ = ctx
+
+
+def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
+    """Resize a caller's `out=` tensor in place to a fresh contiguous
+    `shape` (torch's generic `resize_output` semantics, for a backend with
+    no registered `aten::resize_` kernel of its own: every `out=` op here
+    must do this itself for an out tensor of the wrong shape, rather than
+    relying on a resize that would otherwise happen before dispatch).
+
+    Grows the storage through the shim's allocator when the new shape needs
+    more bytes (`tmb_storage_resize`, which preserves existing bytes up to
+    min(old, new) like torch's own `resize_`), then rewrites sizes/strides
+    (`tmb_tensor_set_sizes_strides`, which requires the storage already be
+    big enough -- hence the order). `t`'s cached view fields are refreshed
+    from the tensor afterward since its shape/strides/numel/contig changed.
+    """
+    var strides = contiguous_strides(shape, rank)
+    var numel = 1
+    for i in range(rank):
+        numel *= shape[MAX_RANK - rank + i]
+    var nbytes = numel * t.itemsize
+    if nbytes > t.storage_nbytes():
+        check(
+            external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
+            "tmb_storage_resize",
+        )
+    set_sizes_strides(t, shape, strides, rank, 0)
+    t = T(t.h)
 
 
 def contiguous(t: T) raises -> T:
@@ -227,3 +262,141 @@ def call_op(
         "tmb_call_op",
     )
     return rets^
+
+
+# ---------------------------------------------------------------------------
+# Scalar embedding and binary dtype promotion, shared by the compare and
+# binary op groups (ported from `_scalar_embed` / `_binary_promotion` /
+# `_promoted_pair` in the old eager_kernels/aten_fast.py).
+# ---------------------------------------------------------------------------
+
+# int64 scalars round-trip through a Float64 fill argument exactly up to
+# this magnitude.
+comptime _MAX_EXACT_INT = 9007199254740992  # 2**53
+
+
+def _is_cast_dtype(dtype: DType) -> Bool:
+    """Dtypes `binary_promotion`/`promoted_pair` can materialize a cast into
+    (matches the old `_CAST_DTYPES`)."""
+    return (
+        dtype == DType.float32
+        or dtype == DType.float16
+        or dtype == DType.bfloat16
+        or dtype == DType.int64
+        or dtype == DType.int32
+        or dtype == DType.uint8
+        or dtype == DType.bool
+    )
+
+
+def _is_embeddable_dtype(dtype: DType) -> Bool:
+    """Dtypes `scalar_embed`'s destination fill can target (matches the old
+    `_FILL_DTYPES`; a strict subset of what `fill_value` itself supports,
+    kept for fidelity with the old eager path)."""
+    return (
+        dtype == DType.float32
+        or dtype == DType.float16
+        or dtype == DType.bfloat16
+        or dtype == DType.float64
+        or dtype == DType.int8
+        or dtype == DType.int16
+        or dtype == DType.int32
+        or dtype == DType.int64
+        or dtype == DType.uint8
+        or dtype == DType.bool
+    )
+
+
+def scalar_embed(v: Value, dtype: DType) raises -> Float64:
+    """`v` (an ATen Scalar record) validated for lossless embedding into
+    `dtype`, as a Float64 ready for `fill_value` / a 0-d fill tensor.
+
+    Ported from `_scalar_embed`: an int/bool magnitude above 2**53 would
+    lose precision through the Float64 round-trip and is declined, a bool
+    destination only accepts 0/1, and a float scalar against a
+    non-floating destination is declined (no implicit promotion here --
+    callers that want promotion cast the tensor operand first).
+    """
+    if not _is_embeddable_dtype(dtype):
+        unsupported("scalar embedding into dtype " + String(dtype))
+    if v_scalar_is_integral(v):
+        var i = v_int(v)
+        if abs(i) > _MAX_EXACT_INT:
+            unsupported("scalar magnitude exceeds the exact float64 range")
+        if dtype == DType.bool and i != 0 and i != 1:
+            unsupported("a bool tensor's scalar must be 0 or 1")
+        return Float64(i)
+    if (
+        dtype != DType.float16
+        and dtype != DType.bfloat16
+        and dtype != DType.float32
+        and dtype != DType.float64
+    ):
+        unsupported("a float scalar against a non-floating tensor")
+    return v_f64(v)
+
+
+def binary_promotion(a_dtype: DType, b_dtype: DType) raises -> DType:
+    """torch's promotion for a binary pair, restricted to what the
+    broadcast-strided spec kernels cover: equal dtypes; bool with any
+    castable dtype; int32/int64; float32 with float16/bfloat16; and
+    float16<->bfloat16 (widens both sides to float32). Declines
+    (`unsupported`) any other pair.
+
+    A caller casts each operand into the returned dtype with
+    `cast_to(operand, torch_dtype(result))`, which already no-ops when an
+    operand is already that dtype -- so, unlike the old `_binary_promotion`,
+    this returns just the common dtype rather than a (cast lhs?, cast rhs?,
+    dtype) triple; there is no separate cast-skipping fast path to expose.
+    Ported from `_binary_promotion`.
+    """
+    if a_dtype == b_dtype:
+        return a_dtype
+    if a_dtype == DType.bool and _is_cast_dtype(b_dtype):
+        return b_dtype
+    if b_dtype == DType.bool and _is_cast_dtype(a_dtype):
+        return a_dtype
+    if a_dtype == DType.int32 and b_dtype == DType.int64:
+        return DType.int64
+    if b_dtype == DType.int32 and a_dtype == DType.int64:
+        return DType.int64
+    if a_dtype == DType.float32 and (
+        b_dtype == DType.float16 or b_dtype == DType.bfloat16
+    ):
+        return DType.float32
+    if b_dtype == DType.float32 and (
+        a_dtype == DType.float16 or a_dtype == DType.bfloat16
+    ):
+        return DType.float32
+    if (a_dtype == DType.float16 and b_dtype == DType.bfloat16) or (
+        a_dtype == DType.bfloat16 and b_dtype == DType.float16
+    ):
+        return DType.float32
+    unsupported(
+        "no dtype promotion for " + String(a_dtype) + " and " + String(b_dtype)
+    )
+    return a_dtype
+
+
+def promoted_pair(a: T, b: T) raises -> Tuple[T, T]:
+    """Same-dtype tensor pair following torch's promotion, materializing a
+    cast side through `cast_to`.
+
+    A deliberate SUBSET of `binary_promotion` (bool+castable, int32/int64
+    only): `where`/`masked_fill` must keep declining mixed float widths
+    rather than silently widening them here. Ported from `_promoted_pair`.
+    The caller releases whichever of the pair has a handle (`.h`) different
+    from the corresponding input -- that side was freshly materialized.
+    """
+    if a.dtype == b.dtype:
+        return (a.copy(), b.copy())
+    if a.dtype == DType.bool and _is_cast_dtype(b.dtype):
+        return (cast_to(a, torch_dtype(b.dtype)), b.copy())
+    if b.dtype == DType.bool and _is_cast_dtype(a.dtype):
+        return (a.copy(), cast_to(b, torch_dtype(a.dtype)))
+    if a.dtype == DType.int32 and b.dtype == DType.int64:
+        return (cast_to(a, torch_dtype(DType.int64)), b.copy())
+    if b.dtype == DType.int32 and a.dtype == DType.int64:
+        return (a.copy(), cast_to(b, torch_dtype(DType.int64)))
+    unsupported("mixed dtypes " + String(a.dtype) + " and " + String(b.dtype))
+    return (a.copy(), b.copy())
