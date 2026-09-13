@@ -325,6 +325,22 @@ def test_mean_and_any_out_variants(mojo_gpu, keepdim):
     torch.testing.assert_close(out_b.cpu(), expected_any)
 
 
+def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
+    """`resize_output` first, and by SHAPE: matching only the element count
+    lets a (2, 3) result be poured into a (3, 2) destination, and the copy
+    then reads the source through the destination's extents."""
+    x = torch.randn(2, 3, 4)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
+
+    transposed = torch.empty(3, 2, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), dim=2, out=transposed)
+    assert tuple(transposed.shape) == (2, 3)
+    torch.testing.assert_close(transposed.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
+
+
 def test_out_variant_into_a_strided_destination(mojo_gpu):
     """A non-contiguous `out` cannot be written by the kernel directly, so the
     result is computed into a fresh buffer and copied across."""
