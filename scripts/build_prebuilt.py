@@ -18,7 +18,8 @@ What this script does, per torch version: make a throwaway venv holding that
 version's CPU wheel and nothing else, and run the shim build *in that venv*,
 so its autocast policy table and its C++ standard come from those exact
 headers. The base library is built once, with the MAX of the environment the
-script itself runs in. Every artefact lands in
+script itself runs in -- or, with `--backend-python`, in a throwaway venv of
+its own. Every artefact lands in
 `torch_mojo_backend/native/prebuilt/` with an entry in `manifest.json`
 recording what it was built from; `torch_mojo_backend.native` uses a file
 only when that entry matches the running environment and the hash of the
@@ -32,8 +33,11 @@ sources shipped beside it.
         bash -c 'pip install uv && python scripts/build_prebuilt.py \
                  --torch 2.11 --no-backend --out /src/prebuilt-x86_64'
 
+    # the base library, in a venv of its own (no project sync, no CUDA torch)
+    python3 scripts/build_prebuilt.py --backend-python 3.12 --out prebuilt-out
+
     # CI: each platform job builds its own, the release job merges them
-    uv run python scripts/build_prebuilt.py --merge artifacts/
+    python3 scripts/build_prebuilt.py --merge artifacts/
 
 The shim venvs hold torch alone -- no MAX, no install of this package -- and
 the build reaches `torch_mojo_backend.native` through `_native_module()`
@@ -64,6 +68,7 @@ from types import ModuleType
 _ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_OUT = _ROOT / "torch_mojo_backend" / "native" / "prebuilt"
 _CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+_PYPI = "https://pypi.org/simple"
 
 
 def _log(msg: str):
@@ -107,6 +112,15 @@ def _native_module() -> ModuleType:
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
+
+
+def _pins() -> list[str]:
+    """This project's max/mojo requirements, so a venv made here builds the
+    base library against the toolchain the wheel pins."""
+    deps = tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"][
+        "dependencies"
+    ]
+    return [d for d in deps if re.match(r"^(max|mojo)\s*==", d)]
 
 
 def _package_version() -> str:
@@ -231,11 +245,42 @@ def build_shim_for(
     return _entry_of(out)
 
 
-def build_backend(out_dir: Path, work_dir: Path) -> dict[str, object]:
-    """The base library, with the MAX of the environment this script runs in."""
+def build_backend(
+    out_dir: Path, work_dir: Path, python: str | None, index_url: str
+) -> dict[str, object]:
+    """The base library, built with the MAX of the environment this script
+    runs in -- or, with `python`, in a throwaway venv holding this project's
+    max/mojo pins and a CPU torch. CI uses the venv: a full project sync
+    would pull the CUDA torch and its several GB of nvidia wheels, none of
+    which this build reads (torch is imported only for its version)."""
+    interpreter = sys.executable
+    if python is not None:
+        venv = work_dir / "venv-backend"
+        _run(["uv", "venv", "--python", python, str(venv)])
+        interpreter = str(venv / "bin" / "python")
+        _run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                interpreter,
+                # max and mojo live on PyPI, torch on the CPU index; the local
+                # version segment of `2.14.0+cpu` sorts above plain `2.14.0`,
+                # so the CPU wheel wins the best-match too.
+                "--index-url",
+                index_url,
+                "--extra-index-url",
+                _PYPI,
+                "--index-strategy",
+                "unsafe-best-match",
+                "torch",
+                *_pins(),
+            ]
+        )
     out = _run(
         [
-            sys.executable,
+            interpreter,
             str(Path(__file__).resolve()),
             "--emit-one",
             "backend",
@@ -357,6 +402,12 @@ def main() -> int:
         help="python version for the throwaway venvs",
     )
     parser.add_argument(
+        "--backend-python",
+        metavar="X.Y",
+        help="build the base library in a throwaway venv of this python "
+        "instead of in the interpreter running this script",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="fail instead of skipping a torch version with no wheel here",
@@ -404,7 +455,9 @@ def main() -> int:
                     raise
                 skipped.append(f"torch {version}: no CPU wheel here ({exc})")
         if args.backend:
-            entries.append(build_backend(args.out, work))
+            entries.append(
+                build_backend(args.out, work, args.backend_python, args.index_url)
+            )
         write_manifest(args.out, entries)
         _summarize(entries, skipped)
     return 0
