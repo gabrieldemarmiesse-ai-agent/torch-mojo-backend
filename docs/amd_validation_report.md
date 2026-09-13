@@ -92,6 +92,8 @@ compile; the pytest time is the suite's own.
 | `test_factories.py` | 97 passed, 2 skipped (CPU-device-only case; no native GPU reference on this accelerator) | 75 s | |
 | `test_foreach.py` | 30 passed, 3 xfailed, 4 xpassed (stale non-strict xfails about `linalg_vector_norm` not being registered yet) | 107 s | |
 | `test_nn.py` | 346 passed, 2 skipped (rank > 4 batch norm is accelerator-only, CPU-device case), 1 xfailed | 374 s | |
+| `test_composed.py` | 25 passed | 59 s | |
+| `test_matmul.py` | first attempt killed by my 90 min cap at 64 of 162 tests: serial first-call compiles of the GEMM specializations (15 built, 2 to 8 min each). Rerun after warming the specializations in parallel outside the lock: see below | | |
 
 ### Finding 2: cumsum bf16/f16 and outer-dim routes were declined on HIP
 
