@@ -19,6 +19,7 @@ from std.os import getenv, makedirs
 from std.os.path import exists, isdir
 from std.pathlib import Path
 from std.subprocess import run as run_command
+from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
 from op_utils import Argv
@@ -301,6 +302,10 @@ struct Loader(Movable):
             + self.kernels_dir
             + "'"
         )
+        comptime if CompilationTarget.is_macos():
+            # Op extensions call the shim and the base library, resolved at
+            # dlopen; ld64 wants to be told so.
+            cmd += " -Xlinker -undefined -Xlinker dynamic_lookup"
         for d in defines:
             cmd += " -D '" + d + "'"
         cmd += (

@@ -569,6 +569,10 @@ def _build_backend_locked(key: str, out: Path) -> Path:
         "-o",
         str(tmp),
     ]
+    if sys.platform == "darwin":
+        # The library calls the shim (tmb_*), resolved at dlopen; ld64 wants
+        # to be told so.
+        cmd += ["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"]
     proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
