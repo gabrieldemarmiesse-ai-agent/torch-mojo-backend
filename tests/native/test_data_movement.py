@@ -333,15 +333,24 @@ def test_select_scatter_negative_dim_and_index(mojo_device):
     torch.testing.assert_close(dev.cpu(), expected)
 
 
-def test_select_scatter_broadcasts_and_casts_src(mojo_gpu):
+def test_select_scatter_casts_src(mojo_gpu):
     # float16 (not float64): the fast CastSpec kernel's dtype set is what
     # select_scatter's src-cast uses, matching the old eager path's
     # `_cast_tensor` (pre-gated on the same set, never a host round trip).
     a = _fill((4, 5), torch.float32)
-    src = torch.tensor(9.0, dtype=torch.float16)  # 0-d, needs broadcast + cast
-    expected = a.select_scatter(src.to(torch.float32).expand(5), 0, 1)
+    src = torch.full((5,), 9.0, dtype=torch.float16)
+    expected = a.select_scatter(src, 0, 1)
     dev = a.to(mojo_gpu).select_scatter(src.to(mojo_gpu), 0, 1)
     torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_select_scatter_rejects_a_src_of_the_wrong_shape(mojo_gpu):
+    """`select_scatter_symint` checks `slice.sizes() == src.sizes()`: it does
+    not broadcast, and neither may this backend."""
+    a = _fill((4, 5), torch.float32).to(mojo_gpu)
+    src = torch.tensor(9.0, device=mojo_gpu)  # 0-d against a (5,) slice
+    with pytest.raises(RuntimeError, match="size equal to the slice"):
+        a.select_scatter(src, 0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +395,54 @@ def test_scatter_value_bool(mojo_gpu):
     expected = a.scatter(0, index, True)
     dev = a.to(mojo_gpu).scatter(0, index.to(mojo_gpu), True)
     assert dev.cpu().tolist() == expected.tolist()
+
+
+def test_scatter_rejects_an_out_of_range_index(mojo_gpu):
+    """The kernel skips the write rather than scribbling outside the tensor,
+    and raises the flag the host reads back after the launch."""
+    a = torch.zeros(4, 5, device=mojo_gpu)
+    src = torch.ones(2, 5, device=mojo_gpu)
+    for bad in (4, -1, 1 << 40):
+        index = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+        index[0, 0] = bad
+        with pytest.raises(RuntimeError, match="index out of range"):
+            a.scatter(0, index, src)
+    with pytest.raises(RuntimeError, match="index out of range"):
+        index = torch.full((2, 5), 9, dtype=torch.int64, device=mojo_gpu)
+        a.scatter(0, index, -3.5)
+    # A valid scatter still works after the flagged one (the flag is fresh
+    # per launch, not a sticky per-device bit).
+    ok = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+    torch.testing.assert_close(
+        a.scatter(0, ok, src).cpu(), torch.zeros(4, 5).scatter(0, ok.cpu(), src.cpu())
+    )
+
+
+def test_scatter_rejects_an_index_bigger_than_self(mojo_gpu):
+    """ATen's `scatter_shape_check`: index.size(d) <= self.size(d) off `dim`,
+    and index.size(d) <= src.size(d) everywhere."""
+    a = torch.zeros(4, 5, device=mojo_gpu)
+    index = torch.zeros(2, 9, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="smaller than self"):
+        a.scatter(0, index, 1.0)
+    index = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="smaller than src"):
+        a.scatter(0, index, torch.ones(1, 5, device=mojo_gpu))
+
+
+def test_index_tensor_out_of_range_index_stays_in_bounds(mojo_gpu):
+    """An out-of-range gather index is clamped in the kernel: the read stays
+    inside the table, so the process survives a bad index instead of reading
+    device memory it does not own."""
+    table = _fill((4, 3), torch.float32).to(mojo_gpu)
+    idx = torch.tensor([0, 99, -99], dtype=torch.int64, device=mojo_gpu)
+    out = table[idx]
+    assert tuple(out.shape) == (3, 3)
+    torch.testing.assert_close(out[0].cpu(), table[0].cpu())
+    # The clamped rows are unspecified in value but must be real table rows.
+    rows = table.cpu().tolist()
+    assert out[1].cpu().tolist() in rows
+    assert out[2].cpu().tolist() in rows
 
 
 def test_scatter_rejects_rank_beyond_4(mojo_gpu):
@@ -471,6 +528,34 @@ def test_nonzero_shapes(mojo_gpu, shape):
     torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
 
 
+@pytest.mark.parametrize("value", [0, 1])
+def test_nonzero_scalar_has_no_coordinate_column(mojo_gpu, value):
+    """A 0-d tensor has no coordinates: ATen reports (n, 0), not (n, 1)."""
+    want = torch.nonzero(torch.tensor(value))
+    got = torch.nonzero(torch.tensor(value, device=mojo_gpu))
+    assert tuple(got.shape) == tuple(want.shape)
+    assert got.cpu().tolist() == want.tolist()
+
+
+def test_cat_out_keeps_a_matching_out_where_it_is(mojo_gpu):
+    """`cat.out` must not resize an out that already has the right shape:
+    resizing resets sizes, strides AND offset, which would send the result to
+    the front of the base storage instead of into the caller's view."""
+    base = torch.zeros(16, device=mojo_gpu)
+    out = base[4:8]
+    parts = [torch.ones(2, device=mojo_gpu), torch.full((2,), 2.0, device=mojo_gpu)]
+    torch.cat(parts, 0, out=out)
+    assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0]
+    assert base.cpu().tolist() == [0.0] * 4 + [1.0, 1.0, 2.0, 2.0] + [0.0] * 8
+
+
+def test_cat_out_resizes_a_mismatching_out(mojo_gpu):
+    out = torch.empty(0, device=mojo_gpu)
+    parts = [torch.ones(2, device=mojo_gpu), torch.full((3,), 2.0, device=mojo_gpu)]
+    torch.cat(parts, 0, out=out)
+    assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0, 2.0]
+
+
 def test_nonzero_int_dtype(mojo_gpu):
     x = torch.tensor([1, 0, 3, 0, 5], dtype=torch.int64)
     torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
@@ -523,4 +608,160 @@ def test_empty_permuted_shape_dtype_device(mojo_device, call_checker):
     assert tuple(out.shape) == (2, 3, 4)
     assert out.dtype == torch.float16
     assert out.device.type == "mojo"
-    assert out.is_contiguous()
+    # physical_layout is the whole point of the op: dim 1 is outermost, then
+    # dim 0, then dim 2 -- the same strides CPU torch produces.
+    reference = torch.ops.aten.empty_permuted([2, 3, 4], [1, 0, 2])
+    assert out.stride() == reference.stride()
+    assert not out.is_contiguous()
+    assert out.permute(1, 0, 2).is_contiguous()
+
+
+@pytest.mark.parametrize(
+    "layout", [[0, 1, 2], [2, 1, 0], [1, 2, 0], [0, 2, 1], [2, 0, 1]]
+)
+def test_empty_permuted_every_layout_matches_cpu(mojo_gpu, layout):
+    out = torch.ops.aten.empty_permuted([2, 3, 4], layout, device=mojo_gpu)
+    reference = torch.ops.aten.empty_permuted([2, 3, 4], layout)
+    assert out.stride() == reference.stride()
+    assert out.is_contiguous() == reference.is_contiguous()
+
+
+def test_empty_permuted_rejects_a_bad_layout(mojo_gpu):
+    with pytest.raises(RuntimeError, match="Duplicate dim"):
+        torch.ops.aten.empty_permuted([2, 3], [0, 0], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="physical_layout"):
+        torch.ops.aten.empty_permuted([2, 3], [0], device=mojo_gpu)
+
+
+# ---------------------------------------------------------------------------
+# Cast exactness across every dtype pair, length and storage offset.
+#
+# `test_to_copy_dtype_cast` above is 11 fixed pairs at shape (3,5) from
+# offset 0. The values here are `arange % 5`, whose period is coprime with
+# every power-of-two vector width, so a rotated lane or an unwritten tail
+# cannot pass; every comparison is exact.
+# ---------------------------------------------------------------------------
+
+_CAST_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.uint8,
+    torch.bool,
+]
+
+
+@pytest.mark.parametrize("src_dtype", _CAST_DTYPES)
+def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
+    for dst_dtype in _CAST_DTYPES:
+        for numel in (1, 3, 17, 1027, 4099):
+            for offset in (0, 1, 2, 3):
+                base = torch.arange(numel + offset) % 5
+                src_cpu = (base != 0) if src_dtype == torch.bool else base.to(src_dtype)
+                view_cpu = src_cpu[offset : offset + numel]
+                view = src_cpu.to(mojo_gpu)[offset : offset + numel]
+                assert view.is_contiguous()
+                assert torch.equal(view.to(dst_dtype).cpu(), view_cpu.to(dst_dtype)), (
+                    src_dtype,
+                    dst_dtype,
+                    numel,
+                    offset,
+                )
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.bfloat16, torch.float16])
+def test_float_narrowing_rounds_like_cpu(mojo_gpu, dst_dtype):
+    """Rounding mode, not just range: 65_539 values at three base alignments,
+    down and back up, exactly equal to CPU."""
+    for numel in (1027, 65_539):
+        for offset in (0, 1, 3):
+            src_cpu = torch.randn(numel + offset, dtype=torch.float32) * 8.0
+            view_cpu = src_cpu[offset:]
+            view = src_cpu.to(mojo_gpu)[offset:]
+            narrowed = view.to(dst_dtype)
+            assert torch.equal(narrowed.cpu(), view_cpu.to(dst_dtype)), (numel, offset)
+            assert torch.equal(
+                narrowed.to(torch.float32).cpu(), view_cpu.to(dst_dtype).float()
+            )
+
+
+# ---------------------------------------------------------------------------
+# cat / repeat / stack batching edges
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize(
+    "shapes,dim",
+    [
+        ([(5000,)] * 64, 0),  # exactly the per-launch segment cap
+        ([(37,)] * 130, 0),  # two batches past it
+        ([(2, 3, 5, 64), (2, 3, 1, 64), (2, 3, 9, 64)], 2),  # 4-D middle dim
+        ([(3, 4), (100_000, 4), (1, 4)], 0),  # wildly unequal members
+    ],
+)
+def test_cat_batching_edges(mojo_gpu, shapes, dim, dtype):
+    parts = [_fill(shape, dtype) for shape in shapes]
+    expected = torch.cat(parts, dim=dim)
+    actual = torch.cat([p.to(mojo_gpu) for p in parts], dim=dim)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def test_cat_mixed_contiguity_in_one_list(mojo_gpu):
+    """One launch must not assume every member has the same layout."""
+    a = _fill((32, 64), torch.float32)
+    b = _fill((64, 32), torch.float32)
+    c = _fill((32, 64), torch.float32)
+    expected = torch.cat([a, b.t(), c], dim=0)
+    actual = torch.cat([a.to(mojo_gpu), b.to(mojo_gpu).t(), c.to(mojo_gpu)], dim=0)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "shape,reps",
+    [
+        ((100, 1), (3, 7)),  # a single input column
+        ((7, 128), (4, 1, 2)),  # more reps than input dims
+        ((2, 3), (1000, 1)),
+        ((1, 5000), (5000, 1)),
+        ((1, 64), (1, 300)),
+        ((64,), (5,)),  # rank-1 input
+        ((64,), (2, 5)),  # rank-1 input, left-padded
+        ((1, 8, 16), (2, 3, 4)),  # leading extent 1
+        ((4, 8, 16), (2, 3, 4)),  # genuine rank-3 tile
+        ((2, 3, 4, 5), (2, 2, 2, 2)),  # rank 4
+    ],
+)
+def test_repeat_geometries(mojo_gpu, shape, reps):
+    cpu = _fill(shape, torch.float32)
+    torch.testing.assert_close(
+        cpu.to(mojo_gpu).repeat(*reps).cpu(), cpu.repeat(*reps), rtol=0, atol=0
+    )
+
+
+def test_stack_opinfo_samples_do_not_corrupt_the_heap(mojo_gpu):
+    """Regression for a SIGSEGV (exit 139), not just a wrong value.
+
+    The destination-side narrow copy vectorized 4 elements wide on CPU and
+    could issue one width-4 store PAST the destination allocation; it only
+    corrupts when the heap is packed, so the faithful repro is the whole
+    OpInfo sample sequence plus a value check.
+    """
+    from torch.testing._internal.common_methods_invocations import (  # noqa: PLC0415 -- importing op_db at module scope would pull torch's OpInfo database into every collection of this file
+        op_db,
+    )
+
+    infos = [info for info in op_db if info.name == "stack"]
+    assert infos, "no `stack` OpInfo in this torch"
+    ran = 0
+    for sample in infos[0].sample_inputs(torch.device("cpu"), torch.int64):
+        parts = list(sample.input)
+        expected = torch.stack(parts, *sample.args, **sample.kwargs)
+        actual = torch.stack(
+            [p.to(mojo_gpu) for p in parts], *sample.args, **sample.kwargs
+        )
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        ran += 1
+    assert ran > 0

@@ -18,7 +18,6 @@ The `_b_`-prefixed helpers (scalar records, dtype promotion, dtype
 predicates, temporaries) are private to this file only to keep the port
 conflict-free; they are generic and belong in ops_common.mojo.
 """
-from std.ffi import external_call
 from std.utils import IndexList
 
 from abi import (
@@ -46,8 +45,7 @@ from abi import (
     TAG_TENSOR_REF,
     Value,
     Values,
-    check,
-    contiguous_strides,
+    default_dtype,
     dtype_code,
     f64_bits,
     new_like,
@@ -57,7 +55,6 @@ from abi import (
     release,
     ret_ref,
     ret_tensor,
-    set_sizes_strides,
     unsupported,
     v_f64,
     v_is_none,
@@ -67,7 +64,7 @@ from abi import (
 from device import copy_d2d, ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import cast_to, contiguous, copy_strided_into
+from ops_common import cast_to, contiguous, copy_strided_into, resize_out
 from registry import Site, impl, op_address_of
 
 # ---------------------------------------------------------------------------
@@ -427,8 +424,23 @@ def _b_fits(t: T, shape: IndexList[MAX_RANK]) -> Bool:
 # ---------------------------------------------------------------------------
 
 
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
     """logic_ops broadcast binary into a caller-allocated contiguous output."""
+    _one_device(a, dst)
+    _one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic_ops", String(op))
@@ -444,6 +456,7 @@ def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
 
 def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
     """elementwise_ops contiguous tensor-with-float-scalar."""
+    _one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise_ops", String(op))
@@ -458,6 +471,7 @@ def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
 
 def _b_int_scalar_spec(op: StaticString, a: T, value: Int, dst: T) raises:
     """elementwise_ops contiguous tensor-with-int-scalar."""
+    _one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise_ops", String(op))
@@ -487,6 +501,8 @@ def _b_raw_add(dst: T, a: T, b: T) raises:
     """elementwise_ops `Add`: contiguous, equal shapes, one dtype. `dst` may
     be `a` — that is the in-place route, and the kernel is a flat elementwise
     loop, so aliasing the destination with an operand is exact."""
+    _one_device(a, dst)
+    _one_device(b, dst)
     if a.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -726,6 +742,30 @@ def _b_try_apple_add(
     return Res(out.take(), True)
 
 
+def _b_is_reduced(st: Int32) -> Bool:
+    return st == ST_FLOAT16 or st == ST_BFLOAT16
+
+
+def _b_alpha_result(lhs: Side, rhs: Side) raises -> Int32:
+    """The result dtype of `a +/- alpha*b` when it is a REDUCED-precision one
+    (float16/bfloat16), else -1.
+
+    That is exactly the case ATen computes in a wider type: its add/sub
+    functor runs in `opmath_type<scalar_t>` -- float32 for both half types --
+    and rounds once, at the store. Scaling the operand in its own dtype first
+    rounds twice, and the second rounding is against a value `alpha` may have
+    shrunk by orders of magnitude.
+    """
+    if not rhs.is_t or not lhs.is_t:
+        return Int32(-1)
+    var result = _b_promote(lhs.t.value().stype, rhs.t.value().stype)
+    if result < 0:
+        return Int32(-1)
+    if _b_is_reduced(result):
+        return result
+    return Int32(-1)
+
+
 def _b_scale(t: T, alpha: Float64, alpha_is_int: Bool) raises -> Held:
     """`t * alpha` as an owned temporary: the tensor half of the old
     `_scaled_operand`."""
@@ -751,22 +791,6 @@ def _b_ret(rets: Values, var r: Res) raises:
     ret_tensor(rets, 0, r.t)
 
 
-def _b_resize_out(dest: T, shape: IndexList[MAX_RANK], rank: Int) raises -> T:
-    """torch's resize_output: grow `dest`'s storage and re-lay it out
-    contiguously when the result does not fit its current shape."""
-    var numel = 1
-    for i in range(MAX_RANK):
-        numel *= shape[i]
-    var nbytes = numel * dest.itemsize
-    if dest.storage_nbytes() < nbytes:
-        check(
-            external_call["tmb_storage_resize", Int32](dest.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
-    set_sizes_strides(dest, shape, contiguous_strides(shape, rank), rank, 0)
-    return T(dest.h)
-
-
 def _b_store_out(rets: Values, dest: T, var res: Res) raises:
     """Finish an `out=` variant: `res` is either `dest` itself (already
     written) or a fresh result to copy — and cast — into it."""
@@ -783,7 +807,10 @@ def _b_store_out(rets: Values, dest: T, var res: Res) raises:
         )
     var dst = dest.copy()
     if not dst.same_shape(held.t):
-        dst = _b_resize_out(dest, held.t.shape, held.t.rank)
+        # Only a MISMATCHING out= is resized: a resize re-lays the tensor out
+        # contiguously, so doing it unconditionally would throw away a
+        # correctly-shaped out's own strides and storage offset.
+        resize_out(dst, held.t.shape, held.t.rank)
     if dst.stype == held.t.stype:
         _b_copy_into(dst, held.t)
     else:
@@ -823,6 +850,60 @@ def _b_device_of(lhs: Side, rhs: Side) raises -> Int:
     return 0
 
 
+def _b_dense_enough(t: T) -> Bool:
+    """A weak stand-in for `TensorImpl::is_non_overlapping_and_dense`: false
+    for a view that repeats elements (a broadcast stride of 0 over a real
+    extent), which is the case ATen's own overlap check calls `TooHard` and
+    declines to judge."""
+    for i in range(t.rank):
+        if t.stride(i) <= 0 and t.dim(i) > 1:
+            return False
+    return True
+
+
+def _b_no_partial_overlap(written: T, other: T) raises:
+    """`at::assert_no_partial_overlap` (c10/core/MemOverlap.cpp).
+
+    An in-place or `out=` op whose input shares storage with the tensor being
+    written, WITHOUT being the same view of it, is a read/write race: the
+    kernel reads and writes the same bytes from different threads in an order
+    nothing fixes. `x[1:].add_(x[:-1])` is the canonical case. The same view
+    (identical span AND identical strides) is fine -- element i is written
+    from element i -- and that is how `x.add_(x)` works.
+    """
+    if written.h == other.h or written.numel == 0 or other.numel == 0:
+        return
+    var storage = written.storage_ptr()
+    if storage == 0 or storage != other.storage_ptr():
+        return
+    if not _b_dense_enough(written) or not _b_dense_enough(other):
+        return
+    var a_begin = written.ptr
+    var a_end = a_begin + written.numel * written.itemsize
+    var b_begin = other.ptr
+    var b_end = b_begin + other.numel * other.itemsize
+    if a_begin == b_begin and a_end == b_end:
+        if written.rank == other.rank:
+            var same = True
+            for i in range(written.rank):
+                if written.stride(i) != other.stride(i):
+                    same = False
+            if same:
+                return
+    elif not (a_begin < b_end and b_begin < a_end):
+        return
+    raise Error(
+        "unsupported operation: some elements of the input tensor and the"
+        " written-to tensor refer to a single memory location. Please clone()"
+        " the tensor before performing the operation."
+    )
+
+
+def _b_no_overlap_side(written: T, side: Side) raises:
+    if side.is_t:
+        _b_no_partial_overlap(written, side.t.value())
+
+
 def _b_self(v: Value, what: StaticString) raises -> T:
     var self = v_tensor(v)
     if not self.on_mojo():
@@ -848,6 +929,31 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
 
 
+def _b_alpha_opmath(
+    lhs: Side,
+    rhs: Side,
+    alpha: Float64,
+    alpha_int: Bool,
+    result_stype: Int32,
+    subtract: Bool,
+) raises -> Res:
+    """`a +/- alpha*b` for reduced-precision operands: every step in float32,
+    one rounding back to `result_stype` at the end (ATen's `opmath_type`
+    contract, see `_b_alpha_result`). Five launches instead of two, on a
+    route `alpha == 1` never reaches."""
+    var a32 = _b_cast(lhs.t.value(), ST_FLOAT32)
+    var b32 = _b_cast(rhs.t.value(), ST_FLOAT32)
+    var scaled = _b_scale(b32.t, -alpha if subtract else alpha, alpha_int)
+    var sum32 = _b_add_routes(_b_tside(a32.t), _b_tside(scaled.t), None)
+    _ = a32
+    _ = b32
+    _ = scaled
+    var held = own(sum32.t.copy())
+    var out = cast_to(held.t, result_stype)
+    _ = held  # the cast reads held.t's pointer inside a launch
+    return Res(out^, True)
+
+
 def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
@@ -868,6 +974,9 @@ def _b_add(
         return _b_add_routes(
             lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
         )
+    var reduced = _b_alpha_result(lhs, rhs)
+    if reduced >= 0:
+        return _b_alpha_opmath(lhs, rhs, alpha, alpha_int, reduced, False)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
@@ -901,6 +1010,9 @@ def _b_sub(
         return _b_sub_routes(
             lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
         )
+    var reduced = _b_alpha_result(lhs, rhs)
+    if reduced >= 0:
+        return _b_alpha_opmath(lhs, rhs, alpha, alpha_int, reduced, True)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
@@ -934,6 +1046,7 @@ def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "add_")
     var rhs = _b_side(args[unsafe_offset=1])
+    _b_no_overlap_side(self, rhs)
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         # Direct in-place kernel when every layout lines up.
@@ -967,6 +1080,8 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
     _b_store_out(
         rets,
         dest,
@@ -991,6 +1106,7 @@ def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "sub_")
     var rhs = _b_side(args[unsafe_offset=1])
+    _b_no_overlap_side(self, rhs)
     var alpha = v_f64(args[unsafe_offset=2])
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
@@ -1008,6 +1124,8 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
     _b_store_out(
         rets,
         dest,
@@ -1031,6 +1149,7 @@ def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "mul_")
     var rhs = _b_side(args[unsafe_offset=1])
+    _b_no_overlap_side(self, rhs)
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
@@ -1045,12 +1164,55 @@ def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
     _b_store_out(rets, dest, _b_mul(lhs, rhs, Optional[T](dest.copy())))
 
 
 # ---------------------------------------------------------------------------
 # div
 # ---------------------------------------------------------------------------
+
+
+def _b_is_floating(st: Int32) -> Bool:
+    return _b_float3(st) or st == ST_FLOAT64
+
+
+def _b_true_div_dtype(a_stype: Int32, rhs: Side) raises -> Int32:
+    """`torch.result_type` for TRUE division.
+
+    ATen builds the divide iterator with `promote_integer_inputs_to_float`,
+    so an otherwise-integral result becomes `torch.get_default_dtype()` --
+    not float32 unconditionally: `torch.set_default_dtype(torch.float64)`
+    moves it. A floating operand keeps its own dtype (int64 / float16 is
+    float16), and a float SCALAR against an integral tensor lands on the
+    default dtype too (`torch.result_type(int_tensor, 0.5)`).
+    """
+    var common = a_stype
+    if rhs.is_t:
+        var b_stype = rhs.t.value().stype
+        var a_float = _b_is_floating(a_stype)
+        var b_float = _b_is_floating(b_stype)
+        if a_float and not b_float:
+            common = a_stype
+        elif b_float and not a_float:
+            common = b_stype
+        elif a_float and b_float:
+            common = _b_promote(a_stype, b_stype)
+            if common < 0:
+                unsupported(
+                    "no dtype promotion for "
+                    + String(a_stype)
+                    + " and "
+                    + String(b_stype)
+                )
+        else:
+            return default_dtype()
+    elif not rhs.s.value().is_int and not _b_is_floating(a_stype):
+        return default_dtype()
+    if not _b_is_floating(common):
+        return default_dtype()
+    return common
 
 
 def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
@@ -1070,20 +1232,22 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     if not lhs.is_t:
         unsupported("div with a scalar numerator")
     var a = lhs.t.value().copy()
-    if _b_float3(a.stype):
-        return _b_binary("DivSpec", lhs, rhs, Int32(-1), dst)
-    if not _b_int_dtype(a.stype):
-        unsupported("div of a tensor of dtype " + String(a.stype))
-    # Integer (and int-scalar) division promotes to float32 in torch.
-    var num = _b_cast(a, ST_FLOAT32)
+    var common = _b_true_div_dtype(a.stype, rhs)
+    if not _b_float3(common):
+        unsupported(
+            "true division producing dtype "
+            + String(common)
+            + " (the divide kernel covers float32/float16/bfloat16)"
+        )
+    var num = _b_cast(a, common)
     if not rhs.is_t:
         var r1 = _b_binary("DivSpec", _b_tside(num.t), rhs, Int32(-1), dst)
         _ = num
         return r1^
     var b = rhs.t.value().copy()
-    if b.device != a.device:
+    if not a.on_mojo() or not b.on_mojo() or b.device != a.device:
         raise Error("expected both operands on the same mojo device")
-    var den = _b_cast(b, ST_FLOAT32)
+    var den = _b_cast(b, common)
     var r2 = _b_binary(
         "DivSpec", _b_tside(num.t), _b_tside(den.t), Int32(-1), dst
     )
@@ -1127,6 +1291,8 @@ def op_div_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
     _b_store_out(
         rets, dest, _b_div(lhs, rhs, _b_no_mode(), Optional[T](dest.copy()))
     )
@@ -1139,6 +1305,8 @@ def op_div_out_mode(
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
+    _b_no_overlap_side(dest, lhs)
+    _b_no_overlap_side(dest, rhs)
     _b_store_out(
         rets,
         dest,
@@ -1277,16 +1445,31 @@ def op_logical_xor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
+def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
+    """`torch.result_type(self, min, max)`: ATen's clamp iterator promotes
+    its inputs to a common dtype, so a FLOAT bound against an integral (or
+    bool) tensor lands on the default floating dtype --
+    `torch.clamp(int_tensor, min=0.5)` is a float tensor. An integral bound
+    keeps the tensor's own dtype (and wraps into it, as ATen does)."""
+    var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
+        not v_is_none(hi) and not _b_scalar_is_int(hi)
+    )
+    if not float_bound or _b_is_floating(self_stype):
+        return self_stype
+    return default_dtype()
+
+
 def _b_clamp(self: T, lo: Value, hi: Value) raises -> Res:
-    if not _b_bcast_dtype(self.stype) or self.stype == ST_FLOAT64:
-        unsupported("clamp of dtype " + String(self.stype))
     var has_min = not v_is_none(lo)
     var has_max = not v_is_none(hi)
     if not has_min and not has_max:
         unsupported("clamp with neither min nor max")
+    var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    if not _b_bcast_dtype(result_stype) or result_stype == ST_FLOAT64:
+        unsupported("clamp producing dtype " + String(result_stype))
     var lo_v = v_f64(lo) if has_min else 0.0
     var hi_v = v_f64(hi) if has_max else 0.0
-    var src = _b_ready(self, self.stype, True)
+    var src = _b_ready(self, result_stype, True)
     var out = own(new_like(src.t))
     if out.t.numel > 0:
         var ctx = ctx_for(self.device)

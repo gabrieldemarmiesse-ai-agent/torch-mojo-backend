@@ -23,6 +23,7 @@ from abi import (
     DEVICE_TYPE_PRIVATEUSE1,
     MEMORY_FORMAT_CHANNELS_LAST,
     MEMORY_FORMAT_PRESERVE,
+    ST_INT32,
     ST_INT64,
     IntList,
     Owned,
@@ -68,10 +69,12 @@ from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import (
     cast_into,
+    fill_value,
     cast_to,
     contiguous,
     copy_strided_into,
     release_if_new,
+    resize_out,
 )
 from registry import Site, impl, op_address_of
 
@@ -741,6 +744,34 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+# aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
+def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """DDP's reducer flattens its buckets with this overload."""
+    var all_tensors = v_tensor_list(args[unsafe_offset=0])
+    var dim_in = v_int_or(args[unsafe_offset=1], 0)
+    var out = v_tensor(args[unsafe_offset=2])
+    var real = List[T]()
+    for x in all_tensors:
+        if not _is_legacy_empty(x):
+            real.append(x.copy())
+    if len(real) == 0:
+        unsupported("aten::cat.out of only legacy-empty tensors")
+    var rank = real[0].rank
+    var dim = dim_in + rank if dim_in < 0 else dim_in
+    var result = _cat_impl(real, dim)
+    if result.t.dtype != out.dtype:
+        raise Error("cat.out: out dtype must match the inputs")
+    if not out.on_mojo() or out.device != result.t.device:
+        raise Error("cat.out: out must be on the inputs' mojo device")
+    # Only a mismatching `out` is resized. Resizing resets sizes, strides and
+    # offset, so doing it unconditionally would send `cat(..., out=base[4:8])`
+    # to the front of `base`.
+    if not out.same_shape(result.t):
+        resize_out(out, result.t.shape, result.t.rank)
+    copy_strided_into(out, result.t)
+    ret_ref(rets, 0, out)
+
+
 def _unsqueeze_view(t: T, dim: Int) raises -> T:
     var new_rank = t.rank + 1
     if new_rank > MAX_RANK:
@@ -964,36 +995,6 @@ def _select_view(t: T, dim: Int, index: Int) raises -> T:
     return view_strided(t, new_shape, new_strides, new_rank, offset)
 
 
-def _expand_to(
-    src: T, target_shape: IndexList[MAX_RANK], target_rank: Int
-) raises -> T:
-    if src.rank > target_rank:
-        raise Error("src has more dims than the destination slice")
-    var new_shape = IndexList[MAX_RANK](1)
-    var new_strides = IndexList[MAX_RANK](0)
-    var pad_t = MAX_RANK - target_rank
-    var pad_s = MAX_RANK - src.rank
-    var lead = target_rank - src.rank
-    for i in range(target_rank):
-        var tgt_size = target_shape[pad_t + i]
-        if i < lead:
-            new_shape[pad_t + i] = tgt_size
-            new_strides[pad_t + i] = 0
-        else:
-            var s_size = src.shape[pad_s + (i - lead)]
-            if s_size == tgt_size:
-                new_shape[pad_t + i] = tgt_size
-                new_strides[pad_t + i] = src.strides[pad_s + (i - lead)]
-            elif s_size == 1:
-                new_shape[pad_t + i] = tgt_size
-                new_strides[pad_t + i] = 0
-            else:
-                raise Error(
-                    "src shape is not broadcastable to the destination slice"
-                )
-    return view_strided(src, new_shape, new_strides, target_rank, src.offset)
-
-
 # aten::select_scatter(Tensor self, Tensor src, int dim, SymInt index) -> Tensor
 def op_select_scatter(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1012,17 +1013,29 @@ def op_select_scatter(
         unsupported("aten::select_scatter with tensors on different devices")
     var out = own(_materialize_contiguous(a))
     var view = own(_select_view(out.t, dim, index_in))
+    # `select_scatter_symint` checks `slice.sizes() == src.sizes()` and does
+    # not broadcast: a mismatch is an error, never an expand.
+    if not src.same_shape(view.t):
+        raise Error(
+            (
+                "select_scatter: expected src to have a size equal to the"
+                " slice of self. src rank/size = "
+            ),
+            src.rank,
+            "/",
+            src.numel,
+            ", slice rank/size = ",
+            view.t.rank,
+            "/",
+            view.t.numel,
+        )
     var feed = src.copy()
     var casted: Optional[T] = None
     if src.stype != out.t.stype:
         var c = cast_to(src, out.t.stype)
         casted = c.copy()
         feed = c^
-    if feed.same_shape(view.t):
-        copy_strided_into(view.t, feed)
-    else:
-        var expanded = own(_expand_to(feed, view.t.shape, view.t.rank))
-        copy_strided_into(view.t, expanded.t)
+    copy_strided_into(view.t, feed)
     if casted:
         release(casted.value().h)
     ret_owned(rets, 0, out)
@@ -1061,6 +1074,23 @@ def _scatter_common(
         or src.value().rank != rank
     ):
         unsupported("aten::scatter with an unsupported src tensor")
+    # ATen's `scatter_shape_check`, restated before any pointer is read: the
+    # index space must fit inside self on every non-scattered axis, and
+    # inside src on every axis.
+    if index.numel > 0:
+        for d in range(rank):
+            if d != dim and index.dim(d) > a.dim(d):
+                raise Error(
+                    (
+                        "Expected index to be smaller than self apart from"
+                        " dimension "
+                    ),
+                    dim,
+                )
+            if src and index.dim(d) > src.value().dim(d):
+                raise Error(
+                    "Expected index to be smaller than src on dimension ", d
+                )
 
     var ctx = ctx_for(a.device)
     if a.dtype == DType.float64 and ctx.api() == "metal":
@@ -1094,8 +1124,17 @@ def _scatter_common(
     for i in range(4):  # idx_strides4
         params.append(0 if i < pad4 else idx_c.stride(i - pad4))
     params.append(dim + pad4)
+    params.append(a.dim(dim))
 
+    var bad_index = False
     if idx_c.numel > 0:
+        # The kernel skips a write whose index falls outside [0, self.size(dim))
+        # and raises this flag; the read back below is one 4-byte D2H, and
+        # scatter has already cloned the whole of `self` above.
+        var flag = own(
+            new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, a.device)
+        )
+        fill_value(flag.t, 0.0)
         var cp = ctx_ptr(ctx)
         var call = KernelCall("data_movement_ops", "ScatterDim")
         call.arg_dtype(0, a.dtype)
@@ -1106,15 +1145,34 @@ def _scatter_common(
         call.int(idx_c.ptr)
         call.int(src_ptr)
         call.tuple(params)
+        call.int(flag.t.ptr)
         call.int(1 if is_value else 0)
         call.f64(value)
         call.int(dtype_code(a.dtype))
         call.int(cp)
         call.run()
+        var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+        copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
+        bad_index = (
+            Pointer[Int32, MutUntrackedOrigin](
+                unsafe_from_address=host_flag.t.ptr
+            )[]
+            != 0
+        )
+        _ = host_flag
+        _ = flag
     _ = ctx
     if src_c:
         release_if_new(src_c.value(), src.value())
     release_if_new(idx_c, index)
+    if bad_index:
+        raise Error(
+            (
+                "index out of range in aten::scatter: every index must be in"
+                " [0, self.size(dim)) with self.size(dim) = "
+            ),
+            a.dim(dim),
+        )
     return out^
 
 
@@ -1303,8 +1361,11 @@ def op_index_tensor(
 # aten::nonzero(Tensor self) -> Tensor
 def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    # torch.nonzero on a 0-d tensor treats it as a one-element 1-d tensor.
+    # A 0-d tensor has one element and no coordinates: ATen scans it like a
+    # one-element tensor but reports the result as (n, 0), one empty
+    # coordinate row per non-zero element.
     var eff_rank = t.rank if t.rank > 0 else 1
+    var out_cols = t.rank
     var eff_shape = List[Int](capacity=eff_rank)
     if t.rank > 0:
         for i in range(t.rank):
@@ -1333,9 +1394,9 @@ def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out_shape = IndexList[MAX_RANK](1)
     var pad = MAX_RANK - 2
     out_shape[pad] = count
-    out_shape[pad + 1] = eff_rank
+    out_shape[pad + 1] = out_cols
     var out = own(new_tensor(out_shape, 2, ST_INT64, t.device))
-    if count > 0:
+    if count > 0 and out_cols > 0:
         var host_out = own(cpu_empty(out.t.shape, 2, ST_INT64))
         var out_ptr = Pointer[Int64, MutUntrackedOrigin](
             unsafe_from_address=host_out.t.ptr
@@ -1395,18 +1456,51 @@ def op_empty_permuted(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var sizes = IntList(args[unsafe_offset=0])
-    # `physical_layout` (args[1]) is intentionally ignored: uninitialized
-    # memory from a plain contiguous alloc of `size` is valid regardless of
-    # the requested physical layout. Mirrors the existing compile backend
-    # (aten_functions.aten_empty_permuted) and the old eager path
-    # (mojo_device_empty_permuted), which make the same simplification.
+    var layout = IntList(args[unsafe_offset=1])
     var stype = v_dtype_or(args[unsafe_offset=2], default_dtype())
     var device = _resolve_device(args[unsafe_offset=4])
-    var out = own(
-        new_tensor(
-            _shape_from_values(sizes.to_list()), len(sizes), stype, device
+    var rank = len(sizes)
+    if len(layout) != rank:
+        raise Error(
+            (
+                "Number of dimensions in size does not match the length of the"
+                " physical_layout; i.e. len(size) = "
+            ),
+            rank,
+            " is not equal to len(physical_layout) = ",
+            len(layout),
         )
+    # `empty_permuted_symint`: allocate contiguously in the PHYSICAL order the
+    # caller asked for, then hand back a logical view of `size` whose strides
+    # put dim `physical_layout[i]` at physical position `i`. The result is
+    # dense but not contiguous -- the whole point of the op, and the reason
+    # a plain contiguous allocation is not a valid answer (`x.stride()` and
+    # anything keyed off `is_contiguous` observe the difference).
+    var seen = List[Bool](capacity=rank)
+    for _ in range(rank):
+        seen.append(False)
+    var phys_sizes = List[Int](capacity=rank)
+    for i in range(rank):
+        var d = layout[i]
+        if d < 0 or d >= rank:
+            raise Error("Dimension out of range in physical_layout: ", d)
+        if seen[d]:
+            raise Error("Duplicate dim not allowed in physical_layout: ", d)
+        seen[d] = True
+        phys_sizes.append(sizes[d])
+    var phys = own(
+        new_tensor(_shape_from_values(phys_sizes), rank, stype, device)
     )
+    var shape = _shape_from_values(sizes.to_list())
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - rank
+    var run = 1
+    for i in range(rank - 1, -1, -1):
+        strides[pad + layout[i]] = run
+        # `TensorImpl::empty_tensor_restride` steps by max(size, 1), so a
+        # zero-extent dim leaves the outer strides meaningful.
+        run *= max(phys_sizes[i], 1)
+    var out = own(view_strided(phys.t, shape, strides, rank, 0))
     ret_owned(rets, 0, out)
 
 
@@ -1414,6 +1508,7 @@ def register_data_movement(site: Site) raises:
     impl[op_clone, "clone"](site)
     impl[op_to_copy, "_to_copy"](site)
     impl[op_cat, "cat"](site)
+    impl[op_cat_out, "cat.out"](site)
     impl[op_stack, "stack"](site)
     impl[op_repeat, "repeat"](site)
     impl[op_tril, "tril"](site)

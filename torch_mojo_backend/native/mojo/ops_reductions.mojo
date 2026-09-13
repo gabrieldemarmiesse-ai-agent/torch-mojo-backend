@@ -54,7 +54,7 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import cast_into, cast_to, copy_strided_into
+from ops_common import cast_into, cast_to, copy_strided_into, resize_out
 from registry import Site, impl, op_address_of
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
@@ -375,6 +375,19 @@ def _ready_operand(
 # ---------------------------------------------------------------------------
 
 
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _reduce_into(
     family: StaticString,
     op: StaticString,
@@ -391,6 +404,7 @@ def _reduce_into(
     reduce-dim tuple, keepdim, the accumulator's extra payload (var's
     correction), output spec.
     """
+    _one_device(a, dst)
     var src = _ready_operand(a, dims, False)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -418,6 +432,7 @@ def _arg_reduce_into(
 ) raises:
     """argmax / argmin: same slots as a scalar reduction, but the in-place
     route has the extra coalescing floor."""
+    _one_device(a, dst)
     var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -439,6 +454,8 @@ def _min_dim_into(
     """min.dim in one call: `_min_dim_spec_into_go` fills both preallocated
     outputs, so values and indices come out of a single pass with torch's
     first-min-wins tie rule and its NaN propagation."""
+    _one_device(a, dst_v)
+    _one_device(a, dst_i)
     var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst_v.device)
     var cp = ctx_ptr(ctx)
@@ -520,13 +537,18 @@ def _copy_result_into(dst: T, src: T) raises:
     """`out[...] = src` with a dtype cast, for any `out` layout. `src` is a
     freshly allocated contiguous result, so the cast kernel's contiguity
     requirement is already met."""
-    if dst.numel != src.numel:
+    _one_device(src, dst)
+    if not dst.same_shape(src):
         raise Error(
-            "out= tensor of ",
+            "out= tensor of rank ",
+            dst.rank,
+            " and ",
             dst.numel,
-            " elements cannot hold a result of ",
+            " elements does not match the result's rank ",
+            src.rank,
+            " / ",
             src.numel,
-            " (the mojo device does not resize out= tensors)",
+            " elements",
         )
     if dst.stype == src.stype:
         copy_strided_into(dst, src)
@@ -557,6 +579,15 @@ def _shape_numel(shape: IndexList[MAX_RANK], rank: Int) -> Int:
     return n
 
 
+def _shape_matches(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
+    if t.rank != rank:
+        return False
+    for i in range(rank):
+        if t.dim(i) != shape[MAX_RANK - rank + i]:
+            return False
+    return True
+
+
 def _scalar_reduction_out(
     family: StaticString,
     op: StaticString,
@@ -566,15 +597,25 @@ def _scalar_reduction_out(
     dims: List[Int],
     keepdim: Bool,
     out_stype: Int32,
-    dst: T,
+    mut dst: T,
 ) raises:
     """Compute into `out` when its shape, dtype, layout and device already
-    match; otherwise compute into a fresh tensor and copy across."""
+    match; otherwise compute into a fresh tensor and copy across.
+
+    An `out=` whose SHAPE differs from the reduced shape is resized first
+    (`resize_output`, the same rule every ATen out= op follows). Matching the
+    element count alone is not enough: the copy below reads the source
+    through the destination's extents, so a (2,3) result poured into a (3,2)
+    out would walk off the end of the source.
+    """
+    _one_device(a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
     var numel = _shape_numel(shape, rank)
+    if not _shape_matches(dst, shape, rank):
+        resize_out(dst, shape, rank)
     if _out_ready(dst, a, out_stype, numel):
         _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
         return
@@ -847,6 +888,12 @@ def op_min_dim_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
     var numel = _shape_numel(shape, rank)
+    _one_device(a, out_v)
+    _one_device(a, out_i)
+    if not _shape_matches(out_v, shape, rank):
+        resize_out(out_v, shape, rank)
+    if not _shape_matches(out_i, shape, rank):
+        resize_out(out_i, shape, rank)
     if _out_ready(out_v, a, a.stype, numel) and _out_ready(
         out_i, a, ST_INT64, numel
     ):

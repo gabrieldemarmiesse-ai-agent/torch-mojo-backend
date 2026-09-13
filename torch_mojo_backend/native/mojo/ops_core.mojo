@@ -1,12 +1,12 @@
-"""Core aten ops: factories, transfers, views, scalar readback, fills.
+"""Core aten ops: empty/empty_strided, transfers, views, scalar readback,
+fills, record_stream.
 
 Each op takes the record stack of its schema (abi.mojo) and writes its
-result records. Views and factories never launch a kernel; transfers are
-MAX copies; fills are memsets on contiguous memory.
+result records. Views and the two empty factories never launch a kernel;
+transfers are MAX copies; fills are memsets on contiguous memory. The
+value-producing factories (arange, normal_, rand...) are ops_factories.mojo.
 """
 from std.utils import IndexList
-
-from registry import Site, impl, op_address_of
 
 from abi import (
     Values,
@@ -46,7 +46,7 @@ from abi import (
     new_tensor,
     new_like,
     own,
-    release_results,
+    own_if_new,
     call_op,
     tensor_arg,
     bool_arg,
@@ -81,6 +81,7 @@ from device import (
 )
 from op_utils import MAX_RANK
 from ops_common import cast_to, contiguous, copy_strided_into, fill_value
+from registry import Site, impl, op_address_of
 
 
 def _target_device(v: Value) -> Int:
@@ -149,18 +150,27 @@ def _strides_of(strides: IntList, rank: Int) raises -> IndexList[MAX_RANK]:
     return strd
 
 
-def _is_dense_same_layout(a: T, b: T) -> Bool:
-    """Both contiguous with identical logical shapes: a flat byte copy is exact.
-    """
-    return a.contig and b.contig and a.same_shape(b)
+def _viewed_as(t: T, like: T) raises -> T:
+    """A view of the contiguous buffer `t` carrying `like`'s logical shape
+    (same dtype, same element count). `copy_strided_into` walks one shape
+    with both operands' strides and so needs them equal, while `copy_` is
+    allowed to feed it a source of another shape: `dst(2,3).copy_(src(1,2,3))`
+    broadcasts to the same elements in the same order."""
+    return view_strided(
+        t,
+        like.shape,
+        contiguous_strides(like.shape, like.rank),
+        like.rank,
+        t.offset,
+    )
 
 
 def _device_copy(dst: T, src: T) raises:
-    """mojo -> mojo, same device: any layouts, any dtype pair."""
+    """mojo -> mojo, same device: any layouts, any dtype pair, and any two
+    logical shapes of the same element count (op_copy_from checked that)."""
     if src.stype != dst.stype:
-        var tmp = own(
-            cast_to(contiguous(src), dst.stype)
-        )  # contiguous, dst dtype
+        var dense = own_if_new(contiguous(src), src)
+        var tmp = own_if_new(cast_to(dense.t, dst.stype), dense.t)
         if dst.contig:
             copy_d2d(
                 ctx_for(dst.device),
@@ -169,14 +179,21 @@ def _device_copy(dst: T, src: T) raises:
                 dst.numel * dst.itemsize,
             )
         else:
-            copy_strided_into(dst, tmp.t)
+            var shaped = own(_viewed_as(tmp.t, dst))
+            copy_strided_into(dst, shaped.t)
         return
-    if _is_dense_same_layout(src, dst):
+    # Two contiguous buffers of equal numel and dtype hold their elements in
+    # the same order whatever their shapes: a flat byte copy is exact.
+    if src.contig and dst.contig:
         copy_d2d(
             ctx_for(dst.device), dst.ptr, src.ptr, dst.numel * dst.itemsize
         )
-    else:
+    elif dst.same_shape(src):
         copy_strided_into(dst, src)
+    else:
+        var dense = own_if_new(contiguous(src), src)
+        var shaped = own(_viewed_as(dense.t, dst))
+        copy_strided_into(dst, shaped.t)
 
 
 def _host_copy(dst: T, src: T) raises:
@@ -186,7 +203,7 @@ def _host_copy(dst: T, src: T) raises:
     args.append(tensor_arg(dst))
     args.append(tensor_arg(src))
     args.append(bool_arg(False))
-    release_results(call_op("aten::copy_", "", args, 1))
+    _ = call_op("aten::copy_", "", args^, 1)  # Results releases copy_'s handle
 
 
 # aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
@@ -217,15 +234,18 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             )
         # host -> device: a dense host copy in dst's dtype (torch's CPU copy_
         # does the layout / dtype work), one H2D, then a device relayout if needed
-        var host = own(
-            src.copy()
-        ) if src.contig and src.stype == dst.stype else own(
-            cpu_empty(dst.shape, dst.rank, dst.stype)
+        var host = own_if_new(
+            src.copy() if src.contig
+            and src.stype
+            == dst.stype else cpu_empty(dst.shape, dst.rank, dst.stype),
+            src,
         )
         if host.t.h != src.h:
             _host_copy(host.t, src)
         var nbytes = dst.numel * dst.itemsize
-        if dst.contig and dst.same_shape(host.t):
+        # `host` is dense in dst's dtype, so a contiguous dst takes the bytes
+        # whatever the two logical shapes are.
+        if dst.contig:
             copy_from_host(
                 dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes
             )
@@ -235,8 +255,6 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 dst.device, ctx_for(dst.device), tmp.t.ptr, host.t.ptr, nbytes
             )
             copy_strided_into(dst, tmp.t)
-        if host.t.h == src.h:
-            _ = host.take()  # borrowed input, not ours to release
     elif src.on_mojo():
         if not dst.on_cpu():
             unsupported(
@@ -246,19 +264,16 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             )
         # device -> host: one D2H of a dense copy in src's dtype, then torch's
         # CPU copy_ for the host layout / dtype when dst is not that already
-        var dense = own(contiguous(src))
-        var direct = (
-            dst.contig and dst.stype == src.stype and dst.same_shape(src)
-        )
+        var dense = own_if_new(contiguous(src), src)
         var nbytes = src.numel * src.itemsize
-        if direct:
+        # Both dense in the same dtype: the bytes land in the right order
+        # whatever the two logical shapes are.
+        if dst.contig and dst.stype == src.stype:
             copy_to_host(ctx_for(src.device), dense.t.ptr, dst.ptr, nbytes)
         else:
             var host = own(cpu_empty(src.shape, src.rank, src.stype))
             copy_to_host(ctx_for(src.device), dense.t.ptr, host.t.ptr, nbytes)
             _host_copy(dst, host.t)
-        if dense.t.h == src.h:
-            _ = dense.take()
     else:
         raise Error("_copy_from: neither tensor is on the mojo device")
     ret_ref(rets, 0, dst)
@@ -431,8 +446,9 @@ def op_fill_scalar_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var value = v_f64(args[unsafe_offset=1])
-    fill_value(t, value)
+    # The Scalar record, not a Float64: a bool tensor fills on nonzero truth
+    # and an int64 one keeps every bit (ops_common.FillScalar).
+    fill_value(t, args[unsafe_offset=1].copy())
     ret_ref(rets, 0, t)
 
 

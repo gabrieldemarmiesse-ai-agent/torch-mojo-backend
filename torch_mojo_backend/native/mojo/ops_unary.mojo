@@ -36,7 +36,12 @@ from abi import (
 )
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
-from ops_common import contiguous, copy_strided_into, fill_value
+from ops_common import (
+    contiguous,
+    copy_strided_into,
+    fill_value,
+    resize_out,
+)
 from registry import Site, impl, op_address_of
 
 
@@ -104,11 +109,71 @@ def _require_bool_spec(op: String, dt: DType) raises:
 # ---------------------------------------------------------------------------
 
 
+def _dense_enough(t: T) -> Bool:
+    """A weak stand-in for `TensorImpl::is_non_overlapping_and_dense`: false
+    for a view that repeats elements, which is the case ATen's own overlap
+    check calls `TooHard` and declines to judge."""
+    for i in range(t.rank):
+        if t.stride(i) <= 0 and t.dim(i) > 1:
+            return False
+    return True
+
+
+def _no_partial_overlap(written: T, other: T) raises:
+    """`at::assert_no_partial_overlap`: an `out=` that shares storage with
+    the input without being the same view of it is a read/write race
+    (`torch.neg(x[:-1], out=x[1:])`). The identical view is fine -- that is
+    how the in-place variants reuse this path. Private to this file until the
+    port is merged; ops_binary.mojo has the same helper and both belong in
+    ops_common.mojo.
+    """
+    if written.h == other.h or written.numel == 0 or other.numel == 0:
+        return
+    var storage = written.storage_ptr()
+    if storage == 0 or storage != other.storage_ptr():
+        return
+    if not _dense_enough(written) or not _dense_enough(other):
+        return
+    var a_begin = written.ptr
+    var a_end = a_begin + written.numel * written.itemsize
+    var b_begin = other.ptr
+    var b_end = b_begin + other.numel * other.itemsize
+    if a_begin == b_begin and a_end == b_end:
+        if written.rank == other.rank:
+            var same = True
+            for i in range(written.rank):
+                if written.stride(i) != other.stride(i):
+                    same = False
+            if same:
+                return
+    elif not (a_begin < b_end and b_begin < a_end):
+        return
+    raise Error(
+        "unsupported operation: some elements of the input tensor and the"
+        " written-to tensor refer to a single memory location. Please clone()"
+        " the tensor before performing the operation."
+    )
+
+
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _unary_direct(
     family: String, op: String, src_c: T, dst: T, out_dtype: DType
 ) raises:
     """dst[...] = f(src_c[...]); src_c must already be contiguous, dst must
     already be the right shape/dtype/contiguity."""
+    _one_device(src_c, dst)
     if src_c.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -135,17 +200,30 @@ def _unary(family: String, op: String, t_in: T, out_dtype: DType) raises -> T:
 
 
 def _unary_out(
-    family: String, op: String, t_in: T, dst: T, out_dtype: DType
+    family: String, op: String, t_in: T, mut dst: T, out_dtype: DType
 ) raises:
     """The `.out` / in-place route: compute straight into dst when it is
     ready, else compute into a temporary and copy (also correct when dst
-    aliases t_in, which is how the in-place ops reuse this)."""
+    aliases t_in, which is how the in-place ops reuse this).
+
+    An `out=` of the wrong shape is resized first, the way every other `out=`
+    op in ATen does (`resize_output`); without that the copy below would face
+    a shape it cannot satisfy. A correctly shaped one keeps its own strides
+    and storage offset, so `out=base[4:8]` writes where the caller asked.
+    """
+    _one_device(t_in, dst)
+    _no_partial_overlap(dst, t_in)
+    if dst.stype != torch_dtype(out_dtype):
+        raise Error(
+            "expected an out= tensor of dtype ",
+            torch_dtype(out_dtype),
+            ", got ",
+            dst.stype,
+        )
+    if not dst.same_shape(t_in):
+        resize_out(dst, t_in.shape, t_in.rank)
     var src = contiguous(t_in)
-    if (
-        dst.contig
-        and dst.stype == torch_dtype(out_dtype)
-        and dst.same_shape(src)
-    ):
+    if dst.contig:
         _unary_direct(family, op, src, dst, out_dtype)
     else:
         var out = own(
@@ -162,7 +240,7 @@ def _float_unary(op: String, t: T) raises -> T:
     return _unary("elementwise_ops", op, t, t.dtype)
 
 
-def _float_unary_out(op: String, t: T, dst: T) raises:
+def _float_unary_out(op: String, t: T, mut dst: T) raises:
     _require_float(op, t.dtype)
     _unary_out("elementwise_ops", op, t, dst, t.dtype)
 
@@ -172,7 +250,7 @@ def _direct_unary(op: String, t: T) raises -> T:
     return _unary("elementwise_ops", op, t, t.dtype)
 
 
-def _direct_unary_out(op: String, t: T, dst: T) raises:
+def _direct_unary_out(op: String, t: T, mut dst: T) raises:
     _require_direct(op, t.dtype)
     _unary_out("elementwise_ops", op, t, dst, t.dtype)
 
@@ -182,7 +260,7 @@ def _bool_unary(op: String, t: T) raises -> T:
     return _unary("elementwise_ops", op, t, DType.bool)
 
 
-def _bool_unary_out(op: String, t: T, dst: T) raises:
+def _bool_unary_out(op: String, t: T, mut dst: T) raises:
     _require_bool_spec(op, t.dtype)
     _unary_out("elementwise_ops", op, t, dst, DType.bool)
 
@@ -264,8 +342,12 @@ def op_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # `_unary_out` with dst == t_in: computes straight into self when self is
     # already contiguous, else materializes and copies back into self's
     # (possibly strided) storage — same as the old `fast_aten_relu` +
-    # `_copy_into_tensor(self, result)` two-step.
-    _direct_unary_out("ReluSpec", t, t)
+    # `_copy_into_tensor(self, result)` two-step. The second handle is a
+    # separate `T` because `_unary_out` takes its destination `mut` (it may
+    # resize an out= of the wrong shape); self is never that case, so no
+    # resize happens here and the two views stay in step.
+    var dst = t.copy()
+    _direct_unary_out("ReluSpec", t, dst)
     ret_ref(rets, 0, t)
 
 
@@ -569,8 +651,19 @@ def _ceil_or_floor(op: String, t: T) raises -> T:
     return _float_unary(op, t)
 
 
-def _ceil_or_floor_into(op: String, t: T, dst: T) raises:
+def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
     if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+        _one_device(t, dst)
+        _no_partial_overlap(dst, t)
+        if dst.stype != t.stype:
+            raise Error(
+                "expected an out= tensor of dtype ",
+                t.stype,
+                ", got ",
+                dst.stype,
+            )
+        if not dst.same_shape(t):
+            resize_out(dst, t.shape, t.rank)
         copy_strided_into(dst, t)
         return
     _float_unary_out(op, t, dst)
@@ -758,6 +851,7 @@ def op_logical_not_out(
 
 
 def _bitwise_not_kernel(src: T, dst: T) raises:
+    _one_device(src, dst)
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -788,7 +882,7 @@ def _bitwise_not(t_in: T) raises -> T:
     return out.take()
 
 
-def _bitwise_not_into(t_in: T, dst: T) raises:
+def _bitwise_not_into(t_in: T, mut dst: T) raises:
     if t_in.dtype == DType.bool:
         _bool_unary_out("LogicalNotSpec", t_in, dst)
         return
@@ -796,8 +890,16 @@ def _bitwise_not_into(t_in: T, dst: T) raises:
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )
+    _one_device(t_in, dst)
+    _no_partial_overlap(dst, t_in)
+    if dst.stype != t_in.stype:
+        raise Error(
+            "expected an out= tensor of dtype ", t_in.stype, ", got ", dst.stype
+        )
+    if not dst.same_shape(t_in):
+        resize_out(dst, t_in.shape, t_in.rank)
     var src = contiguous(t_in)
-    if dst.contig and dst.stype == src.stype and dst.same_shape(src):
+    if dst.contig:
         _bitwise_not_kernel(src, dst)
     else:
         var out = own(new_like(src))

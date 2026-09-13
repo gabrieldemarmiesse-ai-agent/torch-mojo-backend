@@ -10,7 +10,7 @@ Public torch API only, per the porting brief: no `aten_fast`,
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native
+from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
 
@@ -517,3 +517,134 @@ def test_native_dropout_autograd_optional_train_scale(mojo_gpu, train, scale):
     torch.testing.assert_close(
         input.grad.cpu(), grad_output * mask.cpu() * scale, atol=1e-6, rtol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# RNG stream edges the tests above (8192- and 1025-element draws from an
+# aligned base) cannot reach.
+# ---------------------------------------------------------------------------
+
+
+def test_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
+    """7 is not a multiple of the 4-wide philox group: the ragged group must
+    still consume its whole counter, or the next draw repeats it."""
+    device_module.manual_seed_all(20260814)
+    first = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    state = device_module.get_rng_state(mojo_gpu)
+    second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    assert not set(first.tolist()) & set(second.tolist())
+
+    device_module.set_rng_state(state, mojo_gpu)
+    replayed = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    torch.testing.assert_close(replayed, second)
+
+
+def test_uniform_misaligned_destination_indexes_the_stream_the_same_way(mojo_gpu):
+    """An offset base cannot take the 16-byte vector store; the scalar store
+    kernel must index the philox stream identically."""
+    device_module.manual_seed_all(20260814)
+    state = device_module.get_rng_state(mojo_gpu)
+    aligned = torch.zeros(8, device=mojo_gpu).uniform_(-1.0, 1.0).cpu()
+
+    device_module.set_rng_state(state, mojo_gpu)
+    storage = torch.zeros(9, device=mojo_gpu)
+    storage[1:].uniform_(-1.0, 1.0)
+    host = storage.cpu()
+    assert torch.equal(host[1:], aligned)
+    assert float(host[0]) == 0.0
+
+
+def test_torch_manual_seed_reaches_the_device_generator(mojo_gpu):
+    """`torch.manual_seed` (not just device_module.manual_seed_all) must seed
+    the mojo generator."""
+    torch.manual_seed(20260913)
+    first = torch.rand(1000, device=mojo_gpu).cpu()
+    torch.manual_seed(20260913)
+    replayed = torch.rand(1000, device=mojo_gpu).cpu()
+    torch.testing.assert_close(first, replayed)
+    assert not torch.equal(torch.rand(1000, device=mojo_gpu).cpu(), first)
+
+
+def test_arange_needs_a_wide_accumulator(mojo_device):
+    """Past 2**24 an fp32 running sum can no longer add 1.0.
+
+    The reference depends on the device, because the accumulator width does:
+    torch's CPU kernel specifies float64 for a float32 arange, so the MAX CPU
+    device is compared against that scalar sequence (built explicitly --
+    arm64's vectorized kernel rounds differently at this boundary); an
+    accelerator is compared against the vendor backend's own answer, and the
+    test skips where there is none to compare with rather than inventing one.
+    """
+    args = (16_777_217.0, 16_777_227.0, 1.0)
+    result = torch.arange(*args, dtype=torch.float32, device=mojo_device).cpu()
+    cpu_index = len(list(get_accelerators())) - 1
+    if mojo_device == f"mojo:{cpu_index}":
+        expected = torch.tensor(
+            [args[0] + i * args[2] for i in range(10)], dtype=torch.float32
+        )
+    elif torch.cuda.is_available():
+        expected = torch.arange(*args, dtype=torch.float32, device="cuda").cpu()
+    elif torch.backends.mps.is_available():
+        expected = torch.arange(*args, dtype=torch.float32, device="mps").cpu()
+    else:
+        pytest.skip("no native GPU reference for this MAX accelerator")
+    assert torch.equal(result, expected)
+
+
+def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
+    """fp64 is a separate kernel specialization from fp32 for each of these."""
+    if list(get_accelerators())[0].api == "metal":
+        pytest.skip("Metal has no float64")
+    ones = torch.ones(5, dtype=torch.float64, device=mojo_gpu)
+    assert ones.dtype == torch.float64
+    torch.testing.assert_close(ones.cpu(), torch.ones(5, dtype=torch.float64))
+
+    filled = torch.empty(5, dtype=torch.float64, device=mojo_gpu).fill_(2.5)
+    torch.testing.assert_close(filled.cpu(), torch.full((5,), 2.5, dtype=torch.float64))
+
+    scattered = torch.zeros(5, dtype=torch.float64, device=mojo_gpu).scatter(
+        0,
+        torch.tensor([1, 3], device=mojo_gpu),
+        torch.tensor([4.0, 7.0], dtype=torch.float64, device=mojo_gpu),
+    )
+    torch.testing.assert_close(
+        scattered.cpu(), torch.tensor([0.0, 4.0, 0.0, 7.0, 0.0], dtype=torch.float64)
+    )
+
+    ranged = torch.arange(0.0, 2.0, 0.25, dtype=torch.float64, device=mojo_gpu)
+    torch.testing.assert_close(
+        ranged.cpu(), torch.arange(0.0, 2.0, 0.25, dtype=torch.float64)
+    )
+
+
+def test_randint_and_random_on_the_device(mojo_device):
+    """random_.from / .to / random_ draw on the host and copy over."""
+    torch.manual_seed(0)
+    x = torch.randint(3, 9, (200,), device=mojo_device)
+    assert x.dtype == torch.int64
+    vals = x.cpu()
+    assert vals.min() >= 3 and vals.max() < 9 and vals.unique().numel() == 6
+    y = torch.empty(64, dtype=torch.int32, device=mojo_device).random_(5)
+    assert set(y.cpu().tolist()) <= set(range(5))
+    z = torch.empty(64, dtype=torch.uint8, device=mojo_device).random_()
+    assert z.cpu().max() <= 255
+    strided = torch.zeros(4, 6, dtype=torch.int64, device=mojo_device).t()
+    strided.random_(1, 3)
+    assert set(strided.cpu().unique().tolist()) <= {1, 2}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_dropout_half_precision_round_trips_through_float32(mojo_gpu, dtype):
+    # 1 + randn: no input is exactly zero, so a zero output means "dropped"
+    x = (1.0 + torch.rand(64, 32)).to(dtype).to(mojo_gpu).requires_grad_(True)
+    y = torch.nn.functional.dropout(x, p=0.5, training=True)
+    assert y.dtype == dtype
+    kept = y.detach().cpu().float() != 0
+    torch.testing.assert_close(
+        y.detach().cpu().float()[kept], 2 * x.detach().cpu().float()[kept]
+    )
+    assert 0.3 < kept.float().mean() < 0.7
+    y.float().sum().backward()
+    assert x.grad is not None
+    assert x.grad.dtype == dtype
+    torch.testing.assert_close(x.grad.cpu().float(), 2 * kept.float(), atol=0, rtol=0)

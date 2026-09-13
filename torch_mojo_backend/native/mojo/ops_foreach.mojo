@@ -22,26 +22,14 @@ call into. Declining there really does mean NotImplementedError, matching
 the old `_register_fast` (no-fallback) binding exactly.
 
 `_foreach_div_.ScalarList` and `_foreach_addcdiv_.ScalarList` are NOT
-registered here at all: their `Scalar[]` argument cannot be marshalled by the
-current C++ shim. `to_record`'s `ListType` branch in
-`native/csrc/shim_dispatch.cpp` handles `Tensor[]`, `Tensor?[]`, `int[]`,
-`float[]` and `bool[]`, but not `ListType(NumberType)` (a `Scalar[]`) -- any
-call reaches a `TORCH_CHECK(false, ...)` there before our boxed kernel
-adapter is ever entered, batched or not, so nothing we write in Mojo can
-intercept it. Leaving these two overloads unregistered is actually the
-right behavior in the meantime: with no PrivateUse1 override, ATen's own
-CompositeExplicitAutograd decomposition
+registered here: there is no batched kernel for them, and with no
+PrivateUse1 override ATen's own CompositeExplicitAutograd decomposition
 (`foreach_tensor_div_scalarlist_kernel_slow_` /
-`..._addcdiv_scalarlist_kernel_slow_`) runs instead, one `div_.Scalar` /
-`addcdiv_` call per tensor -- each of which marshals only a single `Scalar`,
-not a list, so it reaches our device correctly. Fixing the shim itself is
-out of scope for this file (see AGENT_BRIEF.md: the C++ shim is shared and
-not owned by one op group); the minimal fix is a `NumberType` arm in that
-`ListType` switch, packing each element like `scalar_to_record` does and
-returning `TAG_DOUBLE_LIST` (or a new scalar-list tag) instead of falling
-into the `TORCH_CHECK(false, ...)` default.
+`..._addcdiv_scalarlist_kernel_slow_`) already does exactly what the
+sequential fallbacks below do -- one `div_.Scalar` / `addcdiv_` per tensor.
+(Their `Scalar[]` argument does marshal: `to_record`'s `ListType` branch in
+`native/csrc/shim_dispatch.cpp` has a `NumberType` arm.)
 """
-from std.ffi import external_call
 from std.math import ceildiv
 from std.utils import IndexList
 
@@ -50,13 +38,13 @@ from abi import (
     T,
     Value,
     Values,
+    call_op,
     dtype_code,
     f64_bits,
     new_tensor,
     own,
     Owned,
     ret_tensor_list,
-    shim_error,
     unsupported,
     v_bool,
     v_dtype_or,
@@ -76,8 +64,14 @@ from op_utils import MAX_RANK
 from registry import Site, impl, op_address_of
 
 
-# --- Value-record helpers for tmb_call_op (the sequential per-tensor
-# fallback) -------------------------------------------------------------
+# --- the sequential per-tensor fallback ---------------------------------
+#
+# A foreach op that declines its batched fast path replicates ATen's own
+# sequential decomposition by calling the underlying per-tensor op through
+# the full dispatcher (never the SAME op name, which would re-enter this very
+# registration). Every such call allocates a fresh result handle -- the shim
+# wraps even the tensor an in-place op hands back -- so the results go through
+# `Results`, which releases whatever is not taken.
 
 
 def _tensor_value(t: T) -> Value:
@@ -88,89 +82,61 @@ def _none_value() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
-def _call_op1[
-    n_args: Int
-](
-    op: StaticString,
-    overload: StaticString,
-    mut args: InlineArray[Value, n_args],
-) raises -> Value:
-    """Call `op.overload` through the full ATen dispatcher (`tmb_call_op`)
-    and return its one result record. This is how a foreach op that declines
-    its batched fast path replicates ATen's own sequential decomposition:
-    calling the underlying per-tensor op (never the SAME op name, which would
-    re-enter this very registration)."""
-    var op_s = String(op)
-    var ov_s = String(overload)
-    var rets = InlineArray[Value, 1](fill=_none_value())
-    var rc = external_call["tmb_call_op", Int32](
-        op_s.as_c_string_slice().unsafe_ptr(),
-        ov_s.as_c_string_slice().unsafe_ptr(),
-        args.unsafe_ptr(),
-        Int32(n_args),
-        rets.unsafe_ptr(),
-        Int32(1),
-    )
-    if rc != 0:
-        raise Error(op, ".", overload, ": ", shim_error())
-    return rets[0].copy()
-
-
 def _seq_add_scalar_(t: T, scalar_v: Value) raises:
-    var args = InlineArray[Value, 3](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = scalar_v.copy()
-    args[2] = Value(TAG_SCALAR_INT, 0, 1, 0)  # alpha=1
-    _ = _call_op1[3]("aten::add_", "Scalar", args)
+    var args = List[Value](capacity=3)
+    args.append(_tensor_value(t))
+    args.append(scalar_v.copy())
+    args.append(Value(TAG_SCALAR_INT, 0, 1, 0))  # alpha=1
+    _ = call_op("aten::add_", "Scalar", args^, 1)
 
 
 def _seq_mul_scalar_(t: T, scalar_v: Value) raises:
-    var args = InlineArray[Value, 2](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = scalar_v.copy()
-    _ = _call_op1[2]("aten::mul_", "Scalar", args)
+    var args = List[Value](capacity=2)
+    args.append(_tensor_value(t))
+    args.append(scalar_v.copy())
+    _ = call_op("aten::mul_", "Scalar", args^, 1)
 
 
 def _seq_mul_tensor_(t: T, other: T) raises:
-    var args = InlineArray[Value, 2](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = _tensor_value(other)
-    _ = _call_op1[2]("aten::mul_", "Tensor", args)
+    var args = List[Value](capacity=2)
+    args.append(_tensor_value(t))
+    args.append(_tensor_value(other))
+    _ = call_op("aten::mul_", "Tensor", args^, 1)
 
 
 def _seq_addcmul_(t: T, t1: T, t2: T, value_v: Value) raises:
-    var args = InlineArray[Value, 4](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = _tensor_value(t1)
-    args[2] = _tensor_value(t2)
-    args[3] = value_v.copy()
-    _ = _call_op1[4]("aten::addcmul_", "", args)
+    var args = List[Value](capacity=4)
+    args.append(_tensor_value(t))
+    args.append(_tensor_value(t1))
+    args.append(_tensor_value(t2))
+    args.append(value_v.copy())
+    _ = call_op("aten::addcmul_", "", args^, 1)
 
 
 def _seq_lerp_scalar_(t: T, end: T, weight_v: Value) raises:
-    var args = InlineArray[Value, 3](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = _tensor_value(end)
-    args[2] = weight_v.copy()
-    _ = _call_op1[3]("aten::lerp_", "Scalar", args)
+    var args = List[Value](capacity=3)
+    args.append(_tensor_value(t))
+    args.append(_tensor_value(end))
+    args.append(weight_v.copy())
+    _ = call_op("aten::lerp_", "Scalar", args^, 1)
 
 
 def _seq_sqrt(t: T) raises -> T:
-    var args = InlineArray[Value, 1](fill=_none_value())
-    args[0] = _tensor_value(t)
-    var ret = _call_op1[1]("aten::sqrt", "", args)
-    return T(Int(ret.a))
+    var args = List[Value](capacity=1)
+    args.append(_tensor_value(t))
+    var rets = call_op("aten::sqrt", "", args^, 1)
+    return rets.take_tensor(0)
 
 
 def _seq_vector_norm(t: T, ord_v: Value, dtype_v: Value) raises -> T:
-    var args = InlineArray[Value, 5](fill=_none_value())
-    args[0] = _tensor_value(t)
-    args[1] = ord_v.copy()
-    args[2] = _none_value()  # dim=None
-    args[3] = Value(TAG_SCALAR_INT, 0, 0, 0)  # keepdim=False
-    args[4] = dtype_v.copy()
-    var ret = _call_op1[5]("aten::linalg_vector_norm", "", args)
-    return T(Int(ret.a))
+    var args = List[Value](capacity=5)
+    args.append(_tensor_value(t))
+    args.append(ord_v.copy())
+    args.append(_none_value())  # dim=None
+    args.append(Value(TAG_SCALAR_INT, 0, 0, 0))  # keepdim=False
+    args.append(dtype_v.copy())
+    var rets = call_op("aten::linalg_vector_norm", "", args^, 1)
+    return rets.take_tensor(0)
 
 
 # --- overlap / aliasing (aten_fast._foreach_tensors_overlap /
@@ -838,7 +804,11 @@ def _fused_adamw_impl(args: Values, n_args: Int) raises:
     call.int(found_inf_ptr)
     call.int(cp)
     call.run()
+    # Every list the kernel writes: `grads` too, which it overwrites with
+    # the unscaled gradient when grad_scale is given.
     for t in parameters:
+        t.bump_version()
+    for t in grads:
         t.bump_version()
     for t in exp_avgs:
         t.bump_version()

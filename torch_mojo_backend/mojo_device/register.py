@@ -5,7 +5,10 @@ import torch
 from torch_mojo_backend import native
 from torch_mojo_backend.distributed import register_distributed_backend
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
-from torch_mojo_backend.monkeypatching import fix_privateuse1_dlpack_device_type
+from torch_mojo_backend.monkeypatching import (
+    fix_batch_isend_irecv_for_python_process_groups,
+    fix_privateuse1_dlpack_device_type,
+)
 from torch_mojo_backend.native import device_module
 
 _registered = False
@@ -26,6 +29,7 @@ def register_mojo_devices():
     torch._register_device_module("mojo", device_module)
     torch.utils.generate_methods_for_privateuse1_backend()
     fix_privateuse1_dlpack_device_type()
+    fix_batch_isend_irecv_for_python_process_groups()
     native.register()
     warn_if_gpu_torch_on_hip()
     register_distributed_backend()

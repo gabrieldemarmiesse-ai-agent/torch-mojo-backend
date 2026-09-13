@@ -19,6 +19,7 @@ from kernels import init_loader
 from ops_attention import register_attention
 from ops_binary import register_binary
 from ops_compare import register_compare
+from ops_composed import register_composed
 from ops_core import register_core
 from ops_data_movement import register_data_movement
 from ops_factories import register_factories
@@ -50,6 +51,8 @@ def _group[
 def _register_ops(lib: Int, prebuild: Bool = False) raises:
     _group[register_core](lib, "ops_core", prebuild)
     _group[register_unary](lib, "ops_unary", prebuild)
+    # after every group it composes from
+    _group[register_composed](lib, "ops_composed", prebuild)
     _group[register_binary](lib, "ops_binary", prebuild)
     _group[register_compare](lib, "ops_compare", prebuild)
     _group[register_data_movement](lib, "ops_data_movement", prebuild)

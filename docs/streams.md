@@ -31,36 +31,42 @@ generic PrivateUse1 `torch.Stream` in this torch version exposes no
 a stream id as an opaque int); the native `CUstream`/`hipStream_t` is
 `Stream.native_handle`.
 
-## Why no Python patch is needed anymore
+## Why no Python patch is needed
 
 PyTorch's generic `torch.Stream`/`torch.Event` route through a C++ device
-guard; for a Python-backed PrivateUse1 device with only the default stub
-guard, every stream it mints is stream id 0 and every wait/record is a
-silent no-op. The old Python eager backend worked around that by patching
-`torch.Stream`/`torch.Event` at the class level
-(`torch_mojo_backend/monkeypatching.py`,
-`_install_torch_stream_event_dispatch`) to dispatch mojo-device
-construction to a Python `Stream`/`Event` pair
-(`mojo_device/streams.py`).
+guard; for a PrivateUse1 device with only the default stub guard, every
+stream it mints is stream id 0 and every wait/record is a silent no-op — so
+a Python-implemented backend has to patch `torch.Stream`/`torch.Event` at
+the class level to hand back objects of its own.
 
-The native backend does not need that patch: `native/csrc/shim_runtime.cpp`
-registers a real C++ `PrivateUse1HooksInterface` (device guard, streams,
-events) with torch's own dispatcher, so `torch.Stream`/`torch.Event`
-work for the `mojo` device through the ordinary generic path, exactly like
-CUDA. `register_mojo_devices()` no longer calls
-`apply_torch_monkeypatches`; that module and `mojo_device/streams.py` are
-dead code left over from the old eager path.
+`native/csrc/shim_runtime.cpp` registers a real C++
+`PrivateUse1HooksInterface` (device guard, streams, events) with torch's own
+dispatcher instead, so `torch.Stream`/`torch.Event` work for the `mojo`
+device through the ordinary generic path, exactly like CUDA, and
+`monkeypatching.py` holds one unrelated patch.
 
 ## Execution semantics
 
 Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
 `native/mojo/abi.mojo`/`device.mojo`), so `with torch.Stream(...):` really
-moves execution, not just bookkeeping — unlike the old eager path, which
-always ran on the default stream regardless of the current one.
+moves execution, not just bookkeeping.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —
-including external consumers — touches it. `tensor.record_stream(stream)`
+including external consumers — touches it. That includes a readback:
+`t.cpu()` and `t.item()` issue their copy on the *current* stream, so
+reading a tensor a side stream produced needs `torch.accelerator.synchronize()`
+or a `wait_stream`, exactly as on CUDA. `tensor.record_stream(stream)`
 is supported: the backend turns it into a MAX event the owning stream waits
 on before the buffer is released back to the allocator (see
 `docs/native_backend.md`, "Streams").
+
+`torch.accelerator.synchronize()` and `torch.mojo.synchronize()` are that
+host barrier over *every* stream of the device. They only work because
+`torch.mojo` defines `_lazy_init()`: torch's `_accelerator_synchronizeDevice`
+returns early for a lazy-init-capable device type it has not marked
+initialized, and torch marks PrivateUse1 initialized by calling
+`torch.<backend>._lazy_init()` from `device_lazy_init()` on the first device
+tensor. Without that method the flag never flips and both calls are silent
+no-ops — the device guard is never reached — which is a readback race waiting
+to happen (`tests/native/test_stream_ordering.py` pins it).

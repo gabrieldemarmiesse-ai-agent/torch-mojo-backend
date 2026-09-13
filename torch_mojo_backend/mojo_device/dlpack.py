@@ -1,18 +1,15 @@
-"""DLPack export for TorchMojoTensor.
+"""Hand-built DLPack capsules over a raw device allocation.
 
-TorchMojoTensor's torch-side TensorImpl is a zero-byte meta-backed wrapper,
-so torch's built-in `__dlpack__` would export a null pointer. The real
-allocation lives behind the Python-side metadata (`_ptr`, `_shape`,
-`_dtype`, `_device`, `_holder`). This module builds the `DLManagedTensor`
-capsule from that metadata so consumers like `max.driver.Buffer.from_dlpack`
-can adopt the memory zero-copy — this is how mojo tensors are fed into
-compiled MAX graphs.
+`torch_compile_backend/compiler.py` adopts a compiled MAX graph's output
+buffers as `mojo` tensors zero-copy with `make_capsule_privateuse1`; torch
+cannot do that itself, since its importer keys off the DLPack device-type
+code and MAX tags its buffers with the vendor one. `make_capsule` is the
+vendor-tagged variant, for consumers like `max.driver.Buffer.from_dlpack`.
 
-Only contiguous tensors are exported (callers materialize first), so the
+Only contiguous allocations are exported (callers materialize first), so the
 capsule advertises compact row-major layout (strides=NULL). The capsule
-keeps the producing tensor's `_holder` alive until the consumer's deleter
-runs, which is the same refcount-based ownership the rest of the eager
-backend relies on.
+pins the caller-supplied `holder` -- any object whose refcount keeps the
+memory alive -- until the consumer's deleter runs.
 """
 
 # ctypes._CData / ctypes._Pointer are typeshed-only names (not real runtime

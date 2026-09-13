@@ -4,11 +4,13 @@
 // table Mojo registered. Also the tensor C API the Mojo ops use.
 #include "tmb_internal.h"
 
+#include <ATen/Context.h>
 #include <ATen/EmptyTensor.h>
 #include <ATen/core/Generator.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <torch/csrc/profiler/stubs/base.h>
@@ -421,6 +423,10 @@ int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
 void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
+int32_t tmb_float32_matmul_precision(void) {
+  return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
+}
+int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
 TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 

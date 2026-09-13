@@ -72,7 +72,11 @@ def _shape_eq(t: T, shape: IndexList[MAX_RANK]) -> Bool:
 
 
 def _prepare_out(
-    mut out_arg: T, shape: IndexList[MAX_RANK], rank: Int, stype: Int32
+    mut out_arg: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    stype: Int32,
+    device: Int,
 ) raises -> Bool:
     """Get `out_arg` ready to receive a `shape`/`stype` result: raises if
     its dtype doesn't match (fixed per op, never promoted -- matches torch's
@@ -85,6 +89,8 @@ def _prepare_out(
     `out_arg`; that only happens when `out_arg` already had the right shape
     but a non-contiguous layout, since a resize always leaves it contiguous.
     """
+    if not out_arg.on_mojo() or out_arg.device != device:
+        raise Error("expected the out= tensor on the operands' mojo device")
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -96,11 +102,17 @@ def _prepare_out(
 
 
 def _ensure_out_shape(
-    mut out_arg: T, shape: IndexList[MAX_RANK], rank: Int, stype: Int32
+    mut out_arg: T,
+    shape: IndexList[MAX_RANK],
+    rank: Int,
+    stype: Int32,
+    device: Int,
 ) raises:
     """Like `_prepare_out`, for callers that always compute into a
     temporary and copy (searchsorted/bucketize): only the dtype/shape
     checks matter, not contiguity."""
+    if not out_arg.on_mojo() or out_arg.device != device:
+        raise Error("expected the out= tensor on the operands' mojo device")
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -132,7 +144,22 @@ def _cmp_broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
     return shape
 
 
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
+    _one_device(a, dst)
+    _one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic_ops", String(op))
@@ -178,7 +205,7 @@ def _compare_functional_out(
     var pb = cast_to(b, stype)
     var shape = _cmp_broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
-    if _prepare_out(out_arg, shape, rank, ST_BOOL):
+    if _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
         _compare_spec(op, pa, pb, out_arg)
     else:
         var tmp = own(new_tensor(shape, rank, ST_BOOL, a.device))
@@ -209,7 +236,7 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     var value = scalar_embed(args[unsafe_offset=1], a.dtype)
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)
-    if _prepare_out(out_arg, a.shape, a.rank, ST_BOOL):
+    if _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
         _compare_spec(op, a, fill.t, out_arg)
     else:
         var tmp = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
@@ -379,6 +406,8 @@ def _isin_validate(el: T, te: T) raises -> Bool:
 
 
 def _isin_launch(el: T, te: T, invert: Bool, dst: T) raises:
+    _one_device(el, dst)
+    _one_device(te, dst)
     var elc = contiguous(el)
     var tec = contiguous(te)
     var ctx = ctx_for(el.device)
@@ -434,7 +463,7 @@ def op_isin_tensor_tensor_out(
     var out_arg = v_tensor(args[unsafe_offset=4])
     if not _isin_validate(el, te):
         unsupported("isin: only matching int32/int64 operands are supported")
-    if _prepare_out(out_arg, el.shape, el.rank, ST_BOOL):
+    if _prepare_out(out_arg, el.shape, el.rank, ST_BOOL, el.device):
         _isin_into(el, te, invert, out_arg)
     else:
         var tmp = own(new_tensor(el.shape, el.rank, ST_BOOL, el.device))
@@ -500,6 +529,9 @@ def _where_select(
 ) raises:
     """dst[i] = cond[i] ? a[i] : b[i], for rank<=4 operands (each stride
     array already the correct broadcast strides against dst's shape)."""
+    _one_device(cond, dst)
+    _one_device(a, dst)
+    _one_device(b, dst)
     if dst.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -584,6 +616,8 @@ def _masked_fill_scalar_launch(
     """The fast path: `value` is baked into the launch (no separate Fill
     kernel first). Only float32/float16/bfloat16 `self` is wired to this;
     every other dtype goes through `_masked_fill_where` below."""
+    _one_device(mask, dst)
+    _one_device(self_t, dst)
     var mask_s = _bcast_strides(mask, self_t.shape)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -659,7 +693,7 @@ def op_masked_fill_scalar_out(
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
-    if _prepare_out(out_arg, a.shape, a.rank, a.stype):
+    if _prepare_out(out_arg, a.shape, a.rank, a.stype, a.device):
         _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], out_arg)
     else:
         var tmp = own(new_like(a))
@@ -724,7 +758,7 @@ def op_masked_fill_tensor_out(
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
     var val = _masked_fill_tensor_value(a, args[unsafe_offset=2])
-    if _prepare_out(out_arg, a.shape, a.rank, a.stype):
+    if _prepare_out(out_arg, a.shape, a.rank, a.stype, a.device):
         _masked_fill_where(mask, val, a, out_arg)
     else:
         var tmp = own(new_like(a))
@@ -1019,7 +1053,11 @@ def op_searchsorted_tensor_out(
         boundaries, values, common, out_int32, right, side[0], side[1]
     )
     _ensure_out_shape(
-        out_arg, computed.t.shape, computed.t.rank, computed.t.stype
+        out_arg,
+        computed.t.shape,
+        computed.t.rank,
+        computed.t.stype,
+        computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
     ret_ref(rets, 0, out_arg)
@@ -1076,7 +1114,11 @@ def op_searchsorted_scalar_out(
         boundaries, values.t, common, out_int32, right, side[0], side[1]
     )
     _ensure_out_shape(
-        out_arg, computed.t.shape, computed.t.rank, computed.t.stype
+        out_arg,
+        computed.t.shape,
+        computed.t.rank,
+        computed.t.stype,
+        computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
     ret_ref(rets, 0, out_arg)
@@ -1123,7 +1165,11 @@ def op_bucketize_tensor_out(
         boundaries, self_t, common, out_int32, right, False, String("")
     )
     _ensure_out_shape(
-        out_arg, computed.t.shape, computed.t.rank, computed.t.stype
+        out_arg,
+        computed.t.shape,
+        computed.t.rank,
+        computed.t.stype,
+        computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
     ret_ref(rets, 0, out_arg)
@@ -1178,7 +1224,11 @@ def op_bucketize_scalar_out(
         boundaries, values.t, common, out_int32, right, False, String("")
     )
     _ensure_out_shape(
-        out_arg, computed.t.shape, computed.t.rank, computed.t.stype
+        out_arg,
+        computed.t.shape,
+        computed.t.rank,
+        computed.t.stype,
+        computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
     ret_ref(rets, 0, out_arg)

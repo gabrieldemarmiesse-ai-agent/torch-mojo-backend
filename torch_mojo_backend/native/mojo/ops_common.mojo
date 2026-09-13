@@ -1,9 +1,9 @@
 """Helpers every op group shares: materializing a contiguous copy, strided
 copies and fills, dtype casts (through the memory_ops / data_movement_ops
 families on the tensor's current stream), scalar embedding and binary type
-promotion, `out=` resizing, and two device-level primitives (Philox
-reservation, calling any aten op through the real dispatcher) that more than
-one group needs."""
+promotion, `out=` resizing, and the Philox reservation more than one group
+needs. Calling another aten op through the real dispatcher is `abi.call_op`,
+re-exported here."""
 from std.ffi import external_call
 from std.utils import IndexList
 
@@ -11,21 +11,23 @@ from abi import (
     T,
     Value,
     check,
-    UNSUPPORTED_PREFIX,
-    Values,
+    Results,
+    call_op,
+    call_op_raw,
     contiguous_strides,
     dtype_code,
     dtype_itemsize,
+    f64_bits,
     max_dtype,
     new_like,
     new_like_dtype,
     new_tensor,
+    own,
+    own_if_new,
     release,
     set_sizes_strides,
     torch_dtype,
-    shim_error,
     unsupported,
-    TAG_NONE,
     v_f64,
     v_scalar_is_integral,
     v_int,
@@ -34,39 +36,9 @@ from device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from kernels import KernelCall
 from op_utils import MAX_RANK
 
-
-def call_op_raw(
-    op: String,
-    overload: String,
-    args: Values,
-    n_args: Int,
-    rets: Values,
-    n_rets: Int,
-) raises:
-    """Call any aten op through torch's dispatcher (`tmb_call_op`) over
-    caller-owned record arrays; `call_op` below is the List-based form.
-
-    What an op uses to reach a neighbouring op's kernel or ATen's own
-    composite: the records are the same ones a kernel gets, tensor arguments
-    are borrowed and tensor results come back as owned handles. Dispatch is on
-    the arguments, so an op must never call *itself* this way. A declining
-    kernel comes back as `unsupported` (rc 2) and keeps its prefix, so a
-    caller with another route can tell it apart from a real failure.
-    """
-    var name = String(op)
-    var over = String(overload)
-    var rc = external_call["tmb_call_op", Int32](
-        name.as_c_string_slice().unsafe_ptr(),
-        over.as_c_string_slice().unsafe_ptr(),
-        args,
-        Int32(n_args),
-        rets,
-        Int32(n_rets),
-    )
-    if rc == 2:
-        raise Error(UNSUPPORTED_PREFIX, shim_error())
-    if rc != 0:
-        raise Error(op, ": ", shim_error())
+# `call_op` / `call_op_raw` live in abi.mojo (one implementation, shared with
+# the ops that import them from there); they are re-exported here because most
+# op groups reach every shared helper through ops_common.
 
 
 def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
@@ -76,15 +48,37 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     return out^
 
 
+def shape_str(t: T) raises -> String:
+    var s = String("(")
+    for i in range(t.rank):
+        if i:
+            s += ", "
+        s += String(t.dim(i))
+    return s + ")"
+
+
 def copy_strided_into(dst: T, src: T) raises:
-    """dst[...] = src[...] for equal logical shapes, any strides, same dtype
-    (memory_ops CopyStrided: element-size dispatch, rank <= MAX_RANK)."""
-    if dst.numel == 0:
-        return
+    """dst[...] = src[...] for EQUAL logical shapes, any strides, same dtype
+    (memory_ops CopyStrided: element-size dispatch, rank <= MAX_RANK).
+
+    The kernel walks ONE shape -- the destination's -- indexing both tensors
+    with their own strides, so a source of any other shape is read with the
+    destination's extents and runs past its storage. Equal element counts are
+    not enough: (2,3) into (3,2) has the same numel and reads out of bounds.
+    A caller with a differently shaped dense source views it as the
+    destination's shape first.
+    """
     if src.stype != dst.stype:
         raise Error("copy_strided_into: dtype mismatch")
-    if src.numel != dst.numel:
-        raise Error("copy_strided_into: element count mismatch")
+    if not dst.same_shape(src):
+        raise Error(
+            "copy_strided_into: shape mismatch, destination ",
+            shape_str(dst),
+            " and source ",
+            shape_str(src),
+        )
+    if dst.numel == 0:
+        return
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("memory_ops", "CopyStrided")
@@ -100,59 +94,148 @@ def copy_strided_into(dst: T, src: T) raises:
 
 
 def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
-    """Resize a caller's `out=` tensor in place to a fresh contiguous
-    `shape` (torch's generic `resize_output` semantics, for a backend with
-    no registered `aten::resize_` kernel of its own: every `out=` op here
-    must do this itself for an out tensor of the wrong shape, rather than
-    relying on a resize that would otherwise happen before dispatch).
+    """torch's `resize_output` for a caller's `out=` tensor, in place.
 
-    Grows the storage through the shim's allocator when the new shape needs
-    more bytes (`tmb_storage_resize`, which preserves existing bytes up to
-    min(old, new) like torch's own `resize_`), then rewrites sizes/strides
-    (`tmb_tensor_set_sizes_strides`, which requires the storage already be
-    big enough -- hence the order). `t`'s cached view fields are refreshed
-    from the tensor afterward since its shape/strides/numel/contig changed.
+    A backend with no `aten::resize_` kernel of its own gets no resize
+    before dispatch, so every `out=` op here does this itself. Two halves,
+    both of `at::native::resize_impl`:
+
+    * **An `out` that already has this logical shape is left alone** --
+      strides and storage offset included. `out=base[4:8]` or a transposed
+      `out` is written where it lives; rewriting it to a fresh contiguous
+      layout at offset 0 would scribble over the start of `base`.
+    * Otherwise it is re-laid-out contiguously **at its existing storage
+      offset**, growing the storage to `(offset + numel) * itemsize` first
+      (`tmb_storage_resize` preserves bytes up to `min(old, new)` like
+      torch's `resize_`; `tmb_tensor_set_sizes_strides` bounds-checks
+      against the storage's CURRENT size, hence the order). The common case
+      is a composite handing an `out=` op a fresh `at::empty({0}, ...)`.
+
+    `t`'s cached view fields are refreshed afterwards: its shape, strides,
+    numel and contiguity all changed.
     """
-    var strides = contiguous_strides(shape, rank)
+    if t.rank == rank:
+        var same = True
+        for i in range(rank):
+            if t.dim(i) != shape[MAX_RANK - rank + i]:
+                same = False
+                break
+        if same:
+            return
     var numel = 1
     for i in range(rank):
         numel *= shape[MAX_RANK - rank + i]
-    var nbytes = numel * t.itemsize
+    var offset = t.offset
+    var nbytes = (offset + numel) * t.itemsize
     if nbytes > t.storage_nbytes():
         check(
             external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
             "tmb_storage_resize",
         )
-    set_sizes_strides(t, shape, strides, rank, 0)
+    set_sizes_strides(t, shape, contiguous_strides(shape, rank), rank, offset)
     t = T(t.h)
 
 
 def contiguous(t: T) raises -> T:
     """`t` itself when already contiguous, else a fresh contiguous copy
-    (an owned handle: release it or return it)."""
+    (an owned handle: release it or return it -- `own_if_new(contiguous(t), t)`
+    does both)."""
     if t.contig:
         return t.copy()
-    var out = new_like(t)
-    copy_strided_into(out, t)
-    return out^
+    var out = own(new_like(t))
+    copy_strided_into(out.t, t)
+    return out.take()
+
+
+struct FillScalar(Copyable, Movable):
+    """One constant to fill with, in the forms the different destination
+    dtypes store it in.
+
+    An ATen `Scalar` carries a tag, and rounding it all the way down to a
+    Float64 the way one number-typed argument would loses three things a
+    fill must keep: the truth of a bool destination (`.fill_(0.5)` is True,
+    not `Int(0.5) == 0`), every integer bit above 2**53, and the sign of
+    `-0.0`.
+    """
+
+    var f: Float64  # what a floating destination (and the fill kernel) takes
+    var i: Int  # the exact value, when `integral`
+    var integral: Bool
+    var truth: Bool  # nonzero truth, what a bool destination stores
+
+    def __init__(out self, value: Float64):
+        self.f = value
+        self.i = Int(value)
+        self.integral = False
+        self.truth = value != 0.0
+
+    def __init__(out self, v: Value) raises:
+        """From an ATen Scalar record."""
+        self.integral = v_scalar_is_integral(v)
+        if self.integral:
+            self.i = v_int(v)
+            self.f = Float64(self.i)
+            self.truth = self.i != 0
+        else:
+            self.f = v_f64(v)
+            self.i = Int(self.f)
+            self.truth = self.f != 0.0
+
+    def as_int(self) -> Int:
+        """torch's Scalar -> integer conversion (a float truncates)."""
+        return self.i
+
+    def is_zero_bits(self) -> Bool:
+        """Whether every dtype stores this value as all-zero bytes: positive
+        zero and integer zero, but not `-0.0` (sign bit set)."""
+        if self.integral:
+            return self.i == 0
+        return f64_bits(self.f) == 0
 
 
 def fill_value(t: T, value: Float64) raises:
-    """Constant fill for any layout: a memset when contiguous on an
-    accelerator, else the strided fill kernel. On the MAX CPU device a
-    memset is not ordered against kernel launches (measured: a kernel
-    reading a just-filled buffer saw stale memory 4 times in 50), so that
-    device always fills with the kernel."""
+    """Constant fill from a plain number (`zero_`, an op filling with a
+    computed float). `fill_value(t, some_scalar_record)` keeps the ATen
+    Scalar's tag instead -- prefer it wherever the caller has the record."""
+    _fill(t, FillScalar(value))
+
+
+def fill_value(t: T, value: Value) raises:
+    """Constant fill from an ATen `Scalar` argument record, tag kept."""
+    _fill(t, FillScalar(value))
+
+
+def _fill(t: T, s: FillScalar) raises:
+    """A memset when contiguous on an accelerator, else the strided fill
+    kernel. On the MAX CPU device a memset is not ordered against kernel
+    launches (measured: a kernel reading a just-filled buffer saw stale
+    memory 4 times in 50), so that device always fills with the kernel."""
     if t.numel == 0:
         return
     if t.contig and not dev(t.device)[].is_cpu:
-        _fill_contiguous(t, value)
+        _fill_contiguous(t, s)
         return
+    if s.integral and t.itemsize == 8 and not t.dtype.is_floating_point():
+        # The StridedFill kernel narrows a Float64 into the destination
+        # dtype, which cannot carry a 64-bit integer past 2**53. Fill a dense
+        # buffer exactly (memset) and lay that out instead -- except on the
+        # MAX CPU device, where a memset is not ordered against the strided
+        # copy that would read it.
+        if abs(s.i) > _MAX_EXACT_INT:
+            if dev(t.device)[].is_cpu:
+                unsupported(
+                    "filling a strided 64-bit integer tensor on the MAX CPU"
+                    " device with a magnitude above 2**53"
+                )
+            var dense = own(new_like(t))
+            _fill_contiguous(dense.t, s)
+            copy_strided_into(t, dense.t)
+            return
     var ctx = ctx_for(t.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("memory_ops", "StridedFill")
     call.int(t.ptr)
-    call.f64(value)
+    call.f64(s.f)
     call.tuple(_padded(t.shape))
     call.tuple(_padded(t.strides))
     call.int(dtype_code(t.dtype))
@@ -161,34 +244,38 @@ def fill_value(t: T, value: Float64) raises:
     _ = ctx
 
 
-def _fill_contiguous(t: T, value: Float64) raises:
+def _fill_contiguous(t: T, s: FillScalar) raises:
     var ctx = ctx_for(t.device)
-    if value == 0.0:
+    if t.dtype == DType.bool:
+        # torch stores a bool as one byte holding exactly 0 or 1, and a
+        # Scalar is true when it is nonzero.
+        memset_bytes(ctx, t.ptr, UInt8(1) if s.truth else UInt8(0), t.numel)
+    elif s.is_zero_bits():
         memset_bytes(ctx, t.ptr, 0, t.numel * t.itemsize)
     elif t.dtype == DType.float32:
-        memset_typed[DType.float32](ctx, t.ptr, Float32(value), t.numel)
+        memset_typed[DType.float32](ctx, t.ptr, Float32(s.f), t.numel)
     elif t.dtype == DType.bfloat16:
-        memset_typed[DType.bfloat16](ctx, t.ptr, BFloat16(value), t.numel)
+        memset_typed[DType.bfloat16](ctx, t.ptr, BFloat16(s.f), t.numel)
     elif t.dtype == DType.float16:
-        memset_typed[DType.float16](ctx, t.ptr, Float16(value), t.numel)
+        memset_typed[DType.float16](ctx, t.ptr, Float16(s.f), t.numel)
     elif t.dtype == DType.float64:
-        memset_typed[DType.float64](ctx, t.ptr, value, t.numel)
+        memset_typed[DType.float64](ctx, t.ptr, s.f, t.numel)
     elif t.dtype == DType.int64:
-        memset_typed[DType.int64](ctx, t.ptr, Int64(Int(value)), t.numel)
+        memset_typed[DType.int64](ctx, t.ptr, Int64(s.as_int()), t.numel)
     elif t.dtype == DType.int32:
-        memset_typed[DType.int32](ctx, t.ptr, Int32(Int(value)), t.numel)
+        memset_typed[DType.int32](ctx, t.ptr, Int32(s.as_int()), t.numel)
     elif t.dtype == DType.int16:
-        memset_typed[DType.int16](ctx, t.ptr, Int16(Int(value)), t.numel)
+        memset_typed[DType.int16](ctx, t.ptr, Int16(s.as_int()), t.numel)
     elif t.dtype == DType.int8:
-        memset_typed[DType.int8](ctx, t.ptr, Int8(Int(value)), t.numel)
-    elif t.dtype == DType.uint8 or t.dtype == DType.bool:
-        memset_bytes(ctx, t.ptr, UInt8(Int(value)), t.numel)
+        memset_typed[DType.int8](ctx, t.ptr, Int8(s.as_int()), t.numel)
+    elif t.dtype == DType.uint8:
+        memset_bytes(ctx, t.ptr, UInt8(s.as_int()), t.numel)
     elif t.dtype == DType.uint16:
-        memset_typed[DType.uint16](ctx, t.ptr, UInt16(Int(value)), t.numel)
+        memset_typed[DType.uint16](ctx, t.ptr, UInt16(s.as_int()), t.numel)
     elif t.dtype == DType.uint32:
-        memset_typed[DType.uint32](ctx, t.ptr, UInt32(Int(value)), t.numel)
+        memset_typed[DType.uint32](ctx, t.ptr, UInt32(s.as_int()), t.numel)
     elif t.dtype == DType.uint64:
-        memset_typed[DType.uint64](ctx, t.ptr, UInt64(Int(value)), t.numel)
+        memset_typed[DType.uint64](ctx, t.ptr, UInt64(s.as_int()), t.numel)
     else:
         unsupported("fill of dtype " + String(t.dtype))
     _ = ctx
@@ -212,37 +299,14 @@ def cast_into(dst: T, src: T) raises:
 
 
 def cast_to(t: T, stype: Int32) raises -> T:
-    """A contiguous copy of `t` in dtype `stype` (t itself when unchanged)."""
+    """A contiguous copy of `t` in dtype `stype` (t itself when unchanged).
+    Both the output and the intermediate are released if the cast raises."""
     if t.stype == stype:
         return t.copy()
-    var out = new_like_dtype(t, stype)
-    var src = contiguous(t)
-    cast_into(out, src)
-    if src.h != t.h:
-        release(src.h)
-    return out^
-
-
-def resize_storage_for(
-    t: T, shape: IndexList[MAX_RANK], rank: Int, offset: Int
-) raises:
-    """Grow `t`'s storage, if needed, to hold `shape` at `offset`, before
-    `abi.set_sizes_strides` reshapes it: `tmb_tensor_set_sizes_strides`
-    bounds-checks the new (sizes, strides, offset) against the storage's
-    CURRENT byte size, so an `out=` op that grows its target -- the common
-    case is a fresh `at::empty({0}, ...)` composite hands `arange.start_out`
-    -- must grow the storage first. Mirrors `Tensor::resize_`'s
-    grow-if-needed contract (never shrinks the actual allocation); generic
-    for any group's `out=` op that may need to grow its target."""
-    var numel = 1
-    for i in range(rank):
-        numel *= shape[MAX_RANK - rank + i]
-    var nbytes = (offset + numel) * t.itemsize
-    if nbytes > t.storage_nbytes():
-        check(
-            external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
+    var out = own(new_like_dtype(t, stype))
+    var src = own_if_new(contiguous(t), t)
+    cast_into(out.t, src.t)
+    return out.take()
 
 
 def philox_reserve(
@@ -266,39 +330,6 @@ def philox_reserve(
         "tmb_philox_reserve",
     )
     return (seed, offset)
-
-
-def call_op(
-    name: String, overload: String, var args: List[Value], n_rets: Int
-) raises -> List[Value]:
-    """Call any aten op through the real torch dispatcher (tmb_call_op):
-    composites and CPU/other-device fallbacks reachable from inside a Mojo
-    op body (e.g. `normal_`'s host draw, `arange`'s host fallback). `name`
-    must be namespace-qualified (`"aten::normal_"`, not `"normal_"`) --
-    `c10::Dispatcher::findSchemaOrThrow` looks it up as one `OperatorName`
-    together with `overload` (`""` for the default/unnamed overload,
-    `"start_out"` for `aten::arange.start_out`). `args` are value records in
-    schema order (exact arity: the dispatcher checks it against the op's
-    schema); the result records are returned as-is -- any TAG_TENSOR among
-    them is a freshly owned handle the caller must release (or return) like
-    any other allocation."""
-    var op_name = name
-    var op_overload = overload
-    var rets = List[Value](capacity=max(n_rets, 1))
-    for _ in range(n_rets):
-        rets.append(Value(TAG_NONE, 0, 0, 0))
-    check(
-        external_call["tmb_call_op", Int32](
-            op_name.as_c_string_slice().unsafe_ptr(),
-            op_overload.as_c_string_slice().unsafe_ptr(),
-            args.unsafe_ptr(),
-            Int32(len(args)),
-            rets.unsafe_ptr(),
-            Int32(n_rets),
-        ),
-        "tmb_call_op",
-    )
-    return rets^
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +477,8 @@ def release_if_new(result: T, original: T):
     already has the requested layout/dtype -- so a caller that wraps their
     result in `own()` unconditionally would release a handle it never
     allocated (an argument the caller only borrowed, e.g. an op's `self`).
-    Call this instead of `own(...)` whenever the input might be a borrowed
-    tensor."""
+
+    `abi.own_if_new(contiguous(t), t)` is the same rule as a scope guard and
+    covers the raising paths too; reach for that one in new code."""
     if result.h != original.h:
         release(result.h)

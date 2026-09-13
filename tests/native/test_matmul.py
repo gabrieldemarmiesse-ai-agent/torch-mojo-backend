@@ -7,7 +7,6 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
-import os
 
 import pytest
 import torch
@@ -507,17 +506,164 @@ def test_gemm16_entry_points(mojo_h100, dtype, op):
     torch.testing.assert_close(got.cpu().float(), ref, atol=2e-1, rtol=2e-2)
 
 
-def test_tf32_bridge_opt_in(mojo_h100, monkeypatch):
-    """fp32 stays on the strict SIMT path by default (TF32 drops mantissa
-    bits) and only the explicit opt-in reaches the tensor-core route."""
+def test_tf32_bridge_opt_in(mojo_h100):
+    """fp32 stays on the strict SIMT path under torch's default matmul
+    precision ("highest": TF32 drops mantissa bits) and reaches the
+    tensor-core route once torch.set_float32_matmul_precision allows it."""
     a = torch.randn(128, 256)
     b = torch.randn(256, 192)
     ref = a @ b
-    monkeypatch.setenv("TORCH_MOJO_BACKEND_TF32", "1")
-    got = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        got = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
+    finally:
+        torch.set_float32_matmul_precision(previous)
     # TF32 keeps 10 mantissa bits, so the tolerance is bf16-like, not fp32.
     torch.testing.assert_close(got, ref, atol=2e-1, rtol=2e-2)
-    monkeypatch.delenv("TORCH_MOJO_BACKEND_TF32")
-    assert os.environ.get("TORCH_MOJO_BACKEND_TF32") is None
     strict = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
     torch.testing.assert_close(strict, ref, atol=1e-3, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Strided-operand arms and degenerate GEMM shapes.
+#
+# The layout tests above use `.t()` from offset 0 and an expanded bmm batch.
+# Every arm below is a different route: a gapped B, an offset-view A (the
+# route may not assume offset 0), a stride-0 broadcast read, a rank-3
+# activation, and the m/n/k == 1 shapes decode paths take.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "b_gapped",
+        "a_transposed",
+        "a_offset_transposed",
+        "both_strided",
+        "a_broadcast",
+        "a_rank3_gapped",
+        "batched_transposed",
+    ],
+)
+def test_matmul_every_strided_arm(mojo_gpu, arm):
+    if arm == "batched_transposed":
+        a_cpu = torch.randn(4, 24, 32)
+        b_cpu = torch.randn(4, 24, 16)
+        got = torch.bmm(a_cpu.to(mojo_gpu).transpose(1, 2), b_cpu.to(mojo_gpu))
+        ref = torch.bmm(a_cpu.transpose(1, 2), b_cpu)
+        torch.testing.assert_close(got.cpu(), ref, atol=5e-2, rtol=5e-2)
+        return
+
+    b_base = torch.randn(64, 64)
+    if arm == "b_gapped":
+        a_cpu, b_cpu = torch.randn(48, 64), b_base[:, ::2]
+        a = a_cpu.to(mojo_gpu)
+        b = b_base.to(mojo_gpu)[:, ::2]
+    elif arm == "a_transposed":
+        a_cpu, b_cpu = torch.randn(48, 64).t(), torch.randn(48, 32)
+        a = a_cpu.t().contiguous().to(mojo_gpu).t()
+        b = b_cpu.to(mojo_gpu)
+    elif arm == "a_offset_transposed":
+        base = torch.randn(80, 64)
+        a_cpu, b_cpu = base[8:56].t(), torch.randn(48, 32)
+        a = base.to(mojo_gpu)[8:56].t()
+        b = b_cpu.to(mojo_gpu)
+    elif arm == "both_strided":
+        base = torch.randn(80, 64)
+        # A is (64, 48) after the transpose, so B must have 48 rows.
+        a_cpu, b_cpu = base[8:56].t(), b_base[:48, ::2]
+        a = base.to(mojo_gpu)[8:56].t()
+        b = b_base.to(mojo_gpu)[:48, ::2]
+    elif arm == "a_broadcast":
+        row = torch.randn(1, 48)
+        a_cpu, b_cpu = row.expand(64, 48), torch.randn(48, 32)
+        a = row.to(mojo_gpu).expand(64, 48)
+        b = b_cpu.to(mojo_gpu)
+    else:  # a_rank3_gapped
+        base = torch.randn(16, 64, 48)
+        a_cpu, b_cpu = base[::2], torch.randn(48, 32)
+        a = base.to(mojo_gpu)[::2]
+        b = b_cpu.to(mojo_gpu)
+
+    got = a @ b
+    torch.testing.assert_close(got.cpu(), a_cpu @ b_cpu, atol=5e-2, rtol=5e-2)
+
+
+def test_addmm_strided_bias_and_operands(mojo_gpu):
+    bias_base = torch.randn(64)  # [::2] is the 32 columns of the product
+    a_base = torch.randn(48, 64)
+    b_cpu = torch.randn(48, 32)
+    bias_cpu, a_cpu = bias_base[::2], a_base.t()
+    got = torch.addmm(
+        bias_base.to(mojo_gpu)[::2], a_base.to(mojo_gpu).t(), b_cpu.to(mojo_gpu)
+    )
+    torch.testing.assert_close(
+        got.cpu(), torch.addmm(bias_cpu, a_cpu, b_cpu), atol=5e-2, rtol=5e-2
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("case", ["gevm", "gevm_bias", "out_features_one", "batch_n1"])
+def test_degenerate_gemm_shapes(mojo_gpu, dtype, case):
+    """m == 1 (decode), n == 1, and the batched n == 1: each is a separate
+    route from the general tile ladder."""
+    atol, rtol = _tol(dtype)
+    if case == "gevm":
+        a = torch.randn(1, 128).to(dtype)
+        b = torch.randn(128, 64).to(dtype)
+        got = torch.mm(a.to(mojo_gpu), b.to(mojo_gpu))
+        ref = a.float() @ b.float()
+    elif case == "gevm_bias":
+        a = torch.randn(1, 128).to(dtype)
+        b = torch.randn(128, 64).to(dtype)
+        c = torch.randn(64).to(dtype)
+        got = torch.addmm(c.to(mojo_gpu), a.to(mojo_gpu), b.to(mojo_gpu))
+        ref = a.float() @ b.float() + c.float()
+    elif case == "out_features_one":
+        x = torch.randn(37, 129).to(dtype)
+        w = torch.randn(1, 129).to(dtype)
+        c = torch.randn(1).to(dtype)
+        got = torch.nn.functional.linear(x.to(mojo_gpu), w.to(mojo_gpu), c.to(mojo_gpu))
+        ref = torch.nn.functional.linear(x.float(), w.float(), c.float())
+    else:
+        a = torch.randn(4, 8, 129).to(dtype)
+        b = torch.randn(4, 129, 1).to(dtype)
+        got = torch.bmm(a.to(mojo_gpu), b.to(mojo_gpu))
+        ref = torch.bmm(a.float(), b.float())
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu().float(), ref, atol=atol * 4, rtol=rtol * 4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_linear_single_token(mojo_gpu, dtype):
+    """m == 1 through F.linear: the GPT-2 decode step."""
+    x = torch.randn(1, 768).to(dtype)
+    w = torch.randn(96, 768).to(dtype)
+    c = torch.randn(96).to(dtype)
+    got = torch.nn.functional.linear(x.to(mojo_gpu), w.to(mojo_gpu), c.to(mojo_gpu))
+    ref = torch.nn.functional.linear(x.float(), w.float(), c.float())
+    torch.testing.assert_close(got.cpu().float(), ref, atol=2e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "in_features,out_features", [(768, 2304), (768, 768), (768, 3072), (3072, 768)]
+)
+def test_addmm_model_shapes(mojo_gpu, in_features, out_features):
+    """Skinny-M against a large N, at the four shapes a transformer block
+    actually issues."""
+    x = torch.randn(32, in_features)
+    w = torch.randn(in_features, out_features)
+    c = torch.randn(out_features)
+    got = torch.addmm(c.to(mojo_gpu), x.to(mojo_gpu), w.to(mojo_gpu))
+    torch.testing.assert_close(got.cpu(), torch.addmm(c, x, w), atol=5e-2, rtol=5e-2)
+
+
+def test_linear_skinny_m_large_output(mojo_gpu):
+    x = torch.randn(32, 1, 768)
+    w = torch.randn(8192, 768)
+    got = torch.nn.functional.linear(x.to(mojo_gpu), w.to(mojo_gpu))
+    torch.testing.assert_close(
+        got.cpu(), torch.nn.functional.linear(x, w), atol=5e-2, rtol=5e-2
+    )

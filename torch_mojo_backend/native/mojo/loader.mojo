@@ -280,6 +280,8 @@ struct Loader(Movable):
             + String(perf_counter_ns())
             + ".so"
         )
+        # MODULAR_HOME: the compiler's own cache goes to local scratch too
+        # (native/__init__.py compiler_env explains why)
         var cmd = (
             _compiler_env()
             + " '"

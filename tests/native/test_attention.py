@@ -217,7 +217,7 @@ def test_efficient_attention_math(mojo_device, counting, dtype, is_causal):
     qr, kr, vr, q, k, v = _qkv(mojo_device, dtype, 2, 3, 17, 17, 40, seed=3)
     with torch.no_grad():
         out = aten._scaled_dot_product_efficient_attention(
-            q, k, v, None, True, 0.0, is_causal
+            q, k, v, None, False, 0.0, is_causal
         )[0]
     assert _counted("_scaled_dot_product_efficient_attention") == 1
     torch.testing.assert_close(
@@ -249,6 +249,43 @@ def test_efficient_attention_refuses_grad(mojo_gpu, counting):
     q.requires_grad_()
     with pytest.raises(NotImplementedError, match="torch.no_grad"):
         aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)
+
+
+def test_efficient_attention_declines_compute_log_sumexp(mojo_gpu, counting):
+    """No route here produces an LSE, and the only consumer is a backward op
+    this backend has no kernel for: returning zeros would hand a silently
+    wrong saved value to a backward that cannot run anyway."""
+    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 8, 8, 8)
+    with torch.no_grad(), pytest.raises(NotImplementedError, match="log-sum-exp"):
+        aten._scaled_dot_product_efficient_attention(q, k, v, None, True, 0.0, False)
+    with torch.no_grad():
+        lse = aten._scaled_dot_product_efficient_attention(
+            q, k, v, None, False, 0.0, False
+        )[1]
+    assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_math_attention_does_not_overflow_reduced_precision(mojo_gpu, dtype):
+    """q @ k^T accumulates head_dim products: with q, k of magnitude 100 and
+    head_dim 64 the scores reach 6.4e5, well past float16's 65504 ceiling.
+    The scores and the softmax therefore run in float32."""
+    shape = (1, 1, 8, 64)
+    qr = torch.full(shape, 100.0, dtype=dtype)
+    kr = torch.full(shape, 100.0, dtype=dtype)
+    vr = torch.arange(8 * 64, dtype=torch.float32).reshape(shape).to(dtype) / 64.0
+    q, k, v = qr.to(mojo_gpu), kr.to(mojo_gpu), vr.to(mojo_gpu)
+    with torch.no_grad():
+        out = aten._scaled_dot_product_efficient_attention(
+            q, k, v, None, False, 0.0, False
+        )[0]
+    assert torch.isfinite(out.cpu().float()).all()
+    torch.testing.assert_close(
+        out.contiguous().cpu().float(),
+        F.scaled_dot_product_attention(qr.float(), kr.float(), vr.float()),
+        atol=1e-1,
+        rtol=1e-1,
+    )
 
 
 def test_efficient_attention_declines_bias(mojo_gpu, counting):
@@ -289,3 +326,37 @@ def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
     mask = torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16, device=mojo_gpu)
     assert aten._fused_sdp_choice(q, k, v, mask, 0.0, False) == MATH
     assert aten._fused_sdp_choice(q, k, v, None, 0.25, True) == MATH
+
+
+def test_public_sdpa_takes_the_flash_route_and_trains(mojo_gpu):
+    """F.scaled_dot_product_attention picks its backend through a C++
+    DispatchStub the shim registers for this device, then calls the
+    `_for_cpu` flash overloads (non-CUDA devices), which wrap the flash ops."""
+    native.op_counting(True)
+    before = native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
+    before_bwd = native.op_count(
+        "aten::_scaled_dot_product_flash_attention_for_cpu_backward"
+    )
+    q = torch.randn(
+        2, 4, 128, 64, dtype=torch.bfloat16, device=mojo_gpu, requires_grad=True
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    out.float().sum().backward()
+    assert (
+        native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
+        == before + 1
+    )
+    assert (
+        native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu_backward")
+        == before_bwd + 1
+    )
+    ref_q = q.detach().cpu().float().requires_grad_(True)
+    ref_k = k.detach().cpu().float().requires_grad_(True)
+    ref_v = v.detach().cpu().float().requires_grad_(True)
+    ref = F.scaled_dot_product_attention(ref_q, ref_k, ref_v, is_causal=True)
+    ref.sum().backward()
+    assert q.grad is not None and ref_q.grad is not None
+    torch.testing.assert_close(out.cpu().float(), ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(q.grad.cpu().float(), ref_q.grad, atol=5e-2, rtol=5e-2)

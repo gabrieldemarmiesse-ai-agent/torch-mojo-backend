@@ -241,12 +241,13 @@ def test_compile_backward(mojo_device):
     w = torch.randn(8, 3).to(mojo_device).requires_grad_()
     loss = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x, w)
     loss.backward()
-    assert w.grad.device.type == "mojo"
+    assert w.grad is not None
     assert w.grad.device.type == "mojo"
 
     x_cpu = x.cpu().detach()
     w_cpu = w.cpu().detach().requires_grad_(True)
     fn(x_cpu, w_cpu).backward()
+    assert w_cpu.grad is not None
     torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=2e-2, atol=2e-3)
 
 

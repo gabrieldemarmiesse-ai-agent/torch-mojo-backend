@@ -198,15 +198,25 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     b = torch.full((4096, 4096), 2.0, device=mojo_gpu)
     torch.accelerator.synchronize(mojo_gpu)
 
-    # Establish a conservative duration for the work placed ahead of H2D.
-    _ = a * b
+    # Establish a conservative duration for the work placed ahead of H2D:
+    # enough launches that the device time dwarfs the enqueue cost.
+    def burst():
+        out = a * b
+        for _ in range(31):
+            out = out * b
+        return out
+
+    # The first staged upload of a process pays the pinned-buffer setup
+    # (hundreds of ms); the steady state is what the check is about.
+    _ = torch.arange(16).to(mojo_gpu, non_blocking=True)
+    _ = burst()
     torch.accelerator.synchronize(mojo_gpu)
     started = time.perf_counter()
-    _ = a * b
+    _ = burst()
     torch.accelerator.synchronize(mojo_gpu)
     mul_seconds = time.perf_counter() - started
 
-    delayed = a * b
+    delayed = burst()
     started = time.perf_counter()
     uploaded = torch.arange(4096).to(mojo_gpu, non_blocking=True)
     upload_return_seconds = time.perf_counter() - started
@@ -698,19 +708,12 @@ def test_custom_module_with_seqential(mojo_device):
     function_equivalent_on_both_devices(run_module, mojo_device, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="torch.compile(backend=mojo_backend)'s output adoption still "
-    "goes through the old TorchMojoTensor.__torch_dispatch__, whose "
-    "`tensor_holder` Mojo extension currently fails to build on this branch "
-    "('failed to parse the provided Mojo source module') -- a graph-backend "
-    "build breakage, not a missing native op",
-)
 def test_compile_with_max_device(mojo_device):
     """The torch.compile(backend=mojo_backend) graph path is independent of
     the native eager device: it lowers straight to a MAX graph rather than
     dispatching aten ops one at a time, so it is unaffected by which native
-    ops have landed yet -- when it works at all (see the xfail reason)."""
+    ops have landed yet. Its outputs come back as mojo tensors through
+    `mojo_device/dlpack.py`'s kDLExtDev capsule, not through any wrapper."""
 
     @torch.compile(backend=mojo_backend)
     def do_sqrt(device):

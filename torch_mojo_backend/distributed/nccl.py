@@ -10,8 +10,8 @@ where the library comes from and how the target GPU is selected differ:
 
 - NVIDIA: `libnccl.so.2` from the nvidia-nccl-cu12 wheel. It statically links
   the CUDA runtime and dlopens libcuda.so.1 by itself, so this needs nothing
-  beyond the wheel and a driver — the same trick mojo_device/cuda_peer.py
-  uses. The target GPU is the CUDA context current on the calling thread;
+  beyond the wheel and a driver. The target GPU is the CUDA context current
+  on the calling thread;
   MAX binds the per-device *primary* context, so memory allocated by MAX is
   directly valid for NCCL, and `set_current_device` performs the minimal
   driver-API dance (cuInit -> cuDevicePrimaryCtxRetain -> cuCtxSetCurrent)

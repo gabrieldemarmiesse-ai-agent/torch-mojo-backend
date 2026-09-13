@@ -376,6 +376,12 @@ def run_stream_ordering(failures: list[str]):
     with device_module.stream(side):
         work_b.wait()
         tripled = b + b + b  # tensor+tensor: a scalar multiply mixes dtypes for now
+    # `.cpu()` issues its copy on the *current* stream, which is the default
+    # one again here, so reading `tripled` needs a fence against `side` --
+    # the same rule CUDA has for a tensor produced on another stream. It
+    # still proves the ordering under test: a consumer that ran before the
+    # collective computed the wrong value, and no later barrier repairs that.
+    torch.accelerator.synchronize()
     _check(
         failures,
         "stream_ordering.side_stream",

@@ -18,6 +18,7 @@ Everything else -- an explicit mask, dropout, GQA, a shape no fused route
 takes -- is left to ATen's own math decomposition, which composes ordinary
 aten ops this backend already implements and differentiates itself.
 """
+from std.ffi import external_call
 from std.math import sqrt
 from std.utils import IndexList
 
@@ -42,11 +43,15 @@ from abi import (
     v_opt_tensor,
     v_tensor,
     view_strided,
+    TAG_BOOL,
+    TAG_INT,
+    TAG_NONE,
+    TAG_TENSOR,
 )
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import copy_strided_into, fill_value
+from ops_common import cast_to, copy_strided_into, fill_value, release_if_new
 from registry import Site, impl, op_address_of
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
@@ -151,6 +156,12 @@ def _is_float(t: T) -> Bool:
 
 
 def _needs_grad(q: T, k: T, v: T) -> Bool:
+    """Whether autograd will record this call: grad mode (a C++ TLS bit the
+    shim exposes as tmb_grad_enabled; it cannot be inferred through the
+    dispatcher from inside a backend kernel) and an input that requires
+    grad."""
+    if external_call["tmb_grad_enabled", Int32]() == 0:
+        return False
     return q.requires_grad() or k.requires_grad() or v.requires_grad()
 
 
@@ -342,6 +353,12 @@ def _fa4_forward(
     call.f64(scale)
     call.int(cp)
     call.run()
+    # Mojo destroys a value right after its LAST use, and these owners' last
+    # use is the pointer read above: without these, a materialized Q/K/V copy
+    # is freed before the kernel is even enqueued.
+    _ = qn
+    _ = kn
+    _ = vn
     _ = ctx
     var out = _view(dense.t, [b, h, s, d], [s * h * d, d, h * d, 1])
     return (out^, lse.take())
@@ -403,6 +420,17 @@ def _fa4_backward(
     call.f64(scale)
     call.int(cp)
     call.run()
+    # Last-use lifetime extension: every one of these owns memory the kernel
+    # reads or writes, and nothing below mentions them again.
+    _ = qn
+    _ = kn
+    _ = vn
+    _ = on
+    _ = gn
+    _ = lsen
+    _ = dpsum
+    _ = lse_log2
+    _ = dq_accum
     _ = ctx
 
     var gq = _view(dq.t, [b, h, s, d], [s * h * d, d, h * d, 1])
@@ -601,6 +629,7 @@ def _fused_fa_backward(
     call.int(dtype_code(q.dtype))
     call.int(cp)
     call.run()
+    _ = g  # last use above is g.t.ptr; keep the materialized grad alive
     _ = ctx
     return (dq.take(), dk.take(), dv.take())
 
@@ -732,25 +761,46 @@ def _math_forward(
     var q = _contig(q_in)
     var k = _contig(k_in)
     var v = _contig(v_in)
-    var scores = own(_alloc(q_in.device, q_in.stype, [b * h, lq, lk]))
-    _bmm(scores.t, q.t, k.t, b * h, lq, lk, d, True)
-    var probs = own(_alloc(q_in.device, q_in.stype, [b * h, lq, lk]))
+    # The scores and the softmax run in float32 whatever the inputs are.
+    # q @ k^T accumulates head_dim products, which half cannot hold: the
+    # review's case (q, k of magnitude 100, head_dim 64) reaches 6.4e5
+    # against half's 65504 ceiling and saturates to inf BEFORE the scale and
+    # the softmax can bring it back. ATen's math path avoids that by scaling
+    # q and k by sqrt(scale) first; computing the scores in float32 is the
+    # same fix without an extra pass over q, and the scale stays fused into
+    # the softmax. float32 inputs cast to themselves, so they pay nothing.
+    var q32 = cast_to(q.t, ST_FLOAT32)
+    var k32 = cast_to(k.t, ST_FLOAT32)
+    var scores = own(_alloc(q_in.device, ST_FLOAT32, [b * h, lq, lk]))
+    _bmm(scores.t, q32, k32, b * h, lq, lk, d, True)
+    release_if_new(q32, q.t)
+    release_if_new(k32, k.t)
+    _ = q
+    _ = k
+    var probs32 = own(_alloc(q_in.device, ST_FLOAT32, [b * h, lq, lk]))
     var soft = KernelCall("nn_ops", "SoftmaxRows")
     soft.arg_dtype(0, scores.t.dtype)
-    soft.out_dtype(probs.t.dtype)
+    soft.out_dtype(probs32.t.dtype)
     soft.flag("CAUSAL", 1 if is_causal else 0)
-    soft.int(probs.t.ptr)
+    soft.int(probs32.t.ptr)
     soft.int(scores.t.ptr)
     soft.int(b * h * lq)
     soft.int(lk)
     soft.f64(scale)
     soft.int(1 if is_causal else 0)
     soft.int(lq)
-    soft.int(dtype_code(q_in.dtype))
+    soft.int(dtype_code(DType.float32))
     soft.int(cp)
     soft.run()
+    _ = scores  # read only as a pointer above: keep the scratch alive
+    # The probabilities are in [0, 1]: rounding them back to the input dtype
+    # for the second GEMM is exactly what ATen's math path computes.
+    var probs = cast_to(probs32.t, q_in.stype)
     var out3 = own(_alloc(q_in.device, q_in.stype, [b * h, lq, d]))
-    _bmm(out3.t, probs.t, v.t, b * h, lq, d, lk, False)
+    _bmm(out3.t, probs, v.t, b * h, lq, d, lk, False)
+    release_if_new(probs, probs32.t)
+    _ = probs32
+    _ = v
     _ = ctx
     return _view(out3.t, [b, h, lq, d], [h * lq * d, lq * d, d, 1])
 
@@ -823,6 +873,18 @@ def op_fused_sdp_choice(
     (`REGISTER_PRIVATEUSE1_DISPATCH(_fused_sdp_choice_stub, ...)` forwarding
     here) is what would route `F.scaled_dot_product_attention` into the fused
     kernels below.
+
+    The user's SDP backend switches are NOT honoured, because there is no
+    device-agnostic way to read them from here. They live on the global
+    `at::Context` (`userEnabledFlashSDP()` / `userEnabledMemEfficientSDP()` /
+    `userEnabledMathSDP()`, what `torch.backends.cuda.enable_flash_sdp()`
+    sets), and nothing in the `tmb_*` record ABI exposes them: no aten op
+    reports them and no shim entry point reads them. Honouring them needs
+    three one-line getters in `native/csrc/shim_runtime.cpp` next to
+    `tmb_float32_matmul_precision`, which reads `at::globalContext()` the
+    same way; until then a caller who disables flash still gets flash from a
+    direct call to this op (the composite, which is what those switches are
+    documented to steer, does not reach it at all).
     """
     var q = v_tensor(args[unsafe_offset=0])
     var k = v_tensor(args[unsafe_offset=1])
@@ -990,10 +1052,15 @@ def op_efficient_attention(
     """The fused inference forward: FA4, the fused gfx942 kernels, the decode
     kernel, or the bmm + fused-causal-softmax + bmm decomposition.
 
-    `log_sumexp` is a zero placeholder: only
-    `_scaled_dot_product_efficient_attention_backward` consumes it, and this
-    backend has no kernel for that op, so a grad-requiring call is refused
-    here, in the forward, where the traceback still names the op.
+    `compute_log_sumexp=True` is declined: none of the routes below produces
+    a log-sum-exp (only the flash kernels do, through
+    `aten::_scaled_dot_product_flash_attention`), and the only consumer is
+    `_scaled_dot_product_efficient_attention_backward`, which this backend
+    has no kernel for -- so returning a zero tensor would hand a silently
+    wrong saved value to a backward that cannot run anyway. With
+    `compute_log_sumexp=False` the second result is the empty tensor ATen's
+    own CUDA path returns. A grad-requiring call is refused here, in the
+    forward, where the traceback still names the op.
     """
     var q = v_tensor(args[unsafe_offset=0])
     var k = v_tensor(args[unsafe_offset=1])
@@ -1015,14 +1082,20 @@ def op_efficient_attention(
         unsupported("efficient attention with an attention bias")
     if dropout_p != 0.0:
         unsupported("efficient attention with dropout")
+    if compute_lse:
+        unsupported(
+            "aten::_scaled_dot_product_efficient_attention with"
+            " compute_log_sumexp=True: none of the fused routes on this"
+            " device produces a log-sum-exp."
+            " aten::_scaled_dot_product_flash_attention does, on the inputs"
+            " its kernels take."
+        )
     if q.rank != 4:
         unsupported("efficient attention expects 4-D query/key/value")
     var scale = _scale_of(args[unsafe_offset=7], q.dim(3))
 
     var out = own(_efficient_forward(q, k, v, is_causal, dropout_p, scale))
-    var lse_len = q.dim(2) if compute_lse else 0
-    var lse = own(_alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), lse_len]))
-    fill_value(lse.t, 0.0)
+    var lse = own(_alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), 0]))
     var seed = own(_alloc(q.device, ST_INT64, List[Int]()))
     var offset = own(_alloc(q.device, ST_INT64, List[Int]()))
     fill_value(seed.t, 0.0)
@@ -1033,10 +1106,75 @@ def op_efficient_attention(
     ret_owned(rets, 3, offset)
 
 
+# aten::_scaled_dot_product_flash_attention_for_cpu(Tensor query, Tensor key,
+#   Tensor value, float dropout_p=0.0, bool is_causal=False, *,
+#   Tensor? attn_mask=None, float? scale=None) -> (Tensor output, Tensor logsumexp)
+def op_flash_attention_for_cpu(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """The composite `scaled_dot_product_attention` calls this overload, not
+    the CUDA one, on every device but CUDA/XPU once `_fused_sdp_choice` picked
+    flash: re-marshal onto the flash forward above (its autograd formula is
+    `_for_cpu_backward`, wrapped the same way below)."""
+    if not v_is_none(args[unsafe_offset=5]):
+        unsupported("flash attention with an explicit attn_mask")
+    var fargs = InlineArray[Value, 7](fill=Value(TAG_NONE, 0, 0, 0))
+    for i in range(5):
+        fargs[i] = args[unsafe_offset=i].copy()
+    fargs[5] = Value(TAG_BOOL, 0, 0, 0)  # return_debug_mask
+    fargs[6] = args[unsafe_offset=6].copy()
+    var frets = InlineArray[Value, 9](fill=Value(TAG_NONE, 0, 0, 0))
+    op_flash_attention(
+        Values(unsafe_from_address=Int(fargs.unsafe_ptr())),
+        7,
+        Values(unsafe_from_address=Int(frets.unsafe_ptr())),
+        9,
+    )
+    rets[unsafe_offset=0] = frets[0].copy()
+    rets[unsafe_offset=1] = frets[1].copy()
+    for i in range(2, 9):  # the flash-only results nobody asked for
+        if frets[i].tag == TAG_TENSOR:
+            release(Int(frets[i].a))
+    _ = fargs
+    _ = frets
+
+
+# aten::_scaled_dot_product_flash_attention_for_cpu_backward(Tensor grad_out,
+#   Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp,
+#   float dropout_p, bool is_causal, *, Tensor? attn_mask=None,
+#   float? scale=None) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+def op_flash_attention_for_cpu_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not v_is_none(args[unsafe_offset=8]):
+        unsupported("flash attention backward with an explicit attn_mask")
+    # the CUDA layout: cum_seq_q/k, max_q/k and the philox pair are never read
+    var fargs = InlineArray[Value, 15](fill=Value(TAG_NONE, 0, 0, 0))
+    for i in range(6):
+        fargs[i] = args[unsafe_offset=i].copy()
+    fargs[8] = Value(TAG_INT, 0, 0, 0)
+    fargs[9] = Value(TAG_INT, 0, 0, 0)
+    fargs[10] = args[unsafe_offset=6].copy()
+    fargs[11] = args[unsafe_offset=7].copy()
+    fargs[14] = args[unsafe_offset=9].copy()
+    op_flash_attention_backward(
+        Values(unsafe_from_address=Int(fargs.unsafe_ptr())), 15, rets, n_rets
+    )
+    _ = fargs
+
+
 def register_attention(site: Site) raises:
     impl[op_efficient_attention, "_scaled_dot_product_efficient_attention"](
         site
     )
+    impl[
+        op_flash_attention_for_cpu,
+        "_scaled_dot_product_flash_attention_for_cpu",
+    ](site)
+    impl[
+        op_flash_attention_for_cpu_backward,
+        "_scaled_dot_product_flash_attention_for_cpu_backward",
+    ](site)
     impl[op_flash_attention, "_scaled_dot_product_flash_attention"](site)
     impl[
         op_flash_attention_backward,

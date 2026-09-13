@@ -5,8 +5,8 @@
 > for the full architecture. The Python-level design this file used to
 > describe (`eager_kernels/__init__.py`'s `MojoExtensionLoader`,
 > `MojoExtension` descriptors, one Python-callable `call` per `.so`) was the
-> old eager-mode path; it is superseded, and its historical measurements live
-> in `docs/fast_eager_design.md` (marked superseded there too).
+> old eager-mode path; that code is deleted, and its historical measurements
+> live in `docs/fast_eager_design.md` (marked superseded there too).
 
 ## Compiled at first call
 

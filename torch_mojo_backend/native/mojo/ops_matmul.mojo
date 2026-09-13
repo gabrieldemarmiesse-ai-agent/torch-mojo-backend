@@ -15,7 +15,6 @@ returned NOT_HANDLED.
 """
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import unsafe_alloc
-from std.os import getenv
 from std.os.path import exists
 from std.utils import IndexList
 
@@ -228,18 +227,11 @@ def _sm90_cuda(device: Int) raises -> Bool:
 
 
 def _tf32_enabled() -> Bool:
-    """Whether the TF32 bridge may run — a numerics decision, not a capability
-    one: TF32 drops mantissa bits.
-
-    The old path asked `torch.get_float32_matmul_precision()` and ran only
-    when it was not "highest" (torch's default). Nothing in the C shim exposes
-    that setting to Mojo, so this reads an explicit opt-in env var instead.
-    Default off == torch's default, so fp32 numerics are unchanged; wiring the
-    real setting is one accessor in shim_runtime.cpp away
-    (`at::globalContext().float32MatmulPrecision()`).
-    """
-    var v = getenv("TORCH_MOJO_BACKEND_TF32")
-    return v != "" and v != "0"
+    """Whether the TF32 bridge may run: a numerics decision (TF32 drops
+    mantissa bits), taken from `torch.get_float32_matmul_precision()` exactly
+    as the old path did: any setting but "highest" (torch's default) allows
+    it."""
+    return external_call["tmb_float32_matmul_precision", Int32]() != 0
 
 
 # --- GEMM operands ------------------------------------------------------------
@@ -670,20 +662,14 @@ def _try_tf32_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
 
 def _declined(e: Error) -> Bool:
     """Whether an error is a route declining its operands rather than a real
-    failure. Device-memory exhaustion must never be disguised as
-    "unsupported": retrying would replace the allocator's message with a
-    misleading one."""
-    var msg = String(e).lower()
-    for marker in [
-        "cuda_error_out_of_memory",
-        "hiperroroutofmemory",
-        "out of memory",
-        "failed to allocate device memory",
-        "halerror (code = -13",
-    ]:
-        if msg.find(marker) >= 0:
-            return False
-    return True
+    failure: only the explicit `[unsupported]` status counts.
+
+    Everything else -- an allocator refusing device memory, ptxas failing to
+    assemble, a driver launch error -- is re-raised with its own message. The
+    host gates in `_spec_matmul` already restate every check the spec entry
+    makes, so a decline reaching here at all would be a gate this file is
+    missing rather than a route to retry."""
+    return String(e).startswith(UNSUPPORTED_PREFIX)
 
 
 def _spec_matmul(
@@ -738,6 +724,9 @@ def _spec_matmul(
                 or bias.value().dim(0) != n
             ):
                 return None
+            # The kernel reads the bias as a bare pointer on A's stream.
+            if not bias.value().on_mojo() or bias.value().device != a.device:
+                raise Error("expected every operand on the same mojo device")
         dims = _leading_dims(a)
         dims.append(n)
     var out = own(_new(dims, a.stype, a.device))
