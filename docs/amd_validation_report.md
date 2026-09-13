@@ -166,7 +166,8 @@ the parallel halves of this validation, not a node pair.
 |---|---|
 | `pytest tests/native/test_triton.py` | **2 failed**, 5 passed, 1 skipped (CUDA driver contexts). Failures: (1) `test_triton_launch_on_a_second_device`: `Triton Error [HIP]: Code: 101, invalid device ordinal` from the HIP driver's launch under `with device_module.device(1)`: a real bug in the never-run `_hip_driver_class`, see "Fixes"; (2) `test_driver_is_installed_on_import_after_registration` asserts the class name `MojoCudaDriver`; on HIP it is `MojoHipDriver`: test assumption |
 | liger `LigerRMSNormFunction.apply(h, w, 1e-6, 0.0, "llama", True)` on `mojo:0`, (64, 2048) | forward max err 1.4e-6, dX 7.2e-7, dW 7.6e-6 against the CPU formula (ref max 9.9 / 4.0 / 30.7); `triton.testing.do_bench` 0.0177 ms; `driver.active` is `MojoHipDriver`, target `GPUTarget(backend='hip', arch='gfx942', warp_size=64)`; the launch stream handle 189223616 equals `torch.mojo.stream_native_handle(current_stream())`. The package's `device.type == "cuda"` branches fell through to its generic paths unchanged, as on NVIDIA |
-| same under `with torch.mojo.device(1)` on `mojo:1` | the second-device bug above |
+| same under `with torch.mojo.device(1)` on `mojo:1` | the second-device bug above; after the fix: forward 1.4e-6, dX 7.2e-7, dW 7.6e-6, do_bench 0.059 ms, launch stream == mojo `hipStream_t` |
+| after the fix (commit 5a7eb6a) | `test_triton.py`: 7 passed, 1 skipped (CUDA driver contexts) |
 
 ## 6. TorchInductor
 
@@ -176,4 +177,44 @@ is `OSError: libcuda.so.1: cannot open shared object file` from
 `DeviceProperties.create`: the device interface reads compute capability and
 SM count from libcuda, the mojo Triton target is an alias of
 `CUDABackend`, and `_ptxas.apply_triton_default()` is NVIDIA-only, as the
-docs say. See "Fixes" for the one-hour attempt at a HIP alias.
+docs say. Fixed within the hour (commit b3c9e27): device properties come from the HIP Triton driver's own `get_device_properties` on hip (no libcuda), the mojo Triton target aliases `triton.backends.amd.compiler.HIPBackend` when the accelerator api is hip, ptxas is skipped on hip, and `raise_if_triton_unavailable` looks for the `amd` backend. After: **8 passed** (cold 349 s, warm 19 to 25 s); `test_monkeypatching_is_centralized.py` still passes; ruff and ty clean. The CUDA path is the same code behind an api check.
+
+## 3. The whole suite and the conformance tables
+
+The conformance regeneration (`regenerate_known_unsupported.py --records ... -n 4`,
+under the lock, with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` so four
+workers fit: its recorder writes one file per process and tolerates the
+exit segfault) ran in 115 s once the specializations were warm:
+14 failed, 1112 passed, 236 skipped, 1424 xfailed. `write_accelerator_delta.py`:
+**0 operators differ from the base tables** for `test_matches_cpu` and 0 for
+`test_errors_match`, so no `_ACCELERATOR_DELTAS["amdgpu:gfx942"]` entry is
+needed and there is no `+ declare` list: every operator the H100 tables
+declare unsupported is unsupported here too, and nothing declared
+unsupported passes. (The plan expected many differences; the native backend
+declines op by op in Mojo, not per architecture, which is why the tables
+carry over.)
+
+The 14 failures are numerical, one bf16/f16 ulp or an fp32 summation-order
+difference against tolerances that the H100 happens to meet:
+
+| node | mismatch |
+|---|---|
+| bmm float32 | 1 of 250 elements, abs 1.44e-5 (1e-5 allowed) |
+| pow, __rpow__ float32 | rel 1.4e-6 to 1.6e-6 (1.3e-6 allowed) on 1 to 3 large elements |
+| log_softmax, masked_log_softmax bf16 / f16 | 2 to 3 of 25 elements, abs 3.8e-3 (bf16) / 4.3e-4 (f16); the CPU reference is exactly 0 there |
+| addr float16 | 1 of 50, rel 1.045e-3 (1e-3 allowed) |
+| batch_norm, instance_norm bf16 / f16 | 1 to 7 of 125, one ulp |
+| conv2d bf16 / f16 | 1 element, one ulp |
+
+The suite's existing instrument for this class is `_FP64_ANCHORED` in
+`conformance/test_opinfo.py` (as accurate as torch against a float64
+reference, within 2x); the fix makes it accelerator-keyed and lists these
+nodes under `amdgpu:gfx942`, and any node that fails even that bar stays a
+failure and is reported as a precision finding. See "Fixes".
+
+The whole suite (`pytest tests --ignore=tests/multinode`, serial, one
+process) was OOM-killed twice by the node's global OOM killer, at 24% and
+at 335 s, while my agents held three other MAX contexts on the same node
+(each reserves ~115 GB of the APU's 501 GB at first use; `free` does not
+show those reservations). Its fourth launch, alone on the node, is reported
+below.
