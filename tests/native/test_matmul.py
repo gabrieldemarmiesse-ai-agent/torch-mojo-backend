@@ -13,6 +13,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
+from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import CallChecker
@@ -300,7 +301,7 @@ def test_mm_out_under_allocator_churn_on_a_side_stream(mojo_device):
     any later kernel can write the recycled block. The keepalive is still
     required: nothing in an op may depend on that allocator detail.
     """
-    side = torch.Stream(device=mojo_device)
+    side = side_stream_or_skip(mojo_device)
     outs, refs = [], []
     with device_module.stream(side):
         for _ in range(48):

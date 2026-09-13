@@ -7,6 +7,7 @@ once into a `T` view through the shim's C getters.
 """
 from std.ffi import c_char, external_call
 from std.sys._libc import free as libc_free
+from std.sys.info import CompilationTarget
 from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.utils import IndexList
@@ -192,8 +193,11 @@ def dtype_name(stype: Int32) -> String:
 
     It is the demangled C++ type behind the ScalarType, not the python
     `torch.float32` spelling, so an `out=` message raised here reads exactly
-    like CPU torch's. The integer spellings are gcc's; clang writes `short`
-    where gcc writes `short int`.
+    like CPU torch's. The integer spellings follow the platform's own name
+    mangler/demangler, which differs by libc/ABI rather than by compiler
+    flag: glibc's fixed-width ints are `long`/`short int` typedefs (gcc's
+    spelling on Linux), while macOS's libc++ typedefs them to `long long`/
+    `short` (int64/int16; int8/uint8 and int32/uint32 already agree).
     """
     if stype == ST_FLOAT32:
         return String("float")
@@ -210,17 +214,29 @@ def dtype_name(stype: Int32) -> String:
     if stype == ST_UINT8:
         return String("unsigned char")
     if stype == ST_INT16:
-        return String("short int")
+        comptime if CompilationTarget.is_macos():
+            return String("short")
+        else:
+            return String("short int")
     if stype == ST_UINT16:
-        return String("short unsigned int")
+        comptime if CompilationTarget.is_macos():
+            return String("unsigned short")
+        else:
+            return String("short unsigned int")
     if stype == ST_INT32:
         return String("int")
     if stype == ST_UINT32:
         return String("unsigned int")
     if stype == ST_INT64:
-        return String("long int")
+        comptime if CompilationTarget.is_macos():
+            return String("long long")
+        else:
+            return String("long int")
     if stype == ST_UINT64:
-        return String("long unsigned int")
+        comptime if CompilationTarget.is_macos():
+            return String("unsigned long long")
+        else:
+            return String("long unsigned int")
     return String("ScalarType ") + String(stype)
 
 
