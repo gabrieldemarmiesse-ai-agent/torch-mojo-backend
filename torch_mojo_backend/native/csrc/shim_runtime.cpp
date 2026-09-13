@@ -35,6 +35,8 @@ extern "C" void tmb_set_error(const char* message) {
   tmb_thread_error() = message ? message : "";
 }
 extern "C" const char* tmb_get_error(void) { return tmb_thread_error().c_str(); }
+extern "C" void tmb_lock(void) { tmb_mutex.lock(); }
+extern "C" void tmb_unlock(void) { tmb_mutex.unlock(); }
 
 namespace {
 thread_local int32_t tls_device = 0;

@@ -106,6 +106,9 @@ int32_t tmb_autocast_policy(const char* qualified_name, int32_t policy);
 int32_t tmb_autocast_install_cuda_policies(void);  // torch's own CUDA lists, verbatim
 void tmb_set_error(const char* message);  // thread-local, read by the adapter on failure
 const char* tmb_get_error(void);
+// the backend mutex, for callers that reach Mojo outside the boxed adapter (process group)
+void tmb_lock(void);
+void tmb_unlock(void);
 // thread-local current device / stream, as torch's device guard sees them
 int32_t tmb_current_device(void);
 void tmb_set_current_device(int32_t device);

@@ -137,9 +137,14 @@ def uses_mojoccl() -> bool:
 
 
 def vendor_name() -> str:
-    from torch_mojo_backend.mojo_device import hip_peer  # noqa: PLC0415 -- probes the loaded runtime; keep it lazy
+    """ "rccl" when MAX's accelerators are AMD (HIP api), else "nccl"."""
+    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators  # noqa: PLC0415 -- imports max.driver; keep it off the import path
 
-    return "rccl" if hip_peer.available() else "nccl"
+    return (
+        "rccl"
+        if any(getattr(d, "api", "") == "hip" for d in get_accelerators())
+        else "nccl"
+    )
 
 
 def library_path() -> str:

@@ -13,10 +13,12 @@ go to a private gloo group.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import datetime
 import functools
 import os
+import platform
 import sys
 import traceback
 from collections.abc import Callable
@@ -61,8 +63,6 @@ _NCCL_DTYPE_OF: dict[torch.dtype, int] = {
     torch.float64: nccl.NCCL_FLOAT64,
     torch.bfloat16: nccl.NCCL_BFLOAT16,
 }
-# torch.bool reduces as uint8: SUM/MAX behave as logical OR, MIN as AND —
-# the same convention ProcessGroupNCCL uses.
 
 
 def _nccl_dtype(dtype: torch.dtype) -> int:
@@ -74,7 +74,17 @@ def _nccl_dtype(dtype: torch.dtype) -> int:
         ) from None
 
 
-def _nccl_red_op(op: ReduceOp | ReduceOp.RedOpType) -> int:
+def _nccl_red_op(
+    op: ReduceOp | ReduceOp.RedOpType, dtype: torch.dtype = torch.float32
+) -> int:
+    if dtype == torch.bool:
+        # bool reduces as uint8: SUM and PRODUCT become MAX and MIN (logical
+        # or / and, no overflow); AVG has no meaning -- ProcessGroupNCCL's rules.
+        if op == ReduceOp.SUM or op == ReduceOp.MAX:
+            return nccl.NCCL_MAX
+        if op == ReduceOp.PRODUCT or op == ReduceOp.MIN:
+            return nccl.NCCL_MIN
+        raise TypeError(f"ReduceOp {op} is not supported for bool tensors")
     if op == ReduceOp.SUM:
         return nccl.NCCL_SUM
     if op == ReduceOp.PRODUCT:
@@ -151,6 +161,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         self, store: Store, rank: int, world_size: int, timeout: datetime.timedelta
     ):
         super().__init__(rank, world_size)  # ty: ignore[missing-argument, invalid-argument-type] -- the 2-arg base ctor is the one a Python subclass can use
+        if platform.machine() not in ("x86_64", "AMD64"):
+            raise NotImplementedError(
+                "the mojo process group passes ncclUniqueId with the x86-64 SysV layout; "
+                f"{platform.machine()} is not supported yet"
+            )
         self._store = store
         self._timeout = timeout
         # CPU tensors (object collectives, barriers on CPU groups) go to gloo.
@@ -178,11 +193,29 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._ready: dict[int, torch.Stream] = {}
         self._seq = 0
         self._group_name = ""
+        self._coalescing: int | None = (
+            None  # device index while batch_isend_irecv coalesces
+        )
+        self._coalesced_tensors: list[torch.Tensor] = []
+        # Communicator creation is collective: do it now, while every rank is
+        # here, on the rank's current device (one visible GPU per torchrun rank).
+        self._ensure(device_module.current_device())
 
     # ---- plumbing ------------------------------------------------------------
 
     def getBackendName(self) -> str:
         return "mojo"
+
+    # A Python ProcessGroup subclass is its own backend: torch's
+    # batch_isend_irecv and _coalescing_manager look the backend up with
+    # _get_backend(device) and read supports_coalescing on it, and the C++
+    # lookup would fail because no backend is registered for "mojo".
+    supports_coalescing = True
+    supports_splitting = False
+    _supports_time_estimate = False
+
+    def _get_backend(self, device: torch.device) -> MojoProcessGroup:
+        return self
 
     def _set_group_name(self, name: str):
         self._group_name = name
@@ -194,13 +227,15 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._group_name = name
 
     def shutdown(self):
-        if self._handle:
-            self._core.destroy(self._handle)
-            self._handle = None
+        handle, self._handle = self._handle, None
+        if handle:
+            self._core.destroy(handle)
+        self._ready.clear()
 
     def abort(self):
         for index in list(self._ready):
-            self._core.abort(self._handle, index)
+            self._core.check(self._core.abort(self._handle, index), "ncclCommAbort")
+            del self._ready[index]
 
     def __del__(self):
         try:
@@ -208,15 +243,18 @@ class MojoProcessGroup(dist.ProcessGroup):
         except Exception:
             pass
 
-    @staticmethod
-    def _is_cpu(tensor: torch.Tensor) -> bool:
+    def _is_cpu(self, tensor: torch.Tensor) -> bool:
         if tensor.device.type == "cpu":
             return True
         if tensor.device.type != "mojo":
             raise ValueError(
                 f"the mojo distributed backend handles mojo and cpu tensors, got {tensor.device}"
             )
-        return tensor.device == device_module.cpu()
+        if tensor.device == device_module.cpu():
+            raise NotImplementedError(
+                "collectives on the MAX CPU device are not supported: use plain CPU tensors (gloo) or a GPU"
+            )
+        return False
 
     @staticmethod
     def _index(tensor: torch.Tensor) -> int:
@@ -227,11 +265,15 @@ class MojoProcessGroup(dist.ProcessGroup):
         )
 
     def _ensure(self, index: int) -> torch.Stream:
-        """One communicator per device, bootstrapped through the c10d store."""
+        """One communicator per device, bootstrapped through the c10d store.
+        The store key is rank-consistent (creation order), never the local
+        device index, which differs across ranks without visibility pinning."""
         stream = self._ready.get(index)
         if stream is not None:
             return stream
-        key = f"mojo-ccl-unique-id-{self._seq}-{index}"
+        if self._coalescing is not None:
+            raise RuntimeError("cannot create a communicator inside a coalescing block")
+        key = f"mojo-ccl-unique-id-{self._seq}"
         self._seq += 1
         if self.rank() == 0:
             buf = ctypes.create_string_buffer(nccl.NCCL_UNIQUE_ID_BYTES)
@@ -254,7 +296,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         return stream
 
     def _work(self, index: int, result: list[torch.Tensor]) -> Work:
-        """A Work whose wait() makes the waiter's stream follow the comm stream."""
+        """A Work whose wait() makes the waiter's stream follow the comm stream:
+        the Future's completion events are recorded on the comm stream."""
         future: torch.futures.Future[list[torch.Tensor]] = torch.futures.Future(
             devices=[torch.device("mojo", index)]
         )
@@ -262,12 +305,34 @@ class MojoProcessGroup(dist.ProcessGroup):
             future.set_result(result)
         return _create_work_from_future(future)
 
-    def _staged(self, tensor: torch.Tensor) -> torch.Tensor:
-        return tensor if tensor.is_contiguous() else tensor.contiguous()
+    def _stage_in(self, index: int, tensor: torch.Tensor) -> torch.Tensor:
+        """A dense copy of a non-contiguous input, made on the comm stream after
+        it waited for the current stream, so its release never fences compute."""
+        if tensor.is_contiguous():
+            return tensor
+        comm = self._ready[index]
+        comm.wait_stream(torch.accelerator.current_stream(index))
+        with device_module.stream(comm):
+            staged = tensor.contiguous()
+        return staged
+
+    def _stage_out(self, index: int, tensor: torch.Tensor) -> torch.Tensor:
+        """A fresh dense buffer for a non-contiguous output, on the comm stream."""
+        if tensor.is_contiguous():
+            return tensor
+        with device_module.stream(self._ready[index]):
+            staged = torch.empty_like(tensor, memory_format=torch.contiguous_format)
+        return staged
+
+    def _record(self, index: int, *tensors: torch.Tensor):
+        """Inputs (original and staged): touched by the comm stream, not modified."""
+        comm = self._ready[index]
+        for t in tensors:
+            t.record_stream(comm)
 
     def _finish(self, index: int, *pairs: tuple[torch.Tensor, torch.Tensor]):
-        """After the collective: copy staged results back on the comm stream
-        and record every touched buffer on it so its release is fenced."""
+        """Outputs: copy staged results back on the comm stream and record
+        every buffer on it so its release is fenced."""
         comm = self._ready[index]
         with device_module.stream(comm):
             for tensor, staged in pairs:
@@ -283,11 +348,68 @@ class MojoProcessGroup(dist.ProcessGroup):
                 "the mojo backend takes exactly one tensor per rank per call"
             )
 
-    def _group(self):
-        self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
+    def _same_device(self, tensors: list[torch.Tensor]) -> int:
+        if not tensors:
+            raise ValueError("no tensors")
+        index = self._index(tensors[0])
+        for t in tensors:
+            if self._is_cpu(t) or self._index(t) != index:
+                raise ValueError(
+                    "all tensors of a collective must be on the same mojo device"
+                )
+        return index
 
-    def _ungroup(self):
+    @contextlib.contextmanager
+    def _group(self):
+        """An NCCL group; the end call runs on every exit path so a failed
+        submission never leaves the communicator inside an open group."""
+        if self._coalescing is not None:  # batch_isend_irecv already opened one
+            yield
+            return
+        self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
+        try:
+            yield
+        finally:
+            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+
+    def _op(self, dtype: torch.dtype, op: ReduceOp | ReduceOp.RedOpType) -> int:
+        return _nccl_red_op(op, dtype)
+
+    def _result(self, index: int, tensors: list[torch.Tensor]) -> Work:
+        if self._coalescing is not None:
+            self._coalesced_tensors.extend(tensors)
+            return self._work(
+                index, tensors
+            )  # placeholder: ordering comes from _end_coalescing's Work
+        return self._work(index, tensors)
+
+    # ---- coalescing (torch.distributed.batch_isend_irecv / _coalescing_manager)
+
+    def _start_coalescing(self, device: torch.device):
+        index = (
+            device.index if device.index is not None else device_module.current_device()
+        )
+        self._ensure(index)
+        self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
+        self._coalescing = index
+        self._coalesced_tensors = []
+
+    def _end_coalescing(self, device: torch.device) -> Work:
+        index = (
+            self._coalescing
+            if self._coalescing is not None
+            else self._index_of_device(device)
+        )
+        self._coalescing = None
+        tensors, self._coalesced_tensors = self._coalesced_tensors, []
         self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+        return self._work(index, tensors)
+
+    @staticmethod
+    def _index_of_device(device: torch.device) -> int:
+        return (
+            device.index if device.index is not None else device_module.current_device()
+        )
 
     # ---- collectives -----------------------------------------------------------
 
@@ -299,22 +421,18 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.allreduce(tensors, opts)
         self._one_per_rank(tensors)
         tensor = tensors[0]
-        index = self._index(tensor)
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = self._staged(tensor)
+        dtype, op = _nccl_dtype(tensor.dtype), self._op(tensor.dtype, opts.reduceOp)
+        staged = self._stage_in(index, tensor)
         self._core.check(
             self._core.allreduce(
-                self._handle,
-                index,
-                staged.data_ptr(),
-                staged.numel(),
-                _nccl_dtype(staged.dtype),
-                _nccl_red_op(opts.reduceOp),
+                self._handle, index, staged.data_ptr(), staged.numel(), dtype, op
             ),
             "ncclAllReduce",
         )
         self._finish(index, (tensor, staged))
-        return self._work(index, tensors)
+        return self._result(index, tensors)
 
     @_loud
     def allreduce_coalesced(
@@ -324,25 +442,22 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.allreduce_coalesced(tensors, opts)
-        index = self._index(tensors[0])
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = [self._staged(t) for t in tensors]
-        self._group()
-        for s in staged:
-            self._core.check(
-                self._core.allreduce(
-                    self._handle,
-                    index,
-                    s.data_ptr(),
-                    s.numel(),
-                    _nccl_dtype(s.dtype),
-                    _nccl_red_op(opts.reduceOp),
-                ),
-                "ncclAllReduce",
-            )
-        self._ungroup()
+        plan = [
+            (t, _nccl_dtype(t.dtype), self._op(t.dtype, opts.reduceOp)) for t in tensors
+        ]
+        staged = [self._stage_in(index, t) for t in tensors]
+        with self._group():
+            for (t, dtype, op), s in zip(plan, staged):
+                self._core.check(
+                    self._core.allreduce(
+                        self._handle, index, s.data_ptr(), s.numel(), dtype, op
+                    ),
+                    "ncclAllReduce",
+                )
         self._finish(index, *zip(tensors, staged))
-        return self._work(index, tensors)
+        return self._result(index, tensors)
 
     @_loud
     def broadcast(
@@ -351,24 +466,26 @@ class MojoProcessGroup(dist.ProcessGroup):
         if self._is_cpu(tensors[0]):
             return self._gloo.broadcast(tensors, opts)
         self._one_per_rank(tensors)
+        if opts.rootTensor != 0:
+            raise ValueError("rootTensor must be 0 with one tensor per rank")
         tensor = tensors[0]
-        index = self._index(tensor)
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = self._staged(tensor)
-        root = opts.rootRank * len(tensors) + opts.rootTensor
+        dtype = _nccl_dtype(tensor.dtype)
+        staged = self._stage_in(index, tensor)
         self._core.check(
             self._core.broadcast(
                 self._handle,
                 index,
                 staged.data_ptr(),
                 staged.numel(),
-                _nccl_dtype(staged.dtype),
-                root,
+                dtype,
+                opts.rootRank,
             ),
             "ncclBroadcast",
         )
         self._finish(index, (tensor, staged))
-        return self._work(index, tensors)
+        return self._result(index, tensors)
 
     @_loud
     def reduce(
@@ -378,23 +495,24 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.reduce(tensors, opts)
         self._one_per_rank(tensors)
         tensor = tensors[0]
-        index = self._index(tensor)
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = self._staged(tensor)
+        dtype, op = _nccl_dtype(tensor.dtype), self._op(tensor.dtype, opts.reduceOp)
+        staged = self._stage_in(index, tensor)
         self._core.check(
             self._core.reduce(
                 self._handle,
                 index,
                 staged.data_ptr(),
                 staged.numel(),
-                _nccl_dtype(staged.dtype),
-                _nccl_red_op(opts.reduceOp),
+                dtype,
+                op,
                 opts.rootRank,
             ),
             "ncclReduce",
         )
         self._finish(index, (tensor, staged))
-        return self._work(index, tensors)
+        return self._result(index, tensors)
 
     def _allgather_flat(
         self, index: int, output: torch.Tensor, input: torch.Tensor
@@ -406,8 +524,9 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
         if output.dtype != input.dtype:
             raise ValueError("all_gather output dtype must match the input")
-        staged_in = self._staged(input)
-        staged_out = self._staged(output)
+        dtype = _nccl_dtype(input.dtype)
+        staged_in = self._stage_in(index, input)
+        staged_out = self._stage_out(index, output)
         self._core.check(
             self._core.allgather(
                 self._handle,
@@ -415,7 +534,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 staged_in.data_ptr(),
                 staged_out.data_ptr(),
                 staged_in.numel(),
-                _nccl_dtype(input.dtype),
+                dtype,
             ),
             "ncclAllGather",
         )
@@ -430,11 +549,12 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensor):
             return self._gloo._allgather_base(output_tensor, input_tensor, opts)
-        index = self._index(input_tensor)
+        index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
         staged_in, staged_out = self._allgather_flat(index, output_tensor, input_tensor)
-        self._finish(index, (input_tensor, staged_in), (output_tensor, staged_out))
-        return self._work(index, [output_tensor])
+        self._record(index, input_tensor, staged_in)
+        self._finish(index, (output_tensor, staged_out))
+        return self._result(index, [output_tensor])
 
     @_loud
     def allgather(
@@ -450,20 +570,25 @@ class MojoProcessGroup(dist.ProcessGroup):
         outputs = output_tensors[0]
         if len(outputs) != self.size():
             raise ValueError("all_gather needs world_size output tensors")
-        index = self._index(input)
+        if any(o.numel() != input.numel() or o.dtype != input.dtype for o in outputs):
+            raise NotImplementedError(
+                "all_gather with uneven or differently typed tensors is not supported"
+            )
+        index = self._same_device([input, *outputs])
         comm = self._ensure(index)
-        flat = torch.empty(
-            self.size() * input.numel(), dtype=input.dtype, device=input.device
-        )
-        staged_in, _ = self._allgather_flat(index, flat, input)
         with device_module.stream(comm):
-            n = input.numel()
+            flat = torch.empty(
+                self.size() * input.numel(), dtype=input.dtype, device=input.device
+            )
+        staged_in, _ = self._allgather_flat(index, flat, input)
+        n = input.numel()
+        with device_module.stream(comm):
             for r, out in enumerate(outputs):
                 out.copy_(flat[r * n : (r + 1) * n].view(out.shape))
                 out.record_stream(comm)
             flat.record_stream(comm)
-        self._finish(index, (input, staged_in))
-        return self._work(index, outputs)
+        self._record(index, input, staged_in)
+        return self._result(index, outputs)
 
     @_loud
     def allgather_into_tensor_coalesced(
@@ -476,23 +601,25 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.allgather_into_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
-        index = self._index(input_tensors[0])
+        if len(output_tensors) != len(input_tensors):
+            raise ValueError("coalesced all_gather needs as many outputs as inputs")
+        index = self._same_device([*input_tensors, *output_tensors])
         self._ensure(index)
-        self._group()
-        pairs = [
-            self._allgather_flat(index, o, i)
-            for o, i in zip(output_tensors, input_tensors)
-        ]
-        self._ungroup()
-        self._finish(
-            index,
-            *[(i, si) for i, (si, _) in zip(input_tensors, pairs)],
-            *[(o, so) for o, (_, so) in zip(output_tensors, pairs)],
-        )
-        return self._work(index, output_tensors)
+        with self._group():
+            pairs = [
+                self._allgather_flat(index, o, i)
+                for o, i in zip(output_tensors, input_tensors)
+            ]
+        self._record(index, *input_tensors, *[si for si, _ in pairs])
+        self._finish(index, *[(o, so) for o, (_, so) in zip(output_tensors, pairs)])
+        return self._result(index, output_tensors)
 
     def _reduce_scatter_flat(
-        self, index: int, output: torch.Tensor, input: torch.Tensor, op: int
+        self,
+        index: int,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        op: ReduceOp | ReduceOp.RedOpType,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if input.numel() != output.numel() * self.size():
             raise ValueError(
@@ -500,8 +627,9 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
         if output.dtype != input.dtype:
             raise ValueError("reduce_scatter output dtype must match the input")
-        staged_in = self._staged(input)
-        staged_out = self._staged(output)
+        dtype, nccl_op = _nccl_dtype(input.dtype), self._op(input.dtype, op)
+        staged_in = self._stage_in(index, input)
+        staged_out = self._stage_out(index, output)
         self._core.check(
             self._core.reduce_scatter(
                 self._handle,
@@ -509,8 +637,8 @@ class MojoProcessGroup(dist.ProcessGroup):
                 staged_in.data_ptr(),
                 staged_out.data_ptr(),
                 staged_out.numel(),
-                _nccl_dtype(input.dtype),
-                op,
+                dtype,
+                nccl_op,
             ),
             "ncclReduceScatter",
         )
@@ -525,13 +653,14 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensor):
             return self._gloo._reduce_scatter_base(output_tensor, input_tensor, opts)
-        index = self._index(input_tensor)
+        index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
         staged_in, staged_out = self._reduce_scatter_flat(
-            index, output_tensor, input_tensor, _nccl_red_op(opts.reduceOp)
+            index, output_tensor, input_tensor, opts.reduceOp
         )
-        self._finish(index, (input_tensor, staged_in), (output_tensor, staged_out))
-        return self._work(index, [output_tensor])
+        self._record(index, input_tensor, staged_in)
+        self._finish(index, (output_tensor, staged_out))
+        return self._result(index, [output_tensor])
 
     @_loud
     def reduce_scatter(
@@ -547,16 +676,19 @@ class MojoProcessGroup(dist.ProcessGroup):
         inputs = input_tensors[0]
         if len(inputs) != self.size():
             raise ValueError("reduce_scatter needs world_size input tensors")
-        index = self._index(output)
+        if any(i.numel() != output.numel() or i.dtype != output.dtype for i in inputs):
+            raise ValueError(
+                "reduce_scatter inputs must match the output's size and dtype"
+            )
+        index = self._same_device([output, *inputs])
         comm = self._ensure(index)
-        flat = torch.cat([t.reshape(-1) for t in inputs])
-        _, staged_out = self._reduce_scatter_flat(
-            index, output, flat, _nccl_red_op(opts.reduceOp)
-        )
+        comm.wait_stream(torch.accelerator.current_stream(index))
         with device_module.stream(comm):
-            flat.record_stream(comm)
+            flat = torch.cat([t.reshape(-1) for t in inputs])
+        _, staged_out = self._reduce_scatter_flat(index, output, flat, opts.reduceOp)
+        self._record(index, flat, *inputs)
         self._finish(index, (output, staged_out))
-        return self._work(index, [output])
+        return self._result(index, [output])
 
     @_loud
     def reduce_scatter_tensor_coalesced(
@@ -569,21 +701,35 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.reduce_scatter_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
-        index = self._index(output_tensors[0])
+        if len(output_tensors) != len(input_tensors):
+            raise ValueError("coalesced reduce_scatter needs as many outputs as inputs")
+        index = self._same_device([*input_tensors, *output_tensors])
         self._ensure(index)
-        op = _nccl_red_op(opts.reduceOp)
-        self._group()
-        pairs = [
-            self._reduce_scatter_flat(index, o, i, op)
-            for o, i in zip(output_tensors, input_tensors)
-        ]
-        self._ungroup()
-        self._finish(
-            index,
-            *[(i, si) for i, (si, _) in zip(input_tensors, pairs)],
-            *[(o, so) for o, (_, so) in zip(output_tensors, pairs)],
-        )
-        return self._work(index, output_tensors)
+        with self._group():
+            pairs = [
+                self._reduce_scatter_flat(index, o, i, opts.reduceOp)
+                for o, i in zip(output_tensors, input_tensors)
+            ]
+        self._record(index, *input_tensors, *[si for si, _ in pairs])
+        self._finish(index, *[(o, so) for o, (_, so) in zip(output_tensors, pairs)])
+        return self._result(index, output_tensors)
+
+    def _splits(self, tensor: torch.Tensor, sizes: list[int], what: str) -> list[int]:
+        """Element counts per peer of an all-to-all buffer (rows of dim 0)."""
+        world = self.size()
+        rows = tensor.shape[0] if tensor.dim() > 0 else 1
+        row = tensor.numel() // rows if rows else 0
+        if not sizes:
+            if rows % world:
+                raise ValueError(
+                    f"all_to_all {what} of {rows} rows does not split evenly across {world} ranks"
+                )
+            return [(rows // world) * row] * world
+        if len(sizes) != world or any(s < 0 for s in sizes) or sum(sizes) != rows:
+            raise ValueError(
+                f"all_to_all {what} split sizes must be {world} nonnegative sizes summing to {rows} rows"
+            )
+        return [s * row for s in sizes]
 
     def _sendrecv_chunks(
         self,
@@ -593,39 +739,40 @@ class MojoProcessGroup(dist.ProcessGroup):
         out_sizes: list[int],
         in_sizes: list[int],
     ):
+        if output.dtype != input.dtype:
+            raise ValueError("all_to_all output dtype must match the input")
         dtype = _nccl_dtype(input.dtype)
         itemsize = input.element_size()
-        self._group()
-        in_off = out_off = 0
-        for peer in range(self.size()):
-            n_in, n_out = in_sizes[peer], out_sizes[peer]
-            if n_in:
-                self._core.check(
-                    self._core.send(
-                        self._handle,
-                        index,
-                        input.data_ptr() + in_off * itemsize,
-                        n_in,
-                        dtype,
-                        peer,
-                    ),
-                    "ncclSend",
-                )
-            if n_out:
-                self._core.check(
-                    self._core.recv(
-                        self._handle,
-                        index,
-                        output.data_ptr() + out_off * itemsize,
-                        n_out,
-                        dtype,
-                        peer,
-                    ),
-                    "ncclRecv",
-                )
-            in_off += n_in
-            out_off += n_out
-        self._ungroup()
+        with self._group():
+            in_off = out_off = 0
+            for peer in range(self.size()):
+                n_in, n_out = in_sizes[peer], out_sizes[peer]
+                if n_in:
+                    self._core.check(
+                        self._core.send(
+                            self._handle,
+                            index,
+                            input.data_ptr() + in_off * itemsize,
+                            n_in,
+                            dtype,
+                            peer,
+                        ),
+                        "ncclSend",
+                    )
+                if n_out:
+                    self._core.check(
+                        self._core.recv(
+                            self._handle,
+                            index,
+                            output.data_ptr() + out_off * itemsize,
+                            n_out,
+                            dtype,
+                            peer,
+                        ),
+                        "ncclRecv",
+                    )
+                in_off += n_in
+                out_off += n_out
 
     @_loud
     def alltoall_base(
@@ -640,26 +787,16 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.alltoall_base(
                 output_tensor, input_tensor, output_split_sizes, input_split_sizes, opts
             )
-        index = self._index(input_tensor)
+        index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
-        world = self.size()
-        if not input_split_sizes:
-            input_split_sizes = [input_tensor.shape[0] // world] * world
-        if not output_split_sizes:
-            output_split_sizes = [output_tensor.shape[0] // world] * world
-        row_in = input_tensor[0].numel() if input_tensor.dim() > 0 else 1
-        row_out = output_tensor[0].numel() if output_tensor.dim() > 0 else 1
-        staged_in = self._staged(input_tensor)
-        staged_out = self._staged(output_tensor)
-        self._sendrecv_chunks(
-            index,
-            staged_out,
-            staged_in,
-            [s * row_out for s in output_split_sizes],
-            [s * row_in for s in input_split_sizes],
-        )
-        self._finish(index, (input_tensor, staged_in), (output_tensor, staged_out))
-        return self._work(index, [output_tensor])
+        in_sizes = self._splits(input_tensor, list(input_split_sizes), "input")
+        out_sizes = self._splits(output_tensor, list(output_split_sizes), "output")
+        staged_in = self._stage_in(index, input_tensor)
+        staged_out = self._stage_out(index, output_tensor)
+        self._sendrecv_chunks(index, staged_out, staged_in, out_sizes, in_sizes)
+        self._record(index, input_tensor, staged_in)
+        self._finish(index, (output_tensor, staged_out))
+        return self._result(index, [output_tensor])
 
     @_loud
     def alltoall(
@@ -670,41 +807,41 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensors[0]):
             return self._gloo.alltoall(output_tensors, input_tensors, opts)
-        index = self._index(input_tensors[0])
+        if len(output_tensors) != self.size() or len(input_tensors) != self.size():
+            raise ValueError("all_to_all needs world_size input and output tensors")
+        index = self._same_device([*input_tensors, *output_tensors])
         self._ensure(index)
-        staged_in = [self._staged(t) for t in input_tensors]
-        staged_out = [self._staged(t) for t in output_tensors]
-        self._group()
-        for peer, (i, o) in enumerate(zip(staged_in, staged_out)):
-            if i.numel():
-                self._core.check(
-                    self._core.send(
-                        self._handle,
-                        index,
-                        i.data_ptr(),
-                        i.numel(),
-                        _nccl_dtype(i.dtype),
-                        peer,
-                    ),
-                    "ncclSend",
-                )
-            if o.numel():
-                self._core.check(
-                    self._core.recv(
-                        self._handle,
-                        index,
-                        o.data_ptr(),
-                        o.numel(),
-                        _nccl_dtype(o.dtype),
-                        peer,
-                    ),
-                    "ncclRecv",
-                )
-        self._ungroup()
-        self._finish(
-            index, *zip(input_tensors, staged_in), *zip(output_tensors, staged_out)
-        )
-        return self._work(index, output_tensors)
+        staged_in = [self._stage_in(index, t) for t in input_tensors]
+        staged_out = [self._stage_out(index, t) for t in output_tensors]
+        with self._group():
+            for peer, (i, o) in enumerate(zip(staged_in, staged_out)):
+                if i.numel():
+                    self._core.check(
+                        self._core.send(
+                            self._handle,
+                            index,
+                            i.data_ptr(),
+                            i.numel(),
+                            _nccl_dtype(i.dtype),
+                            peer,
+                        ),
+                        "ncclSend",
+                    )
+                if o.numel():
+                    self._core.check(
+                        self._core.recv(
+                            self._handle,
+                            index,
+                            o.data_ptr(),
+                            o.numel(),
+                            _nccl_dtype(o.dtype),
+                            peer,
+                        ),
+                        "ncclRecv",
+                    )
+        self._record(index, *input_tensors, *staged_in)
+        self._finish(index, *zip(output_tensors, staged_out))
+        return self._result(index, output_tensors)
 
     @_loud
     def gather(
@@ -717,42 +854,54 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.gather(output_tensors, input_tensors, opts)
         self._one_per_rank(input_tensors)
         input = input_tensors[0]
-        index = self._index(input)
+        root = self.rank() == opts.rootRank
+        outputs = output_tensors[0] if root else []
+        if root and (
+            len(outputs) != self.size()
+            or any(
+                o.numel() != input.numel() or o.dtype != input.dtype for o in outputs
+            )
+        ):
+            raise ValueError("gather needs world_size outputs matching the input")
+        index = self._same_device([input, *outputs])
         comm = self._ensure(index)
-        staged_in = self._staged(input)
         dtype = _nccl_dtype(input.dtype)
-        self._group()
-        if self.rank() == opts.rootRank:
-            outputs = output_tensors[0]
-            staged_out = [self._staged(t) for t in outputs]
-            for peer, o in enumerate(staged_out):
-                if peer == self.rank():
-                    continue
+        staged_in = self._stage_in(index, input)
+        staged_out = [self._stage_out(index, t) for t in outputs]
+        comm.wait_stream(torch.accelerator.current_stream(index))
+        with self._group():
+            if root:
+                for peer, o in enumerate(staged_out):
+                    if peer != self.rank():
+                        self._core.check(
+                            self._core.recv(
+                                self._handle,
+                                index,
+                                o.data_ptr(),
+                                o.numel(),
+                                dtype,
+                                peer,
+                            ),
+                            "ncclRecv",
+                        )
+            else:
                 self._core.check(
-                    self._core.recv(
-                        self._handle, index, o.data_ptr(), o.numel(), dtype, peer
+                    self._core.send(
+                        self._handle,
+                        index,
+                        staged_in.data_ptr(),
+                        staged_in.numel(),
+                        dtype,
+                        opts.rootRank,
                     ),
-                    "ncclRecv",
+                    "ncclSend",
                 )
-            self._ungroup()
+        if root:
             with device_module.stream(comm):
                 staged_out[self.rank()].copy_(staged_in)
-            self._finish(index, (input, staged_in), *zip(outputs, staged_out))
-            return self._work(index, outputs)
-        self._core.check(
-            self._core.send(
-                self._handle,
-                index,
-                staged_in.data_ptr(),
-                staged_in.numel(),
-                dtype,
-                opts.rootRank,
-            ),
-            "ncclSend",
-        )
-        self._ungroup()
-        self._finish(index, (input, staged_in))
-        return self._work(index, input_tensors)
+            self._finish(index, *zip(outputs, staged_out))
+        self._record(index, input, staged_in)
+        return self._result(index, outputs if root else input_tensors)
 
     @_loud
     def scatter(
@@ -765,90 +914,100 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.scatter(output_tensors, input_tensors, opts)
         self._one_per_rank(output_tensors)
         output = output_tensors[0]
-        index = self._index(output)
+        root = self.rank() == opts.rootRank
+        inputs = input_tensors[0] if root else []
+        if root and (
+            len(inputs) != self.size()
+            or any(
+                i.numel() != output.numel() or i.dtype != output.dtype for i in inputs
+            )
+        ):
+            raise ValueError("scatter needs world_size inputs matching the output")
+        index = self._same_device([output, *inputs])
         comm = self._ensure(index)
-        staged_out = self._staged(output)
         dtype = _nccl_dtype(output.dtype)
-        self._group()
-        if self.rank() == opts.rootRank:
-            inputs = input_tensors[0]
-            staged_in = [self._staged(t) for t in inputs]
-            for peer, i in enumerate(staged_in):
-                if peer == self.rank():
-                    continue
+        staged_out = self._stage_out(index, output)
+        staged_in = [self._stage_in(index, t) for t in inputs]
+        comm.wait_stream(torch.accelerator.current_stream(index))
+        with self._group():
+            if root:
+                for peer, i in enumerate(staged_in):
+                    if peer != self.rank():
+                        self._core.check(
+                            self._core.send(
+                                self._handle,
+                                index,
+                                i.data_ptr(),
+                                i.numel(),
+                                dtype,
+                                peer,
+                            ),
+                            "ncclSend",
+                        )
+            else:
                 self._core.check(
-                    self._core.send(
-                        self._handle, index, i.data_ptr(), i.numel(), dtype, peer
+                    self._core.recv(
+                        self._handle,
+                        index,
+                        staged_out.data_ptr(),
+                        staged_out.numel(),
+                        dtype,
+                        opts.rootRank,
                     ),
-                    "ncclSend",
+                    "ncclRecv",
                 )
-            self._ungroup()
+        if root:
             with device_module.stream(comm):
                 staged_out.copy_(staged_in[self.rank()])
-            self._finish(index, (output, staged_out), *zip(inputs, staged_in))
-            return self._work(index, output_tensors)
-        self._core.check(
-            self._core.recv(
-                self._handle,
-                index,
-                staged_out.data_ptr(),
-                staged_out.numel(),
-                dtype,
-                opts.rootRank,
-            ),
-            "ncclRecv",
-        )
-        self._ungroup()
+            self._record(index, *inputs, *staged_in)
         self._finish(index, (output, staged_out))
-        return self._work(index, output_tensors)
+        return self._result(index, output_tensors)
 
     @_loud
     def send(self, tensors: list[torch.Tensor], dst_rank: int, tag: int) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.send(tensors, dst_rank, tag)
-        index = self._index(tensors[0])
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = [self._staged(t) for t in tensors]
-        self._group()
-        for s in staged:
-            self._core.check(
-                self._core.send(
-                    self._handle,
-                    index,
-                    s.data_ptr(),
-                    s.numel(),
-                    _nccl_dtype(s.dtype),
-                    dst_rank,
-                ),
-                "ncclSend",
-            )
-        self._ungroup()
-        self._finish(index, *zip(tensors, staged))
-        return self._work(index, tensors)
+        staged = [self._stage_in(index, t) for t in tensors]
+        with self._group():
+            for s in staged:
+                self._core.check(
+                    self._core.send(
+                        self._handle,
+                        index,
+                        s.data_ptr(),
+                        s.numel(),
+                        _nccl_dtype(s.dtype),
+                        dst_rank,
+                    ),
+                    "ncclSend",
+                )
+        self._record(index, *tensors, *staged)
+        return self._result(index, tensors)
 
     @_loud
     def recv(self, tensors: list[torch.Tensor], src_rank: int, tag: int) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.recv(tensors, src_rank, tag)
-        index = self._index(tensors[0])
+        index = self._same_device(tensors)
         self._ensure(index)
-        staged = [self._staged(t) for t in tensors]
-        self._group()
-        for s in staged:
-            self._core.check(
-                self._core.recv(
-                    self._handle,
-                    index,
-                    s.data_ptr(),
-                    s.numel(),
-                    _nccl_dtype(s.dtype),
-                    src_rank,
-                ),
-                "ncclRecv",
-            )
-        self._ungroup()
+        staged = [self._stage_out(index, t) for t in tensors]
+        with self._group():
+            for s in staged:
+                self._core.check(
+                    self._core.recv(
+                        self._handle,
+                        index,
+                        s.data_ptr(),
+                        s.numel(),
+                        _nccl_dtype(s.dtype),
+                        src_rank,
+                    ),
+                    "ncclRecv",
+                )
         self._finish(index, *zip(tensors, staged))
-        return self._work(index, tensors)
+        return self._result(index, tensors)
 
     @_loud
     def barrier(self, opts: BarrierOptions = BarrierOptions()) -> Work:

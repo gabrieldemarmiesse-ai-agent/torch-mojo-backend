@@ -2,21 +2,35 @@
 stream.
 
 torch's `MojoProcessGroup` (distributed/process_group.py) is a thin adapter:
-it resolves data pointers, stages non-contiguous tensors with torch ops and
-wraps a device-typed torch Future whose completion events are recorded on the
-comm stream, so consumers on any stream wait exactly as with ProcessGroupNCCL.
-Communicators, the comm stream and the library calls live here. The three
-libraries share the NCCL C ABI; mojoccl passes the 128-byte unique id the
-way the SysV ABI does for a by-value struct: 16 words after the register
-arguments (see mojoccl.mojo's ncclCommInitRank).
+it resolves data pointers, stages non-contiguous tensors with torch ops on
+the comm stream and wraps a device-typed torch Future whose completion events
+are recorded on the comm stream, so consumers on any stream wait exactly as
+with ProcessGroupNCCL. Communicators, the comm stream and the library calls
+live here. The three libraries share the NCCL C ABI; the 128-byte unique id
+is passed the way the x86-64 SysV ABI lays out a by-value struct: 16 words
+after the register arguments (see mojoccl.mojo's ncclCommInitRank; Python
+refuses other architectures).
+
+The entries are reached from Python outside the boxed adapter, so each one
+takes the backend mutex itself (`Locked`).
 """
 from std.collections import Dict
-from std.ffi import OwnedDLHandle, c_char
+from std.ffi import OwnedDLHandle, c_char, external_call
 from std.memory.alloc import unsafe_alloc
 
-from device import _add_stream, dev, stream_ctx, current_stream, set_error
+from device import _add_stream, current_stream, dev, set_error, stream_ctx
 
 comptime UID_BYTES = 128
+
+
+struct Locked:
+    """Holds the backend mutex (shim tmb_lock) for a scope."""
+
+    def __init__(out self):
+        external_call["tmb_lock", NoneType]()
+
+    def __deinit__(deinit self):
+        external_call["tmb_unlock", NoneType]()
 
 
 @fieldwise_init
@@ -27,17 +41,68 @@ struct Comm(Copyable, Movable):
     var raw: Int  # its vendor stream handle (what the library enqueues on)
 
 
+comptime CollFn = def(Int, Int, Int, Int32, Int32, Int64, Int64) thin abi(
+    "C"
+) -> Int32
+comptime ReduceFn = def(
+    Int, Int, Int, Int32, Int32, Int32, Int64, Int64
+) thin abi("C") -> Int32
+comptime GatherFn = def(Int, Int, Int, Int32, Int64, Int64) thin abi(
+    "C"
+) -> Int32
+comptime P2pFn = def(Int, Int, Int32, Int32, Int64, Int64) thin abi(
+    "C"
+) -> Int32
+comptime GroupFn = def() thin abi("C") -> Int32
+comptime CommFn = def(Int64) thin abi("C") -> Int32
+
+
+def _symbol(lib: OwnedDLHandle, name: String) raises -> Int:
+    var s = lib.get_symbol[NoneType](name)
+    if not s:
+        raise Error("collectives library lacks ", name)
+    return Int(s.value())
+
+
+@always_inline
+def _fn[F: TrivialRegisterPassable](addr: Int) -> F:
+    var a = addr
+    return Pointer(to=a).unsafe_bitcast[F]()[]
+
+
 struct PG(Movable):
     var lib: OwnedDLHandle
     var rank: Int
     var world: Int
     var comms: Dict[Int, Comm]
+    # entry points resolved once (a dlsym per collective was measurable)
+    var f_allreduce: Int
+    var f_broadcast: Int
+    var f_reduce: Int
+    var f_allgather: Int
+    var f_reduce_scatter: Int
+    var f_send: Int
+    var f_recv: Int
+    var f_group_start: Int
+    var f_group_end: Int
 
     def __init__(out self, path: String, rank: Int, world: Int) raises:
         self.lib = OwnedDLHandle(path)
         self.rank = rank
         self.world = world
         self.comms = Dict[Int, Comm]()
+        self.f_allreduce = _symbol(self.lib, "ncclAllReduce")
+        self.f_broadcast = _symbol(self.lib, "ncclBroadcast")
+        self.f_reduce = _symbol(self.lib, "ncclReduce")
+        self.f_allgather = _symbol(self.lib, "ncclAllGather")
+        self.f_reduce_scatter = _symbol(self.lib, "ncclReduceScatter")
+        self.f_send = _symbol(self.lib, "ncclSend")
+        self.f_recv = _symbol(self.lib, "ncclRecv")
+        self.f_group_start = _symbol(self.lib, "ncclGroupStart")
+        self.f_group_end = _symbol(self.lib, "ncclGroupEnd")
+
+    def symbol(self, name: String) raises -> Int:
+        return _symbol(self.lib, name)
 
     def error_string(self, rc: Int32) -> String:
         try:
@@ -56,7 +121,9 @@ struct PG(Movable):
         var c = self.comms.find(device)
         if not c:
             raise Error(
-                "no communicator on mojo:", device, " (init_device first)"
+                "no communicator on mojo:",
+                device,
+                " (init_device first, or it was aborted)",
             )
         return c.value().copy()
 
@@ -81,6 +148,7 @@ def _pg(p: Int) -> PGP:
 def tmb_pg_create(
     path: Pointer[c_char, MutUntrackedOrigin], rank: Int32, world: Int32
 ) abi("C") -> Int:
+    var _lock = Locked()
     try:
         var box = unsafe_alloc[PG](1)
         box.unsafe_write(
@@ -99,12 +167,12 @@ def tmb_pg_create(
 def tmb_pg_destroy(p: Int) abi("C"):
     if p == 0:
         return
+    var _lock = Locked()
     var box = _pg(p)
     try:
+        var f = _fn[CommFn](box[].symbol("ncclCommDestroy"))
         for item in box[].comms.items():
-            _ = box[].lib.get_function[Int32]("ncclCommDestroy")(
-                item.value.handle
-            )
+            _ = f(item.value.handle)
     except e:
         set_error(String(e))
     var moved = box.unsafe_take_pointee()
@@ -113,6 +181,7 @@ def tmb_pg_destroy(p: Int) abi("C"):
 
 
 def tmb_pg_version(p: Int) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var v: Int32 = 0
         _pg(p)[].check(
@@ -128,6 +197,7 @@ def tmb_pg_version(p: Int) abi("C") -> Int32:
 def tmb_pg_unique_id(
     p: Int, buf: Pointer[UInt8, MutUntrackedOrigin]
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         _pg(p)[].check(
             _pg(p)[].lib.get_function[Int32]("ncclGetUniqueId")(buf),
@@ -143,9 +213,12 @@ def tmb_pg_init_device(
     p: Int, device: Int32, uid: Pointer[UInt8, MutUntrackedOrigin]
 ) abi("C") -> Int32:
     """Create the communicator of this rank on mojo:`device` (one per device)
-    and its dedicated comm stream."""
+    and its dedicated comm stream. Collective across ranks."""
+    var _lock = Locked()
     try:
         var pg = _pg(p)
+        if pg[].comms.find(Int(device)):
+            raise Error("mojo:", device, " already has a communicator")
         var d = dev(Int(device))
         if d[].is_cpu:
             raise Error("the mojo process group needs an accelerator device")
@@ -192,6 +265,7 @@ def tmb_pg_init_device(
 
 
 def tmb_pg_comm_stream(p: Int, device: Int32) abi("C") -> Int64:
+    var _lock = Locked()
     try:
         return Int64(_pg(p)[].comm(Int(device)).stream)
     except e:
@@ -202,13 +276,14 @@ def tmb_pg_comm_stream(p: Int, device: Int32) abi("C") -> Int64:
 def tmb_pg_allreduce(
     p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, op: Int32
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclAllReduce")(
-                ptr, ptr, count, dtype, op, c.handle, c.raw
+            _fn[CollFn](pg[].f_allreduce)(
+                ptr, ptr, count, dtype, op, c.handle, Int64(c.raw)
             ),
             "ncclAllReduce",
         )
@@ -221,13 +296,14 @@ def tmb_pg_allreduce(
 def tmb_pg_broadcast(
     p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, root: Int32
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclBroadcast")(
-                ptr, ptr, count, dtype, root, c.handle, c.raw
+            _fn[CollFn](pg[].f_broadcast)(
+                ptr, ptr, count, dtype, root, c.handle, Int64(c.raw)
             ),
             "ncclBroadcast",
         )
@@ -246,13 +322,14 @@ def tmb_pg_reduce(
     op: Int32,
     root: Int32,
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclReduce")(
-                ptr, ptr, count, dtype, op, root, c.handle, c.raw
+            _fn[ReduceFn](pg[].f_reduce)(
+                ptr, ptr, count, dtype, op, root, c.handle, Int64(c.raw)
             ),
             "ncclReduce",
         )
@@ -266,13 +343,14 @@ def tmb_pg_allgather(
     p: Int, device: Int32, send: Int, recv: Int, count: Int, dtype: Int32
 ) abi("C") -> Int32:
     """recv[world * count] <- every rank's send[count]."""
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclAllGather")(
-                send, recv, count, dtype, c.handle, c.raw
+            _fn[GatherFn](pg[].f_allgather)(
+                send, recv, count, dtype, c.handle, Int64(c.raw)
             ),
             "ncclAllGather",
         )
@@ -292,13 +370,14 @@ def tmb_pg_reduce_scatter(
     op: Int32,
 ) abi("C") -> Int32:
     """recv[count] <- reduce of send[world * count] chunk `rank`."""
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclReduceScatter")(
-                send, recv, count, dtype, op, c.handle, c.raw
+            _fn[CollFn](pg[].f_reduce_scatter)(
+                send, recv, count, dtype, op, c.handle, Int64(c.raw)
             ),
             "ncclReduceScatter",
         )
@@ -311,13 +390,14 @@ def tmb_pg_reduce_scatter(
 def tmb_pg_send(
     p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclSend")(
-                ptr, count, dtype, peer, c.handle, c.raw
+            _fn[P2pFn](pg[].f_send)(
+                ptr, count, dtype, peer, c.handle, Int64(c.raw)
             ),
             "ncclSend",
         )
@@ -330,13 +410,14 @@ def tmb_pg_send(
 def tmb_pg_recv(
     p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
 ) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
         pg[].sync_in(c)
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclRecv")(
-                ptr, count, dtype, peer, c.handle, c.raw
+            _fn[P2pFn](pg[].f_recv)(
+                ptr, count, dtype, peer, c.handle, Int64(c.raw)
             ),
             "ncclRecv",
         )
@@ -347,11 +428,9 @@ def tmb_pg_recv(
 
 
 def tmb_pg_group_start(p: Int) abi("C") -> Int32:
+    var _lock = Locked()
     try:
-        _pg(p)[].check(
-            _pg(p)[].lib.get_function[Int32]("ncclGroupStart")(),
-            "ncclGroupStart",
-        )
+        _pg(p)[].check(_fn[GroupFn](_pg(p)[].f_group_start)(), "ncclGroupStart")
         return 0
     except e:
         set_error(String(e))
@@ -359,10 +438,9 @@ def tmb_pg_group_start(p: Int) abi("C") -> Int32:
 
 
 def tmb_pg_group_end(p: Int) abi("C") -> Int32:
+    var _lock = Locked()
     try:
-        _pg(p)[].check(
-            _pg(p)[].lib.get_function[Int32]("ncclGroupEnd")(), "ncclGroupEnd"
-        )
+        _pg(p)[].check(_fn[GroupFn](_pg(p)[].f_group_end)(), "ncclGroupEnd")
         return 0
     except e:
         set_error(String(e))
@@ -370,6 +448,7 @@ def tmb_pg_group_end(p: Int) abi("C") -> Int32:
 
 
 def tmb_pg_async_error(p: Int, device: Int32) abi("C") -> Int32:
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
@@ -387,12 +466,14 @@ def tmb_pg_async_error(p: Int, device: Int32) abi("C") -> Int32:
 
 
 def tmb_pg_abort(p: Int, device: Int32) abi("C") -> Int32:
+    """Abort and forget the device's communicator (vendor NCCL destroys it)."""
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
+        _ = pg[].comms.pop(Int(device))
         pg[].check(
-            pg[].lib.get_function[Int32]("ncclCommAbort")(c.handle),
-            "ncclCommAbort",
+            _fn[CommFn](pg[].symbol("ncclCommAbort"))(c.handle), "ncclCommAbort"
         )
         return 0
     except e:
@@ -403,6 +484,7 @@ def tmb_pg_abort(p: Int, device: Int32) abi("C") -> Int32:
 def tmb_pg_synchronize_comm(p: Int, device: Int32) abi("C") -> Int32:
     """Host-wait for every collective issued so far on the device's comm stream.
     """
+    var _lock = Locked()
     try:
         var pg = _pg(p)
         var c = pg[].comm(Int(device))
@@ -413,7 +495,7 @@ def tmb_pg_synchronize_comm(p: Int, device: Int32) abi("C") -> Int32:
         return 1
 
 
-comptime PG_VTABLE_SLOTS = 17
+comptime PG_VTABLE_SLOTS = 18
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -421,8 +503,8 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     0 create, 1 destroy, 2 version, 3 unique_id, 4 init_device, 5 comm_stream,
     6 allreduce, 7 broadcast, 8 reduce, 9 allgather, 10 reduce_scatter,
     11 send, 12 recv, 13 group_start, 14 group_end, 15 async_error, 16 abort,
-    and synchronize_comm last."""
-    var t = unsafe_alloc[Int](PG_VTABLE_SLOTS + 1)
+    17 synchronize_comm."""
+    var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
         "C"
     ) -> Int = tmb_pg_create
