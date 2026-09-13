@@ -31,6 +31,7 @@ from typing import TypeVar
 
 import torch
 import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+import torch.distributed.distributed_c10d as c10d
 import torch._subclasses.fake_tensor as fake_tensor_module
 import torch.fx.experimental.proxy_tensor as proxy_tensor
 import torch.optim.optimizer as optimizer_module
@@ -435,6 +436,50 @@ def fix_privateuse1_dlpack_device_type():
     torch.Tensor.__dlpack_device__ = (  # ty: ignore[invalid-assignment]
         __dlpack_device__
     )
+
+
+def fix_batch_isend_irecv_for_python_process_groups():
+    """`batch_isend_irecv` never coalesces for a Python `ProcessGroup`
+    subclass, and a bidirectional exchange then deadlocks.
+
+    ``torch/distributed/distributed_c10d.py``'s ``batch_isend_irecv`` gates
+    its NCCL-style coalescing on ``type(group) is ProcessGroup``. The mojo
+    backend IS a Python subclass of ``ProcessGroup`` (it has to be: the
+    C++ ``Backend`` cannot be implemented in Python), so the check is False
+    however capable the backend is, and every operation in the list goes out
+    as its own NCCL group. A two-rank exchange then deadlocks on the device:
+    each rank's comm stream holds ``[send(->peer), recv(<-peer)]``, and the
+    send cannot retire until the peer posts its recv, which sits behind that
+    peer's own send. The very next line asks the backend whether it
+    ``supports_coalescing``, which is the real question; ``isinstance`` is
+    what the type check means. Everything else is torch's own code path,
+    called unchanged.
+    """
+    original = c10d.batch_isend_irecv
+    if getattr(original, "_torch_mojo_backend", False):
+        return
+
+    @wraps(original)
+    def batch_isend_irecv(p2p_op_list: Sequence[object]) -> list[object]:
+        c10d._check_p2p_op_list(p2p_op_list)
+        group = p2p_op_list[0].group or c10d._get_default_group()
+        device = p2p_op_list[0].tensor.device
+        coalesces = (
+            type(group) is not torch.distributed.ProcessGroup
+            and isinstance(group, torch.distributed.ProcessGroup)
+            and group._get_backend(device).supports_coalescing
+        )
+        if not coalesces:
+            return original(p2p_op_list)
+        with c10d._coalescing_manager(group, device, async_ops=True) as manager:
+            for op in p2p_op_list:
+                peer = "group_dst" if op.op is c10d.isend else "group_src"
+                op.op(op.tensor, group=op.group, tag=op.tag, **{peer: op.group_peer})
+        return manager.works
+
+    batch_isend_irecv._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    c10d.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
+    torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
 
 
 def apply_torch_monkeypatches(torch_mojo_device_module: ModuleType):
