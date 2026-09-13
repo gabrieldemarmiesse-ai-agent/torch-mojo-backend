@@ -9,7 +9,6 @@ nothing at launch time. Everything here runs under the shim's mutex.
 from std.ffi import _get_global_or_null, c_char, external_call
 from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
-from std.sys.info import has_apple_gpu_accelerator
 from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
 
@@ -47,25 +46,19 @@ struct Dev(Movable):
     var pool_next: Int
     var staging: List[Int]  # pending pageable-H2D staging boxes (addresses)
 
-    def __init__(
-        out self, var ctx: DeviceContext, is_cpu: Bool, have_vendor: Bool
-    ) raises:
+    def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
         self.is_cpu = is_cpu
         self.views = List[DeviceContext]()
         self.views.append(ctx)
         self.streams = List[DeviceStream]()
         self.raw = List[Int]()
+        self.raw.append(
+            0
+        )  # filled once the vendor driver exists (init_backend)
         self.pool = List[Int]()
         self.pool_next = 0
         self.staging = List[Int]()
-        var r = 0
-        if have_vendor and not is_cpu:
-            try:
-                r = raw_stream(ctx)
-            except e:
-                _warn("no raw stream handle", e)
-        self.raw.append(r)
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -101,33 +94,56 @@ def stream_ctx(device: Int, stream: Int) raises -> DeviceContext:
     return dev(device)[].view(stream)
 
 
+def _probe_api() -> Tuple[String, Int]:
+    """Which accelerator api MAX drives here and how many devices it has,
+    asked at run time: this library is built once for every accelerator
+    (the compile-time default api would tie it to the build machine's)."""
+    var apis = List[String]()
+    apis.append("cuda")
+    apis.append("hip")
+    apis.append("metal")
+    for api in apis:
+        var n = 0
+        try:
+            n = DeviceContext.number_of_devices(api=api)
+        except e:
+            n = 0  # MAX has no support for that api on this machine
+        if n > 0:
+            return (api, n)
+    return (String("cpu"), 0)
+
+
 def init_backend() raises -> Int:
     """Enumerate devices once; returns the mojo device count (GPUs + CPU)."""
     if _get_global_or_null(BACKEND_GLOBAL):
         return len(be()[].devices)
-    var n = 0
-    try:
-        n = DeviceContext.number_of_devices()
-    except e:
-        n = 0
+    var probed = _probe_api()
+    var api = probed[0]
+    var n = probed[1]
     var vendor: Optional[Vendor] = None
-    if n > 0 and not has_apple_gpu_accelerator():
+    if api == "cuda" or api == "hip":
         try:
-            vendor = Vendor()
+            vendor = Vendor(api)
         except e:
             _warn(
                 "vendor driver unavailable, events fall back to host timing", e
             )
-    var have_vendor = Bool(vendor)
     var devs = List[Dev]()
     for i in range(n):
-        devs.append(Dev(DeviceContext(i), False, have_vendor))
-    devs.append(Dev(DeviceContext(api="cpu"), True, False))
+        devs.append(Dev(DeviceContext(i, api=api), False))
+    devs.append(Dev(DeviceContext(api="cpu"), True))
     var box = unsafe_alloc[Backend](1)
     box.unsafe_write(Backend(devs^, vendor^, n))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
+    if be()[].vendor:
+        for i in range(n):
+            var d = dev(i)
+            try:
+                d[].raw[0] = raw_stream(be()[].vendor.value(), d[].ctx)
+            except e:
+                _warn("no raw stream handle", e)
     return n + 1
 
 
@@ -378,7 +394,7 @@ def _add_stream(
     var r = 0
     if be()[].vendor:
         try:
-            r = raw_stream(view)
+            r = raw_stream(be()[].vendor.value(), view)
         except e:
             _warn("no raw stream handle", e)
     d[].streams.append(s^)

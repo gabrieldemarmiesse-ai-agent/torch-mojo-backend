@@ -94,7 +94,10 @@ def _accelerator_identity() -> str:
 
 
 def toolchain_identity() -> str:
-    """What both builds depend on besides their sources."""
+    """What the shim and the Mojo base library depend on besides their
+    sources. Neither depends on the accelerator: the base library picks the
+    device api and vendor driver at run time (device.mojo), so one build
+    serves NVIDIA, AMD and Apple machines and can ship prebuilt."""
     return "|".join(
         [
             f"torch={torch.__version__}",
@@ -104,9 +107,14 @@ def toolchain_identity() -> str:
             f"platform={sys.platform}",
             f"machine={platform.machine()}",
             _compiler_identity(),
-            f"accelerators={_accelerator_identity()}",
         ]
     )
+
+
+def kernel_identity() -> str:
+    """The above plus the accelerators: kernel specializations carry device
+    code for the GPU they were compiled for."""
+    return toolchain_identity() + f"|accelerators={_accelerator_identity()}"
 
 
 def _find_mojo() -> str:
@@ -487,7 +495,7 @@ def build_library(
     roots = [entry.parent, *(roots or [])]
     closure = _mojo_import_closure(entry, roots)
     tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))
-    key = _hash_files(closure, toolchain_identity() + "|" + tag)
+    key = _hash_files(closure, kernel_identity() + "|" + tag)  # device code inside
     out = _CACHE_DIR / f"lib{entry.stem}.hash-{key}.so"
     if out.exists():
         return out
@@ -627,7 +635,7 @@ def register():
             str(_MOJO_SRC).encode(),
             str(_CACHE_DIR).encode(),
             _find_mojo().encode(),
-            toolchain_identity().encode(),
+            kernel_identity().encode(),  # the loader keys kernel builds with it
             1 if _trace_enabled() else 0,
         )
         if n < 0:
