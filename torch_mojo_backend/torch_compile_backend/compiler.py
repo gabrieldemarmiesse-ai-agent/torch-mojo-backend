@@ -12,6 +12,8 @@ from typing import Any, cast
 import max.driver
 import max.graph.value
 import torch
+
+from torch_mojo_backend.native import device_module
 from functorch.compile import make_boxed_func
 from max import engine
 from max.experimental.torch.torch import torch_dtype_to_max
@@ -708,12 +710,11 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
             # (a plain host-to-host copy, not the zero-copy exchange the
             # GPU case below gets).
             return max.driver.Buffer.from_dlpack(t.cpu())
-        # `native_handle` (c10::Stream::native_handle, exposed to Python by
-        # torch/csrc/Stream.cpp) is generic accelerator infrastructure (not
-        # CUDA-specific), routed by the native backend's C++ device guard to
-        # `stream_native_handle` (native/mojo/device.mojo) -- ty's torch
-        # stubs don't have it yet.
-        stream = torch.accelerator.current_stream(t.device).native_handle  # ty: ignore[unresolved-attribute]
+        # the vendor handle of the current mojo stream (torch.Stream's own
+        # native_handle exists only from torch 2.11)
+        stream = device_module.stream_native_handle(
+            torch.accelerator.current_stream(t.device)
+        )
         data = t.__dlpack__()
         return max.driver.Buffer._from_dlpack(data, device, stream)
     return max.driver.Buffer.from_dlpack(t)
