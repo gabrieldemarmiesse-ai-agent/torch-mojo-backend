@@ -405,7 +405,7 @@ def test_pow(mojo_device, call_checker):
     torch.testing.assert_close(out.cpu(), torch.pow(a_cpu, e_cpu))
 
 
-def test_div_and_pow_float64(mojo_device, call_checker):
+def test_div_and_pow_float64(mojo_device, request):
     """float64 through the broadcast binary kernel.
 
     logic_ops' SPEC_BCAST_DTYPES carries float64, and `_binary_spec_into_go`
@@ -413,8 +413,14 @@ def test_div_and_pow_float64(mojo_device, call_checker):
     full precision instead of declining. The scalar exponent takes that same
     broadcast route rather than elementwise_ops' PowScalarSpec, which is
     FLOAT_DTYPES only (and would raise, not narrow, on a float64 operand).
+
+    `call_checker` is fetched lazily (not a plain fixture argument): its
+    teardown unconditionally requires `register` to have been called, and a
+    skip before that point must not have already forced that fixture's
+    setup/teardown into existence.
     """
     skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    call_checker = request.getfixturevalue("call_checker")
     call_checker.register(aten_functions.aten_div)
     base_cpu = torch.rand(4, 5, dtype=torch.float64) + 0.5
     other_cpu = torch.rand(4, 5, dtype=torch.float64) + 0.5
