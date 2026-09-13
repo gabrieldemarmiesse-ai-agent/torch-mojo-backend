@@ -920,8 +920,7 @@ def _check_sorter(sorter: T, boundaries: T) raises:
         )
     if not sorter.same_shape(boundaries):
         raise Error(
-            "torch.searchsorted(): boundary and sorter must have the same"
-            " size"
+            "torch.searchsorted(): boundary and sorter must have the same size"
         )
     if sorter.dtype != DType.int64:
         raise Error(
