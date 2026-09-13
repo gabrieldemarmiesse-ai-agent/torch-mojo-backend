@@ -127,3 +127,53 @@ the node.
 
 The CI-artifact wheel was not available on this box, so the wheel tested is
 the one built here.
+
+### Finding 3: the attention tests assume the H100's FA4 gates
+
+`test_flash_attention_declines_float32`, `test_fused_sdp_choice_efficient_for_inference`
+and `test_fused_sdp_choice_math_when_grad_is_needed` encode FA4's limits (no
+float32, backward only at a full seqlen). The gfx942 fused flash kernels
+(`flash_attention_ops/`, `_fused_fa_plan` in `ops_attention.mojo`) are
+instantiated for float32, bfloat16 and float16 with forward and backward, so
+on this device `_fused_sdp_choice` legitimately answers `flash` where the
+H100 answers `efficient` or `math`, and the fp32 flash call runs instead of
+raising. See "Fixes" for the numerical check of the fp32 route and the
+arch-aware test expectations.
+
+## 4. Distributed (RCCL, then mojoccl)
+
+Second node `a1020` (job 5408315), 4 MI300A, `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`
+for the torchrun legs only, `NCCL_DEBUG=INFO`.
+
+| command | result |
+|---|---|
+| `pytest tests/test_distributed.py` (RCCL, 2-rank torchrun workers) | **40 passed** in 799 s (H100 x2: 39 passed, 1 skipped) |
+| `torchrun --nproc-per-node=4 nanogpt_ddp.py --device mojo` batch 12, 40 steps, RCCL | trace `collectives via /lus/home/softs/rocm/6.4.3/lib/librccl.so.1 (rccl version 22203)`; first step 1133 s (48 kernel builds, 1131 s of compile, cold cache for the 4-rank shapes), then 705 to 720k tok/s; loss 11.0074 -> 6.0455 at step 40 |
+| same, 1 rank, batch 12 | 190k tok/s, loss 6.0858 at step 40 (a different global batch, so a different curve by construction; the stock-vs-mojo same-configuration comparison is in section 9) |
+| `pytest tests/test_distributed.py -k mojo` (`TORCH_MOJO_BACKEND_CCL=mojo`) | 7 passed in 106 s |
+| 4-rank nanoGPT, mojoccl | trace `collectives via .../cache/libmojoccl.hash-68bf71f23b7ee946.so (mojoccl version 23102)`; 695 to 706k tok/s; losses equal to the RCCL run to 1e-4 through step 20 (6.2451 vs 6.2450), 6.0595 vs 6.0455 at step 40 |
+
+The multi-node protocol (`tests/multinode/e2e_three_stacks_adastra.sh`) was
+not run: the two allocations were single nodes used for the sequential and
+the parallel halves of this validation, not a node pair.
+
+## 5. Triton on HIP
+
+`triton` 3.6.0 (the wheel the CUDA torch had pulled) next to the CPU torch,
+`liger-kernel` 0.8.2.
+
+| command | result |
+|---|---|
+| `pytest tests/native/test_triton.py` | **2 failed**, 5 passed, 1 skipped (CUDA driver contexts). Failures: (1) `test_triton_launch_on_a_second_device`: `Triton Error [HIP]: Code: 101, invalid device ordinal` from the HIP driver's launch under `with device_module.device(1)`: a real bug in the never-run `_hip_driver_class`, see "Fixes"; (2) `test_driver_is_installed_on_import_after_registration` asserts the class name `MojoCudaDriver`; on HIP it is `MojoHipDriver`: test assumption |
+| liger `LigerRMSNormFunction.apply(h, w, 1e-6, 0.0, "llama", True)` on `mojo:0`, (64, 2048) | forward max err 1.4e-6, dX 7.2e-7, dW 7.6e-6 against the CPU formula (ref max 9.9 / 4.0 / 30.7); `triton.testing.do_bench` 0.0177 ms; `driver.active` is `MojoHipDriver`, target `GPUTarget(backend='hip', arch='gfx942', warp_size=64)`; the launch stream handle 189223616 equals `torch.mojo.stream_native_handle(current_stream())`. The package's `device.type == "cuda"` branches fell through to its generic paths unchanged, as on NVIDIA |
+| same under `with torch.mojo.device(1)` on `mojo:1` | the second-device bug above |
+
+## 6. TorchInductor
+
+`pytest tests/native/test_inductor.py`: **7 failed**, 1 passed. Every failure
+is `OSError: libcuda.so.1: cannot open shared object file` from
+`inductor.py::_device_properties`, reached through Inductor's
+`DeviceProperties.create`: the device interface reads compute capability and
+SM count from libcuda, the mojo Triton target is an alias of
+`CUDABackend`, and `_ptxas.apply_triton_default()` is NVIDIA-only, as the
+docs say. See "Fixes" for the one-hour attempt at a HIP alias.
