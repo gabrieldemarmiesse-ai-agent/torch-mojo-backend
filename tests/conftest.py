@@ -92,6 +92,7 @@ def reset_compiler():
 
 @pytest.fixture(params=["cpu", "gpu"])
 def mojo_device(request, mojo_gpu_available: bool):
+    register_mojo_devices()  # idempotent
     if request.param == "cpu":
         yield (f"mojo:{len(get_accelerators()) - 1}")
     else:
