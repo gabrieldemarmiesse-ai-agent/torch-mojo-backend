@@ -25,3 +25,66 @@ Setup notes:
   (`/tmp/<user>/.cache/uv`, 30 GB): `ModuleNotFoundError: hatchling.build`
   then `trove_classifiers has no attribute classifiers`, both truncated
   archives. A fresh `UV_CACHE_DIR` on scratch fixed it.
+
+## First contact
+
+`mojo --print-supported-accelerators` lists `amdgpu:gfx942` (and the other
+gfx targets). The first-contact script of the plan, under the lock:
+
+| step | result |
+|---|---|
+| `register_mojo_devices()` | C++ shim built in 6.20 s, Mojo base library in 12.72 s, "native mojo backend ready in 15.29s (5 devices)", registered in 15.6 s |
+| `get_accelerators()` | 4 `Device(type=gpu)` + the CPU device; accelerator identity `hip:gpu,hip:gpu,hip:gpu,hip:gpu,cpu:cpu` (api = hip) |
+| `torch.ones(3) * 2` | `[2.0, 2.0, 2.0]`; first op 31.3 s (five extension builds: `empty.memory_format` 4.0 s, `fill_.Scalar` 6.5 s, `mul.Tensor` 7.6 s, `elementwise_ops MulScalarSpec` 5.6 s, `_to_copy` 7.4 s) |
+| fp32 `torch.mm` 256x256 | **max abs error 21.7 against CPU: wrong** (see finding 1); `MatmulSpec` fp32 spec compiled in 344 s |
+| stream / event | `stream/event ok`, `sum` correct (`SumSpec` 7.3 s, `_local_scalar_dense` 4.1 s) |
+| `stream_native_handle` | 207391536 (non-zero `hipStream_t`) |
+| process exit | exit code 139: the segfault in the HSA runtime's atexit handler that `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` causes (pre-existing, Modular's; the variable was set for this run only) |
+
+Total 7 min 26 s wall, of which 344 s the one fp32 GEMM specialization.
+The HIP vendor bindings (`hipEvent*`, `hipStreamWaitEvent`, ...) resolved and
+worked at first try: `test_bringup.py` and `test_stream_ordering.py` below
+pass.
+
+Cache warm (`native.prebuild_ops()`, outside the lock): **29 min 39 s** wall
+on this node, 239 extensions built in that process (1771 s of compile;
+concurrent test runs built the rest); each op extension is 4 to 8 s, the
+kernel specializations built on first call are the expensive part (GEMM:
+fp32 344 s, bf16 485 s, fp16 120 s; elementwise / reduction 5 to 8 s).
+
+### Finding 1: fp32 GEMM is wrong on gfx942 (pre-existing)
+
+`torch.mm` with float32 operands returns wrong values for m, n >= 64;
+bfloat16 and float16 are correct, tiny fp32 shapes are correct:
+
+| dtype | 256x256x256 | 64x64x64 | 8x8x8 | 3x5x7 | 128x1024x512 |
+|---|---|---|---|---|---|
+| float32 (max abs err / ref max) | 24 / 66 | 9.8 / 34 | 4.8e-7 | 1.2e-7 | 45.9 / 142 |
+| bfloat16 | 0.235 / 68 | 0.062 / 28 | 0.021 | 0.015 | 0.355 / 133 |
+| float16 | 0.029 / 85 | 0.0078 / 30 | 0.0018 | 0.0009 | 0.034 / 150 |
+
+The old eager path (upstream main ba926d9, its own warmed checkout on this
+node) gives the same fp32 numbers (24 / 9.8 / ok / 42.9), so this is a bug in
+the shared kernel family `eager_kernels/matmul_ops/` (gfx942 fp32 route of
+`_amd_dynamic_mfma_dispatch`), not in the native backend, and it predates
+the branch: the aten-level test suites had never been run on MI300A (only the
+distributed tests and bf16 nanoGPT had). Root cause and fix: see "Fixes".
+
+## 2. Runtime and op groups (`tests/native/`)
+
+One `pytest` per file, serial, under the lock, no VMM knob. Wall time
+includes waiting for the lock behind other steps and every first-call
+compile; the pytest time is the suite's own.
+
+| file | AMD result | pytest time | H100 (plan) |
+|---|---|---|---|
+| `test_bringup.py` | 28 passed | 155 s | 32 pass (28 collected on this tree) |
+| `test_loader.py` | 7 passed | 283 s | pass |
+| `test_register_retry.py` | 1 passed | 7 s | pass |
+| `test_prebuilt.py` | 18 passed | 2 s | pass |
+| `test_stream_ordering.py` | 4 passed | 15 s | 4 pass |
+| `test_profiler.py` | 2 passed | 10 s | pass |
+| `test_binary.py` | 183 passed | 495 s | |
+| `test_unary.py` | 241 passed, 2 skipped (GELU bit patterns recorded on H100), 2 xfailed | 308 s | |
+| `test_compare.py` | 203 passed | 2253 s | |
+| `test_reductions.py` | **15 failed**, 432 passed, 4 skipped | 441 s | |
