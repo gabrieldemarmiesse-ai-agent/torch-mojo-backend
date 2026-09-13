@@ -331,7 +331,7 @@ def test_native_layer_norm_backward_output_masks(mojo_gpu, mask):
         else:
             # There is no way to build an undefined at::Tensor from Mojo, so a
             # gradient autograd did not ask for comes back empty.
-            assert got[i].numel() == 0
+            assert got[i] is None  # an undefined Tensor, as ATen returns it
 
 
 def test_native_layer_norm_backward_empty_rows(mojo_gpu):

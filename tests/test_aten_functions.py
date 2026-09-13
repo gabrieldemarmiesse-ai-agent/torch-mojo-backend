@@ -19,6 +19,7 @@ from torch_mojo_backend.testing import (
     check_functions_are_equivalent,
     check_outputs,
 )
+from torch_mojo_backend.testing import _xfail_if_unsupported
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -4153,15 +4154,13 @@ def test_aten__log_softmax_backward_data_noncontiguous(
 def test_aten__log_softmax_backward_data_scalar_nonfinite(
     conf: Conf, call_checker: CallChecker, grad_value: float
 ):
-    if conf.device == "mojo:cpu":
-        pytest.xfail(
-            "_log_softmax_backward_data has no MAX-CPU-device route in the native backend (the old path composed one from exp/sum/addcmul)"
-        )
     call_checker.register(aten_functions.aten__log_softmax_backward_data)
     grad_output = torch.tensor(grad_value, device=conf.device)
     output = torch.tensor(0.0, device=conf.device)
 
-    actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
+    # no MAX-CPU-device route in the native backend: declines there
+    with _xfail_if_unsupported(conf.device):
+        actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
 
     assert torch.isnan(actual.cpu())
 
@@ -4169,10 +4168,6 @@ def test_aten__log_softmax_backward_data_scalar_nonfinite(
 def test_aten__log_softmax_backward_data_half_to_float(
     conf: Conf, call_checker: CallChecker
 ):
-    if conf.device == "mojo:cpu":
-        pytest.xfail(
-            "_log_softmax_backward_data has no MAX-CPU-device route in the native backend (the old path composed one from exp/sum/addcmul)"
-        )
     call_checker.register(aten_functions.aten__log_softmax_backward_data)
     source = torch.randn(3, 7)
     output = torch.log_softmax(source, dim=-1)
@@ -4181,9 +4176,10 @@ def test_aten__log_softmax_backward_data_half_to_float(
         torch.float16
     )
 
-    actual = aten._log_softmax_backward_data(
-        grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
-    )
+    with _xfail_if_unsupported(conf.device):  # no MAX-CPU-device route
+        actual = aten._log_softmax_backward_data(
+            grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
+        )
 
     assert actual.dtype == torch.float16
     torch.testing.assert_close(

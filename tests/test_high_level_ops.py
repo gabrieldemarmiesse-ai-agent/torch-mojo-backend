@@ -11,6 +11,7 @@ from torch_mojo_backend.testing import (
     check_functions_are_equivalent,
     check_outputs,
 )
+from torch_mojo_backend.native import device_module
 
 # torch.testing.assert_close's defaults for float32.
 _FP32_RTOL = 1.3e-6
@@ -5296,7 +5297,7 @@ def test_aten_index_select_basic(conf: Conf):
 
 def test_aten_index_select_second_dim(conf: Conf):
     """Test basic torch.index_select operation"""
-    if conf.device == "mojo:cpu":
+    if torch.device(conf.device) == device_module.cpu():
         pytest.xfail(
             "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
         )
@@ -5313,7 +5314,7 @@ def test_aten_index_select_second_dim(conf: Conf):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_aten_index_select_multiple_dtypes(conf: Conf, dtype):
     """Test basic torch.index_select operation"""
-    if conf.device == "mojo:cpu":
+    if torch.device(conf.device) == device_module.cpu():
         pytest.xfail(
             "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
         )
@@ -5342,7 +5343,7 @@ def test_aten_index_select_multiple_dims(conf: Conf):
 
 def test_aten_index_select_multiple_dims_start_nonzero(conf: Conf):
     """Test basic torch.index_select operation"""
-    if conf.device == "mojo:cpu":
+    if torch.device(conf.device) == device_module.cpu():
         pytest.xfail(
             "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
         )
