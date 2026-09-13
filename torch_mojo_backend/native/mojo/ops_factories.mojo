@@ -404,9 +404,8 @@ def _random_host(
     for i in range(n_scalars):
         call_args.append(args[unsafe_offset=1 + i].copy())
     call_args.append(Value(TAG_NONE, 0, 0, 0))
-    var host_rets = call_op("aten::random_", String(overload), call_args^, 1)
-    if host_rets[0].tag == TAG_TENSOR:
-        release(Int(host_rets[0].a))
+    # `Results` releases tmb_call_op's own fresh wrapper handle.
+    _ = call_op("aten::random_", String(overload), call_args^, 1)
     _copy_cpu_into(t, cpu.t)
     ret_ref(rets, 0, t)
 

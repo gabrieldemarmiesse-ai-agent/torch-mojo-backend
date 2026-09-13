@@ -985,10 +985,7 @@ def call_op_raw(
 
 
 def call_op(
-    op: StaticString,
-    overload: StaticString,
-    var args: List[Value],
-    n_rets: Int,
+    op: String, overload: String, var args: List[Value], n_rets: Int
 ) raises -> Results:
     """`call_op_raw` over a `List[Value]` of arguments in schema order (exact
     arity: the dispatcher checks it against the op's schema). `op` must be
@@ -999,8 +996,8 @@ def call_op(
         rets.append(none_arg())
     var n_args = len(args)
     call_op_raw(
-        String(op),
-        String(overload),
+        op,
+        overload,
         Values(unsafe_from_address=Int(args.unsafe_ptr())),
         n_args,
         Values(unsafe_from_address=Int(rets.unsafe_ptr())),
