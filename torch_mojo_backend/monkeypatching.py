@@ -132,11 +132,18 @@ def add_mojo_to_the_inductor_gpu_types():
 
     Appending is safe here because ``is_gpu`` reads the module global and
     the two modules that ``from ... import GPU_TYPES`` bind the same list
-    object. It does put ``get_gpu_type()`` -- which asserts at most one
-    entry of the list is available -- at risk on a box where torch's CUDA
-    build also works; that function is only reached by max-autotune and a
-    few pattern-matcher passes.
+    object.
+
+    The list is process-wide and ``get_gpu_type()`` asserts at most one of
+    its entries is available, so "mojo" and a working ``torch.cuda`` cannot
+    both be in it: with both, that assert fires in the autotuning
+    subprocess setup and the profiler benchmarking, for CUDA workloads as
+    much as for ours. There is no per-graph answer to give it, so this
+    patch stands aside on a torch with a working CUDA/ROCm build --
+    ``inductor.enable_inductor()`` refuses outright there, and says why.
     """
+    if torch.cuda.is_available():
+        return
     from torch._inductor import (  # noqa: PLC0415 -- 0.87 s of sympy, measured; every register_mojo_devices() would otherwise pay it
         utils as inductor_utils,
     )

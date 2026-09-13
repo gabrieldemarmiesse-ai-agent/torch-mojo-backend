@@ -18,7 +18,10 @@ monkeypatch each: `add_mojo_to_the_inductor_gpu_types`,
 `let_has_triton_see_the_mojo_device`, `register_the_mojo_triton_target` and
 `compile_inductor_kernels_in_process`.
 
-NVIDIA only, like `triton_driver`.
+NVIDIA only, like `triton_driver`, and for a torch with no working CUDA/ROCm
+build only: `GPU_TYPES` is one process-wide list and `get_gpu_type()` asserts
+at most one of its entries is available, so "mojo" and "cuda" cannot both be
+in it (`enable_inductor` refuses rather than break torch's own CUDA path).
 """
 
 from __future__ import annotations
@@ -223,7 +226,28 @@ class MojoDeviceOpOverrides(DeviceOpOverrides):
 
 def enable_inductor():
     """Make `torch.compile(backend="inductor")` codegen for the mojo device
-    (call after `register_mojo_devices`)."""
+    (call after `register_mojo_devices`).
+
+    Needs a torch with no working CUDA/ROCm build. Inductor decides "is this
+    an accelerator?" from one process-wide list, `torch._inductor.utils`'s
+    `GPU_TYPES`, and `get_gpu_type()` asserts at most one of its entries is
+    available; with mojo appended next to a working `torch.cuda` that assert
+    fires -- in autotuning's subprocess setup and in the profiler
+    benchmarking -- for that process's CUDA workloads as much as for ours.
+    Nothing in that API is per-graph, so the choice is one backend or the
+    other, and this raises rather than silently break torch's own.
+
+    It also takes Triton for the whole process (see `enable_triton`).
+    """
+    if torch.cuda.is_available():
+        raise RuntimeError(
+            "Inductor on the mojo device needs a torch without a working "
+            "CUDA/ROCm build: torch._inductor's GPU_TYPES is process-wide and "
+            "get_gpu_type() asserts at most one of its entries is available, so "
+            "'mojo' cannot be added beside 'cuda' without breaking Inductor for "
+            "CUDA workloads too. Use the CPU torch wheel -- the mojo device "
+            "reaches the GPU through MAX, not through torch."
+        )
     enable_triton()
     _ptxas.apply_triton_default()
     monkeypatching.add_mojo_to_the_inductor_gpu_types()

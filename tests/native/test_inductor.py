@@ -5,9 +5,11 @@ and stream, and every result is checked against the same function on CPU."""
 import pytest
 import torch
 import torch._inductor.metrics
+import torch._inductor.utils
 
 pytest.importorskip("triton")
 
+from torch_mojo_backend import monkeypatching  # noqa: E402
 from torch_mojo_backend.inductor import enable_inductor, get_raw_stream  # noqa: E402
 from torch_mojo_backend.native import (
     device_module,  # noqa: E402 -- `torch.mojo` itself, under a name ty can resolve
@@ -20,6 +22,20 @@ def mojo_inductor(mojo_gpu):
     torch._dynamo.reset()
     yield mojo_gpu
     torch._dynamo.reset()
+
+
+def test_inductor_refuses_beside_a_working_cuda_torch(monkeypatch):
+    """`GPU_TYPES` is one process-wide list and `get_gpu_type()` asserts at
+    most one of its entries is available, so "mojo" cannot join "cuda" there
+    without breaking Inductor for that process's CUDA workloads too."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch._inductor.utils, "GPU_TYPES", ["cuda", "mps", "xpu", "mtia"]
+    )
+    with pytest.raises(RuntimeError, match="CPU torch wheel"):
+        enable_inductor()
+    monkeypatching.add_mojo_to_the_inductor_gpu_types()  # the patch stands aside too
+    assert "mojo" not in torch._inductor.utils.GPU_TYPES
 
 
 def _compiled_matches_cpu(fn, mojo_inputs, cpu_inputs, **tolerance):
