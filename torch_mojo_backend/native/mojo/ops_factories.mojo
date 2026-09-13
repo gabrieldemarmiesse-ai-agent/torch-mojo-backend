@@ -45,12 +45,16 @@ from abi import (
     TAG_DOUBLE,
     TAG_NONE,
     TAG_TENSOR,
+    ST_FLOAT32,
+    retain,
 )
 from device import copy_d2d, copy_from_host, ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import (
     call_op,
+    cast_into,
+    cast_to,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -461,15 +465,23 @@ def _native_dropout_fill(
     _ = ctx
 
 
+def _dropout_dtype_ok(dtype: DType) -> Bool:
+    return (
+        dtype == DType.float32
+        or dtype == DType.float16
+        or dtype == DType.bfloat16
+    )
+
+
 # aten::native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)
 def op_native_dropout(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    if a.dtype != DType.float32 or dev(a.device)[].is_cpu:
+    if not _dropout_dtype_ok(a.dtype) or dev(a.device)[].is_cpu:
         unsupported(
-            "native_dropout is only implemented for float32 tensors on the"
-            " mojo GPU device"
+            "native_dropout is only implemented for float32/float16/bfloat16"
+            " tensors on the mojo GPU device"
         )
     # `train=None` behaves like `train=True` (matches the old eager path);
     # only an explicit False takes the inference shortcut.
@@ -508,16 +520,27 @@ def op_native_dropout(
         return
     # Validate and allocate before touching generator state: nothing after
     # the Philox reservation may read the host or synchronize the device.
+    # Half-precision inputs run the float32 kernel on a float32 copy and
+    # cast the output back (the mask is dtype-free).
     var ac = contiguous(a)
+    var a32 = cast_to(ac, ST_FLOAT32)
     var output = own(new_like(a))
+    var out32 = own(new_like(a32)) if a.dtype != DType.float32 else own(
+        T(retain(output.t))
+    )
     var mask = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
     var increment = (a.numel + 3) // 4
     var seed_offset = philox_reserve(0, a.device, increment)
     _native_dropout_fill(
-        output.t, mask.t, ac, p, seed_offset[0], seed_offset[1]
+        out32.t, mask.t, a32, p, seed_offset[0], seed_offset[1]
     )
+    if a32.h != ac.h:
+        release(a32.h)
     if ac.h != a.h:
         release(ac.h)
+    if out32.t.h != output.t.h:
+        cast_into(output.t, out32.t)
+    _ = out32^
     ret_owned(rets, 0, output)
     ret_owned(rets, 1, mask)
 
@@ -530,25 +553,35 @@ def op_native_dropout_backward(
     var keep = v_tensor(args[unsafe_offset=1])
     var scale = v_f64(args[unsafe_offset=2])
     if (
-        grad.dtype != DType.float32
+        not _dropout_dtype_ok(grad.dtype)
         or keep.dtype != DType.bool
         or dev(grad.device)[].is_cpu
         or keep.device != grad.device
         or not grad.same_shape(keep)
     ):
         unsupported(
-            "native_dropout_backward is only implemented for a float32"
-            " grad_output and a bool mask on the same mojo GPU device"
+            "native_dropout_backward is only implemented for a"
+            " float32/float16/bfloat16 grad_output and a bool mask on the"
+            " same mojo GPU device"
         )
     var grad_input = own(new_like(grad))
     if grad.numel > 0:
         var gc = contiguous(grad)
+        var g32 = cast_to(gc, ST_FLOAT32)
         var kc = contiguous(keep)
-        _native_dropout_backward_fill(grad_input.t, gc, kc, scale)
+        var gi32 = own(new_like(g32)) if grad.dtype != DType.float32 else own(
+            T(retain(grad_input.t))
+        )
+        _native_dropout_backward_fill(gi32.t, g32, kc, scale)
+        if g32.h != gc.h:
+            release(g32.h)
         if gc.h != grad.h:
             release(gc.h)
         if kc.h != keep.h:
             release(kc.h)
+        if gi32.t.h != grad_input.t.h:
+            cast_into(grad_input.t, gi32.t)
+        _ = gi32^
     ret_owned(rets, 0, grad_input)
 
 
