@@ -627,9 +627,19 @@ def _bn_backward(
     )
     var gw = _bn_affine_grad(grad_weight, pst, mask[1])
     var gb = _bn_affine_grad(grad_bias, pst, mask[2])
-    ret_owned(rets, 0, gi)
-    ret_owned(rets, 1, gw)
-    ret_owned(rets, 2, gb)
+    # an output autograd did not ask for is an undefined Tensor (None record)
+    if mask[0]:
+        ret_owned(rets, 0, gi)
+    else:
+        rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
+    if mask[1]:
+        ret_owned(rets, 1, gw)
+    else:
+        rets[unsafe_offset=1] = Value(TAG_NONE, 0, 0, 0)
+    if mask[2]:
+        ret_owned(rets, 2, gb)
+    else:
+        rets[unsafe_offset=2] = Value(TAG_NONE, 0, 0, 0)
 
 
 def _bn_stats_then_backward(

@@ -829,6 +829,7 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
     if held.t.stype != self.stype or not self.same_shape(held.t):
         unsupported("an in-place result that changes dtype or shape")
     _b_copy_into(self, held.t)
+    _ = held^  # alive past the launch
     ret_ref(rets, 0, self)
 
 

@@ -742,9 +742,19 @@ def op_native_layer_norm_backward(
     call.run()
     _ = len(keep)
     _ = ctx
-    ret_owned(rets, 0, gi)
-    ret_owned(rets, 1, gw)
-    ret_owned(rets, 2, gb)
+    # an output autograd did not ask for is an undefined Tensor (None record)
+    if mask[0]:
+        ret_owned(rets, 0, gi)
+    else:
+        rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
+    if mask[1]:
+        ret_owned(rets, 1, gw)
+    else:
+        rets[unsafe_offset=1] = Value(TAG_NONE, 0, 0, 0)
+    if mask[2]:
+        ret_owned(rets, 2, gb)
+    else:
+        rets[unsafe_offset=2] = Value(TAG_NONE, 0, 0, 0)
 
 
 def _masked_alloc(

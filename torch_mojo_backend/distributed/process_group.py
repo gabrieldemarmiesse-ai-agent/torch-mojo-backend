@@ -20,6 +20,7 @@ import functools
 import os
 import platform
 import sys
+import threading
 import traceback
 from collections.abc import Callable
 from typing import cast
@@ -205,6 +206,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             None  # device index while batch_isend_irecv coalesces
         )
         self._coalesced_tensors: list[torch.Tensor] = []
+        self._coalescing_thread: int | None = None
         # Work a coalesced call cannot do yet: inside a group nothing is
         # submitted until group_end, so copy-backs and record_stream fences
         # wait there. Holding the tensors also keeps every staging buffer
@@ -285,7 +287,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         stream = self._ready.get(index)
         if stream is not None:
             return stream
-        if self._coalescing is not None:
+        if self._coalescing_open():
             raise RuntimeError("cannot create a communicator inside a coalescing block")
         key = f"mojo-ccl-unique-id-{self._seq}"
         self._seq += 1
@@ -340,7 +342,7 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def _record(self, index: int, *tensors: torch.Tensor):
         """Inputs (original and staged): touched by the comm stream, not modified."""
-        if self._coalescing is not None:
+        if self._coalescing_open():
             self._coalesced_records.extend(tensors)
             return
         comm = self._ready[index]
@@ -357,7 +359,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         collective has not written yet, and a `record_stream` event recorded
         before submission fences nothing.
         """
-        if self._coalescing is not None:
+        if self._coalescing_open():
             self._coalesced_pairs.extend(pairs)
             return
         comm = self._ready[index]
@@ -390,7 +392,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     def _group(self):
         """An NCCL group; the end call runs on every exit path so a failed
         submission never leaves the communicator inside an open group."""
-        if self._coalescing is not None:  # batch_isend_irecv already opened one
+        if self._coalescing_open():
             yield
             return
         self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
@@ -403,7 +405,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         return _nccl_red_op(op, dtype)
 
     def _result(self, index: int, tensors: list[torch.Tensor]) -> Work:
-        if self._coalescing is not None:
+        if self._coalescing_open():
             self._coalesced_tensors.extend(tensors)
             return self._work(
                 index, tensors
@@ -412,13 +414,28 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     # ---- coalescing (torch.distributed.batch_isend_irecv / _coalescing_manager)
 
+    def _coalescing_open(self) -> bool:
+        """Whether the caller is inside this group's coalescing block. NCCL
+        groups belong to the thread that opened them, so another thread must
+        not join (or silently skip) an open block."""
+        if self._coalescing is None:
+            return False
+        if threading.get_ident() != self._coalescing_thread:
+            raise RuntimeError(
+                "a coalescing block of this process group is open on another thread"
+            )
+        return True
+
     def _start_coalescing(self, device: torch.device):
+        if self._coalescing is not None:
+            raise RuntimeError("coalescing blocks do not nest")
         index = (
             device.index if device.index is not None else device_module.current_device()
         )
         self._ensure(index)
         self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
         self._coalescing = index
+        self._coalescing_thread = threading.get_ident()
         self._coalesced_tensors = []
         self._coalesced_records = []
         self._coalesced_pairs = []
@@ -433,6 +450,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             else self._index_of_device(device)
         )
         self._coalescing = None
+        self._coalescing_thread = None
         tensors, self._coalesced_tensors = self._coalesced_tensors, []
         records, self._coalesced_records = self._coalesced_records, []
         pairs, self._coalesced_pairs = self._coalesced_pairs, []
@@ -444,16 +462,22 @@ class MojoProcessGroup(dist.ProcessGroup):
         return self._work(index, tensors)
 
     def _abort_coalescing(self):
-        """Drop a coalescing block that raised: close the NCCL group and
-        discard the deferred work, whose operations were never submitted."""
+        """Unwind a coalescing block that raised. Closing the NCCL group
+        submits what was queued (it does not cancel it), so the deferred
+        copy-backs and fences still run and the staged buffers stay referenced
+        until then; only then is the block's state dropped."""
         if self._coalescing is None:
             return
+        index = self._coalescing
         self._coalescing = None
+        self._coalescing_thread = None
         self._coalesced_tensors = []
-        self._coalesced_records = []
-        self._coalesced_pairs = []
+        records, self._coalesced_records = self._coalesced_records, []
+        pairs, self._coalesced_pairs = self._coalesced_pairs, []
         try:
             self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+            self._record(index, *records)
+            self._finish(index, *pairs)
         except Exception:  # the original failure is the one being propagated
             traceback.print_exc(file=sys.stderr)
 

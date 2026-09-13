@@ -427,6 +427,7 @@ def _foreach_norm_launch(tensors: List[T]) raises -> List[T]:
     call.int(partials.t.numel)
     call.int(cp)
     call.run()
+    _ = partials  # alive past the launch (its last use above is the pointer read)
     _ = ctx
     var result = List[T]()
     for i in range(len(outs)):

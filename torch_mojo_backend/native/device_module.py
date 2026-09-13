@@ -180,16 +180,22 @@ class StreamContext:
     def __init__(self, stream: torch.Stream | None):
         self.stream = stream
         self.prev: torch.Stream | None = None
+        self.prev_device: int | None = None
 
     def __enter__(self):
         if self.stream is None:
             return
+        # set_stream also makes the stream's device current (torch semantics):
+        # both are restored on exit
+        self.prev_device = current_device()
         self.prev = torch.accelerator.current_stream(self.stream.device.index)
         torch.accelerator.set_stream(self.stream)
 
     def __exit__(self, *exc: object) -> bool:
         if self.prev is not None:
             torch.accelerator.set_stream(self.prev)
+        if self.prev_device is not None:
+            set_device(self.prev_device)
         return False
 
 

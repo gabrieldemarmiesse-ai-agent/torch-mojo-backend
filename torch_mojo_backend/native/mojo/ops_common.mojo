@@ -306,6 +306,7 @@ def cast_to(t: T, stype: Int32) raises -> T:
     var out = own(new_like_dtype(t, stype))
     var src = own_if_new(contiguous(t), t)
     cast_into(out.t, src.t)
+    _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
 
 

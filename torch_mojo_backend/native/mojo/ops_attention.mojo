@@ -502,7 +502,9 @@ def _bthd_output(
     views. One dense allocation with a view over it: the view spans every
     element exactly once, so it costs no extra memory."""
     var dense = own(_alloc(device, stype, [b, s, h, d]))
-    return _view(dense.t, [b, h, s, d], [s * h * d, d, h * d, 1])
+    var v = _view(dense.t, [b, h, s, d], [s * h * d, d, h * d, 1])
+    _ = dense^  # the view holds the storage from here on
+    return v^
 
 
 def _fused_fa_forward(

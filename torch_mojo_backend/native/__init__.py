@@ -18,6 +18,7 @@ import contextlib
 import ctypes
 import re
 import fcntl
+import functools
 import hashlib
 import importlib.metadata
 import os
@@ -66,6 +67,32 @@ def _pkg_version(name: str) -> str:
         return "missing"
 
 
+@functools.cache
+def _compiler_identity() -> str:
+    """The compiler actually invoked (not just the package version) and the
+    PTX assembler it will use."""
+    try:
+        version = subprocess.run(
+            [_find_mojo(), "--version"], capture_output=True, text=True, timeout=60
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        version = "unknown"
+    return f"{version}|ptxas={os.environ.get('MODULAR_NVPTX_COMPILER_PATH', '')}"
+
+
+@functools.cache
+def _accelerator_identity() -> str:
+    """The devices a build targets: the Mojo runtime selects its vendor path
+    at compile time, so an H100 build must never serve a gfx942 node."""
+    from torch_mojo_backend.torch_compile_backend.utils import (  # noqa: PLC0415 -- imports max.driver; keep it off the import path
+        get_accelerators,
+    )
+
+    return ",".join(
+        f"{getattr(d, 'api', '')}:{getattr(d, 'label', '')}" for d in get_accelerators()
+    )
+
+
 def toolchain_identity() -> str:
     """What both builds depend on besides their sources."""
     return "|".join(
@@ -76,6 +103,8 @@ def toolchain_identity() -> str:
             f"python={sys.implementation.cache_tag}",
             f"platform={sys.platform}",
             f"machine={platform.machine()}",
+            _compiler_identity(),
+            f"accelerators={_accelerator_identity()}",
         ]
     )
 
@@ -264,7 +293,13 @@ def build_shim() -> Path:
     cflags = ["-O1", "-std=c++17", "-fPIC", "-c", abi, *_torch_include_flags()]
     key = _hash_files(
         sources + headers,
-        toolchain_identity() + "|" + _cxx_identity(cxx) + "|" + " ".join(cflags),
+        toolchain_identity()
+        + "|"
+        + _cxx_identity(cxx)
+        + "|"
+        + " ".join(cflags)
+        + "|"
+        + autocast_policy_table(),  # generated into the build, not a source file
     )
     out = (
         _CACHE_DIR

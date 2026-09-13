@@ -114,7 +114,6 @@ struct Loader(Movable):
     var toolchain: String  # versions of mojo/max/python, from the Python side
     var trace: Bool
     var families: Dict[String, Family]  # "<family>.<slug>" -> loaded build
-    var failures: Dict[String, String]  # same key -> permanent error
     var ops: Dict[String, OpExt]  # "<group>/<aten name>" -> loaded build
     var source_hashes: Dict[String, String]  # family -> closure hash
     var fast: Dict[
@@ -137,7 +136,6 @@ struct Loader(Movable):
         self.toolchain = toolchain
         self.trace = trace
         self.families = Dict[String, Family]()
-        self.failures = Dict[String, String]()
         self.ops = Dict[String, OpExt]()
         self.source_hashes = Dict[String, String]()
         self.fast = Dict[UInt64, Int]()
@@ -424,8 +422,6 @@ struct Loader(Movable):
         var key = family + "." + _slug(defines)
         if key in self.families:
             return self.families[key].entry
-        if key in self.failures:
-            raise Error(self.failures[key])
         try:
             var fam_dir = self.family_dir(family)
             var so = (
@@ -449,7 +445,6 @@ struct Loader(Movable):
             self.families[key] = fam^
             return addr
         except e:
-            self.failures[key] = String(e)
             raise e^
 
 

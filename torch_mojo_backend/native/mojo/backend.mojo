@@ -28,7 +28,7 @@ from ops_matmul import register_matmul
 from ops_nn import register_nn
 from ops_reductions import register_reductions
 from ops_unary import register_unary
-from pg import pg_vtable
+from pg import Locked, pg_vtable
 from registry import Lib, RegisterFn, Site
 
 
@@ -109,7 +109,8 @@ def tmb_prebuild_ops() abi("C") -> Int32:
     compilations up front (and outside any GPU lock) rather than inside the
     first call of each op."""
     try:
-        _register_ops(0, prebuild=True)
+        with Locked():  # the loader's tables are shared with the lazy first calls
+            _register_ops(0, prebuild=True)
         return 0
     except e:
         set_shim_error(String(e))
