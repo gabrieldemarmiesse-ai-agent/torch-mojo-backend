@@ -314,7 +314,9 @@ def copy_from_host(
     if nbytes == 0:
         return
     var dst = wrap_raw(ctx, dev_ptr, nbytes)
-    if ctx.api() == "cpu":
+    if ctx.api() == "cpu" or ctx.api() == "metal":
+        # Metal: unified memory, and MAX's Metal streams have no host
+        # callbacks (enqueue_host_func), which the staged path below needs
         dst.enqueue_copy_from(U8P(unsafe_from_address=host_ptr))
         ctx.synchronize()
         return
