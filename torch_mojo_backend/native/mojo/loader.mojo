@@ -60,15 +60,10 @@ def _local_dir(prefix: String) -> String:
 
 
 def _compiler_env() -> String:
-    """Environment every `mojo build` subprocess runs with. MODULAR_HOME
-    holds the compiler's own module cache: its default is in $HOME, which on
-    a cluster is NFS shared by every node, and concurrent compilers then evict
-    each other's entries ("failed to produce an archive for the module").
-    Node-local it is per-machine and nobody else touches it. A value the
-    caller set deliberately wins."""
-    return (
-        'MODULAR_HOME="${MODULAR_HOME:-' + _local_dir("modular-home-") + '}"'
-    )
+    """Environment every `mojo build` subprocess runs with; an explicit value
+    wins. Why MODULAR_HOME must be node-local: native/__init__.py's
+    `compiler_env`, the same thing on the Python side."""
+    return 'MODULAR_HOME="${MODULAR_HOME:-' + _local_dir("modular-home-") + '}"'
 
 
 struct Family(Movable):

@@ -134,11 +134,13 @@ in `register_<group>` with `impl[op_x, "x.overload"](site)` (the name is a
 compile-time parameter: that is what lets the op's extension select it).
 A new group file needs three things: the `register_<group>` list, the
 `tmb_op_address` export every group file ends with, and one
-`_group[register_<group>](lib, "ops_<group>")` line in `backend.mojo`.
-Read arguments with the `v_*` helpers by schema
-position, build outputs with `new_tensor` / `new_like` / `view_strided`, set
-results with `ret_tensor` (owned output), `ret_ref` (an input handed back:
-in-place ops), `ret_tensor_list`, `ret_scalar_*`.
+`_group[register_<group>](lib, "ops_<group>", prebuild)` line in
+`backend.mojo`.
+
+Read arguments with the `v_*` helpers by schema position, build outputs with
+`new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
+(owned output), `ret_ref` (an input handed back: in-place ops),
+`ret_tensor_list`, `ret_scalar_*`.
 
 To run a kernel:
 
