@@ -199,6 +199,15 @@ def autocast_policy_table() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _cxx_standard() -> str:
+    """torch 2.14's headers need C++20 (std::strong_ordering, requires
+    clauses); older releases compile as C++17, which keeps older compilers
+    usable there. Major.minor only, so a 2.14 nightly counts as 2.14."""
+    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    new_enough = m is not None and (int(m.group(1)), int(m.group(2))) >= (2, 14)
+    return "-std=c++20" if new_enough else "-std=c++17"
+
+
 def _cxx_identity(cxx: list[str]) -> str:
     try:
         out = subprocess.run(
@@ -264,7 +273,15 @@ def compiler_env() -> dict[str, str]:
         or Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
     )
     home.mkdir(parents=True, exist_ok=True)
-    return {**os.environ, "MODULAR_HOME": str(home)}
+    env: dict[str, str] = {**os.environ, "MODULAR_HOME": str(home)}
+    # The MAX runtime exports the interpreter it found on PATH into this
+    # process's environment (children inherit it); with a venv that is not on
+    # PATH the `mojo` launcher script would start /usr/bin/python3 against the
+    # venv's prefix and die with "Could not find platform independent
+    # libraries". loader.mojo's _compiler_env unsets the same two.
+    for name in ("PYTHONEXECUTABLE", "PYTHONHOME"):
+        env.pop(name, None)
+    return env
 
 
 def _atomic_install(tmp: Path, out: Path):
@@ -290,7 +307,7 @@ def build_shim() -> Path:
     headers = sorted(_CSRC.glob("*.h"))
     cxx = _cxx()
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
-    cflags = ["-O1", "-std=c++17", "-fPIC", "-c", abi, *_torch_include_flags()]
+    cflags = ["-O1", _cxx_standard(), "-fPIC", "-c", abi, *_torch_include_flags()]
     key = _hash_files(
         sources + headers,
         toolchain_identity()

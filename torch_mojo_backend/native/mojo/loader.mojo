@@ -69,7 +69,16 @@ def _compiler_env() raises -> String:
     """Environment every `mojo build` subprocess runs with; an explicit value
     wins. Why MODULAR_HOME must be node-local: native/__init__.py's
     `compiler_env`, the same thing on the Python side."""
-    return 'MODULAR_HOME="${MODULAR_HOME:-' + _local_dir("modular-home-") + '}"'
+    # PYTHONEXECUTABLE/PYTHONHOME: the MAX runtime exports the interpreter it
+    # found on PATH into this process's environment (invisible to os.environ,
+    # inherited by children); with a venv that is not on PATH, the `mojo`
+    # launcher script then starts /usr/bin/python3 with the venv's prefix and
+    # dies with "Could not find platform independent libraries".
+    return (
+        'unset PYTHONEXECUTABLE PYTHONHOME; MODULAR_HOME="${MODULAR_HOME:-'
+        + _local_dir("modular-home-")
+        + '}"'
+    )
 
 
 struct Family(Movable):

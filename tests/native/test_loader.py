@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from torch_mojo_backend import native
+
 pytestmark = pytest.mark.xdist_group(name="group1")
 
 _WORKTREE = Path(__file__).resolve().parents[2]
@@ -220,3 +222,25 @@ def test_missing_op_extension_is_rebuilt_alone(tmp_path: Path):
         if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
     }
     assert others_after == others_before
+
+
+def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
+    """The MAX runtime exports PYTHONEXECUTABLE for the interpreter it found on
+    PATH; a `mojo` launcher started with it against another venv's prefix dies
+    with "Could not find platform independent libraries"."""
+    monkeypatch.setenv("PYTHONEXECUTABLE", "/usr/bin/python3")
+    monkeypatch.setenv("PYTHONHOME", "/usr")
+    env = native.compiler_env()
+    assert "PYTHONEXECUTABLE" not in env and "PYTHONHOME" not in env
+    assert env["MODULAR_HOME"]
+
+
+def test_cxx_standard_follows_the_torch_version(monkeypatch):
+    for version, expected in (
+        ("2.11.0+cpu", "-std=c++17"),
+        ("2.13.0", "-std=c++17"),
+        ("2.14.0a0+git0", "-std=c++20"),
+        ("2.14.0+cpu", "-std=c++20"),
+    ):
+        monkeypatch.setattr(native.torch, "__version__", version)
+        assert native._cxx_standard() == expected, version
