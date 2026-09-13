@@ -50,13 +50,7 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import (
-    call_op_raw,
-    cast_to,
-    copy_strided_into,
-    fill_value,
-    release_if_new,
-)
+from ops_common import cast_to, copy_strided_into, fill_value, release_if_new
 from registry import Lib, impl
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
@@ -160,47 +154,26 @@ def _is_float(t: T) -> Bool:
     )
 
 
-def _grad_enabled(t: T) raises -> Bool:
-    """Whether autograd would record a node for `t` right now, i.e.
-    `GradMode::is_enabled()` AND `t.requires_grad()`.
+def _needs_grad(q: T, k: T, v: T) -> Bool:
+    """Whether this call may have a backward to produce.
 
-    The grad-mode flag itself is a C++ TLS bit with no `tmb_*` accessor, so
-    it is read the only way the record ABI reaches it: dispatch `aten::alias`
-    -- a pure view, no device work -- on a tensor that already requires grad
-    and see whether the view came back requiring it too. Inside
-    `torch.no_grad()` / `torch.inference_mode()` the autograd kernel is
-    skipped and it does not. One dispatcher round trip, and only on tensors
-    that require grad in the first place.
+    This is `requires_grad` only, NOT "autograd will record a node": the
+    grad-mode flag is unreachable from here. It is a C++ TLS bit with no
+    `tmb_*` accessor, and it cannot be inferred through the dispatcher
+    either -- the generated VariableType wrapper runs a backend kernel under
+    `AutoDispatchBelowADInplaceOrView`, so a nested `tmb_call_op` from inside
+    this op has the autograd AND view keys excluded and sees no autograd
+    metadata at all (measured: `aten::alias` on a requires-grad tensor comes
+    back with `requires_grad == False` from in here, under grad mode as much
+    as under `torch.no_grad()`).
+
+    The cost is conservatism: inside `torch.no_grad()`, a leaf that requires
+    grad elsewhere still sends this call to the differentiable route. One
+    line in `native/csrc/shim_runtime.cpp` -- a `tmb_grad_enabled()` reading
+    `at::GradMode::is_enabled()`, next to `tmb_float32_matmul_precision`
+    which reads `at::globalContext()` the same way -- is what would fix it.
     """
-    if not t.requires_grad():
-        return False
-    var args = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
-    args[0] = Value(TAG_TENSOR, 0, Int64(t.h), 0)
-    var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
-    call_op_raw(
-        "aten::alias",
-        "",
-        Values(unsafe_from_address=Int(args.unsafe_ptr())),
-        1,
-        Values(unsafe_from_address=Int(rets.unsafe_ptr())),
-        1,
-    )
-    var view = T(Int(rets[0].a))
-    var recorded = view.requires_grad()
-    release(view.h)
-    _ = args
-    _ = rets
-    return recorded
-
-
-def _needs_grad(q: T, k: T, v: T) raises -> Bool:
-    """Whether this call has a backward to produce.
-
-    Not just `requires_grad`: under `torch.no_grad()` nothing is recorded, so
-    a forward-only route is free to run even on parameters that do require
-    grad elsewhere.
-    """
-    return _grad_enabled(q) or _grad_enabled(k) or _grad_enabled(v)
+    return q.requires_grad() or k.requires_grad() or v.requires_grad()
 
 
 # ===========================================================================

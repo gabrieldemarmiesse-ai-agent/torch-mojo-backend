@@ -46,7 +46,6 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK, _f64_slot
 from ops_common import (
-    call_op_raw,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -72,41 +71,6 @@ def _on_gpu(t: T) raises -> Bool:
 def _require_mojo(t: T, what: StaticString) raises:
     if not t.on_mojo():
         unsupported(String(what) + ": operand is not on the mojo device")
-
-
-def _records_grad(t: T) raises -> Bool:
-    """Whether autograd would record a node for `t` right now, i.e.
-    `GradMode::is_enabled()` AND `t.requires_grad()`.
-
-    The grad-mode flag is a C++ TLS bit with no `tmb_*` accessor, so it is
-    read the only way the record ABI reaches it: dispatch `aten::alias` -- a
-    pure view, no device work -- on a tensor that already requires grad and
-    see whether the view came back requiring it too. Inside
-    `torch.no_grad()` / `torch.inference_mode()` the autograd kernel is
-    skipped and it does not.
-
-    Private to this file until the port is merged; ops_attention.mojo has
-    the same helper (`_grad_enabled`) and both belong in ops_common.mojo.
-    """
-    if not t.requires_grad():
-        return False
-    var args = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
-    args[0] = Value(TAG_TENSOR, 0, Int64(t.h), 0)
-    var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
-    call_op_raw(
-        "aten::alias",
-        "",
-        Values(unsafe_from_address=Int(args.unsafe_ptr())),
-        1,
-        Values(unsafe_from_address=Int(rets.unsafe_ptr())),
-        1,
-    )
-    var view = T(Int(rets[0].a))
-    var recorded = view.requires_grad()
-    release(view.h)
-    _ = args
-    _ = rets
-    return recorded
 
 
 def _swapped(
@@ -504,28 +468,30 @@ def op_native_layer_norm(
         unsupported("native_layer_norm: empty normalized_shape")
     var rows = a.numel // cols
     # `native_layer_norm_backward` here covers float32 only, so a
-    # grad-recording call on a reduced-precision input is refused in the
-    # FORWARD, where the traceback still names the op and the user's own
-    # frame -- rather than succeeding and failing later inside the autograd
-    # engine, with nothing in the message pointing at the layer norm. Any of
-    # input / weight / bias requiring grad records the node, so all three are
-    # asked (ATen's autograd formula differentiates whichever ones do).
-    if a.stype != ST_FLOAT32:
-        var records = _records_grad(a)
-        if not records and has_w:
-            records = _records_grad(v_tensor(args[unsafe_offset=2]))
-        if not records and has_b:
-            records = _records_grad(v_tensor(args[unsafe_offset=3]))
-        if records:
-            unsupported(
-                "aten::native_layer_norm on "
-                + String(a.dtype)
-                + " inputs that require grad: this device implements"
-                " aten::native_layer_norm_backward for float32 only, so the"
-                " backward would fail. Run the forward under torch.no_grad(),"
-                " or keep the layer norm in float32 (autocast already does:"
-                " its policy runs normalization in float32)."
-            )
+    # grad-requiring reduced-precision input is refused in the FORWARD, where
+    # the traceback still names the op and the user's own frame, rather than
+    # succeeding and failing later inside the autograd engine with nothing in
+    # the message pointing at the layer norm.
+    #
+    # Only the INPUT is asked, although ATen records the node when the weight
+    # or the bias requires grad too: grad mode is unreachable from inside a
+    # backend kernel (see `_needs_grad` in ops_attention.mojo), and an
+    # `nn.LayerNorm`'s Parameters require grad even under `torch.no_grad()` --
+    # asking them would refuse every reduced-precision INFERENCE forward. An
+    # activation, by contrast, requires grad exactly when a graph is being
+    # built. The residual hole is a reduced-precision layer norm applied to a
+    # non-grad input with grad-requiring parameters, which still fails in the
+    # backward as it did before.
+    if a.stype != ST_FLOAT32 and a.requires_grad():
+        unsupported(
+            "aten::native_layer_norm on a "
+            + String(a.dtype)
+            + " input that requires grad: this device implements"
+            " aten::native_layer_norm_backward for float32 only, so the"
+            " backward would fail. Run the forward under torch.no_grad(), or"
+            " keep the layer norm in float32 (autocast already does: its"
+            " policy runs normalization in float32)."
+        )
     var keep = List[Held]()
     var gamma_ptr = 0
     var beta_ptr = 0

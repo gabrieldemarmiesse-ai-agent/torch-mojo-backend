@@ -265,33 +265,6 @@ def test_efficient_attention_declines_compute_log_sumexp(mojo_gpu, counting):
     assert lse.numel() == 0
 
 
-def test_efficient_attention_runs_under_no_grad_on_grad_inputs(mojo_gpu, counting):
-    """`requires_grad` alone is not "a backward will be recorded": under
-    torch.no_grad() nothing is, so the forward-only route is free to run."""
-    qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 1, 64, 64)
-    q.requires_grad_()
-    k.requires_grad_()
-    v.requires_grad_()
-    with torch.no_grad():
-        out = aten._scaled_dot_product_efficient_attention(
-            q, k, v, None, False, 0.0, False
-        )[0]
-    torch.testing.assert_close(
-        out.contiguous().cpu(),
-        F.scaled_dot_product_attention(qr, kr, vr),
-        atol=_tol(torch.float32),
-        rtol=_tol(torch.float32),
-    )
-
-
-def test_fused_sdp_choice_ignores_requires_grad_under_no_grad(mojo_gpu, counting):
-    _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 1, 64, 64)
-    q.requires_grad_()
-    assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == MATH
-    with torch.no_grad():
-        assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == EFFICIENT
-
-
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_math_attention_does_not_overflow_reduced_precision(mojo_gpu, dtype):
     """q @ k^T accumulates head_dim products: with q, k of magnitude 100 and
