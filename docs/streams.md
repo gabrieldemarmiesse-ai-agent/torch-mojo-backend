@@ -16,42 +16,51 @@ e.synchronize()
 `torch.Stream(device="mojo")`, `torch.Event(device="mojo", enable_timing=True)`,
 `torch.accelerator.current_stream()` / `set_stream()`, and the `torch.mojo`
 module equivalents (`Stream`, `Event`, `current_stream`, `default_stream`,
-`set_stream`, `stream`) all work, with `query` / `synchronize` /
-`wait_event` / `wait_stream` / `record_event` / `elapsed_time` backed by
-real MAX events on real device streams. `isinstance(s, torch.Stream)`
-holds in both directions. Not supported: interprocess events
-(`from_ipc_handle`), stream priorities (accepted, always 0 — MAX has them,
-this backend does not pass the argument through yet), and graph capture
-(`is_capturing()` is always `False`).
+`set_stream`, `stream`, all in `torch_mojo_backend/native/device_module.py`)
+work, with `query` / `synchronize` / `wait_event` / `wait_stream` /
+`record_event` / `elapsed_time` backed by real MAX events on real device
+streams. `isinstance(s, torch.Stream)` holds without qualification: a mojo
+stream is a plain `torch.Stream`/`torch._C.Stream`, not a Python subclass.
+Not supported: interprocess events (`from_ipc_handle`), stream priorities
+(accepted, always 0 — MAX has them, this backend does not pass the argument
+through yet), and graph capture (there is no CUDA-graph equivalent; a
+generic PrivateUse1 `torch.Stream` in this torch version exposes no
+`is_capturing()` at all, so there is nothing to stub).
 
 `Stream.stream_id` is the stream's MAX `DeviceContext` pointer (torch treats
 a stream id as an opaque int); the native `CUstream`/`hipStream_t` is
 `Stream.native_handle`.
 
-## Why registration patches torch.Stream
+## Why no Python patch is needed anymore
 
 PyTorch's generic `torch.Stream`/`torch.Event` route through a C++ device
-guard that is a stub for Python-backed PrivateUse1 devices — every stream
-it mints is stream id 0 and every wait/record is a silent no-op. So
-`register_mojo_devices()` dispatches construction on mojo devices to the
-implementations in `mojo_device/streams.py` (built on
-`mojo_device/device_streams.py`, which also carries the NCCL comm stream
-for distributed training). This mirrors the existing
-`torch.accelerator.synchronize` patch and disappears if upstream ever
-forwards the guard hooks to Python device modules.
+guard; for a Python-backed PrivateUse1 device with only the default stub
+guard, every stream it mints is stream id 0 and every wait/record is a
+silent no-op. The old Python eager backend worked around that by patching
+`torch.Stream`/`torch.Event` at the class level
+(`torch_mojo_backend/monkeypatching.py`,
+`_install_torch_stream_event_dispatch`) to dispatch mojo-device
+construction to a Python `Stream`/`Event` pair
+(`mojo_device/streams.py`).
 
-## Execution semantics (read this before pipelining)
+The native backend does not need that patch: `native/csrc/shim_runtime.cpp`
+registers a real C++ `PrivateUse1HooksInterface` (device guard, streams,
+events) with torch's own dispatcher, so `torch.Stream`/`torch.Event`
+work for the `mojo` device through the ordinary generic path, exactly like
+CUDA. `register_mojo_devices()` no longer calls
+`apply_torch_monkeypatches`; that module and `mojo_device/streams.py` are
+dead code left over from the old eager path.
 
-Eager mojo kernels currently always **execute on the device's default
-stream**, regardless of the current stream. `with s:` tracks the current
-stream per thread and every ordering primitive acts on the real streams,
-so device-agnostic pipelining code runs with exactly the semantics it
-would have on CUDA with a single stream: correct, but without extra
-compute concurrency. (NCCL collectives are the exception — they really do
-run on their own side stream and overlap compute; see `docs/distributed.md`.)
-Redirecting kernel launches through per-stream MAX DeviceContexts is the
-known follow-up that would make `with s:` fully concurrent.
+## Execution semantics
+
+Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
+`native/mojo/abi.mojo`/`device.mojo`), so `with torch.Stream(...):` really
+moves execution, not just bookkeeping — unlike the old eager path, which
+always ran on the default stream regardless of the current one.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —
-including external consumers — touches it.
+including external consumers — touches it. `tensor.record_stream(stream)`
+is supported: the backend turns it into a MAX event the owning stream waits
+on before the buffer is released back to the allocator (see
+`docs/native_backend.md`, "Streams").
