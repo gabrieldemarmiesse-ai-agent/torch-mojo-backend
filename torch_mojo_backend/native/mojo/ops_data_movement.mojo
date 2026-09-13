@@ -72,6 +72,7 @@ from ops_common import (
     contiguous,
     copy_strided_into,
     release_if_new,
+    resize_out,
 )
 from registry import Lib, impl
 
@@ -739,6 +740,28 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dim = dim_in + rank if dim_in < 0 else dim_in
     var out = _cat_impl(real, dim)
     ret_owned(rets, 0, out)
+
+
+# aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
+def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """DDP's reducer flattens its buckets with this overload."""
+    var all_tensors = v_tensor_list(args[unsafe_offset=0])
+    var dim_in = v_int_or(args[unsafe_offset=1], 0)
+    var out = v_tensor(args[unsafe_offset=2])
+    var real = List[T]()
+    for x in all_tensors:
+        if not _is_legacy_empty(x):
+            real.append(x.copy())
+    if len(real) == 0:
+        unsupported("aten::cat.out of only legacy-empty tensors")
+    var rank = real[0].rank
+    var dim = dim_in + rank if dim_in < 0 else dim_in
+    var result = _cat_impl(real, dim)
+    if result.t.dtype != out.dtype:
+        raise Error("cat.out: out dtype must match the inputs")
+    resize_out(out, result.t.shape, result.t.rank)
+    copy_strided_into(out, result.t)
+    ret_ref(rets, 0, out)
 
 
 def _unsqueeze_view(t: T, dim: Int) raises -> T:
@@ -1414,6 +1437,7 @@ def register_data_movement(lib: Lib) raises:
     impl[op_clone](lib, "clone")
     impl[op_to_copy](lib, "_to_copy")
     impl[op_cat](lib, "cat")
+    impl[op_cat_out](lib, "cat.out")
     impl[op_stack](lib, "stack")
     impl[op_repeat](lib, "repeat")
     impl[op_tril](lib, "tril")
