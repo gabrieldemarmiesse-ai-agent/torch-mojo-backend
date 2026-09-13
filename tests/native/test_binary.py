@@ -12,14 +12,7 @@ import contextlib
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native, register_mojo_devices
-
-
-@pytest.fixture(autouse=True)
-def _mojo_registered():
-    """tests/native has no conftest of its own; the device has to exist
-    before any of these tests runs (registration is idempotent)."""
-    register_mojo_devices()
+from torch_mojo_backend import aten_functions, native
 
 
 @contextlib.contextmanager

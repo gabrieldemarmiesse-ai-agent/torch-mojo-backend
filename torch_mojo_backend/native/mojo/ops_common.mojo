@@ -15,7 +15,7 @@ from abi import (
     release,
     unsupported,
 )
-from device import ctx_for, ctx_ptr, memset_bytes, memset_typed
+from device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from kernels import KernelCall
 from op_utils import MAX_RANK
 
@@ -61,11 +61,14 @@ def contiguous(t: T) raises -> T:
 
 
 def fill_value(t: T, value: Float64) raises:
-    """Constant fill for any layout: a memset when contiguous, else the
-    strided fill kernel."""
+    """Constant fill for any layout: a memset when contiguous on an
+    accelerator, else the strided fill kernel. On the MAX CPU device a
+    memset is not ordered against kernel launches (measured: a kernel
+    reading a just-filled buffer saw stale memory 4 times in 50), so that
+    device always fills with the kernel."""
     if t.numel == 0:
         return
-    if t.contig:
+    if t.contig and not dev(t.device)[].is_cpu:
         _fill_contiguous(t, value)
         return
     var ctx = ctx_for(t.device)
