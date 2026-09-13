@@ -1075,9 +1075,10 @@ def op_var_correction(
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(
-    a: T, ord_v: Value, dtype_v: Value, mut src: Operand
-) raises:
+def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
+    """The `ord` / `dtype=` gates shared by the functional and out= forms:
+    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
+    accumulation type by casting first (clip_grad_norm_ asks for float32)."""
     if v_scalar_is_bool(ord_v) or v_f64(ord_v) != 2.0:
         unsupported("linalg_vector_norm with ord != 2")
     var want = _opt_dtype(dtype_v)
@@ -1099,7 +1100,7 @@ def op_linalg_vector_norm(
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
     var src = _borrow(a)
-    _vector_norm_operand(a, args[unsafe_offset=1], args[unsafe_offset=4], src)
+    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
@@ -1127,7 +1128,7 @@ def op_linalg_vector_norm_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    _vector_norm_operand(a, args[unsafe_offset=1], args[unsafe_offset=4], src)
+    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
