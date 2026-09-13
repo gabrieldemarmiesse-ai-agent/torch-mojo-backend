@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from torch_mojo_backend import get_accelerators
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.triton_driver import enable_triton
 
 triton = pytest.importorskip("triton")
@@ -50,7 +51,7 @@ def test_triton_kernel_runs_on_mojo_tensors(mojo_triton):
 
 def test_triton_launch_follows_the_current_mojo_stream(mojo_triton):
     s = torch.Stream(device=mojo_triton)
-    with torch.mojo.stream(s):
+    with device_module.stream(s):
         a = torch.ones(1 << 22, device=mojo_triton) * 3
         b = _add(a, a)
         c = b * 2
@@ -65,10 +66,10 @@ def test_triton_launch_on_a_second_device(mojo_triton):
     # like torch.cuda: a Triton launch goes to the CURRENT device, so the
     # caller selects it; the tensors' device is not consulted
     x = torch.randn(4096, device="mojo:1")
-    with torch.mojo.device(1):
+    with device_module.device(1):
         y = _add(x, x)
     torch.testing.assert_close(y.cpu(), 2 * x.cpu())
-    assert torch.mojo.current_device() == 0
+    assert device_module.current_device() == 0
 
 
 @triton.autotune(
@@ -100,6 +101,7 @@ def test_driver_is_installed_on_import_after_registration(mojo_gpu, tmp_path):
     no explicit enable_triton() call."""
     code = """
 import torch
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend import register_mojo_devices
 register_mojo_devices()
 import triton, triton.language as tl

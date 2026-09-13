@@ -23,7 +23,10 @@ TRITON_ENV_VAR = "TRITON_PTXAS_PATH"
 
 def wheel_ptxas() -> Path | None:
     """The ptxas shipped by nvidia-cuda-nvcc-cu12, or None when not installed."""
-    spec = importlib.util.find_spec("nvidia.cuda_nvcc")
+    try:
+        spec = importlib.util.find_spec("nvidia.cuda_nvcc")
+    except ModuleNotFoundError:  # no `nvidia` namespace package at all (macOS)
+        return None
     if spec is None or not spec.submodule_search_locations:
         return None
     for location in spec.submodule_search_locations:

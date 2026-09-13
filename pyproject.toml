@@ -34,6 +34,27 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["torch_mojo_backend"]
+# The prebuilt native libraries (scripts/build_prebuilt.py) are ignored by
+# git, and hatchling skips VCS-ignored files unless they are named here. The
+# wheel stays py3-none-any: these are data files ctypes loads at run time, not
+# extension modules, and one wheel carrying every platform's pair is simpler
+# than a wheel per platform -- a file that does not match the machine is never
+# opened (see docs/native_backend.md, "Prebuilt libraries and the wheel").
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
+
+[tool.hatch.build.targets.sdist]
+# Plain `uv build` builds the wheel from the sdist, so the same list has to be
+# here or the libraries silently vanish from the wheel. A checkout without
+# prebuilt libraries (every clone) matches nothing and ships as before.
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
 
 [tool.ruff]
 target-version = "py311"

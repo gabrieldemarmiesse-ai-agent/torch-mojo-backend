@@ -53,6 +53,10 @@ def _run(cache_dir: Path, *, trace: bool = True) -> subprocess.CompletedProcess[
     env["TORCH_MOJO_BACKEND_CACHE_DIR"] = str(cache_dir)
     env["PYTHONPATH"] = str(_WORKTREE)
     env["TORCH_MOJO_BACKEND_TRACE"] = "1" if trace else "0"
+    # These tests are about compiling and caching, so never let a prebuilt
+    # library short-circuit a build (a checkout that ran
+    # scripts/build_prebuilt.py has them; a plain clone does not).
+    env["TORCH_MOJO_BACKEND_PREBUILT"] = "0"
     return subprocess.run(
         [sys.executable, "-c", _RUN_ADD],
         env=env,

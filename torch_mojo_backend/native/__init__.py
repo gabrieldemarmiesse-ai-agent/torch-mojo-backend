@@ -20,6 +20,7 @@ import fcntl
 import functools
 import hashlib
 import importlib.metadata
+import json
 import os
 import platform
 import re
@@ -31,7 +32,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 
@@ -46,6 +47,12 @@ _CACHE_DIR = Path(
 )
 _CSRC = _HERE / "csrc"
 _MOJO_SRC = _HERE / "mojo"
+# Libraries shipped in the wheel, built by scripts/build_prebuilt.py.
+_PREBUILT = _HERE / "prebuilt"
+_PREBUILT_MANIFEST = _PREBUILT / "manifest.json"
+# Marks a cached library that was copied from _PREBUILT rather than compiled
+# here, so a load failure can fall back to compiling it (any process).
+_PREBUILT_MARK = ".from-prebuilt"
 
 _lock = threading.Lock()
 _state: dict[str, object] = {}
@@ -75,7 +82,9 @@ def _compiler_identity() -> str:
         version = subprocess.run(
             [_find_mojo(), "--version"], capture_output=True, text=True, timeout=60
         ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        # RuntimeError: no mojo at all. The shim needs none, and it is built
+        # that way for the wheel (scripts/build_prebuilt.py).
         version = "unknown"
     return f"{version}|ptxas={os.environ.get('MODULAR_NVPTX_COMPILER_PATH', '')}"
 
@@ -315,9 +324,106 @@ def _atomic_install(tmp: Path, out: Path):
     os.replace(staged, out)
 
 
-def build_shim() -> Path:
+def _lib_suffix() -> str:
+    return ".dylib" if sys.platform == "darwin" else ".so"
+
+
+def _torch_series() -> str:
+    """major.minor of the running torch. One prebuilt shim serves a whole
+    series: its C++ standard and its autocast policy table are decided by the
+    torch headers it compiled against, and both are stable within a series."""
+    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return f"{m.group(1)}.{m.group(2)}" if m else torch.__version__
+
+
+def shim_source_hash() -> str:
+    """csrc/ alone, with no toolchain in the key: a shipped shim records this,
+    so a wheel whose sources have moved on falls back to compiling."""
+    return _hash_files(sorted(_CSRC.glob("*.cpp")) + sorted(_CSRC.glob("*.h")), "")
+
+
+def backend_source_hash() -> str:
+    """The Mojo closure alone, same contract as shim_source_hash."""
+    return _hash_files(_mojo_closure(), "")
+
+
+def prebuilt_shim_spec() -> dict[str, object]:
+    """What a shipped shim must match to serve this interpreter."""
+    return {
+        "kind": "shim",
+        "torch": _torch_series(),
+        "platform": sys.platform,
+        "machine": platform.machine(),
+        "cxx11abi": int(torch._C._GLIBCXX_USE_CXX11_ABI),
+        "source_hash": shim_source_hash(),
+    }
+
+
+def prebuilt_backend_spec() -> dict[str, object]:
+    """Same for the Mojo base library: no accelerator and no torch in it, so
+    the MAX version, the platform and the sources are the whole key."""
+    return {
+        "kind": "backend",
+        "max": _pkg_version("max-core"),
+        "platform": sys.platform,
+        "machine": platform.machine(),
+        "source_hash": backend_source_hash(),
+    }
+
+
+def prebuilt_file_name(spec: dict[str, object]) -> str:
+    if spec["kind"] == "shim":
+        return (
+            f"libtmb_shim-torch{spec['torch']}-{spec['platform']}-{spec['machine']}"
+            f"-cxx11abi{spec['cxx11abi']}{_lib_suffix()}"
+        )
+    return (
+        f"libtmb_backend-max{spec['max']}-{spec['platform']}-{spec['machine']}"
+        f"{_lib_suffix()}"
+    )
+
+
+def _prebuilt_match(spec: dict[str, object]) -> Path | None:
+    """The shipped library whose manifest entry matches `spec` exactly, if the
+    wheel carries one (TORCH_MOJO_BACKEND_PREBUILT=0 ignores them)."""
+    if os.environ.get("TORCH_MOJO_BACKEND_PREBUILT", "1") == "0":
+        return None
+    try:
+        entries = json.loads(_PREBUILT_MANIFEST.read_text())["entries"]
+    except (OSError, ValueError, KeyError):
+        return None
+    for entry in entries:
+        if all(entry.get(k) == v for k, v in spec.items()):
+            path = _PREBUILT / str(entry.get("file", ""))
+            if path.exists():
+                return path
+    return None
+
+
+def _install_prebuilt(src: Path, out: Path, what: str) -> bool:
+    """Copy a shipped library into the cache under the name the compiler would
+    have written, so every later step -- lookup, dlopen -- is unchanged."""
+    tmp = _scratch_dir() / f"prebuilt-{os.getpid()}-{out.name}"
+    try:
+        shutil.copy2(src, tmp)
+    except OSError as exc:
+        _trace(f"prebuilt {what} ({src.name}) could not be copied: {exc}")
+        return False
+    _atomic_install(tmp, out)
+    (out.parent / (out.name + _PREBUILT_MARK)).touch()
+    _trace(f"using prebuilt {what}: {src.name}")
+    return True
+
+
+class _Builder(Protocol):
+    def __call__(self, *, prebuilt: bool = True) -> Path: ...
+
+
+def build_shim(*, prebuilt: bool = True) -> Path:
     """Compile csrc/*.cpp into one shared library (parallel per file), cached
-    by the sources, the torch version and the compiler."""
+    by the sources, the torch version and the compiler -- or, when the wheel
+    ships one for this torch series, platform and ABI flag, copy that into the
+    cache instead."""
     sources = sorted(_CSRC.glob("*.cpp"))
     headers = sorted(_CSRC.glob("*.h"))
     cxx = _cxx()
@@ -354,6 +460,12 @@ def build_shim() -> Path:
     with _build_lock(out.name):
         if out.exists():
             return out
+        if prebuilt:
+            src = _prebuilt_match(prebuilt_shim_spec())
+            if src is not None and _install_prebuilt(
+                src, out, f"C++ shim for torch {_torch_series()}"
+            ):
+                return out
         return _build_shim_locked(sources, cxx, cflags, out)
 
 
@@ -422,15 +534,22 @@ def _mojo_closure() -> list[Path]:
     return files
 
 
-def build_backend() -> Path:
-    """Compile mojo/backend.mojo into a shared library, cached by its closure."""
+def build_backend(*, prebuilt: bool = True) -> Path:
+    """Compile mojo/backend.mojo into a shared library, cached by its closure --
+    or copy the one the wheel ships for this MAX version and platform."""
     key = _hash_files(_mojo_closure(), toolchain_identity())
-    out = _CACHE_DIR / f"libtmb_backend.hash-{key}.so"
+    out = _CACHE_DIR / f"libtmb_backend.hash-{key}{_lib_suffix()}"
     if out.exists():
         return out
     with _build_lock(out.name):
         if out.exists():
             return out
+        if prebuilt:
+            src = _prebuilt_match(prebuilt_backend_spec())
+            if src is not None and _install_prebuilt(
+                src, out, f"Mojo base library for MAX {_pkg_version('max-core')}"
+            ):
+                return out
         return _build_backend_locked(key, out)
 
 
@@ -523,6 +642,21 @@ def build_library(
 
 def _load(path: Path, mode: int) -> ctypes.CDLL:
     return ctypes.CDLL(str(path), mode=mode)
+
+
+def _load_or_compile(path: Path, build: _Builder, mode: int, what: str) -> ctypes.CDLL:
+    """Load a cached library; if a *prebuilt* one does not load -- an ABI the
+    shipped file was not built for -- compile it here and load that."""
+    try:
+        return _load(path, mode)
+    except OSError as exc:
+        mark = path.parent / (path.name + _PREBUILT_MARK)
+        if not mark.exists():
+            raise
+        _trace(f"the prebuilt {what} did not load ({exc}); compiling it instead")
+        path.unlink(missing_ok=True)
+        mark.unlink(missing_ok=True)
+        return _load(build(prebuilt=False), mode)
 
 
 def is_registered() -> bool:
@@ -618,8 +752,12 @@ def register():
             / ("libtorch_cpu.dylib" if sys.platform == "darwin" else "libtorch_cpu.so"),
             ctypes.RTLD_GLOBAL,
         )
-        shim_lib = _load(shim_path, ctypes.RTLD_GLOBAL)
-        backend = _load(backend_path, ctypes.RTLD_GLOBAL)
+        shim_lib = _load_or_compile(
+            shim_path, build_shim, ctypes.RTLD_GLOBAL, "C++ shim"
+        )
+        backend = _load_or_compile(
+            backend_path, build_backend, ctypes.RTLD_GLOBAL, "Mojo base library"
+        )
         backend.tmb_native_init.restype = ctypes.c_int32
         backend.tmb_native_init.argtypes = [
             ctypes.c_char_p,
