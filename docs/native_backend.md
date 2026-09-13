@@ -41,6 +41,19 @@ call of each op: one `mojo build` of roughly 6 s, once per op per source
 revision per machine (about 0.3–0.5 MB of cache each), and milliseconds — a
 `dlopen` — in every later process.
 
+`native.prebuild_ops()` compiles every op extension up front instead, for a
+test suite or a CI image that would rather not pay a compile inside the first
+call of each op (and, on a shared machine, not inside a GPU lock either).
+
+Every `mojo build` subprocess runs with `MODULAR_HOME` on node-local disk
+(`native.compiler_env`, `loader.mojo`'s `_compiler_env`; an explicit value
+wins). That is where the *compiler* keeps its own module cache: its default
+sits in `$HOME`, which on a cluster is one NFS directory shared by every
+node, and concurrent compilers evict each other's entries there — "failed to
+produce an archive for the module: No such file or directory". Node-local,
+the first build on a machine pays about 25 s to fill it and nothing else
+touches it.
+
 The two shims of the first row:
 
 **C++ shim (`native/csrc/`)** — the c10 objects torch only accepts as C++
