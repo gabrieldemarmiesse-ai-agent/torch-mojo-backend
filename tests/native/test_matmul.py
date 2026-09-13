@@ -7,7 +7,6 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
-import os
 
 import pytest
 import torch
@@ -507,17 +506,20 @@ def test_gemm16_entry_points(mojo_h100, dtype, op):
     torch.testing.assert_close(got.cpu().float(), ref, atol=2e-1, rtol=2e-2)
 
 
-def test_tf32_bridge_opt_in(mojo_h100, monkeypatch):
-    """fp32 stays on the strict SIMT path by default (TF32 drops mantissa
-    bits) and only the explicit opt-in reaches the tensor-core route."""
+def test_tf32_bridge_opt_in(mojo_h100):
+    """fp32 stays on the strict SIMT path under torch's default matmul
+    precision ("highest": TF32 drops mantissa bits) and reaches the
+    tensor-core route once torch.set_float32_matmul_precision allows it."""
     a = torch.randn(128, 256)
     b = torch.randn(256, 192)
     ref = a @ b
-    monkeypatch.setenv("TORCH_MOJO_BACKEND_TF32", "1")
-    got = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        got = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
+    finally:
+        torch.set_float32_matmul_precision(previous)
     # TF32 keeps 10 mantissa bits, so the tolerance is bf16-like, not fp32.
     torch.testing.assert_close(got, ref, atol=2e-1, rtol=2e-2)
-    monkeypatch.delenv("TORCH_MOJO_BACKEND_TF32")
-    assert os.environ.get("TORCH_MOJO_BACKEND_TF32") is None
     strict = torch.mm(a.to(mojo_h100), b.to(mojo_h100)).cpu()
     torch.testing.assert_close(strict, ref, atol=1e-3, rtol=1e-4)

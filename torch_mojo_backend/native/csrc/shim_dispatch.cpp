@@ -65,6 +65,8 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
     case c10::TypeKind::OptionalType:
       return to_record(type->castRaw<c10::OptionalType>()->getElementType(), v, out, arena);
     case c10::TypeKind::TensorType:
+      // an absent `Tensor?` from a C++ composite is an undefined Tensor, not None
+      if (!v.toTensor().defined()) { out.tag = TMB_NONE; return; }
       out.tag = TMB_TENSOR; out.a = reinterpret_cast<int64_t>(&v.toTensor()); return;
     case c10::TypeKind::IntType:
       out.tag = TMB_INT; out.a = v.toInt(); return;

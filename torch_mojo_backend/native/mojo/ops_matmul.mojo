@@ -15,7 +15,6 @@ returned NOT_HANDLED.
 """
 from std.ffi import _get_global_or_null, external_call
 from std.memory.alloc import unsafe_alloc
-from std.os import getenv
 from std.os.path import exists
 from std.utils import IndexList
 
@@ -228,18 +227,11 @@ def _sm90_cuda(device: Int) raises -> Bool:
 
 
 def _tf32_enabled() -> Bool:
-    """Whether the TF32 bridge may run — a numerics decision, not a capability
-    one: TF32 drops mantissa bits.
-
-    The old path asked `torch.get_float32_matmul_precision()` and ran only
-    when it was not "highest" (torch's default). Nothing in the C shim exposes
-    that setting to Mojo, so this reads an explicit opt-in env var instead.
-    Default off == torch's default, so fp32 numerics are unchanged; wiring the
-    real setting is one accessor in shim_runtime.cpp away
-    (`at::globalContext().float32MatmulPrecision()`).
-    """
-    var v = getenv("TORCH_MOJO_BACKEND_TF32")
-    return v != "" and v != "0"
+    """Whether the TF32 bridge may run: a numerics decision (TF32 drops
+    mantissa bits), taken from `torch.get_float32_matmul_precision()` exactly
+    as the old path did: any setting but "highest" (torch's default) allows
+    it."""
+    return external_call["tmb_float32_matmul_precision", Int32]() != 0
 
 
 # --- GEMM operands ------------------------------------------------------------
