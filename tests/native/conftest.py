@@ -31,7 +31,7 @@ def side_stream_or_skip(device: str) -> torch.Stream:
         raise
 
 
-def skip_if_metal(device: str, reason: str) -> None:
+def skip_if_metal(device: str, reason: str):
     """Skip a case that is correct and by design on Apple's Metal backend.
 
     `device` is a `mojo:<index>` string; the index selects which entry of
