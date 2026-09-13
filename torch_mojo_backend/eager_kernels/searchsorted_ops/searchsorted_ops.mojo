@@ -4,8 +4,10 @@
 # One logical worker searches one input value.  A 1-D boundary is shared by
 # every value; an N-D boundary selects the matching flattened prefix row.
 # Optional sorter entries are relative indices within the final dimension,
-# matching ATen.  Python validates shapes, devices, dtypes, and sorter bounds
-# before this raw-pointer bridge is called.
+# matching ATen.  Python validates the sorter's device, shape and dtype
+# before this raw-pointer bridge is called, but NOT its index values (that
+# would need a device-to-host sync); a sorter entry outside the boundary
+# range is clamped in `_binary_search_position` instead of trusted raw.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort
@@ -91,7 +93,12 @@ def _binary_search_position[
         var mid = low + ((high - low) >> 1)
         var boundary_index = mid
         comptime if has_sorter:
-            boundary_index = Int(sorter[unsafe_offset=boundary_base + mid])
+            # Python checks the sorter's device/shape/dtype but not its
+            # values (no device-to-host sync per call): clamp the gathered
+            # index so an out-of-range entry reads some in-bounds boundary
+            # (an unspecified result) instead of out of bounds.
+            var raw_index = Int(sorter[unsafe_offset=boundary_base + mid])
+            boundary_index = max(0, min(raw_index, boundary_size - 1))
         var boundary = SIMD[dtype, 1](
             boundaries[unsafe_offset=boundary_base + boundary_index]
         )

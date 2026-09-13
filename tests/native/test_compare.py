@@ -416,15 +416,68 @@ def test_searchsorted_errors(mojo_gpu: str):
         torch.bucketize(values, boundaries.unsqueeze(0))
 
 
-def test_searchsorted_sorter_declined(mojo_gpu: str):
-    """The native port declines `sorter` (needs a min/max reduction the
-    native reductions group doesn't implement yet -- see the module
-    docstring in ops_compare.mojo); this documents the current behavior."""
-    boundaries = torch.tensor([1.0, 2.0, 3.0]).to(mojo_gpu)
+def test_searchsorted_sorter(mojo_device: str, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_searchsorted)
+    boundaries = torch.tensor([30.0, 10.0, 20.0])
+    values = torch.tensor([5.0, 10.0, 25.0, 35.0])
+    sorter = torch.tensor([1, 2, 0], dtype=torch.int64)
+    expected = torch.searchsorted(boundaries, values, sorter=sorter)
+    got = torch.searchsorted(
+        boundaries.to(mojo_device),
+        values.to(mojo_device),
+        sorter=sorter.to(mojo_device),
+    )
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_searchsorted_sorter_noncontiguous(mojo_device: str, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_searchsorted)
+    boundaries = torch.tensor([30.0, 10.0, 20.0])
+    values = torch.tensor([5.0, 10.0, 25.0, 35.0])
+    # Every other entry of a padded buffer: a genuine non-contiguous sorter.
+    sorter_padded = torch.tensor([1, -1, 2, -1, 0, -1], dtype=torch.int64)
+    sorter = sorter_padded.as_strided((3,), (2,), 0)
+    assert not sorter.is_contiguous()
+    expected = torch.searchsorted(boundaries, values, sorter=sorter)
+
+    sorter_d = sorter_padded.to(mojo_device).as_strided((3,), (2,), 0)
+    assert not sorter_d.is_contiguous()
+    got = torch.searchsorted(
+        boundaries.to(mojo_device), values.to(mojo_device), sorter=sorter_d
+    )
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_searchsorted_sorter_errors(mojo_gpu: str):
+    boundaries = torch.tensor([1.0, 3.0, 7.0]).to(mojo_gpu)
     values = torch.tensor([0.5, 2.5]).to(mojo_gpu)
-    sorter = torch.tensor([0, 1, 2], dtype=torch.int64).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.searchsorted(boundaries, values, sorter=sorter)
+
+    with pytest.raises(RuntimeError, match="sorter must be a tensor of long dtype"):
+        torch.searchsorted(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1, 2], dtype=torch.int32).to(mojo_gpu),
+        )
+    with pytest.raises(
+        RuntimeError, match="sorter and boundary tensors should have same device type"
+    ):
+        torch.searchsorted(
+            boundaries, values, sorter=torch.tensor([0, 1, 2], dtype=torch.int64)
+        )
+    with pytest.raises(
+        RuntimeError, match="boundary and sorter must have the same size"
+    ):
+        torch.searchsorted(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1], dtype=torch.int64).to(mojo_gpu),
+        )
+    # An out-of-range sorter index is not validated (no per-call device
+    # sync); the native backend clamps it in the kernel instead of raising.
+    out_of_range = torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_gpu)
+    unspecified = torch.searchsorted(boundaries, values, sorter=out_of_range)
+    assert unspecified.shape == values.shape
+    assert unspecified.dtype == torch.int64
 
 
 # ---------------------------------------------------------------------------

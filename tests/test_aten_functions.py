@@ -2660,10 +2660,6 @@ def test_aten_searchsorted_and_bucketize_out_variants(
     torch.testing.assert_close(scalar_out.cpu(), expected_scalar)
 
 
-@pytest.mark.xfail(
-    reason="searchsorted with a sorter is not supported by the native backend yet",
-    strict=True,
-)
 def test_aten_searchsorted_and_bucketize_errors(
     mojo_device: str, call_checker: CallChecker
 ):
@@ -2684,12 +2680,15 @@ def test_aten_searchsorted_and_bucketize_errors(
             values,
             sorter=torch.tensor([0, 1, 2], dtype=torch.int32).to(mojo_device),
         )
-    with pytest.raises(RuntimeError, match="sorter index out of range"):
-        aten.searchsorted.Tensor(
-            boundaries,
-            values,
-            sorter=torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device),
-        )
+    # An out-of-range sorter index is not validated (that would need a
+    # device-to-host sync on every call): the native backend clamps it in
+    # the kernel instead of raising, so this must merely not crash.
+    out_of_range_sorter = torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device)
+    unspecified = aten.searchsorted.Tensor(
+        boundaries, values, sorter=out_of_range_sorter
+    )
+    assert unspecified.shape == values.shape
+    assert unspecified.dtype == torch.int64
     with pytest.raises(RuntimeError, match="should have same device type"):
         aten.searchsorted.Tensor(boundaries, torch.tensor([0.0, 4.0]))
     with pytest.raises(
@@ -2698,8 +2697,39 @@ def test_aten_searchsorted_and_bucketize_errors(
         aten.searchsorted.Tensor(
             boundaries, values, sorter=torch.tensor([0, 1, 2], dtype=torch.int64)
         )
+    with pytest.raises(
+        RuntimeError, match="boundary and sorter must have the same size"
+    ):
+        aten.searchsorted.Tensor(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1], dtype=torch.int64).to(mojo_device),
+        )
     with pytest.raises(RuntimeError, match="boundaries tensor must be 1 dimension"):
         aten.bucketize.Tensor(values, boundaries.unsqueeze(0))
+
+
+def test_aten_searchsorted_sorter_noncontiguous(
+    mojo_device: str, call_checker: CallChecker
+):
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    boundaries = torch.tensor([30.0, 10.0, 20.0])
+    values = torch.tensor([5.0, 10.0, 25.0, 35.0])
+    # Every other entry of a padded buffer: a genuine non-contiguous sorter
+    # (stride 2) holding the same permutation as test_aten_searchsorted_sorter.
+    sorter_padded = torch.tensor([1, -1, 2, -1, 0, -1], dtype=torch.int64)
+    sorter = sorter_padded.as_strided((3,), (2,), 0)
+    assert not sorter.is_contiguous()
+    expected = torch.searchsorted(boundaries, values, sorter=sorter)
+
+    sorter_d = sorter_padded.to(mojo_device).as_strided((3,), (2,), 0)
+    assert not sorter_d.is_contiguous()
+    actual = aten.searchsorted.Tensor(
+        boundaries.to(mojo_device), values.to(mojo_device), sorter=sorter_d
+    )
+    torch.testing.assert_close(actual.cpu(), expected)
 
 
 def test_aten_searchsorted_and_bucketize_compile_backend(call_checker: CallChecker):
