@@ -29,7 +29,7 @@ touching `abi.mojo` invalidates every op extension, not just the backend.
 
 | build | when | what it holds |
 |---|---|---|
-| C++ shim, Mojo backend | first `register_mojo_devices()` | the runtime, both fixed-size |
+| C++ shim, Mojo backend | first `register_mojo_devices()`, unless the wheel ships them (see "Prebuilt libraries and the wheel") | the runtime, both fixed-size |
 | one op extension per aten op | that op's first call | that op's body alone |
 | one kernel family specialization | that kernel's first call | one (OP, dtypes, flags) kernel |
 
@@ -250,6 +250,82 @@ carry device code, are keyed with them (`kernel_identity`). Checked by
 building the library on the cluster's login node (no GPU) and running the
 runtime tests and the two-rank collective check on an H100 with that exact
 file.
+
+## Prebuilt libraries and the wheel
+
+The two fixed libraries of the first row above are the only thing between a
+fresh install and a working device, and on a fresh install they cost ~5 s
+(shim) and ~13 s (base library) of compiling plus, for the shim, a C++
+compiler on the box. The wheel therefore ships them prebuilt, in
+`torch_mojo_backend/native/prebuilt/`:
+
+| file | one per |
+|---|---|
+| `libtmb_shim-torch<major.minor>-<platform>-<machine>-cxx11abi<0\|1>.so\|.dylib` | torch series, platform, machine, libstdc++ ABI flag |
+| `libtmb_backend-max<version>-<platform>-<machine>.so\|.dylib` | MAX version, platform, machine |
+| `manifest.json` | what each was built from |
+
+The shim is ~290 KB and links only libtorch_cpu, libc10 and the C/C++
+runtimes — no Python — so one file serves every Python version and both the
+CPU and the CUDA wheel of its torch series; what it *does* depend on is that
+series, because its C++ standard follows it (C++20 from 2.14) and its
+autocast policy table is generated from its headers. The base library is
+~340 KB, holds no device code and makes no compile-time accelerator choice
+(previous section), so it is one file per platform per release — MAX is
+pinned exactly in pyproject.
+
+**Selection.** Before compiling, `build_shim()` / `build_backend()` look for
+a manifest entry matching the running torch series (resp. MAX version),
+platform, machine and ABI flag *and* whose recorded source hash equals the
+hash of the sources shipped beside it — so a checkout whose `csrc/` or
+`mojo/` has moved on compiles rather than loading a stale library. A match is
+copied into the on-demand cache under the name the compiler would have
+written, and everything downstream, `dlopen` included, is unchanged. One
+trace line says which file was used. A prebuilt library that does not load —
+an ABI it was not built for — is dropped, and that build is compiled here
+instead. `TORCH_MOJO_BACKEND_PREBUILT=0` ignores the directory entirely.
+
+Everything else still builds on demand: op extensions and kernel
+specializations carry device code, so they cannot ship.
+
+**glibc.** On Linux the package's floor is glibc 2.34, set by MAX itself:
+`max-core` and `mojo-compiler` publish manylinux_2_34 wheels, so an
+installation below that is not possible whatever we ship. The base library,
+built on any machine MAX runs on, sits at exactly that floor (its
+`dlopen`/`dlsym` moved into libc in 2.34). The shims are built in the
+`quay.io/pypa/manylinux_2_28_{x86_64,aarch64}` containers — torch's own
+floor, and MAX is neither needed nor installable there — because the floor of
+a C++ build is decided by the glibc it compiled against, not by its sources:
+a shim built on Ubuntu 22.04 imports `__libc_single_threaded@GLIBC_2.32`, and
+on a 2.38 host it would pick up `__isoc23_*` too. `manifest.json` records
+each artefact's floor, and `scripts/build_prebuilt.py --report` prints them.
+
+**The wheel** stays `py3-none-any` and carries every platform's files: these
+are data loaded by ctypes at run time, not extension modules, and a file that
+does not match the machine is never opened. Hatchling needs them listed in
+`artifacts` (both the wheel and the sdist target — plain `uv build` builds
+the wheel from the sdist) because they are ignored by git. A wheel built from
+a plain checkout has none of them and simply compiles, as before; the full
+one comes from `.github/workflows/wheel.yml` (`publish.yml`, which uploads to
+PyPI on a GitHub release, builds from a plain checkout).
+
+**Refreshing them** — after a change to `native/csrc/`, `native/mojo/`, or
+the MAX pin:
+
+```bash
+# this machine's platform; a venv per torch version, holding that CPU wheel
+uv run python scripts/build_prebuilt.py --torch 2.7 2.8 2.9 2.10 2.11 2.12 2.13 2.14
+
+# what is there now, and what glibc each artefact needs
+uv run python scripts/build_prebuilt.py --report
+
+# CI does the same in a container, then merges every platform's upload
+python3 scripts/build_prebuilt.py --merge artifacts/
+```
+
+A stale directory is harmless — the source hash no longer matches and the
+build happens as usual — so refreshing is never urgent, and
+`TORCH_MOJO_BACKEND_PREBUILT=0` is the way to compare the two paths.
 
 ## Supported torch versions
 
