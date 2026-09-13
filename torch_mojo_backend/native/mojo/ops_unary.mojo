@@ -1,6 +1,901 @@
-"""aten ops: unary group (see docs/native_backend.md)."""
+"""aten ops: unary group (see docs/native_backend.md).
+
+Ported from `eager_kernels/aten_fast.py`'s unary-elementwise suite
+(`_unary_spec_op` / `_try_spec_unary`) and `activation_backward_ops` (GELU
+backward). Every op here materializes its input contiguous (the elementwise
+spec kernels do not scratch-copy strided operands) and dispatches one kernel
+call; `.out` variants compute directly into the caller's tensor when it is
+already contiguous with the right dtype/shape, else compute into a fresh
+temporary and `copy_strided_into` the result — the same rule for every op,
+factored into `_unary_out`.
+
+Dtype gates mirror the old Python bridge exactly: the "direct" ops (abs, neg,
+sign, relu) accept SPEC_UNARY_DTYPES (float32/float16/bfloat16/float64/
+int8/16/32/64/uint8, see `elementwise_ops.SPEC_UNARY_DTYPES`); every
+transcendental op accepts only FLOAT_DTYPES (float32/float16/bfloat16, see
+`op_utils.FLOAT_DTYPES` — no float64, the kernels comptime-refuse it on GPU);
+isnan/logical_not accept the same broad set plus bool (bool read through its
+uint8 storage). Anything else declines with `unsupported(...)`, matching the
+old NOT_HANDLED convention.
+"""
+from abi import (
+    T,
+    Values,
+    dtype_code,
+    new_like,
+    new_tensor,
+    own,
+    release,
+    ret_owned,
+    ret_ref,
+    torch_dtype,
+    unsupported,
+    v_f64,
+    v_string,
+    v_tensor,
+)
+from device import ctx_for, ctx_ptr, dev
+from kernels import KernelCall
+from ops_common import contiguous, copy_strided_into, fill_value
 from registry import Lib, impl
 
 
+# ---------------------------------------------------------------------------
+# Dtype gates (mirrors aten_fast.py's _FLOAT_DTYPES / elementwise_ops.mojo's
+# SPEC_UNARY_DTYPES — see the module docstring).
+# ---------------------------------------------------------------------------
+
+
+def _is_float_dtype(dt: DType) -> Bool:
+    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
+
+
+def _is_spec_unary_dtype(dt: DType) -> Bool:
+    return (
+        _is_float_dtype(dt)
+        or dt == DType.float64
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+    )
+
+
+def _is_bool_spec_dtype(dt: DType) -> Bool:
+    return _is_spec_unary_dtype(dt) or dt == DType.bool
+
+
+def _is_bitwise_dtype(dt: DType) -> Bool:
+    return (
+        dt == DType.bool
+        or dt == DType.uint8
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+    )
+
+
+def _require_float(op: String, dt: DType) raises:
+    if not _is_float_dtype(dt):
+        unsupported(
+            op
+            + ": dtype "
+            + String(dt)
+            + " is not supported (float32/float16/bfloat16 only)"
+        )
+
+
+def _require_direct(op: String, dt: DType) raises:
+    if not _is_spec_unary_dtype(dt):
+        unsupported(op + ": dtype " + String(dt) + " is not supported")
+
+
+def _require_bool_spec(op: String, dt: DType) raises:
+    if not _is_bool_spec_dtype(dt):
+        unsupported(op + ": dtype " + String(dt) + " is not supported")
+
+
+# ---------------------------------------------------------------------------
+# Shared spec-kernel plumbing (elementwise_ops family: one TensorSpec in, one
+# TensorSpec out — the calling convention `_unary_spec_into_go` /
+# `_unary_bool_spec_into_go` read).
+# ---------------------------------------------------------------------------
+
+
+def _unary_direct(
+    family: String, op: String, src_c: T, dst: T, out_dtype: DType
+) raises:
+    """dst[...] = f(src_c[...]); src_c must already be contiguous, dst must
+    already be the right shape/dtype/contiguity."""
+    if src_c.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall(family, op)
+    call.arg_dtype(0, src_c.dtype)
+    call.out_dtype(out_dtype)
+    call.spec(src_c.spec(cp))
+    call.spec(dst.spec(cp))
+    call.run()
+    _ = ctx
+
+
+def _unary(family: String, op: String, t_in: T, out_dtype: DType) raises -> T:
+    """The functional route: a fresh contiguous output."""
+    var src = contiguous(t_in)
+    var out = own(
+        new_tensor(src.shape, src.rank, torch_dtype(out_dtype), src.device)
+    )
+    _unary_direct(family, op, src, out.t, out_dtype)
+    if src.h != t_in.h:
+        release(src.h)
+    return out.take()
+
+
+def _unary_out(
+    family: String, op: String, t_in: T, dst: T, out_dtype: DType
+) raises:
+    """The `.out` / in-place route: compute straight into dst when it is
+    ready, else compute into a temporary and copy (also correct when dst
+    aliases t_in, which is how the in-place ops reuse this)."""
+    var src = contiguous(t_in)
+    if (
+        dst.contig
+        and dst.stype == torch_dtype(out_dtype)
+        and dst.same_shape(src)
+    ):
+        _unary_direct(family, op, src, dst, out_dtype)
+    else:
+        var out = own(
+            new_tensor(src.shape, src.rank, torch_dtype(out_dtype), src.device)
+        )
+        _unary_direct(family, op, src, out.t, out_dtype)
+        copy_strided_into(dst, out.t)
+    if src.h != t_in.h:
+        release(src.h)
+
+
+def _float_unary(op: String, t: T) raises -> T:
+    _require_float(op, t.dtype)
+    return _unary("elementwise_ops", op, t, t.dtype)
+
+
+def _float_unary_out(op: String, t: T, dst: T) raises:
+    _require_float(op, t.dtype)
+    _unary_out("elementwise_ops", op, t, dst, t.dtype)
+
+
+def _direct_unary(op: String, t: T) raises -> T:
+    _require_direct(op, t.dtype)
+    return _unary("elementwise_ops", op, t, t.dtype)
+
+
+def _direct_unary_out(op: String, t: T, dst: T) raises:
+    _require_direct(op, t.dtype)
+    _unary_out("elementwise_ops", op, t, dst, t.dtype)
+
+
+def _bool_unary(op: String, t: T) raises -> T:
+    _require_bool_spec(op, t.dtype)
+    return _unary("elementwise_ops", op, t, DType.bool)
+
+
+def _bool_unary_out(op: String, t: T, dst: T) raises:
+    _require_bool_spec(op, t.dtype)
+    _unary_out("elementwise_ops", op, t, dst, DType.bool)
+
+
+# ---------------------------------------------------------------------------
+# abs / neg / sign (direct dtypes: floats, float64, every signed/unsigned int
+# up to 64 bits and uint8 — no bool).
+# ---------------------------------------------------------------------------
+
+
+# aten::abs(Tensor self) -> Tensor
+def op_abs(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_direct_unary("AbsSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::abs.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_abs_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _direct_unary_out("AbsSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::neg(Tensor self) -> Tensor
+def op_neg(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_direct_unary("NegSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::neg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_neg_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _direct_unary_out("NegSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::sign(Tensor self) -> Tensor
+def op_sign(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_direct_unary("SignSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::sign.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_sign_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _direct_unary_out("SignSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# ---------------------------------------------------------------------------
+# relu (direct dtypes too) + its in-place variant.
+# ---------------------------------------------------------------------------
+
+
+# aten::relu(Tensor self) -> Tensor
+def op_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_direct_unary("ReluSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_relu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _direct_unary_out("ReluSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::relu_(Tensor(a!) self) -> Tensor(a!)
+def op_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    # `_unary_out` with dst == t_in: computes straight into self when self is
+    # already contiguous, else materializes and copies back into self's
+    # (possibly strided) storage — same as the old `fast_aten_relu` +
+    # `_copy_into_tensor(self, result)` two-step.
+    _direct_unary_out("ReluSpec", t, t)
+    ret_ref(rets, 0, t)
+
+
+# ---------------------------------------------------------------------------
+# Transcendental / float-only unary ops.
+# ---------------------------------------------------------------------------
+
+
+# aten::acos(Tensor self) -> Tensor
+def op_acos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("AcosSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::acos.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_acos_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("AcosSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::asinh(Tensor self) -> Tensor
+def op_asinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("AsinhSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::asinh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_asinh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("AsinhSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::atanh(Tensor self) -> Tensor
+def op_atanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("AtanhSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::atanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_atanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("AtanhSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::cos(Tensor self) -> Tensor
+def op_cos(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("CosSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::cos.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_cos_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("CosSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::cosh(Tensor self) -> Tensor
+def op_cosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("CoshSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::cosh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_cosh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("CoshSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::erf(Tensor self) -> Tensor
+def op_erf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("ErfSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::erf.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_erf_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("ErfSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::exp(Tensor self) -> Tensor
+def op_exp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("ExpSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::exp.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_exp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("ExpSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::log(Tensor self) -> Tensor
+def op_log(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("LogSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::log.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_log_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("LogSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::log1p(Tensor self) -> Tensor
+def op_log1p(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("Log1pSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::log1p.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_log1p_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("Log1pSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::reciprocal(Tensor self) -> Tensor
+def op_reciprocal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("ReciprocalSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::reciprocal.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_reciprocal_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("ReciprocalSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::rsqrt(Tensor self) -> Tensor
+def op_rsqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("RsqrtSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_rsqrt_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("RsqrtSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::sigmoid(Tensor self) -> Tensor
+def op_sigmoid(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("SigmoidSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::sigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_sigmoid_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("SigmoidSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::silu(Tensor self) -> Tensor
+def op_silu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("SiluSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::silu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_silu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("SiluSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::sin(Tensor self) -> Tensor
+def op_sin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("SinSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::sin.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_sin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("SinSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::sinh(Tensor self) -> Tensor
+def op_sinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("SinhSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::sinh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_sinh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("SinhSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::sqrt(Tensor self) -> Tensor
+def op_sqrt(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("SqrtSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::sqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_sqrt_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("SqrtSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::tan(Tensor self) -> Tensor
+def op_tan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("TanSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::tan.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_tan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("TanSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::tanh(Tensor self) -> Tensor
+def op_tanh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("TanhSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_tanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("TanhSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# ---------------------------------------------------------------------------
+# ceil / floor: identity (as a fresh copy, functional semantics) on integer
+# dtypes, the float-only spec kernel otherwise — matches
+# aten_fast._int_unary_identity.
+# ---------------------------------------------------------------------------
+
+
+def _int_identity(t: T) raises -> T:
+    """A fresh tensor holding a copy of t's values (unlike `contiguous`,
+    always allocates — ceil/floor are functional even on the identity path).
+    """
+    var out = new_like(t)
+    if t.numel > 0:
+        copy_strided_into(out, t)
+    return out^
+
+
+def _ceil_or_floor(op: String, t: T) raises -> T:
+    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+        return _int_identity(t)
+    return _float_unary(op, t)
+
+
+def _ceil_or_floor_into(op: String, t: T, dst: T) raises:
+    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+        copy_strided_into(dst, t)
+        return
+    _float_unary_out(op, t, dst)
+
+
+# aten::ceil(Tensor self) -> Tensor
+def op_ceil(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_ceil_or_floor("CeilSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::ceil.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_ceil_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _ceil_or_floor_into("CeilSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::floor(Tensor self) -> Tensor
+def op_floor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_ceil_or_floor("FloorSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::floor.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_floor_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _ceil_or_floor_into("FloorSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# ---------------------------------------------------------------------------
+# gelu / gelu_backward.
+#
+# Forward always goes through the generic elementwise spec (GeluNoneSpec /
+# GeluTanhSpec, float32/float16/bfloat16): the old bridge additionally had a
+# BF16-contiguous-GPU fast path straight to `activation_forward_ops`
+# (GeluForwardBF16) that this port drops — the spec kernel already covers
+# that dtype, so it is a performance-only gap, not a correctness one (see
+# the report).
+#
+# Backward has real device kernels only for float32/bfloat16 on GPU
+# (activation_backward_ops.GeluBackwardF32/BF16), ported faithfully below
+# with the same dtype/device/contiguity gates as `fast_aten_gelu_backward`.
+# ---------------------------------------------------------------------------
+
+
+def _gelu_spec(approximate: String) raises -> String:
+    if approximate == "none":
+        return "GeluNoneSpec"
+    if approximate == "tanh":
+        return "GeluTanhSpec"
+    unsupported("gelu: unknown approximate mode '" + approximate + "'")
+    return ""
+
+
+# aten::gelu(Tensor self, *, str approximate="none") -> Tensor
+def op_gelu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var approximate = v_string(args[unsafe_offset=1])
+    var spec = _gelu_spec(approximate)
+    var out = own(_float_unary(spec, t))
+    ret_owned(rets, 0, out)
+
+
+# aten::gelu.out(Tensor self, *, str approximate="none", Tensor(a!) out) -> Tensor(a!)
+def op_gelu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var approximate = v_string(args[unsafe_offset=1])
+    var dst = v_tensor(args[unsafe_offset=2])
+    var spec = _gelu_spec(approximate)
+    _float_unary_out(spec, t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::gelu_backward(Tensor grad_output, Tensor self, *, str approximate="none") -> Tensor
+def op_gelu_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var grad = v_tensor(args[unsafe_offset=0])
+    var self_t = v_tensor(args[unsafe_offset=1])
+    var approximate = v_string(args[unsafe_offset=2])
+    if approximate != "none" and approximate != "tanh":
+        unsupported(
+            "gelu_backward: unknown approximate mode '" + approximate + "'"
+        )
+    if (
+        not grad.on_mojo()
+        or not self_t.on_mojo()
+        or grad.device != self_t.device
+    ):
+        unsupported(
+            "gelu_backward requires grad_output and self on the same mojo"
+            " device"
+        )
+    if dev(self_t.device)[].is_cpu:
+        unsupported("gelu_backward requires an accelerator device")
+    if self_t.dtype != DType.float32 and self_t.dtype != DType.bfloat16:
+        unsupported(
+            "gelu_backward: dtype "
+            + String(self_t.dtype)
+            + " is not supported (float32/bfloat16 only)"
+        )
+    if grad.dtype != self_t.dtype:
+        unsupported("gelu_backward: grad_output and self must share one dtype")
+    if not grad.same_shape(self_t):
+        unsupported(
+            "gelu_backward: grad_output and self must have the same shape"
+        )
+    var g = contiguous(grad)
+    var s = contiguous(self_t)
+    var out = own(new_like(s))
+    if s.numel > 0:
+        var ctx = ctx_for(s.device)
+        var cp = ctx_ptr(ctx)
+        var op_name = (
+            "GeluBackwardBF16" if s.dtype
+            == DType.bfloat16 else "GeluBackwardF32"
+        )
+        var call = KernelCall("activation_backward_ops", op_name)
+        call.arg_dtype(0, g.dtype)
+        call.arg_dtype(1, s.dtype)
+        call.out_dtype(out.t.dtype)
+        call.int(out.t.ptr)
+        call.int(g.ptr)
+        call.int(s.ptr)
+        call.int(s.numel)
+        call.int(1 if approximate == "tanh" else 0)
+        call.int(cp)
+        call.run()
+        _ = ctx
+    if g.h != grad.h:
+        release(g.h)
+    if s.h != self_t.h:
+        release(s.h)
+    ret_owned(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
+# isnan / logical_not (bool output, broad input dtype incl. bool).
+# ---------------------------------------------------------------------------
+
+
+# aten::isnan(Tensor self) -> Tensor
+def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_bool_unary("IsNanSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::isnan.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_isnan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _bool_unary_out("IsNanSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::logical_not(Tensor self) -> Tensor
+def op_logical_not(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_bool_unary("LogicalNotSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::logical_not.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_logical_not_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _bool_unary_out("LogicalNotSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# ---------------------------------------------------------------------------
+# bitwise_not: logic_ops.BitwiseNot (raw-pointer slots, no TensorSpec), bool
+# routed to logical_not (~True must be False, not a byte complement) —
+# matches fast_aten_bitwise_not exactly.
+# ---------------------------------------------------------------------------
+
+
+def _bitwise_not_kernel(src: T, dst: T) raises:
+    if src.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("logic_ops", "BitwiseNot")
+    call.arg_dtype(0, src.dtype)
+    call.int(dst.ptr)
+    call.int(src.ptr)
+    call.int(src.numel)
+    call.int(dtype_code(src.dtype))
+    call.int(cp)
+    call.run()
+    _ = ctx
+
+
+def _bitwise_not(t_in: T) raises -> T:
+    if t_in.dtype == DType.bool:
+        return _bool_unary("LogicalNotSpec", t_in)
+    if not _is_bitwise_dtype(t_in.dtype):
+        unsupported(
+            "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
+        )
+    var src = contiguous(t_in)
+    var out = own(new_like(src))
+    _bitwise_not_kernel(src, out.t)
+    if src.h != t_in.h:
+        release(src.h)
+    return out.take()
+
+
+def _bitwise_not_into(t_in: T, dst: T) raises:
+    if t_in.dtype == DType.bool:
+        _bool_unary_out("LogicalNotSpec", t_in, dst)
+        return
+    if not _is_bitwise_dtype(t_in.dtype):
+        unsupported(
+            "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
+        )
+    var src = contiguous(t_in)
+    if dst.contig and dst.stype == src.stype and dst.same_shape(src):
+        _bitwise_not_kernel(src, dst)
+    else:
+        var out = own(new_like(src))
+        _bitwise_not_kernel(src, out.t)
+        copy_strided_into(dst, out.t)
+    if src.h != t_in.h:
+        release(src.h)
+
+
+# aten::bitwise_not(Tensor self) -> Tensor
+def op_bitwise_not(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_bitwise_not(t))
+    ret_owned(rets, 0, out)
+
+
+# aten::bitwise_not.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_bitwise_not_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _bitwise_not_into(t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# ---------------------------------------------------------------------------
+# fill.Scalar: the functional fill (fill_.Scalar, the in-place form, is
+# already registered in ops_core.mojo).
+# ---------------------------------------------------------------------------
+
+
+# aten::fill.Scalar(Tensor self, Scalar value) -> Tensor
+def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var value = v_f64(args[unsafe_offset=1])
+    var out = own(new_like(t))
+    fill_value(out.t, value)
+    ret_owned(rets, 0, out)
+
+
 def register_unary(lib: Lib) raises:
-    pass
+    impl[op_abs](lib, "abs")
+    impl[op_abs_out](lib, "abs.out")
+    impl[op_acos](lib, "acos")
+    impl[op_acos_out](lib, "acos.out")
+    impl[op_asinh](lib, "asinh")
+    impl[op_asinh_out](lib, "asinh.out")
+    impl[op_atanh](lib, "atanh")
+    impl[op_atanh_out](lib, "atanh.out")
+    impl[op_ceil](lib, "ceil")
+    impl[op_ceil_out](lib, "ceil.out")
+    impl[op_cos](lib, "cos")
+    impl[op_cos_out](lib, "cos.out")
+    impl[op_cosh](lib, "cosh")
+    impl[op_cosh_out](lib, "cosh.out")
+    impl[op_erf](lib, "erf")
+    impl[op_erf_out](lib, "erf.out")
+    impl[op_exp](lib, "exp")
+    impl[op_exp_out](lib, "exp.out")
+    impl[op_floor](lib, "floor")
+    impl[op_floor_out](lib, "floor.out")
+    impl[op_log](lib, "log")
+    impl[op_log_out](lib, "log.out")
+    impl[op_log1p](lib, "log1p")
+    impl[op_log1p_out](lib, "log1p.out")
+    impl[op_neg](lib, "neg")
+    impl[op_neg_out](lib, "neg.out")
+    impl[op_reciprocal](lib, "reciprocal")
+    impl[op_reciprocal_out](lib, "reciprocal.out")
+    impl[op_rsqrt](lib, "rsqrt")
+    impl[op_rsqrt_out](lib, "rsqrt.out")
+    impl[op_sigmoid](lib, "sigmoid")
+    impl[op_sigmoid_out](lib, "sigmoid.out")
+    impl[op_sign](lib, "sign")
+    impl[op_sign_out](lib, "sign.out")
+    impl[op_silu](lib, "silu")
+    impl[op_silu_out](lib, "silu.out")
+    impl[op_sin](lib, "sin")
+    impl[op_sin_out](lib, "sin.out")
+    impl[op_sinh](lib, "sinh")
+    impl[op_sinh_out](lib, "sinh.out")
+    impl[op_sqrt](lib, "sqrt")
+    impl[op_sqrt_out](lib, "sqrt.out")
+    impl[op_tan](lib, "tan")
+    impl[op_tan_out](lib, "tan.out")
+    impl[op_tanh](lib, "tanh")
+    impl[op_tanh_out](lib, "tanh.out")
+    impl[op_relu](lib, "relu")
+    impl[op_relu_out](lib, "relu.out")
+    impl[op_relu_](lib, "relu_")
+    impl[op_gelu](lib, "gelu")
+    impl[op_gelu_out](lib, "gelu.out")
+    impl[op_gelu_backward](lib, "gelu_backward")
+    impl[op_isnan](lib, "isnan")
+    impl[op_isnan_out](lib, "isnan.out")
+    impl[op_logical_not](lib, "logical_not")
+    impl[op_logical_not_out](lib, "logical_not.out")
+    impl[op_bitwise_not](lib, "bitwise_not")
+    impl[op_bitwise_not_out](lib, "bitwise_not.out")
+    impl[op_fill_scalar](lib, "fill.Scalar")
