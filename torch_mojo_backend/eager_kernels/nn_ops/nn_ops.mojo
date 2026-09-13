@@ -1809,6 +1809,14 @@ def _max_pool2d_go(
 # ---------------------------------------------------------------------------
 # Embedding lookup: out[i] = weight[indices[i // row_len] * row_len +
 # i % row_len]. This is gather along dim 0 of a 2D weight table.
+#
+# `num_rows` is the table's row count: a row index outside [0, num_rows)
+# would read arbitrary device memory, so it is clamped into range. Clamped
+# rather than reported because a host-visible error flag costs a device
+# synchronization on every embedding lookup -- the first op of every
+# transformer forward -- and CUDA_KERNEL_ASSERT has no portable equivalent
+# across CUDA / HIP / Metal. The value produced for an invalid index is
+# unspecified; the memory access is not.
 # ---------------------------------------------------------------------------
 
 
@@ -1821,6 +1829,7 @@ def _gather0[
     indices_addr: Int,
     num_indices: Int,
     row_len: Int,
+    num_rows: Int,
     ctx: DeviceContext,
 ) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
@@ -1833,6 +1842,10 @@ def _gather0[
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var row = Int(indices_ptr[unsafe_offset=i // row_len])
+        if row < 0:
+            row = 0
+        elif row >= num_rows:
+            row = num_rows - 1
         out_ptr[unsafe_offset=i] = weight_ptr[
             unsafe_offset=row * row_len + i % row_len
         ]
@@ -1850,6 +1863,7 @@ def _gather0_data_dispatch[
     indices_addr: Int,
     num_indices: Int,
     row_len: Int,
+    num_rows: Int,
     ctx: DeviceContext,
 ) raises:
     var handled = False
@@ -1862,6 +1876,7 @@ def _gather0_data_dispatch[
                     indices_addr,
                     num_indices,
                     row_len,
+                    num_rows,
                     ctx,
                 )
                 handled = True
@@ -1876,6 +1891,7 @@ def _gather0_go(
     idx_dtype_obj: Arg,
     num_indices: Arg,
     row_len: Arg,
+    num_rows: Arg,
     dtype_obj: Arg,
     device_context_ptr: Arg,
 ) raises:
@@ -1886,6 +1902,7 @@ def _gather0_go(
     var indices_addr = _raw_int(indices_ptr_obj)
     var num_indices_val = _raw_int(num_indices)
     var row_len_val = _raw_int(row_len)
+    var num_rows_val = _raw_int(num_rows)
     var ctx = _raw_ctx(device_context_ptr)
 
     comptime if _dtype_arg_on[1, DType.int64]():
@@ -1898,6 +1915,7 @@ def _gather0_go(
             indices_addr,
             num_indices_val,
             row_len_val,
+            num_rows_val,
             ctx,
         )
     elif _dtype_arg_on[1, DType.int32]():
@@ -1910,6 +1928,7 @@ def _gather0_go(
             indices_addr,
             num_indices_val,
             row_len_val,
+            num_rows_val,
             ctx,
         )
     else:
@@ -2756,6 +2775,7 @@ def _gather0_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=5],
         args[unsafe_offset=6],
         args[unsafe_offset=7],
+        args[unsafe_offset=8],
     )
 
 

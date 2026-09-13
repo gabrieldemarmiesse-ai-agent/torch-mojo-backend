@@ -662,20 +662,14 @@ def _try_tf32_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
 
 def _declined(e: Error) -> Bool:
     """Whether an error is a route declining its operands rather than a real
-    failure. Device-memory exhaustion must never be disguised as
-    "unsupported": retrying would replace the allocator's message with a
-    misleading one."""
-    var msg = String(e).lower()
-    for marker in [
-        "cuda_error_out_of_memory",
-        "hiperroroutofmemory",
-        "out of memory",
-        "failed to allocate device memory",
-        "halerror (code = -13",
-    ]:
-        if msg.find(marker) >= 0:
-            return False
-    return True
+    failure: only the explicit `[unsupported]` status counts.
+
+    Everything else -- an allocator refusing device memory, ptxas failing to
+    assemble, a driver launch error -- is re-raised with its own message. The
+    host gates in `_spec_matmul` already restate every check the spec entry
+    makes, so a decline reaching here at all would be a gate this file is
+    missing rather than a route to retry."""
+    return String(e).startswith(UNSUPPORTED_PREFIX)
 
 
 def _spec_matmul(
@@ -730,6 +724,9 @@ def _spec_matmul(
                 or bias.value().dim(0) != n
             ):
                 return None
+            # The kernel reads the bias as a bare pointer on A's stream.
+            if not bias.value().on_mojo() or bias.value().device != a.device:
+                raise Error("expected every operand on the same mojo device")
         dims = _leading_dims(a)
         dims.append(n)
     var out = own(_new(dims, a.stype, a.device))

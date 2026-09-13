@@ -10,7 +10,6 @@ Families used: nn_ops (classic pointer ABI + SoftmaxSpec),
 normalization_forward_ops, normalization_backward_ops, softmax_backward_ops,
 loss_ops, embedding_backward_ops, reduction_ops (LogSoftmaxSpec).
 """
-from std.ffi import external_call
 from std.utils import IndexList
 
 from abi import (
@@ -21,10 +20,10 @@ from abi import (
     T,
     TAG_BOOL_LIST,
     TAG_NONE,
+    TAG_TENSOR,
     Value,
     Values,
     bits_f64,
-    check,
     contiguous_strides,
     dtype_code,
     new_like,
@@ -34,7 +33,6 @@ from abi import (
     ret_owned,
     ret_ref,
     ret_tensor,
-    set_sizes_strides,
     view_strided,
     unsupported,
     v_bool,
@@ -47,7 +45,13 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK, _f64_slot
-from ops_common import cast_to, contiguous, copy_strided_into, fill_value
+from ops_common import (
+    cast_to,
+    contiguous,
+    copy_strided_into,
+    fill_value,
+    resize_out,
+)
 from registry import Lib, impl
 
 # The three dtypes every nn kernel family is instantiated for
@@ -182,28 +186,26 @@ def _stat_shape(t: T, k: Int) -> IndexList[MAX_RANK]:
     return out
 
 
-def _resize_out(t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
-    """ATen's out= resize: grow the storage if needed, then rebind sizes to a
-    contiguous layout at offset 0."""
-    var numel = 1
-    for i in range(rank):
-        numel *= shape[MAX_RANK - rank + i]
-    if numel * t.itemsize > t.storage_nbytes():
-        check(
-            external_call["tmb_storage_resize", Int32](
-                t.h, Int64(numel * t.itemsize)
-            ),
-            "tmb_storage_resize",
-        )
-    set_sizes_strides(t, shape, contiguous_strides(shape, rank), rank, 0)
-
-
 # ---------------------------------------------------------------------------
 # Softmax / log-softmax
 # ---------------------------------------------------------------------------
 
 
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _spec_unary(family: String, op: String, src: T, dst: T) raises:
+    _one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -311,6 +313,8 @@ def op_log_softmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _lsm_backward(dst: T, grad: T, output: T, rows: Int, cols: Int) raises:
+    _one_device(grad, dst)
+    _one_device(output, dst)
     var ctx = ctx_for(dst.device)
     var call = KernelCall("softmax_backward_ops", "LogSoftmaxBackwardData")
     call.arg_dtype(0, grad.dtype)
@@ -463,6 +467,31 @@ def op_native_layer_norm(
     if cols <= 0:
         unsupported("native_layer_norm: empty normalized_shape")
     var rows = a.numel // cols
+    # `native_layer_norm_backward` here covers float32 only, so a
+    # grad-requiring reduced-precision input is refused in the FORWARD, where
+    # the traceback still names the op and the user's own frame, rather than
+    # succeeding and failing later inside the autograd engine with nothing in
+    # the message pointing at the layer norm.
+    #
+    # Only the INPUT is asked, although ATen records the node when the weight
+    # or the bias requires grad too: grad mode is unreachable from inside a
+    # backend kernel (see `_needs_grad` in ops_attention.mojo), and an
+    # `nn.LayerNorm`'s Parameters require grad even under `torch.no_grad()` --
+    # asking them would refuse every reduced-precision INFERENCE forward. An
+    # activation, by contrast, requires grad exactly when a graph is being
+    # built. The residual hole is a reduced-precision layer norm applied to a
+    # non-grad input with grad-requiring parameters, which still fails in the
+    # backward as it did before.
+    if a.stype != ST_FLOAT32 and a.requires_grad():
+        unsupported(
+            "aten::native_layer_norm on a "
+            + String(a.dtype)
+            + " input that requires grad: this device implements"
+            " aten::native_layer_norm_backward for float32 only, so the"
+            " backward would fail. Run the forward under torch.no_grad(), or"
+            " keep the layer norm in float32 (autocast already does: its"
+            " policy runs normalization in float32)."
+        )
     var keep = List[Held]()
     var gamma_ptr = 0
     var beta_ptr = 0
@@ -564,8 +593,14 @@ def op_native_layer_norm(
         _ = zeros.t.ptr
     _ = ctx
     ret_owned(rets, 0, out)
-    _ret_stat(rets, 1, mean, a.stype)
-    _ret_stat(rets, 2, rstd, a.stype)
+    # float32 statistics whatever the input dtype is, matching the CUDA
+    # kernel (`at::toAccumulateType(input.scalar_type(), true)`). The CPU
+    # kernel returns them in the input dtype instead; the accelerator
+    # contract is the one to keep, because the backward that consumes them
+    # is an accelerator kernel and reduced-precision statistics would lose
+    # the precision the forward accumulated.
+    ret_owned(rets, 1, mean)
+    ret_owned(rets, 2, rstd)
 
 
 def _filled(like: T, n: Int, value: Float64) raises -> T:
@@ -574,15 +609,6 @@ def _filled(like: T, n: Int, value: Float64) raises -> T:
     var t = new_tensor(shape, 1, like.stype, like.device)
     fill_value(t, value)
     return t^
-
-
-def _ret_stat(rets: Values, i: Int, mut stat: Owned, stype: Int32) raises:
-    """A float32 statistic returned in the input's dtype (ATen's
-    `param_scalar_type`)."""
-    if stype == ST_FLOAT32:
-        ret_owned(rets, i, stat)
-        return
-    ret_tensor(rets, i, cast_to(stat.t, stype))
 
 
 # aten::native_layer_norm_backward(Tensor grad_out, Tensor input,
@@ -1000,13 +1026,23 @@ def op_native_group_norm(
     var beta_dtype = a.dtype
     if has_w:
         var w = v_tensor(args[unsafe_offset=1])
-        if w.stype != a.stype or w.rank != 1 or w.dim(0) != c:
+        if (
+            w.stype != a.stype
+            or w.device != a.device
+            or w.rank != 1
+            or w.dim(0) != c
+        ):
             unsupported("native_group_norm: unsupported weight")
         gamma_dtype = w.dtype
         gamma_ptr = _keep_ptr(keep, w)
     if has_b:
         var b = v_tensor(args[unsafe_offset=2])
-        if b.stype != a.stype or b.rank != 1 or b.dim(0) != c:
+        if (
+            b.stype != a.stype
+            or b.device != a.device
+            or b.rank != 1
+            or b.dim(0) != c
+        ):
             unsupported("native_group_norm: unsupported bias")
         beta_dtype = b.dtype
         beta_ptr = _keep_ptr(keep, b)
@@ -1269,7 +1305,7 @@ def _nll_out_ok(dst: T, like: T, what: StaticString) raises:
         )
 
 
-def _nll_dest(dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
+def _nll_dest(mut dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
     """Where the kernel writes for this `out=` argument.
 
     A wrong-shaped out is resized in place (the eager out= convention). A
@@ -1284,8 +1320,8 @@ def _nll_dest(dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
                 matches = False
                 break
     if not matches:
-        _resize_out(dst, shape, rank)
-        return Held(T(dst.h), False)
+        resize_out(dst, shape, rank)
+        return Held(dst.copy(), False)
     if dst.contig:
         return Held(dst.copy(), False)
     return Held(new_tensor(shape, rank, dst.stype, dst.device), True)
@@ -1335,6 +1371,7 @@ def op_embedding(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         call.int(dtype_code(idx.dtype))
         call.int(idx.numel)
         call.int(row_len)
+        call.int(table.dim(0))
         call.int(dtype_code(table.dtype))
         call.int(ctx_ptr(ctx))
         call.run()

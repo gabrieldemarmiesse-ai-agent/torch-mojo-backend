@@ -4562,7 +4562,7 @@ def _fast_scatter(
         + tuple(out_strides4)
         + tuple(src_strides4)
         + tuple(idx_strides4)
-        + (dim_padded,)
+        + (dim_padded, a._shape[dim])
     )
     if idx_c._numel > 0:
         _call_mojo(
@@ -4573,6 +4573,7 @@ def _fast_scatter(
                 idx_c._ptr,
                 src_ptr,
                 params,
+                0,  # no error flag: the kernel just skips an out-of-range write
                 is_value,
                 value_f,
                 a._dtype.value,
@@ -9569,6 +9570,7 @@ def fast_aten_embedding(
                 idx._dtype.value,
                 idx._numel,
                 row_len,
+                table._shape[0],
                 table._dtype.value,
                 _ctx_ptr(table._device),
             ),

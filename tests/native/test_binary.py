@@ -69,6 +69,81 @@ def test_div_int_promotes_to_float(mojo_device):
     torch.testing.assert_close(out_scalar.cpu(), a_cpu / 2)
 
 
+@pytest.mark.parametrize(
+    "denominator_dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_div_int_by_float_takes_the_denominator_dtype(mojo_gpu, denominator_dtype):
+    """`torch.result_type(int64_tensor, half_tensor)` is half, not float32:
+    true division promotes to a float, but to the RIGHT float."""
+    a_cpu, a = _both((6,), torch.int64, mojo_gpu)
+    b_cpu, b = _both((6,), denominator_dtype, mojo_gpu)
+    with native_ran("aten::div.Tensor"):
+        out = a / b
+    assert out.dtype == torch.result_type(a_cpu, b_cpu) == denominator_dtype
+    torch.testing.assert_close(out.cpu(), a_cpu / b_cpu, atol=1e-2, rtol=1e-2)
+
+
+def test_div_int_by_float_scalar_uses_the_default_dtype(mojo_gpu):
+    a_cpu, a = _both((6,), torch.int32, mojo_gpu)
+    with native_ran("aten::div.Tensor"):
+        out = a / 2.5
+    assert out.dtype == torch.get_default_dtype()
+    torch.testing.assert_close(out.cpu(), a_cpu / 2.5)
+
+
+def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
+    """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`;
+    float64 has no divide kernel here, so the op must decline rather than
+    quietly hand back float32."""
+    _, a = _both((6,), torch.int64, mojo_gpu)
+    torch.set_default_dtype(torch.float64)
+    try:
+        with pytest.raises(NotImplementedError, match="true division"):
+            a / a
+    finally:
+        torch.set_default_dtype(torch.float32)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_add_sub_alpha_reduced_precision_uses_opmath(mojo_gpu, dtype):
+    """ATen's add/sub functor runs in `opmath_type<scalar_t>` (float32 for
+    both half types) and rounds ONCE, at the store. Materializing `alpha * b`
+    in the input dtype first rounds twice, and the two answers really differ:
+    exact equality against the single-rounding reference is what separates
+    them."""
+    a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
+    b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
+    alpha = 1.0 / 3.0
+    ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+
+    got = torch.add(ad, bd, alpha=alpha)
+    assert got.dtype == dtype
+    torch.testing.assert_close(
+        got.cpu(), (a.float() + alpha * b.float()).to(dtype), atol=0, rtol=0
+    )
+    got_sub = torch.sub(ad, bd, alpha=alpha)
+    torch.testing.assert_close(
+        got_sub.cpu(), (a.float() - alpha * b.float()).to(dtype), atol=0, rtol=0
+    )
+    # The double-rounded answer is a DIFFERENT tensor: without this the test
+    # would pass on the implementation it is meant to reject.
+    double_rounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(double_rounded, got.cpu())
+
+
+def test_inplace_add_rejects_partial_overlap(mojo_gpu):
+    """`x[1:].add_(x[:-1])` is a read/write race over one storage: ATen
+    refuses it, and so must a backend that hands the kernel raw pointers."""
+    x = torch.arange(8, dtype=torch.float32, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        x[1:].add_(x[:-1])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        x[:-1].mul_(x[1:])
+    # The two allowed shapes still work: identical views and disjoint ones.
+    x[:4].add_(x[:4])
+    x[:2].add_(x[6:])
+
+
 def test_add_alpha(mojo_device, call_checker):
     call_checker.register(aten_functions.aten_add)
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
@@ -341,6 +416,22 @@ def test_clamp(mojo_device, call_checker):
     torch.testing.assert_close(a.clamp(-0.5, 0.5).cpu(), a_cpu.clamp(-0.5, 0.5))
     torch.testing.assert_close(a.clamp(min=0.0).cpu(), a_cpu.clamp(min=0.0))
     torch.testing.assert_close(a.clamp(max=0.0).cpu(), a_cpu.clamp(max=0.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_clamp_with_a_float_bound_promotes_an_integer_tensor(mojo_gpu, dtype):
+    """ATen's clamp iterator promotes its inputs to a common dtype:
+    `torch.clamp(int_tensor, min=0.5)` is a FLOAT tensor, not an integer one
+    with the bound truncated away."""
+    a_cpu, a = _both((10,), dtype, mojo_gpu, low=0, high=5)
+    for kwargs in ({"min": 0.5}, {"max": 3.5}, {"min": 0.5, "max": 3.5}):
+        want = a_cpu.clamp(**kwargs)
+        got = a.clamp(**kwargs)
+        assert got.dtype == want.dtype == torch.get_default_dtype()
+        torch.testing.assert_close(got.cpu(), want)
+    # An INTEGER bound keeps the tensor's own dtype, as it does on CPU.
+    assert a.clamp(min=1).dtype == a_cpu.clamp(min=1).dtype == dtype
+    torch.testing.assert_close(a.clamp(min=1).cpu(), a_cpu.clamp(min=1))
 
 
 # --------------------------------------------------------------------------
