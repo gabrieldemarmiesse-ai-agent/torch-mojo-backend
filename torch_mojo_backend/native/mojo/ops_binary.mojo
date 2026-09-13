@@ -742,12 +742,27 @@ def _b_try_apple_add(
     return Res(out.take(), True)
 
 
+def _b_alpha_as(alpha: Float64, lhs: Side, rhs: Side) raises -> Float64:
+    """`alpha` rounded to the operands' dtype when that is float16/bfloat16:
+    ATen's CPU add/sub kernel takes `alpha` as a scalar_t, and CPU torch is
+    what the conformance suite compares against (CUDA keeps alpha in
+    float32). The operand itself is then scaled in its own dtype, rounding
+    twice like the CPU scalar loop; the CPU vectorized loop's fused single
+    rounding differs from that by an ulp on cancellation, and no one policy
+    matches both."""
+    if not lhs.is_t or not rhs.is_t:
+        return alpha
+    var result = _b_promote(lhs.t.value().stype, rhs.t.value().stype)
+    if result == ST_FLOAT16:
+        return alpha.cast[DType.float16]().cast[DType.float64]()
+    if result == ST_BFLOAT16:
+        return alpha.cast[DType.bfloat16]().cast[DType.float64]()
+    return alpha
+
+
 def _b_scale(t: T, alpha: Float64, alpha_is_int: Bool) raises -> Held:
-    """`t * alpha` as an owned temporary, in `t`'s own dtype: for float16 /
-    bfloat16 that rounds twice, which is what ATen's CPU add/sub kernel does
-    (`a + alpha * b` with `alpha` a scalar_t) and what the conformance suite
-    compares against; CUDA's single-rounding opmath route is the one that
-    differs from CPU."""
+    """`t * alpha` as an owned temporary, in `t`'s own dtype (see
+    `_b_alpha_as` for the rounding this implies)."""
     var side = _b_tside(t)
     var a_side = _b_sside(Scal(alpha, Int(alpha), alpha_is_int, False))
     var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False)
@@ -915,7 +930,7 @@ def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_add` cascade."""
-    var alpha = v_f64(alpha_v)
+    var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_int = _b_scalar_is_int(alpha_v)
     if lhs.is_t and dev(lhs.t.value().device)[].api == "metal":
         var metal = _b_try_apple_add(lhs, rhs, alpha)
@@ -952,7 +967,7 @@ def _b_sub(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_sub` cascade."""
-    var alpha = v_f64(alpha_v)
+    var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_int = _b_scalar_is_int(alpha_v)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)

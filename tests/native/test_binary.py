@@ -106,28 +106,31 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_add_sub_alpha_reduced_precision_matches_cpu(mojo_gpu, dtype):
-    """ATen's CPU add/sub kernel computes `a + alpha * b` with `alpha` a
-    scalar_t, so for the half types `alpha * b` is rounded to the input dtype
-    before the add (twice in total); CUDA's opmath route rounds once and
-    really differs. The reference here is CPU torch, bit for bit, on inputs
-    where the two answers part ways."""
+def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
+    """ATen's CPU add/sub kernel takes `alpha` as a scalar_t (rounded to the
+    half type) and its scalar loop computes `a + alpha * b` one rounding at a
+    time; that is the documented policy here, checked bit for bit. CPU torch
+    itself is not a bit-exact oracle: its vectorized loop fuses the multiply
+    and add into one rounding, so which loop a given element hits depends on
+    the tensor size and the CPU's vector width. The conformance suite is the
+    CPU-parity check, on the small samples where the two agree."""
     a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
     b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
     alpha = 1.0 / 3.0
+    alpha_r = torch.tensor(alpha).to(dtype).float()  # alpha as a scalar_t
     ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
 
     got = torch.add(ad, bd, alpha=alpha)
     assert got.dtype == dtype
-    torch.testing.assert_close(got.cpu(), torch.add(a, b, alpha=alpha), atol=0, rtol=0)
+    expect = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    torch.testing.assert_close(got.cpu(), expect, atol=0, rtol=0)
     got_sub = torch.sub(ad, bd, alpha=alpha)
-    torch.testing.assert_close(
-        got_sub.cpu(), torch.sub(a, b, alpha=alpha), atol=0, rtol=0
-    )
-    # The single-rounded answer is a DIFFERENT tensor: without this the test
+    expect_sub = (a.float() - (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    torch.testing.assert_close(got_sub.cpu(), expect_sub, atol=0, rtol=0)
+    # alpha kept in float32 gives a DIFFERENT tensor: without this the test
     # would pass on the implementation it is meant to reject.
-    single_rounded = (a.float() + alpha * b.float()).to(dtype)
-    assert not torch.equal(single_rounded, got.cpu())
+    unrounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(unrounded, got.cpu())
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
