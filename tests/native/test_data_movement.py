@@ -333,15 +333,24 @@ def test_select_scatter_negative_dim_and_index(mojo_device):
     torch.testing.assert_close(dev.cpu(), expected)
 
 
-def test_select_scatter_broadcasts_and_casts_src(mojo_gpu):
+def test_select_scatter_casts_src(mojo_gpu):
     # float16 (not float64): the fast CastSpec kernel's dtype set is what
     # select_scatter's src-cast uses, matching the old eager path's
     # `_cast_tensor` (pre-gated on the same set, never a host round trip).
     a = _fill((4, 5), torch.float32)
-    src = torch.tensor(9.0, dtype=torch.float16)  # 0-d, needs broadcast + cast
-    expected = a.select_scatter(src.to(torch.float32).expand(5), 0, 1)
+    src = torch.full((5,), 9.0, dtype=torch.float16)
+    expected = a.select_scatter(src, 0, 1)
     dev = a.to(mojo_gpu).select_scatter(src.to(mojo_gpu), 0, 1)
     torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_select_scatter_rejects_a_src_of_the_wrong_shape(mojo_gpu):
+    """`select_scatter_symint` checks `slice.sizes() == src.sizes()`: it does
+    not broadcast, and neither may this backend."""
+    a = _fill((4, 5), torch.float32).to(mojo_gpu)
+    src = torch.tensor(9.0, device=mojo_gpu)  # 0-d against a (5,) slice
+    with pytest.raises(RuntimeError, match="size equal to the slice"):
+        a.select_scatter(src, 0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +395,54 @@ def test_scatter_value_bool(mojo_gpu):
     expected = a.scatter(0, index, True)
     dev = a.to(mojo_gpu).scatter(0, index.to(mojo_gpu), True)
     assert dev.cpu().tolist() == expected.tolist()
+
+
+def test_scatter_rejects_an_out_of_range_index(mojo_gpu):
+    """The kernel skips the write rather than scribbling outside the tensor,
+    and raises the flag the host reads back after the launch."""
+    a = torch.zeros(4, 5, device=mojo_gpu)
+    src = torch.ones(2, 5, device=mojo_gpu)
+    for bad in (4, -1, 1 << 40):
+        index = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+        index[0, 0] = bad
+        with pytest.raises(RuntimeError, match="index out of range"):
+            a.scatter(0, index, src)
+    with pytest.raises(RuntimeError, match="index out of range"):
+        index = torch.full((2, 5), 9, dtype=torch.int64, device=mojo_gpu)
+        a.scatter(0, index, -3.5)
+    # A valid scatter still works after the flagged one (the flag is fresh
+    # per launch, not a sticky per-device bit).
+    ok = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+    torch.testing.assert_close(
+        a.scatter(0, ok, src).cpu(), torch.zeros(4, 5).scatter(0, ok.cpu(), src.cpu())
+    )
+
+
+def test_scatter_rejects_an_index_bigger_than_self(mojo_gpu):
+    """ATen's `scatter_shape_check`: index.size(d) <= self.size(d) off `dim`,
+    and index.size(d) <= src.size(d) everywhere."""
+    a = torch.zeros(4, 5, device=mojo_gpu)
+    index = torch.zeros(2, 9, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="smaller than self"):
+        a.scatter(0, index, 1.0)
+    index = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="smaller than src"):
+        a.scatter(0, index, torch.ones(1, 5, device=mojo_gpu))
+
+
+def test_index_tensor_out_of_range_index_stays_in_bounds(mojo_gpu):
+    """An out-of-range gather index is clamped in the kernel: the read stays
+    inside the table, so the process survives a bad index instead of reading
+    device memory it does not own."""
+    table = _fill((4, 3), torch.float32).to(mojo_gpu)
+    idx = torch.tensor([0, 99, -99], dtype=torch.int64, device=mojo_gpu)
+    out = table[idx]
+    assert tuple(out.shape) == (3, 3)
+    torch.testing.assert_close(out[0].cpu(), table[0].cpu())
+    # The clamped rows are unspecified in value but must be real table rows.
+    rows = table.cpu().tolist()
+    assert out[1].cpu().tolist() in rows
+    assert out[2].cpu().tolist() in rows
 
 
 def test_scatter_rejects_rank_beyond_4(mojo_gpu):
@@ -471,6 +528,34 @@ def test_nonzero_shapes(mojo_gpu, shape):
     torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
 
 
+@pytest.mark.parametrize("value", [0, 1])
+def test_nonzero_scalar_has_no_coordinate_column(mojo_gpu, value):
+    """A 0-d tensor has no coordinates: ATen reports (n, 0), not (n, 1)."""
+    want = torch.nonzero(torch.tensor(value))
+    got = torch.nonzero(torch.tensor(value, device=mojo_gpu))
+    assert tuple(got.shape) == tuple(want.shape)
+    assert got.cpu().tolist() == want.tolist()
+
+
+def test_cat_out_keeps_a_matching_out_where_it_is(mojo_gpu):
+    """`cat.out` must not resize an out that already has the right shape:
+    resizing resets sizes, strides AND offset, which would send the result to
+    the front of the base storage instead of into the caller's view."""
+    base = torch.zeros(16, device=mojo_gpu)
+    out = base[4:8]
+    parts = [torch.ones(2, device=mojo_gpu), torch.full((2,), 2.0, device=mojo_gpu)]
+    torch.cat(parts, 0, out=out)
+    assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0]
+    assert base.cpu().tolist() == [0.0] * 4 + [1.0, 1.0, 2.0, 2.0] + [0.0] * 8
+
+
+def test_cat_out_resizes_a_mismatching_out(mojo_gpu):
+    out = torch.empty(0, device=mojo_gpu)
+    parts = [torch.ones(2, device=mojo_gpu), torch.full((3,), 2.0, device=mojo_gpu)]
+    torch.cat(parts, 0, out=out)
+    assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0, 2.0]
+
+
 def test_nonzero_int_dtype(mojo_gpu):
     x = torch.tensor([1, 0, 3, 0, 5], dtype=torch.int64)
     torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
@@ -523,7 +608,29 @@ def test_empty_permuted_shape_dtype_device(mojo_device, call_checker):
     assert tuple(out.shape) == (2, 3, 4)
     assert out.dtype == torch.float16
     assert out.device.type == "mojo"
-    assert out.is_contiguous()
+    # physical_layout is the whole point of the op: dim 1 is outermost, then
+    # dim 0, then dim 2 -- the same strides CPU torch produces.
+    reference = torch.ops.aten.empty_permuted([2, 3, 4], [1, 0, 2])
+    assert out.stride() == reference.stride()
+    assert not out.is_contiguous()
+    assert out.permute(1, 0, 2).is_contiguous()
+
+
+@pytest.mark.parametrize(
+    "layout", [[0, 1, 2], [2, 1, 0], [1, 2, 0], [0, 2, 1], [2, 0, 1]]
+)
+def test_empty_permuted_every_layout_matches_cpu(mojo_gpu, layout):
+    out = torch.ops.aten.empty_permuted([2, 3, 4], layout, device=mojo_gpu)
+    reference = torch.ops.aten.empty_permuted([2, 3, 4], layout)
+    assert out.stride() == reference.stride()
+    assert out.is_contiguous() == reference.is_contiguous()
+
+
+def test_empty_permuted_rejects_a_bad_layout(mojo_gpu):
+    with pytest.raises(RuntimeError, match="Duplicate dim"):
+        torch.ops.aten.empty_permuted([2, 3], [0, 0], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="physical_layout"):
+        torch.ops.aten.empty_permuted([2, 3], [0], device=mojo_gpu)
 
 
 # ---------------------------------------------------------------------------

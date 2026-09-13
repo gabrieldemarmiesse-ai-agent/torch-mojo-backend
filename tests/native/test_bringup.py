@@ -52,6 +52,89 @@ def test_fills_and_strided_copies(mojo_device):
     assert w.cpu()[:, 1].tolist() == [0.0, 1.0, 2.0]
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_fill_keeps_the_scalar_tag(mojo_device, contiguous: bool):
+    """`fill_` takes an ATen Scalar, not a double: a bool destination is
+    filled on nonzero truth, an int64 one keeps every bit past 2**53, and
+    `-0.0` keeps its sign. Both the contiguous (memset) and the strided
+    (kernel) routes."""
+
+    def target(dtype: torch.dtype) -> torch.Tensor:
+        if contiguous:
+            return torch.empty(4, dtype=dtype, device=mojo_device)
+        return torch.empty(4, 2, dtype=dtype, device=mojo_device)[:, 1]
+
+    for value in (0.5, -0.5, 2, -3, True):
+        b = target(torch.bool)
+        b.fill_(value)
+        assert b.cpu().tolist() == [bool(value)] * 4, value
+
+    b = target(torch.bool)
+    b.fill_(0)
+    assert b.cpu().tolist() == [False] * 4
+
+    f = target(torch.float32)
+    f.fill_(-0.0)
+    assert torch.signbit(f.cpu()).all(), f.cpu()
+    f.fill_(0.0)
+    assert not torch.signbit(f.cpu()).any(), f.cpu()
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_fill_keeps_int64_bits_past_2_53(mojo_gpu: str, contiguous: bool):
+    """An integer Scalar reaches an int64 destination exactly; a Float64
+    round-trip would round it. Accelerators only: on the MAX CPU device every
+    fill goes through the kernel, which takes a Float64, and a memset into a
+    dense temporary is not ordered against the copy that would lay it out --
+    that combination declines instead of rounding silently."""
+    big = 2**60 + 1
+    if contiguous:
+        i = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
+    else:
+        i = torch.empty(4, 2, dtype=torch.int64, device=mojo_gpu)[:, 1]
+    i.fill_(big)
+    assert i.cpu().tolist() == [big] * 4
+
+
+def test_copy_into_a_broadcast_shaped_view(mojo_device):
+    """`copy_` may hand `_copy_from` a source of another logical shape with
+    the same element count (`dst(2,3).copy_(src(1,2,3))`); the strided copy
+    kernel walks one shape, so the source is viewed as the destination's."""
+    src = _arange(6, mojo_device).reshape(1, 2, 3)
+    dense = torch.empty(2, 3, device=mojo_device)
+    dense.copy_(src)
+    assert dense.cpu().tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+    strided = torch.zeros(2, 6, device=mojo_device)[:, ::2]
+    strided.copy_(src)
+    assert strided.cpu().tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+    assert strided.cpu().sum() == src.cpu().sum()
+
+
+def test_out_keeps_a_matching_targets_strides_and_offset(mojo_device):
+    """torch's `resize_output`: an `out=` whose logical shape already
+    matches is written where it lives, offset included. A slice of a larger
+    buffer must not be re-laid-out at offset 0 over the start of its base."""
+    base = torch.zeros(12, device=mojo_device)
+    out = base[4:8]
+    torch.arange(4, dtype=torch.float32, out=out)
+    assert out.cpu().tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert base.cpu().tolist() == [0.0] * 4 + [0.0, 1.0, 2.0, 3.0] + [0.0] * 4
+
+    cat_base = torch.zeros(12, device=mojo_device)
+    cat_out = cat_base[4:8]
+    torch.cat([_arange(2, mojo_device), _arange(2, mojo_device) + 10], out=cat_out)
+    assert cat_out.cpu().tolist() == [0.0, 1.0, 10.0, 11.0]
+    assert cat_base.cpu().tolist() == [0.0] * 4 + [0.0, 1.0, 10.0, 11.0] + [0.0] * 4
+
+    # an out of the wrong shape is resized (and keeps its storage offset)
+    grow = torch.empty(0, device=mojo_device)
+    torch.arange(5, dtype=torch.float32, out=grow)
+    assert grow.cpu().tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    cat_grow = torch.empty(0, device=mojo_device)
+    torch.cat([_arange(3, mojo_device)], out=cat_grow)
+    assert cat_grow.cpu().tolist() == [0.0, 1.0, 2.0]
+
+
 def test_dtype_cast(mojo_device):
     m = _arange(12, mojo_device).reshape(3, 4)
     torch.testing.assert_close(

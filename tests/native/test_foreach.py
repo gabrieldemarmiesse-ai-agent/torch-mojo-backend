@@ -177,6 +177,42 @@ def test_fused_adamw_grad_scale_and_found_inf(mojo_gpu: str):
     _assert_ran("aten::_fused_adamw_")
 
 
+def test_fused_adamw_bumps_the_version_of_every_list_it_writes(mojo_gpu: str):
+    """With grad_scale the kernel writes the UNSCALED gradient back into
+    `grads`, so autograd's version counter has to move there too -- otherwise
+    a saved gradient that this mutated still looks pristine to
+    `_version`-based checks."""
+    _watch("aten::_fused_adamw_")
+    groups = _fused_adamw_case(mojo_gpu, amsgrad=False)
+    parameters, grads, exp_avgs, exp_avg_sqs, _, _ = groups
+    before = [
+        [t._version for t in group]
+        for group in (parameters, grads, exp_avgs, exp_avg_sqs)
+    ]
+    torch.ops.aten._fused_adamw_.default(
+        *groups,
+        lr=0.025,
+        beta1=0.8,
+        beta2=0.95,
+        weight_decay=0.1,
+        eps=1e-8,
+        amsgrad=False,
+        maximize=False,
+        grad_scale=torch.tensor(2.0, device=mojo_gpu),
+        found_inf=torch.tensor(0.0, device=mojo_gpu),
+    )
+    after = [
+        [t._version for t in group]
+        for group in (parameters, grads, exp_avgs, exp_avg_sqs)
+    ]
+    names = ("params", "grads", "exp_avgs", "exp_avg_sqs")
+    for name, old, new in zip(names, before, after, strict=True):
+        assert all(b < a for b, a in zip(old, new, strict=True)), (
+            f"{name}: versions {old} -> {new}"
+        )
+    _assert_ran("aten::_fused_adamw_")
+
+
 def test_fused_adamw_validates_every_tensor_before_write(mojo_gpu: str):
     _watch("aten::_fused_adamw_")
     parameters = [

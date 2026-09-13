@@ -147,10 +147,33 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
         return;
       }
       if (ik == c10::TypeKind::NumberType) {
-        // Scalar[] (the _foreach_*.ScalarList ops): doubles, the way the
-        // kernels consume them; an integer above 2^53 would lose precision
+        // Scalar[] (the _foreach_*.ScalarList ops). A c10::Scalar is tagged,
+        // and the list has no per-element tag to carry, so the LIST takes the
+        // tag every element agrees on: all bool -> TMB_BOOL_LIST, else all
+        // integral -> TMB_INT_LIST (exact past 2^53, where a double is not),
+        // else TMB_DOUBLE_LIST. An empty list is vacuously integral. A mixed
+        // list is the only one that rounds, and only its integers.
+        const auto& xs = v.toListRef();
+        bool all_bool = true, all_int = true;
+        for (const auto& e : xs) {
+          const auto& s = e.toScalar();
+          all_bool &= s.isBoolean();
+          all_int &= s.isIntegral(/*includeBool=*/true);
+        }
+        if (all_bool && !xs.empty()) {
+          arena.bools.emplace_back();
+          for (const auto& e : xs) arena.bools.back().push_back(e.toScalar().toBool() ? 1 : 0);
+          out.tag = TMB_BOOL_LIST; out.a = reinterpret_cast<int64_t>(arena.bools.back().data()); out.len = static_cast<int32_t>(arena.bools.back().size());
+          return;
+        }
+        if (all_int) {
+          arena.ints.emplace_back();
+          for (const auto& e : xs) arena.ints.back().push_back(e.toScalar().toLong());
+          out.tag = TMB_INT_LIST; out.a = reinterpret_cast<int64_t>(arena.ints.back().data()); out.len = static_cast<int32_t>(arena.ints.back().size());
+          return;
+        }
         arena.doubles.emplace_back();
-        for (const auto& e : v.toListRef()) arena.doubles.back().push_back(e.toScalar().toDouble());
+        for (const auto& e : xs) arena.doubles.back().push_back(e.toScalar().toDouble());
         out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
         return;
       }

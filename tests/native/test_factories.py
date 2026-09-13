@@ -631,3 +631,20 @@ def test_randint_and_random_on_the_device(mojo_device):
     strided = torch.zeros(4, 6, dtype=torch.int64, device=mojo_device).t()
     strided.random_(1, 3)
     assert set(strided.cpu().unique().tolist()) <= {1, 2}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_dropout_half_precision_round_trips_through_float32(mojo_gpu, dtype):
+    # 1 + randn: no input is exactly zero, so a zero output means "dropped"
+    x = (1.0 + torch.rand(64, 32)).to(dtype).to(mojo_gpu).requires_grad_(True)
+    y = torch.nn.functional.dropout(x, p=0.5, training=True)
+    assert y.dtype == dtype
+    kept = y.detach().cpu().float() != 0
+    torch.testing.assert_close(
+        y.detach().cpu().float()[kept], 2 * x.detach().cpu().float()[kept]
+    )
+    assert 0.3 < kept.float().mean() < 0.7
+    y.float().sum().backward()
+    assert x.grad is not None
+    assert x.grad.dtype == dtype
+    torch.testing.assert_close(x.grad.cpu().float(), 2 * kept.float(), atol=0, rtol=0)

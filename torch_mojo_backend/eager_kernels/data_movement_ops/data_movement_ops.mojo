@@ -3038,6 +3038,15 @@ def _gather_rows[
         var row = Int(idx_ptr[unsafe_offset=i // row_len])
         if row < 0:
             row += size0
+        # An index outside [0, size0) would read arbitrary device memory.
+        # Clamped rather than reported: a host-visible error flag costs a
+        # device synchronization per gather, and CUDA_KERNEL_ASSERT has no
+        # portable equivalent across CUDA / HIP / Metal. The result for an
+        # invalid index is unspecified; the access is not.
+        if row < 0:
+            row = 0
+        elif row >= size0:
+            row = size0 - 1
         out_ptr[unsafe_offset=i] = in_ptr[
             unsafe_offset=row * row_len + i % row_len
         ]
@@ -3142,8 +3151,12 @@ def _gather_rows_go(
 # scalar value). Implements aten::scatter.src / aten::scatter.value over a
 # rank-<=4 index space; `out` is a contiguous clone of self, `index` is
 # int64, and everything is described by explicit strides (padded to rank 4
-# with leading 0). Match torch: no bounds checking, last-write-wins on
-# duplicate targets. Dispatches on dtype (the scalar value is cast to it).
+# with leading 0). Last-write-wins on duplicate targets, like torch.
+#
+# An index outside `[0, dim_size)` would write arbitrary device memory: the
+# write is skipped and, when `err_addr` is non-zero, an int32 flag there is
+# set to 1 so the host can raise after the launch (the native backend does;
+# a caller passing 0 opts out of the report but still gets the skip).
 # ---------------------------------------------------------------------------
 
 
@@ -3171,6 +3184,8 @@ def _scatter_dim[
     xs2: Int,
     xs3: Int,
     dim_padded: Int,
+    dim_size: Int,
+    err_addr: Int,
     is_value: Int,
     value: Float64,
     ctx: DeviceContext,
@@ -3178,12 +3193,14 @@ def _scatter_dim[
     var out_ptr = _make_ptr[dtype](out_addr)
     var index_ptr = _make_ptr[DType.int64](index_addr)
     var src_ptr = _make_ptr[dtype](src_addr)
+    var err_ptr = _make_ptr[DType.int32](err_addr)
+    var has_err = err_addr != 0
     var scalar = value.cast[dtype]()
     var total = d0 * d1 * d2 * d3
 
     @always_inline
     @parameter
-    @__copy_capture(out_ptr, index_ptr, src_ptr, scalar)
+    @__copy_capture(out_ptr, index_ptr, src_ptr, err_ptr, has_err, scalar)
     def func[width: Int, alignment: Int = 1](coord: Coord):
         var i = Int(coord[0].value())
         var i3 = i % d3
@@ -3195,6 +3212,12 @@ def _scatter_dim[
         var target = Int(
             index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
         )
+        if target < 0 or target >= dim_size:
+            # Out of range: skip the write, report it if the caller asked.
+            # Every writer stores the same 1, so the race is benign.
+            if has_err:
+                err_ptr[] = 1
+            return
         var out_off = i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
         # Replace the coordinate along `dim_padded` with the scatter target.
         if dim_padded == 0:
@@ -3219,7 +3242,9 @@ def _scatter_dim_go(
     out_ptr: Arg,
     index_ptr: Arg,
     src_ptr: Arg,
-    params: Arg,  # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded)
+    # (d0..d3, os0..os3, ss0..ss3, xs0..xs3, dim_padded, dim_size)
+    params: Arg,
+    err_ptr_o: Arg,
     is_value_o: Arg,
     value_o: Arg,
     dtype_o: Arg,
@@ -3245,6 +3270,8 @@ def _scatter_dim_go(
     var xs2 = _raw_tuple_int(params, 14)
     var xs3 = _raw_tuple_int(params, 15)
     var dim_padded = _raw_tuple_int(params, 16)
+    var dim_size = _raw_tuple_int(params, 17)
+    var err_addr = _raw_int(err_ptr_o)
     var is_value = _raw_int(is_value_o)
     var value = _raw_f64(value_o)
     var dtype = _raw_dtype_int(dtype_o)
@@ -3275,6 +3302,8 @@ def _scatter_dim_go(
                     xs2,
                     xs3,
                     dim_padded,
+                    dim_size,
+                    err_addr,
                     is_value,
                     value,
                     ctx,
@@ -3411,6 +3440,7 @@ def _scatter_dim_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=5],
         args[unsafe_offset=6],
         args[unsafe_offset=7],
+        args[unsafe_offset=8],
     )
 
 

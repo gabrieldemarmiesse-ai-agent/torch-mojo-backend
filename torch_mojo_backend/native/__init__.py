@@ -116,24 +116,57 @@ _AUTOCAST_LISTS = {
     "AT_FORALL_PROMOTE": 4,
 }
 
+# AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE (policy 6, fp32_append_dtype) names
+# the source overload and its C++ redispatch *signature*, not the overload that
+# signature belongs to -- so the target is written out here, from
+# native_functions.yaml. A torch release adding an entry this map does not cover
+# fails the build loudly rather than autocasting it wrongly.
+_AUTOCAST_APPEND_DTYPE_TARGET = {
+    "norm.Scalar": "ScalarOpt_dtype",
+    "norm.ScalarOpt_dim": "ScalarOpt_dim_dtype",
+    "norm.names_ScalarOpt_dim": "names_ScalarOpt_dim_dtype",
+}
+
+
+def _autocast_macro_block(header: str, macro: str) -> str | None:
+    """The body of one `#define <macro>(_)` list, line continuations joined."""
+    start = header.find(f"#define {macro}(_)")
+    if start < 0:
+        return None
+    return header[start : header.find("\n\n", start)].replace("\\\n", " ")
+
 
 def autocast_policy_table() -> str:
     """The CUDA autocast op lists of the installed torch, read from
     ATen/autocast_mode.h's AT_FORALL_* macros, as C initializers
-    `{"aten::op.overload", policy},` (see csrc/shim_autocast.cpp)."""
+    `{"aten::op.overload", policy, redispatch_overload},` (see
+    csrc/shim_autocast.cpp; `redispatch_overload` is omitted -- and so
+    null -- for every policy but fp32_append_dtype)."""
     header = (_torch_include_dir() / "ATen" / "autocast_mode.h").read_text()
     lines = []
     for macro, policy in _AUTOCAST_LISTS.items():
-        start = header.find(f"#define {macro}(_)")
-        if start < 0:
+        block = _autocast_macro_block(header, macro)
+        if block is None:
             raise RuntimeError(f"{macro} not found in ATen/autocast_mode.h")
-        end = header.find("\n\n", start)
-        block = header[start:end].replace("\\\n", " ")
         for m in re.finditer(
             r"_\(\s*([A-Za-z0-9_]+)\s*(?:,\s*([A-Za-z0-9_]+))?\s*\)", block
         ):
             name = f"aten::{m.group(1)}" + (f".{m.group(2)}" if m.group(2) else "")
             lines.append(f'{{"{name}", {policy}}},')
+    block = _autocast_macro_block(header, "AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE")
+    if block is not None:
+        for m in re.finditer(
+            r'_\(\s*ADD_NS\(\s*[A-Za-z0-9_]+\s*\)\s*,\s*"([^"]+)"', block
+        ):
+            key = m.group(1)
+            target = _AUTOCAST_APPEND_DTYPE_TARGET.get(key)
+            if target is None:
+                raise RuntimeError(
+                    f"aten::{key} is in AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE but "
+                    "torch_mojo_backend.native._AUTOCAST_APPEND_DTYPE_TARGET does not "
+                    "name the overload it redispatches to"
+                )
+            lines.append(f'{{"aten::{key}", 6, "{target}"}},')
     return "\n".join(lines) + "\n"
 
 

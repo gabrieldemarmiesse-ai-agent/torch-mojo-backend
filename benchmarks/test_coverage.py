@@ -195,6 +195,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::sinh.out": _OUT,
     "aten::sqrt.out": _OUT,
     "aten::sub.out": _OUT,
+    "aten::where.self_out": _OUT,
     "aten::tan.out": _OUT,
     "aten::tanh.out": _OUT,
     # -- composed from already-benchmarked ops ------------------------------
@@ -213,6 +214,15 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::random_.from": _HOST_RNG,
     "aten::random_.to": _HOST_RNG,
     # -- new op, no benchmark yet -------------------------------------------
+    "aten::_softmax_backward_data": (
+        "newly registered; test_softmax covers the forward and the backward "
+        "shares _log_softmax_backward_data's reduce-and-scale shape, but it "
+        "has no benchmark node of its own yet"
+    ),
+    "aten::native_batch_norm_backward": (
+        "newly registered; test_batch_norm covers the forward, and the "
+        "backward has no benchmark node of its own yet"
+    ),
     "aten::addr": (
         "newly added fast kernel (see fix-addr-fp16-bf16-precision) fixes "
         "fp16/bf16 rounding-order drift vs CPU; it has no prior native "

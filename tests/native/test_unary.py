@@ -166,6 +166,29 @@ def test_out_variant(mojo_gpu, op_name, fn):
     torch.testing.assert_close(out2.contiguous().cpu(), expected)
 
 
+def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
+    """Every `out=` op in ATen runs `resize_output` first; without it the copy
+    back faces a shape it cannot satisfy."""
+    x = torch.randn(3, 4, device=mojo_gpu)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.abs(x, out=out)
+    assert tuple(out.shape) == (3, 4)
+    torch.testing.assert_close(out.cpu(), x.cpu().abs())
+    # A correctly shaped `out` that is a view keeps its own offset.
+    base = torch.zeros(16, device=mojo_gpu)
+    view = base[4:8]
+    torch.abs(torch.full((4,), -2.0, device=mojo_gpu), out=view)
+    assert base.cpu().tolist() == [0.0] * 4 + [2.0] * 4 + [0.0] * 8
+
+
+def test_out_variant_rejects_partial_overlap(mojo_gpu):
+    x = torch.arange(8, dtype=torch.float32, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.neg(x[:-1], out=x[1:])
+    # The same view is not an overlap: that is how the in-place ops work.
+    torch.neg(x[:4], out=x[:4])
+
+
 def test_relu_inplace(mojo_gpu):
     x64 = torch.randn(3, 4, dtype=torch.float64)
     expected = torch.relu(x64).to(torch.float32)
