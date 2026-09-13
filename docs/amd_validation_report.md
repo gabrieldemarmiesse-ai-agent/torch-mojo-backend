@@ -91,6 +91,7 @@ compile; the pytest time is the suite's own.
 | `test_data_movement.py` | 360 passed | 467 s | |
 | `test_factories.py` | 97 passed, 2 skipped (CPU-device-only case; no native GPU reference on this accelerator) | 75 s | |
 | `test_foreach.py` | 30 passed, 3 xfailed, 4 xpassed (stale non-strict xfails about `linalg_vector_norm` not being registered yet) | 107 s | |
+| `test_nn.py` | 346 passed, 2 skipped (rank > 4 batch norm is accelerator-only, CPU-device case), 1 xfailed | 374 s | |
 
 ### Finding 2: cumsum bf16/f16 and outer-dim routes were declined on HIP
 
