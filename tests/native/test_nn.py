@@ -14,7 +14,12 @@ import math
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native, register_mojo_devices
+from torch_mojo_backend import (
+    aten_functions,
+    get_accelerators,
+    native,
+    register_mojo_devices,
+)
 from torch_mojo_backend.testing import CallChecker
 
 FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
@@ -385,6 +390,40 @@ def test_batch_norm_inference(mojo_gpu, call_checker: CallChecker, dtype):
     )
 
 
+def test_batch_norm_inference_uniform_dtype(mojo_device, call_checker: CallChecker):
+    """Inference batch norm with every parameter in the input's own dtype.
+
+    That is the shape nn_ops' `BatchNormSpec` takes, which is the MAX CPU
+    device's only route (its accelerator twin carries the input, the
+    statistics and the affine dtypes apart, as `test_batch_norm_inference`
+    covers). The two saved statistics come out of a composition there, not
+    out of the kernel, so they are checked on both devices.
+    """
+    call_checker.register(aten_functions.aten_native_batch_norm)
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, 5, 7)
+    weight = torch.randn(8)
+    bias = torch.randn(8)
+    running_mean = torch.randn(8)
+    running_var = torch.rand(8) + 0.5
+    args = (weight, bias, running_mean, running_var)
+    want = torch.ops.aten.native_batch_norm(x, *args, False, 0.1, 1e-5)
+    dev = [t.to(mojo_device) for t in args]
+    got = torch.ops.aten.native_batch_norm(x.to(mojo_device), *dev, False, 0.1, 1e-5)
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-5, rtol=1e-5)
+    # CPU torch returns the two saved statistics empty for an inference batch
+    # norm; the CUDA kernel fills them (ATen/native/cuda/Normalization.cu) and
+    # so must we, because the autograd formula of the frozen op forwards them
+    # into native_batch_norm_backward.
+    torch.testing.assert_close(got[1].cpu(), running_mean, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        got[2].cpu(), torch.rsqrt(running_var + 1e-5), atol=1e-5, rtol=1e-5
+    )
+    # training=False never touches the running statistics.
+    torch.testing.assert_close(dev[2].cpu(), running_mean, atol=0, rtol=0)
+    torch.testing.assert_close(dev[3].cpu(), running_var, atol=0, rtol=0)
+
+
 def test_batch_norm_module_inference(mojo_gpu):
     x = torch.randn(2, 64, 14, 14)
     bn = torch.nn.BatchNorm2d(64).eval()
@@ -402,8 +441,17 @@ def test_batch_norm_module_inference(mojo_gpu):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(3, 8, 5, 7), (2, 5, 13), (4, 3, 8, 8, 2)])
-def test_batch_norm_training(mojo_gpu, call_checker: CallChecker, dtype, shape):
-    call_checker.register(aten_functions.aten_native_batch_norm)
+def test_batch_norm_training(mojo_device, dtype, shape):
+    """The accelerator runs one fused kernel; the MAX CPU device has none and
+    composes the forward through the dispatcher, so both are checked here.
+
+    `ran` rather than the `call_checker` fixture, whose teardown asserts even
+    for the parametrizations skipped below."""
+    if len(shape) > 4 and mojo_device == f"mojo:{len(list(get_accelerators())) - 1}":
+        pytest.skip(
+            "rank > 4 training batch norm is accelerator-only: the CPU route "
+            "composes through the rank-4 broadcast binary kernels"
+        )
     torch.manual_seed(0)
     channels = shape[1]
     x = torch.randn(shape, dtype=dtype)
@@ -416,18 +464,19 @@ def test_batch_norm_training(mojo_gpu, call_checker: CallChecker, dtype, shape):
     want = torch.ops.aten.native_batch_norm(
         x.float(), weight.float(), bias.float(), ref_mean, ref_var, True, 0.1, 1e-5
     )
-    dev_mean = running_mean.to(mojo_gpu)
-    dev_var = running_var.to(mojo_gpu)
-    got = torch.ops.aten.native_batch_norm(
-        x.to(mojo_gpu),
-        weight.to(mojo_gpu),
-        bias.to(mojo_gpu),
-        dev_mean,
-        dev_var,
-        True,
-        0.1,
-        1e-5,
-    )
+    dev_mean = running_mean.to(mojo_device)
+    dev_var = running_var.to(mojo_device)
+    with ran("aten::native_batch_norm"):
+        got = torch.ops.aten.native_batch_norm(
+            x.to(mojo_device),
+            weight.to(mojo_device),
+            bias.to(mojo_device),
+            dev_mean,
+            dev_var,
+            True,
+            0.1,
+            1e-5,
+        )
     tol = 1e-4 if dtype == torch.float32 else 5e-2
     torch.testing.assert_close(got[0].cpu().float(), want[0], atol=tol, rtol=tol)
     torch.testing.assert_close(got[1].cpu(), want[1], atol=1e-4, rtol=1e-4)
@@ -437,11 +486,11 @@ def test_batch_norm_training(mojo_gpu, call_checker: CallChecker, dtype, shape):
     torch.testing.assert_close(dev_var.cpu(), ref_var, atol=1e-4, rtol=1e-4)
 
 
-def test_batch_norm_training_without_running_stats(mojo_gpu):
+def test_batch_norm_training_without_running_stats(mojo_device):
     x = torch.randn(4, 6, 3, 3)
     want = torch.ops.aten.native_batch_norm(x, None, None, None, None, True, 0.1, 1e-5)
     got = torch.ops.aten.native_batch_norm(
-        x.to(mojo_gpu), None, None, None, None, True, 0.1, 1e-5
+        x.to(mojo_device), None, None, None, None, True, 0.1, 1e-5
     )
     for g, e in zip(got, want, strict=True):
         torch.testing.assert_close(g.cpu(), e, atol=1e-4, rtol=1e-4)

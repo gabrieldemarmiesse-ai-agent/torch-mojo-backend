@@ -92,13 +92,14 @@ def test_div_int_by_float_scalar_uses_the_default_dtype(mojo_gpu):
 
 
 def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
-    """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`;
-    float64 has no divide kernel here, so the op must decline rather than
-    quietly hand back float32."""
+    """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`.
+    The divide kernel does cover float64, but data_movement_ops' CAST_DTYPES
+    does not, so an integer numerator cannot be lifted into it: the op must
+    decline rather than quietly hand back float32."""
     _, a = _both((6,), torch.int64, mojo_gpu)
     torch.set_default_dtype(torch.float64)
     try:
-        with pytest.raises(NotImplementedError, match="true division"):
+        with pytest.raises(NotImplementedError, match="a cast from dtype"):
             a / a
     finally:
         torch.set_default_dtype(torch.float32)
@@ -400,6 +401,35 @@ def test_pow(mojo_device, call_checker):
     with native_ran("aten::pow.Tensor_Tensor"):
         out = torch.pow(a, e)
     torch.testing.assert_close(out.cpu(), torch.pow(a_cpu, e_cpu))
+
+
+def test_div_and_pow_float64(mojo_device, call_checker):
+    """float64 through the broadcast binary kernel.
+
+    logic_ops' SPEC_BCAST_DTYPES carries float64, and `_binary_spec_into_go`
+    asks of div/pow only that the dtype be floating -- so both ops run at
+    full precision instead of declining. The scalar exponent takes that same
+    broadcast route rather than elementwise_ops' PowScalarSpec, which is
+    FLOAT_DTYPES only (and would raise, not narrow, on a float64 operand).
+    """
+    call_checker.register(aten_functions.aten_div)
+    base_cpu = torch.rand(4, 5, dtype=torch.float64) + 0.5
+    other_cpu = torch.rand(4, 5, dtype=torch.float64) + 0.5
+    base, other = base_cpu.to(mojo_device), other_cpu.to(mojo_device)
+
+    got = base / other
+    assert got.dtype == torch.float64
+    torch.testing.assert_close(got.cpu(), base_cpu / other_cpu)
+    torch.testing.assert_close((base / 2.5).cpu(), base_cpu / 2.5)
+
+    with native_ran("aten::pow.Tensor_Tensor"):
+        out = torch.pow(base, other)
+    assert out.dtype == torch.float64
+    torch.testing.assert_close(out.cpu(), torch.pow(base_cpu, other_cpu))
+    with native_ran("aten::pow.Tensor_Scalar"):
+        scalar = torch.pow(base, 7.3)
+    assert scalar.dtype == torch.float64
+    torch.testing.assert_close(scalar.cpu(), torch.pow(base_cpu, 7.3))
 
 
 def test_maximum_minimum(mojo_device, call_checker):
