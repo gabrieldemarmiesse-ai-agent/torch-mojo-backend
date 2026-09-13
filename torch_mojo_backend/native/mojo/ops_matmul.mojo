@@ -42,7 +42,6 @@ from abi import (
     v_bool,
     v_f64,
     v_int,
-    v_opt_tensor,
     v_scalar_is_bool,
     v_tensor,
     view_strided,
@@ -622,7 +621,9 @@ def _try_gemm16_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
             var biased = _try_add(plain.t, bias.value())
             if biased:
                 return biased.value().copy()
-            return plain.take()
+            # The add declined this bias: drop the unbiased product and fall
+            # through to the fused kernel rather than return a biasless one.
+            _ = plain^
     # Either the shape can never reach a fast route regardless of bias, or the
     # fast add declined for this bias: the bias-fused kernel is at worst
     # identical, and never drops the bias silently.
@@ -822,6 +823,33 @@ def _tensor_arg(t: T) -> Value:
     return Value(TAG_TENSOR, 0, Int64(t.h), 0)
 
 
+def _add_or_raise(a: T, b: T) raises -> T:
+    var out = _try_add(a, b)
+    if not out:
+        unsupported("aten::add.Tensor declined the operands of aten::addr")
+    return out.value().copy()
+
+
+def _opt_tensor_arg(v: Value) raises -> Optional[T]:
+    """A `Tensor?` argument that may arrive as an *undefined* at::Tensor.
+
+    torch's C++ composites hand an absent optional tensor over as
+    `std::optional<Tensor>` holding an undefined Tensor (this is what
+    `F.conv2d(x, w)` does to convolution's bias), and the shim's record
+    conversion boxes that as a Tensor rather than as None. Every accessor but
+    `numel()` throws on an undefined tensor, so probe that first: it reads 0,
+    and a genuinely length-0 bias contributes nothing either, so both answer
+    "no bias". The proper fix is one line in the shim's `to_record` (map an
+    undefined tensor to TMB_NONE) and would make this a plain v_opt_tensor.
+    """
+    if v.tag == TAG_NONE:
+        return None
+    var h = Int(v.a)
+    if external_call["tmb_tensor_numel", Int64](h) == 0:
+        return None
+    return T(h)
+
+
 # --- aten::mm / aten::bmm -----------------------------------------------------
 
 
@@ -892,8 +920,9 @@ def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             if biased:
                 ret_tensor(rets, 0, biased.value())
                 return
-            ret_owned(rets, 0, plain)
-            return
+            # The add declined this bias: drop the unbiased product and fall
+            # through to the fused kernel rather than return a biasless one.
+            _ = plain^
     var g = _try_gemm16_mm(mat1, mat2, opt_bias, False, List[Int]())
     if g:
         ret_tensor(rets, 0, g.value())
@@ -964,7 +993,7 @@ def _linear_vector(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
 def op_linear(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var w = v_tensor(args[unsafe_offset=1])
-    var bias = v_opt_tensor(args[unsafe_offset=2])
+    var bias = _opt_tensor_arg(args[unsafe_offset=2])
     var out = _linear_route(a, w, bias)
     if out:
         ret_tensor(rets, 0, out.value())
@@ -1211,24 +1240,16 @@ def _addr_composite(
         return _call_1("aten::mul", "Scalar", _tensor_arg(outer.t), alpha)
     if alpha_v == 1.0:
         if beta_v == 1.0:
-            return _call_1(
-                "aten::add", "Tensor", _tensor_arg(self), _tensor_arg(outer.t)
-            )
+            return _add_or_raise(self, outer.t)
         var lhs = own(_call_1("aten::mul", "Scalar", _tensor_arg(self), beta))
-        return _call_1(
-            "aten::add", "Tensor", _tensor_arg(lhs.t), _tensor_arg(outer.t)
-        )
+        return _add_or_raise(lhs.t, outer.t)
     var scaled = own(
         _call_1("aten::mul", "Scalar", _tensor_arg(outer.t), alpha)
     )
     if beta_v == 1.0:
-        return _call_1(
-            "aten::add", "Tensor", _tensor_arg(self), _tensor_arg(scaled.t)
-        )
+        return _add_or_raise(self, scaled.t)
     var lhs = own(_call_1("aten::mul", "Scalar", _tensor_arg(self), beta))
-    return _call_1(
-        "aten::add", "Tensor", _tensor_arg(lhs.t), _tensor_arg(scaled.t)
-    )
+    return _add_or_raise(lhs.t, scaled.t)
 
 
 # aten::addr(Tensor self, Tensor vec1, Tensor vec2, *, Scalar beta=1,
@@ -1431,7 +1452,7 @@ def _conv_forward(
 def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var input = v_tensor(args[unsafe_offset=0])
     var weight = v_tensor(args[unsafe_offset=1])
-    var bias = v_opt_tensor(args[unsafe_offset=2])
+    var bias = _opt_tensor_arg(args[unsafe_offset=2])
     var out = _conv_forward(
         input,
         weight,

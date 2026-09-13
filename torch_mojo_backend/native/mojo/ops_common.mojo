@@ -55,7 +55,7 @@ def call_op(
     if rc == 2:
         raise Error(UNSUPPORTED_PREFIX, shim_error())
     if rc != 0:
-        raise Error("aten::", op, ": ", shim_error())
+        raise Error(op, ": ", shim_error())
 
 
 def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:

@@ -39,10 +39,11 @@ def mojo_h100(mojo_gpu):
     return mojo_gpu
 
 
-def _tol(dtype: torch.dtype) -> dict[str, float]:
+def _tol(dtype: torch.dtype) -> tuple[float, float]:
+    """(atol, rtol): fp32 to fp32 accuracy, 16-bit to 16-bit rounding."""
     if dtype == torch.float32:
-        return {"atol": 1e-4, "rtol": 1e-4}
-    return {"atol": 5e-2, "rtol": 5e-2}
+        return 1e-4, 1e-4
+    return 5e-2, 5e-2
 
 
 def _ref(*tensors: torch.Tensor) -> list[torch.Tensor]:
@@ -62,7 +63,8 @@ def test_mm(mojo_device, dtype, call_checker: CallChecker):
     got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
     assert got.dtype == dtype
     ra, rb = _ref(a, b)
-    torch.testing.assert_close((ra @ rb).to(dtype), got, **_tol(dtype))
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close((ra @ rb).to(dtype), got, atol=atol, rtol=rtol)
 
 
 def test_mm_transposed_operands(mojo_device):
@@ -110,7 +112,8 @@ def test_bmm(mojo_device, dtype, call_checker: CallChecker):
     b = torch.randn(3, 128, 96).to(dtype)
     got = torch.bmm(a.to(mojo_device), b.to(mojo_device)).cpu()
     ra, rb = _ref(a, b)
-    torch.testing.assert_close(got, torch.bmm(ra, rb).to(dtype), **_tol(dtype))
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(got, torch.bmm(ra, rb).to(dtype), atol=atol, rtol=rtol)
 
 
 def test_bmm_expanded_batch(mojo_device):
@@ -147,7 +150,8 @@ def test_addmm(mojo_device, dtype, call_checker: CallChecker):
     b = torch.randn(128, 96).to(dtype)
     got = torch.addmm(bias.to(mojo_device), a.to(mojo_device), b.to(mojo_device)).cpu()
     rbias, ra, rb = _ref(bias, a, b)
-    torch.testing.assert_close(got, (ra @ rb + rbias).to(dtype), **_tol(dtype))
+    atol, rtol = _tol(dtype)
+    torch.testing.assert_close(got, (ra @ rb + rbias).to(dtype), atol=atol, rtol=rtol)
 
 
 def test_addmm_scaled_declines(mojo_device):
@@ -181,15 +185,26 @@ def test_linear(mojo_device, dtype, shape, call_checker: CallChecker):
         rx, rw = _ref(x, w)
         ref = torch.nn.functional.linear(rx, rw, None if b is None else b.cpu().float())
         assert got.shape == ref.shape
-        torch.testing.assert_close(got, ref.to(dtype), **_tol(dtype))
+        atol, rtol = _tol(dtype)
+        torch.testing.assert_close(got, ref.to(dtype), atol=atol, rtol=rtol)
 
 
-def test_linear_module(mojo_device):
-    layer = torch.nn.Linear(16, 24)
+def test_linear_is_not_decomposed_to_addmm(mojo_device):
+    """nn.Linear reaches aten::linear, not addmm: that is what keeps its
+    backward the fused aten::linear_backward node."""
     x = torch.randn(5, 16)
-    with assert_ran("aten::linear"):
-        got = layer.to(mojo_device)(x.to(mojo_device)).cpu()
-    torch.testing.assert_close(got, layer.cpu()(x), atol=1e-4, rtol=1e-4)
+    layer = torch.nn.Linear(16, 24)
+    native.op_counting(True)
+    before = native.op_counts()
+    got = torch.nn.functional.linear(
+        x.to(mojo_device),
+        layer.weight.detach().to(mojo_device),
+        layer.bias.detach().to(mojo_device),
+    ).cpu()
+    after = native.op_counts()
+    assert after.get("aten::linear", 0) > before.get("aten::linear", 0)
+    assert after.get("aten::addmm", 0) == before.get("aten::addmm", 0)
+    torch.testing.assert_close(got, layer(x), atol=1e-4, rtol=1e-4)
 
 
 def test_linear_empty_features(mojo_device):
@@ -294,7 +309,14 @@ def test_addr(mojo_device, dtype):
             beta=0.6,
             alpha=0.2,
         ).cpu()
-    torch.testing.assert_close(got, torch.addr(self_, vec1, vec2, beta=0.6, alpha=0.2))
+    # The tolerance is one ULP of the *intermediates* (beta*self, alpha*outer),
+    # which a cancelling output element can show in full: on the GPU one of 50
+    # elements lands a bf16 ULP away. ATen's composite gets the order itself
+    # wrong, which moved a fifth of the elements much further than this.
+    atol = 1e-5 if dtype == torch.float32 else 8e-3
+    torch.testing.assert_close(
+        got, torch.addr(self_, vec1, vec2, beta=0.6, alpha=0.2), atol=atol, rtol=2e-2
+    )
 
 
 def test_addr_default_beta_alpha(mojo_device):
