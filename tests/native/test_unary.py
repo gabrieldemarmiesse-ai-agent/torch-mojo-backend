@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from torch_mojo_backend import aten_functions, native
+from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
 
@@ -371,6 +371,15 @@ def test_call_checker_bitwise_not(mojo_gpu, call_checker):
 # --------------------------------------------------------------------------
 
 
+@pytest.fixture
+def mojo_h100(mojo_gpu):
+    """H100 mojo device: the frozen bit patterns below are that card's."""
+    accelerator = list(get_accelerators())[0]
+    if accelerator.api != "cuda" or accelerator.architecture_name != "sm_90a":
+        pytest.skip("the frozen GELU bit patterns were recorded on an H100")
+    return mojo_gpu
+
+
 def _finite_bf16_grid(limit: float) -> torch.Tensor:
     """Every finite bf16 value with |x| <= limit, as a contiguous tensor."""
     bits = torch.arange(1 << 16, dtype=torch.int32).to(torch.uint16)
@@ -391,54 +400,80 @@ def _gelu_none_fp64(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_gelu_bf16_matches_a_double_reference_over_the_whole_grid(mojo_gpu):
-    """Every finite bf16 input, within one ulp of the fp64 answer."""
+    """Every finite bf16 input rounds to the same bf16 as the true function.
+
+    12.5 is where the kernel's `exp2` reaches the smallest fp32 normal, so the
+    last twelve bf16 inputs before the answer underflows bf16 altogether are
+    outside the guarantee and excluded.
+    """
     x_cpu = _finite_bf16_grid(12.5)
     assert x_cpu.numel() > 30000, x_cpu.numel()
-    expected = _gelu_none_fp64(x_cpu).to(torch.bfloat16)
+    expected = _gelu_none_fp64(x_cpu).bfloat16()
     actual = F.gelu(x_cpu.to(mojo_gpu), approximate="none").cpu()
 
-    actual_bits = actual.view(torch.uint16).to(torch.int32)
-    expected_bits = expected.view(torch.uint16).to(torch.int32)
-    differ = actual_bits != expected_bits
-    assert (actual_bits - expected_bits).abs().max().item() <= 1
-    assert int(differ.sum()) <= 8, int(differ.sum())
+    actual_bits = actual.view(torch.int16).int()
+    expected_bits = expected.view(torch.int16).int()
+    worst = int((actual_bits - expected_bits).abs().max())
+    assert worst <= 1, f"a bf16 result is {worst} ULP from the true exact GELU"
+    # The survivors are genuine round-to-nearest ties, not a systematic bias.
+    assert int((actual_bits != expected_bits).sum()) <= 8
 
 
 def test_gelu_bf16_resolves_the_negative_tail(mojo_gpu):
     """Below x ~ -5.2 a form built on `0.5*x*(1+erf(x/sqrt2))` returns
     exactly 0: the sum has lost every bit of the answer."""
-    x_cpu = torch.arange(-12.5, -5.0, 0.0625, dtype=torch.float32).to(torch.bfloat16)
+    x_cpu = torch.arange(-12.5, -5.0, 0.0625, dtype=torch.bfloat16)
     actual = F.gelu(x_cpu.to(mojo_gpu), approximate="none").cpu()
-    assert (actual < 0).all(), actual
-    assert (actual.float().diff() < 0).all()  # strictly decreasing in x
-    expected = _gelu_none_fp64(x_cpu).to(torch.bfloat16)
-    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=0)
+    assert bool((actual < 0).all()), "the negative tail collapsed to zero"
+    # Strictly decreasing in x, i.e. the decay has the shape of the true
+    # function and not of a floor or a plateau.
+    assert bool((actual[1:].double() < actual[:-1].double()).all())
+    torch.testing.assert_close(
+        actual.double(), _gelu_none_fp64(x_cpu), rtol=8e-3, atol=0
+    )
 
 
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
-def test_gelu_bf16_special_values(mojo_gpu, approximate):
-    """+-0, +-inf and NaN, compared as bit patterns. `-inf` is the one
-    deliberate divergence between the two forms: `tanh` gives NaN (from
-    `inf * 0`), `none` gives -0.0."""
-    bits = torch.tensor(
-        [0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC0, 0x0001, 0x8001, 0x7F7F, 0xFF7F],
-        dtype=torch.int32,
-    ).to(torch.uint16)
-    x_cpu = bits.view(torch.bfloat16)
-    x = x_cpu.to(mojo_gpu)
-    out_bits = F.gelu(x, approximate=approximate).cpu().view(torch.uint16)
-    out = out_bits.view(torch.bfloat16)
+def test_gelu_bf16_special_values(mojo_h100, approximate):
+    """Signed zero, non-finites and two mode probes, against frozen H100
+    results. The `-inf` case is the one deliberate divergence from CUDA:
+    CUDA's `0.5*x*(1 + erf(x/sqrt2))` reaches `-inf * 0` and returns NaN,
+    while `relu(x) - 0.5*|x|*erfc(...)` never forms that product and gives
+    the correct limit, -0.0."""
+    input_bits = torch.tensor(
+        [
+            0x0000,
+            0x8000,
+            0x7F80,
+            0xFF80,
+            0x7FC0,
+            0x0001,
+            0x8001,
+            0x7F7F,
+            0xFF7F,
+            0x4005,
+            0x4030,
+        ],
+        dtype=torch.uint16,
+    )
+    source = input_bits.view(torch.bfloat16)
+    on_device = source.to(mojo_h100)
+    actual = F.gelu(on_device, approximate=approximate).cpu()
+    actual_bits = actual.view(torch.uint16)
 
-    assert int(out_bits[0]) == 0x0000  # +0 -> +0
-    assert int(out_bits[1]) == 0x8000  # -0 -> -0
-    assert out[2].float().item() == float("inf")
+    assert int(actual_bits[0]) == 0x0000
+    assert int(actual_bits[1]) == 0x8000
+    assert torch.isposinf(actual[2])
     if approximate == "tanh":
-        assert out[3].isnan()
+        assert torch.isnan(actual[3])
     else:
-        assert int(out_bits[3]) == 0x8000  # -inf -> -0.0
-    assert out[4].isnan()
-    # The input must not have been written through.
-    torch.testing.assert_close(x.cpu().view(torch.uint16), bits, rtol=0, atol=0)
+        assert int(actual_bits[3]) == 0x8000
+    assert torch.isnan(actual[4])
+    expected_probes = (0x4002, 0x402F) if approximate == "none" else (0x4003, 0x4030)
+    assert tuple(int(value) for value in actual_bits[-2:]) == expected_probes
+    torch.testing.assert_close(
+        on_device.cpu().view(torch.int16), source.view(torch.int16), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
