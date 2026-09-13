@@ -73,7 +73,7 @@ from ops_common import (
     copy_strided_into,
     release_if_new,
 )
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -1410,18 +1410,25 @@ def op_empty_permuted(
     ret_owned(rets, 0, out)
 
 
-def register_data_movement(lib: Lib) raises:
-    impl[op_clone](lib, "clone")
-    impl[op_to_copy](lib, "_to_copy")
-    impl[op_cat](lib, "cat")
-    impl[op_stack](lib, "stack")
-    impl[op_repeat](lib, "repeat")
-    impl[op_tril](lib, "tril")
-    impl[op_triu](lib, "triu")
-    impl[op_select_scatter](lib, "select_scatter")
-    impl[op_scatter_src](lib, "scatter.src")
-    impl[op_scatter_value](lib, "scatter.value")
-    impl[op_index_tensor](lib, "index.Tensor")
-    impl[op_nonzero](lib, "nonzero")
-    impl[op_set_source_tensor](lib, "set_.source_Tensor")
-    impl[op_empty_permuted](lib, "empty_permuted")
+def register_data_movement(site: Site) raises:
+    impl[op_clone, "clone"](site)
+    impl[op_to_copy, "_to_copy"](site)
+    impl[op_cat, "cat"](site)
+    impl[op_stack, "stack"](site)
+    impl[op_repeat, "repeat"](site)
+    impl[op_tril, "tril"](site)
+    impl[op_triu, "triu"](site)
+    impl[op_select_scatter, "select_scatter"](site)
+    impl[op_scatter_src, "scatter.src"](site)
+    impl[op_scatter_value, "scatter.value"](site)
+    impl[op_index_tensor, "index.Tensor"](site)
+    impl[op_nonzero, "nonzero"](site)
+    impl[op_set_source_tensor, "set_.source_Tensor"](site)
+    impl[op_empty_permuted, "empty_permuted"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_data_movement]()

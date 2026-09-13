@@ -6,6 +6,8 @@ MAX copies; fills are memsets on contiguous memory.
 """
 from std.utils import IndexList
 
+from registry import Site, impl, op_address_of
+
 from abi import (
     Values,
     Value,
@@ -450,3 +452,24 @@ def op_record_stream(
     var handle = t.storage_ctx()
     if handle != 0:
         record_stream(handle, st[0], st[1])
+
+
+def register_core(site: Site) raises:
+    impl[op_empty_memory_format, "empty.memory_format"](site)
+    impl[op_empty_strided, "empty_strided"](site)
+    impl[op_copy_from, "_copy_from"](site)
+    impl[op_view, "view"](site)
+    impl[op_view, "_unsafe_view"](site)
+    impl[op_reshape_alias, "_reshape_alias"](site)
+    impl[op_as_strided, "as_strided"](site)
+    impl[op_local_scalar_dense, "_local_scalar_dense"](site)
+    impl[op_fill_scalar_, "fill_.Scalar"](site)
+    impl[op_zero_, "zero_"](site)
+    impl[op_record_stream, "record_stream"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_core]()

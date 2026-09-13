@@ -57,7 +57,7 @@ from ops_common import (
     philox_reserve,
     resize_storage_for,
 )
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +531,16 @@ def _native_dropout_backward_fill(
     _ = ctx
 
 
-def register_factories(lib: Lib) raises:
-    impl[op_arange_start_out](lib, "arange.start_out")
-    impl[op_uniform_](lib, "uniform_")
-    impl[op_normal_](lib, "normal_")
-    impl[op_native_dropout](lib, "native_dropout")
-    impl[op_native_dropout_backward](lib, "native_dropout_backward")
+def register_factories(site: Site) raises:
+    impl[op_arange_start_out, "arange.start_out"](site)
+    impl[op_uniform_, "uniform_"](site)
+    impl[op_normal_, "normal_"](site)
+    impl[op_native_dropout, "native_dropout"](site)
+    impl[op_native_dropout_backward, "native_dropout_backward"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_factories]()

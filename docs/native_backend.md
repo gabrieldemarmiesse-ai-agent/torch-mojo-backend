@@ -15,19 +15,40 @@ torch.add(a, b)  ->  dispatcher  ->  MojoBoxedKernel (C++, native/csrc)
                                   logic_ops.so::tmb_call  (built on first use)
 ```
 
-## The two shims
+Nothing above is compiled ahead of time except the runtime: the op body and
+the kernel are each one `mojo build` that happens at the op's first call and
+is then cached on disk (see "Three builds" below).
 
-Both are compiled once per torch/toolchain version, at the first
-`register_mojo_devices()`, into `eager_kernels/__mojocache__/native/`
+## Three builds
+
+Everything is compiled on demand into `eager_kernels/__mojocache__/native/`
 (`TORCH_MOJO_BACKEND_CACHE_DIR` moves the cache; it is contents-addressed so
-several checkouts can share it).
+several checkouts can share it) and each build is keyed by the hash of every
+source it compiles in, the toolchain versions and its `-D` defines — so
+touching `abi.mojo` invalidates every op extension, not just the backend.
+
+| build | when | what it holds |
+|---|---|---|
+| C++ shim, Mojo backend | first `register_mojo_devices()` | the runtime, both fixed-size |
+| one op extension per aten op | that op's first call | that op's body alone |
+| one kernel family specialization | that kernel's first call | one (OP, dtypes, flags) kernel |
+
+The backend library therefore does not grow with the number of ops: it holds
+devices, streams, events, memory, the loader, the record ABI and the
+registration list, and nothing else — about 0.3 MB and 2 s of build against
+3.6 MB and 7 s when every op body was linked into it. The price is the first
+call of each op: one `mojo build` of roughly 6 s, once per op per source
+revision per machine (about 0.3–0.5 MB of cache each), and milliseconds — a
+`dlopen` — in every later process.
+
+The two shims of the first row:
 
 **C++ shim (`native/csrc/`)** — the c10 objects torch only accepts as C++
 classes, each forwarding to a Mojo function pointer:
 
 | file | what |
 |---|---|
-| `shim_dispatch.cpp` | `tmb_library_impl`: registers a Mojo function as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back. `tmb_call_op` calls any aten op from Mojo. |
+| `shim_dispatch.cpp` | `tmb_library_impl` / `tmb_library_impl_lazy`: registers a Mojo function (or a resolver that produces one at the first call) as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back, and caches the resolved kernel pointer. `tmb_call_op` calls any aten op from Mojo. |
 | `shim_runtime.cpp` | allocator (`c10::Allocator` over Mojo alloc/free), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
 | `shim_autocast.cpp` | `AutocastPrivateUse1` as one boxed fallback with a policy table filled from torch's own CUDA op lists. |
 
@@ -37,13 +58,43 @@ Three translation units compile in parallel: about 7 s wall cold.
 
 | file | what |
 |---|---|
-| `backend.mojo` | `tmb_native_init`: hooks table + one `tmb_library_impl` per op |
+| `backend.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
+| `registry.mojo` | `impl[op, "name"]`: registers the name behind a lazy trampoline in the backend, *or* is the selected op in that op's extension — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
 | `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, `record_stream` fences), transfers |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
-| `loader.mojo` | on-demand family builds: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
+| `loader.mojo` | on-demand builds of op extensions and kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
 | `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
-| `ops_*.mojo` | the aten ops |
+| `ops_*.mojo` | the aten ops, and each file's `register_<group>` list |
+
+## Op extensions: how an op body reaches the dispatcher
+
+`backend.mojo` registers names, not implementations: `tmb_library_impl_lazy`
+gives torch one generic trampoline per aten name, carrying the group file the
+op lives in. At the op's first call the trampoline asks the loader for
+
+```
+mojo build native/mojo/ops_<group>.mojo --emit shared-lib -D TMB_OP=<aten name>
+```
+
+dlopens it, calls its `tmb_op_address` for the address of that op's boxed
+entry (`abi.op_entry[op]`, exactly what a non-lazy registration would have
+passed), and the shim stores it in the kernel object — so every later call is
+the same direct call as before, with no added indirection.
+
+One `impl[op, "name"](site)` line does both jobs, and `registry.TARGET_OP`
+(the `TMB_OP` define) picks which:
+
+* **backend library**, no define — register the name; `op` is named only in
+  the branch the compiler drops, so the body is not elaborated;
+* **that op's extension**, `TMB_OP=<name>` — hand back `op_address[op]()`.
+  The other ~40 lines of the group's list compile to nothing, which is what
+  keeps an extension to one op rather than a whole file.
+
+A failed build is reported as a `RuntimeError` and is *not* remembered: the
+next call tries again, so a compiler that died on a full disk is not fatal
+for the process. A kernel that declines its inputs still raises
+`NotImplementedError`, as before.
 
 ## Kernel families: the C entry
 
@@ -65,8 +116,13 @@ its `_spec_dispatcherN[go, "Name"]`; a raised `Error` comes back as
 ## Writing an op
 
 An op is `def op_x(args: Values, n_args: Int, rets: Values, n_rets: Int)
-raises`, registered in `backend.mojo` with `_impl(lib, "x.overload",
-op_address[op_x]())`. Read arguments with the `v_*` helpers by schema
+raises` in one `ops_<group>.mojo`, registered at the bottom of that same file
+in `register_<group>` with `impl[op_x, "x.overload"](site)` (the name is a
+compile-time parameter: that is what lets the op's extension select it).
+A new group file needs three things: the `register_<group>` list, the
+`tmb_op_address` export every group file ends with, and one
+`_group[register_<group>](lib, "ops_<group>")` line in `backend.mojo`.
+Read arguments with the `v_*` helpers by schema
 position, build outputs with `new_tensor` / `new_like` / `view_strided`, set
 results with `ret_tensor` (owned output), `ret_ref` (an input handed back:
 in-place ops), `ret_tensor_list`, `ret_scalar_*`.

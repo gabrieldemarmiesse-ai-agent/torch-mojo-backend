@@ -55,7 +55,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_into, cast_to, copy_strided_into
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
 # (one thread per output column) worth taking over materializing a transposed
@@ -1203,27 +1203,34 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ = src^
 
 
-def register_reductions(lib: Lib) raises:
-    impl[op_all](lib, "all")
-    impl[op_all_dim](lib, "all.dim")
-    impl[op_all_dim](lib, "all.dims")
-    impl[op_amax](lib, "amax")
-    impl[op_amin](lib, "amin")
-    impl[op_any](lib, "any")
-    impl[op_any_dim](lib, "any.dim")
-    impl[op_any_dim](lib, "any.dims")
-    impl[op_any_out](lib, "any.out")
-    impl[op_argmax](lib, "argmax")
-    impl[op_argmin](lib, "argmin")
-    impl[op_cumsum](lib, "cumsum")
-    impl[op_linalg_vector_norm](lib, "linalg_vector_norm")
-    impl[op_linalg_vector_norm_out](lib, "linalg_vector_norm.out")
-    impl[op_max](lib, "max")
-    impl[op_mean](lib, "mean")
-    impl[op_mean_dim](lib, "mean.dim")
-    impl[op_mean_out](lib, "mean.out")
-    impl[op_min](lib, "min")
-    impl[op_min_dim](lib, "min.dim")
-    impl[op_min_dim_min](lib, "min.dim_min")
-    impl[op_sum_dim_intlist](lib, "sum.dim_IntList")
-    impl[op_var_correction](lib, "var.correction")
+def register_reductions(site: Site) raises:
+    impl[op_all, "all"](site)
+    impl[op_all_dim, "all.dim"](site)
+    impl[op_all_dim, "all.dims"](site)
+    impl[op_amax, "amax"](site)
+    impl[op_amin, "amin"](site)
+    impl[op_any, "any"](site)
+    impl[op_any_dim, "any.dim"](site)
+    impl[op_any_dim, "any.dims"](site)
+    impl[op_any_out, "any.out"](site)
+    impl[op_argmax, "argmax"](site)
+    impl[op_argmin, "argmin"](site)
+    impl[op_cumsum, "cumsum"](site)
+    impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
+    impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
+    impl[op_max, "max"](site)
+    impl[op_mean, "mean"](site)
+    impl[op_mean_dim, "mean.dim"](site)
+    impl[op_mean_out, "mean.out"](site)
+    impl[op_min, "min"](site)
+    impl[op_min_dim, "min.dim"](site)
+    impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_sum_dim_intlist, "sum.dim_IntList"](site)
+    impl[op_var_correction, "var.correction"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_reductions]()

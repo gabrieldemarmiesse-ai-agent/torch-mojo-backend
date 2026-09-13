@@ -73,7 +73,7 @@ from device import ctx_for, ctx_ptr, dev
 from foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 
 # --- Value-record helpers for tmb_call_op (the sequential per-tensor
@@ -860,16 +860,23 @@ def op_fused_adamw_(
     _fused_adamw_impl(args, n_args)
 
 
-def register_foreach(lib: Lib) raises:
-    impl[op_foreach_add_scalar_](lib, "_foreach_add_.Scalar")
-    impl[op_foreach_addcmul_scalar_](lib, "_foreach_addcmul_.Scalar")
-    impl[op_foreach_lerp_scalar_](lib, "_foreach_lerp_.Scalar")
-    impl[op_foreach_mul_scalar_](lib, "_foreach_mul_.Scalar")
-    impl[op_foreach_mul_tensor_](lib, "_foreach_mul_.Tensor")
-    impl[op_foreach_norm_scalar](lib, "_foreach_norm.Scalar")
-    impl[op_foreach_sqrt](lib, "_foreach_sqrt")
-    impl[op_fused_adamw_](lib, "_fused_adamw_")
-    impl[op_fused_adamw_](lib, "_fused_adamw_.tensor_lr")
+def register_foreach(site: Site) raises:
+    impl[op_foreach_add_scalar_, "_foreach_add_.Scalar"](site)
+    impl[op_foreach_addcmul_scalar_, "_foreach_addcmul_.Scalar"](site)
+    impl[op_foreach_lerp_scalar_, "_foreach_lerp_.Scalar"](site)
+    impl[op_foreach_mul_scalar_, "_foreach_mul_.Scalar"](site)
+    impl[op_foreach_mul_tensor_, "_foreach_mul_.Tensor"](site)
+    impl[op_foreach_norm_scalar, "_foreach_norm.Scalar"](site)
+    impl[op_foreach_sqrt, "_foreach_sqrt"](site)
+    impl[op_fused_adamw_, "_fused_adamw_"](site)
+    impl[op_fused_adamw_, "_fused_adamw_.tensor_lr"](site)
     # _foreach_div_.ScalarList / _foreach_addcdiv_.ScalarList: intentionally
     # unregistered -- see the module docstring (Scalar[] cannot be marshalled
     # by the current C++ shim).
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_foreach]()

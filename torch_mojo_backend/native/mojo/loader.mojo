@@ -1,11 +1,16 @@
-"""On-demand kernel builds, from Mojo.
+"""On-demand builds, from Mojo, of everything that is not the runtime.
 
-A kernel family (torch_mojo_backend/eager_kernels/<family>/<family>.mojo)
-exposes one C entry, `tmb_call`, and compiles exactly one (OP, dtypes, flags)
-specialization per build, selected with -D defines. This loader is the
-in-process registry of those builds: hash the family's import closure, look
-the .so up in the cache, otherwise run `mojo build` in a subprocess (under a
-cross-process flock, atomic rename), dlopen it, and cache the entry pointer.
+Two kinds of library, built the same way: hash the entry file's import
+closure, look the .so up in the cache, otherwise run `mojo build` in a
+subprocess (under a cross-process flock, atomic rename), dlopen it and keep
+the entry pointer.
+
+* **kernel families** (torch_mojo_backend/eager_kernels/<family>/<family>.mojo)
+  export `tmb_call` and compile one (OP, dtypes, flags) specialization per
+  build, selected with -D defines.
+* **op extensions** (native/mojo/ops_<group>.mojo, `-D TMB_OP=<aten name>`)
+  export `tmb_op_address` and hold the body of exactly one aten op, so the
+  backend library itself carries no op code — see registry.mojo.
 """
 from std.builtin.sort import sort
 from std.collections import Dict
@@ -44,6 +49,25 @@ def _slug(defines: List[String]) -> String:
     return String(_hex(h)[byte=:12])
 
 
+def _local_dir(prefix: String) -> String:
+    """A per-user directory on node-local disk (shell-expanded in the build
+    command, so TMPDIR is read where the compiler runs)."""
+    return (
+        String("${TMPDIR:-/tmp}/")
+        + prefix
+        + String(external_call["getuid", UInt32]())
+    )
+
+
+def _compiler_env() -> String:
+    """Environment every `mojo build` subprocess runs with. MODULAR_HOME
+    holds the compiler's own module cache: its default is in $HOME, which on
+    a cluster is NFS shared by every node, and concurrent compilers then evict
+    each other's entries ("failed to produce an archive for the module").
+    Node-local it is per-machine and nobody else touches it."""
+    return "MODULAR_HOME='" + _local_dir("modular-home-") + "'"
+
+
 struct Family(Movable):
     var lib: OwnedDLHandle
     var entry: Int  # address of tmb_call
@@ -56,14 +80,38 @@ struct Family(Movable):
         self.entry = Int(sym.value())
 
 
+comptime AddressFn = def() thin abi("C") -> Int
+
+
+struct OpExt(Movable):
+    """One aten op's extension: `tmb_op_address` reports the address of the
+    boxed entry of the op the build selected."""
+
+    var lib: OwnedDLHandle
+    var entry: Int
+
+    def __init__(out self, path: String) raises:
+        self.lib = OwnedDLHandle(path)
+        var sym = self.lib.get_symbol[NoneType]("tmb_op_address")
+        if not sym:
+            raise Error("tmb_op_address not exported by ", path)
+        var addr = Int(sym.value())
+        var f = Pointer(to=addr).unsafe_bitcast[AddressFn]()[]
+        self.entry = f()
+        if self.entry == 0:
+            raise Error("no op compiled into ", path)
+
+
 struct Loader(Movable):
     var kernels_dir: String  # torch_mojo_backend/eager_kernels
+    var mojo_dir: String  # torch_mojo_backend/native/mojo
     var cache_dir: String  # <kernels_dir>/__mojocache__/native
     var mojo_exe: String
     var toolchain: String  # versions of mojo/max/python, from the Python side
     var trace: Bool
     var families: Dict[String, Family]  # "<family>.<slug>" -> loaded build
     var failures: Dict[String, String]  # same key -> permanent error
+    var ops: Dict[String, OpExt]  # "<group>/<aten name>" -> loaded build
     var source_hashes: Dict[String, String]  # family -> closure hash
     var fast: Dict[
         UInt64, Int
@@ -72,18 +120,21 @@ struct Loader(Movable):
     def __init__(
         out self,
         kernels_dir: String,
+        mojo_dir: String,
         cache_dir: String,
         mojo_exe: String,
         toolchain: String,
         trace: Bool,
     ):
         self.kernels_dir = kernels_dir
+        self.mojo_dir = mojo_dir
         self.cache_dir = cache_dir
         self.mojo_exe = mojo_exe
         self.toolchain = toolchain
         self.trace = trace
         self.families = Dict[String, Family]()
         self.failures = Dict[String, String]()
+        self.ops = Dict[String, OpExt]()
         self.source_hashes = Dict[String, String]()
         self.fast = Dict[UInt64, Int]()
 
@@ -104,15 +155,15 @@ struct Loader(Movable):
                 return d
         return here
 
-    def _closure(self, family: String) raises -> List[String]:
-        """Every .mojo file the family's entry file reaches through
-        `from X import` / `import X` (resolved in the family dir, then the
-        package root), plus every op_utils/*.mojo, in a deterministic order."""
-        var fam_dir = self.family_dir(family)
+    def _closure(self, entry: String, own_dir: String) raises -> List[String]:
+        """Every .mojo file `entry` reaches through `from X import` /
+        `import X` (resolved in `own_dir`, then the package root), plus every
+        op_utils/*.mojo, in a deterministic order."""
+        var fam_dir = own_dir
         var files = List[String]()
         var seen = Dict[String, Bool]()
         var todo = List[String]()
-        todo.append(fam_dir + "/" + family + ".mojo")
+        todo.append(entry)
         while len(todo) > 0:
             var f = todo.pop()
             if f in seen:
@@ -163,51 +214,82 @@ struct Loader(Movable):
         sort(files)
         return files^
 
-    def source_hash(mut self, family: String) raises -> String:
-        if family in self.source_hashes:
-            return self.source_hashes[family]
+    def _hash_closure(
+        mut self, key: String, entry: String, own_dir: String, strip: String
+    ) raises -> String:
+        """Cache key of one build: every source it compiles in, named
+        relative to `strip`, plus the toolchain — so touching any of them
+        invalidates it."""
+        if key in self.source_hashes:
+            return self.source_hashes[key]
         var h: UInt64 = 14695981039346656037
         _fnv1a(h, CACHE_ABI.as_bytes())
         _fnv1a(h, self.toolchain.as_bytes())
-        for f in self._closure(family):
-            var rel = String(f[byte = self.kernels_dir.byte_length() :])
+        for f in self._closure(entry, own_dir):
+            var rel = String(f[byte = strip.byte_length() :])
             _fnv1a(h, rel.as_bytes())
             var bytes = Path(f).read_bytes()
             _fnv1a(h, Span(bytes))
         var out = _hex(h)
-        self.source_hashes[family] = out
+        self.source_hashes[key] = out
         return out
 
-    def _build(
-        mut self, family: String, defines: List[String], out_path: String
-    ) raises:
+    def source_hash(mut self, family: String) raises -> String:
         var fam_dir = self.family_dir(family)
-        var src = fam_dir + "/" + family + ".mojo"
+        return self._hash_closure(
+            "family:" + family,
+            fam_dir + "/" + family + ".mojo",
+            fam_dir,
+            String(self.kernels_dir),
+        )
+
+    def op_source_hash(mut self, group: String) raises -> String:
+        """Hashes abi/device/kernels/ops_common too (the group file imports
+        them), so a runtime change invalidates every op extension."""
+        return self._hash_closure(
+            "op:" + group,
+            self.mojo_dir + "/" + group + ".mojo",
+            String(self.mojo_dir),
+            String(self.mojo_dir),
+        )
+
+    def _build(
+        mut self,
+        label: String,
+        src: String,
+        own_dir: String,
+        defines: List[String],
+        out_path: String,
+    ) raises:
+        """One `mojo build` into `out_path`. `label` only names the build in
+        traces and scratch paths."""
         var tmp = out_path + ".tmp" + String(perf_counter_ns())
         # The compiler writes to local scratch (the cache may be on NFS,
         # where its intermediate archive went missing under load); the
         # finished library is then moved next to its final name.
-        var scratch = String("${TMPDIR:-/tmp}/torch-mojo-backend-") + String(
-            external_call["getuid", UInt32]()
-        )
+        var scratch = _local_dir("torch-mojo-backend-")
         var local = (
-            scratch + "/" + family + "." + String(perf_counter_ns()) + ".so"
+            scratch + "/" + label + "." + String(perf_counter_ns()) + ".so"
         )
         var cmd = (
             String("mkdir -p '")
             + scratch
-            + "' && '"
+            + "' '"
+            + _local_dir("modular-home-")
+            + "' && "
+            + _compiler_env()
+            + " '"
             + self.mojo_exe
             + "' build '"
             + src
             + "' --emit shared-lib -I '"
-            + fam_dir
+            + own_dir
             + "' -I '"
             + self.kernels_dir
             + "'"
         )
         for d in defines:
-            cmd += " -D " + d
+            cmd += " -D '" + d + "'"
         cmd += (
             " -o '"
             + local
@@ -231,7 +313,7 @@ struct Loader(Movable):
                 )
             raise Error(
                 "mojo build of ",
-                family,
+                label,
                 " failed (rc ",
                 rc,
                 ", ",
@@ -256,13 +338,80 @@ struct Loader(Movable):
         if self.trace:
             print(
                 "[TRACE] built ",
-                family,
+                label,
                 " ",
                 " ".join(defines),
                 " in ",
                 Float64(ms) / 1000.0,
                 "s",
             )
+
+    def _ensure_built(
+        mut self,
+        key: String,
+        so: String,
+        label: String,
+        src: String,
+        own_dir: String,
+        defines: List[String],
+    ) raises:
+        """Build `so` unless it is already in the cache, once per box: the
+        flock makes concurrent processes wait instead of building twice."""
+        if exists(so):
+            return
+        if not isdir(self.cache_dir):
+            makedirs(self.cache_dir, exist_ok=True)
+        var lock_path = self.cache_dir + "/." + key + ".lock"
+        var fd = external_call["creat", Int32](
+            lock_path.as_c_string_slice().unsafe_ptr(), Int32(0o644)
+        )
+        if fd >= 0:
+            _ = external_call["flock", Int32](
+                fd, Int32(2)
+            )  # LOCK_EX (best effort: NFS may refuse)
+
+        try:
+            if not exists(so):
+                self._build(label, src, own_dir, defines, so)
+        finally:
+            if fd >= 0:
+                _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
+                _ = external_call["close", Int32](fd)
+
+    def op_entry(mut self, group: String, name: String) raises -> Int:
+        """Address of the boxed entry of aten::<name>, compiling its
+        extension from native/mojo/<group>.mojo on the first call.
+
+        A failure is not remembered: the next call retries, so a compiler
+        that failed on a full disk or a killed subprocess is not fatal for
+        the rest of the process."""
+        var key = group + "/" + name
+        if key in self.ops:
+            return self.ops[key].entry
+        var so = (
+            self.cache_dir
+            + "/tmbop."
+            + group
+            + "."
+            + name
+            + ".hash-"
+            + self.op_source_hash(group)
+            + ".so"
+        )
+        var defines = List[String]()
+        defines.append("TMB_OP=" + name)
+        self._ensure_built(
+            "tmbop." + group + "." + name,
+            so,
+            group + " " + name,
+            self.mojo_dir + "/" + group + ".mojo",
+            String(self.mojo_dir),
+            defines,
+        )
+        var ext = OpExt(so)
+        var addr = ext.entry
+        self.ops[key] = ext^
+        return addr
 
     def entry(mut self, family: String, defines: List[String]) raises -> Int:
         """Address of the family's `tmb_call` for this specialization."""
@@ -272,6 +421,7 @@ struct Loader(Movable):
         if key in self.failures:
             raise Error(self.failures[key])
         try:
+            var fam_dir = self.family_dir(family)
             var so = (
                 self.cache_dir
                 + "/"
@@ -280,27 +430,14 @@ struct Loader(Movable):
                 + self.source_hash(family)
                 + ".so"
             )
-            if not exists(so):
-                if not isdir(self.cache_dir):
-                    makedirs(self.cache_dir, exist_ok=True)
-                var lock_path = self.cache_dir + "/." + key + ".lock"
-                var fd = external_call["creat", Int32](
-                    lock_path.as_c_string_slice().unsafe_ptr(), Int32(0o644)
-                )
-                if fd >= 0:
-                    _ = external_call["flock", Int32](
-                        fd, Int32(2)
-                    )  # LOCK_EX (best effort: NFS may refuse)
-
-                try:
-                    if not exists(so):
-                        self._build(family, defines, so)
-                finally:
-                    if fd >= 0:
-                        _ = external_call["flock", Int32](
-                            fd, Int32(8)
-                        )  # LOCK_UN
-                        _ = external_call["close", Int32](fd)
+            self._ensure_built(
+                key,
+                so,
+                family,
+                fam_dir + "/" + family + ".mojo",
+                fam_dir,
+                defines,
+            )
             var fam = Family(so)
             var addr = fam.entry
             self.families[key] = fam^

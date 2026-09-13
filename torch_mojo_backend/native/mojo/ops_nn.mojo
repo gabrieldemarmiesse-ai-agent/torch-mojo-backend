@@ -48,7 +48,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK, _f64_slot
 from ops_common import cast_to, contiguous, copy_strided_into, fill_value
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 # The three dtypes every nn kernel family is instantiated for
 # (`op_utils.FLOAT_DTYPES` / `aten_fast._FLOAT_DTYPES`).
@@ -1643,22 +1643,29 @@ def op_upsample_bilinear2d(
     ret_owned(rets, 0, out)
 
 
-def register_nn(lib: Lib) raises:
-    impl[op_adaptive_avg_pool2d](lib, "_adaptive_avg_pool2d")
-    impl[op_log_softmax](lib, "_log_softmax")
-    impl[op_log_softmax_backward_data](lib, "_log_softmax_backward_data")
-    impl[op_batch_norm_legit_no_training](
-        lib, "_native_batch_norm_legit_no_training"
-    )
-    impl[op_softmax](lib, "_softmax")
-    impl[op_avg_pool2d](lib, "avg_pool2d")
-    impl[op_embedding](lib, "embedding")
-    impl[op_embedding_dense_backward](lib, "embedding_dense_backward")
-    impl[op_max_pool2d_with_indices](lib, "max_pool2d_with_indices")
-    impl[op_native_batch_norm](lib, "native_batch_norm")
-    impl[op_native_group_norm](lib, "native_group_norm")
-    impl[op_native_layer_norm](lib, "native_layer_norm")
-    impl[op_native_layer_norm_backward](lib, "native_layer_norm_backward")
-    impl[op_nll_loss_backward_grad_input](lib, "nll_loss_backward.grad_input")
-    impl[op_nll_loss_forward_output](lib, "nll_loss_forward.output")
-    impl[op_upsample_bilinear2d](lib, "upsample_bilinear2d")
+def register_nn(site: Site) raises:
+    impl[op_adaptive_avg_pool2d, "_adaptive_avg_pool2d"](site)
+    impl[op_log_softmax, "_log_softmax"](site)
+    impl[op_log_softmax_backward_data, "_log_softmax_backward_data"](site)
+    impl[
+        op_batch_norm_legit_no_training, "_native_batch_norm_legit_no_training"
+    ](site)
+    impl[op_softmax, "_softmax"](site)
+    impl[op_avg_pool2d, "avg_pool2d"](site)
+    impl[op_embedding, "embedding"](site)
+    impl[op_embedding_dense_backward, "embedding_dense_backward"](site)
+    impl[op_max_pool2d_with_indices, "max_pool2d_with_indices"](site)
+    impl[op_native_batch_norm, "native_batch_norm"](site)
+    impl[op_native_group_norm, "native_group_norm"](site)
+    impl[op_native_layer_norm, "native_layer_norm"](site)
+    impl[op_native_layer_norm_backward, "native_layer_norm_backward"](site)
+    impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
+    impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
+    impl[op_upsample_bilinear2d, "upsample_bilinear2d"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_nn]()

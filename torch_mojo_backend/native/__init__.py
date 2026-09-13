@@ -187,6 +187,21 @@ def _scratch_dir() -> Path:
     return d
 
 
+def compiler_env() -> dict[str, str]:
+    """Environment every `mojo build` subprocess runs with (loader.mojo's
+    `_compiler_env` is the same thing on the Mojo side).
+
+    MODULAR_HOME holds the compiler's own module cache. Its default sits in
+    $HOME, which on a cluster is NFS shared by every node, and concurrent
+    compilers then evict each other's entries — "failed to produce an archive
+    for the module: No such file or directory". Node-local, it is per-machine
+    and nobody else touches it; the first build on a machine pays about 25 s
+    to fill it."""
+    home = Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
+    home.mkdir(parents=True, exist_ok=True)
+    return {**os.environ, "MODULAR_HOME": str(home)}
+
+
 def _atomic_install(tmp: Path, out: Path):
     """Move a finished build from scratch into the cache: a copy into the
     cache directory (scratch is another filesystem), then one rename, so a
@@ -319,7 +334,7 @@ def _build_backend_locked(key: str, out: Path) -> Path:
         "-o",
         str(tmp),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
@@ -379,7 +394,7 @@ def build_library(
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
         cmd += ["-o", str(tmp)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)
             raise RuntimeError(
@@ -427,6 +442,18 @@ def op_counts() -> dict[str, int]:
         if name:
             out[name] = int(count)
     return out
+
+
+def prebuild_ops():
+    """Compile every op's extension now rather than one per first call.
+
+    Only useful up front: a test suite or a CI image pays the compilations
+    here, outside any GPU lock, instead of inside the first call of each op.
+    """
+    fn = backend_lib().tmb_prebuild_ops
+    fn.restype = ctypes.c_int32
+    if fn() != 0:
+        raise RuntimeError("prebuilding the mojo ops failed: " + last_error())
 
 
 def device_count() -> int:
@@ -483,11 +510,13 @@ def register():
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_char_p,
+            ctypes.c_char_p,
             ctypes.c_int32,
         ]
         shim_lib.tmb_get_error.restype = ctypes.c_char_p
         n = backend.tmb_native_init(
             str(_KERNELS_DIR).encode(),
+            str(_MOJO_SRC).encode(),
             str(_CACHE_DIR).encode(),
             _find_mojo().encode(),
             toolchain_identity().encode(),
