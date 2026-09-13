@@ -1090,6 +1090,14 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._finish(index, *zip(tensors, staged))
         return self._result(index, tensors)
 
+    # torch 2.13 renamed the tensor-shaped collectives on ProcessGroup; the
+    # old names stay for 2.12 and older. Both spellings resolve to one body.
+    all_gather_single = _allgather_base
+    all_gather_single_coalesced = allgather_into_tensor_coalesced
+    reduce_scatter_single = _reduce_scatter_base
+    reduce_scatter_single_coalesced = reduce_scatter_tensor_coalesced
+    all_to_all_single = alltoall_base
+
     @_loud
     def barrier(self, opts: BarrierOptions = BarrierOptions()) -> Work:
         """Every rank finishes its device work (all streams, comm included),
