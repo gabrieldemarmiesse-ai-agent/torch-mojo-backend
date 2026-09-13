@@ -198,15 +198,25 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     b = torch.full((4096, 4096), 2.0, device=mojo_gpu)
     torch.accelerator.synchronize(mojo_gpu)
 
-    # Establish a conservative duration for the work placed ahead of H2D.
-    _ = a * b
+    # Establish a conservative duration for the work placed ahead of H2D:
+    # enough launches that the device time dwarfs the enqueue cost.
+    def burst():
+        out = a * b
+        for _ in range(31):
+            out = out * b
+        return out
+
+    # The first staged upload of a process pays the pinned-buffer setup
+    # (hundreds of ms); the steady state is what the check is about.
+    _ = torch.arange(16).to(mojo_gpu, non_blocking=True)
+    _ = burst()
     torch.accelerator.synchronize(mojo_gpu)
     started = time.perf_counter()
-    _ = a * b
+    _ = burst()
     torch.accelerator.synchronize(mojo_gpu)
     mul_seconds = time.perf_counter() - started
 
-    delayed = a * b
+    delayed = burst()
     started = time.perf_counter()
     uploaded = torch.arange(4096).to(mojo_gpu, non_blocking=True)
     upload_return_seconds = time.perf_counter() - started
