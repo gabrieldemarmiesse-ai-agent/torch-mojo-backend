@@ -566,17 +566,29 @@ def test_torch_manual_seed_reaches_the_device_generator(mojo_gpu):
 
 
 def test_arange_needs_a_wide_accumulator(mojo_device):
-    """Past 2**24 an fp32 running sum stops being able to add 1.0. The
-    reference is built element by element, because torch's own CPU kernel
-    accumulates in fp64 and its arm64 vectorization rounds differently here."""
-    start, step, count = 16_777_217.0, 1.0, 10
-    got = torch.arange(
-        start, start + count * step, step, dtype=torch.float32, device=mojo_device
-    )
-    expected = torch.tensor(
-        [start + i * step for i in range(count)], dtype=torch.float32
-    )
-    assert torch.equal(got.cpu(), expected)
+    """Past 2**24 an fp32 running sum can no longer add 1.0.
+
+    The reference depends on the device, because the accumulator width does:
+    torch's CPU kernel specifies float64 for a float32 arange, so the MAX CPU
+    device is compared against that scalar sequence (built explicitly --
+    arm64's vectorized kernel rounds differently at this boundary); an
+    accelerator is compared against the vendor backend's own answer, and the
+    test skips where there is none to compare with rather than inventing one.
+    """
+    args = (16_777_217.0, 16_777_227.0, 1.0)
+    result = torch.arange(*args, dtype=torch.float32, device=mojo_device).cpu()
+    cpu_index = len(list(get_accelerators())) - 1
+    if mojo_device == f"mojo:{cpu_index}":
+        expected = torch.tensor(
+            [args[0] + i * args[2] for i in range(10)], dtype=torch.float32
+        )
+    elif torch.cuda.is_available():
+        expected = torch.arange(*args, dtype=torch.float32, device="cuda").cpu()
+    elif torch.backends.mps.is_available():
+        expected = torch.arange(*args, dtype=torch.float32, device="mps").cpu()
+    else:
+        pytest.skip("no native GPU reference for this MAX accelerator")
+    assert torch.equal(result, expected)
 
 
 def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
