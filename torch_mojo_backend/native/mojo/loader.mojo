@@ -49,17 +49,23 @@ def _slug(defines: List[String]) -> String:
     return String(_hex(h)[byte=:12])
 
 
-def _local_dir(prefix: String) -> String:
-    """A per-user directory on node-local disk (shell-expanded in the build
-    command, so TMPDIR is read where the compiler runs)."""
-    return (
-        String("${TMPDIR:-/tmp}/")
-        + prefix
-        + String(external_call["getuid", UInt32]())
-    )
+def _local_dir(prefix: String) raises -> String:
+    """A per-user directory on node-local disk, created if missing.
+
+    Expanded here rather than left as `${TMPDIR:-/tmp}` in the build command:
+    the command quotes its paths, so the shell took that spelling literally
+    and made a directory of that name inside the caller's working
+    directory."""
+    var tmp = getenv("TMPDIR")
+    if tmp == "":
+        tmp = String("/tmp")
+    var d = tmp + "/" + prefix + String(external_call["getuid", UInt32]())
+    if not isdir(d):
+        makedirs(d, exist_ok=True)
+    return d
 
 
-def _compiler_env() -> String:
+def _compiler_env() raises -> String:
     """Environment every `mojo build` subprocess runs with; an explicit value
     wins. Why MODULAR_HOME must be node-local: native/__init__.py's
     `compiler_env`, the same thing on the Python side."""
@@ -267,15 +273,15 @@ struct Loader(Movable):
         # finished library is then moved next to its final name.
         var scratch = _local_dir("torch-mojo-backend-")
         var local = (
-            scratch + "/" + label + "." + String(perf_counter_ns()) + ".so"
+            scratch
+            + "/"
+            + label.replace(" ", "_")
+            + "."
+            + String(perf_counter_ns())
+            + ".so"
         )
         var cmd = (
-            String("mkdir -p '")
-            + scratch
-            + "' '"
-            + _local_dir("modular-home-")
-            + "' && "
-            + _compiler_env()
+            _compiler_env()
             + " '"
             + self.mojo_exe
             + "' build '"
