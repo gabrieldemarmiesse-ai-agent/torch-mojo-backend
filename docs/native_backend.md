@@ -364,8 +364,34 @@ RMSNorm forward/backward (a package written against `torch.cuda`; its own
 `device.type == "cuda"` branches fall back to generic paths on "mojo", e.g.
 one SM's worth of partial weight gradients, and its autocast decorators
 bind to the CPU device type because it infers the device from
-`torch.cuda.is_available()`). With a CUDA build of torch, the installed
-driver still routes every Triton launch to the mojo current stream.
+`torch.cuda.is_available()`).
+
+**Activation is scoped on purpose.** Triton keeps one active driver per
+process and asks it for the device and the stream *before* it looks at a
+launch's arguments (`triton/runtime/jit.py`'s `run`), so whichever driver is
+installed answers for every Triton launch in that process; nothing in the
+protocol distinguishes a launch over mojo tensors from one over CUDA tensors,
+so there is no automatic answer that is right for both. `register_mojo_devices()`
+therefore installs the driver only where that cannot bite — a torch with no
+working CUDA/ROCm build, which is the case the feature exists for. With a
+vendor build of torch, `enable_triton()` is an explicit call and takes the
+whole process with it: from then on CUDA tensors must not be launched through
+Triton there, or a tensor produced on a `torch.cuda` stream gets consumed on
+an unordered mojo stream, on a different GPU whenever the two current devices
+differ.
+
+Both halves of a launch run under the driver context that owns the stream,
+and put back the context they found. Triton's `loadBinary` loads into
+whatever context is current and only retains `device`'s primary context when
+there is none, and its generated `launch` does the same
+(`ensureCudaContext`) — neither checks that an already-current context
+belongs to the device it was handed. Inductor compiles under
+`DeviceGuard(MojoInterface, i)`, which moves only mojo's TLS device, so
+without the guards a kernel for `mojo:1` could be loaded into device 0's
+context and then launched on device 1's stream. `_MojoCudaUtils.load_binary`
+and `MojoCudaLauncher.__call__` in `triton_driver.py` are those two guards
+(`cuStreamGetCtx` once per stream, then `cuCtxGetCurrent` and a set only when
+it differs); HIP streams are not bound to a context and need neither.
 
 ## TorchInductor
 
@@ -380,6 +406,16 @@ backend uses:
 |---|---|
 | `torch._dynamo.device_interface.register_interface_for_device("mojo", MojoInterface)` | device / stream / event classes, `get_raw_stream`, `synchronize`, properties and compute capability (read from the CUDA driver, not from torch) |
 | `torch._inductor.codegen.common.register_backend_for_device("mojo", TritonScheduling, PythonWrapperCodegen)` | Triton codegen and the Python wrapper; `MojoDeviceOpOverrides` supplies the wrapper's device lines (`from torch_mojo_backend.inductor import get_raw_stream`, `torch.mojo.set_device`, `torch.mojo.device`) |
+
+It **needs** that CPU wheel, and raises on a torch with a working CUDA/ROCm
+build rather than break it: Inductor decides "is this an accelerator?" from
+one process-wide list, `torch._inductor.utils`'s `GPU_TYPES`, and
+`get_gpu_type()` asserts at most one of its entries is available. With "mojo"
+appended beside a working `torch.cuda` that assert fires — in autotuning's
+subprocess setup and in the profiler benchmarking — for that process's CUDA
+graphs as much as for ours, and nothing in that API is per-graph. So it is one
+backend or the other: `enable_inductor()` says so and stops, and
+`add_mojo_to_the_inductor_gpu_types` stands aside.
 
 Everything Inductor keys off a device *registry* then works. What it keys off
 a hardcoded list does not, and each of those is one function in
@@ -433,18 +469,46 @@ both, as aliases rather than copies:
   in both worlds. `as_cuda(t)` / `as_mojo(t)` take torch's own DLPack export
   and rewrite the device code in the capsule (`mojo_device/dlpack.py`'s
   `retag_capsule`: `kDLExtDev` ⟷ `kDLCUDA`), which keeps shape, strides,
-  storage offset and dtype exactly and leaves the source tensor pinned by the
-  capsule's deleter. `data_ptr()` is equal on both sides; nothing is copied.
-  The mojo device index is the CUDA ordinal, as for Triton (checked on a
-  second GPU: `mojo:1` aliases to `cuda:1`).
+  dtype and the addressed elements exactly and leaves the source tensor
+  pinned by the capsule's deleter. `data_ptr()` is equal on both sides;
+  nothing is copied. `storage_offset()` is *not* carried over — torch's
+  DLPack export normalizes it into the pointer (`data` is `data_ptr()`,
+  `byte_offset` is 0), so a view's alias starts at the view's first element
+  with offset 0. The mojo device index is the CUDA ordinal, as for Triton
+  (checked on a second GPU: `mojo:1` aliases to `cuda:1`), and it is not a
+  parameter: relabelling a pointer as another device would copy nothing and
+  hand out memory that device cannot address.
 * **Ordering.** `on_mojo_stream()` installs a `torch.cuda.ExternalStream`
   over the mojo current stream's vendor handle, so the package's launches and
   ours queue on one stream and neither side synchronizes. Like `torch.cuda`'s
   own stream context it makes that device current, and restores the previous
   one on exit.
 
-`call_cuda(fn, *args)` is the two together — convert, call under the stream,
-convert back — and in-place mutation needs no conversion back, since the
+**An alias is memory and nothing else**, and the second bullet is what makes
+the first safe rather than a nicety on top of it:
+
+* it carries no stream handoff. The capsule goes out raw, bypassing torch's
+  `__dlpack__(stream=...)` negotiation — the protocol half where a producer
+  records an event for the consumer's stream — so an alias used on any stream
+  but the one its memory was produced on races that producer;
+* it carries no allocator stream tracking, and `record_stream` cannot add
+  any. A mojo alias of CUDA memory has a `from_blob` deleter, which mojo's
+  `recordDataPtrOnStream` (`shim_runtime.cpp`) ignores and torch 2.11's CUDA
+  caching allocator ignores for foreign deleters, so recording the alias on
+  another stream does not stop the original allocation being recycled while
+  that stream still reads it.
+
+So the correct use is one stream for both sides — `on_mojo_stream()`, or
+`call_cuda` / the fallback, which enter it for you — plus keeping the source
+tensor alive for as long as any stream still uses the alias. `as_cuda` /
+`as_mojo` make that the default by refusing outside an `on_mojo_stream()`
+block for their own device; `unordered=True` is the opt-out for an alias that
+is only inspected (shape, dtype, `data_ptr`) or is ordered some other way,
+and it is a promise, not a fix.
+
+`call_cuda(fn, *args)` is the two together — enter the stream of the first
+mojo argument's device, then convert, call and convert back inside it, one
+device per call — and in-place mutation needs no conversion back, since the
 alias *is* the memory. Gradients do not cross an alias (DLPack carries no
 autograd history), so `cuda_autograd(fwd, bwd)` wraps a package's two entry
 points as one differentiable mojo-level op; the autograd graph then stays on

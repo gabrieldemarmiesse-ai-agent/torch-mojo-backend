@@ -4,12 +4,15 @@ A package with compiled CUDA kernels needs a CUDA build of torch, CUDA
 tensors and a CUDA stream; the mojo device owns the memory and the streams.
 These tests check the two halves of the bridge: the aliases really are the
 same memory (both directions, views included), and an ExternalStream over the
-mojo current stream really does order a torch.cuda kernel with ours.
+mojo current stream really does order a torch.cuda kernel with ours. They also
+pin the contract that binds the two -- an alias carries no ordering of its
+own, so it is refused outside an `on_mojo_stream()` block for its own device.
 
 Every test needs a CUDA build of torch whose driver initializes, so the whole
 module skips on the CPU wheel the project normally uses.
 """
 
+import inspect
 import os
 import subprocess
 import sys
@@ -35,29 +38,37 @@ def gpu(mojo_gpu):
 
 def test_as_cuda_is_the_same_memory(gpu):
     m = torch.arange(12, dtype=torch.float32, device=gpu).reshape(3, 4)
-    c = cuda_interop.as_cuda(m)
-    assert c.device.type == "cuda"
-    assert c.data_ptr() == m.data_ptr()
-    assert c.shape == m.shape and c.stride() == m.stride() and c.dtype == m.dtype
-    torch.testing.assert_close(c.cpu(), m.cpu())
+    with cuda_interop.on_mojo_stream(gpu):
+        c = cuda_interop.as_cuda(m)
+        assert c.device.type == "cuda"
+        assert c.data_ptr() == m.data_ptr()
+        assert c.shape == m.shape and c.stride() == m.stride() and c.dtype == m.dtype
+        torch.testing.assert_close(c.cpu(), m.cpu())
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_as_cuda_round_trips_every_dtype(gpu, dtype):
     m = torch.ones(8, 3, device=gpu, dtype=dtype)
-    back = cuda_interop.as_mojo(cuda_interop.as_cuda(m))
-    assert back.dtype == dtype and back.data_ptr() == m.data_ptr()
-    torch.testing.assert_close(back.cpu(), m.cpu())
+    with cuda_interop.on_mojo_stream(gpu):
+        back = cuda_interop.as_mojo(cuda_interop.as_cuda(m))
+        assert back.dtype == dtype and back.data_ptr() == m.data_ptr()
+        torch.testing.assert_close(back.cpu(), m.cpu())
 
 
 def test_as_cuda_preserves_views(gpu):
+    """Shape, strides, dtype and the addressed elements, not
+    `storage_offset()`: torch's DLPack export normalizes the offset into the
+    pointer, so a view's alias starts at the view's first element."""
     m = torch.arange(12, dtype=torch.float32, device=gpu).reshape(3, 4)
     transposed = m.t()
     sliced = m.reshape(-1)[5:]
-    for v in (transposed, sliced):
-        c = cuda_interop.as_cuda(v)
-        assert c.data_ptr() == v.data_ptr() and c.stride() == v.stride()
-        torch.testing.assert_close(c.cpu(), v.cpu())
+    with cuda_interop.on_mojo_stream(gpu):
+        for v in (transposed, sliced):
+            c = cuda_interop.as_cuda(v)
+            assert c.data_ptr() == v.data_ptr() and c.stride() == v.stride()
+            assert c.storage_offset() == 0
+            torch.testing.assert_close(c.cpu(), v.cpu())
+    assert sliced.storage_offset() == 5
 
 
 def test_a_cuda_kernel_writes_through_the_alias(gpu):
@@ -72,19 +83,21 @@ def test_a_mojo_kernel_reads_cuda_allocator_memory(gpu):
     """The other direction: the memory belongs to torch's CUDA caching
     allocator, and a mojo kernel runs over it."""
     c = torch.arange(6, dtype=torch.float32, device="cuda") * 10
-    m = cuda_interop.as_mojo(c)
-    assert m.device.type == "mojo" and m.data_ptr() == c.data_ptr()
-    torch.testing.assert_close((m + 1).cpu(), c.cpu() + 1)
+    with cuda_interop.on_mojo_stream(gpu):
+        m = cuda_interop.as_mojo(c)
+        assert m.device.type == "mojo" and m.data_ptr() == c.data_ptr()
+        torch.testing.assert_close((m + 1).cpu(), c.cpu() + 1)
 
 
 def test_the_alias_keeps_the_mojo_tensor_alive(gpu):
     m = torch.ones(1024, device=gpu)
-    alias = cuda_interop.as_cuda(m)
-    del m
-    mojo.synchronize()
-    alias.mul_(7.0)
-    mojo.synchronize()
-    assert float(alias.sum().cpu()) == 7168.0
+    with cuda_interop.on_mojo_stream(gpu):
+        alias = cuda_interop.as_cuda(m)
+        del m
+        mojo.synchronize()
+        alias.mul_(7.0)
+        mojo.synchronize()
+        assert float(alias.sum().cpu()) == 7168.0
 
 
 def test_the_mojo_cpu_device_has_no_cuda_alias():
@@ -110,12 +123,12 @@ def test_a_second_gpu_maps_to_its_cuda_ordinal(gpu):
     if mojo.device_count() - 1 < 2:  # the last index is the MAX CPU device
         pytest.skip("needs two GPUs")
     x = torch.arange(8, dtype=torch.float32, device="mojo:1")
-    alias = cuda_interop.as_cuda(x)
-    assert alias.device == torch.device("cuda", 1)
-    assert alias.data_ptr() == x.data_ptr()
     before = torch.cuda.current_device()
     with cuda_interop.on_mojo_stream(1):
         assert torch.cuda.current_device() == 1
+        alias = cuda_interop.as_cuda(x)
+        assert alias.device == torch.device("cuda", 1)
+        assert alias.data_ptr() == x.data_ptr()
         assert torch.cuda.current_stream().cuda_stream == mojo.stream_native_handle(
             mojo.current_stream(1)
         )
@@ -127,10 +140,58 @@ def test_a_second_gpu_maps_to_its_cuda_ordinal(gpu):
 
 def test_gradients_do_not_cross_an_alias(gpu):
     """DLPack carries no autograd history, which is why `cuda_autograd`
-    exists: the alias is always a leaf."""
+    exists: the alias is always a leaf. (Nothing reads the memory here, which
+    is what `unordered=True` is for.)"""
     x = torch.randn(4, 4, device=gpu, requires_grad=True)
-    alias = cuda_interop.as_cuda(x)
+    alias = cuda_interop.as_cuda(x, unordered=True)
     assert not alias.requires_grad and alias.grad_fn is None
+
+
+def test_an_alias_outside_a_stream_block_is_refused(gpu):
+    """An alias is memory and nothing else -- no stream handoff (the raw
+    capsule skips torch's `__dlpack__(stream=)` negotiation) and no allocator
+    stream tracking (a `from_blob` deleter is foreign to both allocators). The
+    one thing that orders it is `on_mojo_stream`, so that is the default and
+    `unordered=True` is the deliberate opt-out."""
+    m = torch.ones(4, device=gpu)
+    with pytest.raises(RuntimeError, match="outside on_mojo_stream"):
+        cuda_interop.as_cuda(m)
+    cuda_interop.as_cuda(m, unordered=True)
+    with cuda_interop.on_mojo_stream(gpu):
+        alias = cuda_interop.as_cuda(m)
+    with pytest.raises(RuntimeError, match="outside on_mojo_stream"):
+        cuda_interop.as_mojo(alias)
+    cuda_interop.as_mojo(alias, unordered=True)
+    with cuda_interop.on_mojo_stream(gpu):
+        assert cuda_interop.as_mojo(alias).device.type == "mojo"
+
+
+def test_an_alias_never_names_a_device_other_than_its_own(gpu):
+    """The mojo index IS the CUDA ordinal and is not a caller's choice:
+    relabelling a pointer as another GPU would copy nothing and hand out
+    memory that GPU cannot address."""
+    assert "index" not in inspect.signature(cuda_interop.as_cuda).parameters
+    assert "index" not in inspect.signature(cuda_interop.as_mojo).parameters
+    if mojo.device_count() - 1 < 2:
+        pytest.skip("needs two GPUs")
+    with cuda_interop.on_mojo_stream(1):
+        m = torch.ones(4, device="mojo:1")
+        assert cuda_interop.as_cuda(m).device == torch.device("cuda", 1)
+        c = torch.ones(4, device="cuda:1")
+        assert cuda_interop.as_mojo(c).device == torch.device("mojo", 1)
+
+
+def test_an_alias_of_another_device_than_the_stream_is_refused(gpu):
+    """One `on_mojo_stream` block is one device: another device's stream
+    orders nothing here."""
+    if mojo.device_count() - 1 < 2:
+        pytest.skip("needs two GPUs")
+    x = torch.ones(4, device="mojo:1")
+    with (
+        cuda_interop.on_mojo_stream(0),
+        pytest.raises(RuntimeError, match="another device"),
+    ):
+        cuda_interop.as_cuda(x)
 
 
 def test_launches_interleave_without_synchronizing(gpu):

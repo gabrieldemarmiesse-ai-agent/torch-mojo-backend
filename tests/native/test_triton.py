@@ -2,21 +2,24 @@
 Triton compiles and launches through its own GPU backend; the driver only
 answers the device and stream questions with the mojo device, and is
 installed automatically when triton's runtime is imported after
-register_mojo_devices()."""
+register_mojo_devices() -- on a torch with no working CUDA build, since the
+active driver is process-wide."""
 
+import ctypes
 import subprocess
 import sys
 
 import pytest
 import torch
 
-from torch_mojo_backend import get_accelerators
+from torch_mojo_backend import get_accelerators, triton_driver
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.triton_driver import enable_triton
 
 triton = pytest.importorskip("triton")
 tl = pytest.importorskip("triton.language")
 from torch._library.triton import triton_op, wrap_triton  # noqa: E402 -- after the skip
+from triton.runtime import driver as active_driver  # noqa: E402 -- idem
 
 
 @pytest.fixture
@@ -70,6 +73,56 @@ def test_triton_launch_on_a_second_device(mojo_triton):
         y = _add(x, x)
     torch.testing.assert_close(y.cpu(), 2 * x.cpu())
     assert device_module.current_device() == 0
+
+
+@triton.jit
+def _double_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * 2, mask=mask)
+
+
+def test_the_second_device_loads_and_launches_in_its_own_context(mojo_triton):
+    """Triton's `loadBinary` and its launcher both use whatever driver context
+    is current and never check its device, and Inductor's DeviceGuard moves
+    only mojo's TLS device. So both must run under the selected device's
+    context -- and put back the one they found, which is what this checks by
+    leaving device 0's current across a device-1 compile and launch."""
+    if triton_driver.accelerator_api() != "cuda":
+        pytest.skip("CUDA driver contexts")
+    if len([d for d in get_accelerators() if getattr(d, "api", "") != "cpu"]) < 2:
+        pytest.skip("needs two GPUs")
+    cuda = ctypes.CDLL("libcuda.so.1")
+    context_0 = triton_driver._stream_context(
+        device_module.stream_native_handle(device_module.current_stream(0))
+    )
+    assert cuda.cuCtxSetCurrent(context_0) == 0
+
+    x = torch.randn(4096, device="mojo:1")
+    out = torch.empty_like(x)
+    with device_module.device(1):
+        _double_kernel[(triton.cdiv(x.numel(), 1024),)](x, out, x.numel(), BLOCK=1024)
+    torch.testing.assert_close(out.cpu(), 2 * x.cpu())
+
+    after = ctypes.c_void_p()
+    cuda.cuCtxGetCurrent(ctypes.byref(after))
+    assert after.value == context_0.value
+
+
+def test_the_automatic_hook_stands_aside_for_a_cuda_torch(mojo_gpu, monkeypatch):
+    """The active Triton driver is process-wide and answers before a launch's
+    arguments are looked at, so installing ours next to a working torch.cuda
+    would send that process's CUDA launches to the mojo device and stream too.
+    `enable_triton()` stays available, explicitly."""
+    installed = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(active_driver, "set_active", installed.append)
+    meta_path = list(sys.meta_path)
+
+    triton_driver.install_triton_hook()
+
+    assert installed == []
+    assert sys.meta_path == meta_path
 
 
 @triton.autotune(
