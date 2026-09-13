@@ -63,7 +63,14 @@ def _resolve(
         return 1
 
 
-def _register_lazy(lib: Int, group: StaticString, name: StaticString) raises:
+def _register_lazy(
+    lib: Int, group: StaticString, name: StaticString, prebuild: Bool
+) raises:
+    """One call per registration site, so the backend library holds a name
+    and a call rather than a copy of this per op."""
+    if prebuild:
+        _ = loader()[].op_entry(String(group), String(name))
+        return
     var box = unsafe_alloc[LazyOp](1)
     box.unsafe_write(LazyOp(group, name))
     var f: def(Int, Pointer[Int, MutUntrackedOrigin]) thin abi(
@@ -84,10 +91,7 @@ def impl[op: OpFn, name: StaticString](site: Site) raises:
     """Register `op` as the PrivateUse1 kernel of aten::<name> ("add.Tensor",
     "view", "fill_.Scalar", ...)."""
     comptime if TARGET_OP == "":
-        if site.prebuild:
-            _ = loader()[].op_entry(String(site.group), String(name))
-        else:
-            _register_lazy(site.lib, site.group, name)
+        _register_lazy(site.lib, site.group, name, site.prebuild)
     elif TARGET_OP == name:
         site.addr[] = op_address[op]()
 
