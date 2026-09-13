@@ -1,10 +1,14 @@
 """Helpers every op group shares: materializing a contiguous copy, strided
-copies and fills, dtype casts. All of them go through the memory_ops /
-data_movement_ops families on the tensor's current stream."""
+copies and fills, dtype casts, and two generic device-level primitives
+(Philox reservation, calling any aten op through the real dispatcher) that
+more than one group's RNG/host-fallback ops need."""
+from std.ffi import external_call
 from std.utils import IndexList
 
 from abi import (
     T,
+    Value,
+    check,
     contiguous_strides,
     dtype_code,
     dtype_itemsize,
@@ -14,6 +18,7 @@ from abi import (
     new_tensor,
     release,
     unsupported,
+    TAG_NONE,
 )
 from device import ctx_for, ctx_ptr, memset_bytes, memset_typed
 from kernels import KernelCall
@@ -141,3 +146,81 @@ def cast_to(t: T, stype: Int32) raises -> T:
     if src.h != t.h:
         release(src.h)
     return out^
+
+
+def resize_storage_for(
+    t: T, shape: IndexList[MAX_RANK], rank: Int, offset: Int
+) raises:
+    """Grow `t`'s storage, if needed, to hold `shape` at `offset`, before
+    `abi.set_sizes_strides` reshapes it: `tmb_tensor_set_sizes_strides`
+    bounds-checks the new (sizes, strides, offset) against the storage's
+    CURRENT byte size, so an `out=` op that grows its target -- the common
+    case is a fresh `at::empty({0}, ...)` composite hands `arange.start_out`
+    -- must grow the storage first. Mirrors `Tensor::resize_`'s
+    grow-if-needed contract (never shrinks the actual allocation); generic
+    for any group's `out=` op that may need to grow its target."""
+    var numel = 1
+    for i in range(rank):
+        numel *= shape[MAX_RANK - rank + i]
+    var nbytes = (offset + numel) * t.itemsize
+    if nbytes > t.storage_nbytes():
+        check(
+            external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
+            "tmb_storage_resize",
+        )
+
+
+def philox_reserve(
+    generator: Int, device: Int, increment: Int
+) raises -> Tuple[UInt64, UInt64]:
+    """Atomically reserve `increment` counters of a device's (generator=0)
+    or an explicit generator's Philox stream: returns `(seed, base_offset)`
+    as they stood *before* the reservation (tmb_philox_reserve,
+    docs/native_backend.md). Generic device-runtime plumbing any RNG op of
+    any group needs, not specific to one op group."""
+    var seed: UInt64 = 0
+    var offset: UInt64 = 0
+    check(
+        external_call["tmb_philox_reserve", Int32](
+            generator,
+            Int32(device),
+            UInt64(increment),
+            Pointer(to=seed),
+            Pointer(to=offset),
+        ),
+        "tmb_philox_reserve",
+    )
+    return (seed, offset)
+
+
+def call_op(
+    name: String, overload: String, var args: List[Value], n_rets: Int
+) raises -> List[Value]:
+    """Call any aten op through the real torch dispatcher (tmb_call_op):
+    composites and CPU/other-device fallbacks reachable from inside a Mojo
+    op body (e.g. `normal_`'s host draw, `arange`'s host fallback). `name`
+    must be namespace-qualified (`"aten::normal_"`, not `"normal_"`) --
+    `c10::Dispatcher::findSchemaOrThrow` looks it up as one `OperatorName`
+    together with `overload` (`""` for the default/unnamed overload,
+    `"start_out"` for `aten::arange.start_out`). `args` are value records in
+    schema order (exact arity: the dispatcher checks it against the op's
+    schema); the result records are returned as-is -- any TAG_TENSOR among
+    them is a freshly owned handle the caller must release (or return) like
+    any other allocation."""
+    var op_name = name
+    var op_overload = overload
+    var rets = List[Value](capacity=max(n_rets, 1))
+    for _ in range(n_rets):
+        rets.append(Value(TAG_NONE, 0, 0, 0))
+    check(
+        external_call["tmb_call_op", Int32](
+            op_name.as_c_string_slice().unsafe_ptr(),
+            op_overload.as_c_string_slice().unsafe_ptr(),
+            args.unsafe_ptr(),
+            Int32(len(args)),
+            rets.unsafe_ptr(),
+            Int32(n_rets),
+        ),
+        "tmb_call_op",
+    )
+    return rets^
