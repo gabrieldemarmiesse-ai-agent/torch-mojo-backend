@@ -76,8 +76,9 @@ valid, and concurrent requests for the same identity compile it once.
 
 The two backend shims (the C++ shim and the Mojo `backend.mojo` itself) are
 cached the same way, one level up, in `native/__init__.py`
-(`libtmb_shim.hash-*.so`, `libtmb_backend.hash-*.so`); see
-`docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
+(`libtmb_shim.hash-*.so`, `libtmb_backend.hash-*.so`) -- or copied there
+from the ones the wheel ships prebuilt, which is the same cache entry by
+another route; see `docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
 end to end through public behavior (env-var relocation, a second process
 reusing a build, a missing/corrupt `.so`).
 
