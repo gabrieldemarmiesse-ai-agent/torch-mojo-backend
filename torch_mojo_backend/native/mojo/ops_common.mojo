@@ -141,3 +141,16 @@ def cast_to(t: T, stype: Int32) raises -> T:
     if src.h != t.h:
         release(src.h)
     return out^
+
+
+def release_if_new(result: T, original: T):
+    """Release `result` only when it is a fresh allocation distinct from
+    `original`. `contiguous()`/`cast_to()` alias their input (returning it
+    unchanged, via `T.copy()`) instead of allocating whenever the input
+    already has the requested layout/dtype -- so a caller that wraps their
+    result in `own()` unconditionally would release a handle it never
+    allocated (an argument the caller only borrowed, e.g. an op's `self`).
+    Call this instead of `own(...)` whenever the input might be a borrowed
+    tensor."""
+    if result.h != original.h:
+        release(result.h)
