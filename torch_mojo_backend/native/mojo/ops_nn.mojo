@@ -528,6 +528,13 @@ def op_native_layer_norm(
             gamma_ptr = ones.t.ptr
         if not has_b:
             beta_ptr = zeros.t.ptr
+        # `fill_value` writes the two synthesized parameters with
+        # `DeviceContext.enqueue_memset`, which the MAX *CPU* context queues,
+        # while the nn_ops kernel below runs inline on this thread: without
+        # this drain the kernel reads uninitialized gamma/beta about one call
+        # in ten (measured). Accelerators order both on the same stream and
+        # never reach this branch.
+        ctx.synchronize()
         var call = KernelCall("nn_ops", "LayerNorm")
         call.arg_dtype(0, a.dtype)
         call.arg_dtype(1, gamma_dtype)
@@ -1046,6 +1053,13 @@ def op_native_group_norm(
             gamma_ptr = ones.t.ptr
         if not has_b:
             beta_ptr = zeros.t.ptr
+        # `fill_value` writes the two synthesized parameters with
+        # `DeviceContext.enqueue_memset`, which the MAX *CPU* context queues,
+        # while the nn_ops kernel below runs inline on this thread: without
+        # this drain the kernel reads uninitialized gamma/beta about one call
+        # in ten (measured). Accelerators order both on the same stream and
+        # never reach this branch.
+        ctx.synchronize()
         var call = KernelCall("nn_ops", "GroupNorm")
         call.arg_dtype(0, a.dtype)
         call.arg_dtype(1, gamma_dtype)

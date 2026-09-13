@@ -232,6 +232,29 @@ def test_layer_norm_module_forward(mojo_device):
         )
 
 
+def test_native_layer_norm_no_affine_repeats(mojo_device):
+    """No weight and no bias: the classic route synthesizes ones/zeros and has
+    to order that fill against the kernel that reads it. The bug this catches
+    fired about one call in ten, so the check repeats."""
+    x = torch.randn(2, 6, 64)
+    want = torch.native_layer_norm(x, (64,), None, None, 1e-5)
+    device_x = x.to(mojo_device)
+    for _ in range(25):
+        got = torch.native_layer_norm(device_x, (64,), None, None, 1e-5)
+        for g, e in zip(got, want, strict=True):
+            torch.testing.assert_close(g.cpu(), e, atol=1e-4, rtol=1e-4)
+
+
+def test_native_group_norm_no_affine_repeats(mojo_device):
+    """The group-norm twin of test_native_layer_norm_no_affine_repeats."""
+    x = torch.randn(2, 8, 16)
+    want = torch.ops.aten.native_group_norm(x, None, None, 2, 8, 16, 4, 1e-5)
+    device_x = x.to(mojo_device)
+    for _ in range(25):
+        got = torch.ops.aten.native_group_norm(device_x, None, None, 2, 8, 16, 4, 1e-5)
+        torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-4, rtol=1e-4)
+
+
 def test_native_layer_norm_noncontiguous_input(mojo_device):
     base = torch.randn(4, 2, 16)
     x = base.transpose(0, 1)
@@ -328,8 +351,13 @@ def test_batch_norm_inference(mojo_gpu, call_checker: CallChecker, dtype):
     )
     tol = 1e-5 if dtype == torch.float32 else 8e-3
     torch.testing.assert_close(got[0].cpu().float(), want[0], atol=tol, rtol=tol)
-    torch.testing.assert_close(got[1].cpu(), want[1], atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(got[2].cpu(), want[2], atol=1e-5, rtol=1e-5)
+    # CPU torch leaves the two saved statistics empty here; the CUDA kernel
+    # fills them (Normalization.cu) and so does ours, because the autograd
+    # formula forwards them into native_batch_norm_backward.
+    torch.testing.assert_close(got[1].cpu(), running_mean, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        got[2].cpu(), torch.rsqrt(running_var + 1e-5), atol=1e-5, rtol=1e-5
+    )
 
 
 def test_batch_norm_module_inference(mojo_gpu):
@@ -737,11 +765,14 @@ def test_avg_pool2d(
 
 @pytest.mark.parametrize("output_size", [(1, 1), (3, 3), (2, 5), (7, 7)])
 def test_adaptive_avg_pool2d(mojo_device, call_checker: CallChecker, output_size):
+    """Called through the aten op, not `F.adaptive_avg_pool2d`: ATen's
+    composite rewrites a (1, 1) output into `mean.dim`, which belongs to the
+    reductions group."""
     call_checker.register(aten_functions.aten__adaptive_avg_pool2d)
     x = torch.randn(2, 4, 7, 9)
     torch.testing.assert_close(
-        torch.nn.functional.adaptive_avg_pool2d(x.to(mojo_device), output_size).cpu(),
-        torch.nn.functional.adaptive_avg_pool2d(x, output_size),
+        torch.ops.aten._adaptive_avg_pool2d(x.to(mojo_device), list(output_size)).cpu(),
+        torch.ops.aten._adaptive_avg_pool2d(x, list(output_size)),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -772,4 +803,21 @@ def test_upsample_bilinear2d_explicit_scales(mojo_device):
     got = torch.ops.aten.upsample_bilinear2d(
         x.to(mojo_device), [8, 10], False, 2.0, 2.0
     )
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# End to end: the two ops F.cross_entropy composes
+# ---------------------------------------------------------------------------
+
+
+def test_cross_entropy_forward(mojo_gpu):
+    """`log_softmax` then `nll_loss_forward` through the public functional."""
+    logits = torch.randn(12, 30)
+    target = torch.arange(12, dtype=torch.int64) % 30
+    want = torch.nn.functional.cross_entropy(logits, target)
+    with ran("aten::_log_softmax"):
+        got = torch.nn.functional.cross_entropy(
+            logits.to(mojo_gpu), target.to(mojo_gpu)
+        )
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
