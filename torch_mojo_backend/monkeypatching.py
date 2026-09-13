@@ -9,11 +9,19 @@ in the package may patch a third-party module; keep new patches in this file
 (``tests/test_monkeypatching_is_centralized.py`` enforces that for
 ``torch``-rooted assignments).
 
-Everything is installed by ``register.register_mojo_devices`` through
-:func:`apply_torch_monkeypatches`, never at import time. Official
-registration APIs (``torch.library.impl``, the PrivateUse1 backend module,
-``torch.__future__`` toggles) are not monkeypatches and stay in
-``mojo_device/register.py``.
+Every patch installer is called by ``register.register_mojo_devices``, never
+at import time. :func:`apply_torch_monkeypatches` bundles the patches that
+are specific to the old wrapper-subclass eager device (``TorchMojoTensor``);
+it is not currently wired up now that the ``mojo`` device is a native
+PrivateUse1 backend with real tensor storage (see docs/native_backend.md),
+and reinstalling it wholesale would be wrong -- e.g.
+:func:`_install_torch_stream_event_dispatch` would redirect
+``torch.Stream``/``torch.Event`` away from the native backend's real,
+generic ones. A patch that is still needed regardless of which device
+layer is active (e.g. :func:`fix_privateuse1_dlpack_device_type`) is its own
+public function, called directly. Official registration APIs
+(``torch.library.impl``, the PrivateUse1 backend module, ``torch.__future__``
+toggles) are not monkeypatches and stay in ``mojo_device/register.py``.
 """
 
 from collections.abc import Callable, Mapping, Sequence
@@ -383,6 +391,49 @@ def _keep_mojo_kernels_out_of_fake_tensor_construction():
     # versions), so this wrapper forwards blindly rather than hardcoding it.
     FakeTensor.__new__ = staticmethod(  # ty: ignore[invalid-assignment]
         fake_new_without_mojo_kernels
+    )
+
+
+def fix_privateuse1_dlpack_device_type():
+    """`Tensor.__dlpack_device__` doesn't recognize a *renamed* PrivateUse1
+    backend.
+
+    ``torch/_tensor.py``'s ``Tensor.__dlpack_device__`` maps a PrivateUse1
+    tensor to DLPack's ``kDLExtDev`` by comparing ``self.device.type``
+    against the string literal ``"privateuse1"`` -- so after
+    ``torch.utils.rename_privateuse1_backend("mojo")`` it never matches, and
+    every mojo tensor's ``__dlpack_device__()`` raises ``ValueError("Unknown
+    device type mojo for Dlpack")``. Two other call sites in that very same
+    file (the ``__cuda_array_interface__`` gate) correctly compare against
+    ``torch._C._get_privateuse1_backend_name()`` instead of the literal;
+    this one method just didn't get the memo.
+
+    ``Tensor.__dlpack__`` itself (the capsule export) is unaffected --
+    ATen's C++ DLConvertor keys off the ``DeviceType`` enum, not the
+    Python-visible name -- so only the device-query half needs patching.
+    ``torch_compile_backend/compiler.py``'s ``fast_from_dlpack`` routes
+    around this bug for its own zero-copy exchange (it never calls
+    ``__dlpack_device__``), but plain ``torch.utils.dlpack`` /
+    ``max.driver.Buffer.from_dlpack(t)`` usage elsewhere (user code,
+    ``test_compile_mojo_device.py``) goes through the single-arg DLPack
+    protocol, which calls ``__dlpack_device__()`` first and needs this fix.
+    """
+    original = torch.Tensor.__dlpack_device__
+    if getattr(original, "_torch_mojo_backend", False):
+        return
+
+    from torch.utils.dlpack import DLDeviceType  # noqa: PLC0415 -- mirrors the private import inside the method being patched
+
+    @wraps(original)
+    def __dlpack_device__(self: torch.Tensor) -> tuple[int, int]:
+        if self.device.type == torch._C._get_privateuse1_backend_name():
+            index = self.device.index if self.device.index is not None else 0
+            return (DLDeviceType.kDLExtDev, index)
+        return original(self)
+
+    __dlpack_device__._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    torch.Tensor.__dlpack_device__ = (  # ty: ignore[invalid-assignment]
+        __dlpack_device__
     )
 
 
