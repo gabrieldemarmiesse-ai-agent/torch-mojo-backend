@@ -940,15 +940,13 @@ def test_native_layer_norm_large_mean_needs_the_moment_repass(mojo_gpu):
 def test_native_layer_norm_noncontiguous_weight_and_bias(mojo_gpu):
     """The test above covers a non-contiguous INPUT; the affine parameters
     have their own read path."""
-    x_cpu = torch.randn(3, 2, 4).transpose(0, 1)
-    w_cpu = torch.randn(4, 3).t()
-    b_cpu = torch.randn(4, 3).t()
-    x = torch.randn(3, 2, 4).to(mojo_gpu).transpose(0, 1)
-    x.copy_(x_cpu)
-    w = torch.randn(4, 3).to(mojo_gpu).t()
-    w.copy_(w_cpu)
-    b = torch.randn(4, 3).to(mojo_gpu).t()
-    b.copy_(b_cpu)
+    x_base = torch.randn(3, 2, 4)
+    w_base = torch.randn(4, 3)
+    b_base = torch.randn(4, 3)
+    x_cpu, w_cpu, b_cpu = x_base.transpose(0, 1), w_base.t(), b_base.t()
+    x = x_base.to(mojo_gpu).transpose(0, 1)
+    w = w_base.to(mojo_gpu).t()
+    b = b_base.to(mojo_gpu).t()
     want = torch.native_layer_norm(x_cpu, (3, 4), w_cpu, b_cpu, 1e-5)
     got = torch.native_layer_norm(x, (3, 4), w, b, 1e-5)
     assert got[0].is_contiguous()

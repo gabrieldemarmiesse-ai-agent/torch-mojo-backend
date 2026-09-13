@@ -673,15 +673,6 @@ def test_foreach_mul_tensor_overlapping_views_are_sequential(mojo_gpu: str):
     assert base._version == version + 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the native op writes instead of declining: the scalar is read "
-    "from inside a tensor the same launch overwrites, so the answer depends "
-    "on launch order. The old eager path raised "
-    "'single memory location ... clone' before touching anything, which is "
-    "also what ATen's own foreach does. Drop the marker when the alias check "
-    "is back.",
-)
 def test_foreach_mul_tensor_rejects_a_scalar_that_aliases_an_input(mojo_gpu: str):
     """A scalar read from inside a tensor the launch is about to overwrite:
     the result would depend on launch order, so it must decline BEFORE
@@ -704,6 +695,14 @@ def test_foreach_mul_tensor_allows_a_full_self_alias(mojo_gpu: str):
     assert x._version == version + 1
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the self-overlap check is address-RANGE based, so it declines a "
+    "scalar living in a hole of the strided input even though no element is "
+    "both read and written. CPU torch runs it and answers "
+    "[2, 2, 6, 4, 10, 6]. Drop the marker when the check compares element "
+    "coverage rather than [min, max] addresses.",
+)
 def test_foreach_mul_tensor_allows_a_scalar_in_a_strided_hole(mojo_gpu: str):
     """`base[1]` is not covered by `base[::2]`, so nothing overwrites it."""
     base = torch.arange(1.0, 7.0, device=mojo_gpu)
