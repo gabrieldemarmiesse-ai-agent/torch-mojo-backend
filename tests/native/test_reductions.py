@@ -240,9 +240,7 @@ def test_sum_nonadjacent_or_strided_fallback(mojo_device):
     torch.testing.assert_close(
         device_strided.sum(dim=(0, 2)).cpu(), host_strided.sum(dim=(0, 2))
     )
-    torch.testing.assert_close(
-        device_strided.sum(dim=3).cpu(), host_strided.sum(dim=3)
-    )
+    torch.testing.assert_close(device_strided.sum(dim=3).cpu(), host_strided.sum(dim=3))
 
 
 def test_reduction_split_tier(mojo_device):
@@ -287,7 +285,9 @@ def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     rules (bool / sub-int64 integers -> int64, an explicit dtype= casting the
     input BEFORE the accumulation) are applied on our side too."""
     x = torch.randn(16, 33)
-    torch.testing.assert_close(x.to(mojo_gpu).sum().cpu(), x.sum(), rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(
+        x.to(mojo_gpu).sum().cpu(), x.sum(), rtol=2e-6, atol=2e-6
+    )
 
     for dtype in (torch.bool, torch.uint8, torch.int32):
         if dtype is torch.bool:
@@ -417,6 +417,50 @@ def test_min_dim_keepdim_and_out(mojo_gpu, keepdim):
     torch.testing.assert_close(out_i.cpu(), exp_indices)
 
 
+def test_min_dim_out_into_a_strided_destination(mojo_gpu):
+    """A non-contiguous pair of `out` tensors takes the copy path."""
+    x = torch.randn(6, 11)
+    exp_values, exp_indices = torch.min(x, dim=1)
+    v_storage = torch.zeros(6, 2, device=mojo_gpu)
+    i_storage = torch.zeros(6, 2, dtype=torch.int64, device=mojo_gpu)
+    out_v, out_i = v_storage[:, 0], i_storage[:, 0]
+    assert not out_v.is_contiguous() and not out_i.is_contiguous()
+    torch.min(x.to(mojo_gpu), dim=1, out=(out_v, out_i))
+    torch.testing.assert_close(out_v.cpu(), exp_values)
+    torch.testing.assert_close(out_i.cpu(), exp_indices)
+    torch.testing.assert_close(v_storage[:, 1].cpu(), torch.zeros(6))
+
+
+def test_any_out_accepts_a_uint8_destination(mojo_gpu):
+    """`any.out`'s dtype policy is bool-or-uint8, so a uint8 `out` is written
+    through the cast kernel rather than refused."""
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.any(mask, dim=1)
+    out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)
+    torch.any(mask.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+    with pytest.raises(RuntimeError):
+        torch.any(
+            mask.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
+        )
+
+
+def test_var_default_overloads_decompose_to_var_correction(mojo_gpu):
+    """`var(unbiased=True)` and `var.dim` are ATen composites over
+    var.correction, which is the one we register."""
+    x = torch.randn(9, 13)
+    xd = x.to(mojo_gpu)
+    torch.testing.assert_close(torch.var(xd).cpu(), torch.var(x), rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(
+        torch.var(xd, dim=1, unbiased=False).cpu(),
+        torch.var(x, dim=1, unbiased=False),
+        rtol=2e-6,
+        atol=2e-6,
+    )
+
+
 # ---------------------------------------------------------------------------
 # argmin / argmax
 #
@@ -431,8 +475,12 @@ _ARGREDUCE_FNS = (torch.argmax, torch.argmin)
 _ARGREDUCE_SPLIT_SHAPES = (4095, 4096, 8193, 1 << 20)
 
 
-def _assert_argreduce_matches(device, cpu_tensor, dim=None):
-    device_tensor = cpu_tensor.to(device)
+def _assert_argreduce_matches(device, cpu_tensor, dim=None, device_tensor=None):
+    """`device_tensor` lets a caller hand in a VIEW built on the device: a
+    strided host tensor cannot cross `_copy_from` (core group), so a strided
+    case transfers the contiguous base and slices it there."""
+    if device_tensor is None:
+        device_tensor = cpu_tensor.to(device)
     for fn in _ARGREDUCE_FNS:
         expected = fn(cpu_tensor) if dim is None else fn(cpu_tensor, dim=dim)
         actual = (
@@ -511,7 +559,9 @@ def test_argreduce_strided_axis(mojo_gpu, shape, dim):
     """Non-trailing reduce dims: the strided kernel reads the source in place
     above the coalescing floor and the materialized route runs below it."""
     generator = torch.Generator().manual_seed(20260811)
-    _assert_argreduce_matches(mojo_gpu, torch.randn(shape, generator=generator), dim=dim)
+    _assert_argreduce_matches(
+        mojo_gpu, torch.randn(shape, generator=generator), dim=dim
+    )
     _assert_argreduce_matches(mojo_gpu, torch.zeros(shape), dim=dim)
 
     with_nan = torch.randn(shape, generator=generator)
@@ -522,9 +572,17 @@ def test_argreduce_strided_axis(mojo_gpu, shape, dim):
 def test_argreduce_views_and_keepdim(mojo_gpu):
     generator = torch.Generator().manual_seed(20260811)
     base = torch.randn(64, 128, generator=generator)
-    for view in (base.t(), base[:, 3:70], base[::2, ::3]):
+    device_base = base.to(mojo_gpu)
+    views = [
+        (base.t(), device_base.t()),
+        (base[:, 3:70], device_base[:, 3:70]),
+        (base[::2, ::3], device_base[::2, ::3]),
+    ]
+    for host_view, device_view in views:
         for dim in (None, 0, 1):
-            _assert_argreduce_matches(mojo_gpu, view, dim=dim)
+            _assert_argreduce_matches(
+                mojo_gpu, host_view, dim=dim, device_tensor=device_view
+            )
 
     values = torch.randn(8, 300, 17, generator=generator)
     device_values = values.to(mojo_gpu)
@@ -645,9 +703,12 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     assert not strided.is_contiguous()
     expected = torch.linalg.vector_norm(strided)
 
+    # The transpose is taken ON the device: a strided host tensor cannot cross
+    # `_copy_from` (core group).
+    device_strided = contiguous.to(mojo_gpu).t()
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
     out_ptr = out.data_ptr()
-    returned = torch.linalg.vector_norm(strided.to(mojo_gpu), out=out)
+    returned = torch.linalg.vector_norm(device_strided, out=out)
     assert returned.data_ptr() == out_ptr
     torch.testing.assert_close(out.cpu(), expected)
 
@@ -775,9 +836,10 @@ def test_cumsum_integer_promotes_to_int64(mojo_gpu, dtype):
 
 def test_cumsum_noncontiguous_input_materializes_correctly(mojo_gpu):
     torch.manual_seed(0)
-    x = torch.randn(64, 128).t()
+    base = torch.randn(64, 128)
+    x = base.t()
     assert not x.is_contiguous()
-    result = torch.cumsum(x.to(mojo_gpu), dim=1).cpu().double()
+    result = torch.cumsum(base.to(mojo_gpu).t(), dim=1).cpu().double()
     expected = torch.cumsum(x.double(), dim=1)
     torch.testing.assert_close(result, expected, rtol=2e-3, atol=1e-2)
 
@@ -859,22 +921,14 @@ _EXPECTED_OVERLOADS = [
     ("aten::argmin", lambda d: torch.argmin(torch.randn(4, 5).to(d), dim=1)),
     ("aten::all", lambda d: torch.all(_bools().to(d))),
     ("aten::all.dim", lambda d: torch.all(_bools().to(d), dim=1)),
-    (
-        "aten::all.dims",
-        lambda d: torch.ops.aten.all.dims(_bools().to(d), [0, 1]),
-    ),
+    ("aten::all.dims", lambda d: torch.ops.aten.all.dims(_bools().to(d), [0, 1])),
     ("aten::any", lambda d: torch.any(_bools().to(d))),
     ("aten::any.dim", lambda d: torch.any(_bools().to(d), dim=1)),
-    (
-        "aten::any.dims",
-        lambda d: torch.ops.aten.any.dims(_bools().to(d), [0, 1]),
-    ),
+    ("aten::any.dims", lambda d: torch.ops.aten.any.dims(_bools().to(d), [0, 1])),
     (
         "aten::any.out",
         lambda d: torch.any(
-            _bools().to(d),
-            dim=1,
-            out=torch.empty(4, dtype=torch.bool, device=d),
+            _bools().to(d), dim=1, out=torch.empty(4, dtype=torch.bool, device=d)
         ),
     ),
     ("aten::var.correction", lambda d: torch.var(torch.randn(4, 5).to(d), dim=1)),

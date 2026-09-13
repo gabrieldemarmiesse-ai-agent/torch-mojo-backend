@@ -77,9 +77,7 @@ comptime BOOL_FULL_REDUCE_MAX = 1 << 22
 
 def _is_float3(dt: DType) -> Bool:
     """reduce_skeleton FLOAT_ONLY_DTYPES: mean, var, the L2 norm."""
-    return (
-        dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
-    )
+    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
 
 
 def _is_row_reduce(dt: DType) -> Bool:
@@ -348,11 +346,23 @@ def _permuted_contiguous(t: T, dims: List[Int]) raises -> T:
     return out.take()
 
 
-def _ready_operand(a: T, mut dims: List[Int]) raises -> Operand:
+def _ready_operand(
+    a: T, mut dims: List[Int], arg_route: Bool
+) raises -> Operand:
     """The operand and dims the kernel is called with: `a` untouched when it
     is already in a layout the kernel reads, else a permuted contiguous copy
-    whose reduce dims are the trailing ones."""
-    if _middle_direct_ok(a, dims) or (a.contig and _is_trailing(dims, a.rank)):
+    whose reduce dims are the trailing ones.
+
+    Two layouts are read in place: trailing reduce dims of a contiguous
+    operand (the ordinary rows/cols kernels) and, on an accelerator, an
+    adjacent ascending interval anywhere else (the strided-axis kernels).
+    `arg_route` picks the second gate's arg-reduction form, which adds the
+    coalescing floor its column kernel needs.
+    """
+    var direct = _arg_direct_ok(a, dims) if arg_route else _middle_direct_ok(
+        a, dims
+    )
+    if direct or (a.contig and _is_trailing(dims, a.rank)):
         return _borrow(a)
     var n = len(dims)
     var materialized = _permuted_contiguous(a, dims)
@@ -375,13 +385,13 @@ def _reduce_into(
     with_correction: Bool,
     correction: Float64,
 ) raises:
-    """One scalar reduction (or arg-reduction) into a preallocated `out`.
+    """One scalar reduction into the preallocated `dst`.
 
-    Slot list of `_rowred_spec_into_go` / `_argmin_spec_into_go` /
-    `_var_spec_into_go`: operand spec, reduce-dim tuple, keepdim, the
-    accumulator's extra payload (var's correction), output spec.
+    Slot list of `_rowred_spec_into_go` / `_var_spec_into_go`: operand spec,
+    reduce-dim tuple, keepdim, the accumulator's extra payload (var's
+    correction), output spec.
     """
-    var src = _ready_operand(a, dims)
+    var src = _ready_operand(a, dims, False)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(String(family), String(op))
@@ -408,13 +418,7 @@ def _arg_reduce_into(
 ) raises:
     """argmax / argmin: same slots as a scalar reduction, but the in-place
     route has the extra coalescing floor."""
-    var src = (
-        _borrow(a) if _arg_direct_ok(a, dims) else Operand(
-            _permuted_contiguous(a, dims), True
-        )
-    )
-    if src.owned:
-        dims = _trailing_dims(a.rank, len(dims))
+    var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(String(family), String(op))
@@ -435,13 +439,7 @@ def _min_dim_into(
     """min.dim in one call: `_min_dim_spec_into_go` fills both preallocated
     outputs, so values and indices come out of a single pass with torch's
     first-min-wins tie rule and its NaN propagation."""
-    var src = (
-        _borrow(a) if _arg_direct_ok(a, dims) else Operand(
-            _permuted_contiguous(a, dims), True
-        )
-    )
-    if src.owned:
-        dims = _trailing_dims(a.rank, len(dims))
+    var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst_v.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("reduction_ops", "MinDimSpec")
@@ -712,6 +710,29 @@ def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
+def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
+    """amax/amin/max/min over a zero-length axis: torch refuses ("Expected
+    reduction dim to have non-zero size") and so does the accumulator
+    (`errors_on_empty_axis`). Declining on the host gives the caller the
+    actionable NotImplementedError the old fast path gave, rather than the
+    kernel's own message. A reduction with no OUTPUTS is an error for nobody."""
+    var is_red = InlineArray[Bool, MAX_RANK](fill=False)
+    var extent = 1
+    for d in dims:
+        is_red[d] = True
+        extent *= t.dim(d)
+    if extent != 0:
+        return
+    var outputs = 1
+    for d in range(t.rank):
+        if not is_red[d]:
+            outputs *= t.dim(d)
+    if outputs > 0:
+        unsupported(
+            String(op) + " over a reduce dim of size 0 (torch refuses it too)"
+        )
+
+
 def _amax_amin(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
@@ -720,6 +741,7 @@ def _amax_amin(op: StaticString, args: Values, rets: Values) raises:
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
     if len(dims) == 0:
         unsupported("amax/amin with no reduce dim (a rank-0 operand)")
+    _refuse_empty_extremum(op, a, dims)
     var out = _scalar_reduction(
         "reduction_ops",
         op,
@@ -754,9 +776,8 @@ def _full_extremum(
     if a.rank == 0:
         unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)
-    var out = _scalar_reduction(
-        family, op, a, dims, False, a.stype, False, 0.0
-    )
+    _refuse_empty_extremum(op, a, dims)
+    var out = _scalar_reduction(family, op, a, dims, False, a.stype, False, 0.0)
     ret_owned(rets, 0, out)
 
 
@@ -775,7 +796,7 @@ def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _min_dim(a: T, dim: Int, keepdim: Bool) raises -> Tuple[Owned, Owned]:
+def _min_dim_gate(a: T, dim: Int) raises -> List[Int]:
     _require_mojo(a)
     if not _is_row_reduce(a.dtype):
         unsupported("min.dim of dtype " + String(a.dtype))
@@ -785,6 +806,11 @@ def _min_dim(a: T, dim: Int, keepdim: Bool) raises -> Tuple[Owned, Owned]:
         unsupported("min.dim of an empty tensor")
     var dims = List[Int]()
     dims.append(_norm_dim(dim, a.rank))
+    return dims^
+
+
+def _min_dim(a: T, dim: Int, keepdim: Bool) raises -> Tuple[Owned, Owned]:
+    var dims = _min_dim_gate(a, dim)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
@@ -809,20 +835,28 @@ def op_min_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::min.dim_min(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) min, Tensor(b!) min_indices)
 #   -> (Tensor(a!) values, Tensor(b!) indices)
-def op_min_dim_min(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def op_min_dim_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var keepdim = v_bool_or(args[unsafe_offset=2], False)
     var out_v = v_tensor(args[unsafe_offset=3])
     var out_i = v_tensor(args[unsafe_offset=4])
     _require_mojo(out_v)
     _require_mojo(out_i)
-    var pair = _min_dim(
-        v_tensor(args[unsafe_offset=0]),
-        v_int(args[unsafe_offset=1]),
-        v_bool_or(args[unsafe_offset=2], False),
-    )
-    _copy_result_into(out_v, pair[0].t)
-    _copy_result_into(out_i, pair[1].t)
+    var dims = _min_dim_gate(a, v_int(args[unsafe_offset=1]))
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    _reduced_shape(a, dims, keepdim, shape, rank)
+    var numel = _shape_numel(shape, rank)
+    if _out_ready(out_v, a, a.stype, numel) and _out_ready(
+        out_i, a, ST_INT64, numel
+    ):
+        _min_dim_into(a, dims.copy(), keepdim, out_v, out_i)
+    else:
+        var values = own(new_tensor(shape, rank, a.stype, a.device))
+        var indices = own(new_tensor(shape, rank, ST_INT64, a.device))
+        _min_dim_into(a, dims.copy(), keepdim, values.t, indices.t)
+        _copy_result_into(out_v, values.t)
+        _copy_result_into(out_i, indices.t)
     ret_ref(rets, 0, out_v)
     ret_ref(rets, 1, out_i)
 
@@ -874,7 +908,9 @@ def _bool_full_reduce(op: StaticString, a: T) raises -> Owned:
     Slots are raw pointers, not specs."""
     var src = Operand(a.copy(), False)
     if not a.contig:
-        src.replace(_permuted_contiguous(a, _trailing_dims(a.rank, a.rank)), True)
+        src.replace(
+            _permuted_contiguous(a, _trailing_dims(a.rank, a.rank)), True
+        )
     var out = own(new_tensor(IndexList[MAX_RANK](1), 0, ST_BOOL, a.device))
     var ctx = ctx_for(a.device)
     var call = KernelCall("nn_ops", String(op))
@@ -1063,9 +1099,7 @@ def op_linalg_vector_norm(
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
     var src = _borrow(a)
-    _vector_norm_operand(
-        a, args[unsafe_offset=1], args[unsafe_offset=4], src
-    )
+    _vector_norm_operand(a, args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
@@ -1093,9 +1127,7 @@ def op_linalg_vector_norm_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    _vector_norm_operand(
-        a, args[unsafe_offset=1], args[unsafe_offset=4], src
-    )
+    _vector_norm_operand(a, args[unsafe_offset=1], args[unsafe_offset=4], src)
     var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
     if len(dims) == 0:
         unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
