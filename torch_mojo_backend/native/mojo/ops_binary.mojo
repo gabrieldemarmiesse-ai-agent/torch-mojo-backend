@@ -950,6 +950,7 @@ def _b_alpha_opmath(
     _ = scaled
     var held = own(sum32.t.copy())
     var out = cast_to(held.t, result_stype)
+    _ = held  # the cast reads held.t's pointer inside a launch
     return Res(out^, True)
 
 
