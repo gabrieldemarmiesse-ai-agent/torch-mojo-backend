@@ -318,6 +318,10 @@ def build_shim() -> Path:
         "-O1",
         _cxx_standard(),
         "-fPIC",
+        "-fvisibility=hidden",  # tmb.h re-exports the C entries; 40% smaller library
+        "-fvisibility-inlines-hidden",
+        "-ffunction-sections",
+        "-fdata-sections",
         "-c",
         abi,
         f"-DTMB_TORCH_VERSION={_torch_version_number()}",
@@ -379,6 +383,7 @@ def _build_shim_locked(
     link = [
         *cxx,
         "-shared",
+        "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
         "-o",
         str(tmp),
         *[str(tmpdir / (s.stem + ".o")) for s in sources],

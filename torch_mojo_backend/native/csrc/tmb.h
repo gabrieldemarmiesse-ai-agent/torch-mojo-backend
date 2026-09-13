@@ -10,6 +10,8 @@
 #include <stdint.h>
 
 #ifdef __cplusplus
+// only the tmb_* entries are exported: the shim builds with -fvisibility=hidden
+#pragma GCC visibility push(default)
 extern "C" {
 #endif
 
@@ -177,4 +179,5 @@ int32_t tmb_call_op(const char* op, const char* overload, const TmbValue* args,
 
 #ifdef __cplusplus
 }
+#pragma GCC visibility pop
 #endif
