@@ -115,13 +115,15 @@ def _is_sum_dtype(dt: DType) -> Bool:
     return _is_float3(dt) or dt == DType.int64
 
 
-def _is_cumsum_dtype(dt: DType, is_cuda: Bool) -> Bool:
+def _is_cumsum_dtype(dt: DType, fast_ok: Bool) -> Bool:
     """cumsum_kernels CUMSUM_DTYPES, minus the bf16/f16 entries on a device
-    where the fast kernels were never measured (`fast_aten_cumsum`'s is_cuda
-    gate; the Mojo dispatch mirrors it)."""
+    where the bf16/f16 route was never measured. Measured correct on NVIDIA
+    (H100, the fast block.prefix_sum kernels) and on AMD MI300A (gfx942, the
+    portable one-thread-per-line fallback -- see `_cumsum_inner_into` /
+    `_cumsum_outer_into` in nn_ops.mojo)."""
     if dt == DType.float32 or dt == DType.int32 or dt == DType.int64:
         return True
-    return is_cuda and (dt == DType.bfloat16 or dt == DType.float16)
+    return fast_ok and (dt == DType.bfloat16 or dt == DType.float16)
 
 
 # ---------------------------------------------------------------------------
@@ -1209,25 +1211,29 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _require_mojo(a)
     if a.numel == 0 or a.rank == 0:
         unsupported("cumsum of an empty or rank-0 tensor")
-    # The fast cumsum family (block.prefix_sum INNER, the long-line workspace
-    # route, OUTER dim=0) was only ever MEASURED on NVIDIA; anything else gets
-    # exactly the pre-existing surface (int64/int32/float32, trailing dim), and
-    # the Mojo-side dispatch gates the same way.
-    var is_cuda = dev(a.device)[].api == "cuda"
+    # The bf16/f16 dtypes and the OUTER (dim=0, rank-2) route were only ever
+    # MEASURED on NVIDIA (the fast block.prefix_sum kernels) until MI300A
+    # (gfx942) measurement widened this to HIP too -- see
+    # `_cumsum_inner_into` / `_cumsum_outer_into` in nn_ops.mojo, which pick
+    # the fast CUDA kernels or the portable one-thread-per-line fallback per
+    # `ctx.api()`, both exercised here. Anything else (Metal, CPU) gets
+    # exactly the pre-existing surface (int64/int32/float32, trailing dim),
+    # and the Mojo-side dispatch gates the same way.
+    var fast_ok = dev(a.device)[].api == "cuda" or dev(a.device)[].api == "hip"
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=2])
     if want >= 0:
-        if not _is_cumsum_dtype(max_dtype(want), is_cuda):
+        if not _is_cumsum_dtype(max_dtype(want), fast_ok):
             unsupported("cumsum with dtype=" + String(max_dtype(want)))
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         # torch promotes bool / sub-int64 integer cumsum to int64.
         _promote(src, ST_INT64)
-    if not _is_cumsum_dtype(src.t.dtype, is_cuda):
+    if not _is_cumsum_dtype(src.t.dtype, fast_ok):
         unsupported("cumsum of dtype " + String(src.t.dtype))
     var dim = _norm_dim(v_int(args[unsafe_offset=1]), src.t.rank)
     var rank = src.t.rank
-    if dim != rank - 1 and not (is_cuda and rank == 2 and dim == 0):
+    if dim != rank - 1 and not (fast_ok and rank == 2 and dim == 0):
         unsupported(
             "cumsum over dim "
             + String(dim)
