@@ -275,6 +275,7 @@ def _fill(t: T, s: FillScalar) raises:
             var dense = own(new_like(t))
             _fill_contiguous(dense.t, s)
             copy_strided_into(t, dense.t)
+            _ = dense^  # alive past the launch
             return
     var ctx = ctx_for(t.device)
     var cp = ctx_ptr(ctx)
