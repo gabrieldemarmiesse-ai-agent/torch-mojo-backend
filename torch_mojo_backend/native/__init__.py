@@ -29,6 +29,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import torch
 
@@ -404,21 +405,21 @@ def op_counts() -> dict[str, int]:
 
 
 def device_count() -> int:
-    return int(_state.get("device_count", 0))
+    return cast(int, _state.get("device_count", 0))
 
 
 def shim() -> ctypes.CDLL:
     lib = _state.get("shim")
     if lib is None:
         raise RuntimeError("the mojo device is not registered yet")
-    return lib  # type: ignore[return-value]
+    return cast(ctypes.CDLL, lib)
 
 
 def backend_lib() -> ctypes.CDLL:
     lib = _state.get("backend")
     if lib is None:
         raise RuntimeError("the mojo device is not registered yet")
-    return lib  # type: ignore[return-value]
+    return cast(ctypes.CDLL, lib)
 
 
 def last_error() -> str:

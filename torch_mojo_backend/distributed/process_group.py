@@ -20,6 +20,7 @@ import os
 import sys
 import traceback
 from collections.abc import Callable
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -38,7 +39,7 @@ from torch._C._distributed_c10d import (
     ScatterOptions,
     Store,
     Work,
-    _create_work_from_future,
+    _create_work_from_future,  # ty: ignore[unresolved-import] -- in torch 2.11's C module, absent from its stub
 )
 
 from torch_mojo_backend import native
@@ -108,27 +109,6 @@ class _Core:
     """The tmb_pg_* entries of the Mojo backend, taken from its vtable
     (functions of an imported Mojo module are not exported symbols)."""
 
-    _ORDER = (
-        "create",
-        "destroy",
-        "version",
-        "unique_id",
-        "init_device",
-        "comm_stream",
-        "allreduce",
-        "broadcast",
-        "reduce",
-        "allgather",
-        "reduce_scatter",
-        "send",
-        "recv",
-        "group_start",
-        "group_end",
-        "async_error",
-        "abort",
-        "synchronize_comm",
-    )
-
     def __init__(self):
         lib = native.backend_lib()
         lib.tmb_pg_vtable.restype = ctypes.c_void_p
@@ -139,28 +119,27 @@ class _Core:
             ctypes.c_void_p,
             ctypes.c_size_t,
         )
-        protos = {
-            "create": ctypes.CFUNCTYPE(vp, ctypes.c_char_p, i32, i32),
-            "destroy": ctypes.CFUNCTYPE(None, vp),
-            "version": ctypes.CFUNCTYPE(i32, vp),
-            "unique_id": ctypes.CFUNCTYPE(i32, vp, vp),
-            "init_device": ctypes.CFUNCTYPE(i32, vp, i32, vp),
-            "comm_stream": ctypes.CFUNCTYPE(i64, vp, i32),
-            "allreduce": ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32),
-            "broadcast": ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32),
-            "reduce": ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i32),
-            "allgather": ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32),
-            "reduce_scatter": ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32, i32),
-            "send": ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32),
-            "recv": ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32),
-            "group_start": ctypes.CFUNCTYPE(i32, vp),
-            "group_end": ctypes.CFUNCTYPE(i32, vp),
-            "async_error": ctypes.CFUNCTYPE(i32, vp, i32),
-            "abort": ctypes.CFUNCTYPE(i32, vp, i32),
-            "synchronize_comm": ctypes.CFUNCTYPE(i32, vp, i32),
-        }
-        for i, name in enumerate(self._ORDER):
-            setattr(self, name, protos[name](table[i]))
+        # the order of pg.mojo's pg_vtable
+        self.create = ctypes.CFUNCTYPE(vp, ctypes.c_char_p, i32, i32)(table[0])
+        self.destroy = ctypes.CFUNCTYPE(None, vp)(table[1])
+        self.version = ctypes.CFUNCTYPE(i32, vp)(table[2])
+        self.unique_id = ctypes.CFUNCTYPE(i32, vp, vp)(table[3])
+        self.init_device = ctypes.CFUNCTYPE(i32, vp, i32, vp)(table[4])
+        self.comm_stream = ctypes.CFUNCTYPE(i64, vp, i32)(table[5])
+        self.allreduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[6])
+        self.broadcast = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[7])
+        self.reduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i32)(table[8])
+        self.allgather = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32)(table[9])
+        self.reduce_scatter = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32, i32)(
+            table[10]
+        )
+        self.send = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[11])
+        self.recv = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[12])
+        self.group_start = ctypes.CFUNCTYPE(i32, vp)(table[13])
+        self.group_end = ctypes.CFUNCTYPE(i32, vp)(table[14])
+        self.async_error = ctypes.CFUNCTYPE(i32, vp, i32)(table[15])
+        self.abort = ctypes.CFUNCTYPE(i32, vp, i32)(table[16])
+        self.synchronize_comm = ctypes.CFUNCTYPE(i32, vp, i32)(table[17])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -171,12 +150,15 @@ class MojoProcessGroup(dist.ProcessGroup):
     def __init__(
         self, store: Store, rank: int, world_size: int, timeout: datetime.timedelta
     ):
-        super().__init__(rank, world_size)
+        super().__init__(rank, world_size)  # ty: ignore[missing-argument, invalid-argument-type] -- the 2-arg base ctor is the one a Python subclass can use
         self._store = store
         self._timeout = timeout
         # CPU tensors (object collectives, barriers on CPU groups) go to gloo.
-        self._gloo = dist.ProcessGroupGloo(
-            PrefixStore("mojo-cpu-gloo", store), rank, world_size, timeout
+        self._gloo = cast(
+            dist.ProcessGroup,  # the gloo stub declares none of the collectives; the base class does
+            dist.ProcessGroupGloo(
+                PrefixStore("mojo-cpu-gloo", store), rank, world_size, timeout
+            ),
         )
         self._core = _Core()
         self._path = nccl.library_path()

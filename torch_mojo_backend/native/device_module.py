@@ -13,6 +13,8 @@ import torch
 
 from torch_mojo_backend import native
 
+_PRIVATEUSE1 = 20  # c10::DeviceType::PrivateUse1
+
 DeviceLike = "int | str | torch.device | None"
 
 
@@ -151,10 +153,9 @@ def current_stream(device: int | str | torch.device | None = None) -> torch.Stre
 
 
 def default_stream(device: int | str | torch.device | None = None) -> torch.Stream:
-    return (
-        torch.Stream(device=torch.device(f"mojo:{_index(device)}"), stream_id=0)
-        if hasattr(torch.Stream, "stream_id")
-        else current_stream(device)
+    """Stream id 0 is every device's default stream."""
+    return torch.Stream(
+        stream_id=0, device_index=_index(device), device_type=_PRIVATEUSE1
     )
 
 
