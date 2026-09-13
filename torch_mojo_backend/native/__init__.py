@@ -199,6 +199,13 @@ def autocast_policy_table() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _torch_version_number() -> int:
+    """major * 100 + minor of the torch in use, for `#if` in the shim (the
+    wheels ship no torch/version.h)."""
+    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+
+
 def _cxx_standard() -> str:
     """torch 2.14's headers need C++20 (std::strong_ordering, requires
     clauses); older releases compile as C++17, which keeps older compilers
@@ -307,7 +314,15 @@ def build_shim() -> Path:
     headers = sorted(_CSRC.glob("*.h"))
     cxx = _cxx()
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
-    cflags = ["-O1", _cxx_standard(), "-fPIC", "-c", abi, *_torch_include_flags()]
+    cflags = [
+        "-O1",
+        _cxx_standard(),
+        "-fPIC",
+        "-c",
+        abi,
+        f"-DTMB_TORCH_VERSION={_torch_version_number()}",
+        *_torch_include_flags(),
+    ]
     key = _hash_files(
         sources + headers,
         toolchain_identity()

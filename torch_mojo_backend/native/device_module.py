@@ -172,6 +172,16 @@ def default_stream(device: int | str | torch.device | None = None) -> torch.Stre
     )
 
 
+def stream_native_handle(stream: torch.Stream) -> int:
+    """The vendor (CUDA/HIP) handle of a mojo stream, for code that launches
+    on it outside torch (Triton). `torch.Stream.native_handle` is the same
+    value on torch >= 2.11; this works on any version."""
+    fn = native.shim().tmb_stream_native_handle
+    fn.restype = ctypes.c_void_p
+    fn.argtypes = [ctypes.c_int32, ctypes.c_int64]
+    return fn(stream.device_index, stream.stream_id) or 0
+
+
 def set_stream(stream: torch.Stream):
     torch.accelerator.set_stream(stream)
 

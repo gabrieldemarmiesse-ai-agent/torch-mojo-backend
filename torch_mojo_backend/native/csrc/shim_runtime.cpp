@@ -275,10 +275,12 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     tls_stream_slot(i) = s.id();
     return old;
   }
+#if TMB_TORCH_VERSION >= 211  // torch.Stream.native_handle exists from 2.11
   void* getStreamNativeHandle(const c10::Stream s) const override {
     Lock g(tmb_mutex);
     return H.stream_native_handle(s.device_index(), s.id());
   }
+#endif
   c10::DeviceIndex deviceCount() const noexcept override {
     return tmb_ready ? static_cast<c10::DeviceIndex>(H.device_count()) : 0;
   }
@@ -423,6 +425,10 @@ int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
 void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
+void* tmb_stream_native_handle(int32_t device, int64_t stream) {
+  Lock g(tmb_mutex);
+  return H.stream_native_handle(device, stream);
+}
 int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }

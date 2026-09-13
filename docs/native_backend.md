@@ -237,6 +237,22 @@ exposed (`tmb_pg_async_error`) for a watchdog but nothing polls it. The
 out (16 words after the register arguments), so other architectures are
 refused at construction.
 
+## Triton
+
+Triton kernels run on mojo tensors with only the CPU torch wheel and the
+`triton` wheel installed: Triton compiles and launches through its own CUDA
+backend (bundled `ptxas`, `libcuda` from the display driver) and asks torch
+only which device and stream are current, through a driver object.
+`torch_mojo_backend.triton_driver.enable_triton()` installs a driver that
+answers with the mojo device and the vendor handle of its current stream
+(`torch.Stream.native_handle`), so a launch is ordered with our kernels on
+that stream. The CUDA device ordinal is the mojo device index. Checked with
+the Triton tutorial add kernel and Liger-Kernel's RMSNorm forward/backward
+(a package written against `torch.cuda`; its own `device.type == "cuda"`
+branches fall back to generic paths on "mojo", e.g. one SM's worth of
+partial weight gradients). NVIDIA only: Triton's AMD backend would need the
+same driver over the HIP handles.
+
 ## Profiling
 
 The shim registers torch's PrivateUse1 `ProfilerStubs` over the backend's
