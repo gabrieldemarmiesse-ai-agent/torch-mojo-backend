@@ -21,6 +21,10 @@ from op_utils import Argv
 
 comptime CACHE_ABI = "native-v1"
 
+# Package directories beside eager_kernels that also hold kernel families
+# (see `Loader.family_dir`).
+comptime SIBLING_ROOTS = ["eager_flash_attention"]
+
 
 def _fnv1a(mut h: UInt64, bytes: Span[UInt8, _]):
     for i in range(len(bytes)):
@@ -79,11 +83,28 @@ struct Loader(Movable):
         self.failures = Dict[String, String]()
         self.source_hashes = Dict[String, String]()
 
+    def family_dir(self, family: String) raises -> String:
+        """The directory holding `<family>.mojo`.
+
+        Normally `<kernels_dir>/<family>`. The vendored FlashAttention-4
+        package is the one family that lives in its own directory beside
+        eager_kernels (so a FA4 change does not rehash every ordinary
+        family), so a family whose entry file is not under the kernels root
+        is looked up in the sibling roots below."""
+        var here = self.kernels_dir + "/" + family
+        if exists(here + "/" + family + ".mojo"):
+            return here
+        comptime for root in SIBLING_ROOTS:
+            var d = self.kernels_dir + "/../" + String(root)
+            if exists(d + "/" + family + ".mojo"):
+                return d
+        return here
+
     def _closure(self, family: String) raises -> List[String]:
         """Every .mojo file the family's entry file reaches through
         `from X import` / `import X` (resolved in the family dir, then the
         package root), plus every op_utils/*.mojo, in a deterministic order."""
-        var fam_dir = self.kernels_dir + "/" + family
+        var fam_dir = self.family_dir(family)
         var files = List[String]()
         var seen = Dict[String, Bool]()
         var todo = List[String]()
@@ -156,7 +177,7 @@ struct Loader(Movable):
     def _build(
         mut self, family: String, defines: List[String], out_path: String
     ) raises:
-        var fam_dir = self.kernels_dir + "/" + family
+        var fam_dir = self.family_dir(family)
         var src = fam_dir + "/" + family + ".mojo"
         var tmp = out_path + ".tmp" + String(perf_counter_ns())
         var cmd = (
