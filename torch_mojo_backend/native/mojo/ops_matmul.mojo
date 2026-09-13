@@ -77,14 +77,15 @@ def _zeros(dims: List[Int], stype: Int32, device: Int) raises -> T:
 
 
 def _empty_result(stype: Int32, device: Int) raises -> T:
-    """The stand-in for an output the caller did not ask for.
-
-    The old Python path returned `None`, which torch turned into an undefined
-    Tensor; the record ABI cannot spell an undefined at::Tensor, so an
-    unrequested result comes back as a 0-element tensor instead (the
-    generated autograd node never reads it).
-    """
+    """Placeholder for an output computed only when requested."""
     return _new([0], stype, device)
+
+
+def _ret_undefined(rets: Values, i: Int):
+    """An output the caller did not ask for: a None record, which the shim
+    hands back as an undefined Tensor exactly like ATen's own backward
+    kernels (the generated autograd node never reads it)."""
+    rets[unsafe_offset=i] = Value(TAG_NONE, 0, 0, 0)
 
 
 def _view(t: T, dims: List[Int]) raises -> T:
@@ -1073,7 +1074,7 @@ def op_linear_backward(
     var device = input.device
     if not mask[0] and not mask[1] and not mask[2]:
         for i in range(3):
-            ret_tensor(rets, i, _empty_result(stype, device))
+            _ret_undefined(rets, i)
         return
 
     var rows = _prod(_leading_dims(input)) if input.rank > 1 else 1
@@ -1088,7 +1089,7 @@ def op_linear_backward(
         if mask[0]:
             ret_tensor(rets, 0, _zeros(input.logical_shape(), stype, device))
         else:
-            ret_tensor(rets, 0, _empty_result(stype, device))
+            _ret_undefined(rets, 0)
         if need_params:
             ret_tensor(rets, 1, _zeros(w.logical_shape(), stype, device))
             if mask[2]:
@@ -1096,8 +1097,8 @@ def op_linear_backward(
             else:
                 ret_tensor(rets, 2, _new([out_features], stype, device))
         else:
-            ret_tensor(rets, 1, _empty_result(stype, device))
-            ret_tensor(rets, 2, _empty_result(stype, device))
+            _ret_undefined(rets, 1)
+            _ret_undefined(rets, 2)
         return
 
     var grad_c = Tmp(grad)
@@ -1136,9 +1137,16 @@ def op_linear_backward(
             grad_bias = own(_new([out_features], stype, device))
 
     _ = grad_c^
-    ret_owned(rets, 0, grad_input)
-    ret_owned(rets, 1, grad_weight)
-    ret_owned(rets, 2, grad_bias)
+    if mask[0]:
+        ret_owned(rets, 0, grad_input)
+    else:
+        _ret_undefined(rets, 0)
+    if need_params:
+        ret_owned(rets, 1, grad_weight)
+        ret_owned(rets, 2, grad_bias)
+    else:
+        _ret_undefined(rets, 1)
+        _ret_undefined(rets, 2)
 
 
 # --- aten::addr ---------------------------------------------------------------
@@ -1223,22 +1231,38 @@ def _addr_composite(
     var outer = own(
         _call_1("aten::outer", "", _tensor_arg(vec1), _tensor_arg(vec2))
     )
+    # Every Owned below stays alive past the call that reads its `.t`: Mojo
+    # destroys a value at its last use, which would otherwise be the argument
+    # read, before the dispatcher runs.
     if beta_v == 0.0:
         if alpha_v == 1.0:
             return outer.take()
-        return _call_1("aten::mul", "Scalar", _tensor_arg(outer.t), alpha)
+        var r = _call_1("aten::mul", "Scalar", _tensor_arg(outer.t), alpha)
+        _ = outer^
+        return r^
     if alpha_v == 1.0:
         if beta_v == 1.0:
-            return _add_or_raise(self, outer.t)
+            var r = _add_or_raise(self, outer.t)
+            _ = outer^
+            return r^
         var lhs = own(_call_1("aten::mul", "Scalar", _tensor_arg(self), beta))
-        return _add_or_raise(lhs.t, outer.t)
+        var r = _add_or_raise(lhs.t, outer.t)
+        _ = lhs^
+        _ = outer^
+        return r^
     var scaled = own(
         _call_1("aten::mul", "Scalar", _tensor_arg(outer.t), alpha)
     )
+    _ = outer^
     if beta_v == 1.0:
-        return _add_or_raise(self, scaled.t)
+        var r = _add_or_raise(self, scaled.t)
+        _ = scaled^
+        return r^
     var lhs = own(_call_1("aten::mul", "Scalar", _tensor_arg(self), beta))
-    return _add_or_raise(lhs.t, scaled.t)
+    var r = _add_or_raise(lhs.t, scaled.t)
+    _ = lhs^
+    _ = scaled^
+    return r^
 
 
 # aten::addr(Tensor self, Tensor vec1, Tensor vec2, *, Scalar beta=1,

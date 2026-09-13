@@ -191,7 +191,9 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
 }
 
 c10::IValue from_record(const c10::TypePtr& type, const TmbValue& r) {
-  if (r.tag == TMB_NONE) return c10::IValue();
+  // a None record for a Tensor result is an undefined Tensor (a masked-off
+  // gradient, as ATen's own backward kernels return it); None otherwise
+  if (r.tag == TMB_NONE) return type->kind() == c10::TypeKind::TensorType ? c10::IValue(at::Tensor()) : c10::IValue();
   switch (type->kind()) {
     case c10::TypeKind::OptionalType:
       return from_record(type->castRaw<c10::OptionalType>()->getElementType(), r);
