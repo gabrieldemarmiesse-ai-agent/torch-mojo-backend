@@ -15,6 +15,7 @@ from torch_mojo_backend.triton_driver import enable_triton
 
 triton = pytest.importorskip("triton")
 tl = pytest.importorskip("triton.language")
+from torch._library.triton import triton_op, wrap_triton  # noqa: E402 -- after the skip
 
 
 @pytest.fixture
@@ -131,7 +132,6 @@ def _plain_scale_kernel(x_ptr, out_ptr, n, factor, BLOCK: tl.constexpr):
 def test_triton_op_traces_under_dynamo(mojo_triton):
     """torch.library.triton_op: a Triton kernel as a custom op that dynamo
     traces through wrap_triton; eager and under the eager/aot_eager backends."""
-    from torch._library.triton import triton_op, wrap_triton
 
     @triton_op("mojo_test::scale", mutates_args={})
     def scale(x: torch.Tensor, factor: float) -> torch.Tensor:
