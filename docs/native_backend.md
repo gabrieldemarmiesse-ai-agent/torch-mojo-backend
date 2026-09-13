@@ -237,6 +237,21 @@ exposed (`tmb_pg_async_error`) for a watchdog but nothing polls it. The
 out (16 words after the register arguments), so other architectures are
 refused at construction.
 
+## Supported torch versions
+
+Checked with the CPU wheels of torch 2.7.1, 2.8.0, 2.9.1, 2.10.0, 2.11.0,
+2.12.1, 2.13.0 and 2.14.0 on an H100 (MAX 26.5, Mojo 1.0, Python 3.12):
+device registration, ops with autograd against CPU, autocast, streams and
+events, the profiler, a fused-AdamW training step, seeded RNG,
+torch.compile through the mojo backend, and the two-rank collective check
+with NCCL and with the Mojo collectives. Version-specific pieces: the shim
+compiles as C++20 from torch 2.14 (its headers require it) and C++17
+before; the guard method behind `torch.Stream.native_handle` exists from
+2.11, so code that needs a stream's vendor handle uses
+`torch.mojo.stream_native_handle` instead. torch 2.6 and older cannot
+import the package: MAX 26.5's torch interop (`max.experimental.torch`,
+used by the torch.compile backend) references a dtype added in 2.7.
+
 ## Triton
 
 Triton kernels run on mojo tensors with only the CPU torch wheel and the
