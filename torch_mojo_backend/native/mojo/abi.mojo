@@ -186,6 +186,43 @@ def is_floating(stype: Int32) -> Bool:
     )
 
 
+def dtype_name(stype: Int32) -> String:
+    """What `caffe2::TypeMeta` streams into a torch error message.
+
+    It is the demangled C++ type behind the ScalarType, not the python
+    `torch.float32` spelling, so an `out=` message raised here reads exactly
+    like CPU torch's. The integer spellings are gcc's; clang writes `short`
+    where gcc writes `short int`.
+    """
+    if stype == ST_FLOAT32:
+        return String("float")
+    if stype == ST_FLOAT64:
+        return String("double")
+    if stype == ST_FLOAT16:
+        return String("c10::Half")
+    if stype == ST_BFLOAT16:
+        return String("c10::BFloat16")
+    if stype == ST_BOOL:
+        return String("bool")
+    if stype == ST_INT8:
+        return String("signed char")
+    if stype == ST_UINT8:
+        return String("unsigned char")
+    if stype == ST_INT16:
+        return String("short int")
+    if stype == ST_UINT16:
+        return String("short unsigned int")
+    if stype == ST_INT32:
+        return String("int")
+    if stype == ST_UINT32:
+        return String("unsigned int")
+    if stype == ST_INT64:
+        return String("long int")
+    if stype == ST_UINT64:
+        return String("long unsigned int")
+    return String("ScalarType ") + String(stype)
+
+
 # --- errors -------------------------------------------------------------------
 comptime UNSUPPORTED_PREFIX = "[unsupported] "
 

@@ -165,6 +165,20 @@ local's address, hand it over as an Int and let the local die before the
 call: the slot then reads freed memory (this produced the first segfault of
 this backend). `KernelCall` owns specs, tuples and slots until `run()`
 returns; keep the `DeviceContext` alive with `_ = ctx` after the call.
+The same rule bites through `Owned`: reading `held.t` copies a *non-owning*
+`T` out, so `f(held.t)` is `held`'s last use and the tensor can be released
+-- its storage freed, stream-ordered at that earlier point in the stream, so
+the next allocation may legally take the block -- before `f` launches
+anything. Write `_ = held^` after the consuming call.
+
+**`out=` variants.** `check_out(dest, like)` first: torch's generated
+`resize_out` requires the caller's tensor to ALREADY carry the result's dtype
+and device and never casts, and checking before any kernel makes a bad `out`
+free. `like` is the input the structured meta function takes its
+`TensorOptions` from, which is not always argument 0 (`mm` uses `self`, `bmm`
+uses `mat2`, `addmm` uses `mat1`). Then `resize_out` when only the shape
+differs -- a correctly shaped `out` keeps its own strides and storage offset
+-- then copy into it and `ret_ref` it back.
 
 **Declining.** `unsupported("why")` raises with a prefix the entry turns into
 rc 2 = `NotImplementedError` in Python; any other `Error` is a
