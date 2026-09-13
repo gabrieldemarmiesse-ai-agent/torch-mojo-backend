@@ -20,12 +20,15 @@ from abi import (
     T,
     TAG_BOOL_LIST,
     TAG_NONE,
+    TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     TAG_TENSOR,
     Value,
     Values,
     bits_f64,
     contiguous_strides,
     dtype_code,
+    f64_bits,
     new_like,
     new_tensor,
     own,
@@ -46,6 +49,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK, _f64_slot
 from ops_common import (
+    call_op,
     cast_to,
     contiguous,
     copy_strided_into,
@@ -792,6 +796,97 @@ def _bn_param(t: T, a: T, channels: Int, what: StaticString) raises:
         )
 
 
+def _nn_arg(t: T) -> Value:
+    return Value(TAG_TENSOR, 0, Int64(t.h), 0)
+
+
+def _nn_call1(
+    name: StaticString, overload: StaticString, var args: List[Value]
+) raises -> T:
+    """One aten op through the dispatcher, one owned Tensor result.
+
+    Mojo destroys a value right after its last use and reading `.t` off an
+    `Owned` ends the borrow, so an intermediate handed in here must be kept
+    alive past the call by the caller (`_ = x.t.h` after it) -- same rule as
+    ops_composed.mojo, where the composed formulas live.
+    """
+    var rets = call_op(String(name), String(overload), args^, 1)
+    return rets.take_tensor(0)
+
+
+def _bn_set_saved_stats(rets: Values, mean: T, var_t: T, eps: Float64) raises:
+    """Results 1 and 2 of an inference batch norm: a copy of `running_mean`
+    and `rsqrt(running_var + eps)`.
+
+    ATen does not leave these empty (`batch_norm_cuda_out`,
+    ATen/native/cuda/Normalization.cu): the autograd formula of
+    `_native_batch_norm_legit_no_training` forwards both into
+    `native_batch_norm_backward`, which is how a frozen BatchNorm still
+    yields gradients. The accelerator kernel emits them as part of its pass;
+    the CPU one does not, so they are composed through the dispatcher.
+    """
+    var save_mean = own(
+        _nn_call1("aten::clone", "", [_nn_arg(mean), Value(TAG_NONE, 0, 0, 0)])
+    )
+    var shifted = own(
+        _nn_call1(
+            "aten::add",
+            "Scalar",
+            [
+                _nn_arg(var_t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(eps), 0),
+                Value(TAG_SCALAR_INT, 0, 1, 0),
+            ],
+        )
+    )
+    var save_invstd = own(_nn_call1("aten::rsqrt", "", [_nn_arg(shifted.t)]))
+    _ = shifted.t.h
+    ret_owned(rets, 1, save_mean)
+    ret_owned(rets, 2, save_invstd)
+
+
+def _bn_inference_cpu(
+    rets: Values, a: T, gamma: T, beta: T, mean: T, var_t: T, eps: Float64
+) raises:
+    """The MAX CPU device's inference route: nn_ops `BatchNormSpec`, one
+    elementwise pass over the whole tensor."""
+    if (
+        mean.stype != a.stype
+        or var_t.stype != a.stype
+        or gamma.stype != a.stype
+        or beta.stype != a.stype
+    ):
+        # `_batch_norm_spec_into_go` carries a single dtype for the input and
+        # every parameter; only the accelerator kernel takes them apart.
+        unsupported(
+            "batch norm on the CPU device needs the running statistics and"
+            " the affine parameters in the input's own dtype"
+        )
+    var am = _mat(a)
+    var out = own(new_like(a))
+    var ctx = ctx_for(a.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("nn_ops", "BatchNormSpec")
+    call.arg_dtype(0, a.dtype)
+    call.arg_dtype(1, mean.dtype)
+    call.arg_dtype(2, var_t.dtype)
+    call.arg_dtype(3, gamma.dtype)
+    call.arg_dtype(4, beta.dtype)
+    call.out_dtype(out.t.dtype)
+    call.spec(am.t.spec(cp))
+    call.spec(mean.spec(cp))
+    call.spec(var_t.spec(cp))
+    call.spec(gamma.spec(cp))
+    call.spec(beta.spec(cp))
+    call.f64(eps)
+    call.spec(out.t.spec(cp))
+    call.run()
+    _ = am.t.ptr
+    _ = ctx
+    ret_owned(rets, 0, out)
+    _bn_set_saved_stats(rets, mean, var_t, eps)
+
+
 def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     """`training=False` batch norm: one elementwise pass that also emits the
     two saved statistics torch's CUDA path fills (Normalization.cu:454)."""
@@ -799,12 +894,6 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     _require_mojo(a, "batch norm")
     if not _is_float(a.dtype):
         unsupported("batch norm of dtype " + String(a.dtype))
-    if not _on_gpu(a):
-        # The Python path had two CPU routes, both of which needed
-        # clone/add/rsqrt to build the saved statistics the kernel emits on
-        # the GPU. Those are other groups' ops; declining keeps this file
-        # free of a cross-group composition.
-        unsupported("batch norm needs an accelerator")
     var channels = _bn_channels(a)
     if (
         v_is_none(args[unsafe_offset=1])
@@ -827,6 +916,9 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     _bn_param(var_t, a, channels, "batch norm running_var")
     if mean.stype != var_t.stype or gamma.stype != beta.stype:
         unsupported("batch norm: running statistics (and affine) must pair up")
+    if not _on_gpu(a):
+        _bn_inference_cpu(rets, a, gamma, beta, mean, var_t, eps)
+        return
     var inner = 1
     for i in range(2, a.rank):
         inner *= a.dim(i)

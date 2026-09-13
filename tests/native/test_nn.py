@@ -385,6 +385,40 @@ def test_batch_norm_inference(mojo_gpu, call_checker: CallChecker, dtype):
     )
 
 
+def test_batch_norm_inference_uniform_dtype(mojo_device, call_checker: CallChecker):
+    """Inference batch norm with every parameter in the input's own dtype.
+
+    That is the shape nn_ops' `BatchNormSpec` takes, which is the MAX CPU
+    device's only route (its accelerator twin carries the input, the
+    statistics and the affine dtypes apart, as `test_batch_norm_inference`
+    covers). The two saved statistics come out of a composition there, not
+    out of the kernel, so they are checked on both devices.
+    """
+    call_checker.register(aten_functions.aten_native_batch_norm)
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, 5, 7)
+    weight = torch.randn(8)
+    bias = torch.randn(8)
+    running_mean = torch.randn(8)
+    running_var = torch.rand(8) + 0.5
+    args = (weight, bias, running_mean, running_var)
+    want = torch.ops.aten.native_batch_norm(x, *args, False, 0.1, 1e-5)
+    dev = [t.to(mojo_device) for t in args]
+    got = torch.ops.aten.native_batch_norm(x.to(mojo_device), *dev, False, 0.1, 1e-5)
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-5, rtol=1e-5)
+    # CPU torch returns the two saved statistics empty for an inference batch
+    # norm; the CUDA kernel fills them (ATen/native/cuda/Normalization.cu) and
+    # so must we, because the autograd formula of the frozen op forwards them
+    # into native_batch_norm_backward.
+    torch.testing.assert_close(got[1].cpu(), running_mean, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        got[2].cpu(), torch.rsqrt(running_var + 1e-5), atol=1e-5, rtol=1e-5
+    )
+    # training=False never touches the running statistics.
+    torch.testing.assert_close(dev[2].cpu(), running_mean, atol=0, rtol=0)
+    torch.testing.assert_close(dev[3].cpu(), running_var, atol=0, rtol=0)
+
+
 def test_batch_norm_module_inference(mojo_gpu):
     x = torch.randn(2, 64, 14, 14)
     bn = torch.nn.BatchNorm2d(64).eval()
