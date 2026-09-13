@@ -31,6 +31,7 @@ from ops_matmul import register_matmul
 from ops_nn import register_nn
 from ops_reductions import register_reductions
 from ops_unary import register_unary
+from pg import pg_vtable
 from registry import Lib, impl
 
 
@@ -94,3 +95,11 @@ def tmb_native_init(
     except e:
         set_shim_error(String(e))
         return -1
+
+
+@export
+def tmb_pg_vtable() abi("C") -> Int:
+    """Addresses of the process-group entries (pg.mojo pg_vtable order):
+    functions of an imported module are not exported from the library, so
+    Python takes them from this table."""
+    return Int(pg_vtable())

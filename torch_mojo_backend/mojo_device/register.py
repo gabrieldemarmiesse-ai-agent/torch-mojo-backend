@@ -3,6 +3,7 @@
 import torch
 
 from torch_mojo_backend import native
+from torch_mojo_backend.distributed import register_distributed_backend
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 from torch_mojo_backend.native import device_module
 
@@ -25,4 +26,5 @@ def register_mojo_devices():
     torch.utils.generate_methods_for_privateuse1_backend()
     native.register()
     warn_if_gpu_torch_on_hip()
+    register_distributed_backend()
     _registered = True

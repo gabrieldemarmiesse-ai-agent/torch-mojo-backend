@@ -127,7 +127,9 @@ def autocast_policy_table() -> str:
             raise RuntimeError(f"{macro} not found in ATen/autocast_mode.h")
         end = header.find("\n\n", start)
         block = header[start:end].replace("\\\n", " ")
-        for m in re.finditer(r"_\(\s*([A-Za-z0-9_]+)\s*(?:,\s*([A-Za-z0-9_]+))?\s*\)", block):
+        for m in re.finditer(
+            r"_\(\s*([A-Za-z0-9_]+)\s*(?:,\s*([A-Za-z0-9_]+))?\s*\)", block
+        ):
             name = f"aten::{m.group(1)}" + (f".{m.group(2)}" if m.group(2) else "")
             lines.append(f'{{"{name}", {policy}}},')
     return "\n".join(lines) + "\n"
@@ -211,6 +213,7 @@ def _build_shim_locked(
     torch_lib = Path(torch.__file__).parent / "lib"
     tmpdir = _CACHE_DIR / f".shim-{os.getpid()}-{key}"
     tmpdir.mkdir(exist_ok=True)
+    (tmpdir / "tmb_autocast_policies.inc").write_text(autocast_policy_table())
     procs = []
     for src in sources:
         obj = tmpdir / (src.stem + ".o")
@@ -218,7 +221,7 @@ def _build_shim_locked(
             (
                 src,
                 subprocess.Popen(
-                    [*cxx, *cflags, str(src), "-o", str(obj)],
+                    [*cxx, *cflags, f"-I{tmpdir}", str(src), "-o", str(obj)],
                     stderr=subprocess.PIPE,
                     text=True,
                 ),
@@ -305,6 +308,62 @@ def _build_backend_locked(key: str, out: Path) -> Path:
     return out
 
 
+def _mojo_import_closure(entry: Path, roots: list[Path]) -> list[Path]:
+    """Every .mojo file `entry` reaches through top-level imports resolved in
+    `roots` (the same rule the Mojo loader uses for kernel families)."""
+    seen: dict[Path, None] = {}
+    todo = [entry.resolve()]
+    while todo:
+        f = todo.pop()
+        if f in seen or not f.exists():
+            continue
+        seen[f] = None
+        for line in f.read_text().splitlines():
+            m = re.match(r"^(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if not m or m.group(1) in ("std", "max", "nn", "linalg", "layout"):
+                continue
+            for root in [f.parent, *roots]:
+                cand = root / f"{m.group(1)}.mojo"
+                if cand.exists():
+                    todo.append(cand.resolve())
+                    break
+    return sorted(seen)
+
+
+def build_library(
+    entry: Path, roots: list[Path] | None = None, defines: dict[str, str] | None = None
+) -> Path:
+    """Compile a plain Mojo shared library (a C-ABI export set, e.g. the mojoccl
+    collectives) once per closure/toolchain, cached like the backend."""
+    roots = [entry.parent, *(roots or [])]
+    closure = _mojo_import_closure(entry, roots)
+    tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))
+    key = _hash_files(closure, toolchain_identity() + "|" + tag)
+    out = _CACHE_DIR / f"lib{entry.stem}.hash-{key}.so"
+    if out.exists():
+        return out
+    with _build_lock(out.name):
+        if out.exists():
+            return out
+        t0 = time.monotonic()
+        tmp = _CACHE_DIR / f".{entry.stem}-{os.getpid()}-{key}.so"
+        cmd = [_find_mojo(), "build", str(entry), "--emit", "shared-lib"]
+        for root in roots:
+            cmd += ["-I", str(root)]
+        for k, v in sorted((defines or {}).items()):
+            cmd += ["-D", f"{k}={v}"]
+        cmd += ["-o", str(tmp)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"building {entry.name} failed:\n" + proc.stdout + proc.stderr
+            )
+        _atomic_install(tmp, out)
+        _trace(f"built {entry.name} in {time.monotonic() - t0:.2f}s")
+        return out
+
+
 def _load(path: Path, mode: int) -> ctypes.CDLL:
     return ctypes.CDLL(str(path), mode=mode)
 
@@ -353,6 +412,20 @@ def shim() -> ctypes.CDLL:
     if lib is None:
         raise RuntimeError("the mojo device is not registered yet")
     return lib  # type: ignore[return-value]
+
+
+def backend_lib() -> ctypes.CDLL:
+    lib = _state.get("backend")
+    if lib is None:
+        raise RuntimeError("the mojo device is not registered yet")
+    return lib  # type: ignore[return-value]
+
+
+def last_error() -> str:
+    """The shim's thread-local error message (set by the last failing call)."""
+    fn = shim().tmb_get_error
+    fn.restype = ctypes.c_char_p
+    return (fn() or b"").decode()
 
 
 def register():

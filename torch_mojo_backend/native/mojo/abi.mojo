@@ -6,6 +6,7 @@ Tensors travel as `at::Tensor*` handles; what an op needs about one is read
 once into a `T` view through the shim's C getters.
 """
 from std.ffi import c_char, external_call
+from std.sys._libc import free as libc_free
 from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
 from std.utils import IndexList
@@ -852,3 +853,64 @@ def op_address[op: OpFn]() -> Int:
         Int32,
     ) thin abi("C") -> Int32 = op_entry[op]
     return Pointer(to=f).unsafe_bitcast[Int]()[]
+
+
+# --- calling other aten ops (composites, CPU-side work) ------------------------
+
+
+def tensor_arg(t: T) -> Value:
+    return Value(TAG_TENSOR, 0, Int64(t.h), 0)
+
+
+def bool_arg(b: Bool) -> Value:
+    return Value(TAG_BOOL, 0, Int64(1) if b else Int64(0), 0)
+
+
+def int_arg(x: Int) -> Value:
+    return Value(TAG_INT, 0, Int64(x), 0)
+
+
+def none_arg() -> Value:
+    return Value(TAG_NONE, 0, 0, 0)
+
+
+def call_op(
+    op: StaticString, overload: StaticString, args: List[Value], n_rets: Int
+) raises -> List[Value]:
+    """Run any aten op through torch's dispatcher (shim tmb_call_op). Tensor
+    results come back as owned handles: `release_results` them or keep them."""
+    var rets = List[Value](capacity=max(n_rets, 1))
+    for _ in range(n_rets):
+        rets.append(none_arg())
+    var o = String(op)
+    var ov = String(overload)
+    var rc = external_call["tmb_call_op", Int32](
+        o.as_c_string_slice().unsafe_ptr(),
+        ov.as_c_string_slice().unsafe_ptr(),
+        args.unsafe_ptr(),
+        Int32(len(args)),
+        rets.unsafe_ptr(),
+        Int32(n_rets),
+    )
+    if rc == 2:
+        unsupported(shim_error())
+    if rc != 0:
+        raise Error(op, ": ", shim_error())
+    return rets^
+
+
+def release_results(rets: List[Value]):
+    for r in rets:
+        if r.tag == TAG_TENSOR:
+            release(Int(r.a))
+        elif r.tag == TAG_TENSOR_LIST:
+            var ptrs = Pointer[Int, MutUntrackedOrigin](
+                unsafe_from_address=Int(r.a)
+            )
+            for i in range(Int(r.len)):
+                release(ptrs[unsafe_offset=i])
+            libc_free(
+                ptrs.unsafe_bitcast[NoneType]().unsafe_origin_cast[
+                    MutAnyOrigin
+                ]()
+            )
