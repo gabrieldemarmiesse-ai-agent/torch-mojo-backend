@@ -127,7 +127,7 @@ def _bind_mojo(driver: GPUDriver):
     driver.get_current_stream = _current_stream_handle
 
 
-def _cuda_driver() -> DriverBase:
+def _cuda_driver_class() -> type[DriverBase]:
     from triton.backends.nvidia.driver import (  # noqa: PLC0415 -- triton is optional
         CudaDriver,
         CudaLauncher,
@@ -155,10 +155,10 @@ def _cuda_driver() -> DriverBase:
         def get_empty_cache_for_benchmark(self) -> torch.Tensor:
             return torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device="mojo")
 
-    return MojoCudaDriver()
+    return MojoCudaDriver
 
 
-def _hip_driver() -> DriverBase:
+def _hip_driver_class() -> type[DriverBase]:
     """The AMD counterpart; its target comes from the HIP driver API
     (`utils.get_device_properties`), so nothing else changes. Untested here:
     written from Triton's AMD driver, no AMD GPU was available."""
@@ -187,19 +187,27 @@ def _hip_driver() -> DriverBase:
         def get_empty_cache_for_benchmark(self) -> torch.Tensor:
             return torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device="mojo")
 
-    return MojoHipDriver()
+    return MojoHipDriver
 
 
-def make_driver() -> DriverBase:
-    """A Triton driver for the mojo device, for the vendor MAX drives."""
+@functools.cache
+def driver_class() -> type[DriverBase]:
+    """The mojo Triton driver class for the vendor MAX drives. Cached: it is
+    also the class of the registered Triton backend
+    (`monkeypatching.register_the_mojo_triton_target`), which Triton compares
+    the active driver against with `isinstance`."""
     api = accelerator_api()
     if api == "cuda":
-        return _cuda_driver()
+        return _cuda_driver_class()
     if api == "hip":
-        return _hip_driver()
+        return _hip_driver_class()
     raise RuntimeError(
         f"Triton has no backend for the mojo device's {api!r} accelerator"
     )
+
+
+def make_driver() -> DriverBase:
+    return driver_class()()
 
 
 def enable_triton():

@@ -36,6 +36,7 @@ from abi import (
     own,
     release,
     ret_owned,
+    ret_ref,
     ret_tensor,
     unsupported,
     v_bool,
@@ -48,7 +49,14 @@ from abi import (
 from device import ctx_for, ctx_ptr
 from kernels import KernelCall, loader
 from op_utils import MAX_RANK
-from ops_common import call_op_raw, contiguous, copy_strided_into, fill_value
+from ops_common import (
+    call_op_raw,
+    cast_to,
+    contiguous,
+    copy_strided_into,
+    fill_value,
+    resize_out,
+)
 from registry import Site, impl, op_address_of
 
 
@@ -853,6 +861,25 @@ def _mm_route(a: T, b: T) raises -> Optional[T]:
     return _spec_matmul("MatmulSpec", a, b, None, 0)
 
 
+def _store_out(rets: Values, dest: T, var result: T) raises:
+    """Finish an `out=` variant: move a freshly computed result into the
+    caller's tensor, resizing and casting it the way torch's own out= kernels
+    do, and return that tensor. TorchInductor reaches every extern kernel
+    through these overloads (`extern_kernels.mm(a, b, out=buf)`)."""
+    var held = own(result^)
+    var dst = dest.copy()
+    if not dst.same_shape(held.t):
+        # Only a MISMATCHING out= is resized: a resize re-lays the tensor out
+        # contiguously, so an already-correct out keeps its own strides.
+        resize_out(dst, held.t.shape, held.t.rank)
+    if dst.stype == held.t.stype:
+        copy_strided_into(dst, held.t)
+    else:
+        var casted = own(cast_to(held.t, dst.stype))
+        copy_strided_into(dst, casted.t)
+    ret_ref(rets, 0, dst)
+
+
 # aten::mm(Tensor self, Tensor mat2) -> Tensor
 def op_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
@@ -863,39 +890,50 @@ def op_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_tensor(rets, 0, out.value())
 
 
+# aten::mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
+def op_mm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out = _mm_route(a, b)
+    if not out:
+        unsupported("aten::mm.out with these operands")
+    _store_out(rets, v_tensor(args[unsafe_offset=2]), out.value().copy())
+
+
+def _bmm_route(a: T, b: T) raises -> Optional[T]:
+    var g = _try_gemm16_bmm(a, b, False)
+    if g:
+        return g.value().copy()
+    var t = _try_tf32_bmm(a, b, False)
+    if t:
+        return t.value().copy()
+    return _spec_matmul("BmmSpec", a, b, None, 0)
+
+
 # aten::bmm(Tensor self, Tensor mat2) -> Tensor
 def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
-    var g = _try_gemm16_bmm(a, b, False)
-    if g:
-        ret_tensor(rets, 0, g.value())
-        return
-    var t = _try_tf32_bmm(a, b, False)
-    if t:
-        ret_tensor(rets, 0, t.value())
-        return
-    var s = _spec_matmul("BmmSpec", a, b, None, 0)
-    if not s:
+    var out = _bmm_route(a, b)
+    if not out:
         unsupported("aten::bmm with these operands")
-    ret_tensor(rets, 0, s.value())
+    ret_tensor(rets, 0, out.value())
+
+
+# aten::bmm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
+def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out = _bmm_route(a, b)
+    if not out:
+        unsupported("aten::bmm.out with these operands")
+    _store_out(rets, v_tensor(args[unsafe_offset=2]), out.value().copy())
 
 
 # --- aten::addmm --------------------------------------------------------------
 
 
-# aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
-#             Scalar alpha=1) -> Tensor
-def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var bias = v_tensor(args[unsafe_offset=0])
-    var mat1 = v_tensor(args[unsafe_offset=1])
-    var mat2 = v_tensor(args[unsafe_offset=2])
-    if (
-        v_f64(args[unsafe_offset=3]) != 1.0
-        or v_f64(args[unsafe_offset=4]) != 1.0
-    ):
-        # beta/alpha scaling is not implemented by the fast path.
-        unsupported("aten::addmm with beta != 1 or alpha != 1")
+def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
     var opt_bias = Optional[T](bias.copy())
     # See _try_gemm16_linear: every gemm16 tensor-core route declines outright
     # when a bias is present, so compute the bias-free mm and add separately
@@ -908,23 +946,51 @@ def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             var plain = own(mm_out.value().copy())
             var biased = _try_add(plain.t, bias)
             if biased:
-                ret_tensor(rets, 0, biased.value())
-                return
+                return biased.value().copy()
             # The add declined this bias: drop the unbiased product and fall
             # through to the fused kernel rather than return a biasless one.
             _ = plain^
     var g = _try_gemm16_mm(mat1, mat2, opt_bias, False, List[Int]())
     if g:
-        ret_tensor(rets, 0, g.value())
-        return
+        return g.value().copy()
     var t = _try_tf32_mm(mat1, mat2, opt_bias, False, List[Int]())
     if t:
-        ret_tensor(rets, 0, t.value())
-        return
-    var s = _spec_matmul("MatmulBiasSpec", mat1, mat2, opt_bias, 0)
-    if not s:
+        return t.value().copy()
+    return _spec_matmul("MatmulBiasSpec", mat1, mat2, opt_bias, 0)
+
+
+def _addmm_unit_scaling(beta: Value, alpha: Value) raises:
+    if v_f64(beta) != 1.0 or v_f64(alpha) != 1.0:
+        # beta/alpha scaling is not implemented by the fast path.
+        unsupported("aten::addmm with beta != 1 or alpha != 1")
+
+
+# aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
+#             Scalar alpha=1) -> Tensor
+def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _addmm_unit_scaling(args[unsafe_offset=3], args[unsafe_offset=4])
+    var out = _addmm_route(
+        v_tensor(args[unsafe_offset=0]),
+        v_tensor(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+    )
+    if not out:
         unsupported("aten::addmm with these operands")
-    ret_tensor(rets, 0, s.value())
+    ret_tensor(rets, 0, out.value())
+
+
+# aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
+#                 Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_addmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _addmm_unit_scaling(args[unsafe_offset=3], args[unsafe_offset=4])
+    var out = _addmm_route(
+        v_tensor(args[unsafe_offset=0]),
+        v_tensor(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+    )
+    if not out:
+        unsupported("aten::addmm.out with these operands")
+    _store_out(rets, v_tensor(args[unsafe_offset=5]), out.value().copy())
 
 
 # --- aten::linear -------------------------------------------------------------
@@ -1483,12 +1549,15 @@ def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_matmul(site: Site) raises:
     impl[op_addmm, "addmm"](site)
+    impl[op_addmm_out, "addmm.out"](site)
     impl[op_addr, "addr"](site)
     impl[op_bmm, "bmm"](site)
+    impl[op_bmm_out, "bmm.out"](site)
     impl[op_convolution, "convolution"](site)
     impl[op_linear, "linear"](site)
     impl[op_linear_backward, "linear_backward"](site)
     impl[op_mm, "mm"](site)
+    impl[op_mm_out, "mm.out"](site)
 
 
 @export
