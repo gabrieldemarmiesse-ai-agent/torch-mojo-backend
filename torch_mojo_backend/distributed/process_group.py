@@ -102,14 +102,22 @@ def _nccl_red_op(
 
 def _loud(method: Callable[..., object]) -> Callable[..., object]:
     """torch swallows exceptions raised inside a Python ProcessGroup method
-    called from the autograd thread; print the traceback before re-raising."""
+    called from the autograd thread; print the traceback before re-raising.
+
+    A failure inside a coalescing block also unwinds that block: torch's
+    `_coalescing_manager` has no `finally`, so `_end_coalescing` never runs
+    after a raise and the communicator would stay inside an open NCCL group
+    with deferred copy-backs queued against operations that were never
+    submitted.
+    """
 
     @functools.wraps(method)
-    def wrapper(*args: object, **kwargs: object) -> object:
+    def wrapper(self: MojoProcessGroup, *args: object, **kwargs: object) -> object:
         try:
-            return method(*args, **kwargs)
+            return method(self, *args, **kwargs)
         except Exception:
             traceback.print_exc(file=sys.stderr)
+            self._abort_coalescing()
             raise
 
     return wrapper
@@ -197,6 +205,12 @@ class MojoProcessGroup(dist.ProcessGroup):
             None  # device index while batch_isend_irecv coalesces
         )
         self._coalesced_tensors: list[torch.Tensor] = []
+        # Work a coalesced call cannot do yet: inside a group nothing is
+        # submitted until group_end, so copy-backs and record_stream fences
+        # wait there. Holding the tensors also keeps every staging buffer
+        # alive until the operations that read and write it are submitted.
+        self._coalesced_records: list[torch.Tensor] = []
+        self._coalesced_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         # Communicator creation is collective: do it now, while every rank is
         # here, on the rank's current device (one visible GPU per torchrun rank).
         self._ensure(device_module.current_device())
@@ -326,13 +340,26 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def _record(self, index: int, *tensors: torch.Tensor):
         """Inputs (original and staged): touched by the comm stream, not modified."""
+        if self._coalescing is not None:
+            self._coalesced_records.extend(tensors)
+            return
         comm = self._ready[index]
         for t in tensors:
             t.record_stream(comm)
 
     def _finish(self, index: int, *pairs: tuple[torch.Tensor, torch.Tensor]):
         """Outputs: copy staged results back on the comm stream and record
-        every buffer on it so its release is fenced."""
+        every buffer on it so its release is fenced.
+
+        Inside a coalescing block the operation that fills `staged` is only
+        submitted by `group_end`, so both the copy-back and the fence are
+        deferred to `_end_coalescing`; copying now would read a buffer the
+        collective has not written yet, and a `record_stream` event recorded
+        before submission fences nothing.
+        """
+        if self._coalescing is not None:
+            self._coalesced_pairs.extend(pairs)
+            return
         comm = self._ready[index]
         with device_module.stream(comm):
             for tensor, staged in pairs:
@@ -393,8 +420,13 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._core.check(self._core.group_start(self._handle), "ncclGroupStart")
         self._coalescing = index
         self._coalesced_tensors = []
+        self._coalesced_records = []
+        self._coalesced_pairs = []
 
     def _end_coalescing(self, device: torch.device) -> Work:
+        """Submit the group, then run the work every call inside it deferred:
+        the copy-backs and fences first (on the comm stream), then the Work
+        whose completion events follow them."""
         index = (
             self._coalescing
             if self._coalescing is not None
@@ -402,8 +434,28 @@ class MojoProcessGroup(dist.ProcessGroup):
         )
         self._coalescing = None
         tensors, self._coalesced_tensors = self._coalesced_tensors, []
+        records, self._coalesced_records = self._coalesced_records, []
+        pairs, self._coalesced_pairs = self._coalesced_pairs, []
+        # Taken out of the group state first: a failed group_end must leave no
+        # deferred work behind for the next block to apply.
         self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+        self._record(index, *records)
+        self._finish(index, *pairs)
         return self._work(index, tensors)
+
+    def _abort_coalescing(self):
+        """Drop a coalescing block that raised: close the NCCL group and
+        discard the deferred work, whose operations were never submitted."""
+        if self._coalescing is None:
+            return
+        self._coalescing = None
+        self._coalesced_tensors = []
+        self._coalesced_records = []
+        self._coalesced_pairs = []
+        try:
+            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+        except Exception:  # the original failure is the one being propagated
+            traceback.print_exc(file=sys.stderr)
 
     @staticmethod
     def _index_of_device(device: torch.device) -> int:
@@ -582,12 +634,17 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
         staged_in, _ = self._allgather_flat(index, flat, input)
         n = input.numel()
-        with device_module.stream(comm):
-            for r, out in enumerate(outputs):
-                out.copy_(flat[r * n : (r + 1) * n].view(out.shape))
-                out.record_stream(comm)
-            flat.record_stream(comm)
         self._record(index, input, staged_in)
+        # Each output is staged behind a slice of `flat`, which the gather
+        # fills: the copy-back and the fence on flat's storage go through
+        # _finish so a coalescing block defers them past its group_end.
+        self._finish(
+            index,
+            *[
+                (out, flat[r * n : (r + 1) * n].view(out.shape))
+                for r, out in enumerate(outputs)
+            ],
+        )
         return self._result(index, outputs)
 
     @_loud

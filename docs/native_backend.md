@@ -144,9 +144,14 @@ stream); inputs are only recorded, outputs are copied back. The group
 reports itself as its own backend (`_get_backend`, `supports_coalescing`)
 because torch looks the backend up that way for `batch_isend_irecv` and
 `_coalescing_manager`; the coalescing hooks map to one NCCL group so a
-bidirectional exchange cannot deadlock. The group takes the backend mutex on
-every entry (`Locked` in pg.mojo), since these calls come from Python outside
-the boxed adapter.
+bidirectional exchange cannot deadlock. Inside such a group nothing is
+submitted before `group_end`, so every copy-back and every `record_stream`
+of a coalesced call is deferred to `_end_coalescing` (which also keeps the
+staging buffers alive until then); a call that raises inside the block closes
+the group and drops that deferred work, since torch's `_coalescing_manager`
+has no `finally`. Each pg.mojo entry holds the backend mutex over its whole
+body (`with Locked():`), since these calls come from Python outside the boxed
+adapter.
 
 Two limitations, both by design of the Future-based Work: `Work.is_completed()`
 is true as soon as the collective is enqueued (completion is a stream event,

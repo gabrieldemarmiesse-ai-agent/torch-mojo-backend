@@ -62,17 +62,15 @@ def _dispatch(
 ) raises -> T:
     """One aten op through the dispatcher, one Tensor result (owned)."""
     var rets = call_op(String(name), String(overload), args^, 1)
-    return T(Int(rets[0].a))
+    return rets.take_tensor(0)
 
 
 def _dispatch_into(
     name: StaticString, overload: StaticString, var args: List[Value], target: T
 ) raises:
     """An out= overload through the dispatcher; its result handle is a fresh
-    reference to `out` and is released here."""
-    var rets = call_op(String(name), String(overload), args^, 1)
-    if rets[0].tag == TAG_TENSOR:
-        release(Int(rets[0].a))
+    reference to `out`, which `Results` releases."""
+    _ = call_op(String(name), String(overload), args^, 1)
     _ = target
 
 
