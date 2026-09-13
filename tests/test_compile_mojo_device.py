@@ -89,14 +89,6 @@ def test_compile_multiple_outputs(mojo_device):
         assert_close_cpu(out, ref)
 
 
-@pytest.mark.xfail(
-    reason="The compiled output itself adopts zero-copy fine; the *post-compile "
-    "eager* `+ 1.0` fails because native aten::add.Tensor doesn't yet promote a "
-    "python-scalar operand to a 0-dim tensor of a different dtype ('mixed "
-    "dtypes') -- a native binary-op limitation, not a compile_backend bug. "
-    "Pending the binary-ops native port.",
-    strict=True,
-)
 def test_compile_output_feeds_eager_ops(mojo_device):
     """Compiled outputs adopt MAX buffers zero-copy; eager kernels must be
     able to consume them directly."""
@@ -150,13 +142,6 @@ def test_compile_shape_int_output(mojo_device):
     assert_close_cpu(out, x.cpu() + 1.0)
 
 
-@pytest.mark.xfail(
-    reason="`w += 1.0` needs aten::add.out (the in-place variant), not yet "
-    "registered natively -- only the functional add.Tensor is. Pending the "
-    "binary-ops native port; the buffer-cache mechanism this test targets is "
-    "otherwise exercised (see the first `compiled(x, w)` call above).",
-    strict=True,
-)
 def test_compile_input_mutated_between_calls(mojo_device):
     """The cross-call buffer cache aliases input memory: in-place updates
     between calls (optimizer-step pattern) must be visible to the graph."""
@@ -267,14 +252,6 @@ def test_compile_recompiles_for_cpu_inputs(mojo_device):
     torch.testing.assert_close(out_mojo.cpu(), out_cpu)
 
 
-@pytest.mark.xfail(
-    reason="The 'eager' dynamo backend runs the traced graph through the "
-    "*native eager* mojo kernels, not the mojo_backend MAX-graph path this "
-    "file otherwise tests. `x * 3.0` hits native aten::mul.Tensor's 'mixed "
-    "dtypes' limitation (no python-scalar-to-tensor dtype promotion yet). "
-    "Pending the binary-ops native port.",
-    strict=True,
-)
 def test_compile_eager_backend(mojo_device):
     """Dynamo-only backend: the traced graph runs through the eager kernels."""
 
@@ -286,12 +263,6 @@ def test_compile_eager_backend(mojo_device):
     assert_close_cpu(out, fn(x.cpu()))
 
 
-@pytest.mark.xfail(
-    reason="aot_eager also runs the functionalized graph through the native "
-    "eager kernels (not the mojo_backend MAX-graph path): `x @ y` needs "
-    "aten::mm, not yet registered natively. Pending the matmul native port.",
-    strict=True,
-)
 def test_compile_aot_eager_backend(mojo_device):
     """aot_eager runs the functionalized aten graph through the eager kernels."""
 
