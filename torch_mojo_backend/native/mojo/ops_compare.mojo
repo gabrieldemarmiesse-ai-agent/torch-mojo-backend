@@ -212,6 +212,7 @@ def _compare_functional_out(
         var tmp = own(new_tensor(shape, rank, ST_BOOL, a.device))
         _compare_spec(op, pa, pb, tmp.t)
         copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
     _release_if_new(pa, a)
     _release_if_new(pb, b)
     ret_ref(rets, 0, out_arg)
@@ -226,6 +227,7 @@ def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
     fill_value(fill.t, value)
     var out = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
     _compare_spec(op, a, fill.t, out.t)
+    _ = fill^  # alive past the launch
     ret_owned(rets, 0, out)
 
 
@@ -239,10 +241,13 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     fill_value(fill.t, value)
     if _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
         _compare_spec(op, a, fill.t, out_arg)
+        _ = fill^  # alive past the launch
     else:
         var tmp = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
         _compare_spec(op, a, fill.t, tmp.t)
+        _ = fill^  # alive past the launch
         copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -470,6 +475,7 @@ def op_isin_tensor_tensor_out(
         var tmp = own(new_tensor(el.shape, el.rank, ST_BOOL, el.device))
         _isin_into(el, te, invert, tmp.t)
         copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -672,6 +678,7 @@ def _masked_fill_scalar_dispatch(
     var fill = own(new_scalar(a.stype, a.device))
     fill_value(fill.t, value)
     _masked_fill_where(mask, fill.t, a, dst)
+    _ = fill^  # alive past the launch
 
 
 # aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor
@@ -700,6 +707,7 @@ def op_masked_fill_scalar_out(
         var tmp = own(new_like(a))
         _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], tmp.t)
         copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -718,6 +726,7 @@ def op_masked_fill__scalar(
         var tmp = own(new_like(a))
         _masked_fill_scalar_dispatch(mask, a, args[unsafe_offset=2], tmp.t)
         copy_strided_into(a, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, a)
 
 
@@ -765,6 +774,7 @@ def op_masked_fill_tensor_out(
         var tmp = own(new_like(a))
         _masked_fill_where(mask, val, a, tmp.t)
         copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -782,6 +792,7 @@ def op_masked_fill__tensor(
         var tmp = own(new_like(a))
         _masked_fill_where(mask, val, a, tmp.t)
         copy_strided_into(a, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, a)
 
 
@@ -1084,6 +1095,7 @@ def op_searchsorted_tensor_out(
         computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
+    _ = computed^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -1110,6 +1122,7 @@ def op_searchsorted_scalar(
     var out = _searchsorted_common(
         boundaries, values.t, common, out_int32, right, side[0], side[1], sorter
     )
+    _ = values^  # alive past the launch
     ret_owned(rets, 0, out)
 
 
@@ -1137,6 +1150,7 @@ def op_searchsorted_scalar_out(
     var computed = _searchsorted_common(
         boundaries, values.t, common, out_int32, right, side[0], side[1], sorter
     )
+    _ = values^  # alive past the launch
     _ensure_out_shape(
         out_arg,
         computed.t.shape,
@@ -1145,6 +1159,7 @@ def op_searchsorted_scalar_out(
         computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
+    _ = computed^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -1196,6 +1211,7 @@ def op_bucketize_tensor_out(
         computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
+    _ = computed^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -1221,6 +1237,7 @@ def op_bucketize_scalar(
     var out = _searchsorted_common(
         boundaries, values.t, common, out_int32, right, False, String(""), None
     )
+    _ = values^  # alive past the launch
     ret_owned(rets, 0, out)
 
 
@@ -1247,6 +1264,7 @@ def op_bucketize_scalar_out(
     var computed = _searchsorted_common(
         boundaries, values.t, common, out_int32, right, False, String(""), None
     )
+    _ = values^  # alive past the launch
     _ensure_out_shape(
         out_arg,
         computed.t.shape,
@@ -1255,6 +1273,7 @@ def op_bucketize_scalar_out(
         computed.t.device,
     )
     copy_strided_into(out_arg, computed.t)
+    _ = computed^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 

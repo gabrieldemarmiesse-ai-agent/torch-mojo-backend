@@ -858,6 +858,7 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
     copy_strided_into(out, result.t)
+    _ = result^  # alive past the launch
     ret_ref(rets, 0, out)
 
 
@@ -1590,6 +1591,7 @@ def op_empty_permuted(
         # zero-extent dim leaves the outer strides meaningful.
         run *= max(phys_sizes[i], 1)
     var out = own(view_strided(phys.t, shape, strides, rank, 0))
+    _ = phys^  # alive past the launch: view_strided dereferences phys.h
     ret_owned(rets, 0, out)
 
 

@@ -305,6 +305,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         )
     )
     copy_strided_into(oview.t, tmp.t)
+    _ = tmp^  # alive past the launch
     _ = work.t.ptr  # src may borrow work's storage; keep it past the call
     ret_owned(rets, 0, out)
 
@@ -432,6 +433,7 @@ def op_log_softmax_backward_data(
         )
     )
     copy_strided_into(back.t, tmp.t)
+    _ = tmp^  # alive past the launch
     ret_owned(rets, 0, out)
 
 

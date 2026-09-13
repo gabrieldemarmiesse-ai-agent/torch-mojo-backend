@@ -108,6 +108,7 @@ def _materialize(var t: Owned) raises -> Owned:
         return t^
     var out = own(_alloc(t.t.device, t.t.stype, t.t.logical_shape()))
     copy_strided_into(out.t, t.t)
+    _ = t^  # alive past the launch
     return out^
 
 
@@ -361,6 +362,7 @@ def _fa4_forward(
     _ = vn
     _ = ctx
     var out = _view(dense.t, [b, h, s, d], [s * h * d, d, h * d, 1])
+    _ = dense^  # the view holds the storage from here on
     return (out^, lse.take())
 
 
@@ -436,6 +438,10 @@ def _fa4_backward(
     var gq = _view(dq.t, [b, h, s, d], [s * h * d, d, h * d, 1])
     var gk = _view(dk.t, [b, h, s, d], [s * h * d, d, h * d, 1])
     var gv = _view(dv.t, [b, h, s, d], [s * h * d, d, h * d, 1])
+    # The views hold the storage from here on.
+    _ = dq^
+    _ = dk^
+    _ = dv^
     return (gq^, gk^, gv^)
 
 
@@ -804,7 +810,9 @@ def _math_forward(
     _ = probs32
     _ = v
     _ = ctx
-    return _view(out3.t, [b, h, lq, d], [h * lq * d, lq * d, d, 1])
+    var out = _view(out3.t, [b, h, lq, d], [h * lq * d, lq * d, d, 1])
+    _ = out3^  # the view holds the storage from here on
+    return out^
 
 
 def _flash_forward(

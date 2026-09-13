@@ -191,6 +191,7 @@ def _host_arange_start_out(
     # `Results` releases tmb_call_op's own fresh wrapper handle.
     _ = call_op("aten::arange", "start_out", call_args^, 1)
     _copy_cpu_into(out_t, cpu.t)
+    _ = cpu^  # alive past the launch
 
 
 def _copy_cpu_into(dst: T, src: T) raises:
@@ -211,6 +212,7 @@ def _copy_cpu_into(dst: T, src: T) raises:
             dst.device, ctx_for(dst.device), tmp.t.ptr, src.ptr, nbytes
         )
         copy_strided_into(dst, tmp.t)
+        _ = tmp^  # alive past the launch
 
 
 # aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)
@@ -242,6 +244,7 @@ def op_arange_start_out(
         var tmp = own(new_like(out_t))
         _arange_fill(tmp.t, start, step)
         copy_strided_into(out_t, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, out_t)
 
 
@@ -345,6 +348,7 @@ def op_uniform_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         var tmp = own(new_like(t))
         _uniform_fill(tmp.t, from_, to, seed_offset[0], seed_offset[1])
         copy_strided_into(t, tmp.t)
+        _ = tmp^  # alive past the launch
     ret_ref(rets, 0, t)
 
 
@@ -380,6 +384,7 @@ def op_normal_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         "aten::normal_", "", call_args^, 1
     )  # Results releases its handle
     _copy_cpu_into(t, cpu.t)
+    _ = cpu^  # alive past the launch
     ret_ref(rets, 0, t)
 
 
@@ -407,6 +412,7 @@ def _random_host(
     # `Results` releases tmb_call_op's own fresh wrapper handle.
     _ = call_op("aten::random_", String(overload), call_args^, 1)
     _copy_cpu_into(t, cpu.t)
+    _ = cpu^  # alive past the launch
     ret_ref(rets, 0, t)
 
 

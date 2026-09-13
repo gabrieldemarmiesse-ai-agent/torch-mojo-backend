@@ -231,6 +231,7 @@ def _unary_out(
         )
         _unary_direct(family, op, src, out.t, out_dtype)
         copy_strided_into(dst, out.t)
+        _ = out^  # alive past the launch
     if src.h != t_in.h:
         release(src.h)
 
@@ -905,6 +906,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
         var out = own(new_like(src))
         _bitwise_not_kernel(src, out.t)
         copy_strided_into(dst, out.t)
+        _ = out^  # alive past the launch
     if src.h != t_in.h:
         release(src.h)
 

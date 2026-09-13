@@ -558,6 +558,7 @@ def _copy_result_into(dst: T, src: T) raises:
         return
     var tmp = own(cast_to(src, dst.stype))
     copy_strided_into(dst, tmp.t)
+    _ = tmp^  # alive past the launch
 
 
 def _out_ready(dst: T, a: T, stype: Int32, numel: Int) -> Bool:
@@ -622,6 +623,7 @@ def _scalar_reduction_out(
     var tmp = own(new_tensor(shape, rank, out_stype, a.device))
     _reduce_into(family, op, a, dims.copy(), keepdim, tmp.t, False, 0.0)
     _copy_result_into(dst, tmp.t)
+    _ = tmp^  # alive past the launch
 
 
 # ---------------------------------------------------------------------------
@@ -903,7 +905,9 @@ def op_min_dim_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         var indices = own(new_tensor(shape, rank, ST_INT64, a.device))
         _min_dim_into(a, dims.copy(), keepdim, values.t, indices.t)
         _copy_result_into(out_v, values.t)
+        _ = values^  # alive past the launch
         _copy_result_into(out_i, indices.t)
+        _ = indices^  # alive past the launch
     ret_ref(rets, 0, out_v)
     ret_ref(rets, 1, out_i)
 

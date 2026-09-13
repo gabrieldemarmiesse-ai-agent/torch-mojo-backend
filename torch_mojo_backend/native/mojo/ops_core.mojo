@@ -188,9 +188,12 @@ def _device_copy(dst: T, src: T) raises:
                 tmp.t.ptr,
                 dst.numel * dst.itemsize,
             )
+            _ = tmp^  # alive past the launch
         else:
             var shaped = own(_viewed_as(tmp.t, dst))
+            _ = tmp^  # alive past the view construction
             copy_strided_into(dst, shaped.t)
+            _ = shaped^  # alive past the launch
         return
     # Two contiguous buffers of equal numel and dtype hold their elements in
     # the same order whatever their shapes: a flat byte copy is exact.
@@ -203,7 +206,9 @@ def _device_copy(dst: T, src: T) raises:
     else:
         var dense = own_if_new(contiguous(src), src)
         var shaped = own(_viewed_as(dense.t, dst))
+        _ = dense^  # alive past the view construction
         copy_strided_into(dst, shaped.t)
+        _ = shaped^  # alive past the launch
 
 
 def _host_copy(dst: T, src: T) raises:
@@ -259,12 +264,15 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             copy_from_host(
                 dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes
             )
+            _ = host^  # alive past the launch
         else:
             var tmp = own(new_like(dst))
             copy_from_host(
                 dst.device, ctx_for(dst.device), tmp.t.ptr, host.t.ptr, nbytes
             )
+            _ = host^  # alive past the launch
             copy_strided_into(dst, tmp.t)
+            _ = tmp^  # alive past the launch
     elif src.on_mojo():
         if not dst.on_cpu():
             unsupported(
@@ -280,10 +288,13 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # whatever the two logical shapes are.
         if dst.contig and dst.stype == src.stype:
             copy_to_host(ctx_for(src.device), dense.t.ptr, dst.ptr, nbytes)
+            _ = dense^  # alive past the launch
         else:
             var host = own(cpu_empty(src.shape, src.rank, src.stype))
             copy_to_host(ctx_for(src.device), dense.t.ptr, host.t.ptr, nbytes)
+            _ = dense^  # alive past the launch
             _host_copy(dst, host.t)
+            _ = host^  # alive past the copy
     else:
         raise Error("_copy_from: neither tensor is on the mojo device")
     ret_ref(rets, 0, dst)
