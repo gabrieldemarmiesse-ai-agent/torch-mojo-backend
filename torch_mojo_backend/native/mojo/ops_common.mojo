@@ -11,6 +11,8 @@ from abi import (
     T,
     Value,
     check,
+    UNSUPPORTED_PREFIX,
+    Values,
     contiguous_strides,
     dtype_code,
     dtype_itemsize,
@@ -21,6 +23,7 @@ from abi import (
     release,
     set_sizes_strides,
     torch_dtype,
+    shim_error,
     unsupported,
     TAG_NONE,
     v_f64,
@@ -30,6 +33,39 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from kernels import KernelCall
 from op_utils import MAX_RANK
+
+
+def call_op(
+    op: String,
+    overload: String,
+    args: Values,
+    n_args: Int,
+    rets: Values,
+    n_rets: Int,
+) raises:
+    """Call any aten op through torch's dispatcher (`tmb_call_op`).
+
+    What an op uses to reach a neighbouring op's kernel or ATen's own
+    composite: the records are the same ones a kernel gets, tensor arguments
+    are borrowed and tensor results come back as owned handles. Dispatch is on
+    the arguments, so an op must never call *itself* this way. A declining
+    kernel comes back as `unsupported` (rc 2) and keeps its prefix, so a
+    caller with another route can tell it apart from a real failure.
+    """
+    var name = String(op)
+    var over = String(overload)
+    var rc = external_call["tmb_call_op", Int32](
+        name.as_c_string_slice().unsafe_ptr(),
+        over.as_c_string_slice().unsafe_ptr(),
+        args,
+        Int32(n_args),
+        rets,
+        Int32(n_rets),
+    )
+    if rc == 2:
+        raise Error(UNSUPPORTED_PREFIX, shim_error())
+    if rc != 0:
+        raise Error(op, ": ", shim_error())
 
 
 def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
