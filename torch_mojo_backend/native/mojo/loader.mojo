@@ -163,8 +163,19 @@ struct Loader(Movable):
         var fam_dir = self.kernels_dir + "/" + family
         var src = fam_dir + "/" + family + ".mojo"
         var tmp = out_path + ".tmp" + String(perf_counter_ns())
+        # The compiler writes to local scratch (the cache may be on NFS,
+        # where its intermediate archive went missing under load); the
+        # finished library is then moved next to its final name.
+        var scratch = String("${TMPDIR:-/tmp}/torch-mojo-backend-") + String(
+            external_call["getuid", UInt32]()
+        )
+        var local = (
+            scratch + "/" + family + "." + String(perf_counter_ns()) + ".so"
+        )
         var cmd = (
-            String("'")
+            String("mkdir -p '")
+            + scratch
+            + "' && '"
             + self.mojo_exe
             + "' build '"
             + src
@@ -176,7 +187,15 @@ struct Loader(Movable):
         )
         for d in defines:
             cmd += " -D " + d
-        cmd += " -o '" + tmp + "' 2>&1; echo __TMB_RC=$?"
+        cmd += (
+            " -o '"
+            + local
+            + "' 2>&1 && mv -f '"
+            + local
+            + "' '"
+            + tmp
+            + "' 2>&1; echo __TMB_RC=$?"
+        )
         var t0 = perf_counter_ns()
         var output = run_command(cmd)
         var ms = (perf_counter_ns() - t0) // 1_000_000

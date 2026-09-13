@@ -25,6 +25,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -175,11 +176,31 @@ def _hash_files(paths: list[Path], extra: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _scratch_dir() -> Path:
+    """Where the compilers write: local disk, never the cache directory.
+    The cache is often on NFS (a cluster home), and a `mojo build` writing
+    its intermediate archive there failed intermittently with "failed to
+    produce an archive for the module: No such file or directory" under
+    load; finished libraries are copied over once, whole."""
+    d = Path(tempfile.gettempdir()) / f"torch-mojo-backend-{os.getuid()}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _atomic_install(tmp: Path, out: Path):
+    """Move a finished build from scratch into the cache: a copy into the
+    cache directory (scratch is another filesystem), then one rename, so a
+    reader never sees a partial file."""
     if out.exists():
         tmp.unlink(missing_ok=True)
-    else:
-        os.replace(tmp, out)
+        return
+    staged = out.parent / f".{out.name}.{os.getpid()}"
+    try:
+        os.replace(tmp, staged)
+    except OSError:  # EXDEV: cross-device
+        shutil.copy2(tmp, staged)
+        tmp.unlink(missing_ok=True)
+    os.replace(staged, out)
 
 
 def build_shim() -> Path:
@@ -212,7 +233,7 @@ def _build_shim_locked(
     key = out.stem.split("hash-")[-1]
     t0 = time.monotonic()
     torch_lib = Path(torch.__file__).parent / "lib"
-    tmpdir = _CACHE_DIR / f".shim-{os.getpid()}-{key}"
+    tmpdir = _scratch_dir() / f"shim-{os.getpid()}-{key}"
     tmpdir.mkdir(exist_ok=True)
     (tmpdir / "tmb_autocast_policies.inc").write_text(autocast_policy_table())
     procs = []
@@ -284,7 +305,7 @@ def build_backend() -> Path:
 
 def _build_backend_locked(key: str, out: Path) -> Path:
     t0 = time.monotonic()
-    tmp = _CACHE_DIR / f".backend-{os.getpid()}-{key}.so"
+    tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
     cmd = [
         _find_mojo(),
         "build",
@@ -302,7 +323,11 @@ def _build_backend_locked(key: str, out: Path) -> Path:
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
-            "building the Mojo backend failed:\n" + proc.stdout + proc.stderr
+            "building the Mojo backend failed:\n"
+            + " ".join(cmd)
+            + "\n"
+            + proc.stdout
+            + proc.stderr
         )
     _atomic_install(tmp, out)
     _trace(f"built Mojo backend in {time.monotonic() - t0:.2f}s")
@@ -347,7 +372,7 @@ def build_library(
         if out.exists():
             return out
         t0 = time.monotonic()
-        tmp = _CACHE_DIR / f".{entry.stem}-{os.getpid()}-{key}.so"
+        tmp = _scratch_dir() / f"{entry.stem}-{os.getpid()}-{key}.so"
         cmd = [_find_mojo(), "build", str(entry), "--emit", "shared-lib"]
         for root in roots:
             cmd += ["-I", str(root)]

@@ -138,7 +138,24 @@ the returned Work is a device-typed torch Future completed while the comm
 stream is current, so `wait()` orders the waiter's stream after the collective
 without blocking the host. Touched buffers are `record_stream`ed on the comm
 stream; the allocator fences their release on it. CPU tensors go to a private
-gloo group.
+gloo group. Non-contiguous operands are staged through dense temporaries
+allocated on the comm stream (so freeing them never fences the compute
+stream); inputs are only recorded, outputs are copied back. The group
+reports itself as its own backend (`_get_backend`, `supports_coalescing`)
+because torch looks the backend up that way for `batch_isend_irecv` and
+`_coalescing_manager`; the coalescing hooks map to one NCCL group so a
+bidirectional exchange cannot deadlock. The group takes the backend mutex on
+every entry (`Locked` in pg.mojo), since these calls come from Python outside
+the boxed adapter.
+
+Two limitations, both by design of the Future-based Work: `Work.is_completed()`
+is true as soon as the collective is enqueued (completion is a stream event,
+not a host-visible flag), and an asynchronous NCCL error surfaces at the next
+call or `synchronize`, not through `Work.wait()`; `ncclCommGetAsyncError` is
+exposed (`tmb_pg_async_error`) for a watchdog but nothing polls it. The
+128-byte `ncclUniqueId` is passed by value the way the x86-64 SysV ABI lays it
+out (16 words after the register arguments), so other architectures are
+refused at construction.
 
 ## Profiling
 
