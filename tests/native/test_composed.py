@@ -32,6 +32,7 @@ def test_activation_backward_composed_through_the_dispatcher(mojo_gpu, act):
     y.backward(grad)
     ref = x.detach().cpu().requires_grad_(True)
     getattr(torch, act)(ref).backward(grad.cpu())
+    assert x.grad is not None and ref.grad is not None
     # two float32 rounding orders (tanh: out*out on device, 1 - out^2 on cpu)
     torch.testing.assert_close(x.grad.cpu(), ref.grad, atol=3e-5, rtol=1e-5)
 

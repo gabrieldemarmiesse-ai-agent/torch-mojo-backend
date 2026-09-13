@@ -9,7 +9,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 
-def _mul_loop(device: str) -> None:
+def _mul_loop(device: str):
     a = torch.ones(512, 512, device=device)
     b = torch.full((512, 512), 2.0, device=device)
     for _ in range(4):

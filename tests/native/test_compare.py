@@ -425,3 +425,187 @@ def test_searchsorted_sorter_declined(mojo_gpu: str):
     sorter = torch.tensor([0, 1, 2], dtype=torch.int64).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.searchsorted(boundaries, values, sorter=sorter)
+
+
+# ---------------------------------------------------------------------------
+# Vector width, ragged tail and runtime base alignment.
+#
+# Every kernel here picks a vector width from the element count AND the
+# runtime base address, then handles a scalar head and tail. The tests above
+# use 4-6 element tensors from offset 0, which is one width with no tail and
+# no head -- they cannot see a rotated lane or an unwritten tail. The sizes
+# below straddle every power-of-two width; the operands are deterministic and
+# coprime with those widths, and every comparison is exact.
+# ---------------------------------------------------------------------------
+
+_TAIL_SIZES = [0, 1, 3, 4, 5, 15, 16, 17, 255, 256, 257, 4095, 100_003]
+_COMPARE_FNS = {
+    "eq": torch.eq,
+    "ne": torch.ne,
+    "lt": torch.lt,
+    "le": torch.le,
+    "gt": torch.gt,
+    "ge": torch.ge,
+}
+
+
+def _ramp(n: int, modulus: int, shift: float, dtype=torch.float32) -> torch.Tensor:
+    return (torch.arange(n, dtype=torch.float32) % modulus - shift).to(dtype)
+
+
+def _compare_operands(n: int, dtype=torch.float32):
+    left = _ramp(n, 97, 48.0, dtype)
+    right = _ramp(n, 61, 30.0, dtype)
+    right[: n // 3] = left[: n // 3]  # so equality is not vacuous
+    return left, right
+
+
+@pytest.mark.parametrize("op_name", sorted(_COMPARE_FNS))
+def test_compare_every_vector_width_and_tail(mojo_device: str, op_name: str):
+    fn = _COMPARE_FNS[op_name]
+    for n in _TAIL_SIZES:
+        left_cpu, right_cpu = _compare_operands(n)
+        left, right = left_cpu.to(mojo_device), right_cpu.to(mojo_device)
+        tensor_out = fn(left, right).cpu()
+        assert tensor_out.dtype == torch.bool
+        assert torch.equal(tensor_out, fn(left_cpu, right_cpu)), n
+        assert torch.equal(fn(left, 0.5).cpu(), fn(left_cpu, 0.5)), n
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_elementwise_offset_views_break_the_alignment_gate(mojo_device: str, offset):
+    """A storage offset misaligns the base pointer at runtime while every
+    shape stays vector-friendly -- the case a shape-only gate gets wrong."""
+    for n in (5, 17, 100_003):
+        left_cpu, right_cpu = _compare_operands(n + offset)
+        left = left_cpu.to(mojo_device)[offset:]
+        right = right_cpu.to(mojo_device)[offset:]
+        left_ref, right_ref = left_cpu[offset:], right_cpu[offset:]
+        assert torch.equal(torch.lt(left, right).cpu(), torch.lt(left_ref, right_ref))
+        assert torch.equal(torch.lt(left, 0.5).cpu(), torch.lt(left_ref, 0.5))
+
+        ints_cpu = (torch.arange(n + offset) * 2654435761 % 2**30).to(torch.int32)
+        ints = ints_cpu.to(mojo_device)[offset:]
+        ints_ref = ints_cpu[offset:]
+        assert torch.equal(
+            torch.bitwise_and(ints, 21).cpu(), torch.bitwise_and(ints_ref, 21)
+        )
+        assert torch.equal(torch.bitwise_not(ints).cpu(), torch.bitwise_not(ints_ref))
+
+        bools_cpu = (torch.arange(n + offset) % 3) == 0
+        bools = bools_cpu.to(mojo_device)[offset:]
+        assert torch.equal(
+            torch.logical_not(bools).cpu(), torch.logical_not(bools_cpu[offset:])
+        )
+
+
+@pytest.mark.parametrize("op_name", ["logical_and", "logical_xor"])
+def test_logical_bool_operands_every_size(mojo_device: str, op_name: str):
+    fn = getattr(torch, op_name)
+    for n in _TAIL_SIZES:
+        left_cpu = (torch.arange(n) % 3) == 0
+        right_cpu = (torch.arange(n) % 5) < 2
+        out = fn(left_cpu.to(mojo_device), right_cpu.to(mojo_device)).cpu()
+        assert torch.equal(out, fn(left_cpu, right_cpu)), n
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int8]
+)
+def test_compare_dtypes_on_a_ragged_length(mojo_device: str, dtype: torch.dtype):
+    """1003 is ragged for widths 2, 4, 8 and 16 at once."""
+    n = 1003
+    if dtype in (torch.int64, torch.int8):
+        left_cpu = (torch.arange(n) % 97 - 48).to(dtype)
+        right_cpu = (torch.arange(n) % 61 - 30).to(dtype)
+        scalar = 1
+    else:
+        left_cpu, right_cpu = _compare_operands(n, dtype)
+        scalar = 0.5
+    left, right = left_cpu.to(mojo_device), right_cpu.to(mojo_device)
+    assert torch.equal(torch.lt(left, right).cpu(), torch.lt(left_cpu, right_cpu))
+    assert torch.equal(torch.ge(left, scalar).cpu(), torch.ge(left_cpu, scalar))
+
+
+@pytest.mark.parametrize("op_name", ["bitwise_and", "bitwise_or", "bitwise_xor"])
+def test_bitwise_scalar_every_tail(mojo_device: str, op_name: str):
+    fn = getattr(torch, op_name)
+    for n in (5, 17, 1003, 100_003):
+        cpu = (torch.arange(n) * 2654435761 % 2**30).to(torch.int32)
+        assert torch.equal(fn(cpu.to(mojo_device), 21).cpu(), fn(cpu, 21)), n
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_masked_fill_and_where_every_vector_width(mojo_device: str, dtype):
+    for n in _TAIL_SIZES:
+        x_cpu = _ramp(n, 97, 48.0, dtype)
+        other_cpu = _ramp(n, 61, 30.0, dtype)
+        mask_cpu = (torch.arange(n) % 3) == 0
+        x = x_cpu.to(mojo_device)
+        other = other_cpu.to(mojo_device)
+        mask = mask_cpu.to(mojo_device)
+
+        assert torch.equal(
+            x.masked_fill(mask, 7.0).cpu(), x_cpu.masked_fill(mask_cpu, 7.0)
+        ), n
+        value_cpu = torch.tensor(7.0, dtype=dtype)
+        assert torch.equal(
+            x.masked_fill(mask, value_cpu.to(mojo_device)).cpu(),
+            x_cpu.masked_fill(mask_cpu, value_cpu),
+        ), n
+        assert torch.equal(
+            torch.where(mask, x, other).cpu(), torch.where(mask_cpu, x_cpu, other_cpu)
+        ), n
+
+        inplace = x_cpu.clone().to(mojo_device)
+        inplace.masked_fill_(mask, -1.0)
+        assert torch.equal(inplace.cpu(), x_cpu.clone().masked_fill_(mask_cpu, -1.0)), n
+
+
+def test_masked_fill_broadcast_mask_and_transposed_operands(mojo_device: str):
+    x_cpu = torch.randn(3, 4, 5)
+    mask_cpu = (torch.arange(20).reshape(4, 5) % 3) == 0
+    x, mask = x_cpu.to(mojo_device), mask_cpu.to(mojo_device)
+    assert torch.equal(x.masked_fill(mask, 7.0).cpu(), x_cpu.masked_fill(mask_cpu, 7.0))
+    value = torch.tensor(7.0)
+    assert torch.equal(
+        x.masked_fill(mask, value.to(mojo_device)).cpu(),
+        x_cpu.masked_fill(mask_cpu, value),
+    )
+    inplace = x_cpu.clone().to(mojo_device)
+    inplace.masked_fill_(mask, 7.0)
+    assert torch.equal(inplace.cpu(), x_cpu.clone().masked_fill_(mask_cpu, 7.0))
+
+    wide_cpu = torch.randn(6, 10)
+    wide_mask_cpu = (torch.arange(60).reshape(6, 10) % 4) == 0
+    wide = wide_cpu.to(mojo_device).t()
+    wide_mask = wide_mask_cpu.to(mojo_device).t()
+    assert torch.equal(
+        wide.masked_fill(wide_mask, 2.5).cpu(),
+        wide_cpu.t().masked_fill(wide_mask_cpu.t(), 2.5),
+    )
+
+
+def test_unary_mask_ops_every_vector_tail(mojo_device: str):
+    for n in _TAIL_SIZES:
+        x_cpu = _ramp(n, 97, 48.0)
+        x_cpu[::5] = float("nan")
+        assert torch.equal(torch.isnan(x_cpu.to(mojo_device)).cpu(), torch.isnan(x_cpu))
+        ints_cpu = (torch.arange(n) * 2654435761 % 2**30).to(torch.int32)
+        assert torch.equal(
+            torch.bitwise_not(ints_cpu.to(mojo_device)).cpu(),
+            torch.bitwise_not(ints_cpu),
+        )
+        bools_cpu = (torch.arange(n) % 3) == 0
+        assert torch.equal(
+            torch.logical_not(bools_cpu.to(mojo_device)).cpu(),
+            torch.logical_not(bools_cpu),
+        )
+
+
+@pytest.mark.parametrize("shape", [(0,), (1,), (7,), (0, 5)])
+def test_binary_add_degenerate_shapes(mojo_device: str, shape):
+    cpu = torch.randn(shape)
+    out = cpu.to(mojo_device) + cpu.to(mojo_device)
+    assert out.shape == cpu.shape
+    torch.testing.assert_close(out.cpu(), cpu + cpu)

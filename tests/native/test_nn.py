@@ -9,6 +9,7 @@ forward would pull in ops from groups that are not ported yet.
 """
 
 import contextlib
+import math
 
 import pytest
 import torch
@@ -862,3 +863,296 @@ def test_cross_entropy_forward(mojo_gpu):
             logits.to(mojo_gpu), target.to(mojo_gpu)
         )
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Launch-route regimes.
+#
+# The shapes above all sit inside one launch route. The counts below straddle
+# every route boundary: a scalar head/tail, the register-cached ladder, the
+# streaming kernel past it, and the grid the L2 budget stops binding.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [7, 789, 1024, 4096, 20000])
+def test_native_layer_norm_row_widths(mojo_gpu, dtype, cols):
+    """789 is not a whole number of 16-byte vectors; 1024/4096 are the
+    register-cached ladder; 20000 falls to the streaming kernel."""
+    x = torch.randn(9, cols).to(dtype)
+    w = torch.randn(cols).to(dtype)
+    b = torch.randn(cols).to(dtype)
+    want = torch.native_layer_norm(x.float(), (cols,), w.float(), b.float(), 1e-5)
+    got = torch.native_layer_norm(
+        x.to(mojo_gpu), (cols,), w.to(mojo_gpu), b.to(mojo_gpu), 1e-5
+    )
+    out_tol = 1e-5 if dtype == torch.float32 else 1e-2
+    stat_tol = (1e-4, 1e-3) if dtype == torch.float32 else (2e-2, 2e-2)
+    torch.testing.assert_close(
+        got[0].cpu().float(), want[0].to(dtype).float(), atol=out_tol, rtol=out_tol
+    )
+    torch.testing.assert_close(
+        got[1].cpu().float(),
+        want[1].to(dtype).float(),
+        atol=stat_tol[0],
+        rtol=stat_tol[0],
+    )
+    torch.testing.assert_close(
+        got[2].cpu().float(),
+        want[2].to(dtype).float(),
+        atol=stat_tol[1],
+        rtol=stat_tol[1],
+    )
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3])
+def test_native_layer_norm_offset_view_row_phase(mojo_gpu, offset):
+    """Whether the cached route may store where it loaded depends on the
+    row's phase, which a storage offset changes."""
+    flat = torch.randn(5 * 64 + offset)
+    w = torch.randn(64)
+    b = torch.randn(64)
+    x_cpu = flat[offset:].view(5, 64)
+    x = flat.to(mojo_gpu)[offset:].view(5, 64)
+    want = torch.native_layer_norm(x_cpu, (64,), w, b, 1e-5)
+    got = torch.native_layer_norm(x, (64,), w.to(mojo_gpu), b.to(mojo_gpu), 1e-5)
+    for g, e in zip(got, want, strict=True):
+        torch.testing.assert_close(g.cpu(), e, atol=1e-5, rtol=1e-5)
+
+
+def test_native_layer_norm_large_mean_needs_the_moment_repass(mojo_gpu):
+    """Past the cached ladder the statistics are taken about the row's first
+    element; when that element is the outlier, the variance loses most of its
+    significand unless the kernel re-reads."""
+    cols = 40000
+    x = torch.randn(4, cols)
+    x[:, 0] = 1e6
+    want = torch.native_layer_norm(x.double(), (cols,), None, None, 1e-5)
+    got = torch.native_layer_norm(x.to(mojo_gpu), (cols,), None, None, 1e-5)
+    torch.testing.assert_close(
+        got[2].cpu().double(), want[2], atol=0, rtol=1e-4
+    )  # rstd
+    torch.testing.assert_close(
+        got[0].cpu().double(), want[0], atol=1e-4, rtol=1e-4
+    )  # output
+
+
+def test_native_layer_norm_noncontiguous_weight_and_bias(mojo_gpu):
+    """The test above covers a non-contiguous INPUT; the affine parameters
+    have their own read path."""
+    x_base = torch.randn(3, 2, 4)
+    w_base = torch.randn(4, 3)
+    b_base = torch.randn(4, 3)
+    x_cpu, w_cpu, b_cpu = x_base.transpose(0, 1), w_base.t(), b_base.t()
+    x = x_base.to(mojo_gpu).transpose(0, 1)
+    w = w_base.to(mojo_gpu).t()
+    b = b_base.to(mojo_gpu).t()
+    want = torch.native_layer_norm(x_cpu, (3, 4), w_cpu, b_cpu, 1e-5)
+    got = torch.native_layer_norm(x, (3, 4), w, b, 1e-5)
+    assert got[0].is_contiguous()
+    assert tuple(got[1].shape) == (2, 1, 1)
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(got[1].cpu(), want[1], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(got[2].cpu(), want[2], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("cols", [768, 769])
+def test_native_layer_norm_nonfinite_rows(mojo_gpu, cols, value):
+    """A row that is entirely non-finite: output, mean AND rstd are all NaN."""
+    x = torch.full((2, cols), value)
+    got = torch.native_layer_norm(x.to(mojo_gpu), (cols,), None, None, 1e-5)
+    for part in got:
+        assert bool(part.cpu().isnan().all()), part
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("n", "c", "hxw", "groups"), [(2, 8, 5, 4), (3, 12, 49, 3), (2, 6, 4096, 2)]
+)
+def test_native_group_norm_spatial_regimes(mojo_gpu, dtype, n, c, hxw, groups):
+    """hxw = 4096 is a different launch regime from the <= 16 cases above."""
+    x = torch.randn(n, c, hxw).to(dtype)
+    w = torch.randn(c).to(dtype)
+    b = torch.randn(c).to(dtype)
+    want = torch.ops.aten.native_group_norm(
+        x.float(), w.float(), b.float(), n, c, hxw, groups, 1e-5
+    )
+    got = torch.ops.aten.native_group_norm(
+        x.to(mojo_gpu), w.to(mojo_gpu), b.to(mojo_gpu), n, c, hxw, groups, 1e-5
+    )
+    out_tol = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(
+        got[0].cpu().float(), want[0].to(dtype).float(), atol=out_tol, rtol=out_tol
+    )
+    torch.testing.assert_close(
+        got[1].cpu().float(), want[1].float(), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize("channels", [3, 200])
+@pytest.mark.parametrize("magnitude", [1e6, -1e6])
+def test_native_batch_norm_training_outlier_first_element(
+    mojo_gpu, channels, magnitude
+):
+    """Element (0, c, 0) is the assumed mean, i.e. the worst available shift.
+    3 channels take the split workspace + merge; 200 take the fused
+    one-block-per-channel path that re-scans in place."""
+    x = torch.randn(6, channels, 4, 9)
+    x[0, :, 0, 0] = magnitude
+    running_mean_cpu = torch.zeros(channels, dtype=torch.float64)
+    running_var_cpu = torch.ones(channels, dtype=torch.float64)
+    want = torch.native_batch_norm(
+        x.double(), None, None, running_mean_cpu, running_var_cpu, True, 0.1, 1e-5
+    )
+    running_mean = torch.zeros(channels).to(mojo_gpu)
+    running_var = torch.ones(channels).to(mojo_gpu)
+    got = torch.native_batch_norm(
+        x.to(mojo_gpu), None, None, running_mean, running_var, True, 0.1, 1e-5
+    )
+    torch.testing.assert_close(
+        got[1].cpu().double(), want[1], atol=0, rtol=1e-5
+    )  # save_mean
+    torch.testing.assert_close(
+        got[2].cpu().double(), want[2], atol=0, rtol=1e-5
+    )  # save_invstd
+    torch.testing.assert_close(
+        running_var.cpu().double(), running_var_cpu, atol=0, rtol=1e-5
+    )
+
+
+# ---------------------------------------------------------------------------
+# log_softmax: wide rows, non-finite rows, and the backward's own regimes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cols", [5, 128, 257, 1023, 1024, 2047, 4096])
+def test_log_softmax_narrow_rows_match_cpu(mojo_gpu, dtype, cols):
+    """Rows narrower than one block pass leave threads with no elements;
+    their -inf running max must not NaN the sum."""
+    x = torch.randn(8, cols).to(dtype)
+    got = torch.log_softmax(x.to(mojo_gpu), dim=-1)
+    torch.testing.assert_close(got.cpu(), torch.log_softmax(x, dim=-1))
+
+
+def test_log_softmax_positive_inf_rows_match_cpu(mojo_gpu):
+    """torch's denominator is NaN here, so the whole row is NaN. Guarding
+    `exp(a-b)` with an `a == b` select turns `exp(inf-inf)` into 1.0 and
+    returns -inf for the finite entries instead."""
+    x = torch.randn(4, 512)
+    x[:, 7] = float("inf")
+    got = torch.log_softmax(x.to(mojo_gpu), dim=-1)
+    torch.testing.assert_close(got.cpu(), torch.log_softmax(x, dim=-1), equal_nan=True)
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "cols", [12_501, 16_384, 16_385, 25_000, 33_000, 50_304, 70_001]
+)
+def test_log_softmax_wide_rows_match_cpu(mojo_gpu, cols, dtype, offset):
+    """These counts straddle the point where the L2 budget stops binding the
+    grid. The offset makes each row base unaligned, so the per-row scalar
+    head and tail run too."""
+    flat = torch.randn(3 * cols + offset).to(dtype)
+    x_cpu = flat[offset:].view(3, cols)
+    x = flat.to(mojo_gpu)[offset:].view(3, cols)
+    got = torch.log_softmax(x, dim=-1).cpu()
+    assert not bool(got.isnan().any())
+    tol = 2e-5 if dtype == torch.float32 else 3e-2
+    torch.testing.assert_close(
+        got.float(), torch.log_softmax(x_cpu.float(), dim=-1), atol=tol, rtol=tol
+    )
+
+
+@pytest.mark.parametrize("cols", [16_385, 50_304])
+def test_log_softmax_wide_rows_stay_finite(mojo_gpu, cols):
+    """A block max seeded with Float32.MIN (= -inf) turns an idle thread's
+    `0 * exp(m-m)` into a NaN the block reduction spreads over the row."""
+    spiked = torch.full((1, cols), -3.0)
+    spiked[0, cols // 3] = 60.0
+    got = torch.log_softmax(spiked.to(mojo_gpu), dim=-1).cpu()
+    assert not bool(got.isnan().any())
+    torch.testing.assert_close(
+        got, torch.log_softmax(spiked, dim=-1), atol=3e-2, rtol=3e-2
+    )
+
+    constant = torch.full((1, cols), 0.25)
+    got_constant = torch.log_softmax(constant.to(mojo_gpu), dim=-1).cpu()
+    torch.testing.assert_close(
+        got_constant, torch.full((1, cols), -math.log(cols)), atol=3e-2, rtol=3e-2
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim", [((33, 257), -1), ((16, 4096), -1), ((2, 3, 129), 2)]
+)
+def test_log_softmax_backward_regimes(mojo_gpu, shape, dim, dtype):
+    """Odd cols exercise the head/tail; 4096 is the pure aligned body; the
+    rank-3 case reduces over a non-final-but-trailing dim."""
+    out = torch.log_softmax(torch.randn(shape), dim=dim).to(dtype)
+    grad = torch.randn(shape).to(dtype)
+    expected = (
+        grad.float() - out.float().exp() * grad.float().sum(dim, keepdim=True)
+    ).to(dtype)
+    got = torch.ops.aten._log_softmax_backward_data(
+        grad.to(mojo_gpu), out.to(mojo_gpu), dim, dtype
+    )
+    tol = 2e-5 if dtype == torch.float32 else 2e-2
+    torch.testing.assert_close(got.cpu().float(), expected.float(), atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cols", [3, 33_000, 50_304, 70_001])
+def test_log_softmax_backward_wide_rows(mojo_gpu, cols, dtype, offset):
+    """cols = 3 is below one 16-byte vector, so the whole row is head/tail
+    scalars; 70001 reaches the re-read fallback."""
+    out_flat = torch.randn(2 * cols + offset).to(dtype)
+    grad_flat = torch.randn(2 * cols + offset).to(dtype)
+    out_cpu = torch.log_softmax(out_flat[offset:].view(2, cols).float(), dim=-1).to(
+        dtype
+    )
+    grad_cpu = grad_flat[offset:].view(2, cols)
+    expected = (
+        grad_cpu.float()
+        - out_cpu.float().exp() * grad_cpu.float().sum(-1, keepdim=True)
+    ).to(dtype)
+    got = torch.ops.aten._log_softmax_backward_data(
+        grad_flat.to(mojo_gpu)[offset:].view(2, cols), out_cpu.to(mojo_gpu), -1, dtype
+    )
+    tol = 2e-5 if dtype == torch.float32 else 3e-2
+    torch.testing.assert_close(got.cpu().float(), expected.float(), atol=tol, rtol=tol)
+
+
+def test_log_softmax_backward_non_trailing_dim(mojo_gpu):
+    out = torch.log_softmax(torch.randn(6, 33, 5), dim=1)
+    grad = torch.randn(6, 33, 5)
+    expected = torch.ops.aten._log_softmax_backward_data(grad, out, 1, torch.float32)
+    got = torch.ops.aten._log_softmax_backward_data(
+        grad.to(mojo_gpu), out.to(mojo_gpu), 1, torch.float32
+    )
+    torch.testing.assert_close(got.cpu(), expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the native op declines an input_dtype different from the "
+    "gradient's ('_log_softmax_backward_data with an input_dtype different "
+    "from the gradient's'); the old eager path served it. AOTAutograd emits "
+    "exactly this call for an autocast log_softmax, so it is a real gap, not "
+    "an exotic overload. Drop the marker when the op accepts it.",
+)
+def test_log_softmax_backward_promotes_to_the_requested_dtype(mojo_gpu):
+    """`input_dtype=float16` with float32 operands: the CPU op REJECTS this
+    promotion, so the reference is built by hand."""
+    out = torch.log_softmax(torch.randn(4, 7), dim=-1)
+    grad = torch.randn(4, 7)
+    expected = (grad - out.exp() * grad.sum(-1, keepdim=True)).to(torch.float16)
+    got = torch.ops.aten._log_softmax_backward_data(
+        grad.to(mojo_gpu), out.to(mojo_gpu), -1, torch.float16
+    )
+    assert got.dtype == torch.float16
+    torch.testing.assert_close(got.cpu(), expected, atol=2e-3, rtol=2e-3)

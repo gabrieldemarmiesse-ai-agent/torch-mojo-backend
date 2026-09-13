@@ -31,32 +31,25 @@ generic PrivateUse1 `torch.Stream` in this torch version exposes no
 a stream id as an opaque int); the native `CUstream`/`hipStream_t` is
 `Stream.native_handle`.
 
-## Why no Python patch is needed anymore
+## Why no Python patch is needed
 
 PyTorch's generic `torch.Stream`/`torch.Event` route through a C++ device
-guard; for a Python-backed PrivateUse1 device with only the default stub
-guard, every stream it mints is stream id 0 and every wait/record is a
-silent no-op. The old Python eager backend worked around that by patching
-`torch.Stream`/`torch.Event` at the class level
-(`torch_mojo_backend/monkeypatching.py`,
-`_install_torch_stream_event_dispatch`) to dispatch mojo-device
-construction to a Python `Stream`/`Event` pair
-(`mojo_device/streams.py`).
+guard; for a PrivateUse1 device with only the default stub guard, every
+stream it mints is stream id 0 and every wait/record is a silent no-op — so
+a Python-implemented backend has to patch `torch.Stream`/`torch.Event` at
+the class level to hand back objects of its own.
 
-The native backend does not need that patch: `native/csrc/shim_runtime.cpp`
-registers a real C++ `PrivateUse1HooksInterface` (device guard, streams,
-events) with torch's own dispatcher, so `torch.Stream`/`torch.Event`
-work for the `mojo` device through the ordinary generic path, exactly like
-CUDA. `register_mojo_devices()` no longer calls
-`apply_torch_monkeypatches`; that module and `mojo_device/streams.py` are
-dead code left over from the old eager path.
+`native/csrc/shim_runtime.cpp` registers a real C++
+`PrivateUse1HooksInterface` (device guard, streams, events) with torch's own
+dispatcher instead, so `torch.Stream`/`torch.Event` work for the `mojo`
+device through the ordinary generic path, exactly like CUDA, and
+`monkeypatching.py` holds one unrelated patch.
 
 ## Execution semantics
 
 Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
 `native/mojo/abi.mojo`/`device.mojo`), so `with torch.Stream(...):` really
-moves execution, not just bookkeeping — unlike the old eager path, which
-always ran on the default stream regardless of the current one.
+moves execution, not just bookkeeping.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —
