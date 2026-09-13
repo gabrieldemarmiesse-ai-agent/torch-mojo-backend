@@ -460,7 +460,7 @@ def fix_batch_isend_irecv_for_python_process_groups():
         return
 
     @wraps(original)
-    def batch_isend_irecv(p2p_op_list: Sequence[object]) -> list[object]:
+    def batch_isend_irecv(p2p_op_list: list[c10d.P2POp]) -> list[c10d.Work]:
         c10d._check_p2p_op_list(p2p_op_list)
         group = p2p_op_list[0].group or c10d._get_default_group()
         device = p2p_op_list[0].tensor.device
