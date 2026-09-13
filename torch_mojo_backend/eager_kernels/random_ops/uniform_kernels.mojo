@@ -259,85 +259,96 @@ def enqueue_uniform[
     var groups = ceildiv(size, GROUP)
     var dst_ptr = _make_ptr[dtype](dst_addr)
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(
-            dst_ptr,
+    @always_inline
+    @parameter
+    @__copy_capture(
+        dst_ptr,
+        from_out,
+        to_out,
+        from_math,
+        range_math,
+        size,
+        seed,
+        base_offset,
+    )
+    def cpu_group[width: Int, alignment: Int = 1](idx: Coord):
+        var group = Int(idx[0].value())
+        var values = _uniform_draw[dtype, GROUP](
+            _philox4x32_10(base_offset + UInt64(group), seed),
             from_out,
             to_out,
             from_math,
             range_math,
-            size,
-            seed,
-            base_offset,
         )
-        def cpu_group[width: Int, alignment: Int = 1](idx: Coord):
-            var group = Int(idx[0].value())
-            var values = _uniform_draw[dtype, GROUP](
-                _philox4x32_10(base_offset + UInt64(group), seed),
-                from_out,
-                to_out,
-                from_math,
-                range_math,
-            )
-            var base = group * GROUP
+        var base = group * GROUP
 
-            comptime for lane in range(GROUP):
-                if base + lane < size:
-                    dst_ptr[unsafe_offset=base + lane] = values[lane]
+        comptime for lane in range(GROUP):
+            if base + lane < size:
+                dst_ptr[unsafe_offset=base + lane] = values[lane]
 
+    if ctx.api() == "cpu":
         elementwise[cpu_group, simd_width=1](Coord(groups), ctx)
         return
 
-    comptime if not has_accelerator():
-        raise Error("no GPU accelerator available at compile time")
+    # The GPU kernel below has float64 SIMD/bitcast arithmetic Metal's AIR
+    # backend rejects outright ("return type 'double' is not supported"), so
+    # this whole branch must never be compiled -- not merely skipped at
+    # runtime -- when the accelerator present is Apple's: `comptime if` (not
+    # a runtime `if`) is what keeps `_uniform_kernel[float64, ...]` out of
+    # the GPU-target compilation entirely. `ctx.api() != "cpu"` was already
+    # raised on above, so this is unreachable at runtime for that combination
+    # and only exists to keep other dtypes' GPU kernels compiling normally.
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        elementwise[cpu_group, simd_width=1](Coord(groups), ctx)
+        return
     else:
-        # A ragged length or an under-aligned base is a correctness question,
-        # not a speed one: the wide store has to be declined on the address
-        # itself, since a tensor can start at any element offset inside its
-        # storage (`x[1:]`).
-        comptime ALIGN = min(16, GROUP * size_of[dtype]())
-        var wide = size % GROUP == 0 and dst_addr % ALIGN == 0
-
-        # `_fill_blocks`: one thread per group, capped, exactly as the
-        # constant fill does -- a generated fill reads nothing and has no
-        # reuse to protect either, so the same "cover the slots" rule applies
-        # and no constant fitted to one card enters the geometry.
-        if wide:
-            _enqueue_cached[_uniform_kernel[dtype, True]](
-                ctx,
-                String(t"uniform_{dtype}_v{GROUP}"),
-                _fill_blocks(groups),
-                1,
-                1,
-                FILL_THREADS,
-                dst_ptr.as_unsafe_any_origin(),
-                from_out,
-                to_out,
-                from_math,
-                range_math,
-                Int64(groups),
-                Int64(size),
-                seed,
-                base_offset,
-            )
+        comptime if not has_accelerator():
+            raise Error("no GPU accelerator available at compile time")
         else:
-            _enqueue_cached[_uniform_kernel[dtype, False]](
-                ctx,
-                String(t"uniform_{dtype}_s{GROUP}"),
-                _fill_blocks(groups),
-                1,
-                1,
-                FILL_THREADS,
-                dst_ptr.as_unsafe_any_origin(),
-                from_out,
-                to_out,
-                from_math,
-                range_math,
-                Int64(groups),
-                Int64(size),
-                seed,
-                base_offset,
-            )
+            # A ragged length or an under-aligned base is a correctness
+            # question, not a speed one: the wide store has to be declined on
+            # the address itself, since a tensor can start at any element
+            # offset inside its storage (`x[1:]`).
+            comptime ALIGN = min(16, GROUP * size_of[dtype]())
+            var wide = size % GROUP == 0 and dst_addr % ALIGN == 0
+
+            # `_fill_blocks`: one thread per group, capped, exactly as the
+            # constant fill does -- a generated fill reads nothing and has no
+            # reuse to protect either, so the same "cover the slots" rule
+            # applies and no constant fitted to one card enters the geometry.
+            if wide:
+                _enqueue_cached[_uniform_kernel[dtype, True]](
+                    ctx,
+                    String(t"uniform_{dtype}_v{GROUP}"),
+                    _fill_blocks(groups),
+                    1,
+                    1,
+                    FILL_THREADS,
+                    dst_ptr.as_unsafe_any_origin(),
+                    from_out,
+                    to_out,
+                    from_math,
+                    range_math,
+                    Int64(groups),
+                    Int64(size),
+                    seed,
+                    base_offset,
+                )
+            else:
+                _enqueue_cached[_uniform_kernel[dtype, False]](
+                    ctx,
+                    String(t"uniform_{dtype}_s{GROUP}"),
+                    _fill_blocks(groups),
+                    1,
+                    1,
+                    FILL_THREADS,
+                    dst_ptr.as_unsafe_any_origin(),
+                    from_out,
+                    to_out,
+                    from_math,
+                    range_math,
+                    Int64(groups),
+                    Int64(size),
+                    seed,
+                    base_offset,
+                )
