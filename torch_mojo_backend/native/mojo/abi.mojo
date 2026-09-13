@@ -790,6 +790,21 @@ def own(var t: T) -> Owned:
     return Owned(t^)
 
 
+def own_if_new(var result: T, original: T) -> Owned:
+    """`Owned` over `result`, live only when it is a fresh allocation
+    distinct from `original`.
+
+    `ops_common.contiguous` / `cast_to` return their input unchanged when it
+    already has the requested layout and dtype, so a caller that wrapped the
+    result in `own()` unconditionally would release a handle it only
+    borrowed (an op's `self`). This releases it exactly when it was
+    allocated, on the raising paths too."""
+    var fresh = result.h != original.h
+    var o = Owned(result^)
+    o.live = fresh
+    return o^
+
+
 def retain(t: T) -> Int:
     return external_call["tmb_tensor_retain", Int](t.h)
 
@@ -880,43 +895,116 @@ def none_arg() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
-def call_op(
-    op: StaticString, overload: StaticString, args: List[Value], n_rets: Int
-) raises -> List[Value]:
-    """Run any aten op through torch's dispatcher (shim tmb_call_op). Tensor
-    results come back as owned handles: `release_results` them or keep them."""
-    var rets = List[Value](capacity=max(n_rets, 1))
-    for _ in range(n_rets):
-        rets.append(none_arg())
+struct Results(Movable):
+    """The result records of a `call_op`, owning everything the shim
+    allocated in them: every handle the caller does not `take_tensor` is
+    released when this dies, on the raising paths too.
+
+    `tmb_call_op` hands back a FRESH `at::Tensor*` for every tensor result --
+    including the one an in-place op returns, which is just another reference
+    to an argument -- so a discarded result record is a leaked handle.
+    """
+
+    var records: List[Value]
+
+    def __init__(out self, var records: List[Value]):
+        self.records = records^
+
+    def __len__(self) -> Int:
+        return len(self.records)
+
+    def __getitem__(self, i: Int) -> Value:
+        return self.records[i].copy()
+
+    def take_tensor(mut self, i: Int) raises -> T:
+        """Result `i` as an owned tensor handle; this container forgets it."""
+        var r = self.records[i].copy()
+        if r.tag != TAG_TENSOR and r.tag != TAG_TENSOR_REF:
+            raise Error(
+                "result ", i, " is not a Tensor (record tag ", r.tag, ")"
+            )
+        self.records[i] = none_arg()
+        return T(Int(r.a))
+
+    def __deinit__(deinit self):
+        for r in self.records:
+            if r.tag == TAG_TENSOR:
+                release(Int(r.a))
+            elif r.tag == TAG_TENSOR_LIST:
+                var ptrs = Pointer[Int, MutUntrackedOrigin](
+                    unsafe_from_address=Int(r.a)
+                )
+                for i in range(Int(r.len)):
+                    release(ptrs[unsafe_offset=i])
+                _free(Int(r.a))
+            elif r.tag == TAG_INT_LIST:
+                _free(Int(r.a))
+
+
+def _free(addr: Int):
+    libc_free(
+        Pointer[NoneType, MutUntrackedOrigin](
+            unsafe_from_address=addr
+        ).unsafe_origin_cast[MutAnyOrigin]()
+    )
+
+
+def call_op_raw(
+    op: String,
+    overload: String,
+    args: Values,
+    n_args: Int,
+    rets: Values,
+    n_rets: Int,
+) raises:
+    """Run any aten op through torch's dispatcher (shim `tmb_call_op`) over
+    caller-owned record arrays. THE implementation: `call_op` below is the
+    List-based front end, and nothing else calls `tmb_call_op` directly.
+
+    What an op uses to reach a neighbouring op's kernel or ATen's own
+    composite: the records are the same ones a kernel gets, tensor arguments
+    are borrowed and tensor results come back as owned handles. Dispatch is on
+    the arguments, so an op must never call *itself* this way. A declining
+    kernel comes back as `unsupported` (rc 2) and keeps that prefix, so a
+    caller with another route can tell it apart from a real failure.
+    """
     var o = String(op)
     var ov = String(overload)
     var rc = external_call["tmb_call_op", Int32](
         o.as_c_string_slice().unsafe_ptr(),
         ov.as_c_string_slice().unsafe_ptr(),
-        args.unsafe_ptr(),
-        Int32(len(args)),
-        rets.unsafe_ptr(),
+        args,
+        Int32(n_args),
+        rets,
         Int32(n_rets),
     )
     if rc == 2:
         unsupported(shim_error())
     if rc != 0:
         raise Error(op, ": ", shim_error())
-    return rets^
 
 
-def release_results(rets: List[Value]):
-    for r in rets:
-        if r.tag == TAG_TENSOR:
-            release(Int(r.a))
-        elif r.tag == TAG_TENSOR_LIST:
-            var ptrs = Pointer[Int, MutUntrackedOrigin](
-                unsafe_from_address=Int(r.a)
-            )
-            for i in range(Int(r.len)):
-                release(ptrs[unsafe_offset=i])
-            libc_free(
-                ptrs.unsafe_bitcast[NoneType]().unsafe_origin_cast[
-                    MutAnyOrigin
-                ]()
-            )
+def call_op(
+    op: StaticString,
+    overload: StaticString,
+    var args: List[Value],
+    n_rets: Int,
+) raises -> Results:
+    """`call_op_raw` over a `List[Value]` of arguments in schema order (exact
+    arity: the dispatcher checks it against the op's schema). `op` must be
+    namespace-qualified (`"aten::normal_"`), `overload` is `""` for the
+    default one. The results own their handles -- see `Results`."""
+    var rets = List[Value](capacity=max(n_rets, 1))
+    for _ in range(n_rets):
+        rets.append(none_arg())
+    var n_args = len(args)
+    call_op_raw(
+        String(op),
+        String(overload),
+        Values(unsafe_from_address=Int(args.unsafe_ptr())),
+        n_args,
+        Values(unsafe_from_address=Int(rets.unsafe_ptr())),
+        n_rets,
+    )
+    _ = args^
+    return Results(rets^)

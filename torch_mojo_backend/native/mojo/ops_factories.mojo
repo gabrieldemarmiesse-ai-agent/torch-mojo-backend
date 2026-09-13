@@ -59,7 +59,7 @@ from ops_common import (
     copy_strided_into,
     fill_value,
     philox_reserve,
-    resize_storage_for,
+    resize_out,
 )
 from registry import Lib, impl
 
@@ -188,9 +188,8 @@ def _host_arange_start_out(
     call_args.append(end_v.copy())
     call_args.append(step_v.copy())
     call_args.append(Value(TAG_TENSOR, 0, Int64(cpu.t.h), 0))
-    var host_rets = call_op("aten::arange", "start_out", call_args^, 1)
-    if host_rets[0].tag == TAG_TENSOR:
-        release(Int(host_rets[0].a))  # tmb_call_op's own fresh wrapper handle
+    # `Results` releases tmb_call_op's own fresh wrapper handle.
+    _ = call_op("aten::arange", "start_out", call_args^, 1)
     _copy_cpu_into(out_t, cpu.t)
 
 
@@ -223,14 +222,9 @@ def op_arange_start_out(
     var step_v = args[unsafe_offset=2].copy()
     var out_t = v_tensor(args[unsafe_offset=3])
     var numel = _arange_numel(start_v, end_v, step_v)
-    if numel != out_t.numel:
-        var shape = IndexList[MAX_RANK](1)
-        shape[MAX_RANK - 1] = numel
-        resize_storage_for(out_t, shape, 1, out_t.offset)
-        set_sizes_strides(
-            out_t, shape, contiguous_strides(shape, 1), 1, out_t.offset
-        )
-        out_t = T(out_t.h)  # refresh the cached view after the resize
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = numel
+    resize_out(out_t, shape, 1)  # a 1-d `out` of this length is left alone
     if numel == 0:
         ret_ref(rets, 0, out_t)
         return
@@ -382,9 +376,9 @@ def op_normal_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     call_args.append(Value(TAG_DOUBLE, 0, f64_bits(mean), 0))
     call_args.append(Value(TAG_DOUBLE, 0, f64_bits(std), 0))
     call_args.append(Value(TAG_NONE, 0, 0, 0))
-    var host_rets = call_op("aten::normal_", "", call_args^, 1)
-    if host_rets[0].tag == TAG_TENSOR:
-        release(Int(host_rets[0].a))  # tmb_call_op's own fresh wrapper handle
+    _ = call_op(
+        "aten::normal_", "", call_args^, 1
+    )  # Results releases its handle
     _copy_cpu_into(t, cpu.t)
     ret_ref(rets, 0, t)
 
