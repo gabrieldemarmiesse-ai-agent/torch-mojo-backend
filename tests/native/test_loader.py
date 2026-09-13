@@ -63,7 +63,7 @@ def _family_sos(cache_dir: Path) -> list[Path]:
     return sorted(cache_dir.glob("logic_ops.*.so"))
 
 
-def _assert_ok(proc: subprocess.CompletedProcess[str]) -> None:
+def _assert_ok(proc: subprocess.CompletedProcess[str]):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "OK" in proc.stdout, proc.stdout + proc.stderr
 

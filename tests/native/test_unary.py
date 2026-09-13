@@ -21,7 +21,7 @@ def _native_count(name: str) -> int:
     return native.op_count(f"aten::{name}")
 
 
-def _reset_native_counts() -> None:
+def _reset_native_counts():
     native.op_counting(True)
     native.op_counts_reset()
 

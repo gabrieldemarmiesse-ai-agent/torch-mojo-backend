@@ -34,7 +34,7 @@ from torch_mojo_backend.testing import CallChecker
 pytestmark = pytest.mark.xdist_group(name="group_native_foreach")
 
 
-def _watch(op_name: str) -> None:
+def _watch(op_name: str):
     """Reset the shim's per-op call counters and start counting."""
     del op_name  # kept as a parameter so call sites read like a doc comment
     native.op_counting(True)
