@@ -363,3 +363,258 @@ def test_call_checker_bitwise_not(mojo_gpu, call_checker):
     call_checker.register(aten_functions.aten_bitwise_not)
     x = torch.randint(0, 10, (3, 4), dtype=torch.int32).to(mojo_gpu)
     torch.bitwise_not(x)
+
+
+# --------------------------------------------------------------------------
+# bf16 GELU exactness. The sweep above compares 15 values at atol 3e-2, which
+# cannot see either failure mode below.
+# --------------------------------------------------------------------------
+
+
+def _finite_bf16_grid(limit: float) -> torch.Tensor:
+    """Every finite bf16 value with |x| <= limit, as a contiguous tensor."""
+    bits = torch.arange(1 << 16, dtype=torch.int32).to(torch.uint16)
+    values = bits.view(torch.bfloat16)
+    values = values[torch.isfinite(values) & (values.abs() <= limit)]
+    return values.contiguous()
+
+
+def _gelu_none_fp64(x: torch.Tensor) -> torch.Tensor:
+    """x * Phi(x), written so it keeps its bits in the left tail.
+
+    NOT `F.gelu(x.double())`: `1 + erf(x/sqrt(2))` is quantized by the fp64
+    epsilon at 1.0, and by x = -8 half the significand is already gone.
+    `erfc` keeps the small value small.
+    """
+    x = x.double()
+    return torch.relu(x) - 0.5 * x.abs() * torch.erfc(x.abs() / 2.0**0.5)
+
+
+def test_gelu_bf16_matches_a_double_reference_over_the_whole_grid(mojo_gpu):
+    """Every finite bf16 input, within one ulp of the fp64 answer."""
+    x_cpu = _finite_bf16_grid(12.5)
+    assert x_cpu.numel() > 30000, x_cpu.numel()
+    expected = _gelu_none_fp64(x_cpu).to(torch.bfloat16)
+    actual = F.gelu(x_cpu.to(mojo_gpu), approximate="none").cpu()
+
+    actual_bits = actual.view(torch.uint16).to(torch.int32)
+    expected_bits = expected.view(torch.uint16).to(torch.int32)
+    differ = actual_bits != expected_bits
+    assert (actual_bits - expected_bits).abs().max().item() <= 1
+    assert int(differ.sum()) <= 8, int(differ.sum())
+
+
+def test_gelu_bf16_resolves_the_negative_tail(mojo_gpu):
+    """Below x ~ -5.2 a form built on `0.5*x*(1+erf(x/sqrt2))` returns
+    exactly 0: the sum has lost every bit of the answer."""
+    x_cpu = torch.arange(-12.5, -5.0, 0.0625, dtype=torch.float32).to(torch.bfloat16)
+    actual = F.gelu(x_cpu.to(mojo_gpu), approximate="none").cpu()
+    assert (actual < 0).all(), actual
+    assert (actual.float().diff() < 0).all()  # strictly decreasing in x
+    expected = _gelu_none_fp64(x_cpu).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=8e-3, atol=0)
+
+
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_bf16_special_values(mojo_gpu, approximate):
+    """+-0, +-inf and NaN, compared as bit patterns. `-inf` is the one
+    deliberate divergence between the two forms: `tanh` gives NaN (from
+    `inf * 0`), `none` gives -0.0."""
+    bits = torch.tensor(
+        [0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC0, 0x0001, 0x8001, 0x7F7F, 0xFF7F],
+        dtype=torch.int32,
+    ).to(torch.uint16)
+    x_cpu = bits.view(torch.bfloat16)
+    x = x_cpu.to(mojo_gpu)
+    out_bits = F.gelu(x, approximate=approximate).cpu().view(torch.uint16)
+    out = out_bits.view(torch.bfloat16)
+
+    assert int(out_bits[0]) == 0x0000  # +0 -> +0
+    assert int(out_bits[1]) == 0x8000  # -0 -> -0
+    assert out[2].float().item() == float("inf")
+    if approximate == "tanh":
+        assert out[3].isnan()
+    else:
+        assert int(out_bits[3]) == 0x8000  # -inf -> -0.0
+    assert out[4].isnan()
+    # The input must not have been written through.
+    torch.testing.assert_close(x.cpu().view(torch.uint16), bits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+@pytest.mark.parametrize(
+    "layout", ["contiguous", "transposed", "gapped", "empty", "fp32", "fp16"]
+)
+def test_gelu_forward_every_layout_and_dtype(mojo_gpu, approximate, layout):
+    """The regimes around the bf16 direct route: other dtypes, a device
+    transpose, a stride-2 view, and an empty tensor (which must not launch)."""
+    if layout == "empty":
+        x = torch.empty(0, 7, dtype=torch.bfloat16, device=mojo_gpu)
+        out = F.gelu(x, approximate=approximate)
+        assert out.shape == (0, 7) and out.dtype == torch.bfloat16
+        return
+    dtype = {"fp32": torch.float32, "fp16": torch.float16}.get(layout, torch.bfloat16)
+    if layout == "transposed":
+        cpu = torch.randn(7, 5).to(dtype)
+        x, x_cpu = cpu.to(mojo_gpu).t(), cpu.t()
+    elif layout == "gapped":
+        cpu = torch.randn(71).to(dtype)
+        x, x_cpu = cpu.to(mojo_gpu)[1:71:2], cpu[1:71:2]
+    else:
+        cpu = torch.randn(5, 7).to(dtype)
+        x, x_cpu = cpu.to(mojo_gpu), cpu
+    rtol, atol = _tol(dtype)
+    torch.testing.assert_close(
+        F.gelu(x, approximate=approximate).cpu(),
+        F.gelu(x_cpu.float(), approximate=approximate).to(dtype),
+        rtol=rtol or 5e-5,
+        atol=atol or 5e-5,
+    )
+
+
+@pytest.mark.parametrize("step", [1, 2])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_backward_runtime_layouts(mojo_gpu, approximate, step):
+    """gelu_backward straight from aten, on operands that start at a nonzero
+    offset (step 1) or skip every other element (step 2). The autograd test
+    above only ever feeds it contiguous tensors from offset 0."""
+    n = 257
+    grad_backing = torch.linspace(2.0, -2.0, 519)
+    input_backing = torch.linspace(-8.0, 8.0, 517)
+    grad_cpu = grad_backing[1 : 1 + n * step : step]
+    input_cpu = input_backing[2 : 2 + n * step : step]
+    grad = grad_backing.to(mojo_gpu)[1 : 1 + n * step : step]
+    x = input_backing.to(mojo_gpu)[2 : 2 + n * step : step]
+    expected = torch.ops.aten.gelu_backward(
+        grad_cpu, input_cpu, approximate=approximate
+    )
+    actual = torch.ops.aten.gelu_backward(grad, x, approximate=approximate)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=5e-5, atol=5e-5)
+
+
+# --------------------------------------------------------------------------
+# fill_ / zero_ over every rank, length, alignment phase and layout.
+#
+# One dtype per element width (8/4/2/1 bytes), because the vector width the
+# kernel picks is a function of the element size, the extent AND the runtime
+# base address. Every case fills a VIEW of an 8192-element base and compares
+# the WHOLE base, so a kernel writing outside the view is caught.
+# --------------------------------------------------------------------------
+
+_FILL_DTYPES = [torch.int64, torch.float32, torch.bfloat16, torch.bool]
+
+
+def _fill_base(dtype: torch.dtype, device: str):
+    if dtype == torch.bool:
+        cpu = (torch.arange(8192) % 3) == 0
+    elif dtype.is_floating_point:
+        cpu = (torch.arange(8192, dtype=torch.float32) % 251 / 8.0).to(dtype)
+    else:
+        cpu = (torch.arange(8192) % 251).to(dtype)
+    return cpu, cpu.to(device)
+
+
+def _fill_value(dtype: torch.dtype):
+    return True if dtype == torch.bool else 7
+
+
+@pytest.mark.parametrize("dtype", _FILL_DTYPES)
+@pytest.mark.parametrize("rank", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_fill_scalar_ranks_one_through_eight(mojo_device, dtype, rank):
+    shape = (2,) * (rank - 1) + (5,)
+    numel = 2 ** (rank - 1) * 5
+    cpu, device = _fill_base(dtype, mojo_device)
+    value = _fill_value(dtype)
+    device[:numel].view(shape).fill_(value)
+    cpu[:numel].view(shape).fill_(value)
+    assert torch.equal(device.cpu(), cpu)
+
+
+@pytest.mark.parametrize("dtype", _FILL_DTYPES)
+def test_fill_scalar_lengths_exercise_the_scalar_tail(mojo_device, dtype):
+    value = _fill_value(dtype)
+    for length in (0, 1, 2, 3, 5, 7, 9, 15, 16, 17, 31, 33, 4099):
+        cpu, device = _fill_base(dtype, mojo_device)
+        device[:length].fill_(value)
+        cpu[:length].fill_(value)
+        assert torch.equal(device.cpu(), cpu), length
+
+
+@pytest.mark.parametrize("dtype", _FILL_DTYPES)
+def test_fill_scalar_every_alignment_phase(mojo_device, dtype):
+    """Offsets 0..16 walk every 16-byte phase of the base address."""
+    value = _fill_value(dtype)
+    for offset in range(17):
+        cpu, device = _fill_base(dtype, mojo_device)
+        device[offset : offset + 333].fill_(value)
+        cpu[offset : offset + 333].fill_(value)
+        assert torch.equal(device.cpu(), cpu), offset
+
+
+@pytest.mark.parametrize("dtype", _FILL_DTYPES)
+@pytest.mark.parametrize(
+    "layout",
+    ["transpose", "column", "gapped", "block", "permuted", "expanded", "scalar"],
+)
+def test_fill_scalar_strided_layouts(mojo_device, dtype, layout):
+    def view(t):
+        if layout == "transpose":
+            return t[:6000].view(60, 100).t()
+        if layout == "column":
+            return t[:6000].view(60, 100).t()[:, 3]
+        if layout == "gapped":
+            return t[:6000:7]
+        if layout == "block":
+            return t[:6000].view(60, 100)[10:50, 20:90]
+        if layout == "permuted":
+            return t[:5040].view(6, 7, 8, 15).permute(2, 0, 3, 1)
+        if layout == "expanded":
+            return t[:100].view(1, 100).expand(7, 100)
+        return t[:1].view(())
+
+    value = _fill_value(dtype)
+    cpu, device = _fill_base(dtype, mojo_device)
+    view(device).fill_(value)
+    view(cpu).fill_(value)
+    assert torch.equal(device.cpu(), cpu)
+
+
+@pytest.mark.parametrize("dtype", _FILL_DTYPES)
+def test_zero__through_a_transposed_view(mojo_device, dtype):
+    cpu, device = _fill_base(dtype, mojo_device)
+    device[:1234].view(2, 617).t().zero_()
+    cpu[:1234].view(2, 617).t().zero_()
+    assert torch.equal(device.cpu(), cpu)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.int32, torch.uint8]
+)
+def test_fill_scalar_value_conversion_matches_cpu(mojo_device, dtype):
+    """How a python value narrows into the destination dtype is ATen's rule,
+    not the kernel's choice."""
+    values = [0, 7, True, False, 0.0, 2.75]
+    if dtype != torch.uint8:
+        values += [-1.5, -3]
+    if dtype.is_floating_point:
+        values += [float("inf"), float("-inf"), float("nan")]
+    for value in values:
+        cpu = torch.zeros(9, dtype=dtype)
+        device = cpu.to(mojo_device)
+        cpu.fill_(value)
+        device.fill_(value)
+        got = device.cpu()
+        if dtype.is_floating_point:
+            assert torch.equal(got.isnan(), cpu.isnan()), value
+            assert torch.equal(got.nan_to_num(0.0), cpu.nan_to_num(0.0)), value
+        else:
+            assert torch.equal(got, cpu), value
+
+
+def test_fill_through_a_transposed_view_keeps_the_allocation(mojo_device):
+    x = torch.zeros(4, 6, dtype=torch.bool).to(mojo_device)
+    view = x.t()
+    before = x.data_ptr()
+    filled = view.fill_(True)
+    assert filled.data_ptr() == before
+    assert bool(x.cpu().all())

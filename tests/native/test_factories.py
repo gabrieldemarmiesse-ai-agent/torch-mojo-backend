@@ -10,7 +10,7 @@ Public torch API only, per the porting brief: no `aten_fast`,
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native
+from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
 
@@ -516,4 +516,90 @@ def test_native_dropout_autograd_optional_train_scale(mojo_gpu, train, scale):
     assert input.grad is not None
     torch.testing.assert_close(
         input.grad.cpu(), grad_output * mask.cpu() * scale, atol=1e-6, rtol=1e-6
+    )
+
+
+# ---------------------------------------------------------------------------
+# RNG stream edges the tests above (8192- and 1025-element draws from an
+# aligned base) cannot reach.
+# ---------------------------------------------------------------------------
+
+
+def test_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
+    """7 is not a multiple of the 4-wide philox group: the ragged group must
+    still consume its whole counter, or the next draw repeats it."""
+    device_module.manual_seed_all(20260814)
+    first = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    state = device_module.get_rng_state(mojo_gpu)
+    second = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    assert not set(first.tolist()) & set(second.tolist())
+
+    device_module.set_rng_state(state, mojo_gpu)
+    replayed = torch.empty(7, device=mojo_gpu).uniform_().cpu()
+    torch.testing.assert_close(replayed, second)
+
+
+def test_uniform_misaligned_destination_indexes_the_stream_the_same_way(mojo_gpu):
+    """An offset base cannot take the 16-byte vector store; the scalar store
+    kernel must index the philox stream identically."""
+    device_module.manual_seed_all(20260814)
+    state = device_module.get_rng_state(mojo_gpu)
+    aligned = torch.zeros(8, device=mojo_gpu).uniform_(-1.0, 1.0).cpu()
+
+    device_module.set_rng_state(state, mojo_gpu)
+    storage = torch.zeros(9, device=mojo_gpu)
+    storage[1:].uniform_(-1.0, 1.0)
+    host = storage.cpu()
+    assert torch.equal(host[1:], aligned)
+    assert float(host[0]) == 0.0
+
+
+def test_torch_manual_seed_reaches_the_device_generator(mojo_gpu):
+    """`torch.manual_seed` (not just device_module.manual_seed_all) must seed
+    the mojo generator."""
+    torch.manual_seed(20260913)
+    first = torch.rand(1000, device=mojo_gpu).cpu()
+    torch.manual_seed(20260913)
+    replayed = torch.rand(1000, device=mojo_gpu).cpu()
+    torch.testing.assert_close(first, replayed)
+    assert not torch.equal(torch.rand(1000, device=mojo_gpu).cpu(), first)
+
+
+def test_arange_needs_a_wide_accumulator(mojo_device):
+    """Past 2**24 an fp32 running sum stops being able to add 1.0. The
+    reference is built element by element, because torch's own CPU kernel
+    accumulates in fp64 and its arm64 vectorization rounds differently here."""
+    start, step, count = 16_777_217.0, 1.0, 10
+    got = torch.arange(
+        start, start + count * step, step, dtype=torch.float32, device=mojo_device
+    )
+    expected = torch.tensor(
+        [start + i * step for i in range(count)], dtype=torch.float32
+    )
+    assert torch.equal(got.cpu(), expected)
+
+
+def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
+    """fp64 is a separate kernel specialization from fp32 for each of these."""
+    if list(get_accelerators())[0].api == "metal":
+        pytest.skip("Metal has no float64")
+    ones = torch.ones(5, dtype=torch.float64, device=mojo_gpu)
+    assert ones.dtype == torch.float64
+    torch.testing.assert_close(ones.cpu(), torch.ones(5, dtype=torch.float64))
+
+    filled = torch.empty(5, dtype=torch.float64, device=mojo_gpu).fill_(2.5)
+    torch.testing.assert_close(filled.cpu(), torch.full((5,), 2.5, dtype=torch.float64))
+
+    scattered = torch.zeros(5, dtype=torch.float64, device=mojo_gpu).scatter(
+        0,
+        torch.tensor([1, 3], device=mojo_gpu),
+        torch.tensor([4.0, 7.0], dtype=torch.float64, device=mojo_gpu),
+    )
+    torch.testing.assert_close(
+        scattered.cpu(), torch.tensor([0.0, 4.0, 0.0, 7.0, 0.0], dtype=torch.float64)
+    )
+
+    ranged = torch.arange(0.0, 2.0, 0.25, dtype=torch.float64, device=mojo_gpu)
+    torch.testing.assert_close(
+        ranged.cpu(), torch.arange(0.0, 2.0, 0.25, dtype=torch.float64)
     )

@@ -971,3 +971,63 @@ def test_sum_default_overload_decomposes_to_dim_intlist(mojo_gpu):
 
 def test_accelerator_count_is_sane(registered):
     assert len(list(get_accelerators())) >= 1
+
+
+# ---------------------------------------------------------------------------
+# var: the cancellation regimes. The tests above are all well-conditioned;
+# none of them can reach the detector that recovers a slice whose moments
+# cancel.
+# ---------------------------------------------------------------------------
+
+_VAR_N = 1 << 22
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("magnitude", [1e6, -1e6])
+@pytest.mark.parametrize(
+    "position", [0, 1, 8192, _VAR_N // 528, _VAR_N // 528 - 1, _VAR_N // 2, _VAR_N - 1]
+)
+def test_var_outlier_anywhere_stays_accurate(mojo_gpu, position, magnitude, dtype):
+    """Position 0 is the catastrophic one: it IS the assumed mean, so
+    `M2 = q - s**2/n` becomes a difference of two ~4e18 quantities. The
+    reference is computed on the SAME quantized values, so this measures the
+    kernel's summation, not the dtype."""
+    x64 = torch.randn(
+        _VAR_N, dtype=torch.float64, generator=torch.Generator().manual_seed(0)
+    )
+    x64[position] = magnitude
+    x = x64.to(dtype)
+    expected = torch.var(x.double(), correction=1)
+    result = torch.var(x.to(mojo_gpu), correction=1).cpu().double()
+    rtol = 1e-6 if dtype == torch.float32 else 5e-3
+    torch.testing.assert_close(result, expected, atol=0, rtol=rtol)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_var_outlier_row_poisons_every_slice(mojo_gpu, dim):
+    """Recovery has to be per output element, not one whole-tensor decision:
+    here every slice contains an outlier."""
+    x64 = torch.randn(
+        2048, 2048, dtype=torch.float64, generator=torch.Generator().manual_seed(0)
+    )
+    if dim == 0:
+        x64[0, :] = 1e6
+    else:
+        x64[:, 0] = 1e6
+    x = x64.to(torch.float32)
+    expected = torch.var(x.double(), dim=dim, correction=1)
+    result = torch.var(x.to(mojo_gpu), dim=dim, correction=1).cpu().double()
+    torch.testing.assert_close(result, expected, atol=0, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("value", [0.0, 3.0, -1e6])
+@pytest.mark.parametrize("shape,dim", [((1 << 22,), None), ((512, 4096), 0)])
+def test_var_constant_slice_is_exactly_zero(mojo_gpu, shape, dim, value, dtype):
+    """The boundary of the cancellation detector: a ratio-based one divides
+    by zero here. Exactly +0.0, never -0.0."""
+    x = torch.full(shape, value, dtype=dtype)
+    kwargs = {} if dim is None else {"dim": dim}
+    result = torch.var(x.to(mojo_gpu), correction=1, **kwargs).cpu()
+    assert bool((result == 0).all()), result
+    assert not bool(result.signbit().any())

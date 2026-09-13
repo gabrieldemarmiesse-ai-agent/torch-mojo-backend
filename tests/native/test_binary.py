@@ -469,5 +469,199 @@ def test_autograd_through_binary_ops(mojo_gpu):
     # `.backward(grad)` rather than `.sum().backward()`: reductions are
     # another op group.
     ((x * y) + x * 2.0).backward(torch.ones(4).to(mojo_gpu))
+    assert x.grad is not None and y.grad is not None
     torch.testing.assert_close(x.grad.cpu(), (y + 2.0).detach().cpu())
     torch.testing.assert_close(y.grad.cpu(), x.detach().cpu())
+
+
+# --------------------------------------------------------------------------
+# Numeric regressions: the operand regimes where a naive formula is wrong.
+# Each of these reproduced a real bug; the ordinary tests above use benign
+# operands that none of them can fire on.
+# --------------------------------------------------------------------------
+
+
+def test_remainder_bfloat16_near_zero_divisor(mojo_device):
+    """A divisor at the smallest bf16 normal makes the quotient overflow.
+
+    `a - trunc(a/b)*b` sends a/b to +/-inf here, though the true remainder is
+    bounded by |b|. The kernel must reduce without forming the quotient.
+    """
+    a_cpu = torch.tensor([0.4922, -7.4375, 2.3125, 91.0], dtype=torch.bfloat16)
+    b_cpu = torch.tensor([1.0, 1.0, 1.0, 1.1754943508222875e-38], dtype=torch.bfloat16)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.remainder(a, b).cpu(), torch.remainder(a_cpu, b_cpu)
+    )
+    torch.testing.assert_close(
+        torch.remainder(b, a).cpu(), torch.remainder(b_cpu, a_cpu)
+    )
+
+
+def test_remainder_float16_large_ratio(mojo_device):
+    """|a/b| ~ 2.4e7 is past fp32's 2**24 integer grid: rounding the quotient
+    to fp32 loses the remainder entirely (it comes back exactly 0)."""
+    a_cpu = torch.tensor([23456.0], dtype=torch.float16)
+    b_cpu = torch.tensor([0.0009937286376953125], dtype=torch.float16)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.remainder(a, b).cpu(), torch.remainder(a_cpu, b_cpu)
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_floor_divide_narrow_float_boundary(mojo_device, dtype):
+    """-6.3125 / -1.0546875 is 5.985..., but rounds to 6.0 at bf16 precision.
+    Dividing in the narrow dtype and flooring afterwards answers 6."""
+    a_cpu = torch.tensor([-6.3125, 91.0, 2.3125, -5.2812, 357.0], dtype=dtype)
+    b_cpu = torch.tensor([-1.0546875, 3.375, 8.5, 1.0547, 6.789], dtype=dtype)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.floor_divide(a, b).cpu(), torch.floor_divide(a_cpu, b_cpu)
+    )
+
+
+def test_floor_divide_subnormal_quotient_underflow(mojo_device):
+    """2**-126 / -4.71875 is an fp32 SUBNORMAL; flushing it to zero answers 0
+    where the floor is -1. bf16-only: fp16's normal range bottoms out at
+    2**-14, far above the fp32 subnormal cliff."""
+    a_cpu = torch.tensor([2.0**-126], dtype=torch.bfloat16)
+    b_cpu = torch.tensor([-4.71875], dtype=torch.bfloat16)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    expected = torch.floor_divide(a_cpu, b_cpu)
+    assert expected.item() == -1.0, expected  # the CPU reference itself
+    torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_div_trunc_mode_keeps_the_narrow_quotient(mojo_device, dtype):
+    """The same operands as floor_divide above, with rounding_mode="trunc":
+    ATen does NOT widen here, so the answer is the rounded-then-truncated 6,
+    not 5. The opposite fix from the floor case -- this is the check that
+    stops someone "correcting" both."""
+    a_cpu = torch.tensor([-6.3125, 91.0, 2.3125, -5.2812, 357.0], dtype=dtype)
+    b_cpu = torch.tensor([-1.0546875, 3.375, 8.5, 1.0547, 6.789], dtype=dtype)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.div(a, b, rounding_mode="trunc").cpu(),
+        torch.div(a_cpu, b_cpu, rounding_mode="trunc"),
+    )
+
+
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
+)
+def test_div_rounding_mode_negative_divisor(mojo_device, mode, dtype):
+    """floor and trunc only disagree when the quotient is negative, so a
+    positive-divisor test cannot tell them apart."""
+    a_cpu = torch.tensor([7, -7, 7, -7, 8, -8, 6, -6], dtype=dtype)
+    b_cpu = torch.tensor([2, 2, -2, -2, 3, 3, -3, -3], dtype=dtype)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.div(a, b, rounding_mode=mode).cpu(),
+        torch.div(a_cpu, b_cpu, rounding_mode=mode),
+    )
+
+
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+def test_div_scalar_mode_negative_scalar(mojo_device, mode):
+    a_cpu = torch.tensor([7, -7, 8, -8, 9, -9], dtype=torch.int32)
+    a = a_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.div(a, -2, rounding_mode=mode).cpu(),
+        torch.div(a_cpu, -2, rounding_mode=mode),
+    )
+
+
+def test_lerp_scalar_weight_at_the_branch_boundary(mojo_device):
+    """weight = 0.5 - 2**-30 narrows to exactly 0.5f, and ATen picks its
+    stable formula from the NARROWED value; these operands separate the two
+    branches, so the answer must be bit-exact, not merely close."""
+    weight = 0.5 - 2.0**-30
+    start_cpu = torch.tensor(
+        [[-1.0687099695205688, -2.0, 3.0], [4.0, -5.0, 6.0]], dtype=torch.float32
+    )
+    end_cpu = torch.tensor([[2.028475284576416, 8.0, -3.0]], dtype=torch.float32)
+    start, end = start_cpu.to(mojo_device), end_cpu.to(mojo_device)
+
+    out = torch.empty_like(start)
+    returned = torch.lerp(start, end, weight, out=out)
+    assert returned is out
+    torch.testing.assert_close(
+        out.cpu(), torch.lerp(start_cpu, end_cpu, weight), rtol=0, atol=0
+    )
+
+    before = start.data_ptr()
+    aliased = start.view(3, 2)
+    assert start.lerp_(end, weight) is start
+    assert start.data_ptr() == before
+    expected = start_cpu.lerp_(end_cpu, weight)
+    torch.testing.assert_close(start.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(aliased.cpu(), expected.view(3, 2), rtol=0, atol=0)
+    torch.testing.assert_close(end.cpu(), end_cpu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("f32_first", [True, False])
+@pytest.mark.parametrize(
+    "shape", [(), (0,), (0, 5), (1,), (7,), (17, 65), (3, 5, 7), (2, 3, 5, 7, 11)]
+)
+def test_add_f32_bf16_fused_is_bit_exact(mojo_gpu, shape, f32_first):
+    """Bit-exact, not merely close: that is what says the bf16 operand was
+    widened in registers rather than materialized through a rounding cast."""
+    f32_cpu = torch.randn(shape, dtype=torch.float32)
+    bf16_cpu = torch.randn(shape, dtype=torch.float32).to(torch.bfloat16)
+    f32, bf16 = f32_cpu.to(mojo_gpu), bf16_cpu.to(mojo_gpu)
+    left, right = (f32, bf16) if f32_first else (bf16, f32)
+    left_cpu, right_cpu = (f32_cpu, bf16_cpu) if f32_first else (bf16_cpu, f32_cpu)
+    out = left + right
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out.cpu(), left_cpu + right_cpu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("f32_first", [True, False])
+def test_add_f32_bf16_fused_on_offset_views(mojo_gpu, f32_first):
+    """Same, off a storage offset: the fused route may not assume its
+    operands start at offset 0."""
+    f32_cpu = torch.randn(1106, dtype=torch.float32)
+    bf16_cpu = torch.randn(1106, dtype=torch.float32).to(torch.bfloat16)
+    f32, bf16 = f32_cpu.to(mojo_gpu)[1:], bf16_cpu.to(mojo_gpu)[1:]
+    left, right = (f32, bf16) if f32_first else (bf16, f32)
+    left_cpu, right_cpu = (
+        (f32_cpu[1:], bf16_cpu[1:]) if f32_first else (bf16_cpu[1:], f32_cpu[1:])
+    )
+    torch.testing.assert_close(
+        (left + right).cpu(), left_cpu + right_cpu, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (5,), (3, 7)])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32]
+)
+def test_inplace_scalar_every_dtype_and_rank(mojo_device, dtype, shape):
+    """add_/mul_ with a python scalar. The integer dtype is here because it
+    must keep falling through to the functional-plus-copy-back path."""
+    scalars = (3, -1, 2) if dtype == torch.int32 else (2.5, -1, 0.0)
+    for scalar in scalars:
+        if dtype.is_floating_point:
+            cpu = torch.randn(shape, dtype=torch.float32).to(dtype)
+        else:
+            cpu = torch.randint(-9, 9, shape, dtype=dtype)
+        x = cpu.to(mojo_device)
+        assert x.add_(scalar) is x
+        torch.testing.assert_close(x.cpu(), cpu.add_(scalar), rtol=2e-2, atol=2e-2)
+        assert x.mul_(scalar) is x
+        torch.testing.assert_close(x.cpu(), cpu.mul_(scalar), rtol=2e-2, atol=2e-2)
+
+
+def test_add_above_last_level_cache(mojo_gpu):
+    """24_000_003 fp32 elements: past a 256 MiB L2, and not a multiple of the
+    4-element vector, so the scalar tail rides the streaming grid too. The
+    only case that reaches the arm covering the vector slots exactly once
+    instead of the capped-block grid."""
+    n = 24_000_003
+    left_cpu = torch.arange(n, dtype=torch.float32) % 1021 - 510.0
+    right_cpu = torch.arange(n, dtype=torch.float32) % 733 - 366.0
+    out = left_cpu.to(mojo_gpu) + right_cpu.to(mojo_gpu)
+    torch.testing.assert_close(out.cpu(), left_cpu + right_cpu, rtol=0, atol=0)

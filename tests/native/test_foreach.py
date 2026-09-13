@@ -503,3 +503,163 @@ def test_batched_inplace_foreach_bumps_the_version_counter(mojo_gpu):
     torch._foreach_mul_(xs, 2.0)
     assert [x._version - v for x, v in zip(xs, before)] == [2, 2, 2]
     assert xs[0].cpu().tolist() == [4.0] * 8
+
+
+# ---------------------------------------------------------------------------
+# Past the per-launch descriptor cap, and the aliasing rules.
+#
+# The lists above are 5 tensors, which fits one batch: nothing here crosses
+# the cap (64 descriptors per launch) and nothing checks what happens when a
+# list member aliases another or the scalar operand.
+# ---------------------------------------------------------------------------
+
+
+def _over_cap_lists(device: str, dtype=torch.float32):
+    """66 entries: an empty, 64 small ones (the cap), and one large."""
+    cpu = (
+        [torch.empty(0, dtype=dtype)]
+        + [torch.tensor([3.0 * i, -4.0 * i], dtype=dtype) for i in range(64)]
+        + [torch.linspace(-3, 4, 65_537).to(dtype)]
+    )
+    return cpu, [t.to(device) for t in cpu]
+
+
+@pytest.mark.parametrize("dtype_arg", [None, torch.float32])
+def test_foreach_norm_over_the_descriptor_cap(mojo_gpu: str, dtype_arg):
+    """65 inputs including an empty one and two non-finite ones: the batch
+    boundary must not reorder or drop a result."""
+    cpu = (
+        [
+            torch.empty(0),
+            torch.tensor([float("inf"), 1.0]),
+            torch.tensor([float("nan"), 2.0]),
+        ]
+        + [torch.tensor([3.0 * i, -4.0 * i]) for i in range(1, 62)]
+        + [torch.linspace(-3, 4, 65_537)]
+    )
+    assert len(cpu) == 65
+    device = [t.to(mojo_gpu) for t in cpu]
+    kwargs = {} if dtype_arg is None else {"dtype": dtype_arg}
+    got = torch.ops.aten._foreach_norm(device, 2, **kwargs)
+    want = torch.ops.aten._foreach_norm(cpu, 2, **kwargs)
+    assert len(got) == len(want)
+    for index, (g, w) in enumerate(zip(got, want, strict=True)):
+        assert g.dtype == torch.float32 and tuple(g.shape) == ()
+        (
+            torch.testing.assert_close(
+                g.cpu(), w.float(), equal_nan=True, rtol=2e-5, atol=1e-6
+            ),
+            index,
+        )
+    pointers = [t.data_ptr() for t in got]
+    assert len(set(pointers)) == len(pointers)  # distinct allocations
+
+
+def test_foreach_norm_strided_inputs(mojo_gpu: str):
+    cpu = [
+        torch.arange(24, dtype=torch.float32).reshape(4, 6).t(),
+        torch.linspace(-2, 3, 35).reshape(5, 7).t(),
+    ]
+    device = [
+        torch.arange(24, dtype=torch.float32).to(mojo_gpu).reshape(4, 6).t(),
+        torch.linspace(-2, 3, 35).to(mojo_gpu).reshape(5, 7).t(),
+    ]
+    got = torch.ops.aten._foreach_norm(device, 2)
+    want = torch.ops.aten._foreach_norm(cpu, 2)
+    for g, w in zip(got, want, strict=True):
+        torch.testing.assert_close(g.cpu(), w, rtol=2e-5, atol=1e-6)
+
+
+def test_foreach_norm_then_mul_over_the_cap_all_empty(mojo_gpu: str):
+    device = [torch.empty(0, device=mojo_gpu) for _ in range(65)]
+    versions = [t._version for t in device]
+    norms = torch.ops.aten._foreach_norm(device, 2)
+    for norm in norms:
+        assert tuple(norm.shape) == ()
+        assert float(norm.cpu()) == 0.0
+    torch.ops.aten._foreach_mul_(device, torch.tensor(2.0, device=mojo_gpu))
+    for tensor, before in zip(device, versions, strict=True):
+        assert tensor._version == before + 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_foreach_add_scalar_over_the_cap_is_bit_exact(mojo_gpu: str, dtype):
+    """The batched kernel widens to fp32 and narrows, which is what the
+    per-tensor `add_.Scalar` does: bit-exactly the same answer."""
+    cpu, device = _over_cap_lists(mojo_gpu, dtype)
+    pointers = [t.data_ptr() for t in device]
+    versions = [t._version for t in device]
+    torch.ops.aten._foreach_add_(device, 1.5)
+    for tensor, source, pointer, version in zip(
+        device, cpu, pointers, versions, strict=True
+    ):
+        assert tensor.data_ptr() == pointer
+        assert tensor._version == version + 1
+        expected = (source.float() + 1.5).to(dtype)
+        assert torch.equal(tensor.cpu(), expected)
+
+
+def test_foreach_mul_tensor_over_the_cap_is_bit_exact(mojo_gpu: str):
+    cpu, device = _over_cap_lists(mojo_gpu)
+    pointers = [t.data_ptr() for t in device]
+    versions = [t._version for t in device]
+    torch.ops.aten._foreach_mul_(device, torch.tensor(2.5, device=mojo_gpu))
+    for tensor, source, pointer, version in zip(
+        device, cpu, pointers, versions, strict=True
+    ):
+        assert tensor.data_ptr() == pointer
+        assert tensor._version == version + 1
+        assert torch.equal(tensor.cpu(), (source.float() * 2.5).to(torch.float32))
+
+
+def test_foreach_add_scalar_duplicate_entry_is_applied_twice(mojo_gpu: str):
+    """ATen's contract for a list with the same tensor twice: the op runs per
+    ENTRY, not per distinct allocation."""
+    x = torch.tensor([2.0, -3.0, 5.0], device=mojo_gpu)
+    version = x._version
+    torch.ops.aten._foreach_add_([x, x], 1.0)
+    torch.testing.assert_close(x.cpu(), torch.tensor([4.0, -1.0, 7.0]))
+    assert x._version == version + 2
+
+
+def test_foreach_mul_tensor_overlapping_views_are_sequential(mojo_gpu: str):
+    base = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], device=mojo_gpu)
+    version = base._version
+    torch.ops.aten._foreach_mul_(
+        [base[:4], base[1:]], torch.tensor(2.0, device=mojo_gpu)
+    )
+    torch.testing.assert_close(base.cpu(), torch.tensor([2.0, 8.0, 12.0, 16.0, 10.0]))
+    assert base._version == version + 2
+
+
+def test_foreach_mul_tensor_rejects_a_scalar_that_aliases_an_input(mojo_gpu: str):
+    """A scalar read from inside a tensor the launch is about to overwrite:
+    the result would depend on launch order, so it must decline BEFORE
+    writing anything."""
+    x = torch.tensor([2.0, 3.0, 4.0], device=mojo_gpu)
+    before = x.cpu().clone()
+    version = x._version
+    with pytest.raises((NotImplementedError, RuntimeError)):
+        torch.ops.aten._foreach_mul_([x], x[0])
+    torch.testing.assert_close(x.cpu(), before)
+    assert x._version == version
+
+
+def test_foreach_mul_tensor_allows_a_full_self_alias(mojo_gpu: str):
+    """The whole 0-d tensor being its own operand is well defined."""
+    x = torch.tensor(3.0, device=mojo_gpu)
+    version = x._version
+    torch.ops.aten._foreach_mul_([x], x)
+    assert float(x.cpu()) == 9.0
+    assert x._version == version + 1
+
+
+def test_foreach_mul_tensor_allows_a_scalar_in_a_strided_hole(mojo_gpu: str):
+    """`base[1]` is not covered by `base[::2]`, so nothing overwrites it."""
+    base = torch.arange(1.0, 7.0, device=mojo_gpu)
+    version = base._version
+    torch.ops.aten._foreach_mul_([base[::2]], base[1])
+    torch.testing.assert_close(
+        base.cpu(), torch.tensor([2.0, 2.0, 6.0, 4.0, 10.0, 6.0])
+    )
+    assert base._version == version + 1

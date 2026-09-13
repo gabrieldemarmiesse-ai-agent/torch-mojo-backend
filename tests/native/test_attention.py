@@ -320,5 +320,6 @@ def test_public_sdpa_takes_the_flash_route_and_trains(mojo_gpu):
     ref_v = v.detach().cpu().float().requires_grad_(True)
     ref = F.scaled_dot_product_attention(ref_q, ref_k, ref_v, is_causal=True)
     ref.sum().backward()
+    assert q.grad is not None and ref_q.grad is not None
     torch.testing.assert_close(out.cpu().float(), ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(q.grad.cpu().float(), ref_q.grad, atol=5e-2, rtol=5e-2)

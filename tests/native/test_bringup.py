@@ -69,6 +69,7 @@ def test_autograd_uses_aten_formulas(mojo_device):
     x = _arange(4, mojo_device).requires_grad_()
     y = torch.full((4,), 3.0).to(mojo_device).requires_grad_()
     (x * y).backward(torch.ones(4).to(mojo_device))
+    assert x.grad is not None and y.grad is not None
     assert x.grad.cpu().tolist() == [3.0] * 4
     assert y.grad.cpu().tolist() == [0.0, 1.0, 2.0, 3.0]
 
@@ -101,3 +102,18 @@ def test_rng_state_and_generator(mojo_device):
     assert g.initial_seed() == 5
     device_module.set_rng_state(state)
     assert device_module.get_rng_state().tolist() == state.tolist()
+
+
+def test_device_oom_is_not_disguised_as_unsupported(mojo_gpu):
+    """An allocation the device cannot satisfy must surface as an OOM
+    carrying the allocator's own message -- not as `NotImplementedError`
+    ("unsupported dtype/shape"), which would send the reader looking for a
+    missing kernel, and not silently at some later synchronize.
+    """
+    with pytest.raises(Exception) as excinfo:  # noqa: B017 -- the point is WHICH type
+        torch.empty(2**44, dtype=torch.float64, device=mojo_gpu).fill_(1.0)
+    assert not isinstance(excinfo.value, NotImplementedError), excinfo.value
+    assert isinstance(excinfo.value, (torch.OutOfMemoryError, RuntimeError)), (
+        type(excinfo.value),
+        excinfo.value,
+    )
