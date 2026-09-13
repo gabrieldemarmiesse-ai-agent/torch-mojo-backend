@@ -51,7 +51,7 @@ from kernels import KernelCall, loader
 from op_utils import MAX_RANK
 from ops_common import (
     call_op_raw,
-    cast_to,
+    check_out,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -863,20 +863,22 @@ def _mm_route(a: T, b: T) raises -> Optional[T]:
 
 def _store_out(rets: Values, dest: T, var result: T) raises:
     """Finish an `out=` variant: move a freshly computed result into the
-    caller's tensor, resizing and casting it the way torch's own out= kernels
-    do, and return that tensor. TorchInductor reaches every extern kernel
-    through these overloads (`extern_kernels.mm(a, b, out=buf)`)."""
+    caller's tensor, resizing it the way torch's own out= kernels do, and
+    return that tensor. TorchInductor reaches every extern kernel through
+    these overloads (`extern_kernels.mm(a, b, out=buf)`).
+
+    Never a cast: `check_out` has already required `dest` to hold the
+    result's dtype, so a mismatch here would be a bug in the route, and
+    `copy_strided_into` raises on one rather than truncating.
+    """
     var held = own(result^)
     var dst = dest.copy()
     if not dst.same_shape(held.t):
         # Only a MISMATCHING out= is resized: a resize re-lays the tensor out
         # contiguously, so an already-correct out keeps its own strides.
         resize_out(dst, held.t.shape, held.t.rank)
-    if dst.stype == held.t.stype:
-        copy_strided_into(dst, held.t)
-    else:
-        var casted = own(cast_to(held.t, dst.stype))
-        copy_strided_into(dst, casted.t)
+    copy_strided_into(dst, held.t)
+    _ = held^  # alive past the launch: reading `.t` copies a non-owning view
     ret_ref(rets, 0, dst)
 
 
@@ -894,10 +896,12 @@ def op_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_mm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=2])
+    check_out(dest, a)  # TORCH_META_FUNC(mm) sets the output from `self`
     var out = _mm_route(a, b)
     if not out:
         unsupported("aten::mm.out with these operands")
-    _store_out(rets, v_tensor(args[unsafe_offset=2]), out.value().copy())
+    _store_out(rets, dest, out.value().copy())
 
 
 def _bmm_route(a: T, b: T) raises -> Optional[T]:
@@ -924,10 +928,12 @@ def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=2])
+    check_out(dest, b)  # common_checks_baddbmm_bmm uses `batch2.options()`
     var out = _bmm_route(a, b)
     if not out:
         unsupported("aten::bmm.out with these operands")
-    _store_out(rets, v_tensor(args[unsafe_offset=2]), out.value().copy())
+    _store_out(rets, dest, out.value().copy())
 
 
 # --- aten::addmm --------------------------------------------------------------
@@ -982,15 +988,20 @@ def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
 #                 Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_addmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=5])
+    # ADDMM_META sets the output from `mat1.options()`, and the meta function
+    # runs before the kernel -- so the out= contract outranks the decline.
+    check_out(dest, mat1)
     _addmm_unit_scaling(args[unsafe_offset=3], args[unsafe_offset=4])
     var out = _addmm_route(
         v_tensor(args[unsafe_offset=0]),
-        v_tensor(args[unsafe_offset=1]),
+        mat1,
         v_tensor(args[unsafe_offset=2]),
     )
     if not out:
         unsupported("aten::addmm.out with these operands")
-    _store_out(rets, v_tensor(args[unsafe_offset=5]), out.value().copy())
+    _store_out(rets, dest, out.value().copy())
 
 
 # --- aten::linear -------------------------------------------------------------
@@ -1042,7 +1053,9 @@ def _linear_vector(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
     if not res:
         return None
     var flat = own(res.value().copy())
-    return _view(flat.t, [out_features])
+    var shaped = _view(flat.t, [out_features])
+    _ = flat^  # `_view` reads `flat`'s handle: it must outlive the call
+    return shaped^
 
 
 # aten::linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
@@ -1180,6 +1193,7 @@ def op_linear_backward(
                 unsupported("aten::linear_backward: no mm route for dgrad")
             var flat = own(dx.value().copy())
             grad_input = own(_view(flat.t, input.logical_shape()))
+            _ = flat^  # `_view` reads `flat`'s handle (see above)
 
     var grad_weight = own(_empty_result(stype, device))
     if need_params:

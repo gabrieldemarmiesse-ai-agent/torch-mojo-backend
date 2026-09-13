@@ -7,11 +7,14 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
+import re
+from collections.abc import Callable
 
 import pytest
 import torch
 
 from torch_mojo_backend import aten_functions, get_accelerators, native
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import CallChecker
 
 
@@ -163,6 +166,158 @@ def test_addmm_scaled_declines(mojo_device):
         torch.addmm(bias, a, b, beta=0.5)
     with pytest.raises(NotImplementedError):
         torch.addmm(bias, a, b, alpha=2.0)
+
+
+# --- the out= overloads (TorchInductor's extern kernels) ----------------------
+
+
+def _out_case(
+    op: str, device: str
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], torch.Tensor]:
+    """(call taking the `out=` tensor, CPU reference) for one out= overload.
+
+    Inductor reaches mm / bmm / addmm through exactly these three
+    (`extern_kernels.mm(a, b, out=buf)`), so each gets the same checks.
+    """
+    if op == "mm":
+        a, b = torch.randn(12, 20), torch.randn(20, 8)
+        return lambda out: torch.mm(a.to(device), b.to(device), out=out), a @ b
+    if op == "bmm":
+        a, b = torch.randn(3, 12, 20), torch.randn(3, 20, 8)
+        return lambda out: torch.bmm(a.to(device), b.to(device), out=out), a @ b
+    # a 1-D bias: the fused MatmulBiasSpec kernel reads one row-broadcast
+    # vector, and a 2-D `self` sends addmm down a route this group declines.
+    c, a, b = torch.randn(8), torch.randn(12, 20), torch.randn(20, 8)
+    return (
+        lambda out: torch.addmm(c.to(device), a.to(device), b.to(device), out=out),
+        torch.addmm(c, a, b),
+    )
+
+
+def _mojo_devices() -> list[str]:
+    return [f"mojo:{i}" for i in range(len(list(get_accelerators())))]
+
+
+@pytest.mark.parametrize("op", ["mm", "bmm", "addmm"])
+def test_out_writes_the_callers_tensor(mojo_device, op):
+    run, ref = _out_case(op, mojo_device)
+    out = torch.empty(ref.shape, device=mojo_device)
+    with assert_ran(f"aten::{op}.out"):
+        got = run(out)
+    assert got.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("op", ["mm", "bmm", "addmm"])
+def test_out_with_the_wrong_dtype_raises_torchs_message(mojo_device, op):
+    """torch's generated `resize_out` requires the `out=` tensor to ALREADY
+    hold the result dtype -- it never casts, so a float result can never be
+    truncated into an integer buffer. The text is taken from the same call on
+    CPU so the two backends cannot drift apart."""
+    for wrong in (torch.float64, torch.int64):
+        run_cpu, _ = _out_case(op, "cpu")
+        with pytest.raises(RuntimeError) as cpu_err:
+            run_cpu(torch.empty(0, dtype=wrong))
+        run_mojo, _ = _out_case(op, mojo_device)
+        with pytest.raises(RuntimeError, match=re.escape(str(cpu_err.value))):
+            run_mojo(torch.empty(0, dtype=wrong, device=mojo_device))
+
+
+def test_mm_out_does_not_cast_bfloat16_up_into_a_float_out(mojo_device):
+    a, b = torch.randn(8, 16).bfloat16(), torch.randn(16, 4).bfloat16()
+    with pytest.raises(RuntimeError) as cpu_err:
+        torch.mm(a, b, out=torch.empty(8, 4))
+    with pytest.raises(RuntimeError, match=re.escape(str(cpu_err.value))):
+        torch.mm(
+            a.to(mojo_device),
+            b.to(mojo_device),
+            out=torch.empty(8, 4, device=mojo_device),
+        )
+
+
+@pytest.mark.parametrize("op", ["mm", "bmm", "addmm"])
+def test_out_on_the_cpu_raises(mojo_device, op):
+    run, ref = _out_case(op, mojo_device)
+    msg = f"Expected out tensor to have device {mojo_device}, but got cpu instead"
+    with pytest.raises(RuntimeError, match=re.escape(msg)):
+        run(torch.empty(ref.shape))
+
+
+def test_out_on_another_mojo_device_raises():
+    """A cross-device `out=` would launch the copy in the destination's
+    context with no ordering against the stream that produced the result;
+    torch rejects it in `resize_out` and so must this backend."""
+    devices = _mojo_devices()
+    if len(devices) < 2:
+        pytest.skip("needs two mojo devices")
+    a, b = torch.randn(12, 20), torch.randn(20, 8)
+    msg = (
+        f"Expected out tensor to have device {devices[0]}, but got {devices[1]} instead"
+    )
+    with pytest.raises(RuntimeError, match=re.escape(msg)):
+        torch.mm(
+            a.to(devices[0]),
+            b.to(devices[0]),
+            out=torch.empty(12, 8, device=devices[1]),
+        )
+
+
+@pytest.mark.parametrize("op", ["mm", "bmm", "addmm"])
+def test_out_of_the_wrong_shape_is_resized(mojo_device, op):
+    """`resize_output`: an empty `out` is the common Inductor case, and a
+    non-empty one of the wrong shape is resized too (torch warns and does it
+    anyway)."""
+    for start in ((0,), (3, 3)):
+        run, ref = _out_case(op, mojo_device)
+        out = torch.zeros(start, device=mojo_device)
+        run(out)
+        assert tuple(out.shape) == tuple(ref.shape)
+        torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
+
+
+def test_out_of_the_right_shape_keeps_its_own_strides(mojo_device):
+    """A correctly shaped `out` is never re-laid-out: a slice of a bigger
+    tensor is written where it lives, leaving the rest of the base alone."""
+    base = torch.zeros(12, 16, device=mojo_device)
+    view = base[:, :8]
+    a, b = torch.randn(12, 20), torch.randn(20, 8)
+    torch.mm(a.to(mojo_device), b.to(mojo_device), out=view)
+    assert view.stride() == (16, 1)
+    torch.testing.assert_close(view.cpu(), a @ b, atol=1e-4, rtol=1e-4)
+    assert bool((base[:, 8:] == 0).all()), "the resize scribbled over the base"
+
+
+def test_mm_out_under_allocator_churn_on_a_side_stream(mojo_device):
+    """`out=` on a side stream, 48 times, each with fresh inputs and a fresh
+    product of exactly the recycled size, with the host never syncing inside
+    the loop -- the hardest case for the helper that copies the product into
+    the caller's tensor.
+
+    It is a guard, not a proof of the lifetime fix in `_store_out`. Measured
+    on an H100: with the `_ = held^` keepalive deleted this still passes,
+    because both the (stream-ordered) release of the product and the copy out
+    of it are enqueued on the same stream, and the stream runs the copy before
+    any later kernel can write the recycled block. The keepalive is still
+    required: nothing in an op may depend on that allocator detail.
+    """
+    side = torch.Stream(device=mojo_device)
+    outs, refs = [], []
+    with device_module.stream(side):
+        for _ in range(48):
+            a, b = torch.randn(96, 128), torch.randn(128, 64)
+            out = torch.empty(96, 64, device=mojo_device)
+            torch.mm(a.to(mojo_device), b.to(mojo_device), out=out)
+            outs.append(out)
+            refs.append(a @ b)
+    torch.accelerator.synchronize()
+    for i, (out, ref) in enumerate(zip(outs, refs, strict=True)):
+        torch.testing.assert_close(
+            out.cpu(),
+            ref,
+            atol=1e-3,
+            rtol=1e-3,
+            msg=lambda m, i=i: f"iteration {i}: {m}",
+        )
 
 
 # --- linear -------------------------------------------------------------------

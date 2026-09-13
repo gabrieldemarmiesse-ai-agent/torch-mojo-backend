@@ -17,6 +17,7 @@ from abi import (
     contiguous_strides,
     dtype_code,
     dtype_itemsize,
+    dtype_name,
     f64_bits,
     max_dtype,
     new_like,
@@ -93,6 +94,46 @@ def copy_strided_into(dst: T, src: T) raises:
     _ = ctx
 
 
+def device_str(t: T) -> String:
+    """`c10::Device::str()`: the lower-case device-type name plus an index
+    when the tensor carries one. PrivateUse1 prints under the name torch was
+    renamed to (`rename_privateuse1_backend("mojo")`)."""
+    if t.on_mojo():
+        return String("mojo:") + String(t.device)
+    if t.on_cpu():
+        return String("cpu")
+    return String("device type ") + String(t.device_type)
+
+
+def check_out(dest: T, like: T) raises:
+    """The dtype and device half of torch's generated `resize_out`
+    (torchgen/dest/register_dispatch_key.py, `gen_resize_out_helper`).
+
+    An `out=` tensor must ALREADY have the result's dtype and live on the
+    result's device; only its shape may differ, and `resize_out` below fixes
+    that. `like` is the input the structured meta function takes its
+    `TensorOptions` from. Run this before any kernel: a wrong `out` then
+    costs no launch, and a float result can never be silently truncated into
+    an integer buffer nor copied across devices without ordering.
+    """
+    if dest.stype != like.stype:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(like.stype),
+            ", but got ",
+            dtype_name(dest.stype),
+            " instead",
+        )
+    if dest.device_type != like.device_type or dest.device != like.device:
+        raise Error(
+            "Expected out tensor to have device ",
+            device_str(like),
+            ", but got ",
+            device_str(dest),
+            " instead",
+        )
+
+
 def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
     """torch's `resize_output` for a caller's `out=` tensor, in place.
 
@@ -113,6 +154,10 @@ def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
 
     `t`'s cached view fields are refreshed afterwards: its shape, strides,
     numel and contiguity all changed.
+
+    Not reproduced: the `TORCH_WARN` ATen emits when the resized `out` was
+    non-empty (deprecated behaviour, advisory only) -- the shim has no way to
+    raise a python warning from a Mojo op.
     """
     if t.rank == rank:
         var same = True
