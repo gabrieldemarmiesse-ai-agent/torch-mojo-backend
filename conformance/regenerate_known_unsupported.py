@@ -97,7 +97,14 @@ def _looks_absent(exc: BaseException) -> bool:
     if any(isinstance(part, NotImplementedError) for part in chain):
         return True
     text = "\n".join(str(part) for part in chain).lower()
-    return "no fast implementation" in text or "unsupported torch dtype" in text
+    return (
+        "no fast implementation" in text
+        or "unsupported torch dtype" in text
+        # an error corpus built out of a tensor the device cannot hold (rank
+        # above its limit) fails before the operator is reached, like a dtype
+        # it does not have
+        or "exceeds the mojo device limit" in text
+    )
 
 
 def _record(event: dict[str, Any]):

@@ -742,33 +742,12 @@ def _b_try_apple_add(
     return Res(out.take(), True)
 
 
-def _b_is_reduced(st: Int32) -> Bool:
-    return st == ST_FLOAT16 or st == ST_BFLOAT16
-
-
-def _b_alpha_result(lhs: Side, rhs: Side) raises -> Int32:
-    """The result dtype of `a +/- alpha*b` when it is a REDUCED-precision one
-    (float16/bfloat16), else -1.
-
-    That is exactly the case ATen computes in a wider type: its add/sub
-    functor runs in `opmath_type<scalar_t>` -- float32 for both half types --
-    and rounds once, at the store. Scaling the operand in its own dtype first
-    rounds twice, and the second rounding is against a value `alpha` may have
-    shrunk by orders of magnitude.
-    """
-    if not rhs.is_t or not lhs.is_t:
-        return Int32(-1)
-    var result = _b_promote(lhs.t.value().stype, rhs.t.value().stype)
-    if result < 0:
-        return Int32(-1)
-    if _b_is_reduced(result):
-        return result
-    return Int32(-1)
-
-
 def _b_scale(t: T, alpha: Float64, alpha_is_int: Bool) raises -> Held:
-    """`t * alpha` as an owned temporary: the tensor half of the old
-    `_scaled_operand`."""
+    """`t * alpha` as an owned temporary, in `t`'s own dtype: for float16 /
+    bfloat16 that rounds twice, which is what ATen's CPU add/sub kernel does
+    (`a + alpha * b` with `alpha` a scalar_t) and what the conformance suite
+    compares against; CUDA's single-rounding opmath route is the one that
+    differs from CPU."""
     var side = _b_tside(t)
     var a_side = _b_sside(Scal(alpha, Int(alpha), alpha_is_int, False))
     var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False)
@@ -932,31 +911,6 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
 
 
-def _b_alpha_opmath(
-    lhs: Side,
-    rhs: Side,
-    alpha: Float64,
-    alpha_int: Bool,
-    result_stype: Int32,
-    subtract: Bool,
-) raises -> Res:
-    """`a +/- alpha*b` for reduced-precision operands: every step in float32,
-    one rounding back to `result_stype` at the end (ATen's `opmath_type`
-    contract, see `_b_alpha_result`). Five launches instead of two, on a
-    route `alpha == 1` never reaches."""
-    var a32 = _b_cast(lhs.t.value(), ST_FLOAT32)
-    var b32 = _b_cast(rhs.t.value(), ST_FLOAT32)
-    var scaled = _b_scale(b32.t, -alpha if subtract else alpha, alpha_int)
-    var sum32 = _b_add_routes(_b_tside(a32.t), _b_tside(scaled.t), None)
-    _ = a32
-    _ = b32
-    _ = scaled
-    var held = own(sum32.t.copy())
-    var out = cast_to(held.t, result_stype)
-    _ = held  # the cast reads held.t's pointer inside a launch
-    return Res(out^, True)
-
-
 def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
@@ -977,9 +931,6 @@ def _b_add(
         return _b_add_routes(
             lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
         )
-    var reduced = _b_alpha_result(lhs, rhs)
-    if reduced >= 0:
-        return _b_alpha_opmath(lhs, rhs, alpha, alpha_int, reduced, False)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
@@ -1013,9 +964,6 @@ def _b_sub(
         return _b_sub_routes(
             lhs, _b_sside(Scal(v, Int(v), s.is_int and alpha_int, False)), dst
         )
-    var reduced = _b_alpha_result(lhs, rhs)
-    if reduced >= 0:
-        return _b_alpha_opmath(lhs, rhs, alpha, alpha_int, reduced, True)
     var scaled = _b_scale(rhs.t.value(), alpha, alpha_int)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
