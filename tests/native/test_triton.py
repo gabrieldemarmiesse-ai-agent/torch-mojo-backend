@@ -119,3 +119,31 @@ print("HOOK OK")
         [sys.executable, str(script)], capture_output=True, text=True, timeout=900
     )
     assert "HOOK OK" in r.stdout, r.stdout[-500:] + r.stderr[-1500:]
+
+
+@triton.jit
+def _plain_scale_kernel(x_ptr, out_ptr, n, factor, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * factor, mask=mask)
+
+
+def test_triton_op_traces_under_dynamo(mojo_triton):
+    """torch.library.triton_op: a Triton kernel as a custom op that dynamo
+    traces through wrap_triton; eager and under the eager/aot_eager backends."""
+    from torch._library.triton import triton_op, wrap_triton
+
+    @triton_op("mojo_test::scale", mutates_args={})
+    def scale(x: torch.Tensor, factor: float) -> torch.Tensor:
+        out = torch.empty_like(x)
+        wrap_triton(_plain_scale_kernel)[(triton.cdiv(x.numel(), 1024),)](
+            x, out, x.numel(), factor, BLOCK=1024
+        )
+        return out
+
+    x = torch.randn(5000, device=mojo_triton)
+    torch.testing.assert_close(scale(x, 3.0).cpu(), x.cpu() * 3.0)
+    for backend in ("eager", "aot_eager"):
+        torch._dynamo.reset()
+        f = torch.compile(lambda t: scale(t, 2.0) + 1, backend=backend)
+        torch.testing.assert_close(f(x).cpu(), x.cpu() * 2.0 + 1)
