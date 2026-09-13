@@ -559,8 +559,7 @@ def test_matmul_every_strided_arm(mojo_gpu, arm):
     b_base = torch.randn(64, 64)
     if arm == "b_gapped":
         a_cpu, b_cpu = torch.randn(48, 64), b_base[:, ::2]
-        a = torch.randn(48, 64).to(mojo_gpu)
-        a.copy_(a_cpu)
+        a = a_cpu.to(mojo_gpu)
         b = b_base.to(mojo_gpu)[:, ::2]
     elif arm == "a_transposed":
         a_cpu, b_cpu = torch.randn(48, 64).t(), torch.randn(48, 32)
@@ -573,9 +572,10 @@ def test_matmul_every_strided_arm(mojo_gpu, arm):
         b = b_cpu.to(mojo_gpu)
     elif arm == "both_strided":
         base = torch.randn(80, 64)
-        a_cpu, b_cpu = base[8:56].t(), b_base[:, ::2]
+        # A is (64, 48) after the transpose, so B must have 48 rows.
+        a_cpu, b_cpu = base[8:56].t(), b_base[:48, ::2]
         a = base.to(mojo_gpu)[8:56].t()
-        b = b_base.to(mojo_gpu)[:, ::2]
+        b = b_base.to(mojo_gpu)[:48, ::2]
     elif arm == "a_broadcast":
         row = torch.randn(1, 48)
         a_cpu, b_cpu = row.expand(64, 48), torch.randn(48, 32)
@@ -592,7 +592,7 @@ def test_matmul_every_strided_arm(mojo_gpu, arm):
 
 
 def test_addmm_strided_bias_and_operands(mojo_gpu):
-    bias_base = torch.randn(128)
+    bias_base = torch.randn(64)  # [::2] is the 32 columns of the product
     a_base = torch.randn(48, 64)
     b_cpu = torch.randn(48, 32)
     bias_cpu, a_cpu = bias_base[::2], a_base.t()
