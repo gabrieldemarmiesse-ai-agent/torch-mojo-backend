@@ -1233,12 +1233,17 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
         unsupported("div with a scalar numerator")
     var a = lhs.t.value().copy()
     var common = _b_true_div_dtype(a.stype, rhs)
-    if not _b_float3(common):
+    # float64 included: DivSpec dispatches on logic_ops SPEC_BCAST_DTYPES,
+    # which has it, and the kernel only asks that the dtype be floating.
+    if not _b_is_floating(common):
         unsupported(
             "true division producing dtype "
             + String(common)
-            + " (the divide kernel covers float32/float16/bfloat16)"
+            + " (the divide kernel covers the float dtypes only)"
         )
+    # An integer numerator still has to be CAST into `common`, and
+    # data_movement_ops' CAST_DTYPES stops before float64: `_b_cast` declines
+    # that pair on its own.
     var num = _b_cast(a, common)
     if not rhs.is_t:
         var r1 = _b_binary("DivSpec", _b_tside(num.t), rhs, Int32(-1), dst)
@@ -1334,23 +1339,24 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
 
 # aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var r = _b_try_scalar(
-        "PowScalarSpec",
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        False,
-    )
-    if not r.__bool__():
-        unsupported("pow of this tensor dtype with this exponent")
+    var lhs = _b_side(args[unsafe_offset=0])
+    var rhs = _b_side(args[unsafe_offset=1])
+    var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False)
+    if r.__bool__():
+        _b_ret(rets, r.value().copy())
         return
-    _b_ret(rets, r.value().copy())
+    # PowScalarSpec is FLOAT_DTYPES only and narrows the exponent to float32.
+    # float64 takes the broadcast route instead, which embeds the exponent in
+    # a 0-d tensor of the operand's dtype and whose PowSpec kernel covers the
+    # dtype (logic_ops SPEC_BCAST_DTYPES); `_b_binary` declines the rest.
+    _b_ret(rets, _b_binary("PowSpec", lhs, rhs, Int32(-1), None))
 
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     # The kernel raises on integers, which would leave the output unwritten.
-    if not lhs.is_t or not _b_float3(lhs.t.value().stype):
+    if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
         unsupported("pow.Tensor_Tensor on a tensor that is not float")
     _b_simple("PowSpec", args, rets)
 
