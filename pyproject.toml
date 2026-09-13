@@ -77,20 +77,13 @@ ban-relative-imports = "all"
 python = ".venv"
 
 [tool.ty.rules]
-# Every occurrence (verified by hand, none blanket-assumed) is one of two
-# deliberate polymorphic-override points that nominal override-checking
-# cannot express: (1) MojoExtension's abstract methods are `*args/**kwargs`
-# placeholders precisely so each concrete descriptor (MojoFileExtension,
-# aten_fast.py's per-op extensions, ...) can declare its own independent
-# call ABI -- callers always go through the concrete subclass, never a
-# MojoExtension-typed reference, so this is runtime-duck-typed dispatch, not
-# a substitutability hole; (2) TorchMojoTensor's __torch_dispatch__,
-# __torch_function__, __repr__, __reduce_ex__ and the autograd Functions'
-# backward() are torch's own documented tensor-subclass/autograd extension
-# points, where every real subclass (including torch's own FakeTensor,
-# LoggingTensor, ...) intentionally uses its own signature. `ty check`
-# exits non-zero on warnings too (no `--exit-zero-on-warning` in CI), so
-# this must be "ignore", not "warn", to keep `ty check` green.
+# One deliberate polymorphic-override point that nominal override-checking
+# cannot express: MojoProcessGroup._get_backend returns itself rather than a
+# c10d Backend, because torch looks a group's backend up that way for
+# batch_isend_irecv and _coalescing_manager and the mojo group IS its own
+# backend (see docs/native_backend.md, "Distributed"). `ty check` exits
+# non-zero on warnings too (no `--exit-zero-on-warning` in CI), so this must
+# be "ignore", not "warn", to keep `ty check` green.
 invalid-method-override = "ignore"
 # Bare `dict`/`list`/`Callable` is an unchecked hole: require the arguments.
 missing-type-argument = "error"
