@@ -114,3 +114,44 @@ thread interleave at op granularity.
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count
 boxed-kernel calls per op (the `CallChecker` in `torch_mojo_backend/testing.py`
 uses them to assert that an op ran natively).
+
+## Streams and events
+
+`torch.Stream(device="mojo")`, `torch.Event`, `torch.accelerator.current_stream
+/ set_stream / synchronize` and `torch.mojo.stream(s)` are torch's own generic
+objects driven by the shim's device guard. A stream is a MAX stream of the
+device's base context (`DeviceContext.create_stream`, then a `select_stream`
+view kernels launch on); events pair a MAX event (ordering: record / wait /
+synchronize on every backend) with a CUDA / HIP driver event on the same raw
+stream for `query()` and `elapsed_time()`. The MAX CPU device has one stream;
+its events time with the host clock.
+
+## Distributed
+
+`torch.distributed.init_process_group(backend="mojo")` registers
+`MojoProcessGroup` (distributed/process_group.py), a thin adapter over
+`native/mojo/pg.mojo`: one communicator and one dedicated comm stream per
+device; every collective makes the comm stream wait for the caller's current
+stream, issues the NCCL / RCCL / mojoccl call on it (the three share the NCCL
+C ABI; `TORCH_MOJO_BACKEND_CCL=mojo` picks the in-repo Mojo collectives), and
+the returned Work is a device-typed torch Future completed while the comm
+stream is current, so `wait()` orders the waiter's stream after the collective
+without blocking the host. Touched buffers are `record_stream`ed on the comm
+stream; the allocator fences their release on it. CPU tensors go to a private
+gloo group.
+
+## Profiling
+
+The shim registers torch's PrivateUse1 `ProfilerStubs` over the backend's
+timed events, so the legacy profiler reports device time per op:
+
+```python
+with torch.autograd.profiler.profile(use_device="mojo") as prof:
+    ...
+prof.key_averages().table(sort_by="self_device_time_total")   # "Self MOJO" columns
+```
+
+`torch.profiler.profile(activities=[CPU, PrivateUse1])` records the CPU-side
+op timeline and exports Chrome traces; device kernel rows need the Kineto
+PrivateUse1 plugin API that only exists in torch >= 2.12 (with a CUDA torch
+wheel that matches the driver, CUPTI already captures MAX kernels).
