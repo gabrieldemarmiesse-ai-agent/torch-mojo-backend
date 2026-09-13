@@ -386,6 +386,15 @@ hit it). Install it once with `xcodebuild -downloadComponent MetalToolchain`.
 The build-failure message names the `-D` set of the specialization, so a
 failing family can be rebuilt by hand with the same `mojo build` line.
 
+What MAX 26.5's Metal backend does not have: user-created streams
+(`createStream is not supported on this device`) and therefore events on
+them, so `torch.mojo.Stream()` raises and everything runs on the device's
+default stream; and host callbacks, which is why host-to-device copies take
+the synchronous route there (`copy_from_host`; unified memory makes the
+pinned staging pointless anyway). Checked on an M4 (macOS 26.6.1): the
+bring-up tests pass except the stream/event ones, and the op groups run
+against CPU torch like on CUDA.
+
 ## Triton
 
 Triton kernels run on mojo tensors with only the CPU torch wheel and the
