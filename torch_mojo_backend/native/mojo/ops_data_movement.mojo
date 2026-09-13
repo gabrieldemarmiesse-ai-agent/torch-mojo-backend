@@ -21,7 +21,6 @@ from std.utils import IndexList
 from abi import (
     DEVICE_TYPE_CPU,
     DEVICE_TYPE_PRIVATEUSE1,
-    MEMORY_FORMAT_CHANNELS_LAST,
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
@@ -31,19 +30,26 @@ from abi import (
     Value,
     Values,
     check,
+    contiguous_strides,
     cpu_empty,
     default_dtype,
+    dense_strides_like,
     dtype_code,
     dtype_itemsize,
+    is_dense,
     max_dtype,
     new_like,
     new_like_dtype,
+    new_strided,
     new_tensor,
     own,
+    own_if_new,
     release,
     ret_owned,
     ret_ref,
     set_sizes_strides,
+    strides_equal,
+    strides_for_memory_format,
     unsupported,
     v_device_index,
     v_device_type,
@@ -350,13 +356,46 @@ def _materialize_contiguous(t: T) raises -> T:
     return out^
 
 
+def _wanted_strides(t: T, mf: Int) raises -> IndexList[MAX_RANK]:
+    """The strides a MemoryFormat asks a COPY of `t` to have.
+
+    `preserve_format` is the only one that reads `t`'s own layout: a dense
+    input keeps its strides exactly (a channels-last tensor stays
+    channels-last through `.clone()` / `.half()`), anything else falls back to
+    torch's `infer_dense_strides`.
+    """
+    if mf != MEMORY_FORMAT_PRESERVE:
+        return strides_for_memory_format(t.shape, t.rank, mf)
+    if is_dense(t.shape, t.strides, t.rank):
+        return t.strides
+    return dense_strides_like(t.shape, t.strides, t.rank)
+
+
+def _materialize_as(t: T, strides: IndexList[MAX_RANK]) raises -> T:
+    """A fresh copy of `t`'s values laid out with `strides` (always a new
+    handle, so it is always safe to `own()`)."""
+    if strides_equal(strides, contiguous_strides(t.shape, t.rank), t.rank):
+        return _materialize_contiguous(t)
+    var out = own(new_strided(t.shape, strides, t.rank, t.stype, t.device))
+    if t.numel > 0:
+        if strides_equal(strides, t.strides, t.rank) and is_dense(
+            t.shape, t.strides, t.rank
+        ):
+            # Same layout, densely packed: the two buffers hold the same bytes
+            # in the same order.
+            var ctx = ctx_for(t.device)
+            copy_d2d(ctx, out.t.ptr, t.ptr, t.numel * t.itemsize)
+            _ = ctx
+        else:
+            copy_strided_into(out.t, t)
+    return out.take()
+
+
 # aten::clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
 def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var mf = v_memory_format_or(args[unsafe_offset=1], MEMORY_FORMAT_PRESERVE)
-    if mf == MEMORY_FORMAT_CHANNELS_LAST:
-        unsupported("channels_last memory format")
-    var out = own(_materialize_contiguous(t))
+    var out = own(_materialize_as(t, _wanted_strides(t, mf)))
     ret_owned(rets, 0, out)
 
 
@@ -369,17 +408,55 @@ def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _to_copy_same_device(t: T, stype: Int32) raises -> T:
+def _flat_view(t: T) raises -> T:
+    """A 1-D contiguous view over a DENSE tensor's elements, in memory order."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = t.numel
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 1] = 1
+    return view_strided(t, shape, strides, 1, t.offset)
+
+
+def _to_copy_same_device(
+    t: T, stype: Int32, want: IndexList[MAX_RANK]
+) raises -> T:
     if stype == t.stype:
-        return _materialize_contiguous(t)
+        return _materialize_as(t, want)
     var dst_dtype = max_dtype(stype)
-    if _is_cast_dtype(t.dtype) and _is_cast_dtype(dst_dtype):
-        var src = contiguous(t)
-        var out = new_like_dtype(src, stype)
-        cast_into(out, src)
-        release_if_new(src, t)
-        return out^
-    return _host_cast(t, stype)
+    if not (_is_cast_dtype(t.dtype) and _is_cast_dtype(dst_dtype)):
+        return _relayout_owned(own(_host_cast(t, stype)), want)
+    if (
+        not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank)
+        and strides_equal(want, t.strides, t.rank)
+        and is_dense(t.shape, t.strides, t.rank)
+    ):
+        # Result and source share one memory order, so the cast reads and
+        # writes packed buffers: one CastSpec over flat views, no relayout
+        # pass (the channels-last `x.half()` of a CNN).
+        var packed = own(new_strided(t.shape, want, t.rank, stype, t.device))
+        var flat_src = own(_flat_view(t))
+        var flat_dst = own(_flat_view(packed.t))
+        cast_into(flat_dst.t, flat_src.t)
+        _ = flat_src^  # alive past the launch (the specs read pointers)
+        _ = flat_dst^
+        return packed.take()
+    var src = own_if_new(contiguous(t), t)
+    var out = own(new_like_dtype(src.t, stype))
+    cast_into(out.t, src.t)
+    _ = src^
+    return _relayout_owned(out^, want)
+
+
+def _relayout_owned(var contig: Owned, want: IndexList[MAX_RANK]) raises -> T:
+    """Hand `contig` (a fresh CONTIGUOUS result) back in `want`'s layout,
+    copying only when the two differ."""
+    if strides_equal(
+        want, contiguous_strides(contig.t.shape, contig.t.rank), contig.t.rank
+    ):
+        return contig.take()
+    var out = _materialize_as(contig.t, want)
+    _ = contig^  # `contig` owns the storage `out` was just read from
+    return out^
 
 
 def _host_cast(t: T, stype: Int32) raises -> T:
@@ -549,8 +626,8 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], t.stype)
     var mf = v_memory_format_or(args[unsafe_offset=6], MEMORY_FORMAT_PRESERVE)
-    if mf == MEMORY_FORMAT_CHANNELS_LAST:
-        unsupported("channels_last memory format")
+    var want = _wanted_strides(t, mf)
+    var contig = contiguous_strides(t.shape, t.rank)
     var dev_v = args[unsafe_offset=3].copy()
     var dev_type = v_device_type(dev_v)
     if (
@@ -578,22 +655,34 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         var target_index = v_device_index(dev_v)
         if target_index < 0:
             raise Error("aten::_to_copy: no explicit mojo device index given")
-        var out = own(_upload_from_cpu(t, stype, target_index))
+        var uploaded = own(_upload_from_cpu(t, stype, target_index))
+        var out = own(_relayout_owned(uploaded^, want))
         ret_owned(rets, 0, out)
         return
 
-    var same_device = own(_to_copy_same_device(t, stype))
-    if dev_type == DEVICE_TYPE_CPU:
-        var out2 = own(_download_to_cpu(same_device.t))
-        ret_owned(rets, 0, out2)
-        return
     var target_index2 = -1
     if dev_type == DEVICE_TYPE_PRIVATEUSE1:
         target_index2 = v_device_index(dev_v)
-    if target_index2 < 0 or target_index2 == t.device:
-        ret_owned(rets, 0, same_device)
+    var cross = target_index2 >= 0 and target_index2 != t.device
+    # A device move copies the whole dense buffer verbatim, so `want` is laid
+    # out where kernels can run: on the source for a download to the host, on
+    # the destination for a move to another mojo device.
+    var staged = own(_to_copy_same_device(t, stype, contig if cross else want))
+    if dev_type == DEVICE_TYPE_CPU:
+        var host = own(_download_to_cpu(staged.t))
+        _ = staged^
+        if not strides_equal(want, contig, t.rank):
+            # `staged` was dense in `want`'s order, so its bytes landed in the
+            # host buffer in that order: the layout is metadata from here.
+            set_sizes_strides(host.t, t.shape, want, t.rank, 0)
+        ret_owned(rets, 0, host)
         return
-    var out3 = own(_upload_cross_device(same_device.t, target_index2))
+    if not cross:
+        ret_owned(rets, 0, staged)
+        return
+    var moved = own(_upload_cross_device(staged.t, target_index2))
+    _ = staged^
+    var out3 = own(_relayout_owned(moved^, want))
     ret_owned(rets, 0, out3)
 
 

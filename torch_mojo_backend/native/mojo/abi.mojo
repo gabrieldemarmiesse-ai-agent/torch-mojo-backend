@@ -61,6 +61,7 @@ comptime DEVICE_TYPE_PRIVATEUSE1 = 20
 comptime MEMORY_FORMAT_CONTIGUOUS = 0
 comptime MEMORY_FORMAT_PRESERVE = 1
 comptime MEMORY_FORMAT_CHANNELS_LAST = 2
+comptime MEMORY_FORMAT_CHANNELS_LAST_3D = 3
 
 
 def max_dtype(stype: Int32) raises -> DType:
@@ -661,6 +662,173 @@ def contiguous_strides(
         strides[i] = acc
         acc *= shape[i]
     return strides
+
+
+def strides_equal(
+    a: IndexList[MAX_RANK], b: IndexList[MAX_RANK], rank: Int
+) -> Bool:
+    var pad = MAX_RANK - rank
+    for i in range(rank):
+        if a[pad + i] != b[pad + i]:
+            return False
+    return True
+
+
+def memory_format_name(mf: Int) -> String:
+    """`c10::MemoryFormat` as torch spells it in an error message."""
+    if mf == MEMORY_FORMAT_CONTIGUOUS:
+        return "Contiguous"
+    if mf == MEMORY_FORMAT_PRESERVE:
+        return "Preserve"
+    if mf == MEMORY_FORMAT_CHANNELS_LAST:
+        return "ChannelsLast"
+    if mf == MEMORY_FORMAT_CHANNELS_LAST_3D:
+        return "ChannelsLast3d"
+    return String(mf)
+
+
+def _channels_last_strides(
+    shape: IndexList[MAX_RANK], rank: Int
+) -> IndexList[MAX_RANK]:
+    """NHWC (rank 4) / NDHWC (rank 5): channel innermost, then the spatial
+    dims right to left, batch outermost."""
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - rank
+    var acc = 1
+    strides[pad + 1] = acc
+    acc *= shape[pad + 1]
+    for d in range(rank - 1, 1, -1):
+        strides[pad + d] = acc
+        acc *= shape[pad + d]
+    strides[pad] = acc
+    return strides
+
+
+def strides_for_memory_format(
+    shape: IndexList[MAX_RANK], rank: Int, mf: Int
+) raises -> IndexList[MAX_RANK]:
+    """torch's `TensorImpl::empty_tensor_restride`: the strides a MemoryFormat
+    asks a fresh allocation for, rank checks and messages included.
+
+    `Preserve` has no answer here -- it is a property of an INPUT tensor, and
+    torch rejects it in this position too."""
+    if mf == MEMORY_FORMAT_CONTIGUOUS:
+        return contiguous_strides(shape, rank)
+    if mf == MEMORY_FORMAT_CHANNELS_LAST:
+        if rank != 4:
+            raise Error("required rank 4 tensor to use channels_last format")
+        return _channels_last_strides(shape, rank)
+    if mf == MEMORY_FORMAT_CHANNELS_LAST_3D:
+        if rank != 5:
+            raise Error("required rank 5 tensor to use channels_last_3d format")
+        return _channels_last_strides(shape, rank)
+    raise Error("unsupported memory format ", memory_format_name(mf))
+
+
+def is_dense(
+    shape: IndexList[MAX_RANK], strides: IndexList[MAX_RANK], rank: Int
+) -> Bool:
+    """c10's `_compute_non_overlapping_and_dense`: the elements cover
+    `numel * itemsize` bytes from the first one, in SOME permutation of the
+    dims (contiguous and channels-last both qualify)."""
+    if rank == 0:
+        return True
+    var pad = MAX_RANK - rank
+    if rank == 1:
+        return shape[pad] < 2 or strides[pad] == 1
+    # Dims sorted by stride ascending, the size-1 (and size-0) ones last:
+    # only those carry a meaningful stride for the density chain below.
+    var perm = IndexList[MAX_RANK](0)
+    for i in range(rank):
+        perm[i] = i
+    for i in range(1, rank):
+        var key = perm[i]
+        var j = i - 1
+        while j >= 0 and _stride_order_less(shape, strides, pad, key, perm[j]):
+            perm[j + 1] = perm[j]
+            j -= 1
+        perm[j + 1] = key
+    var require = 1
+    for i in range(rank):
+        var d = perm[i]
+        if shape[pad + d] < 2:
+            return True
+        if strides[pad + d] != require:
+            return False
+        require *= shape[pad + d]
+    return True
+
+
+def _stride_order_less(
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    pad: Int,
+    a: Int,
+    b: Int,
+) -> Bool:
+    if shape[pad + a] < 2:
+        return False
+    if shape[pad + b] < 2:
+        return True
+    return strides[pad + a] < strides[pad + b]
+
+
+def dense_strides_like(
+    shape: IndexList[MAX_RANK], strides: IndexList[MAX_RANK], rank: Int
+) -> IndexList[MAX_RANK]:
+    """torch's `infer_dense_strides`: a DENSE layout that keeps the input's
+    dim order -- what a `preserve_format` request falls back to when the input
+    is not itself dense, and what makes `x.t()[:, ::2].clone()` come back
+    transposed rather than row-major."""
+    if rank <= 1:
+        return contiguous_strides(shape, rank)
+    var pad = MAX_RANK - rank
+    # Insertion sort by stride, ambiguous comparisons (a zero stride, equal
+    # strides with equal sizes) leaving the order alone, exactly as
+    # TensorIterator propagates strides.
+    var perm = IndexList[MAX_RANK](0)
+    for i in range(rank):
+        perm[i] = rank - 1 - i
+    for i in range(1, rank):
+        var dim1 = i
+        var dim0 = i - 1
+        while dim0 >= 0:
+            var cmp = _should_swap(shape, strides, pad, perm[dim0], perm[dim1])
+            if cmp > 0:
+                var tmp = perm[dim0]
+                perm[dim0] = perm[dim1]
+                perm[dim1] = tmp
+                dim1 = dim0
+            elif cmp < 0:
+                break
+            dim0 -= 1
+    var out = IndexList[MAX_RANK](0)
+    var acc = 1
+    for i in range(rank):
+        var d = perm[i]
+        out[pad + d] = acc
+        acc *= shape[pad + d]
+    return out
+
+
+def _should_swap(
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    pad: Int,
+    d0: Int,
+    d1: Int,
+) -> Int:
+    var s0 = strides[pad + d0]
+    var s1 = strides[pad + d1]
+    if s0 == 0 or s1 == 0:
+        return 0
+    if s0 < s1:
+        return -1
+    if s0 > s1:
+        return 1
+    if shape[pad + d0] > shape[pad + d1]:
+        return 1
+    return 0
 
 
 def new_strided(

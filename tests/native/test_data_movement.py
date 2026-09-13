@@ -10,7 +10,7 @@ some other route) actually ran.
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, register_mojo_devices
+from torch_mojo_backend import aten_functions, get_accelerators, register_mojo_devices
 
 # The `mojo_device` fixture (tests/conftest.py) yields a "mojo:N" string but,
 # unlike `mojo_gpu`, never registers the backend itself -- it assumes some
@@ -54,7 +54,8 @@ def test_clone_strided(mojo_device, call_checker):
     x = _fill((5, 7), torch.float32)
     dev = x.to(mojo_device).t()
     cloned = dev.clone()
-    assert cloned.is_contiguous()
+    # preserve_format, and a transpose IS dense: torch keeps the strides.
+    assert cloned.stride() == x.t().clone().stride()
     torch.testing.assert_close(cloned.cpu(), x.t())
 
 
@@ -67,10 +68,195 @@ def test_clone_every_rank(mojo_gpu, rank):
     torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
 
 
-def test_clone_channels_last_declines(mojo_gpu):
-    x = torch.randn(2, 3, 4, 4).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        x.clone(memory_format=torch.channels_last)
+# ---------------------------------------------------------------------------
+# memory formats (empty.memory_format / clone / _to_copy)
+# ---------------------------------------------------------------------------
+
+# (shape, memory format): rank 4 for channels_last, rank 5 for
+# channels_last_3d, plus the degenerate extents whose strides torch still
+# spells out in full (a size-1 channel, an empty batch).
+_MEMORY_FORMATS = [
+    ((2, 3, 4, 5), torch.channels_last),
+    ((3, 7, 5, 11), torch.channels_last),
+    ((2, 1, 4, 5), torch.channels_last),
+    ((0, 3, 4, 5), torch.channels_last),
+    ((2, 3, 4, 5, 2), torch.channels_last_3d),
+    ((2, 5, 3, 7, 3), torch.channels_last_3d),
+]
+
+
+def _memory_format_id(val):
+    if isinstance(val, torch.memory_format):
+        return str(val).removeprefix("torch.")
+    return "x".join(str(d) for d in val)
+
+
+@pytest.mark.parametrize("shape,memory_format", _MEMORY_FORMATS, ids=_memory_format_id)
+def test_empty_memory_format_strides_match_cpu(mojo_device, shape, memory_format):
+    made = torch.empty(shape, device=mojo_device, memory_format=memory_format)
+    assert made.stride() == torch.empty(shape, memory_format=memory_format).stride()
+    assert made.is_contiguous(memory_format=memory_format)
+
+
+@pytest.mark.parametrize(
+    "factory", [torch.empty_like, torch.zeros_like, torch.ones_like, torch.rand_like]
+)
+def test_like_factories_keep_the_memory_format(mojo_device, factory):
+    """ATen's `*_like` composites resolve the format themselves and land on
+    `empty.memory_format` / `empty_strided`."""
+    x = torch.arange(120.0).reshape(2, 3, 4, 5).to(memory_format=torch.channels_last)
+    dev = x.to(mojo_device)
+    assert factory(dev).stride() == factory(x).stride()
+    for memory_format in (
+        torch.preserve_format,
+        torch.contiguous_format,
+        torch.channels_last,
+    ):
+        got = factory(dev, memory_format=memory_format)
+        assert got.stride() == factory(x, memory_format=memory_format).stride()
+
+
+@pytest.mark.parametrize("shape,memory_format", _MEMORY_FORMATS, ids=_memory_format_id)
+def test_clone_memory_format_matches_cpu(
+    mojo_device, shape, memory_format, call_checker
+):
+    call_checker.register(aten_functions.aten_clone)
+    x = _fill(shape, torch.float32)
+    expected = x.clone(memory_format=memory_format)
+    got = x.to(mojo_device).clone(memory_format=memory_format)
+    assert got.stride() == expected.stride()
+    assert got.is_contiguous(memory_format=memory_format)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("shape,memory_format", _MEMORY_FORMATS, ids=_memory_format_id)
+def test_to_memory_format_matches_cpu(mojo_device, shape, memory_format, call_checker):
+    call_checker.register(aten_functions.aten__to_copy)
+    x = _fill(shape, torch.float32)
+    expected = x.to(memory_format=memory_format)
+    got = x.to(mojo_device).to(memory_format=memory_format)
+    assert got.stride() == expected.stride()
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("shape,memory_format", _MEMORY_FORMATS, ids=_memory_format_id)
+def test_contiguous_memory_format_matches_cpu(mojo_device, shape, memory_format):
+    """`Tensor.contiguous(memory_format=...)` is a composite torch lowers to
+    `clone(memory_format)` -- but only when the tensor is not already in that
+    format, so it also covers the no-copy answer."""
+    x = _fill(shape, torch.float32)
+    dev = x.to(mojo_device)
+    for tensor, reference in (
+        (dev, x),
+        (dev.contiguous(memory_format=memory_format), x),
+    ):
+        got = tensor.contiguous(memory_format=memory_format)
+        expected = reference.contiguous(memory_format=memory_format)
+        assert got.stride() == expected.stride()
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int64])
+def test_to_dtype_and_memory_format_matches_cpu(mojo_device, dtype):
+    x = _fill((2, 3, 4, 5), torch.float32)
+    expected = x.to(dtype, memory_format=torch.channels_last)
+    got = x.to(mojo_device).to(dtype, memory_format=torch.channels_last)
+    assert got.stride() == expected.stride()
+    assert got.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_memory_format_from_a_permuted_input(mojo_device):
+    """A non-contiguous source: the strided read has to feed the strided
+    write, neither of them row-major."""
+    x = _fill((2, 3, 4, 5), torch.float32).permute(0, 2, 3, 1)
+    dev = _fill((2, 3, 4, 5), torch.float32).to(mojo_device).permute(0, 2, 3, 1)
+    for expected, got in (
+        (
+            x.clone(memory_format=torch.channels_last),
+            dev.clone(memory_format=torch.channels_last),
+        ),
+        (
+            x.to(torch.float16, memory_format=torch.channels_last),
+            dev.to(torch.float16, memory_format=torch.channels_last),
+        ),
+        (x.contiguous(), dev.contiguous()),
+    ):
+        assert got.stride() == expected.stride()
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_preserve_format_keeps_the_input_layout(mojo_device):
+    """torch's preserve_format: a non-overlapping-and-dense input keeps its
+    strides exactly, anything else gets `infer_dense_strides`."""
+    x = _fill((2, 3, 4, 5), torch.float32)
+    dev = x.to(mojo_device)
+    cases = [
+        (
+            x.to(memory_format=torch.channels_last),
+            dev.to(memory_format=torch.channels_last),
+        ),
+        (x.permute(0, 2, 3, 1), dev.permute(0, 2, 3, 1)),
+        # Not dense: a strided slice of a transpose.
+        (x.reshape(24, 5).t()[:, ::2], dev.reshape(24, 5).t()[:, ::2]),
+    ]
+    for expected_src, got_src in cases:
+        for expected, got in (
+            (expected_src.clone(), got_src.clone()),  # clone
+            (expected_src.half(), got_src.half()),  # _to_copy
+        ):
+            assert got.stride() == expected.stride()
+            torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_channels_last_survives_a_device_round_trip(mojo_device):
+    x = _fill((2, 3, 4, 5), torch.float32).to(memory_format=torch.channels_last)
+    dev = x.to(mojo_device)
+    assert dev.stride() == x.stride()
+    back = dev.cpu()
+    assert back.stride() == x.stride()
+    assert torch.equal(back, x)
+
+
+def test_channels_last_survives_a_move_between_mojo_devices():
+    """The cross-device leg stages a contiguous buffer and lays the layout out
+    again on the destination."""
+    if len(list(get_accelerators())) < 2:
+        pytest.skip("needs two mojo devices")
+    x = _fill((2, 3, 4, 5), torch.float32).to(memory_format=torch.channels_last)
+    moved = x.to("mojo:0").to("mojo:1")
+    assert moved.stride() == x.stride()
+    torch.testing.assert_close(moved.cpu(), x)
+
+
+@pytest.mark.parametrize(
+    "shape,memory_format",
+    [((2, 3, 4), torch.channels_last), ((2, 3, 4, 5), torch.channels_last_3d)],
+    ids=_memory_format_id,
+)
+def test_memory_format_rank_is_checked_like_torch(mojo_device, shape, memory_format):
+    x = _fill(shape, torch.float32)
+    dev = x.to(mojo_device)
+    calls = [
+        lambda t: torch.empty(shape, device=t.device, memory_format=memory_format),
+        lambda t: t.clone(memory_format=memory_format),
+        lambda t: t.to(torch.float16, memory_format=memory_format),
+        lambda t: t.contiguous(memory_format=memory_format),
+    ]
+    for call in calls:
+        with pytest.raises(RuntimeError) as cpu_error:
+            call(x)
+        with pytest.raises(RuntimeError) as mojo_error:
+            call(dev)
+        assert str(cpu_error.value) in str(mojo_error.value)
+
+
+def test_empty_rejects_preserve_format_like_torch(mojo_device):
+    with pytest.raises(RuntimeError) as cpu_error:
+        torch.empty(3, memory_format=torch.preserve_format)
+    with pytest.raises(RuntimeError) as mojo_error:
+        torch.empty(3, device=mojo_device, memory_format=torch.preserve_format)
+    assert str(cpu_error.value) in str(mojo_error.value)
 
 
 # ---------------------------------------------------------------------------
