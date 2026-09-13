@@ -21,6 +21,7 @@ from abi import (
     T,
     TAG_BOOL_LIST,
     TAG_NONE,
+    TAG_TENSOR,
     Value,
     Values,
     bits_f64,
@@ -47,7 +48,13 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK, _f64_slot
-from ops_common import cast_to, contiguous, copy_strided_into, fill_value
+from ops_common import (
+    call_op_raw,
+    cast_to,
+    contiguous,
+    copy_strided_into,
+    fill_value,
+)
 from registry import Lib, impl
 
 # The three dtypes every nn kernel family is instantiated for
@@ -67,6 +74,41 @@ def _on_gpu(t: T) raises -> Bool:
 def _require_mojo(t: T, what: StaticString) raises:
     if not t.on_mojo():
         unsupported(String(what) + ": operand is not on the mojo device")
+
+
+def _records_grad(t: T) raises -> Bool:
+    """Whether autograd would record a node for `t` right now, i.e.
+    `GradMode::is_enabled()` AND `t.requires_grad()`.
+
+    The grad-mode flag is a C++ TLS bit with no `tmb_*` accessor, so it is
+    read the only way the record ABI reaches it: dispatch `aten::alias` -- a
+    pure view, no device work -- on a tensor that already requires grad and
+    see whether the view came back requiring it too. Inside
+    `torch.no_grad()` / `torch.inference_mode()` the autograd kernel is
+    skipped and it does not.
+
+    Private to this file until the port is merged; ops_attention.mojo has
+    the same helper (`_grad_enabled`) and both belong in ops_common.mojo.
+    """
+    if not t.requires_grad():
+        return False
+    var args = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
+    args[0] = Value(TAG_TENSOR, 0, Int64(t.h), 0)
+    var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
+    call_op_raw(
+        "aten::alias",
+        "",
+        Values(unsafe_from_address=Int(args.unsafe_ptr())),
+        1,
+        Values(unsafe_from_address=Int(rets.unsafe_ptr())),
+        1,
+    )
+    var view = T(Int(rets[0].a))
+    var recorded = view.requires_grad()
+    release(view.h)
+    _ = args
+    _ = rets
+    return recorded
 
 
 def _swapped(
@@ -203,7 +245,21 @@ def _resize_out(t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
 # ---------------------------------------------------------------------------
 
 
+def _one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device.
+
+    A kernel gets bare pointers and one stream: a pointer belonging to
+    another device -- or to no mojo device at all -- would be dereferenced
+    against the wrong context. The fields are cached on `T`, so this costs
+    nothing. Private to this file until the port is merged; it belongs in
+    ops_common.mojo.
+    """
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def _spec_unary(family: String, op: String, src: T, dst: T) raises:
+    _one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -311,6 +367,8 @@ def op_log_softmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _lsm_backward(dst: T, grad: T, output: T, rows: Int, cols: Int) raises:
+    _one_device(grad, dst)
+    _one_device(output, dst)
     var ctx = ctx_for(dst.device)
     var call = KernelCall("softmax_backward_ops", "LogSoftmaxBackwardData")
     call.arg_dtype(0, grad.dtype)
@@ -452,6 +510,21 @@ def op_native_layer_norm(
     _require_mojo(a, "native_layer_norm")
     if a.numel == 0 or not _is_float(a.dtype):
         unsupported("native_layer_norm of dtype " + String(a.dtype))
+    # `native_layer_norm_backward` here covers float32 only, so a
+    # grad-recording call on a reduced-precision input is refused in the
+    # FORWARD, where the traceback still names the op and the user's own
+    # frame -- rather than succeeding and failing later inside the autograd
+    # engine, with nothing in the message pointing at the layer norm.
+    if a.stype != ST_FLOAT32 and _records_grad(a):
+        unsupported(
+            "aten::native_layer_norm on a "
+            + String(a.dtype)
+            + " input that requires grad: this device implements"
+            " aten::native_layer_norm_backward for float32 only, so the"
+            " backward would fail. Run the forward under torch.no_grad(), or"
+            " keep the layer norm in float32 (autocast already does: its"
+            " policy runs normalization in float32)."
+        )
     var k = len(ns)
     if k < 1 or a.rank < k:
         unsupported("native_layer_norm: bad normalized_shape rank")
@@ -564,8 +637,14 @@ def op_native_layer_norm(
         _ = zeros.t.ptr
     _ = ctx
     ret_owned(rets, 0, out)
-    _ret_stat(rets, 1, mean, a.stype)
-    _ret_stat(rets, 2, rstd, a.stype)
+    # float32 statistics whatever the input dtype is, matching the CUDA
+    # kernel (`at::toAccumulateType(input.scalar_type(), true)`). The CPU
+    # kernel returns them in the input dtype instead; the accelerator
+    # contract is the one to keep, because the backward that consumes them
+    # is an accelerator kernel and reduced-precision statistics would lose
+    # the precision the forward accumulated.
+    ret_owned(rets, 1, mean)
+    ret_owned(rets, 2, rstd)
 
 
 def _filled(like: T, n: Int, value: Float64) raises -> T:
@@ -574,15 +653,6 @@ def _filled(like: T, n: Int, value: Float64) raises -> T:
     var t = new_tensor(shape, 1, like.stype, like.device)
     fill_value(t, value)
     return t^
-
-
-def _ret_stat(rets: Values, i: Int, mut stat: Owned, stype: Int32) raises:
-    """A float32 statistic returned in the input's dtype (ATen's
-    `param_scalar_type`)."""
-    if stype == ST_FLOAT32:
-        ret_owned(rets, i, stat)
-        return
-    ret_tensor(rets, i, cast_to(stat.t, stype))
 
 
 # aten::native_layer_norm_backward(Tensor grad_out, Tensor input,
@@ -1000,13 +1070,23 @@ def op_native_group_norm(
     var beta_dtype = a.dtype
     if has_w:
         var w = v_tensor(args[unsafe_offset=1])
-        if w.stype != a.stype or w.rank != 1 or w.dim(0) != c:
+        if (
+            w.stype != a.stype
+            or w.device != a.device
+            or w.rank != 1
+            or w.dim(0) != c
+        ):
             unsupported("native_group_norm: unsupported weight")
         gamma_dtype = w.dtype
         gamma_ptr = _keep_ptr(keep, w)
     if has_b:
         var b = v_tensor(args[unsafe_offset=2])
-        if b.stype != a.stype or b.rank != 1 or b.dim(0) != c:
+        if (
+            b.stype != a.stype
+            or b.device != a.device
+            or b.rank != 1
+            or b.dim(0) != c
+        ):
             unsupported("native_group_norm: unsupported bias")
         beta_dtype = b.dtype
         beta_ptr = _keep_ptr(keep, b)
@@ -1335,6 +1415,7 @@ def op_embedding(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         call.int(dtype_code(idx.dtype))
         call.int(idx.numel)
         call.int(row_len)
+        call.int(table.dim(0))
         call.int(dtype_code(table.dtype))
         call.int(ctx_ptr(ctx))
         call.run()

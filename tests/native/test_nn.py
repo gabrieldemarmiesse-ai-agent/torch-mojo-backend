@@ -203,8 +203,11 @@ def test_native_layer_norm(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_native_layer_norm_reduced_precision(mojo_device, dtype):
-    """The statistics come back in the input's dtype (ATen's
-    `param_scalar_type`), not in the float32 the kernels accumulate in."""
+    """The ACCELERATOR contract for the statistics, not the CPU one: CUDA
+    allocates mean/rstd in `at::toAccumulateType(input.scalar_type(), true)`,
+    i.e. float32 for both half types, while CPU returns them in the input
+    dtype. The backward that consumes them is an accelerator kernel, so
+    float32 is the contract to keep."""
     x = torch.randn(2, 6, 64).to(dtype)
     w = torch.randn(64).to(dtype)
     b = torch.randn(64).to(dtype)
@@ -212,9 +215,25 @@ def test_native_layer_norm_reduced_precision(mojo_device, dtype):
     got = torch.native_layer_norm(
         x.to(mojo_device), (64,), w.to(mojo_device), b.to(mojo_device), 1e-5
     )
-    for g, e in zip(got, want, strict=True):
-        assert g.dtype == e.dtype
-        torch.testing.assert_close(g.cpu(), e, atol=2e-2, rtol=2e-2)
+    assert got[0].dtype == dtype
+    assert got[1].dtype == torch.float32
+    assert got[2].dtype == torch.float32
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=2e-2, rtol=2e-2)
+    for i in (1, 2):
+        torch.testing.assert_close(got[i].cpu(), want[i].float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_layer_norm_refuses_reduced_precision_training(mojo_gpu, dtype):
+    """`native_layer_norm_backward` here covers float32 only. Refusing in the
+    FORWARD keeps the traceback on the user's own frame instead of burying it
+    inside the autograd engine."""
+    x = torch.randn(2, 6, 64).to(dtype).to(mojo_gpu).requires_grad_()
+    with pytest.raises(NotImplementedError, match="requires grad"):
+        torch.native_layer_norm(x, (64,), None, None, 1e-5)
+    # The same input is fine for inference.
+    with torch.no_grad():
+        torch.native_layer_norm(x, (64,), None, None, 1e-5)
 
 
 def test_layer_norm_module_forward(mojo_device):
@@ -661,6 +680,23 @@ def test_embedding_with_padding_idx(mojo_device):
         ).cpu(),
         torch.nn.functional.embedding(idx, table, padding_idx=2),
     )
+
+
+def test_embedding_out_of_range_index_stays_in_bounds(mojo_gpu):
+    """A vocabulary overflow must not read device memory outside the table.
+    The kernel receives the row count and clamps: the value for an invalid
+    index is unspecified, the access is not (there is no portable device
+    assert, and a host-visible error flag would synchronize the device on
+    every embedding lookup)."""
+    table = torch.arange(6 * 3, dtype=torch.float32).reshape(6, 3)
+    idx = torch.tensor([0, 6, 1 << 30, -7], dtype=torch.int64)
+    got = torch.nn.functional.embedding(idx.to(mojo_gpu), table.to(mojo_gpu)).cpu()
+    assert tuple(got.shape) == (4, 3)
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got[0], table[0])
+    rows = table.tolist()
+    for i in (1, 2, 3):
+        assert got[i].tolist() in rows
 
 
 def test_embedding_strided_indices(mojo_device):
