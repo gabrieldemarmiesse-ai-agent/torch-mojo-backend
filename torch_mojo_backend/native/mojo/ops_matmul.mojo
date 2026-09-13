@@ -49,7 +49,7 @@ from abi import (
 from device import ctx_for, ctx_ptr
 from kernels import KernelCall, loader
 from op_utils import MAX_RANK
-from ops_common import call_op, contiguous, copy_strided_into, fill_value
+from ops_common import call_op_raw, contiguous, copy_strided_into, fill_value
 from registry import Lib, impl
 
 
@@ -778,7 +778,7 @@ def _try_add(a: T, b: T) raises -> Optional[T]:
     args[2] = Value(TAG_SCALAR_INT, 0, 1, 0)
     var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
     try:
-        call_op(
+        call_op_raw(
             "aten::add",
             "Tensor",
             Values(unsafe_from_address=Int(args.unsafe_ptr())),
@@ -805,7 +805,7 @@ def _call_1(
     args[0] = a.copy()
     args[1] = b.copy()
     var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
-    call_op(
+    call_op_raw(
         String(op),
         String(overload),
         Values(unsafe_from_address=Int(args.unsafe_ptr())),

@@ -1,0 +1,526 @@
+"""Native backend: data_movement group (see docs/native_backend.md and
+torch_mojo_backend/native/mojo/ops_data_movement.mojo).
+
+Public-API checks only (no `TorchMojoTensor`/`aten_fast`/old-eager
+internals): every op is exercised through ordinary `torch` calls on tensors
+living on a `mojo` device, and `call_checker` confirms the native op (not
+some other route) actually ran.
+"""
+
+import pytest
+import torch
+
+from torch_mojo_backend import aten_functions, register_mojo_devices
+
+# The `mojo_device` fixture (tests/conftest.py) yields a "mojo:N" string but,
+# unlike `mojo_gpu`, never registers the backend itself -- it assumes some
+# other test using the `conf` fixture ran first in the same session. Running
+# this file on its own needs the same idempotent call `mojo_gpu` makes.
+register_mojo_devices()
+
+
+def _fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A deterministic, non-RNG input: consecutive elements differ, so a
+    kernel that reads/writes one element off is caught by VALUE, not just by
+    shape."""
+    numel = 1
+    for extent in shape:
+        numel *= extent
+    base = torch.arange(numel, dtype=torch.int64) % 251
+    if dtype.is_floating_point:
+        base = base.to(torch.float32) / 256.0
+    return base.to(dtype).view(shape)
+
+
+# ---------------------------------------------------------------------------
+# clone
+# ---------------------------------------------------------------------------
+
+
+def test_clone_contiguous(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_clone)
+    x = _fill((3, 4), torch.float32)
+    dev = x.to(mojo_device)
+    cloned = dev.clone()
+    torch.testing.assert_close(cloned.cpu(), x)
+    # An independent allocation: mutating one leaves the other untouched.
+    # (fill_ rather than add_: add.out is a different group's op.)
+    cloned.fill_(99.0)
+    torch.testing.assert_close(dev.cpu(), x)
+
+
+def test_clone_strided(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_clone)
+    x = _fill((5, 7), torch.float32)
+    dev = x.to(mojo_device).t()
+    cloned = dev.clone()
+    assert cloned.is_contiguous()
+    torch.testing.assert_close(cloned.cpu(), x.t())
+
+
+@pytest.mark.parametrize("rank", [1, 2, 3, 4, 5])
+def test_clone_every_rank(mojo_gpu, rank):
+    """rank<=4 takes the PermuteCopy fast path, rank>4 the general one."""
+    shape = tuple(range(2, 2 + rank))
+    x = _fill(shape, torch.bfloat16)
+    dev = x.to(mojo_gpu).permute(*reversed(range(rank)))
+    torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
+
+
+def test_clone_channels_last_declines(mojo_gpu):
+    x = torch.randn(2, 3, 4, 4).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        x.clone(memory_format=torch.channels_last)
+
+
+# ---------------------------------------------------------------------------
+# _to_copy: dtype casts (same device) and device moves
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.int64),
+        (torch.int64, torch.int32),
+        (torch.int32, torch.uint8),
+        (torch.uint8, torch.bool),
+        # Exotic pairs outside the fast CastSpec kernel: the host round trip.
+        (torch.float32, torch.float64),
+        (torch.float64, torch.float32),
+        (torch.float32, torch.int16),
+        (torch.int16, torch.int8),
+        (torch.uint8, torch.uint16),
+    ],
+)
+def test_to_copy_dtype_cast(mojo_device, src_dtype, dst_dtype, call_checker):
+    call_checker.register(aten_functions.aten__to_copy)
+    x = _fill((3, 5), src_dtype if not src_dtype.is_floating_point else torch.float32)
+    x = x.to(src_dtype)
+    dev = x.to(mojo_device)
+    torch.testing.assert_close(dev.to(dst_dtype).cpu(), x.to(dst_dtype))
+
+
+def test_to_copy_always_returns_a_fresh_tensor(mojo_gpu):
+    # `Tensor.to(dtype)` short-circuits to `self` in Python when nothing
+    # would change, without ever reaching `_to_copy`; call the aten op
+    # directly to exercise its own "always a fresh tensor" contract.
+    x = torch.randn(4).to(mojo_gpu)
+    same = torch.ops.aten._to_copy.default(x, dtype=torch.float32)
+    assert same.data_ptr() != x.data_ptr()
+
+
+def test_to_copy_device_round_trip(mojo_device):
+    x = _fill((4, 6), torch.float32)
+    dev = x.to(mojo_device)
+    back = dev.to("cpu")
+    torch.testing.assert_close(back, x)
+
+
+# ---------------------------------------------------------------------------
+# cat
+# ---------------------------------------------------------------------------
+
+
+def test_cat_skips_legacy_empty(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_cat)
+    empty = torch.empty(0)
+    x = torch.randn(1, 12, 6, 8)
+    result = torch.cat([empty.to(mojo_device), x.to(mojo_device)], dim=-2)
+    torch.testing.assert_close(result.cpu(), torch.cat([empty, x], dim=-2))
+
+
+_CAT_CASES = [
+    ("single input", [(1000,)], 0),
+    ("two aligned", [(4096,), (4096,)], 0),
+    ("three", [(777,), (777,), (777,)], 0),
+    ("past one batch", [(311,)] * 70, 0),
+    ("wildly unequal", [(1,), (7,), (4096,), (3,), (10000,)], 0),
+    ("odd lengths", [(12345,), (7,), (999,)], 0),
+    ("zero along dim", [(0, 5), (3, 5)], 0),
+    ("3-D middle dim", [(5, 2, 7), (5, 3, 7), (5, 4, 7)], 1),
+    ("3-D trailing dim", [(5, 6, 2), (5, 6, 3), (5, 6, 4)], 2),
+    ("3-D negative dim", [(5, 6, 2), (5, 6, 3)], -1),
+]
+
+
+@pytest.mark.parametrize(
+    "shapes,dim",
+    [case[1:] for case in _CAT_CASES],
+    ids=[case[0] for case in _CAT_CASES],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_cat_batched(mojo_device, shapes, dim, dtype):
+    host = [torch.randn(shape).to(dtype) for shape in shapes]
+    device = [x.to(mojo_device) for x in host]
+    torch.testing.assert_close(
+        torch.cat(device, dim).cpu(), torch.cat(host, dim), rtol=0, atol=0
+    )
+
+
+def test_cat_strided_inputs(mojo_gpu):
+    """A non-contiguous input takes the per-input strided-view path (the
+    batched kernel only ever sees contiguous inputs)."""
+    host = [torch.randn(64, 32), torch.randn(64, 32)]
+    device = [x.to(mojo_gpu).t() for x in host]
+    torch.testing.assert_close(
+        torch.cat(device, 0).cpu(), torch.cat([x.t() for x in host], 0), rtol=0, atol=0
+    )
+
+
+def test_cat_offset_views_and_legacy_empty(mojo_gpu):
+    host = [torch.randn(2048) for _ in range(4)]
+    device = [x.to(mojo_gpu) for x in host]
+    torch.testing.assert_close(
+        torch.cat([x[3:1000] for x in device]).cpu(),
+        torch.cat([x[3:1000] for x in host]),
+        rtol=0,
+        atol=0,
+    )
+    empty = torch.empty(0)
+    mid = [torch.randn(4, 8), empty, torch.randn(3, 8)]
+    torch.testing.assert_close(
+        torch.cat([x.to(mojo_gpu) for x in mid], 0).cpu(),
+        torch.cat(mid, 0),
+        rtol=0,
+        atol=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# stack
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_stack(mojo_device, dim, call_checker):
+    call_checker.register(aten_functions.aten_stack)
+    host = [torch.randn(6, 5) for _ in range(5)]
+    device = [x.to(mojo_device) for x in host]
+    torch.testing.assert_close(
+        torch.stack(device, dim).cpu(), torch.stack(host, dim), rtol=0, atol=0
+    )
+
+
+def test_stack_many_inputs(mojo_gpu):
+    host = [torch.randn(1024) for _ in range(33)]
+    device = [x.to(mojo_gpu) for x in host]
+    torch.testing.assert_close(
+        torch.stack(device, 0).cpu(), torch.stack(host, 0), rtol=0, atol=0
+    )
+
+
+# ---------------------------------------------------------------------------
+# repeat
+# ---------------------------------------------------------------------------
+
+_REPEAT_CASES = [
+    (357, 789, (2, 3)),
+    (13, 7, (3, 5)),
+    (64, 1024, (3, 2)),
+    (1024, 64, (1, 16)),
+    (33, 33, (2, 2)),
+    (1, 100, (5, 7)),
+    (17, 31, (1, 1)),
+    (3, 4, (2, 3, 5)),
+    (5, 6, (3, 1, 1)),
+    (1, 3, (2000, 1)),
+]
+_REPEAT_IDS = [
+    f"{r}x{c}_r{'x'.join(str(k) for k in reps)}" for r, c, reps in _REPEAT_CASES
+]
+
+
+@pytest.mark.parametrize("rows,cols,reps", _REPEAT_CASES, ids=_REPEAT_IDS)
+def test_repeat_matches_torch(mojo_device, rows, cols, reps, call_checker):
+    call_checker.register(aten_functions.aten_repeat)
+    x = _fill((rows, cols), torch.float32)
+    torch.testing.assert_close(
+        x.to(mojo_device).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.int64, torch.uint8]
+)
+@pytest.mark.parametrize("rows,cols,reps", [(357, 789, (2, 3)), (100, 8, (1, 5))])
+def test_repeat_every_element_size(mojo_gpu, dtype, rows, cols, reps):
+    x = _fill((rows, cols), dtype)
+    torch.testing.assert_close(
+        x.to(mojo_gpu).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("offset", [1, 2, 3, 4])
+def test_repeat_offset_views_are_not_assumed_aligned(mojo_gpu, offset):
+    rows, cols, reps = 357, 789, (2, 3)
+    base = _fill((rows * cols + 4,), torch.float32)
+    x = base[offset : offset + rows * cols].view(rows, cols)
+    device = base.to(mojo_gpu)[offset : offset + rows * cols].view(rows, cols)
+    torch.testing.assert_close(
+        device.repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+    )
+
+
+def test_repeat_degenerate_extents(mojo_device):
+    """A zero repeat factor or a zero input extent is an empty output, not a
+    launch and not a crash. `repeat(x, [])` on a 0-d tensor is a legal 0-d
+    copy with no last dim to tile along."""
+    for shape, reps in (((4, 5), (0, 2)), ((4, 5), (2, 0)), ((0, 5), (2, 3))):
+        x = _fill(shape, torch.float32)
+        torch.testing.assert_close(
+            x.to(mojo_device).repeat(*reps).cpu(), x.repeat(*reps), rtol=0, atol=0
+        )
+    scalar = torch.tensor(1.25)
+    torch.testing.assert_close(
+        torch.ops.aten.repeat(scalar.to(mojo_device), []).cpu(),
+        torch.ops.aten.repeat(scalar, []),
+        rtol=0,
+        atol=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# tril / triu
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("diagonal", [-2, -1, 0, 1, 2])
+@pytest.mark.parametrize("shape", [(5, 5), (357, 41), (2, 6, 4)])
+def test_tril(mojo_device, shape, diagonal, call_checker):
+    call_checker.register(aten_functions.aten_tril)
+    x = _fill(shape, torch.float32)
+    torch.testing.assert_close(x.to(mojo_device).tril(diagonal).cpu(), x.tril(diagonal))
+
+
+@pytest.mark.parametrize("diagonal", [-2, -1, 0, 1, 2])
+@pytest.mark.parametrize("shape", [(5, 5), (41, 357), (2, 6, 4)])
+def test_triu(mojo_device, shape, diagonal, call_checker):
+    call_checker.register(aten_functions.aten_triu)
+    x = _fill(shape, torch.float32)
+    torch.testing.assert_close(x.to(mojo_device).triu(diagonal).cpu(), x.triu(diagonal))
+
+
+def test_triu_every_dtype(mojo_gpu):
+    for dtype in (torch.bfloat16, torch.int64, torch.uint8, torch.bool):
+        x = (_fill((6, 6), torch.int64) % 2).to(dtype)
+        torch.testing.assert_close(x.to(mojo_gpu).triu(1).cpu(), x.triu(1))
+
+
+# ---------------------------------------------------------------------------
+# select_scatter
+# ---------------------------------------------------------------------------
+
+
+def test_select_scatter_basic(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_select_scatter)
+    a = _fill((4, 5), torch.float32)
+    src = torch.full((5,), -1.0)
+    expected = a.select_scatter(src, 0, 2)
+    dev = a.to(mojo_device).select_scatter(src.to(mojo_device), 0, 2)
+    torch.testing.assert_close(dev.cpu(), expected)
+    # `a` itself is untouched (select_scatter is functional).
+    torch.testing.assert_close(a, _fill((4, 5), torch.float32))
+
+
+def test_select_scatter_negative_dim_and_index(mojo_device):
+    a = _fill((3, 4, 5), torch.float32)
+    src = torch.full((3, 5), 7.0)
+    expected = a.select_scatter(src, -2, -1)
+    dev = a.to(mojo_device).select_scatter(src.to(mojo_device), -2, -1)
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_select_scatter_broadcasts_and_casts_src(mojo_gpu):
+    # float16 (not float64): the fast CastSpec kernel's dtype set is what
+    # select_scatter's src-cast uses, matching the old eager path's
+    # `_cast_tensor` (pre-gated on the same set, never a host round trip).
+    a = _fill((4, 5), torch.float32)
+    src = torch.tensor(9.0, dtype=torch.float16)  # 0-d, needs broadcast + cast
+    expected = a.select_scatter(src.to(torch.float32).expand(5), 0, 1)
+    dev = a.to(mojo_gpu).select_scatter(src.to(mojo_gpu), 0, 1)
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+# ---------------------------------------------------------------------------
+# scatter.src / scatter.value
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_scatter_src(mojo_device, dim, call_checker):
+    call_checker.register(aten_functions.aten_scatter_src)
+    a = _fill((4, 5), torch.float32)
+    # Indices with no duplicate destination within a scatter group: torch's
+    # own semantics call a colliding scatter "nondeterministic" (whichever
+    # write lands last wins), so a randint index could legitimately disagree
+    # with the cpu reference by write-order alone -- that is not a kernel bug.
+    # Each row (dim=1/-1) or column (dim=0) is instead a distinct sub-permutation.
+    if dim == 0:
+        index = torch.stack([torch.randperm(4)[:3] for _ in range(5)], dim=1)
+    elif dim == 1:
+        index = torch.stack([torch.randperm(5)[:4] for _ in range(3)], dim=0)
+    else:
+        index = torch.stack([torch.randperm(5)[:3] for _ in range(4)], dim=0)
+    index = index.to(torch.int64)
+    src = _fill(tuple(index.shape), torch.float32) + 100
+    expected = a.scatter(dim, index, src)
+    dev = a.to(mojo_device).scatter(dim, index.to(mojo_device), src.to(mojo_device))
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_scatter_value(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_scatter_value)
+    a = _fill((4, 5), torch.float32)
+    index = torch.randint(0, 4, (2, 5)).to(torch.int64)
+    expected = a.scatter(0, index, -3.5)
+    dev = a.to(mojo_device).scatter(0, index.to(mojo_device), -3.5)
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_scatter_value_bool(mojo_gpu):
+    a = torch.zeros(4, 5, dtype=torch.bool)
+    index = torch.randint(0, 4, (2, 5)).to(torch.int64)
+    expected = a.scatter(0, index, True)
+    dev = a.to(mojo_gpu).scatter(0, index.to(mojo_gpu), True)
+    assert dev.cpu().tolist() == expected.tolist()
+
+
+def test_scatter_rejects_rank_beyond_4(mojo_gpu):
+    a = torch.zeros(2, 2, 2, 2, 2).to(mojo_gpu)
+    index = torch.zeros(2, 2, 2, 2, 2, dtype=torch.int64).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        a.scatter(0, index, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# index.Tensor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+def test_index_tensor_gather_rows(mojo_device, idx_dtype, call_checker):
+    call_checker.register(aten_functions.aten_index)
+    x = _fill((10, 3, 4), torch.float32)
+    idx = torch.tensor([3, 0, 7, 7], dtype=idx_dtype)
+    expected = x[idx]
+    dev = x.to(mojo_device)[idx.to(mojo_device)]
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_index_tensor_negative_indices(mojo_gpu):
+    x = _fill((6, 4), torch.float32)
+    idx = torch.tensor([-1, -2, 0], dtype=torch.int64)
+    expected = x[idx]
+    dev = x.to(mojo_gpu)[idx.to(mojo_gpu)]
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_index_tensor_bool_mask_full_rank(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_index)
+    x = _fill((4, 5), torch.float32)
+    mask = _fill((4, 5), torch.int64) % 3 == 0
+    expected = x[mask]
+    dev = x.to(mojo_device)[mask.to(mojo_device)]
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_index_tensor_bool_mask_partial_rank(mojo_gpu):
+    x = _fill((4, 5, 3), torch.float32)
+    mask = torch.tensor([True, False, True, False])
+    expected = x[mask]
+    dev = x.to(mojo_gpu)[mask.to(mojo_gpu)]
+    torch.testing.assert_close(dev.cpu(), expected)
+
+
+def test_index_tensor_bool_mask_all_false(mojo_gpu):
+    x = _fill((4, 5), torch.float32)
+    mask = torch.zeros(4, 5, dtype=torch.bool)
+    expected = x[mask]
+    dev = x.to(mojo_gpu)[mask.to(mojo_gpu)]
+    assert dev.cpu().shape == expected.shape
+
+
+# ---------------------------------------------------------------------------
+# nonzero
+# ---------------------------------------------------------------------------
+
+
+def test_nonzero_basic(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_nonzero)
+    x = torch.tensor([[1, 0, 2], [0, 3, 0], [4, 0, 5]], dtype=torch.float32)
+    torch.testing.assert_close(x.to(mojo_device).nonzero().cpu(), x.nonzero())
+
+
+def test_nonzero_all_zeros(mojo_device):
+    x = torch.zeros(3, 3, dtype=torch.float32)
+    torch.testing.assert_close(x.to(mojo_device).nonzero().cpu(), x.nonzero())
+
+
+def test_nonzero_all_nonzero(mojo_device):
+    x = torch.ones(2, 3, dtype=torch.float32)
+    torch.testing.assert_close(x.to(mojo_device).nonzero().cpu(), x.nonzero())
+
+
+@pytest.mark.parametrize("shape", [(2,), (3, 4), (2, 3, 4)])
+def test_nonzero_shapes(mojo_gpu, shape):
+    x = _fill(shape, torch.float32)
+    x = x * (x > 0.5)  # scatter in some real zeros
+    torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
+
+
+def test_nonzero_int_dtype(mojo_gpu):
+    x = torch.tensor([1, 0, 3, 0, 5], dtype=torch.int64)
+    torch.testing.assert_close(x.to(mojo_gpu).nonzero().cpu(), x.nonzero())
+
+
+# ---------------------------------------------------------------------------
+# set_.source_Tensor
+# ---------------------------------------------------------------------------
+
+
+def test_set_source_tensor_adopts_the_allocation(mojo_gpu):
+    # Built on the host and uploaded (torch.arange(..., device=mojo) is the
+    # factories group's op, not this one's) rather than through arange/add_
+    # directly on the mojo device.
+    destination = torch.zeros(8, device=mojo_gpu)
+    source = (torch.arange(4, dtype=torch.float32) + 50).to(mojo_gpu)
+    returned = destination.set_(source)  # ty: ignore[invalid-argument-type]
+    assert returned is destination
+    assert tuple(destination.shape) == (4,)
+    assert destination.cpu().tolist() == [50.0, 51.0, 52.0, 53.0]
+    # Sharing the allocation, not a copy of it.
+    source.fill_(99.0)
+    assert destination.cpu().tolist() == [99.0] * 4
+
+
+def test_set_source_tensor_keeps_its_own_dtype(mojo_gpu):
+    """Matches upstream `set_tensor_`'s `set_storage_keep_dtype`: self's own
+    dtype survives, only storage/sizes/strides move -- a raw bit
+    reinterpretation, same as real ATen. `Tensor.set_`'s Python method adds
+    its own dtype-equality check ahead of the dispatcher for this overload,
+    so this goes through the aten op directly, the way FSDP1's C++-side caller
+    does."""
+    destination = torch.zeros(4, dtype=torch.int32, device=mojo_gpu)
+    source = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
+    torch.ops.aten.set_.source_Tensor(destination, source)
+    assert destination.dtype == torch.int32
+    assert destination.cpu().tolist() == [0, 1065353216, 1073741824, 1077936128]
+
+
+# ---------------------------------------------------------------------------
+# empty_permuted
+# ---------------------------------------------------------------------------
+
+
+def test_empty_permuted_shape_dtype_device(mojo_device, call_checker):
+    call_checker.register(aten_functions.aten_empty_permuted)
+    out = torch.ops.aten.empty_permuted(
+        [2, 3, 4], [1, 0, 2], dtype=torch.float16, device=mojo_device
+    )
+    assert tuple(out.shape) == (2, 3, 4)
+    assert out.dtype == torch.float16
+    assert out.device.type == "mojo"
+    assert out.is_contiguous()

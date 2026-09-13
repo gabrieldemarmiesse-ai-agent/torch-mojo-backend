@@ -35,7 +35,7 @@ from kernels import KernelCall
 from op_utils import MAX_RANK
 
 
-def call_op(
+def call_op_raw(
     op: String,
     overload: String,
     args: Values,
@@ -43,7 +43,8 @@ def call_op(
     rets: Values,
     n_rets: Int,
 ) raises:
-    """Call any aten op through torch's dispatcher (`tmb_call_op`).
+    """Call any aten op through torch's dispatcher (`tmb_call_op`) over
+    caller-owned record arrays; `call_op` below is the List-based form.
 
     What an op uses to reach a neighbouring op's kernel or ATen's own
     composite: the records are the same ones a kernel gets, tensor arguments
@@ -436,3 +437,16 @@ def promoted_pair(a: T, b: T) raises -> Tuple[T, T]:
         return (a.copy(), cast_to(b, torch_dtype(DType.int64)))
     unsupported("mixed dtypes " + String(a.dtype) + " and " + String(b.dtype))
     return (a.copy(), b.copy())
+
+
+def release_if_new(result: T, original: T):
+    """Release `result` only when it is a fresh allocation distinct from
+    `original`. `contiguous()`/`cast_to()` alias their input (returning it
+    unchanged, via `T.copy()`) instead of allocating whenever the input
+    already has the requested layout/dtype -- so a caller that wraps their
+    result in `own()` unconditionally would release a handle it never
+    allocated (an argument the caller only borrowed, e.g. an op's `self`).
+    Call this instead of `own(...)` whenever the input might be a borrowed
+    tensor."""
+    if result.h != original.h:
+        release(result.h)
