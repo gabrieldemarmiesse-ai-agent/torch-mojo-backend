@@ -37,6 +37,19 @@ def is_initialized() -> bool:
     return native.is_registered()
 
 
+def _lazy_init():
+    """torch's `device_lazy_init(PrivateUse1)` hook: it imports `torch.mojo`
+    and calls this, then marks the device initialized.
+
+    Nothing to do here (registration already built everything), but the method
+    must EXIST: without it torch never sets its per-device-type initialized
+    flag, and `torch._C._accelerator_synchronizeDevice` -- which returns early
+    for an uninitialized lazy-init device -- silently does nothing. That made
+    `torch.accelerator.synchronize()` and `torch.mojo.synchronize()` no-ops,
+    so a readback after work on a non-default stream could race it.
+    """
+
+
 def _is_in_bad_fork() -> bool:
     return False
 
