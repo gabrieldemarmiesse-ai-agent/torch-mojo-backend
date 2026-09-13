@@ -302,24 +302,16 @@ def test_gelu_backward_declines_on_cpu_device(mojo_gpu):
 
 
 def test_missing_backward_kernels_raise_cleanly(mojo_gpu):
-    """sigmoid_backward / tanh_backward / threshold_backward (relu's
-    backward) have no native kernel (the old eager path preflighted these
-    from the forward, see aten_ops/autograd_preflight.py, because a Python
-    exception raised inside that backend's autograd engine could abort the
-    process). The native backend has no such hazard: an unregistered
-    PrivateUse1 op simply raises out of the dispatcher like any missing
-    kernel, which this test is here to confirm actually holds rather than
-    crashing the interpreter.
-    """
-    for make_y in (
-        lambda x: torch.sigmoid(x),
-        lambda x: torch.tanh(x),
-        lambda x: torch.relu(x),
-    ):
-        x = torch.randn(4).to(mojo_gpu).requires_grad_()
-        y = make_y(x)
-        with pytest.raises((NotImplementedError, RuntimeError)):
-            y.backward(torch.ones_like(y))
+    """An unregistered backward op raises out of the dispatcher like any
+    missing kernel instead of crashing the interpreter (the old eager path
+    had to preflight these from the forward). sigmoid/tanh/threshold
+    backward are composed ops now, so the check uses a backward that still
+    has no kernel: the transposed convolution's."""
+    x = torch.randn(1, 2, 5, 5).to(mojo_gpu).requires_grad_()
+    w = torch.randn(2, 3, 3, 3).to(mojo_gpu)
+    with pytest.raises((NotImplementedError, RuntimeError)):
+        y = torch.nn.functional.conv_transpose2d(x, w)
+        y.backward(torch.ones_like(y))
 
 
 def test_isnan(mojo_gpu):

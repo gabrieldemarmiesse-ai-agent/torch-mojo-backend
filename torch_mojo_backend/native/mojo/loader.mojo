@@ -187,8 +187,13 @@ struct Loader(Movable):
         # The compiler writes to local scratch (the cache may be on NFS,
         # where its intermediate archive went missing under load); the
         # finished library is then moved next to its final name.
-        var scratch = String("${TMPDIR:-/tmp}/torch-mojo-backend-") + String(
-            external_call["getuid", UInt32]()
+        var tmpdir = getenv("TMPDIR")
+        if tmpdir == "":
+            tmpdir = "/tmp"
+        var scratch = (
+            tmpdir
+            + "/torch-mojo-backend-"
+            + String(external_call["getuid", UInt32]())
         )
         var local = (
             scratch + "/" + family + "." + String(perf_counter_ns()) + ".so"

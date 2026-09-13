@@ -10,6 +10,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <torch/csrc/profiler/stubs/base.h>
@@ -425,6 +426,7 @@ void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_ver
 int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }
+int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
 TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 

@@ -132,7 +132,8 @@ int64_t tmb_tensor_storage_nbytes(TmbTensor t);
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_requires_grad(TmbTensor t);
 void tmb_tensor_bump_version(TmbTensor t);
-int32_t tmb_float32_matmul_precision(void);  // torch.get_float32_matmul_precision: 0 highest, 1 high, 2 medium  // what ADInplaceOrView does for Tensor(a!) but not for Tensor(a!)[]
+int32_t tmb_float32_matmul_precision(void);  // torch.get_float32_matmul_precision: 0 highest, 1 high, 2 medium
+int32_t tmb_grad_enabled(void);  // at::GradMode::is_enabled(): whether autograd records this call
 TmbTensor tmb_tensor_retain(TmbTensor t);   // new owned handle to the same tensor
 void tmb_tensor_release(TmbTensor t);
 // allocation through the registered allocator, no dispatcher round trip

@@ -18,6 +18,7 @@ Everything else -- an explicit mask, dropout, GQA, a shape no fused route
 takes -- is left to ATen's own math decomposition, which composes ordinary
 aten ops this backend already implements and differentiates itself.
 """
+from std.ffi import external_call
 from std.math import sqrt
 from std.utils import IndexList
 
@@ -155,24 +156,12 @@ def _is_float(t: T) -> Bool:
 
 
 def _needs_grad(q: T, k: T, v: T) -> Bool:
-    """Whether this call may have a backward to produce.
-
-    This is `requires_grad` only, NOT "autograd will record a node": the
-    grad-mode flag is unreachable from here. It is a C++ TLS bit with no
-    `tmb_*` accessor, and it cannot be inferred through the dispatcher
-    either -- the generated VariableType wrapper runs a backend kernel under
-    `AutoDispatchBelowADInplaceOrView`, so a nested `tmb_call_op` from inside
-    this op has the autograd AND view keys excluded and sees no autograd
-    metadata at all (measured: `aten::alias` on a requires-grad tensor comes
-    back with `requires_grad == False` from in here, under grad mode as much
-    as under `torch.no_grad()`).
-
-    The cost is conservatism: inside `torch.no_grad()`, a leaf that requires
-    grad elsewhere still sends this call to the differentiable route. One
-    line in `native/csrc/shim_runtime.cpp` -- a `tmb_grad_enabled()` reading
-    `at::GradMode::is_enabled()`, next to `tmb_float32_matmul_precision`
-    which reads `at::globalContext()` the same way -- is what would fix it.
-    """
+    """Whether autograd will record this call: grad mode (a C++ TLS bit the
+    shim exposes as tmb_grad_enabled; it cannot be inferred through the
+    dispatcher from inside a backend kernel) and an input that requires
+    grad."""
+    if external_call["tmb_grad_enabled", Int32]() == 0:
+        return False
     return q.requires_grad() or k.requires_grad() or v.requires_grad()
 
 
