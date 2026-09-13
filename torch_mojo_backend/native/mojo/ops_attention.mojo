@@ -52,7 +52,7 @@ from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_to, copy_strided_into, fill_value, release_if_new
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
 comptime SDP_MATH = 0
@@ -1163,16 +1163,28 @@ def op_flash_attention_for_cpu_backward(
     _ = fargs
 
 
-def register_attention(lib: Lib) raises:
-    impl[op_efficient_attention](lib, "_scaled_dot_product_efficient_attention")
-    impl[op_flash_attention_for_cpu](
-        lib, "_scaled_dot_product_flash_attention_for_cpu"
+def register_attention(site: Site) raises:
+    impl[op_efficient_attention, "_scaled_dot_product_efficient_attention"](
+        site
     )
-    impl[op_flash_attention_for_cpu_backward](
-        lib, "_scaled_dot_product_flash_attention_for_cpu_backward"
-    )
-    impl[op_flash_attention](lib, "_scaled_dot_product_flash_attention")
-    impl[op_flash_attention_backward](
-        lib, "_scaled_dot_product_flash_attention_backward"
-    )
-    impl[op_fused_sdp_choice](lib, "_fused_sdp_choice")
+    impl[
+        op_flash_attention_for_cpu,
+        "_scaled_dot_product_flash_attention_for_cpu",
+    ](site)
+    impl[
+        op_flash_attention_for_cpu_backward,
+        "_scaled_dot_product_flash_attention_for_cpu_backward",
+    ](site)
+    impl[op_flash_attention, "_scaled_dot_product_flash_attention"](site)
+    impl[
+        op_flash_attention_backward,
+        "_scaled_dot_product_flash_attention_backward",
+    ](site)
+    impl[op_fused_sdp_choice, "_fused_sdp_choice"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_attention]()

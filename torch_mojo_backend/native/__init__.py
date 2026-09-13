@@ -221,17 +221,21 @@ def _scratch_dir() -> Path:
 
 
 def compiler_env() -> dict[str, str]:
-    """Environment of every compiler subprocess: the Mojo compiler's own
-    cache (`$MODULAR_HOME/cache/.mojo_cache`) moves to local scratch. On a
-    shared NFS home, concurrent compilers on several nodes evict each
-    other's entries and builds fail with "failed to produce an archive for
-    the module"; `TORCH_MOJO_BACKEND_KEEP_MODULAR_HOME=1` keeps the user's."""
-    env = dict(os.environ)
-    if os.environ.get("TORCH_MOJO_BACKEND_KEEP_MODULAR_HOME") != "1":
-        home = _scratch_dir() / "modular-home"
-        home.mkdir(parents=True, exist_ok=True)
-        env["MODULAR_HOME"] = str(home)
-    return env
+    """Environment every `mojo build` subprocess runs with (loader.mojo's
+    `_compiler_env` is the same thing on the Mojo side).
+
+    MODULAR_HOME holds the compiler's own module cache. Its default sits in
+    $HOME, which on a cluster is NFS shared by every node, and concurrent
+    compilers then evict each other's entries — "failed to produce an archive
+    for the module: No such file or directory". Node-local, it is per-machine
+    and nobody else touches it; the first build on a machine pays about 25 s
+    to fill it. A value the caller set deliberately wins."""
+    home = Path(
+        os.environ.get("MODULAR_HOME")
+        or Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
+    )
+    home.mkdir(parents=True, exist_ok=True)
+    return {**os.environ, "MODULAR_HOME": str(home)}
 
 
 def _atomic_install(tmp: Path, out: Path):
@@ -476,6 +480,18 @@ def op_counts() -> dict[str, int]:
     return out
 
 
+def prebuild_ops():
+    """Compile every op's extension now rather than one per first call.
+
+    Only useful up front: a test suite or a CI image pays the compilations
+    here, outside any GPU lock, instead of inside the first call of each op.
+    """
+    fn = backend_lib().tmb_prebuild_ops
+    fn.restype = ctypes.c_int32
+    if fn() != 0:
+        raise RuntimeError("prebuilding the mojo ops failed: " + last_error())
+
+
 def device_count() -> int:
     return cast(int, _state.get("device_count", 0))
 
@@ -530,11 +546,13 @@ def register():
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_char_p,
+            ctypes.c_char_p,
             ctypes.c_int32,
         ]
         shim_lib.tmb_get_error.restype = ctypes.c_char_p
         n = backend.tmb_native_init(
             str(_KERNELS_DIR).encode(),
+            str(_MOJO_SRC).encode(),
             str(_CACHE_DIR).encode(),
             _find_mojo().encode(),
             toolchain_identity().encode(),

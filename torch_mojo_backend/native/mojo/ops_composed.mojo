@@ -46,7 +46,7 @@ from ops_common import (
     fill_value,
     resize_out,
 )
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 
 comptime NEG_INF_BITS: Int64 = -4503599627370496  # 0xFFF0000000000000
@@ -786,17 +786,26 @@ def op_softmax_backward_data(
     ret_owned(rets, 0, gi)
 
 
-def register_composed(lib: Lib) raises:
-    impl[op_threshold_backward](lib, "threshold_backward")
-    impl[op_threshold_backward_grad_input](lib, "threshold_backward.grad_input")
-    impl[op_sigmoid_backward](lib, "sigmoid_backward")
-    impl[op_sigmoid_backward_grad_input](lib, "sigmoid_backward.grad_input")
-    impl[op_tanh_backward](lib, "tanh_backward")
-    impl[op_tanh_backward_grad_input](lib, "tanh_backward.grad_input")
-    impl[op_isneginf](lib, "isneginf")
-    impl[op_isneginf_out](lib, "isneginf.out")
-    impl[op_isposinf](lib, "isposinf")
-    impl[op_isposinf_out](lib, "isposinf.out")
-    impl[op_where_self_out](lib, "where.self_out")
-    impl[op_native_batch_norm_backward](lib, "native_batch_norm_backward")
-    impl[op_softmax_backward_data](lib, "_softmax_backward_data")
+def register_composed(site: Site) raises:
+    impl[op_threshold_backward, "threshold_backward"](site)
+    impl[op_threshold_backward_grad_input, "threshold_backward.grad_input"](
+        site
+    )
+    impl[op_sigmoid_backward, "sigmoid_backward"](site)
+    impl[op_sigmoid_backward_grad_input, "sigmoid_backward.grad_input"](site)
+    impl[op_tanh_backward, "tanh_backward"](site)
+    impl[op_tanh_backward_grad_input, "tanh_backward.grad_input"](site)
+    impl[op_isneginf, "isneginf"](site)
+    impl[op_isneginf_out, "isneginf.out"](site)
+    impl[op_isposinf, "isposinf"](site)
+    impl[op_isposinf_out, "isposinf.out"](site)
+    impl[op_where_self_out, "where.self_out"](site)
+    impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
+    impl[op_softmax_backward_data, "_softmax_backward_data"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_composed]()

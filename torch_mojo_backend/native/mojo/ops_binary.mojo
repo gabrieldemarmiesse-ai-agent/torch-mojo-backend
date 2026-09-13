@@ -65,7 +65,7 @@ from device import copy_d2d, ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_to, contiguous, copy_strided_into, resize_out
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -1666,41 +1666,48 @@ def op_lerp_scalar_out(
 # ---------------------------------------------------------------------------
 
 
-def register_binary(lib: Lib) raises:
-    impl[op_add_tensor](lib, "add.Tensor")
-    impl[op_add_](lib, "add_.Tensor")
-    impl[op_add_out](lib, "add.out")
-    impl[op_addcdiv](lib, "addcdiv")
-    impl[op_addcdiv_out](lib, "addcdiv.out")
-    impl[op_addcmul](lib, "addcmul")
-    impl[op_addcmul_out](lib, "addcmul.out")
-    impl[op_bitwise_and](lib, "bitwise_and.Scalar")
-    impl[op_bitwise_and](lib, "bitwise_and.Tensor")
-    impl[op_bitwise_or](lib, "bitwise_or.Scalar")
-    impl[op_bitwise_or](lib, "bitwise_or.Tensor")
-    impl[op_bitwise_xor](lib, "bitwise_xor.Scalar")
-    impl[op_bitwise_xor](lib, "bitwise_xor.Tensor")
-    impl[op_clamp](lib, "clamp")
-    impl[op_div_tensor](lib, "div.Tensor")
-    impl[op_div_mode](lib, "div.Tensor_mode")
-    impl[op_div_out](lib, "div.out")
-    impl[op_div_out_mode](lib, "div.out_mode")
-    impl[op_floor_divide](lib, "floor_divide")
-    impl[op_floor_divide](lib, "floor_divide.Scalar")
-    impl[op_lerp_scalar](lib, "lerp.Scalar")
-    impl[op_lerp_scalar_out](lib, "lerp.Scalar_out")
-    impl[op_logical_and](lib, "logical_and")
-    impl[op_logical_xor](lib, "logical_xor")
-    impl[op_maximum](lib, "maximum")
-    impl[op_minimum](lib, "minimum")
-    impl[op_mul_tensor](lib, "mul.Tensor")
-    impl[op_mul_](lib, "mul_.Tensor")
-    impl[op_mul_out](lib, "mul.out")
-    impl[op_pow_scalar](lib, "pow.Tensor_Scalar")
-    impl[op_pow_tensor](lib, "pow.Tensor_Tensor")
-    impl[op_remainder](lib, "remainder.Scalar")
-    impl[op_remainder](lib, "remainder.Scalar_Tensor")
-    impl[op_remainder](lib, "remainder.Tensor")
-    impl[op_sub_tensor](lib, "sub.Tensor")
-    impl[op_sub_](lib, "sub_.Tensor")
-    impl[op_sub_out](lib, "sub.out")
+def register_binary(site: Site) raises:
+    impl[op_add_tensor, "add.Tensor"](site)
+    impl[op_add_, "add_.Tensor"](site)
+    impl[op_add_out, "add.out"](site)
+    impl[op_addcdiv, "addcdiv"](site)
+    impl[op_addcdiv_out, "addcdiv.out"](site)
+    impl[op_addcmul, "addcmul"](site)
+    impl[op_addcmul_out, "addcmul.out"](site)
+    impl[op_bitwise_and, "bitwise_and.Scalar"](site)
+    impl[op_bitwise_and, "bitwise_and.Tensor"](site)
+    impl[op_bitwise_or, "bitwise_or.Scalar"](site)
+    impl[op_bitwise_or, "bitwise_or.Tensor"](site)
+    impl[op_bitwise_xor, "bitwise_xor.Scalar"](site)
+    impl[op_bitwise_xor, "bitwise_xor.Tensor"](site)
+    impl[op_clamp, "clamp"](site)
+    impl[op_div_tensor, "div.Tensor"](site)
+    impl[op_div_mode, "div.Tensor_mode"](site)
+    impl[op_div_out, "div.out"](site)
+    impl[op_div_out_mode, "div.out_mode"](site)
+    impl[op_floor_divide, "floor_divide"](site)
+    impl[op_floor_divide, "floor_divide.Scalar"](site)
+    impl[op_lerp_scalar, "lerp.Scalar"](site)
+    impl[op_lerp_scalar_out, "lerp.Scalar_out"](site)
+    impl[op_logical_and, "logical_and"](site)
+    impl[op_logical_xor, "logical_xor"](site)
+    impl[op_maximum, "maximum"](site)
+    impl[op_minimum, "minimum"](site)
+    impl[op_mul_tensor, "mul.Tensor"](site)
+    impl[op_mul_, "mul_.Tensor"](site)
+    impl[op_mul_out, "mul.out"](site)
+    impl[op_pow_scalar, "pow.Tensor_Scalar"](site)
+    impl[op_pow_tensor, "pow.Tensor_Tensor"](site)
+    impl[op_remainder, "remainder.Scalar"](site)
+    impl[op_remainder, "remainder.Scalar_Tensor"](site)
+    impl[op_remainder, "remainder.Tensor"](site)
+    impl[op_sub_tensor, "sub.Tensor"](site)
+    impl[op_sub_, "sub_.Tensor"](site)
+    impl[op_sub_out, "sub.out"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_binary]()

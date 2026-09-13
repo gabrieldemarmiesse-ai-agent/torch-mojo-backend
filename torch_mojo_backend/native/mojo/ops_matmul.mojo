@@ -49,7 +49,7 @@ from device import ctx_for, ctx_ptr
 from kernels import KernelCall, loader
 from op_utils import MAX_RANK
 from ops_common import call_op_raw, contiguous, copy_strided_into, fill_value
-from registry import Lib, impl
+from registry import Site, impl, op_address_of
 
 
 # --- small shape helpers ------------------------------------------------------
@@ -1457,11 +1457,18 @@ def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_tensor(rets, 0, out.value())
 
 
-def register_matmul(lib: Lib) raises:
-    impl[op_addmm](lib, "addmm")
-    impl[op_addr](lib, "addr")
-    impl[op_bmm](lib, "bmm")
-    impl[op_convolution](lib, "convolution")
-    impl[op_linear](lib, "linear")
-    impl[op_linear_backward](lib, "linear_backward")
-    impl[op_mm](lib, "mm")
+def register_matmul(site: Site) raises:
+    impl[op_addmm, "addmm"](site)
+    impl[op_addr, "addr"](site)
+    impl[op_bmm, "bmm"](site)
+    impl[op_convolution, "convolution"](site)
+    impl[op_linear, "linear"](site)
+    impl[op_linear_backward, "linear_backward"](site)
+    impl[op_mm, "mm"](site)
+
+
+@export
+def tmb_op_address() abi("C") -> Int:
+    """Entry of this file's one-op extension: the address of the op the
+    TMB_OP define selected (registry.mojo)."""
+    return op_address_of[register_matmul]()

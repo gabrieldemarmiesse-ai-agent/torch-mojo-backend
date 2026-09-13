@@ -13,8 +13,9 @@ unit cache object to import and poke at. What is left to test is the cache's
 backend in a subprocess against a throwaway cache directory.
 
 These tests build real Mojo extensions (a cold run compiles the C++ shim,
-the Mojo backend, and one kernel-family variant), so they are slow and need
-the GPU allocation like every other native test.
+the Mojo backend, one extension per aten op the script touches, and one
+kernel-family variant), so they are slow and need the GPU allocation like
+every other native test.
 """
 
 from __future__ import annotations
@@ -55,12 +56,18 @@ def _run(cache_dir: Path, *, trace: bool = True) -> subprocess.CompletedProcess[
         env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=900,
     )
 
 
 def _family_sos(cache_dir: Path) -> list[Path]:
     return sorted(cache_dir.glob("logic_ops.*.so"))
+
+
+def _op_sos(cache_dir: Path) -> list[Path]:
+    """The per-op extensions: one `mojo build` of an ops_*.mojo per aten op
+    (native/mojo/registry.mojo), built at that op's first call."""
+    return sorted(cache_dir.glob("tmbop.*.so"))
 
 
 def _assert_ok(proc: subprocess.CompletedProcess[str]):
@@ -81,10 +88,18 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
     )
     family_sos = _family_sos(cache_dir)
     assert family_sos, "logic_ops (AddSpec) kernel variant not cached here"
-    # A cold run must have actually built all three, not found them by luck.
+    op_sos = _op_sos(cache_dir)
+    assert op_sos, "no op extension cached here"
+    # add is one of the ops the script runs, and its body lives in its own
+    # extension rather than in the backend library.
+    assert any(p.name.startswith("tmbop.ops_binary.add.Tensor.") for p in op_sos), [
+        p.name for p in op_sos
+    ]
+    # A cold run must have actually built all of them, not found them by luck.
     assert "built C++ shim" in proc.stdout + proc.stderr
     assert "built Mojo backend" in proc.stdout + proc.stderr
     assert "built  logic_ops" in proc.stdout + proc.stderr
+    assert "built  ops_binary add.Tensor" in proc.stdout + proc.stderr
 
 
 def test_second_process_reuses_every_build(tmp_path: Path):
@@ -102,6 +117,7 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     assert "built C++ shim" not in combined
     assert "built Mojo backend" not in combined
     assert "built  logic_ops" not in combined
+    assert "built  ops_" not in combined, "an op extension was rebuilt warm"
     mtimes_after = {p: p.stat().st_mtime_ns for p in cache_dir.glob("*.so")}
     assert mtimes_after == mtimes_before, "a warm run rewrote a cached .so"
 
@@ -172,3 +188,35 @@ def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(tmp_path: Pat
     recovered = _run(cache_dir)
     _assert_ok(recovered)
     assert "built  logic_ops" in recovered.stdout + recovered.stderr
+
+
+def test_missing_op_extension_is_rebuilt_alone(tmp_path: Path):
+    """Deleting one op's extension makes the next process rebuild that op and
+    nothing else: op bodies are cached per op, independently of the backend
+    library and of the kernel families."""
+    cache_dir = tmp_path / "cache"
+    _assert_ok(_run(cache_dir))
+    add_sos = sorted(cache_dir.glob("tmbop.ops_binary.add.Tensor.*.so"))
+    assert add_sos
+    for so in add_sos:
+        so.unlink()
+    others_before = {
+        p: p.stat().st_mtime_ns
+        for p in cache_dir.glob("*.so")
+        if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
+    }
+
+    proc = _run(cache_dir)
+    _assert_ok(proc)
+
+    combined = proc.stdout + proc.stderr
+    assert "built  ops_binary add.Tensor" in combined
+    assert "built Mojo backend" not in combined
+    assert "built  logic_ops" not in combined
+    assert sorted(cache_dir.glob("tmbop.ops_binary.add.Tensor.*.so"))
+    others_after = {
+        p: p.stat().st_mtime_ns
+        for p in cache_dir.glob("*.so")
+        if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
+    }
+    assert others_after == others_before

@@ -17,6 +17,7 @@ comptime LOADER_GLOBAL = "TMB_NATIVE_LOADER"
 
 def init_loader(
     kernels_dir: String,
+    mojo_dir: String,
     cache_dir: String,
     mojo_exe: String,
     toolchain: String,
@@ -25,7 +26,9 @@ def init_loader(
     if _get_global_or_null(LOADER_GLOBAL):
         return
     var box = unsafe_alloc[Loader](1)
-    box.unsafe_write(Loader(kernels_dir, cache_dir, mojo_exe, toolchain, trace))
+    box.unsafe_write(
+        Loader(kernels_dir, mojo_dir, cache_dir, mojo_exe, toolchain, trace)
+    )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(LOADER_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
