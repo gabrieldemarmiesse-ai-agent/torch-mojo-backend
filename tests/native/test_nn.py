@@ -1080,9 +1080,13 @@ def test_native_batch_norm_training_outlier_first_element(
 def test_log_softmax_narrow_rows_match_cpu(mojo_gpu, dtype, cols):
     """Rows narrower than one block pass leave threads with no elements;
     their -inf running max must not NaN the sum."""
+    torch.manual_seed(cols)
     x = torch.randn(8, cols).to(dtype)
     got = torch.log_softmax(x.to(mojo_gpu), dim=-1)
-    torch.testing.assert_close(got.cpu(), torch.log_softmax(x, dim=-1))
+    # bfloat16 outputs: the kernel and CPU torch round a float32 result to
+    # bfloat16 from slightly different sums, up to a few bf16 ulps apart
+    tol = {"rtol": 2e-2, "atol": 1e-2} if dtype == torch.bfloat16 else {}
+    torch.testing.assert_close(got.cpu(), torch.log_softmax(x, dim=-1), **tol)
 
 
 def test_log_softmax_positive_inf_rows_match_cpu(mojo_gpu):

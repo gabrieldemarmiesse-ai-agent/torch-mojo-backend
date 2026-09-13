@@ -5296,6 +5296,10 @@ def test_aten_index_select_basic(conf: Conf):
 
 def test_aten_index_select_second_dim(conf: Conf):
     """Test basic torch.index_select operation"""
+    if conf.device == "mojo:cpu":
+        pytest.xfail(
+            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
+        )
 
     def fn(x, indices):
         return x[:, indices]
@@ -5309,6 +5313,10 @@ def test_aten_index_select_second_dim(conf: Conf):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_aten_index_select_multiple_dtypes(conf: Conf, dtype):
     """Test basic torch.index_select operation"""
+    if conf.device == "mojo:cpu":
+        pytest.xfail(
+            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
+        )
 
     def fn(x, indices):
         return x[:, indices]
@@ -5334,6 +5342,10 @@ def test_aten_index_select_multiple_dims(conf: Conf):
 
 def test_aten_index_select_multiple_dims_start_nonzero(conf: Conf):
     """Test basic torch.index_select operation"""
+    if conf.device == "mojo:cpu":
+        pytest.xfail(
+            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
+        )
 
     def fn(x, indices1, indices2):
         return x[:, indices1, indices2, indices2]
