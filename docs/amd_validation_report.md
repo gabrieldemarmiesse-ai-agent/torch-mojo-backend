@@ -93,7 +93,8 @@ compile; the pytest time is the suite's own.
 | `test_foreach.py` | 30 passed, 3 xfailed, 4 xpassed (stale non-strict xfails about `linalg_vector_norm` not being registered yet) | 107 s | |
 | `test_nn.py` | 346 passed, 2 skipped (rank > 4 batch norm is accelerator-only, CPU-device case), 1 xfailed | 374 s | |
 | `test_composed.py` | 25 passed | 59 s | |
-| `test_matmul.py` | first attempt killed by my 90 min cap at 64 of 162 tests: serial first-call compiles of the GEMM specializations (15 built, 2 to 8 min each). Rerun after warming the specializations in parallel outside the lock: see below | | |
+| `test_matmul.py` | 153 passed, 9 skipped (pure-Mojo tensor-core fast paths require an H100); with the fp32 fix. A first attempt was killed by my 90 min cap at 64 of 162 tests: serial first-call compiles of the GEMM specializations (15 built, 2 to 8 min each). Warming the specializations with `pytest -n 12` outside the lock took 11 min for matmul + attention + composed together, then the file ran under the lock in 21 min | 1280 s | |
+| `test_attention.py` | **3 failed**, 20 passed, 10 skipped ("the FA4 kernels are compiled for sm_90a"). The three failures are H100 assumptions, see finding 3 | 532 s | pass |
 
 ### Finding 2: cumsum bf16/f16 and outer-dim routes were declined on HIP
 
