@@ -196,8 +196,11 @@ def compiler_env() -> dict[str, str]:
     compilers then evict each other's entries — "failed to produce an archive
     for the module: No such file or directory". Node-local, it is per-machine
     and nobody else touches it; the first build on a machine pays about 25 s
-    to fill it."""
-    home = Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
+    to fill it. A value the caller set deliberately wins."""
+    home = Path(
+        os.environ.get("MODULAR_HOME")
+        or Path(tempfile.gettempdir()) / f"modular-home-{os.getuid()}"
+    )
     home.mkdir(parents=True, exist_ok=True)
     return {**os.environ, "MODULAR_HOME": str(home)}
 
