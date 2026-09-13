@@ -804,7 +804,11 @@ def _fused_adamw_impl(args: Values, n_args: Int) raises:
     call.int(found_inf_ptr)
     call.int(cp)
     call.run()
+    # Every list the kernel writes: `grads` too, which it overwrites with
+    # the unscaled gradient when grad_scale is given.
     for t in parameters:
+        t.bump_version()
+    for t in grads:
         t.bump_version()
     for t in exp_avgs:
         t.bump_version()
