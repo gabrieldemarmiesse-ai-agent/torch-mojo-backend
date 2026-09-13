@@ -35,11 +35,15 @@ touching `abi.mojo` invalidates every op extension, not just the backend.
 
 The backend library therefore does not grow with the number of ops: it holds
 devices, streams, events, memory, the loader, the record ABI and the
-registration list, and nothing else — about 0.3 MB and 2 s of build against
-3.6 MB and 7 s when every op body was linked into it. The price is the first
-call of each op: one `mojo build` of roughly 6 s, once per op per source
-revision per machine (about 0.3–0.5 MB of cache each), and milliseconds — a
-`dlopen` — in every later process.
+registration list, and nothing else. Measured on one H100 node, 226 ops:
+0.33 MB and 5.5 s of build, against 3.58 MB and 6.2 s when every op body was
+linked into it — the size is the number that was growing, and the rest of the
+build time is the compiler and the runtime modules, which are fixed.
+
+The price is the first call of each op: one `mojo build` of 6–7 s, once per
+op per source revision per machine (0.3–0.5 MB of cache each), and
+milliseconds — a `dlopen` — in every later process. Building all 226 takes
+about 22 minutes, which is why `prebuild_ops` exists.
 
 `native.prebuild_ops()` compiles every op extension up front instead, for a
 test suite or a CI image that would rather not pay a compile inside the first
