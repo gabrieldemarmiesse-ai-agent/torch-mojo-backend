@@ -10,7 +10,6 @@ Families used: nn_ops (classic pointer ABI + SoftmaxSpec),
 normalization_forward_ops, normalization_backward_ops, softmax_backward_ops,
 loss_ops, embedding_backward_ops, reduction_ops (LogSoftmaxSpec).
 """
-from std.ffi import external_call
 from std.utils import IndexList
 
 from abi import (
@@ -25,7 +24,6 @@ from abi import (
     Value,
     Values,
     bits_f64,
-    check,
     contiguous_strides,
     dtype_code,
     new_like,
@@ -35,7 +33,6 @@ from abi import (
     ret_owned,
     ret_ref,
     ret_tensor,
-    set_sizes_strides,
     view_strided,
     unsupported,
     v_bool,
@@ -54,6 +51,7 @@ from ops_common import (
     contiguous,
     copy_strided_into,
     fill_value,
+    resize_out,
 )
 from registry import Lib, impl
 
@@ -222,22 +220,6 @@ def _stat_shape(t: T, k: Int) -> IndexList[MAX_RANK]:
     for i in range(k):
         out[MAX_RANK - 1 - i] = 1
     return out
-
-
-def _resize_out(t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
-    """ATen's out= resize: grow the storage if needed, then rebind sizes to a
-    contiguous layout at offset 0."""
-    var numel = 1
-    for i in range(rank):
-        numel *= shape[MAX_RANK - rank + i]
-    if numel * t.itemsize > t.storage_nbytes():
-        check(
-            external_call["tmb_storage_resize", Int32](
-                t.h, Int64(numel * t.itemsize)
-            ),
-            "tmb_storage_resize",
-        )
-    set_sizes_strides(t, shape, contiguous_strides(shape, rank), rank, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -510,21 +492,6 @@ def op_native_layer_norm(
     _require_mojo(a, "native_layer_norm")
     if a.numel == 0 or not _is_float(a.dtype):
         unsupported("native_layer_norm of dtype " + String(a.dtype))
-    # `native_layer_norm_backward` here covers float32 only, so a
-    # grad-recording call on a reduced-precision input is refused in the
-    # FORWARD, where the traceback still names the op and the user's own
-    # frame -- rather than succeeding and failing later inside the autograd
-    # engine, with nothing in the message pointing at the layer norm.
-    if a.stype != ST_FLOAT32 and _records_grad(a):
-        unsupported(
-            "aten::native_layer_norm on a "
-            + String(a.dtype)
-            + " input that requires grad: this device implements"
-            " aten::native_layer_norm_backward for float32 only, so the"
-            " backward would fail. Run the forward under torch.no_grad(), or"
-            " keep the layer norm in float32 (autocast already does: its"
-            " policy runs normalization in float32)."
-        )
     var k = len(ns)
     if k < 1 or a.rank < k:
         unsupported("native_layer_norm: bad normalized_shape rank")
@@ -536,6 +503,29 @@ def op_native_layer_norm(
     if cols <= 0:
         unsupported("native_layer_norm: empty normalized_shape")
     var rows = a.numel // cols
+    # `native_layer_norm_backward` here covers float32 only, so a
+    # grad-recording call on a reduced-precision input is refused in the
+    # FORWARD, where the traceback still names the op and the user's own
+    # frame -- rather than succeeding and failing later inside the autograd
+    # engine, with nothing in the message pointing at the layer norm. Any of
+    # input / weight / bias requiring grad records the node, so all three are
+    # asked (ATen's autograd formula differentiates whichever ones do).
+    if a.stype != ST_FLOAT32:
+        var records = _records_grad(a)
+        if not records and has_w:
+            records = _records_grad(v_tensor(args[unsafe_offset=2]))
+        if not records and has_b:
+            records = _records_grad(v_tensor(args[unsafe_offset=3]))
+        if records:
+            unsupported(
+                "aten::native_layer_norm on "
+                + String(a.dtype)
+                + " inputs that require grad: this device implements"
+                " aten::native_layer_norm_backward for float32 only, so the"
+                " backward would fail. Run the forward under torch.no_grad(),"
+                " or keep the layer norm in float32 (autocast already does:"
+                " its policy runs normalization in float32)."
+            )
     var keep = List[Held]()
     var gamma_ptr = 0
     var beta_ptr = 0
@@ -1349,7 +1339,7 @@ def _nll_out_ok(dst: T, like: T, what: StaticString) raises:
         )
 
 
-def _nll_dest(dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
+def _nll_dest(mut dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
     """Where the kernel writes for this `out=` argument.
 
     A wrong-shaped out is resized in place (the eager out= convention). A
@@ -1364,8 +1354,8 @@ def _nll_dest(dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
                 matches = False
                 break
     if not matches:
-        _resize_out(dst, shape, rank)
-        return Held(T(dst.h), False)
+        resize_out(dst, shape, rank)
+        return Held(dst.copy(), False)
     if dst.contig:
         return Held(dst.copy(), False)
     return Held(new_tensor(shape, rank, dst.stype, dst.device), True)

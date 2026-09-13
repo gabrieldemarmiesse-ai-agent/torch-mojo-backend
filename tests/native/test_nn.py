@@ -229,11 +229,19 @@ def test_native_layer_norm_refuses_reduced_precision_training(mojo_gpu, dtype):
     FORWARD keeps the traceback on the user's own frame instead of burying it
     inside the autograd engine."""
     x = torch.randn(2, 6, 64).to(dtype).to(mojo_gpu).requires_grad_()
-    with pytest.raises(NotImplementedError, match="requires grad"):
+    with pytest.raises(NotImplementedError, match="require grad"):
         torch.native_layer_norm(x, (64,), None, None, 1e-5)
     # The same input is fine for inference.
     with torch.no_grad():
         torch.native_layer_norm(x, (64,), None, None, 1e-5)
+    # A grad-requiring WEIGHT records the node just as well as the input.
+    plain = torch.randn(2, 6, 64).to(dtype).to(mojo_gpu)
+    w = torch.randn(64).to(dtype).to(mojo_gpu).requires_grad_()
+    b = torch.randn(64).to(dtype).to(mojo_gpu)
+    with pytest.raises(NotImplementedError, match="require grad"):
+        torch.native_layer_norm(plain, (64,), w, b, 1e-5)
+    with pytest.raises(NotImplementedError, match="require grad"):
+        torch.native_layer_norm(plain, (64,), None, b.requires_grad_(), 1e-5)
 
 
 def test_layer_norm_module_forward(mojo_device):

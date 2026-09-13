@@ -107,21 +107,28 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_add_sub_alpha_reduced_precision_uses_opmath(mojo_gpu, dtype):
     """ATen's add/sub functor runs in `opmath_type<scalar_t>` (float32 for
-    both half types) and rounds ONCE, at the store. Scaling the operand in
-    its own dtype first rounds twice, and with a tiny alpha the second
-    rounding swallows the whole contribution: 1 + 1e-4*1 is representable in
-    bf16 only if the product is not rounded to bf16 first."""
-    a = torch.ones(64, dtype=dtype)
-    b = torch.ones(64, dtype=dtype)
-    alpha = 2.0**-9
-    reference = (a.float() + alpha * b.float()).to(dtype)
-    got = torch.add(a.to(mojo_gpu), b.to(mojo_gpu), alpha=alpha)
+    both half types) and rounds ONCE, at the store. Materializing `alpha * b`
+    in the input dtype first rounds twice, and the two answers really differ:
+    exact equality against the single-rounding reference is what separates
+    them."""
+    a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
+    b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
+    alpha = 1.0 / 3.0
+    ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+
+    got = torch.add(ad, bd, alpha=alpha)
     assert got.dtype == dtype
-    torch.testing.assert_close(got.cpu(), reference, atol=0, rtol=0)
-    got_sub = torch.sub(a.to(mojo_gpu), b.to(mojo_gpu), alpha=alpha)
+    torch.testing.assert_close(
+        got.cpu(), (a.float() + alpha * b.float()).to(dtype), atol=0, rtol=0
+    )
+    got_sub = torch.sub(ad, bd, alpha=alpha)
     torch.testing.assert_close(
         got_sub.cpu(), (a.float() - alpha * b.float()).to(dtype), atol=0, rtol=0
     )
+    # The double-rounded answer is a DIFFERENT tensor: without this the test
+    # would pass on the implementation it is meant to reject.
+    double_rounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(double_rounded, got.cpu())
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
