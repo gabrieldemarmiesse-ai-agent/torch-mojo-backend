@@ -289,3 +289,36 @@ def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
     mask = torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16, device=mojo_gpu)
     assert aten._fused_sdp_choice(q, k, v, mask, 0.0, False) == MATH
     assert aten._fused_sdp_choice(q, k, v, None, 0.25, True) == MATH
+
+
+def test_public_sdpa_takes_the_flash_route_and_trains(mojo_gpu):
+    """F.scaled_dot_product_attention picks its backend through a C++
+    DispatchStub the shim registers for this device, then calls the
+    `_for_cpu` flash overloads (non-CUDA devices), which wrap the flash ops."""
+    native.op_counting(True)
+    before = native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
+    before_bwd = native.op_count(
+        "aten::_scaled_dot_product_flash_attention_for_cpu_backward"
+    )
+    q = torch.randn(
+        2, 4, 128, 64, dtype=torch.bfloat16, device=mojo_gpu, requires_grad=True
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    out.float().sum().backward()
+    assert (
+        native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
+        == before + 1
+    )
+    assert (
+        native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu_backward")
+        == before_bwd + 1
+    )
+    ref_q = q.detach().cpu().float().requires_grad_(True)
+    ref_k = k.detach().cpu().float().requires_grad_(True)
+    ref_v = v.detach().cpu().float().requires_grad_(True)
+    ref = F.scaled_dot_product_attention(ref_q, ref_k, ref_v, is_causal=True)
+    ref.sum().backward()
+    torch.testing.assert_close(out.cpu().float(), ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(q.grad.cpu().float(), ref_q.grad, atol=5e-2, rtol=5e-2)

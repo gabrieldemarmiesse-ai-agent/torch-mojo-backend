@@ -40,7 +40,6 @@ def test_mojo_autocast_fallback_and_required_policies_are_registered():
         "layer_norm",
         "native_layer_norm",
         "nll_loss",
-        "nll_loss_forward",
         "log_softmax.int",
         "softmax.int",
         "sum.dim_IntList",
@@ -49,6 +48,24 @@ def test_mojo_autocast_fallback_and_required_policies_are_registered():
         assert torch._C._dispatch_has_kernel_for_dispatch_key(
             f"aten::{name}", "AutocastPrivateUse1"
         ), name
+    # An op without a policy falls through (no kernel of its own), so the
+    # inner ops of a composite such as nll_loss_nd are still autocast.
+    for name in ("nll_loss_nd", "nll_loss_forward", "cross_entropy_loss"):
+        assert not torch._C._dispatch_has_kernel_for_dispatch_key(
+            f"aten::{name}", "AutocastPrivateUse1"
+        ), name
+
+
+def test_mojo_autocast_reaches_the_inner_ops_of_a_composite(mojo_h100):
+    """cross_entropy on bf16 logits: the composite has no policy, its inner
+    nll_loss has the fp32 one, so the loss comes back in float32."""
+    logits = torch.randn(6, 50, device=mojo_h100, dtype=torch.bfloat16)
+    target = torch.randint(0, 50, (6,), device=mojo_h100)
+    with torch.autocast("mojo", dtype=torch.bfloat16):
+        loss = torch.nn.functional.cross_entropy(logits, target, ignore_index=-1)
+    assert loss.dtype == torch.float32
+    ref = torch.nn.functional.cross_entropy(logits.cpu().float(), target.cpu())
+    torch.testing.assert_close(loss.cpu(), ref, atol=5e-2, rtol=5e-2)
 
 
 def test_mojo_bf16_autocast_linear_loss_and_grad_dtypes(mojo_h100):

@@ -42,6 +42,10 @@ from abi import (
     v_opt_tensor,
     v_tensor,
     view_strided,
+    TAG_BOOL,
+    TAG_INT,
+    TAG_NONE,
+    TAG_TENSOR,
 )
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
@@ -1033,8 +1037,71 @@ def op_efficient_attention(
     ret_owned(rets, 3, offset)
 
 
+# aten::_scaled_dot_product_flash_attention_for_cpu(Tensor query, Tensor key,
+#   Tensor value, float dropout_p=0.0, bool is_causal=False, *,
+#   Tensor? attn_mask=None, float? scale=None) -> (Tensor output, Tensor logsumexp)
+def op_flash_attention_for_cpu(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """The composite `scaled_dot_product_attention` calls this overload, not
+    the CUDA one, on every device but CUDA/XPU once `_fused_sdp_choice` picked
+    flash: re-marshal onto the flash forward above (its autograd formula is
+    `_for_cpu_backward`, wrapped the same way below)."""
+    if not v_is_none(args[unsafe_offset=5]):
+        unsupported("flash attention with an explicit attn_mask")
+    var fargs = InlineArray[Value, 7](fill=Value(TAG_NONE, 0, 0, 0))
+    for i in range(5):
+        fargs[i] = args[unsafe_offset=i].copy()
+    fargs[5] = Value(TAG_BOOL, 0, 0, 0)  # return_debug_mask
+    fargs[6] = args[unsafe_offset=6].copy()
+    var frets = InlineArray[Value, 9](fill=Value(TAG_NONE, 0, 0, 0))
+    op_flash_attention(
+        Values(unsafe_from_address=Int(fargs.unsafe_ptr())),
+        7,
+        Values(unsafe_from_address=Int(frets.unsafe_ptr())),
+        9,
+    )
+    rets[unsafe_offset=0] = frets[0].copy()
+    rets[unsafe_offset=1] = frets[1].copy()
+    for i in range(2, 9):  # the flash-only results nobody asked for
+        if frets[i].tag == TAG_TENSOR:
+            release(Int(frets[i].a))
+    _ = fargs
+    _ = frets
+
+
+# aten::_scaled_dot_product_flash_attention_for_cpu_backward(Tensor grad_out,
+#   Tensor query, Tensor key, Tensor value, Tensor out, Tensor logsumexp,
+#   float dropout_p, bool is_causal, *, Tensor? attn_mask=None,
+#   float? scale=None) -> (Tensor grad_query, Tensor grad_key, Tensor grad_value)
+def op_flash_attention_for_cpu_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not v_is_none(args[unsafe_offset=8]):
+        unsupported("flash attention backward with an explicit attn_mask")
+    # the CUDA layout: cum_seq_q/k, max_q/k and the philox pair are never read
+    var fargs = InlineArray[Value, 15](fill=Value(TAG_NONE, 0, 0, 0))
+    for i in range(6):
+        fargs[i] = args[unsafe_offset=i].copy()
+    fargs[8] = Value(TAG_INT, 0, 0, 0)
+    fargs[9] = Value(TAG_INT, 0, 0, 0)
+    fargs[10] = args[unsafe_offset=6].copy()
+    fargs[11] = args[unsafe_offset=7].copy()
+    fargs[14] = args[unsafe_offset=9].copy()
+    op_flash_attention_backward(
+        Values(unsafe_from_address=Int(fargs.unsafe_ptr())), 15, rets, n_rets
+    )
+    _ = fargs
+
+
 def register_attention(lib: Lib) raises:
     impl[op_efficient_attention](lib, "_scaled_dot_product_efficient_attention")
+    impl[op_flash_attention_for_cpu](
+        lib, "_scaled_dot_product_flash_attention_for_cpu"
+    )
+    impl[op_flash_attention_for_cpu_backward](
+        lib, "_scaled_dot_product_flash_attention_for_cpu_backward"
+    )
     impl[op_flash_attention](lib, "_scaled_dot_product_flash_attention")
     impl[op_flash_attention_backward](
         lib, "_scaled_dot_product_flash_attention_backward"

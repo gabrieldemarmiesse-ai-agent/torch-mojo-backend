@@ -140,6 +140,8 @@ const PolicyEntry kCudaPolicies[] = {
 
 extern "C" {
 
+// Changes the policy of an op that already has one (the kernel is registered
+// at load time for the table's ops only).
 int32_t tmb_autocast_policy(const char* qualified_name, int32_t policy) {
   std::lock_guard<std::mutex> g(g_policy_mutex);
   g_policies[qualified_name] = policy;
@@ -155,6 +157,17 @@ int32_t tmb_autocast_install_cuda_policies(void) {
 
 }  // extern "C"
 
+// Ops with a policy get the boxed kernel; every other op falls through, so a
+// composite without a policy (nll_loss_nd, cross_entropy_loss, ...) still has
+// its inner ops autocast. A catch-all fallback would exclude the key before
+// redispatching and silently turn autocast off inside every composite.
 TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
-  m.fallback(torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
+
+TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
+  for (const auto& e : kCudaPolicies) {
+    m.impl(e.name + 6 /* strip "aten::" */, torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
+  }
+  m.impl("binary_cross_entropy", torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
 }
