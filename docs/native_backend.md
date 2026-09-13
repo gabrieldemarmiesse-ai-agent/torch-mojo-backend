@@ -374,6 +374,18 @@ before; the guard method behind `torch.Stream.native_handle` exists from
 import the package: MAX 26.5's torch interop (`max.experimental.torch`,
 used by the torch.compile backend) references a dtype added in 2.7.
 
+## macOS
+
+The shim and the base library build with Xcode's clang and link with
+`-undefined dynamic_lookup` (they call into each other at `dlopen`, and ld64
+must be told so). Kernel families compile for Metal through MAX, which needs
+Apple's Metal compiler: since Xcode 26 that is a separate download, and
+without it every kernel that goes through it fails with `Metal Compiler
+failed to compile metallib` (the elementwise scalar ops were the first to
+hit it). Install it once with `xcodebuild -downloadComponent MetalToolchain`.
+The build-failure message names the `-D` set of the specialization, so a
+failing family can be rebuilt by hand with the same `mojo build` line.
+
 ## Triton
 
 Triton kernels run on mojo tensors with only the CPU torch wheel and the

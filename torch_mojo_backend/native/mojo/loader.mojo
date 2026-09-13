@@ -329,9 +329,13 @@ struct Loader(Movable):
                 _ = external_call["unlink", Int32](
                     tmp.as_c_string_slice().unsafe_ptr()
                 )
+            var defs = String()
+            for d in defines:
+                defs += " -D " + d
             raise Error(
                 "mojo build of ",
                 label,
+                defs,
                 " failed (rc ",
                 rc,
                 ", ",
