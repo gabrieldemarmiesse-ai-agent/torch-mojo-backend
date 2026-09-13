@@ -72,18 +72,27 @@ class CallChecker:
             return op_name.startswith(pattern)
         return op_name == pattern
 
-    def register(self, *funcs: Callable[..., object]):
-        """Register the functions expected to run.
+    def register(self, *funcs: Callable[..., object] | str):
+        """Register the implementations expected to run.
 
-        `funcs` are typed `Callable` (each caller's own precise signature,
-        e.g. `aten_functions.aten_min`), not `CountedCallable`: under tests
-        `map_to` always wraps them with a `call_count` attribute, but that
-        fact is deliberately hidden from their static type (see
-        `aten_functions.map_to`). Cast here, at the one place that relies on it.
+        A callable is an `aten_functions` twin, typed `Callable` (each
+        caller's own precise signature, e.g. `aten_functions.aten_min`) and
+        not `CountedCallable`: under tests `map_to` always wraps them with a
+        `call_count` attribute, but that fact is deliberately hidden from
+        their static type (see `aten_functions.map_to`). Cast here, at the
+        one place that relies on it.
+
+        A string is a native op name (`"aten::addr"`), for an op with no
+        `aten_functions` twin because the graph backend leaves it to ATen's
+        decomposition: only the mojo device's own kernel can satisfy it.
         """
         expanded: list[CountedCallable] = []
         self._native_names = []
         for func in funcs:
+            if isinstance(func, str):
+                if func not in self._native_names:
+                    self._native_names.append(func)
+                continue
             counted_func = cast(CountedCallable, func)
             if counted_func not in expanded:
                 expanded.append(counted_func)
@@ -119,6 +128,8 @@ class CallChecker:
             raise ValueError(
                 "No function to check was set, call call_checker.register first"
             )
+        if not self._functions_to_check and not self._native_names:
+            raise ValueError("call_checker.register was called with nothing to check")
         graph_called = any(
             func.call_count > count_before
             for func, count_before in zip(
@@ -126,7 +137,9 @@ class CallChecker:
             )
         )
         if not graph_called and not self._native_called():
-            names = ", ".join(f.__name__ for f in self._functions_to_check)
+            names = ", ".join(
+                [f.__name__ for f in self._functions_to_check] + self._native_names
+            )
             raise AssertionError(
                 f"Expected one of [{names}] (or the native mojo op of the same "
                 "name) to be called at least once in the test, but none was"
