@@ -278,12 +278,26 @@ pinned exactly in pyproject.
 a manifest entry matching the running torch series (resp. MAX version),
 platform, machine and ABI flag *and* whose recorded source hash equals the
 hash of the sources shipped beside it — so a checkout whose `csrc/` or
-`mojo/` has moved on compiles rather than loading a stale library. A match is
-copied into the on-demand cache under the name the compiler would have
-written, and everything downstream, `dlopen` included, is unchanged. One
-trace line says which file was used. A prebuilt library that does not load —
-an ABI it was not built for — is dropped, and that build is compiled here
-instead. `TORCH_MOJO_BACKEND_PREBUILT=0` ignores the directory entirely.
+`mojo/` has moved on compiles rather than loading a stale library. A shim is
+taken only under a *release* torch (`2.11.0`, `2.11.0+cpu`): the key is the
+series, and only releases keep a series ABI-stable; a nightly or a custom
+build compiles its own. A match is copied into the on-demand cache under the
+name the compiler would have written (its provenance mark first, so the copy
+is never visible without it), and everything downstream, `dlopen` included,
+is unchanged. One trace line says which file was used. A prebuilt library
+that does not load — an ABI it was not built for — is dropped under the
+build lock and that build is compiled here instead. No C++ compiler is
+looked for as long as a shim matches: the "no C++ compiler found" error is
+raised only when one would actually have to run.
+`TORCH_MOJO_BACKEND_PREBUILT=0` ignores the directory entirely.
+
+**CPU target.** `mojo build` targets the host CPU by default, and a base
+library built on an AVX-512 machine dies with SIGILL on one without (seen on
+GitHub's runner pool). The base library is runtime glue, not a kernel, so
+`build_backend()` always targets the platform baseline
+(`portable_target_cpu()`: `x86-64-v3` on x86, `apple-m1`, `generic` on other
+arm64); op extensions and kernel specializations are built on the machine
+that runs them and keep the host target.
 
 Everything else still builds on demand: op extensions and kernel
 specializations carry device code, so they cannot ship.

@@ -172,7 +172,10 @@ def _emit_one(kind: str, out_dir: Path) -> int:
     else:
         spec = native.prebuilt_backend_spec()
         built = native.build_backend(prebuilt=False)
-        extra = {"mojo": native._pkg_version("mojo-compiler")}
+        extra = {
+            "mojo": native._pkg_version("mojo-compiler"),
+            "target_cpu": native.portable_target_cpu(),
+        }
     name = native.prebuilt_file_name(spec)
     shutil.copy2(built, out_dir / name)
     entry = {
@@ -362,16 +365,25 @@ def report(out_dir: Path, max_glibc: str | None, kind: str | None) -> int:
     if max_glibc is None:
         return 0
     limit = tuple(int(p) for p in max_glibc.split("."))
+    checked = [e for e in entries if kind is None or e.get("kind") == kind]
+    # a Linux entry with no recorded floor is a build that could not be
+    # inspected: fail closed rather than ship it unmeasured
+    unmeasured = [
+        e
+        for e in checked
+        if e.get("platform") == "linux" and e.get("glibc_floor") is None
+    ]
     too_new = [
         e
-        for e in entries
-        if (kind is None or e.get("kind") == kind)
-        and e.get("glibc_floor") is not None
+        for e in checked
+        if e.get("glibc_floor") is not None
         and tuple(int(p) for p in str(e["glibc_floor"]).split(".")) > limit
     ]
+    for e in unmeasured:
+        _log(f"FAIL {e['file']} records no glibc floor")
     for e in too_new:
         _log(f"FAIL {e['file']} needs glibc {e['glibc_floor']} > {max_glibc}")
-    return 1 if too_new else 0
+    return 1 if too_new or unmeasured else 0
 
 
 def main() -> int:

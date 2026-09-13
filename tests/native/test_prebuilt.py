@@ -10,10 +10,13 @@ nothing: they point the lookup at a manifest in tmp_path.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from torch_mojo_backend import native
 
@@ -107,3 +110,77 @@ def test_source_hashes_are_stable_and_distinct():
     assert native.shim_source_hash() == native.shim_source_hash()
     assert native.backend_source_hash() == native.backend_source_hash()
     assert native.shim_source_hash() != native.backend_source_hash()
+
+
+def test_a_dev_torch_never_takes_a_prebuilt_shim(prebuilt_dir: Path, monkeypatch):
+    """The key is the torch series, which only a release keeps ABI-stable."""
+    _manifest(prebuilt_dir, _shim_entry())
+    monkeypatch.setattr(torch, "__version__", "2.11.0.dev20260101+cpu")
+    assert native._prebuilt_match(native.prebuilt_shim_spec()) is None
+    assert native._is_release_torch() is False
+    monkeypatch.setattr(torch, "__version__", "2.11.0+cpu")
+    assert native._is_release_torch() is True
+
+
+@pytest.fixture
+def cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(native, "_CACHE_DIR", cache)
+    return cache
+
+
+def test_no_compiler_still_uses_a_matching_prebuilt_shim(
+    prebuilt_dir: Path, cache_dir: Path, monkeypatch
+):
+    """The compiler-free install the wheel promises: a matching shim is copied
+    without ever looking for c++ (`_find_cxx` is the one discovery point)."""
+    _manifest(prebuilt_dir, _shim_entry())
+    monkeypatch.setattr(native, "_find_cxx", lambda: None)
+    out = native.build_shim()
+    assert out.parent == cache_dir and out.exists()
+    assert (cache_dir / (out.name + native._PREBUILT_MARK)).exists()
+
+
+def test_no_compiler_and_no_prebuilt_shim_raises(
+    prebuilt_dir: Path, cache_dir: Path, monkeypatch
+):
+    monkeypatch.setattr(native, "_find_cxx", lambda: None)
+    with pytest.raises(RuntimeError, match="no C\\+\\+ compiler found"):
+        native.build_shim()
+
+
+def _libc() -> Path:
+    name = ctypes.util.find_library("c")
+    assert name, "no libc to load"
+    return Path(name)
+
+
+def test_a_prebuilt_copy_that_does_not_load_is_compiled_instead(cache_dir: Path):
+    bogus = cache_dir / "libtmb_shim.hash-0.so"
+    bogus.write_bytes(b"not a library")
+    mark = cache_dir / (bogus.name + native._PREBUILT_MARK)
+    mark.touch()
+    built = []
+
+    def build(*, prebuilt: bool = True) -> Path:
+        built.append(prebuilt)
+        return _libc()
+
+    lib = native._load_or_compile(bogus, build, ctypes.RTLD_LOCAL, "test shim")
+    assert lib is not None
+    assert built == [False]  # compiled, never another prebuilt lookup
+    assert not bogus.exists() and not mark.exists()
+
+
+def test_a_compiled_library_that_does_not_load_raises(cache_dir: Path):
+    """No provenance mark means it was compiled here: nothing to fall back to."""
+    bogus = cache_dir / "libtmb_shim.hash-1.so"
+    bogus.write_bytes(b"not a library")
+
+    def build(*, prebuilt: bool = True) -> Path:
+        raise AssertionError("must not rebuild")
+
+    with pytest.raises(OSError):
+        native._load_or_compile(bogus, build, ctypes.RTLD_LOCAL, "test shim")
+    assert bogus.exists()

@@ -137,13 +137,21 @@ def _find_mojo() -> str:
     return exe
 
 
-def _cxx() -> list[str]:
+def _find_cxx() -> list[str] | None:
     for cand in (os.environ.get("CXX"), "c++", "g++", "clang++"):
         if cand and shutil.which(cand):
             return [cand]
-    raise RuntimeError(
-        "no C++ compiler found: install g++ or clang++ (only the shim needs it)"
-    )
+    return None
+
+
+def _cxx() -> list[str]:
+    cxx = _find_cxx()
+    if cxx is None:
+        raise RuntimeError(
+            "no C++ compiler found: install g++ or clang++ (only the shim needs"
+            " it, and only when the wheel ships no prebuilt one for this torch)"
+        )
+    return cxx
 
 
 def _torch_include_dir() -> Path:
@@ -383,10 +391,18 @@ def prebuilt_file_name(spec: dict[str, object]) -> str:
     )
 
 
+def _is_release_torch() -> bool:
+    """A shipped shim is keyed by torch series, which only a release keeps
+    ABI-stable; a nightly or a custom build compiles its own."""
+    return re.fullmatch(r"\d+\.\d+\.\d+(\+[\w.]+)?", torch.__version__) is not None
+
+
 def _prebuilt_match(spec: dict[str, object]) -> Path | None:
     """The shipped library whose manifest entry matches `spec` exactly, if the
     wheel carries one (TORCH_MOJO_BACKEND_PREBUILT=0 ignores them)."""
     if os.environ.get("TORCH_MOJO_BACKEND_PREBUILT", "1") == "0":
+        return None
+    if spec["kind"] == "shim" and not _is_release_torch():
         return None
     try:
         entries = json.loads(_PREBUILT_MANIFEST.read_text())["entries"]
@@ -409,8 +425,9 @@ def _install_prebuilt(src: Path, out: Path, what: str) -> bool:
     except OSError as exc:
         _trace(f"prebuilt {what} ({src.name}) could not be copied: {exc}")
         return False
-    _atomic_install(tmp, out)
+    # mark first: a library visible without its mark could not fall back
     (out.parent / (out.name + _PREBUILT_MARK)).touch()
+    _atomic_install(tmp, out)
     _trace(f"using prebuilt {what}: {src.name}")
     return True
 
@@ -426,7 +443,7 @@ def build_shim(*, prebuilt: bool = True) -> Path:
     cache instead."""
     sources = sorted(_CSRC.glob("*.cpp"))
     headers = sorted(_CSRC.glob("*.h"))
-    cxx = _cxx()
+    cxx = _find_cxx()  # None is fine as long as a prebuilt shim matches
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
     cflags = [
         "-O1",
@@ -445,7 +462,7 @@ def build_shim(*, prebuilt: bool = True) -> Path:
         sources + headers,
         toolchain_identity()
         + "|"
-        + _cxx_identity(cxx)
+        + (_cxx_identity(cxx) if cxx else "no C++ compiler")
         + "|"
         + " ".join(cflags)
         + "|"
@@ -466,7 +483,9 @@ def build_shim(*, prebuilt: bool = True) -> Path:
                 src, out, f"C++ shim for torch {_torch_series()}"
             ):
                 return out
-        return _build_shim_locked(sources, cxx, cflags, out)
+        if cxx is None:
+            _cxx()  # raises: no compiler, and the wheel ships no shim for us
+        return _build_shim_locked(sources, cast(list[str], cxx), cflags, out)
 
 
 def _build_shim_locked(
@@ -553,6 +572,18 @@ def build_backend(*, prebuilt: bool = True) -> Path:
         return _build_backend_locked(key, out)
 
 
+def portable_target_cpu() -> str:
+    """The base library is shipped prebuilt and is runtime glue, not a kernel:
+    it targets the platform's baseline CPU, never the build host's (a host
+    build carries AVX-512 and dies with SIGILL on a CPU without it)."""
+    machine = platform.machine()
+    if machine in ("x86_64", "AMD64"):
+        return "x86-64-v3"  # AVX2: every x86 CPU since 2013
+    if sys.platform == "darwin":
+        return "apple-m1"
+    return "generic"
+
+
 def _build_backend_locked(key: str, out: Path) -> Path:
     t0 = time.monotonic()
     tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
@@ -566,6 +597,8 @@ def _build_backend_locked(key: str, out: Path) -> Path:
         str(_MOJO_SRC),
         "-I",
         str(_KERNELS_DIR),
+        "--target-cpu",
+        portable_target_cpu(),
         "-o",
         str(tmp),
     ]
@@ -655,11 +688,18 @@ def _load_or_compile(path: Path, build: _Builder, mode: int, what: str) -> ctype
         return _load(path, mode)
     except OSError as exc:
         mark = path.parent / (path.name + _PREBUILT_MARK)
-        if not mark.exists():
-            raise
+        with _build_lock(path.name):
+            # under the lock: another process may already have replaced the
+            # prebuilt copy with a compiled one, which must not be deleted
+            replaced = mark.exists()
+            if replaced:
+                path.unlink(missing_ok=True)
+                mark.unlink(missing_ok=True)
+        if not replaced:
+            if not path.exists():
+                raise
+            return _load(path, mode)  # what the other process built
         _trace(f"the prebuilt {what} did not load ({exc}); compiling it instead")
-        path.unlink(missing_ok=True)
-        mark.unlink(missing_ok=True)
         return _load(build(prebuilt=False), mode)
 
 
