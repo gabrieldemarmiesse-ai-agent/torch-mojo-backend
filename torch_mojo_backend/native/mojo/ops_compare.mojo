@@ -33,6 +33,7 @@ from abi import (
     unsupported,
     v_bool_or,
     v_is_none,
+    v_opt_tensor,
     v_scalar_is_integral,
     v_string,
     v_tensor,
@@ -789,14 +790,13 @@ def op_masked_fill__tensor(
 # Searchsorted), shared by CPU/GPU. Ported from `_fast_searchsorted`,
 # `fast_aten_searchsorted`, `fast_aten_bucketize`.
 #
-# The old `sorter` argument requires validating its values are a genuine
-# permutation of [0, boundary_size) -- a device-side min/max readback the
-# old eager path did with `fast_aten_min`/`fast_aten_max`. The native
-# reductions group (ops_reductions.mojo) isn't implemented yet, so `sorter`
-# is declined here (`unsupported`) rather than launched unchecked: an
-# invalid sorter would let the kernel index out of bounds. Add the check
-# once a native min/max reduction exists, then wire `sorter` through
-# unconditionally.
+# `sorter` (searchsorted only) is checked the way `searchsorted_pre_check`
+# (BucketizationUtils.h) checks it statically -- device, shape, dtype -- but
+# NOT the way it checks values: torch's own check there is a device-to-host
+# `aminmax().item()`, a sync we won't pay on every call. An out-of-range
+# sorter entry is instead made harmless in the kernel itself (clamped into
+# the valid boundary range), see `_binary_search_position` in
+# `searchsorted_ops.mojo`.
 # ---------------------------------------------------------------------------
 
 # _SS_ALLOWED (float32/bfloat16/float16/int32/int64): float64, and integers
@@ -898,11 +898,23 @@ def _prep_flat(t: T, stype: Int32) raises -> T:
     return contiguous(t)
 
 
-def _reject_sorter(v: Value) raises:
-    if not v_is_none(v):
-        unsupported(
-            "searchsorted: a sorter argument is not supported by the native"
-            " backend yet"
+def _check_sorter(sorter: T, boundaries: T) raises:
+    """torch's static `sorter` checks (`searchsorted_pre_check`): device,
+    shape, dtype. Index VALUES are not checked here -- see the header
+    comment above."""
+    if not sorter.on_mojo() or sorter.device != boundaries.device:
+        raise Error(
+            "torch.searchsorted(): sorter and boundary tensors should have"
+            " same device type"
+        )
+    if not sorter.same_shape(boundaries):
+        raise Error(
+            "torch.searchsorted(): boundary and sorter must have the same"
+            " size"
+        )
+    if sorter.dtype != DType.int64:
+        raise Error(
+            "torch.searchsorted(): sorter must be a tensor of long dtype"
         )
 
 
@@ -914,6 +926,7 @@ def _searchsorted_common(
     right0: Bool,
     has_side: Bool,
     side_str: String,
+    sorter0: Optional[T],
 ) raises -> Owned:
     var right = right0
     if has_side:
@@ -965,6 +978,10 @@ def _searchsorted_common(
                     " tensor and input value tensor must match"
                 )
 
+    var has_sorter = Bool(sorter0)
+    if has_sorter:
+        _check_sorter(sorter0.value(), boundaries0)
+
     var boundary_size = boundaries0.dim(-1)
     if out_int32 and boundary_size >= 2147483647:
         raise Error(
@@ -978,6 +995,11 @@ def _searchsorted_common(
     var stype = torch_dtype(common)
     var boundaries = _prep_flat(boundaries0, stype)
     var values = _prep_flat(values0, stype)
+    # The kernel indexes it as flat int64 storage, same as boundaries/values.
+    var sorter_c: Optional[T] = None
+    if has_sorter:
+        sorter_c = contiguous(sorter0.value())
+    var sorter_ptr = sorter_c.value().ptr if has_sorter else 0
 
     var out_dtype = DType.int32 if out_int32 else DType.int64
     var out = own(
@@ -997,12 +1019,12 @@ def _searchsorted_common(
         call.int(out.t.ptr)
         call.int(boundaries.ptr)
         call.int(values.ptr)
-        call.int(0)  # sorter: unsupported (rejected by `_reject_sorter`)
+        call.int(sorter_ptr)
         call.int(values0.numel)
         call.int(boundary_size)
         call.int(values_per_batch)
         call.int(1 if boundaries0.rank == 1 else 0)
-        call.int(0)  # has_sorter
+        call.int(1 if has_sorter else 0)
         call.int(1 if right else 0)
         call.int(dtype_code(common))
         call.int(dtype_code(out_dtype))
@@ -1011,6 +1033,8 @@ def _searchsorted_common(
         _ = ctx
     _release_if_new(boundaries, boundaries0)
     _release_if_new(values, values0)
+    if has_sorter:
+        _release_if_new(sorter_c.value(), sorter0.value())
     return out^
 
 
@@ -1029,10 +1053,10 @@ def op_searchsorted_tensor(
     var out_int32 = v_bool_or(args[unsafe_offset=2], False)
     var right = v_bool_or(args[unsafe_offset=3], False)
     var side = _side_of(args[unsafe_offset=4])
-    _reject_sorter(args[unsafe_offset=5])
+    var sorter = v_opt_tensor(args[unsafe_offset=5])
     var common = _searchsorted_dtype(boundaries.dtype, values.dtype)
     var out = _searchsorted_common(
-        boundaries, values, common, out_int32, right, side[0], side[1]
+        boundaries, values, common, out_int32, right, side[0], side[1], sorter
     )
     ret_owned(rets, 0, out)
 
@@ -1046,11 +1070,11 @@ def op_searchsorted_tensor_out(
     var out_int32 = v_bool_or(args[unsafe_offset=2], False)
     var right = v_bool_or(args[unsafe_offset=3], False)
     var side = _side_of(args[unsafe_offset=4])
-    _reject_sorter(args[unsafe_offset=5])
+    var sorter = v_opt_tensor(args[unsafe_offset=5])
     var out_arg = v_tensor(args[unsafe_offset=6])
     var common = _searchsorted_dtype(boundaries.dtype, values.dtype)
     var computed = _searchsorted_common(
-        boundaries, values, common, out_int32, right, side[0], side[1]
+        boundaries, values, common, out_int32, right, side[0], side[1], sorter
     )
     _ensure_out_shape(
         out_arg,
@@ -1071,7 +1095,7 @@ def op_searchsorted_scalar(
     var out_int32 = v_bool_or(args[unsafe_offset=2], False)
     var right = v_bool_or(args[unsafe_offset=3], False)
     var side = _side_of(args[unsafe_offset=4])
-    _reject_sorter(args[unsafe_offset=5])
+    var sorter = v_opt_tensor(args[unsafe_offset=5])
     if boundaries.rank != 1:
         raise Error(
             "torch.searchsorted(): input value can be a scalar only when"
@@ -1084,7 +1108,7 @@ def op_searchsorted_scalar(
     var values = own(new_scalar(torch_dtype(common), boundaries.device))
     fill_value(values.t, value)
     var out = _searchsorted_common(
-        boundaries, values.t, common, out_int32, right, side[0], side[1]
+        boundaries, values.t, common, out_int32, right, side[0], side[1], sorter
     )
     ret_owned(rets, 0, out)
 
@@ -1097,7 +1121,7 @@ def op_searchsorted_scalar_out(
     var out_int32 = v_bool_or(args[unsafe_offset=2], False)
     var right = v_bool_or(args[unsafe_offset=3], False)
     var side = _side_of(args[unsafe_offset=4])
-    _reject_sorter(args[unsafe_offset=5])
+    var sorter = v_opt_tensor(args[unsafe_offset=5])
     var out_arg = v_tensor(args[unsafe_offset=6])
     if boundaries.rank != 1:
         raise Error(
@@ -1111,7 +1135,7 @@ def op_searchsorted_scalar_out(
     var values = own(new_scalar(torch_dtype(common), boundaries.device))
     fill_value(values.t, value)
     var computed = _searchsorted_common(
-        boundaries, values.t, common, out_int32, right, side[0], side[1]
+        boundaries, values.t, common, out_int32, right, side[0], side[1], sorter
     )
     _ensure_out_shape(
         out_arg,
@@ -1140,7 +1164,7 @@ def op_bucketize_tensor(
         )
     var common = _searchsorted_dtype(boundaries.dtype, self_t.dtype)
     var out = _searchsorted_common(
-        boundaries, self_t, common, out_int32, right, False, String("")
+        boundaries, self_t, common, out_int32, right, False, String(""), None
     )
     ret_owned(rets, 0, out)
 
@@ -1162,7 +1186,7 @@ def op_bucketize_tensor_out(
         )
     var common = _searchsorted_dtype(boundaries.dtype, self_t.dtype)
     var computed = _searchsorted_common(
-        boundaries, self_t, common, out_int32, right, False, String("")
+        boundaries, self_t, common, out_int32, right, False, String(""), None
     )
     _ensure_out_shape(
         out_arg,
@@ -1195,7 +1219,7 @@ def op_bucketize_scalar(
     var values = own(new_scalar(torch_dtype(common), boundaries.device))
     fill_value(values.t, value)
     var out = _searchsorted_common(
-        boundaries, values.t, common, out_int32, right, False, String("")
+        boundaries, values.t, common, out_int32, right, False, String(""), None
     )
     ret_owned(rets, 0, out)
 
@@ -1221,7 +1245,7 @@ def op_bucketize_scalar_out(
     var values = own(new_scalar(torch_dtype(common), boundaries.device))
     fill_value(values.t, value)
     var computed = _searchsorted_common(
-        boundaries, values.t, common, out_int32, right, False, String("")
+        boundaries, values.t, common, out_int32, right, False, String(""), None
     )
     _ensure_out_shape(
         out_arg,
