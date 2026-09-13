@@ -144,6 +144,14 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
         out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
         return;
       }
+      if (ik == c10::TypeKind::NumberType) {
+        // Scalar[] (the _foreach_*.ScalarList ops): doubles, the way the
+        // kernels consume them; an integer above 2^53 would lose precision
+        arena.doubles.emplace_back();
+        for (const auto& e : v.toListRef()) arena.doubles.back().push_back(e.toScalar().toDouble());
+        out.tag = TMB_DOUBLE_LIST; out.a = reinterpret_cast<int64_t>(arena.doubles.back().data()); out.len = static_cast<int32_t>(arena.doubles.back().size());
+        return;
+      }
       if (ik == c10::TypeKind::BoolType) {
         arena.bools.emplace_back();
         for (bool b : v.toBoolList()) arena.bools.back().push_back(b ? 1 : 0);

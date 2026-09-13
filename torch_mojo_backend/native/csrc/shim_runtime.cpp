@@ -420,6 +420,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
+void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
 TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 

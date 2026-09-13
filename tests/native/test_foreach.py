@@ -491,3 +491,15 @@ def test_foreach_scalarlist_ops_unregistered_still_correct(
     apply(*mojo_lists)
     for expected, actual in zip(cpu_lists[0], mojo_lists[0], strict=True):
         torch.testing.assert_close(actual.cpu(), expected, rtol=2e-6, atol=2e-7)
+
+
+def test_batched_inplace_foreach_bumps_the_version_counter(mojo_gpu):
+    """The dispatcher bumps `Tensor(a!)` arguments but not the members of a
+    `Tensor(a!)[]`; the batched kernels do it themselves so autograd notices
+    an in-place update of a saved tensor."""
+    xs = [torch.ones(8, device=mojo_gpu) for _ in range(3)]
+    before = [x._version for x in xs]
+    torch._foreach_add_(xs, 1.0)
+    torch._foreach_mul_(xs, 2.0)
+    assert [x._version - v for x, v in zip(xs, before)] == [2, 2, 2]
+    assert xs[0].cpu().tolist() == [4.0] * 8

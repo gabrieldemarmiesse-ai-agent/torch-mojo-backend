@@ -528,6 +528,12 @@ struct T(Copyable, Movable):
     def requires_grad(self) -> Bool:
         return external_call["tmb_tensor_requires_grad", Int32](self.h) != 0
 
+    def bump_version(self):
+        """Autograd's version counter. The dispatcher's ADInplaceOrView kernel
+        bumps a `Tensor(a!)` argument itself but not the members of a
+        `Tensor(a!)[]`, so ops mutating tensor lists call this per tensor."""
+        external_call["tmb_tensor_bump_version", NoneType](self.h)
+
     def storage_ptr(self) -> Int:
         return external_call["tmb_tensor_storage_data_ptr", Int](self.h)
 

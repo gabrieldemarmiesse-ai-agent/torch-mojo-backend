@@ -310,6 +310,8 @@ def _foreach_ew_scalar_launch(
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
+    for t in tensors:
+        t.bump_version()
     _ = ctx
 
 
@@ -332,6 +334,8 @@ def _foreach_mul_tensor_launch(tensors: List[T], scalar: T) raises:
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
+    for t in tensors:
+        t.bump_version()
     _ = ctx
 
 
@@ -364,6 +368,8 @@ def _foreach_lerp_launch(
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
+    for t in self_list:
+        t.bump_version()
     _ = ctx
 
 
@@ -393,6 +399,8 @@ def _foreach_addcmul_launch(
     call.int(dtype_code(dtype))
     call.int(cp)
     call.run()
+    for t in self_list:
+        t.bump_version()
     _ = ctx
 
 
@@ -830,6 +838,14 @@ def _fused_adamw_impl(args: Values, n_args: Int) raises:
     call.int(found_inf_ptr)
     call.int(cp)
     call.run()
+    for t in parameters:
+        t.bump_version()
+    for t in exp_avgs:
+        t.bump_version()
+    for t in exp_avg_sqs:
+        t.bump_version()
+    for t in max_exp_avg_sqs:
+        t.bump_version()
     _ = ctx
 
 
