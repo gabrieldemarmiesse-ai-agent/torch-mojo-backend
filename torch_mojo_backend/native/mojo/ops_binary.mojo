@@ -816,6 +816,8 @@ def _b_store_out(rets: Values, dest: T, var res: Res) raises:
     else:
         var casted = own(cast_to(held.t, dst.stype))
         _b_copy_into(dst, casted.t)
+        _ = casted^  # alive past the launch
+    _ = held^
     ret_ref(rets, 0, dst)
 
 
