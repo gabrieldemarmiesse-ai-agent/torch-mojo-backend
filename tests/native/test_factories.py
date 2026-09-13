@@ -603,3 +603,19 @@ def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
     torch.testing.assert_close(
         ranged.cpu(), torch.arange(0.0, 2.0, 0.25, dtype=torch.float64)
     )
+
+
+def test_randint_and_random_on_the_device(mojo_device):
+    """random_.from / .to / random_ draw on the host and copy over."""
+    torch.manual_seed(0)
+    x = torch.randint(3, 9, (200,), device=mojo_device)
+    assert x.dtype == torch.int64
+    vals = x.cpu()
+    assert vals.min() >= 3 and vals.max() < 9 and vals.unique().numel() == 6
+    y = torch.empty(64, dtype=torch.int32, device=mojo_device).random_(5)
+    assert set(y.cpu().tolist()) <= set(range(5))
+    z = torch.empty(64, dtype=torch.uint8, device=mojo_device).random_()
+    assert z.cpu().max() <= 255
+    strided = torch.zeros(4, 6, dtype=torch.int64, device=mojo_device).t()
+    strided.random_(1, 3)
+    assert set(strided.cpu().unique().tolist()) <= {1, 2}

@@ -30,6 +30,7 @@ from ops_foreach import register_foreach
 from ops_matmul import register_matmul
 from ops_nn import register_nn
 from ops_reductions import register_reductions
+from ops_composed import register_composed
 from ops_unary import register_unary
 from pg import pg_vtable
 from registry import Lib, impl
@@ -50,6 +51,7 @@ def _register_ops(lib: Lib) raises:
     impl[op_record_stream](lib, "record_stream")
     # one file per group; each group registers its own ops
     register_unary(lib)
+    register_composed(lib)  # after every group it composes from
     register_binary(lib)
     register_compare(lib)
     register_data_movement(lib)

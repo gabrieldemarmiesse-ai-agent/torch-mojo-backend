@@ -187,6 +187,20 @@ def _scratch_dir() -> Path:
     return d
 
 
+def compiler_env() -> dict[str, str]:
+    """Environment of every compiler subprocess: the Mojo compiler's own
+    cache (`$MODULAR_HOME/cache/.mojo_cache`) moves to local scratch. On a
+    shared NFS home, concurrent compilers on several nodes evict each
+    other's entries and builds fail with "failed to produce an archive for
+    the module"; `TORCH_MOJO_BACKEND_KEEP_MODULAR_HOME=1` keeps the user's."""
+    env = dict(os.environ)
+    if os.environ.get("TORCH_MOJO_BACKEND_KEEP_MODULAR_HOME") != "1":
+        home = _scratch_dir() / "modular-home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["MODULAR_HOME"] = str(home)
+    return env
+
+
 def _atomic_install(tmp: Path, out: Path):
     """Move a finished build from scratch into the cache: a copy into the
     cache directory (scratch is another filesystem), then one rename, so a
@@ -319,7 +333,7 @@ def _build_backend_locked(key: str, out: Path) -> Path:
         "-o",
         str(tmp),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
@@ -379,7 +393,7 @@ def build_library(
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
         cmd += ["-o", str(tmp)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)
             raise RuntimeError(

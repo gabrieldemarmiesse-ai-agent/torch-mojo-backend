@@ -53,7 +53,20 @@ moves execution, not just bookkeeping.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —
-including external consumers — touches it. `tensor.record_stream(stream)`
+including external consumers — touches it. That includes a readback:
+`t.cpu()` and `t.item()` issue their copy on the *current* stream, so
+reading a tensor a side stream produced needs `torch.accelerator.synchronize()`
+or a `wait_stream`, exactly as on CUDA. `tensor.record_stream(stream)`
 is supported: the backend turns it into a MAX event the owning stream waits
 on before the buffer is released back to the allocator (see
 `docs/native_backend.md`, "Streams").
+
+`torch.accelerator.synchronize()` and `torch.mojo.synchronize()` are that
+host barrier over *every* stream of the device. They only work because
+`torch.mojo` defines `_lazy_init()`: torch's `_accelerator_synchronizeDevice`
+returns early for a lazy-init-capable device type it has not marked
+initialized, and torch marks PrivateUse1 initialized by calling
+`torch.<backend>._lazy_init()` from `device_lazy_init()` on the first device
+tensor. Without that method the flag never flips and both calls are silent
+no-ops — the device guard is never reached — which is a readback race waiting
+to happen (`tests/native/test_stream_ordering.py` pins it).

@@ -86,6 +86,12 @@ _OUT = (
     "right shape/dtype/layout to compute into directly)"
 )
 
+_COMPOSED = (
+    "no kernel of its own: ops_composed.mojo builds it from ops this suite "
+    "already measures (a few extra launches, nothing new to regress against)"
+)
+_HOST_RNG = "host-side torch RNG + upload; no device kernel of ours"
+
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
     # -- views ------------------------------------------------------------
@@ -105,7 +111,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::_local_scalar_dense": (
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
     ),
-    "aten::normal_": "host-side torch RNG + upload; no device kernel of ours",
+    "aten::normal_": _HOST_RNG,
     "aten::record_stream": (
         "stream-lifetime bookkeeping, not compute: records a MAX event on "
         "the named stream so a buffer's free is fenced behind a foreign "
@@ -191,6 +197,21 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::sub.out": _OUT,
     "aten::tan.out": _OUT,
     "aten::tanh.out": _OUT,
+    # -- composed from already-benchmarked ops ------------------------------
+    "aten::threshold_backward": _COMPOSED,
+    "aten::threshold_backward.grad_input": _COMPOSED,
+    "aten::sigmoid_backward": _COMPOSED,
+    "aten::sigmoid_backward.grad_input": _COMPOSED,
+    "aten::tanh_backward": _COMPOSED,
+    "aten::tanh_backward.grad_input": _COMPOSED,
+    "aten::isneginf": _COMPOSED,
+    "aten::isneginf.out": _COMPOSED,
+    "aten::isposinf": _COMPOSED,
+    "aten::isposinf.out": _COMPOSED,
+    # -- host-side RNG ------------------------------------------------------
+    "aten::random_": _HOST_RNG,
+    "aten::random_.from": _HOST_RNG,
+    "aten::random_.to": _HOST_RNG,
     # -- new op, no benchmark yet -------------------------------------------
     "aten::addr": (
         "newly added fast kernel (see fix-addr-fp16-bf16-precision) fixes "

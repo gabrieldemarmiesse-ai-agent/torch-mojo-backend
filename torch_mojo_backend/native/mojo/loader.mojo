@@ -193,10 +193,14 @@ struct Loader(Movable):
         var local = (
             scratch + "/" + family + "." + String(perf_counter_ns()) + ".so"
         )
+        # MODULAR_HOME: the compiler's own cache goes to local scratch too
+        # (native/__init__.py compiler_env explains why)
         var cmd = (
             String("mkdir -p '")
             + scratch
-            + "' && '"
+            + "/modular-home' && export MODULAR_HOME='"
+            + scratch
+            + "/modular-home' && '"
             + self.mojo_exe
             + "' build '"
             + src
