@@ -268,6 +268,54 @@ branches fall back to generic paths on "mojo", e.g. one SM's worth of
 partial weight gradients). NVIDIA only: Triton's AMD backend would need the
 same driver over the HIP handles.
 
+## TorchInductor
+
+`torch_mojo_backend.inductor.enable_inductor()` makes
+`torch.compile(fn, backend="inductor")` generate and launch Triton kernels
+for mojo tensors — still with a CPU torch wheel, since the kernels reach the
+GPU through the Triton driver above. It calls `enable_triton()` and then the
+two registrations Inductor offers out-of-tree devices, the ones Intel's XPU
+backend uses:
+
+| registry | what we give it |
+|---|---|
+| `torch._dynamo.device_interface.register_interface_for_device("mojo", MojoInterface)` | device / stream / event classes, `get_raw_stream`, `synchronize`, properties and compute capability (read from the CUDA driver, not from torch) |
+| `torch._inductor.codegen.common.register_backend_for_device("mojo", TritonScheduling, PythonWrapperCodegen)` | Triton codegen and the Python wrapper; `MojoDeviceOpOverrides` supplies the wrapper's device lines (`from torch_mojo_backend.inductor import get_raw_stream`, `torch.mojo.set_device`, `torch.mojo.device`) |
+
+Everything Inductor keys off a device *registry* then works. What it keys off
+a hardcoded list does not, and each of those is one function in
+`monkeypatching.py`: `GPU_TYPES` (`add_mojo_to_the_inductor_gpu_types`),
+`torch.utils._triton.has_triton`'s device dict
+(`let_has_triton_see_the_mojo_device`), the Triton compiler backend selected
+by the device-type string inside `GPUTarget`
+(`register_the_mojo_triton_target`), and the compile-worker subprocess, which
+imports only torch and so cannot know our device
+(`compile_inductor_kernels_in_process` runs the compiles in-process instead;
+`TORCHINDUCTOR_WORKER_START=fork` is the alternative). `_ptxas.py` also points
+Triton at MAX's ptxas rather than the one inside the torch wheel, whose cubins
+a driver older than that wheel's CUDA cannot load.
+
+Ops Inductor does not generate — `mm`, `addmm`, `bmm`, convolution — it calls
+as ATen extern kernels, through the `out=` overloads, which run as our native
+ops.
+
+Measured on one H100, a 256x1024-4096-4096-1024 fp32 MLP training step
+(forward, loss, backward): 1384 us/step compiled against 1457 us/step eager,
+5% faster, device time from one event pair around 50 steps. The three GEMMs
+and their backwards dominate and are the same native kernels in both legs;
+what Inductor buys is the fusion of everything around them.
+
+Not production yet. `mode="max-autotune"` and `mode="reduce-overhead"` both
+compile and run correctly, but neither does what it says: no Triton GEMM
+template is registered for a device type outside {cuda, xpu, cpu, mtia}
+(`torch/_inductor/template_heuristics/registry.py` logs "No template
+heuristic found ... device_type=mojo" and falls back to the ATen mm), and
+CUDA graphs are skipped (`cudagraph_skips`), cudagraph trees being written
+against `torch.cuda.CUDAGraph`. Coordinate-descent autotuning of the
+*generated* kernels does run, benchmarking on our device through the Triton
+driver. AOTInductor is unimplemented (the C++ half of `DeviceOpOverrides`),
+and this is NVIDIA only, like the Triton driver.
+
 ## Profiling
 
 The shim registers torch's PrivateUse1 `ProfilerStubs` over the backend's

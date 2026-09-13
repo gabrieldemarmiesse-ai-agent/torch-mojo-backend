@@ -68,9 +68,14 @@ class _DeviceInterface:
         pass
 
 
-def make_driver() -> DriverBase:
+@functools.cache
+def driver_class() -> type[DriverBase]:
     """A Triton driver for the mojo device (a CudaDriver whose device and
-    stream come from torch.mojo)."""
+    stream come from torch.mojo).
+
+    Cached because it is also the class of a registered Triton backend
+    (`monkeypatching.register_the_mojo_triton_target`), and Triton compares
+    the active driver against it with `isinstance`."""
     from triton.backends.nvidia.driver import (  # noqa: PLC0415 -- triton is optional
         CudaDriver,
         CudaLauncher,
@@ -106,7 +111,11 @@ def make_driver() -> DriverBase:
         def get_empty_cache_for_benchmark(self) -> torch.Tensor:
             return torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device="mojo")
 
-    return MojoTritonDriver()
+    return MojoTritonDriver
+
+
+def make_driver() -> DriverBase:
+    return driver_class()()
 
 
 def enable_triton():
