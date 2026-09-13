@@ -18,7 +18,9 @@ from abi import (
     ST_FLOAT32,
     ST_INT64,
     T,
+    TAG_BOOL,
     TAG_BOOL_LIST,
+    TAG_INT_LIST,
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
@@ -33,6 +35,7 @@ from abi import (
     new_tensor,
     own,
     release,
+    retain,
     ret_owned,
     ret_ref,
     ret_tensor,
@@ -814,6 +817,105 @@ def _nn_call1(
     return rets.take_tensor(0)
 
 
+def _nn_hold(t: T) raises -> Owned:
+    """A second owned handle to `t`, so a value that is sometimes a borrowed
+    input and sometimes a fresh allocation is handled uniformly."""
+    return own(T(retain(t)))
+
+
+def _nn_cast(t: Owned, stype: Int32) raises -> Owned:
+    """`t` in `stype`, always as a handle the caller owns: `cast_to` returns
+    the input itself when the dtype already matches."""
+    if t.t.stype == stype:
+        return _nn_hold(t.t)
+    return own(cast_to(t.t, stype))
+
+
+def _nn_mul(a: Owned, b: Owned) raises -> Owned:
+    return own(_nn_call1("aten::mul", "Tensor", [_nn_arg(a.t), _nn_arg(b.t)]))
+
+
+def _nn_add(a: Owned, b: Owned) raises -> Owned:
+    return own(
+        _nn_call1(
+            "aten::add",
+            "Tensor",
+            [_nn_arg(a.t), _nn_arg(b.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
+        )
+    )
+
+
+def _nn_sub(a: Owned, b: Owned) raises -> Owned:
+    return own(
+        _nn_call1(
+            "aten::sub",
+            "Tensor",
+            [_nn_arg(a.t), _nn_arg(b.t), Value(TAG_SCALAR_INT, 0, 1, 0)],
+        )
+    )
+
+
+def _nn_add_scalar(a: Owned, v: Float64) raises -> Owned:
+    return own(
+        _nn_call1(
+            "aten::add",
+            "Scalar",
+            [
+                _nn_arg(a.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(v), 0),
+                Value(TAG_SCALAR_INT, 0, 1, 0),
+            ],
+        )
+    )
+
+
+def _nn_div_scalar(a: Owned, v: Float64) raises -> Owned:
+    return own(
+        _nn_call1(
+            "aten::div",
+            "Scalar",
+            [_nn_arg(a.t), Value(TAG_SCALAR_DOUBLE, 0, f64_bits(v), 0)],
+        )
+    )
+
+
+def _nn_rsqrt(a: Owned) raises -> Owned:
+    return own(_nn_call1("aten::rsqrt", "", [_nn_arg(a.t)]))
+
+
+def _nn_sum_dims(x: Owned, dims: List[Int64]) raises -> Owned:
+    """`x.sum(dims)` without keepdim: for batch norm's reduce set, a
+    per-channel vector."""
+    return own(
+        _nn_call1(
+            "aten::sum",
+            "dim_IntList",
+            [
+                _nn_arg(x.t),
+                Value(
+                    TAG_INT_LIST,
+                    Int32(len(dims)),
+                    Int64(Int(dims.unsafe_ptr())),
+                    0,
+                ),
+                Value(TAG_BOOL, 0, 0, 0),
+                Value(TAG_NONE, 0, 0, 0),
+            ],
+        )
+    )
+
+
+def _nn_channel_view(vec: Owned, rank: Int) raises -> Owned:
+    """A rank-`rank` `[1, C, 1, ...]` view of a per-channel vector, which is
+    what lines it up with dim 1 of the input for the broadcast binary
+    kernels. Zero-copy: only the C axis carries a real stride."""
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - rank + 1] = vec.t.dim(0)
+    strides[MAX_RANK - rank + 1] = vec.t.stride(0)
+    return own(view_strided(vec.t, shape, strides, rank, vec.t.offset))
+
+
 def _bn_set_saved_stats(rets: Values, mean: T, var_t: T, eps: Float64) raises:
     """Results 1 and 2 of an inference batch norm: a copy of `running_mean`
     and `rsqrt(running_var + eps)`.
@@ -966,15 +1068,115 @@ def _channel_vec(channels: Int, stype: Int32, device: Int) raises -> T:
     return new_tensor(shape, 1, stype, device)
 
 
+def _bn_affine_step(
+    args: Values, body: Owned, i: Int, rank: Int, present: Bool, scale: Bool
+) raises -> Owned:
+    """`body * weight` (scale) or `body + bias` per channel, `body` untouched
+    when that parameter is absent."""
+    if not present:
+        return _nn_hold(body.t)
+    var p = _nn_hold(v_tensor(args[unsafe_offset=i]))
+    var pf = _nn_cast(p, ST_FLOAT32)
+    var pv = _nn_channel_view(pf, rank)
+    if scale:
+        return _nn_mul(body, pv)
+    return _nn_add(body, pv)
+
+
+def _bn_update_running(running: T, batch: Owned, momentum: Float64) raises:
+    """ATen's in-place `running = (1 - momentum) * running + momentum * batch`,
+    written as `running.add_(batch - running, alpha=momentum)`: the same
+    value, and `mul_.Scalar` is not registered."""
+    var cur = _nn_hold(running)
+    var stat = _nn_cast(batch, running.stype)
+    var delta = _nn_sub(stat, cur)
+    _ = call_op(
+        String("aten::add_"),
+        String("Tensor"),
+        [
+            _nn_arg(running),
+            _nn_arg(delta.t),
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(momentum), 0),
+        ],
+        1,
+    )
+    _ = delta.t.h
+
+
+def _bn_training_cpu(
+    args: Values,
+    rets: Values,
+    a: T,
+    channels: Int,
+    has_w: Bool,
+    has_b: Bool,
+    has_mean: Bool,
+    momentum: Float64,
+    eps: Float64,
+) raises:
+    """The MAX CPU device's training route.
+
+    nn_ops has no training kernel, so the whole forward is composed through
+    the dispatcher, the way ops_composed.mojo builds the batch norm BACKWARD:
+    per-channel statistics over every dim but 1, then
+    `(x - mean) * rsqrt(var + eps) * weight + bias`. Reduced precision
+    accumulates in float32 (ATen's `opmath_t`, and what the accelerator
+    kernel does) and rounds once, at the final cast.
+    """
+    var rank = a.rank
+    if rank > 4:
+        # The broadcast binary kernels stop at rank 4; the accelerator kernel
+        # reduces any rank itself.
+        unsupported(
+            "training batch norm of rank > 4 on the CPU device (the"
+            " accelerator kernel takes any rank)"
+        )
+    var n = a.numel // channels
+    if n < 2:
+        # ATen's unbiased running variance divides by N-1.
+        unsupported("training batch norm over a single sample")
+    var dims = List[Int64](capacity=rank - 1)
+    dims.append(0)
+    for i in range(2, rank):
+        dims.append(Int64(i))
+
+    var ain = _nn_hold(a)
+    var af = _nn_cast(ain, ST_FLOAT32)
+    var total = _nn_sum_dims(af, dims)
+    var mean = _nn_div_scalar(total, Float64(n))
+    var mean_b = _nn_channel_view(mean, rank)
+    var centered = _nn_sub(af, mean_b)
+    var squared = _nn_mul(centered, centered)
+    var sq_total = _nn_sum_dims(squared, dims)
+    # Biased (divided by N), which is what the normalization uses; the
+    # running variance takes the unbiased one below.
+    var variance = _nn_div_scalar(sq_total, Float64(n))
+    var shifted = _nn_add_scalar(variance, eps)
+    var invstd = _nn_rsqrt(shifted)
+    var invstd_b = _nn_channel_view(invstd, rank)
+    var normed = _nn_mul(centered, invstd_b)
+    var scaled = _bn_affine_step(args, normed, 1, rank, has_w, True)
+    var biased = _bn_affine_step(args, scaled, 2, rank, has_b, False)
+    var out = _nn_cast(biased, a.stype)
+
+    if has_mean:
+        _bn_update_running(v_tensor(args[unsafe_offset=3]), mean, momentum)
+        var unbiased = _nn_div_scalar(variance, Float64(n - 1) / Float64(n))
+        _bn_update_running(v_tensor(args[unsafe_offset=4]), unbiased, momentum)
+    # float32 statistics whatever the input dtype is, like the accelerator
+    # kernel and `at::acc_type`.
+    ret_owned(rets, 0, out)
+    ret_owned(rets, 1, mean)
+    ret_owned(rets, 2, invstd)
+
+
 def _bn_training(args: Values, rets: Values) raises:
     """`aten::native_batch_norm` with `training=True`: per-channel statistics
     over N*HxW, ATen's running-stat update, then the elementwise pass."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a, "batch norm")
-    if not _is_float(a.dtype) or not _on_gpu(a):
-        unsupported(
-            "training batch norm needs a float tensor on an accelerator"
-        )
+    if not _is_float(a.dtype):
+        unsupported("training batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
     var has_w = not v_is_none(args[unsafe_offset=1])
     var has_b = not v_is_none(args[unsafe_offset=2])
@@ -1015,6 +1217,11 @@ def _bn_training(args: Values, rets: Values) raises:
         stat_dtype = m.dtype
         mean_ptr = m.ptr
         var_ptr = v.ptr
+    if not _on_gpu(a):
+        _bn_training_cpu(
+            args, rets, a, channels, has_w, has_b, has_mean, momentum, eps
+        )
+        return
     var hxw = 1
     for i in range(2, a.rank):
         hxw *= a.dim(i)
