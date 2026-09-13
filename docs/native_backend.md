@@ -243,7 +243,11 @@ The Mojo base library (`libtmb_backend`) contains no device code and makes
 no compile-time choice about the accelerator: `init_backend` asks MAX at run
 time which api has devices (`cuda`, `hip`, `metal`, else CPU only) and
 `vendor.mojo` resolves the CUDA or HIP driver entry points by name from that
-answer. So it builds on a machine with no accelerator at all, and one build
+answer. One api per process: the probe takes the first of `cuda`, `hip`,
+`metal` that has a device, so a machine with an NVIDIA and an AMD card sees
+only the NVIDIA one (MAX device ordinals, and so mojo device indices, are
+per api; mixing two apis would need per-device vendor state). So it builds
+on a machine with no accelerator at all, and one build
 serves NVIDIA, AMD and Apple machines; its cache key deliberately excludes
 the accelerators (`toolchain_identity`), while kernel specializations, which
 carry device code, are keyed with them (`kernel_identity`). Checked by
