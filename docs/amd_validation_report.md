@@ -87,4 +87,39 @@ compile; the pytest time is the suite's own.
 | `test_binary.py` | 183 passed | 495 s | |
 | `test_unary.py` | 241 passed, 2 skipped (GELU bit patterns recorded on H100), 2 xfailed | 308 s | |
 | `test_compare.py` | 203 passed | 2253 s | |
-| `test_reductions.py` | **15 failed**, 432 passed, 4 skipped | 441 s | |
+| `test_reductions.py` | **15 failed**, 432 passed, 4 skipped (before the cumsum fix; 40/40 cumsum cases pass after it, see finding 2) | 441 s | |
+| `test_data_movement.py` | 360 passed | 467 s | |
+| `test_factories.py` | 97 passed, 2 skipped (CPU-device-only case; no native GPU reference on this accelerator) | 75 s | |
+| `test_foreach.py` | 30 passed, 3 xfailed, 4 xpassed (stale non-strict xfails about `linalg_vector_norm` not being registered yet) | 107 s | |
+
+### Finding 2: cumsum bf16/f16 and outer-dim routes were declined on HIP
+
+All 15 `test_reductions.py` failures were `NotImplementedError: cumsum ...`:
+`op_cumsum` (`native/mojo/ops_reductions.mojo`) declined bfloat16 / float16
+and the dim-0-of-rank-2 route on every device whose api is not `cuda`, with
+the comment "only ever MEASURED on NVIDIA". Measured on MI300A: every
+declined case is correct (40 of 40 cumsum tests, integer cumsum bit-exact,
+float errors at accumulation level), because HIP runs the portable
+one-thread-per-line kernels of `nn_ops.mojo` (the NVIDIA `block.prefix_sum`
+fast path is gated separately, inside the kernels, on `ctx.api() == "cuda"`
+and is untouched). The gate is widened to `cuda or hip`; Metal and the CPU
+device keep the old surface. Commit 3f609ed.
+
+## 8. Prebuilt libraries
+
+Compute nodes have no internet here, so the shim builds (which create a
+throwaway venv per torch series) ran on the login node; everything else on
+the node.
+
+| step | result |
+|---|---|
+| `scripts/build_prebuilt.py --torch 2.7 ... 2.14` | shims for torch 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14 (268 to 284 KiB each, glibc >= 2.32, cxx11abi1) and the base library `libtmb_backend-max26.5.0-linux-x86_64.so` (333 KiB, glibc >= 2.34); ~15 min including the wheel downloads. `--report` lists all nine. Note: `--report` alone on an empty out dir raises "no manifest entries" (it never builds). |
+| `uv build` | `torch_mojo_backend-0.3.1-py3-none-any.whl` 1.93 MB (13.0 MB / 161 files uncompressed, of which 2.6 MB prebuilt libraries) |
+| wheel venv | `uv pip install dist/*.whl "torch==2.11.0+cpu" --extra-index-url https://download.pytorch.org/whl/cpu`. The plan's `--index-url` form fails: it hides PyPI and `max==26.5` is not on the torch index. |
+| `scripts/smoke_prebuilt_wheel.py` | "using prebuilt C++ shim for torch 2.11" and "using prebuilt Mojo base library for MAX 26.5.0", backend ready in 4.12 s, `ones(3) * 2` on the CPU device OK, rc 0 |
+| register from the wheel venv on the GPU node | prebuilt shim used, ready in 2.23 s, `(arange(6)*2+1).sum()` = 36 and a 2x3 fp32 `mm` exact on `mojo:0`: the base library built with no accelerator in sight drives the MI300A |
+| `TORCH_MOJO_BACKEND_PREBUILT=0` | ready in 15.49 s (both compiled), op correct: the fallback works |
+| `benchmarks/test_coverage.py` | 2 passed (no GPU) |
+
+The CI-artifact wheel was not available on this box, so the wheel tested is
+the one built here.
