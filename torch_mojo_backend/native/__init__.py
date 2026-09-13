@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import re
 import fcntl
 import functools
 import hashlib
 import importlib.metadata
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys

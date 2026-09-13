@@ -57,7 +57,9 @@ def fix_privateuse1_dlpack_device_type():
     if getattr(original, "_torch_mojo_backend", False):
         return
 
-    from torch.utils.dlpack import DLDeviceType  # noqa: PLC0415 -- mirrors the private import inside the method being patched
+    from torch.utils.dlpack import (  # noqa: PLC0415 -- mirrors the private import inside the method being patched
+        DLDeviceType,
+    )
 
     @wraps(original)
     def __dlpack_device__(self: torch.Tensor) -> tuple[int, int]:
@@ -202,7 +204,9 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]"):
     backend".
     """
     import triton.backends  # noqa: PLC0415 -- triton is optional
-    from triton.backends.nvidia.compiler import CUDABackend  # noqa: PLC0415 -- triton is optional
+    from triton.backends.nvidia.compiler import (  # noqa: PLC0415 -- triton is optional
+        CUDABackend,
+    )
 
     if "mojo" in triton.backends.backends:
         return

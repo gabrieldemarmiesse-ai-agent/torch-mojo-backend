@@ -27,7 +27,6 @@ import ctypes
 import functools
 from dataclasses import dataclass
 
-
 import torch
 from torch._dynamo.device_interface import (
     DeviceInterface,

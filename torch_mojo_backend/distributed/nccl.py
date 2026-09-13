@@ -138,7 +138,9 @@ def uses_mojoccl() -> bool:
 
 def vendor_name() -> str:
     """ "rccl" when MAX's accelerators are AMD (HIP api), else "nccl"."""
-    from torch_mojo_backend.torch_compile_backend.utils import get_accelerators  # noqa: PLC0415 -- imports max.driver; keep it off the import path
+    from torch_mojo_backend.torch_compile_backend.utils import (  # noqa: PLC0415 -- imports max.driver; keep it off the import path
+        get_accelerators,
+    )
 
     return (
         "rccl"
@@ -151,7 +153,9 @@ def library_path() -> str:
     """Path of the collectives library: mojoccl (built from Mojo on first use,
     TORCH_MOJO_BACKEND_CCL=mojo) or the vendor NCCL / RCCL."""
     if uses_mojoccl():
-        from torch_mojo_backend.distributed.mojoccl_build import ensure_built  # noqa: PLC0415 -- builds a library; keep it lazy
+        from torch_mojo_backend.distributed.mojoccl_build import (  # noqa: PLC0415 -- builds a library; keep it lazy
+            ensure_built,
+        )
 
         return ensure_built()
     candidates = (

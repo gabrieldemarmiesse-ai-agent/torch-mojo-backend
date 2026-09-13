@@ -215,7 +215,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._coalesced_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         # Communicator creation is collective: do it now, while every rank is
         # here, on the rank's current device (one visible GPU per torchrun rank).
-        self._ensure(device_module.current_device())
+        # A machine with no accelerator (the MAX CPU pseudo-device is current)
+        # gets no communicator: only the gloo delegation for CPU tensors works.
+        current = device_module.current_device()
+        if torch.device("mojo", current) != device_module.cpu():
+            self._ensure(current)
 
     # ---- plumbing ------------------------------------------------------------
 

@@ -9,8 +9,8 @@ and dtype-checked `out=` ops must reject a mismatched output dtype with a
 clear error rather than a wrong answer.
 """
 
-import torch
 import pytest
+import torch
 
 from torch_mojo_backend import aten_functions
 from torch_mojo_backend.testing import CallChecker

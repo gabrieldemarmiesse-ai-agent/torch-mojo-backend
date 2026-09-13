@@ -9,7 +9,9 @@ import torch._inductor.metrics
 pytest.importorskip("triton")
 
 from torch_mojo_backend.inductor import enable_inductor, get_raw_stream  # noqa: E402
-from torch_mojo_backend.native import device_module  # noqa: E402 -- `torch.mojo` itself, under a name ty can resolve
+from torch_mojo_backend.native import (
+    device_module,  # noqa: E402 -- `torch.mojo` itself, under a name ty can resolve
+)
 
 
 @pytest.fixture

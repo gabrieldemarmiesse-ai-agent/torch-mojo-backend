@@ -6,12 +6,12 @@ import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
 
 from torch_mojo_backend import mojo_backend
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import (
     Conf,
     check_functions_are_equivalent,
     check_outputs,
 )
-from torch_mojo_backend.native import device_module
 
 # torch.testing.assert_close's defaults for float32.
 _FP32_RTOL = 1.3e-6

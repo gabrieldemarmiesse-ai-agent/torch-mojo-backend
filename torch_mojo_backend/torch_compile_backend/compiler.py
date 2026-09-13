@@ -12,8 +12,6 @@ from typing import Any, cast
 import max.driver
 import max.graph.value
 import torch
-
-from torch_mojo_backend.native import device_module
 from functorch.compile import make_boxed_func
 from max import engine
 from max.experimental.torch.torch import torch_dtype_to_max
@@ -29,6 +27,7 @@ from torch_mojo_backend.aten_functions import (
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
 from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,

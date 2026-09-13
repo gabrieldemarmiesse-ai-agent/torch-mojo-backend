@@ -16,10 +16,10 @@ from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devic
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
+    _xfail_if_unsupported,
     check_functions_are_equivalent,
     check_outputs,
 )
-from torch_mojo_backend.testing import _xfail_if_unsupported
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
