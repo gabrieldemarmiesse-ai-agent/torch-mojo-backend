@@ -152,14 +152,16 @@ def test_autotune_benchmarks_through_the_mojo_device_interface(mojo_triton):
 def test_driver_is_installed_on_import_after_registration(mojo_gpu, tmp_path):
     """A fresh process: register the device, import triton afterwards, launch;
     no explicit enable_triton() call."""
-    code = """
+    # one driver class per vendor api (cuda -> MojoCudaDriver, hip -> MojoHipDriver)
+    expected = triton_driver.driver_class().__name__
+    code = f"""
 import torch
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend import register_mojo_devices
 register_mojo_devices()
 import triton, triton.language as tl
 from triton.runtime import driver
-assert type(driver.active).__name__ == "MojoCudaDriver", type(driver.active)
+assert type(driver.active).__name__ == "{expected}", type(driver.active)
 @triton.jit
 def k(x_ptr, n, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)

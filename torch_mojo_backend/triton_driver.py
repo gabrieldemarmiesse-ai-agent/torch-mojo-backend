@@ -30,21 +30,25 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 
 from torch_mojo_backend.native import device_module
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import ModuleType
 
+    from triton.backends.amd.driver import HIPUtils
     from triton.backends.driver import DriverBase, GPUDriver
     from triton.backends.nvidia.driver import CudaUtils
 
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 _DRIVER_MODULE = "triton.runtime.driver"
+
+_Previous = TypeVar("_Previous")
 
 
 @functools.cache
@@ -132,6 +136,34 @@ def _pop_context(previous: ctypes.c_void_p | None):
         _libcuda().cuCtxSetCurrent(previous)
 
 
+@functools.cache
+def _libhip() -> ctypes.CDLL:
+    return ctypes.CDLL("libamdhip64.so")
+
+
+def _push_hip_device(device: int) -> int | None:
+    """Make `device` the thread's current HIP device, returning the one to put
+    back -- None when it already was. HIP has no contexts, but a module is
+    still loaded for the current device, and mojo's `device(i)` moves only
+    mojo's TLS device: observed on MI300A, `hipGetDevice()` stayed 0 under
+    `device(1)`, so the hsaco was loaded on device 0 and its launch on
+    device 1's stream failed with hipErrorInvalidDevice (101)."""
+    hip = _libhip()
+    previous = ctypes.c_int()
+    if hip.hipGetDevice(ctypes.byref(previous)) != 0:
+        raise RuntimeError("hipGetDevice failed")
+    if previous.value == device:
+        return None
+    if hip.hipSetDevice(device) != 0:
+        raise RuntimeError(f"hipSetDevice({device}) failed")
+    return previous.value
+
+
+def _pop_hip_device(previous: int | None):
+    if previous is not None:
+        _libhip().hipSetDevice(previous)
+
+
 def _current_stream_handle(device: int) -> int:
     """Triton asks this right before every launch, for the current device."""
     return device_module.stream_native_handle(device_module.current_stream(device))
@@ -167,8 +199,9 @@ def _bind_mojo(driver: GPUDriver):
     driver.get_current_stream = _current_stream_handle
 
 
-class _MojoCudaUtils:
-    """Triton's `CudaUtils` with `load_binary` under the right context.
+class _MojoUtils(Generic[_Previous]):
+    """Triton's `CudaUtils` / `HIPUtils` with `load_binary` under the right
+    context (CUDA) or current device (HIP), through the given push/pop pair.
 
     `loadBinary` (`triton/backends/nvidia/driver.c`) calls `cuModuleLoadData`
     in whatever context is current and retains `device`'s primary context only
@@ -176,24 +209,33 @@ class _MojoCudaUtils:
     belongs to `device`. Inductor loads under `DeviceGuard(MojoInterface, i)`,
     which moves only mojo's TLS device, so compiling for `mojo:1` with device
     0's context current would put the module in context 0 and then launch it
-    on device 1's stream.
+    on device 1's stream. The AMD `loadBinary` likewise calls
+    `hipModuleLoadDataEx` for the thread's current HIP device and never
+    `hipSetDevice(device)` (see `_push_hip_device`).
 
     Delegation rather than wrapping the method in place: `CudaUtils` is a
     process-wide singleton whose `__init__` re-binds `load_binary` on every
     `CudaUtils()`, so an in-place wrapper would silently come undone.
     """
 
-    def __init__(self, utils: CudaUtils):
+    def __init__(
+        self,
+        utils: CudaUtils | HIPUtils,
+        push: Callable[[int], _Previous],
+        pop: Callable[[_Previous], None],
+    ):
         self._utils = utils
+        self._push = push
+        self._pop = pop
 
     def load_binary(
         self, name: str, data: bytes, shared: int, device: int
     ) -> tuple[int, int, int, int, int]:
-        previous = _push_device_context(device)
+        previous = self._push(device)
         try:
             return self._utils.load_binary(name, data, shared, device)
         finally:
-            _pop_context(previous)
+            self._pop(previous)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._utils, name)
@@ -234,7 +276,7 @@ def _cuda_driver_class() -> type[DriverBase]:
     class MojoCudaDriver(CudaDriver):
         def __init__(self):
             # not the base constructors: they bind torch.cuda
-            self.utils = _MojoCudaUtils(CudaUtils())
+            self.utils = _MojoUtils(CudaUtils(), _push_device_context, _pop_context)
             self.launcher_cls = MojoCudaLauncher
             self.get_device_capability = _device_capability
             _bind_mojo(self)
@@ -257,10 +299,10 @@ def _cuda_driver_class() -> type[DriverBase]:
 
 def _hip_driver_class() -> type[DriverBase]:
     """The AMD counterpart; its target comes from the HIP driver API
-    (`utils.get_device_properties`), so nothing else changes -- HIP streams
-    are not bound to a context, so the context guards above have no
-    counterpart here. Untested: written from Triton's AMD driver, no AMD GPU
-    was available."""
+    (`utils.get_device_properties`). HIP streams are not bound to a context,
+    so the launcher needs no guard (a launch on device 1's stream works with
+    device 0 current -- checked on MI300A), but a module is loaded for the
+    thread's current device, so `load_binary` runs under `hipSetDevice`."""
     from triton.backends.amd.driver import (  # noqa: PLC0415 -- triton is optional
         HIPDriver,
         HIPLauncher,
@@ -269,7 +311,7 @@ def _hip_driver_class() -> type[DriverBase]:
 
     class MojoHipDriver(HIPDriver):
         def __init__(self):
-            self.utils = HIPUtils()
+            self.utils = _MojoUtils(HIPUtils(), _push_hip_device, _pop_hip_device)
             self.launcher_cls = HIPLauncher
             _bind_mojo(self)
 
