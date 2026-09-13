@@ -42,6 +42,7 @@ from abi import (
     ret_scalar_bool,
     ret_tensor_list,
     contiguous_strides,
+    strides_for_memory_format,
     new_strided,
     new_tensor,
     new_like,
@@ -64,7 +65,6 @@ from abi import (
     torch_dtype,
     is_floating,
     MEMORY_FORMAT_CONTIGUOUS,
-    MEMORY_FORMAT_CHANNELS_LAST,
     TAG_NONE,
     TAG_TENSOR,
     TAG_TENSOR_REF,
@@ -116,9 +116,19 @@ def op_empty_memory_format(
     var stype = v_dtype_or(args[unsafe_offset=1], default_dtype())
     var device = _target_device(args[unsafe_offset=3])
     var mf = v_memory_format_or(args[unsafe_offset=5], MEMORY_FORMAT_CONTIGUOUS)
-    if mf == MEMORY_FORMAT_CHANNELS_LAST:
-        unsupported("channels_last memory format")
-    ret_tensor(rets, 0, new_tensor(_shape_of(sizes), len(sizes), stype, device))
+    var shape = _shape_of(sizes)
+    var rank = len(sizes)
+    ret_tensor(
+        rets,
+        0,
+        new_strided(
+            shape,
+            strides_for_memory_format(shape, rank, mf),
+            rank,
+            stype,
+            device,
+        ),
+    )
 
 
 # aten::empty_strided(SymInt[] size, SymInt[] stride, *, ScalarType? dtype,
