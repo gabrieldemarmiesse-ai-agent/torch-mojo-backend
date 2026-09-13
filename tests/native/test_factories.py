@@ -10,6 +10,7 @@ Public torch API only, per the porting brief: no `aten_fast`,
 import pytest
 import torch
 
+from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
@@ -165,6 +166,8 @@ UNIFORM_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.float64]
 @pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
 @pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-100.0, 100.0), (1.0, 2.0)])
 def test_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "uniform_ of dtype float64 is declined on Apple GPU")
     device_module.manual_seed_all(20260814)
     drawn = torch.empty(200_000, dtype=dtype, device=mojo_device).uniform_(low, high)
     host = drawn.cpu().double()
@@ -178,6 +181,8 @@ def test_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
 
 @pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
 def test_uniform_from_equals_to_is_constant(mojo_gpu, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "uniform_ of dtype float64 is declined on Apple GPU")
     drawn = torch.empty(37, dtype=dtype, device=mojo_gpu).uniform_(2.5, 2.5)
     assert torch.equal(drawn.cpu(), torch.full((37,), 2.5, dtype=dtype))
 
@@ -593,8 +598,7 @@ def test_arange_needs_a_wide_accumulator(mojo_device):
 
 def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
     """fp64 is a separate kernel specialization from fp32 for each of these."""
-    if list(get_accelerators())[0].api == "metal":
-        pytest.skip("Metal has no float64")
+    skip_if_metal(mojo_gpu, "Metal has no float64")
     ones = torch.ones(5, dtype=torch.float64, device=mojo_gpu)
     assert ones.dtype == torch.float64
     torch.testing.assert_close(ones.cpu(), torch.ones(5, dtype=torch.float64))

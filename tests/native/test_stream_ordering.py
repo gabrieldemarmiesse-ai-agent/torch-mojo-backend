@@ -12,6 +12,7 @@ CUDA.
 import pytest
 import torch
 
+from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend.native import device_module
 
 pytestmark = pytest.mark.xdist_group(name="group1")
@@ -51,7 +52,7 @@ def test_accelerator_synchronize_drains_side_streams(mojo_gpu):
     `_lazy_init` for torch's `device_lazy_init()` to call. The device guard
     was never reached, so a readback could race the stream that produced it.
     """
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     buf = _slow_producer(mojo_gpu, side)
     torch.accelerator.synchronize()
     assert side.query(), "accelerator.synchronize() returned with the side stream busy"
@@ -60,8 +61,8 @@ def test_accelerator_synchronize_drains_side_streams(mojo_gpu):
 
 def test_event_orders_a_side_stream(mojo_gpu):
     """record on the producer, wait on a consumer stream."""
-    prod = torch.Stream(device=mojo_gpu)
-    side = torch.Stream(device=mojo_gpu)
+    prod = side_stream_or_skip(mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     buf = _slow_producer(mojo_gpu, prod)
     event = torch.Event()
     event.record(prod)
@@ -72,8 +73,8 @@ def test_event_orders_a_side_stream(mojo_gpu):
 
 
 def test_wait_stream_orders_a_side_stream(mojo_gpu):
-    prod = torch.Stream(device=mojo_gpu)
-    side = torch.Stream(device=mojo_gpu)
+    prod = side_stream_or_skip(mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     buf = _slow_producer(mojo_gpu, prod)
     side.wait_stream(prod)
     with device_module.stream(side):
@@ -89,8 +90,8 @@ def test_device_future_wait_orders_a_side_stream(mojo_gpu):
     work_from_future = pytest.importorskip(
         "torch._C._distributed_c10d"
     )._create_work_from_future
-    prod = torch.Stream(device=mojo_gpu)
-    side = torch.Stream(device=mojo_gpu)
+    prod = side_stream_or_skip(mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     buf = _slow_producer(mojo_gpu, prod)
     future: torch.futures.Future[list[torch.Tensor]] = torch.futures.Future(
         devices=[buf.device]

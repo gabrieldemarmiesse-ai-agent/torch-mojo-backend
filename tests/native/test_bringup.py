@@ -4,6 +4,7 @@ views, fills, item, autograd, streams, events, RNG (public torch API only)."""
 import pytest
 import torch
 
+from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module
 
@@ -158,7 +159,7 @@ def test_autograd_uses_aten_formulas(mojo_device):
 
 
 def test_streams_and_events(mojo_gpu):
-    s = torch.Stream(device=mojo_gpu)
+    s = side_stream_or_skip(mojo_gpu)
     assert s.device.type == "mojo"
     assert s.stream_id != torch.accelerator.current_stream().stream_id
     a = _arange(6, mojo_gpu)

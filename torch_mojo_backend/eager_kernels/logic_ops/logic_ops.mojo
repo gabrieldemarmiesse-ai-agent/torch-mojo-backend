@@ -352,10 +352,14 @@ def _bin_vec_op[
             # -1. fp64's subnormal threshold is ~2.2e-308 -- nowhere near
             # reachable from bf16/fp16 operands -- so widening the CPU path
             # to fp64 sidesteps the flush entirely without chasing whatever
-            # sets the CPU codegen's FTZ mode. GPU device kernels are not
-            # observed to flush (measured against this same input) and stay
-            # on fp32 unconditionally: fp64 is not just slower there, it is
-            # outright unsupported on Apple's Metal backend.
+            # sets the CPU codegen's FTZ mode. GPU device kernels stay on
+            # fp32 unconditionally: fp64 is not just slower there, it is
+            # outright unsupported on Apple's Metal backend, so this same
+            # widen-to-fp64 fix cannot apply to a GPU kernel at all.
+            # Checked against this same input on an NVIDIA GPU (no flush,
+            # correct answer) and on Apple's Metal GPU (DOES flush this fp32
+            # intermediate to zero -- `test_floor_divide_subnormal_quotient_
+            # underflow` skips there, unresolved: see that test).
             comptime if dtype == DType.float16 or dtype == DType.bfloat16:
                 comptime if cpu_floordiv_f64:
                     return (
