@@ -10,6 +10,7 @@ from torch_mojo_backend.monkeypatching import (
     fix_privateuse1_dlpack_device_type,
 )
 from torch_mojo_backend.native import device_module
+from torch_mojo_backend.triton_driver import install_triton_hook
 
 _registered = False
 
@@ -31,6 +32,7 @@ def register_mojo_devices():
     fix_privateuse1_dlpack_device_type()
     fix_batch_isend_irecv_for_python_process_groups()
     native.register()
+    install_triton_hook()
     warn_if_gpu_torch_on_hip()
     register_distributed_backend()
     _registered = True

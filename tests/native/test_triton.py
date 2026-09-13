@@ -1,10 +1,16 @@
-"""Triton kernels on the mojo device (torch_mojo_backend.triton_driver): Triton
-compiles and launches through its own CUDA backend; the driver only answers
-the device and stream questions with the mojo device."""
+"""Triton kernels on the mojo device (torch_mojo_backend.triton_driver):
+Triton compiles and launches through its own GPU backend; the driver only
+answers the device and stream questions with the mojo device, and is
+installed automatically when triton's runtime is imported after
+register_mojo_devices()."""
+
+import subprocess
+import sys
 
 import pytest
 import torch
 
+from torch_mojo_backend import get_accelerators
 from torch_mojo_backend.triton_driver import enable_triton
 
 triton = pytest.importorskip("triton")
@@ -29,20 +35,87 @@ def _add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
     )
 
 
+def _add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    _add_kernel[(triton.cdiv(x.numel(), 1024),)](x, y, out, x.numel(), BLOCK=1024)
+    return out
+
+
 def test_triton_kernel_runs_on_mojo_tensors(mojo_triton):
     x = torch.randn(100_003, device=mojo_triton)
     y = torch.randn(100_003, device=mojo_triton)
-    out = torch.empty_like(x)
-    _add_kernel[(triton.cdiv(x.numel(), 1024),)](x, y, out, x.numel(), BLOCK=1024)
-    torch.testing.assert_close(out.cpu(), x.cpu() + y.cpu())
+    torch.testing.assert_close(_add(x, y).cpu(), x.cpu() + y.cpu())
 
 
 def test_triton_launch_follows_the_current_mojo_stream(mojo_triton):
     s = torch.Stream(device=mojo_triton)
     with torch.mojo.stream(s):
         a = torch.ones(1 << 22, device=mojo_triton) * 3
-        b = torch.empty_like(a)
-        _add_kernel[(triton.cdiv(a.numel(), 1024),)](a, a, b, a.numel(), BLOCK=1024)
+        b = _add(a, a)
         c = b * 2
     torch.accelerator.synchronize()
     assert float(c.sum().cpu()) == 12 * (1 << 22)
+
+
+def test_triton_launch_on_a_second_device(mojo_triton):
+    gpus = [d for d in get_accelerators() if getattr(d, "api", "") != "cpu"]
+    if len(gpus) < 2:
+        pytest.skip("needs two GPUs")
+    # like torch.cuda: a Triton launch goes to the CURRENT device, so the
+    # caller selects it; the tensors' device is not consulted
+    x = torch.randn(4096, device="mojo:1")
+    with torch.mojo.device(1):
+        y = _add(x, x)
+    torch.testing.assert_close(y.cpu(), 2 * x.cpu())
+    assert torch.mojo.current_device() == 0
+
+
+@triton.autotune(
+    configs=[triton.Config({"BLOCK": 256}), triton.Config({"BLOCK": 1024})], key=["n"]
+)
+@triton.jit
+def _scale_kernel(x_ptr, out_ptr, n, factor, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * factor, mask=mask)
+
+
+def test_autotune_benchmarks_through_the_mojo_device_interface(mojo_triton):
+    """The autotuner times each config with do_bench: events, synchronize and
+    the L2-flush buffer all come from the mojo device."""
+    x = torch.randn(1 << 20, device=mojo_triton)
+    out = torch.empty_like(x)
+    _scale_kernel[lambda meta: (triton.cdiv(x.numel(), meta["BLOCK"]),)](
+        x, out, x.numel(), 2.5
+    )
+    torch.testing.assert_close(out.cpu(), x.cpu() * 2.5)
+    ms = triton.testing.do_bench(lambda: _add(x, x))
+    assert ms > 0
+
+
+def test_driver_is_installed_on_import_after_registration(mojo_gpu, tmp_path):
+    """A fresh process: register the device, import triton afterwards, launch;
+    no explicit enable_triton() call."""
+    code = """
+import torch
+from torch_mojo_backend import register_mojo_devices
+register_mojo_devices()
+import triton, triton.language as tl
+from triton.runtime import driver
+assert type(driver.active).__name__ == "MojoCudaDriver", type(driver.active)
+@triton.jit
+def k(x_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(x_ptr + offs, tl.load(x_ptr + offs, mask=offs < n) + 1, mask=offs < n)
+x = torch.zeros(3000, device="mojo:0")
+k[(3,)](x, x.numel(), BLOCK=1024)
+assert x.cpu().sum().item() == 3000
+print("HOOK OK")
+"""
+    script = tmp_path / "hook_probe.py"  # a file: triton reads the kernel's source
+    script.write_text(code)
+    r = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=900
+    )
+    assert "HOOK OK" in r.stdout, r.stdout[-500:] + r.stderr[-1500:]

@@ -255,18 +255,27 @@ used by the torch.compile backend) references a dtype added in 2.7.
 ## Triton
 
 Triton kernels run on mojo tensors with only the CPU torch wheel and the
-`triton` wheel installed: Triton compiles and launches through its own CUDA
-backend (bundled `ptxas`, `libcuda` from the display driver) and asks torch
-only which device and stream are current, through a driver object.
-`torch_mojo_backend.triton_driver.enable_triton()` installs a driver that
-answers with the mojo device and the vendor handle of its current stream
-(`torch.Stream.native_handle`), so a launch is ordered with our kernels on
-that stream. The CUDA device ordinal is the mojo device index. Checked with
-the Triton tutorial add kernel and Liger-Kernel's RMSNorm forward/backward
-(a package written against `torch.cuda`; its own `device.type == "cuda"`
-branches fall back to generic paths on "mojo", e.g. one SM's worth of
-partial weight gradients). NVIDIA only: Triton's AMD backend would need the
-same driver over the HIP handles.
+`triton` wheel installed: Triton compiles and launches through its own GPU
+backend (bundled `ptxas`, `libcuda` or `libamdhip64` from the display
+driver) and asks torch only which device and stream are current, through a
+driver object. `torch_mojo_backend/triton_driver.py` provides that driver
+for the mojo device (a CUDA and an untested HIP variant, chosen by the
+accelerator MAX drives); `register_mojo_devices()` installs it the moment
+`triton.runtime.driver` is imported, or at once if it already is
+(`TORCH_MOJO_BACKEND_TRITON=0` opts out; `enable_triton()` does it by
+hand). Launches go to the mojo current stream's vendor handle
+(`torch.mojo.stream_native_handle`), so they are ordered with our kernels;
+like `torch.cuda`, a launch targets the *current* device, so select it
+(`with torch.mojo.device(i):`) for tensors on another GPU. The autotuner
+and `triton.testing.do_bench` time through the mojo device's events. The
+CUDA device ordinal is the mojo device index. Checked with the Triton
+tutorial add kernel, an autotuned kernel, a second GPU, and Liger-Kernel's
+RMSNorm forward/backward (a package written against `torch.cuda`; its own
+`device.type == "cuda"` branches fall back to generic paths on "mojo", e.g.
+one SM's worth of partial weight gradients, and its autocast decorators
+bind to the CPU device type because it infers the device from
+`torch.cuda.is_available()`). With a CUDA build of torch, the installed
+driver still routes every Triton launch to the mojo current stream.
 
 ## Profiling
 
