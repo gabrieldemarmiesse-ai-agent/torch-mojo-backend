@@ -22,6 +22,9 @@ def register_mojo_devices():
     global _registered
     if _registered:
         return
+    # set first: torch's own registrations below are not repeatable, so a
+    # failure later in this function must not make a retry redo them
+    _registered = True
     # Module._apply otherwise replaces a shared CPU Parameter independently in
     # each child module; swapping preserves tied weights (GPT-2's token
     # embedding and lm_head) as one Parameter and one allocation.
@@ -35,4 +38,3 @@ def register_mojo_devices():
     install_triton_hook()
     warn_if_gpu_torch_on_hip()
     register_distributed_backend()
-    _registered = True

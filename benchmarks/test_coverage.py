@@ -45,7 +45,9 @@ NATIVE_MOJO_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "native" / "mojo"
 # `impl[op_add_tensor](lib, "add.Tensor")` in an ops_*.mojo file IS the
 # registration (see docs/native_backend.md): the backend registers its ops
 # from Mojo, so the list is read from the source rather than imported.
-_IMPL_RE = re.compile(r'impl\[[^\]]+\]\(\s*lib,\s*"([^"]+)"')
+# `impl[op_x, "name.overload"](site)` in each register_<group> (registry.mojo);
+# the formatter may break the call over several lines
+_IMPL_RE = re.compile(r'impl\[\s*\w+\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S)
 
 
 def registered_ops() -> set[str]:

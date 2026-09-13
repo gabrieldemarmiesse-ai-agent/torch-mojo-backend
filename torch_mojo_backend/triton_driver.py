@@ -232,7 +232,8 @@ class _AfterTritonDriverImport(importlib.abc.MetaPathFinder, importlib.abc.Loade
 
     def exec_module(self, module: ModuleType):
         self._loader.exec_module(module)
-        module.driver.set_active(make_driver())
+        if accelerator_api() in ("cuda", "hip"):  # never break an unrelated import
+            module.driver.set_active(make_driver())
 
 
 def install_triton_hook():
@@ -243,6 +244,7 @@ def install_triton_hook():
     if importlib.util.find_spec("triton") is None:
         return
     if _DRIVER_MODULE in sys.modules:
-        enable_triton()
+        if accelerator_api() in ("cuda", "hip"):
+            enable_triton()
     elif not any(isinstance(f, _AfterTritonDriverImport) for f in sys.meta_path):
         sys.meta_path.insert(0, _AfterTritonDriverImport())

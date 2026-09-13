@@ -78,6 +78,17 @@ jobs:
           restore-keys: |
             modular-${{ matrix.test-index }}
       
+      # The native backend compiles its shim, base library, op extensions and
+      # kernel specializations on first use; keyed by their sources, so a run
+      # that changes nothing native reuses the previous run's builds.
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: torch_mojo_backend/eager_kernels/__mojocache__/native
+          key: native-${{ matrix.test-index }}-${{ matrix.mojo-device }}-${{ hashFiles('torch_mojo_backend/native/**', 'torch_mojo_backend/eager_kernels/**/*.mojo', 'uv.lock') }}
+          restore-keys: |
+            native-${{ matrix.test-index }}-${{ matrix.mojo-device }}-
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
       
