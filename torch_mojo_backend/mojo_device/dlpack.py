@@ -100,6 +100,14 @@ _pyapi.Py_IncRef.restype = None
 _pyapi.Py_DecRef.argtypes = [ctypes.py_object]
 _pyapi.Py_DecRef.restype = None
 
+# A second handle on the same symbols, taking the capsule as a Python object
+# rather than as a raw address: ctypes caches one function object per name per
+# library, so `argtypes` cannot be both at once and the two callers above and
+# below need different ones.
+_pyapi_obj = ctypes.PyDLL(None)
+_pyapi_obj.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+_pyapi_obj.PyCapsule_GetPointer.restype = ctypes.c_void_p
+
 
 class _ExportState:
     """Python objects that must outlive one exported DLManagedTensor.
@@ -309,3 +317,30 @@ def make_capsule_privateuse1(
     tagged with MAX's own vendor device type (see compiler.py).
     """
     return _build_capsule(holder, data_ptr, shape, dtype, _KDL_EXT_DEV, device_index)
+
+
+def retag_capsule(capsule: object, device_type: int, device_id: int) -> object:
+    """Rewrite the device recorded in an unconsumed "dltensor" capsule.
+
+    The producer of a capsule decides which DLPack device code it carries,
+    and that code is the only thing an importer looks at to pick the torch
+    device -- but the *memory* is the same either way when the two devices
+    are two names for one piece of hardware. That is exactly the mojo/CUDA
+    pair: a mojo tensor exports ``kDLExtDev``, a CUDA tensor exports
+    ``kDLCUDA``, and both are a pointer into the same device's address
+    space. Retagging is therefore how `cuda_interop` builds an alias --
+    torch's own exporter fills in shape, strides, offset and dtype, and its
+    deleter keeps the source tensor alive, which a hand-built capsule
+    (`make_capsule*` above) would have to redo.
+
+    The capsule is mutated in place and returned. Only a capsule the
+    consumer has not adopted yet ("dltensor", not "used_dltensor") can be
+    retagged: `PyCapsule_GetPointer` raises `ValueError` for anything else,
+    which `PyDLL` turns back into a Python exception here.
+    """
+    managed = ctypes.cast(
+        _pyapi_obj.PyCapsule_GetPointer(capsule, _CAPSULE_NAME),
+        ctypes.POINTER(_DLManagedTensor),
+    )
+    managed.contents.dl_tensor.device = _DLDevice(device_type, device_id)
+    return capsule
