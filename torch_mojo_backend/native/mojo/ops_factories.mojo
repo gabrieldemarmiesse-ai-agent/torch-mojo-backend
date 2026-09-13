@@ -385,6 +385,46 @@ def op_normal_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, t)
 
 
+# aten::random_.from(Tensor(a!) self, int from, int? to, *, Generator? generator=None) -> Tensor(a!)
+# aten::random_.to(Tensor(a!) self, int to, *, Generator? generator=None) -> Tensor(a!)
+# aten::random_(Tensor(a!) self, *, Generator? generator=None) -> Tensor(a!)
+def _random_host(
+    overload: StaticString, args: Values, rets: Values, n_scalars: Int
+) raises:
+    """torch.randint / random_ on the device: drawn by the host kernel on a
+    CPU scratch tensor (the host's default CPU generator, like normal_),
+    then copied over; `n_scalars` integer arguments follow `self`."""
+    var t = v_tensor(args[unsafe_offset=0])
+    if v_generator(args[unsafe_offset=1 + n_scalars]) != 0:
+        unsupported(
+            "aten::random_ on the mojo device draws from the host's default"
+            " CPU generator; an explicit generator= is not supported"
+        )
+    var cpu = own(cpu_empty(t.shape, t.rank, t.stype))
+    var call_args = List[Value](capacity=2 + n_scalars)
+    call_args.append(Value(TAG_TENSOR, 0, Int64(cpu.t.h), 0))
+    for i in range(n_scalars):
+        call_args.append(args[unsafe_offset=1 + i].copy())
+    call_args.append(Value(TAG_NONE, 0, 0, 0))
+    var host_rets = call_op("aten::random_", String(overload), call_args^, 1)
+    if host_rets[0].tag == TAG_TENSOR:
+        release(Int(host_rets[0].a))
+    _copy_cpu_into(t, cpu.t)
+    ret_ref(rets, 0, t)
+
+
+def op_random_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _random_host("from", args, rets, 2)
+
+
+def op_random_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _random_host("to", args, rets, 1)
+
+
+def op_random_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _random_host("", args, rets, 0)
+
+
 # ---------------------------------------------------------------------------
 # native_dropout / native_dropout_backward -- float32 GPU only, matching the
 # old eager path exactly (dropout_ops family: NativeDropoutF32,
@@ -532,6 +572,9 @@ def _native_dropout_backward_fill(
 
 
 def register_factories(lib: Lib) raises:
+    impl[op_random_from](lib, "random_.from")
+    impl[op_random_to](lib, "random_.to")
+    impl[op_random_](lib, "random_")
     impl[op_arange_start_out](lib, "arange.start_out")
     impl[op_uniform_](lib, "uniform_")
     impl[op_normal_](lib, "normal_")
