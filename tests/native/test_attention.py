@@ -22,6 +22,8 @@ EFFICIENT = 2
 
 # FA4 runs on Hopper only; every other GPU declines every flash route.
 _HOPPER_ONLY = "the FA4 kernels are compiled for sm_90a"
+# The fused MFMA flash forward/backward exists on CDNA3 only.
+_GFX942_ONLY = "the fused MFMA flash kernels are compiled for gfx942"
 
 
 def _counted(name: str) -> int:
@@ -70,6 +72,16 @@ def _tol(dtype: torch.dtype) -> float:
         return 3e-2
     if dtype == torch.float16:
         return 5e-3
+    return 1e-4
+
+
+def _grad_tol(dtype: torch.dtype) -> float:
+    """Same, for gradients: the backward rounds P and dS to `dtype` before its
+    second GEMMs, so it carries about twice the forward's error."""
+    if dtype == torch.bfloat16:
+        return 6e-2
+    if dtype == torch.float16:
+        return 1e-2
     return 1e-4
 
 
@@ -162,6 +174,8 @@ def test_flash_attention_backward(mojo_gpu, counting, head_dim):
 
 
 def test_flash_attention_declines_float32(mojo_gpu, counting):
+    if _arch(mojo_gpu) == "gfx942":
+        pytest.skip("the fused gfx942 route serves float32 (baseline kernels)")
     _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 1, 128, 128, 64)
     with pytest.raises(NotImplementedError):
         aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)
@@ -185,6 +199,37 @@ def test_flash_attention_backward_refuses_partial_tail(mojo_gpu, counting):
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[0]
     with pytest.raises(NotImplementedError):
         out.backward(torch.ones_like(out))
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(1, 2, 200, 64), (1, 2, 8, 8)])
+def test_fused_flash_backward_partial_tail_gfx942(
+    mojo_gpu, counting, shape, dtype, is_causal
+):
+    """The gfx942 MFMA backward accepts any seqlen. Its dK/dV kernel runs a
+    partial last query tile (and a whole sequence shorter than one tile)
+    through its masked path, which used to apply the causal bound even for
+    non-causal attention and silently dropped every q < kv term of the tail
+    keys (regression: 1x2x8x8 non-causal dK was off by 1.4 on a 1.8 range)."""
+    if _arch(mojo_gpu) != "gfx942":
+        pytest.skip(_GFX942_ONLY)
+    batch, heads, seq, head_dim = shape
+    qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, batch, heads, seq, seq, head_dim)
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, is_causal)[0]
+    out.backward(torch.ones_like(out))
+    assert _counted("_scaled_dot_product_flash_attention_backward") == 1
+    F.scaled_dot_product_attention(qr, kr, vr, is_causal=is_causal).backward(
+        torch.ones_like(qr)
+    )
+    tol = _grad_tol(dtype)
+    for got, want in ((q, qr), (k, kr), (v, vr)):
+        assert got.grad is not None and want.grad is not None
+        torch.testing.assert_close(
+            got.grad.contiguous().cpu().float(), want.grad, atol=tol, rtol=tol
+        )
 
 
 # --------------------------------------------------------------------------
@@ -310,7 +355,9 @@ def test_fused_sdp_choice_flash(mojo_gpu, counting):
 
 def test_fused_sdp_choice_efficient_for_inference(mojo_gpu, counting):
     _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 1, 64, 64)
-    assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == EFFICIENT
+    # gfx942's fused flash route takes float32 and q_len 1; nothing else does.
+    want = FLASH if _arch(mojo_gpu) == "gfx942" else EFFICIENT
+    assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == want
 
 
 def test_fused_sdp_choice_math_when_grad_is_needed(mojo_gpu, counting):
@@ -318,7 +365,9 @@ def test_fused_sdp_choice_math_when_grad_is_needed(mojo_gpu, counting):
     grad-requiring call must be sent to the differentiable decomposition."""
     _, _, _, q, k, v = _qkv(mojo_gpu, torch.float32, 1, 2, 8, 8, 8)
     q.requires_grad_()
-    assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == MATH
+    # gfx942's fused flash route has a float32 backward; nothing else does.
+    want = FLASH if _arch(mojo_gpu) == "gfx942" else MATH
+    assert aten._fused_sdp_choice(q, k, v, None, 0.0, False) == want
 
 
 def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
