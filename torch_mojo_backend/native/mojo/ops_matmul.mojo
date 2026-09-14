@@ -196,6 +196,9 @@ def _gemm16_available() raises -> Bool:
             "gemm16_v3_kernels.mojo",
             "gemm16_tn_v4_kernels.mojo",
             "gemm16_kernels.mojo",
+            "gemm16_candidate_dispatch.mojo",
+            "gemm16_rolling_kernels.mojo",
+            "gemm16_nt_bias_kernels.mojo",
         ],
     )
 
@@ -337,6 +340,29 @@ def _bias_fits(bias: T, n: Int, stype: Int32, device: Int) -> Bool:
     )
 
 
+comptime GEMM16_FAMILY = "gemm16_matmul_ops"
+
+
+def _gemm16_tuning(mut call: KernelCall):
+    """The build settings the gemm16 candidate kernels were measured with.
+
+    They are `-D` defines of the kernel family, not of this extension, so
+    they have to travel on the call that builds it; passing them through
+    `KernelCall.flag` also puts them in the specialization key, so changing
+    one here compiles (and caches) its own library rather than silently
+    reusing the last one. `get_defined_bool` reads 1 as true.
+
+    All three were fitted on an H100 PCIe, the card the candidates were
+    measured on: PAIR_CAST selects the paired bf16 conversion of the rolling
+    NN epilogue, TUNE_NT_ROLLING the fused NT kernel's rolling stage/parity
+    counters, and TUNE_NT_RASTER its raster height (upstream's default is
+    16). No matrix dimension is ever a compile-time constant.
+    """
+    call.flag("PAIR_CAST", 1)
+    call.flag("TUNE_NT_ROLLING", 1)
+    call.flag("TUNE_NT_RASTER", 8)
+
+
 def _gemm_bridge(
     family: StaticString,
     op: StaticString,
@@ -383,6 +409,8 @@ def _gemm_bridge(
     if has_bias:
         call.arg_dtype(2, dt)
     call.out_dtype(dt)
+    if family == GEMM16_FAMILY:
+        _gemm16_tuning(call)
     call.flag("HAS_BIAS", 1 if has_bias else 0)
     call.flag("TRANSPOSE_B", 1 if transpose_b else 0)
     call.int(out.t.ptr)
@@ -441,6 +469,113 @@ def _bmm_bridge(
     call.int(ctx_ptr(ctx))
     call.run()
     _ = ctx
+    return out.take()
+
+
+def _nt_bias_regime(m: Int, n: Int, k: Int) -> Bool:
+    """The cheap metadata half of the fused NT-bias gate.
+
+    A copy of the shape predicate `try_enqueue_candidate_nt_bias` applies
+    (gemm16_candidate_dispatch.mojo), restated here for one reason: without
+    it every biased projection on the device would allocate an output and
+    cross into the kernel family only to be declined. The kernel-side helper
+    stays the authoritative gate -- it alone checks dtype, architecture,
+    pointer alignment, TMA extents and launch resources -- so this one is
+    allowed to be looser, never tighter.
+    """
+    if m < 4096 or n < 1024 or k < 1024:
+        return False
+    if m % 128 != 0 or n % 64 != 0 or k % 64 != 0:
+        return False
+    # The residue-64 regime the candidate was fitted for; 128-aligned N and K
+    # keep the routes they had.
+    if n % 128 != 64 and k % 128 != 64:
+        return False
+    # max(n, k) <= 8 * min(n, k), without the overflow: a vocabulary
+    # projection is far outside the measured aspect band.
+    return 1 + (max(n, k) - 1) // 8 <= min(n, k)
+
+
+def _try_gemm16_nt_bias_fused(
+    a: Mat,
+    b: Mat,
+    transpose_b: Bool,
+    bias: T,
+    dt: DType,
+    stype: Int32,
+    device: Int,
+    out_dims: List[Int],
+) raises -> Optional[T]:
+    """`C = A @ B.T + bias` in ONE launch, or None when nothing was launched.
+
+    `Gemm16` always hands back an output tensor, so a kernel that declines
+    inside it is indistinguishable from one that ran: this OP adds a host
+    status slot that says which happened. On None the caller must fall back
+    to its ORIGINAL unbiased GEMM plus broadcasting add -- never to the old
+    bias-enabled ladder, which is the slow accepted mma.sync kernel.
+
+    The caller has already checked the operands belong to gemm16 (dtype,
+    device, sm_90a, family present); everything specific to the fused
+    kernel is checked here and, finally, inside the kernel helper itself.
+    """
+    var m = a.rows
+    var k = a.cols
+    var n = b.rows if transpose_b else b.cols
+    var rhs_k = b.cols if transpose_b else b.rows
+    if m <= 0 or n <= 0 or k <= 0 or rhs_k != k:
+        return None
+    # The kernel reads A as (M, K) row-major and B as (N, K) row-major: the
+    # physical NT pair, whatever combination of view and requested transpose
+    # produced it. A transposed weight view makes an aten::linear physically
+    # NN, and that is a different kernel's call.
+    if a.t != 0 or (b.t ^ (1 if transpose_b else 0)) != 1:
+        return None
+    # The candidate is bf16 only; float16 keeps every route it had.
+    if dt != DType.bfloat16:
+        return None
+    if not _bias_fits(bias, n, stype, device):
+        return None
+    if not _nt_bias_regime(m, n, k):
+        return None
+    var dims = List[Int]()
+    if len(out_dims) == 0:
+        dims.append(m)
+        dims.append(n)
+    else:
+        dims = out_dims.copy()
+        if dims[len(dims) - 1] != n or _prod(dims) != m * n:
+            return None
+    var out = own(_new(dims, stype, device))
+    var ctx = ctx_for(device)
+    # The kernel family writes its verdict here. It is a host Int64 whose
+    # address travels as a slot, so it -- like `ctx` and `out` -- must still
+    # be alive when `run()` returns: reading it below is what keeps it so.
+    var accepted = Int64(0)
+    var call = KernelCall(GEMM16_FAMILY, "Gemm16NTBiasTry")
+    call.arg_dtype(0, dt)
+    call.arg_dtype(1, dt)
+    call.arg_dtype(2, dt)
+    call.out_dtype(dt)
+    _gemm16_tuning(call)
+    call.int(out.t.ptr)
+    call.int(a.ptr)
+    call.int(b.ptr)
+    call.int(bias.ptr)
+    call.int(m)
+    call.int(n)
+    call.int(k)
+    call.int(0)  # transpose_a: physical NT, checked above
+    call.int(1)  # transpose_b
+    call.int(1)  # has_bias
+    call.int(ctx_ptr(ctx))
+    call.int(Int(Pointer(to=accepted)))
+    call.run()
+    _ = ctx
+    if accepted == 0:
+        # Nothing was enqueued: drop the unused output and let the caller's
+        # original route run.
+        return None
+    _ = accepted
     return out.take()
 
 
@@ -576,12 +711,18 @@ def _alignment_favors_split(a: Mat, b: Mat, transpose_b: Bool) -> Bool:
 def _try_gemm16_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
     """A dense rank >= 2 16-bit projection without copies.
 
-    Every gemm16 tensor-core route declines outright when a bias is present,
-    so a fused-bias call would silently fall back to the far slower accepted
-    mma.sync kernel (measured 3.6-7.4x stock on deep-K shapes, versus ~1.3x
-    for the identical unbiased mm). When the shape could reach a fast route at
-    all (`_alignment_favors_split`), compute the bias-free mm and add the bias
-    afterwards with the ordinary broadcasting add instead.
+    ONE gemm16 route computes a bias: the fused NT kernel, over the narrow
+    bf16 shape regime it was measured on (`_try_gemm16_nt_bias_fused`). It is
+    tried first and, when it takes the call, its single launch IS the result
+    -- no second add ever runs on that output.
+
+    Every other tensor-core route declines outright when a bias is present,
+    so a fused-bias call through them would silently fall back to the far
+    slower accepted mma.sync kernel (measured 3.6-7.4x stock on deep-K
+    shapes, versus ~1.3x for the identical unbiased mm). When the shape could
+    reach a fast route at all (`_alignment_favors_split`), compute the
+    bias-free mm and add the bias afterwards with the ordinary broadcasting
+    add instead.
     """
     if not _gemm16_gate(a, w):
         return None
@@ -604,6 +745,18 @@ def _try_gemm16_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
             a.device,
             dims,
         )
+    var fused = _try_gemm16_nt_bias_fused(
+        am.value(),
+        wm.value(),
+        True,
+        bias.value(),
+        a.dtype,
+        a.stype,
+        a.device,
+        dims,
+    )
+    if fused:
+        return fused.value().copy()
     if _alignment_favors_split(am.value(), wm.value(), True):
         var mm_out = _gemm_bridge(
             "gemm16_matmul_ops",
@@ -941,11 +1094,28 @@ def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
     var opt_bias = Optional[T](bias.copy())
-    # See _try_gemm16_linear: every gemm16 tensor-core route declines outright
-    # when a bias is present, so compute the bias-free mm and add separately
-    # whenever the shape could plausibly reach one.
     var am = _dense_2d(mat1)
     var bm = _dense_2d(mat2)
+    # The one gemm16 route that computes a bias itself: a `mat2` stored
+    # transposed is the physical NT pair the fused kernel takes, and the
+    # usual `input @ weight.T` addmm is exactly that view. On acceptance its
+    # single launch is the whole result.
+    if am and bm and _gemm16_gate(mat1, mat2):
+        var fused = _try_gemm16_nt_bias_fused(
+            am.value(),
+            bm.value(),
+            False,
+            bias,
+            mat1.dtype,
+            mat1.stype,
+            mat1.device,
+            List[Int](),
+        )
+        if fused:
+            return fused.value().copy()
+    # See _try_gemm16_linear: every other gemm16 tensor-core route declines
+    # outright when a bias is present, so compute the bias-free mm and add
+    # separately whenever the shape could plausibly reach one.
     if am and bm and _alignment_favors_split(am.value(), bm.value(), False):
         var mm_out = _try_gemm16_mm(mat1, mat2, None, False, List[Int]())
         if mm_out:
