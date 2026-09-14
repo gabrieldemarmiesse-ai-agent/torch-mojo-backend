@@ -4,6 +4,23 @@ Run of `docs/amd_validation_plan.md` on the Adastra cluster (CINES),
 2026-09-13, branch `mojo-native-backend` at 588f776. Everything below was run
 by an agent on one exclusive MI300A node; the sections follow the plan.
 
+## At a glance
+
+| section | outcome |
+|---|---|
+| 1 setup / first contact | works: shim 6 s, base library 13 s, api = hip, 4 GPUs; every HIP vendor binding worked at first try; the process exit segfault with the VMM knob is Modular's known bug |
+| 2 runtime + op groups (`tests/native/`) | 1911 passed after the fixes; the only real failures were the three findings below; the fp32 GEMM bug was found by the very first `torch.mm` |
+| 3 whole suite | see the table in section 3 (fifth launch; two were OOM-killed by my own agents' memory use, one was scancel'ed by an agent) |
+| 3 conformance | no AMD delta needed except two operators that decline empty tensors; 13 one-ulp nodes anchored to float64 per accelerator; **2 failed** (`pow`, `__rpow__` float32: a real 14-ulp precision gap, not fixed) |
+| 4 distributed | RCCL 40 / 40, mojoccl 7 / 7, 4-rank nanoGPT on both, losses match |
+| 5 Triton on HIP | works after one fix (second-device launch); liger-kernel RMSNorm correct and benchmarked through the HIP driver |
+| 6 Inductor | made to work on HIP within the hour: 8 / 8 |
+| 7 cuda_interop (ROCm torch wheel) | the two HIP runtimes coexist; 27 passed, 1 skipped; ordinals match; `benchmarks/` could not complete (compile-bound) |
+| 8 prebuilt libraries | shims for torch 2.7 to 2.14 and the base library build; the wheel's prebuilt base library drives the MI300A; the compile fallback works |
+| 9 performance | ours / stock ROCm torch: 1.05 to 1.12 on one GPU, 1.05 (RCCL) and 1.03 (mojoccl) on 4-rank DDP at batch 48, 1.10 / 1.07 at batch 12 |
+| fixes | 5 bugs fixed + Inductor HIP support + conformance instrument, each its own commit with a test; sm_90a assembly unchanged for the two kernel fixes; nothing run on an H100 |
+| open | fp32 `pow` precision (finding 5); run-to-run nondeterminism of our training losses (stock is bit-reproducible here); the mojoccl batch-48 bimodality |
+
 ## 1. Environment
 
 | item | value |
