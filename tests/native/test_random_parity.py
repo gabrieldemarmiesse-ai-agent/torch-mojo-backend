@@ -16,9 +16,9 @@ import pytest
 import torch
 
 from tests.native import rng_parity_cases as cases
-from torch_mojo_backend.native import device_module
 from tests.native.rng_parity_dump import Record, digest_of, run_case
 from torch_mojo_backend import get_accelerators
+from torch_mojo_backend.native import device_module
 
 _GOLDEN = json.loads((Path(__file__).with_name("rng_golden.json")).read_text())
 

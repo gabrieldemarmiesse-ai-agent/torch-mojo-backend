@@ -194,6 +194,189 @@ def _tan_acc[ACC: DType](v: Scalar[ACC]) -> Scalar[ACC]:
         return rebind[Scalar[ACC]](nv_fast_tanf(rebind[Float32](v)))
 
 
+# ---------------------------------------------------------------------------
+# One transform per distribution: `w` is one curand4 result, the return is
+# the UNROLL output values (ATen/core/TransformationHelper.h).
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _draw_uniform[
+    dtype: DType, N: Int
+](
+    w: U32x4,
+    from_out: Scalar[dtype],
+    to_out: Scalar[dtype],
+    from_acc: Scalar[acc_dtype[dtype]()],
+    range_acc: Scalar[acc_dtype[dtype]()],
+) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var u = _uniform_acc[ACC, N](w)
+    var value = fma(u, SIMD[ACC, N](range_acc), SIMD[ACC, N](from_acc)).cast[
+        dtype
+    ]()
+    # curand's (0, 1] folded onto [from, to): `value == to ? from : value`.
+    return value.eq(SIMD[dtype, N](to_out)).select(
+        SIMD[dtype, N](from_out), value
+    )
+
+
+@always_inline
+def _draw_normal[
+    dtype: DType, N: Int
+](
+    w: U32x4, mean: Scalar[acc_dtype[dtype]()], std: Scalar[acc_dtype[dtype]()]
+) -> SIMD[acc_dtype[dtype](), N]:
+    comptime ACC = acc_dtype[dtype]()
+    return fma(_normal_acc[ACC, N](w), SIMD[ACC, N](std), SIMD[ACC, N](mean))
+
+
+@always_inline
+def _draw_log_normal[
+    dtype: DType, N: Int
+](
+    w: U32x4, mean: Scalar[acc_dtype[dtype]()], std: Scalar[acc_dtype[dtype]()]
+) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var n = _draw_normal[dtype, N](w, mean, std)
+    var out = SIMD[ACC, N]()
+
+    comptime for i in range(N):
+        out[i] = _exp_acc[ACC](n[i])
+    return out.cast[dtype]()
+
+
+@always_inline
+def _cauchy_one[
+    ACC: DType
+](u: Scalar[ACC], median: Scalar[ACC], sigma: Scalar[ACC]) -> Scalar[ACC]:
+    comptime if ACC == DType.float32:
+        # __tanf overflows at the ends of (0, 1); float32 only.
+        comptime ONE_MINUS = Float32(1.0) - _EPS_F32
+        var v = rebind[Float32](u)
+        if v > ONE_MINUS:
+            v = ONE_MINUS
+        if v < _EPS_F32:
+            v = _EPS_F32
+        var t = nv_fast_tanf(_PI_F32 * (v - Float32(0.5)))
+        return fma(sigma, rebind[Scalar[ACC]](t), median)
+    else:
+        var t = nv_tan(_PI_F64 * (rebind[Float64](u) - Float64(0.5)))
+        return fma(sigma, rebind[Scalar[ACC]](t), median)
+
+
+@always_inline
+def _draw_cauchy[
+    dtype: DType, N: Int
+](
+    w: U32x4,
+    median: Scalar[acc_dtype[dtype]()],
+    sigma: Scalar[acc_dtype[dtype]()],
+) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var u = _uniform_acc[ACC, N](w)
+    var out = SIMD[ACC, N]()
+
+    comptime for i in range(N):
+        out[i] = _cauchy_one[ACC](u[i], median, sigma)
+    return out.cast[dtype]()
+
+
+@always_inline
+def _exponential_one[
+    ACC: DType
+](u: Scalar[ACC], lambd: Scalar[ACC]) -> Scalar[ACC]:
+    # curand's range is (0, 1]: log(1) == 0 is excluded by hand.
+    var lg: Scalar[ACC]
+    comptime if ACC == DType.float32:
+        var v = rebind[Float32](u)
+        if v >= Float32(1.0) - _EPS_F32 / 2:
+            lg = rebind[Scalar[ACC]](-_EPS_F32 / 2)
+        else:
+            lg = rebind[Scalar[ACC]](nv_fast_logf(v))
+    else:
+        var v = rebind[Float64](u)
+        if v >= Float64(1.0) - _EPS_F64 / 2:
+            lg = rebind[Scalar[ACC]](-_EPS_F64 / 2)
+        else:
+            lg = rebind[Scalar[ACC]](nv_log(v))
+    return (Scalar[ACC](-1.0) / lambd) * lg
+
+
+@always_inline
+def _draw_exponential[
+    dtype: DType, N: Int
+](w: U32x4, lambd: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var u = _uniform_acc[ACC, N](w)
+    var out = SIMD[ACC, N]()
+
+    comptime for i in range(N):
+        out[i] = _exponential_one[ACC](u[i], lambd)
+    return out.cast[dtype]()
+
+
+@always_inline
+def _draw_geometric[
+    dtype: DType, N: Int
+](w: U32x4, p: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var u = _uniform_acc[ACC, N](w)
+    var out = SIMD[ACC, N]()
+
+    comptime for i in range(N):
+        out[i] = ceil(_log_acc[ACC](u[i]) / _log1p_acc[ACC](-p))
+    return _float_to[dtype, ACC, N](out)
+
+
+@always_inline
+def _draw_bernoulli[
+    dtype: DType, N: Int
+](w: U32x4, p: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = acc_dtype[dtype]()
+    var keep = _uniform_acc[ACC, N](w).lt(SIMD[ACC, N](p))
+    comptime if dtype == DType.bool:
+        return rebind[SIMD[dtype, N]](keep)
+    else:
+        return keep.cast[dtype]()
+
+
+@always_inline
+def _random_words[N: Int](w: U32x4) -> SIMD[DType.uint64, N]:
+    """The integer draw: four u32 words, or two u64 (hi << 32 | lo) pairs."""
+    comptime if N == 4:
+        return rebind[SIMD[DType.uint64, N]](w.cast[DType.uint64]())
+    else:
+        return rebind[SIMD[DType.uint64, N]](_u64_pairs(w))
+
+
+@always_inline
+def _draw_random_from_to[
+    dtype: DType, N: Int
+](w: U32x4, range_bits: Int64, base: Int64) -> SIMD[dtype, N]:
+    """`(val % range) + base` in uint64, then `static_cast<int64_t>`."""
+    var range_ = UInt64(range_bits.cast[DType.uint64]())
+    var b = SIMD[DType.uint64, N](base.cast[DType.uint64]())
+    var val = _random_words[N](w)
+    return _int64_to[dtype, N](((val % range_) + b).cast[DType.int64]())
+
+
+@always_inline
+def _draw_random_full_64[dtype: DType, N: Int](w: U32x4) -> SIMD[dtype, N]:
+    return _int64_to[dtype, N](_random_words[N](w).cast[DType.int64]())
+
+
+@always_inline
+def _draw_random[dtype: DType, N: Int](w: U32x4) -> SIMD[dtype, N]:
+    """`transformation::uniform_int`."""
+    var val = _random_words[N](w)
+    comptime if dtype == DType.bool:
+        return rebind[SIMD[dtype, N]]((val & 1).ne(0))
+    else:
+        comptime M: UInt64 = _uniform_int_modulus[dtype]()
+        return _int64_to[dtype, N]((val % M).cast[DType.int64]())
+
+
 @always_inline
 def dist_draw[
     dtype: DType, DIST: Int
@@ -213,108 +396,27 @@ def dist_draw[
     exponential (-, -, lambda, -); geometric / bernoulli (-, -, p, -);
     random_from_to (range bits in i0, base in i1).
     """
-    comptime ACC = acc_dtype[dtype]()
     comptime N = dist_unroll[DIST, dtype]()
     comptime if DIST == DIST_UNIFORM:
-        var u = _uniform_acc[ACC, N](w)
-        var value = fma(u, SIMD[ACC, N](p_acc1), SIMD[ACC, N](p_acc0)).cast[
-            dtype
-        ]()
-        # curand's (0, 1] folded onto [from, to): `value == to ? from : value`.
-        return value.eq(SIMD[dtype, N](p_out1)).select(
-            SIMD[dtype, N](p_out0), value
-        )
+        return _draw_uniform[dtype, N](w, p_out0, p_out1, p_acc0, p_acc1)
     elif DIST == DIST_NORMAL:
-        var n = _normal_acc[ACC, N](w)
-        return fma(n, SIMD[ACC, N](p_acc1), SIMD[ACC, N](p_acc0)).cast[dtype]()
+        return _draw_normal[dtype, N](w, p_acc0, p_acc1).cast[dtype]()
     elif DIST == DIST_LOG_NORMAL:
-        var n = fma(
-            _normal_acc[ACC, N](w), SIMD[ACC, N](p_acc1), SIMD[ACC, N](p_acc0)
-        )
-        var out = SIMD[ACC, N]()
-
-        comptime for i in range(N):
-            out[i] = _exp_acc[ACC](n[i])
-        return out.cast[dtype]()
+        return _draw_log_normal[dtype, N](w, p_acc0, p_acc1)
     elif DIST == DIST_CAUCHY:
-        var u = _uniform_acc[ACC, N](w)
-        var out = SIMD[ACC, N]()
-
-        comptime for i in range(N):
-            comptime if ACC == DType.float32:
-                # __tanf overflows at the ends of (0, 1); float32 only.
-                comptime ONE_MINUS = Float32(1.0) - _EPS_F32
-                var v = rebind[Float32](u[i])
-                if v > ONE_MINUS:
-                    v = ONE_MINUS
-                if v < _EPS_F32:
-                    v = _EPS_F32
-                var t = nv_fast_tanf(_PI_F32 * (v - Float32(0.5)))
-                out[i] = fma(p_acc1, rebind[Scalar[ACC]](t), p_acc0)
-            else:
-                var v = rebind[Float64](u[i])
-                var t = nv_tan(_PI_F64 * (v - Float64(0.5)))
-                out[i] = fma(p_acc1, rebind[Scalar[ACC]](t), p_acc0)
-        return out.cast[dtype]()
+        return _draw_cauchy[dtype, N](w, p_acc0, p_acc1)
     elif DIST == DIST_EXPONENTIAL:
-        var u = _uniform_acc[ACC, N](w)
-        var out = SIMD[ACC, N]()
-
-        comptime for i in range(N):
-            var lg: Scalar[ACC]
-            # curand's range is (0, 1]: log(1) == 0 is excluded by hand.
-            comptime if ACC == DType.float32:
-                var v = rebind[Float32](u[i])
-                if v >= Float32(1.0) - _EPS_F32 / 2:
-                    lg = rebind[Scalar[ACC]](-_EPS_F32 / 2)
-                else:
-                    lg = rebind[Scalar[ACC]](nv_fast_logf(v))
-            else:
-                var v = rebind[Float64](u[i])
-                if v >= Float64(1.0) - _EPS_F64 / 2:
-                    lg = rebind[Scalar[ACC]](-_EPS_F64 / 2)
-                else:
-                    lg = rebind[Scalar[ACC]](nv_log(v))
-            out[i] = (Scalar[ACC](-1.0) / p_acc0) * lg
-        return out.cast[dtype]()
+        return _draw_exponential[dtype, N](w, p_acc0)
     elif DIST == DIST_GEOMETRIC:
-        var u = _uniform_acc[ACC, N](w)
-        var out = SIMD[ACC, N]()
-
-        comptime for i in range(N):
-            out[i] = ceil(_log_acc[ACC](u[i]) / _log1p_acc[ACC](-p_acc0))
-        return _float_to[dtype, ACC, N](out)
+        return _draw_geometric[dtype, N](w, p_acc0)
     elif DIST == DIST_BERNOULLI:
-        var u = _uniform_acc[ACC, N](w)
-        var keep = u.lt(SIMD[ACC, N](p_acc0))
-        comptime if dtype == DType.bool:
-            return rebind[SIMD[dtype, N]](keep)
-        else:
-            return keep.cast[dtype]()
-    elif DIST == DIST_RANDOM_FROM_TO_32:
-        var range_ = UInt64(i0.cast[DType.uint64]())
-        var base = SIMD[DType.uint64, N](i1.cast[DType.uint64]())
-        var val = rebind[SIMD[DType.uint64, N]](w.cast[DType.uint64]())
-        return _int64_to[dtype, N](((val % range_) + base).cast[DType.int64]())
-    elif DIST == DIST_RANDOM_FROM_TO_64:
-        var range_ = UInt64(i0.cast[DType.uint64]())
-        var base = SIMD[DType.uint64, N](i1.cast[DType.uint64]())
-        var val = rebind[SIMD[DType.uint64, N]](_u64_pairs(w))
-        return _int64_to[dtype, N](((val % range_) + base).cast[DType.int64]())
+        return _draw_bernoulli[dtype, N](w, p_acc0)
+    elif DIST == DIST_RANDOM_FROM_TO_32 or DIST == DIST_RANDOM_FROM_TO_64:
+        return _draw_random_from_to[dtype, N](w, i0, i1)
     elif DIST == DIST_RANDOM_FULL_64:
-        var val = rebind[SIMD[DType.uint64, N]](_u64_pairs(w))
-        return _int64_to[dtype, N](val.cast[DType.int64]())
-    elif DIST == DIST_RANDOM_32:
-        var val = rebind[SIMD[DType.uint64, N]](w.cast[DType.uint64]())
-        comptime if dtype == DType.bool:
-            return rebind[SIMD[dtype, N]]((val & 1).ne(0))
-        else:
-            comptime M: UInt64 = _uniform_int_modulus[dtype]()
-            return _int64_to[dtype, N]((val % M).cast[DType.int64]())
-    else:  # DIST_RANDOM_64: int64 or float64
-        var val = rebind[SIMD[DType.uint64, N]](_u64_pairs(w))
-        comptime M: UInt64 = _uniform_int_modulus[dtype]()
-        return _int64_to[dtype, N]((val % M).cast[DType.int64]())
+        return _draw_random_full_64[dtype, N](w)
+    else:  # DIST_RANDOM_32 / DIST_RANDOM_64
+        return _draw_random[dtype, N](w)
 
 
 @always_inline
