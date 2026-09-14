@@ -60,7 +60,7 @@ def _target_id(accelerator: str | None) -> str:
     return accelerator or "no-accelerator"
 
 
-def _build(cmd: list[str]) -> None:
+def _build(cmd: list[str]):
     proc = subprocess.run(
         cmd, capture_output=True, text=True, env=native.compiler_env()
     )
