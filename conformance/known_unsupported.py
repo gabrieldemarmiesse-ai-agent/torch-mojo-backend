@@ -255,7 +255,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "log10": ("float32", "bfloat16", "float16", "int64", "bool"),
     "log1p": ("int64", "bool"),
     "log2": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "log_softmax": ("float32",),
     "log_softmax_with_dtype": ("float32", "bfloat16", "float16", "int64", "bool"),
     "logaddexp": ("float32", "bfloat16", "float16"),
     "logaddexp2": ("float32", "bfloat16", "float16"),
@@ -274,7 +273,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "masked_cumprod": ("float32", "bfloat16", "float16", "int64"),
     "masked_cumsum": ("float32", "bfloat16", "float16", "int64"),
     "masked_fill": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "masked_log_softmax": ("float32",),
     "masked_logaddexp": ("float32", "bfloat16", "float16"),
     "masked_logsumexp": ("float32", "bfloat16", "float16", "int64"),
     "masked_mean": ("float32", "bfloat16", "float16"),
@@ -284,8 +282,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "masked_prod": ("float32", "bfloat16", "float16", "int64", "bool"),
     "masked_scatter": ("float32", "bfloat16", "float16", "int64", "bool"),
     "masked_select": ("float32", "bfloat16", "float16", "int64", "bool"),
-    "masked_softmax": ("float32", "bfloat16", "float16"),
-    "masked_softmin": ("float32", "bfloat16", "float16"),
     "masked_std": ("int64",),
     "masked_sum": ("float32", "bfloat16", "float16", "int64", "bool"),
     "masked_var": ("int64",),
@@ -411,7 +407,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_selu": ("float32", "bfloat16", "float16"),
     "nn_functional_smooth_l1_loss": ("float32", "bfloat16", "float16"),
     "nn_functional_soft_margin_loss": ("float32", "bfloat16", "float16"),
-    "nn_functional_softmin": ("float32", "bfloat16", "float16"),
     "nn_functional_softmin_with_dtype": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_softplus": ("float32", "bfloat16", "float16"),
     "nn_functional_softshrink": ("float32", "bfloat16", "float16"),
@@ -470,7 +465,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "sin": ("int64", "bool"),
     "sinc": ("float32", "bfloat16", "float16", "int64", "bool"),
     "sinh": ("int64", "bool"),
-    "softmax": ("float32", "bfloat16", "float16"),
     "softmax_with_dtype": ("float32", "bfloat16", "float16", "int64", "bool"),
     "sort": ("float32", "bfloat16", "float16", "int64", "bool"),
     "sparse_sampled_addmm": ("float32",),
@@ -647,11 +641,10 @@ TABLE_NAMES: dict[str, str] = {
 _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
     "cpu": {
         "test_matches_cpu": {
-            "__rpow__": ("float32", "int64"),
             "bmm": ("float32", "int64"),
             "cumulative_trapezoid": ("float32", "bfloat16", "float16", "int64"),
-            "log_softmax": ("float32", "bfloat16", "float16"),
-            "masked_log_softmax": ("float32", "bfloat16", "float16"),
+            "log_softmax": ("bfloat16", "float16"),
+            "masked_log_softmax": ("bfloat16", "float16"),
             "native_dropout_backward": (
                 "float32",
                 "bfloat16",
@@ -662,17 +655,10 @@ _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
             "nn_functional_batch_norm": ("bfloat16", "float16"),
             "nn_functional_conv2d": ("bfloat16", "float16", "int64"),
             "nn_functional_instance_norm": ("bfloat16", "float16"),
-            "pow": ("float32", "int64"),
         },
         "test_errors_match": {},
     },
-    "gfx942": {
-        "test_matches_cpu": {
-            "log_softmax": ("float32", "bfloat16", "float16"),
-            "masked_log_softmax": ("float32", "bfloat16", "float16"),
-        },
-        "test_errors_match": {},
-    },
+    "gfx942": {"test_matches_cpu": {}, "test_errors_match": {}},
 }
 
 

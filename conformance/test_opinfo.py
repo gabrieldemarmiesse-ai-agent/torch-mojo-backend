@@ -319,6 +319,30 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
 #     crashes (RuntimeError from `torch_error.max()` on a 0-element sample
 #     tensor) before any comparison runs.
 _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
+    # sm_90a (H100), measured 2026-09-14 after the base tables were regenerated
+    # for the native backend: the same last-ulp class as gfx942's below (a
+    # reduction-order or one-ulp difference against CPU torch, no farther from
+    # float64 than torch's own result), which the absence-based tables cannot
+    # express and CPU-only CI never sees.
+    "sm_90a": frozenset(
+        {
+            ("__rpow__", torch.float32),
+            ("addr", torch.bfloat16),
+            ("addr", torch.float16),
+            ("bmm", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
+            ("nn_functional_conv2d", torch.bfloat16),
+            ("nn_functional_conv2d", torch.float16),
+            ("nn_functional_instance_norm", torch.bfloat16),
+            ("nn_functional_instance_norm", torch.float16),
+            ("pow", torch.float32),
+        }
+    ),
     "gfx942": frozenset(
         {
             ("bmm", torch.float32),
@@ -342,7 +366,7 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
             ("nn_functional_batch_norm", torch.bfloat16),
             ("nn_functional_batch_norm", torch.float16),
         }
-    )
+    ),
 }
 
 # Merged once at collection time: the base set plus this accelerator's own
