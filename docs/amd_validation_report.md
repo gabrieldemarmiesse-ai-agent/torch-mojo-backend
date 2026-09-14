@@ -416,7 +416,7 @@ process (MAX's from `/opt/rocm`, torch's bundled one) and
 | device ordinals | `mojo:i` aliases to `cuda:i` for i in 0..3, each a distinct MI300A uuid |
 | `pytest tests/native/test_cuda_interop.py` | **27 passed, 1 skipped** (`causal_conv1d` not installed) in 302 s; H100 CUDA venv: 28 passed. The ROCm side written from sources (`kDLROCM` retag, `torch.cuda.ExternalStream` over a `hipStream_t`) works unchanged |
 | `as_cuda` outside `on_mojo_stream` | raises the documented ordering error (my first probe tripped it) |
-| `pytest benchmarks/ --update-baselines` from that venv | see below |
+| `pytest benchmarks/ --update-baselines` from that venv | did not produce a measurement: the full run spent its 2 h cap compiling 24 specializations into that venv's own cache; `benchmarks/test_gemm.py` alone, with the cache seeded from the main one (same kernel-family hashes), sat on its first case `test_mm[S1_4096x4096x4096-NN-bf16]` for the whole 1 h cap without finishing it and without building anything new. Not diagnosed (the plan said to stop there); the two runtimes do coexist for the interop tests above, so the hang is specific to the benchmark harness (a torch.cuda event / MAX stream interaction is the first suspect). `benchmarks/baselines.html` therefore has no gfx942 entries; `benchmarks/test_coverage.py` passes |
 
 causal-conv1d was not built from source (optional in the plan).
 
