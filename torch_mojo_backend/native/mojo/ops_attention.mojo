@@ -1,4 +1,4 @@
-"""aten ops: attention group (see docs/native_backend.md).
+"""ATen ops: attention group (see docs/native_backend.md).
 
 `F.scaled_dot_product_attention` is CompositeImplicitAutograd: ATen picks a
 backend, calls the matching lower op, and autograd differentiates *that* op
@@ -993,7 +993,7 @@ def op_flash_attention(
 def op_flash_attention_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """cum_seq_q/cum_seq_k/philox_* are deliberately not read: only this
+    """`cum_seq_q`/`cum_seq_k`/`philox_*` are deliberately not read: only this
     backend's own forward can produce a flash result here, it always returns
     them empty (the nested-tensor ragged layout has no kernel), and dropout
     is refused, so the RNG payload is unobserved."""
