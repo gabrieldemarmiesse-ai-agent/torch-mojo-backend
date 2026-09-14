@@ -269,3 +269,23 @@ Observations:
 
 `benchmarks/` against stock torch in the same process: see section 7.
 `benchmarks/test_coverage.py`: 2 passed.
+
+## 7. Compiled HIP extensions and `cuda_interop`
+
+A separate venv: a copy of the stock `torch 2.9.1+rocm6.4` venv plus MAX
+26.5 and the package's dependencies, with `PYTHONPATH` at the checkout
+(the package pins `torch>=2.10`, which the shim honours for 2.9 since it
+ships a 2.9 shim; nothing complained). Two HIP runtimes are in the
+process (MAX's from `/opt/rocm`, torch's bundled one) and
+`register_mojo_devices()` warns about it, as designed.
+
+| check | result |
+|---|---|
+| registration with the ROCm wheel | OK: `torch.cuda.device_count()` 4, `torch.mojo.device_count()` 5 |
+| a MAX-allocated pointer read by a torch HIP kernel | `as_cuda(t)` inside `on_mojo_stream(i)`, then `t_cuda * 2`: `[2, 4, ..., 16]` correct on every device |
+| device ordinals | `mojo:i` aliases to `cuda:i` for i in 0..3, each a distinct MI300A uuid |
+| `pytest tests/native/test_cuda_interop.py` | **27 passed, 1 skipped** (`causal_conv1d` not installed) in 302 s; H100 CUDA venv: 28 passed. The ROCm side written from sources (`kDLROCM` retag, `torch.cuda.ExternalStream` over a `hipStream_t`) works unchanged |
+| `as_cuda` outside `on_mojo_stream` | raises the documented ordering error (my first probe tripped it) |
+| `pytest benchmarks/ --update-baselines` from that venv | see below |
+
+causal-conv1d was not built from source (optional in the plan).
