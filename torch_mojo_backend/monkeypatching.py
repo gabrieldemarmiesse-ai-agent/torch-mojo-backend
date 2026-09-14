@@ -214,7 +214,9 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
     module raises "Could not find an active GPU backend".
     """
     import triton.backends  # noqa: PLC0415 -- triton is optional
-    from triton.backends.compiler import GPUTarget  # noqa: PLC0415 -- triton is optional
+    from triton.backends.compiler import (  # noqa: PLC0415 -- triton is optional
+        GPUTarget,
+    )
 
     if "mojo" in triton.backends.backends:
         return

@@ -7,9 +7,10 @@ from collections.abc import Callable
 
 import numpy as np
 import torch
-from torch_mojo_backend import register_mojo_devices
-import torch_mojo_backend.native as n
 from torch.testing._internal.common_methods_invocations import op_db
+
+import torch_mojo_backend.native as n
+from torch_mojo_backend import register_mojo_devices
 
 register_mojo_devices()
 

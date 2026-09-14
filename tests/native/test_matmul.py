@@ -13,7 +13,6 @@ from collections.abc import Callable
 import pytest
 import torch
 
-
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module

@@ -6,8 +6,9 @@ import time
 from collections.abc import Callable
 
 import torch
-from torch_mojo_backend import register_mojo_devices
+
 import torch_mojo_backend.native as n
+from torch_mojo_backend import register_mojo_devices
 
 register_mojo_devices()
 label = sys.argv[1]
