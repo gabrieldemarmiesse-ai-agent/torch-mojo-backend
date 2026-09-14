@@ -1,356 +1,314 @@
-"""Production pure-Mojo kernels for eager FP32 ``aten::native_dropout`` and
-``aten::native_dropout_backward`` (training mode, contiguous).
+"""`aten::native_dropout` / `native_dropout_backward`, bit-identical to
+aten/src/ATen/native/cuda/Dropout.cu.
 
-Ported unchanged from the validated showcase candidate
-``candidate_native_dropout.mojo`` (full correctness matrix + H100 profiling).
-
-RNG design
-==========
-Counter-based Philox4x32-10 (Salmon et al., SC'11) — the same stateless family
-CUDA/PyTorch use for dropout.  Mapping from ``(seed, base_offset, index i)``:
-
-- Key ``(k0, k1) = (seed[31:0], seed[63:32])``: every seed bit, including bit
-  63, keys the stream.
-- Element ``i`` belongs to Philox block ``g = i // 4`` with lane ``i % 4``.
-  Its 128-bit counter is ``(c0, c1, c2, c3) = ((base_offset + g)[31:0],
-  (base_offset + g)[63:32], 0, 0)``, so bumping ``base_offset`` by one shifts
-  the logical stream by exactly four lanes and counter bit 63 lands in the top
-  bit of ``c1``.  The mapping is independent of launch geometry, vector width,
-  and tail handling.
-- One Philox4x32-10 evaluation yields four independent 32-bit words; word
-  ``i % 4`` supplies element ``i``.
-
-Threshold convention
-====================
-The keep probability is formed exactly as the CUDA FP32 kernel does:
-``keep_f32 = Float32(1.0 - p)`` with the subtraction in Float64 followed by a
-single narrowing.  A lane is kept iff ``u32 < floor(keep_f32 * 2^32)`` using
-all 32 random bits, so P(keep) equals ``keep_f32`` up to 2^-32 quantization
-and ``p == 0`` maps to threshold ``2^32`` (always keep).  On device the
-comparison is evaluated branch-free as ``(u64(u32) - threshold) >> 63`` (both
-operands are below 2^63, so the borrow bit is exactly ``u32 < threshold``).
-The ``p == 1`` endpoint is decided on the exact Float64 argument and takes
-PyTorch's zeros_like path; drop probabilities that merely round to 1 in
-Float32 stay stochastic.
-
-Arithmetic
-==========
-Forward (``0 <= p < 1``): ``output[i] = (input[i] * Float32(mask[i])) *
-(Float32(1) / keep_f32)`` — plain multiplication so dropped -0/NaN/Inf follow
-IEEE semantics.  Backward: ``grad_input[i] = (grad_output[i] *
-Float32(mask[i])) * Float32(scale)`` for every element, no branches to +0.
-
-Vector dispatch is a host-side runtime decision: the 16-byte float4 path is
-used only when every participating FP32 pointer is 16-byte aligned and the
-mask pointer is 4-byte aligned; otherwise a scalar generic kernel with the
-identical index->lane mapping runs.
+Forward is `fused_dropout_kernel_vec<VEC>` when the tensors are dense and the
+input pointer allows a VEC-wide access (flat memory index, one thread per VEC
+consecutive elements, RAND_SIZE = ceil(VEC / 4) fresh `curand_uniform4` per
+iteration), else `fused_dropout_kernel` (UNROLL = 4 grid-stride over the
+logical index, offsets through each tensor's strides). Keep probability
+`p = float(1 - p_drop)`, `scale = float(1.0 / double(p))`, element
+`(x * float(rand < p)) * scale`, all in the accumulation type (float, or double
+for a float64 tensor). Geometry and the counter reservation come from the
+caller (native/mojo/ops_random.mojo).
 """
-
-from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import ceildiv
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.sys.info import has_accelerator, has_apple_gpu_accelerator
 
+from curand_philox import (
+    U32x4,
+    curand4,
+    curand_ctr,
+    curand_key,
+    curand_uniform4,
+    philox4x32_10,
+)
+from op_utils import _enqueue_cached, _fill_blocks, _make_ptr, FILL_THREADS
 
-comptime _BLOCK = 256
-
-comptime _PHILOX_ROUNDS = 10
-comptime _PHILOX_M0 = UInt32(0xD2511F53)
-comptime _PHILOX_M1 = UInt32(0xCD9E8D57)
-comptime _PHILOX_W0 = UInt32(0x9E3779B9)
-comptime _PHILOX_W1 = UInt32(0xBB67AE85)
-
-
-@always_inline
-def _philox4x32_10(counter: UInt64, seed: UInt64) -> SIMD[DType.uint32, 4]:
-    var c0 = (counter & 0xFFFF_FFFF).cast[DType.uint32]()
-    var c1 = (counter >> 32).cast[DType.uint32]()
-    var c2 = UInt32(0)
-    var c3 = UInt32(0)
-    var k0 = (seed & 0xFFFF_FFFF).cast[DType.uint32]()
-    var k1 = (seed >> 32).cast[DType.uint32]()
-
-    comptime for _round in range(_PHILOX_ROUNDS):
-        var prod0 = _PHILOX_M0.cast[DType.uint64]() * c0.cast[DType.uint64]()
-        var prod1 = _PHILOX_M1.cast[DType.uint64]() * c2.cast[DType.uint64]()
-        var hi0 = (prod0 >> 32).cast[DType.uint32]()
-        var lo0 = (prod0 & 0xFFFF_FFFF).cast[DType.uint32]()
-        var hi1 = (prod1 >> 32).cast[DType.uint32]()
-        var lo1 = (prod1 & 0xFFFF_FFFF).cast[DType.uint32]()
-        var next0 = hi1 ^ c1 ^ k0
-        var next2 = hi0 ^ c3 ^ k1
-        c0 = next0
-        c1 = lo1
-        c2 = next2
-        c3 = lo0
-        k0 += _PHILOX_W0
-        k1 += _PHILOX_W1
-    return SIMD[DType.uint32, 4](c0, c1, c2, c3)
-
-
-@__name("native_dropout_forward_philox_vec4")
-def _forward_vec4(
-    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    elements_arg: Int64,
-    seed: UInt64,
-    base_offset: UInt64,
-    threshold: UInt64,
-    scale: Float32,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var elements = Int(elements_arg)
-    var group = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
-    var base = group * 4
-    if base >= elements:
-        return
-    var rnd = _philox4x32_10(base_offset + UInt64(group), seed)
-    if base + 4 <= elements:
-        var keep_bits = (
-            rnd.cast[DType.uint64]() - SIMD[DType.uint64, 4](threshold)
-        ) >> 63
-        var x = input.unsafe_load[width=4, alignment=16](base)
-        var result = x * keep_bits.cast[DType.float32]() * scale
-        output.unsafe_store[alignment=16](base, result)
-        mask.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_store[alignment=4](
-            base, keep_bits.cast[DType.uint8]()
-        )
-    else:
-        comptime for lane in range(4):
-            var idx = base + lane
-            if idx < elements:
-                var keep_bit = (
-                    rnd[lane].cast[DType.uint64]() - threshold
-                ) >> 63
-                output[unsafe_offset=idx] = (
-                    input[unsafe_offset=idx]
-                    * keep_bit.cast[DType.float32]()
-                    * scale
-                )
-                mask[unsafe_offset=idx] = Scalar[DType.bool](keep_bit != 0)
-
-
-@__name("native_dropout_forward_philox_generic")
-def _forward_generic(
-    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    elements_arg: Int64,
-    seed: UInt64,
-    base_offset: UInt64,
-    threshold: UInt64,
-    scale: Float32,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var elements = Int(elements_arg)
-    var group = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
-    var base = group * 4
-    if base >= elements:
-        return
-    var rnd = _philox4x32_10(base_offset + UInt64(group), seed)
-
-    comptime for lane in range(4):
-        var idx = base + lane
-        if idx < elements:
-            var keep_bit = (rnd[lane].cast[DType.uint64]() - threshold) >> 63
-            output[unsafe_offset=idx] = (
-                input[unsafe_offset=idx]
-                * keep_bit.cast[DType.float32]()
-                * scale
-            )
-            mask[unsafe_offset=idx] = Scalar[DType.bool](keep_bit != 0)
-
-
-@__name("native_dropout_forward_zero_fill")
-def _forward_zero_fill(
-    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    elements_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var elements = Int(elements_arg)
-    var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
-
-    comptime for lane in range(4):
-        var idx = base + lane
-        if idx < elements:
-            output[unsafe_offset=idx] = Float32(0.0)
-            mask[unsafe_offset=idx] = Scalar[DType.bool](False)
-
-
-@__name("native_dropout_backward_vec4")
-def _backward_vec4(
-    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    elements_arg: Int64,
-    scale: Float32,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var elements = Int(elements_arg)
-    var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
-    if base >= elements:
-        return
-    if base + 4 <= elements:
-        var g = grad_output.unsafe_load[width=4, alignment=16](base)
-        var mask_bytes = mask.unsafe_bitcast[Scalar[DType.uint8]]().unsafe_load[
-            width=4, alignment=4
-        ](base)
-        # Bool storage is 0/1 by contract, so the byte cast is Float32(mask).
-        var m = mask_bytes.cast[DType.float32]()
-        grad_input.unsafe_store[alignment=16](base, g * m * scale)
-    else:
-        comptime for lane in range(4):
-            var idx = base + lane
-            if idx < elements:
-                grad_input[unsafe_offset=idx] = (
-                    grad_output[unsafe_offset=idx]
-                    * mask[unsafe_offset=idx].cast[DType.float32]()
-                    * scale
-                )
-
-
-@__name("native_dropout_backward_generic")
-def _backward_generic(
-    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    elements_arg: Int64,
-    scale: Float32,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var elements = Int(elements_arg)
-    var base = (Int(block_idx.x) * _BLOCK + Int(thread_idx.x)) * 4
-    if base >= elements:
-        return
-
-    comptime for lane in range(4):
-        var idx = base + lane
-        if idx < elements:
-            grad_input[unsafe_offset=idx] = (
-                grad_output[unsafe_offset=idx]
-                * mask[unsafe_offset=idx].cast[DType.float32]()
-                * scale
-            )
+comptime I64x8 = SIMD[DType.int64, 8]
+comptime BLOCK = 256
 
 
 @always_inline
-def _is_aligned(address: Int, alignment: Int) -> Bool:
-    return address % alignment == 0
+def _philox4x32_10(counter: UInt64, seed: UInt64) -> U32x4:
+    """Philox of the 128-bit counter `(counter, 0)`: nn_ops' fused
+    softmax-dropout keys its stream this way."""
+    return philox4x32_10(
+        U32x4(
+            counter.cast[DType.uint32](),
+            (counter >> 32).cast[DType.uint32](),
+            0,
+            0,
+        ),
+        curand_key(seed),
+    )
 
 
-def enqueue_native_dropout_f32(
-    output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+@always_inline
+def _acc[dtype: DType]() -> DType:
+    comptime if dtype == DType.float64:
+        return DType.float64
+    else:
+        return DType.float32
+
+
+@always_inline
+def _scale_of[ACC: DType](p: Scalar[ACC]) -> Scalar[ACC]:
+    """`accscalar_t scale = 1.0 / p`: a double division, then narrowed."""
+    return (Float64(1.0) / p.cast[DType.float64]()).cast[ACC]()
+
+
+@always_inline
+def _offset_of(li: Int, sizes: I64x8, strides: I64x8, ndim: Int) -> Int:
+    var rem = li
+    var off = 0
+    for d in range(ndim):
+        var s = Int(sizes[d])
+        off += (rem % s) * Int(strides[d])
+        rem //= s
+    return off
+
+
+@__name(t"dropout_philox_vec{VEC}_{dtype}")
+def _dropout_vec_kernel[
+    dtype: DType, VEC: Int
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
     mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    elements: Int,
-    p: Float64,
+    inp: Pointer[Scalar[dtype], MutAnyOrigin],
+    numel_arg: Int64,
+    p: Scalar[_acc[dtype]()],
     seed: UInt64,
-    base_offset: UInt64,
+    offset: UInt64,
+):
+    comptime ACC = _acc[dtype]()
+    comptime RAND_SIZE = (VEC + 3) // 4
+    var numel = Int(numel_arg)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var ctr = curand_ctr(offset, UInt64(idx))
+    var key = curand_key(seed)
+    var scale = _scale_of[ACC](p)
+    var stride = Int(grid_dim.x) * Int(block_dim.x) * VEC
+    var linear = idx * VEC
+    var k: UInt64 = 0
+    while linear < numel:
+        var keep = SIMD[DType.bool, 4 * RAND_SIZE]()
+
+        comptime for jj in range(RAND_SIZE):
+            var r = curand_uniform4(curand4(ctr, key, k))
+            k += 1
+            var m = r.cast[ACC]().lt(SIMD[ACC, 4](p))
+
+            comptime for ii in range(4):
+                keep[jj * 4 + ii] = m[ii]
+
+        comptime for e in range(VEC):
+            var m = keep[e].cast[ACC]()
+            var x = inp[unsafe_offset=linear + e].cast[ACC]()
+            dst[unsafe_offset=linear + e] = ((x * m) * scale).cast[dtype]()
+            mask[unsafe_offset=linear + e] = keep[e]
+        linear += stride
+
+
+@__name(t"dropout_philox_strided_{dtype}")
+def _dropout_strided_kernel[
+    dtype: DType
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    inp: Pointer[Scalar[dtype], MutAnyOrigin],
+    numel_arg: Int64,
+    ndim_arg: Int64,
+    sizes: I64x8,
+    in_strides: I64x8,
+    out_strides: I64x8,
+    p: Scalar[_acc[dtype]()],
+    seed: UInt64,
+    offset: UInt64,
+):
+    comptime ACC = _acc[dtype]()
+    var numel = Int(numel_arg)
+    var ndim = Int(ndim_arg)
+    var total = Int(grid_dim.x) * Int(block_dim.x)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var ctr = curand_ctr(offset, UInt64(idx))
+    var key = curand_key(seed)
+    var scale = _scale_of[ACC](p)
+    var rounded = ((numel - 1) // (total * 4) + 1) * total * 4
+    var linear = idx
+    var k: UInt64 = 0
+    while linear < rounded:
+        var r = curand_uniform4(curand4(ctr, key, k))
+        k += 1
+        var keep = r.cast[ACC]().lt(SIMD[ACC, 4](p))
+
+        comptime for ii in range(4):
+            var li = linear + total * ii
+            if li < numel:
+                var ai = _offset_of(li, sizes, in_strides, ndim)
+                var bi = _offset_of(li, sizes, out_strides, ndim)
+                var m = keep[ii].cast[ACC]()
+                var x = inp[unsafe_offset=ai].cast[ACC]()
+                dst[unsafe_offset=bi] = ((x * m) * scale).cast[dtype]()
+                mask[unsafe_offset=bi] = keep[ii]
+        linear += total * 4
+
+
+@__name(t"dropout_backward_masked_scale_{dtype}")
+def _dropout_backward_kernel[
+    dtype: DType
+](
+    grad_input: Pointer[Scalar[dtype], MutAnyOrigin],
+    grad: Pointer[Scalar[dtype], MutAnyOrigin],
+    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
+    numel_arg: Int64,
+    scale: Scalar[_acc[dtype]()],
+):
+    comptime ACC = _acc[dtype]()
+    var numel = Int(numel_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < numel:
+        var m = mask[unsafe_offset=i].cast[ACC]()
+        var g = grad[unsafe_offset=i].cast[ACC]()
+        grad_input[unsafe_offset=i] = ((m * g) * scale).cast[dtype]()
+        i += stride
+
+
+def enqueue_native_dropout[
+    dtype: DType
+](
     ctx: DeviceContext,
+    out_addr: Int,
+    mask_addr: Int,
+    in_addr: Int,
+    numel: Int,
+    ndim: Int,
+    sizes: I64x8,
+    in_strides: I64x8,
+    out_strides: I64x8,
+    vec: Int,
+    grid: Int,
+    keep_p: Float64,
+    seed: UInt64,
+    offset: UInt64,
 ) raises:
-    # NaN fails both comparisons, so this single conjunction rejects NaN and
-    # every value outside [0, 1] before any launch.
-    if not (p >= 0.0 and p <= 1.0):
-        raise Error(
-            "native_dropout_kernels: invalid dropout probability; p must"
-            " satisfy 0 <= p <= 1 (NaN rejected)"
-        )
-    if elements <= 0:
+    comptime ACC = _acc[dtype]()
+    if numel <= 0:
         return
-
-    var groups = ceildiv(elements, 4)
-    var grid = ceildiv(groups, _BLOCK)
-
-    if p == 1.0:
-        # Exact Float64 endpoint only: PyTorch's zeros_like shortcut with an
-        # all-false mask and no divide-by-zero.
-        ctx.enqueue_function[_forward_zero_fill](
-            output,
-            mask,
-            Int64(elements),
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
-        )
-        return
-
-    var keep_f32 = Float32(1.0 - p)
-    var scale = Float32(1.0) / keep_f32
-    var threshold = (Float64(keep_f32) * 4294967296.0).cast[DType.uint64]()
-
-    if (
-        _is_aligned(Int(output), 16)
-        and _is_aligned(Int(input), 16)
-        and _is_aligned(Int(mask), 4)
-    ):
-        ctx.enqueue_function[_forward_vec4](
-            output,
-            mask,
-            input,
-            Int64(elements),
-            seed,
-            base_offset,
-            threshold,
-            scale,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
-        )
+    if ctx.api() == "cpu":
+        raise Error("native_dropout runs on the GPU device only")
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        raise Error("float64 is not supported on Apple GPU")
     else:
-        ctx.enqueue_function[_forward_generic](
-            output,
-            mask,
-            input,
-            Int64(elements),
-            seed,
-            base_offset,
-            threshold,
-            scale,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
-        )
+        comptime if not has_accelerator():
+            raise Error("no GPU accelerator available at compile time")
+        else:
+            var dst = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
+            var mask = _make_ptr[DType.bool](mask_addr).as_unsafe_any_origin()
+            var inp = _make_ptr[dtype](in_addr).as_unsafe_any_origin()
+            var p = keep_p.cast[ACC]()
+            if vec == 8:
+                _enqueue_cached[_dropout_vec_kernel[dtype, 8]](
+                    ctx,
+                    String(t"dropout_v8_{dtype}"),
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    dst,
+                    mask,
+                    inp,
+                    Int64(numel),
+                    p,
+                    seed,
+                    offset,
+                )
+            elif vec == 4:
+                _enqueue_cached[_dropout_vec_kernel[dtype, 4]](
+                    ctx,
+                    String(t"dropout_v4_{dtype}"),
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    dst,
+                    mask,
+                    inp,
+                    Int64(numel),
+                    p,
+                    seed,
+                    offset,
+                )
+            elif vec == 2:
+                _enqueue_cached[_dropout_vec_kernel[dtype, 2]](
+                    ctx,
+                    String(t"dropout_v2_{dtype}"),
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    dst,
+                    mask,
+                    inp,
+                    Int64(numel),
+                    p,
+                    seed,
+                    offset,
+                )
+            else:
+                _enqueue_cached[_dropout_strided_kernel[dtype]](
+                    ctx,
+                    String(t"dropout_s_{dtype}"),
+                    grid,
+                    1,
+                    1,
+                    BLOCK,
+                    dst,
+                    mask,
+                    inp,
+                    Int64(numel),
+                    Int64(ndim),
+                    sizes,
+                    in_strides,
+                    out_strides,
+                    p,
+                    seed,
+                    offset,
+                )
 
 
-def enqueue_native_dropout_backward_f32(
-    grad_input: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
-    mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
-    elements: Int,
+def enqueue_native_dropout_backward[
+    dtype: DType
+](
+    ctx: DeviceContext,
+    grad_input_addr: Int,
+    grad_addr: Int,
+    mask_addr: Int,
+    numel: Int,
     scale: Float64,
-    ctx: DeviceContext,
 ) raises:
-    if elements <= 0:
+    comptime ACC = _acc[dtype]()
+    if numel <= 0:
         return
-
-    var groups = ceildiv(elements, 4)
-    var grid = ceildiv(groups, _BLOCK)
-    var scale_f32 = Float32(scale)
-
-    if (
-        _is_aligned(Int(grad_input), 16)
-        and _is_aligned(Int(grad_output), 16)
-        and _is_aligned(Int(mask), 4)
-    ):
-        ctx.enqueue_function[_backward_vec4](
-            grad_input,
-            grad_output,
-            mask,
-            Int64(elements),
-            scale_f32,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
-        )
+    if ctx.api() == "cpu":
+        raise Error("native_dropout_backward runs on the GPU device only")
+    comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
+        raise Error("float64 is not supported on Apple GPU")
     else:
-        ctx.enqueue_function[_backward_generic](
-            grad_input,
-            grad_output,
-            mask,
-            Int64(elements),
-            scale_f32,
-            grid_dim=(grid,),
-            block_dim=(_BLOCK,),
-        )
+        comptime if not has_accelerator():
+            raise Error("no GPU accelerator available at compile time")
+        else:
+            _enqueue_cached[_dropout_backward_kernel[dtype]](
+                ctx,
+                String(t"dropout_bwd_{dtype}"),
+                _fill_blocks(numel),
+                1,
+                1,
+                FILL_THREADS,
+                _make_ptr[dtype](grad_input_addr).as_unsafe_any_origin(),
+                _make_ptr[dtype](grad_addr).as_unsafe_any_origin(),
+                _make_ptr[DType.bool](mask_addr).as_unsafe_any_origin(),
+                Int64(numel),
+                scale.cast[ACC](),
+            )

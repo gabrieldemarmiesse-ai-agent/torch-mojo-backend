@@ -118,12 +118,18 @@ struct MojoAllocator final : c10::Allocator {
 MojoAllocator g_allocator;
 
 // ---- generator: Philox (seed, offset) ------------------------------------------
+// `offset_` counts in curand's unit (one Philox4x32 block = 4), exactly like
+// CUDAGeneratorImpl's philox_offset_per_thread_, so the state and every draw
+// match stock CUDA bit for bit (docs/native_backend.md, "RNG").
 struct MojoGeneratorImpl final : c10::GeneratorImpl {
   explicit MojoGeneratorImpl(c10::DeviceIndex index)
       : c10::GeneratorImpl(c10::Device(c10::DeviceType::PrivateUse1, index),
                            c10::DispatchKeySet(c10::DispatchKey::PrivateUse1)) {}
   void set_current_seed(uint64_t seed) override { seed_ = seed; offset_ = 0; }
-  void set_offset(uint64_t offset) override { offset_ = offset; }
+  void set_offset(uint64_t offset) override {
+    TORCH_CHECK(offset % 4 == 0, "offset must be a multiple of 4");
+    offset_ = offset;
+  }
   uint64_t get_offset() const override { return offset_; }
   uint64_t current_seed() const override { return seed_; }
   uint64_t seed() override {
@@ -137,8 +143,11 @@ struct MojoGeneratorImpl final : c10::GeneratorImpl {
                     new_state.device().is_cpu() && new_state.is_contiguous(),
                 "mojo backend: RNG state must be a contiguous 16-byte uint8 CPU tensor");
     const auto* p = static_cast<const uint8_t*>(new_state.data());
+    uint64_t offset = 0;
+    std::memcpy(&offset, p + 8, 8);
+    TORCH_CHECK(offset % 4 == 0, "offset must be a multiple of 4");
     std::memcpy(&seed_, p, 8);
-    std::memcpy(&offset_, p + 8, 8);
+    offset_ = offset;
   }
   c10::intrusive_ptr<c10::TensorImpl> get_state() const override {
     auto t = at::detail::empty_cpu({16}, c10::ScalarType::Byte);
@@ -534,8 +543,10 @@ int32_t tmb_philox_reserve(TmbGenerator gen, int32_t device, uint64_t increment,
     auto* impl = mojo_impl(g);
     *seed = impl->seed_;
     *offset = impl->offset_;
+    // CUDAGeneratorState::increase: round up to a whole Philox block.
+    increment = ((increment + 3) / 4) * 4;
     TORCH_CHECK(increment <= UINT64_MAX - impl->offset_, "mojo backend: Philox counter reservation would wrap");
-    impl->offset_ += increment;  // the kernels' own unit (same contract as the old _reserve_philox_state)
+    impl->offset_ += increment;
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
@@ -578,8 +589,11 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
     auto g = default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
     auto* impl = mojo_impl(g);
+    uint64_t offset = 0;
+    std::memcpy(&offset, in16 + 8, 8);
+    TORCH_CHECK(offset % 4 == 0, "offset must be a multiple of 4");
     std::memcpy(&impl->seed_, in16, 8);
-    std::memcpy(&impl->offset_, in16 + 8, 8);
+    impl->offset_ = offset;
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());

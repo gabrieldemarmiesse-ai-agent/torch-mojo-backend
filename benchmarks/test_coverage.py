@@ -92,7 +92,14 @@ _COMPOSED = (
     "no kernel of its own: ops_composed.mojo builds it from ops this suite "
     "already measures (a few extra launches, nothing new to regress against)"
 )
-_HOST_RNG = "host-side torch RNG + upload; no device kernel of ours"
+_NORMAL_COMPOSITE = (
+    "normal_ (test_inplace's test_normal_) followed by mul_/add_ this suite "
+    "already measures, as ATen's own composite does"
+)
+_RNG_TRANSFORM = (
+    "the Philox grid-stride kernel test_inplace's test_uniform_ / test_normal_ "
+    "measure, with a different per-element transform; nothing new to time"
+)
 
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
@@ -113,7 +120,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::_local_scalar_dense": (
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
     ),
-    "aten::normal_": _HOST_RNG,
     "aten::record_stream": (
         "stream-lifetime bookkeeping, not compute: records a MAX event on "
         "the named stream so a buffer's free is fenced behind a foreign "
@@ -214,10 +220,26 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::isneginf.out": _COMPOSED,
     "aten::isposinf": _COMPOSED,
     "aten::isposinf.out": _COMPOSED,
-    # -- host-side RNG ------------------------------------------------------
-    "aten::random_": _HOST_RNG,
-    "aten::random_.from": _HOST_RNG,
-    "aten::random_.to": _HOST_RNG,
+    # -- RNG transforms sharing the benchmarked Philox kernel ----------------
+    "aten::random_": _RNG_TRANSFORM,
+    "aten::random_.from": _RNG_TRANSFORM,
+    "aten::random_.to": _RNG_TRANSFORM,
+    "aten::log_normal_": _RNG_TRANSFORM,
+    "aten::cauchy_": _RNG_TRANSFORM,
+    "aten::exponential_": _RNG_TRANSFORM,
+    "aten::geometric_": _RNG_TRANSFORM,
+    "aten::bernoulli_.float": _RNG_TRANSFORM,
+    "aten::bernoulli_.Tensor": (
+        "one curand_uniform4 per four elements against a probability tensor "
+        "(CUDA_tensor_apply2 geometry): the traffic of a compare, no regime "
+        "of its own to track"
+    ),
+    "aten::normal.Tensor_float": _NORMAL_COMPOSITE,
+    "aten::normal.float_Tensor": _NORMAL_COMPOSITE,
+    "aten::normal.Tensor_Tensor": _NORMAL_COMPOSITE,
+    "aten::normal.Tensor_float_out": _NORMAL_COMPOSITE,
+    "aten::normal.float_Tensor_out": _NORMAL_COMPOSITE,
+    "aten::normal.Tensor_Tensor_out": _NORMAL_COMPOSITE,
     # -- new op, no benchmark yet -------------------------------------------
     "aten::_softmax_backward_data": (
         "newly registered; test_softmax covers the forward and the backward "
