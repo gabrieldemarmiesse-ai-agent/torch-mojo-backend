@@ -10,4 +10,12 @@
 extern std::recursive_mutex tmb_mutex;
 extern TmbBackendHooks tmb_hooks;
 extern bool tmb_ready;
+// The MAX runtime is not fork-safe: its worker threads and device contexts do
+// not exist in a forked child, and a device call there waits forever on a
+// thread that is gone. tmb_backend_register() installs a pthread_atfork child
+// handler that sets this flag, and every entry that reaches the runtime --
+// allocation, the boxed kernel -- refuses with a message that names the fix
+// (the 'spawn' start method), as CUDA does. docs/native_backend.md, "Fork".
+extern bool tmb_in_bad_fork;
+void tmb_check_not_forked();
 std::string& tmb_thread_error();

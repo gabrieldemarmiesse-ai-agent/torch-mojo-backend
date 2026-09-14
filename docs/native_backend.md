@@ -198,6 +198,23 @@ owner stream waits on before the buffer is released.
 ops need no locking of their own; the autograd engine's thread and the main
 thread interleave at op granularity.
 
+**Fork.** The MAX runtime is not fork-safe, and it is up before any device
+is: `import max.nn` (which `aten_functions.py` imports; the trigger is
+`max._kv_cache_ops`) starts one runtime worker thread per hardware thread,
+and `register_mojo_devices()` creates every device context. A forked child
+inherits none of those threads, so a device call there waits forever
+(measured: `DeviceContext.synchronize` under `_to_copy`, a futex that is
+never signalled; on a GPU, modular/modular#5483 reports a segfault). The
+shim therefore installs a `pthread_atfork` child handler at registration:
+in the child `torch.mojo._is_in_bad_fork()` is True, `torch.manual_seed`
+skips the device (torch's contract for that method), and an allocation or
+an op raises "cannot be used in a forked subprocess ... use the 'spawn'
+start method", as CUDA does. What keeps working after a fork is what
+DataLoader needs: `torch.accelerator.is_available()` and `device_count()`
+are reads of registration state and never reach the runtime, and forked
+workers that only touch CPU tensors run normally
+(`tests/native/test_fork.py`).
+
 ## Test support
 
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count
