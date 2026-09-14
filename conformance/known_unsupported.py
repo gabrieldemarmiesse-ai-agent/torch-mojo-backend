@@ -665,7 +665,14 @@ _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
             "pow": ("float32", "int64"),
         },
         "test_errors_match": {},
-    }
+    },
+    "gfx942": {
+        "test_matches_cpu": {
+            "log_softmax": ("float32", "bfloat16", "float16"),
+            "masked_log_softmax": ("float32", "bfloat16", "float16"),
+        },
+        "test_errors_match": {},
+    },
 }
 
 
