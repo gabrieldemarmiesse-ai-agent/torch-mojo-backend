@@ -328,13 +328,13 @@ reviewer with an H100 should run `tests/native/test_matmul.py`,
 
 | commit | fix | test | H100-side check |
 |---|---|---|---|
-| 6598e2b | fp32 GEMM on gfx942: 32x32 warp tile for fp32 in the non-transposed and deep-K geometries; comptime guard `transpose_b or float32` against single-MMA warp tiles | `test_mm_float32_tensor_core_regime` (3 shapes), extended in 4a6f4c1-ish (see below) to the deep-K geometry and `addmm` | `compare_kernel_asm.py --accelerator sm_90a`: 0 of 396 kernels differ; the route is under `comptime if gfx942` |
+| 6598e2b | fp32 GEMM on gfx942: 32x32 warp tile for fp32 in the non-transposed and deep-K geometries; comptime guard `transpose_b or float32` against single-MMA warp tiles | `test_mm_float32_tensor_core_regime` (3 shapes), extended in ba372d6 to the deep-K geometry and `addmm` | `compare_kernel_asm.py --accelerator sm_90a`: 0 of 396 kernels differ; the route is under `comptime if gfx942` |
 | 3f609ed | cumsum bf16/f16 and outer-dim routes enabled on HIP (the fast NVIDIA kernels stay gated on `ctx.api() == "cuda"` inside `nn_ops.mojo`) | 40 / 40 cumsum tests on MI300A | host-side gate only: `cuda` behaviour unchanged, Metal and CPU keep the old surface |
 | b3c9e27 | Inductor on HIP: device properties from the HIP Triton driver, `HIPBackend` alias for the mojo target, no ptxas | `test_inductor.py` 8 / 8 | api-gated; CUDA path is the same code |
 | 5a7eb6a | Triton HIP driver: `hipSetDevice` guard around `load_binary` (shared `_MojoUtils` wrapper; CUDA keeps its context push/pop) | `test_triton.py` 7 passed, 1 skipped; liger on `mojo:1` | CUDA path unchanged in behaviour (refactored wrapper) |
 | 506e2c9 | flash-attention backward: causal bound only when causal in the half-float dK/dV tail tile | `test_fused_flash_backward_partial_tail_gfx942` (8 ids) | sm_90a: 0 of 34 kernels differ (the MFMA kernels are under `is_amd_gpu()`) |
 | 2a93241 | review follow-ups: `GPUTarget` hint, checked `hipSetDevice` on restore, cumsum comment | ruff, ty | none needed |
-| (next) | `test_matmul.py`: deep-K fp32 and fused-bias cases | 10 / 10 | none needed |
+| ba372d6 | `test_matmul.py`: deep-K fp32 and fused-bias cases | 10 / 10 | none needed |
 
 A code-only review by Codex (`gpt-6-astra`) of the first four commits found
 them mergeable and produced the follow-ups; its one substantive caveat is
