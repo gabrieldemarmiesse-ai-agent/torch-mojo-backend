@@ -167,7 +167,14 @@ def try_enqueue_candidate_tn(
     if sms < 2:
         return False
     var tiles192 = ((m + 127) // 128) * ((n + 191) // 192)
-    if tiles192 <= sms or tiles192 > max_grid:
+    if tiles192 > max_grid:
+        return False
+    # A grid that does not reach one full wave still beats the ladder's
+    # fallback when it keeps at least three quarters of the SMs busy: the
+    # 1600x1600 weight gradient is 117 tiles, more than the 114 SMs of an
+    # H100 PCIe but fewer than the 132 of an H100 SXM.  (Measured on SXM:
+    # the fallback ran that shape at 9x cuBLAS.)
+    if tiles192 * 4 < sms * 3:
         return False
     var clusters192 = ((m + 255) // 256) * ((n + 191) // 192)
     var clusters256 = ((m + 255) // 256) * ((n + 255) // 256)
