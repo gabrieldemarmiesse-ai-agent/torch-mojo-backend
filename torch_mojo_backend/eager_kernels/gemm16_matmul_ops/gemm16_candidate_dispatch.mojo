@@ -18,7 +18,10 @@ from gemm16_dtype import _GEMM16_DT
 from gemm16_nn_v4_kernels import _v4_enqueue_nn_persistent
 from gemm16_tn_v4_kernels import _v4_enqueue_direct_m128n192
 from gemm16_rolling_kernels import enqueue_rolling_persistent
-from gemm16_nt_bias_kernels import maybe_enqueue_gemm16_nt_bias_v4
+from gemm16_nt_bias_kernels import (
+    _v4c_nt_bias_hw_gate,
+    maybe_enqueue_gemm16_nt_bias_v4,
+)
 
 comptime PTR = Pointer[Scalar[_GEMM16_DT], MutAnyOrigin]
 
@@ -36,9 +39,20 @@ def try_enqueue_candidate_nt_bias(
 ) raises -> Bool:
     """Conservative large NT bias regime; original routes handle the rest.
 
-    TUNE_NT_ROLLING=True and TUNE_NT_RASTER=8 reproduce H100 measurements.
-    The existing fused helper checks dtype, architecture, pointers, TMA
-    extents, products and launch resources after this performance gate.
+    The 192x192 rolling kernel (fused bias epilogue, has_bias=True on
+    gemm16_rolling_kernels.mojo's kmaj_b instantiation) runs first --
+    worst-case ratio 1.052 against cuBLAS over six H100 SXM shapes
+    (8192x4800x1600 down to the ragged 6600x4800x1600), independently
+    reproduced across three jobs -- ahead of the 128-row
+    maybe_enqueue_gemm16_nt_bias_v4 fallback for whatever it declines (an
+    SM count too small for one cluster, or a grid past MAX_GRID_DIM_X;
+    dtype/architecture/alignment/overflow are already covered by this
+    outer regime plus the shared `_v4c_nt_bias_hw_gate`).
+
+    TUNE_NT_ROLLING=True and TUNE_NT_RASTER=8 reproduce the 128-row
+    fallback's H100 measurements; the 192 route takes its raster group (8)
+    as an explicit kernel parameter instead, independently measured for
+    this regime (see gemm16_rolling_kernels.mojo's module docstring).
     """
     if (
         not has_bias
@@ -55,7 +69,57 @@ def try_enqueue_candidate_nt_bias(
     # Overflow-safe max(N,K)<=8*min(N,K); reject very wide vocabulary work.
     if 1 + (max(n, k) - 1) // 8 > min(n, k):
         return False
+    if _try_enqueue_nt_bias_rolling_192(output, a, b, bias, m, n, k, ctx):
+        return True
     return maybe_enqueue_gemm16_nt_bias_v4(output, a, b, bias, m, n, k, ctx)
+
+
+def _try_enqueue_nt_bias_rolling_192(
+    output: PTR,
+    a: PTR,
+    b: PTR,
+    bias: PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """192x192 persistent rolling NT+bias kernel, H100 SXM sm:1500 MHz.
+
+    Tuning provenance: BM=BN=192, BK=64, stages=3 (216 KiB of the 227 KiB
+    sm_90 dynamic-smem limit), cluster_m=2 with cooperative B multicast,
+    3 consumer warp groups (160 registers each), raster group=8 -- measured
+    worst-case ratio over six shapes: group 2 -> 1.065, group 4 -> 1.043,
+    group 6 -> 1.090, group 8 -> 1.037, group 12 -> 1.100, n-major -> 1.064,
+    cluster_m=1 (no B multicast) -> 1.107.
+
+    Shares `_v4c_nt_bias_hw_gate` (gemm16_nt_bias_kernels.mojo) with the
+    128-row fallback for the dtype/cc/alignment/overflow checks both routes
+    need; the grid-occupancy check below is this tile's own, since a
+    192x192 cluster tiles the same (m, n) into a different work census than
+    the 128-row kernel's 192/256-wide tiles.
+    """
+    comptime if _GEMM16_DT != DType.bfloat16 or not _has_sm_9x():
+        return False
+    if not _v4c_nt_bias_hw_gate(output, a, b, bias, m, n, k, ctx):
+        return False
+    comptime CLUSTER_M = 2
+    comptime BM = 192
+    comptime BN = 192
+    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    if sms < CLUSTER_M:
+        return False
+    var macro_rows = (m + BM * CLUSTER_M - 1) // (BM * CLUSTER_M)
+    var blocks_n = (n + BN - 1) // BN
+    if (
+        macro_rows
+        > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X) // blocks_n
+    ):
+        return False
+    enqueue_rolling_persistent[
+        3, CLUSTER_M, BM, BN, 3, True, False, True, True, 8, True
+    ](output, a, b, bias, m, n, k, sms, ctx)
+    return True
 
 
 def try_enqueue_candidate_nn(
@@ -118,8 +182,9 @@ def try_enqueue_candidate_nn(
     # arithmetic. Small/short and aligned regimes keep their old kernels.
     if wave192 * 192 * width > wave256 * 128 * 256:
         return False
+    # has_bias=False (default): the bias arg is unused, filled with output.
     enqueue_rolling_persistent[3, 2, 192, 192, 3, True, False, False, True](
-        output, a, b, m, n, k, sms, ctx
+        output, a, b, output, m, n, k, sms, ctx
     )
     return True
 

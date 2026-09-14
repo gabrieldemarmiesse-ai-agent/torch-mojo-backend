@@ -360,6 +360,52 @@ def test_gemm16_addmm_residue64_sites(mojo_h100, site, n, k):
     assert _rel_err(got, ref) < _bf16_bound(k)
 
 
+# --- the NT+bias 192x192 rolling kernel (GPT-2 XL forward linear sites) ------
+#
+# gemm16_candidate_dispatch.mojo's try_enqueue_candidate_nt_bias now tries the
+# 192x192 rolling kernel (gemm16_rolling_kernels.mojo's kmaj_b + has_bias
+# instantiation, `bf16_gemm_nt_bias_rolling_ws_m192n192_s3c2wg3g8`) ahead of
+# the 128-row maybe_enqueue_gemm16_nt_bias_v4 fallback; both -- and the
+# generic bf16 route below them for shapes neither accepts, e.g. m not a
+# multiple of 128 -- fuse the bias into the accumulator, so assert_no_bias_add
+# holds regardless of which one actually served a given shape.
+#
+# Shapes are exactly the ones the standalone engagement measured on H100 SXM
+# (worst ratio 1.052 against cuBLAS), plus two smaller ones exercising the
+# ragged-N tile boundary (1600 and 6400 are not multiples of BN=192; only
+# 4800 is) at a cheaper M for test time.
+# -------------------------------------------------------------------------------
+
+NT_BIAS_192_SHAPES = [
+    (8192, 4800, 1600),  # c_attn
+    (8192, 1600, 1600),  # c_proj
+    (8192, 6400, 1600),  # c_fc
+    (8192, 1600, 6400),  # mlp_proj
+    (16384, 4800, 1600),  # c_attn at the larger batch -- kept full-size
+    (6600, 4800, 1600),  # ragged M (not a multiple of 128 or of 384)
+    (4096, 1664, 1600),  # small, ragged N (1664 % 192 != 0)
+    (4224, 4800, 1664),  # small, one tile past the regime's 4096 minimum
+]
+
+
+@pytest.mark.parametrize("m,n,k", NT_BIAS_192_SHAPES)
+def test_gemm16_nt_bias_rolling_192(mojo_h100, m, n, k):
+    """Forward linear in bf16 with a bias at the 192x192 rolling kernel's own
+    shapes: fused in one launch regardless of which NT+bias route inside the
+    regime actually serves it (see the module comment above)."""
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    b = torch.randn(n, dtype=torch.bfloat16)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(
+                x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+            )
+    ref = torch.nn.functional.linear(x.float(), w.float(), b.float())
+    assert got.dtype == torch.bfloat16
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
 # --- the out= overloads (TorchInductor's extern kernels) ----------------------
 
 

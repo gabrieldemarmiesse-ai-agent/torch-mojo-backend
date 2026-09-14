@@ -68,7 +68,7 @@ from max.gpu.primitives import (
     cluster_sync,
     cluster_sync_relaxed,
 )
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
 from std.utils.index import Index, IndexList
@@ -267,6 +267,72 @@ def _v4_mma_tile[
     wgmma_commit_group_sync()
     warpgroup_fence(accum)
     wgmma_wait_group_sync()
+
+
+# Bias-fused accumulator pack shared by every NT+bias epilogue (the 128-row
+# persistent kernel in gemm16_nt_bias_kernels.mojo and the 192-row rolling
+# one in gemm16_rolling_kernels.mojo): for st.matrix instruction t, matrix
+# j holds fragment pair q = 4t + j (row half j % 2, column block 2t + j //
+# 2), so four bias scalars serve the whole instruction. Bias loads need
+# only bf16 alignment and are individually clipped -- TMA clips the C
+# store, but not these. NT-specific: the column map assumes bias varies
+# along the tile's N axis the way kmaj_b's B operand does (see
+# _v4_mma_tile); do not reuse for a TN/TT epilogue without re-deriving it.
+@always_inline
+def _v4_bias_epilogue_quad[
+    bn: Int
+](
+    accum: LayoutTensor[
+        _V4_F32,
+        Layout.row_major(1, 64 * bn // 128),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ],
+    t: Int,
+    lane: Int,
+    bias: _V4_PTR,
+    n0: Int,
+    n: Int,
+) -> SIMD[DType.float32, 4]:
+    var bias_col = n0 + 16 * t + (lane % 4) * 2
+    var bias0 = Float32(0)
+    var bias1 = Float32(0)
+    var bias8 = Float32(0)
+    var bias9 = Float32(0)
+    if bias_col < n:
+        bias0 = bias[unsafe_offset=bias_col].cast[DType.float32]()
+    if bias_col + 1 < n:
+        bias1 = bias[unsafe_offset=bias_col + 1].cast[DType.float32]()
+    if bias_col + 8 < n:
+        bias8 = bias[unsafe_offset=bias_col + 8].cast[DType.float32]()
+    if bias_col + 9 < n:
+        bias9 = bias[unsafe_offset=bias_col + 9].cast[DType.float32]()
+    return SIMD[DType.float32, 4](
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t] + bias0).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 1] + bias1).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 2] + bias0).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 3] + bias1).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 4] + bias8).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 5] + bias9).cast[_V4_DT](),
+            )
+        ),
+        bitcast[DType.float32, 1](
+            SIMD[_V4_DT, 2](
+                (accum.ptr[unsafe_offset=8 * t + 6] + bias8).cast[_V4_DT](),
+                (accum.ptr[unsafe_offset=8 * t + 7] + bias9).cast[_V4_DT](),
+            )
+        ),
+    )
 
 
 # Kernel-symbol layout tag for the persistent body: col_a selects the TN
