@@ -2074,8 +2074,8 @@ def _cumsum_cols_portable[
     `op_cumsum`'s `fast_ok` gate (ops_reductions.mojo) reaches dim=0 on CUDA
     and HIP devices (this body serves HIP there, since `ctx.api()` picks the
     fast block.prefix_sum kernel only for `"cuda"`) and declines it
-    elsewhere, so on today's dispatch this body runs for HIP and for the
-    `mojo:cpu` test device; it stays a real, tested implementation (not a
+    elsewhere (the CPU mojo device included), so on today's dispatch this
+    body runs for HIP only; it stays a real, tested implementation (not a
     stub) so the gate can be loosened further (e.g. Metal) without a new
     kernel."""
     comptime acc = _acc_dtype[dtype]()

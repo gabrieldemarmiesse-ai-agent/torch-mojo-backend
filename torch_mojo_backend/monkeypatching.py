@@ -214,6 +214,7 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
     module raises "Could not find an active GPU backend".
     """
     import triton.backends  # noqa: PLC0415 -- triton is optional
+    from triton.backends.compiler import GPUTarget  # noqa: PLC0415 -- triton is optional
 
     if "mojo" in triton.backends.backends:
         return
@@ -225,7 +226,7 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
 
         class MojoBackend(HIPBackend):
             @staticmethod
-            def supports_target(target: object) -> bool:
+            def supports_target(target: GPUTarget) -> bool:
                 return getattr(target, "backend", None) == "mojo"
     else:
         from triton.backends.nvidia.compiler import (  # noqa: PLC0415 -- triton is optional
@@ -234,7 +235,7 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
 
         class MojoBackend(CUDABackend):
             @staticmethod
-            def supports_target(target: object) -> bool:
+            def supports_target(target: GPUTarget) -> bool:
                 return getattr(target, "backend", None) == "mojo"
 
     triton.backends.backends["mojo"] = triton.backends.Backend(

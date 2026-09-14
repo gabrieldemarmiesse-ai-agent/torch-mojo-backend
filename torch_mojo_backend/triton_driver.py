@@ -160,8 +160,8 @@ def _push_hip_device(device: int) -> int | None:
 
 
 def _pop_hip_device(previous: int | None):
-    if previous is not None:
-        _libhip().hipSetDevice(previous)
+    if previous is not None and _libhip().hipSetDevice(previous) != 0:
+        raise RuntimeError(f"hipSetDevice({previous}) failed while restoring")
 
 
 def _current_stream_handle(device: int) -> int:
