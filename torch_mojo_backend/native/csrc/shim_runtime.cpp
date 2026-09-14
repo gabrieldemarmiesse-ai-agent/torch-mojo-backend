@@ -10,6 +10,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#include <pthread.h>
 #include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
@@ -27,6 +28,15 @@
 std::recursive_mutex tmb_mutex;
 TmbBackendHooks tmb_hooks{};
 bool tmb_ready = false;
+bool tmb_in_bad_fork = false;
+
+void tmb_check_not_forked() {
+  TORCH_CHECK(!tmb_in_bad_fork,
+              "mojo backend: the mojo device cannot be used in a forked subprocess: the MAX runtime's "
+              "threads and device contexts do not survive fork(). To use the mojo device with "
+              "multiprocessing, use the 'spawn' start method "
+              "(torch.multiprocessing.set_start_method('spawn')).");
+}
 
 std::string& tmb_thread_error() {
   static thread_local std::string err;
@@ -38,6 +48,7 @@ extern "C" void tmb_set_error(const char* message) {
 }
 extern "C" const char* tmb_get_error(void) { return tmb_thread_error().c_str(); }
 extern "C" void tmb_lock(void) { tmb_mutex.lock(); }
+extern "C" int32_t tmb_is_in_bad_fork(void) { return tmb_in_bad_fork ? 1 : 0; }
 extern "C" void tmb_unlock(void) { tmb_mutex.unlock(); }
 
 namespace {
@@ -57,7 +68,11 @@ namespace {
 
 using Lock = std::lock_guard<std::recursive_mutex>;
 #define H tmb_hooks
-#define REQUIRE_READY() TORCH_CHECK(tmb_ready, "mojo backend: tmb_backend_register() has not run")
+#define REQUIRE_READY()                                                             \
+  do {                                                                              \
+    TORCH_CHECK(tmb_ready, "mojo backend: tmb_backend_register() has not run");      \
+    tmb_check_not_forked();                                                         \
+  } while (0)
 
 // Void hooks report failure through the thread-local message: clear it
 // before the call, raise if the hook left one.
@@ -396,6 +411,9 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
     at::RegisterPrivateUse1HooksInterface(&g_hooks_iface);
     torch::profiler::impl::registerPrivateUse1Methods(&g_profiler_stubs);
     tmb_ready = true;
+    // From here the runtime is up (every device context exists), so a child
+    // of this process cannot use it: mark the child, see tmb_check_not_forked.
+    pthread_atfork(nullptr, nullptr, [] { tmb_in_bad_fork = true; });
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());

@@ -51,7 +51,10 @@ def _lazy_init():
 
 
 def _is_in_bad_fork() -> bool:
-    return False
+    """True in a child forked after registration, where the runtime is
+    unusable (docs/native_backend.md, "Fork"). torch.manual_seed consults it
+    before seeding this device from a forked DataLoader worker."""
+    return native.is_registered() and bool(native.shim().tmb_is_in_bad_fork())
 
 
 def device_count() -> int:
