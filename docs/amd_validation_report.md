@@ -240,8 +240,18 @@ also raises on that sample for bf16/f16 is not known from here.
 What stays failing after the delta: **`pow` float32 and `__rpow__` float32**,
 a real precision gap (finding 5): the fp64-anchored bar cannot accept a
 result 14 ulp from the float64 answer when torch is at 0.5 ulp, and a table
-entry only excuses an exception. The final conformance count is in the
-table below.
+entry only excuses an exception. 
+
+| command | result |
+|---|---|
+| `regenerate_known_unsupported.py --records ... -n 4` (first, before the anchoring) | 14 failed, 1112 passed, 236 skipped, 1424 xfailed; 0 operators differ |
+| same, after the anchoring and the helper fix | 6 failed, 1120 passed; 2 operators differ (`log_softmax`, `masked_log_softmax`) |
+| `write_accelerator_delta.py regen_amd2.log --write` + `ruff format` | `_ACCELERATOR_DELTAS["gfx942"]` with those two operators, commit a6fe537 |
+| `pytest conformance/test_opinfo.py -n 4` (VMM=1, GPU 3) | **2 failed** (`pow` float32, `__rpow__` float32), 1120 passed, 236 skipped, 1428 xfailed in 109 s |
+| `pytest conformance/test_known_unsupported.py` | 7 passed |
+
+The plan's "must be 0 failed" is not met by two nodes, both the `pow`
+precision gap of finding 5.
 
 ## 4. Distributed (RCCL, then mojoccl)
 
