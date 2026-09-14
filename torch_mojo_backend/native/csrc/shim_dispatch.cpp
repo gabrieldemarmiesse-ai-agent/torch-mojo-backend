@@ -351,6 +351,7 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
       : resolve_(resolve), resolve_ctx_(resolve_ctx) {}
 
   void operator()(const c10::OperatorHandle& op, c10::DispatchKeySet /*ks*/, torch::jit::Stack* stack) {
+    tmb_check_not_forked();
     const auto& schema = op.schema();
     const auto& arguments = schema.arguments();
     const auto& returns = schema.returns();

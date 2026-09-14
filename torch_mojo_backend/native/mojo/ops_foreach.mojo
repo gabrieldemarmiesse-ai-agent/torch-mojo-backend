@@ -1,4 +1,4 @@
-"""aten ops: foreach group (see docs/native_backend.md).
+"""ATen ops: foreach group (see docs/native_backend.md).
 
 Every `_foreach_*_` / `_fused_adamw_` op below tries ONE batched kernel
 launch (the `optimizer_ops` family, ported host-side from

@@ -8,10 +8,16 @@
 
 from max.algorithm import elementwise
 from std.builtin.device_passable import DevicePassable
+from std.collections import OptionalReg
 from std.ffi import _get_global_or_null, external_call
 from max.gpu.sync import barrier
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+from max.gpu.host import (
+    DeviceAttribute,
+    DeviceBuffer,
+    DeviceContext,
+    FuncAttribute,
+)
 from std.math import ceildiv, cos, floor, sin, sqrt, tan
 from std.math.polynomial import polynomial_evaluate
 from std.memory import OpaquePointer, bitcast, stack_allocation
@@ -371,11 +377,29 @@ def custom_remainder[
 
 
 @always_inline
+def _dyn_smem_attr[dyn_bytes: Int]() -> OptionalReg[FuncAttribute]:
+    """The opt-in above sm_90's 48 KiB default dynamic-shared allowance, or
+    no attribute at all for a kernel that asks for no dynamic shared memory.
+
+    A compiled function carries this attribute, so it belongs to the compile
+    and not to the launch: `_enqueue_cached` passes it on the miss that
+    creates the cached `DeviceFunction`.
+    """
+    comptime if dyn_bytes > 0:
+        return OptionalReg[FuncAttribute](
+            FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(dyn_bytes))
+        )
+    else:
+        return OptionalReg[FuncAttribute](None)
+
+
+@always_inline
 def _enqueue_cached[
     declared_arg_types: TypeList[Trait=AnyType, ...],
     //,
     func: def(* args: * declared_arg_types) thin -> None,
     *Ts: DevicePassable,
+    dyn_smem: Int = 0,
 ](
     ctx: DeviceContext,
     key: String,
@@ -391,20 +415,41 @@ def _enqueue_cached[
     (~180µs even when the runtime's module cache hits); caching the
     `DeviceFunction` in the process-global registry — the same pattern the
     vendor BLAS handle uses — brings the enqueue cost down to a few µs.
+
+    `dyn_smem` is the dynamic shared memory one block asks for: the compile
+    opts into it through `_dyn_smem_attr` and every launch passes the same
+    size. It is part of the registry name because a `DeviceFunction` compiled
+    for one allowance must never be launched with another. Cluster dimensions
+    are NOT passed here: the warp-specialized GEMMs declare them as kernel
+    metadata (`nvvm.cluster_dim`), which the compiled function carries.
+
+    `key` must name everything that selects the generated code and nothing
+    that does not: algorithm, dtype, geometry, stage count, layout, epilogue
+    options and any build define the body reads. Never a pointer, never a
+    problem dimension — those travel as arguments.
     """
-    var name = String(t"TMB_KERNEL_{key}_{ctx.id()}")
+    var name = String(t"TMB_KERNEL_{key}_{dyn_smem}_{ctx.id()}")
     comptime FuncT = type_of(ctx.compile_function[func]())
+    comptime SMEM = OptionalReg[Int](dyn_smem) if dyn_smem > 0 else OptionalReg[
+        Int
+    ](None)
 
     var global_ptr = _get_global_or_null(name)
 
     if global_ptr:
         var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
         ctx.enqueue_function(
-            fptr[], *args, grid_dim=(gx, gy, gz), block_dim=(threads,)
+            fptr[],
+            *args,
+            grid_dim=(gx, gy, gz),
+            block_dim=(threads,),
+            shared_mem_bytes=SMEM,
         )
         return
 
-    var compiled = ctx.compile_function[func]()
+    var compiled = ctx.compile_function[func](
+        func_attribute=_dyn_smem_attr[dyn_smem]()
+    )
     var fptr = unsafe_alloc[FuncT](1)
     fptr.unsafe_write(compiled^)
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
@@ -412,7 +457,11 @@ def _enqueue_cached[
         fptr.unsafe_bitcast[NoneType](),
     )
     ctx.enqueue_function(
-        fptr[], *args, grid_dim=(gx, gy, gz), block_dim=(threads,)
+        fptr[],
+        *args,
+        grid_dim=(gx, gy, gz),
+        block_dim=(threads,),
+        shared_mem_bytes=SMEM,
     )
 
 

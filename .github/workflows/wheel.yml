@@ -13,10 +13,20 @@ name: Wheel
 # produces a wheel with NO prebuilt libraries (it still works: the package
 # compiles them on first use). The artefact-carrying wheel is the one this
 # workflow uploads.
+#
+# It runs on the same events as the unit tests (ci.yml): every commit of a
+# pull request and every push to main, so a change that breaks the shim
+# build on one platform, pushes an artefact past its glibc floor, or makes
+# the installed wheel compile instead of using its prebuilt libraries is
+# caught on the PR that makes it, not on the next release tag. The wheel it
+# uploads on a `v*` tag is the release one.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:

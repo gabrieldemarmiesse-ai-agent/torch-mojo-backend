@@ -4,6 +4,10 @@ import os
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
 os.environ["MAX_USE_EAGER_INTERPRETER"] = "1"
 os.environ["TORCH_MOJO_BACKEND_TESTING"] = "1"
+# Every Mojo build under the tests (backend library, op extensions, kernel
+# specializations, mojoccl) fails on a compiler warning instead of hiding it
+# in captured stderr; off by default for users.
+os.environ["TORCH_MOJO_BACKEND_WERROR"] = "1"
 import pytest
 
 # must be called before importing torch_mojo_backend

@@ -67,6 +67,20 @@ def _trace(msg: str):
         print(f"[TRACE] {msg}", file=sys.stderr, flush=True)
 
 
+def mojo_diagnostic_flags() -> list[str]:
+    """Extra `mojo build` flags every Mojo build gets (loader.mojo's `_build`
+    appends the same for the kernel families and op extensions).
+
+    TORCH_MOJO_BACKEND_WERROR=1 turns compiler warnings into build failures.
+    Off by default -- a user on a newer toolchain that warns about something
+    new must not lose their device over it -- and on in the test suite
+    (tests/conftest.py), so a warning in any Mojo source fails the tests that
+    build it instead of scrolling past in a subprocess's captured stderr."""
+    if os.environ.get("TORCH_MOJO_BACKEND_WERROR", "0") == "1":
+        return ["--Werror"]
+    return []
+
+
 def _pkg_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -584,9 +598,15 @@ def portable_target_cpu() -> str:
     return "generic"
 
 
-def _build_backend_locked(key: str, out: Path) -> Path:
-    t0 = time.monotonic()
-    tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
+def backend_build_command(out: Path, accelerator: str | None = None) -> list[str]:
+    """The `mojo build` that produces the Mojo base library at `out`.
+
+    `accelerator` is a `--target-accelerator` name (`sm_90a`, `mi300a`,
+    `apple-m4`; `mojo build --print-supported-accelerators` lists them);
+    None lets the compiler pick, which is what production does. The library
+    must not depend on that choice -- it ships prebuilt, one file per
+    platform -- and tests/test_backend_has_no_device_code.py holds it to
+    that by building here with several values and comparing the bytes."""
     cmd = [
         _find_mojo(),
         "build",
@@ -600,12 +620,22 @@ def _build_backend_locked(key: str, out: Path) -> Path:
         "--target-cpu",
         portable_target_cpu(),
         "-o",
-        str(tmp),
+        str(out),
+        *mojo_diagnostic_flags(),
     ]
+    if accelerator is not None:
+        cmd += ["--target-accelerator", accelerator]
     if sys.platform == "darwin":
         # The library calls the shim (tmb_*), resolved at dlopen; ld64 wants
         # to be told so.
         cmd += ["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"]
+    return cmd
+
+
+def _build_backend_locked(key: str, out: Path) -> Path:
+    t0 = time.monotonic()
+    tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
+    cmd = backend_build_command(tmp)
     proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
@@ -665,7 +695,7 @@ def build_library(
             cmd += ["-I", str(root)]
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
-        cmd += ["-o", str(tmp)]
+        cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)

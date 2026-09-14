@@ -198,6 +198,23 @@ owner stream waits on before the buffer is released.
 ops need no locking of their own; the autograd engine's thread and the main
 thread interleave at op granularity.
 
+**Fork.** The MAX runtime is not fork-safe, and it is up before any device
+is: `import max.nn` (which `aten_functions.py` imports; the trigger is
+`max._kv_cache_ops`) starts one runtime worker thread per hardware thread,
+and `register_mojo_devices()` creates every device context. A forked child
+inherits none of those threads, so a device call there waits forever
+(measured: `DeviceContext.synchronize` under `_to_copy`, a futex that is
+never signalled; on a GPU, modular/modular#5483 reports a segfault). The
+shim therefore installs a `pthread_atfork` child handler at registration:
+in the child `torch.mojo._is_in_bad_fork()` is True, `torch.manual_seed`
+skips the device (torch's contract for that method), and an allocation or
+an op raises "cannot be used in a forked subprocess ... use the 'spawn'
+start method", as CUDA does. What keeps working after a fork is what
+DataLoader needs: `torch.accelerator.is_available()` and `device_count()`
+are reads of registration state and never reach the runtime, and forked
+workers that only touch CPU tensors run normally
+(`tests/native/test_fork.py`).
+
 ## Test support
 
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count
@@ -363,7 +380,20 @@ does not match the machine is never opened. Hatchling needs them listed in
 the wheel from the sdist) because they are ignored by git. A wheel built from
 a plain checkout has none of them and simply compiles, as before; the full
 one comes from `.github/workflows/wheel.yml` (`publish.yml`, which uploads to
-PyPI on a GitHub release, builds from a plain checkout).
+PyPI on a GitHub release, builds from a plain checkout). That workflow runs on
+every pull-request commit and every push to `main`, like the unit tests, and
+on `v*` tags: each run builds the shims for every supported torch series on
+Linux x86_64, Linux aarch64 and macOS arm64, checks their glibc floors, builds
+the wheel, then installs it in a fresh venv and runs
+`scripts/smoke_prebuilt_wheel.py` against two torch versions, which fails
+unless both prebuilt libraries were used and an op ran on the CPU device.
+That one base library per platform can drive any GPU only because it holds
+no device code, and `tests/test_backend_has_no_device_code.py` holds it to
+that on every commit: it builds the library with the production command for
+no accelerator, Apple M4, MI300A and H100, and requires the four shared
+libraries to be byte-identical with no `.ptx`/`.amdgcn`/`.ll` sidecar. A
+control in the same file builds a one-kernel module for two targets and
+requires those to differ, so the equality cannot pass vacuously.
 
 **Refreshing them** — after a change to `native/csrc/`, `native/mojo/`, or
 the MAX pin:

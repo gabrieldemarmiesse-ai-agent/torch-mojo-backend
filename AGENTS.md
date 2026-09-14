@@ -63,6 +63,9 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
     every specialization compiles inline at its first call and is cached in
     `__mojocache__`; build timings print by default
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
+    `TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build fail on a compiler
+    warning; off by default, on under pytest (`tests/conftest.py`), so keep
+    the Mojo sources warning-free.
   - `TORCH_MOJO_BACKEND_CCL=mojo` swaps NCCL/RCCL for the in-repo Mojo
     collectives (`docs/distributed.md`, "Mojo collectives"); default is
     the vendor library.

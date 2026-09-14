@@ -210,6 +210,156 @@ def test_addmm_scaled_declines(mojo_device):
         torch.addmm(bias, a, b, alpha=2.0)
 
 
+# --- the residue-64 bf16 candidates (GPT-2 XL linear sites) -------------------
+#
+# 1600 / 4800 / 6400 are 64 modulo 128, the regime the three measured
+# candidates in gemm16_candidate_dispatch.mojo were fitted for: the rolling
+# NN kernel (dX), the widened TN selection (dW) and the fused-bias NT kernel
+# (forward).  M is scaled down from the model's 16384 to the gate's minimum
+# so these stay unit tests; every N/K width is the model's, because those are
+# what select the route.
+# ---------------------------------------------------------------------------
+
+# (name, out_features, in_features)
+XL_SITES = [
+    ("c_attn", 4800, 1600),
+    ("attn.c_proj", 1600, 1600),
+    ("mlp.c_fc", 6400, 1600),
+    ("mlp.c_proj", 1600, 6400),
+]
+XL_M = 4096  # the fused NT gate's minimum m, and a multiple of 128
+
+
+def _bf16_bound(k: int) -> float:
+    """Max relative error of a K-long dot product with bf16 storage and fp32
+    accumulation: bf16's epsilon is 2^-8 and the tile sums grow like sqrt(K).
+    A failure here is a kernel bug, not a tolerance bug."""
+    return 2**-8 * (k**0.5) * 0.5
+
+
+def _rel_err(got: torch.Tensor, ref32: torch.Tensor) -> float:
+    scale = ref32.abs().max().clamp(min=1.0)
+    return float((got.cpu().float() - ref32).abs().max() / scale)
+
+
+@contextlib.contextmanager
+def assert_no_bias_add():
+    """Assert no aten::add ran in the block: the fused NT kernel computes
+    `A @ B.T + bias` in one launch, and the split-bias fallback it replaces
+    would show up here as the broadcasting add it used to need."""
+    native.op_counting(True)
+    before = native.op_counts()
+    yield
+    after = native.op_counts()
+    added = after.get("aten::add.Tensor", 0) - before.get("aten::add.Tensor", 0)
+    assert added == 0, f"a second add ran on the fused output ({added} launches)"
+
+
+@pytest.mark.parametrize("site,n,k", XL_SITES)
+@pytest.mark.parametrize("bias", [True, False])
+def test_gemm16_linear_residue64_sites(mojo_h100, site, n, k, bias):
+    """Forward linear at each GPT-2 XL width, with and without a bias.
+
+    With a bias this is the fused NT route and the result must be the single
+    fp32-rounded product -- there is no second add to account for.
+    """
+    x = torch.randn(XL_M, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    b = torch.randn(n, dtype=torch.bfloat16) if bias else None
+    dev_b = b.to(mojo_h100) if b is not None else None
+    with assert_ran("aten::linear"):
+        if bias:
+            with assert_no_bias_add():
+                got = torch.nn.functional.linear(
+                    x.to(mojo_h100), w.to(mojo_h100), dev_b
+                )
+        else:
+            got = torch.nn.functional.linear(x.to(mojo_h100), w.to(mojo_h100), dev_b)
+    ref = torch.nn.functional.linear(
+        x.float(), w.float(), b.float() if b is not None else None
+    )
+    assert got.dtype == torch.bfloat16
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+@pytest.mark.parametrize("site,n,k", XL_SITES)
+def test_gemm16_linear_backward_residue64_sites(mojo_h100, site, n, k):
+    """dX (rolling NN), dW (the widened TN selection) and the unchanged
+    row-sum bias gradient, at the same widths."""
+    x = torch.randn(XL_M, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    g = torch.randn(XL_M, n, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        dx, dw, db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    assert _rel_err(dx, g.float() @ w.float()) < _bf16_bound(n)
+    assert _rel_err(dw, g.float().t() @ x.float()) < _bf16_bound(XL_M)
+    assert _rel_err(db, g.float().sum(0)) < _bf16_bound(XL_M)
+
+
+def test_gemm16_fused_bias_awkward_shape_falls_back(mojo_h100):
+    """357 x 789 x 1231: no dimension is a multiple of 64, so every candidate
+    declines on metadata alone and the pre-existing route serves the call."""
+    x = torch.randn(357, 1231, dtype=torch.bfloat16)
+    w = torch.randn(789, 1231, dtype=torch.bfloat16)
+    b = torch.randn(789, dtype=torch.bfloat16)
+    got = torch.nn.functional.linear(x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100))
+    ref = torch.nn.functional.linear(x.float(), w.float(), b.float())
+    assert _rel_err(got, ref) < _bf16_bound(1231)
+    # and the matching backward, which reaches mm with ragged m/n/k
+    g = torch.randn(357, 789, dtype=torch.bfloat16)
+    dx, dw, db = torch.ops.aten.linear_backward(
+        x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+    )
+    assert _rel_err(dx, g.float() @ w.float()) < _bf16_bound(789)
+    assert _rel_err(dw, g.float().t() @ x.float()) < _bf16_bound(357)
+    assert _rel_err(db, g.float().sum(0)) < _bf16_bound(357)
+
+
+def test_gemm16_fused_bias_needs_a_physical_nt_pair(mojo_h100):
+    """A weight reached through a `.t()` view makes the linear physically NN,
+    which is a different kernel's call: the fused NT route must decline it and
+    the split-bias path must produce the same answer."""
+    x = torch.randn(XL_M, 1600, dtype=torch.bfloat16)
+    wt = torch.randn(1600, 4800, dtype=torch.bfloat16)  # (k, n), viewed as (n, k)
+    b = torch.randn(4800, dtype=torch.bfloat16)
+    w_view = wt.to(mojo_h100).t()
+    assert not w_view.is_contiguous()
+    got = torch.nn.functional.linear(x.to(mojo_h100), w_view, b.to(mojo_h100))
+    ref = x.float() @ wt.float() + b.float()
+    assert _rel_err(got, ref) < _bf16_bound(1600)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_gemm16_fused_bias_is_bfloat16_only(mojo_h100, dtype):
+    """fp32 (TF32 / strict SIMT) and float16 keep the routes they had: the
+    candidate is gated to bfloat16, so both must still add the bias
+    separately and still be right."""
+    x = torch.randn(XL_M, 1600).to(dtype)
+    w = torch.randn(4800, 1600).to(dtype)
+    b = torch.randn(4800).to(dtype)
+    got = torch.nn.functional.linear(x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100))
+    ref = x.float() @ w.float().t() + b.float()
+    assert got.dtype == dtype
+    bound = 1e-4 if dtype == torch.float32 else _bf16_bound(1600)
+    assert _rel_err(got, ref) < bound
+
+
+@pytest.mark.parametrize("site,n,k", XL_SITES)
+def test_gemm16_addmm_residue64_sites(mojo_h100, site, n, k):
+    """The same fused route through addmm, where the NT pair arrives as a
+    transposed `mat2` rather than as a linear's weight."""
+    a = torch.randn(XL_M, k, dtype=torch.bfloat16)
+    bt = torch.randn(n, k, dtype=torch.bfloat16)
+    bias = torch.randn(n, dtype=torch.bfloat16)
+    with assert_ran("aten::addmm"):
+        with assert_no_bias_add():
+            got = torch.addmm(bias.to(mojo_h100), a.to(mojo_h100), bt.to(mojo_h100).t())
+    ref = a.float() @ bt.float().t() + bias.float()
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
 # --- the out= overloads (TorchInductor's extern kernels) ----------------------
 
 

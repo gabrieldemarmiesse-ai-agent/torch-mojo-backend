@@ -103,11 +103,8 @@ def _probe_api() -> Tuple[String, Int]:
     apis.append("hip")
     apis.append("metal")
     for api in apis:
-        var n = 0
-        try:
-            n = DeviceContext.number_of_devices(api=api)
-        except e:
-            n = 0  # MAX has no support for that api on this machine
+        # 0 when MAX has no support for that api on this machine
+        var n = DeviceContext.number_of_devices(api=api)
         if n > 0:
             return (api, n)
     return (String("cpu"), 0)
