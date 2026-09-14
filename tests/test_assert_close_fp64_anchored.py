@@ -55,3 +55,46 @@ def test_dtype_and_shape_must_match():
         assert_close_fp64_anchored(torch_result.double(), torch_result, _REFERENCE)
     with pytest.raises(AssertionError):
         assert_close_fp64_anchored(torch_result.flatten(), torch_result, _REFERENCE)
+
+
+def test_a_nan_where_the_reference_is_finite_fails():
+    torch_result = _rounded_with_noise(2e-5)
+    ours = torch_result.clone()
+    ours[2, 2] = float("nan")
+    with pytest.raises(AssertionError, match="non-finite"):
+        assert_close_fp64_anchored(ours, torch_result, _REFERENCE)
+
+
+def test_non_finite_reference_positions_take_the_plain_bar():
+    """A masked -inf (or a NaN) in the reference is compared as such, and the
+    finite elements next to it are still anchored."""
+    reference = _REFERENCE.clone()
+    reference[0, 0] = float("-inf")
+    reference[0, 1] = float("nan")
+    torch_result = reference.float()
+    torch_result[3, 3] += 2e-5
+    ours = reference.float()
+    ours[5, 1] -= 3e-5  # anchored: within 2x torch's 2e-5 miss
+    assert_close_fp64_anchored(ours, torch_result, reference)
+    ours[0, 0] = 1.0  # finite where torch says -inf: the plain bar rejects it
+    with pytest.raises(AssertionError):
+        assert_close_fp64_anchored(ours, torch_result, reference)
+
+
+def test_a_non_finite_torch_result_at_a_finite_reference_takes_the_plain_bar():
+    torch_result = _REFERENCE.float()
+    torch_result[1, 1] = float(
+        "inf"
+    )  # torch overflowed where the exact answer is finite
+    ours = torch_result.clone()
+    assert_close_fp64_anchored(
+        ours, torch_result, _REFERENCE
+    )  # we overflow the same way
+    ours[1, 1] = 1.0
+    with pytest.raises(AssertionError):
+        assert_close_fp64_anchored(ours, torch_result, _REFERENCE)
+
+
+def test_an_empty_tensor_passes():
+    empty = torch.empty(0, 3, dtype=torch.float64)
+    assert_close_fp64_anchored(empty.float(), empty.float(), empty)
