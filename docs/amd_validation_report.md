@@ -208,6 +208,109 @@ difference against tolerances that the H100 happens to meet:
 
 The suite's existing instrument for this class is `_FP64_ANCHORED` in
 `conformance/test_opinfo.py` (as accurate as torch against a float64
+reference, within 2x). Two things were done with it, both measured on GPU 3
+of `a1018`:
+
+- `assert_close_fp64_anchored` (`torch_mojo_backend/testing.py`) used to drop
+  the whole tensor to the default bar when any element of the reference was
+  non-finite (a masked `-inf`, a NaN from a negative base to a fractional
+  power) and crashed on an empty reference; it now anchors the finite
+  elements and compares the rest with the default bar (commit 99a675f; the
+  helper's own tests still pass).
+- the anchored set became accelerator-keyed (`_FP64_ANCHORED_BY_ACCELERATOR`,
+  merged by `known_unsupported.accelerator_key()`, which returns `gfx942`
+  here; the H100 set is untouched), listing 13 of the 14 nodes (commit
+  7542add + 99a675f). With it: bmm, addr, batch_norm, instance_norm and
+  conv2d pass the anchored bar.
+
+Second regeneration after that (`regen_amd2.log`, 205 s): 6 failed, 1120
+passed, 236 skipped, 1424 xfailed, and now **2 operators differ from the
+base** for `test_matches_cpu`: `log_softmax` and `masked_log_softmax` in
+bfloat16 / float16 raise `NotImplementedError: softmax of an empty tensor`
+on the `(5, 0, 0)` sample (`ops_nn.mojo` declines every empty softmax; the
+one-ulp failure on an earlier sample used to hide it). The base table
+already declares `log_softmax` float32 for the same reason and the MAX CPU
+device's delta declares exactly these two operators in all three dtypes,
+so `write_accelerator_delta.py --write` records them under
+`_ACCELERATOR_DELTAS["gfx942"]` (the accelerator key string this tree
+produces; the plan's `amdgpu:gfx942` spelling is what the docstring says,
+`accelerator_key()` returns the bare architecture name). Whether the H100
+also raises on that sample for bf16/f16 is not known from here.
+
+What stays failing after the delta: **`pow` float32 and `__rpow__` float32**,
+a real precision gap (finding 5): the fp64-anchored bar cannot accept a
+result 14 ulp from the float64 answer when torch is at 0.5 ulp, and a table
+entry only excuses an exception. The final conformance count is in the
+table below.
+
+## 4. Distributed (RCCL, then mojoccl)
+
+Second node `a1020` (job 5408315), 4 MI300A, `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`
+for the torchrun legs only, `NCCL_DEBUG=INFO`.
+
+| command | result |
+|---|---|
+| `pytest tests/test_distributed.py` (RCCL, 2-rank torchrun workers) | **40 passed** in 799 s (H100 x2: 39 passed, 1 skipped) |
+| `torchrun --nproc-per-node=4 nanogpt_ddp.py --device mojo` batch 12, 40 steps, RCCL | trace `collectives via /lus/home/softs/rocm/6.4.3/lib/librccl.so.1 (rccl version 22203)`; first step 1133 s (48 kernel builds, 1131 s of compile, cold cache for the 4-rank shapes), then 705 to 720k tok/s; loss 11.0074 -> 6.0455 at step 40 |
+| same, 1 rank, batch 12 | 190k tok/s, loss 6.0858 at step 40 (a different global batch, so a different curve by construction; the stock-vs-mojo same-configuration comparison is in section 9) |
+| `pytest tests/test_distributed.py -k mojo` (`TORCH_MOJO_BACKEND_CCL=mojo`) | 7 passed in 106 s |
+| 4-rank nanoGPT, mojoccl | trace `collectives via .../cache/libmojoccl.hash-68bf71f23b7ee946.so (mojoccl version 23102)`; 695 to 706k tok/s; losses equal to the RCCL run to 1e-4 through step 20 (6.2451 vs 6.2450), 6.0595 vs 6.0455 at step 40 |
+
+The multi-node protocol (`tests/multinode/e2e_three_stacks_adastra.sh`) was
+not run: the two allocations were single nodes used for the sequential and
+the parallel halves of this validation, not a node pair.
+
+## 5. Triton on HIP
+
+`triton` 3.6.0 (the wheel the CUDA torch had pulled) next to the CPU torch,
+`liger-kernel` 0.8.2.
+
+| command | result |
+|---|---|
+| `pytest tests/native/test_triton.py` | **2 failed**, 5 passed, 1 skipped (CUDA driver contexts). Failures: (1) `test_triton_launch_on_a_second_device`: `Triton Error [HIP]: Code: 101, invalid device ordinal` from the HIP driver's launch under `with device_module.device(1)`: a real bug in the never-run `_hip_driver_class`, see "Fixes"; (2) `test_driver_is_installed_on_import_after_registration` asserts the class name `MojoCudaDriver`; on HIP it is `MojoHipDriver`: test assumption |
+| liger `LigerRMSNormFunction.apply(h, w, 1e-6, 0.0, "llama", True)` on `mojo:0`, (64, 2048) | forward max err 1.4e-6, dX 7.2e-7, dW 7.6e-6 against the CPU formula (ref max 9.9 / 4.0 / 30.7); `triton.testing.do_bench` 0.0177 ms; `driver.active` is `MojoHipDriver`, target `GPUTarget(backend='hip', arch='gfx942', warp_size=64)`; the launch stream handle 189223616 equals `torch.mojo.stream_native_handle(current_stream())`. The package's `device.type == "cuda"` branches fell through to its generic paths unchanged, as on NVIDIA |
+| same under `with torch.mojo.device(1)` on `mojo:1` | the second-device bug above; after the fix: forward 1.4e-6, dX 7.2e-7, dW 7.6e-6, do_bench 0.059 ms, launch stream == mojo `hipStream_t` |
+| after the fix (commit 5a7eb6a) | `test_triton.py`: 7 passed, 1 skipped (CUDA driver contexts) |
+
+## 6. TorchInductor
+
+`pytest tests/native/test_inductor.py`: **7 failed**, 1 passed. Every failure
+is `OSError: libcuda.so.1: cannot open shared object file` from
+`inductor.py::_device_properties`, reached through Inductor's
+`DeviceProperties.create`: the device interface reads compute capability and
+SM count from libcuda, the mojo Triton target is an alias of
+`CUDABackend`, and `_ptxas.apply_triton_default()` is NVIDIA-only, as the
+docs say. Fixed within the hour (commit b3c9e27): device properties come from the HIP Triton driver's own `get_device_properties` on hip (no libcuda), the mojo Triton target aliases `triton.backends.amd.compiler.HIPBackend` when the accelerator api is hip, ptxas is skipped on hip, and `raise_if_triton_unavailable` looks for the `amd` backend. After: **8 passed** (cold 349 s, warm 19 to 25 s); `test_monkeypatching_is_centralized.py` still passes; ruff and ty clean. The CUDA path is the same code behind an api check.
+
+## 3. The whole suite and the conformance tables
+
+The conformance regeneration (`regenerate_known_unsupported.py --records ... -n 4`,
+under the lock, with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` so four
+workers fit: its recorder writes one file per process and tolerates the
+exit segfault) ran in 115 s once the specializations were warm:
+14 failed, 1112 passed, 236 skipped, 1424 xfailed. `write_accelerator_delta.py`:
+**0 operators differ from the base tables** for `test_matches_cpu` and 0 for
+`test_errors_match`, so no `_ACCELERATOR_DELTAS["amdgpu:gfx942"]` entry is
+needed and there is no `+ declare` list: every operator the H100 tables
+declare unsupported is unsupported here too, and nothing declared
+unsupported passes. (The plan expected many differences; the native backend
+declines op by op in Mojo, not per architecture, which is why the tables
+carry over.)
+
+The 14 failures are numerical, one bf16/f16 ulp or an fp32 summation-order
+difference against tolerances that the H100 happens to meet:
+
+| node | mismatch |
+|---|---|
+| bmm float32 | 1 of 250 elements, abs 1.44e-5 (1e-5 allowed) |
+| pow, __rpow__ float32 | rel 1.4e-6 to 1.6e-6 (1.3e-6 allowed) on 1 to 3 large elements |
+| log_softmax, masked_log_softmax bf16 / f16 | 2 to 3 of 25 elements, abs 3.8e-3 (bf16) / 4.3e-4 (f16); the CPU reference is exactly 0 there |
+| addr float16 | 1 of 50, rel 1.045e-3 (1e-3 allowed) |
+| batch_norm, instance_norm bf16 / f16 | 1 to 7 of 125, one ulp |
+| conv2d bf16 / f16 | 1 element, one ulp |
+
+The suite's existing instrument for this class is `_FP64_ANCHORED` in
+`conformance/test_opinfo.py` (as accurate as torch against a float64
 reference, within 2x); the fix makes it accelerator-keyed and lists these
 nodes under `amdgpu:gfx942`, and any node that fails even that bar stays a
 failure and is reported as a precision finding. See "Fixes".
@@ -341,6 +444,36 @@ them mergeable and produced the follow-ups; its one substantive caveat is
 performance: the fp32 non-transposed blocks now run 128 threads (deep-K: 64)
 instead of 256, which is unmeasured; the benchmarks run of section 7 gives
 the fp32 GEMM ratio against stock torch.
+
+### Finding 5: float32 `pow` is 14 to 46 ulp off on gfx942 (not fixed)
+
+Route: `aten::pow.Tensor_Tensor` -> `PowSpec` (`logic_ops.mojo`) and
+`pow.Tensor_Scalar` -> `PowScalarSpec` (`elementwise_ops.mojo`), both
+`std.math.pow` -> the Mojo stdlib's `SIMD._powf_scalar`: integral exponents
+by repeated squaring, otherwise fp32 `exp(y * log(x))`. On AMD that is
+`v_exp_f32` after a software (Cephes) fp32 log; half an ulp of the fp32
+product `y * log(x)` is the same *relative* error in the result: 1.1e-6 at
+`y * log(x) ~ 18.8`, i.e. 14 ulp, growing with the magnitude. NVIDIA's fp32
+log takes a hardware log2 route in the same stdlib, which is why the H100
+sits inside torch's rtol 1.3e-6 and the MI300A outside (and why the MAX CPU
+device declares `pow` float32 in its delta). Measured with
+`scripts/pow_probe.py` (1M elements, ulps against float64): max 46, mean
+3.8, 2.1% of elements beyond 16 ulp; torch CPU max 0.585; integral
+exponents fine (the untouched `_powi` path, 7 ulp at y = 105).
+
+Two accurate replacements were written on branch `amd-pow-candidates`
+(a fp64 `exp(y log x)` with an exact-coefficient log, and a lean variant
+with `v_rcp_f64` + Newton and a `v_exp_f32` tail): both reach 0.5 to 0.84
+ulp and pass the two conformance nodes, but on a 16M-element streamed
+timing the tensor-scalar kernel (`PowScalarSpec`, whose body handles several
+lanes per thread) costs +42 to 47% for a fractional scalar exponent and up
+to +19% for `pow(x, 2.0)`, the RMSNorm / MSE case, because the per-lane fp64
+path either serializes the lanes (out of line) or inflates the register
+footprint (inlined). Not merged. The lead for a next attempt is to
+vectorize the fp64 path across the lanes with SIMD float64 and a select
+instead of a per-lane branch. `scripts/pow_probe.py` and
+`scripts/pow_timing.py` are committed (5f18d69) so the next attempt starts
+from the numbers.
 
 Observation, not a fix: on the deep-K fp32 shapes (k = 2080, 4128) both the
 gfx942 kernel and the CPU mojo device sit ~2e-4 from torch's blocked fp32
