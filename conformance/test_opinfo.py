@@ -304,20 +304,10 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
 #   addr f16: 1/50 elements, abs 3.9e-3, rel 1.045e-3 vs 1e-3.
 #   instance_norm bf16, f16 and conv2d bf16, f16: 1-7 elements, one bf16/f16
 #     ulp each.
-# The other 8 stay OUT of this set -- anchoring does not make them pass, for
-# reasons unrelated to (or beyond) reduction order; see the commit message
-# and conformance_brief.md for the measured detail on each:
-#   pow f32 genuinely exceeds the 2x-anchored bound (a real precision gap).
-#   __rpow__ f32, masked_log_softmax bf16/f16: `assert_close_fp64_anchored`'s
-#     non-finite check is all-or-nothing -- one NaN/-inf element anywhere in
-#     the sample (a negative base to a non-integer power; a masked, -inf
-#     log-probability) falls the WHOLE tensor back to default tolerance, so
-#     the one genuinely anchorable finite element never gets anchored.
-#   log_softmax bf16/f16: unrelated to precision -- `aten::_log_softmax`
-#     raises NotImplementedError on an empty-tensor sample (5,0,0).
-#   nn_functional_batch_norm bf16/f16: `assert_close_fp64_anchored` itself
-#     crashes (RuntimeError from `torch_error.max()` on a 0-element sample
-#     tensor) before any comparison runs.
+# The other 8 were anchored once `assert_close_fp64_anchored` anchored the
+# finite elements of a sample that also holds a masked -inf or a NaN and
+# survived an empty sample (see the entries below); `pow` float32 was a real
+# precision gap until float32 pow went through float64 (logic_ops.mojo).
 _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
     # sm_90a (H100), measured 2026-09-14 after the base tables were regenerated
     # for the native backend: the same last-ulp class as gfx942's below (a

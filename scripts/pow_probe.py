@@ -12,10 +12,11 @@ from torch.testing._internal.common_methods_invocations import op_db
 import torch_mojo_backend.native as n
 from torch_mojo_backend import register_mojo_devices
 
-register_mojo_devices()
 
-print("KERNELS_DIR", n._KERNELS_DIR, "torch", torch.__version__, flush=True)
-DEV = torch.device("mojo:0")
+def _dev() -> torch.device:
+    return torch.device("mojo:0")  # only after register_mojo_devices()
+
+
 f32, f64 = np.float32, np.float64
 LOG2E = f32(1.4426950408889634)
 
@@ -91,7 +92,7 @@ def run_sample(
     y = np.ascontiguousarray(y, dtype=f32)
     ref = np.power(x.astype(f64), y.astype(f64))
     ours = (
-        torch.pow(torch.from_numpy(x).to(DEV), torch.from_numpy(y).to(DEV))
+        torch.pow(torch.from_numpy(x).to(_dev()), torch.from_numpy(y).to(_dev()))
         .cpu()
         .numpy()
     )
@@ -138,79 +139,9 @@ def run_sample(
     return ours, cpu, ref
 
 
-# 1. Random sample x in [0.5, 50], y in [0, 6].
-rng = np.random.default_rng(0)
-N = 1 << 20
-run_sample(
-    "random x in [0.5,50], y in [0,6]", rng.uniform(0.5, 50, N), rng.uniform(0, 6, N)
-)
-run_sample(
-    "stress x in [0.5,50], y in [-20,20]",
-    rng.uniform(0.5, 50, N),
-    rng.uniform(-20, 20, N),
-)
-run_sample(
-    "stress x in [1,2], y in [0,120]", rng.uniform(1, 2, N), rng.uniform(0, 120, N)
-)
-run_sample(
-    "stress x in [1e-3,1e3], y in [-5,5]",
-    10 ** rng.uniform(-3, 3, N),
-    rng.uniform(-5, 5, N),
-)
-
-# 2. __rpow__: scalar ** tensor
-xs = rng.uniform(0, 6, N).astype(f32)
-ref = np.power(f64(2.5), xs.astype(f64))
-ours = (torch.tensor(2.5).to(DEV) ** torch.from_numpy(xs).to(DEV)).cpu().numpy()
-cpu = (2.5 ** torch.from_numpy(xs)).numpy()
-m = np.isfinite(ref)
-print(
-    "--- __rpow__ tensor(2.5) ** x, x in [0, 6]  (pow.Scalar_out is not registered: 0-d tensor base)"
-)
-summarize("ours (mojo)", ours, ref, m)
-summarize("torch cpu", cpu, ref, m)
-
-# 3. Tensor_Scalar: x ** 2.5
-xs = rng.uniform(0.5, 50, N).astype(f32)
-ref = np.power(xs.astype(f64), 2.5)
-ours = (torch.from_numpy(xs).to(DEV) ** 2.5).cpu().numpy()
-cpu = (torch.from_numpy(xs) ** 2.5).numpy()
-print("--- Tensor_Scalar x ** 2.5, x in [0.5, 50]")
-summarize("ours (mojo)", ours, ref, m)
-summarize("torch cpu", cpu, ref, m)
-
-# 4. The OpInfo samples the conformance node uses (pow, float32, tensor exponent).
-op = next(o for o in op_db if o.name == "pow" and o.variant_test_name == "")
-torch.manual_seed(0)
-for i, s in enumerate(op.sample_inputs("cpu", torch.float32, requires_grad=False)):
-    if not (
-        isinstance(s.input, torch.Tensor)
-        and s.args
-        and isinstance(s.args[0], torch.Tensor)
-    ):
-        continue
-    if s.args[0].dtype != torch.float32 or s.input.dtype != torch.float32:
-        continue
-    x, y = s.input.numpy(), s.args[0].numpy()
-    if x.size == 0 or y.size == 0:
-        continue
-    ours, cpu, ref = run_sample(
-        f"opinfo sample {i} {tuple(x.shape)} ** {tuple(y.shape)}", x, y
-    )
-    fin = np.isfinite(ref) & (ref != 0)
-    rel_o = np.abs(ours.astype(f64) - ref) / np.abs(ref)
-    rel_c = np.abs(cpu.astype(f64) - ref) / np.abs(ref)
-    print(
-        f"  max rel vs f64: ours {rel_o[fin].max():.3e} ({(rel_o[fin] > 1.3e-6).sum()} > rtol 1.3e-6), "
-        f"torch cpu {rel_c[fin].max():.3e}",
-        flush=True,
-    )
-
-# 5. Streamed device-time proxy on 16M elements (synchronize, burst, synchronize).
-sync = torch.mojo.synchronize  # ty: ignore[unresolved-attribute]
-
-
-def time_us(fn: Callable[[], object], iters: int = 20, reps: int = 5) -> float:
+def time_us(
+    fn: Callable[[], object], sync: Callable[[], object], iters: int = 20, reps: int = 5
+) -> float:
     for _ in range(3):
         fn()
     sync()
@@ -225,18 +156,101 @@ def time_us(fn: Callable[[], object], iters: int = 20, reps: int = 5) -> float:
     return best
 
 
-M = 1 << 24
-xt = (torch.rand(M) * 49.5 + 0.5).to(DEV)
-yt = (torch.rand(M) * 6).to(DEV)
-base = torch.tensor(2.5).to(DEV)
-for name, fn, nbytes in (
-    ("pow(T,T) fractional y", lambda: torch.pow(xt, yt), 12 * M),
-    ("pow(T, 2.5)", lambda: torch.pow(xt, 2.5), 8 * M),
-    ("pow(T, 2.0)", lambda: torch.pow(xt, 2.0), 8 * M),
-    ("tensor(2.5) ** T", lambda: torch.pow(base, yt), 8 * M),
-):
-    us = time_us(fn)
-    print(
-        f"timing 16M f32 {name:24s} {us:9.1f} us/iter  {nbytes / us / 1e3:7.0f} GB/s",
-        flush=True,
+def main() -> int:
+    register_mojo_devices()
+    print("KERNELS_DIR", n._KERNELS_DIR, "torch", torch.__version__, flush=True)
+    # 1. Random sample x in [0.5, 50], y in [0, 6].
+    rng = np.random.default_rng(0)
+    N = 1 << 20
+    run_sample(
+        "random x in [0.5,50], y in [0,6]",
+        rng.uniform(0.5, 50, N),
+        rng.uniform(0, 6, N),
     )
+    run_sample(
+        "stress x in [0.5,50], y in [-20,20]",
+        rng.uniform(0.5, 50, N),
+        rng.uniform(-20, 20, N),
+    )
+    run_sample(
+        "stress x in [1,2], y in [0,120]", rng.uniform(1, 2, N), rng.uniform(0, 120, N)
+    )
+    run_sample(
+        "stress x in [1e-3,1e3], y in [-5,5]",
+        10 ** rng.uniform(-3, 3, N),
+        rng.uniform(-5, 5, N),
+    )
+
+    # 2. __rpow__: scalar ** tensor
+    xs = rng.uniform(0, 6, N).astype(f32)
+    ref = np.power(f64(2.5), xs.astype(f64))
+    ours = (
+        (torch.tensor(2.5).to(_dev()) ** torch.from_numpy(xs).to(_dev())).cpu().numpy()
+    )
+    cpu = (2.5 ** torch.from_numpy(xs)).numpy()
+    m = np.isfinite(ref)
+    print(
+        "--- __rpow__ tensor(2.5) ** x, x in [0, 6]  (pow.Scalar_out is not registered: 0-d tensor base)"
+    )
+    summarize("ours (mojo)", ours, ref, m)
+    summarize("torch cpu", cpu, ref, m)
+
+    # 3. Tensor_Scalar: x ** 2.5
+    xs = rng.uniform(0.5, 50, N).astype(f32)
+    ref = np.power(xs.astype(f64), 2.5)
+    ours = (torch.from_numpy(xs).to(_dev()) ** 2.5).cpu().numpy()
+    cpu = (torch.from_numpy(xs) ** 2.5).numpy()
+    print("--- Tensor_Scalar x ** 2.5, x in [0.5, 50]")
+    summarize("ours (mojo)", ours, ref, m)
+    summarize("torch cpu", cpu, ref, m)
+
+    # 4. The OpInfo samples the conformance node uses (pow, float32, tensor exponent).
+    op = next(o for o in op_db if o.name == "pow" and o.variant_test_name == "")
+    torch.manual_seed(0)
+    for i, s in enumerate(op.sample_inputs("cpu", torch.float32, requires_grad=False)):
+        if not (
+            isinstance(s.input, torch.Tensor)
+            and s.args
+            and isinstance(s.args[0], torch.Tensor)
+        ):
+            continue
+        if s.args[0].dtype != torch.float32 or s.input.dtype != torch.float32:
+            continue
+        x, y = s.input.numpy(), s.args[0].numpy()
+        if x.size == 0 or y.size == 0:
+            continue
+        ours, cpu, ref = run_sample(
+            f"opinfo sample {i} {tuple(x.shape)} ** {tuple(y.shape)}", x, y
+        )
+        fin = np.isfinite(ref) & (ref != 0)
+        rel_o = np.abs(ours.astype(f64) - ref) / np.abs(ref)
+        rel_c = np.abs(cpu.astype(f64) - ref) / np.abs(ref)
+        print(
+            f"  max rel vs f64: ours {rel_o[fin].max():.3e} ({(rel_o[fin] > 1.3e-6).sum()} > rtol 1.3e-6), "
+            f"torch cpu {rel_c[fin].max():.3e}",
+            flush=True,
+        )
+
+    # 5. Streamed device-time proxy on 16M elements (synchronize, burst, synchronize).
+    sync = torch.mojo.synchronize  # ty: ignore[unresolved-attribute]
+
+    M = 1 << 24
+    xt = (torch.rand(M) * 49.5 + 0.5).to(_dev())
+    yt = (torch.rand(M) * 6).to(_dev())
+    base = torch.tensor(2.5).to(_dev())
+    for name, fn, nbytes in (
+        ("pow(T,T) fractional y", lambda: torch.pow(xt, yt), 12 * M),
+        ("pow(T, 2.5)", lambda: torch.pow(xt, 2.5), 8 * M),
+        ("pow(T, 2.0)", lambda: torch.pow(xt, 2.0), 8 * M),
+        ("tensor(2.5) ** T", lambda: torch.pow(base, yt), 8 * M),
+    ):
+        us = time_us(fn, sync)
+        print(
+            f"timing 16M f32 {name:24s} {us:9.1f} us/iter  {nbytes / us / 1e3:7.0f} GB/s",
+            flush=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

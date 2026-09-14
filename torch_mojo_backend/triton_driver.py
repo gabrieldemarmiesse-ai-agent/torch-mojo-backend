@@ -233,9 +233,15 @@ class _MojoUtils(Generic[_Previous]):
     ) -> tuple[int, int, int, int, int]:
         previous = self._push(device)
         try:
-            return self._utils.load_binary(name, data, shared, device)
-        finally:
-            self._pop(previous)
+            result = self._utils.load_binary(name, data, shared, device)
+        except BaseException as exc:
+            try:
+                self._pop(previous)
+            except Exception as restore:
+                exc.add_note(f"restoring the previous device also failed: {restore}")
+            raise
+        self._pop(previous)  # a failure here is the error when the load went through
+        return result
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._utils, name)

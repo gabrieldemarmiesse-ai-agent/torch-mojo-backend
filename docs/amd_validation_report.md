@@ -11,7 +11,7 @@ by an agent on one exclusive MI300A node; the sections follow the plan.
 | 1 setup / first contact | works: shim 6 s, base library 13 s, api = hip, 4 GPUs; every HIP vendor binding worked at first try; the process exit segfault with the VMM knob is Modular's known bug |
 | 2 runtime + op groups (`tests/native/`) | about 2170 passed across the 17 files after the fixes (per-file table in section 2); the only real failures were the three findings below; the fp32 GEMM bug was found by the very first `torch.mm` |
 | 3 whole suite | 3741 passed, 342 skipped, 123 xfailed, 36 xpassed, **2 failed** (RCCL 2-rank workers inside the suite: the documented APU test-order pitfall; the same file passes 40 / 40 standalone). Fifth launch: two were OOM-killed by my own agents' memory use, one was scancel'ed by an agent |
-| 3 conformance | no AMD delta needed except two operators that decline empty tensors; 13 one-ulp nodes anchored to float64 per accelerator; **2 failed** (`pow`, `__rpow__` float32: a real 14-ulp precision gap, not fixed) |
+| 3 conformance | no AMD delta needed except two operators that decline empty tensors; 13 one-ulp nodes anchored to float64 per accelerator; **2 failed** (`pow`, `__rpow__` float32: a real 14-ulp precision gap). Both closed afterwards on the H100 side, see "Reviewer follow-up" |
 | 4 distributed | RCCL 40 / 40, mojoccl 7 / 7, 4-rank nanoGPT on both, losses match |
 | 5 Triton on HIP | works after one fix (second-device launch); liger-kernel RMSNorm correct and benchmarked through the HIP driver |
 | 6 Inductor | made to work on HIP within the hour: 8 / 8 |
@@ -19,7 +19,7 @@ by an agent on one exclusive MI300A node; the sections follow the plan.
 | 8 prebuilt libraries | shims for torch 2.7 to 2.14 and the base library build; the wheel's prebuilt base library drives the MI300A; the compile fallback works |
 | 9 performance | ours / stock ROCm torch: 1.05 to 1.12 on one GPU, 1.05 (RCCL) and 1.03 (mojoccl) on 4-rank DDP at batch 48, 1.10 / 1.07 at batch 12 |
 | fixes | 5 bugs fixed + Inductor HIP support + conformance instrument, each its own commit with a test; sm_90a assembly unchanged for the two kernel fixes; nothing run on an H100 |
-| open | fp32 `pow` precision (finding 5); run-to-run nondeterminism of our training losses (stock is bit-reproducible here); the mojoccl batch-48 bimodality |
+| open | run-to-run nondeterminism of our training losses (stock is bit-reproducible here); the mojoccl batch-48 bimodality |
 
 ## 1. Environment
 
@@ -204,7 +204,7 @@ workers fit: its recorder writes one file per process and tolerates the
 exit segfault) ran in 115 s once the specializations were warm:
 14 failed, 1112 passed, 236 skipped, 1424 xfailed. `write_accelerator_delta.py`:
 **0 operators differ from the base tables** for `test_matches_cpu` and 0 for
-`test_errors_match`, so no `_ACCELERATOR_DELTAS["amdgpu:gfx942"]` entry is
+`test_errors_match`, so no `_ACCELERATOR_DELTAS["gfx942"]` entry is
 needed and there is no `+ declare` list: every operator the H100 tables
 declare unsupported is unsupported here too, and nothing declared
 unsupported passes. (The plan expected many differences; the native backend
@@ -269,78 +269,6 @@ entry only excuses an exception.
 
 The plan's "must be 0 failed" is not met by two nodes, both the `pow`
 precision gap of finding 5.
-
-## 4. Distributed (RCCL, then mojoccl)
-
-Second node `a1020` (job 5408315), 4 MI300A, `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`
-for the torchrun legs only, `NCCL_DEBUG=INFO`.
-
-| command | result |
-|---|---|
-| `pytest tests/test_distributed.py` (RCCL, 2-rank torchrun workers) | **40 passed** in 799 s (H100 x2: 39 passed, 1 skipped) |
-| `torchrun --nproc-per-node=4 nanogpt_ddp.py --device mojo` batch 12, 40 steps, RCCL | trace `collectives via /lus/home/softs/rocm/6.4.3/lib/librccl.so.1 (rccl version 22203)`; first step 1133 s (48 kernel builds, 1131 s of compile, cold cache for the 4-rank shapes), then 705 to 720k tok/s; loss 11.0074 -> 6.0455 at step 40 |
-| same, 1 rank, batch 12 | 190k tok/s, loss 6.0858 at step 40 (a different global batch, so a different curve by construction; the stock-vs-mojo same-configuration comparison is in section 9) |
-| `pytest tests/test_distributed.py -k mojo` (`TORCH_MOJO_BACKEND_CCL=mojo`) | 7 passed in 106 s |
-| 4-rank nanoGPT, mojoccl | trace `collectives via .../cache/libmojoccl.hash-68bf71f23b7ee946.so (mojoccl version 23102)`; 695 to 706k tok/s; losses equal to the RCCL run to 1e-4 through step 20 (6.2451 vs 6.2450), 6.0595 vs 6.0455 at step 40 |
-
-The multi-node protocol (`tests/multinode/e2e_three_stacks_adastra.sh`) was
-not run: the two allocations were single nodes used for the sequential and
-the parallel halves of this validation, not a node pair.
-
-## 5. Triton on HIP
-
-`triton` 3.6.0 (the wheel the CUDA torch had pulled) next to the CPU torch,
-`liger-kernel` 0.8.2.
-
-| command | result |
-|---|---|
-| `pytest tests/native/test_triton.py` | **2 failed**, 5 passed, 1 skipped (CUDA driver contexts). Failures: (1) `test_triton_launch_on_a_second_device`: `Triton Error [HIP]: Code: 101, invalid device ordinal` from the HIP driver's launch under `with device_module.device(1)`: a real bug in the never-run `_hip_driver_class`, see "Fixes"; (2) `test_driver_is_installed_on_import_after_registration` asserts the class name `MojoCudaDriver`; on HIP it is `MojoHipDriver`: test assumption |
-| liger `LigerRMSNormFunction.apply(h, w, 1e-6, 0.0, "llama", True)` on `mojo:0`, (64, 2048) | forward max err 1.4e-6, dX 7.2e-7, dW 7.6e-6 against the CPU formula (ref max 9.9 / 4.0 / 30.7); `triton.testing.do_bench` 0.0177 ms; `driver.active` is `MojoHipDriver`, target `GPUTarget(backend='hip', arch='gfx942', warp_size=64)`; the launch stream handle 189223616 equals `torch.mojo.stream_native_handle(current_stream())`. The package's `device.type == "cuda"` branches fell through to its generic paths unchanged, as on NVIDIA |
-| same under `with torch.mojo.device(1)` on `mojo:1` | the second-device bug above; after the fix: forward 1.4e-6, dX 7.2e-7, dW 7.6e-6, do_bench 0.059 ms, launch stream == mojo `hipStream_t` |
-| after the fix (commit 5a7eb6a) | `test_triton.py`: 7 passed, 1 skipped (CUDA driver contexts) |
-
-## 6. TorchInductor
-
-`pytest tests/native/test_inductor.py`: **7 failed**, 1 passed. Every failure
-is `OSError: libcuda.so.1: cannot open shared object file` from
-`inductor.py::_device_properties`, reached through Inductor's
-`DeviceProperties.create`: the device interface reads compute capability and
-SM count from libcuda, the mojo Triton target is an alias of
-`CUDABackend`, and `_ptxas.apply_triton_default()` is NVIDIA-only, as the
-docs say. Fixed within the hour (commit b3c9e27): device properties come from the HIP Triton driver's own `get_device_properties` on hip (no libcuda), the mojo Triton target aliases `triton.backends.amd.compiler.HIPBackend` when the accelerator api is hip, ptxas is skipped on hip, and `raise_if_triton_unavailable` looks for the `amd` backend. After: **8 passed** (cold 349 s, warm 19 to 25 s); `test_monkeypatching_is_centralized.py` still passes; ruff and ty clean. The CUDA path is the same code behind an api check.
-
-## 3. The whole suite and the conformance tables
-
-The conformance regeneration (`regenerate_known_unsupported.py --records ... -n 4`,
-under the lock, with `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` so four
-workers fit: its recorder writes one file per process and tolerates the
-exit segfault) ran in 115 s once the specializations were warm:
-14 failed, 1112 passed, 236 skipped, 1424 xfailed. `write_accelerator_delta.py`:
-**0 operators differ from the base tables** for `test_matches_cpu` and 0 for
-`test_errors_match`, so no `_ACCELERATOR_DELTAS["amdgpu:gfx942"]` entry is
-needed and there is no `+ declare` list: every operator the H100 tables
-declare unsupported is unsupported here too, and nothing declared
-unsupported passes. (The plan expected many differences; the native backend
-declines op by op in Mojo, not per architecture, which is why the tables
-carry over.)
-
-The 14 failures are numerical, one bf16/f16 ulp or an fp32 summation-order
-difference against tolerances that the H100 happens to meet:
-
-| node | mismatch |
-|---|---|
-| bmm float32 | 1 of 250 elements, abs 1.44e-5 (1e-5 allowed) |
-| pow, __rpow__ float32 | rel 1.4e-6 to 1.6e-6 (1.3e-6 allowed) on 1 to 3 large elements |
-| log_softmax, masked_log_softmax bf16 / f16 | 2 to 3 of 25 elements, abs 3.8e-3 (bf16) / 4.3e-4 (f16); the CPU reference is exactly 0 there |
-| addr float16 | 1 of 50, rel 1.045e-3 (1e-3 allowed) |
-| batch_norm, instance_norm bf16 / f16 | 1 to 7 of 125, one ulp |
-| conv2d bf16 / f16 | 1 element, one ulp |
-
-The suite's existing instrument for this class is `_FP64_ANCHORED` in
-`conformance/test_opinfo.py` (as accurate as torch against a float64
-reference, within 2x); the fix makes it accelerator-keyed and lists these
-nodes under `amdgpu:gfx942`, and any node that fails even that bar stays a
-failure and is reported as a precision finding. See "Fixes".
 
 The whole suite (`pytest tests --ignore=tests/multinode`, serial, one
 process) was OOM-killed twice by the node's global OOM killer, at 24% and
@@ -490,8 +418,8 @@ reviewer with an H100 should run `tests/native/test_matmul.py`,
 A code-only review by Codex (`gpt-6-astra`) of the first four commits found
 them mergeable and produced the follow-ups; its one substantive caveat is
 performance: the fp32 non-transposed blocks now run 128 threads (deep-K: 64)
-instead of 256, which is unmeasured; the benchmarks run of section 7 gives
-the fp32 GEMM ratio against stock torch.
+instead of 256, which is unmeasured: the benchmarks run of section 7 did
+not complete, so the fp32 GEMM ratio against stock torch is still owed.
 
 ### Finding 5: float32 `pow` is 14 to 46 ulp off on gfx942 (not fixed)
 
@@ -528,6 +456,38 @@ gfx942 kernel and the CPU mojo device sit ~2e-4 from torch's blocked fp32
 sum on a few elements, about 4x torch's own distance from float64: the
 kernels accumulate in k order. Within fp32 expectations, but the
 fp64-anchored bar of the conformance suite would not accept it.
+
+## Reviewer follow-up (H100 side, 2026-09-14)
+
+Done from the NVIDIA cluster on this branch before merging it:
+
+- `scripts/compare_kernel_asm.py --accelerator sm_90a`: 0 of 290
+  specializations differ between `mojo-native-backend` and this branch.
+- H100, the files this branch touches (`test_matmul.py`, `test_reductions.py`,
+  `test_attention.py`, `test_triton.py`, `test_inductor.py`): 662 passed,
+  12 skipped; `test_nn.py`, `test_binary.py`, `test_unary.py`,
+  `test_composed.py` after the follow-ups below: see the PR.
+- The H100 conformance suite had 15 failures of its own on the same nodes
+  this report anchored for gfx942 (never seen before: CPU-only CI, and the
+  sm_90a base tables were regenerated without a re-run). Fixed here:
+  fifteen `sm_90a` nodes anchored the same way; float32 `pow` and `__rpow__`
+  now go through float64 in both kernels (`logic_ops` BOP_POW,
+  `elementwise_ops` SOP_POW; not on Apple GPUs), which costs nothing
+  measurable on the H100 (`scripts/pow_timing.py`: 71.0 us before and after
+  on 16M elements, memory-bound) and should close finding 5 on MI300A too
+  (unverified there); `softmax` of an empty tensor returns an empty tensor
+  instead of declining, so the `log_softmax` / `masked_log_softmax` delta
+  entries recorded above went with the decline (the gfx942 key stays, empty:
+  a re-run there is owed). Softmax and pow entries regenerated on the H100
+  and the MAX CPU device; both suites 0 failed.
+- gpt-6-astra reviewed the diff: one P1 (the anchored comparison accepted a
+  NaN where torch and the reference are finite, and let a non-finite torch
+  result poison the error budget: fixed, with host-only tests) and four P2s
+  (the two probe scripts ran GPU work on import, now behind `main()`; a
+  failed `hipSetDevice` restore replaced the loader's exception, now a note
+  on it; the wall-time timing is labelled as such; and this report carried
+  two copies of sections 3 to 6 and a claim that section 7 measured fp32
+  GEMM: consolidated).
 
 ## 10. Not run, and how this was run
 
