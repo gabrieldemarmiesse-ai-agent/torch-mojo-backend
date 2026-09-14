@@ -106,8 +106,8 @@ def _launch[
     comptime ACC = acc_dtype[dtype]()
     var p_out0 = Scalar[dtype]()
     var p_out1 = Scalar[dtype]()
-    var p_acc0 = Scalar[ACC]()
-    var p_acc1 = Scalar[ACC]()
+    var p_acc0: Scalar[ACC]
+    var p_acc1: Scalar[ACC]
     comptime if DIST == DIST_UNIFORM:
         p_out0 = _narrow[dtype](pf0)
         p_out1 = _narrow[dtype](pf1)
