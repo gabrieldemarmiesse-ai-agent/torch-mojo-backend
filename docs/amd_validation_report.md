@@ -9,7 +9,7 @@ by an agent on one exclusive MI300A node; the sections follow the plan.
 | section | outcome |
 |---|---|
 | 1 setup / first contact | works: shim 6 s, base library 13 s, api = hip, 4 GPUs; every HIP vendor binding worked at first try; the process exit segfault with the VMM knob is Modular's known bug |
-| 2 runtime + op groups (`tests/native/`) | 1911 passed after the fixes; the only real failures were the three findings below; the fp32 GEMM bug was found by the very first `torch.mm` |
+| 2 runtime + op groups (`tests/native/`) | about 2170 passed across the 17 files after the fixes (per-file table in section 2); the only real failures were the three findings below; the fp32 GEMM bug was found by the very first `torch.mm` |
 | 3 whole suite | see the table in section 3 (fifth launch; two were OOM-killed by my own agents' memory use, one was scancel'ed by an agent) |
 | 3 conformance | no AMD delta needed except two operators that decline empty tensors; 13 one-ulp nodes anchored to float64 per accelerator; **2 failed** (`pow`, `__rpow__` float32: a real 14-ulp precision gap, not fixed) |
 | 4 distributed | RCCL 40 / 40, mojoccl 7 / 7, 4-rank nanoGPT on both, losses match |
