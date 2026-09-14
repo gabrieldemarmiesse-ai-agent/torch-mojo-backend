@@ -346,6 +346,13 @@ Linux x86_64, Linux aarch64 and macOS arm64, checks their glibc floors, builds
 the wheel, then installs it in a fresh venv and runs
 `scripts/smoke_prebuilt_wheel.py` against two torch versions, which fails
 unless both prebuilt libraries were used and an op ran on the CPU device.
+That one base library per platform can drive any GPU only because it holds
+no device code, and `tests/test_backend_has_no_device_code.py` holds it to
+that on every commit: it builds the library with the production command for
+no accelerator, Apple M4, MI300A and H100, and requires the four shared
+libraries to be byte-identical with no `.ptx`/`.amdgcn`/`.ll` sidecar. A
+control in the same file builds a one-kernel module for two targets and
+requires those to differ, so the equality cannot pass vacuously.
 
 **Refreshing them** — after a change to `native/csrc/`, `native/mojo/`, or
 the MAX pin:
