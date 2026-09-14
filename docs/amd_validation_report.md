@@ -10,7 +10,7 @@ by an agent on one exclusive MI300A node; the sections follow the plan.
 |---|---|
 | 1 setup / first contact | works: shim 6 s, base library 13 s, api = hip, 4 GPUs; every HIP vendor binding worked at first try; the process exit segfault with the VMM knob is Modular's known bug |
 | 2 runtime + op groups (`tests/native/`) | about 2170 passed across the 17 files after the fixes (per-file table in section 2); the only real failures were the three findings below; the fp32 GEMM bug was found by the very first `torch.mm` |
-| 3 whole suite | see the table in section 3 (fifth launch; two were OOM-killed by my own agents' memory use, one was scancel'ed by an agent) |
+| 3 whole suite | 3741 passed, 342 skipped, 123 xfailed, 36 xpassed, **2 failed** (RCCL 2-rank workers inside the suite: the documented APU test-order pitfall; the same file passes 40 / 40 standalone). Fifth launch: two were OOM-killed by my own agents' memory use, one was scancel'ed by an agent |
 | 3 conformance | no AMD delta needed except two operators that decline empty tensors; 13 one-ulp nodes anchored to float64 per accelerator; **2 failed** (`pow`, `__rpow__` float32: a real 14-ulp precision gap, not fixed) |
 | 4 distributed | RCCL 40 / 40, mojoccl 7 / 7, 4-rank nanoGPT on both, losses match |
 | 5 Triton on HIP | works after one fix (second-device launch); liger-kernel RMSNorm correct and benchmarked through the HIP driver |
@@ -348,6 +348,27 @@ at 335 s, while my agents held three other MAX contexts on the same node
 (each reserves ~115 GB of the APU's 501 GB at first use; `free` does not
 show those reservations). Its fourth launch, alone on the node, is reported
 below.
+
+Fifth launch (`a1020`, `ROCR_VISIBLE_DEVICES=1,2,3`, alone on the node
+except the stuck benchmark process on GPU 0 until 05:50):
+
+| command | wall | result |
+|---|---|---|
+| `pytest tests -q --ignore=tests/multinode` (serial, one process, with all the fixes in the tree) | 2 h 31 min (H100: ~50 min; the difference is first-call compiles of the specializations this run met first) | **2 failed**, 3741 passed, 342 skipped, 123 xfailed, 36 xpassed (H100 reference, tree 8e964c4: 3587 passed, 287 skipped, 127 xfailed, 11 failed) |
+
+The two failures are `tests/test_distributed.py::test_two_rank_nccl[collectives-vendor]`
+and `[stress-vendor]`: the RCCL worker dies with `ncclGroupEnd failed:
+unhandled cuda error`. Both passed in the standalone run of the file
+(section 4: 40 passed) and the same two modes pass with mojoccl inside the
+whole suite; classification: **test-order interaction on the APU**, the
+pitfall `test_distributed.py`'s own docstring describes (the pytest
+process has by then created mojo tensors, so MAX holds its ~115 GB
+reservation on the GPU rank 0 is pinned to, and RCCL's P2P setup on that
+GPU fails). The file guards its own single-process probe against it by
+using a subprocess, but cannot guard against the 3000 tests before it. Not
+a backend bug; on an APU run `test_distributed.py` in its own process. The
+36 xpassed are non-strict xfails that the branch has since fixed (the
+`foreach` ones of section 2 among them).
 
 ## 9. Performance
 
