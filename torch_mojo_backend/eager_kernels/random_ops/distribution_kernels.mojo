@@ -15,7 +15,11 @@ from max.algorithm import elementwise
 from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceil, fma
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator
+from std.sys.info import (
+    bit_width_of,
+    has_accelerator,
+    has_apple_gpu_accelerator,
+)
 from std.utils.coord import Coord
 
 from curand_philox import (
@@ -421,26 +425,14 @@ def dist_draw[
 
 @always_inline
 def _uniform_int_modulus[dtype: DType]() -> UInt64:
-    """`transformation::uniform_int`: `max + 1` for integers, `2^digits + 1`
-    for floats."""
-    comptime if dtype == DType.int64:
-        return UInt64(1) << 63
-    elif dtype == DType.int32:
-        return UInt64(1) << 31
-    elif dtype == DType.int16:
-        return UInt64(1) << 15
-    elif dtype == DType.int8:
-        return UInt64(1) << 7
-    elif dtype == DType.uint8:
-        return UInt64(1) << 8
-    elif dtype == DType.float64:
-        return (UInt64(1) << 53) + 1
-    elif dtype == DType.float32:
-        return (UInt64(1) << 24) + 1
-    elif dtype == DType.float16:
-        return (UInt64(1) << 11) + 1
-    else:  # bfloat16
-        return (UInt64(1) << 8) + 1
+    """`transformation::uniform_int`: `2^digits + 1` for floats, `max + 1`
+    for integers."""
+    comptime if dtype.is_floating_point():
+        return (UInt64(1) << UInt64(DType.mantissa_width[dtype]() + 1)) + 1
+    elif dtype.is_unsigned():
+        return UInt64(1) << UInt64(bit_width_of[dtype]())
+    else:
+        return UInt64(1) << UInt64(bit_width_of[dtype]() - 1)
 
 
 @always_inline
