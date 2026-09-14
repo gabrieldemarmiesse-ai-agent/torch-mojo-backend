@@ -1,7 +1,16 @@
-"""Runtime regime dispatch for external candidates; upstream stays a fallback.
+"""Runtime regime gates of the three measured bf16 candidates.
 
-The TN selection uses existing kernel bodies. NN/fused-NT integration is
-added only after each candidate has passed its independent measurements.
+Reached from the top of `enqueue_gemm16_gemm` (the single-matrix GEMM
+entry); every helper here returns False WITHOUT launching anything for a
+shape it does not serve, and the whole pre-existing ladder is what runs
+then. The TN selection launches unchanged upstream device bodies -- what it
+adds is coverage and a wave-cost comparison; NN and fused-NT launch the
+kernels in gemm16_rolling_kernels.mojo and gemm16_nt_bias_kernels.mojo.
+
+Every crossover constant below was fitted on an H100 PCIe (114 SMs) at
+1410 MHz. Matrix dimensions and the SM count stay runtime values: the gates
+are shape REGIMES (residue-64 widths, bounded aspect ratios, deep K, grids
+that fill more than one wave), never particular sizes.
 """
 from max.gpu.host import DeviceContext, DeviceAttribute
 from std.sys.info import _has_sm_9x

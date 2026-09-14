@@ -1,11 +1,11 @@
 """Persistent bf16 GEMM with rolling TMA ring stage and phase counters.
 
-Derived from the measured st.matrix candidate at git 5603b00.
 The producer and consumer advance explicit counters across all output
-work, avoiding division/modulo by the non-power-of-two stage count.
-The remainder of this frozen experimental body is unchanged.
+work, avoiding division/modulo by the non-power-of-two stage count; both
+counters span output-work boundaries, so the barrier sequence is the
+parent's with the repeated stage-index arithmetic removed.
 
-Originally derived from upstream gemm16_nn_v4_kernels.mojo.  Only the scalar-pair
+Derived from upstream gemm16_nn_v4_kernels.mojo.  Only the scalar-pair
 shared-store loop changes: four 8x8 matrices are packed per st.matrix,
 using the original BM-high, 64-column swizzled TMA boxes.  The existing
 pipeline, layouts, consumer barriers, C descriptor, and TMA-store launches

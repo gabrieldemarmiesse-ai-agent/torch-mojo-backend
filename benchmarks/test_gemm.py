@@ -38,6 +38,36 @@ SHAPES = {
     "S5_357x789x333": (357, 789, 333),  # awkward, exercises edge tiles
     "S6_32768x768x768": (32768, 768, 768),  # tall-skinny
     "S7_768x50304x49152": (768, 50304, 49152),  # lm_head wgrad: tiny-M/huge-N/huge-K
+    # GPT-2 XL (1600 embedding, B=16 x T=1024 tokens) projection sites, as
+    # aten::linear sees them: M x out_features x in_features.  1600, 4800 and
+    # 6400 are all 64 modulo 128 -- a residue no shape above has in ANY
+    # dimension, and the one the gemm16 candidates (rolling NN, the widened TN
+    # selection, the fused-bias NT) are gated on.  test_linear measures the
+    # fused forward; test_linear_backward's two legs are the dX (M x K x N) and
+    # dW (N x K x M) products, which is where the NN and TN candidates run.
+    "S8_16384x4800x1600": (16384, 4800, 1600),  # c_attn
+    "S9_16384x1600x1600": (16384, 1600, 1600),  # attn.c_proj
+    "S10_16384x6400x1600": (16384, 6400, 1600),  # mlp.c_fc
+    "S11_16384x1600x6400": (16384, 1600, 6400),  # mlp.c_proj
+    # lm_head, the fifth site of the same step and bias-free in the model:
+    # measured at parity with cuda before the candidates went in, and outside
+    # every one of their gates (the aspect limits reject a 50304-wide
+    # projection). A regression guard for the routes it already had, not a
+    # candidate target. test_linear passes a bias on every shape, so this node
+    # measures the biased call rather than the model's bias-free one.
+    "S12_16384x50304x1600": (16384, 50304, 1600),
+}
+
+# Batched, these four would be 2-3 TFLOP and several GB per leg for a regime
+# the candidates never serve: the single-matrix GEMM entry is where they are
+# installed, so every BMM item keeps its existing route by construction.
+BMM_EXCLUDED = {
+    "S7_768x50304x49152",  # ~40 GB per leg
+    "S8_16384x4800x1600",
+    "S9_16384x1600x1600",
+    "S10_16384x6400x1600",
+    "S11_16384x1600x6400",
+    "S12_16384x50304x1600",  # tens of GB per leg batched
 }
 
 LAYOUTS = ("NN", "NT", "TN", "TT")
@@ -61,11 +91,10 @@ COVERS: dict[str, str] = {
 SKIPPED: dict[str, str] = {}
 
 BMM_BATCH = 8
-# S7 batched would need ~40 GB per leg; every other shape fits everywhere.
 BMM_SHAPES = {
     f"{tag.split('_')[0]}_{BMM_BATCH}x{tag.split('_')[1]}": dims
     for tag, dims in SHAPES.items()
-    if tag != "S7_768x50304x49152"
+    if tag not in BMM_EXCLUDED
 }
 
 
