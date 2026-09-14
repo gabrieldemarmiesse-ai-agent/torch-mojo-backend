@@ -100,7 +100,7 @@ def main():
         peak_gib = torch.cuda.max_memory_allocated() / 2**30
         print(f"peak allocated after warmup full steps: {peak_gib:.2f} GiB")
 
-    def fwd_bwd() -> None:
+    def fwd_bwd():
         inputs, targets = next(stream)
         with context:
             _, loss = model(inputs, targets)
