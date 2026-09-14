@@ -314,6 +314,22 @@ def test_out_variants(mojo_device):
     torch.testing.assert_close(dest.cpu(), a_cpu / b_cpu)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 1, 4, 7])
+def test_scalar_mul_out_into_bucket_view(mojo_device, dtype, offset):
+    """DDP's reducer: `mul_out(bucket_view, grad, 1/world)` with the view at
+    whatever element offset the previous parameter left (aligned and not:
+    the vector and scalar lanes of the kernel)."""
+    n = 1000 * 16 + 3
+    grad_cpu, grad = _both((n,), dtype, mojo_device)
+    bucket = torch.zeros(n + 8, dtype=dtype, device=mojo_device)
+    with native_ran("aten::mul.out"):
+        torch.mul(grad, 1.0 / 16, out=bucket[offset : offset + n])
+    expected = torch.zeros(n + 8, dtype=dtype)
+    expected[offset : offset + n] = grad_cpu * (1.0 / 16)
+    torch.testing.assert_close(bucket.cpu(), expected)
+
+
 def test_out_resizes(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)
