@@ -289,3 +289,61 @@ process (MAX's from `/opt/rocm`, torch's bundled one) and
 | `pytest benchmarks/ --update-baselines` from that venv | see below |
 
 causal-conv1d was not built from source (optional in the plan).
+
+### Finding 4: bf16 / fp16 flash-attention backward wrong on partial tiles (gfx942)
+
+Found by the fp32 probe written for finding 3, which also ran bf16:
+`_scaled_dot_product_flash_attention(...)[0].sum().backward()` on
+BHSD inputs against the float64 math SDPA on CPU:
+
+| dtype | b h s d causal | out | dq | dk | dv | ref max |
+|---|---|---|---|---|---|---|
+| float32 | 2 4 200 64 F | 1.0e-6 | 1.2e-6 | 8.9e-7 | 8.4e-7 | 0.90 |
+| bfloat16 | 2 4 200 64 F | 2.0e-3 | 3.4e-3 | **9.3e-2** | **6.2e-2** | 0.77 |
+| bfloat16 | 1 2 8 8 F | 3.0e-3 | 4.8e-3 | **1.65** | **1.35** | 1.23 |
+| bfloat16 | 1 2 128 64 T | 6.7e-3 | 8.2e-3 | 1.2e-2 | 1.4e-2 | 3.17 |
+
+Root cause (`flash_attention_bwd_kernels.mojo`, `_bwd_dkv_mfma`,
+`_tile[MASKED=True]`): the causal bound on the scores was applied whenever
+the tile was the masked variant, but that variant is also the path for a
+partial last query tile and for a sequence shorter than one 64-row tile,
+regardless of `is_causal`, so every query-before-key term of the keys in
+that tile was dropped from dK and dV for non-causal inputs. dQ and the
+forward fold the causal flag into a per-query limit and were right; fp32
+takes the baseline kernels (`is_half_float` gate) whose bound respects the
+flag. One expression fixed it (the bound applies only when causal). Grid of
+107 (shape, dtype, causal) cases: 24 wrong before, 0 after. Regression test
+`test_fused_flash_backward_partial_tail_gfx942` (8 ids). sm_90a assembly: 0
+of 34 kernels differ. The code-only Codex reader and the debugging agent
+reached the same root cause independently. Commit 506e2c9.
+
+## Fixes
+
+Each fix is its own commit on `amd-validation` with a test. None was run on
+an H100: the NVIDIA-side check is the cross-compiled sm_90a assembly compare
+for the two kernel fixes, and an api gate for the three Python ones. A
+reviewer with an H100 should run `tests/native/test_matmul.py`,
+`test_reductions.py`, `test_attention.py`, `test_triton.py` and
+`test_inductor.py` on it.
+
+| commit | fix | test | H100-side check |
+|---|---|---|---|
+| 6598e2b | fp32 GEMM on gfx942: 32x32 warp tile for fp32 in the non-transposed and deep-K geometries; comptime guard `transpose_b or float32` against single-MMA warp tiles | `test_mm_float32_tensor_core_regime` (3 shapes), extended in 4a6f4c1-ish (see below) to the deep-K geometry and `addmm` | `compare_kernel_asm.py --accelerator sm_90a`: 0 of 396 kernels differ; the route is under `comptime if gfx942` |
+| 3f609ed | cumsum bf16/f16 and outer-dim routes enabled on HIP (the fast NVIDIA kernels stay gated on `ctx.api() == "cuda"` inside `nn_ops.mojo`) | 40 / 40 cumsum tests on MI300A | host-side gate only: `cuda` behaviour unchanged, Metal and CPU keep the old surface |
+| b3c9e27 | Inductor on HIP: device properties from the HIP Triton driver, `HIPBackend` alias for the mojo target, no ptxas | `test_inductor.py` 8 / 8 | api-gated; CUDA path is the same code |
+| 5a7eb6a | Triton HIP driver: `hipSetDevice` guard around `load_binary` (shared `_MojoUtils` wrapper; CUDA keeps its context push/pop) | `test_triton.py` 7 passed, 1 skipped; liger on `mojo:1` | CUDA path unchanged in behaviour (refactored wrapper) |
+| 506e2c9 | flash-attention backward: causal bound only when causal in the half-float dK/dV tail tile | `test_fused_flash_backward_partial_tail_gfx942` (8 ids) | sm_90a: 0 of 34 kernels differ (the MFMA kernels are under `is_amd_gpu()`) |
+| 2a93241 | review follow-ups: `GPUTarget` hint, checked `hipSetDevice` on restore, cumsum comment | ruff, ty | none needed |
+| (next) | `test_matmul.py`: deep-K fp32 and fused-bias cases | 10 / 10 | none needed |
+
+A code-only review by Codex (`gpt-6-astra`) of the first four commits found
+them mergeable and produced the follow-ups; its one substantive caveat is
+performance: the fp32 non-transposed blocks now run 128 threads (deep-K: 64)
+instead of 256, which is unmeasured; the benchmarks run of section 7 gives
+the fp32 GEMM ratio against stock torch.
+
+Observation, not a fix: on the deep-K fp32 shapes (k = 2080, 4128) both the
+gfx942 kernel and the CPU mojo device sit ~2e-4 from torch's blocked fp32
+sum on a few elements, about 4x torch's own distance from float64: the
+kernels accumulate in k order. Within fp32 expectations, but the
+fp64-anchored bar of the conformance suite would not accept it.
