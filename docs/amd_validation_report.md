@@ -490,3 +490,40 @@ gfx942 kernel and the CPU mojo device sit ~2e-4 from torch's blocked fp32
 sum on a few elements, about 4x torch's own distance from float64: the
 kernels accumulate in k order. Within fp32 expectations, but the
 fp64-anchored bar of the conformance suite would not accept it.
+
+## 10. Not run, and how this was run
+
+Not run:
+- The multi-node protocol (`tests/multinode/e2e_three_stacks_adastra.sh`):
+  the two allocations were single nodes used in parallel (suites on one,
+  distributed / perf on the other), never a pair.
+- The CI-artifact wheel: not available on this box; the wheel tested in
+  section 8 was built here.
+- causal-conv1d from source (optional).
+- `benchmarks/` beyond `test_gemm.py`: the full suite compiled for two hours
+  into the ROCm venv's own cache without reaching a measurement (24
+  specializations); only the GEMM file was rerun with a seeded cache, see
+  section 7.
+- The H100 side of every fix (section "Fixes").
+- Clock locking (no permission).
+
+How: one exclusive MI300A node (`a1018`, 10 h) for the serial suites, a
+second one (`a1020`, 10 h) taken after 3.5 h for sections 4 to 9 in
+parallel; every GPU command under a per-GPU `flock`; kernel specializations
+warmed with `pytest -n 12` / `-n 16` outside the lock before the timed
+runs (the serial first-call compiles were the dominant cost: GEMM
+specializations 2 to 8 min each, ~40 of them). Five bugs were hunted with a
+debugging agent and a code-only Codex reader in parallel; the reader's
+diagnosis landed first and was verified by the probe for the Triton loader,
+the flash-attention backward and the pow route. Two things went wrong with
+that parallelism and are worth knowing: three agent processes plus the
+suite exceeded the APU's memory twice (each MAX context reserves ~115 GB of
+the 501 GB and `free` does not show it; the global OOM killer took the
+suite), and one agent's `scancel` loop killed the fourth whole-suite launch
+at 91% and a regeneration step. The `register_mojo_devices()` side effect on
+the C environment (`PYTHONEXECUTABLE` set to the system interpreter without
+`VIRTUAL_ENV`, `:` prepended to `PYTHONPATH`) made subprocess-based tests
+fail with "No module named torch" when pytest was started with the bare venv
+python instead of `uv run`; and `uv run python /path/script.py` resolves an
+editable install to the checkout, not to a worktree on `PYTHONPATH`, unless
+`PYTHONPATH` is set explicitly (checked with `native._KERNELS_DIR`).
