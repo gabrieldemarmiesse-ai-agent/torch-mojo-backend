@@ -13,6 +13,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
+
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
@@ -83,7 +84,18 @@ def test_mm_transposed_operands(mojo_device):
     torch.testing.assert_close(got2.cpu(), a @ bt.t(), atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("shape", [(64, 64, 64), (96, 128, 64), (256, 256, 256)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 64, 64),
+        (96, 128, 64),
+        (256, 256, 256),
+        # deep K (k >= 2048 and k >= 2n) with k % 64 != 0: the second fp32
+        # geometry that used to pick a single-MMA (16x16) warp tile
+        (64, 2080, 64),
+        (128, 4128, 96),
+    ],
+)
 def test_mm_float32_tensor_core_regime(mojo_device, shape):
     """fp32 mm on the shapes that reach a matrix-core route (m >= 64, k % 32).
 
@@ -96,9 +108,21 @@ def test_mm_float32_tensor_core_regime(mojo_device, shape):
     m, k, n = shape
     a = torch.randn(m, k)
     b = torch.randn(k, n)
+    # The bar grows like sqrt(k): the kernels accumulate in fp32 in k order,
+    # so at k = 4128 a correct result sits ~2e-4 from torch's blocked sum on
+    # a few elements (measured on gfx942 and on the CPU device alike).
+    tol = 1e-4 * max(1.0, (k / 64) ** 0.5)
     with assert_ran("aten::mm"):
         got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
-    torch.testing.assert_close(got, a @ b, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(got, a @ b, atol=tol, rtol=tol)
+
+    # the same geometries through the fused-bias route
+    bias = torch.randn(n)
+    with assert_ran("aten::addmm"):
+        got_bias = torch.addmm(
+            bias.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+        ).cpu()
+    torch.testing.assert_close(got_bias, a @ b + bias, atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
