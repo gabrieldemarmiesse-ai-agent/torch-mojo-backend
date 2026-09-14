@@ -44,6 +44,11 @@ from gemm16_kernels import (
     enqueue_gemm16_gemm as _enqueue_accepted_bf16_gemm,
 )
 from gemm16_bmm_v5_kernels import try_enqueue_bmm16_nn_batched
+from gemm16_candidate_dispatch import (
+    try_enqueue_candidate_nn,
+    try_enqueue_candidate_nt_bias,
+    try_enqueue_candidate_tn,
+)
 from gemm16_nn_v4_kernels import (
     _v4_dyn_smem_attr,
     _v4_dyn_smem_tile,
@@ -1672,6 +1677,29 @@ def enqueue_gemm16_gemm(
     has_bias: Bool,
     ctx: DeviceContext,
 ) raises:
+    # Externally measured bf16/SM90 candidates, ahead of the ladder below.
+    # Each helper re-checks dtype, architecture, alignment, bounds and its own
+    # shape regime and returns False without launching anything otherwise, so
+    # every shape it declines keeps the exact route (and the exact order) it
+    # had before.  The regimes are narrow on purpose -- residue-64 N or K,
+    # bounded aspect ratios, deep K -- and were fitted on an H100 PCIe;
+    # gemm16_candidate_dispatch.mojo states each one.
+    #
+    # Inserted here, at the single-matrix entry, rather than inside
+    # _try_enqueue_gemm16_tn_route: the per-item BMM loop below reaches that
+    # helper too, and batched dispatch is deliberately left untouched.
+    if not has_bias:
+        if not transpose_a and not transpose_b:
+            if try_enqueue_candidate_nn(output, a, b, m, n, k, ctx):
+                return
+        elif transpose_a and not transpose_b:
+            if try_enqueue_candidate_tn(output, a, b, m, n, k, ctx):
+                return
+    elif not transpose_a and transpose_b:
+        if try_enqueue_candidate_nt_bias(
+            output, a, b, bias, m, n, k, True, ctx
+        ):
+            return
     # NT (forward linear) route: persistent clustered v4 kernel with TMA
     # multicast and TMA-store epilogue (gemm16_nt_v4_kernels.mojo).  The
     # helper enqueues only for regimes it fully supports (SM90, aligned

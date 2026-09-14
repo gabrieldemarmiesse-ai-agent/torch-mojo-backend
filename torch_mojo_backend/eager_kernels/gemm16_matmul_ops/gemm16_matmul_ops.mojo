@@ -19,6 +19,7 @@
 from std.os import abort
 
 from gemm16_v3_kernels import enqueue_gemm16_bmm, enqueue_gemm16_gemm
+from gemm16_candidate_dispatch import try_enqueue_candidate_nt_bias
 from gemm16_dtype import _GEMM16_DT
 from op_utils import (
     Arg,
@@ -27,6 +28,7 @@ from op_utils import (
     _raw_ctx,
     _raw_int,
     _spec_dispatcher11,
+    _spec_dispatcher12,
     _spec_dispatcher13,
 )
 
@@ -68,6 +70,65 @@ def _bf16_gemm_go(
         _raw_int(has_bias_obj) != 0,
         ctx,
     )
+
+
+def _bf16_gemm_nt_bias_try_go(
+    output_ptr_obj: Arg,
+    a_ptr_obj: Arg,
+    b_ptr_obj: Arg,
+    bias_ptr_obj: Arg,
+    m_obj: Arg,
+    n_obj: Arg,
+    k_obj: Arg,
+    transpose_a_obj: Arg,
+    transpose_b_obj: Arg,
+    has_bias_obj: Arg,
+    device_context_ptr: Arg,
+    accepted_ptr_obj: Arg,
+) raises:
+    """`C = A @ B.T + bias` in ONE launch, or nothing at all.
+
+    The eleven `Gemm16` slots plus a twelfth: the address of a host Int64 the
+    caller initialized to zero, which this entry sets to 1 when -- and only
+    when -- the fused kernel took the call. `Gemm16` always produces an
+    output tensor, so it has no way to say "declined"; the native bridge
+    needs that distinction to fall back to its original unbiased GEMM plus
+    broadcasting add rather than to the far slower bias-enabled ladder.
+
+    The status write is ordinary host code: it launches nothing, reads no
+    tensor, and on a decline no kernel has been enqueued at all.
+    """
+    var accepted = _make_ptr[DType.int64](_raw_int(accepted_ptr_obj))
+    accepted[] = 0
+    # Physical NT with a bias is the only shape of call the fused kernel
+    # serves; a transposed-weight view that arrives as NN is not it.
+    if (
+        _raw_int(transpose_a_obj) != 0
+        or _raw_int(transpose_b_obj) == 0
+        or _raw_int(has_bias_obj) == 0
+    ):
+        return
+    var output = _make_ptr[_GEMM16_DT](
+        _raw_int(output_ptr_obj)
+    ).as_unsafe_any_origin()
+    var a = _make_ptr[_GEMM16_DT](_raw_int(a_ptr_obj)).as_unsafe_any_origin()
+    var b = _make_ptr[_GEMM16_DT](_raw_int(b_ptr_obj)).as_unsafe_any_origin()
+    var bias = _make_ptr[_GEMM16_DT](
+        _raw_int(bias_ptr_obj)
+    ).as_unsafe_any_origin()
+    var ctx = _raw_ctx(device_context_ptr)
+    if try_enqueue_candidate_nt_bias(
+        output,
+        a,
+        b,
+        bias,
+        _raw_int(m_obj),
+        _raw_int(n_obj),
+        _raw_int(k_obj),
+        True,
+        ctx,
+    ):
+        accepted[] = 1
 
 
 def _bf16_bmm_go(
@@ -119,6 +180,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["Gemm16"]():
             _spec_dispatcher11[_bf16_gemm_go, "Gemm16"](argv, argc)
+            return 0
+        comptime if _op_on["Gemm16NTBiasTry"]():
+            _spec_dispatcher12[_bf16_gemm_nt_bias_try_go, "Gemm16NTBiasTry"](
+                argv, argc
+            )
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
