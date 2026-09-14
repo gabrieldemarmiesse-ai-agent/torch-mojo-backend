@@ -187,7 +187,7 @@ def let_has_triton_see_the_mojo_device():
             module.has_triton = has_triton  # ty: ignore[unresolved-attribute] -- setting an attribute torch bound by value
 
 
-def register_the_mojo_triton_target(driver: "type[DriverBase]"):
+def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
     """Triton picks a compiler backend by the name inside the target, and
     Inductor puts the torch device type there.
 
@@ -195,33 +195,50 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]"):
     ``GPUTarget(compile_meta["device_type"], ...)`` from
     ``DeviceProperties.type``, which is the torch device type -- "mojo".
     ``triton.compiler.compiler.make_backend`` then asks every registered
-    backend ``supports_target(target)``, and NVIDIA's answers only to
-    "cuda", so compilation dies with "0 compatible backends". Registering
-    an alias of the NVIDIA backend under our name is what an out-of-tree
-    Triton backend would do through the ``triton.backends`` entry point;
-    only ``supports_target`` differs, the target's ``arch`` (the compute
-    capability) is what the backend actually compiles against.
+    backend ``supports_target(target)``, and NVIDIA's (or AMD's) answers
+    only to "cuda" (or "hip"), so compilation dies with "0 compatible
+    backends". Registering an alias of the vendor backend under our name is
+    what an out-of-tree Triton backend would do through the
+    ``triton.backends`` entry point; only ``supports_target`` differs, the
+    target's ``arch`` (compute capability, or the gfx string) is what the
+    backend actually compiles against. `api` (``accelerator_api()``) picks
+    which vendor backend to alias -- NVIDIA's ``CUDABackend`` for "cuda",
+    AMD's ``HIPBackend`` for "hip".
 
     The entry also carries `driver` (`triton_driver.driver_class()`), because
     the same dict is what `torch/_inductor/runtime/triton_helpers.py`'s
     ``set_driver_to_gpu`` -- run at the import of every generated kernel
-    module -- scans for a backend whose driver ``is_active()``. NVIDIA's says
-    no (it asks ``torch.cuda.is_available()``), so without an entry of ours
-    the import of the generated module raises "Could not find an active GPU
-    backend".
+    module -- scans for a backend whose driver ``is_active()``. The vendor
+    driver says no (it asks ``torch.cuda.is_available()`` / the HIP
+    equivalent), so without an entry of ours the import of the generated
+    module raises "Could not find an active GPU backend".
     """
     import triton.backends  # noqa: PLC0415 -- triton is optional
-    from triton.backends.nvidia.compiler import (  # noqa: PLC0415 -- triton is optional
-        CUDABackend,
+    from triton.backends.compiler import (  # noqa: PLC0415 -- triton is optional
+        GPUTarget,
     )
 
     if "mojo" in triton.backends.backends:
         return
 
-    class MojoBackend(CUDABackend):
-        @staticmethod
-        def supports_target(target: object) -> bool:
-            return getattr(target, "backend", None) == "mojo"
+    if api == "hip":
+        from triton.backends.amd.compiler import (  # noqa: PLC0415 -- triton is optional
+            HIPBackend,
+        )
+
+        class MojoBackend(HIPBackend):
+            @staticmethod
+            def supports_target(target: GPUTarget) -> bool:
+                return getattr(target, "backend", None) == "mojo"
+    else:
+        from triton.backends.nvidia.compiler import (  # noqa: PLC0415 -- triton is optional
+            CUDABackend,
+        )
+
+        class MojoBackend(CUDABackend):
+            @staticmethod
+            def supports_target(target: GPUTarget) -> bool:
+                return getattr(target, "backend", None) == "mojo"
 
     triton.backends.backends["mojo"] = triton.backends.Backend(
         compiler=MojoBackend, driver=driver

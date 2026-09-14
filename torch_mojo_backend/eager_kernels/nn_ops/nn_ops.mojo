@@ -2021,16 +2021,21 @@ def _any_bool_go(
 #       there is no warp coalescing to lose in the first place, and this is
 #       what the small int tensors of the generation loop, position ids
 #       from attention-mask cumsum, hit today), and
-#   (b) any GPU `ctx.api()` is not `"cuda"` for (AMD, Apple): `block.
+#   (b) any GPU `ctx.api()` is not `"cuda"` (AMD, Apple): `block.
 #       prefix_sum`/`block.sum` are portable MAX primitives and this whole
 #       kernel family DOES cross-compile for gfx942 (verified with
-#       scripts/compare_kernel_asm.py), but it was only ever MEASURED on
-#       NVIDIA (H100) — see the PR that added this file. Per AGENTS.md's
-#       "To check a kernel change against a GPU you do not have", an
-#       unmeasured architecture gets the change gated off, not shipped on
-#       faith, so non-CUDA GPUs keep running the exact naive kernel `main`
-#       ran for cumsum before this file existed (dispatch matches at the
-#       Python layer too — see `fast_aten_cumsum`'s `is_cuda` gate).
+#       scripts/compare_kernel_asm.py), but the fast kernels were only ever
+#       MEASURED on NVIDIA (H100) — see the PR that added this file. Per
+#       AGENTS.md's "To check a kernel change against a GPU you do not
+#       have", an unmeasured architecture gets the change gated off, not
+#       shipped on faith, so non-CUDA GPUs keep running the exact naive
+#       kernel `main` ran for cumsum before this file existed. AMD (gfx942)
+#       was later measured correct on this portable path for every dtype
+#       and both routes (INNER and OUTER dim=0) -- see `_is_cumsum_dtype`'s
+#       `fast_ok` gate in ops_reductions.mojo, which is where "cuda" or
+#       "hip" reaches the OUTER route and the bf16/f16 dtypes at all; Metal
+#       stays on the pre-existing (int64/int32/float32, trailing-dim)
+#       surface, unmeasured.
 #       `_parallel_for` itself already knows how to target a non-CPU
 #       device (`elementwise[..., target="gpu"]`), so this same function
 #       serves both (a) and (b) — "portable", not "CPU-only".
@@ -2066,11 +2071,13 @@ def _cumsum_cols_portable[
     """Portable (CPU or non-CUDA GPU) fallback for dim=0: one parallel task
     per column. Unlike `_cumsum_rows_portable`, this has no naive-kernel
     precedent on `main` (dim=0 simply raised NotImplementedError there).
-    `fast_aten_cumsum` currently only ever reaches dim=0 on a CUDA device
-    (its own `is_cuda` gate declines dim=0 elsewhere, matching "keep AMD on
-    its current path"), so on today's dispatch this body only runs for the
-    `mojo:cpu` test device; it stays a real, tested implementation (not a
-    stub) so that gate can be loosened later without a new kernel."""
+    `op_cumsum`'s `fast_ok` gate (ops_reductions.mojo) reaches dim=0 on CUDA
+    and HIP devices (this body serves HIP there, since `ctx.api()` picks the
+    fast block.prefix_sum kernel only for `"cuda"`) and declines it
+    elsewhere (the CPU mojo device included), so on today's dispatch this
+    body runs for HIP only; it stays a real, tested implementation (not a
+    stub) so the gate can be loosened further (e.g. Metal) without a new
+    kernel."""
     comptime acc = _acc_dtype[dtype]()
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
@@ -2100,9 +2107,11 @@ def _cumsum_inner_into[
     The fast `block.prefix_sum`-based kernels below are NVIDIA-only by
     measurement, not by portability (`block.prefix_sum`/`block.sum` cross-
     compile fine for AMD -- verified with scripts/compare_kernel_asm.py,
-    --accelerator gfx942). `ctx.api() == "cuda"` gates them off on anything
-    else, same as `_device.api == "cuda"` gates `fast_aten_cumsum`'s own
-    dim/dtype widening in aten_fast.py -- see that gate's comment for why.
+    --accelerator gfx942). `ctx.api() == "cuda"` gates the fast kernels off
+    on anything else (HIP included, on today's measurement -- it runs the
+    portable fallback below instead), independently of `op_cumsum`'s own
+    `fast_ok` dim/dtype gate in ops_reductions.mojo, which is what decides
+    whether HIP reaches this function at all for bf16/f16 or dim=0.
     """
     if ctx.api() == "cuda":
         comptime if has_accelerator():

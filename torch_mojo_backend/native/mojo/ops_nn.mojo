@@ -32,6 +32,7 @@ from abi import (
     dtype_code,
     f64_bits,
     new_like,
+    new_like_dtype,
     new_tensor,
     own,
     release,
@@ -241,8 +242,6 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     _require_mojo(self, "softmax")
     if not _is_float(self.dtype):
         unsupported("softmax of dtype " + String(self.dtype))
-    if self.numel == 0:
-        unsupported("softmax of an empty tensor")
     var work_stype = self.stype
     if half_to_float:
         # torch computes a half input in fp32 and returns fp32. The old path
@@ -257,6 +256,10 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         elif self.dtype != DType.float16 and self.dtype != DType.bfloat16:
             unsupported("_softmax half_to_float from " + String(self.dtype))
         work_stype = ST_FLOAT32
+    if self.numel == 0:
+        var empty = own(new_like_dtype(self, work_stype))
+        ret_owned(rets, 0, empty)
+        return
     var work = _cast(self, work_stype)
     var rank = work.t.rank
     if rank == 0:

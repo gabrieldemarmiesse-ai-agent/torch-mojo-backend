@@ -256,14 +256,27 @@ def assert_close_fp64_anchored(
     assert reference.dtype == torch.float64, reference.dtype
     rtol, atol = _DEFAULT_TOLERANCES[expected.dtype]
     actual, expected = actual.cpu(), expected.cpu()
-    if not torch.isfinite(reference).all():
+    # Anchor where both the reference and torch are finite; anywhere else
+    # (a masked -inf, a NaN from a negative base, an overflow torch reproduces)
+    # takes the plain bar, NaN matching NaN.
+    finite = torch.isfinite(reference) & torch.isfinite(expected)
+    if not finite.all():
         torch.testing.assert_close(
-            actual, expected, rtol=rtol, atol=atol, equal_nan=True
+            actual[~finite], expected[~finite], rtol=rtol, atol=atol, equal_nan=True
         )
-        return
-    error = (actual.double() - reference).abs()
-    torch_error = (expected.double() - reference).abs()
-    allowed = torch.clamp(atol + rtol * reference.abs(), min=slack * torch_error.max())
+    if not finite.any():
+        return  # nothing to anchor: an empty tensor, or all non-finite
+    if not torch.isfinite(actual[finite]).all():
+        raise AssertionError(
+            f"{int((~torch.isfinite(actual) & finite).sum())} non-finite elements "
+            "where both torch and the float64 reference are finite"
+        )
+    error = torch.where(finite, (actual.double() - reference).abs(), 0.0)
+    torch_error = torch.where(finite, (expected.double() - reference).abs(), 0.0)
+    allowed = torch.clamp(
+        atol + rtol * torch.where(finite, reference.abs(), 0.0),
+        min=slack * torch_error.max(),
+    )
     bad = error > allowed
     if bad.any():
         worst = int(error.flatten().argmax())

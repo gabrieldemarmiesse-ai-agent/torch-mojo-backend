@@ -83,6 +83,47 @@ def test_mm_transposed_operands(mojo_device):
     torch.testing.assert_close(got2.cpu(), a @ bt.t(), atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 64, 64),
+        (96, 128, 64),
+        (256, 256, 256),
+        # deep K (k >= 2048 and k >= 2n) with k % 64 != 0: the second fp32
+        # geometry that used to pick a single-MMA (16x16) warp tile
+        (64, 2080, 64),
+        (128, 4128, 96),
+    ],
+)
+def test_mm_float32_tensor_core_regime(mojo_device, shape):
+    """fp32 mm on the shapes that reach a matrix-core route (m >= 64, k % 32).
+
+    On gfx942 the non-transposed route used to select a 16x32 warp tile, which
+    is a single MMA tall for the fp32 16x16x4 matrix core and is miscompiled:
+    a k-step vanished from part of the accumulator, so one output element in
+    eight was wrong by O(1) (max abs error 24 at 256x256x256) while every
+    shape below the route's cutoffs stayed exact.
+    """
+    m, k, n = shape
+    a = torch.randn(m, k)
+    b = torch.randn(k, n)
+    # The bar grows like sqrt(k): the kernels accumulate in fp32 in k order,
+    # so at k = 4128 a correct result sits ~2e-4 from torch's blocked sum on
+    # a few elements (measured on gfx942 and on the CPU device alike).
+    tol = 1e-4 * max(1.0, (k / 64) ** 0.5)
+    with assert_ran("aten::mm"):
+        got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
+    torch.testing.assert_close(got, a @ b, atol=tol, rtol=tol)
+
+    # the same geometries through the fused-bias route
+    bias = torch.randn(n)
+    with assert_ran("aten::addmm"):
+        got_bias = torch.addmm(
+            bias.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+        ).cpu()
+    torch.testing.assert_close(got_bias, a @ b + bias, atol=tol, rtol=tol)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_mm_degenerate_dims(mojo_device, dtype):
     # n == 1 used to segfault the CPU library-matmul route (gemv special case

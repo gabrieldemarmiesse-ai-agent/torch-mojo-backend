@@ -766,7 +766,19 @@ def _scalar_elementwise[
             comptime if op_code == SOP_MUL:
                 out_ptr.unsafe_store[width=width](i, (a * s).cast[dtype]())
             comptime if op_code == SOP_POW:
-                out_ptr.unsafe_store[width=width](i, pow(a, s).cast[dtype]())
+                # float32 through float64, as in logic_ops' BOP_POW (the
+                # float32 exp(y * log x) is up to 16 ulp off on H100)
+                comptime if dtype == DType.float32 and not has_apple_gpu_accelerator():
+                    out_ptr.unsafe_store[width=width](
+                        i,
+                        pow(
+                            a.cast[DType.float64](), s.cast[DType.float64]()
+                        ).cast[dtype](),
+                    )
+                else:
+                    out_ptr.unsafe_store[width=width](
+                        i, pow(a, s).cast[dtype]()
+                    )
 
         if ctx.api() == "cpu":
             elementwise[func, simd_width=simd_width_of[dtype]()](

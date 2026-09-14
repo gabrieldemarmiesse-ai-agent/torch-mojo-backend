@@ -1161,15 +1161,18 @@ def _bwd_dkv_mfma[
                         )
 
                     comptime if MASKED:
-                        # Key `kv` is attended by query `q` iff
-                        # `q >= kv - delta`; `kv` is one scalar per lane and the
-                        # sixteen `q` are the accumulator rows.
+                        # Causal: key `kv` is attended by query `q` iff
+                        # `q >= kv - delta`; `kv` is one scalar per lane and
+                        # the sixteen `q` are the accumulator rows. A partial
+                        # last q tile is MASKED under either mask, and the
+                        # non-causal one keeps every `q < kv` term (bound 0);
+                        # its padded rows are already zeroed by the NEG_ROW lse.
                         var qv = (
                             SIMD[DType.int32, 16](q0 + mt * 32 + 4 * hi)
                             + ACC_ROWS
                         )
                         var need = SIMD[DType.int32, 16](
-                            kv_lane + kt * 32 - delta
+                            kv_lane + kt * 32 - delta if causal != 0 else 0
                         )
                         s_acc = qv.ge(need).select(s_acc, NEG_BIG)
                     var pv = exp2(s_acc.fma(SIMD[DType.float32, 16](sl), nl_v))

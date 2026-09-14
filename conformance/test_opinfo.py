@@ -288,6 +288,83 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
     {("nn_functional_conv2d", torch.float32)}
 )
 
+# Per-accelerator extensions to `_FP64_ANCHORED`, keyed like
+# `known_unsupported._ACCELERATOR_DELTAS` (see `known_unsupported.accelerator_key()`).
+# The base set above holds one node measured on GitHub's CPU runners; an
+# accelerator that produces its own last-ulp differences records them here
+# instead of widening the base set for everyone.
+#
+# gfx942 (MI300A, ROCm 6.4.3), measured 2026-09-14. The regeneration run
+# (14 failed / 1112 passed / 236 skipped / 1424 xfailed, 0 operators absent)
+# flagged 14 (op, dtype) nodes as last-ulp mismatches; running them anchored
+# confirmed 6 as exactly that -- ordinary rounding/reduction-order
+# differences, no farther from float64 than torch's own result:
+#   bmm f32: 1/250 elements, abs 1.44e-5 vs 1e-5 allowed, rel 1.19e-5 vs 1.3e-6
+#     (sample (10,5,10)@(10,10,5)).
+#   addr f16: 1/50 elements, abs 3.9e-3, rel 1.045e-3 vs 1e-3.
+#   instance_norm bf16, f16 and conv2d bf16, f16: 1-7 elements, one bf16/f16
+#     ulp each.
+# The other 8 were anchored once `assert_close_fp64_anchored` anchored the
+# finite elements of a sample that also holds a masked -inf or a NaN and
+# survived an empty sample (see the entries below); `pow` float32 was a real
+# precision gap until float32 pow went through float64 (logic_ops.mojo).
+_FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
+    # sm_90a (H100), measured 2026-09-14 after the base tables were regenerated
+    # for the native backend: the same last-ulp class as gfx942's below (a
+    # reduction-order or one-ulp difference against CPU torch, no farther from
+    # float64 than torch's own result), which the absence-based tables cannot
+    # express and CPU-only CI never sees.
+    "sm_90a": frozenset(
+        {
+            ("__rpow__", torch.float32),
+            ("addr", torch.bfloat16),
+            ("addr", torch.float16),
+            ("bmm", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
+            ("nn_functional_conv2d", torch.bfloat16),
+            ("nn_functional_conv2d", torch.float16),
+            ("nn_functional_instance_norm", torch.bfloat16),
+            ("nn_functional_instance_norm", torch.float16),
+            ("pow", torch.float32),
+        }
+    ),
+    "gfx942": frozenset(
+        {
+            ("bmm", torch.float32),
+            ("addr", torch.float16),
+            ("nn_functional_instance_norm", torch.bfloat16),
+            ("nn_functional_instance_norm", torch.float16),
+            ("nn_functional_conv2d", torch.bfloat16),
+            ("nn_functional_conv2d", torch.float16),
+            # The same one-ulp / summation-order class, anchorable only once
+            # `assert_close_fp64_anchored` anchored the finite elements of a
+            # sample that also holds a masked -inf or a NaN, and survived an
+            # empty sample: __rpow__ rel 1.4e-6 on one element (abs 38 on
+            # 1.4e7); masked_log_softmax and log_softmax one bf16/f16 ulp
+            # (3.8e-3 / 4.3e-4) where the CPU result is exactly 0; batch_norm
+            # one ulp on 1 to 7 of 125 elements.
+            ("__rpow__", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
+        }
+    ),
+}
+
+# Merged once at collection time: the base set plus this accelerator's own
+# extension, if it has one.
+_FP64_ANCHORED = _FP64_ANCHORED | _FP64_ANCHORED_BY_ACCELERATOR.get(
+    known_unsupported.accelerator_key(), frozenset()
+)
+
 
 def _to_float64(sample: SampleInput) -> SampleInput:
     return sample.transform(lambda t: t.double() if t.is_floating_point() else t)

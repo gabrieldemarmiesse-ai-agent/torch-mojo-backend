@@ -410,10 +410,18 @@ def _bin_vec_op[
                 return needs_adjust.select(q + 1, q).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher); accumulate halves in
-            # float32 to match torch's numerics.
+            # float32 to match torch's numerics. float32 goes through
+            # float64: pow is exp(y * log x), and rounding that product in
+            # float32 costs |y log x| * 2^-24 relative in the result -- 16
+            # ulp at 1e7 on H100, up to 46 on MI300A -- where torch's CPU
+            # powf is correctly rounded. Not on Apple GPUs (no float64).
             comptime if dtype == DType.float16 or dtype == DType.bfloat16:
                 return pow(
                     a.cast[DType.float32](), b.cast[DType.float32]()
+                ).cast[out_dtype]()
+            elif dtype == DType.float32 and not has_apple_gpu_accelerator():
+                return pow(
+                    a.cast[DType.float64](), b.cast[DType.float64]()
                 ).cast[out_dtype]()
             elif dtype.is_floating_point():
                 return pow(a, b).cast[out_dtype]()

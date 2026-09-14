@@ -1030,23 +1030,37 @@ def _amd_dynamic_mfma_gemm[
     k: Int,
     ctx: DeviceContext,
 ) raises:
-    # --- gfx942 transposed-B geometry guard -------------------------------
+    # --- gfx942 warp-tile geometry guard ----------------------------------
     # MAX's two-stage `multistage_gemm_kernel` miscompiles on gfx942 for a set
-    # of transposed-B block/warp decompositions: one MFMA k-step's contribution
-    # is dropped from part of the accumulator, and which part varies per
-    # workgroup.  It reproduces with K == BLOCK_K, where the K loop performs no
-    # global-to-LDS prefetch at all and therefore cannot race, so it is a
-    # code-generation defect and not a synchronization bug; three or four
-    # pipeline stages also make it disappear.  Every observed failure has a
-    # warp tile only one MMA wide in some dimension (WM == 16 or WN == 16),
-    # so require at least a 2x2 MMA warp tile whenever B is read transposed.
-    # See optimization_journal.md, "Change 10".
+    # of block/warp decompositions: one MFMA k-step's contribution is dropped
+    # from part of the accumulator, and which part varies per workgroup.  It
+    # reproduces with K == BLOCK_K, where the K loop performs no global-to-LDS
+    # prefetch at all and therefore cannot race, so it is a code-generation
+    # defect and not a synchronization bug; for the transposed-B geometries
+    # three or four pipeline stages also make it disappear, though for the
+    # float32 one below they do not (measured: 32x64 block, 16x32 warp,
+    # three stages, error unchanged).  Every observed failure has a warp tile
+    # only one MMA wide in some dimension (WM == 16 or WN == 16), so require
+    # at least a 2x2 MMA warp tile.  See optimization_journal.md, "Change 10".
+    #
+    # It was first found with B read transposed, but float32 fails the same
+    # way with B in its native (k, n) layout: its MMA is 16x16x4, so one
+    # BLOCK_K tile is four times as many k-steps as a 16-bit MMA takes, and a
+    # 16x32 warp tile then loses a k-step from accumulator register 3 of the
+    # second N MMA -- one output element in eight wrong, max abs error 24 at
+    # 256x256x256.  Measured on MI300A over m, n, k in {32 ... 256}: a 32x64
+    # block tile with a 16x32 warp tile is wrong at every k >= 32, while the
+    # same block tile -- and a 32x32 one -- with a 32x32 warp tile is
+    # bit-exact on all of them.  The 16x16 warp tile the deep-K route used is
+    # narrower still and is covered by the same rule.
     comptime MMA_DIM = get_mma_shape[dtype, DType.float32]()[0]
-    comptime if transpose_b:
+    comptime if transpose_b or dtype == DType.float32:
         comptime assert WM >= 2 * MMA_DIM and WN >= 2 * MMA_DIM, (
-            "transposed-B multistage geometries with a single-MMA warp tile are"
-            " miscompiled on gfx942; use WM, WN >= 2 * mma_dim"
+            "multistage geometries with a single-MMA warp tile are miscompiled"
+            " on gfx942 (transposed-B at any dtype, float32 in either layout);"
+            " use WM, WN >= 2 * mma_dim"
         )
+    comptime if transpose_b:
         # The B tile copy distributes `min(threads, BN*BLOCK_K/simd)` threads
         # over BN rows; a row count that does not divide BN drops or duplicates
         # rows of B.
@@ -1685,14 +1699,16 @@ def _amd_batched_mfma_gemm[
     a_bstride: Int,
     ctx: DeviceContext,
 ) raises:
-    # Same gfx942 transposed-B geometry preconditions as the unbatched route;
+    # Same gfx942 warp-tile geometry preconditions as the unbatched route;
     # see `_amd_dynamic_mfma_gemm` and optimization_journal.md "Change 10".
     comptime MMA_DIM = get_mma_shape[dtype, DType.float32]()[0]
-    comptime if transpose_b:
+    comptime if transpose_b or dtype == DType.float32:
         comptime assert WM >= 2 * MMA_DIM and WN >= 2 * MMA_DIM, (
-            "transposed-B multistage geometries with a single-MMA warp tile are"
-            " miscompiled on gfx942; use WM, WN >= 2 * mma_dim"
+            "multistage geometries with a single-MMA warp tile are miscompiled"
+            " on gfx942 (transposed-B at any dtype, float32 in either layout);"
+            " use WM, WN >= 2 * mma_dim"
         )
+    comptime if transpose_b:
         comptime B_COPY_ROWS = min(
             (BM // WM) * (BN // WN) * WARP_K_PARTITIONS * 64,
             BN * BLOCK_K // simd_width_of[dtype](),
@@ -3758,9 +3774,18 @@ def _amd_dynamic_mfma_dispatch[
                     dtype, 32, 32, 32, 32, transpose_b, fuse_bias
                 ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
         else:
-            _amd_dynamic_mfma_gemm[
-                dtype, 32, 32, 16, 16, transpose_b, fuse_bias
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            # FP32 is miscompiled with a single-MMA warp tile in this layout
+            # too (see the guard in `_amd_dynamic_mfma_gemm`): its MMA is
+            # 16x16x4, so a 16x16 warp tile is one MMA in both dimensions.
+            # A 32x32 warp tile computes the same block tile correctly.
+            comptime if dtype == DType.float32:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 32, 32, 32, transpose_b, fuse_bias
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            else:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 32, 16, 16, transpose_b, fuse_bias
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
     else:
         comptime if transpose_b:
             # 32x64 with a 16x32 warp tile is the miscompiled transposed-B
@@ -3770,9 +3795,21 @@ def _amd_dynamic_mfma_dispatch[
                 dtype, 32, 64, 32, 32, transpose_b, fuse_bias
             ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
         else:
-            _amd_dynamic_mfma_gemm[
-                dtype, 32, 64, 16, 32, transpose_b, fuse_bias
-            ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            # FP32 needs a 32x32 warp tile here as well: with mma 16x16x4 the
+            # 16x32 tile is one MMA tall, and that is the miscompiled shape.
+            # Measured on MI300A over m, n, k in {32 ... 256}: this block tile
+            # with a 16x32 warp tile drops a k-step from accumulator register
+            # 3 of the second N MMA -- one output element in eight wrong, max
+            # abs error 24 at 256x256x256 -- while the same block tile with a
+            # 32x32 warp tile is bit-exact.
+            comptime if dtype == DType.float32:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 64, 32, 32, transpose_b, fuse_bias
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            else:
+                _amd_dynamic_mfma_gemm[
+                    dtype, 32, 64, 16, 32, transpose_b, fuse_bias
+                ](c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
     return True
 
 
