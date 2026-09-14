@@ -327,6 +327,20 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
             ("nn_functional_instance_norm", torch.float16),
             ("nn_functional_conv2d", torch.bfloat16),
             ("nn_functional_conv2d", torch.float16),
+            # The same one-ulp / summation-order class, anchorable only once
+            # `assert_close_fp64_anchored` anchored the finite elements of a
+            # sample that also holds a masked -inf or a NaN, and survived an
+            # empty sample: __rpow__ rel 1.4e-6 on one element (abs 38 on
+            # 1.4e7); masked_log_softmax and log_softmax one bf16/f16 ulp
+            # (3.8e-3 / 4.3e-4) where the CPU result is exactly 0; batch_norm
+            # one ulp on 1 to 7 of 125 elements.
+            ("__rpow__", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
         }
     )
 }
