@@ -218,3 +218,54 @@ at 335 s, while my agents held three other MAX contexts on the same node
 (each reserves ~115 GB of the APU's 501 GB at first use; `free` does not
 show those reservations). Its fourth launch, alone on the node, is reported
 below.
+
+## 9. Performance
+
+Node `a1020` (4x MI300A), clocks not locked (no site permission). Stock:
+the separate venv with `torch 2.9.1+rocm6.4` (the newest ROCm wheel that runs
+at full speed on this 6.4.3 driver: the rocm7.1 wheel of torch 2.11 is 600x
+slower here, measured on 2026-09-10), `--device cuda`, its bundled RCCL. Ours:
+this venv (`torch 2.11.0+cpu`, MAX 26.5), `--device mojo`, system RCCL or
+mojoccl, `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`. nanoGPT 124M, bf16,
+block 1024, 60 steps, seed 1337, the same `demo_scripts/nanogpt_ddp.py` on
+both legs. Throughput = tokens / time over steps 20..60 (step time from the
+per-step tok/s the script logs), one number per leg; the per-step warm-up of
+step 1 is excluded. Every leg is a fresh process.
+
+Single GPU (`ROCR_VISIBLE_DEVICES=0`), ABBA = stock, mojo, mojo, stock:
+
+| batch | stock (A1, A2) | mojo (B1, B2) | mojo / stock |
+|---|---|---|---|
+| 1 | 54.6k, 55.0k | 59.5k, 59.7k | **1.09** |
+| 4 | 118.6k, 119.7k | 128.1k, 128.2k | **1.075** |
+| 12 | 170.1k, 169.4k | 189.8k, 189.3k | **1.12** |
+| 48 | 213.0k, 212.6k | 223.9k, 224.2k | **1.05** |
+
+H100 reference from the plan: 0.90, 0.94, 0.96, 1.02.
+
+DDP, 4 ranks, three rounds of (stock, mojo+RCCL, mojoccl, mojoccl, mojo+RCCL, stock),
+tok/s aggregate over the 4 ranks, all six legs listed in run order:
+
+| per-rank batch | stock | mojo + RCCL | mojo + mojoccl | RCCL / stock | mojoccl / stock |
+|---|---|---|---|---|---|
+| 48 | 826.3k, 827.1k, 829.4k, 828.6k, 825.0k, 821.1k (mean 826.3k) | 870.8k, 866.7k, 870.5k, 866.1k, 869.4k, 869.5k (mean 868.8k) | 867.9k, 834.3k, 835.8k, 865.0k, 827.8k, 866.4k (mean 849.5k) | **1.051** | **1.028** |
+| 12 | 655.4k, 652.0k, 653.8k, 654.1k, 653.9k, 656.1k (mean 654.2k) | 722.7k, 714.4k, 716.1k, 719.4k, 719.0k, 719.9k (mean 718.6k) | 699.4k, 682.1k, 702.6k, 703.5k, 701.4k, 701.4k (mean 698.4k) | **1.098** | **1.068** |
+
+H100 reference: 16 ranks 1.006 (RCCL) and 1.012 (mojoccl) at batch 48.
+
+Observations:
+- mojoccl at batch 48 alternates between two levels (~866k and ~830k) from
+  run to run; RCCL does not. Not investigated here.
+- The stock leg's loss at step 60 is bit-identical across its six runs
+  (5.6215 at batch 48); our legs vary from run to run at the 1e-2 level
+  (5.57 to 5.69 at batch 48; RCCL and mojoccl alike), so some kernel on our
+  side is run-to-run nondeterministic (a split-K or attention-backward
+  reduction order is the usual suspect). Stock CUDA/ROCm torch is not
+  deterministic in general either, but here it was. Not investigated.
+- Every leg completed (52 of 52, rc 0). Warm start latency of our legs is 5
+  to 20 s against 35 to 60 s for the stock leg (its ROCm wheel imports from
+  Lustre); the compile-everything cold start of the first-ever run was ~19
+  min (section 4).
+
+`benchmarks/` against stock torch in the same process: see section 7.
+`benchmarks/test_coverage.py`: 2 passed.
