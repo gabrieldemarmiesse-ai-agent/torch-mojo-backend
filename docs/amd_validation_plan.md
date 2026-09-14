@@ -100,7 +100,7 @@ command so a hang is attributable. Reference counts are the H100's.
 | `test_binary.py test_unary.py test_compare.py test_reductions.py test_data_movement.py test_factories.py test_foreach.py test_nn.py test_matmul.py test_composed.py` | the op groups against CPU torch | 1811 pass, 0 fail (ten files) |
 | `test_attention.py` | flash attention forward/backward, SDPA dispatch with autograd and autocast | pass |
 
-Kernels with an explicit `amdgpu:gfx942` route (the ones most likely to have
+Kernels with an explicit gfx942 route (the ones most likely to have
 drifted while untested) live in `ops_attention.mojo`, `ops_matmul.mojo`,
 `flash_attention_ops/`, `nn_ops`, `reduction_ops`, `data_movement_ops`,
 `activation_forward_ops`; the lifetime-keepalive sweep touched
@@ -130,7 +130,7 @@ is expected and is exactly what the regeneration fixes:
 ```bash
 flock /tmp/gpu_lock_0.lock uv run --no-sync python conformance/regenerate_known_unsupported.py --records $SCRATCH/records_amd -n 8 > regen_amd.log 2>&1
 uv run --no-sync python conformance/write_accelerator_delta.py regen_amd.log          # dry run: how many operators differ
-uv run --no-sync python conformance/write_accelerator_delta.py regen_amd.log --write   # _ACCELERATOR_DELTAS["amdgpu:gfx942"]
+uv run --no-sync python conformance/write_accelerator_delta.py regen_amd.log --write   # _ACCELERATOR_DELTAS[<accelerator_key()>], "gfx942" on MI300A
 uv run --no-sync ruff format conformance/known_unsupported.py
 flock /tmp/gpu_lock_0.lock uv run --no-sync pytest conformance/test_opinfo.py -q -n 8 -p no:cacheprovider   # must be 0 failed
 ```

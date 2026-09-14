@@ -678,10 +678,9 @@ def dtype_token(dtype: torch.dtype) -> str:
 def accelerator_key() -> str:
     """Architecture name of the accelerator the mojo device runs kernels on.
 
-    "sm_90a", "amdgpu:gfx942", ... -- the identity the kernels themselves
-    branch on (`tensor._device.architecture_name`), so a table keyed by it
-    splits exactly where support can differ.  "cpu" when the machine has no
-    accelerator at all.
+    "sm_90a", "gfx942" (MI300A), ... -- MAX's `architecture_name` of the
+    device, so a table keyed by it splits exactly where support can differ.
+    "cpu" when the machine has no accelerator at all.
 
     Cached: every node asks, and the answer cannot change inside one process.
     """
