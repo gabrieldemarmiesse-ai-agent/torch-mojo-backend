@@ -431,7 +431,7 @@ def op_local_scalar_dense(
     if t.dtype == DType.bool:
         ret_scalar_bool(rets, 0, p[] != 0)
     elif t.dtype.is_floating_point():
-        var v: Float64 = 0
+        var v: Float64
         if t.dtype == DType.float32:
             v = Float64(p.unsafe_bitcast[Float32]()[])
         elif t.dtype == DType.bfloat16:
@@ -442,7 +442,7 @@ def op_local_scalar_dense(
             v = p.unsafe_bitcast[Float64]()[]
         ret_scalar_f64(rets, 0, v)
     else:
-        var v: Int = 0
+        var v: Int
         if t.dtype == DType.int64:
             v = Int(p.unsafe_bitcast[Int64]()[])
         elif t.dtype == DType.int32:

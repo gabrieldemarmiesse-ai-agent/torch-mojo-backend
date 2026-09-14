@@ -67,6 +67,20 @@ def _trace(msg: str):
         print(f"[TRACE] {msg}", file=sys.stderr, flush=True)
 
 
+def mojo_diagnostic_flags() -> list[str]:
+    """Extra `mojo build` flags every Mojo build gets (loader.mojo's `_build`
+    appends the same for the kernel families and op extensions).
+
+    TORCH_MOJO_BACKEND_WERROR=1 turns compiler warnings into build failures.
+    Off by default -- a user on a newer toolchain that warns about something
+    new must not lose their device over it -- and on in the test suite
+    (tests/conftest.py), so a warning in any Mojo source fails the tests that
+    build it instead of scrolling past in a subprocess's captured stderr."""
+    if os.environ.get("TORCH_MOJO_BACKEND_WERROR", "0") == "1":
+        return ["--Werror"]
+    return []
+
+
 def _pkg_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -607,6 +621,7 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
         portable_target_cpu(),
         "-o",
         str(out),
+        *mojo_diagnostic_flags(),
     ]
     if accelerator is not None:
         cmd += ["--target-accelerator", accelerator]
@@ -680,7 +695,7 @@ def build_library(
             cmd += ["-I", str(root)]
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
-        cmd += ["-o", str(tmp)]
+        cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)

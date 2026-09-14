@@ -185,7 +185,7 @@ struct Loader(Movable):
             var text = Path(f).read_text()
             for line in text.splitlines():
                 var s = String(line)
-                var name = String()
+                var name: String
                 if s.startswith("from "):
                     var rest = String(s[byte=5:])
                     var sp = rest.find(" ")
@@ -308,6 +308,12 @@ struct Loader(Movable):
             cmd += " -Xlinker -undefined -Xlinker dynamic_lookup"
         for d in defines:
             cmd += " -D '" + d + "'"
+        # TORCH_MOJO_BACKEND_WERROR=1: warnings fail the build (off by
+        # default, on under pytest); native/__init__.py's
+        # mojo_diagnostic_flags is the same switch for the Python-driven
+        # builds.
+        if getenv("TORCH_MOJO_BACKEND_WERROR") == "1":
+            cmd += " --Werror"
         cmd += (
             " -o '"
             + local

@@ -19,6 +19,11 @@ and the call waits for it; every later call — and every later process, as
 long as the sources and the toolchain are unchanged — dlopens the cached
 `.so`. `TORCH_MOJO_BACKEND_TRACE` (on by default; `0` silences it) prints a
 `[TRACE]` line for each variant build, with its duration.
+`TORCH_MOJO_BACKEND_WERROR=1` passes `--Werror` to every Mojo build (kernel
+variants, op extensions, the base library, mojoccl), so a compiler warning
+fails the build instead of scrolling past in captured stderr. It is off by
+default and `tests/conftest.py` turns it on, which is the repository's
+no-warnings check: a warning in any Mojo source fails the tests that build it.
 
 This mirrors the old Python loader's behavior (same "one `.so` per exact
 specialization, built inline at first use" design, same rationale — see

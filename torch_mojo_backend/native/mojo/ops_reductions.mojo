@@ -1,4 +1,4 @@
-"""aten ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
+"""ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
 any/all, var, the L2 vector norm and cumsum).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping

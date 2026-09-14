@@ -1,4 +1,4 @@
-"""aten ops: binary arithmetic — add/sub/mul/div, pow, maximum/minimum,
+"""ATen ops: binary arithmetic — add/sub/mul/div, pow, maximum/minimum,
 remainder, floor_divide, lerp, addcmul/addcdiv, clamp and the logical and
 bitwise ops, with their in-place and `out=` variants.
 

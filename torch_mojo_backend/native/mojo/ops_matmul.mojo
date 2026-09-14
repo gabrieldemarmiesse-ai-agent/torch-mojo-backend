@@ -1,4 +1,4 @@
-"""aten ops: matmul group — mm, bmm, addmm, linear, linear_backward, addr and
+"""ATen ops: matmul group — mm, bmm, addmm, linear, linear_backward, addr and
 the convolution forward.
 
 The route cascade is the old fast path's (aten_fast.py), unchanged:
