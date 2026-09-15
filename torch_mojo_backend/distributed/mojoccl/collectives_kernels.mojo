@@ -205,11 +205,14 @@ counter's traffic never invalidates the line every block is spinning on.
 Purely rank-local -- no peer ever reads them -- and zeroed by `region_init`
 with the rest of the signal area. Only arena 0's pair is ever used: the fused
 inter-node kernel spans arenas but is one grid. They are a fixed rendezvous,
-not generation-tagged: one fused kernel at a time per communicator. Every
-`ncclAllReduce` on a communicator is issued under its lock in stream order,
-and NCCL's contract (one stream per communicator at a time) is what keeps
-two of them from overlapping -- two streams on one communicator are
-unsupported here as there, and would mis-count here silently."""
+not generation-tagged, so two collectives of one communicator must never be
+on the device at once. mojoccl (not NCCL, which allows groups across
+streams) enforces that itself: a collective issued on a stream other than
+the communicator's previous one is made to wait, through an event, for
+everything that stream had enqueued (`_order_streams`, mojoccl.mojo), so
+every collective of a communicator runs in one total order whatever streams
+the caller uses. The process group issues everything on one comm stream
+anyway, and the event costs nothing until a stream switch."""
 
 comptime _POISON_OFFSET = 448
 """Device word one block of a persistent kernel raises to tell the others to
@@ -304,6 +307,12 @@ comptime ERR_FUSED_GRID = 10
 """A grid barrier inside the fused inter-node allreduce (internode_fused.mojo)
 gave up: this rank's own blocks stopped arriving, which only happens because
 another spin in the same kernel already failed and returned."""
+
+comptime ERR_HOST_LAUNCH = 11
+"""The host failed to launch the fused inter-node allreduce after reserving
+its exchange counters (mojoccl.mojo `_do_allreduce_fused`): the peers will
+wait for flags and exchanges that are never coming, so the communicator is
+failed from the host through the same status page a device deadline uses."""
 
 
 # ===-------------------------------------------------------------------=== #

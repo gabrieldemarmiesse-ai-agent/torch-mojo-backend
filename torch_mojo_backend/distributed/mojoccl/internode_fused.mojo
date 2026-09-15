@@ -188,22 +188,35 @@ def _resident_blocks[
     )
 
 
+def _resident_all_dtypes[
+    NW: Int
+](ctx: DeviceContext, sm_count: Int) raises -> Int:
+    var r = _resident_blocks[DType.float32, NW](ctx, sm_count)
+    r = min(r, _resident_blocks[DType.float16, NW](ctx, sm_count))
+    r = min(r, _resident_blocks[DType.bfloat16, NW](ctx, sm_count))
+    r = min(r, _resident_blocks[DType.int32, NW](ctx, sm_count))
+    return min(r, _resident_blocks[DType.int64, NW](ctx, sm_count))
+
+
 def fused_resident_blocks(
     ctx: DeviceContext, world: Int, sm_count: Int
 ) raises -> Int:
-    """Co-resident bound of the fp32 kernel for a node of `world` ranks.
+    """Co-resident bound of the fused kernel for a node of `world` ranks: the
+    minimum over every dtype it can be launched with.
 
-    Compiled here, at init, so the number can be exchanged and checked across
-    the node's ranks before any collective; the other dtypes' bounds are the
-    same function of the same build and the same GPU, and are applied at
-    launch. Zero means the kernel cannot run on this device at all."""
+    Every instantiation is compiled here, at init -- so no compilation, no
+    occupancy query and no per-rank clamp is left for launch time, and the
+    grid a rank launches is the node-agreed number (this bound is exchanged
+    and checked across the node's ranks) rather than anything derived
+    locally. Zero means some instantiation cannot run on this device, and the
+    communicator takes the split schedule."""
     if world == 8:
-        return _resident_blocks[DType.float32, 8](ctx, sm_count)
+        return _resident_all_dtypes[8](ctx, sm_count)
     if world == 4:
-        return _resident_blocks[DType.float32, 4](ctx, sm_count)
+        return _resident_all_dtypes[4](ctx, sm_count)
     if world == 2:
-        return _resident_blocks[DType.float32, 2](ctx, sm_count)
-    return _resident_blocks[DType.float32, 0](ctx, sm_count)
+        return _resident_all_dtypes[2](ctx, sm_count)
+    return _resident_all_dtypes[0](ctx, sm_count)
 
 
 @always_inline
@@ -466,7 +479,6 @@ def _launch_fused[
     ctx: DeviceContext,
     stream: DeviceStream,
     blocks: Int,
-    sm_count: Int,
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
@@ -485,26 +497,15 @@ def _launch_fused[
     scale: Float32,
     timeout_ns: UInt64,
 ) raises:
-    # The grid must be co-resident (`grid_barrier`). Bounded by this
-    # instantiation's occupancy -- the same on every rank of the node, so the
-    # block-matched barriers still agree -- and launched cooperatively so the
-    # driver refuses, rather than deadlocks, a grid it cannot hold.
-    var occ = _cached_occupancy[_fused_ar_kernel[dtype, W, NW]](
-        ctx, _fused_key[dtype, NW](), FUSED_THREADS
-    )
-    var grid = blocks
-    if occ > 0:
-        grid = min(grid, occ * sm_count)
-    if grid < 1:
-        raise Error(
-            "mojoccl: the fused allreduce kernel cannot be resident on this"
-            " device"
-        )
+    # `blocks` is the node-agreed grid (`fused_blocks` over the bound every
+    # rank checked at init); nothing here re-derives it, or the block-matched
+    # barriers would disagree. The kernel was compiled at init; the launch is
+    # cooperative so a grid the device cannot hold is refused, not hung.
     _enqueue_cached_dim[_fused_ar_kernel[dtype, W, NW]](
         ctx,
         stream,
         _fused_key[dtype, NW](),
-        grid,
+        blocks,
         FUSED_THREADS,
         True,
         regions,
@@ -575,7 +576,6 @@ def internode_allreduce_fused[
     generation: Int,
     scale: Float32,
     blocks: Int,
-    sm_count: Int,
     timeout_ns: UInt64,
 ) raises:
     """Enqueue the whole pipelined multi-node allreduce as one kernel.
@@ -609,7 +609,6 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
-            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -633,7 +632,6 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
-            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -657,7 +655,6 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
-            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -681,7 +678,6 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
-            sm_count,
             rp,
             in_ptr,
             out_ptr,

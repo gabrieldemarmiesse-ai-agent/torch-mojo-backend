@@ -727,14 +727,29 @@ the reduce-scatter and all-gather bodies of `collectives_kernels.mojo`, the
 inbox add, the mailbox store that releases a chunk to the progress thread
 and the spin on its completion are phases of that kernel, separated by a
 rank-local grid barrier where a launch boundary used to be. A grid that
-waits for itself must be entirely resident, and an ordinary launch under
-persistent GEMMs holding the SMs does not promise that, so the grid is
-bounded by the driver's occupancy answer for the kernel times the SM count
-(`fused_resident_blocks`, asked at init and again per dtype at launch) and
-launched with CUDA's cooperative attribute, which makes the driver refuse a
-grid it cannot hold rather than let it spin to the deadline (MAX's launch
-attributes are CUDA-only; on AMD the occupancy bound is the whole
-guarantee). A call the geometry cuts into more chunks than the inter-node
+waits for itself must be entirely resident, and that has two halves. The
+first is capacity: the grid never exceeds the driver's occupancy answer for
+the kernel times the SM count, taken at init as the minimum over every
+dtype the kernel can be launched with (`fused_resident_blocks`, every
+instantiation compiled there), exchanged and checked across the node's
+ranks, and used as the node-agreed grid at launch -- no rank re-derives it
+-- and the launch carries CUDA's cooperative attribute, so a grid past the
+empty-device capacity is refused, not hung. The second is progress under
+concurrency, which no launch mode guarantees: cooperative launch checks
+empty-device capacity only, and under running kernels the collective's
+blocks simply wait for SMs. That is progress here because everything else
+on the device -- the persistent GEMM CTAs above all -- is finite and never
+waits on this stream; a resident kernel polling for work that is ordered
+behind this collective would starve it until the deadline. Where the
+cooperative attribute is unsupported (MAX's launch attributes are
+CUDA-only, so on AMD) the ordinary launch guarantees nothing beyond the
+occupancy bound, and the deadline is the backstop. A launch that fails
+after the call's exchanges were reserved fails the communicator from the
+host through the status page (`ERR_HOST_LAUNCH`), so later calls return
+`ncclRemoteError` and the peers' own deadlines report the rank, instead of
+a hang. The SM count comes from MAX's device attribute on both vendors, so
+AMD takes the fused path too (unmeasured there: for the AMD agent). A call
+the geometry cuts into more chunks than the inter-node
 work ring has slots (`WORK_SLOTS`, 512: a 129 MiB allreduce at
 `MOJOCCL_REGION_MB=1`) takes the split schedule, which releases chunks as it
 goes, because the fused kernel files every chunk's exchange before it
@@ -1265,7 +1280,7 @@ with `E2E_TAG=e2e_gpt2xl`): stock 495k, mojo + NCCL 495k (1.001 ± 0.002),
 mojo + mojoccl 487k = 0.984 ± 0.001; host cost per call unchanged at
 30–31 µs (job 251253).
 
-Validated in the same state (jobs 250997, 251023, 251056): `collectives`,
+Validated in the same state (jobs 250997, 251023, 251056; after the review fixes 251177, 251178, 251297, 251298): `collectives`,
 `ddp_parity` and `stress` at 16 ranks under both libraries and at 8 ranks
 on one node, `collectives` under `MOJOCCL_IB_PROXY=0` and under
 `MOJOCCL_FUSED=0` (plus `stress`), `ring_pressure.py`, nanoGPT-124M at 16
