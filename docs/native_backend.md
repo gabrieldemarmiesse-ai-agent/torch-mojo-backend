@@ -240,6 +240,23 @@ inaccessible; `enable_error` injects an error before enabling a capable
 pair. The latter two also print routes and exercise negative caching in
 subprocess tests. They preserve transfer results through host staging.
 
+`TORCH_MOJO_BACKEND_TEST_PEER_COPY` is a **test-only**, subprocess-scoped
+hook, also cached at initialization. Unset, it only adds cached checks;
+no tracing or injection runs. `audit` logs native allocation bytes/pointers
+and actual retirement (the backend does not expose allocated-memory stats).
+`submit_error` submits real peer DMA after source readiness, then raises
+before installing the reverse completion event. `drain_error` additionally
+fails the destination cleanup drain; logs distinguish completed drains,
+freed allocations and quarantined allocations. These modes intentionally
+raise from every nonempty direct transfer and must never be used in training.
+`gate` queues a host callback before peer DMA, blocked reading one byte from
+`TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD` (an already-open pipe descriptor,
+also cached at initialization). The test releases the pipe independently of
+the torch dispatcher, including on failure, to prove submission returns
+before destination completion without timing GPU work. Only tests should
+set these variables; a missing release will block the stream. See
+`tests/native/test_peer_copy.py` for the public torch callers and assertions.
+
 ### Threads and fork
 
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
