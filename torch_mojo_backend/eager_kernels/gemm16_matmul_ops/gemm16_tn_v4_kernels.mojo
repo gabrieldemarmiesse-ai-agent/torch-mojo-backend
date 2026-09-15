@@ -1020,6 +1020,24 @@ comptime _V4_TN_ROLL_GROUP = StaticTuple[Int, _V4_TN_ROLL_NGEOM](4, 8, 4)
 # results above) -- kept as a named constant rather than a fourth tuple so
 # a reader sees at a glance that none of the three varies it.
 comptime _V4_TN_ROLL_CLUSTER_M = 2
+# Smallest output area (m * n) worth a persistent-rolling launch when NO
+# other rung of the ladder can take the shape at all, so the alternative is
+# the generic non-TMA route.  Fitted on H100 SXM at 1980 MHz over 21 shapes
+# with no fallback (m in 64..2048 x n in {320, 448, 704}, none of which
+# divides 128, 192 or 256), rolling us / generic us:
+#
+#     m * n      64x320  128x320  256x320  512x320  384x704  512x704  1024x320
+#     ratio       0.26     2.40     1.67     1.27     1.00     0.75      0.75
+#
+# Below m = _V4_BM the generic route is catastrophic at every n measured
+# (125-128 us against rolling's 33) because m is under every other rung's
+# floor and the generic grid degenerates, so those shapes keep rolling
+# whatever their area.  At or above it the generic route tiles m properly and
+# costs roughly m * n, while rolling is pinned near a fixed ~33 us per launch
+# (three cuTensorMapEncodeTiled calls plus the persistent prologue, which a
+# tiny output cannot hide): the two cross at an area of about 270e3, the same
+# place for all three n, which is what this constant rounds.
+comptime _V4_TN_ROLL_MIN_AREA = 262144
 
 
 @always_inline
@@ -1206,11 +1224,22 @@ def _try_enqueue_tn_rolling_geom(
     geometry's bm exceeds m; only when bm <= m (no such waste) does the
     three-quarters occupancy floor decide.
 
-    Together, the escape hatch (accept unconditionally) is: no fallback
-    is available at all, OR the only available fallback is the small-
-    tile route and it is not a strictly better fit than the chosen
-    geometry. This is why 64x192x4096 (n=192 divides neither 128 nor
-    256: no fallback at all) keeps its genuine 4x win (125.6 -> 32.6 us):
+    (3) "No fallback exists" is a reason to look at the generic non-TMA
+    route, not a reason to skip looking: it is a disaster for a small m
+    and perfectly good above one. Measured over 21 no-fallback shapes
+    (see `_V4_TN_ROLL_MIN_AREA`), rolling wins by 4x below m = _V4_BM at
+    every n, and loses by up to 2.4x above it until the output area
+    reaches about 270e3 -- (256, 320, 4096) is 33.4 us on rolling against
+    20.0 on generic. So the no-fallback branch keeps rolling for
+    m < _V4_BM whatever the area, and above it only from that area up.
+
+    Together, the escape hatch (accept unconditionally) is: no fallback is
+    available at all AND either m is under the ladder's own 128-row floor
+    or the output is big enough to hide a persistent launch, OR the only
+    available fallback is the small-tile route and it is not a strictly
+    better fit than the chosen geometry. This is why 64x192x4096 (n=192
+    divides neither 128 nor 256, and m = 64: no fallback at all, and the
+    generic route degenerates) keeps its genuine 4x win (125.6 -> 32.6 us):
     nothing else can take it.
     """
     if n % 64 != 0 or sm_count < _V4_TN_ROLL_CLUSTER_M:
@@ -1259,6 +1288,16 @@ def _try_enqueue_tn_rolling_geom(
         var clusters_max = sm_count // _V4_TN_ROLL_CLUSTER_M
         if best_works * 4 < clusters_max * 3:
             return False
+    elif m >= _V4_BM and m * n < _V4_TN_ROLL_MIN_AREA:
+        # No fallback rung, so the alternative is the generic non-TMA route,
+        # and "accept unconditionally" was too broad: below _V4_TN_ROLL_MIN_
+        # AREA that route is genuinely faster, because rolling's fixed
+        # per-launch cost cannot be hidden by so small an output.  (256, 320,
+        # 4096) measured 33.4 us on rolling against 20.0 on generic, and
+        # 21 shapes agree on where the two cross -- see the constant.  The
+        # m < _V4_BM shapes stay on rolling: there the generic route is the
+        # 4x disaster this escape hatch was written for.
+        return False
     comptime for g in range(_V4_TN_ROLL_NGEOM):
         if best == g:
             return _v4_try_launch_tn_roll_geom[g](

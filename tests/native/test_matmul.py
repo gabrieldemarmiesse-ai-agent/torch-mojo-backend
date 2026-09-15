@@ -499,7 +499,19 @@ def test_gemm16_tn_rolling_small_ragged_m(mojo_h100):
 # (50 of 66 clusters) -- so occupancy alone was not enough to stop the
 # rolling dispatcher from choosing a 128-row geometry that pads m=64 to
 # 128 (4x the small-tile route's padding-free work), also a Codex finding.
-TN_ROLLING_ESCAPE_HATCH_SHAPES = [(256, 320, 4096), (64, 9600, 64)]
+# (64, 320, 4096) and (2048, 320, 4096) are the two sides of the third
+# finding (agent C): with no fallback rung the generic route is still the
+# right answer for a small output above the ladder's 128-row floor -- so
+# (256, 320, 4096) now DECLINES to it (33.4 -> 20.0 us) while these two,
+# one under the floor and one far past _V4_TN_ROLL_MIN_AREA, keep rolling
+# (0.26x and 0.35x of generic). All four must be numerically right
+# whichever route the dispatcher picks for them.
+TN_ROLLING_ESCAPE_HATCH_SHAPES = [
+    (256, 320, 4096),
+    (64, 9600, 64),
+    (64, 320, 4096),
+    (2048, 320, 4096),
+]
 
 
 @pytest.mark.parametrize(
