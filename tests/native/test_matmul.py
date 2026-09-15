@@ -406,6 +406,23 @@ def test_gemm16_nt_bias_rolling_192(mojo_h100, m, n, k):
     assert _rel_err(got, ref) < _bf16_bound(k)
 
 
+@pytest.mark.parametrize("m,n,k", NT_BIAS_192_SHAPES)
+def test_gemm16_nt_bias_rolling_192_bias_only(mojo_h100, m, n, k):
+    """Zero products: the output IS the bias, so a dropped, shifted or
+    misindexed bias column shows up exactly, across every column-tile
+    boundary. (The random-input test above tolerates bf16 accumulation error
+    of the size of a unit bias.)"""
+    x = torch.zeros(m, k, dtype=torch.bfloat16)
+    w = torch.zeros(n, k, dtype=torch.bfloat16)
+    b = (torch.arange(n, dtype=torch.float32) % 251 - 125).to(torch.bfloat16)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(
+                x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+            )
+    torch.testing.assert_close(got.cpu(), b.expand(m, n), rtol=0, atol=0)
+
+
 # --- the TN persistent-rolling geometry dispatcher (GPT-2 XL dW sites) -------
 #
 # gemm16_tn_v4_kernels.mojo's try_enqueue_gemm16_gemm_tn_v4 now routes a

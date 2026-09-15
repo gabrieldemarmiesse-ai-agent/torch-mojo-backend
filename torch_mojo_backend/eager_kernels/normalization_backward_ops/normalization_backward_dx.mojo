@@ -42,6 +42,7 @@ from max.gpu.primitives import block
 from std.gpu.primitives import warp
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
+from std.sys import has_amd_gpu_accelerator
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 
 from op_utils import _enqueue_cached
@@ -70,9 +71,12 @@ comptime _SMEM_BUDGET = 32 * 1024 if has_apple_gpu_accelerator() else 64 * 1024
 comptime _MAX_WARP_CHUNKS = 6 if has_apple_gpu_accelerator() else 8
 # Rows of 1025-2048 columns (a 1600-wide transformer, say) used to fall to
 # `_dx_generic`; c16 serves them with half the warps per block so its q
-# staging is the same 32 KiB c8 uses.  Not on Apple: over its 32 KiB cap.
+# staging is the same 32 KiB c8 uses.  Measured on H100 only: not on Apple
+# (over its 32 KiB cap) and not on AMD, where the 64-wide warps would make it
+# a 2049-4096-column regime nobody has timed against the generic kernel.
 comptime _WIDE_CHUNKS = 16
 comptime _WIDE_WARPS = _WARPS_PER_BLOCK // 2
+comptime _WIDE_ON = not has_apple_gpu_accelerator() and not has_amd_gpu_accelerator()
 
 
 @always_inline
@@ -623,7 +627,7 @@ def enqueue_layer_norm_backward_dx_f32(
                         Int64(hw),
                     )
                 return
-            comptime if not has_apple_gpu_accelerator():
+            comptime if _WIDE_ON:
                 if needed <= _WIDE_CHUNKS:
                     _enqueue_cached[_dx_c16](
                         ctx,
