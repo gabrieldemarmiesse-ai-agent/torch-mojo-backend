@@ -342,13 +342,17 @@ def test_normal_strided_destination(mojo_gpu):
     assert host[:, ::2].std().item() > 0.0
 
 
-def test_normal_explicit_generator_declined(mojo_gpu):
-    """The mojo generator's Philox state can't feed the host CPU draw this
-    op performs, so an explicit generator is still rejected (see
-    op_normal_'s comment)."""
-    drawn = torch.empty(4, device=mojo_gpu)
-    with pytest.raises(NotImplementedError, match="explicit generator"):
-        drawn.normal_(0.0, 1.0, generator=torch.Generator(device=mojo_gpu))
+def test_normal_explicit_generator_is_independent_and_reproducible(mojo_gpu):
+    """normal_ draws from the generator it is given, not the default one."""
+    g = torch.Generator(device=mojo_gpu).manual_seed(111)
+    device_module.manual_seed_all(999)
+    before = device_module.get_rng_state(mojo_gpu)
+    a = torch.empty(512, device=mojo_gpu).normal_(generator=g).cpu()
+    torch.testing.assert_close(device_module.get_rng_state(mojo_gpu), before)
+    g.manual_seed(111)
+    torch.testing.assert_close(
+        torch.empty(512, device=mojo_gpu).normal_(generator=g).cpu(), a
+    )
 
 
 def test_normal_native_call_counted(mojo_gpu):
@@ -457,8 +461,8 @@ def test_native_dropout_invalid_probability_does_not_touch_rng(mojo_gpu, p):
     torch.testing.assert_close(device_module.get_rng_state(input.device), before)
 
 
-def test_native_dropout_declines_non_float32(mojo_gpu):
-    input = torch.randn(4, dtype=torch.float64, device=mojo_gpu)
+def test_native_dropout_declines_integer_dtypes(mojo_gpu):
+    input = torch.ones(4, dtype=torch.int32, device=mojo_gpu)
     with pytest.raises(NotImplementedError, match="native_dropout"):
         torch.ops.aten.native_dropout.default(input, 0.5, True)
 
@@ -531,8 +535,8 @@ def test_native_dropout_autograd_optional_train_scale(mojo_gpu, train, scale):
 
 
 def test_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
-    """7 is not a multiple of the 4-wide philox group: the ragged group must
-    still consume its whole counter, or the next draw repeats it."""
+    """A 7-element draw still advances the counter by a whole reservation, or
+    the next draw repeats it."""
     device_module.manual_seed_all(20260814)
     first = torch.empty(7, device=mojo_gpu).uniform_().cpu()
     state = device_module.get_rng_state(mojo_gpu)
@@ -545,8 +549,7 @@ def test_uniform_non_multiple_of_four_draws_do_not_overlap(mojo_gpu):
 
 
 def test_uniform_misaligned_destination_indexes_the_stream_the_same_way(mojo_gpu):
-    """An offset base cannot take the 16-byte vector store; the scalar store
-    kernel must index the philox stream identically."""
+    """The stream mapping is independent of the destination's alignment."""
     device_module.manual_seed_all(20260814)
     state = device_module.get_rng_state(mojo_gpu)
     aligned = torch.zeros(8, device=mojo_gpu).uniform_(-1.0, 1.0).cpu()
@@ -622,7 +625,7 @@ def test_float64_factories_fill_scatter_and_arange(mojo_gpu):
 
 
 def test_randint_and_random_on_the_device(mojo_device):
-    """random_.from / .to / random_ draw on the host and copy over."""
+    """random_.from / .to / random_ draw on the device (values in range)."""
     torch.manual_seed(0)
     x = torch.randint(3, 9, (200,), device=mojo_device)
     assert x.dtype == torch.int64

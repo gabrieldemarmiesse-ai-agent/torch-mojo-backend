@@ -34,6 +34,7 @@ COVERS: dict[str, str] = {
     "aten::masked_fill_.Scalar": "test_masked_fill_[Scalar]",
     "aten::masked_fill_.Tensor": "test_masked_fill_[Tensor]",
     "aten::uniform_": "test_uniform_",
+    "aten::normal_": "test_normal_",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -162,3 +163,20 @@ def test_masked_fill_(
             lambda: x_our.masked_fill_(mask_our, v_our),
             flops=float(x_ref.numel()),
         )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("normal_")
+def test_normal_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """uniform_'s kernel plus the Box-Muller transform (a log, a sqrt and a
+    sincos per pair): the compute-heaviest of the Philox fills."""
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.normal_(0.0, 1.0),
+        lambda: x_our.normal_(0.0, 1.0),
+        flops=float(x_ref.numel()),
+    )

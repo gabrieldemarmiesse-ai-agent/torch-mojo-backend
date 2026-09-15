@@ -232,6 +232,30 @@ synchronize on every backend) with a CUDA / HIP driver event on the same raw
 stream for `query()` and `elapsed_time()`. The MAX CPU device has one stream;
 its events time with the host clock.
 
+## RNG
+
+The device generator is bit-compatible with CUDA's: `MojoGeneratorImpl`
+(shim_runtime.cpp) keeps a Philox seed and an offset counted in curand's unit,
+`get_rng_state()` is CUDA's 16 bytes (seed, offset), and every draw of
+`ops_random.mojo` -- `uniform_`, `normal_`, `log_normal_`, `cauchy_`,
+`exponential_`, `geometric_`, `bernoulli_` (scalar and tensor p), the
+`random_` family, `native_dropout` -- reproduces the CUDA kernel it mirrors:
+same element order (TensorIterator's), same launch geometry (which makes
+draws above the grid cap of `sm_count * max_threads_per_sm / 256` blocks
+depend on the GPU model, as on CUDA), same counter reservation, same
+`curand4` / `curand_uniform4` / `curand_normal4` conversions
+(`eager_kernels/curand_philox.mojo`), same transforms and the same math -- the CUDA fast intrinsics ATen uses for
+float, the precise libdevice routines for double, both ported bit-exactly in
+`eager_kernels/libdevice_port.mojo`. `torch.manual_seed(s)` therefore gives
+the same `torch.rand` / `randn` / `randint` / `bernoulli` / dropout values on
+the mojo device (NVIDIA; on AMD and Apple the float transforms fall back to
+std.math and only the integer draws are bit-exact) and on a CUDA device of
+the same model, and
+`tests/native/test_random_parity.py` holds it to that against recorded CUDA
+digests (`rng_golden.json`, refreshed with `rng_parity_dump.py`). Not covered:
+`multinomial`, `randperm`, `poisson`, `rrelu_with_noise` (unregistered), and
+draws on the MAX CPU device (same kernels' closed form, no CUDA to match).
+
 ## Distributed
 
 `torch.distributed.init_process_group(backend="mojo")` registers

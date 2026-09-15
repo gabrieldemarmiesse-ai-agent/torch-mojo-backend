@@ -236,8 +236,8 @@ either implemented in Mojo or `NotImplementedError`.
 
 1. Write `op_<name>` in the matching
    `torch_mojo_backend/native/mojo/ops_<group>.mojo` — `core`, `unary`,
-   `binary`, `compare`, `data_movement`, `factories`, `reductions`, `matmul`,
-   `nn`, `attention`, `foreach`; generic helpers shared by several groups go
+   `binary`, `compare`, `data_movement`, `factories`, `random`, `reductions`,
+   `matmul`, `nn`, `attention`, `foreach`; generic helpers shared by several groups go
    in `ops_common.mojo`. Read the arguments by schema position with the `v_*`
    helpers, build outputs with `new_tensor` / `new_like` / `view_strided`
    (never write into an input unless the schema says so), and set results with

@@ -26,6 +26,7 @@ from ops_factories import register_factories
 from ops_foreach import register_foreach
 from ops_matmul import register_matmul
 from ops_nn import register_nn
+from ops_random import register_random
 from ops_reductions import register_reductions
 from ops_unary import register_unary
 from pg import Locked, pg_vtable
@@ -57,6 +58,7 @@ def _register_ops(lib: Int, prebuild: Bool = False) raises:
     _group[register_compare](lib, "ops_compare", prebuild)
     _group[register_data_movement](lib, "ops_data_movement", prebuild)
     _group[register_factories](lib, "ops_factories", prebuild)
+    _group[register_random](lib, "ops_random", prebuild)
     _group[register_reductions](lib, "ops_reductions", prebuild)
     _group[register_matmul](lib, "ops_matmul", prebuild)
     _group[register_nn](lib, "ops_nn", prebuild)
