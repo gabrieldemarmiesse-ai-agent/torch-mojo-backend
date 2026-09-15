@@ -42,8 +42,8 @@
 # a thread and restart it, and that delay does NOT cancel between the two
 # nodes (each side ends up measuring the other's dispatch jitter; both
 # reported ~390 us of "waiting for the peer" on a transfer worth 3 us). It
-# survives behind `MOJOCCL_IB_PROXY=0`: same exchange body, one fewer core
-# burned, several hundred microseconds slower.
+# remains an internal callback implementation of the same exchange body.
+# Production uses the proxy; host-only tests drive the exchange directly.
 #
 # The GPUDirect flush. Seeing the RDMA_WRITE_WITH_IMM completion does NOT
 # mean the payload is visible in GPU memory: the completion lands in host
@@ -440,7 +440,7 @@ struct IbState(Movable):
         self.fab = 0
         self.netdev = String("")
         self.peers = List[IbPeer]()
-        self.do_flush = getenv("MOJOCCL_FABRIC_FLUSH", "1") != "0"
+        self.do_flush = True
         self.region = region
         self.my_node = my_node
         self.nnodes = nnodes
@@ -485,7 +485,10 @@ struct IbState(Movable):
         self.error_word = region
         self.status_host = 0
         self.abort_dev = 0
-        self.proxy = getenv("MOJOCCL_IB_PROXY", "1") != "0"
+        # Fused + proxy is the measured production schedule on H100 and
+        # MI300A (Adastra job 5417296, 2026-09-15: disabling it loses 22.31%
+        # in full-model ABBA). Only synchronous selftests opt out below.
+        self.proxy = True
         self.thread_id = 0
         self.trace = getenv("MOJOCCL_IB_TRACE", "0") != "0"
         self.t_post_ns = 0
@@ -521,7 +524,7 @@ def _comp(st: IbState, i: Int) -> Pointer[NetCompletion, MutAnyOrigin]:
 
 
 # `IbState.error` and `IbWork.status` are written by the proxy thread (or the
-# `MOJOCCL_IB_PROXY=0` callback thread) inside `ib_drive` and read by
+# internal callback thread) inside `ib_drive` and read by
 # the calling thread -- `ib_error` from the torch-facing calling thread,
 # `ib_enqueue`'s ring-reuse check from the same -- with no other
 # synchronization between the two. Every access goes through these two
@@ -558,7 +561,7 @@ def _status_ptr(mut w: IbWork) -> Pointer[Int, MutAnyOrigin]:
 # ===-------------------------------------------------------------------=== #
 #
 # One non-blocking step function, `ib_drive`, shared by all three drivers:
-# the progress thread, the `MOJOCCL_IB_PROXY=0` stream callback and the
+# the progress thread, the internal stream callback and the
 # GPU-free self-tests. They differ only in who advances `request_seq` (the
 # mailbox, the callback, the calling thread) and who reads `done_seq`.
 #
@@ -971,7 +974,7 @@ def ib_drive(mut st: IbState) -> Bool:
 
 
 def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
-    """`cuLaunchHostFunc` entry point -- the MOJOCCL_IB_PROXY=0 path.
+    """Internal `cuLaunchHostFunc` exchange implementation.
 
     Runs on a driver-owned thread with the stream stalled behind it, so it
     must never call the CUDA/HIP driver, and it cannot pipeline: it drives
@@ -1035,7 +1038,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     aten launches on the Python main thread) shares this core's SMT sibling,
     and measured end to end (job 234072, 2x8 H100) an unconditional hot spin
     here cost nanoGPT DDP ~20% of its steady-state tok/s against real NCCL.
-    `MOJOCCL_IB_PROXY_IDLE_US` tunes the backoff quantum.
+    The idle backoff quantum is fixed at 20 us.
 
     THE STOPPED-COMMUNICATOR GUARD LIVES HERE, not in the request kernel.
     Once a kernel on this communicator has given up (`publish_fault` raises
@@ -1108,7 +1111,7 @@ def _set_thread_affinity(tid: Int, cpu: Int) raises:
     var byte_idx = cpu // 8
     if cpu < 0 or byte_idx >= CPU_SET_BYTES:
         raise Error(
-            "mojoccl: MOJOCCL_IB_PROXY_CPU=" + String(cpu) + " out of range"
+            "mojoccl: progress thread cpu=" + String(cpu) + " out of range"
         )
     var mask = alloc_bytes(CPU_SET_BYTES)
     mask[unsafe_offset=byte_idx] = UInt8(1) << UInt8(cpu % 8)
@@ -1176,8 +1179,7 @@ def _smt_sibling_free(cpu: Int, reserved: List[Int]) -> Bool:
 
 
 def _default_proxy_cpu(local_rank: Int, local_world: Int) -> Int:
-    """Default pin when `MOJOCCL_IB_PROXY_CPU` is unset, or -1 for "don't
-    pin".
+    """Topology-based proxy placement, or -1 when pinning would crowd ranks.
 
     torchrun gives every rank of a node the same affinity mask, so taking
     that mask's CPUs in descending order and indexing by `local_rank` spreads
@@ -1235,38 +1237,25 @@ def _start_proxy(ib: Int, local_rank: Int, local_world: Int) raises:
     st.thread_id = Int(tid[unsafe_offset=0])
     # A best-effort placement hint, not load-bearing for correctness, so a
     # bad CPU index or a failed syscall only prints rather than failing
-    # communicator init. MOJOCCL_IB_PROXY_CPU=none opts out of the default
-    # policy below (unpinned, like every release before this one); any other
-    # value overrides it with an exact CPU.
-    var cpu_s = getenv("MOJOCCL_IB_PROXY_CPU", "")
-    if cpu_s == "none":
+    # communicator init. Placement follows the process affinity mask.
+    var cpu = _default_proxy_cpu(local_rank, local_world)
+    if cpu < 0:
+        if st.trace:
+            print(
+                (
+                    "mojoccl: progress thread left unpinned (affinity mask too"
+                    " small for"
+                ),
+                local_world,
+                "local ranks)",
+            )
         return
-    var cpu: Int
-    if cpu_s.byte_length() > 0:
-        try:
-            cpu = Int(cpu_s)
-        except e:
-            print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
-            return
-    else:
-        cpu = _default_proxy_cpu(local_rank, local_world)
-        if cpu < 0:
-            if st.trace:
-                print(
-                    (
-                        "mojoccl: progress thread left unpinned (affinity mask"
-                        " too small for"
-                    ),
-                    local_world,
-                    "local ranks)",
-                )
-            return
     try:
         _set_thread_affinity(st.thread_id, cpu)
         if st.trace:
             print("mojoccl: progress thread pinned to cpu", cpu)
     except e:
-        print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
+        print("mojoccl: progress thread pinning failed:", e)
 
 
 def _stop_proxy(mut st: IbState):
@@ -1378,6 +1367,7 @@ def ib_setup(
     region_bytes: Int,
     nslots: Int,
     credit_off: Int,
+    _synchronous_test: Bool = False,
 ) raises -> Int:
     """Open a NIC and register the region on whichever transport this
     machine has.
@@ -1391,6 +1381,12 @@ def ib_setup(
     is the region offset of the credit landing pad. Both must be identical on
     every rank -- they are part of the wire layout. `local_world` only feeds
     the progress thread's default CPU pin (`_default_proxy_cpu`).
+
+    `_synchronous_test` is private to the ib_bringup, ib_pipeline and
+    fabric_hmem selftests. They drive `ib_drive` from the calling thread;
+    starting a proxy would race that driver. The two host-only probes also
+    pass libc as their driver and cannot allocate a GPU-visible mailbox.
+    Production always uses the proxy; this is not an environment setting.
     """
     if nslots < 1 or nslots > PIPE_MAX_SLOTS:
         raise Error(
@@ -1418,6 +1414,7 @@ def ib_setup(
     var st = IbState(
         _select_backend(), region, my_node, nnodes, nslots, credit_off
     )
+    st.proxy = not _synchronous_test
     st.timeout_ns = Int(_ib_timeout_s() * 1.0e9)
 
     # Every step below can raise after an earlier one already allocated a
@@ -1476,19 +1473,8 @@ def _ib_timeout_s() -> Float64:
 
 
 def _proxy_idle_ns() -> Int:
-    """`MOJOCCL_IB_PROXY_IDLE_US`, read once at thread start (not from inside
-    the progress-thread loop -- a `getenv` per idle iteration would defeat
-    the point of backing off)."""
-    var s = getenv("MOJOCCL_IB_PROXY_IDLE_US", String(DEFAULT_IB_PROXY_IDLE_US))
-    var us = DEFAULT_IB_PROXY_IDLE_US
-    try:
-        var parsed = Int(s)
-        if parsed > 0:
-            us = parsed
-    except:
-        # Unparseable value: keep the default quantum.
-        us = DEFAULT_IB_PROXY_IDLE_US
-    return us * 1000
+    """Idle quantum; no measured improvement justifies changing 20 us."""
+    return DEFAULT_IB_PROXY_IDLE_US * 1000
 
 
 def _nanosleep_ns(ts_addr: Int, ns: Int):
@@ -1614,10 +1600,8 @@ def ib_mailbox_dev(ib: Int) -> StaticTuple[Int, 3]:
 
 
 def ib_uses_proxy(ib: Int) -> Bool:
-    """Whether the progress thread is driving the engine. False means
-    `MOJOCCL_IB_PROXY=0`, where the exchange runs inside a stream callback and
-    the fused kernel cannot be used -- there is no point in the stream for the
-    callback to run at."""
+    """Whether the progress thread drives the engine. Always true in
+    production; only synchronous transport probes disable it."""
     return _st(ib)[].proxy
 
 
@@ -1737,7 +1721,7 @@ def _await_ring_slot(mut st: IbState, seq: Int) raises:
     ordinary back-pressure, not an error: wait for the slot.
 
     Waiting here cannot deadlock. The engine is driven by the progress thread
-    (default) or, under `MOJOCCL_IB_PROXY=0`, by a stream callback -- neither
+    (default) or by an internal stream callback -- neither
     needs this thread, and the stream already holds every kernel the
     outstanding exchanges need. The inline self-test path is the one caller
     that drives the engine itself, and it does not come through here (see
@@ -1853,7 +1837,7 @@ def ib_enqueue_request(
     is the stronger place for it -- and the stream runs on: several exchanges
     may be in flight, and `ib_enqueue_wait` is what eventually stops the
     stream.
-    Without the proxy (`MOJOCCL_IB_PROXY=0`) it is a `cuLaunchHostFunc` that
+    The internal non-proxy implementation uses a `cuLaunchHostFunc` that
     runs the whole exchange inline -- correct with the same schedule, but
     with no overlap and several hundred microseconds of driver latency per
     exchange.
@@ -1892,7 +1876,7 @@ def ib_enqueue_wait(
     ib: Int, ctx: DeviceContext, stream: DeviceStream, seq: Int
 ) raises:
     """Hold the stream until exchange `seq` has been retired, so the kernel
-    enqueued next may read the inbox. A no-op on the `MOJOCCL_IB_PROXY=0`
+    enqueued next may read the inbox. A no-op on the internal callback
     path, where `ib_enqueue_request`'s callback already waited."""
     ref st = _st(ib)[]
     if not st.proxy:
@@ -1977,7 +1961,7 @@ def ib_exchange_now(
     The bring-up self-test uses it: the transport can then be exercised on
     a host with InfiniBand but no GPU (registered host memory, no stream to
     hang kernels on), which is where the bootstrap/QP/immediate wiring is
-    cheapest to debug -- run it with `MOJOCCL_IB_PROXY=0`, since the proxy
+    cheapest to debug. Pass `_synchronous_test=True` to `ib_setup`, since the proxy
     mailbox needs a driver that can pin host memory.
     """
     ib_submit_now(

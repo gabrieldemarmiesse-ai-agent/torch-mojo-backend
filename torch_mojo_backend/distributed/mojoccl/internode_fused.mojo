@@ -33,8 +33,8 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from std.os import getenv
-from std.sys import get_defined_int, size_of
+from std.sys import size_of
+from std.sys.info import _accelerator_arch
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
@@ -66,9 +66,8 @@ from collectives_kernels import (
 from internode import EMPTY_SHARD_BYTES
 from internode_kernels import _inbox_add_body
 
-# Geometry of the fused kernel. Compile-time (`-D`, see MOJOCCL_BUILD_DEFINES
-# in mojoccl_build.py) because the register budget follows from it; the block
-# COUNT is the runtime knob (`MOJOCCL_FUSED_BLOCKS`).
+# Geometry of the fused kernel. Compile-time because the register budget
+# follows from it; the block caps below select the measured hardware defaults.
 #
 # The whole design is per-SM throughput: a GEMM block of this backend needs
 # the entire register file, so every SM holding a block of this kernel is
@@ -80,13 +79,13 @@ from internode_kernels import _inbox_add_body
 # protocol keeps 512 worker threads x 8 x 16 B = 64 KiB in flight per block
 # (nccl:src/include/device.h ncclCollUnroll = 8 on sm_80+, NCCL_SIMPLE_MAX_NTHREADS
 # 512); the split kernels got there with 216 blocks x 256 threads x 4 vectors.
-comptime FUSED_THREADS = get_defined_int["ccl_fused_threads", 512]()
+comptime FUSED_THREADS = 512
 """Threads per block. Part of the wire layout: the barriers of
 `_rs_stage_body`/`_ag_finish_body` are matched by block index and every
 block's grid-stride slice follows from (blocks, threads), so every rank of a
 node must be built with the same value -- one `.so` per build, so it is."""
 
-comptime FUSED_UNROLL = get_defined_int["ccl_fused_unroll", 4]()
+comptime FUSED_UNROLL = 4
 """16-byte vectors in flight per thread in the all-gather's remote loads.
 
 Fitted on GPT-2 XL 2x8 H100 (job 250904, mean tok/s of two passes, mojo+NCCL
@@ -96,10 +95,10 @@ Fitted on GPT-2 XL 2x8 H100 (job 250904, mean tok/s of two passes, mojo+NCCL
 Doubling the bytes in flight past this point does not shorten the kernel's
 life in the step, so what it costs the GEMMs is what decides."""
 
-comptime FUSED_PUSH_UNROLL = get_defined_int["ccl_fused_push_unroll", 4]()
+comptime FUSED_PUSH_UNROLL = 4
 """Same, for the reduce-scatter's remote stores."""
 
-comptime FUSED_CTAS_PER_SM = get_defined_int["ccl_fused_ctas_per_sm", 1]()
+comptime FUSED_CTAS_PER_SM = 1
 """`nvvm.minctasm`: caps registers at 65536 / (FUSED_THREADS x this). 512 x 1
 is 128 registers, enough for the 8-way reduce with 8 vectors in flight."""
 
@@ -116,47 +115,42 @@ comptime _MB_ABORT_CHECK = 256
 PCIe reads, so this is what bounds how long an abort holds the stream (a
 few hundred microseconds), as `_proxy_wait_kernel` had it."""
 
-comptime DEFAULT_FUSED_BLOCKS = 16
-"""Block cap (`MOJOCCL_FUSED_BLOCKS` overrides; checked equal on every rank
-at init because the barriers are block-matched). NCCL's kernel takes 16
-channels for the same trade; see FUSED_THREADS for why the count is small."""
+# The host pass uses the bare --target-accelerator name; device compilation
+# can use the target-qualified spelling. These are the same architecture.
+comptime _MI300A = (
+    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
+)
+# Fitted on 2x4 MI300A, GPT-2 XL, Adastra job 5417296 (2026-09-15):
+# full-model ABBA 16/64 -> 8/16 raised 125104.5 -> 128363.6 tokens/s
+# (+2.61%, -13.30 ms/step); 4/16 lost 1.16%. This is an architecture fit,
+# not a CU-count rule: 228 CUs alone does not explain the nonmonotonic sweep.
+# NVIDIA keeps the H100 fit, 16/64, byte-for-byte (jobs 250904/250995).
+comptime DEFAULT_FUSED_BLOCKS = 8 if _MI300A else 16
+"""Block cap, checked equal on every rank at init because the barriers are
+block-matched. See FUSED_THREADS for why the count is small."""
 
-comptime DEFAULT_FUSED_BIG_BLOCKS = 64
+comptime DEFAULT_FUSED_BIG_BLOCKS = 16 if _MI300A else 64
 comptime DEFAULT_FUSED_BIG_MB = 128
-"""Block cap for messages of at least `DEFAULT_FUSED_BIG_MB`
-(`MOJOCCL_FUSED_BIG_BLOCKS` / `MOJOCCL_FUSED_BIG_MB`). A message that large
+"""Block cap for messages of at least `DEFAULT_FUSED_BIG_MB`. A message that large
 is DDP's last bucket (GPT-2 XL: 313 MiB, the tied embedding), which nothing
 overlaps: the SMs the small cap saves for the GEMMs are idle, and at 16
 blocks it ran 5.9 ms against NCCL's 3.0 (job 250904 traces). Shape-based,
 like the split path's `_AR_BIG_BYTES`."""
 
 
-def _int_env(name: String, default: Int, lo: Int, hi: Int) -> Int:
-    var raw = getenv(name, String(default))
-    try:
-        return max(lo, min(hi, Int(raw)))
-    except:
-        return default
-
-
 def fused_block_cap() -> Int:
-    """`MOJOCCL_FUSED_BLOCKS`, or `DEFAULT_FUSED_BLOCKS`."""
-    return _int_env("MOJOCCL_FUSED_BLOCKS", DEFAULT_FUSED_BLOCKS, 1, MAX_BLOCKS)
+    """Measured block cap for this accelerator."""
+    return DEFAULT_FUSED_BLOCKS
 
 
 def fused_big_block_cap() -> Int:
-    """`MOJOCCL_FUSED_BIG_BLOCKS`, or `DEFAULT_FUSED_BIG_BLOCKS`."""
-    return _int_env(
-        "MOJOCCL_FUSED_BIG_BLOCKS", DEFAULT_FUSED_BIG_BLOCKS, 1, MAX_BLOCKS
-    )
+    """Measured block cap for large messages on this accelerator."""
+    return DEFAULT_FUSED_BIG_BLOCKS
 
 
 def fused_big_bytes() -> Int:
-    """Bytes from which `fused_big_block_cap` applies (`MOJOCCL_FUSED_BIG_MB`).
-    """
-    return _int_env(
-        "MOJOCCL_FUSED_BIG_MB", DEFAULT_FUSED_BIG_MB, 0, 1 << 20
-    ) * (1024 * 1024)
+    """Bytes from which `fused_big_block_cap` applies."""
+    return DEFAULT_FUSED_BIG_MB * (1024 * 1024)
 
 
 def fused_blocks(cap: Int, resident: Int, per: Int, W: Int) -> Int:

@@ -376,7 +376,6 @@ export NCCL_DEBUG=WARN
 # Conservative recipe for the earlier 124M measurements above.
 # The XL verification below uses VMM=1 with fused mojoccl.
 unset MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM
-export MOJOCCL_REGION_MB=64   # what makes four ranks per node fit without it
 MASTER_ADDR=$(scontrol show hostname "$SLURM_JOB_NODELIST" | head -n 1)
 srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     uv run torchrun --nnodes="$SLURM_JOB_NUM_NODES" --nproc-per-node=4 \
@@ -407,14 +406,14 @@ interval is the Student-t 95% confidence interval across rounds.
 Both native stacks used `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`;
 stock left it unset. Both native ratios exceed the 0.95 target.
 
-For this measured XL workload, use the following mojoccl settings on
-every rank. These block-cap overrides are fitted to MI300A; the library's
-defaults remain 16/64.
+MI300A (`gfx942`) selects fused caps **8/16** and a **64 MiB** staging
+capacity automatically. NVIDIA retains the H100-fitted **16/64** caps and
+**256 MiB** staging capacity. The large-message threshold remains 128 MiB.
+The library detects Slingshot/libfabric, chooses the nearest NIC, and runs
+the progress thread automatically; no `MOJOCCL_*` exports are needed.
 
 ```bash
 export TORCH_MOJO_BACKEND_CCL=mojo
-export MOJOCCL_NET=fabric MOJOCCL_REGION_MB=64
-export MOJOCCL_FUSED_BLOCKS=8 MOJOCCL_FUSED_BIG_BLOCKS=16
 export FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1
 export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1
 ```
@@ -428,9 +427,10 @@ outside GPU locks.
 
 Full-model ABBA on a1070/a1071, job 5417296, improves from 125.1k to
 128.4k tokens/s when changing caps 16/64 to 8/16 (+2.61%). Reducing the
-small cap further to 4 loses 1.16%. `MOJOCCL_IB_PROXY=0` still selects
-the split schedule and passes the payload checks, but loses 22.31% in
-full-model ABBA. Keep the fused schedule for this workload.
+small cap further to 4 loses 1.16%. Disabling the proxy in the historical
+experiment passed the payload checks but lost 22.31% in full-model ABBA.
+Those measurements are now the code defaults. The split schedule remains
+the automatic fallback when a tiny staging region exceeds the fused work ring.
 
 The fused kernel builds warning-free at 512 threads. Payload and deadline
 probes pass for barrier sleep immediates 0/1/2/4/8 on all eight ranks;
@@ -480,7 +480,7 @@ NCCL-class collectives, not a general library:
   (NCCL's shape), and `ncclCommInitRank` runs three relayed all-gathers over
   it (host identity, IPC handle plus IB connection data, barrier);
 - every rank owns one shared staging region (`MOJOCCL_REGION_MB`, default
-  256 MiB, multiple of 4 KiB; larger requests are chunked). MAX's own
+  64 MiB on gfx942, 256 MiB elsewhere; multiple of 4 KiB; larger requests are chunked). MAX's own
   allocations cannot be shared across processes (§5.6 of the study), which
   is why the kernels stage through this region; the push / local-reduce /
   pull design makes the staging free. The region is either a `cuMemAlloc`
@@ -616,7 +616,7 @@ multicast, and so does this library now.
 A single-node communicator whose devices all report
 `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED` builds its region as VMM memory
 bound to a per-node multicast object, and routes allreduces of
-`MOJOCCL_NVLS_MIN_MB` (48 MiB) or more through `multimem.ld_reduce` /
+`NVLS_MIN_BYTES` (48 MiB) or more through `multimem.ld_reduce` /
 `multimem.st`: rank r pulls its 1/world slice through the switch, which sums
 the `world` contributions and returns one value, and pushes the result back
 into all `world` regions in one instruction. NVLink traffic falls to `bytes`
@@ -646,7 +646,7 @@ sequence costs 150–230 ms once per communicator, dominated by
 `cuMulticastBindMem` and the mappings.
 
 The socket name is derived from the unique id's magic and the local rank
-(`/tmp`, or `MOJOCCL_SOCKET_DIR`), so the rendezvous carries no extra round.
+(`/tmp`), so the rendezvous carries no extra round.
 `tests/multinode/selftest/fd_exchange.mojo` runs that transport over ordinary
 file descriptors with no GPU and no multicast hardware — the msghdr /
 cmsghdr / sockaddr_un structs are laid out by hand over `UInt64` words
@@ -658,8 +658,7 @@ cmsghdr / sockaddr_un structs are laid out by hand over `UInt64` words
 uses MINIMUM, so that `MOJOCCL_REGION_MB` keeps meaning what it says — at
 RECOMMENDED the default region (`128 KiB + 2 × 256 MiB`) rounds up to a 1 GiB
 allocation per rank and even a deliberately tiny test region costs 512 MiB,
-while at MINIMUM the same region is 514 MiB. `MOJOCCL_NVLS_GRANULARITY=rec`
-asks for NCCL's choice back.
+while at MINIMUM the same region is 514 MiB. MINIMUM is the code default.
 
 The NVLS kernel stages **one** buffer, not two, so it uses the whole `2 × cap`
 arena rather than a half: a 512 MiB allreduce is one launch on the default
@@ -742,7 +741,7 @@ tail bucket goes from 1.31× to 1.06× and 512 MiB from 1.39× to 1.03×. 1 MiB
 is below this bench's noise floor (per-leg medians 27–59 µs on every
 configuration, NVLS or not) and is left out of the table.
 
-A seventh leg measured `MOJOCCL_NVLS_GRANULARITY=rec` — NCCL's 512 MiB
+A seventh leg measured `RECOMMENDED multicast granularity` — NCCL's 512 MiB
 multicast objects instead of the default 2 MiB ones — at 806/2213 fp32 and
 798/2213 bf16 for the two large sizes: **the same within noise**, and the
 2 MiB objects allocate 514 MiB per rank against 1 GiB. That granularity had
@@ -851,13 +850,10 @@ from the autograd thread that also issues the backward's GEMMs, ~24 µs of
 driver time per launch) that cost the compute stream 1179 idle gaps of
 ~250 µs per 5.5 s -- 90.3% busy against 96.2% under NCCL, 0.906 of stock
 end to end. See "One kernel per allreduce" below for the numbers.
-`MOJOCCL_FUSED=0` is the old schedule, still used behind
-`MOJOCCL_IB_PROXY=0` (a stream callback needs a point in stream order to
-run at, which a kernel's middle is not). The two schedules launch different
-grids and the intra-node barriers are block-matched, so the effective
-schedule, the build's threads per block and -- within a node -- the fused
-kernel's co-resident bound and SM count are exchanged at init and a
-mismatch is refused with a message naming the knobs.
+The split fallback and fused path launch different grids and use
+block-matched intra-node barriers. The effective schedule, threads per
+block, and each node's occupancy bound and multiprocessor count are
+exchanged at init; incompatible builds are rejected.
 
 `K = sqrt(bytes / (local_world × 640 KB))`, capped at 16 by choice and
 raised from below by geometry when a chunk would not fit — the square root
@@ -865,7 +861,7 @@ is of what an extra chunk costs (originally two launches; now two grid
 barriers and two 8-way start barriers) against the 40–45 GB/s the RDMA runs
 at. It gives K = 1 up to ~10 MiB, 2 at the 27–39 MiB DDP buckets, 5 at
 168 MiB and 10 at 512 MiB, and keeps a chunk's shard above 1 MiB without a
-second clause. `MOJOCCL_PIPE_SPLIT_UNIT` re-fits the constant in one job;
+second clause. The constant is fitted in source;
 it is part of the wire layout (K decides how many exchange counters a
 collective consumes) and is checked equal on every rank at init.
 
@@ -970,7 +966,7 @@ rank's own region through its own address-vector entry, in the same role as
 the verbs self-QP read. The fence argument probably already covers it and
 MI300A's "device memory" is host-attached HBM anyway, but no cxi
 documentation was found that promises the ordering, it costs ~3.6 µs, and
-`MOJOCCL_FABRIC_FLUSH=0` turns it off for measurement.
+The flush is always enabled.
 
 Every struct offset, size and constant `libfabric.mojo` hard-codes is dumped
 by `tests/multinode/selftest/fabric_abi.c` (gcc, against the installed
@@ -1008,15 +1004,15 @@ credit — the fact the credit asserts, published from the device rather than
 inferred on the host from enqueue order (the split schedule's `credit_upto`,
 which the unfused broadcast/all-gather paths still use). Several exchanges
 live between request and done, so the thread is one non-blocking step
-function (`ib_drive`, shared with the `MOJOCCL_IB_PROXY=0` callback and the
+function (`ib_drive`, shared with the internal callback and the
 GPU-free self-tests) that retires exchanges in sequence order — RC ordering
 is per queue pair, so arrivals are not ordered across peers — and pipelines
 the flush read the same way. The thread spins only while something is
-outstanding; idle, it yields and then sleeps in `MOJOCCL_IB_PROXY_IDLE_US`
+outstanding; idle, it yields and then sleeps in `20 µs`
 steps, because a thread spinning between exchanges competed with the
 host-bound Python dispatch thread and cost ~20% of end-to-end training
 throughput at 16 ranks. A `cuLaunchHostFunc`/`hipLaunchHostFunc` stream
-callback does the same job behind `MOJOCCL_IB_PROXY=0` and costs about
+callback did the same job in the proxy-disabled experiment and cost about
 480 µs of fixed driver latency per exchange on this cluster (2.6× slower at
 the DDP bucket), which is why the thread is the default. HCA choice: the
 longest common `/sys/devices` prefix between the GPU's and the HCA's PCI
@@ -1029,8 +1025,8 @@ end to end (job 234455, 16 ranks/2×8 H100, nanoGPT DDP) as a mode in one of
 three ABBA runs: steps 4–11 at 45–46 ms (within 2% of NCCL's steady 44.6–44.9
 ms), steps 12–35 at a sustained 51 ms (~13% slower), then back to 46 ms —
 the scheduler leaving the progress thread on a shared core for a stretch of
-the run, not throughout it. `MOJOCCL_IB_PROXY_CPU` unset therefore pins by
-default:
+the run, not throughout it. The default placement policy therefore pins
+automatically:
 `sched_getaffinity` reads this process's mask, and if it holds at least
 `2 × local_world` CPUs (torchrun gives every rank of a node the same mask),
 the thread goes on that mask's CPUs taken in descending order, indexed by
@@ -1040,11 +1036,9 @@ candidate whose SMT sibling is itself another rank's pin is deprioritized in
 favor of one that isn't (`topology/thread_siblings_list`, best-effort — read
 failures just skip the check). A mask smaller than `2 × local_world` leaves
 the thread unpinned rather than fight Python for a scarce core.
-`MOJOCCL_IB_PROXY_CPU=<n>` overrides with an exact CPU;
-`MOJOCCL_IB_PROXY_CPU=none` opts out of pinning entirely.
 `MOJOCCL_IB_TRACE=1` prints the chosen CPU (or why none was chosen).
 
-**Follow-up, unfixed: the sibling check does not catch the common case.**
+**Unmeasured placement follow-up.**
 Measured on Adastra (`taskset -pc` of every rank of a 2x4 job): each rank's
 affinity mask is `0-47,96-143`, which is 48 physical cores with BOTH their
 SMT threads -- `96+c` is the sibling of `c`. Taking the mask's CPUs in
@@ -1054,39 +1048,47 @@ Python and autograd threads run on. `_smt_sibling_free` accepts them because
 it only rejects a CPU whose sibling is ANOTHER RANK'S PIN, and 44-47 are not
 pins. So on any node whose mask is a full-SMT range the policy reliably puts
 every progress thread on a busy core's sibling, which is the placement it
-exists to avoid; the ~20% this cost on H100 is the size of the effect.
+exists to avoid; H100 measurements motivate investigating this, but do not measure its effect on MI300A.
 A fix would prefer, among the mask's CPUs, ones whose sibling is not also in
 the mask, and only then fall back to the descending rule. Not the cause of
 any bug currently open.
 
-| variable | default | controls |
-|---|---|---|
-| `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
-| `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | absolute deadline for the whole rendezvous. Every socket it opens is non-blocking and every wait is a `poll(2)` computed from the deadline (`connect` included, verified with `SO_ERROR`), so no syscall can outlive it; `SO_RCVTIMEO`/`SO_SNDTIMEO` stay on as a backstop |
-| `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
-| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for a peer that stopped answering before latching an error — **every** wait: the inter-node exchange, the fused kernel's phases (its clock restarts per chunk, before the exchange wait and before the all-gather; the grid barriers get one extra second so the informative fault is the one latched), and the intra-node and NVLS barrier spins, which read it once per process |
-| `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread (and the split, five-kernels-per-chunk allreduce schedule) |
-| `MOJOCCL_FUSED` | 1 | `0`: the split allreduce schedule (five launches per chunk) instead of the one persistent kernel per allreduce. The effective schedule (this, or `MOJOCCL_IB_PROXY=0`) must match on every rank -- the two launch different grids and the barriers are block-matched |
-| `MOJOCCL_FUSED_BLOCKS` | 16 | grid of the fused allreduce kernel, i.e. how many SMs it holds for its whole life (`internode_fused.mojo` explains the trade); must match on every rank |
-| `MOJOCCL_FUSED_BIG_BLOCKS` / `MOJOCCL_FUSED_BIG_MB` | 64 / 128 | grid for allreduces of at least that many MiB (DDP's last bucket, which nothing overlaps); must match on every rank |
-| `MOJOCCL_PIPE_SPLIT_UNIT` | 640000 | the chunk rule's constant, `K = sqrt(bytes / (local_world × unit))`; must match on every rank |
-| `MOJOCCL_BUILD_DEFINES` | unset | `-D` defines for the `libmojoccl.so` build (`ccl_fused_threads=512,ccl_fused_unroll=4,...`), part of the cache key. Per process: each rank builds or loads its own `.so` from its own environment, and the fused kernel's threads per block are part of the wire layout, so `ncclCommInitRank` checks the compiled value matches on every rank |
-| `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
-| `MOJOCCL_IB_PROXY_CPU` | unset: auto-pin (mask permitting), see above | an exact CPU to pin the progress thread to; `none` disables pinning |
-| `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
-| `MOJOCCL_IB_TRACE` | 0 | `1`: one line per rank at destroy — backend and device, peers, slot groups, exchanges, credit stalls, mean µs posting / in flight / flushing; on libfabric a second line with the negotiated FI_HMEM interface, memory key, addressing mode, address length and receive depth |
-| `MOJOCCL_NET` | unset: verbs if an ACTIVE IB port exists, else libfabric | `verbs` or `fabric`, forcing the transport |
-| `MOJOCCL_LIBFABRIC` | unset: `libfabric.so.1`, then `/opt/cray/libfabric/2.2.0rc1/lib64/libfabric.so.1` | an exact `libfabric.so.1` to dlopen |
-| `MOJOCCL_FABRIC_PROVIDER` | `cxi` | provider name asked of `fi_getinfo`; if it finds none, any provider satisfying the same hints is accepted |
-| `MOJOCCL_FABRIC_DOMAIN` | affinity choice among the provider's domains (PCI proximity to the GPU, then `local_rank % n`) | exact domain to use instead (`cxi2`) — the libfabric analogue of `MOJOCCL_IB_HCA` |
-| `MOJOCCL_FABRIC_HMEM` | `auto`: FI_HMEM_ROCR, then FI_HMEM_CUDA, then FI_HMEM_SYSTEM, first one the provider accepts | `system`, `rocr` or `cuda`, forcing the `fi_mr_attr.iface` the region registers under |
-| `MOJOCCL_FABRIC_FLUSH` | 1 | `0`: skip the `fi_read` flush after an exchange (libfabric backend only) |
-| `MOJOCCL_FABRIC_SETUP_RETRY_S` | 30 | how long `fab_setup` keeps retrying an endpoint bring-up that fails with `-FI_ENOMEM` (see the fragmentation note below); `0` fails on the first attempt |
-| `MOJOCCL_REGION_MB` | 256 | staging size; single node `[signal \| stage_in cap \| stage_out cap]`, multi-node `PIPE_ARENAS` arenas of `cap/PIPE_ARENAS` halves plus a cap-sized network area. Must match on every rank — `ncclCommInitRank` checks it. On an NVLS region only the allocation is rounded up to the multicast granularity (2 MiB by default, 512 MiB under `MOJOCCL_NVLS_GRANULARITY=rec`); the halves keep the size asked for |
-| `MOJOCCL_NVLS` | 1 | `0`: no multicast region and no NVLS kernel, on every rank of the communicator (it is ANDed across ranks) |
-| `MOJOCCL_NVLS_MIN_MB` | 48 | single-node allreduces at or above this go through the switch; below it the unicast kernels keep the traffic. The default is the measured crossover. Must match on every rank — `ncclCommInitRank` checks it |
-| `MOJOCCL_NVLS_GRANULARITY` | `min` | `rec`: size the multicast object with `CU_MULTICAST_GRANULARITY_RECOMMENDED` (NCCL's choice, 512 MiB objects on H100) instead of `MINIMUM` (2 MiB) |
-| `MOJOCCL_SOCKET_DIR` | `/tmp` | where the node-local AF_UNIX sockets that carry the VMM/multicast file descriptors are bound |
+### Automatic defaults and supported configuration
+
+The measured algorithm choices live in source: fused scheduling, hardware
+block caps, 512 threads/block, four-vector unrolls, one CTA/SM launch bound,
+128 MiB large-message threshold, pipeline unit 640000, 48 MiB NVLS threshold,
+MINIMUM multicast granularity, 20 µs idle proxy sleep, provider-negotiated
+memory registration, enabled fabric flush, 30 s fabric setup retry, and
+`/tmp` local descriptor sockets. They have no environment tuning overrides.
+Changes require a source fit and validation on the affected hardware.
+
+Only settings with a similar NCCL/RCCL purpose remain. The analog names below
+describe purpose; their units and value syntax can differ. See the
+[NCCL environment reference](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html).
+
+| Variable | Default | Purpose | NCCL/RCCL analog |
+|---|---|---|---|
+| `MOJOCCL_SOCKET_IFNAME` | UP non-loopback IPv4 interface with a default route | Bootstrap interface; exact name | `NCCL_SOCKET_IFNAME` |
+| `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 s | Whole rendezvous deadline | `NCCL_SOCKET_RETRY_CNT`, `NCCL_SOCKET_RETRY_SLEEP_MSEC` (connection retry budget) |
+| `MOJOCCL_IB_HCA` | GPU/NIC affinity | Exact verbs adapter name | `NCCL_IB_HCA` |
+| `MOJOCCL_IB_TIMEOUT_S` | 60 s | Peer/device progress deadline | `NCCL_IB_TIMEOUT` (verbs timeout; different units and scope) |
+| `MOJOCCL_IB_RELAXED_ORDERING` | 1 | Relaxed-ordering memory registration | `NCCL_IB_PCI_RELAXED_ORDERING` |
+| `MOJOCCL_IB_TRACE` | 0 | Transport diagnostics and timings | `NCCL_DEBUG`, `NCCL_DEBUG_SUBSYS` |
+| `MOJOCCL_NET` | Active verbs port, otherwise libfabric | Transport selection | `NCCL_NET` |
+| `MOJOCCL_LIBFABRIC` | Loader soname, then Cray path | Transport library path | `NCCL_NET_PLUGIN` (library selection) |
+| `MOJOCCL_FABRIC_PROVIDER` | Prefer cxi, then a provider satisfying the required capabilities | Fabric provider selection | `NCCL_NET` |
+| `MOJOCCL_FABRIC_DOMAIN` | GPU/NIC affinity, then rank modulo domain count | Exact fabric NIC/domain | `NCCL_IB_HCA` |
+| `MOJOCCL_REGION_MB` | 64 on gfx942; 256 elsewhere | Staging capacity, equal across ranks | `NCCL_BUFFSIZE` (different layout and units) |
+| `MOJOCCL_NVLS` | 1, capability checked across all ranks | Enable multicast where supported | `NCCL_NVLS_ENABLE` |
+
+The `ib_bringup`, `ib_pipeline` and `fabric_hmem` selftests pass a private
+`_synchronous_test=True` argument to `ib_setup`: their calling thread drives
+the transport directly, so a concurrent proxy would race it. The first two
+also use libc and cannot allocate a GPU-visible mailbox. Production never
+sets this argument; there is no environment switch for it. `MOJOCCL_ROOT_`
+names an internal compiler-runtime global, not an environment variable.
+
 
 Limits and failure modes: 8 ranks per node, 16 nodes; a multi-node
 communicator on a machine with neither an ACTIVE InfiniBand port nor a
@@ -1114,7 +1116,7 @@ attributable):
 |---|---|---|---|
 | RCCL over the same cxi NICs (aws-ofi-rccl 1.18.0) | 7 072 us | 132.8 GB/s | 1.00x |
 | mojoccl | 10 568 us | 88.9 GB/s | 1.49x |
-| mojoccl, `MOJOCCL_FABRIC_FLUSH=0` | 9 387 us | 100.1 GB/s | 1.33x |
+| mojoccl, fabric flush disabled (historical experiment) | 9 387 us | 100.1 GB/s | 1.33x |
 | mojoccl, same size inside a 1/9/27/168/512 MiB sweep | 21 553 us | 43.6 GB/s | 3.05x |
 
 Three things that says. **The sweep is 2x pessimistic**: the same allreduce
@@ -1128,7 +1130,7 @@ behind the exchange's own multi-megabyte writes on the same transmit command
 queue, and the trace reads ~500 us. It stays on by default -- see
 `fab_post_flush` for why the fence probably makes it unnecessary and why
 "probably" is not enough to remove a memory-ordering guarantee -- but
-`MOJOCCL_FABRIC_FLUSH=0` measured `correct=OK`. **The FI_FENCE is not the
+fabric flush disabled (historical experiment) measured `correct=OK`. **The FI_FENCE is not the
 cap**: exchanges do overlap despite it (the sum of per-exchange in-flight
 times, 14 x ~1.9 ms, is 2.5x the 10.6 ms the allreduce takes), so it does not
 serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
@@ -1186,7 +1188,7 @@ demand once the fragmented node went out of allocation: eight nanoGPT runs
 under that ballast took zero retries and had zero init failures.
 
 What this repo does about it: `fab_setup` retries the endpoint bring-up while
-the provider says `-FI_ENOMEM`, for `MOJOCCL_FABRIC_SETUP_RETRY_S` (30 s).
+the provider says `-FI_ENOMEM`, for the fixed 30 s setup retry budget.
 That is a mitigation, not a fix — fragmentation does not clear in 30 s — but
 the pressure does ease as ranks free staging buffers, and ranks were measured
 recovering on a later attempt. What actually fixes it is leaving the node
@@ -1253,7 +1255,7 @@ NIC either, and the last two need no peers) — plus one that does need a GPU,
 FI_HMEM_ROCR and exchanges into it. The transport ones run against either
 backend (`MOJOCCL_NET`) on a host with a NIC and no GPU — the login node
 under InfiniBand, a compute node under Slingshot — with
-`MOJOCCL_IB_PROXY=0`; they caught
+the historical proxy-disabled experiment; they caught
 six bugs before any GPU time was spent.
 
 **Results**, 16 ranks on 2×8 H100, `ar_bench_gpt2.py` through the process
@@ -1318,7 +1320,7 @@ thread × blocks):
 
 | geometry | tok/s | vs mojo+NCCL |
 |---|---|---|
-| split schedule (`MOJOCCL_FUSED=0`) | 449.1k | 0.907 |
+| split schedule (the historical forced-split experiment) | 449.1k | 0.907 |
 | 256 × 2 × 32, 2 CTAs/SM (first draft) | 476.9k | 0.963 |
 | 256 × 8 × 32, 2 CTAs/SM | 474.3k | 0.957 |
 | 256 × 8 × 16, 2 CTAs/SM | 463.9k | 0.936 |
@@ -1347,7 +1349,7 @@ against mojo+NCCL in the same job (rank 0, 5.5 s window): compute stream
 54.9% against 37.7%; the allreduce kernel's per-call duration p50 923 µs
 against `ncclDevKernel_AllReduce_f32_RING`'s 664 µs, and the last bucket
 (313 MiB, the tied embedding, which nothing overlaps) 5.9 ms against
-3.0–3.9 -- which is what `MOJOCCL_FUSED_BIG_BLOCKS` is for. What is left
+3.0–3.9 -- which is why the large-message block cap is higher on H100. What is left
 against NCCL is the GEMMs: 102.6 ms/step of non-bias GEMM against 98.4,
 i.e. the 16 held SMs over a longer life. Host cost per `dist.all_reduce`
 (`tests/multinode/enqueue_bench.py`, 27 MiB fp32, 100 calls, no sync,
@@ -1373,8 +1375,8 @@ mojo + mojoccl 487k = 0.984 ± 0.001; host cost per call unchanged at
 
 Validated in the same state (jobs 250997, 251023, 251056; after the review fixes 251177, 251178, 251297, 251298): `collectives`,
 `ddp_parity` and `stress` at 16 ranks under both libraries and at 8 ranks
-on one node, `collectives` under `MOJOCCL_IB_PROXY=0` and under
-`MOJOCCL_FUSED=0` (plus `stress`), `ring_pressure.py`, nanoGPT-124M at 16
+on one node, `collectives` under the historical proxy-disabled experiment and under
+the historical forced-split experiment (plus `stress`), `ring_pressure.py`, nanoGPT-124M at 16
 ranks to the same losses, and `tests/multinode/deadline_probe.py`: rank 0
 sleeps through `MOJOCCL_IB_TIMEOUT_S=3`, its node-mates latch
 `DEVICE DEADLINE in the multi-node allreduce's reduce-scatter stage` and the
@@ -1396,7 +1398,7 @@ is covered an extra chunk only buys launches.
 libraries (job 234229, `cl02s01dgx06` + `cl02s04dgx02`), including `stress`'s
 200 rounds of interleaved 4-byte / 27 MiB / broadcast / allgather
 collectives and its 256 MiB messages, which the pipeline cuts into 7 chunks.
-The `MOJOCCL_IB_PROXY=0` fallback passes `collectives` too: it cannot
+The historical proxy-disabled experiment fallback passes `collectives` too: it cannot
 overlap (the callback blocks the stream) but the schedule and the credit
 protocol are correct on it. nanoGPT-124M DDP at 16 ranks reaches the same
 losses. End to end, six 40-step runs alternating NCCL and mojoccl on one

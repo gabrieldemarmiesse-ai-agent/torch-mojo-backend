@@ -37,8 +37,8 @@
 # so that `MOJOCCL_REGION_MB` keeps meaning what it says -- at RECOMMENDED the
 # default 256 MiB region (128 KiB + 2 x 256 MiB) rounds up to a 1 GiB
 # allocation per rank, and even a deliberately tiny test region costs 512 MiB.
-# `MOJOCCL_NVLS_GRANULARITY=rec` asks for NCCL's choice back; the two measured
-# the same on H100 (docs/distributed.md).
+# MINIMUM and RECOMMENDED measured the same on H100 (docs/distributed.md),
+# so production uses MINIMUM to avoid rounding up that much memory.
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory.alloc import unsafe_alloc

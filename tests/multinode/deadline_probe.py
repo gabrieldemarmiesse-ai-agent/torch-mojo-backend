@@ -15,10 +15,11 @@ must not look like a hang of the probe itself::
 Every rank prints a `probe:` verdict and exits 0 only on the expected
 outcome (rank 0 included: after its sleep its own allreduce waits for peers
 that already gave up and must fail the same way), so torchrun's exit code
-is the result. `MOJOCCL_FUSED=0` runs the same probe against the split
-schedule's wait kernel.
+is the result. With `MOJOCCL_REGION_MB=1 --size-mib 129`, the payload
+exceeds the fused work-ring capacity and exercises the split wait kernel.
 """
 
+import argparse
 import os
 import sys
 import threading
@@ -48,6 +49,9 @@ def _watchdog(rank: int, budget_s: float):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size-mib", type=int, default=32)
+    args = parser.parse_args()
     register_mojo_devices()
     dist.init_process_group(backend="mojo", timeout=datetime.timedelta(seconds=300))
     rank = dist.get_rank()
@@ -57,7 +61,7 @@ def main():
         target=_watchdog, args=(rank, sleep_s + timeout_s * 4 + 30), daemon=True
     ).start()
     device = torch.device("mojo", torch.accelerator.current_device_index())
-    x = torch.ones(8 << 20, dtype=torch.float32, device=device)
+    x = torch.ones(args.size_mib << 18, dtype=torch.float32, device=device)
     dist.all_reduce(x)
     torch.accelerator.synchronize()
     if rank == 0:

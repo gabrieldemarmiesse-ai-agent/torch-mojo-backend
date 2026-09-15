@@ -113,34 +113,8 @@ srun bash -c "MOJOCCL_IB_TRACE=1 flock /tmp/gpu_lock_0.lock uv run --no-sync tor
   2>&1 | tee "$TRLOG" | grep -E "^step|mojoccl net:|collectives via|Error|Traceback"
 echo "=== ibtrace exit: ${PIPESTATUS[0]} ==="
 
-# --- how much of the GPU the fused collective may take, and how finely ----
-# MOJOCCL_FUSED_BLOCKS is the grid of the one-launch multi-node allreduce, and
-# on this model it is a direct trade against the compute stream: a GPT-2 XL
-# GEMM block needs a whole SM, so every SM holding a collective block is one
-# the GEMM cannot use until the collective retires. MOJOCCL_PIPE_SPLIT_UNIT is
-# the chunking rule's constant (K = sqrt(bytes / (local_world * unit))):
-# 2560000 gives K=1 at DDP's 39 MiB bucket, 640000 (shipped) K=2, 160000 K=4.
-# `split` is MOJOCCL_FUSED=0, the five-kernels-per-chunk schedule, as control.
-# Palindromic order so a thermal ramp cancels to first order.
-run_grid() {  # $1 = blocks or "split", $2 = split unit, $3 = pass
-  echo "=== fused grid $1 unit $2 pass $3 ==="
-  set_ccl mojo
-  local env="MOJOCCL_FUSED_BLOCKS=$1 MOJOCCL_PIPE_SPLIT_UNIT=$2"
-  [ "$1" = "split" ] && env="MOJOCCL_FUSED=0 MOJOCCL_PIPE_SPLIT_UNIT=$2"
-  local log="$LOGDIR/mojoccl_probe_${SLURM_JOB_ID}_grid_${1}_${2}_$3.log"
-  srun bash -c "$env flock /tmp/gpu_lock_0.lock uv run --no-sync torchrun \
-      --nnodes=\$SLURM_NNODES --nproc-per-node=8 --rdzv-backend=c10d \
-      --rdzv-endpoint=$MASTER_ADDR:29615 --rdzv-id=\$SLURM_JOB_ID-g$1-$2-$3 \
-      tests/multinode/rank_bind.py --device mojo --nanogpt-path $NANOGPT \
-      --data-dir $NANOGPT/data/shakespeare --log-interval 1 --seed 1337 \
-      --max-iters 20 --eval-interval 0 --batch-size 8 $XL" \
-    2>&1 | tee "$log" | grep -E "^step|Error|Traceback"
-  echo "=== fused grid $1 unit $2 pass $3 exit: ${PIPESTATUS[0]} ==="
-}
-COMBOS="split:640000 32:2560000 32:640000 32:160000 64:640000 64:160000"
-for pass in 1 2; do
-  for c in $COMBOS; do run_grid "${c%%:*}" "${c##*:}" $pass; done
-done
+# Fused geometry and pipeline chunking use measured code defaults.
+# Benchmark a source change through the normal stack protocol above.
 
 # --- broadcast burst (work-ring back-pressure) -----------------------------
 echo "=== ring_pressure (mojoccl) ==="

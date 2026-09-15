@@ -70,14 +70,14 @@ equivalent of the stream callback — alternating inbox halves and verifying
 every peer's slot against a rank/sequence-derived pattern.
 
     for r in 0 1 2 3; do
-        MOJOCCL_IB_PROXY=0 /tmp/ib_bringup $r 4 /tmp/uid4.txt &
+        /tmp/ib_bringup $r 4 /tmp/uid4.txt &
     done; wait
 
 On Slingshot, the same thing with the other backend (on a compute node --
 `srun --overlap --ntasks=1 --cpus-per-task=8`, no GPU needed):
 
     for r in 0 1 2 3; do
-        MOJOCCL_NET=fabric MOJOCCL_IB_PROXY=0 /tmp/ib_bringup $r 4 /tmp/uid4.txt &
+        MOJOCCL_NET=fabric /tmp/ib_bringup $r 4 /tmp/uid4.txt &
     done; wait
 
 Exercised on `cxi` at 2, 4 and 6 processes, and at 4 with
@@ -87,11 +87,12 @@ unresolved flake described in `docs/distributed.md` ("One unresolved flake on
 Slingshot") -- a node condition, not this code. Retry; that has always
 worked.
 
-`MOJOCCL_IB_PROXY=0` is required here and only here: the progress thread's
-mailbox is pinned, device-mapped host memory, which needs a driver that can
-allocate it, and this host has no GPU. Without it `ib_setup` fails with
-"symbol not found: cuMemHostAlloc" -- which is the honest answer, not
-something to paper over, since on a real node that symbol is always there.
+These synchronous probes explicitly pass `_synchronous_test=True` to `ib_setup`.
+They use libc as the driver and host memory as the region, so a GPU-visible
+proxy mailbox cannot be allocated. This private argument is only for these
+tests; production always enables its proxy. No environment setting is needed.
+The GPU-backed `fabric_hmem` probe uses the same private argument to avoid
+racing its synchronous exchange loop with a concurrent proxy.
 
 400 exchanges is deliberately past `RECV_DEPTH` (64): a receive WR that is
 consumed and not reposted shows up as a hang rather than as wrong data.
@@ -105,7 +106,7 @@ chunk k, consume chunk k-(depth-1) — with the calling thread standing in
 for the stream, so `credit_upto` takes the values it takes in production.
 
     for r in 0 1 2 3; do
-        MOJOCCL_IB_PROXY=0 /tmp/ib_pipeline $r 4 /tmp/uidp.txt 5 4 200 &
+        /tmp/ib_pipeline $r 4 /tmp/uidp.txt 5 4 200 &
     done; wait
 
 `MOJOCCL_NET=fabric` runs the same matrix on Slingshot; the credit protocol
@@ -205,7 +206,7 @@ different kernel driver, and the piece most likely to be missing from a
 libfabric build.
 
     for r in 0 1; do
-        MOJOCCL_NET=fabric MOJOCCL_IB_PROXY=0 MOJOCCL_IB_TRACE=1 \
+        MOJOCCL_NET=fabric MOJOCCL_IB_TRACE=1 \
             /tmp/fabric_hmem $r 2 /tmp/uidh.txt 50 &
     done; wait
 
@@ -242,6 +243,23 @@ PYTHONPATH=$PWD uv run --no-sync mojo build tests/multinode/selftest/host_fault_
   -o /tmp/mojoccl_host_fault_test
 PYTHONPATH=$PWD uv run --no-sync /tmp/mojoccl_host_fault_test
 ```
+
+## `defaults.mojo` — host dispatch constants across architectures
+
+This probe checks production default readers without opening a GPU context.
+Pass expected values independently of the implementation's architecture gate:
+
+```bash
+uv run --no-sync mojo build tests/multinode/selftest/defaults.mojo \
+    -I torch_mojo_backend/distributed/mojoccl --target-accelerator gfx942 \
+    --Werror -o /tmp/mojoccl_defaults
+uv run --no-sync /tmp/mojoccl_defaults 8 16 64
+```
+
+For `sm_90a` and `sm_80`, rebuild with that target and pass `16 64 256`.
+The arguments are the two block caps and staging MiB. The probe also checks
+the shared thread counts, thresholds, unrolls, pipeline constant and idle sleep.
+The compiled programs run on the build host even without the target GPU.
 
 ## `comm_state_probe.mojo` — abort release assertion
 

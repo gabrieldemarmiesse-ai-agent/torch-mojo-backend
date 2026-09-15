@@ -26,7 +26,7 @@
 #   NVLS      single node, every local device reporting
 #             CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED: VMM memory bound to a
 #             per-node multicast object and mapped twice (vmm.mojo), so that
-#             allreduces of MOJOCCL_NVLS_MIN_MB or more can go through the
+#             allreduces of NVLS_MIN_BYTES or more can go through the
 #             NVSwitch's own reduction engine (nvls_kernels.mojo) instead of
 #             over unicast NVLink. Peers are imported through the same
 #             file-descriptor exchange rather than with cuIpcOpenMemHandle,
@@ -170,6 +170,7 @@ from internode import (
     ib_teardown,
 )
 from internode_fused import (
+    _MI300A,
     FUSED_THREADS,
     check_fused_call,
     fused_big_block_cap,
@@ -237,7 +238,7 @@ comptime NCCL_AVG: Int32 = 4
 #
 # 4, not 2: the pipeline is GPU-bound at every size that gets chunked, so
 # depth 2 overlaps in principle, but its window is one reduce-scatter and
-# the progress thread's idle backoff alone (MOJOCCL_IB_PROXY_IDLE_US, 20 us)
+# the progress thread's idle backoff alone (20 us)
 # can eat that. Depth 4 gives a window of two whole chunks, and costs region
 # layout rather than memory -- each arena is 1/4 of the staging.
 comptime PIPE_ARENAS = 4
@@ -275,11 +276,10 @@ comptime PIPE_MAX_CHUNKS = 16
 # point where the network is covered only buys launches.
 comptime PIPE_SPLIT_UNIT = 640_000
 
-# `MOJOCCL_PIPE_SPLIT_UNIT` overrides it. Part of the wire layout in the same
+# Part of the wire layout in the same
 # way `MOJOCCL_REGION_MB` is -- K decides how many exchange counters a
 # collective consumes, so two ranks that disagree about it stop agreeing about
-# which exchange is which -- so `ncclCommInitRank` checks it matches, and it is
-# an environment variable only so that the rule can be re-fitted in one job.
+# which exchange is which -- so `ncclCommInitRank` checks it matches.
 #
 # Re-measured for the fused kernel (2x8 H100, GPT-2 XL, job 250995, mean
 # tok/s of steps 10-20 over two passes, vs mojo+NCCL in the same job), where
@@ -289,19 +289,19 @@ comptime PIPE_SPLIT_UNIT = 640_000
 
 
 def _pipe_split_unit() -> Int:
-    var raw = getenv("MOJOCCL_PIPE_SPLIT_UNIT", String(PIPE_SPLIT_UNIT))
-    try:
-        return max(1, Int(raw))
-    except:
-        return PIPE_SPLIT_UNIT
+    return PIPE_SPLIT_UNIT
 
 
-comptime DEFAULT_REGION_MB = 256
+# MI300A: 64 MiB supports four ranks/node without the large shared-memory
+# reservation conflict (Adastra 124M measurements in docs/distributed.md),
+# and the GPT-2 XL five-round series at 0.9873x stock used it, job 5417296,
+# 2026-09-15. NVIDIA retains its H100 staging fit of 256 MiB.
+comptime DEFAULT_REGION_MB = 64 if _MI300A else 256
 comptime DEFAULT_BOOTSTRAP_TIMEOUT_S: Float64 = 120.0
 
 comptime DEFAULT_SOCKET_DIR = "/tmp"
 """Where the node-local AF_UNIX sockets that carry the VMM/multicast file
-descriptors are bound (`MOJOCCL_SOCKET_DIR`). Node-local by definition -- a
+descriptors are bound. Node-local by definition -- a
 shared filesystem would work too but buys nothing, since the ranks that talk
 over it are on one host. NCCL puts its own at /tmp as well
 (nccl:src/os/linux_ipcsocket.cc)."""
@@ -343,12 +343,14 @@ def _bootstrap_timeout_s() -> Float64:
 
 
 def _fused_enabled() -> Bool:
-    """`MOJOCCL_FUSED=0` puts multi-node allreduces back on the split
-    schedule (five kernels per chunk). The two schedules launch different
-    grids (216 x 256 threads against 16 x 512 at the DDP bucket) and the
-    intra-node barriers are matched by block index, so every rank has to run
-    the same one: the effective mode is exchanged and checked at init."""
-    return getenv("MOJOCCL_FUSED", "1") != "0"
+    """Prefer fused allreduce whenever the region can hold its pipeline.
+
+    Fitted on H100 (job 250904: 487.6k vs split 449.1k tokens/s) and
+    MI300A (job 5417296: 128400.0 vs split 99759.1, 2026-09-15).
+    The effective schedule is exchanged and checked at init because its
+    intra-node barriers are matched by block index.
+    """
+    return True
 
 
 def _nvls_enabled() -> Bool:
@@ -364,27 +366,20 @@ def _nvls_enabled() -> Bool:
 
 def _nvls_min_bytes() -> Int:
     """Message size at or above which a single-node allreduce goes through the
-    switch (`MOJOCCL_NVLS_MIN_MB`, default 48 MiB -- the measured crossover,
+    switch (48 MiB -- the measured crossover,
     see `NVLS_MIN_BYTES` in nvls_kernels.mojo)."""
-    var s = getenv("MOJOCCL_NVLS_MIN_MB", String(""))
-    if s == String(""):
-        return nvls_min_bytes()
-    try:
-        return Int(s) * 1024 * 1024
-    except:
-        return nvls_min_bytes()
+    return nvls_min_bytes()
 
 
 def _nvls_recommended_granularity() -> Bool:
-    """`MOJOCCL_NVLS_GRANULARITY=rec` sizes the multicast object with
-    `CU_MULTICAST_GRANULARITY_RECOMMENDED`, which is what NCCL does and what
-    the prototype measured; the default `min` allocates what the region asked
-    for. The two measured the same on H100 -- see docs/distributed.md."""
-    return getenv("MOJOCCL_NVLS_GRANULARITY", String("min")) == String("rec")
+    """Use MINIMUM multicast granularity: it allocates what the region asks
+    for. MINIMUM and RECOMMENDED measured the same on H100; see
+    docs/distributed.md's NVLS measurements."""
+    return False
 
 
 def _socket_dir() -> String:
-    return getenv("MOJOCCL_SOCKET_DIR", String(DEFAULT_SOCKET_DIR))
+    return String(DEFAULT_SOCKET_DIR)
 
 
 def _dtype_item_bytes(nccl_dtype: Int32) -> Int:
@@ -490,8 +485,8 @@ struct CommState(Movable):
     # to be co-resident, so it is one block per multiprocessor
     # (`fused_blocks`), and every rank of a node derives the same number.
     var sm_count: Int
-    # Grid caps of the fused kernel (`MOJOCCL_FUSED_BLOCKS`, and
-    # `MOJOCCL_FUSED_BIG_BLOCKS` for messages of at least `fused_big_bytes`),
+    # Grid caps of the fused kernel (`fused_blocks`, and
+    # `fused_big_blocks` for messages of at least `fused_big_bytes`),
     # checked equal on every rank at init: its barriers are matched by block
     # index.
     var fused_cap: Int
@@ -500,12 +495,11 @@ struct CommState(Movable):
     # Co-resident bound of the fused kernel on this GPU (occupancy times SMs,
     # `fused_resident_blocks`); the grid never exceeds it.
     var fused_resident: Int
-    # `MOJOCCL_PIPE_SPLIT_UNIT`; checked equal on every rank at init.
+    # `PIPE_SPLIT_UNIT`; checked equal on every rank at init.
     var split_unit: Int
     # Whether multi-node allreduces go through the one-launch fused kernel.
-    # Off without the progress thread (MOJOCCL_IB_PROXY=0 runs the exchange in
-    # a stream callback, which needs a point in stream order to run at) and
-    # off under MOJOCCL_FUSED=0, which is the way back to the split schedule.
+    # Requires the progress thread. A message exceeding the fused work-ring
+    # capacity still takes the split schedule at launch time.
     var fused: Bool
     # `ncclCommGetAsyncError`'s scratch, built once instead of per poll: the
     # device word the copy kernel writes and the host word it lands in.
@@ -1561,7 +1555,7 @@ def _bootstrap(
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
         # (a per-node environment, a stale export) silently gives the peers
         # different arena and inbox offsets, which is a data race, not an error;
-        # a per-rank `MOJOCCL_NVLS_MIN_MB` sends one rank into the multicast
+        # a per-rank `NVLS_MIN_BYTES` sends one rank into the multicast
         # counter barrier and another into the flag barrier, which is a hang.
         # Checking three integers here turns both into a message.
         comptime CFG_BYTES = 88
@@ -1663,11 +1657,8 @@ def _bootstrap(
                     + ("fused" if rcfg[unsafe_offset=7] != 0 else "split")
                     + " x "
                     + String(Int(rcfg[unsafe_offset=8]))
-                    + "; MOJOCCL_REGION_MB, MOJOCCL_NVLS_MIN_MB,"
-                    " MOJOCCL_FUSED_BLOCKS, MOJOCCL_FUSED_BIG_BLOCKS,"
-                    " MOJOCCL_FUSED_BIG_MB, MOJOCCL_PIPE_SPLIT_UNIT,"
-                    " MOJOCCL_FUSED, MOJOCCL_IB_PROXY and the build's"
-                    " ccl_fused_threads must match on every rank"
+                    + "; MOJOCCL_REGION_MB and the build's collective geometry,"
+                    " thresholds and schedule must match on every rank"
                 )
             if topo.node_of[r] == topo.my_node and (
                 rcfg[unsafe_offset=9] != cfg[unsafe_offset=9]
@@ -2495,9 +2486,8 @@ def _do_allreduce_split[
 ) raises:
     """The pipelined multi-node allreduce as five kernels per chunk.
 
-    What ran before `_do_allreduce_fused`, kept for `MOJOCCL_IB_PROXY=0` --
-    where the exchange happens in a stream callback and there is no point
-    inside a kernel for it to run at -- and for `MOJOCCL_FUSED=0`.
+    Releases work-ring slots incrementally, so it handles messages whose
+    chunk count exceeds the fused kernel's pre-enqueued work capacity.
     """
     comptime item = size_of[dtype]()
     # Chunk k is issued as reduce-scatter, release; its wait / add /

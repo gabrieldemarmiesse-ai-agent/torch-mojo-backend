@@ -119,6 +119,7 @@ def main() raises:
         region_bytes,
         2,
         net_off,
+        _synchronous_test=True,
     )
     var b2 = alloc_bytes(IB_BLOB_BYTES)
     ib_local_info(ib, b2)
@@ -161,3 +162,6 @@ def main() raises:
     free_region(lib, region)
     conn.close()
     print("rank", rank, "PASS" if failed == 0 else "FAIL")
+
+    if failed:
+        raise Error("fabric_hmem transport failure")

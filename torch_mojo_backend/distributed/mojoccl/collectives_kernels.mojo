@@ -162,7 +162,6 @@ from max.gpu.sync import barrier
 from std.memory import AddressSpace, stack_allocation
 from std.memory.alloc import unsafe_alloc
 from std.sys import (
-    get_defined_int,
     has_amd_gpu_accelerator,
     size_of,
 )
@@ -241,14 +240,12 @@ is on this node's NVLink or on the other end of the fabric."""
 comptime _SPIN_CHECK = 4096
 """Spins between two reads of the (not free) global timer."""
 
-# The tuning constants below carry a `-D` override so the benchmark harness
-# can sweep them without editing this file; the defaults are what a plain
-# build (and therefore production) uses.
+# Measured algorithm constants. Changes are fitted and reviewed in source.
 
-comptime _UNROLL = get_defined_int["ccl_unroll", 4]()
+comptime _UNROLL = 4
 """16-byte vectors in flight per thread in the NVLink copy loops."""
 
-comptime _ONESHOT_MAX_BYTES = get_defined_int["ccl_oneshot_max", 512 * 1024]()
+comptime _ONESHOT_MAX_BYTES = 512 * 1024
 """At or below this an allreduce uses the one-shot path: (world-1)x the NVLink
 bytes but one sync instead of two, which wins while the transfer is
 latency-bound. Measured crossover on 8xH100/NVSwitch (us, one-shot vs
@@ -256,9 +253,7 @@ two-shot): 128 KiB 9.3/19.0, 256 KiB 12.3/19.3, 512 KiB 18.1/19.8,
 1 MiB 30.0/20.5 -- so the crossover sits just above 512 KiB. The path is taken
 only if 2*world message-sized slots also fit the region."""
 
-comptime _AR_MAX_BLOCKS = get_defined_int[
-    "ccl_ar_blocks", 128 if has_amd_gpu_accelerator() else 216
-]()
+comptime _AR_MAX_BLOCKS = 128 if has_amd_gpu_accelerator() else 216
 """Grid cap for allreduce, fitted on H100 (132 SMs) / NVSwitch; see the block
 sweep in RESULTS.md. Not portable: re-fit it on another card. The AMD value
 was swept on one 4x MI300A node (228 CUs) with the push/reduce/push-back
@@ -269,12 +264,10 @@ best value moved down from 224 once the release fence went back to every
 thread; 64 starves the 27 MiB transfer. Re-fit it on another card, and re-fit
 it if the barrier changes."""
 
-comptime _AR_BIG_BYTES = get_defined_int["ccl_ar_big_bytes", 64 * 1024 * 1024]()
+comptime _AR_BIG_BYTES = 64 * 1024 * 1024
 """Above this message size the allreduce grid drops to `_AR_BIG_BLOCKS`."""
 
-comptime _AR_BIG_BLOCKS = get_defined_int[
-    "ccl_ar_big_blocks", 912 if has_amd_gpu_accelerator() else 128
-]()
+comptime _AR_BIG_BLOCKS = 912 if has_amd_gpu_accelerator() else 128
 """Grid cap for large allreduces. A grid that fits in one wave of an H100's
 132 SMs measured 8% faster at 512 MiB than 216 blocks (2825 vs 3065 us) and
 the same at 168 MiB, because the barrier is per block index: with more blocks
@@ -289,7 +282,7 @@ waves of the 228 CUs and is the only value that is best at both sizes; the
 response in between is not monotonic (224, one block per CU, is the worst
 point measured) so do not interpolate -- re-sweep."""
 
-comptime _COPY_MAX_BLOCKS = get_defined_int["ccl_copy_blocks", 432]()
+comptime _COPY_MAX_BLOCKS = 432
 """Grid cap for the pure-copy collectives (broadcast / allgather)."""
 
 # Error codes written to the region's error word (`error_offset()`).
@@ -881,6 +874,10 @@ def grid_barrier(
                     # trip (internode_kernels.mojo has the measurement for
                     # one such thread). Sleep between polls; the ordering
                     # stays as it is.
+                    # MI300A sweep, Adastra job 5417296 (2026-09-15):
+                    # sleep 0/1/2/4/8 passed payload/deadline probes; the
+                    # best 168 MiB gain was 0.89%, below reproduction
+                    # noise (~1%). Keep the measured production sleep 2.
                     llvm_intrinsic[
                         "llvm.amdgcn.s.sleep", NoneType, has_side_effect=True
                     ](Int32(2))

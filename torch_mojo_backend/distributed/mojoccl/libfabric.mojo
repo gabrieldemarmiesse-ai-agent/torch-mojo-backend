@@ -887,7 +887,7 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
             " cxi driver failing to find 512 KiB of contiguous kernel memory"
             " for an address context. /proc/buddyinfo and the kernel's"
             " Mem-Info dump show the per-NUMA high-order counts that decide"
-            " it. MOJOCCL_FABRIC_SETUP_RETRY_S sets how long this waits for"
+            " it. Setup retries for 30 seconds, waiting for"
             " the pressure to ease"
         )
     raise Error(
@@ -899,31 +899,6 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
         + msg
         + ")"
         + hint
-    )
-
-
-def _hmem_iface_from_env() raises -> Int:
-    """`MOJOCCL_FABRIC_HMEM`: `auto` (default), `system`, `rocr` or `cuda`.
-
-    In `auto` the region is registered with the accelerator interface first
-    and plain host memory second: whether a pointer is device memory is a
-    question only the driver can answer, and the provider answering "I
-    cannot register that as ROCr memory" is a definite answer rather than a
-    guess. Registering DEVICE memory as FI_HMEM_SYSTEM, the other way round,
-    is the failure that would be silent.
-    """
-    var s = getenv("MOJOCCL_FABRIC_HMEM", "auto")
-    if s == "auto":
-        return -1
-    if s == "system":
-        return FI_HMEM_SYSTEM
-    if s == "rocr":
-        return FI_HMEM_ROCR
-    if s == "cuda":
-        return FI_HMEM_CUDA
-    raise Error(
-        "mojoccl: MOJOCCL_FABRIC_HMEM must be auto, system, rocr or cuda, got "
-        + s
     )
 
 
@@ -1140,14 +1115,13 @@ def _fab_setup_once(
         st.host_desc = fi_mr_desc(st.host_mr)
 
         # ---- the communicator's region ---------------------------------
-        var want_iface = _hmem_iface_from_env()
+        # Ask the provider which accelerator interface can register this
+        # pointer, then try host memory. This preserves the measured auto
+        # order and never guesses that an accelerator pointer is host memory.
         var ifaces = List[Int]()
-        if want_iface >= 0:
-            ifaces.append(want_iface)
-        else:
-            ifaces.append(FI_HMEM_ROCR)
-            ifaces.append(FI_HMEM_CUDA)
-            ifaces.append(FI_HMEM_SYSTEM)
+        ifaces.append(FI_HMEM_ROCR)
+        ifaces.append(FI_HMEM_CUDA)
+        ifaces.append(FI_HMEM_SYSTEM)
         var mr = 0
         var last = 0
         for iface in ifaces:
@@ -1191,15 +1165,8 @@ def _fab_setup_once(
 
 
 def _fab_setup_retry_s() -> Float64:
-    """`MOJOCCL_FABRIC_SETUP_RETRY_S`: the -FI_ENOMEM retry budget, seconds.
-    Zero fails on the first attempt, which is what a test that WANTS to see
-    the error asks for."""
-    var s = getenv("MOJOCCL_FABRIC_SETUP_RETRY_S", String(FAB_SETUP_RETRY_S))
-    try:
-        var v = Float64(s)
-        return v if v > 0.0 else 0.0
-    except:
-        return FAB_SETUP_RETRY_S
+    """Bound endpoint retries under transient provider memory pressure."""
+    return FAB_SETUP_RETRY_S
 
 
 def _is_enomem(e: Error) -> Bool:
@@ -1233,7 +1200,7 @@ def fab_setup(
     buffers as they go, and in two of four failing runs some of the ranks
     that failed the first attempt got through a later one. It is not a fast
     flap, though: eight tries over 2.5 s all failed on all four ranks of a
-    node, so the budget is a wall-clock one (`MOJOCCL_FABRIC_SETUP_RETRY_S`,
+    node, so the budget is a wall-clock one (`FAB_SETUP_RETRY_S`,
     30 s) rather than a try count, and it sits inside the bootstrap's own
     120 s deadline so a node that spends it all still meets its peers.
 
@@ -1552,8 +1519,7 @@ def fab_post_flush(
     payload in memory. No cxi provider documentation was found that promises
     it, and on an MI300A "device memory" is host-attached HBM anyway, so the
     read stays: it costs about a microsecond and it is the difference
-    between an argument and a guarantee. `MOJOCCL_FABRIC_FLUSH=0` turns it
-    off for measurement.
+    between an argument and a guarantee. The flush is always enabled.
     """
     for _ in range(EAGAIN_SPINS):
         var rc = fi_read(
@@ -1601,8 +1567,8 @@ def fab_poll(mut f: FabricNet, comps: Int, max_comps: Int) -> Int:
 def fab_iface_name(f: FabricNet) -> String:
     """The FI_HMEM interface the region actually registered under -- the one
     thing about this transport that cannot be predicted from the
-    environment, since `MOJOCCL_FABRIC_HMEM=auto` asks the provider rather
-    than guessing (see `_hmem_iface_from_env`)."""
+    environment, since registration asks the provider rather
+    than guessing (see `_fab_setup_once`)."""
     if f.hmem_iface == FI_HMEM_ROCR:
         return String("rocr")
     if f.hmem_iface == FI_HMEM_CUDA:

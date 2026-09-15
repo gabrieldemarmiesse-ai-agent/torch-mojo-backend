@@ -7,7 +7,7 @@ take; `_do_allreduce` has to hand that call to the split schedule, and a 20
 MiB one (still dozens of chunks) stays fused. A wrong dispatch is a hang
 (the host waiting on a ring slot only its own unlaunched kernel would
 free), which is why the sizes straddle the bound. At the default region the
-same sizes straddle `MOJOCCL_FUSED_BIG_MB` instead, so the 129 MiB call runs
+same sizes straddle the 128 MiB large-message threshold, so the 129 MiB call runs
 the big grid. Both are checked against the analytic sum::
 
     MOJOCCL_REGION_MB=1 TORCH_MOJO_BACKEND_CCL=mojo torchrun --nnodes=2 ... \\
