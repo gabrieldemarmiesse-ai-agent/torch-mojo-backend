@@ -109,6 +109,21 @@ Measured on 2 nodes x 4 MI300A over cxi (216 MiB of buckets per step): 6.0
 ms/step plain, 8.8 with one matmul per bucket, 36.8 with a rank-skewed three
 -- against 2800 ms/step for a nanoGPT DDP step moving the same bytes.
 
+## enqueue_bench.py, ddp_buckets.py, run_enqueue_probe.sbatch
+
+`enqueue_bench.py` times the host side of `dist.all_reduce` -- the wall time
+of the Python call, nothing synchronized, 100 calls per size, both CCLs --
+because that, not the collective's device time, is what starves the compute
+stream when DDP issues 146 allreduces per step from the autograd thread.
+`ddp_buckets.py` prints the bucket sizes the reducer actually hands the
+process group for a nanoGPT model (recorded at the process group on the
+second step, after DDP has rebuilt its buckets in autograd order; GPT-2 XL:
+144 × 39 MiB then 313 MiB), in the form `bucket_loop.py`'s `BUCKETS=` takes.
+`run_enqueue_probe.sbatch` runs both, `bucket_loop.py` on that list, a
+`MOJOCCL_IB_TRACE=1` GPT-2 XL step and `ring_pressure.py` in one two-node
+job, with the enqueue legs in ABBA order; run it before and after a change
+to the collectives' launch structure.
+
 ## GPU-free self-tests
 
 `tests/multinode/selftest/` holds seven standalone Mojo programs that
