@@ -1173,23 +1173,45 @@ def _try_enqueue_tn_rolling_geom(
     (a Codex review finding: two 128x192 CTAs computing six times the
     padded work of the one 64x128 CTA gemm16_v3_kernels.mojo's dedicated
     small-tile route would have used) when this dispatcher ran
-    unconditionally. Declining below three quarters of the available
-    clusters busy (the same bar try_enqueue_candidate_tn's own occupancy
-    gate already uses) sends those back to split-K / the narrow-tile-192
-    rung / v3's aligned-TN routes (m % 128 == 0, n % 256 == 0) or v3's
-    small-tile route (m % 64 == 0, n % 128 == 0), all tuned for exactly
-    that "small output, spare SMs" regime.
+    unconditionally.
 
-    The decline's own escape hatch is exactly those two alternatives'
-    combined precondition: `m % 64 == 0 and (m % 128 == 0 or
-    n % 128 == 0)`. Outside it -- an m not even 64-aligned, or a 64-
-    aligned m paired with an n neither v3 rung's fixed width divides --
-    nothing else in the ladder can serve the shape at all, so it is
-    accepted unconditionally regardless of modeled occupancy. This is
-    why 64x192x4096 (m=64, n=192 divides neither 128 nor 256, works=1,
-    the same rock-bottom occupancy as the 128x128x8192 regression above)
-    is a genuine 4x win to keep (125.6 -> 32.6 us): nothing else can
-    take it.
+    Declining requires TWO things, both Codex review findings on the
+    first cut of this decline: (1) a fallback actually exists, and (2)
+    when the fallback is the dedicated small-tile route specifically,
+    that its bm=64 is a strictly better fit than the geometry this
+    function would otherwise pick.
+
+    (1) `_v4_tn_fallback_available` below encodes the alignment each
+    ladder rung needs (m % 128 == 0 for split-K / narrow-tile-192 / v3's
+    large aligned route, or m % 64 == 0 and n % 128 == 0 for v3's small-
+    tile route) -- a shape whose N does not divide 128, 192 or 256 at
+    all, e.g. (256, 320, 4096) (320 divides none of them), has NO
+    fallback anywhere in the ladder and must keep the rolling dispatcher
+    regardless of modeled occupancy: declining it here used to fall all
+    the way to the generic non-TMA route.
+
+    (2) Even with a fallback, declining below three quarters of the
+    available clusters busy (the same bar try_enqueue_candidate_tn's own
+    occupancy gate uses) is the right call only when no fallback is
+    STRICTLY better-fitted than that occupancy math already accounts
+    for. The small-tile route's bm=64 breaks that assumption: on 132
+    SMs, (64, 9600, 64) clears the three-quarters floor outright (50 of
+    66 clusters, cost-model works=50) yet still loses to the small-tile
+    route, because the CHOSEN rolling geometry's bm (128, from this
+    shape's own cost model) does not divide m=64 at all -- half its
+    CTAs (the second cluster rank, entirely) are pure padding and the
+    other half wastes half their rows, 4x the small-tile route's exact
+    64-row fit. So the small-tile route is preferred outright (bypassing
+    the occupancy math entirely) whenever it is eligible AND the chosen
+    geometry's bm exceeds m; only when bm <= m (no such waste) does the
+    three-quarters occupancy floor decide.
+
+    Together, the escape hatch (accept unconditionally) is: no fallback
+    is available at all, OR the only available fallback is the small-
+    tile route and it is not a strictly better fit than the chosen
+    geometry. This is why 64x192x4096 (n=192 divides neither 128 nor
+    256: no fallback at all) keeps its genuine 4x win (125.6 -> 32.6 us):
+    nothing else can take it.
     """
     if n % 64 != 0 or sm_count < _V4_TN_ROLL_CLUSTER_M:
         return False
@@ -1198,6 +1220,7 @@ def _try_enqueue_tn_rolling_geom(
         _V4_TN_ROLL_BM[0], _V4_TN_ROLL_BN[0], m, n, sm_count
     )
     var best_area = _V4_TN_ROLL_BM[0] * _V4_TN_ROLL_BN[0]
+    var best_bm = _V4_TN_ROLL_BM[0]
     var best_works = _v4_tn_roll_works(
         _V4_TN_ROLL_BM[0], _V4_TN_ROLL_BN[0], m, n
     )
@@ -1212,18 +1235,27 @@ def _try_enqueue_tn_rolling_geom(
             best = g
             best_cost = c
             best_area = area
+            best_bm = _V4_TN_ROLL_BM[g]
             best_works = _v4_tn_roll_works(
                 _V4_TN_ROLL_BM[g], _V4_TN_ROLL_BN[g], m, n
             )
     # m % 64 == 0 and n % 128 == 0 mirrors gemm16_v3_kernels.mojo's
     # _V3_TN_SMALL_BM / _V3_TN_SMALL_BN (the dedicated 64x128 small-tile
     # route); m % _V4_BM == 0 mirrors its _V3_TN_WS_BM and this file's own
-    # split-K / narrow-tile-192 (all m % 128 == 0).  Importing those
-    # constants directly would cycle (gemm16_v3_kernels.mojo already
-    # imports from this file), so the values are repeated here -- see the
-    # docstring above for why this exact pair is the decline's escape
-    # hatch.
-    if m % 64 == 0 and (m % _V4_BM == 0 or n % 128 == 0):
+    # split-K / narrow-tile-192 (all m % 128 == 0, n % 256 == 0 or
+    # n % 192 == 0).  Importing those constants directly would cycle
+    # (gemm16_v3_kernels.mojo already imports from this file), so the
+    # values are repeated here -- see the docstring above for the two
+    # Codex review findings this pair of checks fixes.
+    var small_tile_fits = m % 64 == 0 and n % 128 == 0
+    var large_fallback = m % _V4_BM == 0 and (n % 256 == 0 or n % 192 == 0)
+    if small_tile_fits and m < best_bm:
+        # The small-tile route's exact 64-row fit beats the chosen
+        # geometry's padding outright: bypass the occupancy math (a
+        # shape can clear three quarters of the clusters -- e.g.
+        # (64, 9600, 64), 50 of 66 -- and still lose 4x to this padding).
+        return False
+    if small_tile_fits or large_fallback:
         var clusters_max = sm_count // _V4_TN_ROLL_CLUSTER_M
         if best_works * 4 < clusters_max * 3:
             return False

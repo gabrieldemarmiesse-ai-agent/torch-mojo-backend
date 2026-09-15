@@ -484,6 +484,41 @@ def test_gemm16_tn_rolling_small_ragged_m(mojo_h100):
     assert _rel_err(dw, ref) < _bf16_bound(tokens)
 
 
+# n=320 divides none of 128/192/256 -- no fallback rung (split-K, narrow-
+# tile-192, v3's aligned or small-tile routes) exists anywhere in the TN
+# ladder, so the occupancy decline must keep the rolling dispatcher
+# regardless of how low its own modeled occupancy is (a Codex review
+# finding: it used to fall all the way to the generic non-TMA route).
+# m=64, n=9600 is the opposite failure mode of the same decline: n % 128
+# == 0 makes v3's small-tile route (bm=64, an exact fit) eligible, and on
+# 132 SMs this shape clears the three-quarters occupancy floor outright
+# (50 of 66 clusters) -- so occupancy alone was not enough to stop the
+# rolling dispatcher from choosing a 128-row geometry that pads m=64 to
+# 128 (4x the small-tile route's padding-free work), also a Codex finding.
+TN_ROLLING_ESCAPE_HATCH_SHAPES = [(256, 320, 4096), (64, 9600, 64)]
+
+
+@pytest.mark.parametrize(
+    "out_features,in_features,tokens", TN_ROLLING_ESCAPE_HATCH_SHAPES
+)
+def test_gemm16_tn_rolling_occupancy_decline_escape_hatch(
+    mojo_h100, out_features, in_features, tokens
+):
+    """Correctness at the two shapes the occupancy decline's escape hatch
+    (_try_enqueue_tn_rolling_geom's docstring) must get right: one with no
+    fallback rung at all, one where the fallback exists but the rolling
+    dispatcher's own geometry would pad m severely worse than it does."""
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
 def test_gemm16_tn_rolling_m4800_boundary_guard(mojo_h100):
     """m = 4800 lands exactly on the 192x192/cluster-2 geometry's macro-row
     boundary: 4800 % (192 * 2) == 192, so the second cluster rank's box for
