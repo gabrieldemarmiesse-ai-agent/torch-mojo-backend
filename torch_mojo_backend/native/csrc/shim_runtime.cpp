@@ -10,6 +10,9 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator exists from 2.9
+#include <c10/core/CachingDeviceAllocator.h>
+#endif
 #include <pthread.h>
 #include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
@@ -20,6 +23,7 @@
 #include <exception>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -107,14 +111,25 @@ int32_t alloc_device() {
 }
 
 // ---- allocator ---------------------------------------------------------------
-struct MojoAllocator final : c10::Allocator {
+struct MojoAllocator final
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator exists from 2.9
+    : c10::DeviceAllocator
+#else
+    : c10::Allocator
+#endif
+{
   static void deleter(void* p) {
-    if (!p) return;
+    if (!p || tmb_in_bad_fork) return;
     Lock g(tmb_mutex);
     H.free(p);
   }
   c10::DataPtr allocate(size_t n) override {
     REQUIRE_READY();
+    // c10 uses size_t, but the Mojo hook takes a signed 64-bit Int. In
+    // particular, Storage.resize_(-1) reaches us as SIZE_MAX on PrivateUse1.
+    // Reject unrepresentable requests before calling MAX or touching stats.
+    TORCH_CHECK(n <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+                "mojo backend: allocation size cannot be represented as int64: ", n);
     Lock g(tmb_mutex);
     const int32_t dev = alloc_device();
     void* data = nullptr;
@@ -129,6 +144,64 @@ struct MojoAllocator final : c10::Allocator {
   void copy_data(void* dst, const void* src, size_t n) const override {
     HOOK(H.copy_data(dst, src, n, tls_device, tls_stream_slot(tls_device)));
   }
+  // The device guard also records streams on torch versions without DeviceAllocator.
+  void record_stream(const c10::DataPtr& ptr, c10::Stream stream) {
+    REQUIRE_READY();
+    if (!ptr.get_context() || ptr.get_deleter() != &deleter) return;
+    HOOK(H.record_stream(ptr.get_context(), stream.device_index(), stream.id()));
+  }
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator's memory API exists from 2.9
+  bool initialized() override { return tmb_ready && !tmb_in_bad_fork; }
+  void emptyCache(c10::MempoolId_t = {0, 0}) override {
+    // Ignore non-default mempool_id: nothing in this backend creates pools.
+    if (tmb_in_bad_fork) return;
+    REQUIRE_READY();
+    HOOK(H.empty_cache());
+  }
+  void recordStream(const c10::DataPtr& ptr, c10::Stream stream) override {
+    record_stream(ptr, stream);
+  }
+  c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    int64_t slots[TMB_MEM_STATS_SLOTS]{};
+    HOOK(H.mem_stats(device, slots, TMB_MEM_STATS_SLOTS));
+    c10::CachingDeviceAllocator::DeviceStats stats{};
+    c10::CachingAllocator::Stat* fields[] = {
+        &stats.allocated_bytes[0], &stats.allocation[0],
+        &stats.requested_bytes[0], &stats.reserved_bytes[0]};
+    for (size_t i = 0; i < 4; ++i) {
+      fields[i]->current = slots[4 * i];
+      fields[i]->peak = slots[4 * i + 1];
+      fields[i]->allocated = slots[4 * i + 2];
+      fields[i]->freed = slots[4 * i + 3];
+    }
+    stats.num_device_alloc = slots[16];
+    stats.num_device_free = slots[17];
+    stats.num_alloc_retries = slots[18];
+    stats.num_ooms = slots[19];
+    return stats;
+  }
+  void resetAccumulatedStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    HOOK(H.mem_reset_accumulated(device));
+  }
+  void resetPeakStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    HOOK(H.mem_reset_peak(device));
+  }
+#endif
+#if TMB_TORCH_VERSION >= 210  // c10::DeviceAllocator::getMemoryInfo exists from 2.10
+  std::pair<size_t, size_t> getMemoryInfo(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    tmb_thread_error().clear();
+    size_t free = 0, total = 0;
+    const int32_t rc = H.mem_get_info(device, &free, &total);
+    TORCH_CHECK_NOT_IMPLEMENTED(rc != 2, "mojo backend: ", tmb_thread_error());
+    TORCH_CHECK(rc == 0, "mojo backend: ", tmb_thread_error());
+    return {free, total};
+  }
+#endif
 };
 MojoAllocator g_allocator;
 
@@ -348,8 +421,7 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     HOOK(H.synchronize_device(di));
   }
   void recordDataPtrOnStream(const c10::DataPtr& p, const c10::Stream& s) const override {
-    if (!p.get_context() || p.get_deleter() != &MojoAllocator::deleter) return;  // not ours (e.g. from_blob)
-    HOOK(H.record_stream(p.get_context(), s.device_index(), s.id()));
+    g_allocator.record_stream(p, s);
   }
   double elapsedTime(void* e1, void* e2, const c10::DeviceIndex) const override {
     double ms = 0;
@@ -410,6 +482,19 @@ inline at::Tensor& T(TmbTensor t) { return *reinterpret_cast<at::Tensor*>(t); }
 }  // namespace
 
 extern "C" {
+
+int32_t tmb_device_properties(int32_t device, int64_t* out, int32_t n,
+                              char* text, int32_t text_cap) {
+  try {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    tmb_thread_error().clear();
+    return H.device_props(device, out, n, text, text_cap);
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
 
 int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
   try {

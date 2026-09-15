@@ -891,6 +891,9 @@ def new_strided(
     stype: Int32,
     device: Int,
 ) raises -> T:
+    # T rejects unsupported ScalarTypes. Validate before creating its owned
+    # C++ handle, otherwise a failed T(h) strands that handle and its storage.
+    _ = max_dtype(stype)
     var sizes = InlineArray[Int64, MAX_RANK](fill=0)
     var strd = InlineArray[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
