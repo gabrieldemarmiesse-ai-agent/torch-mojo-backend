@@ -199,6 +199,32 @@ current stream; a tensor used by another stream gets `record_stream`ed by
 torch (`recordDataPtrOnStream`), which the backend turns into an event the
 owner stream waits on before the buffer is released.
 
+**Transfers.** `.to("mojo:j")` and `dst.copy_(src)` between mojo devices
+use MAX `DeviceBuffer.enqueue_copy_from` directly when CUDA or HIP peer
+access is available. The destination device lazily calls `can_access` and
+`enable_peer_access` for each source device and caches success or failure;
+the shim mutex serializes this state. CPU, Metal, inaccessible pairs, and
+peer-enabling errors use the existing D2H → H2D host staging path.
+
+The direct copy runs on the destination's **current stream**. It waits for
+the source's current stream, so queued producers and destination allocations
+precede the copy. The destination stream then synchronizes before returning,
+keeping source storage alive through the remote read even when its allocator
+owner is another stream. This costs one host-blocking stream synchronization
+per transfer, including with `non_blocking=True`; it does not promise CUDA's
+host overlap. Subsequent destination-stream work and blocking host reads see
+the copied data. MAX also inserts cross-stream copy events. Callers still
+order unrelated producer streams themselves, as for ordinary torch ops.
+
+Dtype and layout handling reuse the local copy helpers: `.to` stages on the
+source and restores the requested memory format on the destination;
+`copy_` packs the source, transfers, then uses the destination's local dtype
+and strided-copy path as needed. Dtype pairs outside the fast cast kernel
+use CPU torch to cast, preserving integer precision, before uploading the
+converted values. No GPU kernels or allocator are added.
+HIP uses MAX's direct copy when peer access succeeds; ROCm performance has
+not been measured for this path.
+
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
 ops need no locking of their own; the autograd engine's thread and the main
 thread interleave at op granularity.

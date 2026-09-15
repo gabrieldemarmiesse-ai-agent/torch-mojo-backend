@@ -68,6 +68,173 @@ def test_clone_every_rank(mojo_gpu, rank):
     torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
 
 
+@pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
+def mojo_pair(request: pytest.FixtureRequest) -> tuple[str, str]:
+    if len(get_accelerators()) - 1 < 2:
+        pytest.skip("requires two mojo GPUs")
+    src, dst = request.param
+    return f"mojo:{src}", f"mojo:{dst}"
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("shape", [(357, 789), (), (0, 3)])
+def test_cross_device_to(
+    mojo_pair: tuple[str, str], dtype: torch.dtype, shape: tuple[int, ...]
+):
+    src, dst = mojo_pair
+    expected = _fill(shape, dtype)
+    actual = expected.to(src).to(dst)
+    assert str(actual.device) == dst
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("layout", ["transpose", "channels_last", "slice", "offset"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "memory_format",
+    [torch.preserve_format, torch.contiguous_format, torch.channels_last],
+)
+def test_cross_device_to_layout(
+    mojo_pair: tuple[str, str],
+    layout: str,
+    dtype: torch.dtype,
+    memory_format: torch.memory_format,
+):
+    src, dst = mojo_pair
+    cpu = _fill((3, 5, 7, 11), torch.float32)
+    gpu = cpu.to(src)
+    if layout == "transpose":
+        cpu, gpu = cpu.transpose(1, 3), gpu.transpose(1, 3)
+    elif layout == "channels_last":
+        cpu = cpu.contiguous(memory_format=torch.channels_last)
+        gpu = gpu.contiguous(memory_format=torch.channels_last)
+    elif layout == "slice":
+        cpu, gpu = cpu[:, :, 1::2, 1::2], gpu[:, :, 1::2, 1::2]
+    else:
+        cpu, gpu = cpu[1:], gpu[1:]
+    expected = cpu.to(dtype=dtype, memory_format=memory_format, copy=True)
+    actual = gpu.to(dst, dtype=dtype, memory_format=memory_format)
+    assert actual.stride() == expected.stride()
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("reshape", [False, True])
+def test_cross_device_copy(
+    mojo_pair: tuple[str, str], strided: bool, dtype: torch.dtype, reshape: bool
+):
+    src, dst = mojo_pair
+    cpu = _fill((19, 37), torch.float32).t()
+    source = _fill((19, 37), torch.float32).to(src).t()
+    host_base = torch.full((37, 38), -1, dtype=dtype)
+    device_base = host_base.to(dst)
+    expected = host_base[:, ::2] if strided else host_base[:, :19].contiguous()
+    actual = device_base[:, ::2] if strided else device_base[:, :19].contiguous()
+    if reshape:
+        expected, actual = expected.unsqueeze(0), actual.unsqueeze(0)
+    expected.copy_(cpu)
+    result = actual.copy_(source)
+    assert result is actual
+    torch.testing.assert_close(actual.cpu(), expected)
+    if strided:
+        torch.testing.assert_close(device_base.cpu(), host_base)
+
+
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [
+        (torch.float64, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.int16, torch.int64),
+        (torch.int64, torch.uint64),
+        (torch.uint64, torch.int64),
+        (torch.int8, torch.float32),
+        (torch.float32, torch.int16),
+        (torch.uint32, torch.int64),
+    ],
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_cross_device_copy_other_dtypes(
+    mojo_pair: tuple[str, str],
+    src_dtype: torch.dtype,
+    dst_dtype: torch.dtype,
+    strided: bool,
+):
+    src, dst = mojo_pair
+    values = torch.tensor([2**60 + 3, 2**60 + 5, 0, 1, 19, 251]).reshape(2, 3)
+    host = values.to(src_dtype)
+    expected = torch.empty((2, 3), dtype=dst_dtype).copy_(host)
+    actual = torch.empty((2, 6) if strided else (2, 3), dtype=dst_dtype, device=dst)
+    if strided:
+        actual = actual[:, ::2]
+    actual.copy_(host.to(src))
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("copy_into", [False, True])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_cross_device_stream_lifetime(
+    mojo_pair: tuple[str, str], copy_into: bool, non_blocking: bool
+):
+    src, dst = mojo_pair
+    n = 64 * 1024 * 1024  # 256 MiB; queued producers outlast host dispatch.
+    source_stream = torch.Stream(device=src)
+    destination_stream = torch.Stream(device=dst)
+    with source_stream:
+        source = torch.full((n,), 1.0, device=src)
+        for _ in range(8):
+            source.add_(1.0)
+        with destination_stream:
+            if copy_into:
+                actual = torch.full((n,), -3.0, device=dst)
+                actual.copy_(source, non_blocking=non_blocking)
+            else:
+                actual = source.to(dst, non_blocking=non_blocking)
+            del source
+            # Reuse source-side allocations while the destination consumes.
+            scratch = torch.empty((n,), device=src)
+            scratch.fill_(-11.0)
+            actual.add_(1.0)
+            torch.testing.assert_close(actual.cpu(), torch.full((n,), 10.0))
+    source_stream.synchronize()
+    destination_stream.synchronize()
+
+
+def test_cross_device_autograd(mojo_pair: tuple[str, str]):
+    src, dst = mojo_pair
+    x = _fill((13, 7), torch.float32).requires_grad_()
+    w1 = _fill((7, 11), torch.float32).requires_grad_()
+    w2 = _fill((11, 5), torch.float32).requires_grad_()
+    gx = x.detach().to(src).requires_grad_()
+    gw1 = w1.detach().to(src).requires_grad_()
+    gw2 = w2.detach().to(dst).requires_grad_()
+    expected = ((x @ w1).relu() @ w2).square().mean()
+    actual = ((gx @ gw1).relu().to(dst) @ gw2).square().mean()
+    expected.backward()
+    actual.backward()
+    torch.testing.assert_close(actual.cpu(), expected.detach())
+    for got, ref in [(gx, x), (gw1, w1), (gw2, w2)]:
+        assert got.grad is not None and ref.grad is not None
+        torch.testing.assert_close(got.grad.cpu(), ref.grad, rtol=2e-4, atol=2e-4)
+
+
+def test_cross_device_cpu_fallback(mojo_gpu: str):
+    cpu_device = f"mojo:{len(get_accelerators()) - 1}"
+    expected = _fill((17, 23), torch.float32).t()
+    source = _fill((17, 23), torch.float32).to(mojo_gpu).t()
+    moved = source.to(cpu_device).to(mojo_gpu)
+    torch.testing.assert_close(moved.cpu(), expected)
+    for target, source_device in [(cpu_device, mojo_gpu), (mojo_gpu, cpu_device)]:
+        actual = torch.empty((23, 34), device=target)[:, ::2]
+        actual.copy_(expected.to(source_device))
+        torch.testing.assert_close(actual.cpu(), expected)
+
+
 # ---------------------------------------------------------------------------
 # memory formats (empty.memory_format / clone / _to_copy)
 # ---------------------------------------------------------------------------
