@@ -385,7 +385,7 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
 
 ### GPT-2 XL on two MI300A nodes
 
-Measured on September 15, 2026, with four gfx942 APUs per node (228 CUs
+Measured on September 15–16, 2026, with four gfx942 APUs per node (228 CUs
 per APU), MAX 26.5 and the native backend using torch 2.11.0+cpu. Stock
 uses torch 2.9.1+rocm6.4 and RCCL 2.22.3. The model is unchanged:
 48 layers, 25 heads, width 1600, biases, bf16 autocast, batch 8 × 1024
@@ -397,11 +397,17 @@ rounds, with the original NUMA binder adapted to four ranks per node.
 Each run contributes its mean printed tokens/s over steps 20–30; the
 interval is the Student-t 95% confidence interval across rounds.
 
-| Stack | Tokens/s ± 95% CI | Ratio vs stock | Step 1 |
+This clean-environment rerun used a1007+a1056, Adastra job 5417526,
+at implementation commit `e8759a2`.
+All 18 runs completed with **no `MOJOCCL_*` variables**. Every log includes
+rank 0's environment; all eight C ranks verified the live defaults before
+timing. No compilation occurred during the series.
+
+| Stack | Tokens/s ± 95% CI | Ratio vs A ± 95% CI | Step 1 |
 |---|---:|---:|---:|
-| Stock torch + RCCL | 129,969.1 ± 199.4 | 1.0000 | 9.40 s |
-| Mojo backend + RCCL | 129,738.2 ± 491.3 | 0.9982 | 1.84 s |
-| Mojo backend + mojoccl/fabric | 128,312.7 ± 742.5 | 0.9873 | 1.88 s |
+| A — Stock torch + RCCL | 129,194.55 ± 125.57 | 1.000000 | 9.38 s |
+| B — Mojo backend + RCCL | 129,625.45 ± 575.11 | 1.003335 ± 0.004557 | 1.86 s |
+| C — Mojo backend + mojoccl | 128,896.36 ± 438.17 | 0.997692 ± 0.003527 | 1.90 s |
 
 Both native stacks used `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`;
 stock left it unset. Both native ratios exceed the 0.95 target.
