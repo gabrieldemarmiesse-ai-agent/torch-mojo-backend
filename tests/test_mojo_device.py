@@ -22,10 +22,13 @@ import sys
 import textwrap
 import time
 import warnings
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier
+from statistics import median
+from threading import Barrier, Event, Timer
 from typing import Generic, NamedTuple, TypeVar
 
 import numpy as np
@@ -35,6 +38,7 @@ from torch.optim.optimizer import _default_to_fused_or_foreach
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
 
+from tests.native.conftest import side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import (
     get_accelerators,
     mojo_backend,
@@ -191,14 +195,7 @@ def test_non_blocking_cpu_to_mojo_transfers(mojo_device):
 
 
 def test_non_blocking_cpu_source_lifetime(mojo_device):
-    """An async upload remains valid after its temporary CPU source dies.
-
-    The old test also asserted `uploaded._device not in _PENDING_H2D`
-    directly; that bookkeeping is now internal to the C++ shim
-    (`native/csrc/shim_runtime.cpp`), so only the observable correctness
-    contract -- the value survives the source's destruction -- is left to
-    test here.
-    """
+    """An upload retains its snapshot after the temporary CPU source dies."""
     source = torch.arange(1 << 20, dtype=torch.int32)
     expected = source.clone()
     uploaded = source.to(mojo_device, non_blocking=True)
@@ -222,7 +219,7 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
 
     # Establish a conservative duration for the work placed ahead of H2D:
     # enough launches that the device time dwarfs the enqueue cost.
-    def burst():
+    def burst() -> torch.Tensor:
         out = a * b
         for _ in range(31):
             out = out * b
@@ -233,63 +230,98 @@ def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     _ = torch.arange(16).to(mojo_gpu, non_blocking=True)
     _ = burst()
     torch.accelerator.synchronize(mojo_gpu)
-    started = time.perf_counter()
-    _ = burst()
-    torch.accelerator.synchronize(mojo_gpu)
-    mul_seconds = time.perf_counter() - started
+    reference_seconds, return_seconds = [], []
+    source = torch.arange(4096)
+    for trial in range(4):
+        # Alternate reference/transfer order (ABBA), then compare medians.
+        for reference in (True, False) if trial % 2 == 0 else (False, True):
+            if reference:
+                started = time.perf_counter()
+                _ = burst()
+                torch.accelerator.synchronize(mojo_gpu)
+                reference_seconds.append(time.perf_counter() - started)
+            else:
+                delayed = burst()
+                started = time.perf_counter()
+                uploaded = source.to(mojo_gpu, non_blocking=True)
+                return_seconds.append(time.perf_counter() - started)
+                torch.accelerator.synchronize(mojo_gpu)
+                torch.testing.assert_close(uploaded.cpu(), source)
+                assert delayed.shape == (4096, 4096)
 
-    delayed = burst()
-    started = time.perf_counter()
-    uploaded = torch.arange(4096).to(mojo_gpu, non_blocking=True)
-    upload_return_seconds = time.perf_counter() - started
-
-    assert upload_return_seconds < mul_seconds * 0.5
-    torch.accelerator.synchronize(mojo_gpu)
-    torch.testing.assert_close(uploaded.cpu(), torch.arange(4096))
-    assert delayed.shape == (4096, 4096)
+    assert median(return_seconds) < median(reference_seconds) * 0.5
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="native D2H (`_copy_from` mojo->cpu) currently completes "
-    "synchronously regardless of non_blocking=True: measured ~2.5-4.5ms "
-    "return time for a 4MB download independent of how much prior GPU work "
-    "was queued (no async/pinned-staging D2H path yet, unlike H2D)",
-)
-def test_non_blocking_mojo_to_cpu_does_not_drain_prior_gpu_work(mojo_gpu: str):
-    """Async D2H returns without draining queued kernels.
+def _empty_mojo_pinned_like(source: torch.Tensor) -> torch.Tensor:
+    """Use our allocator even when a CUDA wheel's factories prefer CUDA."""
+    if torch.cuda.is_available():
+        return torch.empty_like(source).pin_memory()
+    return torch.empty_like(source, pin_memory=True)
 
-    The "prior work" queue is many elementwise multiplies rather than a
-    matmul (`aten::mm` isn't ported yet): a single large elementwise op is
-    fast enough on modern hardware that its GPU time can be within noise of
-    the async-download's own Python-side dispatch cost, so this queues many
-    of them and uses a generous margin to stay robust on a busy shared GPU.
+
+@pytest.mark.parametrize("free_immediately", [False, True])
+@pytest.mark.parametrize("api", ["copy", "to"])
+def test_non_blocking_mojo_to_cpu_does_not_drain_prior_gpu_work(
+    mojo_gpu: str, free_immediately: bool, api: str
+):
+    """Async D2H (including free) returns without draining queued kernels.
+
+    Both an explicit pinned copy destination and to("cpu", non_blocking=True)
+    use Mojo's allocator, even with a CUDA-enabled torch wheel.
+    Many elementwise multiplies make the queued GPU time dwarf dispatch cost;
+    the generous margin keeps this robust on a busy shared GPU.
     """
+    if free_immediately and get_accelerators()[0].api != "cuda":
+        pytest.skip("MAX host callbacks require CUDA; free synchronizes otherwise")
     a = torch.full((4096, 4096), 1.0, device=mojo_gpu)
     b = torch.full((4096, 4096), 2.0, device=mojo_gpu)
     expected = torch.arange(1 << 20, dtype=torch.float32)
     source = expected.to(mojo_gpu)
+    with device_module.device(mojo_gpu):
+        downloaded = _empty_mojo_pinned_like(expected)
 
-    # Warm the async-download path before timing.
+    # Warm both the async-download path and the queued kernel before timing.
+    downloaded.copy_(source, non_blocking=True)
     _ = source.to("cpu", non_blocking=True)
+    _ = a * b
     torch.accelerator.synchronize(mojo_gpu)
 
-    queue_repeats = 200
-    started = time.perf_counter()
-    for _ in range(queue_repeats):
-        _ = a * b
-    torch.accelerator.synchronize(mojo_gpu)
-    queued_seconds = time.perf_counter() - started
+    def burst() -> torch.Tensor:
+        out = a * b
+        for _ in range(199):
+            out = a * b
+        return out
 
-    delayed = [a * b for _ in range(queue_repeats)]
-    started = time.perf_counter()
-    downloaded = source.to("cpu", non_blocking=True)
-    download_return_seconds = time.perf_counter() - started
+    reference_seconds, return_seconds = [], []
+    for trial in range(4):
+        # Alternate reference/transfer order (ABBA), then compare medians.
+        for reference in (True, False) if trial % 2 == 0 else (False, True):
+            if reference:
+                started = time.perf_counter()
+                _ = burst()
+                torch.accelerator.synchronize(mojo_gpu)
+                reference_seconds.append(time.perf_counter() - started)
+            else:
+                with device_module.device(mojo_gpu):
+                    downloaded = _empty_mojo_pinned_like(expected)
+                delayed = burst()
+                started = time.perf_counter()
+                if api == "copy":
+                    downloaded.copy_(source, non_blocking=True)
+                else:
+                    downloaded = source.to("cpu", non_blocking=True)
+                assert downloaded.is_pinned()
+                if free_immediately:
+                    del downloaded
+                return_seconds.append(time.perf_counter() - started)
+                # A host deschedule can let the queue finish at any point;
+                # timing the transfer is the assertion, not an event query.
+                torch.accelerator.synchronize(mojo_gpu)
+                if not free_immediately:
+                    torch.testing.assert_close(downloaded, expected)
+                assert delayed.shape == (4096, 4096)
 
-    assert download_return_seconds < queued_seconds * 0.5
-    torch.accelerator.synchronize(mojo_gpu)
-    torch.testing.assert_close(downloaded, expected)
-    assert all(result.shape == (4096, 4096) for result in delayed)
+    assert median(return_seconds) < median(reference_seconds) * 0.5
 
 
 def test_non_blocking_strided_d2h_survives_source_destruction(mojo_gpu: str):
@@ -305,9 +337,7 @@ def test_non_blocking_strided_d2h_survives_source_destruction(mojo_gpu: str):
 
 
 def test_non_blocking_d2h_survives_destination_destruction(mojo_gpu: str):
-    """Dropping the CPU alias early must not crash or corrupt later transfers
-    (the in-flight download's pinned host buffer is kept alive internally
-    until the copy actually completes)."""
+    """An automatically pinned download can be freed while DMA is pending."""
     a = torch.full((4096, 4096), 1.0, device=mojo_gpu)
     b = torch.full((4096, 4096), 2.0, device=mojo_gpu)
     source = torch.arange(1 << 20, dtype=torch.float32).to(mojo_gpu)
@@ -323,6 +353,868 @@ def test_non_blocking_d2h_survives_destination_destruction(mojo_gpu: str):
     # behind by the dropped in-flight one).
     again = source.to("cpu")
     torch.testing.assert_close(again, source.cpu())
+
+
+def test_non_blocking_pageable_download(mojo_device: str):
+    """Mojo guarantees completed pageable copy_ values even with the true flag."""
+    expected = torch.arange(1 << 20, dtype=torch.int32)
+    source = expected.to(mojo_device)
+    downloaded = torch.empty_like(expected)
+    assert not downloaded.is_pinned()
+    downloaded.copy_(source, non_blocking=True)
+    torch.testing.assert_close(downloaded, expected)
+    downloaded.zero_()
+    downloaded.copy_(source, non_blocking=True)
+    torch.testing.assert_close(downloaded, expected)
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_pinned_transfer_interior_pointer(mojo_device: str, non_blocking: bool):
+    """Direct copies recognize offset views of the same pinned allocation."""
+    expected = torch.arange(4096, dtype=torch.float32)
+    with device_module.device(mojo_device):
+        host = torch.full((4096 + 32,), -1.0).pin_memory()
+        source = host[16:-16]
+        source.copy_(expected)
+        uploaded = source.to(mojo_device, non_blocking=non_blocking)
+        if non_blocking:
+            torch.accelerator.synchronize(mojo_device)
+        source.zero_()
+        source.copy_(uploaded, non_blocking=non_blocking)
+        if non_blocking:
+            torch.accelerator.synchronize(mojo_device)
+        torch.testing.assert_close(source, expected)
+        assert torch.all(host[:16] == -1) and torch.all(host[-16:] == -1)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_non_blocking_pinned_download_layout_and_dtype(
+    mojo_device: str, strided: bool, dtype: torch.dtype
+):
+    """Host relayout/casting consumes a completed, blocking staged download."""
+    expected = torch.arange(1024, dtype=torch.float32).reshape(32, 32)
+    source = expected.to(mojo_device)
+    with device_module.device(mojo_device):
+        storage = torch.full((32, 65), -1, dtype=dtype).pin_memory()
+        destination = (
+            storage[:, 1::2] if strided else storage.flatten()[1:1025].view(32, 32)
+        )
+        destination.copy_(source, non_blocking=True)
+        # Only the dense, same-dtype route needs an explicit wait.
+        if not strided and dtype == expected.dtype:
+            torch.accelerator.synchronize(mojo_device)
+        torch.testing.assert_close(destination, expected.to(dtype))
+        if strided:
+            assert torch.all(storage[:, ::2] == -1)
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_non_blocking_pinned_transfer_survives_host_destruction(
+    mojo_device: str, direction: str
+):
+    """Free a pinned block used on two streams; neither may lose its DMA data."""
+    expected = torch.arange(1 << 20, dtype=torch.float32)
+    is_cpu = torch.device(mojo_device) == device_module.cpu()
+    streams = (
+        [device_module.current_stream(mojo_device)]
+        if is_cpu
+        else [side_stream_or_skip(mojo_device) for _ in range(2)]
+    )
+    with device_module.device(mojo_device):
+        host = torch.cat((expected, expected)).pin_memory()
+        source = expected.to(mojo_device)
+        a = torch.full((2048, 2048), 1.0, device=mojo_device)
+        b = torch.full_like(a, 2.0)
+        _ = a * b  # compile before queueing delayed copies
+        torch.accelerator.synchronize(mojo_device)
+        uploaded = []
+        delayed = []
+        for index, stream in enumerate(streams):
+            with device_module.stream(stream):
+                if not is_cpu:
+                    delayed.extend(a * b for _ in range(64))
+                view = host[index * expected.numel() : (index + 1) * expected.numel()]
+                if direction == "upload":
+                    # Repeated use of one stream must be deduplicated.
+                    uploaded.append(view.to(mojo_device, non_blocking=True))
+                    uploaded.append(view.to(mojo_device, non_blocking=True))
+                else:
+                    view.copy_(source, non_blocking=True)
+                    view.copy_(source, non_blocking=True)
+                del view
+        del host
+        # The churn below is what proves the deferred free: had the block gone
+        # back for reuse before its DMA finished, one of these would hold the
+        # transferred values instead of -1. (Asking is_pinned() about the freed
+        # address cannot show that -- once CUDA is initialized it claims MAX's
+        # page-locked pointers too, so the answer depends on test order.)
+        churn = [torch.full((2 << 20,), -1.0).pin_memory() for _ in range(4)]
+        for stream in streams:
+            stream.synchronize()
+        assert all(torch.all(block == -1) for block in churn)
+        for tensor in uploaded:
+            torch.testing.assert_close(tensor.cpu(), expected)
+        torch.testing.assert_close(source.cpu(), expected)
+        assert all(result.shape == a.shape for result in delayed)
+
+
+@contextmanager
+def _held_transfer_stream(stream: torch.Stream) -> Iterator[Event]:
+    """A real driver callback gates DMA; a watchdog bounds failed tests.
+
+    Mutating before releasing this gate is ordered, not a race with DMA.
+    The callback uses no device API or backend mutex. Keep it alive until
+    stream completion, including exception unwinding. Hold only one callback
+    at a time: CUDA may serialize callback execution across streams.
+    """
+    if get_accelerators()[stream.device_index].api != "cuda":
+        pytest.skip("the independent stream gate uses CUDA host callbacks")
+    driver = ctypes.CDLL("libcuda.so.1")
+    callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+    driver.cuLaunchHostFunc.argtypes = [ctypes.c_void_p, callback_type, ctypes.c_void_p]
+    driver.cuLaunchHostFunc.restype = ctypes.c_int
+    entered, release, expired = Event(), Event(), Event()
+
+    def wait_for_release(unused: int | None):
+        entered.set()
+        if not release.wait(30):
+            expired.set()
+
+    callback = callback_type(wait_for_release)
+    assert (
+        driver.cuLaunchHostFunc(
+            device_module.stream_native_handle(stream), callback, None
+        )
+        == 0
+    )
+    try:
+        assert entered.wait(10), "driver did not enter stream gate"
+        yield release
+    finally:
+        release.set()
+        stream.synchronize()
+    assert not expired.is_set(), "stream gate watchdog expired"
+
+
+@pytest.mark.parametrize("api", ["copy", "to"])
+@pytest.mark.parametrize("host_class", ["owned", "pageable", "foreign", "other-device"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_non_blocking_pinned_upload_skips_staging_memcpy(
+    mojo_gpu: str, api: str, host_class: str, offset: int
+):
+    """Direct DMA sees the post-mutation value; staging preserves the snapshot.
+
+    The held stream makes the source mutation happen before DMA can start,
+    including a one-byte-offset pointer. Timing cannot distinguish these routes.
+    """
+    with device_module.device(mojo_gpu):
+        storage = torch.full((4099,), 17, dtype=torch.uint8)
+        if host_class == "owned":
+            storage = storage.pin_memory()
+        elif host_class == "foreign":
+            if not torch.cuda.is_available():
+                pytest.skip("requires CUDA's foreign pinned allocator")
+            storage = torch.full_like(storage, 17, pin_memory=True)
+        elif host_class == "other-device":
+            with device_module.device(device_module.cpu()):
+                storage = storage.pin_memory()
+        source = storage[offset : offset + 4096]
+        destination = source.to(mojo_gpu, non_blocking=True)
+        destination.copy_(source, non_blocking=True)
+        stream = device_module.current_stream(mojo_gpu)
+        stream.synchronize()
+        with _held_transfer_stream(stream):
+            if api == "to":
+                destination = source.to(mojo_gpu, non_blocking=True)
+            else:
+                destination.copy_(source, non_blocking=True)
+            source.fill_(29)
+        expected = torch.full_like(source, 29 if host_class == "owned" else 17)
+        assert not destination.is_pinned()
+        torch.testing.assert_close(destination.cpu(), expected)
+        assert torch.all(storage[offset + 4096 :] == 17)
+        assert torch.all(storage[:offset] == 17)
+
+
+@pytest.mark.parametrize("api", ["copy", "to"])
+@pytest.mark.parametrize("non_blocking", [False, True])
+@pytest.mark.parametrize("streams", ["default", "side", "cross"])
+@pytest.mark.parametrize("conversion", ["none", "dtype", "transpose"])
+def test_download_then_upload_orders_pinned_reads(
+    mojo_gpu: str, api: str, non_blocking: bool, streams: str, conversion: str
+):
+    """A queued D2H feeds H2D, including CPU conversion and explicit waits.
+
+    Raw reads stay stream-ordered; a CPU cast/relayout must synchronize before
+    reading. Both blocking and nonblocking uploads must see downloaded values.
+    """
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(1 << 20, dtype=torch.float32).reshape(1024, 1024)
+        host = torch.full_like(expected, -17).pin_memory()
+        source = expected.to(mojo_gpu)
+        read_view = host.t() if conversion == "transpose" else host
+        dtype = torch.float64 if conversion == "dtype" else host.dtype
+        wanted = expected.t().contiguous() if conversion == "transpose" else expected
+        destination = torch.empty(read_view.shape, dtype=dtype, device=mojo_gpu)
+        # Warm both spellings and all conversions before holding the stream.
+        destination.copy_(read_view, non_blocking=non_blocking)
+        _ = read_view.to(mojo_gpu, dtype=dtype, non_blocking=non_blocking)
+        host.copy_(source, non_blocking=True)
+        torch.accelerator.synchronize(mojo_gpu)
+        host.fill_(-17)
+        first = (
+            device_module.current_stream(mojo_gpu)
+            if streams == "default"
+            else side_stream_or_skip(mojo_gpu)
+        )
+        second = side_stream_or_skip(mojo_gpu) if streams == "cross" else first
+        with _held_transfer_stream(first) as release:
+            with device_module.stream(first):
+                host.copy_(source, non_blocking=True)
+                ready = first.record_event()
+            assert not ready.query()
+            # Blocking calls and CPU conversion legitimately wait for DMA.
+            timer = Timer(0.2, release.set)
+            timer.start()
+            try:
+                with device_module.stream(second):
+                    second.wait_event(ready)
+                    if api == "copy":
+                        destination.copy_(read_view, non_blocking=non_blocking)
+                    else:
+                        destination = read_view.to(
+                            mojo_gpu, dtype=dtype, non_blocking=non_blocking
+                        )
+                    destination.record_stream(second)
+            finally:
+                timer.join()
+        second.synchronize()
+        torch.testing.assert_close(destination.cpu(), wanted.to(dtype))
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+@pytest.mark.parametrize("api", ["copy", "to"])
+@pytest.mark.parametrize("side_stream", [False, True])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_upload_then_download_orders_values(
+    mojo_gpu: str, non_blocking: bool, api: str, side_stream: bool, pinned: bool
+):
+    """H2D then D2H uses the chosen stream in either transfer spelling."""
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(8192, dtype=torch.int32)
+        host = expected.pin_memory() if pinned else expected.clone()
+        downloaded = torch.empty_like(expected)
+        if pinned:
+            downloaded = downloaded.pin_memory()
+        stream = (
+            side_stream_or_skip(mojo_gpu)
+            if side_stream
+            else device_module.current_stream(mojo_gpu)
+        )
+        with device_module.stream(stream):
+            uploaded = host.to(mojo_gpu, non_blocking=non_blocking)
+            if api == "copy":
+                result = downloaded.copy_(uploaded, non_blocking=non_blocking)
+                assert result is downloaded
+            else:
+                downloaded = uploaded.to("cpu", non_blocking=non_blocking)
+                assert downloaded.is_pinned() == non_blocking
+            if not non_blocking or (api == "copy" and not pinned):
+                torch.testing.assert_close(downloaded, expected)
+            stream.synchronize()
+        torch.testing.assert_close(downloaded, expected)
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+@pytest.mark.parametrize("host_class", ["owned", "pageable", "foreign", "other-device"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_blocking_transfer_completes_selected_stream(
+    mojo_gpu: str, direction: str, host_class: str, strided: bool
+):
+    """Blocking downloads and direct uploads finish reading caller memory."""
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(4096, dtype=torch.float32).reshape(64, 64)
+        host = expected.clone()
+        if host_class == "owned":
+            host = host.pin_memory()
+        elif host_class == "foreign":
+            if not torch.cuda.is_available():
+                pytest.skip("requires CUDA's foreign pinned allocator")
+            host = torch.empty_like(host, pin_memory=True).copy_(expected)
+        elif host_class == "other-device":
+            with device_module.device(device_module.cpu()):
+                host = host.pin_memory()
+        storage = expected.to(mojo_gpu)
+        gpu = storage.t() if strided else storage
+        source, destination = (host, gpu) if direction == "upload" else (gpu, host)
+        destination.copy_(source)  # warm the selected path
+        stream = device_module.current_stream(mojo_gpu)
+        with _held_transfer_stream(stream) as release:
+            pending = stream.record_event()
+            timer = Timer(0.2, release.set)
+            timer.start()
+            try:
+                destination.copy_(source, non_blocking=False)
+                if direction == "download" or host_class == "owned":
+                    assert pending.query(), "blocking copy returned before its stream"
+                if direction == "download":
+                    torch.testing.assert_close(
+                        host, expected.t() if strided else expected
+                    )
+                else:
+                    host.zero_()  # Staged uploads must already own a snapshot.
+            finally:
+                timer.join()
+        if direction == "upload":
+            torch.testing.assert_close(gpu.cpu(), expected)
+
+
+@pytest.mark.parametrize("api", ["copy", "copy_strided", "to", "arange"])
+def test_blocking_pageable_upload_does_not_drain_prior_gpu_work(
+    mojo_gpu: str, api: str
+):
+    """The host snapshot satisfies blocking semantics without draining DMA."""
+    expected = torch.arange(2**54, 2**54 + 16, dtype=torch.int64)
+    source = expected.clone()
+    assert not source.is_pinned()
+    destination = torch.empty((16, 2), dtype=source.dtype, device=mojo_gpu)[:, 0]
+    if api != "copy_strided":
+        destination = torch.empty_like(source, device=mojo_gpu)
+
+    def upload() -> torch.Tensor:
+        if api == "arange":
+            # Large integer factories use the internal pageable staging path.
+            return torch.arange(2**54, 2**54 + 16, dtype=torch.int64, device=mojo_gpu)
+        if api == "to":
+            return source.to(mojo_gpu, non_blocking=False)
+        return destination.copy_(source, non_blocking=False)
+
+    uploaded = upload()  # Warm compilation and the staging allocator.
+    stream = device_module.current_stream(mojo_gpu)
+    stream.synchronize()
+    return_seconds = []
+    hold_seconds = 0.3
+    for _ in range(4):
+        source.copy_(expected)
+        with _held_transfer_stream(stream) as release:
+            timer = Timer(hold_seconds, release.set)
+            timer.start()
+            try:
+                started = time.perf_counter()
+                uploaded = upload()
+                return_seconds.append(time.perf_counter() - started)
+                source.zero_()
+            finally:
+                timer.join()
+        torch.testing.assert_close(uploaded.cpu(), expected)
+    assert median(return_seconds) < hold_seconds * 0.5
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_to_cpu_explicit_pin_memory(
+    mojo_device: str,
+    non_blocking: bool,
+    pin_memory: bool,
+    pin_allocator_probe: "_PinAllocatorProbe",
+):
+    """_to_copy exposes pin_memory; Tensor.to's Python overloads do not.
+
+    Upstream overwrites the pin_memory option with non_blocking for strided
+    accelerator-to-CPU transfers, including pin_memory=True on blocking output.
+    """
+    expected = torch.arange(257, dtype=torch.float32)
+    source = expected.to(mojo_device)
+    with device_module.device(device_module.cpu()):
+        result = torch.ops.aten._to_copy.default(
+            source,
+            device=torch.device("cpu"),
+            pin_memory=pin_memory,
+            non_blocking=non_blocking,
+        )
+        assert result.is_pinned() == non_blocking
+        if result.is_pinned():
+            assert pin_allocator_probe.uses_mojo_allocator(result)
+        assert device_module.current_device() == device_module.cpu().index
+        if not non_blocking:
+            torch.testing.assert_close(result, expected)
+        torch.accelerator.synchronize(mojo_device)
+    torch.testing.assert_close(result, expected)
+
+
+def test_blocking_to_cpu_ignores_explicit_pin_memory(mojo_device: str):
+    """Upstream pin_out overwrites even an explicit true pin_memory option."""
+    expected = torch.arange(257, dtype=torch.int32)
+    result = torch.ops.aten._to_copy.default(
+        expected.to(mojo_device),
+        device=torch.device("cpu"),
+        layout=torch.strided,
+        pin_memory=True,
+        non_blocking=False,
+    )
+    assert not result.is_pinned()
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("transpose", [False, True])
+def test_to_cpu_device_conversion_stays_asynchronous(
+    mojo_gpu: str, dtype: torch.dtype, transpose: bool
+):
+    """Unlike copy_'s host cast, to() casts/relayouts on GPU and stays async."""
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(1024, dtype=torch.float32).reshape(32, 32)
+        if transpose:
+            expected = expected.t()
+        source = expected.to(mojo_gpu)
+        _ = source.to("cpu", dtype=dtype, non_blocking=True)
+        stream = device_module.current_stream(mojo_gpu)
+        stream.synchronize()
+        with _held_transfer_stream(stream):
+            pending = stream.record_event()
+            with device_module.device(device_module.cpu()):
+                downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
+                assert device_module.current_device() == device_module.cpu().index
+            assert downloaded.is_pinned()
+            assert not pending.query()
+        assert downloaded.stride() == expected.stride()
+        torch.testing.assert_close(downloaded, expected.to(dtype))
+
+
+def test_to_cpu_host_conversion_is_deliberately_blocking(mojo_gpu: str):
+    """Float64 to() uses our host cast fallback; CUDA can cast it on the GPU."""
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(257, dtype=torch.float32)
+        source = expected.to(mojo_gpu)
+        _ = source.to("cpu", dtype=torch.float64, non_blocking=True)
+        stream = device_module.current_stream(mojo_gpu)
+        stream.synchronize()
+        with _held_transfer_stream(stream) as release:
+            pending = stream.record_event()
+            timer = Timer(0.2, release.set)
+            timer.start()
+            try:
+                output = source.to("cpu", dtype=torch.float64, non_blocking=True)
+                assert pending.query()
+                torch.testing.assert_close(output, expected.double())
+            finally:
+                timer.join()
+        torch.accelerator.synchronize(mojo_gpu)
+        assert output.is_pinned()
+        torch.testing.assert_close(output, expected.double())
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bool,
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.float32,
+        torch.int64,
+        torch.float64,
+    ],
+)
+@pytest.mark.parametrize("shape", [(), (0,), (3, 0, 5), (17,), (257,)])
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_transfer_raw_bytes_and_empty_storage(
+    mojo_device: str,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    pinned: bool,
+    non_blocking: bool,
+):
+    """Both APIs preserve every supported element width, scalar rank and empties."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "Metal does not support float64")
+    expected = (torch.arange(math.prod(shape)) % 31).to(dtype).reshape(shape)
+    with device_module.device(mojo_device):
+        host = expected.pin_memory() if pinned else expected.clone()
+        uploaded = host.to(mojo_device, non_blocking=non_blocking)
+        downloaded = uploaded.to("cpu", non_blocking=non_blocking)
+        torch.accelerator.synchronize(mojo_device)
+        assert downloaded.shape == shape
+        assert downloaded.dtype == dtype
+        assert torch.equal(
+            downloaded.reshape(-1).view(torch.uint8),
+            expected.reshape(-1).view(torch.uint8),
+        )
+        if not math.prod(shape):
+            assert downloaded.untyped_storage().data_ptr() == 0
+            assert not downloaded.is_pinned()
+        uploaded.copy_(host, non_blocking=non_blocking)
+        result = host.copy_(uploaded, non_blocking=non_blocking)
+        assert result is host
+        torch.accelerator.synchronize(mojo_device)
+        assert torch.equal(
+            host.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1,),
+        (3,),
+        (255,),
+        (256,),
+        (4095,),
+        (4096,),
+        (4097,),
+        (357, 789),
+        (8 * 1024 * 1024 + 3,),
+    ],
+)
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_transfer_byte_boundaries_and_buffer_alias(
+    mojo_device: str, shape: tuple[int, ...], non_blocking: bool
+):
+    """An independent storage beginning one byte into a pinned block is eligible."""
+    count = math.prod(shape)
+    expected = (torch.arange(count) % 251).to(torch.uint8).reshape(shape)
+    with device_module.device(mojo_device):
+        storage = torch.full((count + 2,), 253, dtype=torch.uint8).pin_memory()
+        alias = torch.frombuffer(
+            storage.numpy(), dtype=torch.uint8, count=count, offset=1
+        ).reshape(shape)
+        assert alias.untyped_storage().data_ptr() == storage.data_ptr() + 1
+        assert alias.is_pinned()
+        alias.copy_(expected)
+        uploaded = alias.to(mojo_device, non_blocking=non_blocking)
+        torch.accelerator.synchronize(mojo_device)
+        alias.zero_()
+        alias.copy_(uploaded, non_blocking=non_blocking)
+        torch.accelerator.synchronize(mojo_device)
+        assert torch.equal(alias, expected)
+        assert storage[0] == 253 and storage[-1] == 253
+        # Empty views keep storage pinning while zero-element copies do nothing.
+        empty = storage[count + 2 :]
+        assert empty.is_pinned()
+        empty.copy_(empty.to(mojo_device), non_blocking=non_blocking)
+        assert storage[0] == 253 and storage[-1] == 253
+
+
+@pytest.mark.parametrize("layout", ["transpose", "gapped", "expanded", "channels-last"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_transfer_layout_and_conversion_canaries(
+    mojo_device: str, layout: str, dtype: torch.dtype, non_blocking: bool
+):
+    """Host relayout/cast snapshots before return and never overwrites gaps."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "Metal does not support float64")
+    with device_module.device(mojo_device):
+        storage = torch.arange(512, dtype=torch.float32).pin_memory()
+        if layout == "transpose":
+            host = storage[:256].view(16, 16).t()
+        elif layout == "gapped":
+            host = storage[1::2].view(16, 16)
+        elif layout == "expanded":
+            host = storage[:16].view(1, 16).expand(16, 16)
+        else:
+            host = storage[:256].view(2, 4, 4, 8).permute(0, 3, 1, 2)
+        expected = host.clone().to(dtype)
+        backing = torch.full((*host.shape, 2), -999, dtype=dtype, device=mojo_device)
+        destination = backing[..., 1]
+        destination.copy_(host, non_blocking=non_blocking)
+        via_to = host.to(mojo_device, dtype=dtype, non_blocking=non_blocking)
+        host.fill_(-13)
+        torch.testing.assert_close(destination.cpu(), expected)
+        torch.testing.assert_close(via_to.cpu(), expected)
+        assert torch.all(backing[..., 0].cpu() == -999)
+        cpu_backing = torch.full(
+            (*host.shape, 2), -999, dtype=torch.float32
+        ).pin_memory()
+        cpu_destination = cpu_backing[..., 1]
+        ptr, strides = cpu_destination.data_ptr(), cpu_destination.stride()
+        result = cpu_destination.copy_(destination, non_blocking=non_blocking)
+        assert result is cpu_destination
+        assert cpu_destination.data_ptr() == ptr and cpu_destination.stride() == strides
+        assert cpu_destination.is_pinned()
+        # A strided host destination requires blocking host work for either flag.
+        torch.testing.assert_close(cpu_destination, expected.float())
+        assert torch.all(cpu_backing[..., 0] == -999)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float64]
+)
+def test_transfer_conversion_value_boundaries(mojo_device: str, dtype: torch.dtype):
+    """Host and device casts preserve defined rounding, signs, NaNs and infinities."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "Metal does not support float64")
+    source = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            1.00390625,
+            -1.00390625,
+            255.5,
+            -128.5,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ]
+    )
+    with device_module.device(mojo_device):
+        host = source.pin_memory()
+        result = host.to(mojo_device, dtype=dtype, non_blocking=True)
+        expected = source.to(dtype)
+        torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+        gpu = source.to(mojo_device)
+        output = torch.empty_like(source, dtype=dtype).pin_memory()
+        output.copy_(gpu, non_blocking=True)
+        torch.testing.assert_close(output, expected, equal_nan=True)
+        if dtype != torch.bool:
+            assert torch.equal(torch.signbit(output[:2]), torch.signbit(expected[:2]))
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+@pytest.mark.parametrize("src_pinned", [False, True])
+@pytest.mark.parametrize("dst_pinned", [False, True])
+def test_host_to_host_copy_pinning_is_storage_property(
+    mojo_device: str, non_blocking: bool, src_pinned: bool, dst_pinned: bool
+):
+    """CPU copies finish immediately for every pinned/pageable pairing."""
+    with device_module.device(mojo_device):
+        source = torch.arange(257)
+        destination = torch.empty_like(source)
+        if src_pinned:
+            source = source.pin_memory()
+        if dst_pinned:
+            destination = destination.pin_memory()
+        assert destination.copy_(source, non_blocking=non_blocking) is destination
+        torch.testing.assert_close(destination, source)
+        assert destination.is_pinned() == dst_pinned
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+@pytest.mark.parametrize("first_to_finish", [0, 1])
+def test_transfer_final_offset_owner_waits_for_both_streams(
+    mojo_gpu: str, direction: str, first_to_finish: int
+):
+    """One completion cannot reclaim a block still used by another stream."""
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(8192, dtype=torch.float32)
+        host = torch.cat(
+            (torch.tensor([-1.0]), expected, expected, torch.tensor([-1.0]))
+        ).pin_memory()
+        streams = [side_stream_or_skip(mojo_gpu), side_stream_or_skip(mojo_gpu)]
+        source = expected.to(mojo_gpu)
+        outputs = [torch.empty_like(source) for _ in streams]
+        for output in outputs:
+            output.copy_(expected, non_blocking=True)
+        # Warm the download registration before entering either driver gate.
+        host[1:8193].copy_(source, non_blocking=True)
+        torch.accelerator.synchronize(mojo_gpu)
+        delayed = 1 - first_to_finish
+        with _held_transfer_stream(streams[delayed]):
+            for index, stream in enumerate(streams):
+                with device_module.stream(stream):
+                    view = (
+                        host[1:8193]
+                        if direction == "upload"
+                        else host[1 + index * 8192 : 1 + (index + 1) * 8192]
+                    )
+                    if direction == "upload":
+                        outputs[index].copy_(view, non_blocking=True)
+                        outputs[index].record_stream(stream)
+                    else:
+                        view.copy_(source, non_blocking=True)
+                    del view
+            streams[first_to_finish].synchronize()
+            assert not streams[delayed].query()
+            # The first use is complete at destruction; the other must keep
+            # the backing alive. Do not wait for a free callback while the
+            # gate holds CUDA's callback worker.
+            del host
+            replacements = [torch.full((16386,), -23.0).pin_memory() for _ in range(8)]
+        streams[first_to_finish].synchronize()
+        assert all(torch.all(block == -23) for block in replacements)
+        for output in outputs:
+            torch.testing.assert_close(output.cpu(), expected)
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_transfer_gpu_endpoint_destruction_and_device_churn(
+    mojo_gpu: str, direction: str
+):
+    """Both device allocations and the host block outlive their queued DMA."""
+    with device_module.device(mojo_gpu):
+        expected = torch.arange(8192, dtype=torch.float32)
+        host = expected.pin_memory()
+        stream = side_stream_or_skip(mojo_gpu)
+        with device_module.stream(stream):
+            gpu = expected.to(mojo_gpu)
+            host.copy_(gpu, non_blocking=True)
+            stream.synchronize()
+            with _held_transfer_stream(stream):
+                if direction == "upload":
+                    gpu.copy_(host, non_blocking=True)
+                else:
+                    host.copy_(gpu, non_blocking=True)
+                del gpu
+                replacements = [
+                    torch.full_like(expected, -31, device=mojo_gpu) for _ in range(8)
+                ]
+        torch.testing.assert_close(host, expected)
+        for replacement in replacements:
+            assert torch.all(replacement.cpu() == -31)
+
+
+def test_blocking_transfer_does_not_synchronize_other_streams(mojo_gpu: str):
+    """Blocking means the selected stream; unrelated stream work stays pending."""
+    with device_module.device(mojo_gpu):
+        host = torch.arange(4096, dtype=torch.float32).pin_memory()
+        gpu = host.to(mojo_gpu)
+        other = side_stream_or_skip(mojo_gpu)
+        with _held_transfer_stream(other):
+            pending = other.record_event()
+            gpu.copy_(host)
+            downloaded = gpu.to("cpu")
+            torch.testing.assert_close(downloaded, host)
+            assert not pending.query()
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_max_cpu_transfer_is_synchronous(non_blocking: bool):
+    """The MAX CPU device completes host DMA and conversion before returning."""
+    expected = torch.arange(257, dtype=torch.float32)
+    with device_module.device("mojo:0"):
+        host = expected.pin_memory()
+    cpu = device_module.cpu()
+    uploaded = host.to(cpu, dtype=torch.float64, non_blocking=non_blocking)
+    host.zero_()
+    result = uploaded.to("cpu", non_blocking=non_blocking)
+    torch.testing.assert_close(result, expected.double())
+    host.copy_(uploaded, non_blocking=non_blocking)
+    torch.testing.assert_close(host, expected)
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_transfer_repeated_use_keeps_last_fence(mojo_gpu: str, direction: str):
+    """A completed first use must not free storage before a later use finishes."""
+    with device_module.device(mojo_gpu):
+        first = torch.full((8192,), 13.0)
+        second = torch.full_like(first, 29.0)
+        host = first.pin_memory()
+        gpu = first.to(mojo_gpu)
+        next_gpu = second.to(mojo_gpu)
+        stream = device_module.current_stream(mojo_gpu)
+        host.copy_(gpu, non_blocking=True)
+        stream.synchronize()
+        host.copy_(second)
+        with _held_transfer_stream(stream):
+            if direction == "upload":
+                gpu.copy_(host, non_blocking=True)
+            else:
+                host.copy_(next_gpu, non_blocking=True)
+                # The write and read must share a lifetime and be ordered.
+                gpu.copy_(host, non_blocking=True)
+            with device_module.device(device_module.cpu()):
+                del host
+            replacements = [torch.full_like(first, -1).pin_memory() for _ in range(8)]
+        torch.testing.assert_close(gpu.cpu(), second)
+        assert all(torch.all(block == -1) for block in replacements)
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_transfer_broadcast_and_overlapping_destination(
+    mojo_device: str, non_blocking: bool
+):
+    """Public copy_ broadcasts sources and rejects definite overlap before writes."""
+    source = torch.tensor([[1.0], [2.0], [3.0]]).pin_memory()
+    gpu = torch.full((3, 7), -1.0, device=mojo_device)
+    gpu.copy_(source, non_blocking=non_blocking)
+    torch.testing.assert_close(gpu.cpu(), source.expand(3, 7))
+    host = torch.full((1,), -19.0).pin_memory()
+    expanded = host.expand(3, 7)
+    with pytest.raises(RuntimeError, match="single memory location|overlap"):
+        expanded.copy_(gpu, non_blocking=non_blocking)
+    assert host.item() == -19
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_transfer_lazy_negative_and_to_identity(mojo_device: str, non_blocking: bool):
+    """Logical negative views survive transfers; same-device to() is not a fence."""
+    expected = torch.arange(257, dtype=torch.float32)
+    host = expected.pin_memory()
+    negative = torch.ops.aten._neg_view.default(host)
+    gpu = negative.to(mojo_device, non_blocking=non_blocking)
+    torch.testing.assert_close(gpu.cpu(), -expected)
+    assert gpu.to(mojo_device, non_blocking=non_blocking) is gpu
+    copied = gpu.to(mojo_device, copy=True, non_blocking=non_blocking)
+    assert copied.data_ptr() != gpu.data_ptr()
+    torch.testing.assert_close(copied.cpu(), -expected)
+    gpu_negative = torch.ops.aten._neg_view.default(gpu)
+    downloaded = gpu_negative.to("cpu", non_blocking=non_blocking)
+    torch.accelerator.synchronize(mojo_device)
+    torch.testing.assert_close(downloaded, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_transfer_unsupported_complex_is_explicit(mojo_device: str, dtype: torch.dtype):
+    """Complex host pinning is supported; device transfer has a clear dtype boundary."""
+    host = torch.tensor([1 + 2j, -3 - 4j], dtype=dtype).pin_memory()
+    expected = host.clone()
+    with pytest.raises(NotImplementedError, match="dtype|ScalarType"):
+        host.conj().to(mojo_device, non_blocking=True)
+    torch.testing.assert_close(host, expected)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_transfer_other_gpu_requires_snapshot_and_host_wait(reverse: bool):
+    """A GPU event wait cannot order a host snapshot across allocation devices."""
+    if len(get_accelerators()) < 3:
+        pytest.skip("requires two GPUs plus the MAX CPU device")
+    first, second = ("mojo:1", "mojo:0") if reverse else ("mojo:0", "mojo:1")
+    expected = torch.arange(8192, dtype=torch.float32)
+    with device_module.device(first):
+        host = torch.full_like(expected, -1).pin_memory()
+        source = expected.to(first)
+        host.copy_(source, non_blocking=True)
+        done = device_module.current_stream(first).record_event()
+    done.synchronize()  # Host staging on the other device needs a host wait.
+    with device_module.device(second):
+        result = host.to(second, non_blocking=True)
+        host.zero_()
+        torch.testing.assert_close(result.cpu(), expected)
+        host.copy_(result, non_blocking=True)
+        torch.testing.assert_close(host, expected)
+
+
+def test_non_blocking_foreign_pinned_transfers(mojo_gpu: str, cuda_available: bool):
+    """CUDA's pinned allocator cannot track DMA on Mojo streams."""
+    if not cuda_available:
+        pytest.skip("requires CUDA's pinned allocator")
+    expected = torch.arange(1 << 20, dtype=torch.float32)
+    pinned = torch.empty_like(expected, pin_memory=True)
+    pinned.copy_(expected)
+    uploaded = pinned.to(mojo_gpu, non_blocking=True)
+    pinned.zero_()  # The upload must have taken a snapshot.
+    torch.testing.assert_close(uploaded.cpu(), expected)
+    pinned.copy_(uploaded, non_blocking=True)
+    torch.testing.assert_close(pinned, expected)  # D2H must already be complete.
+
+
+def test_non_blocking_pinned_other_device(mojo_gpu: str):
+    """A block pinned on the MAX CPU device takes the conservative GPU path."""
+    expected = torch.arange(1 << 20, dtype=torch.float32)
+    with device_module.device(device_module.cpu()):
+        host = expected.pin_memory()
+    with device_module.device(mojo_gpu):
+        uploaded = host.to(mojo_gpu, non_blocking=True)
+        host.zero_()
+        torch.testing.assert_close(uploaded.cpu(), expected)
+        host.copy_(uploaded, non_blocking=True)
+        torch.testing.assert_close(host, expected)
 
 
 def test_same_device_d2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
@@ -1403,9 +2295,95 @@ def test_pinned_allocation_failure_preserves_source_and_recovers(
     assert "allocation failure recovered" in proc.stdout
 
 
+def test_non_blocking_download_falls_back_after_pinned_allocation_failure(
+    mojo_device: str, pinned_host_failure_preload: Path
+):
+    """Only automatic download pinning falls back, with completed CPU values."""
+    script = textwrap.dedent("""
+        import ctypes
+        import os
+        import sys
+        from contextlib import nullcontext
+        from threading import Timer
+        import torch
+        from tests.test_mojo_device import _held_transfer_stream
+        from torch_mojo_backend import get_accelerators, register_mojo_devices
+        from torch_mojo_backend.native import device_module
+
+        torch.set_num_threads(1)
+        register_mojo_devices()
+        device = sys.argv[1]
+        probe = ctypes.CDLL(sys.argv[2])
+        with device_module.device(device):
+            expected = torch.arange(1 << 20, dtype=torch.int32)
+            source = expected.to(device)
+            warm = source.to('cpu', non_blocking=True)
+            torch.accelerator.synchronize(device)
+            assert warm.is_pinned()
+            del warm
+            stream = device_module.current_stream(device)
+            cuda = get_accelerators()[stream.device_index].api == 'cuda'
+            gate = _held_transfer_stream(stream) if cuda else nullcontext(None)
+            with gate as release:
+                pending = stream.record_event() if cuda else None
+                timer = Timer(0.2, release.set) if release is not None else None
+                if timer is not None:
+                    timer.start()
+                os.environ['TMB_TEST_FAIL_HOST_BUFFER'] = '1'
+                try:
+                    result = source.to('cpu', non_blocking=True)
+                    assert probe.tmb_test_host_buffer_failures() == 1
+                    assert not result.is_pinned()
+                    if pending is not None:
+                        assert pending.query(), 'pageable fallback must finish DMA'
+                    torch.testing.assert_close(result, expected)
+                finally:
+                    del os.environ['TMB_TEST_FAIL_HOST_BUFFER']
+                    if timer is not None:
+                        timer.join()
+            recovered = source.to('cpu', non_blocking=True)
+            torch.accelerator.synchronize(device)
+            assert recovered.is_pinned()
+            torch.testing.assert_close(recovered, expected)
+            # Transfer failures must propagate both with and without fallback.
+            for fail_allocation in (False, True):
+                os.environ['TMB_TEST_FAIL_DOWNLOAD'] = '1'
+                if fail_allocation:
+                    os.environ['TMB_TEST_FAIL_HOST_BUFFER'] = '1'
+                try:
+                    try:
+                        source.to('cpu', non_blocking=True)
+                    except RuntimeError as error:
+                        assert 'injected download failure' in str(error), str(error)
+                    else:
+                        raise AssertionError('download error was swallowed')
+                finally:
+                    del os.environ['TMB_TEST_FAIL_DOWNLOAD']
+                    os.environ.pop('TMB_TEST_FAIL_HOST_BUFFER', None)
+            print('download allocation fallback recovered', flush=True)
+    """)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    env["LD_PRELOAD"] = str(pinned_host_failure_preload) + (
+        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, mojo_device, str(pinned_host_failure_preload)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "download allocation fallback recovered" in proc.stdout
+
+
 @pytest.fixture(scope="module")
 def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A subprocess-only fault at MAX's C ABI, with no production test switch."""
+    """Subprocess-only faults at MAX's C ABI, with no production test switch."""
     if not sys.platform.startswith("linux"):
         pytest.skip("MAX allocation fault injection requires Linux LD_PRELOAD")
     directory = tmp_path_factory.mktemp("host-buffer-failure")
@@ -1432,6 +2410,16 @@ def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Pat
                 RTLD_NEXT, "AsyncRT_DeviceContext_createHostBuffer"));
             if (!create) return strdup("test interposer could not find MAX host allocator");
             return create(result, pointer, context, count, itemsize);
+        }
+        extern "C" const char* AsyncRT_DeviceContext_DtoH_async(
+            const void* context, void* destination, const void* source) {
+            if (getenv("TMB_TEST_FAIL_DOWNLOAD"))
+                return strdup("injected download failure");
+            using Download = const char* (*)(const void*, void*, const void*);
+            auto download = reinterpret_cast<Download>(dlsym(
+                RTLD_NEXT, "AsyncRT_DeviceContext_DtoH_async"));
+            if (!download) return strdup("test interposer could not find MAX download");
+            return download(context, destination, source);
         }
     """)
     output = directory / "fail_host_buffer.so"
@@ -1513,7 +2501,8 @@ def _current_rss_bytes() -> int | None:
     return None
 
 
-def test_pinned_allocations_are_released(mojo_device: str):
+@pytest.mark.parametrize("async_use", [False, True])
+def test_pinned_allocations_are_released(mojo_device: str, async_use: bool):
     """Catch leaked HostBuffers that were not destroyed after their tensors died.
 
     Current RSS bounds retained memory after churn regardless of earlier peaks.
@@ -1522,16 +2511,23 @@ def test_pinned_allocations_are_released(mojo_device: str):
     with device_module.device(mojo_device):
         # Tensor.pin_memory() uses our allocator even with a CUDA torch wheel.
         source = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
+        uploaded = torch.empty_like(source, device=mojo_device)
         warm = source.pin_memory()
+        if async_use:
+            uploaded.copy_(warm, non_blocking=True)
         del warm
+        torch.accelerator.synchronize(mojo_device)
         before = _current_rss_bytes()
         # Churn 256 MiB in total with only 32 MiB of live pinned blocks.
         for _ in range(8):
             blocks = [source.pin_memory() for _ in range(8)]
             while blocks:
                 block = blocks.pop(len(blocks) // 2)
+                if async_use:
+                    uploaded.copy_(block, non_blocking=True)
                 del block
                 assert all(live.is_pinned() for live in blocks)
+        torch.accelerator.synchronize(mojo_device)
         after = _current_rss_bytes()
         if before is not None and after is not None:
             assert after - before < 128 * 1024 * 1024
