@@ -91,6 +91,7 @@ struct Dev(Movable):
     var num_alloc_retries: Int64
     var num_ooms: Int64
     var properties: Optional[Properties]
+    var peers: Dict[Int, Bool]  # access from this device to each peer
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -112,6 +113,7 @@ struct Dev(Movable):
         self.num_alloc_retries = 0
         self.num_ooms = 0
         self.properties = None
+        self.peers = Dict[Int, Bool]()
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -507,6 +509,46 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
     d.enqueue_copy_from(s)
     if ctx.api() == "cpu":
         ctx.synchronize()
+
+
+def _peer_access(device: Int, peer: Int) raises -> Bool:
+    var d = dev(device)
+    if peer in d[].peers:
+        return d[].peers[peer]
+    var other = dev(peer)
+    var enabled = False
+    if (d[].api == "cuda" or d[].api == "hip") and d[].api == other[].api:
+        try:
+            if d[].ctx.can_access(other[].ctx):
+                d[].ctx.enable_peer_access(other[].ctx)
+                enabled = True
+        except e:
+            # Unsupported access (including driver errors) uses host staging.
+            enabled = False
+    d[].peers[peer] = enabled
+    return enabled
+
+
+def copy_peer(
+    dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
+) raises -> Bool:
+    """Copy on the destination current stream; False requests host staging."""
+    if nbytes == 0:
+        return True
+    if not _peer_access(dst_device, src_device):
+        return False
+    var dst_ctx = ctx_for(dst_device)
+    var src_ctx = ctx_for(src_device)
+    dst_ctx.enqueue_wait_for(src_ctx)
+    var d = wrap_raw(dst_ctx, dst, nbytes)
+    var s = wrap_raw(src_ctx, src, nbytes)
+    d.enqueue_copy_from(s)
+    # MAX frees on the allocation's owner stream only. Complete the remote
+    # read before the caller can release its source or staging allocation.
+    dst_ctx.synchronize()
+    _ = s^
+    _ = d^
+    return True
 
 
 def copy_to_host(

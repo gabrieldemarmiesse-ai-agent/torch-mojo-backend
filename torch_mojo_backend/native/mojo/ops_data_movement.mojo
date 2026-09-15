@@ -74,6 +74,7 @@ from device import (
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import (
+    is_cast_dtype,
     cast_into,
     fill_value,
     cast_to,
@@ -83,6 +84,7 @@ from ops_common import (
     resize_out,
 )
 from registry import Site, impl, op_address_of
+from ops_core import copy_between_devices
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -131,20 +133,6 @@ def _row_major(shape: List[Int]) -> List[Int]:
         strides[i] = acc
         acc *= shape[i]
     return strides^
-
-
-def _is_cast_dtype(dt: DType) -> Bool:
-    """The dtypes the fast CastSpec kernel supports on either end (mirrors
-    data_movement_ops.mojo's `CAST_DTYPES`)."""
-    return (
-        dt == DType.float32
-        or dt == DType.float16
-        or dt == DType.bfloat16
-        or dt == DType.int64
-        or dt == DType.int32
-        or dt == DType.uint8
-        or dt == DType.bool
-    )
 
 
 def _is_scatter_dtype(dt: DType) -> Bool:
@@ -400,11 +388,7 @@ def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
-# _to_copy: dtype casts (same mojo device) and device moves. A genuine
-# device CHANGE is handled here too (this op is only ever reached when
-# `self` already carries the PrivateUse1 dispatch key -- a CPU tensor
-# arriving here would already be a bug in the dispatcher), by the same
-# host-bounce `_copy_from` uses on its mojo<->cpu paths.
+# _to_copy: dtype casts, layouts and device moves.
 # ---------------------------------------------------------------------------
 
 
@@ -423,7 +407,7 @@ def _to_copy_same_device(
     if stype == t.stype:
         return _materialize_as(t, want)
     var dst_dtype = max_dtype(stype)
-    if not (_is_cast_dtype(t.dtype) and _is_cast_dtype(dst_dtype)):
+    if not (is_cast_dtype(t.dtype) and is_cast_dtype(dst_dtype)):
         return _relayout_owned(own(_host_cast(t, stype)), want)
     if (
         not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank)
@@ -515,17 +499,8 @@ def _download_to_cpu(t: T) raises -> T:
 
 
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
-    var host = own(_download_to_cpu(t))
     var out = new_tensor(t.shape, t.rank, t.stype, target_device)
-    if t.numel > 0:
-        var ctx = ctx_for(target_device)
-        copy_from_host(
-            target_device, ctx, out.ptr, host.t.ptr, t.numel * t.itemsize
-        )
-        _ = ctx
-    # A plain CPU allocation: keep it alive through the read above (see the
-    # comment in `_host_cast`).
-    _ = host
+    copy_between_devices(out, t)
     return out^
 
 
