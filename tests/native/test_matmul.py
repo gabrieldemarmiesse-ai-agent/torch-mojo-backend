@@ -1374,13 +1374,27 @@ def test_gemm16_sched_on_a_side_stream(mojo_h100):
     m, n, k = SCHED_NN_DX_SMALL
     a, b, ref = _sched_mm(mojo_h100, m, n, k)
     bound = _bf16_bound(k)
+    # Prewarm both streams (kernel build, allocator) and preallocate every
+    # output, so the bursts below are nothing but back-to-back launches.
+    with device_module.stream(side):
+        warm_side = torch.mm(a, b)
+    warm_default = torch.mm(a, b)
+    on_side = [torch.empty(m, n, dtype=a.dtype, device=a.device) for _ in range(24)]
+    on_default = [torch.empty(m, n, dtype=a.dtype, device=a.device) for _ in range(24)]
     # The inputs were filled on the default stream; that is the only
     # cross-stream dependency, and this is the last fence before the bursts.
     torch.accelerator.synchronize()
-    with device_module.stream(side):
-        on_side = [torch.mm(a, b) for _ in range(8)]
-    on_default = [torch.mm(a, b) for _ in range(8)]
+    # Interleave the two streams' submissions so neither burst can drain
+    # before the other starts (a side burst issued whole before the default
+    # one could finish first and never overlap -- a Codex review finding).
+    # Overlap is made likely, not proven: nothing here observes the device
+    # timeline, so a shared counter would show only as a wrong tile.
+    for out_side, out_default in zip(on_side, on_default, strict=True):
+        with device_module.stream(side):
+            torch.mm(a, b, out=out_side)
+        torch.mm(a, b, out=out_default)
     torch.accelerator.synchronize()
+    del warm_side, warm_default
     for got in on_default:
         assert _rel_err(got, ref) < bound
     first = on_default[0].cpu()
