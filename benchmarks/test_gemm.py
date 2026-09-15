@@ -72,6 +72,17 @@ SHAPES = {
     # the rolling dispatcher's TMA clip (m % 8 == 0) reaches it -- measured
     # 942 us (generic fallback) -> 149 us (rolling route) on H100 SXM.
     "S18_4808x1600x6592": (4808, 1600, 6592),
+    # Low-occupancy TN regression guards (agent-C review of dff066a): an
+    # aligned m (% 128 == 0) whose rolling-geometry work census barely
+    # dents the available clusters must fall through to split-K / the
+    # narrow-tile-192 rung / v3, not take the rolling dispatcher
+    # unconditionally.  Measured H100 SXM, sm:1500 MHz, before the
+    # dispatcher's occupancy decline -> after:
+    "S19_768x768x12288": (768, 768, 12288),  # 35.3 -> 89.0 us (+152%)
+    "S20_256x256x65536": (256, 256, 65536),  # 84.4 -> 443.1 us (+425%);
+    # also a split-K case (m % 128 == 0, n % 256 == 0) that must be tried
+    # before the rolling dispatcher, not after.
+    "S21_128x128x8192": (128, 128, 8192),  # 37.1 -> 59.8 us (+61%)
 }
 
 # Batched, these four would be 2-3 TFLOP and several GB per leg for a regime

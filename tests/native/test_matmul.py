@@ -472,27 +472,42 @@ def test_gemm16_tn_rolling_m4800_boundary_guard(mojo_h100):
     boundary: 4800 % (192 * 2) == 192, so the second cluster rank's box for
     the grid's last macro row starts exactly at m -- entirely out of bounds
     for the A load and the C store, not merely a partial tile (an A2 review
-    finding on this engagement, documented in tn_rolling geometry's kernel
-    docstring). Guard with a real buffer, not only a value comparison, the
-    same way test_out_of_the_right_shape_keeps_its_own_strides above does:
-    `out=` a slice of a larger tensor and require the rows past m are
-    untouched.
+    finding on this engagement, documented in _try_enqueue_tn_rolling_geom's
+    docstring, gemm16_tn_v4_kernels.mojo).
 
     Geometry selection is SM-count dependent (see
     _try_enqueue_tn_rolling_geom's cost model); this (out, in) pair picks
     the 192x192 geometry on an H100 SXM (132 SMs), the hardware this
     engagement was measured on -- on a different SM count the correctness
-    and guard checks below still hold for whichever geometry actually ran.
+    check below still holds for whichever geometry actually ran.
+
+    What this can and cannot detect (a Codex review finding): `out=`
+    (ops_matmul.mojo's op_mm_out / _store_out) computes into a freshly
+    allocated, exactly (m, n)-sized temporary and then copy_strided_intos
+    it into `view`; that copy is itself bounded by (m, n), so the nonzero
+    canary below guards the COPY against overrunning `view`, not the GEMM
+    kernel's own TMA store against overrunning ITS temporary -- the canary
+    rows never border the kernel's real destination memory, so an
+    out-of-bounds *write* by the kernel itself would not reach them (nor
+    would a zero canary catch an out-of-bounds write of zero, which is why
+    this one is not zero). Real evidence for the kernel's own store comes
+    from a clean `compute-sanitizer --tool memcheck` run over the direct
+    (non-`out=`) `torch.mm(grad.t(), x)` path at this m and the ragged
+    m=4808, cited in this change's commit message. This test remains a
+    regression guard for the `out=` copy path (a real thing that could
+    still break on its own), not a substitute for that sanitizer evidence.
     """
     m, n, k = 4800, 1600, 1024
-    base = torch.zeros(m + 192, n, dtype=torch.bfloat16, device=mojo_h100)
+    canary = -12345.0
+    base = torch.full((m + 192, n), canary, dtype=torch.bfloat16, device=mojo_h100)
     view = base[:m]
     g = torch.randn(k, m, dtype=torch.bfloat16)
     x = torch.randn(k, n, dtype=torch.bfloat16)
     torch.mm(g.to(mojo_h100).t(), x.to(mojo_h100), out=view)
     ref = g.float().t() @ x.float()
     assert _rel_err(view, ref) < _bf16_bound(k)
-    assert bool((base[m:] == 0).all()), "the TN rolling route wrote past m"
+    expected_guard = torch.full((192, n), canary, dtype=torch.bfloat16)
+    assert torch.equal(base[m:].cpu(), expected_guard), "the out= copy wrote past m"
 
 
 # --- the out= overloads (TorchInductor's extern kernels) ----------------------

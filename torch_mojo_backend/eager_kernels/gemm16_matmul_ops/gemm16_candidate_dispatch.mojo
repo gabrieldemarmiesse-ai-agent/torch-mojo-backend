@@ -21,6 +21,7 @@ from gemm16_dtype import _GEMM16_DT
 from gemm16_nn_v4_kernels import _v4_enqueue_nn_persistent
 from gemm16_tn_v4_kernels import (
     _try_enqueue_tn_rolling_geom,
+    _try_enqueue_tn_splitk_m128n256,
     _v4_enqueue_direct_m128n192,
 )
 from gemm16_rolling_kernels import enqueue_rolling_persistent
@@ -163,56 +164,69 @@ def try_enqueue_candidate_nn(
     crossovers are fitted on H100 PCIe, using runtime waves. No matrix
     dimension is specialized at compilation.
     """
-    comptime if not _has_sm_9x() or _GEMM16_DT != DType.bfloat16:
+    # Two statements, not one `or`-combined guard: see
+    # _try_enqueue_nt_bias_rolling_192's comment (bc39b78) -- the combined
+    # form does not stop Mojo from instantiating the enqueue call below in
+    # a non-bfloat16 or non-sm_9x build. This one also failed to
+    # cross-compile for gfx942 ("failed to run the pass manager for
+    # offload") on both a719286 and this branch before this fix: the AMD
+    # backend cannot lower whatever WGMMA/TMA/cluster intrinsics leaked
+    # into a compiled unit that should have declined this whole function
+    # at comptime.
+    comptime if _GEMM16_DT != DType.bfloat16:
         return False
-    if ctx.api() != "cuda":
-        return False
-    if (
-        ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) != 9
-        or ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR) != 0
-    ):
-        return False
-    if (
-        m < 256
-        or n < 512
-        or k < 1024
-        or m % 128 != 0
-        or n % 256 != 64
-        or k % 64 != 0
-        or Int(output) % 16 != 0
-        or Int(a) % 16 != 0
-        or Int(b) % 16 != 0
-        or m > 2_147_483_647
-        or n > 2_147_483_647
-        or k > 2_147_483_647
-        or k > 9_223_372_036_854_775_807 // m
-        or k > 9_223_372_036_854_775_807 // n
-        or n > 9_223_372_036_854_775_807 // m
-    ):
-        return False
-    if m < 4 * n or m > 32 * n or k < n or k > 8 * n:
-        return False
-    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    if sms < 2:
-        return False
-    var clusters = sms // 2
-    var macro192 = (m + 383) // 384
-    var work256 = ((m + 255) // 256) * ((n + 255) // 256)
-    var wave256 = (work256 + clusters - 1) // clusters
-    var width = 192
-    var work192 = macro192 * ((n + width - 1) // width)
-    if 2 * work192 > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X):
-        return False
-    var wave192 = (work192 + clusters - 1) // clusters
-    # Admit only when the new geometry reduces or preserves rounded-wave
-    # arithmetic. Small/short and aligned regimes keep their old kernels.
-    if wave192 * 192 * width > wave256 * 128 * 256:
-        return False
-    # has_bias=False (default): the bias arg is unused, filled with output.
-    enqueue_rolling_persistent[3, 2, 192, 192, 3, True, False, False, True](
-        output, a, b, output, m, n, k, sms, ctx
-    )
-    return True
+    comptime if _has_sm_9x():
+        if ctx.api() != "cuda":
+            return False
+        if (
+            ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) != 9
+            or ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR) != 0
+        ):
+            return False
+        if (
+            m < 256
+            or n < 512
+            or k < 1024
+            or m % 128 != 0
+            or n % 256 != 64
+            or k % 64 != 0
+            or Int(output) % 16 != 0
+            or Int(a) % 16 != 0
+            or Int(b) % 16 != 0
+            or m > 2_147_483_647
+            or n > 2_147_483_647
+            or k > 2_147_483_647
+            or k > 9_223_372_036_854_775_807 // m
+            or k > 9_223_372_036_854_775_807 // n
+            or n > 9_223_372_036_854_775_807 // m
+        ):
+            return False
+        if m < 4 * n or m > 32 * n or k < n or k > 8 * n:
+            return False
+        var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        if sms < 2:
+            return False
+        var clusters = sms // 2
+        var macro192 = (m + 383) // 384
+        var work256 = ((m + 255) // 256) * ((n + 255) // 256)
+        var wave256 = (work256 + clusters - 1) // clusters
+        var width = 192
+        var work192 = macro192 * ((n + width - 1) // width)
+        if 2 * work192 > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X):
+            return False
+        var wave192 = (work192 + clusters - 1) // clusters
+        # Admit only when the new geometry reduces or preserves
+        # rounded-wave arithmetic. Small/short and aligned regimes keep
+        # their old kernels.
+        if wave192 * 192 * width > wave256 * 128 * 256:
+            return False
+        # has_bias=False (default): the bias arg is unused, filled with
+        # output.
+        enqueue_rolling_persistent[3, 2, 192, 192, 3, True, False, False, True](
+            output, a, b, output, m, n, k, sms, ctx
+        )
+        return True
+    return False
 
 
 def try_enqueue_candidate_tn(
@@ -224,93 +238,118 @@ def try_enqueue_candidate_tn(
     k: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
-    comptime if not _has_sm_9x() or _GEMM16_DT != DType.bfloat16:
+    # Two statements, not one `or`-combined guard: see
+    # _try_enqueue_nt_bias_rolling_192's comment (bc39b78) -- the combined
+    # form does not stop Mojo from instantiating the enqueue call below in
+    # a non-bfloat16 or non-sm_9x build. This one also failed to
+    # cross-compile for gfx942 ("failed to run the pass manager for
+    # offload") on both a719286 and this branch before this fix: the AMD
+    # backend cannot lower whatever WGMMA/TMA/cluster intrinsics leaked
+    # into a compiled unit that should have declined this whole function
+    # at comptime.
+    comptime if _GEMM16_DT != DType.bfloat16:
         return False
-    if ctx.api() != "cuda":
-        return False
-    if (
-        ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) != 9
-        or ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR) != 0
-    ):
-        return False
-    # Deep-K and wave crossovers are fitted on H100 PCIe. The gate protects
-    # underfilled grids, short reductions and very tall vocabulary products.
-    if (
-        m < 256
-        or n < 256
-        or k < 4096
-        or m % 64 != 0
-        or n % 64 != 0
-        or k % 64 != 0
-        or Int(output) % 16 != 0
-        or Int(a) % 16 != 0
-        or Int(b) % 16 != 0
-        or m > 2_147_483_647
-        or n > 2_147_483_647
-        or k > 2_147_483_647
-        or k > 9_223_372_036_854_775_807 // m
-        or k > 9_223_372_036_854_775_807 // n
-        or n > 9_223_372_036_854_775_807 // m
-    ):
-        return False
-    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    var max_grid = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
-    if sms < 2:
-        return False
-    # The rolling geometry dispatcher (gemm16_tn_v4_kernels.mojo) runs first:
-    # every shape this gate admits also clears its own (looser) gate, and
-    # its runtime cost model over three geometries beats what the fixed
-    # 128-row routes below produce on every one of the standalone
-    # engagement's six measured shapes -- including three (c_attn, c_proj,
-    # mlp_proj: m % 128 == 64) that this function's OWN "m % 128 == 64"
-    # branch below would otherwise have claimed unconditionally, before
-    # ever reaching try_enqueue_gemm16_gemm_tn_v4's ladder.  Falls through
-    # to the existing routes below for whatever it declines (a GPU too
-    # small for its cluster_m=2, or a grid past MAX_GRID_DIM_X).
-    if _try_enqueue_tn_rolling_geom(output, a, b, m, n, k, sms, max_grid, ctx):
-        return True
-    var tiles192 = ((m + 127) // 128) * ((n + 191) // 192)
-    if tiles192 > max_grid:
-        return False
-    # A grid that does not reach one full wave still beats the ladder's
-    # fallback when it keeps at least three quarters of the SMs busy: the
-    # 1600x1600 weight gradient is 117 tiles, more than the 114 SMs of an
-    # H100 PCIe but fewer than the 132 of an H100 SXM.  (Measured on SXM:
-    # the fallback ran that shape at 9x cuBLAS.)
-    if tiles192 * 4 < sms * 3:
-        return False
-    var clusters192 = ((m + 255) // 256) * ((n + 191) // 192)
-    var clusters256 = ((m + 255) // 256) * ((n + 255) // 256)
-    var waves192 = (clusters192 + sms // 2 - 1) // (sms // 2)
-    var waves256 = (clusters256 + sms // 2 - 1) // (sms // 2)
-    var direct_waves192 = (tiles192 + sms - 1) // sms
-    if m % 128 == 64:
-        # A wide output exposes the wasted peer row of an M-tail cluster;
-        # independent direct CTAs avoid that work. Ceil launch is essential.
-        if n >= 2 * m and direct_waves192 * 192 < waves256 * 256:
-            _v4_enqueue_direct_m128n192(
-                output, a, b, m, n, k, tiles192, True, ctx
-            )
+    comptime if _has_sm_9x():
+        if ctx.api() != "cuda":
+            return False
+        if (
+            ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) != 9
+            or ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR) != 0
+        ):
+            return False
+        # Deep-K and wave crossovers are fitted on H100 PCIe. The gate
+        # protects underfilled grids, short reductions and very tall
+        # vocabulary products.
+        if (
+            m < 256
+            or n < 256
+            or k < 4096
+            or m % 64 != 0
+            or n % 64 != 0
+            or k % 64 != 0
+            or Int(output) % 16 != 0
+            or Int(a) % 16 != 0
+            or Int(b) % 16 != 0
+            or m > 2_147_483_647
+            or n > 2_147_483_647
+            or k > 2_147_483_647
+            or k > 9_223_372_036_854_775_807 // m
+            or k > 9_223_372_036_854_775_807 // n
+            or n > 9_223_372_036_854_775_807 // m
+        ):
+            return False
+        var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        var max_grid = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+        if sms < 2:
+            return False
+        # Split-K first (see _try_enqueue_tn_splitk_m128n256's docstring):
+        # a deep-K, underfilled-output shape parallelizes over K here in a
+        # way the rolling dispatcher below cannot.  Then the rolling
+        # geometry dispatcher: every shape this gate admits also clears
+        # its own (looser) gate, and its runtime cost model over three
+        # geometries beats what the fixed 128-row routes below produce on
+        # every one of the standalone engagement's six measured shapes --
+        # including three (c_attn, c_proj, mlp_proj: m % 128 == 64) that
+        # this function's OWN "m % 128 == 64" branch below would otherwise
+        # have claimed unconditionally, before ever reaching
+        # try_enqueue_gemm16_gemm_tn_v4's ladder.  Falls through to the
+        # existing routes below for whatever both decline (a GPU too small
+        # for its cluster_m=2, a grid past MAX_GRID_DIM_X, or low modeled
+        # occupancy -- see _try_enqueue_tn_rolling_geom's own docstring).
+        if _try_enqueue_tn_splitk_m128n256(
+            output, a, b, m, n, k, sms, max_grid, ctx
+        ):
             return True
-        if waves192 * 192 < waves256 * 256:
+        if _try_enqueue_tn_rolling_geom(
+            output, a, b, m, n, k, sms, max_grid, ctx
+        ):
+            return True
+        var tiles192 = ((m + 127) // 128) * ((n + 191) // 192)
+        if tiles192 > max_grid:
+            return False
+        # A grid that does not reach one full wave still beats the
+        # ladder's fallback when it keeps at least three quarters of the
+        # SMs busy: the 1600x1600 weight gradient is 117 tiles, more than
+        # the 114 SMs of an H100 PCIe but fewer than the 132 of an H100
+        # SXM.  (Measured on SXM: the fallback ran that shape at 9x
+        # cuBLAS.)
+        if tiles192 * 4 < sms * 3:
+            return False
+        var clusters192 = ((m + 255) // 256) * ((n + 191) // 192)
+        var clusters256 = ((m + 255) // 256) * ((n + 255) // 256)
+        var waves192 = (clusters192 + sms // 2 - 1) // (sms // 2)
+        var waves256 = (clusters256 + sms // 2 - 1) // (sms // 2)
+        var direct_waves192 = (tiles192 + sms - 1) // sms
+        if m % 128 == 64:
+            # A wide output exposes the wasted peer row of an M-tail
+            # cluster; independent direct CTAs avoid that work. Ceil
+            # launch is essential.
+            if n >= 2 * m and direct_waves192 * 192 < waves256 * 256:
+                _v4_enqueue_direct_m128n192(
+                    output, a, b, m, n, k, tiles192, True, ctx
+                )
+                return True
+            if waves192 * 192 < waves256 * 256:
+                _v4_enqueue_nn_persistent[
+                    4, 2, 128, 192, 2, True, True, False, True
+                ](output, a, b, m, n, k, sms, ctx)
+            else:
+                _v4_enqueue_nn_persistent[
+                    3, 2, 128, 256, 2, True, True, False, True
+                ](output, a, b, m, n, k, sms, ctx)
+            return True
+        # Preserve aligned routes except this clipped-column,
+        # moderate-aspect regime where the four-stage 192 tile removes
+        # excess per-wave work.
+        if (
+            n % 256 == 64
+            and m >= 2 * n
+            and m <= 8 * n
+            and waves192 * 192 < waves256 * 256
+        ):
             _v4_enqueue_nn_persistent[
                 4, 2, 128, 192, 2, True, True, False, True
             ](output, a, b, m, n, k, sms, ctx)
-        else:
-            _v4_enqueue_nn_persistent[
-                3, 2, 128, 256, 2, True, True, False, True
-            ](output, a, b, m, n, k, sms, ctx)
-        return True
-    # Preserve aligned routes except this clipped-column, moderate-aspect
-    # regime where the four-stage 192 tile removes excess per-wave work.
-    if (
-        n % 256 == 64
-        and m >= 2 * n
-        and m <= 8 * n
-        and waves192 * 192 < waves256 * 256
-    ):
-        _v4_enqueue_nn_persistent[4, 2, 128, 192, 2, True, True, False, True](
-            output, a, b, m, n, k, sms, ctx
-        )
-        return True
+            return True
+        return False
     return False
