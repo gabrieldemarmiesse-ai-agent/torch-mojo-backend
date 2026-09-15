@@ -270,7 +270,11 @@ Verified on CINES's Adastra (4 × MI300A per node, ROCm 6.4.3, RCCL 2.22.3).
   (`--nproc-per-node=1`, a couple of steps) and expect the bimodal first
   step. Capping the HIP heap instead (`GPU_MAX_HEAP_SIZE=30`) is not an
   option: MAX's allocator becomes ~40x slower.
-- **But do NOT set that knob for a MULTI-NODE mojoccl run.** With
+- **Earlier 124M multi-node VMM slowdown.** The measurements below
+  describe an earlier nanoGPT-124M experiment. The later
+  [GPT-2 XL verification](#gpt-2-xl-on-two-mi300a-nodes) runs successfully
+  with VMM=1 and fused mojoccl; this is not a blanket ban for that path.
+  In the earlier experiment, with
   `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` a two-node DDP step costs
   ~26x what it should. nanoGPT-124M, 2 nodes x 4 MI300A over cxi, batch 12,
   everything else identical (same region size, same build, same job):
@@ -305,7 +309,8 @@ Verified on CINES's Adastra (4 × MI300A per node, ROCm 6.4.3, RCCL 2.22.3).
   network. Nothing in mojoccl fixes this; the release has to become
   stream-ordered in MAX.
 
-  **What to do instead.** Leave the knob unset and shrink the communicator's
+  **Workaround for that earlier case.** Leave the knob unset and shrink the
+  communicator's
   region so four ranks still fit: `MOJOCCL_REGION_MB=64` gives a 192 MiB
   region per rank against 768 MiB at the default, and that is what the
   numbers above were taken with. At the default 256 MiB, four ranks per node
@@ -368,8 +373,9 @@ module load aws-ofi-rccl   # multi-node only
 export ROCM_PATH=/opt/rocm
 export LD_LIBRARY_PATH=/opt/cray/pe/gcc-libs:/opt/rocm/lib:${LD_LIBRARY_PATH}
 export NCCL_DEBUG=WARN
-# NO MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM here: on two nodes that knob
-# costs 26x (see the memory paragraph). A single-node job still wants it.
+# Conservative recipe for the earlier 124M measurements above.
+# The XL verification below uses VMM=1 with fused mojoccl.
+unset MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM
 export MOJOCCL_REGION_MB=64   # what makes four ranks per node fit without it
 MASTER_ADDR=$(scontrol show hostname "$SLURM_JOB_NODELIST" | head -n 1)
 srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
@@ -377,6 +383,75 @@ srun --ntasks-per-node=1 --gpus-per-task=4 --cpus-per-task=96 -- \
     --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR:29500" \
     --rdzv-id="$SLURM_JOB_ID" demo_scripts/nanogpt_ddp.py ...
 ```
+
+### GPT-2 XL on two MI300A nodes
+
+Measured on September 15, 2026, with four gfx942 APUs per node (228 CUs
+per APU), MAX 26.5 and the native backend using torch 2.11.0+cpu. Stock
+uses torch 2.9.1+rocm6.4 and RCCL 2.22.3. The model is unchanged:
+48 layers, 25 heads, width 1600, biases, bf16 autocast, batch 8 × 1024
+per rank, eight ranks and 30 steps.
+
+The comparison follows `tests/multinode/e2e_three_stacks.sbatch`: one
+discarded warm-up per stack, then five interleaved ABC CBA ABC CBA ABC
+rounds, with the original NUMA binder adapted to four ranks per node.
+Each run contributes its mean printed tokens/s over steps 20–30; the
+interval is the Student-t 95% confidence interval across rounds.
+
+| Stack | Tokens/s ± 95% CI | Ratio vs stock | Step 1 |
+|---|---:|---:|---:|
+| Stock torch + RCCL | 129,969.1 ± 199.4 | 1.0000 | 9.40 s |
+| Mojo backend + RCCL | 129,738.2 ± 491.3 | 0.9982 | 1.84 s |
+| Mojo backend + mojoccl/fabric | 128,312.7 ± 742.5 | 0.9873 | 1.88 s |
+
+Both native stacks used `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`;
+stock left it unset. Both native ratios exceed the 0.95 target.
+
+For this measured XL workload, use the following mojoccl settings on
+every rank. These block-cap overrides are fitted to MI300A; the library's
+defaults remain 16/64.
+
+```bash
+export TORCH_MOJO_BACKEND_CCL=mojo
+export MOJOCCL_NET=fabric MOJOCCL_REGION_MB=64
+export MOJOCCL_FUSED_BLOCKS=8 MOJOCCL_FUSED_BIG_BLOCKS=16
+export FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1
+export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1
+```
+
+The demo completes its own cleanup and calls `os._exit(0)`, avoiding the
+MAX/ROCr interpreter-exit problem described above. These XL runs verify
+VMM=1 with the fused path; they do not establish that the older 124M VMM
+slowdown is fixed in every schedule or workload. Build the caches with
+one process before launching four ranks per node, and keep compilation
+outside GPU locks.
+
+Full-model ABBA on a1070/a1071, job 5417296, improves from 125.1k to
+128.4k tokens/s when changing caps 16/64 to 8/16 (+2.61%). Reducing the
+small cap further to 4 loses 1.16%. `MOJOCCL_IB_PROXY=0` still selects
+the split schedule and passes the payload checks, but loses 22.31% in
+full-model ABBA. Keep the fused schedule for this workload.
+
+The fused kernel builds warning-free at 512 threads. Payload and deadline
+probes pass for barrier sleep immediates 0/1/2/4/8 on all eight ranks;
+every deadline arrives at 3.0 s within the 9 s bound. Reversed-order
+collective timings find only a 0.89% best large-payload gain over sleep 2,
+within the approximately 1% baseline reproduction spread, so the
+production backoff stays 2. Raw traces verify the grids and pinned host
+mailbox allocations; profiling perturbs the progress thread and is kept
+separate from throughput measurements. The `ib_pipeline` self-test passes
+over fabric/cxi on one node with four ranks; the full DDP runs separately
+validate multinode operation. Small-region fallback and both fused/split
+deadlines also pass.
+
+The biased bf16 forward projections now use direct NT MFMA, adding bias
+in the fp32 accumulator before its sole bf16 conversion. They do not use `Gemm16`,
+whose reported gfx942 eight-element bf16 MMA lowering remains outside
+this training path. On one a1007 APU, full-model ABBA reaches 18,904.5
+tokens/s against stock's 16,890.9 (1.119×); native mean step time falls
+from 641.15 to 433.35 ms, inferred from the printed throughput. Step 1
+averages 1.75 s native and 8.80 s stock,
+after model/DDP construction. Losses remain close, not bitwise identical.
 
 ## Mojo collectives (experimental): `TORCH_MOJO_BACKEND_CCL=mojo`
 
@@ -762,7 +837,9 @@ an incomplete submission needs conservative caller-stream queries. Concurrent
 error polling skips the device read while submission holds the lock, but
 still checks the atomic terminal-failure flag.
 The SM count comes from MAX's device attribute on both vendors, so
-AMD takes the fused path too (unmeasured there: for the AMD agent). A call
+AMD takes the fused path too. It is now measured at 512 threads on two
+nodes with four MI300A APUs each; see the
+[XL verification](#gpt-2-xl-on-two-mi300a-nodes). A call
 the geometry cuts into more chunks than the inter-node
 work ring has slots (`WORK_SLOTS`, 512: a 129 MiB allreduce at
 `MOJOCCL_REGION_MB=1`) takes the split schedule, which releases chunks as it
