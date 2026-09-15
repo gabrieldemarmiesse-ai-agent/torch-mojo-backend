@@ -1065,35 +1065,44 @@ def maybe_enqueue_gemm16_tn_v4_persistent[
     k: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
-    """Route a multi-wave TN (wgrad) GEMM -- or, with kmaj_b, a TT one --
-    to the persistent clustered v4 body in its col-major-A mode.
+    """Route a multi-wave TT GEMM to this file's OWN persistent clustered v4
+    body (_v4_nn_persistent_ws below) in its col-major-A, K-major-B mode --
+    distinct from gemm16_rolling_kernels.mojo's _rolling_persistent_body,
+    which the TN dispatcher's rolling-geometry route uses instead (see
+    below).
 
-    Called by the TN and TT dispatchers in gemm16_tn_v4_kernels.mojo
-    AFTER their split-K attempt (deep-K underfilled outputs stay on split-K)
-    and BEFORE the remaining one-CTA-per-tile routes.  By default it engages
-    only when the 128x256 tiling of the output is strictly multi-wave on the
-    current GPU: that is the regime where the one-CTA-per-tile kernels pay a
-    per-wave pipeline refill plus a serialized scalar epilogue, and where
-    this body's persistent scheduler, cluster B multicast and background
-    TMA-store epilogue were measured to win (H100 PCIe; same regime split as
-    the NN dispatcher above).  Single-wave TN shapes keep the pre-existing
-    narrow-tile / v3 routes, which beat the persistent body there.  The TT
+    Called by try_enqueue_gemm16_gemm_tt_v4 (gemm16_tn_v4_kernels.mojo)
+    AFTER its split-K attempt (deep-K underfilled outputs stay on split-K)
+    and BEFORE the remaining one-CTA-per-tile routes; kmaj_b=True there
+    selects the TT (col-major A, K-major B) instantiation.  By default it
+    engages only when the 128x256 tiling of the output is strictly
+    multi-wave on the current GPU: that is the regime where the
+    one-CTA-per-tile kernels pay a per-wave pipeline refill plus a
+    serialized scalar epilogue, and where this body's persistent scheduler,
+    cluster B multicast and background TMA-store epilogue were measured to
+    win (H100 PCIe; same regime split as the NN dispatcher above).  The TT
     dispatcher passes any_wave=True because it makes its own wave decision
     (its 128x64 small-tile kernel beats this body on every single-wave
     shape measured; see try_enqueue_gemm16_gemm_tt_v4), and ragged_n=True so
     n % 256 != 0 multi-wave shapes (n % 64 == 0, guaranteed by its gate)
     reach the body's n-clip instantiation instead of falling off to the far
-    slower one-CTA-per-tile grid.  The TN dispatcher calls twice: once with
-    the defaults (exact n, its pre-existing rung) and -- when n % 256 != 0
-    -- once more with ragged_n=True, so multi-wave half-tile-n wgrad shapes
-    (GPT-2's padded vocab 50304 has n % 256 == 128) stop falling through to
-    the one-CTA-per-tile v3 grid, which loses ~2x there.
+    slower one-CTA-per-tile grid.
+
+    The TN dispatcher used to call this same function (kmaj_b=False) twice,
+    once at defaults and once with ragged_n=True; it now uses a runtime
+    geometry dispatcher over three tunings of the OTHER family's shared
+    body instead (gemm16_tn_v4_kernels.mojo::_try_enqueue_tn_rolling_geom),
+    which also clips a ragged m via TMA -- something this function's own
+    body still cannot do reachably (see the precondition note below).
 
     Precondition: m % 128 == 0, k % 64 == 0, and n % 256 == 0 unless
-    ragged_n (then n % 64 == 0).  Both callers
-    (try_enqueue_gemm16_gemm_tn_v4 / _tt_v4) gate m % 128 == 0 before calling,
-    so the kernel body's ragged-m clip path (TMA read clamp + store clip) is
-    unreachable and untested on these routes.
+    ragged_n (then n % 64 == 0).  Its one remaining caller
+    (try_enqueue_gemm16_gemm_tt_v4) still gates m % 128 == 0 before calling,
+    so this body's own col_a ragged-m clip path (TMA read clamp + store
+    clip) stays unreachable and untested here -- unlike the OTHER family's
+    col_a clip path, which the TN rolling dispatcher now exercises in
+    production (measured job 250131, six shapes down to the ragged
+    4808x1600x6592).
     Returns False when the caller must fall back."""
     comptime if not _has_sm_9x():
         return False

@@ -3,9 +3,12 @@
 Reached from the top of `enqueue_gemm16_gemm` (the single-matrix GEMM
 entry); every helper here returns False WITHOUT launching anything for a
 shape it does not serve, and the whole pre-existing ladder is what runs
-then. The TN selection launches unchanged upstream device bodies -- what it
-adds is coverage and a wave-cost comparison; NN and fused-NT launch the
-kernels in gemm16_rolling_kernels.mojo and gemm16_nt_bias_kernels.mojo.
+then. NN and fused-NT launch the kernels in gemm16_rolling_kernels.mojo and
+gemm16_nt_bias_kernels.mojo. TN now tries the same shared body's rolling
+geometry dispatcher first (gemm16_tn_v4_kernels.mojo::
+_try_enqueue_tn_rolling_geom, the same helper try_enqueue_gemm16_gemm_tn_v4
+uses further down its own ladder) before falling back to the fixed 128-row
+routes below, which launch unchanged upstream device bodies.
 
 Every crossover constant below was fitted on an H100 PCIe (114 SMs) at
 1410 MHz. Matrix dimensions and the SM count stay runtime values: the gates
@@ -16,7 +19,10 @@ from max.gpu.host import DeviceContext, DeviceAttribute
 from std.sys.info import _has_sm_9x
 from gemm16_dtype import _GEMM16_DT
 from gemm16_nn_v4_kernels import _v4_enqueue_nn_persistent
-from gemm16_tn_v4_kernels import _v4_enqueue_direct_m128n192
+from gemm16_tn_v4_kernels import (
+    _try_enqueue_tn_rolling_geom,
+    _v4_enqueue_direct_m128n192,
+)
 from gemm16_rolling_kernels import enqueue_rolling_persistent
 from gemm16_nt_bias_kernels import (
     _v4c_nt_bias_hw_gate,
@@ -251,6 +257,18 @@ def try_enqueue_candidate_tn(
     var max_grid = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
     if sms < 2:
         return False
+    # The rolling geometry dispatcher (gemm16_tn_v4_kernels.mojo) runs first:
+    # every shape this gate admits also clears its own (looser) gate, and
+    # its runtime cost model over three geometries beats what the fixed
+    # 128-row routes below produce on every one of the standalone
+    # engagement's six measured shapes -- including three (c_attn, c_proj,
+    # mlp_proj: m % 128 == 64) that this function's OWN "m % 128 == 64"
+    # branch below would otherwise have claimed unconditionally, before
+    # ever reaching try_enqueue_gemm16_gemm_tn_v4's ladder.  Falls through
+    # to the existing routes below for whatever it declines (a GPU too
+    # small for its cluster_m=2, or a grid past MAX_GRID_DIM_X).
+    if _try_enqueue_tn_rolling_geom(output, a, b, m, n, k, sms, max_grid, ctx):
+        return True
     var tiles192 = ((m + 127) // 128) * ((n + 191) // 192)
     if tiles192 > max_grid:
         return False

@@ -406,6 +406,95 @@ def test_gemm16_nt_bias_rolling_192(mojo_h100, m, n, k):
     assert _rel_err(got, ref) < _bf16_bound(k)
 
 
+# --- the TN persistent-rolling geometry dispatcher (GPT-2 XL dW sites) -------
+#
+# gemm16_tn_v4_kernels.mojo's try_enqueue_gemm16_gemm_tn_v4 now routes a
+# multi-wave TN (weight-gradient) GEMM to one of three tuned geometries of
+# the shared persistent-rolling body (192x192 / 128x256 / 128x192, chosen by
+# a runtime cost model -- see _try_enqueue_tn_rolling_geom's module comment
+# in that file), replacing the old fixed-128x256 rung, and clips a ragged M
+# (m % 8 == 0) via TMA instead of declining it the way the split-K and
+# narrow-tile rungs below it still do.
+#
+# Shapes are the standalone engagement's six (out_features, in_features,
+# tokens); tokens is scaled down on all but the first the way this file's
+# other site tables scale down whatever axis dominates test time (XL_M
+# above) -- the geometry choice is a function of out_features/in_features
+# and the GPU's SM count only, never of tokens.
+# -------------------------------------------------------------------------------
+
+TN_ROLLING_SHAPES = [
+    (4800, 1600, 8192),  # c_attn dW -- full-size tokens, the flagship shape
+    (1600, 1600, 1024),  # c_proj dW
+    (6400, 1600, 1024),  # c_fc dW
+    (1600, 6400, 1024),  # mlp_proj dW
+    (4800, 1600, 2048),  # c_attn dW at the model's deeper reduction (16384)
+    (4808, 1600, 1024),  # ragged M -- not a multiple of 64; measured 942 us
+    # (generic fallback) -> 149 us (rolling route) at full size, job 250131
+]
+
+
+@pytest.mark.parametrize("out_features,in_features,tokens", TN_ROLLING_SHAPES)
+def test_gemm16_tn_rolling_geometry_dispatch(
+    mojo_h100, out_features, in_features, tokens
+):
+    """dW through linear_backward at the rolling dispatcher's own shapes."""
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert dw.dtype == torch.bfloat16
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
+def test_gemm16_tn_rolling_small_ragged_m(mojo_h100):
+    """A small ragged M (64 <= m < 1600) was not part of the standalone
+    engagement's measured sweep (an A2 review finding); this is the
+    smallest case that still clears the dispatcher's m >= 64 floor."""
+    out_features, in_features, tokens = 136, 1600, 512
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    with assert_ran("aten::linear_backward"):
+        _dx, dw, _db = torch.ops.aten.linear_backward(
+            x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
+        )
+    ref = g.float().t() @ x.float()
+    assert _rel_err(dw, ref) < _bf16_bound(tokens)
+
+
+def test_gemm16_tn_rolling_m4800_boundary_guard(mojo_h100):
+    """m = 4800 lands exactly on the 192x192/cluster-2 geometry's macro-row
+    boundary: 4800 % (192 * 2) == 192, so the second cluster rank's box for
+    the grid's last macro row starts exactly at m -- entirely out of bounds
+    for the A load and the C store, not merely a partial tile (an A2 review
+    finding on this engagement, documented in tn_rolling geometry's kernel
+    docstring). Guard with a real buffer, not only a value comparison, the
+    same way test_out_of_the_right_shape_keeps_its_own_strides above does:
+    `out=` a slice of a larger tensor and require the rows past m are
+    untouched.
+
+    Geometry selection is SM-count dependent (see
+    _try_enqueue_tn_rolling_geom's cost model); this (out, in) pair picks
+    the 192x192 geometry on an H100 SXM (132 SMs), the hardware this
+    engagement was measured on -- on a different SM count the correctness
+    and guard checks below still hold for whichever geometry actually ran.
+    """
+    m, n, k = 4800, 1600, 1024
+    base = torch.zeros(m + 192, n, dtype=torch.bfloat16, device=mojo_h100)
+    view = base[:m]
+    g = torch.randn(k, m, dtype=torch.bfloat16)
+    x = torch.randn(k, n, dtype=torch.bfloat16)
+    torch.mm(g.to(mojo_h100).t(), x.to(mojo_h100), out=view)
+    ref = g.float().t() @ x.float()
+    assert _rel_err(view, ref) < _bf16_bound(k)
+    assert bool((base[m:] == 0).all()), "the TN rolling route wrote past m"
+
+
 # --- the out= overloads (TorchInductor's extern kernels) ----------------------
 
 

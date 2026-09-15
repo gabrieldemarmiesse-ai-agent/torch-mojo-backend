@@ -56,6 +56,22 @@ SHAPES = {
     # candidate target. test_linear passes a bias on every shape, so this node
     # measures the biased call rather than the model's bias-free one.
     "S12_16384x50304x1600": (16384, 50304, 1600),
+    # The TN persistent-rolling geometry dispatcher's own six shapes
+    # (gemm16_tn_v4_kernels.mojo::_try_enqueue_tn_rolling_geom), as the
+    # wgrad GEMM itself sees them: out_features x in_features x tokens (S8
+    # above uses the SAME weights but as test_linear's tokens x out x in --
+    # a "TN"-layout test_mm case here reduces over tokens directly, which is
+    # what the standalone engagement measured with a bare torch.mm(g.t(), x)
+    # and what test_linear_backward's dW leg bundles in with dX and dbias).
+    "S13_4800x1600x8192": (4800, 1600, 8192),  # c_attn dW
+    "S14_1600x1600x8192": (1600, 1600, 8192),  # attn.c_proj dW
+    "S15_6400x1600x8192": (6400, 1600, 8192),  # mlp.c_fc dW
+    "S16_1600x6400x8192": (1600, 6400, 8192),  # mlp.c_proj dW
+    "S17_4800x1600x16384": (4800, 1600, 16384),  # c_attn dW, the deeper batch
+    # Ragged M: 4808 % 64 == 8, so every aligned TN rung declines and only
+    # the rolling dispatcher's TMA clip (m % 8 == 0) reaches it -- measured
+    # 942 us (generic fallback) -> 149 us (rolling route) on H100 SXM.
+    "S18_4808x1600x6592": (4808, 1600, 6592),
 }
 
 # Batched, these four would be 2-3 TFLOP and several GB per leg for a regime
@@ -67,6 +83,12 @@ BMM_EXCLUDED = {
     "S9_16384x1600x1600",
     "S10_16384x6400x1600",
     "S11_16384x1600x6400",
+    "S13_4800x1600x8192",
+    "S14_1600x1600x8192",
+    "S15_6400x1600x8192",
+    "S16_1600x6400x8192",
+    "S17_4800x1600x16384",
+    "S18_4808x1600x6592",
     "S12_16384x50304x1600",  # tens of GB per leg batched
 }
 
