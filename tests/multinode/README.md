@@ -174,6 +174,23 @@ see `/home/gabriel/ddp_work/mojo_collectives/mn/NCCL_REFERENCE_16.md` for
 node names, SM clock, NCCL algo/protocol choices and the resulting numbers
 from that run.
 
+## e2e_three_stacks for other nanoGPT sizes
+
+`e2e_three_stacks.sbatch` runs from any checkout (`MOJO_TREE`, default the submitting one) and
+takes the nanoGPT config from `MODEL_ARGS`; the log-name prefix `E2E_TAG` keeps runs apart and
+the summariser reads the same tag. GPT-2 XL, which fits batch 8 only on 80 GB under DDP:
+
+```bash
+sbatch --export=ALL,BATCHES=8,E2E_TAG=e2e_gpt2xl,MODEL_ARGS="--n-layer 48 --n-head 25 --n-embd 1600 --bias" \
+    tests/multinode/e2e_three_stacks.sbatch
+E2E_TAG=e2e_gpt2xl E2E_MODEL="nanoGPT GPT-2 XL (1.5B)" \
+    uv run --no-sync python tests/multinode/summarize_three_stacks.py <jobid>
+```
+
+Each batch size now starts with one discarded warm-up per stack, which doubles as the fit gate
+(a size whose warm-up fails on any stack is skipped), and a 1-rank mojo prewarm builds the
+kernel cache before the 16-rank runs race for it.
+
 ## e2e_three_stacks on Adastra (2 x 4 MI300A, Slingshot)
 
 `e2e_three_stacks_adastra.sh` is the same protocol as `e2e_three_stacks.sbatch`
