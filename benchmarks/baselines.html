@@ -4768,6 +4768,102 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "torchvision::_deform_conv2d_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 1.068
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.497
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 0.929
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.962
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_ps_roi_align_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.652
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.493
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.839
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.622
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_ps_roi_pool_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.636
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.543
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.675
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.645
+                  }
+                }
+              }
+            }
+          }
+        },
         "torchvision::_roi_align_backward": {
           "dtypes": {
             "f16": {
@@ -4872,6 +4968,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "torchvision::deform_conv2d": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 0.918
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.747
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 1.024
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.927
+                  }
+                }
+              }
+            }
+          }
+        },
         "torchvision::nms": {
           "dtypes": {
             "f16": {
@@ -4908,6 +5036,70 @@ document.addEventListener("DOMContentLoaded", boot);
                 "K5000": {
                   "layouts": {
                     "contig": 0.086
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::ps_roi_align": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.753
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.542
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.882
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.577
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::ps_roi_pool": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.695
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.72
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.651
                   }
                 }
               }

@@ -788,6 +788,301 @@ def _launch[
         _ = ctx
 
 
+@always_inline
+def _ps_pool_bounds[
+    dt: DType, acc: DType, backward: Bool
+](
+    rois: Pointer[Scalar[dt], MutAnyOrigin],
+    roi: Int,
+    n: Int,
+    h: Int,
+    w: Int,
+    ph: Int,
+    pw: Int,
+    by: Int,
+    bx: Int,
+    scale: Scalar[acc],
+) -> Tuple[Int, Int, Int, Int, Int]:
+    if not _valid_roi(rois, roi, n, scale):
+        return (-1, 0, 0, 0, 0)
+    var batch = Int(rois[unsafe_offset=roi * 5])
+    var x0 = _round_away(rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale)
+    var y0 = _round_away(rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale)
+    var x1 = _round_away(rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale)
+    var y1 = _round_away(rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale)
+    var bh = Scalar[acc](max(y1 - y0, 1)) / Scalar[acc](ph)
+    var bw = Scalar[acc](max(x1 - x0, 1)) / Scalar[acc](pw)
+    # Upstream PS pooling clips forward to size-1, backward to size.
+    var ymax = h if backward else h - 1
+    var xmax = w if backward else w - 1
+    var ys = min(max(y0 + Int(floor(Scalar[acc](by) * bh)), 0), ymax)
+    var ye = min(max(y0 + Int(ceil(Scalar[acc](by + 1) * bh)), 0), ymax)
+    var xs = min(max(x0 + Int(floor(Scalar[acc](bx) * bw)), 0), xmax)
+    var xe = min(max(x0 + Int(ceil(Scalar[acc](bx + 1) * bw)), 0), xmax)
+    return (batch, ys, ye, xs, xe)
+
+
+@always_inline
+def _ps_add[
+    dt: DType
+](
+    output: Pointer[Scalar[dt], MutAnyOrigin],
+    offset: Int,
+    value: Scalar[dt],
+    count: Int,
+):
+    comptime if dt == DType.float16 and is_nvidia_gpu():
+        _pool_add_half(output.unsafe_offset(offset), value, offset, count)
+    else:
+        _add(output.unsafe_offset(offset), value)
+
+
+@__name(
+    "ps_roi_"
+    + ("pool" if pool else "align")
+    + ("_bwd_scatter_" if backward else "_fwd_")
+    + String(dt)
+    + ("_fastdiv" if fast else "_i64")
+)
+def _ps_roi[
+    dt: DType, acc: DType, out_dt: DType, pool: Bool, backward: Bool, fast: Bool
+](
+    input: Pointer[Scalar[dt], MutAnyOrigin],
+    rois: Pointer[Scalar[dt], MutAnyOrigin],
+    output: Pointer[Scalar[out_dt], MutAnyOrigin],
+    mapping: Pointer[Int32, MutAnyOrigin],
+    n64: Int64,
+    c64: Int64,
+    h64: Int64,
+    w64: Int64,
+    k64: Int64,
+    ph64: Int64,
+    pw64: Int64,
+    scale: Scalar[acc],
+    sampling64: Int64,
+    div_pw: SIMD[DType.uint32, 4],
+    div_ph: SIMD[DType.uint32, 4],
+    div_c: SIMD[DType.uint32, 4],
+):
+    var n = Int(n64)
+    var c = Int(c64)
+    var h = Int(h64)
+    var w = Int(w64)
+    var ph = Int(ph64)
+    var pw = Int(pw64)
+    var co = c // (ph * pw)
+    comptime idt = DType.int32 if fast else DType.int64
+    var count = Scalar[idt](Int(k64) * c)
+    var index = Scalar[idt](block_idx.x) * BLOCK + Scalar[idt](thread_idx.x)
+    while index < count:
+        var i = Int(index)
+        var (bx, by, channel, roi) = _coordinates[fast](
+            i, co, ph, pw, div_pw, div_ph, div_c
+        )
+        var ci = (channel * ph + by) * pw + bx
+        comptime if backward:
+            ci = Int(mapping[unsafe_offset=i])
+        else:
+            mapping[unsafe_offset=i] = Int32(ci)
+            output[unsafe_offset=i] = 0
+        if ci < 0 or ci >= c or not _valid_roi(rois, roi, n, scale):
+            index += Scalar[idt](grid_dim.x) * BLOCK
+            continue
+        var batch = Int(rois[unsafe_offset=roi * 5])
+        var base = (batch * c + ci) * h * w
+        comptime if pool:
+            var (_, ys, ye, xs, xe) = _ps_pool_bounds[dt, acc, backward](
+                rois, roi, n, h, w, ph, pw, by, bx, scale
+            )
+            if ye > ys and xe > xs:
+                var area = Scalar[acc]((ye - ys) * (xe - xs))
+                comptime if backward:
+                    var value = (
+                        input[unsafe_offset=i].cast[acc]() / area
+                    ).cast[out_dt]()
+                    for y in range(ys, ye):
+                        for x in range(xs, xe):
+                            _ps_add(
+                                output, base + y * w + x, value, n * c * h * w
+                            )
+                else:
+                    var value = Scalar[acc](0)
+                    for y in range(ys, ye):
+                        for x in range(xs, xe):
+                            value += input[unsafe_offset=base + y * w + x].cast[
+                                acc
+                            ]()
+                    output[unsafe_offset=i] = (value / area).cast[out_dt]()
+        else:
+            var x0 = rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale - 0.5
+            var y0 = rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale - 0.5
+            var rw = (
+                rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale - 0.5 - x0
+            )
+            var rh = (
+                rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale - 0.5 - y0
+            )
+            var bh = rh / Scalar[acc](ph)
+            var bw = rw / Scalar[acc](pw)
+            var gh = Int(sampling64) if sampling64 > 0 else Int(ceil(bh))
+            var gw = Int(sampling64) if sampling64 > 0 else Int(ceil(bw))
+            var samples = Scalar[acc](gh * gw)
+            var value = Scalar[acc](0)
+            for iy in range(gh):
+                var y = (
+                    y0
+                    + Scalar[acc](by) * bh
+                    + (Scalar[acc](iy) + 0.5) * bh / Scalar[acc](gh)
+                )
+                for ix in range(gw):
+                    var x = (
+                        x0
+                        + Scalar[acc](bx) * bw
+                        + (Scalar[acc](ix) + 0.5) * bw / Scalar[acc](gw)
+                    )
+                    comptime if backward:
+                        if (
+                            y < -1
+                            or y > Scalar[acc](h)
+                            or x < -1
+                            or x > Scalar[acc](w)
+                        ):
+                            continue
+                        var (yl, yh, ly) = _axis(y, h)
+                        var (xl, xh, lx) = _axis(x, w)
+                        var grad = input[unsafe_offset=i].cast[acc]()
+                        _ps_add(
+                            output,
+                            base + yl * w + xl,
+                            (grad * ((1 - ly) * (1 - lx)) / samples).cast[
+                                out_dt
+                            ](),
+                            n * c * h * w,
+                        )
+                        _ps_add(
+                            output,
+                            base + yl * w + xh,
+                            (grad * ((1 - ly) * lx) / samples).cast[out_dt](),
+                            n * c * h * w,
+                        )
+                        _ps_add(
+                            output,
+                            base + yh * w + xl,
+                            (grad * (ly * (1 - lx)) / samples).cast[out_dt](),
+                            n * c * h * w,
+                        )
+                        _ps_add(
+                            output,
+                            base + yh * w + xh,
+                            (grad * (ly * lx) / samples).cast[out_dt](),
+                            n * c * h * w,
+                        )
+                    else:
+                        value += _sample(input, base, y, x, h, w)
+            comptime if not backward:
+                output[unsafe_offset=i] = (value / samples).cast[out_dt]()
+        index += Scalar[idt](grid_dim.x) * BLOCK
+
+
+def _enqueue_ps[
+    dt: DType, pool: Bool, backward: Bool, fast: Bool
+](argv: Argv, blocks: Int) raises:
+    comptime acc = DType.float64 if dt == DType.float64 else DType.float32
+    comptime out_dt = DType.float32 if backward and dt == DType.float16 and not has_nvidia_gpu_accelerator() else dt
+    var input = _make_ptr[dt](
+        _raw_int(argv[unsafe_offset=0])
+    ).as_unsafe_any_origin()
+    var rois = _make_ptr[dt](
+        _raw_int(argv[unsafe_offset=1])
+    ).as_unsafe_any_origin()
+    var output = _make_ptr[out_dt](
+        _raw_int(argv[unsafe_offset=2])
+    ).as_unsafe_any_origin()
+    var mapping = Pointer[Int32, MutAnyOrigin](
+        unsafe_from_address=_raw_int(argv[unsafe_offset=3])
+    )
+    var n = Int64(_raw_int(argv[unsafe_offset=4]))
+    var c = Int64(_raw_int(argv[unsafe_offset=5]))
+    var h = Int64(_raw_int(argv[unsafe_offset=6]))
+    var w = Int64(_raw_int(argv[unsafe_offset=7]))
+    var k = Int64(_raw_int(argv[unsafe_offset=8]))
+    var ph = Int64(_raw_int(argv[unsafe_offset=9]))
+    var pw = Int64(_raw_int(argv[unsafe_offset=10]))
+    var scale = Scalar[acc](_raw_f64(argv[unsafe_offset=11]))
+    var sampling = Int64(_raw_int(argv[unsafe_offset=12]))
+    var ctx = _raw_ctx(argv[unsafe_offset=14])
+    var div_pw = SIMD[DType.uint32, 4](0)
+    var div_ph = SIMD[DType.uint32, 4](0)
+    var div_c = SIMD[DType.uint32, 4](0)
+    comptime if fast:
+        div_pw = _divisor(Int(pw))
+        div_ph = _divisor(Int(ph))
+        div_c = _divisor(Int(c // (ph * pw)))
+    _enqueue_cached[_ps_roi[dt, acc, out_dt, pool, backward, fast]](
+        ctx,
+        "ps_roi_" + String(dt) + String(pool) + String(backward) + String(fast),
+        blocks,
+        1,
+        1,
+        BLOCK,
+        input,
+        rois,
+        output,
+        mapping,
+        n,
+        c,
+        h,
+        w,
+        k,
+        ph,
+        pw,
+        scale,
+        sampling,
+        div_pw,
+        div_ph,
+        div_c,
+    )
+    _ = ctx
+
+
+def _launch_ps[
+    dt: DType, pool: Bool, backward: Bool
+](argv: Argv, argc: Int) raises:
+    if argc != 15:
+        raise Error("PS ROI kernel expects 15 argument slots")
+    var ctx = _raw_ctx(argv[unsafe_offset=14])
+    comptime if backward:
+        comptime out_dt = DType.float32 if dt == DType.float16 and not has_nvidia_gpu_accelerator() else dt
+        var count = (
+            _raw_int(argv[unsafe_offset=4])
+            * _raw_int(argv[unsafe_offset=5])
+            * _raw_int(argv[unsafe_offset=6])
+            * _raw_int(argv[unsafe_offset=7])
+        )
+        if count:
+            var output = _make_ptr[out_dt](_raw_int(argv[unsafe_offset=2]))
+            var buffer = DeviceBuffer[out_dt](
+                ctx,
+                output.unsafe_origin_cast[MutUntrackedOrigin](),
+                count,
+                owning=False,
+            )
+            ctx.enqueue_memset(buffer, Scalar[out_dt](0))
+            _ = buffer
+    var count = _raw_int(argv[unsafe_offset=8]) * _raw_int(
+        argv[unsafe_offset=5]
+    )
+    if count == 0:
+        return
+    var cap = BACKWARD_BLOCKS_PER_SM if backward else FORWARD_BLOCKS_PER_SM
+    var blocks = min(ceildiv(count, BLOCK), _device_sm_count(ctx) * cap)
+    if count <= 2147483647 - blocks * BLOCK:
+        _enqueue_ps[dt, pool, backward, True](argv, blocks)
+    else:
+        _enqueue_ps[dt, pool, backward, False](argv, blocks)
+    _ = ctx
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -804,6 +1099,18 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                     return 0
                 elif _op_on["RoiPoolBackward"]():
                     _launch[dt, True, True](argv, argc)
+                    return 0
+                elif _op_on["PsRoiAlignForward"]():
+                    _launch_ps[dt, False, False](argv, argc)
+                    return 0
+                elif _op_on["PsRoiAlignBackward"]():
+                    _launch_ps[dt, False, True](argv, argc)
+                    return 0
+                elif _op_on["PsRoiPoolForward"]():
+                    _launch_ps[dt, True, False](argv, argc)
+                    return 0
+                elif _op_on["PsRoiPoolBackward"]():
+                    _launch_ps[dt, True, True](argv, argc)
                     return 0
         raise Error(NO_OP_COMPILED)
     except e:

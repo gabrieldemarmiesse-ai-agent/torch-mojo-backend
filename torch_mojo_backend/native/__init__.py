@@ -248,7 +248,14 @@ def autocast_policy_table() -> str:
                 )
             lines.append(f'{{"aten::{key}", 6, "{target}"}},')
     # torchvision 0.26 autocast/*.cpp: ROI wrappers restore input dtype.
-    for name, policy in (("nms", 2), ("roi_align", 7), ("roi_pool", 7)):
+    for name, policy in (
+        ("nms", 2),
+        ("roi_align", 7),
+        ("roi_pool", 7),
+        ("ps_roi_align", 7),
+        ("ps_roi_pool", 7),
+        ("deform_conv2d", 7),
+    ):
         lines.append(f'{{"torchvision::{name}", {policy}}},')
     return "\n".join(lines) + "\n"
 

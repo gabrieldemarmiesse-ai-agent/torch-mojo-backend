@@ -22,6 +22,7 @@ from ops_compare import register_compare
 from ops_composed import register_composed
 from ops_core import register_core
 from ops_data_movement import register_data_movement
+from ops_deform_conv import register_deform_conv
 from ops_factories import register_factories
 from ops_foreach import register_foreach
 from ops_matmul import register_matmul
@@ -69,6 +70,7 @@ def _register_ops(lib: Int, prebuild: Bool = False) raises:
 
 
 def _register_detection(lib: Int, prebuild: Bool = False) raises:
+    _group[register_deform_conv](lib, "ops_deform_conv", prebuild)
     _group[register_nms](lib, "ops_nms", prebuild)
     _group[register_roi](lib, "ops_roi", prebuild)
 

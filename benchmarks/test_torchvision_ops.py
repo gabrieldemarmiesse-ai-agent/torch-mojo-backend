@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import ModuleType
 
 import pytest
@@ -29,7 +30,52 @@ COVERS = {
     "torchvision::roi_pool": "test_roi_pool",
     "torchvision::_roi_pool_backward": "test_roi_pool_backward",
 }
+COVERS.update(
+    {
+        "torchvision::ps_roi_align": "test_ps_roi_align",
+        "torchvision::_ps_roi_align_backward": "test_ps_roi_align_backward",
+        "torchvision::ps_roi_pool": "test_ps_roi_pool",
+        "torchvision::_ps_roi_pool_backward": "test_ps_roi_pool_backward",
+        "torchvision::deform_conv2d": "test_deform_conv2d",
+        "torchvision::_deform_conv2d_backward": "test_deform_conv2d_backward",
+    }
+)
 SKIPPED = {}
+PS_SHAPES = {
+    "N2C490H64W64K300_o7_s2": (2, 490, 64, 64, 300, 7, 7, 2),
+    "N3C105H37W53K19_o7x5_adaptive": (3, 105, 37, 53, 19, 7, 5, -1),
+}
+# N, C, O, H, W, kernel, stride, padding, dilation, groups, offset groups, mask.
+DEFORM_SHAPES = {
+    "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": (
+        8,
+        256,
+        256,
+        64,
+        64,
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        True,
+    ),
+    "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": (
+        3,
+        12,
+        10,
+        17,
+        23,
+        3,
+        2,
+        2,
+        2,
+        2,
+        3,
+        False,
+    ),
+}
 
 
 @pytest.fixture
@@ -187,3 +233,215 @@ def test_nms(
         lambda: vision.ops.nms(b_our, s_our, 0.5),
         flops=float(k * k * 12),
     )
+
+
+def _ps_call(
+    kind: str,
+    backward: bool,
+    x: torch.Tensor,
+    rois: torch.Tensor,
+    grad: torch.Tensor,
+    shape: tuple[int, int, int, int, int, int, int, int],
+) -> Callable[[], object]:
+    n, c, h, w, _, ph, pw, sampling = shape
+    args = (x, rois, 1.0, ph, pw)
+
+    def forward() -> tuple[torch.Tensor, torch.Tensor]:
+        if kind == "align":
+            return torch.ops.torchvision.ps_roi_align(*args, sampling)
+        return torch.ops.torchvision.ps_roi_pool(*args)
+
+    if not backward:
+        return forward
+    _, mapping = forward()
+    if kind == "align":
+        return lambda: torch.ops.torchvision._ps_roi_align_backward(
+            grad, rois, mapping, 1.0, ph, pw, sampling, n, c, h, w
+        )
+    return lambda: torch.ops.torchvision._ps_roi_pool_backward(
+        grad, rois, mapping, 1.0, ph, pw, n, c, h, w
+    )
+
+
+def _bench_ps(
+    kind: str,
+    backward: bool,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    shape = PS_SHAPES[shape_id]
+    _, c, _, _, k, ph, pw, _ = shape
+    x, rois = _roi_inputs(shape, DTYPES[dtype_id])
+    grad = torch.randn(
+        k,
+        c // (ph * pw),
+        ph,
+        pw,
+        dtype=DTYPES[dtype_id],
+        generator=torch.Generator().manual_seed(1),
+    )
+    with gpu_lock():
+        x_ref, x_our = both(x, hw, mojo_device)
+        r_ref, r_our = both(rois, hw, mojo_device)
+        g_ref, g_our = both(grad, hw, mojo_device)
+        ref = _ps_call(kind, backward, x_ref, r_ref, g_ref, shape)
+        ours = _ps_call(kind, backward, x_our, r_our, g_our, shape)
+    bench.run(ref, ours, flops=float(k * c * 32))
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", PS_SHAPES)
+@pytest.mark.bench_op("torchvision::ps_roi_align")
+def test_ps_roi_align(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_ps("align", False, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", PS_SHAPES)
+@pytest.mark.bench_op("torchvision::_ps_roi_align_backward")
+def test_ps_roi_align_backward(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_ps("align", True, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", PS_SHAPES)
+@pytest.mark.bench_op("torchvision::ps_roi_pool")
+def test_ps_roi_pool(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_ps("pool", False, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", PS_SHAPES)
+@pytest.mark.bench_op("torchvision::_ps_roi_pool_backward")
+def test_ps_roi_pool_backward(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_ps("pool", True, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+def _deform_inputs(
+    shape: tuple[int, int, int, int, int, int, int, int, int, int, int, bool],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, ...]:
+    n, c, o, h, w, k, stride, pad, dilation, groups, offset_groups, use_mask = shape
+    oh = (h + 2 * pad - dilation * (k - 1) - 1) // stride + 1
+    ow = (w + 2 * pad - dilation * (k - 1) - 1) // stride + 1
+    generator = torch.Generator().manual_seed(312)
+    x = torch.randn(n, c, h, w, generator=generator).to(dtype)
+    weight = (torch.randn(o, c // groups, k, k, generator=generator) * 0.05).to(dtype)
+    offset = (
+        torch.rand(n, 2 * offset_groups * k * k, oh, ow, generator=generator) - 0.5
+    ).to(dtype)
+    mask = (
+        torch.rand(n, offset_groups * k * k, oh, ow, generator=generator).to(dtype)
+        if use_mask
+        else torch.zeros(n, 1, dtype=dtype)
+    )
+    bias = torch.randn(o, generator=generator).to(dtype)
+    grad = torch.randn(n, o, oh, ow, generator=generator).to(dtype)
+    return x, weight, offset, mask, bias, grad
+
+
+def _deform_call(
+    tensors: tuple[torch.Tensor, ...],
+    shape: tuple[int, int, int, int, int, int, int, int, int, int, int, bool],
+    backward: bool,
+) -> Callable[[], object]:
+    _, _, _, _, _, _, stride, pad, dilation, groups, offset_groups, use_mask = shape
+    x, weight, offset, mask, bias, grad = tensors
+    args = (
+        x,
+        weight,
+        offset,
+        mask,
+        bias,
+        stride,
+        stride,
+        pad,
+        pad,
+        dilation,
+        dilation,
+        groups,
+        offset_groups,
+        use_mask,
+    )
+    if backward:
+        return lambda: torch.ops.torchvision._deform_conv2d_backward(grad, *args)
+    return lambda: torch.ops.torchvision.deform_conv2d(*args)
+
+
+def _bench_deform(
+    backward: bool,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    shape = DEFORM_SHAPES[shape_id]
+    tensors = _deform_inputs(shape, DTYPES[dtype_id])
+    with gpu_lock():
+        pairs = [both(t, hw, mojo_device) for t in tensors]
+        ref = _deform_call(tuple(p[0] for p in pairs), shape, backward)
+        ours = _deform_call(tuple(p[1] for p in pairs), shape, backward)
+    n, c, o, _, _, k, _, _, _, groups, _, _ = shape
+    oh, ow = tensors[-1].shape[-2:]
+    flops = 2 * n * o * oh * ow * (c // groups) * k * k
+    bench.run(ref, ours, flops=float(flops * (3 if backward else 1)))
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", DEFORM_SHAPES)
+@pytest.mark.bench_op("torchvision::deform_conv2d")
+def test_deform_conv2d(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_deform(False, shape_id, dtype_id, bench, hw, mojo_device)
+
+
+@pytest.mark.parametrize("dtype_id", ["f32", "f16"])
+@pytest.mark.parametrize("shape_id", DEFORM_SHAPES)
+@pytest.mark.bench_op("torchvision::_deform_conv2d_backward")
+def test_deform_conv2d_backward(
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+    vision: ModuleType,
+):
+    _bench_deform(True, shape_id, dtype_id, bench, hw, mojo_device)

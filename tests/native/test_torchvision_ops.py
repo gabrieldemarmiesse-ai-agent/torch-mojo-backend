@@ -358,6 +358,682 @@ def test_roi_pool_argmax(mojo_gpu: str):
     torch.testing.assert_close(got_argmax.cpu(), want_argmax)
 
 
+def _ps_roi_op(
+    kind: str,
+    x: torch.Tensor,
+    rois: torch.Tensor,
+    output: tuple[int, int] = (3, 5),
+    scale: float = 1.0,
+    sampling: int = 2,
+) -> torch.Tensor:
+    if kind == "align":
+        return vision.ops.ps_roi_align(x, rois, output, scale, sampling)
+    return vision.ops.ps_roi_pool(x, rois, output, scale)
+
+
+def _check_ps_roi(
+    device: str,
+    kind: str,
+    dtype: torch.dtype,
+    scale: float = 1.0,
+    sampling: int = 2,
+    empty: bool = False,
+    noncontiguous: bool = False,
+):
+    _dtype_supported(device, dtype)
+    generator = torch.Generator().manual_seed(201)
+    data = torch.randn(3, 45, 37, 53, generator=generator).to(dtype)
+    rois = _rois(scale, dtype)
+    rois[-1, 3:] += 1 / scale
+    if empty:
+        rois = rois[:0]
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference = data.to(reference_dtype).detach().requires_grad_()
+    ours = data.to(device).detach().requires_grad_()
+    reference_input, device_input = reference, ours
+    device_rois = rois.to(device)
+    if noncontiguous:
+        reference_input = reference.transpose(2, 3)
+        device_input = ours.transpose(2, 3)
+        rois = rois.t().contiguous().t()
+        device_rois = rois.t().contiguous().to(device).t()
+    expected = _ps_roi_op(
+        kind, reference_input, rois.to(reference_dtype), scale=scale, sampling=sampling
+    )
+    result = _ps_roi_op(kind, device_input, device_rois, scale=scale, sampling=sampling)
+    assert result.shape == (rois.shape[0], 3, 3, 5)
+    assert result.dtype == dtype
+    _assert_close(result, expected, dtype)
+    grad = torch.randn(result.shape, generator=generator).to(dtype)
+    if noncontiguous:
+        grad = grad.transpose(2, 3).contiguous().transpose(2, 3)
+    expected.backward(grad.to(reference_dtype))
+    device_grad = grad.transpose(2, 3).contiguous().to(device).transpose(2, 3)
+    result.backward(device_grad)
+    assert reference.grad is not None and ours.grad is not None
+    _assert_close(ours.grad, reference.grad, dtype)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_ps_roi_forward_backward(
+    mojo_gpu: str, kind: str, dtype: torch.dtype, noncontiguous: bool
+):
+    _check_ps_roi(mojo_gpu, kind, dtype, noncontiguous=noncontiguous)
+
+
+@pytest.mark.parametrize("sampling", [-1, 0, 1, 3])
+@pytest.mark.parametrize("scale", [1.0, 0.25, 1 / 16])
+def test_ps_roi_align_sampling(mojo_gpu: str, sampling: int, scale: float):
+    _check_ps_roi(mojo_gpu, "align", torch.float32, scale, sampling)
+
+
+@pytest.mark.parametrize("scale", [0.25, 1 / 16])
+def test_ps_roi_pool_scale(mojo_gpu: str, scale: float):
+    _check_ps_roi(mojo_gpu, "pool", torch.float32, scale)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_ps_roi_empty(mojo_gpu: str, kind: str, dtype: torch.dtype):
+    _check_ps_roi(mojo_gpu, kind, dtype, empty=True)
+
+
+@pytest.mark.parametrize("sampling", [-1, 0, 2])
+def test_ps_roi_align_zero_area(mojo_gpu: str, sampling: int):
+    data = torch.arange(4 * 7 * 9, dtype=torch.float32).reshape(1, 4, 7, 9)
+    rois = torch.tensor([[0.0, 2.0, 3.0, 2.0, 3.0]])
+    reference = data.detach().requires_grad_()
+    ours = data.to(mojo_gpu).requires_grad_()
+    expected = _ps_roi_op("align", reference, rois, (2, 2), sampling=sampling)
+    result = _ps_roi_op("align", ours, rois.to(mojo_gpu), (2, 2), sampling=sampling)
+    torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+    expected.backward(torch.ones_like(expected))
+    result.backward(torch.ones(result.shape).to(mojo_gpu))
+    assert reference.grad is not None and ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), reference.grad, equal_nan=True)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_ps_roi_channel_mapping(mojo_gpu: str, kind: str, dtype: torch.dtype):
+    _dtype_supported(mojo_gpu, dtype)
+    data = torch.arange(30, dtype=dtype).reshape(1, 30, 1, 1).expand(1, 30, 9, 11)
+    rois = torch.tensor([[0, 1, 1, 8, 7], [0, -9, -8, -6, -4]], dtype=dtype)
+    op = getattr(torch.ops.torchvision, f"ps_roi_{kind}")
+    args = (1.0, 3, 5, 2) if kind == "align" else (1.0, 3, 5)
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    expected, mapping = op(data.to(reference_dtype), rois.to(reference_dtype), *args)
+    result, actual_mapping = op(
+        data.contiguous().to(mojo_gpu), rois.to(mojo_gpu), *args
+    )
+    _assert_close(result, expected, dtype)
+    assert actual_mapping.dtype == torch.int32
+    assert not actual_mapping.requires_grad
+    torch.testing.assert_close(actual_mapping.cpu(), mapping)
+    torch.testing.assert_close(
+        mapping[0].flatten(), torch.arange(30, dtype=torch.int32)
+    )
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+def test_ps_roi_module(mojo_gpu: str, kind: str):
+    module = (
+        vision.ops.PSRoIAlign((3, 5), 0.25, 2)
+        if kind == "align"
+        else vision.ops.PSRoIPool((3, 5), 0.25)
+    )
+    data = torch.randn(3, 45, 37, 53, generator=torch.Generator().manual_seed(202))
+    rois = _rois(0.25)
+    _assert_close(
+        module(data.to(mojo_gpu), rois.to(mojo_gpu)), module(data, rois), data.dtype
+    )
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_ps_roi_autocast(mojo_gpu: str, kind: str, dtype: torch.dtype):
+    data = torch.randn(3, 30, 37, 53, generator=torch.Generator().manual_seed(203)).to(
+        dtype
+    )
+    rois = _rois(dtype=dtype)
+    reference = data.float().detach().requires_grad_()
+    ours = data.to(mojo_gpu).detach().requires_grad_()
+    expected = _ps_roi_op(kind, reference, rois.float())
+    op = getattr(torch.ops.torchvision, f"ps_roi_{kind}")
+    args = (1.0, 3, 5, 2) if kind == "align" else (1.0, 3, 5)
+    _, mapping = op(reference.detach(), rois.float(), *args)
+    with torch.autocast("mojo", dtype=torch.float16):
+        result = _ps_roi_op(kind, ours, rois.to(mojo_gpu))
+        tuple_result, actual_mapping = op(ours, rois.to(mojo_gpu), *args)
+    assert result.dtype == dtype and actual_mapping.dtype == dtype
+    assert not actual_mapping.requires_grad
+    _assert_close(result, expected, dtype)
+    _assert_close(tuple_result, expected, dtype)
+    torch.testing.assert_close(actual_mapping.cpu(), mapping.to(dtype))
+    grad = torch.randn(result.shape, generator=torch.Generator().manual_seed(204)).to(
+        dtype
+    )
+    expected.backward(grad.float())
+    result.backward(grad.to(mojo_gpu))
+    assert reference.grad is not None and ours.grad is not None
+    _assert_close(ours.grad, reference.grad, dtype)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("warn_only", [False, True])
+def test_ps_roi_deterministic_algorithms(
+    mojo_gpu: str, kind: str, empty: bool, warn_only: bool
+):
+    data = torch.ones(1, 6, 5, 7)
+    ours = data.to(mojo_gpu).requires_grad_()
+    rois = torch.tensor([[0.0, 0.0, 0.0, 6.0, 4.0]])[: 0 if empty else 1]
+    result = _ps_roi_op(kind, ours, rois.to(mojo_gpu), (3, 2))
+    grad = torch.ones(result.shape).to(mojo_gpu)
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        if empty:
+            result.backward(grad)
+            assert ours.grad is not None
+            torch.testing.assert_close(ours.grad.cpu(), torch.zeros_like(data))
+        elif warn_only:
+            with pytest.warns(UserWarning, match=f"ps_roi_{kind}_backward_kernel"):
+                result.backward(grad)
+        else:
+            with pytest.raises(RuntimeError, match=f"ps_roi_{kind}_backward_kernel"):
+                result.backward(grad)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn)
+
+
+def _deform_data(
+    dtype: torch.dtype,
+    groups: int = 1,
+    offset_groups: int = 1,
+    stride: tuple[int, int] = (1, 1),
+    padding: tuple[int, int] = (1, 1),
+    dilation: tuple[int, int] = (1, 1),
+    batch: int = 2,
+) -> tuple[torch.Tensor, ...]:
+    generator = torch.Generator().manual_seed(205)
+    height, width = 9, 13
+    kernel_h, kernel_w = 3, 2
+    out_h = (height + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[
+        0
+    ] + 1
+    out_w = (width + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
+    data = torch.randn(batch, 6, height, width, generator=generator) * 0.2
+    weight = torch.randn(6, 6 // groups, kernel_h, kernel_w, generator=generator) * 0.2
+    offset = (
+        torch.randn(
+            batch,
+            2 * offset_groups * kernel_h * kernel_w,
+            out_h,
+            out_w,
+            generator=generator,
+        )
+        * 0.7
+    )
+    mask = torch.rand(
+        batch, offset_groups * kernel_h * kernel_w, out_h, out_w, generator=generator
+    )
+    bias = torch.randn(6, generator=generator) * 0.2
+    return tuple(tensor.to(dtype) for tensor in (data, offset, weight, bias, mask))
+
+
+def _deform_op(
+    tensors: tuple[torch.Tensor, ...],
+    use_mask: bool,
+    use_bias: bool,
+    stride: tuple[int, int] = (1, 1),
+    padding: tuple[int, int] = (1, 1),
+    dilation: tuple[int, int] = (1, 1),
+) -> torch.Tensor:
+    data, offset, weight, bias, mask = tensors
+    return vision.ops.deform_conv2d(
+        data,
+        offset,
+        weight,
+        bias if use_bias else None,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        mask=mask if use_mask else None,
+    )
+
+
+def _check_deform(
+    device: str,
+    dtype: torch.dtype,
+    groups: int = 1,
+    offset_groups: int = 1,
+    use_mask: bool = True,
+    use_bias: bool = True,
+    stride: tuple[int, int] = (1, 1),
+    padding: tuple[int, int] = (1, 1),
+    dilation: tuple[int, int] = (1, 1),
+    batch: int = 2,
+    noncontiguous: bool = False,
+    autocast: bool = False,
+):
+    _dtype_supported(device, dtype)
+    tensors = _deform_data(
+        dtype, groups, offset_groups, stride, padding, dilation, batch
+    )
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference = tuple(t.to(reference_dtype).detach().requires_grad_() for t in tensors)
+    ours = tuple(t.to(device).detach().requires_grad_() for t in tensors)
+    if noncontiguous:
+        reference = tuple(
+            t.t().contiguous().t().detach().requires_grad_()
+            if t.ndim == 2
+            else t.transpose(0, -1)
+            .contiguous()
+            .transpose(0, -1)
+            .detach()
+            .requires_grad_()
+            for t in reference
+        )
+        ours = tuple(
+            t.transpose(0, -1)
+            .contiguous()
+            .to(device)
+            .transpose(0, -1)
+            .detach()
+            .requires_grad_()
+            for t in tensors
+        )
+    expected = _deform_op(reference, use_mask, use_bias, stride, padding, dilation)
+    with torch.autocast("mojo", dtype=torch.float16, enabled=autocast):
+        result = _deform_op(ours, use_mask, use_bias, stride, padding, dilation)
+    assert result.dtype == dtype
+    _assert_close(result, expected, dtype)
+    grad = (
+        torch.randn(result.shape, generator=torch.Generator().manual_seed(206)) * 0.2
+    ).to(dtype)
+    expected.backward(grad.to(reference_dtype))
+    result.backward(grad.to(device))
+    for index, (actual, wanted) in enumerate(zip(ours, reference, strict=True)):
+        if (index == 3 and not use_bias) or (index == 4 and not use_mask):
+            assert actual.grad is None and wanted.grad is None
+        else:
+            assert actual.grad is not None and wanted.grad is not None
+            _assert_close(actual.grad, wanted.grad, dtype)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "use_mask,use_bias", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_deform_conv2d_forward_backward(
+    mojo_gpu: str, dtype: torch.dtype, use_mask: bool, use_bias: bool
+):
+    _check_deform(mojo_gpu, dtype, use_mask=use_mask, use_bias=use_bias)
+
+
+@pytest.mark.parametrize(
+    "groups,offset_groups", [(1, 3), (2, 1), (2, 3), (3, 2), (6, 6)]
+)
+@pytest.mark.parametrize(
+    "stride,padding,dilation", [((2, 1), (0, 2), (1, 2)), ((1, 2), (2, 1), (2, 1))]
+)
+def test_deform_conv2d_groups_geometry(
+    mojo_gpu: str,
+    groups: int,
+    offset_groups: int,
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+):
+    _check_deform(
+        mojo_gpu,
+        torch.float32,
+        groups,
+        offset_groups,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+    )
+
+
+@pytest.mark.parametrize("batch", [33, 34])
+@pytest.mark.parametrize("groups", [1, 2])
+def test_deform_conv2d_batch_chunks(mojo_gpu: str, batch: int, groups: int):
+    _check_deform(mojo_gpu, torch.float32, groups=groups, offset_groups=3, batch=batch)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_deform_conv2d_noncontiguous(mojo_gpu: str, dtype: torch.dtype):
+    _check_deform(mojo_gpu, dtype, groups=2, offset_groups=3, noncontiguous=True)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_deform_conv2d_empty(mojo_gpu: str, dtype: torch.dtype, use_mask: bool):
+    _check_deform(mojo_gpu, dtype, use_mask=use_mask, batch=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("use_mask,use_bias", [(False, False), (True, True)])
+def test_deform_conv2d_autocast(
+    mojo_gpu: str, dtype: torch.dtype, use_mask: bool, use_bias: bool
+):
+    _check_deform(mojo_gpu, dtype, use_mask=use_mask, use_bias=use_bias, autocast=True)
+
+
+def test_deform_conv2d_module(mojo_gpu: str):
+    data, offset, weight, bias, mask = _deform_data(
+        torch.float32, groups=2, offset_groups=3
+    )
+    module = vision.ops.DeformConv2d(6, 6, (3, 2), padding=(1, 1), groups=2)
+    with torch.no_grad():
+        module.weight.copy_(weight)
+        assert module.bias is not None
+        module.bias.copy_(bias)
+    reference = data.detach().requires_grad_()
+    expected = module(reference, offset, mask)
+    expected.backward(torch.ones_like(expected))
+    expected_weight = module.weight.grad
+    expected_bias = module.bias.grad
+    module.zero_grad(set_to_none=True)
+    module.to(mojo_gpu)
+    ours = data.to(mojo_gpu).requires_grad_()
+    result = module(ours, offset.to(mojo_gpu), mask.to(mojo_gpu))
+    result.backward(torch.ones(result.shape).to(mojo_gpu))
+    _assert_close(result, expected, data.dtype)
+    assert ours.grad is not None and reference.grad is not None
+    _assert_close(ours.grad, reference.grad, data.dtype)
+    assert module.weight.grad is not None and expected_weight is not None
+    assert module.bias.grad is not None and expected_bias is not None
+    _assert_close(module.weight.grad, expected_weight, data.dtype)
+    _assert_close(module.bias.grad, expected_bias, data.dtype)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("warn_only", [False, True])
+def test_deform_conv2d_deterministic_algorithms(
+    mojo_gpu: str, empty: bool, warn_only: bool
+):
+    tensors = _deform_data(torch.float32, batch=0 if empty else 1)
+    ours = tuple(t.to(mojo_gpu).requires_grad_() for t in tensors)
+    result = _deform_op(ours, True, True)
+    grad = torch.ones(result.shape).to(mojo_gpu)
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        if empty:
+            result.backward(grad)
+            for tensor in ours:
+                assert tensor.grad is not None
+                torch.testing.assert_close(
+                    tensor.grad.cpu(), torch.zeros_like(tensor.cpu())
+                )
+        elif warn_only:
+            with pytest.warns(UserWarning, match="compute_grad_input"):
+                result.backward(grad)
+        else:
+            with pytest.raises(RuntimeError, match="compute_grad_input"):
+                result.backward(grad)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_ps_roi_overlapping_backward(mojo_gpu: str, kind: str, dtype: torch.dtype):
+    _dtype_supported(mojo_gpu, dtype)
+    data = (torch.arange(30 * 11 * 13).reshape(1, 30, 11, 13) % 17).to(dtype) / 16
+    rois = torch.tensor([[0, -2, -1, 10, 9]], dtype=dtype).repeat(257, 1)
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference = data.to(reference_dtype).detach().requires_grad_()
+    ours = data.to(mojo_gpu).detach().requires_grad_()
+    expected = _ps_roi_op(kind, reference, rois.to(reference_dtype))
+    result = _ps_roi_op(kind, ours, rois.to(mojo_gpu))
+    grad = (
+        (torch.arange(result.numel()) % 9 - 4).reshape(result.shape).float() / 16
+    ).to(dtype)
+    expected.backward(grad.to(reference_dtype))
+    result.backward(grad.to(mojo_gpu))
+    _assert_close(result, expected, dtype)
+    assert ours.grad is not None and reference.grad is not None
+    _assert_close(ours.grad, reference.grad, dtype)
+
+
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_deform_conv2d_zero_offsets(mojo_gpu: str, use_mask: bool):
+    data, offset, weight, bias, mask = _deform_data(
+        torch.float32, groups=2, offset_groups=3
+    )
+    offset.zero_()
+    mask.fill_(1)
+    expected = torch.nn.functional.conv2d(data, weight, bias, padding=(1, 1), groups=2)
+    ours = tuple(t.to(mojo_gpu) for t in (data, offset, weight, bias, mask))
+    result = _deform_op(ours, use_mask, True)
+    _assert_close(result, expected, data.dtype)
+
+
+@pytest.mark.parametrize("offset_value", [-100.0, -1.0, 0.0, 0.5, 100.0])
+def test_deform_conv2d_offset_boundaries(mojo_gpu: str, offset_value: float):
+    tensors = _deform_data(torch.float32, batch=1)
+    tensors[1].fill_(offset_value)
+    reference = tuple(t.detach().requires_grad_() for t in tensors)
+    ours = tuple(t.detach().to(mojo_gpu).requires_grad_() for t in tensors)
+    expected = _deform_op(reference, True, True)
+    result = _deform_op(ours, True, True)
+    grad = torch.full(expected.shape, 0.125)
+    expected.backward(grad)
+    result.backward(grad.to(mojo_gpu))
+    _assert_close(result, expected, torch.float32)
+    for actual, wanted in zip(ours, reference, strict=True):
+        assert actual.grad is not None and wanted.grad is not None
+        _assert_close(actual.grad, wanted.grad, torch.float32)
+
+
+@pytest.mark.parametrize(
+    ("channels", "out_channels", "height", "width", "offset_groups"),
+    [(64, 128, 65, 67, 2), (65, 132, 67, 69, 5)],
+)
+def test_deform_conv2d_large_matrix(
+    mojo_gpu: str,
+    channels: int,
+    out_channels: int,
+    height: int,
+    width: int,
+    offset_groups: int,
+):
+    data = (torch.arange(2 * channels * height * width) % 17 - 8).float() / 32
+    data = data.reshape(2, channels, height, width)
+    weight = (torch.arange(out_channels * channels * 9) % 13 - 6).float() / 256
+    weight = weight.reshape(out_channels, channels, 3, 3)
+    offset = torch.full((2, 18 * offset_groups, height, width), 0.25)
+    offset[:, 1::2] = -0.25
+    mask = torch.full((2, 9 * offset_groups, height, width), 0.5)
+    bias = (torch.arange(out_channels) % 5 - 2).float() / 16
+    reference = tuple(
+        t.detach().requires_grad_() for t in (data, offset, weight, bias, mask)
+    )
+    ours = tuple(t.detach().to(mojo_gpu).requires_grad_() for t in reference)
+    expected = vision.ops.deform_conv2d(
+        *reference[:3], bias=reference[3], mask=reference[4], padding=1
+    )
+    result = vision.ops.deform_conv2d(*ours[:3], bias=ours[3], mask=ours[4], padding=1)
+    grad = ((torch.arange(expected.numel()) % 7 - 3).float() / 256).reshape(
+        expected.shape
+    )
+    expected.backward(grad)
+    result.backward(grad.to(mojo_gpu))
+    _assert_close(result, expected, torch.float32)
+    for actual, wanted in zip(ours, reference, strict=True):
+        assert actual.grad is not None and wanted.grad is not None
+        _assert_close(actual.grad, wanted.grad, torch.float32)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_deform_conv2d_large_spatial_sampling(mojo_gpu: str, dtype: torch.dtype):
+    height, width = 513, 517
+    data = (
+        ((torch.arange(4 * height * width) % 17 - 8).float() / 16)
+        .reshape(1, 4, height, width)
+        .to(dtype)
+    )
+    weight = (
+        ((torch.arange(2 * 4 * 2 * 2) % 9 - 4).float() / 32)
+        .reshape(2, 4, 2, 2)
+        .to(dtype)
+    )
+    offset = torch.full((1, 8, height - 1, width - 1), 0.25, dtype=dtype)
+    reference = tuple(
+        t.float().detach().requires_grad_() for t in (data, offset, weight)
+    )
+    ours = tuple(
+        t.to(mojo_gpu).detach().requires_grad_() for t in (data, offset, weight)
+    )
+    expected = vision.ops.deform_conv2d(*reference)
+    result = vision.ops.deform_conv2d(*ours)
+    grad = (
+        ((torch.arange(result.numel()) % 7 - 3).float() / 16)
+        .reshape(result.shape)
+        .to(dtype)
+    )
+    expected.backward(grad.float())
+    result.backward(grad.to(mojo_gpu))
+    _assert_close(result, expected, dtype)
+    for actual, wanted in zip(ours, reference, strict=True):
+        assert actual.grad is not None and wanted.grad is not None
+        _assert_close(actual.grad, wanted.grad, dtype)
+
+
+@pytest.mark.parametrize("batch", [0, 2])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_deform_conv2d_ignored_mask_gradient(
+    mojo_gpu: str, batch: int, dtype: torch.dtype
+):
+    _dtype_supported(mojo_gpu, dtype)
+    data = torch.ones(batch, 2, 3, 5, dtype=dtype)
+    weight = torch.full((3, 2, 1, 1), 0.25, dtype=dtype)
+    offset = torch.zeros(batch, 2, 3, 5, dtype=dtype)
+    mask = torch.full((37, 41), 13.0, dtype=dtype).t()
+    bias = torch.zeros(3, dtype=dtype)
+    grad = torch.full((batch, 3, 3, 5), 0.125, dtype=dtype)
+    tensors = (grad, data, weight, offset, mask, bias)
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference = tuple(t.to(reference_dtype) for t in tensors)
+    ours = tuple(t.to(mojo_gpu) for t in tensors)
+    parameters = (1, 1, 0, 0, 1, 1, 1, 1, False)
+    expected = torch.ops.torchvision._deform_conv2d_backward(*reference, *parameters)
+    result = torch.ops.torchvision._deform_conv2d_backward(*ours, *parameters)
+    for actual, wanted in zip(result, expected, strict=True):
+        _assert_close(actual, wanted, dtype)
+    assert result[3].shape == mask.shape
+    torch.testing.assert_close(result[3].cpu(), torch.zeros_like(mask))
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_deform_conv2d_half_offset_knot(mojo_gpu: str, axis: int):
+    height, width = (3, 1) if axis == 0 else (1, 3)
+    data = torch.tensor([0, 1, 5], dtype=torch.float16).reshape(1, 1, height, width)
+    offset = torch.zeros(1, 2, height, width, dtype=torch.float16)
+    offset[0, axis, height // 2, width // 2] = -(2**-12)
+    weight = torch.ones(1, 1, 1, 1, dtype=torch.float16)
+    reference_offset = offset.float().requires_grad_()
+    device_offset = offset.to(mojo_gpu).requires_grad_()
+    expected = vision.ops.deform_conv2d(data.float(), reference_offset, weight.float())
+    result = vision.ops.deform_conv2d(
+        data.to(mojo_gpu), device_offset, weight.to(mojo_gpu)
+    )
+    grad = torch.zeros_like(data)
+    grad[0, 0, height // 2, width // 2] = 1
+    expected.backward(grad.float())
+    result.backward(grad.to(mojo_gpu))
+    assert reference_offset.grad is not None and device_offset.grad is not None
+    assert reference_offset.grad[0, axis, height // 2, width // 2] == 1
+    _assert_close(result, expected, data.dtype)
+    _assert_close(device_offset.grad, reference_offset.grad, data.dtype)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_deform_conv2d_half_spatial_bound(mojo_gpu: str, axis: int):
+    height, width = (2049, 1) if axis == 0 else (1, 2049)
+    data = torch.zeros(1, 1, height, width, dtype=torch.float16)
+    data[0, 0, -1, -1] = 2
+    offset = torch.zeros(1, 2, height, width, dtype=torch.float16)
+    weight = torch.full((1, 1, 1, 1), 3.0, dtype=torch.float16)
+    reference = data.float().requires_grad_()
+    reference_offset = offset.float().requires_grad_()
+    ours = data.to(mojo_gpu).requires_grad_()
+    device_offset = offset.to(mojo_gpu).requires_grad_()
+    expected = vision.ops.deform_conv2d(reference, reference_offset, weight.float())
+    result = vision.ops.deform_conv2d(ours, device_offset, weight.to(mojo_gpu))
+    grad = torch.zeros_like(data)
+    grad[0, 0, -1, -1] = 1
+    expected.backward(grad.float())
+    result.backward(grad.to(mojo_gpu))
+    assert expected[0, 0, -1, -1] == 6
+    _assert_close(result, expected, data.dtype)
+    assert ours.grad is not None and reference.grad is not None
+    assert device_offset.grad is not None and reference_offset.grad is not None
+    _assert_close(ours.grad, reference.grad, data.dtype)
+    _assert_close(device_offset.grad, reference_offset.grad, data.dtype)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_deform_conv2d_offset_boundary_derivative(mojo_gpu: str, axis: int):
+    data = torch.tensor([[[[2.0]]]])
+    weight = torch.tensor([[[[3.0]]]])
+    offset = torch.zeros(1, 2, 1, 1)
+    offset[0, axis, 0, 0] = -1
+    reference_offset = offset.detach().requires_grad_()
+    device_offset = offset.to(mojo_gpu).requires_grad_()
+    expected = vision.ops.deform_conv2d(data, reference_offset, weight)
+    result = vision.ops.deform_conv2d(
+        data.to(mojo_gpu), device_offset, weight.to(mojo_gpu)
+    )
+    expected.backward(torch.ones_like(expected))
+    result.backward(torch.ones(result.shape).to(mojo_gpu))
+    assert reference_offset.grad is not None and device_offset.grad is not None
+    assert reference_offset.grad[0, axis, 0, 0] == 6
+    torch.testing.assert_close(result.cpu(), expected)
+    torch.testing.assert_close(device_offset.grad.cpu(), reference_offset.grad)
+
+
+def test_deform_conv2d_numerical_gradient(mojo_gpu: str):
+    _dtype_supported(mojo_gpu, torch.float64)
+    generator = torch.Generator().manual_seed(207)
+    tensors = (
+        torch.randn(1, 1, 4, 3, generator=generator, dtype=torch.float64),
+        torch.full((1, 8, 3, 2), 0.23, dtype=torch.float64),
+        torch.randn(1, 1, 2, 2, generator=generator, dtype=torch.float64),
+        torch.randn(1, generator=generator, dtype=torch.float64),
+        torch.rand(1, 4, 3, 2, generator=generator, dtype=torch.float64),
+    )
+    ours = tuple(t.to(mojo_gpu).requires_grad_() for t in tensors)
+    result = _deform_op(ours, True, True, padding=(0, 0))
+    result.backward(torch.ones(result.shape, dtype=torch.float64).to(mojo_gpu))
+    epsilon = 1e-5
+    indices = ((0, 5, 11), (0, 7, 13, 47), (0, 1, 2, 3), (0,), (0, 11, 23))
+    for tensor_index, sample_indices in enumerate(indices):
+        gradient = ours[tensor_index].grad
+        assert gradient is not None
+        gradient = gradient.cpu().flatten()
+        for element_index in sample_indices:
+            plus = tuple(t.clone() for t in tensors)
+            minus = tuple(t.clone() for t in tensors)
+            plus[tensor_index].flatten()[element_index] += epsilon
+            minus[tensor_index].flatten()[element_index] -= epsilon
+            numerical = (
+                _deform_op(plus, True, True, padding=(0, 0)).sum()
+                - _deform_op(minus, True, True, padding=(0, 0)).sum()
+            ) / (2 * epsilon)
+            torch.testing.assert_close(
+                gradient[element_index], numerical, atol=1e-8, rtol=1e-8
+            )
+
+
 @pytest.mark.parametrize("kind", ["align", "pool"])
 def test_roi_numerical_gradient(mojo_gpu: str, kind: str):
     _dtype_supported(mojo_gpu, torch.float64)
@@ -540,6 +1216,9 @@ def test_second_gpu(mojo_gpu: str):
             test_nms("mojo:1", torch.float32, 47, 0.5)
             _check_roi("mojo:1", "align", torch.float32, 1.0, 2, True)
             _check_roi("mojo:1", "pool", torch.float32, 1.0, 2, False)
+            _check_ps_roi("mojo:1", "align", torch.float32)
+            _check_ps_roi("mojo:1", "pool", torch.float32)
+            _check_deform("mojo:1", torch.float32, groups=2, offset_groups=3)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

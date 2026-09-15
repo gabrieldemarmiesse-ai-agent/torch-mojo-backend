@@ -153,19 +153,30 @@ their schemas is imported. Qualified names also select `TMB_OP`; the loader
 escapes colons in extension filenames while retaining the full name in cache
 keys. Torchvision remains optional at runtime.
 
-The native detection groups are `ops_roi.mojo` (ROI align/pool and their
-backwards) and `ops_nms.mojo` (non-maximum suppression), backed by `roi_ops`
-and `nms_ops` kernel families. They support float16/float32/float64 GPU inputs
-(float64 requires device support). ROI inputs are made contiguous; NMS
-declines non-contiguous inputs. ROI backward gathers contributions per input
-pixel in a fixed order without atomics. NMS uses a stable device sort, device
-IoU masks, a host greedy pass, and device index gathering.
+The native detection groups are `ops_roi.mojo` (ROI align/pool, their
+position-sensitive variants, and backwards), `ops_nms.mojo` (non-maximum
+suppression), and `ops_deform_conv.mojo` (deformable convolution). They support
+float16/float32/float64 GPU inputs (float64 requires device support). ROI
+inputs are made contiguous; NMS declines non-contiguous inputs. ROI backward
+uses relaxed atomic scatter and
+honors PyTorch's deterministic-algorithms error/warning policy. NMS uses a
+stable device sort, device IoU masks, a host greedy pass, and device index
+gathering.
 
 Torchvision 0.26 CUDA autocast policies are included in the shim's generated
 table: NMS casts eligible inputs to float32 and returns int64 indices; ROI
-align/pool compute in float32 and restore the input dtype. As in upstream
-0.26, the ROI pool autocast wrapper also converts its argmax output. Normal
-ROI pool dispatch returns int32 argmax. Float64 inputs bypass autocast.
+align/pool, PS-ROI align/pool, and deformable convolution compute in float32
+and restore the input dtype. As in upstream 0.26, autocast also converts ROI
+pool's argmax and PS-ROI's channel mapping; normal ROI/PS-ROI dispatch keeps
+these in int32. Float64 inputs are not narrowed.
+
+Deformable convolution composes deformable im2col with the existing Mojo
+GEMM routes. It supports independent convolution and offset groups, optional
+mask/bias, and gradients for input, weight, offset, mask, and bias. Its input
+gradient scatter follows upstream's nondeterminism policy. No vendor BLAS
+library is required. Half inputs use float32 coordinate and interpolation
+arithmetic with half stored intermediates. This can differ from torchvision
+CUDA's half-coordinate rounding near pixel boundaries.
 
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
