@@ -191,7 +191,7 @@ def record_tensor_stream(t: T) raises:
 
 
 def copy_between_devices(dst: T, src: T) raises:
-    """Copy contiguous equal-dtype buffers, with host staging without P2P."""
+    """Requires contiguous buffers of equal dtype and size."""
     record_tensor_stream(src)
     record_tensor_stream(dst)
     var nbytes = src.numel * src.itemsize
@@ -216,8 +216,7 @@ def copy_between_devices(dst: T, src: T) raises:
 
 
 def _device_copy(dst: T, src: T) raises:
-    """mojo -> mojo: any layouts, any dtype pair, and any two
-    logical shapes of the same element count (op_copy_from checked that)."""
+    """Shapes may differ; op_copy_from checks equal element counts."""
     if src.device != dst.device:
         record_tensor_stream(src)
         record_tensor_stream(dst)
