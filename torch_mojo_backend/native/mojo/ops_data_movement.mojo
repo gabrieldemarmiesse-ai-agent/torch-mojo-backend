@@ -84,7 +84,7 @@ from ops_common import (
     resize_out,
 )
 from registry import Site, impl, op_address_of
-from ops_core import copy_between_devices
+from ops_core import cast_for_copy, copy_between_devices, record_tensor_stream
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -444,49 +444,10 @@ def _relayout_owned(var contig: Owned, want: IndexList[MAX_RANK]) raises -> T:
 
 
 def _host_cast(t: T, stype: Int32) raises -> T:
-    """Exotic dtype pair (outside CastSpec's dtype set, e.g. float64,
-    int8/16, uint16/32/64): cast element-by-element on the host through a
-    Float64 bridge -- the same precision tradeoff `_read_f64_at` documents.
-    """
-    var src = contiguous(t)
-    var numel = src.numel
-    var src_dtype = src.dtype
-    var src_shape = src.shape
-    var src_rank = src.rank
-    var src_device = src.device
-    var host_src = own(cpu_empty(src_shape, src_rank, src.stype))
-    if numel > 0:
-        var ctx = ctx_for(src_device)
-        copy_to_host(ctx, src.ptr, host_src.t.ptr, numel * src.itemsize)
-        _ = ctx
-    release_if_new(src, t)
-    var host_dst = own(cpu_empty(src_shape, src_rank, stype))
-    var dst_dtype = max_dtype(stype)
-    for i in range(numel):
-        _write_f64_at(
-            host_dst.t.ptr,
-            i,
-            _read_f64_at(host_src.t.ptr, i, src_dtype),
-            dst_dtype,
-        )
-    var out = new_tensor(src_shape, src_rank, stype, src_device)
-    if numel > 0:
-        var ctx2 = ctx_for(src_device)
-        copy_from_host(
-            src_device,
-            ctx2,
-            out.ptr,
-            host_dst.t.ptr,
-            numel * dtype_itemsize(dst_dtype),
-        )
-        _ = ctx2
-    # `host_src`/`host_dst` are plain CPU allocations (not this backend's
-    # stream-ordered device allocator): keep them alive through their last
-    # read above, or a hot allocator can reuse the bytes underneath a
-    # "finished" copy that only just enqueued.
-    _ = host_src
-    _ = host_dst
-    return out^
+    var dense = own_if_new(contiguous(t), t)
+    var out = own(cast_for_copy(dense.t, stype))
+    _ = dense^
+    return out.take()
 
 
 def _download_to_cpu(t: T) raises -> T:
@@ -499,9 +460,9 @@ def _download_to_cpu(t: T) raises -> T:
 
 
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
-    var out = new_tensor(t.shape, t.rank, t.stype, target_device)
-    copy_between_devices(out, t)
-    return out^
+    var out = own(new_tensor(t.shape, t.rank, t.stype, target_device))
+    copy_between_devices(out.t, t)
+    return out.take()
 
 
 def _host_materialize_contiguous(t: T) raises -> T:
@@ -639,10 +600,20 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if dev_type == DEVICE_TYPE_PRIVATEUSE1:
         target_index2 = v_device_index(dev_v)
     var cross = target_index2 >= 0 and target_index2 != t.device
-    # A device move copies the whole dense buffer verbatim, so `want` is laid
-    # out where kernels can run: on the source for a download to the host, on
-    # the destination for a move to another mojo device.
-    var staged = own(_to_copy_same_device(t, stype, contig if cross else want))
+    if cross:
+        record_tensor_stream(t)
+        var dense = own_if_new(
+            t.copy() if t.contig
+            and stype == t.stype else _to_copy_same_device(t, stype, contig),
+            t,
+        )
+        var moved = own(_upload_cross_device(dense.t, target_index2))
+        _ = dense^
+        var result = own(_relayout_owned(moved^, want))
+        ret_owned(rets, 0, result)
+        return
+    # Downloads materialize the requested memory order before copying bytes.
+    var staged = own(_to_copy_same_device(t, stype, want))
     if dev_type == DEVICE_TYPE_CPU:
         var host = own(_download_to_cpu(staged.t))
         _ = staged^
@@ -652,13 +623,7 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             set_sizes_strides(host.t, t.shape, want, t.rank, 0)
         ret_owned(rets, 0, host)
         return
-    if not cross:
-        ret_owned(rets, 0, staged)
-        return
-    var moved = own(_upload_cross_device(staged.t, target_index2))
-    _ = staged^
-    var out3 = own(_relayout_owned(moved^, want))
-    ret_owned(rets, 0, out3)
+    ret_owned(rets, 0, staged)
 
 
 # ---------------------------------------------------------------------------

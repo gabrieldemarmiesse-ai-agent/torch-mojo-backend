@@ -76,6 +76,8 @@ from device import (
     copy_to_host,
     ctx_for,
     current_device,
+    current_stream,
+    drain_copy,
     dev,
     read_bytes_sync,
     record_stream,
@@ -182,14 +184,34 @@ def _viewed_as(t: T, like: T) raises -> T:
     )
 
 
+def record_tensor_stream(t: T) raises:
+    var handle = t.storage_ctx()
+    if handle != 0:
+        record_stream(handle, t.device, current_stream(t.device))
+
+
 def copy_between_devices(dst: T, src: T) raises:
     """Copy contiguous equal-dtype buffers, with host staging without P2P."""
+    record_tensor_stream(src)
+    record_tensor_stream(dst)
     var nbytes = src.numel * src.itemsize
-    if copy_peer(dst.device, dst.ptr, src.device, src.ptr, nbytes):
-        return
+    try:
+        if copy_peer(dst.device, dst.ptr, src.device, src.ptr, nbytes):
+            return
+    except e:
+        _ = drain_copy(dst.device, src.device)
+        raise e
     var host = own(cpu_empty(src.shape, src.rank, src.stype))
-    copy_to_host(ctx_for(src.device), src.ptr, host.t.ptr, nbytes)
-    copy_from_host(dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes)
+    try:
+        copy_to_host(ctx_for(src.device), src.ptr, host.t.ptr, nbytes)
+        copy_from_host(
+            dst.device, ctx_for(dst.device), dst.ptr, host.t.ptr, nbytes
+        )
+    except e:
+        if not drain_copy(dst.device, src.device):
+            _ = retain(host.t)
+        _ = host^
+        raise e
     _ = host^
 
 
@@ -197,6 +219,8 @@ def _device_copy(dst: T, src: T) raises:
     """mojo -> mojo: any layouts, any dtype pair, and any two
     logical shapes of the same element count (op_copy_from checked that)."""
     if src.device != dst.device:
+        record_tensor_stream(src)
+        record_tensor_stream(dst)
         var dense = own_if_new(contiguous(src), src)
         if dst.contig and dst.stype == src.stype:
             copy_between_devices(dst, dense.t)
@@ -211,7 +235,7 @@ def _device_copy(dst: T, src: T) raises:
         return
     if src.stype != dst.stype:
         var dense = own_if_new(contiguous(src), src)
-        var tmp = own_if_new(_cast_for_copy(dense.t, dst.stype), dense.t)
+        var tmp = own_if_new(cast_for_copy(dense.t, dst.stype), dense.t)
         if dst.contig:
             copy_d2d(
                 ctx_for(dst.device),
@@ -252,7 +276,7 @@ def _host_copy(dst: T, src: T) raises:
     _ = call_op("aten::copy_", "", args^, 1)  # Results releases copy_'s handle
 
 
-def _cast_for_copy(src: T, stype: Int32) raises -> T:
+def cast_for_copy(src: T, stype: Int32) raises -> T:
     if is_cast_dtype(src.dtype) and is_cast_dtype(max_dtype(stype)):
         return cast_to(src, stype)
     # CPU torch preserves integer precision for pairs outside CastSpec.

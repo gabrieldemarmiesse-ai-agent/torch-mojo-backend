@@ -102,7 +102,7 @@ end. Standard DDP brought into one process via thread-ranks replaces it.
 This section describes the former Python-wrapper backend. The native
 backend now supports direct peer copies for `.to("mojo:1")` and cross-device
 `copy_`, with host staging when peer access is unavailable. See
-[native backend transfers](native_backend.md#writing-an-op) for the current
+[native backend transfers](native_backend.md#transfers) for the current
 implementation.
 
 Exists and is directly reusable:
