@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
     "mojo==1.0",
     "max==26.5",
+    "platformdirs",
     "tabulate",
     "torch>=2.10",
     # NCCL for the mojo-device distributed backend (torch_mojo_backend/distributed).
@@ -26,6 +27,9 @@ dependencies = [
     # unless MODULAR_NVPTX_COMPILER_PATH is already set.
     "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
 ]
+
+[project.scripts]
+torch-mojo-backend = "torch_mojo_backend.cli:main"
 
 [project.urls]
 "Source" = "https://github.com/gabrieldemarmiesse/torch-mojo-backend"
