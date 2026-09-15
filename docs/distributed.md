@@ -754,11 +754,13 @@ still being published. That selection is latched and cannot change later.
 Subsequent calls return `ncclRemoteError` and the peers'
 own deadlines report the rank, instead of a hang. Collectives of one
 communicator are kept in one total order across streams: an event is
-recorded on the stream after every call (2.53 µs host time on H100, job
-251506) and a call on a different
+recorded on the stream after every call and a call on a different
 stream waits for it first. Default stream 0 participates, and the caller may
 destroy a completed stream before the next call. Teardown and error polling
-also synchronize the owned completion event, never a saved caller handle.
+also use the owned completion event. Abort polls it without blocking; only
+an incomplete submission needs conservative caller-stream queries. Concurrent
+error polling skips the device read while submission holds the lock, but
+still checks the atomic terminal-failure flag.
 The SM count comes from MAX's device attribute on both vendors, so
 AMD takes the fused path too (unmeasured there: for the AMD agent). A call
 the geometry cuts into more chunks than the inter-node

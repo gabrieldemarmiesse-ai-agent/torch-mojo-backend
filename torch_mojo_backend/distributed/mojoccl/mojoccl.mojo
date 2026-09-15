@@ -75,12 +75,12 @@ from max.gpu.host import (
     DeviceAttribute,
     DeviceBuffer,
     DeviceContext,
-    DeviceEvent,
     DeviceStream,
 )
 
 from driver import (
     HANDLE_BYTES,
+    CompletionEvent,
     alloc_host,
     alloc_region,
     close_handle,
@@ -464,10 +464,12 @@ struct CommState(Movable):
     var stream_cache: Dict[Int64, DeviceStream]
     # Recorded on the stream after every collective; a collective issued on
     # another stream waits for it first (`_order_before` / `_order_after`).
-    var order_event: DeviceEvent
+    var order_event: CompletionEvent
     var order_recorded: Bool
-    # A failed enqueue/record cannot authorize reuse or teardown.
+    # Protected by the submission lock, including while a call is in progress.
     var order_incomplete: Bool
+    # Atomic terminal flag: watchdogs may read it without the submission lock.
+    var submission_failed: Int64
     var local_rank: Int
     var local_world: Int
     var my_node: Int
@@ -558,9 +560,10 @@ struct CommState(Movable):
         self.owned_base = owned_base
         self.generation = 0
         self.last_stream = 0
-        self.order_event = ctx.create_event()
+        self.order_event = CompletionEvent(ctx)
         self.order_recorded = False
         self.order_incomplete = False
+        self.submission_failed = 0
         self.aborted = False
         self.released = False
         self.abort_host = abort_host
@@ -611,9 +614,8 @@ def _lock(mut state: CommState):
     submissions could interleave -- thread A's reduce-scatter, then thread
     B's on the same arena before A released its exchange. NCCL declares
     concurrent calls on one communicator unsupported; a spin word costs ~20 ns
-    uncontended and turns that into a serialization. Never taken by
-    `ncclCommAbort` or `ncclCommGetAsyncError`: a watchdog must be able to
-    abort a communicator whose submitter is stuck behind a full launch queue.
+    uncontended and turns that into a serialization. Watchdogs use bounded
+    or nonblocking attempts: a submitter may be stuck behind a full queue.
     """
     var p = Pointer(to=state.lock).unsafe_origin_cast[MutAnyOrigin]()
     while True:
@@ -765,19 +767,34 @@ def _order_before(mut state: CommState, handle: Int64) raises:
     """
     _ensure_stream_cached(state, handle)
     if state.order_recorded and state.last_stream != handle:
-        state.stream_cache[handle].enqueue_wait_for(state.order_event)
+        state.order_event.wait_on(handle)
     state.last_stream = handle
     state.order_incomplete = True
 
 
 def _order_after(mut state: CommState, handle: Int64) raises:
-    """Record completion before returning; one host event record per call.
-
-    Host cost: 2.53 us on H100 (7 x 10,000 warmed records, job 251506).
-    """
-    state.stream_cache[handle].record_event(state.order_event)
+    """Record completion before returning; one driver event record per call."""
+    state.order_event.record(handle)
     state.order_recorded = True
     state.order_incomplete = False
+
+
+def _fail_submission(mut state: CommState):
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+        Pointer(to=state.submission_failed).unsafe_origin_cast[MutAnyOrigin](),
+        1,
+    )
+
+
+def _submission_failed(state: CommState) -> Bool:
+    return (
+        Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            Pointer(to=state.submission_failed).unsafe_origin_cast[
+                MutAnyOrigin
+            ]()
+        )
+        != 0
+    )
 
 
 def _ensure_stream_cached(mut state: CommState, handle: Int64) raises:
@@ -1040,6 +1057,8 @@ def _latched_error(mut state: CommState) -> Int32:
     checking it is what turned a timed-out barrier from a silently wrong
     result into a failed call. Neither check touches a stream.
     """
+    if _submission_failed(state):
+        return NCCL_REMOTE_ERROR
     if state.ib != 0 and ib_error(state.ib) != 0:
         return NCCL_REMOTE_ERROR
     if _fault_code(state) != 0 or _host_fault_word(state) != 0:
@@ -1815,6 +1834,7 @@ def _release_resources(mut state: CommState) raises:
         free_host(state.driver, state.abort_host)
         state.abort_host = 0
         state.abort_dev = 0
+    state.order_event.release()
     state.released = True
 
 
@@ -1835,20 +1855,20 @@ def _destroy_locked(comm: Int64) -> Int32:
 
 
 def _abort_quiesced(state: CommState, deadline_ns: Int) -> Bool:
-    """Poll every stream a collective ran on until all are idle, or the
-    deadline passes.
-
-    `cuStreamQuery`, not `cuStreamSynchronize`: the point of the abort word is
-    that the spin kernels are already on their way out, and a synchronize
-    would be exactly the unbounded wait abort promises not to do.
+    """Poll owned completion; failed submissions need conservative stream checks.
     """
-    var handles = _cached_stream_handles(state)
+    var handles = List[Int64]()
+    if state.order_incomplete:
+        handles = _cached_stream_handles(state)
     while True:
         var pending = False
-        for i in range(len(handles)):
-            if not stream_done(state.driver, Int(handles[i])):
-                pending = True
-                break
+        if not state.order_incomplete:
+            pending = state.order_recorded and not state.order_event.done()
+        else:
+            for i in range(len(handles)):
+                if not stream_done(state.driver, Int(handles[i])):
+                    pending = True
+                    break
         if not pending:
             return True
         if perf_counter_ns() > deadline_ns:
@@ -1938,32 +1958,46 @@ def ncclCommGetAsyncError(
             _report_fault(state)
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        # Synchronize first: the freshest read this cheaply-checkable word
-        # can give is "everything enqueued so far landed", same as before --
-        # only the read itself changes, from a host dereference of device
-        # memory (wrong) to a real D2H copy (_read_error_word).
-        _drain_all_streams(state)
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            # A proxy failure during that sync releases the spin kernels
-            # through MB_DONE without touching the device error word; the
-            # host word is the only record of it.
+        if _submission_failed(state):
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        # One error word per pipeline arena: a multi-node allreduce spreads
-        # its chunks over all of them, and a barrier that gave up did so in
-        # exactly one.
-        for a in range(state.narenas):
-            var word = _read_error_word(
-                state,
-                state.regions[state.local_rank] + a * state.arena_stride,
-            )
-            if Int(word) != 0:
-                err_out[] = NCCL_REMOTE_ERROR
-                return NCCL_SUCCESS
-        err_out[] = NCCL_SUCCESS
+        # Never read ordering fields or share poll scratch without the lock.
+        # A busy submitter is healthy unless it publishes a terminal failure.
+        if not _try_lock(state, perf_counter_ns()):
+            err_out[] = NCCL_REMOTE_ERROR if _submission_failed(
+                state
+            ) else NCCL_SUCCESS
+            return NCCL_SUCCESS
+        try:
+            err_out[] = _async_error_locked(state)
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
         return NCCL_SUCCESS
     except:
         return NCCL_INTERNAL_ERROR
+
+
+def _async_error_locked(mut state: CommState) raises -> Int32:
+    if state.aborted or state.released:
+        return NCCL_SYSTEM_ERROR
+    if _submission_failed(state):
+        return NCCL_REMOTE_ERROR
+    # Do not hold up submissions behind unfinished GPU work.
+    if state.order_recorded and not state.order_event.query():
+        return NCCL_SUCCESS
+    _drain_all_streams(state)
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        return NCCL_REMOTE_ERROR
+    for a in range(state.narenas):
+        var word = _read_error_word(
+            state,
+            state.regions[state.local_rank] + a * state.arena_stride,
+        )
+        if Int(word) != 0:
+            return NCCL_REMOTE_ERROR
+    return NCCL_SUCCESS
 
 
 @export
@@ -2562,12 +2596,14 @@ def ncclAllReduce(
                 comm, sendbuff, recvbuff, count, datatype, op, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)
             except e:
+                _fail_submission(state)
                 _unlock(state)
                 raise e
         _unlock(state)
@@ -2674,12 +2710,14 @@ def ncclBroadcast(
                 comm, sendbuff, recvbuff, Int(count) * item, root, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)
             except e:
+                _fail_submission(state)
                 _unlock(state)
                 raise e
         _unlock(state)
@@ -2890,12 +2928,14 @@ def ncclAllGather(
                 comm, sendbuff, recvbuff, Int(sendcount) * item, stream
             )
         except e:
+            _fail_submission(state)
             _unlock(state)
             raise e
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)
             except e:
+                _fail_submission(state)
                 _unlock(state)
                 raise e
         _unlock(state)

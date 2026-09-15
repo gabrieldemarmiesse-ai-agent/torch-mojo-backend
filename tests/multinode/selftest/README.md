@@ -239,6 +239,19 @@ observed source and host details remain latched. No GPU code runs.
 ```bash
 PYTHONPATH=$PWD uv run --no-sync mojo build tests/multinode/selftest/host_fault_test.mojo \
     -I torch_mojo_backend/distributed/mojoccl --target-accelerator sm_90a \
-    -o /tmp/mojoccl_host_fault_test
+  -o /tmp/mojoccl_host_fault_test
 PYTHONPATH=$PWD uv run --no-sync /tmp/mojoccl_host_fault_test
+```
+
+## `comm_state_probe.mojo` — abort release assertion
+
+Read-only helper for `stream_order_probe.py`, built against the same source
+as the tested library. Checks the release flag and cleared IB, status-page,
+and completion-event handles after abort.
+
+```bash
+PYTHONPATH=$PWD uv run --no-sync mojo build --emit shared-lib \
+    tests/multinode/selftest/comm_state_probe.mojo \
+    -I torch_mojo_backend/distributed/mojoccl -o /tmp/comm_state_probe.so
+export MOJOCCL_STATE_PROBE_LIBRARY=/tmp/comm_state_probe.so
 ```
