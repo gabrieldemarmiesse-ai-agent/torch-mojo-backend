@@ -48,6 +48,7 @@ from collectives_kernels import (
     _SIGNAL_BYTES,
     _ag_finish_body,
     _align_up,
+    _cached_occupancy,
     _enqueue_cached_dim,
     _region_ptrs,
     _rs_stage_body,
@@ -158,15 +159,51 @@ def fused_big_bytes() -> Int:
     ) * (1024 * 1024)
 
 
-def fused_blocks(cap: Int, sm_count: Int, per: Int, W: Int) -> Int:
-    """Grid of the fused kernel: the cap, the multiprocessor count (every
-    block must be resident for `grid_barrier`), and what the shard can keep
-    busy. Every rank of a node derives the same number from the same shape
-    and the same GPU, which the block-matched barriers need."""
+def fused_blocks(cap: Int, resident: Int, per: Int, W: Int) -> Int:
+    """Grid of the fused kernel: the cap, the co-resident bound (`resident`,
+    the driver's occupancy for this kernel times the multiprocessor count --
+    every block must be resident for `grid_barrier`), and what the shard can
+    keep busy. Every rank of a node derives the same number from the same
+    shape and the same GPU, which the block-matched barriers need."""
     var lim = min(cap, MAX_BLOCKS)
-    if sm_count > 0:
-        lim = min(lim, sm_count)
+    if resident > 0:
+        lim = min(lim, resident)
     return min(lim, max(1, (per // W + 1 + FUSED_THREADS - 1) // FUSED_THREADS))
+
+
+def _fused_key[dtype: DType, NW: Int]() -> String:
+    return String(t"fused_ar_{dtype}_{NW}")
+
+
+def _resident_blocks[
+    dtype: DType, NW: Int
+](ctx: DeviceContext, sm_count: Int) raises -> Int:
+    """How many blocks of this instantiation the device can hold at once."""
+    comptime W = 16 // size_of[dtype]()
+    return (
+        _cached_occupancy[_fused_ar_kernel[dtype, W, NW]](
+            ctx, _fused_key[dtype, NW](), FUSED_THREADS
+        )
+        * sm_count
+    )
+
+
+def fused_resident_blocks(
+    ctx: DeviceContext, world: Int, sm_count: Int
+) raises -> Int:
+    """Co-resident bound of the fp32 kernel for a node of `world` ranks.
+
+    Compiled here, at init, so the number can be exchanged and checked across
+    the node's ranks before any collective; the other dtypes' bounds are the
+    same function of the same build and the same GPU, and are applied at
+    launch. Zero means the kernel cannot run on this device at all."""
+    if world == 8:
+        return _resident_blocks[DType.float32, 8](ctx, sm_count)
+    if world == 4:
+        return _resident_blocks[DType.float32, 4](ctx, sm_count)
+    if world == 2:
+        return _resident_blocks[DType.float32, 2](ctx, sm_count)
+    return _resident_blocks[DType.float32, 0](ctx, sm_count)
 
 
 @always_inline
@@ -267,7 +304,6 @@ def _fused_ar_kernel[
     var tid = Int(global_idx.x)
     var nblocks = Int(grid_dim.x)
     var stride = nblocks * FUSED_THREADS
-    var t0 = device_now_ns()
     var total = Int(count)
     var ce = Int(chunk_elems)
     var nchunks = Int(shape[0])
@@ -288,15 +324,19 @@ def _fused_ar_kernel[
         Atomic[DType.uint64].store[ordering=Ordering.RELAXED](poison, UInt64(0))
 
     for k in range(nchunks + depth - 1):
+        # The deadline is per phase, as it was per kernel on the split
+        # schedule: `t0` restarts here, before the exchange wait and before
+        # the all-gather, so MOJOCCL_IB_TIMEOUT_S bounds each wait rather
+        # than the whole collective.
+        var t0 = device_now_ns()
         # The launch boundary, restored: nothing of chunk k starts until every
         # block of this rank is done with chunk k-1; peers inherit it because
-        # chunk k's flags are published after it.
+        # chunk k's flags are published after it. A False here is a deadline
+        # or another block's poison, either way for the whole block.
         if not grid_barrier(
             me, poison, nblocks, ERR_FUSED_GRID, t0, timeout_ns + _GRID_GRACE_NS
         ):
             _give_up(poison)
-            return
-        if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](poison) != 0:
             return
 
         if k < nchunks:
@@ -351,6 +391,7 @@ def _fused_ar_kernel[
             var my_cnt = _shard_cnt(cnt, per, rank)
             var seq = Int(seq0) + j
 
+            t0 = device_now_ns()
             if block_idx.x == 0 and thread_idx.x == 0:
                 _await_exchange(
                     mb_done, poison, me, page, UInt64(seq), t0, timeout_ns
@@ -364,11 +405,6 @@ def _fused_ar_kernel[
                 timeout_ns + _GRID_GRACE_NS,
             ):
                 _give_up(poison)
-                return
-            if (
-                Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](poison)
-                != 0
-            ):
                 return
 
             if my_cnt > 0:
@@ -402,6 +438,7 @@ def _fused_ar_kernel[
                     mb_consumed, UInt64(seq)
                 )
 
+            t0 = device_now_ns()
             if not _ag_finish_body[dtype, W, FUSED_UNROLL](
                 regions,
                 arena_off,
@@ -429,6 +466,7 @@ def _launch_fused[
     ctx: DeviceContext,
     stream: DeviceStream,
     blocks: Int,
+    sm_count: Int,
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
@@ -447,12 +485,28 @@ def _launch_fused[
     scale: Float32,
     timeout_ns: UInt64,
 ) raises:
+    # The grid must be co-resident (`grid_barrier`). Bounded by this
+    # instantiation's occupancy -- the same on every rank of the node, so the
+    # block-matched barriers still agree -- and launched cooperatively so the
+    # driver refuses, rather than deadlocks, a grid it cannot hold.
+    var occ = _cached_occupancy[_fused_ar_kernel[dtype, W, NW]](
+        ctx, _fused_key[dtype, NW](), FUSED_THREADS
+    )
+    var grid = blocks
+    if occ > 0:
+        grid = min(grid, occ * sm_count)
+    if grid < 1:
+        raise Error(
+            "mojoccl: the fused allreduce kernel cannot be resident on this"
+            " device"
+        )
     _enqueue_cached_dim[_fused_ar_kernel[dtype, W, NW]](
         ctx,
         stream,
-        String(t"fused_ar_{dtype}_{NW}"),
-        blocks,
+        _fused_key[dtype, NW](),
+        grid,
         FUSED_THREADS,
+        True,
         regions,
         Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=in_ptr),
         Pointer[Scalar[dtype], MutAnyOrigin](unsafe_from_address=out_ptr),
@@ -473,6 +527,26 @@ def _launch_fused[
         scale,
         timeout_ns,
     )
+
+
+def check_fused_call[
+    dtype: DType
+](
+    in_ptr: Int,
+    out_ptr: Int,
+    chunk_elems: Int,
+    arena_cap: Int,
+    nchunks: Int,
+) raises:
+    """Everything `internode_allreduce_fused` would refuse, checked BEFORE
+    the caller reserves exchange counters and fills work items: a call
+    rejected after that would strand ring slots the engine never sees."""
+    if nchunks <= 0 or chunk_elems <= 0:
+        raise Error("mojoccl: fused allreduce with no chunks")
+    if chunk_elems * size_of[dtype]() > arena_cap:
+        raise Error("mojoccl: fused allreduce chunk exceeds an arena")
+    if in_ptr % 16 != 0 or out_ptr % 16 != 0:
+        raise Error("mojoccl: fused allreduce needs 16-byte aligned buffers")
 
 
 def internode_allreduce_fused[
@@ -501,6 +575,7 @@ def internode_allreduce_fused[
     generation: Int,
     scale: Float32,
     blocks: Int,
+    sm_count: Int,
     timeout_ns: UInt64,
 ) raises:
     """Enqueue the whole pipelined multi-node allreduce as one kernel.
@@ -534,6 +609,7 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
+            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -557,6 +633,7 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
+            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -580,6 +657,7 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
+            sm_count,
             rp,
             in_ptr,
             out_ptr,
@@ -603,6 +681,7 @@ def internode_allreduce_fused[
             ctx,
             stream,
             blocks,
+            sm_count,
             rp,
             in_ptr,
             out_ptr,

@@ -152,7 +152,12 @@ from std.gpu import (
     grid_dim,
     thread_idx,
 )
-from max.gpu.host import DeviceContext, DeviceStream
+from max.gpu.host import DeviceAttribute, DeviceContext, DeviceStream
+from max.gpu.host.launch_attribute import (
+    LaunchAttribute,
+    LaunchAttributeID,
+    LaunchAttributeValue,
+)
 from max.gpu.sync import barrier
 from std.memory import AddressSpace, stack_allocation
 from std.memory.alloc import unsafe_alloc
@@ -199,7 +204,12 @@ comptime _GRIDBAR_RELEASE_OFFSET = 384
 counter's traffic never invalidates the line every block is spinning on.
 Purely rank-local -- no peer ever reads them -- and zeroed by `region_init`
 with the rest of the signal area. Only arena 0's pair is ever used: the fused
-inter-node kernel spans arenas but is one grid."""
+inter-node kernel spans arenas but is one grid. They are a fixed rendezvous,
+not generation-tagged: one fused kernel at a time per communicator. Every
+`ncclAllReduce` on a communicator is issued under its lock in stream order,
+and NCCL's contract (one stream per communicator at a time) is what keeps
+two of them from overlapping -- two streams on one communicator are
+unsupported here as there, and would mis-count here silently."""
 
 comptime _POISON_OFFSET = 448
 """Device word one block of a persistent kernel raises to tell the others to
@@ -849,6 +859,16 @@ def grid_barrier(
                 Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](release)
                 == seen
             ):
+                comptime if _AMD:
+                    # On gfx942 the acquire load above is a `buffer_inv sc0
+                    # sc1` -- an L1+L2 invalidate -- per iteration, and
+                    # nblocks-1 threads spin here for a whole network round
+                    # trip (internode_kernels.mojo has the measurement for
+                    # one such thread). Sleep between polls; the ordering
+                    # stays as it is.
+                    llvm_intrinsic[
+                        "llvm.amdgcn.s.sleep", NoneType, has_side_effect=True
+                    ](Int32(2))
                 spins += 1
                 if spins >= _SPIN_CHECK:
                     spins = 0
@@ -882,6 +902,16 @@ def grid_barrier(
                             )
                         failed[unsafe_offset=0] = 1
                         break
+        # Read once, by one thread, for the whole block: a block that has
+        # been released may still be one another block just poisoned, and
+        # the answer has to be the same for every thread of this CTA or part
+        # of it would leave while the rest reaches the next `barrier()`.
+        if (
+            failed[unsafe_offset=0] == 0
+            and Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](poison)
+            != 0
+        ):
+            failed[unsafe_offset=0] = 1
     barrier()
     return failed[unsafe_offset=0] == 0
 
@@ -2213,6 +2243,52 @@ def _store_u64_kernel(dst: Pointer[UInt64, MutAnyOrigin], value: UInt64):
 
 
 @always_inline
+def _cached_function[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+](ctx: DeviceContext, key: String) raises -> Pointer[
+    type_of(ctx.compile_function[func]()), MutUntrackedOrigin
+]:
+    """Compile `func` at most once per process and context (same caching
+    pattern as the repo's eager kernels)."""
+    var name = String(t"CCL_KERNEL_{key}_{ctx.id()}")
+    comptime FuncT = type_of(ctx.compile_function[func]())
+    var global_ptr = _get_global_or_null(name)
+    if global_ptr:
+        return global_ptr.value().unsafe_bitcast[FuncT]()
+    var compiled = ctx.compile_function[func]()
+    var fptr = unsafe_alloc[FuncT](1)
+    fptr.unsafe_write(compiled^)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), fptr.unsafe_bitcast[NoneType]()
+    )
+    return fptr
+
+
+def _cached_occupancy[
+    declared_arg_types: TypeList[Trait=AnyType, ...],
+    //,
+    func: def(* args: * declared_arg_types) thin -> None,
+](ctx: DeviceContext, key: String, threads: Int) raises -> Int:
+    """The driver's occupancy answer for `func` at `threads` per block --
+    blocks per multiprocessor that can be active at once -- which is what a
+    kernel whose blocks wait for each other has to size its grid by
+    (`internode_fused.mojo`). Asked once per (kernel, context)."""
+    var name = String(t"CCL_OCC_{key}_{ctx.id()}")
+    var global_ptr = _get_global_or_null(name)
+    if global_ptr:
+        return global_ptr.value().unsafe_bitcast[Int]()[]
+    var f = _cached_function[func](ctx, key)
+    var occ = f[].occupancy_max_active_blocks_per_multiprocessor(threads, 0)
+    var p = unsafe_alloc[Int](1)
+    p.unsafe_write(occ)
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(name), p.unsafe_bitcast[NoneType]()
+    )
+    return occ
+
+
 def _enqueue_cached[
     declared_arg_types: TypeList[Trait=AnyType, ...],
     //,
@@ -2226,7 +2302,7 @@ def _enqueue_cached[
     *args: *Ts,
 ) raises:
     """`_enqueue_cached_dim` at this file's `BLOCK` threads per block."""
-    _enqueue_cached_dim[func](ctx, stream, key, blocks, BLOCK, *args)
+    _enqueue_cached_dim[func](ctx, stream, key, blocks, BLOCK, False, *args)
 
 
 def _enqueue_cached_dim[
@@ -2240,33 +2316,40 @@ def _enqueue_cached_dim[
     key: String,
     blocks: Int,
     threads: Int,
+    cooperative: Bool,
     *args: *Ts,
 ) raises:
-    """Enqueue `func` on `stream`, compiling it at most once per process and
-    context. `ctx` is only the compilation/caching handle -- the launch always
-    goes to the stream the caller handed us, which in production is a foreign
-    `cudaStream_t` wrapped by `DeviceContext.create_external_stream`. Same
-    caching pattern as the repo's eager kernels. `threads` must not exceed
-    the kernel's MAX_THREADS_PER_BLOCK_METADATA."""
-    var name = String(t"CCL_KERNEL_{key}_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[func]())
+    """Enqueue `func` on `stream`. `ctx` is only the compilation/caching
+    handle -- the launch always goes to the stream the caller handed us, which
+    in production is a foreign `cudaStream_t` wrapped by
+    `DeviceContext.create_external_stream`. `threads` must not exceed the
+    kernel's MAX_THREADS_PER_BLOCK_METADATA.
 
-    var global_ptr = _get_global_or_null(name)
-    if global_ptr:
-        var fptr = global_ptr.value().unsafe_bitcast[FuncT]()
-        stream.enqueue_function(
-            fptr[], *args, grid_dim=(blocks,), block_dim=(threads,)
-        )
-        return
-
-    var compiled = ctx.compile_function[func]()
-    var fptr = unsafe_alloc[FuncT](1)
-    fptr.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(name), fptr.unsafe_bitcast[NoneType]()
-    )
+    `cooperative` asks the driver for a co-resident grid (CUDA's
+    `CU_LAUNCH_ATTRIBUTE_COOPERATIVE`, where the device supports it): the
+    launch is refused outright, instead of deadlocking at the first grid
+    barrier, when the grid cannot be resident at once. MAX's launch
+    attributes are CUDA-only, so on AMD the occupancy bound the caller
+    applied is the whole guarantee."""
+    var f = _cached_function[func](ctx, key)
+    var attrs = List[LaunchAttribute]()
+    comptime if not _AMD:
+        if (
+            cooperative
+            and ctx.get_attribute(DeviceAttribute.COOPERATIVE_LAUNCH) != 0
+        ):
+            attrs.append(
+                LaunchAttribute(
+                    id=LaunchAttributeID.COOPERATIVE,
+                    value=LaunchAttributeValue(True),
+                )
+            )
     stream.enqueue_function(
-        fptr[], *args, grid_dim=(blocks,), block_dim=(threads,)
+        f[],
+        *args,
+        grid_dim=(blocks,),
+        block_dim=(threads,),
+        attributes=attrs^,
     )
 
 

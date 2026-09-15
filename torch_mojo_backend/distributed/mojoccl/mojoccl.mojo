@@ -138,6 +138,7 @@ from internode import (
     EMPTY_SHARD_BYTES,
     IB_BLOB_BYTES,
     MAX_NODES,
+    WORK_SLOTS,
     OP_ALLGATHER,
     OP_ALLREDUCE,
     OP_BROADCAST,
@@ -161,10 +162,13 @@ from internode import (
     ib_teardown,
 )
 from internode_fused import (
+    FUSED_THREADS,
+    check_fused_call,
     fused_big_block_cap,
     fused_big_bytes,
     fused_block_cap,
     fused_blocks,
+    fused_resident_blocks,
     internode_allreduce_fused,
 )
 from internode_kernels import copy_bytes, inbox_add, place_blocks
@@ -332,10 +336,10 @@ def _bootstrap_timeout_s() -> Float64:
 
 def _fused_enabled() -> Bool:
     """`MOJOCCL_FUSED=0` puts multi-node allreduces back on the split
-    schedule (five kernels per chunk). Not part of the wire layout -- it
-    changes only how one rank issues its own kernels -- so ranks may disagree
-    about it, which is what makes it usable to isolate a regression to the
-    fused kernel on one rank."""
+    schedule (five kernels per chunk). The two schedules launch different
+    grids (216 x 256 threads against 16 x 512 at the DDP bucket) and the
+    intra-node barriers are matched by block index, so every rank has to run
+    the same one: the effective mode is exchanged and checked at init."""
     return getenv("MOJOCCL_FUSED", "1") != "0"
 
 
@@ -477,6 +481,9 @@ struct CommState(Movable):
     var fused_cap: Int
     var fused_big_cap: Int
     var fused_big_bytes: Int
+    # Co-resident bound of the fused kernel on this GPU (occupancy times SMs,
+    # `fused_resident_blocks`); the grid never exceeds it.
+    var fused_resident: Int
     # `MOJOCCL_PIPE_SPLIT_UNIT`; checked equal on every rank at init.
     var split_unit: Int
     # Whether multi-node allreduces go through the one-launch fused kernel.
@@ -524,6 +531,7 @@ struct CommState(Movable):
         fused_cap: Int,
         fused_big_cap: Int,
         fused_big_bytes: Int,
+        fused_resident: Int,
         split_unit: Int,
         fused: Bool,
         abort_host: Int,
@@ -564,6 +572,7 @@ struct CommState(Movable):
         self.fused_cap = fused_cap
         self.fused_big_cap = fused_big_cap
         self.fused_big_bytes = fused_big_bytes
+        self.fused_resident = fused_resident
         self.split_unit = split_unit
         self.fused = fused
         # Barriers the NVLS kernel has completed on this region. Its flag is a
@@ -1214,6 +1223,11 @@ def _bootstrap(
     var fused_big_cap = fused_big_block_cap()
     var fused_big = fused_big_bytes()
     var split_unit = _pipe_split_unit()
+    var fused = False
+    var fused_resident = 0
+    # The NVLS grid and the fused grid must be entirely resident, so both are
+    # functions of this device's SM count, not constants.
+    var device_sms = sm_count(lib, ordinal)
     # A positive multiple of 4096 (the kernels' own precondition,
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
@@ -1396,6 +1410,20 @@ def _bootstrap(
             )
             ib_set_abort_word(ib, abort_dev, abort_host)
 
+        # The schedule this rank will run and the fused kernel's residency,
+        # decided before round 2 so the peers can check them. The probe
+        # compiles the fp32 kernel now rather than at the first collective.
+        if (
+            _fused_enabled()
+            and ib != 0
+            and ib_uses_proxy(ib)
+            and device_sms > 0
+        ):
+            fused_resident = fused_resident_blocks(
+                ctx, topo.local_world, device_sms
+            )
+            fused = fused_resident > 0
+
         # Round 2: IPC handle + IB connection data + the geometry every rank has
         # to agree on. `MOJOCCL_REGION_MB` reaching one rank and not another
         # (a per-node environment, a stale export) silently gives the peers
@@ -1403,7 +1431,7 @@ def _bootstrap(
         # a per-rank `MOJOCCL_NVLS_MIN_MB` sends one rank into the multicast
         # counter barrier and another into the flag barrier, which is a hang.
         # Checking three integers here turns both into a message.
-        comptime CFG_BYTES = 56
+        comptime CFG_BYTES = 88
         comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
         var b2 = unsafe_alloc[UInt8](BLOB2)
         for i in range(BLOB2):
@@ -1432,6 +1460,17 @@ def _bootstrap(
         cfg[unsafe_offset=4] = Int64(split_unit)
         cfg[unsafe_offset=5] = Int64(fused_big_cap)
         cfg[unsafe_offset=6] = Int64(fused_big)
+        # The effective schedule and the fused kernel's geometry. The split
+        # and fused schedules launch different grids and the barriers are
+        # block-matched, so a rank on the other schedule, built with another
+        # thread count, or on a GPU that holds a different number of blocks
+        # would sync a different slice of the data: a hang or a race, caught
+        # here as a message. The two device numbers are compared within a
+        # node only -- the barriers never cross nodes.
+        cfg[unsafe_offset=7] = Int64(1 if fused else 0)
+        cfg[unsafe_offset=8] = Int64(FUSED_THREADS)
+        cfg[unsafe_offset=9] = Int64(fused_resident)
+        cfg[unsafe_offset=10] = Int64(device_sms)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
         for r in range(nranks):
@@ -1449,6 +1488,8 @@ def _bootstrap(
                 or rcfg[unsafe_offset=4] != cfg[unsafe_offset=4]
                 or rcfg[unsafe_offset=5] != cfg[unsafe_offset=5]
                 or rcfg[unsafe_offset=6] != cfg[unsafe_offset=6]
+                or rcfg[unsafe_offset=7] != cfg[unsafe_offset=7]
+                or rcfg[unsafe_offset=8] != cfg[unsafe_offset=8]
             ):
                 raise Error(
                     "mojoccl: rank "
@@ -1481,10 +1522,36 @@ def _bootstrap(
                     + String(Int(cfg[unsafe_offset=4]))
                     + " against that rank's "
                     + String(Int(rcfg[unsafe_offset=4]))
+                    + ", schedule "
+                    + ("fused" if cfg[unsafe_offset=7] != 0 else "split")
+                    + " x "
+                    + String(Int(cfg[unsafe_offset=8]))
+                    + " threads against that rank's "
+                    + ("fused" if rcfg[unsafe_offset=7] != 0 else "split")
+                    + " x "
+                    + String(Int(rcfg[unsafe_offset=8]))
                     + "; MOJOCCL_REGION_MB, MOJOCCL_NVLS_MIN_MB,"
                     " MOJOCCL_FUSED_BLOCKS, MOJOCCL_FUSED_BIG_BLOCKS,"
-                    " MOJOCCL_FUSED_BIG_MB and MOJOCCL_PIPE_SPLIT_UNIT must"
-                    " match on every rank"
+                    " MOJOCCL_FUSED_BIG_MB, MOJOCCL_PIPE_SPLIT_UNIT,"
+                    " MOJOCCL_FUSED, MOJOCCL_IB_PROXY and the build's"
+                    " ccl_fused_threads must match on every rank"
+                )
+            if topo.node_of[r] == topo.my_node and (
+                rcfg[unsafe_offset=9] != cfg[unsafe_offset=9]
+                or rcfg[unsafe_offset=10] != cfg[unsafe_offset=10]
+            ):
+                raise Error(
+                    "mojoccl: rank "
+                    + String(r)
+                    + " on this node can hold "
+                    + String(Int(rcfg[unsafe_offset=9]))
+                    + " blocks of the fused allreduce kernel on "
+                    + String(Int(rcfg[unsafe_offset=10]))
+                    + " multiprocessors, this rank "
+                    + String(fused_resident)
+                    + " on "
+                    + String(device_sms)
+                    + "; the ranks of a node must run identical GPUs"
                 )
 
         # Same-node peers only: an IPC handle from another host is meaningless.
@@ -1538,10 +1605,6 @@ def _bootstrap(
     var rank_at = List[Int]()
     for i in range(len(topo.rank_at)):
         rank_at.append(topo.rank_at[i])
-    # Read before `lib` is moved into the state. The NVLS grid must be
-    # entirely resident (see `nvls_blocks`), so it is a function of this
-    # device's SM count, not a constant.
-    var device_sms = sm_count(lib, ordinal)
     var nvls_grid = nvls_blocks(device_sms)
     var state = CommState(
         rank=rank,
@@ -1571,13 +1634,9 @@ def _bootstrap(
         fused_cap=fused_cap,
         fused_big_cap=fused_big_cap,
         fused_big_bytes=fused_big,
+        fused_resident=fused_resident,
         split_unit=split_unit,
-        fused=(
-            _fused_enabled()
-            and ib != 0
-            and ib_uses_proxy(ib)
-            and device_sms > 0
-        ),
+        fused=fused,
         abort_host=abort_host,
         abort_dev=abort_dev,
     )
@@ -2172,13 +2231,19 @@ def _do_allreduce[
             done += chunk
         return
 
-    if state.fused:
+    # The fused kernel files every chunk's work item before it launches, so a
+    # collective of more chunks than the ring has slots would wait on itself
+    # (`_await_ring_slot`); geometry can cut a large message that finely
+    # (129 MiB at MOJOCCL_REGION_MB=1 is over 500 chunks). The split schedule
+    # releases chunks as it goes and has no such bound.
+    var plan = _pipeline_plan(state, count, item)
+    if state.fused and plan[1] <= WORK_SLOTS:
         _do_allreduce_fused[dtype](
-            state, stream, sendbuff, recvbuff, count, scale
+            state, stream, sendbuff, recvbuff, count, scale, plan
         )
         return
     _do_allreduce_split[dtype](
-        state, stream, raw_stream, sendbuff, recvbuff, count, scale
+        state, stream, raw_stream, sendbuff, recvbuff, count, scale, plan
     )
 
 
@@ -2204,6 +2269,7 @@ def _do_allreduce_fused[
     recvbuff: Int,
     count: Int,
     scale: Float32,
+    plan: Tuple[Int, Int, Int],
 ) raises:
     """The pipelined multi-node allreduce as one launch (internode_fused.mojo).
 
@@ -2215,7 +2281,6 @@ def _do_allreduce_fused[
     """
     comptime item = size_of[dtype]()
     comptime W = 16 // item
-    var plan = _pipeline_plan(state, count, item)
     var chunk_elems = plan[0]
     var nchunks = plan[1]
     var npeers = ib_npeers(state.ib)
@@ -2223,6 +2288,19 @@ def _do_allreduce_fused[
     # Two generations per chunk, reserved up front, so each chunk's
     # all-gather is its own reduce-scatter's plus one (the split kernels'
     # documented pairing).
+    # Every reason to refuse the call comes before anything is reserved:
+    # the largest chunk (the first) sets the largest inbox slot.
+    check_fused_call[dtype](
+        sendbuff, recvbuff, chunk_elems, state.arena_cap, nchunks
+    )
+    var sr0 = shard_range(
+        min(chunk_elems, count), state.local_world, state.local_rank, item
+    )
+    if npeers * _align_up(max(sr0[1] * item, EMPTY_SHARD_BYTES), 16) > group:
+        raise Error(
+            "mojoccl: the inter-node inbox overflows the network area; this"
+            " is a chunking bug"
+        )
     var g0 = state.generation + 1
     state.generation += 2 * nchunks
     var seq0 = ib_reserve_seqs(state.ib, nchunks)
@@ -2232,11 +2310,6 @@ def _do_allreduce_fused[
         var sr = shard_range(cnt, state.local_world, state.local_rank, item)
         var nbytes = sr[1] * item
         var slot_bytes = _align_up(max(nbytes, EMPTY_SHARD_BYTES), 16)
-        if npeers * slot_bytes > group:
-            raise Error(
-                "mojoccl: the inter-node inbox overflows the network area;"
-                " this is a chunking bug"
-            )
         var seq = seq0 + k
         var inbox_base = _inbox_base(state, seq)
         var shard = _arena_shard(state, k % state.narenas, sr[0] * item)
@@ -2284,10 +2357,11 @@ def _do_allreduce_fused[
         fused_blocks(
             state.fused_big_cap if count * item
             >= state.fused_big_bytes else state.fused_cap,
-            state.sm_count,
+            state.fused_resident,
             _shard_per(chunk_elems, state.local_world, W),
             W,
         ),
+        state.sm_count,
         spin_timeout_ns(),
     )
 
@@ -2302,6 +2376,7 @@ def _do_allreduce_split[
     recvbuff: Int,
     count: Int,
     scale: Float32,
+    plan: Tuple[Int, Int, Int],
 ) raises:
     """The pipelined multi-node allreduce as five kernels per chunk.
 
@@ -2316,7 +2391,6 @@ def _do_allreduce_split[
     # `depth <= narenas` is what keeps chunk k+narenas's reduce-scatter
     # enqueued AFTER chunk k's all-gather, which is what the arena's start
     # barrier needs to order the reuse.
-    var plan = _pipeline_plan(state, count, item)
     var chunk_elems = plan[0]
     var nchunks = plan[1]
     var depth = plan[2]

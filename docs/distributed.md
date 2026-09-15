@@ -726,7 +726,20 @@ per allreduce (`internode_fused.mojo`, `ccl_internode_allreduce_pipelined_*`):
 the reduce-scatter and all-gather bodies of `collectives_kernels.mojo`, the
 inbox add, the mailbox store that releases a chunk to the progress thread
 and the spin on its completion are phases of that kernel, separated by a
-rank-local grid barrier where a launch boundary used to be. It used to be
+rank-local grid barrier where a launch boundary used to be. A grid that
+waits for itself must be entirely resident, and an ordinary launch under
+persistent GEMMs holding the SMs does not promise that, so the grid is
+bounded by the driver's occupancy answer for the kernel times the SM count
+(`fused_resident_blocks`, asked at init and again per dtype at launch) and
+launched with CUDA's cooperative attribute, which makes the driver refuse a
+grid it cannot hold rather than let it spin to the deadline (MAX's launch
+attributes are CUDA-only; on AMD the occupancy bound is the whole
+guarantee). A call the geometry cuts into more chunks than the inter-node
+work ring has slots (`WORK_SLOTS`, 512: a 129 MiB allreduce at
+`MOJOCCL_REGION_MB=1`) takes the split schedule, which releases chunks as it
+goes, because the fused kernel files every chunk's exchange before it
+launches and would wait on a slot only its own kernel could free
+(`tests/multinode/small_region_probe.py`). It used to be
 five launches per chunk, and on GPT-2 XL (146 allreduces per step, issued
 from the autograd thread that also issues the backward's GEMMs, ~24 µs of
 driver time per launch) that cost the compute stream 1179 idle gaps of
@@ -734,7 +747,11 @@ driver time per launch) that cost the compute stream 1179 idle gaps of
 end to end. See "One kernel per allreduce" below for the numbers.
 `MOJOCCL_FUSED=0` is the old schedule, still used behind
 `MOJOCCL_IB_PROXY=0` (a stream callback needs a point in stream order to
-run at, which a kernel's middle is not).
+run at, which a kernel's middle is not). The two schedules launch different
+grids and the intra-node barriers are block-matched, so the effective
+schedule, the build's threads per block and -- within a node -- the fused
+kernel's co-resident bound and SM count are exchanged at init and a
+mismatch is refused with a message naming the knobs.
 
 `K = sqrt(bytes / (local_world × 640 KB))`, capped at 16 by choice and
 raised from below by geometry when a chunk would not fit — the square root
@@ -941,13 +958,13 @@ any bug currently open.
 | `MOJOCCL_SOCKET_IFNAME` | first UP non-loopback IPv4 interface with a default route (`bond0` here) | interface whose address rank 0 publishes in the unique id; one name, no lists |
 | `MOJOCCL_BOOTSTRAP_TIMEOUT_S` | 120 | absolute deadline for the whole rendezvous. Every socket it opens is non-blocking and every wait is a `poll(2)` computed from the deadline (`connect` included, verified with `SO_ERROR`), so no syscall can outlive it; `SO_RCVTIMEO`/`SO_SNDTIMEO` stay on as a backstop |
 | `MOJOCCL_IB_HCA` | affinity choice | exact HCA name to use instead (`mlx5_4`) |
-| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for a peer that stopped answering before latching an error — **every** wait: the inter-node exchange, its wait kernel, and the intra-node and NVLS barrier spins, which read it once per process |
+| `MOJOCCL_IB_TIMEOUT_S` | 60 | how long a rank waits for a peer that stopped answering before latching an error — **every** wait: the inter-node exchange, the fused kernel's phases (its clock restarts per chunk, before the exchange wait and before the all-gather; the grid barriers get one extra second so the informative fault is the one latched), and the intra-node and NVLS barrier spins, which read it once per process |
 | `MOJOCCL_IB_PROXY` | 1 | `0`: stream host callback instead of the progress thread (and the split, five-kernels-per-chunk allreduce schedule) |
-| `MOJOCCL_FUSED` | 1 | `0`: the split allreduce schedule (five launches per chunk) instead of the one persistent kernel per allreduce. Not part of the wire layout; ranks may disagree |
+| `MOJOCCL_FUSED` | 1 | `0`: the split allreduce schedule (five launches per chunk) instead of the one persistent kernel per allreduce. The effective schedule (this, or `MOJOCCL_IB_PROXY=0`) must match on every rank -- the two launch different grids and the barriers are block-matched |
 | `MOJOCCL_FUSED_BLOCKS` | 16 | grid of the fused allreduce kernel, i.e. how many SMs it holds for its whole life (`internode_fused.mojo` explains the trade); must match on every rank |
 | `MOJOCCL_FUSED_BIG_BLOCKS` / `MOJOCCL_FUSED_BIG_MB` | 64 / 128 | grid for allreduces of at least that many MiB (DDP's last bucket, which nothing overlaps); must match on every rank |
 | `MOJOCCL_PIPE_SPLIT_UNIT` | 640000 | the chunk rule's constant, `K = sqrt(bytes / (local_world × unit))`; must match on every rank |
-| `MOJOCCL_BUILD_DEFINES` | unset | `-D` defines for the `libmojoccl.so` build (`ccl_fused_threads=512,ccl_fused_unroll=4,...`), part of the cache key; the fused kernel's threads per block are part of the wire layout, so every rank must build with the same value |
+| `MOJOCCL_BUILD_DEFINES` | unset | `-D` defines for the `libmojoccl.so` build (`ccl_fused_threads=512,ccl_fused_unroll=4,...`), part of the cache key. Per process: each rank builds or loads its own `.so` from its own environment, and the fused kernel's threads per block are part of the wire layout, so `ncclCommInitRank` checks the compiled value matches on every rank |
 | `MOJOCCL_IB_PROXY_IDLE_US` | 20 | sleep quantum of the idle progress thread (it spins only during an exchange) |
 | `MOJOCCL_IB_PROXY_CPU` | unset: auto-pin (mask permitting), see above | an exact CPU to pin the progress thread to; `none` disables pinning |
 | `MOJOCCL_IB_RELAXED_ORDERING` | 1 | `0`: plain `ibv_reg_mr` |
@@ -1242,6 +1259,12 @@ The table (job 250996, the same protocol as job 250679 above):
 | mojo backend + NCCL | 496k ± 1k | 0.999 ± 0.003 |
 | mojo backend + mojoccl (all Mojo) | 488k ± 1k | **0.984 ± 0.002** |
 
+Re-run after the review fixes (cooperative launch, occupancy bound, init
+checks, ring bound; job 251179, `tests/multinode/e2e_three_stacks.sbatch`
+with `E2E_TAG=e2e_gpt2xl`): stock 495k, mojo + NCCL 495k (1.001 ± 0.002),
+mojo + mojoccl 487k = 0.984 ± 0.001; host cost per call unchanged at
+30–31 µs (job 251253).
+
 Validated in the same state (jobs 250997, 251023, 251056): `collectives`,
 `ddp_parity` and `stress` at 16 ranks under both libraries and at 8 ranks
 on one node, `collectives` under `MOJOCCL_IB_PROXY=0` and under
@@ -1250,7 +1273,10 @@ ranks to the same losses, and `tests/multinode/deadline_probe.py`: rank 0
 sleeps through `MOJOCCL_IB_TIMEOUT_S=3`, its node-mates latch
 `DEVICE DEADLINE in the multi-node allreduce's reduce-scatter stage` and the
 other node's ranks the exchange wait, and every rank's next allreduce raises
-`ncclRemoteError` instead of hanging. The GPU-free self-tests
+`ncclRemoteError` within the deadline plus the 1 s grid grace instead of
+hanging (measured per rank, under a watchdog). A rank alone on the split
+schedule is refused at init, and a 129 MiB allreduce on a 1 MiB region --
+past the work ring -- is correct (`small_region_probe.py`). The GPU-free self-tests
 (`geometry_test`, `ib_pipeline` with the credit protocol) pass on the login
 node.
 

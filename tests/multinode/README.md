@@ -119,7 +119,12 @@ stream when DDP issues 146 allreduces per step from the autograd thread.
 process group for a nanoGPT model (recorded at the process group on the
 second step, after DDP has rebuilt its buckets in autograd order; GPT-2 XL:
 144 × 39 MiB then 313 MiB), in the form `bucket_loop.py`'s `BUCKETS=` takes.
-`run_enqueue_probe.sbatch` runs both, `bucket_loop.py` on that list, a
+`deadline_probe.py` puts one rank to sleep past `MOJOCCL_IB_TIMEOUT_S` and
+checks that every other rank raises within the deadline plus the fused
+kernel's grid grace, under a watchdog; `small_region_probe.py` allreduces
+20 and 129 MiB on a `MOJOCCL_REGION_MB=1` region, the second of which is
+more chunks than the inter-node work ring holds and has to take the split
+schedule. `run_enqueue_probe.sbatch` runs the first two, `bucket_loop.py` on that list, a
 `MOJOCCL_IB_TRACE=1` GPT-2 XL step and `ring_pressure.py` in one two-node
 job, with the enqueue legs in ABBA order; run it before and after a change
 to the collectives' launch structure.
