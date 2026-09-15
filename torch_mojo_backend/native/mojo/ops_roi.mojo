@@ -4,8 +4,10 @@ from std.utils import IndexList
 
 from abi import (
     ST_INT32,
+    ST_FLOAT32,
     T,
     Values,
+    alert_not_deterministic,
     new_tensor,
     own,
     own_if_new,
@@ -19,7 +21,7 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import contiguous
+from ops_common import cast_to, contiguous
 from registry import Site, impl, op_address_of
 
 
@@ -166,9 +168,21 @@ def _backward[pool: Bool](args: Values, rets: Values) raises:
         unsupported(
             "ROI backward gradient shape does not match pooled dimensions"
         )
+    if grad.numel:
+        alert_not_deterministic(
+            "roi_pool_backward_kernel" if pool else "roi_align_backward_kernel"
+        )
     var g = own_if_new(contiguous(grad), grad)
     var r = own_if_new(contiguous(rois), rois)
-    var out = own(new_tensor(_shape(n, c, h, w), 4, grad.stype, grad.device))
+    var half_workspace = grad.dtype == DType.float16
+    comptime if pool:
+        var ctx = ctx_for(grad.device)
+        half_workspace = half_workspace and ctx.api() != "cuda"
+        _ = ctx
+    var accumulation_type = ST_FLOAT32 if half_workspace else grad.stype
+    var out = own(
+        new_tensor(_shape(n, c, h, w), 4, accumulation_type, grad.device)
+    )
     comptime if pool:
         var indices = v_tensor(args[unsafe_offset=2])
         if (
@@ -221,7 +235,12 @@ def _backward[pool: Bool](args: Values, rets: Values) raises:
                 v_int(args[unsafe_offset=9]),
                 v_bool(args[unsafe_offset=10]),
             )
-    ret_tensor(rets, 0, out.take())
+    if half_workspace:
+        var result = own(cast_to(out.t, grad.stype))
+        ret_tensor(rets, 0, result.take())
+    else:
+        ret_tensor(rets, 0, out.take())
+    _ = out^
     _ = g^
     _ = r^
 

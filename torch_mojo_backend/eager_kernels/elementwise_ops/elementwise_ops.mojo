@@ -45,6 +45,7 @@ from std.math import (
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
     is_apple_gpu,
     simd_width_of,
     size_of,
@@ -630,6 +631,18 @@ def _unary_elementwise[
                 comptime if dtype != DType.float64 or (
                     op_code == UOP_LOG2 and not has_apple_gpu_accelerator()
                 ):
+                    comptime if (
+                        op_code == UOP_LOG2
+                        and (dtype == DType.float32 or dtype == DType.bfloat16)
+                        and has_nvidia_gpu_accelerator()
+                    ):
+                        if _flat_vec_unary[
+                            dtype,
+                            dtype,
+                            _unary_apply[dtype, _, op_code],
+                            "log2",
+                        ](Int(out_ptr), Int(in_ptr), size, ctx):
+                            return
                     comptime if has_apple_gpu_accelerator():
                         # Apple: 4-wide vector body when both pointers are
                         # vector-aligned; the scalar grid-stride tail in the

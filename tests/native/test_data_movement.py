@@ -976,6 +976,84 @@ def test_index_put_single_axis(mojo_gpu: str, dtype: torch.dtype, axis: int):
     torch.testing.assert_close(ours.cpu(), expected)
 
 
+@pytest.mark.parametrize("rowlen", [3, 4, 7, 8, 9, 257, 789, 1024, 1025, 1028, 2056])
+@pytest.mark.parametrize(
+    "target_offset,source_offset", [(0, 0), (1, 0), (0, 1), (1, 1)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_index_put_row_copy_offsets(
+    mojo_gpu: str,
+    rowlen: int,
+    target_offset: int,
+    source_offset: int,
+    dtype: torch.dtype,
+):
+    n, k = 11, 5
+    indices = torch.tensor([8, 0, 10, 3, 5])
+    source_host = ((torch.arange(k * rowlen + source_offset + 1) % 31).float() / 8).to(
+        dtype
+    )
+    source_storage = source_host.to(mojo_gpu)
+    values = source_storage[source_offset : source_offset + k * rowlen].reshape(
+        k, rowlen
+    )
+    storage = torch.full((n * rowlen + target_offset + 1,), -99.0, dtype=dtype).to(
+        mojo_gpu
+    )
+    ours = storage[target_offset : target_offset + n * rowlen].reshape(n, rowlen)
+    expected = torch.full((n, rowlen), -99.0, dtype=dtype)
+    expected[indices] = source_host[source_offset : source_offset + k * rowlen].reshape(
+        k, rowlen
+    )
+    pointer = ours.data_ptr()
+    returned = ours.index_put_((indices.to(mojo_gpu),), values)
+    assert returned.data_ptr() == pointer
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+    actual_storage = storage.cpu()
+    torch.testing.assert_close(
+        actual_storage[:target_offset], torch.full((target_offset,), -99.0, dtype=dtype)
+    )
+    assert actual_storage[-1] == -99
+    torch.testing.assert_close(source_storage.cpu(), source_host, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bad_index", [-1, 11])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_index_put_row_copy_invalid_leaves_target(
+    mojo_gpu: str, bad_index: int, dtype: torch.dtype
+):
+    data = torch.full((11, 1024), -31.0, dtype=dtype)
+    ours = data.to(mojo_gpu)
+    indices = torch.tensor([2, bad_index, 0]).to(mojo_gpu)
+    values = torch.full((3, 1024), 17.0, dtype=dtype).to(mojo_gpu)
+    with pytest.raises(NotImplementedError, match="nonnegative"):
+        ours.index_put_((indices,), values)
+    torch.testing.assert_close(ours.cpu(), data, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_index_put_row_copy_broadcast_fallback(mojo_gpu: str, dtype: torch.dtype):
+    indices = torch.tensor([8, 0, 10, 3, 5])
+    values = torch.arange(5, dtype=dtype).reshape(5, 1)
+    expected = torch.full((11, 257), -13.0, dtype=dtype)
+    expected[indices] = values
+    ours = torch.full((11, 257), -13.0, dtype=dtype).to(mojo_gpu)
+    ours.index_put_((indices.to(mojo_gpu),), values.to(mojo_gpu))
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_index_put_row_copy_strided_index_fallback(mojo_gpu: str, dtype: torch.dtype):
+    storage = torch.tensor([8, 9, 0, 9, 10, 9, 3, 9, 5, 9])
+    indices = storage.to(mojo_gpu)[::2]
+    values = torch.arange(5 * 257, dtype=dtype).reshape(5, 257)
+    expected = torch.full((11, 257), -13.0, dtype=dtype)
+    expected[storage[::2]] = values
+    ours = torch.full((11, 257), -13.0, dtype=dtype).to(mojo_gpu)
+    ours.index_put_((indices,), values.to(mojo_gpu))
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("value_shape", [(), (1,), (1, 4), (2, 1)])
 def test_index_put_broadcast(mojo_gpu: str, value_shape: tuple[int, ...]):
     data = torch.arange(20, dtype=torch.float32).reshape(5, 4)

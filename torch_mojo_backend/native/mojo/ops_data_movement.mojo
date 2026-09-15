@@ -1599,6 +1599,34 @@ def op_index_put_impl_(
             "_index_put_impl_: indices must be nonnegative and less than the"
             " indexed dimension; negative wrapping is not supported"
         )
+    var row_copy = (
+        axis == 0
+        and index.stride(0) == 1
+        and values.contig
+        and values.rank == target.rank
+        and (target.dtype == DType.float32 or target.dtype == DType.bfloat16)
+        and ctx.api() == "cuda"
+    )
+    if row_copy:
+        for d in range(target.rank):
+            row_copy = row_copy and values.dim(d) == shape[d]
+    if row_copy:
+        var rowlen = 1
+        for d in range(1, target.rank):
+            rowlen *= target.dim(d)
+        var rows = KernelCall("data_movement_ops", "IndexPutRows")
+        rows.arg_dtype(0, target.dtype)
+        rows.int(target.ptr)
+        rows.int(index.ptr)
+        rows.int(values.ptr)
+        rows.int(target.dim(0))
+        rows.int(index.numel)
+        rows.int(rowlen)
+        rows.int(ctx_ptr(ctx))
+        rows.run()
+        _ = ctx
+        ret_ref(rets, 0, target)
+        return
     var call = KernelCall("data_movement_ops", "ScatterDim")
     call.arg_dtype(0, target.dtype)
     call.arg_dtype(1, index.dtype)

@@ -165,7 +165,159 @@ def _check_roi(
         kind, ours, rois.to(device), scale=scale, sampling=sampling, aligned=aligned
     ).backward(grad.to(device))
     assert ours.grad is not None
-    torch.testing.assert_close(ours.grad.cpu(), first_grad, rtol=0, atol=0)
+    _assert_close(ours.grad, first_grad, dtype)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("count", [19, 255, 257, 1025])
+@pytest.mark.parametrize("full_image", [False, True])
+def test_roi_backward_overlapping(
+    mojo_gpu: str, kind: str, dtype: torch.dtype, count: int, full_image: bool
+):
+    _dtype_supported(mojo_gpu, dtype)
+    data = ((torch.arange(2 * 3 * 17 * 19) * 71) % 997).reshape(2, 3, 17, 19)
+    data = (data.to(torch.float64) / 1024).to(dtype)
+    rois = torch.tensor(
+        [[0, 0, 0, 18, 16] if full_image else [0, -2, -3, 10.5, 12.25]], dtype=dtype
+    ).repeat(count, 1)
+    rois[:, 0] = torch.arange(count) % 2
+    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference = data.to(reference_dtype).requires_grad_()
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    expected = _roi_op(kind, reference, rois.to(reference_dtype), (3, 5))
+    result = _roi_op(kind, ours, rois.to(mojo_gpu), (3, 5))
+    grad = ((torch.arange(result.numel()) * 13) % 31 - 15).reshape(result.shape)
+    grad = (grad.to(torch.float64) / 16).to(dtype)
+    expected.backward(grad.to(reference_dtype))
+    result.backward(grad.to(mojo_gpu))
+    _assert_close(result, expected, dtype)
+    assert ours.grad is not None and reference.grad is not None
+    _assert_close(ours.grad, reference.grad, dtype)
+
+
+@pytest.mark.parametrize("kind", ["align", "pool"])
+@pytest.mark.parametrize("warn_only", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_roi_backward_deterministic_algorithms(
+    mojo_gpu: str, kind: str, warn_only: bool, empty: bool
+):
+    data = torch.arange(35, dtype=torch.float32).reshape(1, 1, 5, 7)
+    rois = torch.tensor([[0.0, 0.0, 0.0, 6.0, 4.0]])[: 0 if empty else 1]
+    ours = data.to(mojo_gpu).requires_grad_()
+    result = _roi_op(kind, ours, rois.to(mojo_gpu), (3, 2))
+    grad = torch.ones(result.shape).to(mojo_gpu)
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        if empty:
+            result.backward(grad)
+            assert ours.grad is not None
+            torch.testing.assert_close(ours.grad.cpu(), torch.zeros_like(data))
+        elif warn_only:
+            with pytest.warns(UserWarning, match=f"roi_{kind}_backward_kernel"):
+                result.backward(grad)
+            assert ours.grad is not None
+        else:
+            with pytest.raises(RuntimeError, match="does not have a deterministic"):
+                result.backward(grad)
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn)
+
+
+@pytest.mark.parametrize(
+    "batches,width,count", [(1, 1, 33), (1, 2, 257), (2049, 1, 33)]
+)
+def test_roi_pool_backward_half_subnormal(
+    mojo_gpu: str, batches: int, width: int, count: int
+):
+    data = torch.ones(batches, 1, 1, width, dtype=torch.float16)
+    rois = torch.zeros(count, 5, dtype=data.dtype)
+    rois[:, 0] = batches - 1
+    rois[:, 1] = torch.arange(count) % width
+    rois[:, 3] = rois[:, 1]
+    ours = data.to(mojo_gpu).requires_grad_()
+    result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (1, 1))
+    grad = torch.full(result.shape, 2**-24, dtype=data.dtype)
+    result.backward(grad.to(mojo_gpu))
+    expected = torch.zeros_like(data)
+    for pixel in range(width):
+        expected[-1, 0, 0, pixel] = ((count + width - 1 - pixel) // width) * 2**-24
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batches,count", [(1, 1025), (2, 257)])
+@pytest.mark.parametrize("positive", [False, True])
+def test_roi_pool_backward_half_odd_extent(
+    mojo_gpu: str, batches: int, count: int, positive: bool
+):
+    index = torch.arange(batches * 3 * 17 * 19, dtype=torch.int64)
+    data = ((index * 1103515245 + 12345) % 65521 % 17 - 8).float() / 16
+    data = data.half().reshape(batches, 3, 17, 19)
+    rois = torch.tensor([[0, 0, 0, 18, 16]], dtype=data.dtype).repeat(count, 1)
+    rois[:, 0] = torch.arange(count) % batches
+    reference = data.float().requires_grad_()
+    ours = data.to(mojo_gpu).requires_grad_()
+    expected = vision.ops.roi_pool(reference, rois.float(), (3, 5))
+    result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (3, 5))
+    index = torch.arange(result.numel(), dtype=torch.int64)
+    grad = ((index * 1103515245 + 12345) % 65521 % 17 - 8).float() / 16
+    grad = grad.half().reshape(result.shape)
+    if positive:
+        grad.fill_(0.0625)
+    expected.backward(grad.float())
+    result.backward(grad.to(mojo_gpu))
+    assert ours.grad is not None and reference.grad is not None
+    _assert_close(ours.grad, reference.grad, data.dtype)
+
+
+def test_roi_pool_backward_half_batch_bound(mojo_gpu: str):
+    data = torch.ones(2049, 1, 1, 1, dtype=torch.float16)
+    rois = torch.tensor([[2048, 0, 0, 0, 0]], dtype=torch.float16)
+    ours = data.to(mojo_gpu).requires_grad_()
+    result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (1, 1))
+    result.backward(torch.ones(result.shape, dtype=data.dtype).to(mojo_gpu))
+    expected = torch.zeros_like(data)
+    expected[2048] = 1
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected)
+
+
+def test_roi_pool_backward_rounded_bin_edge(mojo_gpu: str):
+    data = torch.zeros(1, 1, 3, 59)
+    data[0, 0, 1, 57] = 100
+    rois = torch.tensor([[0.0, 0.0, 0.0, 56.0, 2.0]])
+    reference = data.requires_grad_()
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    expected = vision.ops.roi_pool(reference, rois, (1, 7))
+    result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (1, 7))
+    # ceil(7 * float32(57 / 7)) is 58: saved argmax defines the footprint.
+    expected.backward(torch.ones_like(expected))
+    result.backward(torch.ones(result.shape).to(mojo_gpu))
+    assert reference.grad is not None and ours.grad is not None
+    assert reference.grad[0, 0, 1, 57] == 1
+    torch.testing.assert_close(result.cpu(), expected)
+    torch.testing.assert_close(ours.grad.cpu(), reference.grad)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("channels", [31, 32, 33])
+def test_roi_pool_geometry_regimes(mojo_gpu: str, dtype: torch.dtype, channels: int):
+    _dtype_supported(mojo_gpu, dtype)
+    data = torch.randn(
+        1, channels, 15, 15, generator=torch.Generator().manual_seed(781)
+    ).to(dtype)
+    rois = torch.tensor([[0, 0, 0, 13, 13], [0, -1, -1, 12, 12]], dtype=dtype).repeat(
+        600, 1
+    )
+    expected, expected_indices = torch.ops.torchvision.roi_pool(data, rois, 1.0, 7, 7)
+    result, indices = torch.ops.torchvision.roi_pool(
+        data.to(mojo_gpu), rois.to(mojo_gpu), 1.0, 7, 7
+    )
+    _assert_close(result, expected, dtype)
+    torch.testing.assert_close(indices.cpu(), expected_indices)
 
 
 @pytest.mark.parametrize("kind", ["align", "pool"])

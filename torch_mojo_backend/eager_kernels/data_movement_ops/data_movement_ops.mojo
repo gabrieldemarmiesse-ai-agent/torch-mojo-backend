@@ -20,7 +20,12 @@ from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+    size_of,
+)
 from std.utils.coord import Coord
 
 from max.algorithm import elementwise
@@ -3146,6 +3151,119 @@ def _gather_rows_go(
         raise Error("GatherRows: unsupported index dtype ", idx_dtype)
 
 
+@__name(
+    "index_put_rows_"
+    + ("f32" if dtype == DType.float32 else "bf16")
+    + "_v"
+    + String(width)
+)
+def _index_put_rows_kernel[
+    dtype: DType, width: Int
+](
+    output: Pointer[Scalar[dtype], MutAnyOrigin],
+    indices: Pointer[Int64, MutAnyOrigin],
+    source: Pointer[Scalar[dtype], MutAnyOrigin],
+    n: Int64,
+    k: Int64,
+    rowlen: Int64,
+    tiles: Int64,
+):
+    var task = Int(block_idx.x)
+    var ntasks = Int(k * tiles)
+    while task < ntasks:
+        var row = task // Int(tiles)
+        var tile = task % Int(tiles)
+        var target = Int(indices[unsafe_offset=row])
+        var col = (tile * 256 + Int(thread_idx.x)) * width
+        if target >= 0 and target < Int(n):
+            if col + width <= Int(rowlen):
+                var value = source.unsafe_load[
+                    width=width, alignment=width * size_of[dtype]()
+                ](row * Int(rowlen) + col)
+                output.unsafe_store[
+                    width=width, alignment=width * size_of[dtype]()
+                ](target * Int(rowlen) + col, value)
+            elif col < Int(rowlen):
+                for j in range(col, Int(rowlen)):
+                    output[unsafe_offset=target * Int(rowlen) + j] = source[
+                        unsafe_offset=row * Int(rowlen) + j
+                    ]
+        task += Int(grid_dim.x)
+
+
+def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 7:
+        raise Error("IndexPutRows expects 7 argument slots")
+    comptime if has_nvidia_gpu_accelerator() and (
+        _dtype_arg_on[0, DType.float32]() or _dtype_arg_on[0, DType.bfloat16]()
+    ):
+        comptime dtype = DType.float32 if _dtype_arg_on[
+            0, DType.float32
+        ]() else DType.bfloat16
+        comptime vector_width = 16 // size_of[dtype]()
+        comptime kernel_name = "index_put_rows_" + (
+            "f32" if dtype == DType.float32 else "bf16"
+        ) + "_v"
+        var output_addr = _raw_int(argv[unsafe_offset=0])
+        var source_addr = _raw_int(argv[unsafe_offset=2])
+        var output = _make_ptr[dtype](output_addr).as_unsafe_any_origin()
+        var indices = _make_ptr[DType.int64](
+            _raw_int(argv[unsafe_offset=1])
+        ).as_unsafe_any_origin()
+        var source = _make_ptr[dtype](source_addr).as_unsafe_any_origin()
+        var n = Int64(_raw_int(argv[unsafe_offset=3]))
+        var k = Int64(_raw_int(argv[unsafe_offset=4]))
+        var rowlen = Int64(_raw_int(argv[unsafe_offset=5]))
+        var ctx = _raw_ctx(argv[unsafe_offset=6])
+        if k == 0 or rowlen == 0:
+            return
+        var vector = (
+            rowlen % Int64(vector_width) == 0
+            and (output_addr | source_addr) % 16 == 0
+        )
+        var width = vector_width if vector else 1
+        var tiles = ceildiv(Int(rowlen), 256 * width)
+        # Measured on H100: eight blocks/SM for vector copies, four for scalar.
+        var blocks = min(
+            Int(k) * tiles, _device_sm_count(ctx) * (8 if vector else 4)
+        )
+        if vector:
+            _enqueue_cached[_index_put_rows_kernel[dtype, vector_width]](
+                ctx,
+                kernel_name + String(vector_width),
+                blocks,
+                1,
+                1,
+                256,
+                output,
+                indices,
+                source,
+                n,
+                k,
+                rowlen,
+                Int64(tiles),
+            )
+        else:
+            _enqueue_cached[_index_put_rows_kernel[dtype, 1]](
+                ctx,
+                kernel_name + "1",
+                blocks,
+                1,
+                1,
+                256,
+                output,
+                indices,
+                source,
+                n,
+                k,
+                rowlen,
+                Int64(tiles),
+            )
+        _ = ctx
+    else:
+        raise Error("IndexPutRows requires NVIDIA and float32/bfloat16")
+
+
 # ---------------------------------------------------------------------------
 # ScatterDim: out[coord with coord[dim] := index[coord]] = src[coord] (or a
 # scalar value). Implements aten::scatter.src / aten::scatter.value over a
@@ -3524,6 +3642,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["GatherRows"]():
             _gather_rows_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["IndexPutRows"]():
+            _index_put_rows_dispatcher(argv, argc)
             return 0
         comptime if _op_on["ScatterDim"]():
             _scatter_dim_dispatcher(argv, argc)

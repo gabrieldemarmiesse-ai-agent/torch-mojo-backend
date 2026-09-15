@@ -270,6 +270,15 @@ def set_shim_error(msg: String):
     )
 
 
+def alert_not_deterministic(var caller: String) raises:
+    check(
+        external_call["tmb_alert_not_deterministic", Int32](
+            caller.as_c_string_slice().unsafe_ptr()
+        ),
+        "nondeterministic operation",
+    )
+
+
 # --- records ------------------------------------------------------------------
 @fieldwise_init
 struct Value(Copyable, Movable):

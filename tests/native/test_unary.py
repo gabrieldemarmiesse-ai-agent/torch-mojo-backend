@@ -728,6 +728,44 @@ def test_log2_noncontiguous(mojo_gpu: str):
     torch.testing.assert_close(result.cpu(), torch.log2(data.transpose(0, 1)))
 
 
+@pytest.mark.parametrize("count", [1, 4, 5, 7, 8, 9, 1023, 1024, 1025, 357 * 789])
+@pytest.mark.parametrize("input_offset,output_offset", [(0, 0), (1, 0), (0, 1), (3, 3)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_log2_offset_tail(
+    mojo_gpu: str, count: int, input_offset: int, output_offset: int, dtype: torch.dtype
+):
+    data = torch.linspace(0.125, 8.0, count + input_offset + 3).to(dtype)
+    source = data.to(mojo_gpu)[input_offset : input_offset + count]
+    storage = torch.full((count + output_offset + 3,), -12345.0, dtype=dtype).to(
+        mojo_gpu
+    )
+    output = storage[output_offset : output_offset + count]
+    returned = torch.log2(source, out=output)
+    assert returned.data_ptr() == output.data_ptr()
+    expected = torch.full((count + output_offset + 3,), -12345.0, dtype=dtype)
+    expected[output_offset : output_offset + count] = torch.log2(
+        data[input_offset : input_offset + count]
+    )
+    rtol, atol = (0.008, 1e-5) if dtype == torch.bfloat16 else (2e-6, 2e-6)
+    torch.testing.assert_close(storage.cpu(), expected, rtol=rtol, atol=atol)
+
+
+def test_log2_bfloat16_normals_and_domain(mojo_gpu: str):
+    normals = torch.arange(0x0080, 0x7F80, dtype=torch.int16).view(torch.bfloat16)
+    domain = torch.tensor(
+        [0.0, -0.0, -1.0, 1.0, 2.0, float("inf"), -float("inf"), float("nan"), 0.5],
+        dtype=torch.bfloat16,
+    )
+    data = torch.cat((normals, -normals, domain))
+    torch.testing.assert_close(
+        torch.log2(data.to(mojo_gpu)).cpu(),
+        torch.log2(data),
+        rtol=0.008,
+        atol=1e-5,
+        equal_nan=True,
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
 def test_log2_integral_promotion(mojo_gpu: str, dtype: torch.dtype):
     data = torch.tensor([0, 1, 2, 8], dtype=dtype)

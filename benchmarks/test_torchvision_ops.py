@@ -100,8 +100,7 @@ def test_roi_align_backward(
         lambda: torch.ops.torchvision._roi_align_backward(
             g_our, r_our, 1.0, ph, pw, n, c, h, w, sampling, True
         ),
-        # Include the gather's per-pixel ROI scan in the iteration budget.
-        flops=float(n * c * h * w * k * 32),
+        flops=float(k * c * ph * pw * 32),
     )
 
 
@@ -159,7 +158,7 @@ def test_roi_pool_backward(
         lambda: torch.ops.torchvision._roi_pool_backward(
             g_our, r_our, a_our, 1.0, ph, pw, n, c, h, w
         ),
-        flops=float(n * c * h * w * k * 32),
+        flops=float(k * c * ph * pw * 4),
     )
 
 
