@@ -328,8 +328,7 @@ def _fill_contiguous(t: T, s: FillScalar) raises:
 
 
 def is_cast_dtype(dt: DType) -> Bool:
-    """The dtypes the fast CastSpec kernel supports on either end (mirrors
-    data_movement_ops.mojo's `CAST_DTYPES`)."""
+    """Mirrors data_movement_ops.mojo's `CAST_DTYPES`."""
     return (
         dt == DType.float32
         or dt == DType.float16

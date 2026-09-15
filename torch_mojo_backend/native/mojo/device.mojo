@@ -77,7 +77,6 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
-    var peer_copy: String
     var test_peer_copy: String
     var test_peer_gate: Int
 
@@ -139,14 +138,16 @@ def init_backend() raises -> Int:
     devs.append(Dev(DeviceContext(api="cpu"), True))
     var gate = getenv("TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD")
     var gate_fd = Int(gate) if gate != "" else -1
+    var modes = getenv("TORCH_MOJO_BACKEND_TEST_PEER_COPY")
+    # Delimit once so mode checks match whole tokens without getenv or splitting.
+    var test_peer_copy = "," + modes + "," if modes != "" else ""
     var box = unsafe_alloc[Backend](1)
     box.unsafe_write(
         Backend(
             devs^,
             vendor^,
             n,
-            getenv("TORCH_MOJO_BACKEND_PEER_COPY"),
-            getenv("TORCH_MOJO_BACKEND_TEST_PEER_COPY"),
+            test_peer_copy^,
             gate_fd,
         )
     )
@@ -302,24 +303,25 @@ def _peer_access(device: Int, peer: Int) raises -> Bool:
     var enabled = False
     if (d[].api == "cuda" or d[].api == "hip") and d[].api == other[].api:
         try:
-            if be()[].peer_copy != "host" and d[].ctx.can_access(other[].ctx):
-                if be()[].peer_copy == "enable_error":
+            if ",host," not in be()[].test_peer_copy and d[].ctx.can_access(
+                other[].ctx
+            ):
+                if ",enable_error," in be()[].test_peer_copy:
                     raise Error("injected peer enable failure")
                 d[].ctx.enable_peer_access(other[].ctx)
                 enabled = True
         except e:
-            # Unsupported access (including driver errors) uses host staging.
-            if be()[].peer_copy != "":
+            if be()[].test_peer_copy != "":
                 print("peer enable failed", String(e))
             enabled = False
-    if be()[].peer_copy != "":
+    if be()[].test_peer_copy != "":
         print("peer probe", device, peer, enabled)
     d[].peers[peer] = enabled
     return enabled
 
 
 def _test_peer_gate(p: Pointer[NoneType, MutAnyOrigin]):
-    # Test subprocess owns the pipe and always releases it, even on failure.
+    # The test releases the pipe even on failure.
     var byte = UInt8(0)
     _ = external_call["read", Int](Int(p), Pointer(to=byte), 1)
 
@@ -331,14 +333,14 @@ def _test_peer_submit(
     s: DeviceBuffer[DType.uint8],
 ) raises:
     var mode = be()[].test_peer_copy
-    if mode == "gate":
+    if ",gate," in mode:
         dst_ctx.stream().enqueue_host_func(
             _test_peer_gate,
             Pointer[NoneType, MutAnyOrigin](
                 unsafe_from_address=be()[].test_peer_gate
             ),
         )
-    elif mode == "submit_error" or mode == "drain_error":
+    elif ",submit_error," in mode or ",drain_error," in mode:
         dst_ctx.enqueue_wait_for(src_ctx)
         dst_ctx.enqueue_copy_no_cross_stream_sync(d, s)
         print("P2P_SUBMITTED", Int(d.unsafe_ptr()), Int(s.unsafe_ptr()))
@@ -348,12 +350,12 @@ def _test_peer_submit(
 def copy_peer(
     dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
 ) raises -> Bool:
-    """Copy on the destination current stream; caller fences storage and
-    drains both streams on error. False requests host staging."""
+    """False requests host staging; caller fences storage and drains on error.
+    """
     if nbytes == 0:
         return True
     if not _peer_access(dst_device, src_device):
-        if be()[].peer_copy != "":
+        if be()[].test_peer_copy != "":
             print("peer copy host", dst_device, src_device)
         return False
     var dst_ctx = ctx_for(dst_device)
@@ -363,7 +365,7 @@ def copy_peer(
     if be()[].test_peer_copy != "":
         _test_peer_submit(dst_ctx, src_ctx, d, s)
     d.enqueue_copy_from(s)
-    if be()[].peer_copy != "":
+    if be()[].test_peer_copy != "":
         print("peer copy direct", dst_device, src_device)
     _ = s^
     _ = d^
@@ -376,7 +378,7 @@ def drain_copy(dst_device: Int, src_device: Int) -> Bool:
     for i in range(2):
         var device = dst_device if i == 0 else src_device
         try:
-            if be()[].test_peer_copy == "drain_error" and i == 0:
+            if ",drain_error," in be()[].test_peer_copy and i == 0:
                 raise Error("injected destination drain failure")
             ctx_for(device).synchronize()
             if be()[].test_peer_copy != "":

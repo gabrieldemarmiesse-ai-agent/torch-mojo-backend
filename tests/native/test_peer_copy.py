@@ -3,6 +3,12 @@
 Tensor operations use public torch APIs. The cached test-only native hook
 observes allocator retirement and injects failures after a real DMA. A pipe
 holds the destination stream to distinguish event ordering from a host wait.
+
+TORCH_MOJO_BACKEND_TEST_PEER_COPY accepts comma-separated modes: trace (routes),
+host (force staging), enable_error (fail peer enable), audit (allocations),
+submit_error (fail after DMA), drain_error (also fail cleanup), gate (hold DMA
+on TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD). Route and allocation logs accompany
+every mode; unset disables all hooks. Settings are cached at initialization.
 """
 
 import ctypes
@@ -30,8 +36,7 @@ def _run(scenario: str, mode: str, *args: str) -> str:
         cwd=Path(__file__).resolve().parents[2],
         env={
             **os.environ,
-            "TORCH_MOJO_BACKEND_TEST_PEER_COPY": mode,
-            "TORCH_MOJO_BACKEND_PEER_COPY": "trace",
+            "TORCH_MOJO_BACKEND_TEST_PEER_COPY": f"trace,{mode}",
             "PYTHONUNBUFFERED": "1",
         },
         capture_output=True,

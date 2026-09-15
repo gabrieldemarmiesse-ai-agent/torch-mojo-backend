@@ -202,60 +202,31 @@ the buffer is released.
 
 ### Transfers
 
-`.to("mojo:j")` and `dst.copy_(src)` between mojo devices use MAX
-`DeviceBuffer.enqueue_copy_from` when CUDA or HIP peer access is available.
-The destination lazily probes and enables access to each source, caching
-success and failure under the shim mutex. CPU, Metal, inaccessible pairs,
-and peer-enabling errors use D2H → H2D host staging.
+`.to("mojo:j")` and `dst.copy_(src)` automatically use MAX
+`DeviceBuffer.enqueue_copy_from` for CUDA/HIP peer-capable pairs. Peer access
+is enabled lazily per ordered pair; success and failure are cached under the
+shim mutex. CPU, Metal, inaccessible pairs, and enable errors use host staging.
+ROCm correctness and performance remain unmeasured.
 
-The direct copy runs on the destination's **current stream**. MAX inserts
-source → destination and destination → source events around the copy.
-The backend records the original source before packing/casting, source
-staging, and destination storage on each allocation's **own device's current
-stream**. On release, the allocation's owner stream waits for its recorded
-streams; MAX's reverse event extends the source lifetime through the remote
-read. This also covers allocations made on a different stream and sources
-freed immediately after `.to`. Callers must still order producers on
-unrelated streams before using their tensors, as with ordinary torch ops.
+Direct copies run on the destination's current stream, with MAX events in
+both directions and no host completion wait for either `non_blocking` value.
+Destination consumers are ordered after the copy; `.cpu()` and `.item()` wait
+for readback. Callers must order producers on unrelated streams.
 
-The direct copy has no host completion wait, for either `non_blocking` value.
-Destination-stream consumers are ordered after the copy; `.cpu()` and
-`.item()` wait for their host readbacks and see the copied data. A transfer
-error drains both participating streams before releasing storage. If a drain
-also fails, allocations on both devices are retained until process exit;
-pinned host staging is retained unless completion can be established.
+Original source, staging, and destination storage are recorded on their own
+device's current stream. At release, allocation-owner streams wait for those
+streams; MAX's reverse event fences the remote source read. Transfer errors
+drain both streams before release. A failed drain retains both devices'
+allocations until exit; pinned staging is retained unless completion is known.
 
-`.to` borrows an already contiguous source with unchanged dtype, otherwise
-packs or casts on the source, and restores the requested destination memory
-format. `copy_` packs, transfers, then uses the destination's local dtype
-and strided-copy helpers as needed. Both paths use CPU torch for dtype pairs
-outside the fast cast kernel, preserving integer precision. No GPU kernels
-or allocator are added. HIP uses the direct route when peer access succeeds;
-ROCm runtime correctness and performance remain unmeasured.
+`.to` borrows contiguous, unchanged-dtype sources, otherwise packs/casts on
+the source, then restores destination memory format. `copy_` packs and moves
+before casting or copying into destination strides. Dtype pairs outside the
+fast cast kernel use CPU torch to preserve exact integer conversions.
 
-For transfer diagnostics, `TORCH_MOJO_BACKEND_PEER_COPY` is read once at
-backend initialization: unset selects normal operation; `trace` prints
-pair probes and completed submissions; `host` treats GPU pairs as
-inaccessible; `enable_error` injects an error before enabling a capable
-pair. The latter two also print routes and exercise negative caching in
-subprocess tests. They preserve transfer results through host staging.
-
-`TORCH_MOJO_BACKEND_TEST_PEER_COPY` is a **test-only**, subprocess-scoped
-hook, also cached at initialization. Unset, it only adds cached checks;
-no tracing or injection runs. `audit` logs native allocation bytes/pointers
-and actual retirement (the backend does not expose allocated-memory stats).
-`submit_error` submits real peer DMA after source readiness, then raises
-before installing the reverse completion event. `drain_error` additionally
-fails the destination cleanup drain; logs distinguish completed drains,
-freed allocations and quarantined allocations. These modes intentionally
-raise from every nonempty direct transfer and must never be used in training.
-`gate` queues a host callback before peer DMA, blocked reading one byte from
-`TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD` (an already-open pipe descriptor,
-also cached at initialization). The test releases the pipe independently of
-the torch dispatcher, including on failure, to prove submission returns
-before destination completion without timing GPU work. Only tests should
-set these variables; a missing release will block the stream. See
-`tests/native/test_peer_copy.py` for the public torch callers and assertions.
+`TORCH_MOJO_BACKEND_TEST_PEER_COPY` and `TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD`
+are test-only hooks cached at initialization; unset leaves no-op checks.
+See `tests/native/test_peer_copy.py` for modes and usage.
 
 ### Threads and fork
 

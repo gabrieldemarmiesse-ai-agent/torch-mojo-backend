@@ -370,9 +370,9 @@ def test_cross_device_interleaved_stress(mojo_pair: tuple[str, str]):
         stream.synchronize()
 
 
-@pytest.mark.parametrize("mode", ["trace", "host", "enable_error"])
-def test_cross_device_route(mojo_pair: tuple[str, str], mode: str):
-    # A fresh process is required: the diagnostic switch and peer cache are per backend.
+@pytest.mark.parametrize("mode", [None, "trace", "host", "enable_error"])
+def test_cross_device_route(mojo_pair: tuple[str, str], mode: str | None):
+    # The test hook and peer cache are per backend.
     code = r"""
 import ctypes
 import os
@@ -393,8 +393,8 @@ except OSError:
     sys.exit(77)
 if not capable.value:
     sys.exit(77)
-mode = os.environ["TORCH_MOJO_BACKEND_PEER_COPY"]
-os.environ["TORCH_MOJO_BACKEND_PEER_COPY"] = "host" if mode != "host" else "trace"
+mode = os.environ.get("TORCH_MOJO_BACKEND_TEST_PEER_COPY", "")
+os.environ["TORCH_MOJO_BACKEND_TEST_PEER_COPY"] = "host" if mode != "host" else "trace"
 for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
     cpu = torch.arange(357 * 79, dtype=torch.float32).reshape(357, 79)
     source = cpu.to(src)
@@ -404,10 +404,14 @@ for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
         target.copy_(source)
         torch.testing.assert_close(target.cpu(), cpu)
 """
+    env = dict(os.environ)
+    env.pop("TORCH_MOJO_BACKEND_TEST_PEER_COPY", None)
+    if mode is not None:
+        env["TORCH_MOJO_BACKEND_TEST_PEER_COPY"] = mode
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=Path(__file__).resolve().parents[2],
-        env={**os.environ, "TORCH_MOJO_BACKEND_PEER_COPY": mode},
+        env=env,
         capture_output=True,
         text=True,
         timeout=600,
@@ -416,6 +420,9 @@ for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
         pytest.skip("route assertion requires a CUDA peer-capable pair")
     assert result.returncode == 0, result.stdout + result.stderr
     output = result.stdout
+    if mode is None:
+        assert "peer " not in output and "P2P_" not in output, output
+        return
     assert output.count("peer probe") == 2, output
     assert output.count("peer enable failed") == (2 if mode == "enable_error" else 0), (
         output
