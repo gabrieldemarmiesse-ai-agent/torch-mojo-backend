@@ -72,11 +72,7 @@ from max.gpu.memory import (
 )
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
-from max.gpu.primitives import (
-    block_rank_in_cluster,
-    cluster_sync,
-    cluster_sync_relaxed,
-)
+from max.gpu.primitives import block_rank_in_cluster, cluster_sync
 from std.memory import bitcast, stack_allocation
 from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
@@ -98,6 +94,8 @@ from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from gemm16_kernels import _pick_regime
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+
+from op_utils import _enqueue_cached
 
 from gemm16_sched_pool import (
     SCHED_PTR,
@@ -548,8 +546,16 @@ def _v4_nn_persistent_ws[
                 c_tma.prefetch_descriptor()
             fence_mbarrier_init()
         # All barriers must be initialized cluster-wide before any arrival
-        # (the consumers below arrive at peer CTAs' empty barriers).
-        cluster_sync_relaxed()
+        # (the consumers below arrive at peer CTAs' empty barriers), and the
+        # zeroed ticket ring must be VISIBLE to the peer before it can poll
+        # it.  `cluster_sync_relaxed` orders neither -- it is an arrive/wait
+        # with no memory ordering -- and `fence_mbarrier_init` covers only
+        # the mbarrier state, so a peer could read whatever was in that
+        # shared word before the kernel started; one arbitrary word in 1024
+        # carries round 0's tag and would be accepted as a published ticket
+        # (wrong macro-row, or a hang).  `cluster_sync` is the same barrier
+        # with the fence, once per launch (a Codex review finding).
+        cluster_sync()
 
         comptime CFRAG = 64 * bn // 128
         comptime MACRO_BM = bm * cluster_m
@@ -947,7 +953,18 @@ def _v4_enqueue_nn_persistent[
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
-    ctx.enqueue_function[
+    # Compiled once per process and context: `ctx.enqueue_function[kernel]`
+    # re-runs compile_function on EVERY launch (~180 us of host time even
+    # when the runtime's module cache hits), and a DDP step issues 48 of
+    # these.  The key names what selects the code -- dtype, geometry, stages,
+    # layout, epilogue -- and nothing about this call's pointers or its
+    # m/n/k, which travel as arguments.  The trailing `2` is the ABI version:
+    # the registry is keyed by string, so a key unchanged across a signature
+    # change would bitcast a stale DeviceFunction compiled for the old ABI,
+    # and this kernel gained the `sched` counter pointer.  The cluster shape
+    # rides on the kernel's own `nvvm.cluster_dim` metadata, as it did when
+    # this call was a bare `enqueue_function`.
+    _enqueue_cached[
         _v4_nn_persistent_ws[
             stages,
             cluster_m,
@@ -958,8 +975,17 @@ def _v4_enqueue_nn_persistent[
             col_a,
             kmaj_b,
             ragged_n,
-        ]
+        ],
+        dyn_smem=DYN_SMEM,
     ](
+        ctx,
+        String(
+            t"g16v4p2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}"
+        ),
+        grid_x,
+        1,
+        1,
+        128 * (consumers + 1),
         a_tma,
         b_tma,
         c_tma,
@@ -968,10 +994,6 @@ def _v4_enqueue_nn_persistent[
         Int64(m),
         Int64(n),
         Int64(k),
-        grid_dim=(grid_x,),
-        block_dim=(128 * (consumers + 1),),
-        shared_mem_bytes=DYN_SMEM,
-        func_attribute=_v4_dyn_smem_attr[DYN_SMEM](),
     )
     return True
 

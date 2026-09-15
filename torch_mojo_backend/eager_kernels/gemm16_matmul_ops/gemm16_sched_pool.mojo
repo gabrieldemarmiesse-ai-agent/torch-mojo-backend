@@ -117,10 +117,15 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 
 # --- layout constants ------------------------------------------------------
 
-# Int32 words per counter: only word 0 is live (the ticket dispenser).  The
-# block is padded to a full 128-byte L2 line so two streams' counters, which
-# ARE hit concurrently, never share one.
+# Int32 words per counter: only word 0 is live (the ticket dispenser).  It
+# gets a whole 128-byte L2 line to itself so two streams' counters, which ARE
+# hit concurrently by 66 clusters each, never share one -- which means the
+# base must be ALIGNED to 128 bytes, not merely 128 bytes long: nothing
+# promises what alignment `enqueue_create_buffer` hands back, so twice the
+# size is allocated and the base is rounded up inside it.
 comptime SCHED_WORDS = 32
+comptime SCHED_ALLOC_WORDS = 2 * SCHED_WORDS
+comptime SCHED_LINE = 4 * SCHED_WORDS
 
 # Ring depth (power of two: the slot index is a mask, never a modulo) and the
 # tag period, a MULTIPLE of the depth so one counter `rm` gives both the slot
@@ -313,7 +318,10 @@ def sched_store_global(ptr: SCHED_PTR, val: Int32):
 @always_inline
 def sched_init_ring(ring: SCHED_SMEM_PTR):
     """Zero the ring (tag 0 = "nothing published"). One thread per CTA, and
-    the caller must `cluster_sync_relaxed()` before any peer reads it."""
+    the caller must `cluster_sync()` -- the ORDERED cluster barrier, not
+    `cluster_sync_relaxed` -- before any peer reads it: without the fence the
+    peer may still see the pre-launch contents of that shared word, and one
+    arbitrary word in 1024 carries round 0's tag."""
     comptime for i in range(SCHED_RING):
         ring[unsafe_offset=i] = UInt32(0)
 
@@ -328,6 +336,15 @@ def sched_finish(
     loop.  Exactly `total_works + num_clusters` tickets are issued per launch,
     so the holder of the highest one is the last fetcher: it resets the
     counter for the next launch, with no `done` counter and no extra atomic.
+
+    The reset is IN BAND, so a launch that never runs to completion -- a
+    device-side fault, a context teardown mid-flight -- leaves the counter at
+    whatever it had reached, and the next launch on that same stream would
+    start mid-count and skip its first tiles.  That is not a case worth
+    guarding: a fault has already poisoned the CUDA context and every
+    subsequent launch on it fails anyway.  A host-side memset per launch is
+    the alternative, and it is exactly the hot-path cost this design exists
+    to avoid.
     """
     if last_ticket == total_works + num_clusters - 1:
         sched_store_global(slot, 0)
@@ -382,14 +399,28 @@ def sched_supported(total_works: Int) -> Bool:
 # driver calls per launch, so host time there is not free.)
 #
 # Words, all Int64:
-#     [0]              slots claimed so far (atomic, `fetch_add` to claim)
-#     [1 + 4 * i + 0]  valid flag, release-stored after the three below
-#     [1 + 4 * i + 1]  device id
-#     [1 + 4 * i + 2]  stream key
-#     [1 + 4 * i + 3]  counter pointer
+#     [0]              slots claimed so far (atomic, `fetch_add` to claim);
+#                      also the release/acquire pair that publishes the
+#                      zeroed table to a thread that found it in the registry
+#     [1]              "already warned about exhaustion" flag
+#     [2 + 4 * i + 0]  valid flag, release-stored after the three below
+#     [2 + 4 * i + 1]  device id
+#     [2 + 4 * i + 2]  context (device, stream) key
+#     [2 + 4 * i + 3]  counter pointer
+#
+# The slot count bounds how many distinct (device, stream) contexts can ever
+# take a persistent route in one process.  Entries are reused -- a stream that
+# comes back finds its own entry -- but never evicted, because a counter must
+# outlive every launch that can still be in flight and the backend's
+# `Dev.views` never shrinks either, so a process that creates more than
+# `_SCHED_MAX_SLOTS` distinct streams and runs a persistent GEMM on each would
+# put every later one on the fallback kernels for good.  512 is far past what
+# torch's stream pool hands out; the decline warns once when it happens rather
+# than silently getting slower.
 comptime _SCHED_REG = "TMB_SCHEDPOOL"
 comptime _SCHED_MAX_SLOTS = 512
-comptime _SCHED_TABLE_WORDS = 1 + 4 * _SCHED_MAX_SLOTS
+comptime _SCHED_HEADER = 2
+comptime _SCHED_TABLE_WORDS = _SCHED_HEADER + 4 * _SCHED_MAX_SLOTS
 comptime _SCHED_TABLE = Pointer[Scalar[DType.int64], MutAnyOrigin]
 
 
@@ -402,8 +433,13 @@ def _sched_table() raises -> _SCHED_TABLE:
             .as_unsafe_any_origin()
         )
     var table = unsafe_alloc[Scalar[DType.int64]](_SCHED_TABLE_WORDS)
-    for i in range(_SCHED_TABLE_WORDS):
+    for i in range(1, _SCHED_TABLE_WORDS):
         table[unsafe_offset=i] = Int64(0)
+    # Word 0 last, with RELEASE: every reader's first act is an ACQUIRE load
+    # of it (`sched_slot_ptr`), so that pair is what makes the zeroed words
+    # above visible to a thread that finds the table through the registry
+    # rather than building it.
+    Atomic[DType.int64].store[ordering=Ordering.RELEASE](table, Int64(0))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(_SCHED_REG), table.unsafe_bitcast[NoneType]()
     )
@@ -444,6 +480,30 @@ def _sched_stream_key(ctx: DeviceContext) raises -> Optional[Int]:
     return Int(handle.value())
 
 
+def _sched_warn_exhausted(table: _SCHED_TABLE):
+    """Say once, on the process's first exhaustion, why the persistent GEMM
+    routes have quietly stopped being chosen.
+
+    Prefix and destination match the backend's only other runtime warning
+    (`_warn` in native/mojo/device.mojo), which prints to stdout; a decline is
+    a slowdown, not an error, so it must not raise.
+    """
+    var flag = table.unsafe_offset(1)
+    if (
+        Atomic[DType.int64].fetch_add[ordering=Ordering.RELAXED](flag, Int64(1))
+        != 0
+    ):
+        return
+    print(
+        "torch-mojo-backend: more than ",
+        _SCHED_MAX_SLOTS,
+        " (device, stream) pairs have run a persistent bf16 GEMM; the tile",
+        " scheduler's counter table is full, so those routes will decline to",
+        " slower kernels from now on. Reuse streams instead of creating new",
+        " ones, or raise _SCHED_MAX_SLOTS in gemm16_sched_pool.mojo.",
+    )
+
+
 def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
     """The ticket counter launches on this (device, stream) use, or nothing
     when the table is full (the caller then declines and the dispatch
@@ -466,7 +526,7 @@ def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
     )
     var scan = min(claimed, _SCHED_MAX_SLOTS)
     for i in range(scan):
-        var entry = table.unsafe_offset(1 + 4 * i)
+        var entry = table.unsafe_offset(_SCHED_HEADER + 4 * i)
         if Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](entry) == 0:
             continue
         if (
@@ -480,15 +540,22 @@ def sched_slot_ptr(ctx: DeviceContext) raises -> Optional[SCHED_PTR]:
         )
     )
     if idx >= _SCHED_MAX_SLOTS:
+        _sched_warn_exhausted(table)
         return None
-    var buf = ctx.enqueue_create_buffer[DType.int32](SCHED_WORDS)
+    var buf = ctx.enqueue_create_buffer[DType.int32](SCHED_ALLOC_WORDS)
     # Stream-ordered against the launch that follows on this same context, so
     # no host synchronize is needed to know the kernel sees zeros.
     ctx.enqueue_memset(buf, Int32(0))
     var held = unsafe_alloc[BufT](1)
     held.unsafe_write(buf^)
-    var base = held[].unsafe_ptr().as_unsafe_any_origin()
-    var entry = table.unsafe_offset(1 + 4 * idx)
+    # Round the base up to a 128-byte line: the counter word is hit by every
+    # cluster of every launch on this stream, and a neighbour's counter in
+    # the same line would bounce it.
+    var raw = Int(held[].unsafe_ptr())
+    var base = SCHED_PTR(
+        unsafe_from_address=raw + (SCHED_LINE - raw % SCHED_LINE) % SCHED_LINE
+    )
+    var entry = table.unsafe_offset(_SCHED_HEADER + 4 * idx)
     entry[unsafe_offset=1] = Int64(device)
     entry[unsafe_offset=2] = Int64(key)
     entry[unsafe_offset=3] = Int64(Int(base))

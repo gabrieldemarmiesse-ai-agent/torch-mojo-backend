@@ -7,8 +7,11 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
+import os
+import pathlib
 import re
-import time
+import subprocess
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -1305,19 +1308,30 @@ def test_gemm16_sched_dw_mm(mojo_h100):
 
 
 def test_gemm16_sched_counter_is_reset_between_launches(mojo_h100):
-    """64 back-to-back launches sharing one ticket counter, then a GEMM with
-    a different work census on the same stream.
+    """64 back-to-back launches sharing one ticket counter, each computing a
+    DIFFERENT product, then a GEMM with a different work census.
 
     Nothing synchronizes between the launches, so they are exactly the
     same-stream sequence the reset argument relies on: launch j+1 may only
     start once launch j's last fetcher has stored 0 back.  A counter left
-    dirty makes launch j+1 start mid-count and never issue its first tiles,
-    which the final comparison sees as whole rows of zeros."""
+    dirty makes launch j+1 start mid-count and never issue its first tiles.
+
+    Every launch slides the A operand down one row, so consecutive launches
+    have different answers everywhere. That is what makes the final
+    comparison able to see a skipped tile at all: torch.mm allocates a fresh
+    output each call and the caching allocator hands back the block the
+    previous result just freed, so a launch that recomputed the SAME product
+    would find correct bytes already sitting in the tiles it never wrote (an
+    agent-C review finding on the first cut of this test)."""
     m, n, k = SCHED_NN_DX_SMALL
-    a, b, ref = _sched_mm(mojo_h100, m, n, k)
-    got = torch.mm(a, b)
-    for _ in range(63):
-        got = torch.mm(a, b)
+    laps = 64
+    a = torch.randn(m + laps, k, dtype=torch.bfloat16)
+    b = torch.randn(k, n, dtype=torch.bfloat16)
+    dev_a, dev_b = a.to(mojo_h100), b.to(mojo_h100)
+    got = torch.mm(dev_a[:m], dev_b)
+    for lap in range(1, laps):
+        got = torch.mm(dev_a[lap : lap + m], dev_b)
+    ref = a[laps - 1 : laps - 1 + m].float() @ b.float()
     assert _rel_err(got, ref) < _bf16_bound(k)
     # A different census on the same counter: the TN body's work loop is a
     # different length, so a stale count would land somewhere else entirely.
@@ -1329,47 +1343,105 @@ def test_gemm16_sched_counter_is_reset_between_launches(mojo_h100):
 
 
 def test_gemm16_sched_on_a_side_stream(mojo_h100):
-    """A second stream takes its own ticket counter.
+    """Two streams running persistent GEMMs AT THE SAME TIME.
 
     The whole reuse argument is "launches on one stream are ordered", so a
-    GEMM issued on a side stream must not share the default stream's
-    counter; if it did, two genuinely concurrent launches could hand two
-    clusters the same tile.  Both legs run, both are checked."""
+    GEMM issued on a side stream must not share the default stream's counter:
+    if it did, two genuinely concurrent launches would dispense from one
+    counter and two clusters would compute the same tile while another tile
+    went unwritten.  Only genuinely overlapping launches can show that, so
+    the streams are fenced once for INPUT readiness and then each issues its
+    own burst with no fence in between -- an earlier cut of this test fenced
+    the side stream behind the default stream's GEMM, which serialized the
+    two and tested nothing (an agent-C/Codex review finding).
+
+    Outputs are held until after the barrier: freeing a side stream's tensor
+    is ordered on its owner stream only, so dropping them inside the burst
+    would hand live memory back to the allocator."""
     side = side_stream_or_skip(mojo_h100)
     m, n, k = SCHED_NN_DX_SMALL
     a, b, ref = _sched_mm(mojo_h100, m, n, k)
-    on_default = torch.mm(a, b)
-    side.wait_stream(torch.accelerator.current_stream(on_default.device.index))
-    with device_module.stream(side):
-        on_side = torch.mm(a, b)
+    bound = _bf16_bound(k)
+    # The inputs were filled on the default stream; that is the only
+    # cross-stream dependency, and this is the last fence before the bursts.
     torch.accelerator.synchronize()
-    assert _rel_err(on_side, ref) < _bf16_bound(k)
-    assert torch.equal(on_side.cpu(), on_default.cpu())
+    with device_module.stream(side):
+        on_side = [torch.mm(a, b) for _ in range(8)]
+    on_default = [torch.mm(a, b) for _ in range(8)]
+    torch.accelerator.synchronize()
+    for got in on_default:
+        assert _rel_err(got, ref) < bound
+    first = on_default[0].cpu()
+    for got in on_side:
+        assert _rel_err(got, ref) < bound
+        # Same operands, same per-tile K order: the answer is bit-identical
+        # however the tiles were shared out, on either stream.
+        assert torch.equal(got.cpu(), first)
+
+
+# The 650-launch body runs in a FRESH process: the counter table is
+# process-global and never evicts, so a test sharing a process with the rest
+# of this file could find it already exhausted and then measure two runs of
+# the SAME fallback kernel -- equal times, a green test, and the bug intact
+# (an agent-C/Codex review finding). A subprocess also keeps the timing away
+# from whatever else the session has left resident.
+_SLOT_STABILITY_PROGRAM = """
+import os, time
+os.environ.setdefault("MODULAR_TELEMETRY_ENABLED", "0")
+import torch
+from torch_mojo_backend import register_mojo_devices
+
+register_mojo_devices()
+dev = "mojo:0"
+grad = torch.randn(8192, 1600, dtype=torch.bfloat16, device=dev)
+x = torch.randn(8192, 1600, dtype=torch.bfloat16, device=dev)
+
+
+def burst(n):
+    torch.mojo.synchronize()
+    start = time.perf_counter()
+    for _ in range(n):
+        out = torch.mm(grad.t(), x)
+    torch.mojo.synchronize()
+    return (time.perf_counter() - start) / n, out
+
+
+burst(8)
+first, _ = burst(50)
+for _ in range(600):
+    torch.mm(grad.t(), x)
+last, out = burst(50)
+ref = grad.t().float().cpu() @ x.float().cpu()
+scale = ref.abs().max().clamp(min=1.0)
+rel = float((out.cpu().float() - ref).abs().max() / scale)
+print("RESULT", first, last, rel, flush=True)
+"""
 
 
 def test_gemm16_sched_slot_is_stable_across_many_launches(mojo_h100):
     """The scheduler's counter slot is keyed on the (device, stream) context
     handle. Keyed on a per-call object it appended one table entry per launch
-    until the 512-slot table filled and every persistent route declined to the
-    fallback kernels for the rest of the process (2dde72f's first shape).
-    Launch well past that count and check the last launches are as fast as
-    the first ones (a decline is a 3-9x cliff, not a few percent)."""
-    grad = torch.randn(8192, 1600, dtype=torch.bfloat16, device=mojo_h100)
-    x = torch.randn(8192, 1600, dtype=torch.bfloat16, device=mojo_h100)
+    -- a device allocation and a memset on the hot path -- until the 512-slot
+    table filled, after which every persistent route declined to the fallback
+    kernels for the rest of the process (the GPT-2 XL step went 227 -> 460
+    ms). Launch well past that count in a fresh process and check the last
+    launches are as fast as the first (a decline is a 3-9x cliff, not a few
+    percent).
 
-    def burst(n):
-        torch.mojo.synchronize()
-        start = time.perf_counter()
-        for _ in range(n):
-            out = torch.mm(grad.t(), x)
-        torch.mojo.synchronize()
-        return (time.perf_counter() - start) / n, out
-
-    burst(8)
-    first, _ = burst(50)
-    for _ in range(600):
-        torch.mm(grad.t(), x)
-    last, out = burst(50)
+    What this can NOT see is a table that fills for some other reason and
+    takes both bursts down with it; that is what the fresh process is for,
+    and why the absolute per-launch time is printed on failure."""
+    out = subprocess.run(
+        [sys.executable, "-c", _SLOT_STABILITY_PROGRAM],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(__file__).parents[2])},
+    )
+    assert out.returncode == 0, f"subprocess failed:\n{out.stdout}\n{out.stderr}"
+    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT ")]
+    assert line, f"no RESULT line:\n{out.stdout}\n{out.stderr}"
+    _, first, last, rel = line[-1].split()
+    first, last, rel = float(first), float(last), float(rel)
     assert last < 1.5 * first, f"per-launch {first * 1e6:.0f} -> {last * 1e6:.0f} us"
-    ref = torch.mm(grad.t().float().cpu(), x.float().cpu())
-    assert _rel_err(out, ref) < _bf16_bound(8192)
+    assert rel < _bf16_bound(8192), f"relative error {rel}"

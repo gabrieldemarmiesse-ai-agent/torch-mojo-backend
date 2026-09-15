@@ -75,11 +75,7 @@ from max.gpu.memory import (
 )
 from std.memory import AddressSpace
 from max.gpu.sync import named_barrier
-from max.gpu.primitives import (
-    block_rank_in_cluster,
-    cluster_sync,
-    cluster_sync_relaxed,
-)
+from max.gpu.primitives import block_rank_in_cluster, cluster_sync
 from std.memory import bitcast, stack_allocation
 from std.sys import size_of
 from std.sys.info import _has_sm_9x, _is_sm_9x
@@ -378,8 +374,16 @@ def _rolling_persistent_body[
                 c_tma.prefetch_descriptor()
             fence_mbarrier_init()
         # All barriers must be initialized cluster-wide before any arrival
-        # (the consumers below arrive at peer CTAs' empty barriers).
-        cluster_sync_relaxed()
+        # (the consumers below arrive at peer CTAs' empty barriers), and the
+        # zeroed ticket ring must be VISIBLE to the peer before it can poll
+        # it.  `cluster_sync_relaxed` orders neither -- it is an arrive/wait
+        # with no memory ordering -- and `fence_mbarrier_init` covers only
+        # the mbarrier state, so a peer could read whatever was in that
+        # shared word before the kernel started; one arbitrary word in 1024
+        # carries round 0's tag and would be accepted as a published ticket
+        # (wrong macro-row, or a hang).  `cluster_sync` is the same barrier
+        # with the fence, once per launch (a Codex review finding).
+        cluster_sync()
 
         comptime CFRAG = 64 * bn // 128
         comptime MACRO_BM = bm * cluster_m
