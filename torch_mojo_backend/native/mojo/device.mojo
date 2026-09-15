@@ -24,6 +24,7 @@ from max.gpu.host import (
 from vendor import Vendor, raw_stream
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
+comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
 comptime EvP = Pointer[Ev, MutUntrackedOrigin]
 comptime StagingP = Pointer[Staging, MutUntrackedOrigin]
 comptime U8P = Pointer[UInt8, MutUntrackedOrigin]
@@ -125,6 +126,7 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
+    var pinned: List[Int]  # Pinned box addresses, sorted by buffer base
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -183,7 +185,7 @@ def init_backend() raises -> Int:
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
     var box = unsafe_alloc[Backend](1)
-    box.unsafe_write(Backend(devs^, vendor^, n))
+    box.unsafe_write(Backend(devs^, vendor^, n, List[Int]()))
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
@@ -456,6 +458,82 @@ def h_device_props(
     except e:
         set_error(String(e))
         return 1
+
+
+@fieldwise_init
+struct Pinned(Movable):
+    var buf: Optional[HostBuffer[DType.uint8]]
+    var base: Int
+    var nbytes: Int
+    var device: Int  # host memory is not necessarily portable across devices
+
+
+def _pinned_lower_bound(base: Int) -> Int:
+    ref blocks = be()[].pinned
+    var lo = 0
+    var hi = len(blocks)
+    while lo < hi:
+        var mid = lo + (hi - lo) // 2
+        if PinnedP(unsafe_from_address=blocks[mid])[].base < base:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def h_host_alloc(
+    nbytes: Int, device: Int32, data: Pointer[Int, MutUntrackedOrigin]
+) abi("C") -> Int:
+    try:
+        var index = Int(device)
+        if index < 0 or index >= len(be()[].devices):
+            index = len(be()[].devices) - 1
+        var buf = Optional[HostBuffer[DType.uint8]]()
+        var base = 0
+        if nbytes != 0:
+            var ctx = dev(index)[].ctx
+            buf = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+            base = Int(buf.value().unsafe_ptr())
+        # Zero bytes still need a handle to free, but have no address to pin.
+        var box = unsafe_alloc[Pinned](1)
+        box.unsafe_write(Pinned(buf^, base, nbytes, index))
+        if nbytes != 0:
+            be()[].pinned.insert(_pinned_lower_bound(base), Int(box))
+        data[] = base
+        return Int(box)
+    except e:
+        set_error(String(e))
+        return 0
+
+
+def h_host_free(handle: Int) abi("C"):
+    if handle == 0:
+        return
+    var box = PinnedP(unsafe_from_address=handle)
+    if box[].nbytes != 0:
+        ref blocks = be()[].pinned
+        var i = _pinned_lower_bound(box[].base)
+        # A missing or mismatched handle must not remove another live allocation.
+        if i >= len(blocks) or blocks[i] != handle:
+            return
+        _ = blocks.pop(i)
+    # No async copies use this block yet. The async-transfer follow-up needs
+    # deferred free keyed on outstanding async copies before direct DMA.
+    var moved = box.unsafe_take_pointee()
+    box.unsafe_free()
+    _ = moved^
+
+
+def h_is_pinned_ptr(ptr: Int) abi("C") -> Int32:
+    ref blocks = be()[].pinned
+    var i = _pinned_lower_bound(ptr)
+    if i < len(blocks) and PinnedP(unsafe_from_address=blocks[i])[].base == ptr:
+        return 1
+    if i > 0:
+        var box = PinnedP(unsafe_from_address=blocks[i - 1])
+        if ptr - box[].base < box[].nbytes:
+            return 1
+    return external_call["tmb_cuda_is_pinned_ptr", Int32](ptr)
 
 
 def h_copy_data(
@@ -840,9 +918,9 @@ def set_error(msg: String):
 
 
 def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
-    """The TmbBackendHooks struct (tmb.h): a u32 size then 28 function pointers.
+    """TmbBackendHooks (tmb.h): a u32 size padded to 8 bytes, then 31 pointers.
     """
-    comptime N = 29
+    comptime N = 32
     var t = unsafe_alloc[Int](N)
     for i in range(N):
         t[unsafe_offset=i] = 0
@@ -892,6 +970,11 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
         Pointer[c_char, MutUntrackedOrigin],
         Int32,
     ) thin abi("C") -> Int32 = h_device_props
+    var f_host_alloc: def(
+        Int, Int32, Pointer[Int, MutUntrackedOrigin]
+    ) thin abi("C") -> Int = h_host_alloc
+    var f_host_free: def(Int) thin abi("C") -> None = h_host_free
+    var f_pinned: def(Int) thin abi("C") -> Int32 = h_is_pinned_ptr
     t[unsafe_offset=1] = Pointer(to=f_alloc).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f_free).unsafe_bitcast[Int]()[]
     t[unsafe_offset=3] = Pointer(to=f_copy).unsafe_bitcast[Int]()[]
@@ -918,6 +1001,9 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=26] = Pointer(to=f_empty).unsafe_bitcast[Int]()[]
     t[unsafe_offset=27] = Pointer(to=f_info).unsafe_bitcast[Int]()[]
     t[unsafe_offset=28] = Pointer(to=f_props).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=29] = Pointer(to=f_host_alloc).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=30] = Pointer(to=f_host_free).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=31] = Pointer(to=f_pinned).unsafe_bitcast[Int]()[]
     return t
 
 
