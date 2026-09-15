@@ -423,16 +423,22 @@ def _sched_table() raises -> _SCHED_TABLE:
 
 
 def _sched_stream_key(ctx: DeviceContext) raises -> Optional[Int]:
-    """Identity of the stream this context view submits to, or nothing.
+    """Identity of the stream this context submits to, or nothing.
 
-    Distinct views of one stream collapse onto one counter, which is what the
-    ordering argument in the module docstring is about.  A context with no
-    stream handle at all returns nothing rather than a shared sentinel: two
-    such contexts would be indistinguishable here, and a shared counter
-    between two streams that CAN overlap is the one thing this key exists to
-    prevent.  The caller then declines and the ladder serves the shape.
+    The key is the context's own C++ handle: the backend keeps one
+    DeviceContext per (device, stream) and hands out copies of it
+    (`Dev.views`), so the handle is stable across launches on a stream and
+    distinct between streams.  It must NOT be `ctx.stream()._handle`:
+    `stream()` wraps a fresh DeviceStream object on every call, so that key
+    appended one table entry -- a buffer allocation and a memset on the hot
+    path -- per launch until the table filled, after which every persistent
+    route declined to the fallback kernels for the rest of the process (the
+    GPT-2 XL step went from 227 to 460 ms).  A context with no handle returns
+    nothing rather than a shared sentinel: two such contexts would be
+    indistinguishable here, and a counter shared between two streams that CAN
+    overlap is the one thing this key exists to prevent.
     """
-    var handle = ctx.stream()._handle
+    var handle = ctx._handle
     if not handle:
         return None
     return Int(handle.value())

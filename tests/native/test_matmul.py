@@ -8,6 +8,7 @@ produced it (rather than a decomposition into something else).
 
 import contextlib
 import re
+import time
 from collections.abc import Callable
 
 import pytest
@@ -1344,3 +1345,31 @@ def test_gemm16_sched_on_a_side_stream(mojo_h100):
     torch.accelerator.synchronize()
     assert _rel_err(on_side, ref) < _bf16_bound(k)
     assert torch.equal(on_side.cpu(), on_default.cpu())
+
+
+def test_gemm16_sched_slot_is_stable_across_many_launches(mojo_h100):
+    """The scheduler's counter slot is keyed on the (device, stream) context
+    handle. Keyed on a per-call object it appended one table entry per launch
+    until the 512-slot table filled and every persistent route declined to the
+    fallback kernels for the rest of the process (2dde72f's first shape).
+    Launch well past that count and check the last launches are as fast as
+    the first ones (a decline is a 3-9x cliff, not a few percent)."""
+    grad = torch.randn(8192, 1600, dtype=torch.bfloat16, device=mojo_h100)
+    x = torch.randn(8192, 1600, dtype=torch.bfloat16, device=mojo_h100)
+
+    def burst(n):
+        torch.mojo.synchronize()
+        start = time.perf_counter()
+        for _ in range(n):
+            out = torch.mm(grad.t(), x)
+        torch.mojo.synchronize()
+        return (time.perf_counter() - start) / n, out
+
+    burst(8)
+    first, _ = burst(50)
+    for _ in range(600):
+        torch.mm(grad.t(), x)
+    last, out = burst(50)
+    assert last < 1.5 * first, f"per-launch {first * 1e6:.0f} -> {last * 1e6:.0f} us"
+    ref = torch.mm(grad.t().float().cpu(), x.float().cpu())
+    assert _rel_err(out, ref) < _bf16_bound(8192)
