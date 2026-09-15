@@ -78,6 +78,8 @@ struct Backend(Movable):
     var vendor: Optional[Vendor]
     var n_accel: Int
     var peer_copy: String
+    var test_peer_copy: String
+    var test_peer_gate: Int
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -135,9 +137,18 @@ def init_backend() raises -> Int:
     for i in range(n):
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
+    var gate = getenv("TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD")
+    var gate_fd = Int(gate) if gate != "" else -1
     var box = unsafe_alloc[Backend](1)
     box.unsafe_write(
-        Backend(devs^, vendor^, n, getenv("TORCH_MOJO_BACKEND_PEER_COPY"))
+        Backend(
+            devs^,
+            vendor^,
+            n,
+            getenv("TORCH_MOJO_BACKEND_PEER_COPY"),
+            getenv("TORCH_MOJO_BACKEND_TEST_PEER_COPY"),
+            gate_fd,
+        )
     )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
@@ -195,6 +206,8 @@ def h_alloc(
         data[] = Int(buf.unsafe_ptr())
         var box = unsafe_alloc[Buf](1)
         box.unsafe_write(Buf(buf^, Int(device), Int(stream), List[Int]()))
+        if be()[].test_peer_copy != "":
+            print("P2P_ALLOC", Int(device), data[], nbytes)
         return Int(box)
     except e:
         set_error(String(e))
@@ -206,6 +219,8 @@ def h_free(handle: Int) abi("C"):
         return
     var box = BufP(unsafe_from_address=handle)
     if be()[].devices[box[].device].quarantine:
+        if be()[].test_peer_copy != "":
+            print("P2P_RETAIN", box[].device, Int(box[].buf.unsafe_ptr()))
         return
     # MAX releases the block stream-ordered on the OWNER stream only. Every
     # other stream that used it (torch.Tensor.record_stream) gets fenced now,
@@ -221,6 +236,8 @@ def h_free(handle: Int) abi("C"):
             # let MAX reuse memory another stream may still be reading.
             set_error(String(e))
             return
+    if be()[].test_peer_copy != "":
+        print("P2P_FREE", box[].device, Int(box[].buf.unsafe_ptr()))
     var moved = box.unsafe_take_pointee()
     box.unsafe_free()
     _ = moved^
@@ -301,6 +318,33 @@ def _peer_access(device: Int, peer: Int) raises -> Bool:
     return enabled
 
 
+def _test_peer_gate(p: Pointer[NoneType, MutAnyOrigin]):
+    # Test subprocess owns the pipe and always releases it, even on failure.
+    var byte = UInt8(0)
+    _ = external_call["read", Int](Int(p), Pointer(to=byte), 1)
+
+
+def _test_peer_submit(
+    dst_ctx: DeviceContext,
+    src_ctx: DeviceContext,
+    d: DeviceBuffer[DType.uint8],
+    s: DeviceBuffer[DType.uint8],
+) raises:
+    var mode = be()[].test_peer_copy
+    if mode == "gate":
+        dst_ctx.stream().enqueue_host_func(
+            _test_peer_gate,
+            Pointer[NoneType, MutAnyOrigin](
+                unsafe_from_address=be()[].test_peer_gate
+            ),
+        )
+    elif mode == "submit_error" or mode == "drain_error":
+        dst_ctx.enqueue_wait_for(src_ctx)
+        dst_ctx.enqueue_copy_no_cross_stream_sync(d, s)
+        print("P2P_SUBMITTED", Int(d.unsafe_ptr()), Int(s.unsafe_ptr()))
+        raise Error("injected failure after DMA, before reverse event")
+
+
 def copy_peer(
     dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
 ) raises -> Bool:
@@ -316,6 +360,8 @@ def copy_peer(
     var src_ctx = ctx_for(src_device)
     var d = wrap_raw(dst_ctx, dst, nbytes)
     var s = wrap_raw(src_ctx, src, nbytes)
+    if be()[].test_peer_copy != "":
+        _test_peer_submit(dst_ctx, src_ctx, d, s)
     d.enqueue_copy_from(s)
     if be()[].peer_copy != "":
         print("peer copy direct", dst_device, src_device)
@@ -330,7 +376,11 @@ def drain_copy(dst_device: Int, src_device: Int) -> Bool:
     for i in range(2):
         var device = dst_device if i == 0 else src_device
         try:
+            if be()[].test_peer_copy == "drain_error" and i == 0:
+                raise Error("injected destination drain failure")
             ctx_for(device).synchronize()
+            if be()[].test_peer_copy != "":
+                print("P2P_DRAINED", device)
         except e:
             _warn("transfer drain failed; retaining storage", e)
             drained = False
