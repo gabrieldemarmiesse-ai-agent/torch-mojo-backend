@@ -54,12 +54,20 @@ def try_enqueue_candidate_nt_bias(
     as an explicit kernel parameter instead, independently measured for
     this regime (see gemm16_rolling_kernels.mojo's module docstring).
     """
+    # m % 8 (not the historical m % 128): every A/C TMA descriptor here
+    # carries M as the operand's outer extent with K (already % 64 == 0) as
+    # the inner one, so no descriptor stride depends on M -- both the
+    # 192x192 rolling route and the 128-row fallback already clip a ragged
+    # M edge exactly as they clip ragged N (see gemm16_rolling_kernels.mojo
+    # and gemm16_nt_bias_kernels.mojo's "m and n need NOT be tile-aligned"
+    # note). Measured: the ragged 6600x4800x1600 shape now reaches the
+    # fused 192x192 kernel at 148 us vs 547 us on the unfused fallback.
     if (
         not has_bias
         or m < 4096
         or n < 1024
         or k < 1024
-        or m % 128 != 0
+        or m % 8 != 0
         or n % 64 != 0
         or k % 64 != 0
     ):
@@ -99,27 +107,39 @@ def _try_enqueue_nt_bias_rolling_192(
     192x192 cluster tiles the same (m, n) into a different work census than
     the 128-row kernel's 192/256-wide tiles.
     """
-    comptime if _GEMM16_DT != DType.bfloat16 or not _has_sm_9x():
+    # Two statements, not one `or`-combined guard: `comptime if A or B: return
+    # False` does not stop Mojo from instantiating (and emitting into the
+    # binary) the enqueue call below in a build where only A is true -- the
+    # call sits lexically AFTER the guard rather than inside a comptime-if
+    # branch, so nothing prunes it there. Nesting the rest inside `comptime
+    # if _has_sm_9x():`, as maybe_enqueue_gemm16_nt_bias_v4 already does,
+    # makes the call site itself conditional on the branch. Verified with
+    # scripts/compare_kernel_asm.py --ops Gemm16NTBiasTry --dtypes float16:
+    # the combined-guard version emitted the full 192x192 kernel in a
+    # float16 build; this form emits zero kernels for it.
+    comptime if _GEMM16_DT != DType.bfloat16:
         return False
-    if not _v4c_nt_bias_hw_gate(output, a, b, bias, m, n, k, ctx):
-        return False
-    comptime CLUSTER_M = 2
-    comptime BM = 192
-    comptime BN = 192
-    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-    if sms < CLUSTER_M:
-        return False
-    var macro_rows = (m + BM * CLUSTER_M - 1) // (BM * CLUSTER_M)
-    var blocks_n = (n + BN - 1) // BN
-    if (
-        macro_rows
-        > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X) // blocks_n
-    ):
-        return False
-    enqueue_rolling_persistent[
-        3, CLUSTER_M, BM, BN, 3, True, False, True, True, 8, True
-    ](output, a, b, bias, m, n, k, sms, ctx)
-    return True
+    comptime if _has_sm_9x():
+        if not _v4c_nt_bias_hw_gate(output, a, b, bias, m, n, k, ctx):
+            return False
+        comptime CLUSTER_M = 2
+        comptime BM = 192
+        comptime BN = 192
+        var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        if sms < CLUSTER_M:
+            return False
+        var macro_rows = (m + BM * CLUSTER_M - 1) // (BM * CLUSTER_M)
+        var blocks_n = (n + BN - 1) // BN
+        if (
+            macro_rows
+            > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X) // blocks_n
+        ):
+            return False
+        enqueue_rolling_persistent[
+            3, CLUSTER_M, BM, BN, 3, True, False, True, True, 8, True
+        ](output, a, b, bias, m, n, k, sms, ctx)
+        return True
+    return False
 
 
 def try_enqueue_candidate_nn(
