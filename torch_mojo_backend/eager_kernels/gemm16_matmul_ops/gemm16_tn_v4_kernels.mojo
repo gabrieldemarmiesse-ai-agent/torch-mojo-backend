@@ -1059,9 +1059,10 @@ def _v4_try_launch_tn_roll_geom[
 ) raises -> Bool:
     """Launch geometry `g` of the shared persistent-rolling body in its TN
     (col_a) mode, or decline (False) if this geometry's cluster grid would
-    overflow the GPU's grid-x limit.  has_bias defaults to False, so
-    `output` also fills the body's unread `bias` slot (see
-    enqueue_rolling_persistent's docstring)."""
+    overflow the GPU's grid-x limit -- or if the enqueuer itself declines
+    (its dynamic tile scheduler cannot serve the work census).  has_bias
+    defaults to False, so `output` also fills the body's unread `bias` slot
+    (see enqueue_rolling_persistent's docstring)."""
     comptime BM = _V4_TN_ROLL_BM[g]
     comptime BN = _V4_TN_ROLL_BN[g]
     var macro_rows = (m + BM * _V4_TN_ROLL_CLUSTER_M - 1) // (
@@ -1070,7 +1071,7 @@ def _v4_try_launch_tn_roll_geom[
     var blocks_n = (n + BN - 1) // BN
     if blocks_n <= 0 or macro_rows > max_grid_x // blocks_n:
         return False
-    enqueue_rolling_persistent[
+    return enqueue_rolling_persistent[
         _V4_TN_ROLL_STAGES[g],
         _V4_TN_ROLL_CLUSTER_M,
         BM,
@@ -1082,7 +1083,6 @@ def _v4_try_launch_tn_roll_geom[
         True,
         _V4_TN_ROLL_GROUP[g],
     ](output, a, b, output, m, n, k, sm_count, ctx)
-    return True
 
 
 def _try_enqueue_tn_splitk_m128n256(

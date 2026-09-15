@@ -199,6 +199,7 @@ def _gemm16_available() raises -> Bool:
             "gemm16_candidate_dispatch.mojo",
             "gemm16_rolling_kernels.mojo",
             "gemm16_nt_bias_kernels.mojo",
+            "gemm16_sched_pool.mojo",
         ],
     )
 

@@ -142,10 +142,12 @@ def _try_enqueue_nt_bias_rolling_192(
             > ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X) // blocks_n
         ):
             return False
-        enqueue_rolling_persistent[
+        # A declined launch (the tile scheduler cannot serve the work
+        # census) falls back to the 128-row route, as every other decline
+        # above does.
+        return enqueue_rolling_persistent[
             3, CLUSTER_M, BM, BN, 3, True, False, True, True, 8, True
         ](output, a, b, bias, m, n, k, sms, ctx)
-        return True
     return False
 
 
@@ -222,10 +224,9 @@ def try_enqueue_candidate_nn(
             return False
         # has_bias=False (default): the bias arg is unused, filled with
         # output.
-        enqueue_rolling_persistent[3, 2, 192, 192, 3, True, False, False, True](
-            output, a, b, output, m, n, k, sms, ctx
-        )
-        return True
+        return enqueue_rolling_persistent[
+            3, 2, 192, 192, 3, True, False, False, True
+        ](output, a, b, output, m, n, k, sms, ctx)
     return False
 
 
@@ -330,14 +331,12 @@ def try_enqueue_candidate_tn(
                 )
                 return True
             if waves192 * 192 < waves256 * 256:
-                _v4_enqueue_nn_persistent[
+                return _v4_enqueue_nn_persistent[
                     4, 2, 128, 192, 2, True, True, False, True
                 ](output, a, b, m, n, k, sms, ctx)
-            else:
-                _v4_enqueue_nn_persistent[
-                    3, 2, 128, 256, 2, True, True, False, True
-                ](output, a, b, m, n, k, sms, ctx)
-            return True
+            return _v4_enqueue_nn_persistent[
+                3, 2, 128, 256, 2, True, True, False, True
+            ](output, a, b, m, n, k, sms, ctx)
         # Preserve aligned routes except this clipped-column,
         # moderate-aspect regime where the four-stage 192 tile removes
         # excess per-wave work.
@@ -347,9 +346,8 @@ def try_enqueue_candidate_tn(
             and m <= 8 * n
             and waves192 * 192 < waves256 * 256
         ):
-            _v4_enqueue_nn_persistent[
+            return _v4_enqueue_nn_persistent[
                 4, 2, 128, 192, 2, True, True, False, True
             ](output, a, b, m, n, k, sms, ctx)
-            return True
         return False
     return False

@@ -1181,3 +1181,131 @@ def test_linear_skinny_m_large_output(mojo_gpu):
     torch.testing.assert_close(
         got.cpu(), torch.nn.functional.linear(x, w), atol=5e-2, rtol=5e-2
     )
+
+
+# --- the dynamic tile scheduler (gemm16_sched_pool.mojo) ----------------------
+#
+# The three persistent bodies -- `_rolling_persistent_ws`,
+# `_nt_bias_rolling_ws` (gemm16_rolling_kernels.mojo) and
+# `_v4_nn_persistent_ws` (gemm16_nn_v4_kernels.mojo) -- take their output
+# tiles from a global ticket counter instead of owning a static share, so a
+# cluster that cannot launch (NCCL holding its SMs on a DDP job's comm
+# stream) costs its tiles' latency rather than the whole kernel's.  The
+# counter lives in a per-(device, stream) block that the kernel itself
+# resets: the last cluster to fetch a ticket stores 0 back.  What that makes
+# testable, beyond the ordinary correctness the tables above already cover:
+#
+#   * a MISSED reset shows up only on the SECOND launch that shares the
+#     counter (it would start mid-count and skip tiles), so the tests below
+#     launch repeatedly without a sync in between and check the last result;
+#   * the tile order is dynamic but each tile's K order is not, so two runs
+#     of one GEMM must agree BIT for bit -- a stronger assertion than the
+#     bf16 bound, and the one that would catch a torn ticket handing two
+#     clusters the same tile;
+#   * a second stream gets its own counter, which is what makes reuse safe
+#     without reasoning about occupancy.
+# -----------------------------------------------------------------------------
+
+# (m, n, k) through the NN rolling body: m % 128 == 0, n % 256 == 64,
+# 4n <= m <= 32n and n <= k <= 8n is try_enqueue_candidate_nn's own gate.
+SCHED_NN_DX = (8192, 1600, 4800)  # c_attn dX
+SCHED_NN_DX_SMALL = (6400, 1600, 1600)  # attn.c_proj dX, cheap enough to loop
+SCHED_TN_DW = (4800, 1600, 8192)  # c_attn dW, through the TN rolling body
+
+
+def _sched_mm(device, m, n, k):
+    """One bf16 NN GEMM on `device`, with its fp32 CPU reference."""
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    b = torch.randn(k, n, dtype=torch.bfloat16)
+    return a.to(device), b.to(device), a.float() @ b.float()
+
+
+@pytest.mark.parametrize("m,n,k", [(8192, 4800, 1600), (8192, 1600, 6400)])
+def test_gemm16_sched_fused_forward(mojo_h100, m, n, k):
+    """The fused NT+bias 192x192 kernel through the scheduler.
+
+    That instantiation (`_nt_bias_rolling_ws`, the only one with a live
+    `bias` argument) was compiled but never launched while the scheduler was
+    developed outside the tree, so it gets its own test: the bias still fuses
+    into the one launch, the result still clears the bf16 bound, and two runs
+    agree bit for bit."""
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    b = torch.randn(n, dtype=torch.bfloat16)
+    dx, dw, db = x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
+    with assert_ran("aten::linear"):
+        with assert_no_bias_add():
+            got = torch.nn.functional.linear(dx, dw, db)
+    again = torch.nn.functional.linear(dx, dw, db)
+    assert torch.equal(got.cpu(), again.cpu()), (
+        "two runs of one GEMM disagree: the tile ORDER is dynamic but each "
+        "tile's K order is not, so the result must be bit-identical"
+    )
+    ref = torch.nn.functional.linear(x.float(), w.float(), b.float())
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+def test_gemm16_sched_dx_mm(mojo_h100):
+    """dX as a bare mm: the NN rolling body's own route."""
+    m, n, k = SCHED_NN_DX
+    a, b, ref = _sched_mm(mojo_h100, m, n, k)
+    with assert_ran("aten::mm"):
+        got = torch.mm(a, b)
+    assert torch.equal(got.cpu(), torch.mm(a, b).cpu())
+    assert _rel_err(got, ref) < _bf16_bound(k)
+
+
+def test_gemm16_sched_dw_mm(mojo_h100):
+    """dW as `mm(grad.t(), x)`: the TN (col_a) instantiation of the same
+    body, reached through the rolling geometry dispatcher."""
+    out_features, in_features, tokens = SCHED_TN_DW
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    dx, dg = x.to(mojo_h100), g.to(mojo_h100)
+    with assert_ran("aten::mm"):
+        got = torch.mm(dg.t(), dx)
+    assert torch.equal(got.cpu(), torch.mm(dg.t(), dx).cpu())
+    assert _rel_err(got, g.float().t() @ x.float()) < _bf16_bound(tokens)
+
+
+def test_gemm16_sched_counter_is_reset_between_launches(mojo_h100):
+    """64 back-to-back launches sharing one ticket counter, then a GEMM with
+    a different work census on the same stream.
+
+    Nothing synchronizes between the launches, so they are exactly the
+    same-stream sequence the reset argument relies on: launch j+1 may only
+    start once launch j's last fetcher has stored 0 back.  A counter left
+    dirty makes launch j+1 start mid-count and never issue its first tiles,
+    which the final comparison sees as whole rows of zeros."""
+    m, n, k = SCHED_NN_DX_SMALL
+    a, b, ref = _sched_mm(mojo_h100, m, n, k)
+    got = torch.mm(a, b)
+    for _ in range(63):
+        got = torch.mm(a, b)
+    assert _rel_err(got, ref) < _bf16_bound(k)
+    # A different census on the same counter: the TN body's work loop is a
+    # different length, so a stale count would land somewhere else entirely.
+    out_features, in_features, tokens = 1600, 1600, 8192
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
+    dw = torch.mm(g.to(mojo_h100).t(), x.to(mojo_h100))
+    assert _rel_err(dw, g.float().t() @ x.float()) < _bf16_bound(tokens)
+
+
+def test_gemm16_sched_on_a_side_stream(mojo_h100):
+    """A second stream takes its own ticket counter.
+
+    The whole reuse argument is "launches on one stream are ordered", so a
+    GEMM issued on a side stream must not share the default stream's
+    counter; if it did, two genuinely concurrent launches could hand two
+    clusters the same tile.  Both legs run, both are checked."""
+    side = side_stream_or_skip(mojo_h100)
+    m, n, k = SCHED_NN_DX_SMALL
+    a, b, ref = _sched_mm(mojo_h100, m, n, k)
+    on_default = torch.mm(a, b)
+    side.wait_stream(torch.accelerator.current_stream(on_default.device.index))
+    with device_module.stream(side):
+        on_side = torch.mm(a, b)
+    torch.accelerator.synchronize()
+    assert _rel_err(on_side, ref) < _bf16_bound(k)
+    assert torch.equal(on_side.cpu(), on_default.cpu())

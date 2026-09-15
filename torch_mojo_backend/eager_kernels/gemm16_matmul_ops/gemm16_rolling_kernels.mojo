@@ -34,6 +34,16 @@ route is its own `@__name`d entry point with its own `bias` argument. See
 does not generalize past NT, and the comptime assert in
 `_rolling_persistent_body` that enforces it.
 
+Output tiles are assigned DYNAMICALLY: every cluster takes its next work
+index from a global ticket counter (gemm16_sched_pool.mojo) instead of the
+static `w = cluster_id; w += num_clusters` this body used to walk.  That is
+what keeps these kernels from losing nearly half their throughput whenever
+another kernel -- NCCL on a DDP job's comm stream -- holds some of the SMs a
+persistent grid assumed it owned.  The `@__name`s are deliberately unchanged
+(a profile of this kernel names the same algorithm it always did); the
+`_enqueue_cached` keys are not, because the kernel ABI gained the `sched`
+counter pointer.
+
 Tuning provenance: BK=64 and the parent's intended BM=128/BN=256/stages=3/
 cluster_m=2/consumers=2 regime are the upstream H100-tuned configuration
 for the has_bias=False (NN) route.  Problem dimensions are never
@@ -93,6 +103,21 @@ from std.sys import get_defined_bool
 from gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
 
 from op_utils import _enqueue_cached
+
+from gemm16_sched_pool import (
+    SCHED_PTR,
+    SCHED_RING,
+    sched_advance,
+    sched_fetch_add,
+    sched_finish,
+    sched_init_ring,
+    sched_poll_local,
+    sched_publish_first,
+    sched_publish_round,
+    sched_read_local,
+    sched_slot_ptr,
+    sched_supported,
+)
 
 from gemm16_nn_v4_kernels import (
     _V4_DT,
@@ -233,6 +258,7 @@ def _rolling_persistent_body[
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
     bias: _V4_PTR,
+    sched: SCHED_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -246,6 +272,12 @@ def _rolling_persistent_body[
     argument, and its exact device-side behavior, is decided entirely by
     each caller's own signature and has_bias -- this body has no `@__name`
     of its own and is never launched directly.
+
+    `sched` is the launch's ticket counter (gemm16_sched_pool.mojo): rank 0's
+    producer thread dispenses work indices from it, the peer rank reads them
+    over DSMEM and every consumer reads its own CTA's ring.  Per-tile K order
+    is untouched, so results are bit-identical to the static assignment this
+    replaced -- only WHICH cluster computes a tile changes.
     """
     comptime assert not has_bias or (
         tma_store and kmaj_b and not col_a
@@ -307,7 +339,31 @@ def _rolling_persistent_body[
             address_space=AddressSpace.SHARED,
             alignment=8,
         ]()
+        # Published work tickets, one 32-bit word per round (see
+        # gemm16_sched_pool.mojo).  A slot is rewritten SCHED_RING rounds
+        # later and publication runs at most `stages + 1` rounds ahead of the
+        # slowest reader in the cluster, so this bound is what keeps a live
+        # ticket from being overwritten under a reader.
+        comptime assert (
+            SCHED_RING >= stages + 4
+        ), "work-ticket ring too shallow for this pipeline depth"
+        var work_ring = stack_allocation[
+            SCHED_RING,
+            Scalar[DType.uint32],
+            address_space=AddressSpace.SHARED,
+            alignment=16,
+        ]()
+        # Round 0's ticket is fetched HERE, before the barrier inits, the TMA
+        # descriptor prefetches and the cluster barrier: every cluster's rank
+        # 0 hits the same counter word at the same instant, and same-address
+        # L2 atomics serialise.  Issuing it first lets that queue drain behind
+        # the prologue instead of standing between kernel entry and the first
+        # TMA.
+        var ticket0 = UInt32(0)
         if thread_idx.x == 0:
+            if Int(block_rank_in_cluster()) == 0:
+                ticket0 = UInt32(sched_fetch_add(sched, 1))
+            sched_init_ring(work_ring)
             comptime for stage in range(stages):
                 full_barriers[unsafe_offset=stage].init()
                 # Released by every consumer warp group of every CTA in the
@@ -333,7 +389,8 @@ def _rolling_persistent_body[
         var warp_group_idx = Int(thread_idx.x) // 128
         var warp_group_thread_idx = Int(thread_idx.x) % 128
         var rank = Int(block_rank_in_cluster())
-        var cluster_id = Int(block_idx.x) // cluster_m
+        # No cluster id: the work index is a ticket from the global counter,
+        # not `cluster_id + j * num_clusters` (gemm16_sched_pool.mojo).
         var num_clusters = Int(grid_dim.x) // cluster_m
         # m may be ragged: TMA A reads clamp out-of-bounds rows and the
         # epilogue stores are row-predicated.  With ragged_n, n may be too
@@ -354,12 +411,26 @@ def _rolling_persistent_body[
                 )
 
         if warp_group_idx == 0:
-            warpgroup_reg_dealloc[24]()
+            # 32, not 24: the scheduler adds live state to this warp
+            # group and 24 spills it to local memory (ptxas -v: 32 bytes of
+            # spill stores at 24, zero at 32).  32 still fits the SM's 65536
+            # registers beside three consumer warp groups at 160
+            # (3 * 128 * 160 + 128 * 32 = 65536 exactly) and two at 232.
+            # Measured worth up to 6% under contention (tn_c_attn at a 16-SM
+            # hog: 252.9 -> 239.1 us).
+            warpgroup_reg_dealloc[32]()
             if warp_group_thread_idx == 0:
                 var ring_stage = 0
                 var ring_phase = UInt32(0)
-                var w = cluster_id
+                var rm = UInt32(0)
+                sched_publish_first(work_ring, rank, rm, ticket0)
+                var w = sched_read_local(work_ring, rm)
                 while w < total_works:
+                    # Publish round j+1 BEFORE issuing round j, so the peer
+                    # rank's DSMEM poll and both CTAs' consumer polls are
+                    # already satisfied when they look.
+                    var rm_next = sched_advance(rm)
+                    sched_publish_round(sched, work_ring, rank, rm_next)
                     var g = w // group_span
                     var rem = w % group_span
                     var rows_in_group = min(group, macro_rows - g * group)
@@ -454,7 +525,13 @@ def _rolling_persistent_body[
                         if ring_stage == stages:
                             ring_stage = 0
                             ring_phase = ring_phase ^ UInt32(1)
-                    w += num_clusters
+                    rm = rm_next
+                    w = sched_read_local(work_ring, rm)
+                if rank == 0:
+                    # `w` is this cluster's past-the-end ticket; see
+                    # gemm16_sched_pool.mojo for why the highest one resets
+                    # the counter.
+                    sched_finish(sched, w, total_works, num_clusters)
         else:
             # Consumer registers: three warp groups fit 65536 regs/SM only
             # at 160 regs/thread (96 accumulator + addressing); two fit 232.
@@ -480,7 +557,8 @@ def _rolling_persistent_body[
 
             var ring_stage = 0
             var ring_phase = UInt32(0)
-            var w = cluster_id
+            var rm = UInt32(0)
+            var w = sched_poll_local(work_ring, rm)
             while w < total_works:
                 var g = w // group_span
                 var rem = w % group_span
@@ -588,7 +666,8 @@ def _rolling_persistent_body[
                             output.unsafe_store[alignment=4](
                                 (m0 + row) * n + n0 + col, pair
                             )
-                w += num_clusters
+                rm = sched_advance(rm)
+                w = sched_poll_local(work_ring, rm)
             comptime if tma_store:
                 # Outstanding bulk stores must complete before kernel exit.
                 if warp_group_idx == 1 and warp_group_thread_idx == 0:
@@ -672,6 +751,7 @@ def _rolling_persistent_ws[
     b_tma: TMATensorTile[_V4_DT, 2, b_tile_shape, b_desc_shape],
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
+    sched: SCHED_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -694,7 +774,7 @@ def _rolling_persistent_ws[
         a_desc_shape,
         b_tile_shape,
         b_desc_shape,
-    ](a_tma, b_tma, c_tma, output, output, m_arg, n_arg, k_arg)
+    ](a_tma, b_tma, c_tma, output, output, sched, m_arg, n_arg, k_arg)
 
 
 @__llvm_arg_metadata(a_tma, `nvvm.grid_constant`)
@@ -727,6 +807,7 @@ def _nt_bias_rolling_ws[
     c_tma: TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)],
     output: _V4_PTR,
     bias: _V4_PTR,
+    sched: SCHED_PTR,
     m_arg: Int64,
     n_arg: Int64,
     k_arg: Int64,
@@ -747,7 +828,7 @@ def _nt_bias_rolling_ws[
         Index(bm, _V4_BK),
         Index(64, _V4_BK),
         Index(64, _V4_BK),
-    ](a_tma, b_tma, c_tma, output, bias, m_arg, n_arg, k_arg)
+    ](a_tma, b_tma, c_tma, output, bias, sched, m_arg, n_arg, k_arg)
 
 
 def enqueue_rolling_persistent[
@@ -774,7 +855,30 @@ def enqueue_rolling_persistent[
     k: Int,
     sm_count: Int,
     ctx: DeviceContext,
-) raises:
+) raises -> Bool:
+    """Launch one of this file's persistent-rolling kernels, or decline.
+
+    Returns False WITHOUT launching -- and without building a single TMA
+    descriptor -- when the dynamic tile scheduler cannot serve the shape: a
+    work census past the ring word's 22-bit payload, or a counter table with
+    no free entry (see gemm16_sched_pool.mojo).  Every caller treats that as
+    "this rung declines" and falls through to the next one.
+    """
+    # The work census decides both the grid and whether the scheduler can
+    # serve the shape at all, so it is computed before anything is allocated.
+    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
+    var blocks_n = n // bn
+    comptime if ragged_n:
+        blocks_n = (n + bn - 1) // bn
+    var total_works = macro_rows * blocks_n
+    if not sched_supported(total_works):
+        return False
+    # One ticket counter per (device, stream); allocated once and self-reset
+    # by the kernel, so nothing is allocated or memset per launch.
+    var slot = sched_slot_ptr(ctx)
+    if not slot:
+        return False
+    var sched = slot.value()
     # Each descriptor follows its operand's physical layout: (M, K) row-major
     # with a whole-tile box, or -- for the TN/wgrad and TT col_a routes --
     # (K, M) row-major with a (BK, 64) box feeding the MN-major shared tile;
@@ -823,11 +927,6 @@ def enqueue_rolling_persistent[
     var a_tma = TMATensorTile[_V4_DT, 2, A_TILE, A_DESC](a_desc)
     var b_tma = TMATensorTile[_V4_DT, 2, B_TILE, B_TILE](b_desc)
     var c_tma = TMATensorTile[_V4_DT, 2, Index(bm, 64), Index(bm, 64)](c_desc)
-    var macro_rows = (m + bm * cluster_m - 1) // (bm * cluster_m)
-    var blocks_n = n // bn
-    comptime if ragged_n:
-        blocks_n = (n + bn - 1) // bn
-    var total_works = macro_rows * blocks_n
     var num_clusters = min(sm_count // cluster_m, total_works)
     var grid_x = num_clusters * cluster_m
     comptime DYN_SMEM = _v4_persistent_smem_bytes[stages, bm, bn, tma_store]()
@@ -850,7 +949,7 @@ def enqueue_rolling_persistent[
         ](
             ctx,
             String(
-                t"ntbroll_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_g{group}"
+                t"ntbroll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_g{group}"
             ),
             grid_x,
             1,
@@ -861,6 +960,7 @@ def enqueue_rolling_persistent[
             c_tma,
             output,
             bias,
+            sched,
             Int64(m),
             Int64(n),
             Int64(k),
@@ -883,7 +983,7 @@ def enqueue_rolling_persistent[
         ](
             ctx,
             String(
-                t"g16roll_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{group}_p{Int(_ROLL_PAIR_CAST)}"
+                t"g16roll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{group}_p{Int(_ROLL_PAIR_CAST)}"
             ),
             grid_x,
             1,
@@ -893,7 +993,9 @@ def enqueue_rolling_persistent[
             b_tma,
             c_tma,
             output,
+            sched,
             Int64(m),
             Int64(n),
             Int64(k),
         )
+    return True
