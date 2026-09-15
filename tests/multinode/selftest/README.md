@@ -228,3 +228,17 @@ partially-created resources on a failure path. NOT covered: the progress
 thread and its two spin kernels (they need pinned host memory and a stream),
 byte-level verification of an RMA write into device memory, and everything
 in `mojoccl.mojo` above the transport.
+
+## `host_fault_test.mojo` — independent host/device fault records
+
+Calls the production host publisher against a stack-allocated status page.
+Checks device-first, host-first, partially published device details, and a
+second host fault: host writes never change device fields, and the first
+observed source and host details remain latched. No GPU code runs.
+
+```bash
+PYTHONPATH=$PWD uv run --no-sync mojo build tests/multinode/selftest/host_fault_test.mojo \
+    -I torch_mojo_backend/distributed/mojoccl --target-accelerator sm_90a \
+    -o /tmp/mojoccl_host_fault_test
+PYTHONPATH=$PWD uv run --no-sync /tmp/mojoccl_host_fault_test
+```

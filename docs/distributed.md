@@ -745,9 +745,21 @@ cooperative attribute is unsupported (MAX's launch attributes are
 CUDA-only, so on AMD) the ordinary launch guarantees nothing beyond the
 occupancy bound, and the deadline is the backstop. A launch that fails
 after the call's exchanges were reserved fails the communicator from the
-host through the status page (`ERR_HOST_LAUNCH`), so later calls return
-`ncclRemoteError` and the peers' own deadlines report the rank, instead of
-a hang. The SM count comes from MAX's device attribute on both vendors, so
+host (`ERR_HOST_LAUNCH`, in the status page's own host word -- the device's
+record is claimed by a compare-exchange on device memory the host cannot
+join, so the two never share words). `_report_fault` selects the first
+fully published fault observed at host latching: an already visible device
+fault wins; otherwise the host fault wins, including against a device record
+still being published. That selection is latched and cannot change later.
+Subsequent calls return `ncclRemoteError` and the peers'
+own deadlines report the rank, instead of a hang. Collectives of one
+communicator are kept in one total order across streams: an event is
+recorded on the stream after every call (2.53 µs host time on H100, job
+251506) and a call on a different
+stream waits for it first. Default stream 0 participates, and the caller may
+destroy a completed stream before the next call. Teardown and error polling
+also synchronize the owned completion event, never a saved caller handle.
+The SM count comes from MAX's device attribute on both vendors, so
 AMD takes the fused path too (unmeasured there: for the AMD agent). A call
 the geometry cuts into more chunks than the inter-node
 work ring has slots (`WORK_SLOTS`, 512: a 129 MiB allreduce at

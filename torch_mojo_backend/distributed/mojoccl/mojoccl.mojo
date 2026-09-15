@@ -124,9 +124,9 @@ from collectives_kernels import (
     MAX_WORLD,
     PHASES_PER_GEN,
     STATUS_FAULT_WORD,
+    STATUS_HOST_FAULT_WORD,
     STATUS_PAGE_BYTES,
     _shard_per,
-    publish_fault,
     allgather,
     allgather_max_bytes,
     allgather_finish,
@@ -462,9 +462,12 @@ struct CommState(Movable):
     # message is worth one line, not one per call.
     var fault_said: Bool
     var stream_cache: Dict[Int64, DeviceStream]
-    # Orders a collective issued on a new stream behind the previous stream's
-    # work (`_order_streams`).
+    # Recorded on the stream after every collective; a collective issued on
+    # another stream waits for it first (`_order_before` / `_order_after`).
     var order_event: DeviceEvent
+    var order_recorded: Bool
+    # A failed enqueue/record cannot authorize reuse or teardown.
+    var order_incomplete: Bool
     var local_rank: Int
     var local_world: Int
     var my_node: Int
@@ -503,13 +506,10 @@ struct CommState(Movable):
     # off under MOJOCCL_FUSED=0, which is the way back to the split schedule.
     var fused: Bool
     # `ncclCommGetAsyncError`'s scratch, built once instead of per poll: the
-    # device word the copy kernel writes, the host word it lands in, and the
-    # stream to use before any collective has named one. A watchdog polls
-    # this on a timer, and a fresh DeviceStream, DeviceBuffer and host
-    # allocation per poll was three allocations and a leak of the last one.
+    # device word the copy kernel writes and the host word it lands in.
+    # Reusing them avoids an allocation (and formerly a leak) per poll.
     var err_buf: DeviceBuffer[DType.uint64]
     var err_host: Int
-    var own_stream: DeviceStream
     # Submission lock (`_lock`/`_unlock`): 0 free, 1 held.
     var lock: Int64
 
@@ -559,6 +559,8 @@ struct CommState(Movable):
         self.generation = 0
         self.last_stream = 0
         self.order_event = ctx.create_event()
+        self.order_recorded = False
+        self.order_incomplete = False
         self.aborted = False
         self.released = False
         self.abort_host = abort_host
@@ -595,7 +597,6 @@ struct CommState(Movable):
         self.nvls_bars = 0
         self.err_buf = self.ctx.enqueue_create_buffer[DType.uint64](1)
         self.err_host = Int(unsafe_alloc[UInt64](1))
-        self.own_stream = DeviceStream(self.ctx)
         self.lock = 0
 
 
@@ -755,25 +756,28 @@ def _any(p: Pointer[UInt8, MutUntrackedOrigin]) -> Pointer[UInt8, MutAnyOrigin]:
     return Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p))
 
 
-def _order_streams(mut state: CommState, handle: Int64) raises:
-    """Make the collective about to be enqueued on `handle` run after
-    everything the communicator's previous stream has enqueued.
+def _order_before(mut state: CommState, handle: Int64) raises:
+    """Wait for the previous collective, including one on default stream 0.
 
-    The fused kernel's barrier words (and the arenas' start barriers, which
-    order reuse by stream position) assume the communicator's collectives
-    reach the device one at a time; NCCL does not restrict callers to one
-    stream, and mojoccl does not either -- it records an event on the stream
-    the last collective used and makes the new one wait for it, so a caller
-    switching streams gets one total order instead of two kernels on the
-    same rendezvous. Same stream as last time: nothing is enqueued."""
+    Record before returning to the caller: a later call cannot touch the
+    previous stream, which the caller may have destroyed in the meantime.
+    The event orders reuse of the communicator's shared barrier words.
+    """
     _ensure_stream_cached(state, handle)
-    if state.last_stream != 0 and state.last_stream != handle:
-        if state.last_stream in state.stream_cache:
-            state.stream_cache[state.last_stream].record_event(
-                state.order_event
-            )
-            state.stream_cache[handle].enqueue_wait_for(state.order_event)
+    if state.order_recorded and state.last_stream != handle:
+        state.stream_cache[handle].enqueue_wait_for(state.order_event)
     state.last_stream = handle
+    state.order_incomplete = True
+
+
+def _order_after(mut state: CommState, handle: Int64) raises:
+    """Record completion before returning; one host event record per call.
+
+    Host cost: 2.53 us on H100 (7 x 10,000 warmed records, job 251506).
+    """
+    state.stream_cache[handle].record_event(state.order_event)
+    state.order_recorded = True
+    state.order_incomplete = False
 
 
 def _ensure_stream_cached(mut state: CommState, handle: Int64) raises:
@@ -877,6 +881,50 @@ def _fault_code(state: CommState) -> UInt64:
     return _fault_field(state, FAULT_CODE)
 
 
+@always_inline
+def _host_fault_word(state: CommState) -> UInt64:
+    """`STATUS_HOST_FAULT_WORD`: the host's own latched failure, 0 if none."""
+    if state.abort_host == 0:
+        return UInt64(0)
+    return Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=state.abort_host + STATUS_HOST_FAULT_WORD * 8
+        )
+    )
+
+
+def _latch_host_fault_record(page: Int, code: Int, detail: Int):
+    """Latch a separate host record under the communicator's submission lock."""
+    if page == 0:
+        return
+    var host = Pointer[UInt64, MutAnyOrigin](
+        unsafe_from_address=page + STATUS_HOST_FAULT_WORD * 8
+    )
+    if Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](host) != 0:
+        return
+    # First fully published fault observed here wins. A device record still
+    # being published loses to this host fault; their detail words are disjoint.
+    var device = Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=page + (STATUS_FAULT_WORD + FAULT_CODE) * 8
+        )
+    )
+    var device_first = UInt64(device != 0) << 63
+    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+        host,
+        device_first
+        | (UInt64(code) << 32)
+        | (UInt64(detail) & UInt64(0xFFFF_FFFF)),
+    )
+
+
+def _latch_host_fault(state: CommState, code: Int, detail: Int):
+    """Publish only to the host record, then release this rank's device spins.
+    """
+    _latch_host_fault_record(state.abort_host, code, detail)
+    _raise_abort_word(state)
+
+
 def _fault_kind(code: UInt64) -> String:
     """The collective a fault code names, for the message."""
     var c = Int(code)
@@ -913,6 +961,26 @@ def _report_fault(mut state: CommState):
     if state.fault_said:
         return
     var code = _fault_code(state)
+    var host = _host_fault_word(state)
+    # Bit 63 snapshots precedence at host publication; a later device
+    # fault must not replace the host fault before the first report.
+    if host != 0 and host >> 63 == 0:
+        state.fault_said = True
+        print(
+            "mojoccl: rank",
+            state.rank,
+            ": HOST FAULT in",
+            _fault_kind(host >> 32),
+            "at exchange",
+            host & UInt64(0xFFFF_FFFF),
+            (
+                "-- the kernel launch failed after its exchanges were reserved,"
+                " so this rank's peers will report a deadline waiting for it;"
+                " every later collective on this communicator fails with"
+                " ncclRemoteError."
+            ),
+        )
+        return
     if code == 0:
         return
     state.fault_said = True
@@ -940,11 +1008,6 @@ def _report_fault(mut state: CommState):
         what += String(": block ") + String(block) + String(" waited ")
         what += String(secs)
         what += String(" s for the other blocks of its own kernel")
-    elif Int(code) == ERR_HOST_LAUNCH:
-        what += String(
-            ": the kernel launch failed after its exchanges were reserved,"
-            " so the peers' waits for this rank were never going to end"
-        )
     elif peer == FAULT_NO_PEER:
         # The NVLS barrier is a multicast counter, not a per-peer flag.
         what += String(" (arena ") + String(arena) + String(", phase ")
@@ -979,7 +1042,7 @@ def _latched_error(mut state: CommState) -> Int32:
     """
     if state.ib != 0 and ib_error(state.ib) != 0:
         return NCCL_REMOTE_ERROR
-    if _fault_code(state) != 0:
+    if _fault_code(state) != 0 or _host_fault_word(state) != 0:
         _report_fault(state)
         return NCCL_REMOTE_ERROR
     return NCCL_SUCCESS
@@ -1270,7 +1333,7 @@ def _bootstrap(
     # query answers on both vendors (the driver-binding one, `vmm.sm_count`,
     # is NVIDIA-only and reads 0 on AMD, which would leave AMD on the split
     # schedule for no reason); the binding is the fallback.
-    var device_sms = 0
+    var device_sms: Int
     try:
         device_sms = Int(
             ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
@@ -1698,53 +1761,22 @@ def _bootstrap(
 
 
 def _cached_stream_handles(state: CommState) -> List[Int64]:
-    """Every raw stream handle wrapped in `state.stream_cache`, copied into a
-    plain List.
-
-    Kept to exactly this -- iterating `Dict.keys()` inside a `raises`
-    function narrows the function's inferred error type to `DictKeyError`,
-    which then rejects every unrelated `raise Error(...)` still in scope. A
-    helper doing nothing else keeps that narrowing from leaking into
-    `_drain_all_streams` or its callers.
-    """
+    """Copy cached stream handles for abort's bounded polling."""
     var handles = List[Int64]()
     for h in state.stream_cache.keys():
         handles.append(h)
     return handles^
 
 
-def _async_error_stream(state: CommState) -> DeviceStream:
-    """The stream `ncclCommGetAsyncError` synchronizes: the cached wrapper for
-    the stream a collective last ran on, or the communicator's own if none
-    has.
+def _drain_all_streams(state: CommState) raises:
+    """The last completion event covers the total order across all streams.
 
-    A helper of its own for the same reason `_cached_stream_handles` is one:
-    indexing a `Dict` narrows the enclosing function's inferred error type to
-    `DictKeyError`, which then rejects every unrelated `raise Error(...)`
-    still in scope. It also takes no lock, so `last_stream` may be set by a
-    concurrent submission a moment before that stream is cached -- hence the
-    membership test rather than an insert.
+    Caller-owned streams may already be destroyed; only the event is ours.
     """
-    try:
-        if state.last_stream != 0 and state.last_stream in state.stream_cache:
-            return state.stream_cache[state.last_stream]
-    except:
-        # Lost the race with a concurrent insert: the communicator's own
-        # stream is always a valid answer.
-        return state.own_stream
-    return state.own_stream
-
-
-def _drain_all_streams(mut state: CommState) raises:
-    """Synchronize every stream a collective has ever run on.
-
-    `state.last_stream` is only the MOST RECENT one: `stream_cache` can hold
-    several (the side-stream test in the suite uses two), and an exchange
-    still in flight on a stream that isn't the last one used would otherwise
-    find its QPs destroyed out from under it by `ncclCommDestroy`.
-    """
-    for h in _cached_stream_handles(state):
-        state.stream_cache[h].synchronize()
+    if state.order_incomplete:
+        raise Error("collective completion was not recorded; abort required")
+    if state.order_recorded:
+        state.order_event.synchronize()
 
 
 # ---------------------------------------------------------------------------
@@ -1793,10 +1825,7 @@ def _destroy_locked(comm: Int64) -> Int32:
         # abort either ran this same unwind or decided it could not safely.
         if state.released or state.aborted:
             return NCCL_SUCCESS
-        # The inter-node callbacks were enqueued on the CALLER's stream(s),
-        # not on the context's own, and they dereference the IbState this
-        # tears down -- so drain every cached stream too before touching
-        # it, not just the last one used (see `_drain_all_streams`).
+        # Completion includes all inter-node callbacks that use IbState.
         _drain_all_streams(state)
         state.ctx.synchronize()
         _release_resources(state)
@@ -1901,7 +1930,7 @@ def ncclCommGetAsyncError(
             # Host-side state, so it needs no device read.
             err_out[] = NCCL_REMOTE_ERROR
             return NCCL_SUCCESS
-        if _fault_code(state) != 0:
+        if _fault_code(state) != 0 or _host_fault_word(state) != 0:
             # A device deadline, latched in the status page. Also host memory,
             # so a watchdog polling this function pays nothing for it and --
             # unlike the arena read below -- does not block behind the kernel
@@ -1913,13 +1942,7 @@ def ncclCommGetAsyncError(
         # can give is "everything enqueued so far landed", same as before --
         # only the read itself changes, from a host dereference of device
         # memory (wrong) to a real D2H copy (_read_error_word).
-        # The wrapper comes out of the same cache the collectives use, and
-        # `own_stream` covers the case where no collective has named a stream
-        # yet. This poll takes no lock, so `last_stream` can be set by a
-        # concurrent submission a moment before it is cached -- hence the
-        # membership test rather than an insert.
-        var s = _async_error_stream(state)
-        s.synchronize()
+        _drain_all_streams(state)
         if state.ib != 0 and ib_error(state.ib) != 0:
             # A proxy failure during that sync releases the spin kernels
             # through MB_DONE without touching the device error word; the
@@ -2417,20 +2440,10 @@ def _do_allreduce_fused[
         )
     except e:
         # The exchanges are reserved and the peers will wait for this rank's
-        # flags: fail the communicator now, through the page a device
-        # deadline uses, so every later call here returns ncclRemoteError
-        # and the peers' own deadlines say what happened, instead of a hang.
-        if state.abort_host != 0:
-            publish_fault(
-                state.abort_host,
-                ERR_HOST_LAUNCH,
-                0,
-                0,
-                FAULT_NO_PEER,
-                0,
-                UInt64(seq0),
-                0,
-            )
+        # flags: fail the communicator now, so every later call here returns
+        # ncclRemoteError and the peers' own deadlines say what happened,
+        # instead of a hang.
+        _latch_host_fault(state, ERR_HOST_LAUNCH, seq0)
         raise e
 
 
@@ -2551,6 +2564,12 @@ def ncclAllReduce(
         except e:
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2573,7 +2592,9 @@ def _allreduce_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    _order_streams(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     var scale = Float32(1.0)
     if op == NCCL_AVG:
@@ -2655,6 +2676,12 @@ def ncclBroadcast(
         except e:
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2678,7 +2705,9 @@ def _broadcast_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    _order_streams(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
         var max_bytes = max(1, state.cap_bytes)
@@ -2863,6 +2892,12 @@ def ncclAllGather(
         except e:
             _unlock(state)
             raise e
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -2883,7 +2918,9 @@ def _allgather_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    _order_streams(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if state.nnodes == 1:
         # AMD's push all-gather stages `world-1` slots, so its chunk is

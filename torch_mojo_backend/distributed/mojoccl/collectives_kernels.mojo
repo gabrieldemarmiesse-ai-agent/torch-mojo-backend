@@ -208,11 +208,11 @@ inter-node kernel spans arenas but is one grid. They are a fixed rendezvous,
 not generation-tagged, so two collectives of one communicator must never be
 on the device at once. mojoccl (not NCCL, which allows groups across
 streams) enforces that itself: a collective issued on a stream other than
-the communicator's previous one is made to wait, through an event, for
-everything that stream had enqueued (`_order_streams`, mojoccl.mojo), so
+the communicator's previous one is made to wait, through an event, for the
+previous collective (`_order_before` / `_order_after`, mojoccl.mojo), so
 every collective of a communicator runs in one total order whatever streams
 the caller uses. The process group issues everything on one comm stream
-anyway, and the event costs nothing until a stream switch."""
+anyway."""
 
 comptime _POISON_OFFSET = 448
 """Device word one block of a persistent kernel raises to tell the others to
@@ -391,6 +391,12 @@ comptime STATUS_ABORT_WORD = 0
 
 comptime STATUS_FAULT_WORD = 8
 """Word index of the first word of the fault record (second cache line)."""
+
+comptime STATUS_HOST_FAULT_WORD = 15
+"""Host-only record: bit 63 = device fault already observed, bits 32..62 =
+code, bits 0..31 = exchange. The host cannot join the device arena's claim,
+so it never writes the device record. `_report_fault` keeps the first fully
+published fault observed when the host latches this word."""
 
 # Fault record layout, as word offsets from `STATUS_FAULT_WORD`. `FAULT_CODE`
 # is written LAST, with a release store, so a nonzero code also means the six
