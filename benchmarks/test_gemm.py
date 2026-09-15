@@ -272,6 +272,35 @@ def test_linear(
         )
 
 
+NT_BIAS_SHAPES = {
+    "NTB1_8192x1600x1600": (8192, 1600, 1600),
+    "NTB2_8192x4800x1600": (8192, 4800, 1600),
+    "NTB3_8192x6400x1600": (8192, 6400, 1600),
+    "NTB4_8192x1600x6400": (8192, 1600, 6400),
+    "NTB5_4096x1536x3072": (4096, 1536, 3072),
+    "NTB6_357x789x544": (357, 789, 544),
+}
+
+
+@pytest.mark.bench_op("linear")
+@pytest.mark.parametrize("dtype_id", ["bf16"])
+@pytest.mark.parametrize("shape_id", NT_BIAS_SHAPES)
+def test_linear_nt_bias(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """The six NT+bias tuning regimes, including a masked output edge."""
+    m, n, k = NT_BIAS_SHAPES[shape_id]
+    dtype, _ = DTYPES[dtype_id]
+    operands = [torch.randn(*shape, dtype=dtype) for shape in ((m, k), (n, k), (n,))]
+    reference = [t.to(hw.stock_device) for t in operands]
+    native = [t.to(mojo_device) for t in operands]
+    bench.run(
+        lambda: torch.nn.functional.linear(*reference),
+        lambda: torch.nn.functional.linear(*native),
+        flops=2.0 * m * n * k,
+    )
+
+
 # aten::linear_backward has no CUDA registration in stock PyTorch (CUDA
 # decomposes linear to addmm, so its backward is matmul nodes); the stock
 # reference leg therefore composes the exact equivalent three-op sequence:

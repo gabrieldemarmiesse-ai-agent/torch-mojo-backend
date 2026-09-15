@@ -14,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 
+import numpy as np
 import pytest
 import torch
 
@@ -212,6 +213,126 @@ def test_addmm_scaled_declines(mojo_device):
         torch.addmm(bias, a, b, beta=0.5)
     with pytest.raises(NotImplementedError):
         torch.addmm(bias, a, b, alpha=2.0)
+
+
+@pytest.fixture
+def mojo_gfx942(mojo_gpu):
+    accelerator = list(get_accelerators())[0]
+    if accelerator.architecture_name != "gfx942":
+        pytest.skip("the NT MFMA bias route requires gfx942")
+    return mojo_gpu
+
+
+NT_MFMA_BIAS_SHAPES = [
+    (8192, 1600, 1600),
+    (8192, 4800, 1600),
+    (8192, 6400, 1600),
+    (8192, 1600, 6400),
+    (4096, 1536, 3072),
+    (357, 789, 544),
+]
+
+
+def _nt_bias_hash(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """The standalone harness's exact binary fractions, without an RNG."""
+    size = int(np.prod(shape))
+    x = np.arange(size, dtype=np.uint64) ^ np.uint64(
+        (seed * 0x9E3779B97F4A7C15) % (1 << 64)
+    )
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    x ^= x >> np.uint64(31)
+    values = ((x % np.uint64(17)).astype(np.float32) - 8) / 64
+    return torch.from_numpy(values.reshape(shape)).bfloat16()
+
+
+@pytest.mark.parametrize("m,n,k", NT_MFMA_BIAS_SHAPES)
+def test_nt_mfma_bias_harness(mojo_gfx942, m, n, k):
+    """Six measured regimes: exact sampled fp64 reference and full input checks.
+
+    Every dot product is exact in fp32 for these binary fractions. Rounding
+    before adding bias therefore fails the zero-tolerance comparison.
+    """
+    for seed in (1, 4):
+        x = _nt_bias_hash((m, k), seed)
+        w = _nt_bias_hash((n, k), seed + 1)
+        bias = _nt_bias_hash((n,), seed + 2)
+        dx, dw, db = [t.to(mojo_gfx942) for t in (x, w, bias)]
+        with assert_ran("aten::linear"):
+            got = torch.nn.functional.linear(dx, dw, db).cpu()
+        for sample in range(72):
+            row = (sample * 131 + sample * sample * 17) % m
+            col = (sample * 397 + sample * sample * 29) % n
+            if sample >= 64:
+                row = min(m - 1, (sample - 64) * 128) if sample < 68 else m - 1
+                col = n - 1 if sample < 68 else min(n - 1, (sample - 68) * 256)
+            ref = (x[row].double() @ w[col].double() + bias[col].double()).bfloat16()
+            torch.testing.assert_close(got[row, col], ref, atol=0, rtol=0)
+        for actual, original in zip((dx, dw, db), (x, w, bias), strict=True):
+            torch.testing.assert_close(actual.cpu(), original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 3, 7),
+        (1, 17, 1),
+        (3, 19, 15),
+        (17, 35, 31),
+        (7, 13, 40),
+        (35, 67, 72),
+        (67, 131, 333),
+        (357, 789, 544),
+    ],
+)
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("op", ["linear", "addmm"])
+def test_nt_mfma_bias_edges(mojo_gfx942, m, n, k, offset, op):
+    """K tails, partial MFMA tiles and contiguous offset views must stay safe."""
+    x = _nt_bias_hash((m, k), 4)
+    w = _nt_bias_hash((n, k), 5)
+    bias = _nt_bias_hash((n,), 6)
+    originals = [
+        torch.cat((torch.zeros(offset, dtype=t.dtype), t.flatten()))
+        for t in (x, w, bias)
+    ]
+    storage = [t.to(mojo_gfx942) for t in originals]
+    dx, dw, db = [
+        torch.as_strided(t, ref.shape, ref.stride(), offset)
+        for t, ref in zip(storage, (x, w, bias), strict=True)
+    ]
+    if offset:
+        assert dx.data_ptr() % 16 != 0 and dw.data_ptr() % 16 != 0
+    with assert_ran("aten::" + op):
+        got = (
+            torch.nn.functional.linear(dx, dw, db)
+            if op == "linear"
+            else torch.addmm(db, dx, dw.t())
+        ).cpu()
+    ref = (x.double() @ w.double().t() + bias.double()).bfloat16()
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+    for actual, original in zip(storage, originals, strict=True):
+        torch.testing.assert_close(actual.cpu(), original, atol=0, rtol=0)
+
+
+def test_nt_mfma_bias_multiexponent(mojo_gfx942):
+    """Nonuniform exponents also exercise cancellation in fp32 accumulators."""
+    generator = torch.Generator().manual_seed(773)
+    x = (
+        torch.randn(137, 296, generator=generator)
+        * torch.exp2(torch.randint(-4, 4, (137, 296), generator=generator).float())
+    ).bfloat16()
+    w = (
+        torch.randn(259, 296, generator=generator)
+        * torch.exp2(torch.randint(-4, 4, (259, 296), generator=generator).float())
+    ).bfloat16()
+    bias = torch.randn(259, generator=generator).bfloat16()
+    dev = [t.to(mojo_gfx942) for t in (x, w, bias)]
+    got = torch.nn.functional.linear(*dev).cpu()
+    ref = (x.double() @ w.double().t() + bias.double()).bfloat16()
+    torch.testing.assert_close(got, ref, rtol=8e-3, atol=2e-3)
+    for actual, original in zip(dev, (x, w, bias), strict=True):
+        torch.testing.assert_close(actual.cpu(), original, atol=0, rtol=0)
 
 
 # --- the residue-64 bf16 candidates (GPT-2 XL linear sites) -------------------
