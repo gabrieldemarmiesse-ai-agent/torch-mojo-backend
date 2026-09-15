@@ -11,6 +11,7 @@ from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
 from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
+from std.os import getenv
 
 from max.gpu.host import (
     DeviceAttribute,
@@ -92,6 +93,7 @@ struct Dev(Movable):
     var num_ooms: Int64
     var properties: Optional[Properties]
     var peers: Dict[Int, Bool]  # access from this device to each peer
+    var quarantine: Bool  # failed drain: allocations must not be reused
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -114,6 +116,7 @@ struct Dev(Movable):
         self.num_ooms = 0
         self.properties = None
         self.peers = Dict[Int, Bool]()
+        self.quarantine = False
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -127,6 +130,7 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
+    var peer_copy: String
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -185,7 +189,9 @@ def init_backend() raises -> Int:
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
     var box = unsafe_alloc[Backend](1)
-    box.unsafe_write(Backend(devs^, vendor^, n))
+    box.unsafe_write(
+        Backend(devs^, vendor^, n, getenv("TORCH_MOJO_BACKEND_PEER_COPY"))
+    )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
@@ -263,6 +269,8 @@ def h_free(handle: Int) abi("C"):
     if handle == 0:
         return
     var box = BufP(unsafe_from_address=handle)
+    if be()[].devices[box[].device].quarantine:
+        return
     # MAX releases the block stream-ordered on the OWNER stream only. Every
     # other stream that used it (torch.Tensor.record_stream) gets fenced now,
     # at release time: the owner waits for all of that stream's work so far.
@@ -519,12 +527,18 @@ def _peer_access(device: Int, peer: Int) raises -> Bool:
     var enabled = False
     if (d[].api == "cuda" or d[].api == "hip") and d[].api == other[].api:
         try:
-            if d[].ctx.can_access(other[].ctx):
+            if be()[].peer_copy != "host" and d[].ctx.can_access(other[].ctx):
+                if be()[].peer_copy == "enable_error":
+                    raise Error("injected peer enable failure")
                 d[].ctx.enable_peer_access(other[].ctx)
                 enabled = True
         except e:
             # Unsupported access (including driver errors) uses host staging.
+            if be()[].peer_copy != "":
+                print("peer enable failed", String(e))
             enabled = False
+    if be()[].peer_copy != "":
+        print("peer probe", device, peer, enabled)
     d[].peers[peer] = enabled
     return enabled
 
@@ -532,23 +546,40 @@ def _peer_access(device: Int, peer: Int) raises -> Bool:
 def copy_peer(
     dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
 ) raises -> Bool:
-    """Copy on the destination current stream; False requests host staging."""
+    """Copy on the destination current stream; caller fences storage and
+    drains both streams on error. False requests host staging."""
     if nbytes == 0:
         return True
     if not _peer_access(dst_device, src_device):
+        if be()[].peer_copy != "":
+            print("peer copy host", dst_device, src_device)
         return False
     var dst_ctx = ctx_for(dst_device)
     var src_ctx = ctx_for(src_device)
-    dst_ctx.enqueue_wait_for(src_ctx)
     var d = wrap_raw(dst_ctx, dst, nbytes)
     var s = wrap_raw(src_ctx, src, nbytes)
     d.enqueue_copy_from(s)
-    # MAX frees on the allocation's owner stream only. Complete the remote
-    # read before the caller can release its source or staging allocation.
-    dst_ctx.synchronize()
+    if be()[].peer_copy != "":
+        print("peer copy direct", dst_device, src_device)
     _ = s^
     _ = d^
     return True
+
+
+def drain_copy(dst_device: Int, src_device: Int) -> Bool:
+    """Error cleanup only; a failed drain quarantines both devices' storage."""
+    var drained = True
+    for i in range(2):
+        var device = dst_device if i == 0 else src_device
+        try:
+            ctx_for(device).synchronize()
+        except e:
+            _warn("transfer drain failed; retaining storage", e)
+            drained = False
+    if not drained:
+        be()[].devices[dst_device].quarantine = True
+        be()[].devices[src_device].quarantine = True
+    return drained
 
 
 def copy_to_host(
@@ -609,14 +640,24 @@ def copy_from_host(
         src=U8P(unsafe_from_address=host_ptr),
         count=nbytes,
     )
-    dst.enqueue_copy_from(host)
     var box = unsafe_alloc[Staging](1)
     box.unsafe_write(Staging(host^, Atomic[DType.int32](0)))
-    ctx.stream().enqueue_host_func(
-        _staging_done,
-        box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
-    )
+    # Own pinned staging before submission, including partial-submit errors.
     d[].staging.append(Int(box))
+    try:
+        dst.enqueue_copy_from(box[].buf)
+        ctx.stream().enqueue_host_func(
+            _staging_done,
+            box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
+        )
+    except e:
+        try:
+            ctx.synchronize()
+            box[].done.store(1)
+        except drain_error:
+            d[].quarantine = True
+            _warn("H2D drain failed; retaining staging", drain_error)
+        raise e
 
 
 def read_bytes_sync(

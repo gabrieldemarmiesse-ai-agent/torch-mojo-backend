@@ -195,35 +195,52 @@ the op decides whether to try another route or propagate.
 
 **Streams.** Ops launch on the device's current stream (`ctx_for`), so
 `with torch.Stream(...)` really moves execution. Memory is allocated on the
-current stream; a tensor used by another stream gets `record_stream`ed by
-torch (`recordDataPtrOnStream`), which the backend turns into an event the
-owner stream waits on before the buffer is released.
+current stream; callers using a tensor on another stream must record that
+use (`Tensor.record_stream`, or torch's internal `recordDataPtrOnStream`),
+which the backend turns into an event the owner stream waits on before
+the buffer is released.
 
-**Transfers.** `.to("mojo:j")` and `dst.copy_(src)` between mojo devices
-use MAX `DeviceBuffer.enqueue_copy_from` directly when CUDA or HIP peer
-access is available. The destination device lazily calls `can_access` and
-`enable_peer_access` for each source device and caches success or failure;
-the shim mutex serializes this state. CPU, Metal, inaccessible pairs, and
-peer-enabling errors use the existing D2H → H2D host staging path.
+### Transfers
 
-The direct copy runs on the destination's **current stream**. It waits for
-the source's current stream, so queued producers and destination allocations
-precede the copy. The destination stream then synchronizes before returning,
-keeping source storage alive through the remote read even when its allocator
-owner is another stream. This costs one host-blocking stream synchronization
-per transfer, including with `non_blocking=True`; it does not promise CUDA's
-host overlap. Subsequent destination-stream work and blocking host reads see
-the copied data. MAX also inserts cross-stream copy events. Callers still
-order unrelated producer streams themselves, as for ordinary torch ops.
+`.to("mojo:j")` and `dst.copy_(src)` between mojo devices use MAX
+`DeviceBuffer.enqueue_copy_from` when CUDA or HIP peer access is available.
+The destination lazily probes and enables access to each source, caching
+success and failure under the shim mutex. CPU, Metal, inaccessible pairs,
+and peer-enabling errors use D2H → H2D host staging.
 
-Dtype and layout handling reuse the local copy helpers: `.to` stages on the
-source and restores the requested memory format on the destination;
-`copy_` packs the source, transfers, then uses the destination's local dtype
-and strided-copy path as needed. Dtype pairs outside the fast cast kernel
-use CPU torch to cast, preserving integer precision, before uploading the
-converted values. No GPU kernels or allocator are added.
-HIP uses MAX's direct copy when peer access succeeds; ROCm performance has
-not been measured for this path.
+The direct copy runs on the destination's **current stream**. MAX inserts
+source → destination and destination → source events around the copy.
+The backend records the original source before packing/casting, source
+staging, and destination storage on each allocation's **own device's current
+stream**. On release, the allocation's owner stream waits for its recorded
+streams; MAX's reverse event extends the source lifetime through the remote
+read. This also covers allocations made on a different stream and sources
+freed immediately after `.to`. Callers must still order producers on
+unrelated streams before using their tensors, as with ordinary torch ops.
+
+The direct copy has no host completion wait, for either `non_blocking` value.
+Destination-stream consumers are ordered after the copy; `.cpu()` and
+`.item()` wait for their host readbacks and see the copied data. A transfer
+error drains both participating streams before releasing storage. If a drain
+also fails, allocations on both devices are retained until process exit;
+pinned host staging is retained unless completion can be established.
+
+`.to` borrows an already contiguous source with unchanged dtype, otherwise
+packs or casts on the source, and restores the requested destination memory
+format. `copy_` packs, transfers, then uses the destination's local dtype
+and strided-copy helpers as needed. Both paths use CPU torch for dtype pairs
+outside the fast cast kernel, preserving integer precision. No GPU kernels
+or allocator are added. HIP uses the direct route when peer access succeeds;
+ROCm runtime correctness and performance remain unmeasured.
+
+For transfer diagnostics, `TORCH_MOJO_BACKEND_PEER_COPY` is read once at
+backend initialization: unset selects normal operation; `trace` prints
+pair probes and completed submissions; `host` treats GPU pairs as
+inaccessible; `enable_error` injects an error before enabling a capable
+pair. The latter two also print routes and exercise negative caching in
+subprocess tests. They preserve transfer results through host staging.
+
+### Threads and fork
 
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
 ops need no locking of their own; the autograd engine's thread and the main

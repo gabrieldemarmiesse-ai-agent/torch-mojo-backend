@@ -7,6 +7,11 @@ living on a `mojo` device, and `call_checker` confirms the native op (not
 some other route) actually ran.
 """
 
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 
@@ -221,6 +226,176 @@ def test_cross_device_autograd(mojo_pair: tuple[str, str]):
     for got, ref in [(gx, x), (gw1, w1), (gw2, w2)]:
         assert got.grad is not None and ref.grad is not None
         torch.testing.assert_close(got.grad.cpu(), ref.grad, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("same_device", [False, True])
+def test_cross_device_to_exact_integer_cast(
+    mojo_pair: tuple[str, str], same_device: bool
+):
+    src, dst = mojo_pair
+    cpu = torch.tensor([2**60 + 3, 2**60 + 5, 0, 19], dtype=torch.int64)
+    actual = cpu.to(src).to(src if same_device else dst, dtype=torch.uint64)
+    torch.testing.assert_close(actual.cpu(), cpu.to(torch.uint64), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "transpose", "cast"])
+@pytest.mark.parametrize("copy_into", [False, True])
+def test_cross_device_allocation_stream(
+    mojo_pair: tuple[str, str], layout: str, copy_into: bool
+):
+    src, dst = mojo_pair
+    owner_src, owner_dst = torch.Stream(device=src), torch.Stream(device=dst)
+    current_src, current_dst = torch.Stream(device=src), torch.Stream(device=dst)
+    cpu = _fill((1021, 4093), torch.float32)
+    with owner_src:
+        source = cpu.to(src)
+    with owner_dst:
+        actual = torch.empty_like(cpu, device=dst)
+    current_src.wait_stream(owner_src)
+    current_dst.wait_stream(owner_dst)
+    with current_src, current_dst:
+        source.add_(1)
+        expected = cpu + 1
+        if layout == "transpose":
+            source, expected, actual = source.t(), expected.t(), actual.t()
+        dtype = torch.float16 if layout == "cast" else torch.float32
+        if copy_into:
+            if dtype != actual.dtype:
+                with owner_dst:
+                    actual = actual.to(dtype=dtype)
+                current_dst.wait_stream(owner_dst)
+            actual.copy_(source, non_blocking=True)
+        else:
+            actual = source.to(dst, dtype=dtype, non_blocking=False)
+        del source
+        # Churn on the allocation streams, before either current stream drains.
+        with owner_src:
+            torch.empty_like(cpu, device=src).fill_(-111)
+        if copy_into:
+            # Immediately free destination storage after enqueueing a consumer.
+            consumed = actual + 2
+            del actual
+            with owner_dst:
+                torch.empty_like(cpu, device=dst, dtype=dtype).fill_(-222)
+            actual = consumed
+            expected = expected.to(dtype) + 2
+        else:
+            expected = expected.to(dtype)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert torch.tensor(19, device=src).to(dst, non_blocking=False).item() == 19
+    owner_src.synchronize()
+    owner_dst.synchronize()
+
+
+def _peer_autograd_stress(src: str, dst: str, iterations: int):
+    a, b = torch.Stream(device=src), torch.Stream(device=dst)
+    with a, b:
+        for _ in range(iterations):
+            x = torch.full((257, 31), 0.25, device=src, requires_grad=True)
+            y = (x * 2).to(dst)
+            y.square().sum().backward()
+            assert x.grad is not None
+            torch.testing.assert_close(x.grad.cpu(), torch.full((257, 31), 2.0))
+
+
+def test_cross_device_interleaved_stress(mojo_pair: tuple[str, str]):
+    src, dst = mojo_pair
+    owners = [torch.Stream(device=d) for d in (src, dst)]
+    streams = [torch.Stream(device=d) for d in (src, dst)]
+    shape = (257, 1021)
+    pending = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(_peer_autograd_stress, src, dst, 100)
+        for i in range(300):
+            direction = i % 2
+            source_device, dest_device = (src, dst) if direction == 0 else (dst, src)
+            owner, target_owner = owners[direction], owners[1 - direction]
+            current, target_current = streams[direction], streams[1 - direction]
+            with owner:
+                source = torch.full(shape, float(i % 19), device=source_device)
+            with target_owner:
+                target = torch.empty(shape, device=dest_device)
+            current.wait_stream(owner)
+            target_current.wait_stream(target_owner)
+            with current, target_current:
+                source.add_(1)
+                if i % 3 == 0:
+                    source, target = source.t(), target.t()
+                if i % 4 < 2:
+                    target.copy_(source, non_blocking=True)
+                else:
+                    target = source.to(dest_device, non_blocking=True)
+                del source
+                result = target + 2
+                del target
+                pending.append((result, float(i % 19 + 3), target_current))
+            with owner:
+                torch.empty(shape, device=source_device).fill_(-999)
+            with target_owner:
+                torch.empty(shape, device=dest_device).fill_(-888)
+            if len(pending) == 16:
+                for result, value, stream in pending:
+                    with stream:
+                        torch.testing.assert_close(
+                            result.cpu(), torch.full(result.shape, value)
+                        )
+                pending.clear()
+        for result, value, stream in pending:
+            with stream:
+                torch.testing.assert_close(
+                    result.cpu(), torch.full(result.shape, value)
+                )
+        worker.result()
+    for stream in owners + streams:
+        stream.synchronize()
+
+
+@pytest.mark.parametrize("mode", ["trace", "host", "enable_error"])
+def test_cross_device_route(mojo_pair: tuple[str, str], mode: str):
+    # A fresh process is required: the diagnostic switch and peer cache are per backend.
+    code = r"""
+import ctypes
+import os
+import sys
+import torch
+from torch_mojo_backend import register_mojo_devices
+register_mojo_devices()
+# Independent capability query: losing the backend's direct route must fail.
+try:
+    driver = ctypes.CDLL("libcuda.so.1")
+    assert driver.cuInit(0) == 0
+    capable = ctypes.c_int()
+    assert driver.cuDeviceCanAccessPeer(ctypes.byref(capable), 1, 0) == 0
+except OSError:
+    sys.exit(77)
+if not capable.value:
+    sys.exit(77)
+mode = os.environ["TORCH_MOJO_BACKEND_PEER_COPY"]
+os.environ["TORCH_MOJO_BACKEND_PEER_COPY"] = "host" if mode != "host" else "trace"
+for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
+    cpu = torch.arange(357 * 79, dtype=torch.float32).reshape(357, 79)
+    source = cpu.to(src)
+    for _ in range(3):
+        torch.testing.assert_close(source.to(dst).cpu(), cpu)
+        target = torch.empty((357, 158), device=dst)[:, ::2]
+        target.copy_(source)
+        torch.testing.assert_close(target.cpu(), cpu)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "TORCH_MOJO_BACKEND_PEER_COPY": mode},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode == 77:
+        pytest.skip("route assertion requires a CUDA peer-capable pair")
+    assert result.returncode == 0, result.stdout + result.stderr
+    output = result.stdout
+    assert output.count("peer probe") == 2, output
+    route = "direct" if mode == "trace" else "host"
+    assert output.count(f"peer copy {route}") == 12, output
+    assert f"peer copy {'host' if route == 'direct' else 'direct'}" not in output
 
 
 def test_cross_device_cpu_fallback(mojo_gpu: str):
