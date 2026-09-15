@@ -36,6 +36,7 @@ from std.math import (
     floor,
     log,
     log1p,
+    log2,
     pow,
     sin,
     sinh,
@@ -50,7 +51,7 @@ from std.sys.info import (
 )
 from std.utils.index import IndexList
 from std.utils.coord import Coord
-from std.utils.numerics import isnan
+from std.utils.numerics import isnan, max_or_inf
 
 from max.algorithm import elementwise
 
@@ -345,6 +346,7 @@ comptime UOP_SQRT = 22
 comptime UOP_TAN = 23
 comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
+comptime UOP_LOG2 = 26
 
 
 @always_inline
@@ -380,6 +382,11 @@ def _float_unary[
         res = erf(a)
     comptime if op_code == UOP_LOG:
         res = log(a)
+    comptime if op_code == UOP_LOG2:
+        res = log2(a)
+        comptime if dtype == DType.float64:
+            # std.math.log2's double approximation omits the +inf case.
+            res = a.eq(max_or_inf[dtype]()).select(a, res)
     comptime if op_code == UOP_LOG1P:
         comptime if is_apple_gpu():
             # Mojo's log1p currently upcasts to float64, which Metal rejects.
@@ -620,7 +627,9 @@ def _unary_elementwise[
             )
         else:
             comptime if has_accelerator():
-                comptime if dtype != DType.float64:
+                comptime if dtype != DType.float64 or (
+                    op_code == UOP_LOG2 and not has_apple_gpu_accelerator()
+                ):
                     comptime if has_apple_gpu_accelerator():
                         # Apple: 4-wide vector body when both pointers are
                         # vector-aligned; the scalar grid-stride tail in the
@@ -1059,7 +1068,11 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
         or op_code == UOP_SIGN
     )
     var supported = False
-    comptime if is_direct:
+    comptime if op_code == UOP_LOG2:
+        supported = _dtype_supported[
+            [DType.float16, DType.bfloat16, DType.float32, DType.float64]
+        ](a.dtype)
+    elif is_direct:
         supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
     else:
         supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
@@ -1350,6 +1363,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["LogSpec"]():
             _spec_dispatcher2[_unary_spec_into_go[UOP_LOG], "a unary spec op"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["Log2Spec"]():
+            _spec_dispatcher2[_unary_spec_into_go[UOP_LOG2], "a unary spec op"](
                 argv, argc
             )
             return 0

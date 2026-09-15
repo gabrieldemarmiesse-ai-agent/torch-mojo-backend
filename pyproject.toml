@@ -100,6 +100,8 @@ ban-relative-imports = "all"
 # conda env doesn't look like a normal Python install. `uv run ty check`
 # already sidesteps this, but pin it so a bare `ty check` also works.
 python = ".venv"
+# These suites expose sibling modules through their runtime sys.path setup.
+extra-paths = ["benchmarks", "conformance"]
 
 [tool.ty.rules]
 # One deliberate polymorphic-override point that nominal override-checking
@@ -158,6 +160,7 @@ dev = [
     # OpInfo database the conformance/ suite runs -- cannot be imported at all.
     "expecttest>=0.2.1",
     "pillow>=11.3.0",
+    "torchvision==0.26.*",
     "pytest>=8.4.1",
     "pytest-forked>=1.6.0",
     "pytest-split>=0.10.0",

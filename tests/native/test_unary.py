@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
@@ -696,3 +697,48 @@ def test_fill_through_a_transposed_view_keeps_the_allocation(mojo_device):
     filled = view.fill_(True)
     assert filled.data_ptr() == before
     assert bool(x.cpu().all())
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+def test_log2_domain(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    data = torch.tensor(
+        [-1.0, -0.0, 0.0, 0.125, 1.0, 2.0, 3.0, float("inf"), float("nan")], dtype=dtype
+    )
+    result = torch.log2(data.to(mojo_gpu))
+    assert result.device.type == "mojo"
+    rtol, atol = _tol(dtype)
+    torch.testing.assert_close(
+        result.cpu(), torch.log2(data), rtol=rtol, atol=atol, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (3, 5)])
+def test_log2_shapes(mojo_gpu: str, shape: tuple[int, ...]):
+    data = torch.full(shape, 8.0)
+    torch.testing.assert_close(torch.log2(data.to(mojo_gpu)).cpu(), torch.log2(data))
+
+
+def test_log2_noncontiguous(mojo_gpu: str):
+    data = torch.arange(1, 36, dtype=torch.float32).reshape(5, 7)
+    result = torch.log2(data.to(mojo_gpu).transpose(0, 1))
+    torch.testing.assert_close(result.cpu(), torch.log2(data.transpose(0, 1)))
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
+def test_log2_integral_promotion(mojo_gpu: str, dtype: torch.dtype):
+    data = torch.tensor([0, 1, 2, 8], dtype=dtype)
+    result = torch.log2(data.to(mojo_gpu))
+    assert result.dtype == torch.get_default_dtype()
+    torch.testing.assert_close(result.cpu(), torch.log2(data))
+
+
+def test_log2_out(mojo_gpu: str):
+    data = torch.tensor([0.5, 1, 2, 8]).to(mojo_gpu)
+    out = torch.empty(4).to(mojo_gpu)
+    result = torch.log2(data, out=out)
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.tensor([-1.0, 0.0, 1.0, 3.0]))

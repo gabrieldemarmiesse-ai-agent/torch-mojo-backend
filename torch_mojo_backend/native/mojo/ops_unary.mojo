@@ -19,12 +19,16 @@ uint8 storage). Anything else declines with `unsupported(...)`, matching the
 old NOT_HANDLED convention.
 """
 from abi import (
+    Owned,
+    ST_FLOAT64,
     T,
     Values,
+    default_dtype,
     dtype_code,
     new_like,
     new_tensor,
     own,
+    own_if_new,
     release,
     ret_owned,
     ret_ref,
@@ -37,6 +41,7 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from ops_common import (
+    cast_to,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -490,6 +495,44 @@ def op_log1p_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dst = v_tensor(args[unsafe_offset=1])
     _float_unary_out("Log1pSpec", t, dst)
     ret_ref(rets, 0, dst)
+
+
+def _log2_input(t: T) raises -> Owned:
+    if not t.on_mojo():
+        unsupported("log2 requires an input on the mojo device")
+    if (
+        not _is_float_dtype(t.dtype)
+        and t.dtype != DType.float64
+        and not _is_bool_spec_dtype(t.dtype)
+    ):
+        unsupported(
+            "log2 supports real floating point, integer, and bool inputs"
+        )
+    var target = t.stype if t.dtype.is_floating_point() else default_dtype()
+    if target == ST_FLOAT64 and dev(t.device)[].api == "metal":
+        unsupported("log2 float64 is unavailable on Apple GPUs")
+    return own_if_new(cast_to(t, target), t)
+
+
+# aten::log2(Tensor self) -> Tensor
+def op_log2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var source = _log2_input(t)
+    var out = own(
+        _unary("elementwise_ops", "Log2Spec", source.t, source.t.dtype)
+    )
+    ret_owned(rets, 0, out)
+    _ = source^
+
+
+# aten::log2.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_log2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    var source = _log2_input(t)
+    _unary_out("elementwise_ops", "Log2Spec", source.t, dst, source.t.dtype)
+    ret_ref(rets, 0, dst)
+    _ = source^
 
 
 # aten::reciprocal(Tensor self) -> Tensor
@@ -968,6 +1011,8 @@ def register_unary(site: Site) raises:
     impl[op_log_out, "log.out"](site)
     impl[op_log1p, "log1p"](site)
     impl[op_log1p_out, "log1p.out"](site)
+    impl[op_log2, "log2"](site)
+    impl[op_log2_out, "log2.out"](site)
     impl[op_neg, "neg"](site)
     impl[op_neg_out, "neg.out"](site)
     impl[op_reciprocal, "reciprocal"](site)

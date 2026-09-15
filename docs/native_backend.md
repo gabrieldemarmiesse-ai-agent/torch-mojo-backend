@@ -146,6 +146,27 @@ A new group file needs three things: the `register_<group>` list, the
 `_group[register_<group>](lib, "ops_<group>", prebuild)` line in
 `backend.mojo`.
 
+External operator namespaces use their own `tmb_library_new` handle and
+fully qualified registration names, such as `torchvision::roi_align`.
+The dispatcher accepts these implementations before the extension defining
+their schemas is imported. Qualified names also select `TMB_OP`; the loader
+escapes colons in extension filenames while retaining the full name in cache
+keys. Torchvision remains optional at runtime.
+
+The native detection groups are `ops_roi.mojo` (ROI align/pool and their
+backwards) and `ops_nms.mojo` (non-maximum suppression), backed by `roi_ops`
+and `nms_ops` kernel families. They support float16/float32/float64 GPU inputs
+(float64 requires device support). ROI inputs are made contiguous; NMS
+declines non-contiguous inputs. ROI backward gathers contributions per input
+pixel in a fixed order without atomics. NMS uses a stable device sort, device
+IoU masks, a host greedy pass, and device index gathering.
+
+Torchvision 0.26 CUDA autocast policies are included in the shim's generated
+table: NMS casts eligible inputs to float32 and returns int64 indices; ROI
+align/pool compute in float32 and restore the input dtype. As in upstream
+0.26, the ROI pool autocast wrapper also converts its argmax output. Normal
+ROI pool dispatch returns int32 argmax. Float64 inputs bypass autocast.
+
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
 (owned output), `ret_ref` (an input handed back: in-place ops),

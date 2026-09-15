@@ -951,3 +951,79 @@ def test_stack_opinfo_samples_do_not_corrupt_the_heap(mojo_gpu):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         ran += 1
     assert ran > 0
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_index_put_single_axis(mojo_gpu: str, dtype: torch.dtype, axis: int):
+    data = torch.arange(5 * 7 * 9).reshape(5, 7, 9).to(dtype)
+    indices = torch.tensor([4, 0, 2], dtype=torch.int64)
+    value_shape = list(data.shape)
+    value_shape[axis] = indices.numel()
+    values = torch.full(value_shape, -7, dtype=dtype)
+    expected = data.clone()
+    cpu_indexer = (slice(None),) * axis + (indices,) + (slice(None),) * (2 - axis)
+    expected[cpu_indexer] = values
+    ours = data.to(mojo_gpu)
+    pointer = ours.data_ptr()
+    gpu_indexer = (
+        (slice(None),) * axis + (indices.to(mojo_gpu),) + (slice(None),) * (2 - axis)
+    )
+    ours[gpu_indexer] = values.to(mojo_gpu)
+    assert ours.data_ptr() == pointer
+    torch.testing.assert_close(ours.cpu(), expected)
+
+
+@pytest.mark.parametrize("value_shape", [(), (1,), (1, 4), (2, 1)])
+def test_index_put_broadcast(mojo_gpu: str, value_shape: tuple[int, ...]):
+    data = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    indices = torch.tensor([1, 4])
+    values = torch.full(value_shape, -3.0)
+    expected = data.clone()
+    expected[indices] = values
+    ours = data.to(mojo_gpu)
+    returned = ours.index_put_((indices.to(mojo_gpu),), values.to(mojo_gpu))
+    assert returned.data_ptr() == ours.data_ptr()
+    torch.testing.assert_close(ours.cpu(), expected)
+
+
+def test_index_put_empty(mojo_gpu: str):
+    data = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    ours = data.to(mojo_gpu)
+    ours.index_put_(
+        (torch.empty(0, dtype=torch.int64).to(mojo_gpu),),
+        torch.empty(0, 4).to(mojo_gpu),
+    )
+    torch.testing.assert_close(ours.cpu(), data)
+
+
+def test_index_put_noncontiguous(mojo_gpu: str):
+    data = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    indices = torch.tensor([1, 4])
+    values = torch.full((2, 4), -3.0)
+    expected = data.t().clone()
+    expected[indices] = values
+    ours = data.to(mojo_gpu).t()
+    try:
+        ours.index_put_((indices.to(mojo_gpu),), values.to(mojo_gpu))
+    except NotImplementedError as exc:
+        assert "contigu" in str(exc).lower()
+    else:
+        torch.testing.assert_close(ours.cpu(), expected)
+
+
+@pytest.mark.parametrize("case", ["int32", "negative", "out_of_bounds", "accumulate"])
+def test_index_put_declined_inputs(mojo_gpu: str, case: str):
+    indices = torch.tensor(
+        [-1] if case == "negative" else [9] if case == "out_of_bounds" else [1],
+        dtype=torch.int32 if case == "int32" else torch.int64,
+    )
+    data = torch.zeros(3, 4).to(mojo_gpu)
+    values = torch.ones(1, 4).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        data.index_put_(
+            (indices.to(mojo_gpu),), values, accumulate=case == "accumulate"
+        )
+    torch.testing.assert_close(data.cpu(), torch.zeros(3, 4))

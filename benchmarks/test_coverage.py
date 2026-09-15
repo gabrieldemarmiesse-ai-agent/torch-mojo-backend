@@ -32,12 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bench_lib import baselines
 
-# conftest is resolved via the sys.path.insert above (this script also runs
-# standalone, not just under pytest's conftest auto-discovery); ty's module
-# resolver doesn't follow that runtime path manipulation. (A real fix is
-# `environment.root = ["benchmarks"]` in [tool.ty], mirroring the sys.path
-# insert -- left for a repo-wide config change rather than a local workaround.)
-from conftest import KEY_DUMP_ENV  # ty: ignore[unresolved-import]
+from conftest import KEY_DUMP_ENV
 
 BENCH_DIR = Path(__file__).resolve().parent
 NATIVE_MOJO_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "native" / "mojo"
@@ -53,7 +48,10 @@ _IMPL_RE = re.compile(r'impl\[\s*\w+\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S)
 def registered_ops() -> set[str]:
     names: set[str] = set()
     for path in sorted(NATIVE_MOJO_DIR.glob("*.mojo")):
-        names |= {f"aten::{name}" for name in _IMPL_RE.findall(path.read_text())}
+        names |= {
+            name if "::" in name else f"aten::{name}"
+            for name in _IMPL_RE.findall(path.read_text())
+        }
     if not names:
         raise AssertionError(f"no aten op registrations found under {NATIVE_MOJO_DIR}")
     return names
@@ -72,6 +70,7 @@ FAMILY_MODULES = (
     "test_dropout_loss",
     "test_foreach",
     "test_vision",
+    "test_torchvision_ops",
     "test_data_movement",
 )
 
@@ -103,6 +102,7 @@ _RNG_TRANSFORM = (
 
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
+    "aten::log2.out": _OUT,
     # -- views ------------------------------------------------------------
     "aten::as_strided": _VIEW,
     "aten::view": _VIEW,

@@ -51,6 +51,7 @@ from abi import (
     strides_equal,
     strides_for_memory_format,
     unsupported,
+    v_bool,
     v_device_index,
     v_device_type,
     v_dtype_or,
@@ -1448,6 +1449,175 @@ def op_index_tensor(
     unsupported("aten::index.Tensor with a non-integer, non-bool index dtype")
 
 
+def _overlaps_contiguous_target(target: T, source: T) -> Bool:
+    if target.numel == 0 or source.numel == 0:
+        return False
+    var extent = 1
+    for d in range(source.rank):
+        extent += (source.dim(d) - 1) * source.stride(d)
+    return (
+        target.ptr < source.ptr + extent * source.itemsize
+        and source.ptr < target.ptr + target.numel * target.itemsize
+    )
+
+
+# aten::_index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values,
+#                      bool accumulate=False, bool unsafe=False) -> Tensor(a!)
+def op_index_put_impl_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var target = v_tensor(args[unsafe_offset=0])
+    var present = v_opt_tensor_list_present(args[unsafe_offset=1])
+    var indices = v_tensor_list(args[unsafe_offset=1])
+    var values = v_tensor(args[unsafe_offset=2])
+    if v_bool(args[unsafe_offset=3]):
+        unsupported("_index_put_impl_: accumulate=True is not supported")
+    if target.rank == 0 or target.rank > 4 or not target.contig:
+        unsupported(
+            "_index_put_impl_: requires a contiguous rank-1 to rank-4"
+            " destination"
+        )
+    if len(present) > target.rank or len(indices) != 1:
+        unsupported("_index_put_impl_: requires exactly one advanced index")
+    var axis = -1
+    for d in range(len(present)):
+        if present[d]:
+            axis = d
+    if axis < 0:
+        unsupported("_index_put_impl_: requires one tensor index")
+    var index = indices[0].copy()
+    if index.rank != 1 or index.dtype != DType.int64:
+        unsupported("_index_put_impl_: requires a one-dimensional int64 index")
+    if (
+        not target.on_mojo()
+        or not values.on_mojo()
+        or not index.on_mojo()
+        or target.device != values.device
+        or target.device != index.device
+    ):
+        unsupported(
+            "_index_put_impl_: all tensors must be on the same mojo device"
+        )
+    if not _is_scatter_dtype(target.dtype) or values.dtype != target.dtype:
+        unsupported(
+            "_index_put_impl_: requires matching supported source and"
+            " destination dtypes"
+        )
+    if values.rank > target.rank:
+        unsupported(
+            "_index_put_impl_: values rank exceeds the indexed result rank"
+        )
+    if _overlaps_contiguous_target(
+        target, values
+    ) or _overlaps_contiguous_target(target, index):
+        unsupported(
+            "_index_put_impl_: source or index overlaps destination storage"
+        )
+
+    var shape = List[Int](capacity=target.rank)
+    var total = 1
+    var value_pad = target.rank - values.rank
+    for d in range(target.rank):
+        var extent = index.numel if d == axis else target.dim(d)
+        shape.append(extent)
+        total *= extent
+        if (
+            d >= value_pad
+            and values.dim(d - value_pad) != 1
+            and values.dim(d - value_pad) != extent
+        ):
+            raise Error(
+                "_index_put_impl_: values cannot broadcast to the indexed"
+                " result"
+            )
+    if total == 0:
+        ret_ref(rets, 0, target)
+        return
+    var ctx = ctx_for(target.device)
+    if target.dtype == DType.float64 and ctx.api() == "metal":
+        unsupported("_index_put_impl_: float64 is not supported on Apple GPU")
+    var pad4 = 4 - target.rank
+    var params = List[Int](capacity=18)
+    for d in range(4):
+        params.append(1 if d < pad4 else shape[d - pad4])
+    for d in range(4):
+        params.append(0 if d < pad4 else target.stride(d - pad4))
+    for d in range(4):
+        var source_axis = d - pad4 - value_pad
+        params.append(
+            0 if source_axis < 0
+            or values.dim(source_axis) == 1 else values.stride(source_axis)
+        )
+    for d in range(4):
+        params.append(index.stride(0) if d == axis + pad4 else 0)
+    params.append(axis + pad4)
+    params.append(target.dim(axis))
+    # Validate K indices before writing the destination. Each valid lane writes
+    # its own scratch word; the scatter axis has zero stride. Last word: flag.
+    var check_shape = IndexList[MAX_RANK](1)
+    check_shape[MAX_RANK - 1] = index.numel + 1
+    var flag = own(new_tensor(check_shape, 1, ST_INT32, target.device))
+    fill_value(flag.t, 0.0)
+    var validation = List[Int](capacity=18)
+    for d in range(4):
+        validation.append(index.numel if d == 0 else 1)
+    for d in range(4):
+        validation.append(1 if d == 0 else 0)
+    for _ in range(4):
+        validation.append(0)
+    for d in range(4):
+        validation.append(index.stride(0) if d == 0 else 0)
+    validation.append(3)
+    validation.append(target.dim(axis))
+    var validate = KernelCall("data_movement_ops", "ScatterDim")
+    validate.arg_dtype(0, DType.int32)
+    validate.arg_dtype(1, DType.int64)
+    validate.arg_dtype(2, DType.int32)
+    validate.out_dtype(DType.int32)
+    validate.int(flag.t.ptr)
+    validate.int(index.ptr)
+    validate.int(flag.t.ptr)
+    validate.tuple(validation)
+    validate.int(flag.t.ptr + index.numel * 4)
+    validate.int(1)
+    validate.f64(0.0)
+    validate.int(dtype_code(DType.int32))
+    validate.int(ctx_ptr(ctx))
+    validate.run()
+    var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr + index.numel * 4, host_flag.t.ptr, 4)
+    var bad_index = (
+        Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host_flag.t.ptr
+        )[]
+        != 0
+    )
+    _ = flag^
+    _ = host_flag^
+    if bad_index:
+        unsupported(
+            "_index_put_impl_: indices must be nonnegative and less than the"
+            " indexed dimension; negative wrapping is not supported"
+        )
+    var call = KernelCall("data_movement_ops", "ScatterDim")
+    call.arg_dtype(0, target.dtype)
+    call.arg_dtype(1, index.dtype)
+    call.arg_dtype(2, values.dtype)
+    call.out_dtype(target.dtype)
+    call.int(target.ptr)
+    call.int(index.ptr)
+    call.int(values.ptr)
+    call.tuple(params)
+    call.int(0)
+    call.int(0)
+    call.f64(0.0)
+    call.int(dtype_code(target.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    ret_ref(rets, 0, target)
+
+
 # aten::nonzero(Tensor self) -> Tensor
 def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
@@ -1608,6 +1778,7 @@ def register_data_movement(site: Site) raises:
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_value, "scatter.value"](site)
     impl[op_index_tensor, "index.Tensor"](site)
+    impl[op_index_put_impl_, "_index_put_impl_"](site)
     impl[op_nonzero, "nonzero"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_empty_permuted, "empty_permuted"](site)

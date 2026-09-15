@@ -247,6 +247,9 @@ def autocast_policy_table() -> str:
                     "name the overload it redispatches to"
                 )
             lines.append(f'{{"aten::{key}", 6, "{target}"}},')
+    # torchvision 0.26 autocast/*.cpp: ROI wrappers restore input dtype.
+    for name, policy in (("nms", 2), ("roi_align", 7), ("roi_pool", 7)):
+        lines.append(f'{{"torchvision::{name}", {policy}}},')
     return "\n".join(lines) + "\n"
 
 
