@@ -33,6 +33,18 @@ comptime BACKWARD_BLOCKS_PER_SM = 8
 
 
 @always_inline
+def _roi_scale[dt: DType](value: Float64) -> Scalar[dt]:
+    # Preserve c10::Half(float)'s float32 rounding against cast folding.
+    comptime if dt == DType.float16:
+        var rounded = value.cast[DType.float32]()
+        var ptr = Pointer(to=rounded)
+        ptr.unsafe_store[volatile=True](0, rounded)
+        return ptr.unsafe_load[volatile=True](0).cast[dt]()
+    else:
+        return value.cast[dt]()
+
+
+@always_inline
 def _valid_roi[
     dt: DType, acc: DType
 ](
@@ -656,7 +668,7 @@ def _launch_backward[dt: DType, pool: Bool](argv: Argv, argc: Int) raises:
             Int64(nout),
         )
     else:
-        var scale = Scalar[acc](_raw_f64(argv[unsafe_offset=11]))
+        var scale = _roi_scale[acc](_raw_f64(argv[unsafe_offset=11]))
         var sampling = Int64(_raw_int(argv[unsafe_offset=12]))
         var aligned = Int64(_raw_int(argv[unsafe_offset=13]))
         _enqueue_cached[_align_scatter[dt, acc]](
@@ -704,7 +716,7 @@ def _enqueue_forward[
     var k = Int64(_raw_int(argv[unsafe_offset=8]))
     var ph = Int64(_raw_int(argv[unsafe_offset=9]))
     var pw = Int64(_raw_int(argv[unsafe_offset=10]))
-    var scale = Scalar[acc](_raw_f64(argv[unsafe_offset=11]))
+    var scale = _roi_scale[acc](_raw_f64(argv[unsafe_offset=11]))
     var ctx = _raw_ctx(argv[unsafe_offset=14])
     var div_pw = SIMD[DType.uint32, 4](0)
     var div_ph = SIMD[DType.uint32, 4](0)
@@ -1099,7 +1111,7 @@ def _enqueue_ps[
     var k = Int64(_raw_int(argv[unsafe_offset=8]))
     var ph = Int64(_raw_int(argv[unsafe_offset=9]))
     var pw = Int64(_raw_int(argv[unsafe_offset=10]))
-    var scale = Scalar[acc](_raw_f64(argv[unsafe_offset=11]))
+    var scale = _roi_scale[acc](_raw_f64(argv[unsafe_offset=11]))
     var sampling = Int64(_raw_int(argv[unsafe_offset=12]))
     var ctx = _raw_ctx(argv[unsafe_offset=14])
     var div_pw = SIMD[DType.uint32, 4](0)

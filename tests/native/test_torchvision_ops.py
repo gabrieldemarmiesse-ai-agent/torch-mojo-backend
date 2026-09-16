@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import io
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -69,6 +72,65 @@ def _assert_close(got: torch.Tensor, want: torch.Tensor, dtype: torch.dtype):
     )
 
 
+def _reference_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONHOME", "PYTHONEXECUTABLE"}
+    }
+
+
+def _cuda_reference_candidates() -> tuple[str, ...]:
+    candidates = [os.environ.get("TORCHVISION_CUDA_REFERENCE_PYTHON"), sys.executable]
+    candidates.extend(shutil.which(name) for name in ("python", "python3"))
+    for root in (Path.cwd(), Path.cwd().parent):
+        for pattern in (".venv-cuda/bin/python", "torch_cu*/bin/python"):
+            candidates.extend(str(path) for path in sorted(root.glob(pattern)))
+    return tuple(dict.fromkeys(path for path in candidates if path))
+
+
+@functools.cache
+def _find_cuda_reference(candidates: tuple[str, ...]) -> tuple[str | None, str]:
+    script = textwrap.dedent("""
+        import sys
+        try:
+            import torch
+            import torchvision
+            if not torch.cuda.is_available():
+                raise RuntimeError("torch.cuda.is_available() is false")
+            for op in ("nms", "roi_align", "_roi_align_backward", "roi_pool",
+                       "_roi_pool_backward", "ps_roi_align", "_ps_roi_align_backward",
+                       "ps_roi_pool", "_ps_roi_pool_backward", "deform_conv2d",
+                       "_deform_conv2d_backward"):
+                if not torch._C._dispatch_has_kernel_for_dispatch_key(
+                        "torchvision::" + op, "CUDA"):
+                    raise RuntimeError("missing CUDA kernel: torchvision::" + op)
+            torchvision.ops.nms(torch.zeros(1, 4, device="cuda"),
+                                torch.ones(1, device="cuda"), 0.5)
+            torch.cuda.synchronize()
+        except Exception as error:
+            print(type(error).__name__ + ": " + str(error))
+            sys.exit(77)
+    """)
+    failures = []
+    for interpreter in candidates:
+        try:
+            result = subprocess.run(
+                [interpreter, "-c", script],
+                capture_output=True,
+                env=_reference_env(),
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{interpreter}: {error}")
+            continue
+        if result.returncode == 0:
+            return interpreter, ""
+        reason = (result.stdout + result.stderr).decode(errors="replace").strip()
+        failures.append(f"{interpreter}: {reason or f'exit {result.returncode}'}")
+    return None, "stock CUDA torchvision unavailable; tried " + "; ".join(failures)
+
+
 def _cuda_reference(
     op: str,
     tensors: tuple[torch.Tensor, ...],
@@ -76,9 +138,9 @@ def _cuda_reference(
     grad: torch.Tensor | None = None,
     autocast: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    interpreter = Path("/home/gabriel/ddp_work/torch_cu128/bin/python")
-    if not interpreter.is_file():
-        pytest.skip("stock CUDA torchvision reference environment is absent")
+    interpreter, reason = _find_cuda_reference(_cuda_reference_candidates())
+    if interpreter is None:
+        pytest.skip(reason)
     payload = io.BytesIO()
     torch.save((op, tensors, kwargs, grad, autocast), payload)
     script = textwrap.dedent("""
@@ -86,8 +148,6 @@ def _cuda_reference(
         import sys
         import torch
         import torchvision
-        if not torch.cuda.is_available():
-            sys.exit(77)
         op, tensors, kwargs, grad, autocast = torch.load(
             io.BytesIO(sys.stdin.buffer.read()), weights_only=True)
         inputs = tuple(t.detach().cuda().requires_grad_(t.requires_grad) for t in tensors)
@@ -108,15 +168,9 @@ def _cuda_reference(
         [str(interpreter), "-c", script],
         input=payload.getvalue(),
         capture_output=True,
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key not in {"PYTHONHOME", "PYTHONEXECUTABLE"}
-        },
+        env=_reference_env(),
         timeout=180,
     )
-    if result.returncode == 77:
-        pytest.skip("stock CUDA reference has no CUDA GPU")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     return torch.load(io.BytesIO(result.stdout), weights_only=True)
 
@@ -253,6 +307,79 @@ def test_nms(mojo_gpu: str, dtype: torch.dtype, count: int, threshold: float):
     assert got.dtype == torch.int64
     assert got.device.type == "mojo"
     torch.testing.assert_close(got.cpu(), want)
+
+
+def test_cuda_reference_environment_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    interpreter = tmp_path / "stock-python"
+    interpreter.touch()
+    monkeypatch.setenv("TORCHVISION_CUDA_REFERENCE_PYTHON", str(interpreter))
+    stream = io.BytesIO()
+    expected = (torch.tensor([0]),)
+    torch.save(expected, stream)
+
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, stream.getvalue(), b""))
+    monkeypatch.setattr(subprocess, "run", run)
+    result = _cuda_reference("nms", (), {})
+    assert run.call_args_list
+    assert all(call.args[0][0] == str(interpreter) for call in run.call_args_list)
+    torch.testing.assert_close(result[0], expected[0])
+
+
+def test_cuda_reference_skip_reason(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    interpreter = tmp_path / "cpu-python"
+    interpreter.touch()
+    monkeypatch.setenv("TORCHVISION_CUDA_REFERENCE_PYTHON", str(interpreter))
+
+    run = Mock(
+        return_value=subprocess.CompletedProcess(
+            [], 77, b"RuntimeError: torch.cuda.is_available() is false\n", b""
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        _cuda_reference("nms", (), {})
+    reason = str(skipped.value)
+    assert str(interpreter) in reason
+    assert "torch.cuda.is_available() is false" in reason
+    assert "tried" in reason
+
+
+@pytest.mark.parametrize(
+    "kind", ["roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool"]
+)
+def test_roi_half_scale_midpoint_neighbors(mojo_gpu: str, kind: str):
+    data = torch.tensor(
+        [[[[10, 1, 3, 7], [2, 9, 4, 6], [5, 3, 8, 1], [7, 4, 2, 9]]]],
+        dtype=torch.float16,
+        requires_grad=True,
+    )
+    rois = torch.tensor([[0, 1, 0, 2, 2]], dtype=torch.float16)
+    grad = torch.ones(1, 1, 1, 1, dtype=torch.float16)
+    for lower in (0.499755859375, 0.5, 0.99951171875, 1.0):
+        lo = torch.tensor(lower, dtype=torch.float16)
+        hi = torch.nextafter(lo, torch.full_like(lo, math.inf)).item()
+        midpoint = (lower + hi) / 2
+        for scale in (
+            math.nextafter(midpoint, -math.inf),
+            midpoint,
+            math.nextafter(midpoint, math.inf),
+        ):
+            kwargs = {"output_size": (1, 1), "spatial_scale": scale}
+            if "align" in kind:
+                kwargs["sampling_ratio"] = 1
+            expected, expected_grad = _cuda_reference(kind, (data, rois), kwargs, grad)
+            ours = data.detach().to(mojo_gpu).requires_grad_()
+            result = getattr(vision.ops, kind)(ours, rois.to(mojo_gpu), **kwargs)
+            result.backward(grad.to(mojo_gpu))
+            torch.testing.assert_close(
+                result.cpu(), expected, rtol=0, atol=0, msg=f"scale={scale!r}"
+            )
+            assert ours.grad is not None
+            torch.testing.assert_close(
+                ours.grad.cpu(), expected_grad, rtol=0, atol=0, msg=f"scale={scale!r}"
+            )
 
 
 @pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0])
@@ -1192,6 +1319,26 @@ def test_deform_conv2d_half_spatial_bound(mojo_gpu: str, axis: int):
     actual = (result.cpu(),) + tuple(t.grad.cpu() for t in ours if t.grad is not None)
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_deform_conv2d_half_last_neighbor(mojo_gpu: str, axis: int):
+    height, width = (2052, 1) if axis == 0 else (1, 2052)
+    data = torch.zeros(1, 1, height, width, dtype=torch.float16, requires_grad=True)
+    offset = torch.zeros(1, 2, height, width, dtype=torch.float16)
+    weight = torch.ones(1, 1, 1, 1, dtype=torch.float16)
+    grad = torch.zeros_like(data)
+    grad[0, 0, -1, -1] = 1
+    expected, expected_grad = _cuda_reference(
+        "deform_conv2d", (data, offset, weight), {}, grad
+    )
+    assert expected_grad[0, 0, -1, -1].item() == 1
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    result = vision.ops.deform_conv2d(ours, offset.to(mojo_gpu), weight.to(mojo_gpu))
+    result.backward(grad.to(mojo_gpu))
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected_grad, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("axis", [0, 1])

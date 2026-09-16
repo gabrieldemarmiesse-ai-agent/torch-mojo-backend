@@ -382,12 +382,20 @@ def _scatter[
             Scalar[acc](px * Int(p.sw) - Int(p.pw) + kx * Int(p.dw))
             + off[unsafe_offset=oi + s].cast[acc]()
         )
-        if (
+        var in_bounds = (
             y > -1
             and y.cast[coord]() < Scalar[coord](p.h)
             and z > -1
             and z.cast[coord]() < Scalar[coord](p.w)
-        ):
+        )
+        comptime if dt == DType.float16:
+            if abs(y) >= 2048 or abs(z) >= 2048:
+                # CUDA bounds-checks neighbors, even when Half(size-1) == size.
+                in_bounds = (
+                    abs(y).cast[coord]() < 65536
+                    and abs(z).cast[coord]() < 65536
+                )
+        if in_bounds:
             var v = col[unsafe_offset=i].cast[acc]()
             var m = mask[unsafe_offset=mi].cast[acc]() if Int(
                 p.mask

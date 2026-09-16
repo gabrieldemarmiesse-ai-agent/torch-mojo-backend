@@ -183,7 +183,8 @@ Arithmetic follows torchvision 0.26 CUDA, including its intermediate rounding:
   IoU arithmetic. Every dtype uses a float32 threshold and strict `>`.
 - ROI align/pool and PS ROI align/pool use the input dtype for scale, geometry,
   interpolation, pooling, and gradient contributions. Half products round
-  before additions; backward accumulates into the input dtype. ROI pool uses
+  before additions; host scales round through float32 before half, matching
+  `c10::Half(float)`. Backward accumulates into the input dtype. ROI pool uses
   ties-away coordinate rounding; PS pool follows CUDA's `roundf`, including
   its float32 conversion for double coordinates.
 - Deformable convolution uses the input dtype for coordinates, interpolation,
@@ -200,6 +201,14 @@ CPU and CUDA can also differ in half gradients through accumulation order.
 Parallel backward scatter has CUDA's nondeterministic accumulation order, so
 general gradients need numeric comparison; the boundary regressions use
 order-independent exact comparisons.
+
+The CUDA-reference tests in `tests/native/test_torchvision_ops.py` accept
+`TORCHVISION_CUDA_REFERENCE_PYTHON=/path/to/cuda-venv/bin/python`. They try that
+interpreter first, then the current interpreter, `python`/`python3` on `PATH`,
+and `.venv-cuda`/`torch_cu*` environments in the working directory and its parent.
+Each candidate must import torch/torchvision, provide the detection CUDA kernels,
+and execute on a CUDA GPU. If none works, the skip reason lists each interpreter
+and its failure. Once selected, reference execution failures fail the test.
 
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
