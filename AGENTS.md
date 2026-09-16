@@ -56,6 +56,17 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   be upstreamed and deleted. Never patch elsewhere;
   `tests/test_monkeypatching_is_centralized.py` enforces it for torch-rooted
   assignments.
+- **Environment variables**: every one this project reads is registered in
+  `torch_mojo_backend/env_vars.py`, with a line saying what setting it does.
+  `register_mojo_devices()` checks the user's environment against that table
+  and warns — with a "did you mean" — about anything spelled
+  `TORCH_MOJO_BACKEND_*` or `MOJOCCL_*` that is not in it, so a misspelled
+  knob stops being silent. The Mojo side keeps the names it reads as
+  constants in one file per compiled library
+  (`native/mojo/env_vars.mojo`, `distributed/mojoccl/env_vars.mojo`) rather
+  than as literals at the `getenv`. Adding a variable anywhere means adding
+  it to the Python table too; `tests/test_env_vars_are_registered.py` scans
+  the repo and fails otherwise.
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`

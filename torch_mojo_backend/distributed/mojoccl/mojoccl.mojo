@@ -73,6 +73,14 @@ from std.time import perf_counter_ns, sleep
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceBuffer, DeviceStream
 
+from env_vars import (
+    MOJOCCL_BOOTSTRAP_TIMEOUT_S,
+    MOJOCCL_NVLS,
+    MOJOCCL_NVLS_GRANULARITY,
+    MOJOCCL_NVLS_MIN_MB,
+    MOJOCCL_REGION_MB,
+    MOJOCCL_SOCKET_DIR,
+)
 from driver import (
     HANDLE_BYTES,
     alloc_host,
@@ -284,7 +292,7 @@ or the surviving ranks block in `recvmsg` forever."""
 
 
 def _region_cap_bytes() -> Int:
-    var s = getenv("MOJOCCL_REGION_MB", String(DEFAULT_REGION_MB))
+    var s = getenv(MOJOCCL_REGION_MB, String(DEFAULT_REGION_MB))
     try:
         return Int(s) * 1024 * 1024
     except:
@@ -293,7 +301,7 @@ def _region_cap_bytes() -> Int:
 
 def _bootstrap_timeout_s() -> Float64:
     var s = getenv(
-        "MOJOCCL_BOOTSTRAP_TIMEOUT_S", String(DEFAULT_BOOTSTRAP_TIMEOUT_S)
+        MOJOCCL_BOOTSTRAP_TIMEOUT_S, String(DEFAULT_BOOTSTRAP_TIMEOUT_S)
     )
     try:
         return Float64(s)
@@ -309,14 +317,14 @@ def _nvls_enabled() -> Bool:
     some ranks bound a multicast region and others did not is not a
     configuration, it is a crash.
     """
-    return getenv("MOJOCCL_NVLS", String("1")) != String("0")
+    return getenv(MOJOCCL_NVLS, String("1")) != String("0")
 
 
 def _nvls_min_bytes() -> Int:
     """Message size at or above which a single-node allreduce goes through the
     switch (`MOJOCCL_NVLS_MIN_MB`, default 48 MiB -- the measured crossover,
     see `NVLS_MIN_BYTES` in nvls_kernels.mojo)."""
-    var s = getenv("MOJOCCL_NVLS_MIN_MB", String(""))
+    var s = getenv(MOJOCCL_NVLS_MIN_MB, String(""))
     if s == String(""):
         return nvls_min_bytes()
     try:
@@ -330,11 +338,11 @@ def _nvls_recommended_granularity() -> Bool:
     `CU_MULTICAST_GRANULARITY_RECOMMENDED`, which is what NCCL does and what
     the prototype measured; the default `min` allocates what the region asked
     for. The two measured the same on H100 -- see docs/distributed.md."""
-    return getenv("MOJOCCL_NVLS_GRANULARITY", String("min")) == String("rec")
+    return getenv(MOJOCCL_NVLS_GRANULARITY, String("min")) == String("rec")
 
 
 def _socket_dir() -> String:
-    return getenv("MOJOCCL_SOCKET_DIR", String(DEFAULT_SOCKET_DIR))
+    return getenv(MOJOCCL_SOCKET_DIR, String(DEFAULT_SOCKET_DIR))
 
 
 def _dtype_item_bytes(nccl_dtype: Int32) -> Int:

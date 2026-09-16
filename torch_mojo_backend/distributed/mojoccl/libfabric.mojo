@@ -63,6 +63,13 @@ from std.os import getenv
 from std.sys import size_of
 from std.time import perf_counter_ns, sleep
 
+from env_vars import (
+    MOJOCCL_FABRIC_DOMAIN,
+    MOJOCCL_FABRIC_HMEM,
+    MOJOCCL_FABRIC_PROVIDER,
+    MOJOCCL_FABRIC_SETUP_RETRY_S,
+    MOJOCCL_LIBFABRIC,
+)
 from netutil import (
     P8,
     alloc_bytes,
@@ -349,7 +356,7 @@ struct Fab(Movable):
     var lib: OwnedDLHandle
 
     def __init__(out self) raises:
-        var want = getenv("MOJOCCL_LIBFABRIC", "")
+        var want = getenv(MOJOCCL_LIBFABRIC, "")
         if want.byte_length() > 0:
             self.lib = OwnedDLHandle(want)
             return
@@ -912,7 +919,7 @@ def _hmem_iface_from_env() raises -> Int:
     guess. Registering DEVICE memory as FI_HMEM_SYSTEM, the other way round,
     is the failure that would be silent.
     """
-    var s = getenv("MOJOCCL_FABRIC_HMEM", "auto")
+    var s = getenv(MOJOCCL_FABRIC_HMEM, "auto")
     if s == "auto":
         return -1
     if s == "system":
@@ -981,7 +988,7 @@ def _fab_setup_once(
     var fab = Fab()
     var api = _api_version(fab)
     var out = alloc_bytes(8)
-    var prov = getenv("MOJOCCL_FABRIC_PROVIDER", "cxi")
+    var prov = getenv(MOJOCCL_FABRIC_PROVIDER, "cxi")
     var rc = fab.getinfo(api, 0, _build_hints(String(prov)), out)
     if rc != 0 or ld64(out, 0) == 0:
         # No cxi (or whatever was asked for): let libfabric pick any
@@ -1010,7 +1017,7 @@ def _fab_setup_once(
             names.append(String(dn))
             paths.append("/sys/class/cxi/" + dn + "/device")
             p = ld64(P8(unsafe_from_address=p), INFO_NEXT)
-        var want = getenv("MOJOCCL_FABRIC_DOMAIN", "")
+        var want = getenv(MOJOCCL_FABRIC_DOMAIN, "")
         var pick = -1
         if want.byte_length() > 0:
             for i in range(len(names)):
@@ -1194,7 +1201,7 @@ def _fab_setup_retry_s() -> Float64:
     """`MOJOCCL_FABRIC_SETUP_RETRY_S`: the -FI_ENOMEM retry budget, seconds.
     Zero fails on the first attempt, which is what a test that WANTS to see
     the error asks for."""
-    var s = getenv("MOJOCCL_FABRIC_SETUP_RETRY_S", String(FAB_SETUP_RETRY_S))
+    var s = getenv(MOJOCCL_FABRIC_SETUP_RETRY_S, String(FAB_SETUP_RETRY_S))
     try:
         var v = Float64(s)
         return v if v > 0.0 else 0.0
