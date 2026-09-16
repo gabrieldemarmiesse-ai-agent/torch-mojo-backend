@@ -32,6 +32,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "ptxas":
+        if _ptxas.driver_cuda_version() is None:
+            # Which ptxas fits is decided by the driver's CUDA version, and a
+            # machine without an NVIDIA driver has none to decide by -- the
+            # answer would belong to whatever machine the cubins end up on.
+            print(
+                "no NVIDIA driver on this machine (libcuda.so.1): which ptxas "
+                "can be used depends on the driver's CUDA version, so there is "
+                "nothing to report here. Run this on the machine with the GPU.",
+                file=sys.stderr,
+            )
+            return 1
         print(_ptxas.report())
         return 0
     cache_dir = native.cache_dir()
