@@ -706,4 +706,14 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
 
 int32_t tmb_default_dtype(void) { return static_cast<int32_t>(c10::typeMetaToScalarType(c10::get_default_dtype())); }
 
+int32_t tmb_alert_not_deterministic(const char* caller) {
+  try {
+    at::globalContext().alertNotDeterministic(caller);
+    return 0;
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
+
 }  // extern "C"

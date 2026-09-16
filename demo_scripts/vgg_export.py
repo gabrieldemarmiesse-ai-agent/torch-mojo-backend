@@ -7,10 +7,7 @@ import torch
 from max.driver import Accelerator
 from max.graph import DeviceRef
 from PIL import Image
-
-# torchvision is a demo-only extra, not a project dependency (pip install it
-# yourself to run this script).
-from torchvision import models, transforms  # ty: ignore[unresolved-import]
+from torchvision import models, transforms
 
 from torch_mojo_backend.torch_compile_backend.exporter import export_to_max_graph
 

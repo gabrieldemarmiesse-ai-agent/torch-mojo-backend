@@ -13,7 +13,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tests.native.conftest import side_stream_or_skip
+from tests.native.conftest import side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import CallChecker
@@ -81,6 +81,37 @@ def test_mm_transposed_operands(mojo_device):
     with assert_ran("aten::mm"):
         got2 = torch.mm(a.to(mojo_device).t().contiguous().t(), bt.to(mojo_device).t())
     torch.testing.assert_close(got2.cpu(), a @ bt.t(), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("shape", [(17, 37, 23), (1, 129, 31), (19, 35, 1)])
+@pytest.mark.parametrize(
+    "transpose_a,transpose_b",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_mm_float64(
+    mojo_gpu: str, shape: tuple[int, int, int], transpose_a: bool, transpose_b: bool
+):
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    m, k, n = shape
+    generator = torch.Generator().manual_seed(211)
+    a = torch.randn(m, k, dtype=torch.float64, generator=generator)
+    b = torch.randn(k, n, dtype=torch.float64, generator=generator)
+    device_a = a.t().contiguous().to(mojo_gpu).t() if transpose_a else a.to(mojo_gpu)
+    device_b = b.t().contiguous().to(mojo_gpu).t() if transpose_b else b.to(mojo_gpu)
+    with assert_ran("aten::mm"):
+        result = torch.mm(device_a, device_b)
+    assert result.dtype == torch.float64
+    torch.testing.assert_close(result.cpu(), torch.mm(a, b), atol=2e-12, rtol=2e-12)
+
+
+def test_mm_float64_accumulation(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    a = torch.tensor([[1.0 + 2**-40, 1.0, -1.0]], dtype=torch.float64)
+    b = torch.tensor([[1.0], [2**-40], [1.0]], dtype=torch.float64)
+    result = torch.mm(a.to(mojo_gpu), b.to(mojo_gpu))
+    torch.testing.assert_close(
+        result.cpu(), torch.tensor([[2**-39]], dtype=torch.float64), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize(

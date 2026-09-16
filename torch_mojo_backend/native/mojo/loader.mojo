@@ -416,12 +416,13 @@ struct Loader(Movable):
         var key = group + "/" + name
         if key in self.ops:
             return self.ops[key].entry
+        var filename_name = name.replace(":", "%3A")
         var so = (
             self.cache_dir
             + "/tmbop."
             + group
             + "."
-            + name
+            + filename_name
             + ".hash-"
             + self.op_source_hash(group)
             + ".so"
@@ -429,7 +430,7 @@ struct Loader(Movable):
         var defines = List[String]()
         defines.append("TMB_OP=" + name)
         self._ensure_built(
-            "tmbop." + group + "." + name,
+            "tmbop." + group + "." + filename_name,
             so,
             group + " " + name,
             self.mojo_dir + "/" + group + ".mojo",

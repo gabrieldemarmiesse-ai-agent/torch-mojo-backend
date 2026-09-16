@@ -4,7 +4,7 @@
 # `Matmul` / `Bmm` run pure-Mojo GEMM kernels (shared-memory tiled with
 # per-thread register tiles, plus a bandwidth-oriented small-M variant) so
 # the fast path works with only the NVIDIA driver — no cuBLAS. All kernels
-# accumulate in float32 and handle dynamic shapes with edge guards.
+# handle dynamic shapes with edge guards; float64 retains float64 accumulation.
 #
 # `Matmul` / `MatmulBiasSpec` / `Bmm` also run on the CPU MAX device, via
 # modular's production CPU matmul (`linalg.matmul.matmul` target="cpu"; see
@@ -142,7 +142,7 @@ from variant_gates import (
 # ---------------------------------------------------------------------------
 # Tiled GEMM kernel: each block computes a BM x BN tile of C using shared
 # memory K-slabs and a TM x TN register tile per thread. Batched via
-# block_idx.z. Accumulates in float32.
+# block_idx.z. Accumulates in float32, or float64 for double inputs.
 #
 #   C[z, m, n] = A[z, m, k] @ B[z, k, n]     (transpose_b=False)
 #   C[z, m, n] = A[z, m, k] @ B[z, n, k]^T   (transpose_b=True)
@@ -228,9 +228,8 @@ def _gemm_tiled_kernel[
     var tn0 = (tid % (BN // TN)) * TN
     var tm0 = (tid // (BN // TN)) * TM
 
-    var acc = InlineArray[SIMD[DType.float32, TN], TM](
-        fill=SIMD[DType.float32, TN](0)
-    )
+    comptime acc_dtype = DType.float64 if dtype == DType.float64 else DType.float32
+    var acc = InlineArray[SIMD[acc_dtype, TN], TM](fill=SIMD[acc_dtype, TN](0))
 
     for kt in range(k_start, k_end, BK):
         # Cooperative loads, zero-padded on every edge.
@@ -272,13 +271,13 @@ def _gemm_tiled_kernel[
         # live registers (1 block/SM); this stays ~2x lower.
         for kk in range(BK):
             var a_frag = a_smem.unsafe_load[width=TM](kk * BM + tm0).cast[
-                DType.float32
+                acc_dtype
             ]()
             var b_frag = b_smem.unsafe_load[width=TN](kk * BN + tn0).cast[
-                DType.float32
+                acc_dtype
             ]()
             comptime for i in range(TM):
-                acc[i] = b_frag.fma(SIMD[DType.float32, TN](a_frag[i]), acc[i])
+                acc[i] = b_frag.fma(SIMD[acc_dtype, TN](a_frag[i]), acc[i])
 
         barrier()
 
@@ -6581,7 +6580,9 @@ def _matmul_spec_checks(
         raise Error("mojo spec matmul: operand dtypes differ")
     if a.ctx_ptr != b.ctx_ptr:
         raise Error("mojo spec matmul: operands on different devices")
-    if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
+    if a.dtype != DType.float64 and not _dtype_supported[
+        List[DType](FLOAT_DTYPES)
+    ](a.dtype):
         raise Error("mojo spec matmul: unsupported dtype ", a.dtype)
     if a.rank < 2 or b.rank != 2:
         raise Error("mojo spec matmul: bad ranks")
@@ -6603,6 +6604,42 @@ def _matmul_spec_checks(
 
 
 @always_inline
+def _gemm_f64_enqueue[
+    transpose_b: Bool
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    batch: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if has_accelerator() and not has_apple_gpu_accelerator():
+        _enqueue_cached[
+            _gemm_tiled_kernel[DType.float64, 32, 32, 16, 2, 2, transpose_b]
+        ](
+            ctx,
+            String(t"gemm_t32_float64_tb{transpose_b}"),
+            ceildiv(n, 32),
+            ceildiv(m, 32),
+            batch,
+            256,
+            _make_ptr[DType.float64](c_addr).as_unsafe_any_origin(),
+            _make_ptr[DType.float64](a_addr).as_unsafe_any_origin().as_imm(),
+            _make_ptr[DType.float64](b_addr).as_unsafe_any_origin().as_imm(),
+            Int64(m),
+            Int64(n),
+            Int64(k),
+            Int64(m * k),
+            Int64(1),
+        )
+    else:
+        raise Error("float64 matmul requires a CUDA or HIP GPU")
+
+
+@always_inline
 def _matmul_spec_launch(
     dtype: DType,
     c_addr: Int,
@@ -6619,6 +6656,19 @@ def _matmul_spec_launch(
 ) raises:
     """The spec ops' tier launch over raw operand addresses. batch > 1 is
     the bmm shape (no bias, no GEMV tier — mirrors the classic entries)."""
+    comptime if _dtype_arg_on[0, DType.float64]():
+        if dtype == DType.float64:
+            if has_bias or ctx.api() == "cpu":
+                raise Error("float64 matmul requires a GPU and no fused bias")
+            if transpose_b:
+                _gemm_f64_enqueue[True](
+                    c_addr, a_addr, b_addr, batch, m, n, k, ctx
+                )
+            else:
+                _gemm_f64_enqueue[False](
+                    c_addr, a_addr, b_addr, batch, m, n, k, ctx
+                )
+            return
     if has_bias:
         _matmul_bias_run(
             dtype, c_addr, a_addr, b_addr, bias_addr, m, n, k, transpose_b, ctx

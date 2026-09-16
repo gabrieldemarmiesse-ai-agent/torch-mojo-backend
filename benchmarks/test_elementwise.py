@@ -41,6 +41,7 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "isnan": torch.isnan,
     "log": torch.log,
     "log1p": torch.log1p,
+    "log2": torch.log2,
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
