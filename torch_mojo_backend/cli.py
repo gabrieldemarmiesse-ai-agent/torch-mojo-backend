@@ -1,6 +1,7 @@
 """The `torch-mojo-backend` command line: `cache dir` prints the native
 kernel cache directory and `cache clean` removes it (see
-docs/native_backend.md, "Three builds": nothing else ever reaps it)."""
+docs/native_backend.md, "Three builds": nothing else ever reaps it).
+`ptxas` prints which assembler the kernels are built with and why."""
 
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import argparse
 import shutil
 import sys
 
-from torch_mojo_backend import native
+from torch_mojo_backend import _ptxas, native
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -22,11 +23,17 @@ def _build_parser() -> argparse.ArgumentParser:
     cache_commands.add_parser(
         "clean", help="remove the cache directory; every build recompiles at next use"
     )
+    commands.add_parser(
+        "ptxas", help="the assembler the NVIDIA kernels are built with, and why"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "ptxas":
+        print(_ptxas.report())
+        return 0
     cache_dir = native.cache_dir()
     if args.cache_command == "dir":
         print(cache_dir)

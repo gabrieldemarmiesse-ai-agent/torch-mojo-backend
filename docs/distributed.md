@@ -200,10 +200,12 @@ communicators and does the actual library calls.
 
 ## Cluster notes (SLURM, IB — NVIDIA)
 
-- ptxas needs no configuration: the package defaults
-  `MODULAR_NVPTX_COMPILER_PATH` to the CUDA 12.8 ptxas of the
-  `nvidia-cuda-nvcc-cu12` wheel it depends on, whose cubins load on r570+
-  drivers (`torch_mojo_backend/_ptxas.py`). Export the variable yourself
+- ptxas needs no configuration: the package sets
+  `MODULAR_NVPTX_COMPILER_PATH` itself, to the assembler on the node that
+  suits both the driver and the GPU — the `nvidia-cuda-nvcc-cu12` wheel's
+  CUDA 12.8 one wherever it fits (`torch_mojo_backend/_ptxas.py`,
+  docs/native_backend.md "Which ptxas assembles the kernels").
+  `torch-mojo-backend ptxas` prints the choice; export the variable yourself
   only to use another ptxas.
 - `NCCL_DEBUG=WARN` (or `INFO` during bring-up) is the first knob for
   diagnosing init hangs; on multi-homed nodes set `NCCL_SOCKET_IFNAME` if

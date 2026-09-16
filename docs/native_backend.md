@@ -89,6 +89,52 @@ Three translation units compile in parallel: about 7 s wall cold.
 | `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
 | `ops_*.mojo` | the aten ops, and each file's `register_<group>` list |
 
+## Which ptxas assembles the kernels (NVIDIA)
+
+Every one of those builds ends in ptxas, and which one runs is not a detail:
+a cubin is only loadable by a driver at least as new as the toolkit that
+assembled it, and only buildable by a toolkit that knows the architecture. So
+the choice is pinned between two moving bounds, and `_ptxas.py` picks inside
+them:
+
+| bound | set by | what a violation looks like |
+|---|---|---|
+| upper | the driver | `CUDA_ERROR_INVALID_IMAGE (device kernel image is invalid)` — at the *first op*, after every build succeeded |
+| lower | the GPU | `ptxas fatal : Value 'sm_90a' is not defined for option 'gpu-name'`, inside a `mojo build` dump |
+
+Within a CUDA major the upper bound is loose (minor version compatibility:
+any 12.x cubin loads on r525+, any 13.x on r580+), so it is the major that
+decides. The lower bound is not monotonic — CUDA 13 added sm_110 and dropped
+everything below sm_75 and sm_101 — which is why "newest wins" is wrong and
+the candidates are asked what they target (`ptxas --help`) rather than
+assumed to be ordered.
+
+MAX bundles a CUDA 13 assembler, so on an r570 driver it refuses to create a
+device at all unless `MODULAR_NVPTX_COMPILER_PATH` names another one. The
+package always sets that variable: at import from the driver alone (`cuDriverGetVersion`
+needs no `cuInit`, so it is safe before `max` loads and before any fork), then
+again at `register_mojo_devices()` from the architecture, which only the
+initialized driver can answer. Candidates are the `nvidia-cuda-nvcc*` wheels
+(`nvidia/cuda_nvcc/bin/ptxas` for cu12, `nvidia/cu13/bin/ptxas` for CUDA 13),
+torch's `torch/bin/ptxas`, Triton's, `$CUDA_HOME`, `$PATH` and
+`/usr/local/cuda*`. Among the ones that fit, the wheel `pyproject.toml` pins
+wins — it is the combination this project's kernels are tested and tuned
+with, and a torch upgrade shipping a newer ptxas must not silently move an
+existing machine onto it.
+
+A child process inherits the environment and nothing else, so the pick is
+marked in it too (`TORCH_MOJO_BACKEND_PTXAS_AUTO`): without that, every
+torchrun rank and every Inductor compile worker would read the inherited
+value as a setting of the user's and refuse to move off it for the GPU it
+actually has.
+
+When nothing fits, registration raises before the first build with the
+candidate table, the reason each one was rejected and the wheel to install;
+`torch-mojo-backend ptxas` prints the same table on demand, and
+`TORCH_MOJO_BACKEND_PTXAS_CHECK=0` downgrades the refusal to a warning for a
+machine whose rules we got wrong. A `MODULAR_NVPTX_COMPILER_PATH` the user
+set is never overridden — only explained, if it cannot work here.
+
 ## Op extensions: how an op body reaches the dispatcher
 
 `backend.mojo` registers names, not implementations: `tmb_library_impl_lazy`

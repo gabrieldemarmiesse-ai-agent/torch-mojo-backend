@@ -37,6 +37,8 @@ from typing import Protocol, cast
 import platformdirs
 import torch
 
+from torch_mojo_backend import _ptxas
+
 _HERE = Path(__file__).resolve().parent
 _PACKAGE = _HERE.parent
 _KERNELS_DIR = _PACKAGE / "eager_kernels"
@@ -661,12 +663,13 @@ def _build_backend_locked(key: str, out: Path) -> Path:
     proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
+        log = proc.stdout + proc.stderr
         raise RuntimeError(
             "building the Mojo backend failed:\n"
             + " ".join(cmd)
             + "\n"
-            + proc.stdout
-            + proc.stderr
+            + log
+            + _ptxas.diagnose(log)
         )
     _atomic_install(tmp, out)
     _trace(f"built Mojo backend in {time.monotonic() - t0:.2f}s")
@@ -721,8 +724,9 @@ def build_library(
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)
+            log = proc.stdout + proc.stderr
             raise RuntimeError(
-                f"building {entry.name} failed:\n" + proc.stdout + proc.stderr
+                f"building {entry.name} failed:\n" + log + _ptxas.diagnose(log)
             )
         _atomic_install(tmp, out)
         _trace(f"built {entry.name} in {time.monotonic() - t0:.2f}s")

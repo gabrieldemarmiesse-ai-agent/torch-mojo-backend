@@ -1,4 +1,5 @@
-"""`torch-mojo-backend cache dir` / `cache clean` against a relocated cache."""
+"""`torch-mojo-backend cache dir` / `cache clean` against a relocated cache,
+and `torch-mojo-backend ptxas` on whatever machine this is."""
 
 import os
 import subprocess
@@ -40,3 +41,10 @@ def test_cache_clean_removes_the_directory(tmp_path: Path):
 def test_cache_clean_on_a_missing_directory_succeeds(tmp_path: Path):
     proc = _run(tmp_path / "absent", "cache", "clean")
     assert "nothing to remove" in proc.stderr
+
+
+def test_ptxas_prints_the_assembler_picture(tmp_path: Path):
+    """It is what an error message tells the user to run, so it has to work
+    on a machine with no GPU and no CUDA at all (a laptop, a CI runner)."""
+    out = _run(tmp_path / "cache", "ptxas").stdout
+    assert "driver" in out and "ptxas found" in out

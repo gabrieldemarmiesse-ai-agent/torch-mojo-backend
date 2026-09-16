@@ -23,8 +23,10 @@ dependencies = [
     # ptxas for the eager kernels and the MAX graph compiler on NVIDIA. MAX
     # bundles the newest CUDA's ptxas, whose cubins need a driver at least as
     # new (r580 for CUDA 13); the 12.8 wheel's ptxas assembles cubins that
-    # every r570+ driver loads. torch_mojo_backend/_ptxas.py points MAX at it
-    # unless MODULAR_NVPTX_COMPILER_PATH is already set.
+    # every r525+ driver loads, and targets every architecture up to sm_120.
+    # torch_mojo_backend/_ptxas.py prefers it, falls back to another assembler
+    # on the machine for a GPU it cannot target (sm_110 and up need CUDA 13),
+    # and says which wheel to install when nothing on the machine fits.
     "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
 ]
 

@@ -1,6 +1,10 @@
 """The CUDA 12.8 ptxas from the nvidia-cuda-nvcc-cu12 wheel is MAX's default
 assembler: ``torch_mojo_backend`` sets ``MODULAR_NVPTX_COMPILER_PATH`` to it
-at import unless the variable is already set."""
+at import unless the variable is already set.
+
+That is the import-time half, which knows only the driver. What happens when
+the wheel's does not suit this machine's GPU is
+tests/test_ptxas_selection.py."""
 
 import os
 import subprocess
@@ -24,13 +28,14 @@ def test_wheel_ships_a_cuda_12_8_ptxas():
     assert "release 12.8" in version
 
 
-def _import_and_read(env_value: str | None) -> str:
-    env = {k: v for k, v in os.environ.items() if k != _ptxas.ENV_VAR}
+def _import_and_read(env_value: str | None, var: str | None = None) -> str:
+    dropped = (_ptxas.ENV_VAR, _ptxas.AUTO_ENV_VAR)
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
     if env_value is not None:
         env[_ptxas.ENV_VAR] = env_value
     code = (
         "import os, torch_mojo_backend; "
-        f"print('PTXAS=' + os.environ.get({_ptxas.ENV_VAR!r}, ''))"
+        f"print('PTXAS=' + os.environ.get({var or _ptxas.ENV_VAR!r}, ''))"
     )
     out = subprocess.run(
         [sys.executable, "-c", code],
@@ -49,3 +54,11 @@ def test_import_sets_the_default_when_unset():
 
 def test_an_explicit_setting_wins():
     assert _import_and_read("/custom/ptxas") == "/custom/ptxas"
+
+
+def test_the_default_is_marked_as_ours_for_the_children_to_read():
+    """A child inherits the environment and nothing else, so the pick is
+    marked there: without it every torchrun rank would read an inherited
+    default as a setting of the user's (tests/test_ptxas_selection.py)."""
+    assert _import_and_read(None, _ptxas.AUTO_ENV_VAR) == str(_ptxas.wheel_ptxas())
+    assert _import_and_read("/custom/ptxas", _ptxas.AUTO_ENV_VAR) == ""
