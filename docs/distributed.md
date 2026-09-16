@@ -10,8 +10,10 @@ no ctypes calls into NCCL/RCCL happen in Python any more. No CUDA/ROCm torch
 build and no libcudart needed, in keeping with the project's "CPU-only torch
 install, we bring the GPU stack" motto:
 
-- NVIDIA: `libnccl.so.2` comes from the `nvidia-nccl-cu12` wheel (a
-  dependency of this package).
+- NVIDIA: install `libnccl.so.2` with `pip install "nvidia-nccl-cu12>=2.27"`,
+  or use an existing system library. Set `TORCH_MOJO_BACKEND_NCCL_LIB` to
+  select a specific library path. The wheel is included in development
+  dependencies only; installing this package does not directly require NCCL.
 - AMD: `librccl.so.1` comes from the ROCm install MAX itself already loads
   its HIP runtime from — the one at `$ROCM_PATH` or `/opt/rocm`, or a
   path in `TORCH_MOJO_BACKEND_RCCL_LIB`. Nothing extra to install: every
