@@ -74,7 +74,7 @@ def test_a_gpu_the_pinned_wheel_cannot_target_moves_to_a_newer_one(arches):
     chosen, rejected = _ptxas.choose((13, 0), (110,), [WHEEL_12_8, TORCH_13_0])
     assert chosen is TORCH_13_0
     assert (
-        "cannot target sm_110a"
+        "too old for this GPU: cannot target sm_110a"
         in dict((p.path, r) for p, r in rejected)[WHEEL_12_8.path]
     )
 
@@ -91,7 +91,7 @@ def test_an_assembler_without_the_a_variant_is_refused(arches):
     `Value 'sm_90a' is not defined`."""
     chosen, rejected = _ptxas.choose((12, 8), (90,), [SYSTEM_11_8])
     assert chosen is None
-    assert "cannot target sm_90a" in rejected[0][1]
+    assert "too old for this GPU: cannot target sm_90a" in rejected[0][1]
 
 
 def test_every_gpu_present_has_to_be_supported(arches):
@@ -139,7 +139,7 @@ def test_the_builtin_is_ranked_like_any_other(arches):
 def test_the_builtin_is_bound_by_the_driver_like_any_other(arches):
     chosen, rejected = _ptxas.choose((12, 8), (90,), [BUILTIN_13_1])
     assert chosen is None
-    assert "driver r580" in rejected[0][1]
+    assert rejected[0][1].startswith("too new for this driver")
 
 
 def test_the_builtin_is_chosen_over_a_refusal(arches):
@@ -213,7 +213,17 @@ def test_the_report_shows_every_candidate_and_its_verdict(arches):
     assert "H100" in text and "sm_90" in text
     assert "[USED] /wheel/nvidia/cuda_nvcc/bin/ptxas" in text
     assert "[  no] /wheel/torch/bin/ptxas" in text
-    assert "CUDA 13.0, from torch wheel -- cubins need driver r580" in text
+    assert "CUDA 13.0, from torch wheel -- too new for this driver" in text
+
+
+def test_the_report_lists_newest_first_and_names_what_would_not_answer(arches):
+    silent = _ptxas.Ptxas(Path(__file__), "system CUDA", None)  # exists, no answer
+    text = _ptxas.report(
+        (13, 0), ((90, "NVIDIA H100 80GB HBM3"),), [WHEEL_12_8, TORCH_13_0, silent]
+    )
+    order = [text.index(str(p.path)) for p in (TORCH_13_0, WHEEL_12_8, silent)]
+    assert order == sorted(order)
+    assert f"{silent.path}\n           --version failed, from system CUDA" in text
 
 
 def test_the_report_marks_nothing_as_used_when_the_setting_is_broken(arches):

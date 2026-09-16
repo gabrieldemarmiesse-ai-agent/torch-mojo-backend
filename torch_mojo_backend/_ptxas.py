@@ -147,7 +147,7 @@ class Ptxas:
     @property
     def release(self) -> str:
         if self.version is None:
-            return "unusable"
+            return "no such file" if not self.path.is_file() else "--version failed"
         return f"CUDA {self.version[0]}.{self.version[1]}"
 
     @property
@@ -474,15 +474,13 @@ def rejection(
 ) -> str | None:
     """Why this ptxas cannot be used here, or None when it can."""
     if ptxas.version is None:
-        if not ptxas.path.is_file():
-            return "no such file"
-        return "does not run"
+        return ptxas.release  # "no such file" or "--version failed"
     major, minor, _ = ptxas.version
     if driver is not None and major > driver[0]:
         floor = MIN_DRIVER.get(major, f"the CUDA {major} minimum")
         return (
-            f"cubins need driver {floor} or newer; "
-            f"this driver supports CUDA {driver[0]}.{driver[1]}"
+            f"too new for this driver: its cubins need driver {floor} or newer, "
+            f"and this driver supports CUDA {driver[0]}.{driver[1]}"
         )
     supported = (
         table_arches(ptxas.version) if ptxas.is_builtin else arches_of(ptxas.path)
@@ -490,7 +488,7 @@ def rejection(
     if supported:  # empty means --help could not be parsed: not a rejection
         missing = {target_name(arch) for arch in arches} - supported
         if missing:
-            return f"CUDA {major}.{minor} cannot target {', '.join(sorted(missing))}"
+            return f"too old for this GPU: cannot target {', '.join(sorted(missing))}"
     return None
 
 
@@ -603,10 +601,11 @@ def report(
     else:
         lines.append("  gpu       none visible")
     lines.append("")
-    lines.append("  ptxas found")
+    lines.append("  ptxas found, newest first")
     if not found:
         lines.append("    none")
-    for ptxas in found:
+    # Newest first; the ones whose version could not be read close the list.
+    for ptxas in sorted(found, key=lambda p: p.version or (-1, 0, 0), reverse=True):
         why = reasons.get(id(ptxas))
         if why is not None:
             mark = "no"
@@ -620,6 +619,8 @@ def report(
         if ptxas.is_builtin:
             detail += f" (release per MAX version, in force when {ENV_VAR} is unset)"
         lines.append(f"    [{mark:>4}] {ptxas.path}")
+        if why is not None and ptxas.version is None:
+            why = None  # the release column already says what went wrong
         lines.append(f"           {detail}" + (f" -- {why}" if why else ""))
     if chosen is None:
         lines.append("")
