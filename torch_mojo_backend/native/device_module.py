@@ -8,6 +8,9 @@ surface: device selection, RNG state, synchronize, amp dtypes, memory info.
 from __future__ import annotations
 
 import ctypes
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Never, TypeAlias
 
 import torch
 
@@ -20,13 +23,316 @@ DeviceLike = "int | str | torch.device | None"
 
 def _index(device: int | str | torch.device | None) -> int:
     if device is None:
-        return current_device()
-    if isinstance(device, int):
-        return device
-    d = torch.device(device)
-    if d.type != "mojo":
-        raise ValueError(f"expected a mojo device, got {d}")
-    return current_device() if d.index is None else d.index
+        idx = current_device()
+    elif isinstance(device, int):
+        idx = device
+    else:
+        d = torch.device(device)
+        if d.type != "mojo":
+            raise ValueError(f"expected a mojo device, got {d}")
+        idx = current_device() if d.index is None else d.index
+    if idx < 0 or idx >= device_count():
+        raise ValueError(
+            f"Invalid mojo device index {idx}; expected 0 <= index < {device_count()}"
+        )
+    return idx
+
+
+MemoryStats: TypeAlias = dict[str, "int | MemoryStats"]
+
+
+def _require_memory_binding(name: str, minimum_version: str = "2.9"):
+    """Explain unsupported torch builds before accessing their memory bindings."""
+    if not hasattr(torch._C, name):
+        raise RuntimeError(
+            f"torch {torch.__version__} is missing torch._C.{name}; "
+            f"this Mojo memory API needs torch's accelerator memory bindings "
+            f"(torch>={minimum_version}; torch-mojo-backend requires torch>=2.10)."
+        )
+
+
+def memory_stats_as_nested_dict(
+    device: int | str | torch.device | None = None,
+) -> MemoryStats:
+    """Allocator statistics from torch's DeviceAllocator binding.
+
+    Only ``all`` is populated. Requested and reserved bytes equal allocated
+    bytes: we neither round requests nor own MAX's caching arena. Pool,
+    segment, active, inactive-split and oversize statistics are structurally
+    zero; they describe allocator concepts this backend does not implement.
+    """
+    _require_memory_binding("_accelerator_getDeviceStats")
+    return torch._C._accelerator_getDeviceStats(_index(device))
+
+
+def memory_stats(
+    device: int | str | torch.device | None = None,
+) -> OrderedDict[str, int]:
+    """Sorted, flattened statistics with torch.cuda's key spelling."""
+    pairs = []
+
+    def flatten(prefix: str, value: int | MemoryStats):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                flatten(f"{prefix}.{key}" if prefix else key, child)
+        else:
+            pairs.append((prefix, value))
+
+    flatten("", memory_stats_as_nested_dict(device))
+    return OrderedDict(sorted(pairs))
+
+
+def memory_allocated(device: int | str | torch.device | None = None) -> int:
+    """Bytes in live storage allocated by this backend on this device."""
+    return memory_stats(device)["allocated_bytes.all.current"]
+
+
+def max_memory_allocated(device: int | str | torch.device | None = None) -> int:
+    """Peak live storage bytes since the last peak reset."""
+    return memory_stats(device)["allocated_bytes.all.peak"]
+
+
+def memory_reserved(device: int | str | torch.device | None = None) -> int:
+    """Equals memory_allocated: MAX's arena reservation is not exposed."""
+    return memory_stats(device)["reserved_bytes.all.current"]
+
+
+def max_memory_reserved(device: int | str | torch.device | None = None) -> int:
+    """Equals max_memory_allocated; this backend has no caching arena."""
+    return memory_stats(device)["reserved_bytes.all.peak"]
+
+
+def reset_peak_memory_stats(device: int | str | torch.device | None = None):
+    """Reset peaks to current usage, including storage still alive."""
+    _require_memory_binding("_accelerator_resetPeakStats")
+    torch._C._accelerator_resetPeakStats(_index(device))
+
+
+def reset_accumulated_memory_stats(device: int | str | torch.device | None = None):
+    """Zero cumulative allocation, free, retry and OOM counts; keep current/peak."""
+    _require_memory_binding("_accelerator_resetAccumulatedStats")
+    torch._C._accelerator_resetAccumulatedStats(_index(device))
+
+
+def empty_cache():
+    """Release completed deferred host staging buffers on every device.
+
+    Does not synchronize or return device memory to the OS: MAX owns the
+    arena and exposes no trim API. Live tensor storage is unaffected.
+    Like torch.accelerator.empty_cache, this is a no-op in a forked child.
+    """
+    _require_memory_binding("_accelerator_emptyCache")
+    torch._C._accelerator_emptyCache()
+
+
+def mem_get_info(device: int | str | torch.device | None = None) -> tuple[int, int]:
+    """MAX's reported (free, total) bytes, separate from our storage counters.
+
+    The MAX CPU device reports host memory. A device whose MAX runtime cannot
+    supply capacity raises explicitly rather than returning fabricated zeros.
+    """
+    _require_memory_binding("_accelerator_getMemoryInfo", minimum_version="2.10")
+    return torch._C._accelerator_getMemoryInfo(_index(device))
+
+
+def memory_summary(
+    device: int | str | torch.device | None = None, abbreviated: bool = False
+) -> str:
+    """Format allocator counters in bytes/counts, with their Mojo meanings."""
+    idx = _index(device)
+    stats = memory_stats(idx)
+    lines = [
+        f"Mojo memory summary, device {idx} (bytes unless marked count)",
+        f"{'Metric':<28} {'Current':>16} {'Peak':>16} {'Allocated':>16} {'Freed':>16}",
+    ]
+    metrics = [
+        ("Allocated memory", "allocated_bytes"),
+        ("Reserved memory", "reserved_bytes"),
+    ]
+    if not abbreviated:
+        metrics += [
+            ("Requested memory", "requested_bytes"),
+            ("Allocations (count)", "allocation"),
+        ]
+    for label, metric in metrics:
+        values = " ".join(
+            f"{stats[f'{metric}.all.{field}']:>16,}"
+            for field in ("current", "peak", "allocated", "freed")
+        )
+        lines.append(f"{label:<28} {values}")
+    for key in ("num_device_alloc", "num_device_free", "num_alloc_retries", "num_ooms"):
+        lines.append(f"{key}: {stats[key]:,}")
+    lines += [
+        "Reserved = allocated: MAX owns the arena; its cached slack is not exposed.",
+        "Pool, segment, active, inactive_split and oversize breakdowns are structurally zero.",
+    ]
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MojoDeviceProperties:
+    """Cached MAX properties; unavailable fields are None, clock_rate is kHz.
+
+    Inductor's separate MojoDeviceProperties in inductor.py has the exact
+    field set its Triton autotuner requires; this is the public MAX view.
+    """
+
+    name: str
+    major: int | None
+    minor: int | None
+    total_memory: int | None
+    multi_processor_count: int | None
+    max_threads_per_multi_processor: int | None
+    warp_size: int | None
+    regs_per_multiprocessor: int | None
+    gcnArchName: str | None
+    api: str
+    is_cpu: bool
+    arch_name: str | None
+    max_threads_per_block: int | None
+    regs_per_block: int | None
+    shared_memory_per_block: int | None
+    shared_memory_per_block_optin: int | None
+    shared_memory_per_multiprocessor: int | None
+    max_blocks_per_multi_processor: int | None
+    clock_rate: int | None
+    max_grid_dim_x: int | None
+
+
+def get_device_properties(
+    device: int | str | torch.device | None = None,
+) -> MojoDeviceProperties:
+    """Properties cached per device in Mojo, including the MAX CPU device."""
+    idx = _index(device)
+    values = (ctypes.c_int64 * 16)()
+    text = ctypes.create_string_buffer(4096)
+    fn = native.shim().tmb_device_properties
+    fn.argtypes = [
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_char),
+        ctypes.c_int32,
+    ]
+    fn.restype = ctypes.c_int32
+    if fn(idx, values, len(values), text, len(text)):
+        raise RuntimeError(native.last_error())
+    name, api, arch = (
+        part.decode("utf-8", errors="replace") for part in text.raw.split(b"\0")[:3]
+    )
+
+    def value(slot: int) -> int | None:
+        return values[slot] if values[slot] >= 0 else None
+
+    return MojoDeviceProperties(
+        name=name,
+        major=value(0),
+        minor=value(1),
+        total_memory=value(2),
+        multi_processor_count=value(3),
+        max_threads_per_multi_processor=value(4),
+        warp_size=value(5),
+        regs_per_multiprocessor=value(6),
+        gcnArchName=(arch or None) if api == "hip" else None,
+        api=api,
+        is_cpu=bool(values[15]),
+        arch_name=arch or None,
+        max_threads_per_block=value(7),
+        regs_per_block=value(8),
+        shared_memory_per_block=value(9),
+        shared_memory_per_block_optin=value(10),
+        shared_memory_per_multiprocessor=value(11),
+        max_blocks_per_multi_processor=value(12),
+        clock_rate=value(13),
+        max_grid_dim_x=value(14),
+    )
+
+
+def get_device_name(device: int | str | torch.device | None = None) -> str:
+    """MAX's device name."""
+    return get_device_properties(device).name
+
+
+def get_device_capability(
+    device: int | str | torch.device | None = None,
+) -> tuple[int | None, int | None]:
+    """CUDA (major, minor); unknown components are None on other APIs."""
+    props = get_device_properties(device)
+    return props.major, props.minor
+
+
+def memory_snapshot() -> Never:
+    raise NotImplementedError(
+        "MAX does not expose its arena blocks or allocation history"
+    )
+
+
+def _record_memory_history(
+    enabled: str | None = "all",
+    context: str | None = "all",
+    stacks: str = "all",
+    max_entries: int = 9223372036854775807,
+    device: int | str | torch.device | None = None,
+    clear_history: bool = False,
+    compile_context: bool = False,
+    global_record_annotations: bool = False,
+    skip_actions: list[str] | None = None,
+) -> Never:
+    _index(device)
+    raise NotImplementedError(
+        "Mojo tracks counters, not allocation histories or stack traces"
+    )
+
+
+def _dump_snapshot(
+    filename: str = "dump_snapshot.pickle", augment_with_fx_traces: bool = False
+) -> Never:
+    raise NotImplementedError("MAX does not expose an allocator snapshot to dump")
+
+
+def caching_allocator_alloc(
+    size: int,
+    device: int | str | torch.device | None = None,
+    stream: int | torch.Stream | None = None,
+) -> Never:
+    _index(device)
+    raise NotImplementedError(
+        "Mojo allocations require owned storage handles, not raw pointers"
+    )
+
+
+def caching_allocator_delete(mem_ptr: int) -> Never:
+    raise NotImplementedError("Mojo frees owned storage handles, not raw pointers")
+
+
+def set_per_process_memory_fraction(
+    fraction: float, device: int | str | torch.device | None = None
+) -> Never:
+    _index(device)
+    raise NotImplementedError(
+        "MAX owns the arena and exposes no per-process memory limit"
+    )
+
+
+def list_gpu_processes(device: int | str | torch.device | None = None) -> Never:
+    _index(device)
+    raise NotImplementedError("MAX does not expose per-process GPU memory usage")
+
+
+def host_memory_stats() -> Never:
+    raise NotImplementedError("MAX does not expose pinned host allocator statistics")
+
+
+def host_memory_stats_as_nested_dict() -> Never:
+    raise NotImplementedError("MAX does not expose pinned host allocator statistics")
+
+
+def reset_accumulated_host_memory_stats() -> Never:
+    raise NotImplementedError("MAX does not expose pinned host allocator statistics")
+
+
+def reset_peak_host_memory_stats() -> Never:
+    raise NotImplementedError("MAX does not expose pinned host allocator statistics")
 
 
 def is_available() -> bool:

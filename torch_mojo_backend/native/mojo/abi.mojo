@@ -270,6 +270,15 @@ def set_shim_error(msg: String):
     )
 
 
+def alert_not_deterministic(var caller: String) raises:
+    check(
+        external_call["tmb_alert_not_deterministic", Int32](
+            caller.as_c_string_slice().unsafe_ptr()
+        ),
+        "nondeterministic operation",
+    )
+
+
 # --- records ------------------------------------------------------------------
 @fieldwise_init
 struct Value(Copyable, Movable):
@@ -891,6 +900,9 @@ def new_strided(
     stype: Int32,
     device: Int,
 ) raises -> T:
+    # T rejects unsupported ScalarTypes. Validate before creating its owned
+    # C++ handle, otherwise a failed T(h) strands that handle and its storage.
+    _ = max_dtype(stype)
     var sizes = InlineArray[Int64, MAX_RANK](fill=0)
     var strd = InlineArray[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank

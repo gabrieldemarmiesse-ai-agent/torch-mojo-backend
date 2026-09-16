@@ -103,6 +103,11 @@ from max.gpu.host import DeviceContext, DeviceStream
 
 from std.atomic import Atomic, Ordering
 
+from env_vars import (
+    MOJOCCL_IB_TIMEOUT_S,
+    MOJOCCL_IB_TRACE,
+    MOJOCCL_NET,
+)
 from driver import (
     alloc_host,
     device_pci_bus_id,
@@ -490,7 +495,7 @@ struct IbState(Movable):
         # in full-model ABBA). Only synchronous selftests opt out below.
         self.proxy = True
         self.thread_id = 0
-        self.trace = getenv("MOJOCCL_IB_TRACE", "0") != "0"
+        self.trace = getenv(MOJOCCL_IB_TRACE, "0") != "0"
         self.t_post_ns = 0
         self.t_wait_ns = 0
         self.t_flush_ns = 0
@@ -1334,7 +1339,7 @@ def _select_backend() raises -> Int:
     machine with neither gets the same error message this library has always
     given. Verbs is tried first because it is the measured path.
     """
-    var want = getenv("MOJOCCL_NET", "")
+    var want = getenv(MOJOCCL_NET, "")
     if want == "verbs":
         return NET_VERBS
     if want == "fabric":
@@ -1465,7 +1470,7 @@ def ib_setup(
 
 
 def _ib_timeout_s() -> Float64:
-    var s = getenv("MOJOCCL_IB_TIMEOUT_S", String(DEFAULT_IB_TIMEOUT_S))
+    var s = getenv(MOJOCCL_IB_TIMEOUT_S, String(DEFAULT_IB_TIMEOUT_S))
     try:
         return Float64(s)
     except:

@@ -2695,7 +2695,12 @@ def aten_log1p(input: MaxTensor) -> MaxTensor:
     return F.log1p(input)
 
 
-# log2(Tensor self) -> Tensor
+# aten::log2(Tensor self) -> Tensor
+@map_to(aten.log2)
+def aten_log2(input: MaxTensor) -> MaxTensor:
+    if input.dtype.is_integral() or input.dtype == DType.bool:
+        input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    return F.log(input) / math.log(2.0)
 
 
 # logical_and(Tensor self, Tensor other) -> Tensor

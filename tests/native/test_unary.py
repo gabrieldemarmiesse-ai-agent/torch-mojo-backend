@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 
@@ -550,6 +551,30 @@ def test_gelu_forward_every_layout_and_dtype(mojo_gpu, approximate, layout):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_vector_body_tail_and_offset(
+    mojo_gpu: str, dtype: torch.dtype, offset: int, approximate: str
+):
+    """The 4-wide route handles aligned bodies and unaligned scalar tails."""
+    count = 1027
+    source = torch.linspace(-5, 5, count + offset + 3).to(dtype)
+    device_source = source.to(mojo_gpu)
+    input_view = device_source[offset : offset + count]
+    output = torch.full_like(source, -123).to(mojo_gpu)
+    output_view = output[offset : offset + count]
+    with torch.no_grad():
+        torch.ops.aten.gelu.out(input_view, approximate=approximate, out=output_view)
+    expected = torch.full_like(source, -123)
+    expected[offset : offset + count] = F.gelu(
+        source[offset : offset + count].float(), approximate=approximate
+    ).to(dtype)
+    tolerance = 3e-2 if dtype != torch.float32 else 5e-5
+    torch.testing.assert_close(output.cpu(), expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(device_source.cpu(), source, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("step", [1, 2])
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_gelu_backward_runtime_layouts(mojo_gpu, approximate, step):
@@ -696,3 +721,86 @@ def test_fill_through_a_transposed_view_keeps_the_allocation(mojo_device):
     filled = view.fill_(True)
     assert filled.data_ptr() == before
     assert bool(x.cpu().all())
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+def test_log2_domain(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    data = torch.tensor(
+        [-1.0, -0.0, 0.0, 0.125, 1.0, 2.0, 3.0, float("inf"), float("nan")], dtype=dtype
+    )
+    result = torch.log2(data.to(mojo_gpu))
+    assert result.device.type == "mojo"
+    rtol, atol = _tol(dtype)
+    torch.testing.assert_close(
+        result.cpu(), torch.log2(data), rtol=rtol, atol=atol, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (3, 5)])
+def test_log2_shapes(mojo_gpu: str, shape: tuple[int, ...]):
+    data = torch.full(shape, 8.0)
+    torch.testing.assert_close(torch.log2(data.to(mojo_gpu)).cpu(), torch.log2(data))
+
+
+def test_log2_noncontiguous(mojo_gpu: str):
+    data = torch.arange(1, 36, dtype=torch.float32).reshape(5, 7)
+    result = torch.log2(data.to(mojo_gpu).transpose(0, 1))
+    torch.testing.assert_close(result.cpu(), torch.log2(data.transpose(0, 1)))
+
+
+@pytest.mark.parametrize("count", [1, 4, 5, 7, 8, 9, 1023, 1024, 1025, 357 * 789])
+@pytest.mark.parametrize("input_offset,output_offset", [(0, 0), (1, 0), (0, 1), (3, 3)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_log2_offset_tail(
+    mojo_gpu: str, count: int, input_offset: int, output_offset: int, dtype: torch.dtype
+):
+    data = torch.linspace(0.125, 8.0, count + input_offset + 3).to(dtype)
+    source = data.to(mojo_gpu)[input_offset : input_offset + count]
+    storage = torch.full((count + output_offset + 3,), -12345.0, dtype=dtype).to(
+        mojo_gpu
+    )
+    output = storage[output_offset : output_offset + count]
+    returned = torch.log2(source, out=output)
+    assert returned.data_ptr() == output.data_ptr()
+    expected = torch.full((count + output_offset + 3,), -12345.0, dtype=dtype)
+    expected[output_offset : output_offset + count] = torch.log2(
+        data[input_offset : input_offset + count]
+    )
+    rtol, atol = (0.008, 1e-5) if dtype == torch.bfloat16 else (2e-6, 2e-6)
+    torch.testing.assert_close(storage.cpu(), expected, rtol=rtol, atol=atol)
+
+
+def test_log2_bfloat16_normals_and_domain(mojo_gpu: str):
+    normals = torch.arange(0x0080, 0x7F80, dtype=torch.int16).view(torch.bfloat16)
+    domain = torch.tensor(
+        [0.0, -0.0, -1.0, 1.0, 2.0, float("inf"), -float("inf"), float("nan"), 0.5],
+        dtype=torch.bfloat16,
+    )
+    data = torch.cat((normals, -normals, domain))
+    torch.testing.assert_close(
+        torch.log2(data.to(mojo_gpu)).cpu(),
+        torch.log2(data),
+        rtol=0.008,
+        atol=1e-5,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.bool])
+def test_log2_integral_promotion(mojo_gpu: str, dtype: torch.dtype):
+    data = torch.tensor([0, 1, 2, 8], dtype=dtype)
+    result = torch.log2(data.to(mojo_gpu))
+    assert result.dtype == torch.get_default_dtype()
+    torch.testing.assert_close(result.cpu(), torch.log2(data))
+
+
+def test_log2_out(mojo_gpu: str):
+    data = torch.tensor([0.5, 1, 2, 8]).to(mojo_gpu)
+    out = torch.empty(4).to(mojo_gpu)
+    result = torch.log2(data, out=out)
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.tensor([-1.0, 0.0, 1.0, 3.0]))

@@ -46,7 +46,7 @@ from abi import (
     v_tensor,
     view_strided,
 )
-from device import ctx_for, ctx_ptr
+from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall, loader
 from op_utils import MAX_RANK
 from ops_common import (
@@ -856,9 +856,14 @@ def _spec_matmul(
     materializing here would only hide those routes behind a transpose the
     kernel does not need.
     """
-    if a.stype != b.stype or not _is_float(a.dtype):
+    if a.stype != b.stype or (
+        not _is_float(a.dtype)
+        and not (a.dtype == DType.float64 and op == "MatmulSpec")
+    ):
         return None
     if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        return None
+    if a.dtype == DType.float64 and dev(a.device)[].api not in ("cuda", "hip"):
         return None
     var dims = List[Int]()
     if op == "BmmSpec":

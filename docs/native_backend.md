@@ -21,9 +21,14 @@ is then cached on disk (see "Three builds" below).
 
 ## Three builds
 
-Everything is compiled on demand into `eager_kernels/__mojocache__/native/`
-(`TORCH_MOJO_BACKEND_CACHE_DIR` moves the cache; it is contents-addressed so
-several checkouts can share it) and each build is keyed by the hash of every
+Everything is compiled on demand into the user's cache directory —
+`~/.cache/torch-mojo-backend/native/` on Linux (`XDG_CACHE_HOME` honored),
+`~/Library/Caches/torch-mojo-backend/native/` on macOS — so the builds
+outlive the venv and the checkout; `TORCH_MOJO_BACKEND_CACHE_DIR` moves the
+cache (it is contents-addressed so several checkouts share it, and nothing
+ever reaps it: a torch/mojo/max upgrade orphans every entry, so
+`torch-mojo-backend cache clean` wipes the directory when it grows, and
+`torch-mojo-backend cache dir` prints it). Each build is keyed by the hash of every
 source it compiles in, the toolchain versions and its `-D` defines — so
 touching `abi.mojo` invalidates every op extension, not just the backend.
 
@@ -66,7 +71,7 @@ classes, each forwarding to a Mojo function pointer:
 | file | what |
 |---|---|
 | `shim_dispatch.cpp` | `tmb_library_impl` / `tmb_library_impl_lazy`: registers a Mojo function (or a resolver that produces one at the first call) as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back, and caches the resolved kernel pointer. `tmb_call_op` calls any aten op from Mojo. |
-| `shim_runtime.cpp` | allocator (`c10::Allocator` over Mojo alloc/free), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
+| `shim_runtime.cpp` | allocator (`c10::DeviceAllocator` forwarding allocation and memory APIs to Mojo), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
 | `shim_autocast.cpp` | `AutocastPrivateUse1` as one boxed fallback with a policy table filled from torch's own CUDA op lists. |
 
 Three translation units compile in parallel: about 7 s wall cold.
@@ -78,7 +83,7 @@ Three translation units compile in parallel: about 7 s wall cold.
 | `backend.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
 | `registry.mojo` | `impl[op, "name"]`: registers the name behind a lazy trampoline in the backend, *or* is the selected op in that op's extension — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
-| `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, `record_stream` fences), transfers |
+| `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
 | `loader.mojo` | on-demand builds of op extensions and kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
 | `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
@@ -141,6 +146,70 @@ A new group file needs three things: the `register_<group>` list, the
 `_group[register_<group>](lib, "ops_<group>", prebuild)` line in
 `backend.mojo`.
 
+External operator namespaces use their own `tmb_library_new` handle and
+fully qualified registration names, such as `torchvision::roi_align`.
+The dispatcher accepts these implementations before the extension defining
+their schemas is imported. Qualified names also select `TMB_OP`; the loader
+escapes colons in extension filenames while retaining the full name in cache
+keys. Torchvision remains optional at runtime.
+
+The native detection groups are `ops_roi.mojo` (ROI align/pool, their
+position-sensitive variants, and backwards), `ops_nms.mojo` (non-maximum
+suppression), and `ops_deform_conv.mojo` (deformable convolution). They support
+float16/float32/float64 GPU inputs (float64 requires device support). ROI
+inputs are made contiguous; NMS declines non-contiguous inputs. ROI backward
+uses relaxed atomic scatter and
+honors PyTorch's deterministic-algorithms error/warning policy. NMS uses a
+stable device sort, device IoU masks, a host greedy pass, and device index
+gathering.
+
+Torchvision 0.26 CUDA autocast policies are included in the shim's generated
+table: NMS casts eligible inputs to float32 and returns int64 indices; ROI
+align/pool, PS-ROI align/pool, and deformable convolution compute in float32
+and restore the input dtype. As in upstream 0.26, autocast also converts ROI
+pool's argmax and PS-ROI's channel mapping; normal ROI/PS-ROI dispatch keeps
+these in int32. Float64 inputs are not narrowed.
+
+Deformable convolution composes deformable im2col with the existing Mojo
+GEMM routes. It supports independent convolution and offset groups, optional
+mask/bias, and gradients for input, weight, offset, mask, and bias. Its input
+gradient scatter follows upstream's nondeterminism policy. No vendor BLAS
+library is required.
+
+Arithmetic follows torchvision 0.26 CUDA, including its intermediate rounding:
+
+- NMS rounds half intersection widths/heights and each box's height difference
+  in half, then computes areas and IoU in float32. Double boxes retain double
+  IoU arithmetic. Every dtype uses a float32 threshold and strict `>`.
+- ROI align/pool and PS ROI align/pool use the input dtype for scale, geometry,
+  interpolation, pooling, and gradient contributions. Half products round
+  before additions; host scales round through float32 before half, matching
+  `c10::Half(float)`. Backward accumulates into the input dtype. ROI pool uses
+  ties-away coordinate rounding; PS pool follows CUDA's `roundf`, including
+  its float32 conversion for double coordinates.
+- Deformable convolution uses the input dtype for coordinates, interpolation,
+  mask products, and offset/mask gradient accumulation. Input-gradient weights
+  follow CUDA's promoted `std::abs` expression before rounding to the input
+  dtype. GEMM and bias reduction accumulate half inputs in float32; their
+  stored results are half. At large half coordinates, input gradients retain
+  CUDA's three-neighbor scan where adjacent integer indices round together.
+  Double arithmetic remains double.
+
+CUDA is the oracle where CPU differs: CPU NMS has no half kernel and compares
+against the original double threshold; CPU PS pool uses `round`, not `roundf`.
+CPU and CUDA can also differ in half gradients through accumulation order.
+Parallel backward scatter has CUDA's nondeterministic accumulation order, so
+general gradients need numeric comparison; the boundary regressions use
+order-independent exact comparisons.
+
+The CUDA-reference tests in `tests/native/test_torchvision_ops.py` accept
+`TORCHVISION_CUDA_REFERENCE_PYTHON=/path/to/cuda-venv/bin/python`. They try that
+interpreter first, then the current interpreter, `python`/`python3` on `PATH`,
+and `.venv-cuda`/`torch_cu*` environments in the working directory and its parent.
+Each candidate must import torch/torchvision, provide the detection CUDA kernels,
+and execute on a CUDA GPU. If none works, the skip reason lists each interpreter
+and its failure. Once selected, reference execution failures fail the test.
+
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
 (owned output), `ret_ref` (an input handed back: in-place ops),
@@ -190,9 +259,40 @@ the op decides whether to try another route or propagate.
 
 **Streams.** Ops launch on the device's current stream (`ctx_for`), so
 `with torch.Stream(...)` really moves execution. Memory is allocated on the
-current stream; a tensor used by another stream gets `record_stream`ed by
-torch (`recordDataPtrOnStream`), which the backend turns into an event the
-owner stream waits on before the buffer is released.
+current stream; callers using a tensor on another stream must record that
+use (`Tensor.record_stream`, or torch's internal `recordDataPtrOnStream`),
+which the backend turns into an event the owner stream waits on before
+the buffer is released.
+
+### Transfers
+
+`.to("mojo:j")` and `dst.copy_(src)` automatically use MAX
+`DeviceBuffer.enqueue_copy_from` for CUDA/HIP peer-capable pairs. Peer access
+is enabled lazily per ordered pair; success and failure are cached under the
+shim mutex. CPU, Metal, inaccessible pairs, and enable errors use host staging.
+ROCm correctness and performance remain unmeasured.
+
+Direct copies run on the destination's current stream, with MAX events in
+both directions and no host completion wait for either `non_blocking` value.
+Destination consumers are ordered after the copy; `.cpu()` and `.item()` wait
+for readback. Callers must order producers on unrelated streams.
+
+Original source, staging, and destination storage are recorded on their own
+device's current stream. At release, allocation-owner streams wait for those
+streams; MAX's reverse event fences the remote source read. Transfer errors
+drain both streams before release. A failed drain retains both devices'
+allocations until exit; pinned staging is retained unless completion is known.
+
+`.to` borrows contiguous, unchanged-dtype sources, otherwise packs/casts on
+the source, then restores destination memory format. `copy_` packs and moves
+before casting or copying into destination strides. Dtype pairs outside the
+fast cast kernel use CPU torch to preserve exact integer conversions.
+
+`TORCH_MOJO_BACKEND_TEST_PEER_COPY` and `TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD`
+are test-only hooks cached at initialization; unset leaves no-op checks.
+See `tests/native/test_peer_copy.py` for modes and usage.
+
+### Threads and fork
 
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
 ops need no locking of their own; the autograd engine's thread and the main
@@ -220,6 +320,122 @@ workers that only touch CPU tensors run normally
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count
 boxed-kernel calls per op (the `CallChecker` in `torch_mojo_backend/testing.py`
 uses them to assert that an op ran natively).
+
+## Memory accounting
+
+`torch.accelerator` memory APIs need torch 2.9+; `get_memory_info` needs 2.10+; this package requires torch 2.10+.
+
+`torch.mojo.memory_allocated(device=None)` reports the bytes of live tensor
+storage allocated by this backend, per device. Views, slices and
+`as_strided` share a storage and count once; a zero-byte storage counts
+nothing. CPU tensors, pinned host staging, foreign storage aliases and
+MAX's internal workspaces/context memory do not appear in these counters.
+Tensors on the MAX CPU device (the last mojo index) do count, under that
+index only. Releasing a storage decrements its device's counters when the
+block is handed back to MAX; MAX orders physical reuse on the owning stream.
+This happens at final storage release, before device synchronization, including
+when `record_stream` has fenced pending consumers; it does not wait for physical
+reuse or a host retirement queue.
+
+`memory_stats()` is a sorted `OrderedDict` with torch.cuda's keys;
+`memory_stats_as_nested_dict()` returns the same data before flattening.
+`memory_summary(abbreviated=False)` formats those counters. Every counter
+and reset lives in Mojo, serialized by the shim mutex. The C++ allocator
+only forwards and marshals torch's `DeviceStats`, so `torch.accelerator`'s
+memory APIs and Inductor's `MojoInterface.memory_allocated()` read the same
+accounting.
+
+Registration eagerly initializes MAX's contexts and the allocator, before any
+tensor allocation. Before `register_mojo_devices()` there is no `torch.mojo`
+module; after it, `initialized()` is true and even zero-usage queries validate
+their device arguments. There is no public registered-but-uninitialized window.
+
+| statistic | meaning here |
+|---|---|
+| `allocated_bytes.all` | live storage bytes (`current`), their high-water mark (`peak`), and cumulative bytes allocated/freed (`allocated`/`freed`) |
+| `allocation.all` | the same four counters, in nonempty storage allocations |
+| `requested_bytes.all` | equals allocated bytes: we do not round or split requests |
+| `reserved_bytes.all` | **equals allocated bytes**: there is no caching allocator of ours; MAX owns the arena and does not expose its reservation/slack |
+| `num_device_alloc`, `num_device_free` | successful buffer allocations/releases at our boundary with MAX, not driver malloc/free calls inside its arena |
+| `num_alloc_retries` | initial MAX allocation failures for which we drain the device and retry once |
+| `num_ooms` | allocations that still fail on that recovery path |
+
+`memory_reserved() - memory_allocated()` is therefore **structurally zero**.
+It does not measure MAX's cached slack as the corresponding CUDA expression
+measures torch's caching allocator. `small_pool`/`large_pool`, `segment`,
+`active*`, `inactive_split*`, `oversize_*`, `max_split_size` and
+`num_sync_all_streams` are also structurally zero: this backend has none
+of those allocator concepts. All measured activity is under `all`.
+
+`max_memory_allocated()` and `max_memory_reserved()` retain the peaks after
+a free. `reset_peak_memory_stats()` resets peaks to **current usage**, not
+zero. `reset_accumulated_memory_stats()` zeroes cumulative allocated/freed
+values and allocation/free/retry/OOM event counts, leaving current usage and
+peaks alone. Both resets apply only to the requested device.
+
+`empty_cache()` releases **completed pinned host staging buffers** on every
+device. Pending copies keep their buffers. It neither waits nor synchronizes,
+and cannot return cached device memory to the OS: **MAX owns the arena and
+exposes no trim API**. Calling it twice, or before any allocation, is safe;
+live storage and its accounting are unchanged.
+
+`mem_get_info()` (spelled `get_memory_info()` on `torch.accelerator`) returns
+MAX's current `(free, total)` bytes, which are separate from our per-process
+storage accounting. MAX may report its arena budget rather than physical
+installed VRAM: on the H100 tested, its total was smaller than `nvidia-smi`'s
+and a 4 MiB tensor consumed a 256 MiB arena chunk. These are MAX's numbers,
+not a replacement implementation of CUDA's `cudaMemGetInfo`. Do not infer
+our reserved bytes from `total - free`.
+The MAX CPU device returns **host** memory information (verified with MAX
+26.5 on Linux), not zeroes. A MAX implementation that supplies no memory
+capacity raises an explicit `NotImplementedError` instead of fabricating it.
+
+`get_device_properties()` returns a frozen dataclass, gathered and cached
+per device in Mojo through MAX, without CUDA/HIP probing in Python.
+`get_device_name()` and `get_device_capability()` read that cache. Field
+names follow torch.cuda where possible; `api`, `is_cpu`, `arch_name`, shared
+memory limits and `clock_rate` (kHz) provide additional MAX information.
+Unavailable fields are `None`. MAX's CPU returns zero for GPU attributes;
+we expose those as `None` because they do not describe CPU hardware.
+Compute capability is a CUDA `(major, minor)` pair; other APIs return
+`(None, None)`, with HIP's architecture in `gcnArchName` and `arch_name`.
+This dataclass is separate from Inductor's Triton autotuner property contract.
+`torch.accelerator.get_device_capability()` describes dtype support and raises
+the default unsupported-capability error, just as CUDA does; we do not advertise
+an unverified dtype support list.
+
+There is no counterpart for CUDA allocator snapshots/history
+(`memory_snapshot`, `_record_memory_history`, `_dump_snapshot`), raw caching
+allocator pointers (`caching_allocator_alloc`/`caching_allocator_delete`),
+per-process limits (`set_per_process_memory_fraction`), process listings
+(`list_gpu_processes`), or host/pinned allocator statistics
+(`host_memory_stats`, `host_memory_stats_as_nested_dict`,
+`reset_accumulated_host_memory_stats`, `reset_peak_host_memory_stats`).
+These names raise `NotImplementedError` with a reason: MAX does not expose
+the necessary arena/process information, and we keep counters, not allocation
+histories or a raw-pointer allocator.
+
+After `fork()`, memory queries/resets and property reads reject device use
+before taking the shim mutex, with the same `spawn` guidance as allocations.
+`empty_cache()` is a no-op. Torch's accelerator wrappers additionally return
+empty/zero statistics when `initialized()` is false, as it is in the child.
+## Host memory
+
+The device allocator owns MAX `DeviceBuffer` boxes; the pinned CPU allocator
+owns MAX `HostBuffer` boxes from `enqueue_create_host_buffer`, backed by
+page-locked host memory for the current mojo device's context. Mojo owns
+zero-byte requests too: a real allocation handle with a null data pointer,
+no host buffer and no registry entry, so `is_pinned()` stays false.
+`is_pinned()` forwards to Mojo, which queries its registry with a binary
+interval lookup, including interior pointers, then asks torch's CUDA hook
+through a C accessor on a miss. Torch's CPU factories prefer CUDA's pinned
+allocator when CUDA is available; `pin_memory=True` uses the Mojo allocator
+with a CPU torch build. The CUDA fallback accounts for factories preferring
+CUDA's allocator while queries prefer PrivateUse1.
+H2D still copies into a separate pinned staging buffer before asynchronous
+DMA on CUDA/HIP (CPU and Metal copy synchronously); D2H is synchronous.
+Direct asynchronous copies using pinned tensors need deferred frees tied to
+outstanding copies.
 
 ## Streams and events
 

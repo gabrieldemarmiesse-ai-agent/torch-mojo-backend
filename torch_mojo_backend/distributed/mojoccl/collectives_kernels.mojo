@@ -169,6 +169,8 @@ from std.sys import llvm_intrinsic
 from std.time import global_perf_counter_ns
 from std.utils import StaticTuple
 
+from env_vars import MOJOCCL_IB_TIMEOUT_S
+
 # ===-------------------------------------------------------------------=== #
 # Compile-time configuration
 # ===-------------------------------------------------------------------=== #
@@ -437,7 +439,7 @@ def spin_timeout_ns() -> UInt64:
     if g:
         return g.value().unsafe_bitcast[UInt64]()[unsafe_offset=0]
     var ns = UInt64(DEFAULT_TIMEOUT_NS)
-    var raw = getenv("MOJOCCL_IB_TIMEOUT_S", String(""))
+    var raw = getenv(MOJOCCL_IB_TIMEOUT_S, String(""))
     if raw != String(""):
         try:
             var seconds = Float64(raw)

@@ -122,7 +122,8 @@ void to_record(const c10::TypePtr& type, const c10::IValue& v, TmbValue& out, Ar
         present.reserve(list.size());
         for (size_t i = 0; i < list.size(); ++i) {
           std::optional<at::Tensor> e = list.get(i);
-          present.push_back(e.has_value());
+          // ATen indexing also represents an omitted axis as an undefined Tensor.
+          present.push_back(e.has_value() && e->defined());
           ts.push_back(e.has_value() ? *e : at::Tensor());
         }
         arena.tensor_ptrs.emplace_back();

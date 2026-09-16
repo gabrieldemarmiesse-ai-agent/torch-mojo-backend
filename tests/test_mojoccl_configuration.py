@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from scripts.compare_kernel_asm import find_entry_modules
+from torch_mojo_backend import env_vars
 
 PACKAGE = Path(__file__).resolve().parents[1] / "torch_mojo_backend"
 # Purpose analogs, not promises of identical value syntax/units. Reviewed
@@ -29,6 +30,10 @@ def test_mojoccl_has_only_reviewed_environment_controls():
     for path in PACKAGE.rglob("*"):
         if path.suffix not in {".mojo", ".py"}:
             continue
+        # The project-wide table also indexes standalone probe artifact paths.
+        # The control surface here is what the shipped library itself uses.
+        if path == PACKAGE / "env_vars.py":
+            continue
         source = path.read_text()
         found.update(re.findall(r"\bMOJOCCL_[A-Z0-9_]+", source))
     # This is a compiler-runtime global key, never read with getenv.
@@ -37,6 +42,12 @@ def test_mojoccl_has_only_reviewed_environment_controls():
         "New collective controls need a reviewed NCCL/RCCL purpose analog; "
         f"unexpected={found - SUPPORTED.keys()}, missing={SUPPORTED.keys() - found}"
     )
+    registry = PACKAGE / "distributed/mojoccl/env_vars.mojo"
+    registered = set(
+        re.findall(r"^comptime (MOJOCCL_\w+) =", registry.read_text(), re.M)
+    )
+    assert registered == set(SUPPORTED)
+    assert registered <= env_vars.OWN_ENV_VARS.keys()
 
 
 def test_asm_discovery_covers_collective_entry_and_skips_helpers(tmp_path: Path):

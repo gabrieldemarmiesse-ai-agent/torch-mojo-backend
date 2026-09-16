@@ -56,12 +56,25 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   be upstreamed and deleted. Never patch elsewhere;
   `tests/test_monkeypatching_is_centralized.py` enforces it for torch-rooted
   assignments.
+- **Environment variables**: every one this project reads is registered in
+  `torch_mojo_backend/env_vars.py`, with a line saying what setting it does.
+  `register_mojo_devices()` checks the user's environment against that table
+  and warns — with a "did you mean" — about anything spelled
+  `TORCH_MOJO_BACKEND_*` or `MOJOCCL_*` that is not in it, so a misspelled
+  knob stops being silent. The Mojo side keeps the names it reads as
+  constants in one file per compiled library
+  (`native/mojo/env_vars.mojo`, `distributed/mojoccl/env_vars.mojo`) rather
+  than as literals at the `getenv`. Adding a variable anywhere means adding
+  it to the Python table too; `tests/test_env_vars_are_registered.py` scans
+  the repo and fails otherwise.
 - **Debugging Tools**:
   - Environment variables for profiling and verbose output
   - Graph visualization when `TORCH_MOJO_BACKEND_VERBOSE=1`
   - Eager-mode kernel builds are described in `docs/mojo_extensions.md`:
     every specialization compiles inline at its first call and is cached in
-    `__mojocache__`; build timings print by default
+    `~/.cache/torch-mojo-backend/native/` (`TORCH_MOJO_BACKEND_CACHE_DIR`
+    moves it, `torch-mojo-backend cache dir` prints it,
+    `torch-mojo-backend cache clean` wipes it); build timings print by default
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
     `TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build fail on a compiler
     warning; off by default, on under pytest (`tests/conftest.py`), so keep
@@ -269,7 +282,7 @@ reads freed memory.
 If the op needs a new Mojo kernel, add it to the matching
 `eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
 one specialization per (OP, DTYPE) on first use and caches it in
-`__mojocache__`). You may import kernels from the modular repo inside the
+`~/.cache/torch-mojo-backend/native/`). You may import kernels from the modular repo inside the
 `.mojo` file (`from nn import ...`) only if they don't call
 CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
 available in the modular repo, write the kernel yourself.

@@ -78,6 +78,11 @@ from max.gpu.host import (
     DeviceStream,
 )
 
+from env_vars import (
+    MOJOCCL_BOOTSTRAP_TIMEOUT_S,
+    MOJOCCL_NVLS,
+    MOJOCCL_REGION_MB,
+)
 from driver import (
     HANDLE_BYTES,
     CompletionEvent,
@@ -325,7 +330,7 @@ or the surviving ranks block in `recvmsg` forever."""
 
 
 def _region_cap_bytes() -> Int:
-    var s = getenv("MOJOCCL_REGION_MB", String(DEFAULT_REGION_MB))
+    var s = getenv(MOJOCCL_REGION_MB, String(DEFAULT_REGION_MB))
     try:
         return Int(s) * 1024 * 1024
     except:
@@ -334,7 +339,7 @@ def _region_cap_bytes() -> Int:
 
 def _bootstrap_timeout_s() -> Float64:
     var s = getenv(
-        "MOJOCCL_BOOTSTRAP_TIMEOUT_S", String(DEFAULT_BOOTSTRAP_TIMEOUT_S)
+        MOJOCCL_BOOTSTRAP_TIMEOUT_S, String(DEFAULT_BOOTSTRAP_TIMEOUT_S)
     )
     try:
         return Float64(s)
@@ -361,7 +366,7 @@ def _nvls_enabled() -> Bool:
     some ranks bound a multicast region and others did not is not a
     configuration, it is a crash.
     """
-    return getenv("MOJOCCL_NVLS", String("1")) != String("0")
+    return getenv(MOJOCCL_NVLS, String("1")) != String("0")
 
 
 def _nvls_min_bytes() -> Int:

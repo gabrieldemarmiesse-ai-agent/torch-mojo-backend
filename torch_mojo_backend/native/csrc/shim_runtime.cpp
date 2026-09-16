@@ -10,6 +10,9 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/Allocator.h>
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator exists from 2.9
+#include <c10/core/CachingDeviceAllocator.h>
+#endif
 #include <pthread.h>
 #include <c10/core/GradMode.h>
 #include <c10/core/GeneratorImpl.h>
@@ -20,6 +23,7 @@
 #include <exception>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -107,14 +111,29 @@ int32_t alloc_device() {
 }
 
 // ---- allocator ---------------------------------------------------------------
-struct MojoAllocator final : c10::Allocator {
+struct MojoAllocator final
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator exists from 2.9
+    : c10::DeviceAllocator
+#else
+    : c10::Allocator
+#endif
+{
   static void deleter(void* p) {
-    if (!p) return;
+    // Same reasoning as the pinned deleter below: a forked child inherits
+    // tmb_mutex possibly locked by a thread that no longer exists, so taking
+    // it here deadlocks. The child cannot use the runtime anyway, and its
+    // copy of the block dies with it.
+    if (!p || tmb_in_bad_fork) return;
     Lock g(tmb_mutex);
     H.free(p);
   }
   c10::DataPtr allocate(size_t n) override {
     REQUIRE_READY();
+    // c10 uses size_t, but the Mojo hook takes a signed 64-bit Int. In
+    // particular, Storage.resize_(-1) reaches us as SIZE_MAX on PrivateUse1.
+    // Reject unrepresentable requests before calling MAX or touching stats.
+    TORCH_CHECK(n <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+                "mojo backend: allocation size cannot be represented as int64: ", n);
     Lock g(tmb_mutex);
     const int32_t dev = alloc_device();
     void* data = nullptr;
@@ -129,8 +148,92 @@ struct MojoAllocator final : c10::Allocator {
   void copy_data(void* dst, const void* src, size_t n) const override {
     HOOK(H.copy_data(dst, src, n, tls_device, tls_stream_slot(tls_device)));
   }
+  // The device guard also records streams on torch versions without DeviceAllocator.
+  void record_stream(const c10::DataPtr& ptr, c10::Stream stream) {
+    REQUIRE_READY();
+    if (!ptr.get_context() || ptr.get_deleter() != &deleter) return;
+    HOOK(H.record_stream(ptr.get_context(), stream.device_index(), stream.id()));
+  }
+#if TMB_TORCH_VERSION >= 209  // c10::DeviceAllocator's memory API exists from 2.9
+  bool initialized() override { return tmb_ready && !tmb_in_bad_fork; }
+  void emptyCache(c10::MempoolId_t = {0, 0}) override {
+    // Ignore non-default mempool_id: nothing in this backend creates pools.
+    if (tmb_in_bad_fork) return;
+    REQUIRE_READY();
+    HOOK(H.empty_cache());
+  }
+  void recordStream(const c10::DataPtr& ptr, c10::Stream stream) override {
+    record_stream(ptr, stream);
+  }
+  c10::CachingDeviceAllocator::DeviceStats getDeviceStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    int64_t slots[TMB_MEM_STATS_SLOTS]{};
+    HOOK(H.mem_stats(device, slots, TMB_MEM_STATS_SLOTS));
+    c10::CachingDeviceAllocator::DeviceStats stats{};
+    c10::CachingAllocator::Stat* fields[] = {
+        &stats.allocated_bytes[0], &stats.allocation[0],
+        &stats.requested_bytes[0], &stats.reserved_bytes[0]};
+    for (size_t i = 0; i < 4; ++i) {
+      fields[i]->current = slots[4 * i];
+      fields[i]->peak = slots[4 * i + 1];
+      fields[i]->allocated = slots[4 * i + 2];
+      fields[i]->freed = slots[4 * i + 3];
+    }
+    stats.num_device_alloc = slots[16];
+    stats.num_device_free = slots[17];
+    stats.num_alloc_retries = slots[18];
+    stats.num_ooms = slots[19];
+    return stats;
+  }
+  void resetAccumulatedStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    HOOK(H.mem_reset_accumulated(device));
+  }
+  void resetPeakStats(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    HOOK(H.mem_reset_peak(device));
+  }
+#endif
+#if TMB_TORCH_VERSION >= 210  // c10::DeviceAllocator::getMemoryInfo exists from 2.10
+  std::pair<size_t, size_t> getMemoryInfo(c10::DeviceIndex device) override {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    tmb_thread_error().clear();
+    size_t free = 0, total = 0;
+    const int32_t rc = H.mem_get_info(device, &free, &total);
+    TORCH_CHECK_NOT_IMPLEMENTED(rc != 2, "mojo backend: ", tmb_thread_error());
+    TORCH_CHECK(rc == 0, "mojo backend: ", tmb_thread_error());
+    return {free, total};
+  }
+#endif
 };
 MojoAllocator g_allocator;
+
+struct MojoPinnedAllocator final : c10::Allocator {
+  static void deleter(void* p) {
+    // A vanished parent thread may own the mutex, and MAX's inherited buffers
+    // cannot be destroyed safely. Let child process exit reclaim its copy.
+    if (!p || tmb_in_bad_fork) return;
+    Lock g(tmb_mutex);
+    H.host_free(p);
+  }
+  c10::DataPtr allocate(size_t n) override {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    void* data = nullptr;
+    tmb_thread_error().clear();
+    void* handle = H.host_alloc(n, alloc_device(), &data);
+    TORCH_CHECK(handle, "mojo backend: failed to allocate ", n,
+                " bytes of pinned host memory (", tmb_thread_error(), ")");
+    return {data, handle, &deleter, c10::Device(c10::kCPU)};
+  }
+  // data != context here, which raw_allocate/raw_deallocate cannot express.
+  c10::DeleterFnPtr raw_deleter() const override { return nullptr; }
+  void copy_data(void* dst, const void* src, size_t n) const override {
+    std::memcpy(dst, src, n);
+  }
+};
+MojoPinnedAllocator g_pinned_allocator;
 
 // ---- generator: Philox (seed, offset) ------------------------------------------
 // `offset_` counts in curand's unit (one Philox4x32 block = 4), exactly like
@@ -219,8 +322,17 @@ struct MojoHooks final : at::PrivateUse1HooksInterface {
     return old;
   }
   c10::DeviceIndex maybeExchangeDevice(c10::DeviceIndex d) const override { return d < 0 ? getCurrentDevice() : exchangeDevice(d); }
-  bool isPinnedPtr(const void*) const override { return false; }
-  c10::Allocator* getPinnedMemoryAllocator() const override { return c10::GetAllocator(c10::kCPU); }
+  bool isPinnedPtr(const void* ptr) const override {
+    // tmb_internal.h forbids runtime access in a forked child.
+    if (tmb_in_bad_fork) return false;
+    if (!tmb_ready || !H.is_pinned_ptr) return false;
+    Lock g(tmb_mutex);
+    return H.is_pinned_ptr(ptr) != 0;
+  }
+  c10::Allocator* getPinnedMemoryAllocator() const override {
+    REQUIRE_READY();
+    return &g_pinned_allocator;
+  }
   at::Device getDeviceFromPtr(void* data) const override {
     Lock g(tmb_mutex);
     int32_t d = H.device_of_ptr(data);
@@ -348,8 +460,7 @@ struct MojoGuardImpl final : c10::impl::DeviceGuardImplInterface {
     HOOK(H.synchronize_device(di));
   }
   void recordDataPtrOnStream(const c10::DataPtr& p, const c10::Stream& s) const override {
-    if (!p.get_context() || p.get_deleter() != &MojoAllocator::deleter) return;  // not ours (e.g. from_blob)
-    HOOK(H.record_stream(p.get_context(), s.device_index(), s.id()));
+    g_allocator.record_stream(p, s);
   }
   double elapsedTime(void* e1, void* e2, const c10::DeviceIndex) const override {
     double ms = 0;
@@ -411,6 +522,19 @@ inline at::Tensor& T(TmbTensor t) { return *reinterpret_cast<at::Tensor*>(t); }
 
 extern "C" {
 
+int32_t tmb_device_properties(int32_t device, int64_t* out, int32_t n,
+                              char* text, int32_t text_cap) {
+  try {
+    REQUIRE_READY();
+    Lock g(tmb_mutex);
+    tmb_thread_error().clear();
+    return H.device_props(device, out, n, text, text_cap);
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
+
 int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
   try {
     TORCH_CHECK(hooks && hooks->size >= sizeof(TmbBackendHooks), "mojo backend: hook table too small");
@@ -423,6 +547,8 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
     // From here the runtime is up (every device context exists), so a child
     // of this process cannot use it: mark the child, see tmb_check_not_forked.
     pthread_atfork(nullptr, nullptr, [] { tmb_in_bad_fork = true; });
+    // init() is a no-op; flip Context's guard so the first is_pinned reaches us.
+    at::globalContext().lazyInitDevice(c10::DeviceType::PrivateUse1);
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
@@ -460,6 +586,9 @@ int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }
 int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
+int32_t tmb_cuda_is_pinned_ptr(const void* ptr) {
+  return at::globalContext().isPinnedPtr(ptr, c10::DeviceType::CUDA) ? 1 : 0;
+}
 TmbTensor tmb_tensor_retain(TmbTensor t) { return new at::Tensor(T(t)); }
 void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); }
 
@@ -620,5 +749,15 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
 }
 
 int32_t tmb_default_dtype(void) { return static_cast<int32_t>(c10::typeMetaToScalarType(c10::get_default_dtype())); }
+
+int32_t tmb_alert_not_deterministic(const char* caller) {
+  try {
+    at::globalContext().alertNotDeterministic(caller);
+    return 0;
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
 
 }  // extern "C"

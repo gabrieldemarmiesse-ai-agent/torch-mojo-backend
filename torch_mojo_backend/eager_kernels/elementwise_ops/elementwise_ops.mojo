@@ -36,6 +36,7 @@ from std.math import (
     floor,
     log,
     log1p,
+    log2,
     pow,
     sin,
     sinh,
@@ -44,13 +45,14 @@ from std.math import (
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
     is_apple_gpu,
     simd_width_of,
     size_of,
 )
 from std.utils.index import IndexList
 from std.utils.coord import Coord
-from std.utils.numerics import isnan
+from std.utils.numerics import isnan, max_or_inf
 
 from max.algorithm import elementwise
 
@@ -345,6 +347,7 @@ comptime UOP_SQRT = 22
 comptime UOP_TAN = 23
 comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
+comptime UOP_LOG2 = 26
 
 
 @always_inline
@@ -380,6 +383,11 @@ def _float_unary[
         res = erf(a)
     comptime if op_code == UOP_LOG:
         res = log(a)
+    comptime if op_code == UOP_LOG2:
+        res = log2(a)
+        comptime if dtype == DType.float64:
+            # std.math.log2's double approximation omits the +inf case.
+            res = a.eq(max_or_inf[dtype]()).select(a, res)
     comptime if op_code == UOP_LOG1P:
         comptime if is_apple_gpu():
             # Mojo's log1p currently upcasts to float64, which Metal rejects.
@@ -420,6 +428,50 @@ def _float_unary[
         var inner = sqrt_2_over_pi * (a + 0.044715 * a * a * a)
         res = 0.5 * a * (1 + tanh(inner))
     return res
+
+
+def _unary_contig_kernel[
+    dtype: DType, op_code: Int
+](
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    size_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var size = Int(size_arg)
+    comptime is_direct = (
+        op_code == UOP_RELU
+        or op_code == UOP_ABS
+        or op_code == UOP_NEG
+        or op_code == UOP_SIGN
+    )
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var gstride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < size:
+        var a = in_ptr[unsafe_offset=i]
+        comptime if op_code == UOP_RELU:
+            out_ptr[unsafe_offset=i] = max(a, Scalar[dtype](0))
+        comptime if op_code == UOP_ABS:
+            out_ptr[unsafe_offset=i] = abs(a)
+        comptime if op_code == UOP_NEG:
+            # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
+            out_ptr[unsafe_offset=i] = -a
+        comptime if op_code == UOP_SIGN:
+            var zero = Scalar[dtype](0)
+            var pos = a.gt(zero).cast[dtype]()
+            var neg = a.lt(zero).cast[dtype]()
+            # NaN compares false on both sides -> 0, matching torch.
+            out_ptr[unsafe_offset=i] = pos - neg
+        comptime if not is_direct:
+            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+                var af = a.cast[DType.float32]()
+                out_ptr[unsafe_offset=i] = _float_unary[
+                    DType.float32, 1, op_code
+                ](af).cast[dtype]()
+            elif dtype.is_floating_point():
+                out_ptr[unsafe_offset=i] = _float_unary[dtype, 1, op_code](a)
+        i += gstride
 
 
 @always_inline
@@ -576,7 +628,35 @@ def _unary_elementwise[
             )
         else:
             comptime if has_accelerator():
-                comptime if dtype != DType.float64:
+                comptime if (
+                    op_code == UOP_LOG2
+                    and (dtype == DType.float32 or dtype == DType.bfloat16)
+                    and has_nvidia_gpu_accelerator()
+                ):
+                    if _flat_vec_unary[
+                        dtype,
+                        dtype,
+                        _unary_apply[dtype, _, op_code],
+                        "log2",
+                    ](Int(out_ptr), Int(in_ptr), size, ctx):
+                        return
+                comptime if (
+                    op_code == UOP_LOG2 and not has_apple_gpu_accelerator()
+                ):
+                    # Preserve log2's upstream scalar fallback, including
+                    # float64; the existing unary ops keep their 4-wide route.
+                    _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
+                        ctx,
+                        String(t"ew_unary_{op_code}_{dtype}"),
+                        _gs_blocks(size),
+                        1,
+                        1,
+                        GS_THREADS,
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
+                        Int64(size),
+                    )
+                elif dtype != DType.float64:
                     # 4-wide vector body when both pointers are vector-
                     # aligned; the scalar grid-stride tail in the same kernel
                     # keeps arbitrary sizes and unproven alignment correct.
@@ -1033,7 +1113,11 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
         or op_code == UOP_SIGN
     )
     var supported = False
-    comptime if is_direct:
+    comptime if op_code == UOP_LOG2:
+        supported = _dtype_supported[
+            [DType.float16, DType.bfloat16, DType.float32, DType.float64]
+        ](a.dtype)
+    elif is_direct:
         supported = _dtype_supported[SPEC_UNARY_DTYPES](a.dtype)
     else:
         supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
@@ -1324,6 +1408,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["LogSpec"]():
             _spec_dispatcher2[_unary_spec_into_go[UOP_LOG], "a unary spec op"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["Log2Spec"]():
+            _spec_dispatcher2[_unary_spec_into_go[UOP_LOG2], "a unary spec op"](
                 argv, argc
             )
             return 0

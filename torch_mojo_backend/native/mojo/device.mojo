@@ -6,13 +6,15 @@ MAX stream of the device's base context; kernels get the context *view* bound
 to it (`DeviceContext.select_stream`), so real multi-stream execution costs
 nothing at launch time. Everything here runs under the shim's mutex.
 """
-from std.ffi import _get_global_or_null, c_char, external_call
+from std.ffi import _get_global_or_null, c_char, c_size_t, external_call
 from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
 from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
+from std.os import getenv
 
 from max.gpu.host import (
+    DeviceAttribute,
     DeviceBuffer,
     DeviceContext,
     DeviceEvent,
@@ -20,13 +22,56 @@ from max.gpu.host import (
     HostBuffer,
 )
 
+from env_vars import (
+    TORCH_MOJO_BACKEND_TEST_PEER_COPY,
+    TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
+)
 from vendor import Vendor, raw_stream
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
+comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
 comptime EvP = Pointer[Ev, MutUntrackedOrigin]
 comptime StagingP = Pointer[Staging, MutUntrackedOrigin]
 comptime U8P = Pointer[UInt8, MutUntrackedOrigin]
 comptime POOL_STREAMS = 4
+
+
+struct MemoryStat(Copyable, Movable):
+    var current: Int64
+    var peak: Int64
+    var allocated: Int64
+    var freed: Int64
+
+    def __init__(out self):
+        self.current = 0
+        self.peak = 0
+        self.allocated = 0
+        self.freed = 0
+
+    def add(mut self, n: Int64):
+        self.current += n
+        self.peak = max(self.peak, self.current)
+        self.allocated += n
+
+    def remove(mut self, n: Int64):
+        self.current -= n
+        self.freed += n
+
+    def reset_accumulated(mut self):
+        self.allocated = 0
+        self.freed = 0
+
+    def write(self, dst: Pointer[Int64, MutUntrackedOrigin]):
+        dst[unsafe_offset=0] = self.current
+        dst[unsafe_offset=1] = self.peak
+        dst[unsafe_offset=2] = self.allocated
+        dst[unsafe_offset=3] = self.freed
+
+
+@fieldwise_init
+struct Properties(Movable):
+    var values: List[Int64]
+    var text: String
 
 
 def _warn(what: StaticString, e: Error):
@@ -45,6 +90,15 @@ struct Dev(Movable):
     var pool: List[Int]
     var pool_next: Int
     var staging: List[Int]  # pending pageable-H2D staging boxes (addresses)
+    var allocated_bytes: MemoryStat
+    var allocation: MemoryStat
+    var num_device_alloc: Int64
+    var num_device_free: Int64
+    var num_alloc_retries: Int64
+    var num_ooms: Int64
+    var properties: Optional[Properties]
+    var peers: Dict[Int, Bool]  # access from this device to each peer
+    var quarantine: Bool  # failed drain: allocations must not be reused
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -59,6 +113,15 @@ struct Dev(Movable):
         self.pool = List[Int]()
         self.pool_next = 0
         self.staging = List[Int]()
+        self.allocated_bytes = MemoryStat()
+        self.allocation = MemoryStat()
+        self.num_device_alloc = 0
+        self.num_device_free = 0
+        self.num_alloc_retries = 0
+        self.num_ooms = 0
+        self.properties = None
+        self.peers = Dict[Int, Bool]()
+        self.quarantine = False
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -72,6 +135,9 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
+    var test_peer_copy: String
+    var test_peer_gate: Int
+    var pinned: List[Int]  # Pinned box addresses, sorted by buffer base
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -129,8 +195,22 @@ def init_backend() raises -> Int:
     for i in range(n):
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
+    var gate = getenv(TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD)
+    var gate_fd = Int(gate) if gate != "" else -1
+    var modes = getenv(TORCH_MOJO_BACKEND_TEST_PEER_COPY)
+    # Delimit once so mode checks match whole tokens without getenv or splitting.
+    var test_peer_copy = "," + modes + "," if modes != "" else ""
     var box = unsafe_alloc[Backend](1)
-    box.unsafe_write(Backend(devs^, vendor^, n))
+    box.unsafe_write(
+        Backend(
+            devs^,
+            vendor^,
+            n,
+            test_peer_copy^,
+            gate_fd,
+            List[Int](),
+        )
+    )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
@@ -151,6 +231,7 @@ def init_backend() raises -> Int:
 struct Buf(Movable):
     var buf: DeviceBuffer[DType.uint8]
     var device: Int
+    var nbytes: Int
     var stream: Int  # owner stream: where MAX orders the release
     var users: List[Int]  # other streams that used the buffer (record_stream)
 
@@ -171,7 +252,12 @@ def _create_retry(
     except e:
         for i in range(len(d[].views)):
             d[].views[i].synchronize()
-        return _create(ctx, nbytes)
+        d[].num_alloc_retries += 1
+        try:
+            return _create(ctx, nbytes)
+        except retry_error:
+            d[].num_ooms += 1
+            raise retry_error^
 
 
 def h_alloc(
@@ -186,7 +272,14 @@ def h_alloc(
         var buf = _create_retry(d, ctx, nbytes)
         data[] = Int(buf.unsafe_ptr())
         var box = unsafe_alloc[Buf](1)
-        box.unsafe_write(Buf(buf^, Int(device), Int(stream), List[Int]()))
+        box.unsafe_write(
+            Buf(buf^, Int(device), nbytes, Int(stream), List[Int]())
+        )
+        d[].allocated_bytes.add(Int64(nbytes))
+        d[].allocation.add(1)
+        d[].num_device_alloc += 1
+        if be()[].test_peer_copy != "":
+            print("P2P_ALLOC", Int(device), data[], nbytes)
         return Int(box)
     except e:
         set_error(String(e))
@@ -197,6 +290,10 @@ def h_free(handle: Int) abi("C"):
     if handle == 0:
         return
     var box = BufP(unsafe_from_address=handle)
+    if be()[].devices[box[].device].quarantine:
+        if be()[].test_peer_copy != "":
+            print("P2P_RETAIN", box[].device, Int(box[].buf.unsafe_ptr()))
+        return
     # MAX releases the block stream-ordered on the OWNER stream only. Every
     # other stream that used it (torch.Tensor.record_stream) gets fenced now,
     # at release time: the owner waits for all of that stream's work so far.
@@ -211,9 +308,265 @@ def h_free(handle: Int) abi("C"):
             # let MAX reuse memory another stream may still be reading.
             set_error(String(e))
             return
+    # Account for storage returned to MAX, whose own arena and stream-ordered
+    # release are opaque to us. A deliberately leaked block above stays live.
+    ref d = be()[].devices[box[].device]
+    d.allocated_bytes.remove(Int64(box[].nbytes))
+    d.allocation.remove(1)
+    d.num_device_free += 1
+    if be()[].test_peer_copy != "":
+        print("P2P_FREE", box[].device, Int(box[].buf.unsafe_ptr()))
     var moved = box.unsafe_take_pointee()
     box.unsafe_free()
     _ = moved^
+
+
+def h_mem_stats(
+    device: Int32, dst: Pointer[Int64, MutUntrackedOrigin], n: Int32
+) abi("C"):
+    try:
+        var d = dev(Int(device))
+        if n != 20:
+            raise Error("memory stats ABI mismatch: expected 20 slots")
+        # tmb.h's flat contract. No rounding, splitting or arena of our own:
+        # requested and reserved equal allocated, entirely in the 'all' pool.
+        d[].allocated_bytes.write(dst)
+        d[].allocation.write(dst.unsafe_offset(4))
+        d[].allocated_bytes.write(dst.unsafe_offset(8))
+        d[].allocated_bytes.write(dst.unsafe_offset(12))
+        dst[unsafe_offset=16] = d[].num_device_alloc
+        dst[unsafe_offset=17] = d[].num_device_free
+        dst[unsafe_offset=18] = d[].num_alloc_retries
+        dst[unsafe_offset=19] = d[].num_ooms
+    except e:
+        set_error(String(e))
+
+
+def h_mem_reset_peak(device: Int32) abi("C"):
+    try:
+        var d = dev(Int(device))
+        d[].allocated_bytes.peak = d[].allocated_bytes.current
+        d[].allocation.peak = d[].allocation.current
+    except e:
+        set_error(String(e))
+
+
+def h_mem_reset_accumulated(device: Int32) abi("C"):
+    try:
+        var d = dev(Int(device))
+        d[].allocated_bytes.reset_accumulated()
+        d[].allocation.reset_accumulated()
+        d[].num_device_alloc = 0
+        d[].num_device_free = 0
+        d[].num_alloc_retries = 0
+        d[].num_ooms = 0
+    except e:
+        set_error(String(e))
+
+
+def h_empty_cache() abi("C"):
+    # Only release completed host staging buffers. MAX owns the device arena
+    # and exposes no trim API; never synchronize to imitate a cache flush.
+    for i in range(len(be()[].devices)):
+        _drain_staging(
+            Pointer(to=be()[].devices[i]).unsafe_origin_cast[
+                MutUntrackedOrigin
+            ]()
+        )
+
+
+def h_mem_get_info(
+    device: Int32,
+    free: Pointer[c_size_t, MutUntrackedOrigin],
+    total: Pointer[c_size_t, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    try:
+        var d = dev(Int(device))
+        var info: Tuple[c_size_t, c_size_t]
+        try:
+            info = d[].ctx.get_memory_info()
+        except e:
+            set_error(
+                "MAX "
+                + d[].api
+                + " device memory information is unavailable: "
+                + String(e)
+            )
+            return 2
+        if info[1] == 0:
+            set_error("MAX does not expose memory capacity on this device")
+            return 2
+        free[] = info[0]
+        total[] = info[1]
+        return 0
+    except e:
+        set_error(String(e))
+        return 1
+
+
+def _attribute(ctx: DeviceContext, attr: DeviceAttribute) -> Int64:
+    try:
+        return Int64(ctx.get_attribute(attr))
+    except:
+        return -1
+
+
+def _properties(d: Pointer[Dev, MutUntrackedOrigin]) -> Properties:
+    var ctx = d[].ctx
+    var values = List[Int64]()
+    # Capability is CUDA-specific; HIP uses the architecture string instead.
+    values.append(
+        _attribute(ctx, DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) if d[].api
+        == "cuda" else -1
+    )
+    values.append(
+        _attribute(ctx, DeviceAttribute.COMPUTE_CAPABILITY_MINOR) if d[].api
+        == "cuda" else -1
+    )
+    var total = Int64(-1)
+    try:
+        var info = ctx.get_memory_info()
+        if info[1] > 0:
+            total = Int64(info[1])
+    except:
+        # A MAX runtime that cannot report capacity leaves it unknown; the
+        # properties call itself still succeeds, and mem_get_info() is the
+        # entry point that surfaces the error.
+        total = Int64(-1)
+    values.append(total)
+    var attrs: List[DeviceAttribute] = [
+        DeviceAttribute.MULTIPROCESSOR_COUNT,
+        DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR,
+        DeviceAttribute.WARP_SIZE,
+        DeviceAttribute.MAX_REGISTERS_PER_MULTIPROCESSOR,
+        DeviceAttribute.MAX_THREADS_PER_BLOCK,
+        DeviceAttribute.MAX_REGISTERS_PER_BLOCK,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_BLOCK,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+        DeviceAttribute.MAX_BLOCKS_PER_MULTIPROCESSOR,
+        DeviceAttribute.CLOCK_RATE,
+        DeviceAttribute.MAX_GRID_DIM_X,
+    ]
+    for attr in attrs:
+        # MAX CPU returns successful zeroes for GPU attributes. They do not
+        # describe CPU hardware, so expose them as unknown, not as capacities.
+        values.append(-1 if d[].is_cpu else _attribute(ctx, attr))
+    values.append(Int64(d[].is_cpu))
+    var arch: String
+    try:
+        arch = ctx.arch_name()
+    except:
+        # Only AMD reports one; elsewhere the empty string means "no gfx
+        # architecture", which Python exposes as None.
+        arch = String()
+    var text = ctx.name() + "\0" + d[].api + "\0" + arch + "\0"
+    return Properties(values^, text^)
+
+
+def h_device_props(
+    device: Int32,
+    dst: Pointer[Int64, MutUntrackedOrigin],
+    n: Int32,
+    text: Pointer[c_char, MutUntrackedOrigin],
+    text_cap: Int32,
+) abi("C") -> Int32:
+    try:
+        var d = dev(Int(device))
+        if n != 16:
+            raise Error("device properties ABI mismatch: expected 16 slots")
+        if not d[].properties:
+            d[].properties = _properties(d)
+        ref props = d[].properties.value()
+        if Int(text_cap) < props.text.byte_length():
+            raise Error("device properties text buffer too small")
+        for i in range(16):
+            dst[unsafe_offset=i] = props.values[i]
+        unsafe_memcpy(
+            dest=text,
+            src=props.text.as_c_string_slice().unsafe_ptr(),
+            count=props.text.byte_length(),
+        )
+        return 0
+    except e:
+        set_error(String(e))
+        return 1
+
+
+@fieldwise_init
+struct Pinned(Movable):
+    var buf: Optional[HostBuffer[DType.uint8]]
+    var base: Int
+    var nbytes: Int
+    var device: Int  # host memory is not necessarily portable across devices
+
+
+def _pinned_lower_bound(base: Int) -> Int:
+    ref blocks = be()[].pinned
+    var lo = 0
+    var hi = len(blocks)
+    while lo < hi:
+        var mid = lo + (hi - lo) // 2
+        if PinnedP(unsafe_from_address=blocks[mid])[].base < base:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def h_host_alloc(
+    nbytes: Int, device: Int32, data: Pointer[Int, MutUntrackedOrigin]
+) abi("C") -> Int:
+    try:
+        var index = Int(device)
+        if index < 0 or index >= len(be()[].devices):
+            index = len(be()[].devices) - 1
+        var buf = Optional[HostBuffer[DType.uint8]]()
+        var base = 0
+        if nbytes != 0:
+            var ctx = dev(index)[].ctx
+            buf = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
+            base = Int(buf.value().unsafe_ptr())
+        # Zero bytes still need a handle to free, but have no address to pin.
+        var box = unsafe_alloc[Pinned](1)
+        box.unsafe_write(Pinned(buf^, base, nbytes, index))
+        if nbytes != 0:
+            be()[].pinned.insert(_pinned_lower_bound(base), Int(box))
+        data[] = base
+        return Int(box)
+    except e:
+        set_error(String(e))
+        return 0
+
+
+def h_host_free(handle: Int) abi("C"):
+    if handle == 0:
+        return
+    var box = PinnedP(unsafe_from_address=handle)
+    if box[].nbytes != 0:
+        ref blocks = be()[].pinned
+        var i = _pinned_lower_bound(box[].base)
+        # A missing or mismatched handle must not remove another live allocation.
+        if i >= len(blocks) or blocks[i] != handle:
+            return
+        _ = blocks.pop(i)
+    # No async copies use this block yet. The async-transfer follow-up needs
+    # deferred free keyed on outstanding async copies before direct DMA.
+    var moved = box.unsafe_take_pointee()
+    box.unsafe_free()
+    _ = moved^
+
+
+def h_is_pinned_ptr(ptr: Int) abi("C") -> Int32:
+    ref blocks = be()[].pinned
+    var i = _pinned_lower_bound(ptr)
+    if i < len(blocks) and PinnedP(unsafe_from_address=blocks[i])[].base == ptr:
+        return 1
+    if i > 0:
+        var box = PinnedP(unsafe_from_address=blocks[i - 1])
+        if ptr - box[].base < box[].nbytes:
+            return 1
+    return external_call["tmb_cuda_is_pinned_ptr", Int32](ptr)
 
 
 def h_copy_data(
@@ -265,6 +618,103 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
     d.enqueue_copy_from(s)
     if ctx.api() == "cpu":
         ctx.synchronize()
+
+
+def _peer_access(device: Int, peer: Int) raises -> Bool:
+    var d = dev(device)
+    if peer in d[].peers:
+        return d[].peers[peer]
+    var other = dev(peer)
+    var enabled = False
+    if (d[].api == "cuda" or d[].api == "hip") and d[].api == other[].api:
+        try:
+            if ",host," not in be()[].test_peer_copy and d[].ctx.can_access(
+                other[].ctx
+            ):
+                if ",enable_error," in be()[].test_peer_copy:
+                    raise Error("injected peer enable failure")
+                d[].ctx.enable_peer_access(other[].ctx)
+                enabled = True
+        except e:
+            if be()[].test_peer_copy != "":
+                print("peer enable failed", String(e))
+            enabled = False
+    if be()[].test_peer_copy != "":
+        print("peer probe", device, peer, enabled)
+    d[].peers[peer] = enabled
+    return enabled
+
+
+def _test_peer_gate(p: Pointer[NoneType, MutAnyOrigin]):
+    # The test releases the pipe even on failure.
+    var byte = UInt8(0)
+    _ = external_call["read", Int](Int(p), Pointer(to=byte), 1)
+
+
+def _test_peer_submit(
+    dst_ctx: DeviceContext,
+    src_ctx: DeviceContext,
+    d: DeviceBuffer[DType.uint8],
+    s: DeviceBuffer[DType.uint8],
+) raises:
+    var mode = be()[].test_peer_copy
+    if ",gate," in mode:
+        dst_ctx.stream().enqueue_host_func(
+            _test_peer_gate,
+            Pointer[NoneType, MutAnyOrigin](
+                unsafe_from_address=be()[].test_peer_gate
+            ),
+        )
+    elif ",submit_error," in mode or ",drain_error," in mode:
+        dst_ctx.enqueue_wait_for(src_ctx)
+        dst_ctx.enqueue_copy_no_cross_stream_sync(d, s)
+        print("P2P_SUBMITTED", Int(d.unsafe_ptr()), Int(s.unsafe_ptr()))
+        raise Error("injected failure after DMA, before reverse event")
+
+
+def copy_peer(
+    dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
+) raises -> Bool:
+    """False requests host staging; caller fences storage and drains on error.
+    """
+    if nbytes == 0:
+        return True
+    if not _peer_access(dst_device, src_device):
+        if be()[].test_peer_copy != "":
+            print("peer copy host", dst_device, src_device)
+        return False
+    var dst_ctx = ctx_for(dst_device)
+    var src_ctx = ctx_for(src_device)
+    var d = wrap_raw(dst_ctx, dst, nbytes)
+    var s = wrap_raw(src_ctx, src, nbytes)
+    if be()[].test_peer_copy != "":
+        _test_peer_submit(dst_ctx, src_ctx, d, s)
+    d.enqueue_copy_from(s)
+    if be()[].test_peer_copy != "":
+        print("peer copy direct", dst_device, src_device)
+    _ = s^
+    _ = d^
+    return True
+
+
+def drain_copy(dst_device: Int, src_device: Int) -> Bool:
+    """Error cleanup only; a failed drain quarantines both devices' storage."""
+    var drained = True
+    for i in range(2):
+        var device = dst_device if i == 0 else src_device
+        try:
+            if ",drain_error," in be()[].test_peer_copy and i == 0:
+                raise Error("injected destination drain failure")
+            ctx_for(device).synchronize()
+            if be()[].test_peer_copy != "":
+                print("P2P_DRAINED", device)
+        except e:
+            _warn("transfer drain failed; retaining storage", e)
+            drained = False
+    if not drained:
+        be()[].devices[dst_device].quarantine = True
+        be()[].devices[src_device].quarantine = True
+    return drained
 
 
 def copy_to_host(
@@ -325,14 +775,24 @@ def copy_from_host(
         src=U8P(unsafe_from_address=host_ptr),
         count=nbytes,
     )
-    dst.enqueue_copy_from(host)
     var box = unsafe_alloc[Staging](1)
     box.unsafe_write(Staging(host^, Atomic[DType.int32](0)))
-    ctx.stream().enqueue_host_func(
-        _staging_done,
-        box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
-    )
+    # Own pinned staging before submission, including partial-submit errors.
     d[].staging.append(Int(box))
+    try:
+        dst.enqueue_copy_from(box[].buf)
+        ctx.stream().enqueue_host_func(
+            _staging_done,
+            box.unsafe_bitcast[NoneType]().unsafe_origin_cast[MutAnyOrigin](),
+        )
+    except e:
+        try:
+            ctx.synchronize()
+            box[].done.store(1)
+        except drain_error:
+            d[].quarantine = True
+            _warn("H2D drain failed; retaining staging", drain_error)
+        raise e
 
 
 def read_bytes_sync(
@@ -598,9 +1058,9 @@ def set_error(msg: String):
 
 
 def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
-    """The TmbBackendHooks struct (tmb.h): a u32 size then 23 function pointers.
+    """TmbBackendHooks (tmb.h): a u32 size padded to 8 bytes, then 31 pointers.
     """
-    comptime N = 24
+    comptime N = 32
     var t = unsafe_alloc[Int](N)
     for i in range(N):
         t[unsafe_offset=i] = 0
@@ -632,6 +1092,29 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     var f_evq: def(Int) thin abi("C") -> Int32 = h_event_query
     var f_evs: def(Int) thin abi("C") -> None = h_event_synchronize
     var f_eve: def(Int, Int) thin abi("C") -> Float64 = h_event_elapsed_ms
+    var f_stats: def(Int32, Pointer[Int64, MutUntrackedOrigin], Int32) thin abi(
+        "C"
+    ) -> None = h_mem_stats
+    var f_peak: def(Int32) thin abi("C") -> None = h_mem_reset_peak
+    var f_accum: def(Int32) thin abi("C") -> None = h_mem_reset_accumulated
+    var f_empty: def() thin abi("C") -> None = h_empty_cache
+    var f_info: def(
+        Int32,
+        Pointer[c_size_t, MutUntrackedOrigin],
+        Pointer[c_size_t, MutUntrackedOrigin],
+    ) thin abi("C") -> Int32 = h_mem_get_info
+    var f_props: def(
+        Int32,
+        Pointer[Int64, MutUntrackedOrigin],
+        Int32,
+        Pointer[c_char, MutUntrackedOrigin],
+        Int32,
+    ) thin abi("C") -> Int32 = h_device_props
+    var f_host_alloc: def(
+        Int, Int32, Pointer[Int, MutUntrackedOrigin]
+    ) thin abi("C") -> Int = h_host_alloc
+    var f_host_free: def(Int) thin abi("C") -> None = h_host_free
+    var f_pinned: def(Int) thin abi("C") -> Int32 = h_is_pinned_ptr
     t[unsafe_offset=1] = Pointer(to=f_alloc).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f_free).unsafe_bitcast[Int]()[]
     t[unsafe_offset=3] = Pointer(to=f_copy).unsafe_bitcast[Int]()[]
@@ -652,6 +1135,15 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=18] = Pointer(to=f_evs).unsafe_bitcast[Int]()[]
     t[unsafe_offset=19] = Pointer(to=f_eve).unsafe_bitcast[Int]()[]
     # 20..22: prof_mark / prof_range_push / prof_range_pop stay NULL for now
+    t[unsafe_offset=23] = Pointer(to=f_stats).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=24] = Pointer(to=f_peak).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=25] = Pointer(to=f_accum).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=26] = Pointer(to=f_empty).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=27] = Pointer(to=f_info).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=28] = Pointer(to=f_props).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=29] = Pointer(to=f_host_alloc).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=30] = Pointer(to=f_host_free).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=31] = Pointer(to=f_pinned).unsafe_bitcast[Int]()[]
     return t
 
 
