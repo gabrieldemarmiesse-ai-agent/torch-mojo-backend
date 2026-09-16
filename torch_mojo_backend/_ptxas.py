@@ -601,7 +601,9 @@ def report(
     else:
         lines.append("  gpu       none visible")
     lines.append("")
-    lines.append("  ptxas found, newest first")
+    lines.append(
+        f"  ptxas found, newest first, use {ENV_VAR} to override the automatic selection"
+    )
     if not found:
         lines.append("    none")
     # Newest first; the ones whose version could not be read close the list.
@@ -616,8 +618,6 @@ def report(
         else:
             mark = "ok"
         detail = f"{ptxas.release}, from {ptxas.source}"
-        if ptxas.is_builtin:
-            detail += f" (release per MAX version, in force when {ENV_VAR} is unset)"
         lines.append(f"    [{mark:>4}] {ptxas.path}")
         if why is not None and ptxas.version is None:
             why = None  # the release column already says what went wrong
