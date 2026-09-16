@@ -123,15 +123,12 @@ into `max`, which is what runs when the variable is unset. It exports
 nothing Python can ask, so its release is looked up by MAX version
 (`BUILTIN_NVPTX` in `_ptxas.py`, from the MAX release notes: 26.2 moved it
 from CUDA 12.9 to 13.1) and its targets come from the architecture tables
-rather than a `--help`. The nvcc wheel is optional at runtime and pinned only
-in the development dependencies in `pyproject.toml`. Among the ones that fit,
-that wheel wins when installed — it is the combination this project's kernels
-are tested and tuned with, and a torch upgrade shipping a newer ptxas must
-not silently move an existing machine onto it. Any external ptxas that fits
-beats the built-in, whose release we assert rather than measure; the built-in
-beats a refusal, and picking it means *unsetting* the variable (the mark then
-reads `<max built-in>`), so an r580 box with a GPU newer than the pinned
-wheel runs on what MAX shipped instead of being told to install something.
+rather than a `--help`. Among the ones that fit, the newest no newer than
+the driver wins, then the newest outright; where it came from does not enter
+into it. Picking the built-in means *unsetting* the variable (the mark then
+reads `<max built-in>`). The nvcc wheel is optional at runtime and pinned only
+in the development dependencies in `pyproject.toml`; it is one candidate
+among the others.
 
 A child process inherits the environment and nothing else, so the pick is
 marked in it too (`TORCH_MOJO_BACKEND_PTXAS_AUTO`): without that, every

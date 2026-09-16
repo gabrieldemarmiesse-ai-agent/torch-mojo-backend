@@ -47,11 +47,11 @@ uv add torch-mojo-backend
 ```
 
 On NVIDIA GPUs the package discovers a `ptxas` assembler compatible with
-the driver and GPU from installed wheels or CUDA toolkits, falling back to
-the compiler MAX ships when only that one fits. The nvcc wheel
-is optional at runtime; only the development dependencies install
-`nvidia-cuda-nvcc-cu12==12.8.*`. Its assembler is preferred when installed
-and compatible. When no assembler fits, an error names the wheel to install.
+the driver and GPU among installed wheels, CUDA toolkits and the compiler
+MAX ships, and uses the newest that fits. The nvcc wheel is optional at
+runtime; only the development dependencies install
+`nvidia-cuda-nvcc-cu12==12.8.*`. When no assembler fits, an error names the
+wheel to install.
 `torch-mojo-backend ptxas` shows which assembler was picked and why, and
 `MODULAR_NVPTX_COMPILER_PATH` overrides it.
 

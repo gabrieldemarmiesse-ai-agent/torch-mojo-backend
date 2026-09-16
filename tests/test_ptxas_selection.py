@@ -31,6 +31,7 @@ SYSTEM_11_8 = _ptxas.Ptxas(
 )
 MISSING = _ptxas.Ptxas(Path("/nonexistent/ptxas"), _ptxas.ENV_VAR, None)
 BUILTIN_13_1 = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, (13, 1, 0))
+BUILTIN_12_9 = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, (12, 9, 0))
 
 # What each of those really lists in `ptxas --help`, abbreviated to the
 # architectures these tests reason about.
@@ -58,12 +59,16 @@ def test_a_cuda_13_assembler_is_refused_on_an_r570_driver(arches):
     assert "r580" in rejected[0][1] and "CUDA 12.8" in rejected[0][1]
 
 
-def test_the_pinned_wheel_wins_when_several_would_work(arches):
-    """Newest-wins would move an H100 that works today onto a torch wheel's
-    assembler the moment the driver got new enough for it."""
-    chosen, rejected = _ptxas.choose((13, 0), (90,), [TORCH_13_0, WHEEL_12_8])
-    assert chosen is WHEEL_12_8
+def test_the_newest_no_newer_than_the_driver_wins(arches):
+    chosen, rejected = _ptxas.choose((13, 0), (90,), [WHEEL_12_8, TORCH_13_0])
+    assert chosen is TORCH_13_0
     assert rejected == []
+    # 13.1 loads on an r580 driver reporting 13.0 (minor version
+    # compatibility), but one that needs no such leniency is preferred.
+    chosen, _ = _ptxas.choose((13, 0), (90,), [WHEEL_12_8, TORCH_13_0, BUILTIN_13_1])
+    assert chosen is TORCH_13_0
+    chosen, _ = _ptxas.choose((13, 1), (90,), [WHEEL_12_8, TORCH_13_0, BUILTIN_13_1])
+    assert chosen is BUILTIN_13_1
 
 
 def test_a_gpu_the_pinned_wheel_cannot_target_moves_to_a_newer_one(arches):
@@ -123,13 +128,12 @@ def test_the_builtin_compiler_is_judged_by_the_tables():
     assert "sm_70" in _ptxas.table_arches((12, 9, 0))
 
 
-def test_any_external_ptxas_that_fits_beats_the_builtin(arches):
-    """Its release is a table entry, not an answer it gave, so anything we
-    could actually ask ranks above it -- the pinned wheel most of all."""
-    chosen, _ = _ptxas.choose((13, 0), (90,), [BUILTIN_13_1, TORCH_13_0, WHEEL_12_8])
-    assert chosen is WHEEL_12_8
+def test_the_builtin_is_ranked_like_any_other(arches):
+    """Where an assembler came from does not enter the ranking."""
     chosen, _ = _ptxas.choose((13, 0), (110,), [BUILTIN_13_1, TORCH_13_0])
     assert chosen is TORCH_13_0
+    chosen, _ = _ptxas.choose((12, 9), (90,), [WHEEL_12_8, BUILTIN_12_9])
+    assert chosen is BUILTIN_12_9
 
 
 def test_the_builtin_is_bound_by_the_driver_like_any_other(arches):
@@ -281,12 +285,13 @@ def test_check_is_silent_without_an_nvidia_driver(monkeypatch):
 
 def test_check_rewrites_the_import_time_choice_for_the_gpu(monkeypatch):
     """Import time knows the driver but not the architecture: a Blackwell-next
-    box gets the pinned wheel at import and the right one here."""
+    box gets one choice at import and the right one here."""
     _check(
         monkeypatch,
         driver=(13, 0),
         devices=((110, "NVIDIA B300"),),
         found=[WHEEL_12_8, TORCH_13_0],
+        ours=str(WHEEL_12_8.path),
     )
     assert os.environ[_ptxas.ENV_VAR] == str(TORCH_13_0.path)
 
@@ -481,4 +486,3 @@ def test_the_wheels_ptxas_is_found_and_answers():
     found = {p.path: p for p in _ptxas.candidates()}
     assert wheel in found
     assert found[wheel].version is not None
-    assert found[wheel].is_pinned_wheel

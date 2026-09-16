@@ -17,14 +17,12 @@ constraints that pull in opposite directions:
 
 So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
 system CUDA, and the ``libnvptxcompiler`` MAX links into itself), ask each
-one its release and which architectures it targets, and keep the ones that
-satisfy both bounds -- preferring the wheel ``pyproject.toml`` pins for
-development, since that is what this project tests. MAX's own compiler is
-what runs when ``MODULAR_NVPTX_COMPILER_PATH`` is unset; it cannot be asked
-anything from Python, so its release is looked up by MAX version
-(:data:`BUILTIN_NVPTX`) and it ranks below every external ptxas that fits --
-but above a refusal, because on a machine where it is the only thing that
-fits, the right answer is to leave the variable alone.
+one its release and which architectures it targets, keep the ones that
+satisfy both bounds, and take the newest of those that is no newer than the
+driver. MAX's own compiler is a candidate like the others -- it is what runs
+when ``MODULAR_NVPTX_COMPILER_PATH`` is unset, and choosing it means leaving
+the variable unset. It cannot be asked anything from Python, so its release
+is looked up by MAX version (:data:`BUILTIN_NVPTX`).
 :func:`apply_default` does the driver half at import, before ``max`` is
 loaded; :func:`check` does the GPU half at ``register_mojo_devices()``, where
 the device can be asked what it is. When nothing qualifies the user gets
@@ -152,10 +150,6 @@ class Ptxas:
         if self.version is None:
             return "unusable"
         return f"CUDA {self.version[0]}.{self.version[1]}"
-
-    @property
-    def is_pinned_wheel(self) -> bool:
-        return self.source == f"{PINNED_WHEEL[0]} wheel"
 
     @property
     def is_builtin(self) -> bool:
@@ -367,9 +361,8 @@ def candidates() -> list[Ptxas]:
     """Every ptxas on this machine, in discovery order, each asked its version.
 
     The environment's own choice comes first so a report always explains the
-    setting in force; the pinned wheel comes before the rest so the tested
-    combination is what an equal-in-every-way comparison lands on; MAX's own
-    compiler comes last, since it is what runs when nothing is set.
+    setting in force; MAX's own compiler comes last, since it is what runs
+    when nothing is set.
     """
     found: list[tuple[Path, str]] = []
     explicit = explicit_choice()
@@ -509,12 +502,9 @@ def choose(
 ) -> tuple[Ptxas | None, list[tuple[Ptxas, str]]]:
     """The best usable ptxas, and every rejected one with its reason.
 
-    Among usable ones the pinned wheel wins -- it is the assembler this
-    project's kernels are tested and tuned with -- then any external ptxas
-    over MAX's built-in compiler (whose release is a table entry, not an
-    answer it gave), then one no newer than the driver, then the highest
-    release. Newest-wins would silently move an existing machine to a
-    different assembler the moment a torch wheel shipped one.
+    Among usable ones, one no newer than the driver wins over one relying
+    on minor version compatibility, then the highest release. Where it came
+    from -- a wheel, the system, MAX itself -- does not enter into it.
     """
     if found is None:
         found = candidates()
@@ -528,10 +518,10 @@ def choose(
     if not usable:
         return None, rejected
 
-    def rank(ptxas: Ptxas) -> tuple[bool, bool, bool, tuple[int, int, int]]:
+    def rank(ptxas: Ptxas) -> tuple[bool, tuple[int, int, int]]:
         version = ptxas.version or (0, 0, 0)
         no_newer = driver is None or version[:2] <= driver
-        return (ptxas.is_pinned_wheel, not ptxas.is_builtin, no_newer, version)
+        return (no_newer, version)
 
     return max(usable, key=rank), rejected
 

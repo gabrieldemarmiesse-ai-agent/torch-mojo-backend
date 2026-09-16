@@ -224,10 +224,9 @@ FOREIGN_ENV_VARS: dict[str, str] = {
     "CUDA_HOME": "A CUDA toolkit root, searched for a ptxas to assemble with.",
     "CUDA_PATH": "Older spelling of CUDA_HOME, searched the same way.",
     "MODULAR_NVPTX_COMPILER_PATH": (
-        "The ptxas MAX assembles with. Defaulted to the one on this machine "
-        "that suits both the driver and the GPU -- the nvidia-cuda-nvcc-cu12 "
-        "wheel's where it fits, and left unset for MAX's own compiler when "
-        "only that one does. An explicit value wins and is only checked; "
+        "The ptxas MAX assembles with. Defaulted to the newest on this "
+        "machine that suits both the driver and the GPU, and left unset when "
+        "that is MAX's own compiler. An explicit value wins and is only checked; "
         "`torch-mojo-backend ptxas` shows the choice and the alternatives."
     ),
     "ROCM_PATH": "ROCm install root, searched for the HIP runtime and librccl.",
