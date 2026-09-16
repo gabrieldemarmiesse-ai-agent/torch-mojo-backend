@@ -576,6 +576,7 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
 }
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
+int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }
 void tmb_tensor_bump_version(TmbTensor t) { T(t).unsafeGetTensorImpl()->bump_version(); }
 void* tmb_stream_native_handle(int32_t device, int64_t stream) {
@@ -676,6 +677,18 @@ int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes) {
 int32_t tmb_cpu_empty(int64_t ndim, const int64_t* sizes, int32_t dtype, TmbTensor* ret) {
   try {
     *ret = new at::Tensor(at::detail::empty_cpu(c10::IntArrayRef(sizes, ndim), static_cast<c10::ScalarType>(dtype)));
+    return 0;
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
+
+int32_t tmb_cpu_empty_pinned(int64_t ndim, const int64_t* sizes, int32_t dtype, int32_t device, TmbTensor* ret) {
+  try {
+    AllocDeviceScope scope(device);
+    *ret = new at::Tensor(at::detail::empty_generic(c10::IntArrayRef(sizes, ndim), &g_pinned_allocator,
+        c10::DispatchKeySet(c10::DispatchKey::CPU), static_cast<c10::ScalarType>(dtype), std::nullopt));
     return 0;
   } catch (const std::exception& e) {
     tmb_set_error(e.what());
