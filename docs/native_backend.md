@@ -111,16 +111,18 @@ assumed to be ordered.
 
 MAX bundles a CUDA 13 assembler, so on an r570 driver it refuses to create a
 device at all unless `MODULAR_NVPTX_COMPILER_PATH` names another one. The
-package always sets that variable: at import from the driver alone (`cuDriverGetVersion`
+package sets that variable when it finds a suitable assembler: at import
+from the driver alone (`cuDriverGetVersion`
 needs no `cuInit`, so it is safe before `max` loads and before any fork), then
 again at `register_mojo_devices()` from the architecture, which only the
 initialized driver can answer. Candidates are the `nvidia-cuda-nvcc*` wheels
 (`nvidia/cuda_nvcc/bin/ptxas` for cu12, `nvidia/cu13/bin/ptxas` for CUDA 13),
 torch's `torch/bin/ptxas`, Triton's, `$CUDA_HOME`, `$PATH` and
-`/usr/local/cuda*`. Among the ones that fit, the wheel `pyproject.toml` pins
-wins — it is the combination this project's kernels are tested and tuned
-with, and a torch upgrade shipping a newer ptxas must not silently move an
-existing machine onto it.
+`/usr/local/cuda*`. The nvcc wheel is optional at runtime and pinned only in
+the development dependencies in `pyproject.toml`. Among the ones that fit,
+that wheel wins when installed — it is the combination this project's kernels
+are tested and tuned with, and a torch upgrade shipping a newer ptxas must
+not silently move an existing machine onto it.
 
 A child process inherits the environment and nothing else, so the pick is
 marked in it too (`TORCH_MOJO_BACKEND_PTXAS_AUTO`): without that, every

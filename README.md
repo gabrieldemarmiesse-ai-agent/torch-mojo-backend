@@ -46,12 +46,13 @@ pip install torch-mojo-backend
 uv add torch-mojo-backend
 ```
 
-On NVIDIA GPUs the kernels are assembled with the CUDA 12.8 `ptxas` from the
-`nvidia-cuda-nvcc-cu12` wheel installed alongside, which every driver from
-r525 up loads. A GPU that needs a newer assembler than that (sm_110 and up)
-gets one from elsewhere on the machine if there is one, and otherwise a
-message naming the wheel to install; `torch-mojo-backend ptxas` shows which
-assembler was picked and why, and `MODULAR_NVPTX_COMPILER_PATH` overrides it.
+On NVIDIA GPUs the package discovers a `ptxas` assembler compatible with
+the driver and GPU from installed wheels or CUDA toolkits. The nvcc wheel
+is optional at runtime; only the development dependencies install
+`nvidia-cuda-nvcc-cu12==12.8.*`. Its assembler is preferred when installed
+and compatible. When no assembler fits, an error names the wheel to install.
+`torch-mojo-backend ptxas` shows which assembler was picked and why, and
+`MODULAR_NVPTX_COMPILER_PATH` overrides it.
 
 ## Quick Start
 

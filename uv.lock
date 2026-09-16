@@ -2397,7 +2397,6 @@ source = { editable = "." }
 dependencies = [
     { name = "max" },
     { name = "mojo" },
-    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "platformdirs" },
     { name = "tabulate" },
@@ -2420,6 +2419,7 @@ dev = [
     { name = "mojo-compiler" },
     { name = "mojo-compiler-mojo-libs" },
     { name = "mojo-lldb-libs" },
+    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pytest" },
@@ -2442,7 +2442,6 @@ dev = [
 requires-dist = [
     { name = "max", specifier = "==26.5" },
     { name = "mojo", specifier = "==1.0" },
-    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'", specifier = "==12.8.*" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'", specifier = ">=2.27" },
     { name = "platformdirs" },
     { name = "tabulate" },
@@ -2464,6 +2463,7 @@ dev = [
     { name = "mojo-compiler", specifier = "==1.0.0" },
     { name = "mojo-compiler-mojo-libs", specifier = "==1.0.0" },
     { name = "mojo-lldb-libs", specifier = "==1.0.0" },
+    { name = "nvidia-cuda-nvcc-cu12", marker = "sys_platform == 'linux'", specifier = "==12.8.*" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pytest", specifier = ">=8.4.1" },

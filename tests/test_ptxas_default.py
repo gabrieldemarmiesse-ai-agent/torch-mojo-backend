@@ -1,6 +1,6 @@
 """The CUDA 12.8 ptxas from the nvidia-cuda-nvcc-cu12 wheel is MAX's default
-assembler: ``torch_mojo_backend`` sets ``MODULAR_NVPTX_COMPILER_PATH`` to it
-at import unless the variable is already set.
+assembler in the development environment: ``torch_mojo_backend`` sets
+``MODULAR_NVPTX_COMPILER_PATH`` to it at import unless the variable is already set.
 
 That is the import-time half, which knows only the driver. What happens when
 the wheel's does not suit this machine's GPU is
@@ -15,7 +15,7 @@ import pytest
 from torch_mojo_backend import _ptxas
 
 pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="the nvcc wheel is a Linux dependency"
+    sys.platform != "linux", reason="the nvcc wheel is a Linux dev dependency"
 )
 
 

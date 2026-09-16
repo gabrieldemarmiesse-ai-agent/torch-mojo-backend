@@ -20,14 +20,6 @@ dependencies = [
     # itself, so it runs on any CUDA-12-capable driver (>= r525) regardless of
     # which CUDA version torch was built for.
     "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
-    # ptxas for the eager kernels and the MAX graph compiler on NVIDIA. MAX
-    # bundles the newest CUDA's ptxas, whose cubins need a driver at least as
-    # new (r580 for CUDA 13); the 12.8 wheel's ptxas assembles cubins that
-    # every r525+ driver loads, and targets every architecture up to sm_120.
-    # torch_mojo_backend/_ptxas.py prefers it, falls back to another assembler
-    # on the machine for a GPU it cannot target (sm_110 and up need CUDA 13),
-    # and says which wheel to install when nothing on the machine fits.
-    "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
 ]
 
 [project.scripts]
@@ -144,6 +136,10 @@ skip-magic-trailing-comma = true
 
 [dependency-groups]
 dev = [
+    # Tested ptxas for NVIDIA kernel development. Runtime installs discover
+    # a compatible assembler on the machine and explain how to install one
+    # when none fits; nvcc is not a runtime dependency.
+    "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
     # Bump the version of mojo/max here.  These come from PyPI like everything
     # else: mojo 1.0 is a stable release, so there is no nightly index and no
     # prerelease opt-in to keep in sync with them.

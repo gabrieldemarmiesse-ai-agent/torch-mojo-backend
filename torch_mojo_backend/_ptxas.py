@@ -18,7 +18,7 @@ constraints that pull in opposite directions:
 So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
 system CUDA), ask each one its release and which architectures it targets,
 and keep the ones that satisfy both bounds -- preferring the wheel
-``pyproject.toml`` pins, since that is the combination this project tests.
+``pyproject.toml`` pins for development, since that is what this project tests.
 :func:`apply_default` does the driver half at import, before ``max`` is
 loaded; :func:`check` does the GPU half at ``register_mojo_devices()``, where
 the device can be asked what it is. When nothing qualifies the user gets
@@ -49,8 +49,8 @@ TRITON_ENV_VAR = "TRITON_PTXAS_PATH"
 CHECK_ENV_VAR = "TORCH_MOJO_BACKEND_PTXAS_CHECK"
 AUTO_ENV_VAR = "TORCH_MOJO_BACKEND_PTXAS_AUTO"
 
-# What pyproject.toml pins, and what to tell a user to install. The cu12
-# series is the default because its cubins load on every r525+ driver; CUDA
+# Development pins and suggested optional installs. The cu12 series is the
+# default because its cubins load on every r525+ driver; CUDA
 # 13 renamed the project (`nvidia-cuda-nvcc-cu13` is a deprecated stub).
 WHEELS: dict[int, tuple[str, str]] = {
     11: ("nvidia-cuda-nvcc-cu11", "11.8.*"),
@@ -474,18 +474,6 @@ def install_advice(
         ]
     wheel, spec = WHEELS.get(major, PINNED_WHEEL)
     pinned = tuple(int(part) for part in spec.rstrip(".*").split("."))
-    if needed > pinned and wheel == PINNED_WHEEL[0]:
-        # Newer than what this package pins, so the resolver cannot be asked
-        # for it: the wheel replaces the pinned one in place, and every
-        # resolver says so. Naming that is better than an `uv add` that
-        # simply refuses.
-        return [
-            f'pip install --no-deps "{wheel}=={needed[0]}.{needed[1]}.*"'
-            f"  -- {names} is newer than the {wheel}=={PINNED_WHEEL[1]} this "
-            "package pins, so it goes in over the top (your resolver will "
-            f"note the mismatch), or point {ENV_VAR} at a CUDA "
-            f"{needed[0]}.{needed[1]} toolkit of your own."
-        ]
     spec = f">={needed[0]}.{needed[1]},<{major + 1}" if needed > pinned else f"=={spec}"
     advice = [f'pip install "{wheel}{spec}"  (uv add "{wheel}{spec}")']
     if major < 12:

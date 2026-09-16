@@ -17,7 +17,7 @@ import pytest
 from torch_mojo_backend import _ptxas
 
 pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="the nvcc wheel is a Linux dependency"
+    sys.platform != "linux", reason="the nvcc wheel is a Linux dev dependency"
 )
 
 WHEEL_12_8 = _ptxas.Ptxas(
@@ -123,13 +123,12 @@ def test_the_advice_names_the_wheel_for_this_driver():
     )
 
 
-def test_the_advice_does_not_ask_for_a_wheel_our_own_pin_forbids():
-    """`uv add "nvidia-cuda-nvcc-cu12>=12.9"` cannot resolve against this
-    package's own ==12.8.* pin, so advice that says it is advice that fails."""
+def test_the_advice_allows_a_wheel_newer_than_the_dev_pin():
+    """The development pin does not constrain a user's runtime install."""
     advice = _ptxas.install_advice((12, 9), (103,))[0]
-    assert "--no-deps" in advice
-    assert ">=12.9" not in advice and "uv add" not in advice
-    assert _ptxas.ENV_VAR in advice
+    assert 'pip install "nvidia-cuda-nvcc-cu12>=12.9,<13"' in advice
+    assert 'uv add "nvidia-cuda-nvcc-cu12>=12.9,<13"' in advice
+    assert "--no-deps" not in advice
 
 
 def test_the_advice_asks_for_the_other_wheel_when_it_is_not_the_pinned_one():
@@ -366,11 +365,13 @@ def test_the_arch_table_agrees_with_the_installed_assemblers(arch):
         )
 
 
-def test_no_assembler_is_run_at_import_without_an_nvidia_driver(monkeypatch):
+@pytest.mark.parametrize("wheel", [WHEEL_12_8.path, None])
+def test_no_assembler_is_run_at_import_without_an_nvidia_driver(monkeypatch, wheel):
     """On AMD, on Apple, on a CPU-only box, every ptxas found would be a
     subprocess for nothing -- and one hung toolkit wrapper on a network mount
     would hold up the import for its timeout."""
     monkeypatch.setattr(_ptxas, "driver_cuda_version", lambda: None)
+    monkeypatch.setattr(_ptxas, "wheel_ptxas", lambda: wheel)
     monkeypatch.setattr(
         _ptxas,
         "_version_of",
@@ -379,7 +380,9 @@ def test_no_assembler_is_run_at_import_without_an_nvidia_driver(monkeypatch):
     monkeypatch.delenv(_ptxas.ENV_VAR, raising=False)
     monkeypatch.delenv(_ptxas.AUTO_ENV_VAR, raising=False)
     _ptxas.apply_default()
-    assert os.environ[_ptxas.ENV_VAR] == str(_ptxas.wheel_ptxas())
+    expected = str(wheel) if wheel is not None else None
+    assert os.environ.get(_ptxas.ENV_VAR) == expected
+    assert os.environ.get(_ptxas.AUTO_ENV_VAR) == expected
 
 
 def test_the_wheels_ptxas_is_found_and_answers():
@@ -388,7 +391,9 @@ def test_the_wheels_ptxas_is_found_and_answers():
     architecture) is a candidate we are meant to survive, not a test
     failure -- it comes back with no version and is rejected by name."""
     wheel = _ptxas.wheel_ptxas()
-    assert wheel is not None, "the nvidia-cuda-nvcc-cu12 wheel is a Linux dependency"
+    assert wheel is not None, (
+        "the nvidia-cuda-nvcc-cu12 wheel is a Linux dev dependency"
+    )
     found = {p.path: p for p in _ptxas.candidates()}
     assert wheel in found
     assert found[wheel].version is not None
