@@ -4,7 +4,6 @@ from io import BytesIO
 import requests
 import torch
 from PIL import Image
-
 from torchvision import models, transforms
 
 from torch_mojo_backend import register_mojo_devices

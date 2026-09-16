@@ -7,11 +7,11 @@ import functools
 import io
 import math
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
