@@ -92,6 +92,42 @@ def test_metal_streams_share_the_default_stream(mojo_gpu: str, priority: int):
     assert device_module.current_stream() == default
 
 
+@pytest.mark.parametrize("shape", [(1024,), (257, 129)])
+def test_metal_independent_stream_workflows_read_back_without_explicit_sync(
+    mojo_gpu: str, shape: tuple[int, ...]
+):
+    """Both workflows finish before CPU readback without user-inserted fences.
+
+    Separately constructed Metal streams share the default queue, so CPU
+    readback outside their contexts is ordered after both producers. This
+    would require explicit ordering on a backend with independent queues.
+    """
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU stream semantics")
+    first = torch.Stream(device=mojo_gpu)
+    second = torch.Stream(device=mojo_gpu)
+    # Repeat so first-use kernel compilation cannot hide a readback race.
+    for iteration in range(2):
+        with first:
+            x = torch.full(shape, 2.0 + iteration, device=mojo_gpu)
+            first_result = (x * x + 3.0) * 0.5
+        with second:
+            y = torch.full(shape, -3.0 - iteration, device=mojo_gpu)
+            shifted = y * 2.0 - 1.0
+            second_result = shifted * shifted
+
+        # No synchronize(), query(), events or stream waits: blocking .cpu()
+        # copies on the default queue are the only readback barriers.
+        first_cpu = first_result.cpu()
+        second_cpu = second_result.cpu()
+        torch.testing.assert_close(
+            first_cpu, torch.full(shape, ((2.0 + iteration) ** 2 + 3.0) * 0.5)
+        )
+        torch.testing.assert_close(
+            second_cpu, torch.full(shape, ((-3.0 - iteration) * 2.0 - 1.0) ** 2)
+        )
+
+
 @pytest.mark.parametrize("enable_timing", [False, True])
 def test_metal_events_raise_on_record(mojo_gpu: str, enable_timing: bool):
     if device_module.get_device_properties(mojo_gpu).api != "metal":
