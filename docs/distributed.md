@@ -397,17 +397,17 @@ rounds, with the original NUMA binder adapted to four ranks per node.
 Each run contributes its mean printed tokens/s over steps 20–30; the
 interval is the Student-t 95% confidence interval across rounds.
 
-This clean-environment rerun used a1007+a1056, Adastra job 5417526,
-at implementation commit `e8759a2`.
+This clean-environment rerun used a[1007,1056], Adastra job 5417609,
+at implementation commit `4152e03`.
 All 18 runs completed with **no `MOJOCCL_*` variables**. Every log includes
 rank 0's environment; all eight C ranks verified the live defaults before
 timing. No compilation occurred during the series.
 
 | Stack | Tokens/s ± 95% CI | Ratio vs A ± 95% CI | Step 1 |
 |---|---:|---:|---:|
-| A — Stock torch + RCCL | 129,194.55 ± 125.57 | 1.000000 | 9.38 s |
-| B — Mojo backend + RCCL | 129,625.45 ± 575.11 | 1.003335 ± 0.004557 | 1.86 s |
-| C — Mojo backend + mojoccl | 128,896.36 ± 438.17 | 0.997692 ± 0.003527 | 1.90 s |
+| A — Stock torch + RCCL | 129,207.27 ± 215.09 | 1.000000 | 9.48 s |
+| B — Mojo backend + RCCL | 130,045.45 ± 570.36 | 1.006487 ± 0.004722 | 1.88 s |
+| C — Mojo backend + mojoccl | 128,214.55 ± 100.50 | 0.992317 ± 0.001826 | 1.90 s |
 
 Both native stacks used `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1`;
 stock left it unset. Both native ratios exceed the 0.95 target.
