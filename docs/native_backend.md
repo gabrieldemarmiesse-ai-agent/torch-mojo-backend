@@ -174,9 +174,32 @@ Deformable convolution composes deformable im2col with the existing Mojo
 GEMM routes. It supports independent convolution and offset groups, optional
 mask/bias, and gradients for input, weight, offset, mask, and bias. Its input
 gradient scatter follows upstream's nondeterminism policy. No vendor BLAS
-library is required. Half inputs use float32 coordinate and interpolation
-arithmetic with half stored intermediates. This can differ from torchvision
-CUDA's half-coordinate rounding near pixel boundaries.
+library is required.
+
+Arithmetic follows torchvision 0.26 CUDA, including its intermediate rounding:
+
+- NMS rounds half intersection widths/heights and each box's height difference
+  in half, then computes areas and IoU in float32. Double boxes retain double
+  IoU arithmetic. Every dtype uses a float32 threshold and strict `>`.
+- ROI align/pool and PS ROI align/pool use the input dtype for scale, geometry,
+  interpolation, pooling, and gradient contributions. Half products round
+  before additions; backward accumulates into the input dtype. ROI pool uses
+  ties-away coordinate rounding; PS pool follows CUDA's `roundf`, including
+  its float32 conversion for double coordinates.
+- Deformable convolution uses the input dtype for coordinates, interpolation,
+  mask products, and offset/mask gradient accumulation. Input-gradient weights
+  follow CUDA's promoted `std::abs` expression before rounding to the input
+  dtype. GEMM and bias reduction accumulate half inputs in float32; their
+  stored results are half. At large half coordinates, input gradients retain
+  CUDA's three-neighbor scan where adjacent integer indices round together.
+  Double arithmetic remains double.
+
+CUDA is the oracle where CPU differs: CPU NMS has no half kernel and compares
+against the original double threshold; CPU PS pool uses `round`, not `roundf`.
+CPU and CUDA can also differ in half gradients through accumulation order.
+Parallel backward scatter has CUDA's nondeterministic accumulation order, so
+general gradients need numeric comparison; the boundary regressions use
+order-independent exact comparisons.
 
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`

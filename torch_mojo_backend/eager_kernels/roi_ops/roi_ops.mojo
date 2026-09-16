@@ -5,9 +5,9 @@ from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, grid_dim, thread_idx
 from std.gpu.intrinsics import mulhi
 from std.sys import is_amd_gpu, is_nvidia_gpu, inlined_assembly
-from std.sys.info import has_nvidia_gpu_accelerator
 from std.utils.fast_div import FastDiv
 from std.math import ceil, ceildiv, floor
+from dtype_arithmetic import _product
 from std.memory import bitcast
 from op_utils import (
     Argv,
@@ -41,13 +41,18 @@ def _valid_roi[
     n: Int,
     scale: Scalar[acc],
 ) -> Bool:
-    var batch = rois[unsafe_offset=roi * 5].cast[acc]()
-    if not (batch >= 0 and batch < Scalar[acc](n)):
+    comptime coord = DType.float64 if dt == DType.float64 else DType.float32
+    var batch = rois[unsafe_offset=roi * 5].cast[coord]()
+    if not (batch >= 0 and batch < Scalar[coord](9223372036854775808.0)):
+        return False
+    if Int(batch) >= n:
         return False
     for axis in range(1, 5):
-        var coord = rois[unsafe_offset=roi * 5 + axis].cast[acc]() * scale
+        var value = _product(
+            rois[unsafe_offset=roi * 5 + axis].cast[acc](), scale
+        ).cast[coord]()
         # Invalid coordinates must never become pointer offsets.
-        if not (abs(coord) < Scalar[acc](1 << 60)):
+        if not (abs(value) < Scalar[coord](1 << 60)):
             return False
     return True
 
@@ -74,23 +79,44 @@ def _sample[
     h: Int,
     w: Int,
 ) -> Scalar[acc]:
-    if y < -1 or y > Scalar[acc](h) or x < -1 or x > Scalar[acc](w):
+    comptime coord = DType.float64 if acc == DType.float64 else DType.float32
+    if (
+        y < -1
+        or y.cast[coord]() > Scalar[coord](h)
+        or x < -1
+        or x.cast[coord]() > Scalar[coord](w)
+    ):
         return 0
     var (yl, yh, ly) = _axis(y, h)
     var (xl, xh, lx) = _axis(x, w)
     var hy = 1 - ly
     var hx = 1 - lx
     return (
-        hy * hx * input[unsafe_offset=base + yl * w + xl].cast[acc]()
-        + hy * lx * input[unsafe_offset=base + yl * w + xh].cast[acc]()
-        + ly * hx * input[unsafe_offset=base + yh * w + xl].cast[acc]()
-        + ly * lx * input[unsafe_offset=base + yh * w + xh].cast[acc]()
+        _product(
+            _product(hy, hx),
+            input[unsafe_offset=base + yl * w + xl].cast[acc](),
+        )
+        + _product(
+            _product(hy, lx),
+            input[unsafe_offset=base + yl * w + xh].cast[acc](),
+        )
+        + _product(
+            _product(ly, hx),
+            input[unsafe_offset=base + yh * w + xl].cast[acc](),
+        )
+        + _product(
+            _product(ly, lx),
+            input[unsafe_offset=base + yh * w + xh].cast[acc](),
+        )
     )
 
 
 @always_inline
 def _round_away[dt: DType](value: Scalar[dt]) -> Int:
-    return Int(floor(value + 0.5)) if value >= 0 else Int(ceil(value - 0.5))
+    var magnitude = abs(value)
+    var whole = Int(magnitude)
+    var rounded = whole + Int(magnitude - Scalar[dt](whole) >= 0.5)
+    return rounded if value >= 0 else -rounded
 
 
 @always_inline
@@ -160,15 +186,23 @@ def _pool_bounds[
     if not _valid_roi(rois, roi, n, scale):
         return (-1, 0, 0, 0, 0)
     var batch = Int(rois[unsafe_offset=roi * 5])
-    var x0 = _round_away(rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale)
-    var y0 = _round_away(rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale)
-    var x1 = _round_away(rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale)
-    var y1 = _round_away(rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale)
+    var x0 = _round_away(
+        _product(rois[unsafe_offset=roi * 5 + 1].cast[acc](), scale)
+    )
+    var y0 = _round_away(
+        _product(rois[unsafe_offset=roi * 5 + 2].cast[acc](), scale)
+    )
+    var x1 = _round_away(
+        _product(rois[unsafe_offset=roi * 5 + 3].cast[acc](), scale)
+    )
+    var y1 = _round_away(
+        _product(rois[unsafe_offset=roi * 5 + 4].cast[acc](), scale)
+    )
     var bh = Scalar[acc](max(y1 - y0 + 1, 1)) / Scalar[acc](ph)
     var bw = Scalar[acc](max(x1 - x0 + 1, 1)) / Scalar[acc](pw)
-    var ys = min(max(y0 + Int(floor(Scalar[acc](by) * bh)), 0), h)
+    var ys = min(max(y0 + Int(floor(_product(Scalar[acc](by), bh))), 0), h)
     var ye = min(max(y0 + Int(ceil(Scalar[acc](by + 1) * bh)), 0), h)
-    var xs = min(max(x0 + Int(floor(Scalar[acc](bx) * bw)), 0), w)
+    var xs = min(max(x0 + Int(floor(_product(Scalar[acc](bx), bw))), 0), w)
     var xe = min(max(x0 + Int(ceil(Scalar[acc](bx + 1) * bw)), 0), w)
     return (batch, ys, ye, xs, xe)
 
@@ -244,13 +278,23 @@ def _align_forward[
             continue
         var batch = Int(rois[unsafe_offset=roi * 5])
         var offset = Scalar[acc](0.5) if aligned else Scalar[acc](0)
-        var x0 = rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale - offset
-        var y0 = rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale - offset
+        var x0 = (
+            _product(rois[unsafe_offset=roi * 5 + 1].cast[acc](), scale)
+            - offset
+        )
+        var y0 = (
+            _product(rois[unsafe_offset=roi * 5 + 2].cast[acc](), scale)
+            - offset
+        )
         var rw = (
-            rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale - offset - x0
+            _product(rois[unsafe_offset=roi * 5 + 3].cast[acc](), scale)
+            - offset
+            - x0
         )
         var rh = (
-            rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale - offset - y0
+            _product(rois[unsafe_offset=roi * 5 + 4].cast[acc](), scale)
+            - offset
+            - y0
         )
         if not aligned:
             rw = max(rw, Scalar[acc](1))
@@ -264,14 +308,15 @@ def _align_forward[
             for iy in range(gh):
                 var y = (
                     y0
-                    + Scalar[acc](by) * bh
-                    + (Scalar[acc](iy) + 0.5) * bh / Scalar[acc](gh)
+                    + _product(Scalar[acc](by), bh)
+                    + _product((Scalar[acc](iy) + 0.5), bh) / Scalar[acc](gh)
                 )
                 for ix in range(gw):
                     var x = (
                         x0
-                        + Scalar[acc](bx) * bw
-                        + (Scalar[acc](ix) + 0.5) * bw / Scalar[acc](gw)
+                        + _product(Scalar[acc](bx), bw)
+                        + _product((Scalar[acc](ix) + 0.5), bw)
+                        / Scalar[acc](gw)
                     )
                     value += _sample(
                         input, (batch * c + channel) * h * w, y, x, h, w
@@ -386,6 +431,7 @@ def _align_scatter[
     sampling64: Int64,
     aligned64: Int64,
 ):
+    comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     var aligned = aligned64 != 0
     var n = Int(n64)
     var c = Int(c64)
@@ -405,13 +451,23 @@ def _align_scatter[
             continue
         var batch = Int(rois[unsafe_offset=roi * 5])
         var offset = Scalar[acc](0.5) if aligned else Scalar[acc](0)
-        var x0 = rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale - offset
-        var y0 = rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale - offset
+        var x0 = (
+            _product(rois[unsafe_offset=roi * 5 + 1].cast[acc](), scale)
+            - offset
+        )
+        var y0 = (
+            _product(rois[unsafe_offset=roi * 5 + 2].cast[acc](), scale)
+            - offset
+        )
         var rw = (
-            rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale - offset - x0
+            _product(rois[unsafe_offset=roi * 5 + 3].cast[acc](), scale)
+            - offset
+            - x0
         )
         var rh = (
-            rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale - offset - y0
+            _product(rois[unsafe_offset=roi * 5 + 4].cast[acc](), scale)
+            - offset
+            - y0
         )
         if not aligned:
             rw = max(rw, Scalar[acc](1))
@@ -421,45 +477,54 @@ def _align_scatter[
         var gh = Int(sampling64) if sampling64 > 0 else Int(ceil(bh))
         var gw = Int(sampling64) if sampling64 > 0 else Int(ceil(bw))
         var grad = input[unsafe_offset=index].cast[acc]()
-        grad /= Scalar[acc](max(gh * gw, 1))
+        var samples = Scalar[acc](gh * gw)
         if batch >= 0 and batch < n:
             for iy in range(gh):
                 var y = (
                     y0
-                    + Scalar[acc](by) * bh
-                    + (Scalar[acc](iy) + 0.5) * bh / Scalar[acc](gh)
+                    + _product(Scalar[acc](by), bh)
+                    + _product((Scalar[acc](iy) + 0.5), bh) / Scalar[acc](gh)
                 )
                 for ix in range(gw):
                     var x = (
                         x0
-                        + Scalar[acc](bx) * bw
-                        + (Scalar[acc](ix) + 0.5) * bw / Scalar[acc](gw)
+                        + _product(Scalar[acc](bx), bw)
+                        + _product((Scalar[acc](ix) + 0.5), bw)
+                        / Scalar[acc](gw)
                     )
                     if (
                         y < -1
-                        or y > Scalar[acc](h)
+                        or y.cast[coord]() > Scalar[coord](h)
                         or x < -1
-                        or x > Scalar[acc](w)
+                        or x.cast[coord]() > Scalar[coord](w)
                     ):
                         continue
                     var (yl, yh, ly) = _axis(y, h)
                     var (xl, xh, lx) = _axis(x, w)
                     var base = (batch * c + channel) * h * w
-                    _add(
-                        output.unsafe_offset(base + yl * w + xl),
-                        (grad * (1 - ly) * (1 - lx)).cast[acc](),
+                    _ps_add(
+                        output,
+                        base + yl * w + xl,
+                        (grad * ((1 - ly) * (1 - lx)) / samples).cast[acc](),
+                        n * c * h * w,
                     )
-                    _add(
-                        output.unsafe_offset(base + yl * w + xh),
-                        (grad * (1 - ly) * lx).cast[acc](),
+                    _ps_add(
+                        output,
+                        base + yl * w + xh,
+                        (grad * ((1 - ly) * lx) / samples).cast[acc](),
+                        n * c * h * w,
                     )
-                    _add(
-                        output.unsafe_offset(base + yh * w + xl),
-                        (grad * ly * (1 - lx)).cast[acc](),
+                    _ps_add(
+                        output,
+                        base + yh * w + xl,
+                        (grad * (ly * (1 - lx)) / samples).cast[acc](),
+                        n * c * h * w,
                     )
-                    _add(
-                        output.unsafe_offset(base + yh * w + xh),
-                        (grad * ly * lx).cast[acc](),
+                    _ps_add(
+                        output,
+                        base + yh * w + xh,
+                        (grad * (ly * lx) / samples).cast[acc](),
+                        n * c * h * w,
                     )
         index += Int(grid_dim.x) * BLOCK
 
@@ -504,7 +569,7 @@ def _pool_scatter[
     bins: Int64,
     count: Int64,
 ):
-    comptime coord = DType.float32 if acc == DType.float16 else acc
+    comptime coord = DType.float64 if dt == DType.float64 else DType.float32
     var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
     while i < Int(count):
         var plane = i // Int(bins)
@@ -514,7 +579,8 @@ def _pool_scatter[
         var pixel = Int(argmax[unsafe_offset=i])
         if (
             batch_value >= 0
-            and batch_value < Scalar[coord](n)
+            and batch_value < Scalar[coord](9223372036854775808.0)
+            and Int(batch_value) < Int(n)
             and pixel >= 0
             and pixel < Int(hw)
         ):
@@ -537,10 +603,7 @@ def _pool_scatter[
 def _launch_backward[dt: DType, pool: Bool](argv: Argv, argc: Int) raises:
     if argc != 15:
         raise Error("ROI kernel expects 15 argument slots")
-    comptime half_pool = pool and dt == DType.float16 and has_nvidia_gpu_accelerator()
-    comptime acc = DType.float16 if half_pool else (
-        DType.float64 if dt == DType.float64 else DType.float32
-    )
+    comptime acc = dt
     var input = _make_ptr[dt](
         _raw_int(argv[unsafe_offset=0])
     ).as_unsafe_any_origin()
@@ -624,7 +687,7 @@ def _launch_backward[dt: DType, pool: Bool](argv: Argv, argc: Int) raises:
 def _enqueue_forward[
     dt: DType, pool: Bool, fast: Bool
 ](argv: Argv, blocks: Int, sm: Int) raises:
-    comptime acc = DType.float64 if dt == DType.float64 else DType.float32
+    comptime acc = dt
     var input = _make_ptr[dt](
         _raw_int(argv[unsafe_offset=0])
     ).as_unsafe_any_origin()
@@ -806,18 +869,34 @@ def _ps_pool_bounds[
     if not _valid_roi(rois, roi, n, scale):
         return (-1, 0, 0, 0, 0)
     var batch = Int(rois[unsafe_offset=roi * 5])
-    var x0 = _round_away(rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale)
-    var y0 = _round_away(rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale)
-    var x1 = _round_away(rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale)
-    var y1 = _round_away(rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale)
+    var x0 = _round_away(
+        (_product(rois[unsafe_offset=roi * 5 + 1].cast[acc](), scale)).cast[
+            DType.float32
+        ]()
+    )
+    var y0 = _round_away(
+        (_product(rois[unsafe_offset=roi * 5 + 2].cast[acc](), scale)).cast[
+            DType.float32
+        ]()
+    )
+    var x1 = _round_away(
+        (_product(rois[unsafe_offset=roi * 5 + 3].cast[acc](), scale)).cast[
+            DType.float32
+        ]()
+    )
+    var y1 = _round_away(
+        (_product(rois[unsafe_offset=roi * 5 + 4].cast[acc](), scale)).cast[
+            DType.float32
+        ]()
+    )
     var bh = Scalar[acc](max(y1 - y0, 1)) / Scalar[acc](ph)
     var bw = Scalar[acc](max(x1 - x0, 1)) / Scalar[acc](pw)
     # Upstream PS pooling clips forward to size-1, backward to size.
     var ymax = h if backward else h - 1
     var xmax = w if backward else w - 1
-    var ys = min(max(y0 + Int(floor(Scalar[acc](by) * bh)), 0), ymax)
+    var ys = min(max(y0 + Int(floor(_product(Scalar[acc](by), bh))), 0), ymax)
     var ye = min(max(y0 + Int(ceil(Scalar[acc](by + 1) * bh)), 0), ymax)
-    var xs = min(max(x0 + Int(floor(Scalar[acc](bx) * bw)), 0), xmax)
+    var xs = min(max(x0 + Int(floor(_product(Scalar[acc](bx), bw))), 0), xmax)
     var xe = min(max(x0 + Int(ceil(Scalar[acc](bx + 1) * bw)), 0), xmax)
     return (batch, ys, ye, xs, xe)
 
@@ -864,6 +943,7 @@ def _ps_roi[
     div_ph: SIMD[DType.uint32, 4],
     div_c: SIMD[DType.uint32, 4],
 ):
+    comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     var n = Int(n64)
     var c = Int(c64)
     var h = Int(h64)
@@ -914,13 +994,23 @@ def _ps_roi[
                             ]()
                     output[unsafe_offset=i] = (value / area).cast[out_dt]()
         else:
-            var x0 = rois[unsafe_offset=roi * 5 + 1].cast[acc]() * scale - 0.5
-            var y0 = rois[unsafe_offset=roi * 5 + 2].cast[acc]() * scale - 0.5
+            var x0 = (
+                _product(rois[unsafe_offset=roi * 5 + 1].cast[acc](), scale)
+                - 0.5
+            )
+            var y0 = (
+                _product(rois[unsafe_offset=roi * 5 + 2].cast[acc](), scale)
+                - 0.5
+            )
             var rw = (
-                rois[unsafe_offset=roi * 5 + 3].cast[acc]() * scale - 0.5 - x0
+                _product(rois[unsafe_offset=roi * 5 + 3].cast[acc](), scale)
+                - 0.5
+                - x0
             )
             var rh = (
-                rois[unsafe_offset=roi * 5 + 4].cast[acc]() * scale - 0.5 - y0
+                _product(rois[unsafe_offset=roi * 5 + 4].cast[acc](), scale)
+                - 0.5
+                - y0
             )
             var bh = rh / Scalar[acc](ph)
             var bw = rw / Scalar[acc](pw)
@@ -931,21 +1021,22 @@ def _ps_roi[
             for iy in range(gh):
                 var y = (
                     y0
-                    + Scalar[acc](by) * bh
-                    + (Scalar[acc](iy) + 0.5) * bh / Scalar[acc](gh)
+                    + _product(Scalar[acc](by), bh)
+                    + _product((Scalar[acc](iy) + 0.5), bh) / Scalar[acc](gh)
                 )
                 for ix in range(gw):
                     var x = (
                         x0
-                        + Scalar[acc](bx) * bw
-                        + (Scalar[acc](ix) + 0.5) * bw / Scalar[acc](gw)
+                        + _product(Scalar[acc](bx), bw)
+                        + _product((Scalar[acc](ix) + 0.5), bw)
+                        / Scalar[acc](gw)
                     )
                     comptime if backward:
                         if (
                             y < -1
-                            or y > Scalar[acc](h)
+                            or y.cast[coord]() > Scalar[coord](h)
                             or x < -1
-                            or x > Scalar[acc](w)
+                            or x.cast[coord]() > Scalar[coord](w)
                         ):
                             continue
                         var (yl, yh, ly) = _axis(y, h)
@@ -987,8 +1078,8 @@ def _ps_roi[
 def _enqueue_ps[
     dt: DType, pool: Bool, backward: Bool, fast: Bool
 ](argv: Argv, blocks: Int) raises:
-    comptime acc = DType.float64 if dt == DType.float64 else DType.float32
-    comptime out_dt = DType.float32 if backward and dt == DType.float16 and not has_nvidia_gpu_accelerator() else dt
+    comptime acc = dt
+    comptime out_dt = dt
     var input = _make_ptr[dt](
         _raw_int(argv[unsafe_offset=0])
     ).as_unsafe_any_origin()
@@ -1052,7 +1143,7 @@ def _launch_ps[
         raise Error("PS ROI kernel expects 15 argument slots")
     var ctx = _raw_ctx(argv[unsafe_offset=14])
     comptime if backward:
-        comptime out_dt = DType.float32 if dt == DType.float16 and not has_nvidia_gpu_accelerator() else dt
+        comptime out_dt = dt
         var count = (
             _raw_int(argv[unsafe_offset=4])
             * _raw_int(argv[unsafe_offset=5])

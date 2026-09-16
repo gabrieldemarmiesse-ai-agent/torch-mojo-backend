@@ -1,11 +1,11 @@
 """Deformable im2col, its derivatives, and convolution layout transforms."""
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, grid_dim, thread_idx
 from std.math import ceildiv, floor
 from max.gpu.primitives import block
-from roi_ops.roi_ops import _divisor, _divide
-from std.sys import has_nvidia_gpu_accelerator, is_amd_gpu, is_nvidia_gpu
+from roi_ops.roi_ops import _divisor, _divide, _ps_add
+from dtype_arithmetic import _product
+from std.sys import has_nvidia_gpu_accelerator
 from op_utils import (
     Argv,
     _make_ptr,
@@ -98,16 +98,6 @@ struct Geometry(DevicePassable, TrivialRegisterPassable):
 
 
 @always_inline
-def _scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _pixel[
     dt: DType, acc: DType, idx: DType = DType.int64
 ](
@@ -132,11 +122,12 @@ def _sample[
     z: Scalar[acc],
     p: Geometry,
 ) -> Tuple[Scalar[acc], Scalar[acc], Scalar[acc]]:
+    comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     if not (
         y >= -1
-        and y < Scalar[acc](Int(p.h))
+        and y.cast[coord]() < Scalar[coord](p.h)
         and z >= -1
-        and z < Scalar[acc](Int(p.w))
+        and z.cast[coord]() < Scalar[coord](p.w)
     ):
         return (0, 0, 0)
     var yl = Scalar[idx](floor(y))
@@ -150,15 +141,15 @@ def _sample[
     var value = Scalar[acc](0)
     if y > -1 and z > -1:
         value = (
-            (1 - ly) * (1 - lz) * a
-            + (1 - ly) * lz * b
-            + ly * (1 - lz) * c
-            + ly * lz * d
+            _product(_product(1 - ly, 1 - lz), a)
+            + _product(_product(1 - ly, lz), b)
+            + _product(_product(ly, 1 - lz), c)
+            + _product(_product(ly, lz), d)
         )
     return (
         value,
-        (1 - lz) * (c - a) + lz * (d - b),
-        (1 - ly) * (b - a) + ly * (d - c),
+        _product(lz, d - b) + _product(1 - lz, c - a),
+        _product(ly, d - c) + _product(1 - ly, b - a),
     )
 
 
@@ -225,7 +216,7 @@ def _im2col[
     dw: SIMD[DType.uint32, 4],
     dkw: SIMD[DType.uint32, 4],
 ):
-    comptime acc = DType.float64 if dt == DType.float64 else DType.float32
+    comptime acc = dt
     var s = Int(p.oh) * Int(p.ow)
     var ks = Int(p.kh) * Int(p.kw)
     var count = Int(p.c) * ks * Int(p.n) * s
@@ -308,23 +299,52 @@ def _im2col_pixel_loop[
                 var k = ky * kw + kx
                 var oi = oi0 + 2 * k * s
                 var y = (
-                    Float32(y0 + ky * dh)
-                    + off[unsafe_offset=Int(oi)].cast[DType.float32]()
+                    Scalar[dt](y0 + ky * dh)
+                    + off[unsafe_offset=Int(oi)].cast[dt]()
                 )
                 var z = (
-                    Float32(x0 + kx * dilw)
-                    + off[unsafe_offset=Int(oi + s)].cast[DType.float32]()
+                    Scalar[dt](x0 + kx * dilw)
+                    + off[unsafe_offset=Int(oi + s)].cast[dt]()
                 )
                 var m = mask[unsafe_offset=Int(mi0 + k * s)].cast[
-                    DType.float32
-                ]() if p.mask else Float32(1)
-                var v = _sample[dt, DType.float32, DType.int32](
-                    x, Int(base), y, z, p
-                )[0]
+                    dt
+                ]() if p.mask else Scalar[dt](1)
+                var v = _sample[dt, dt, DType.int32](x, Int(base), y, z, p)[0]
                 col[unsafe_offset=Int(ci0 + k * n * s)] = (v * m).cast[dt]()
                 kx += 1
             ky += 1
         i += Int32(grid_dim.x) * BLOCK
+
+
+@always_inline
+def _scatter_neighbors[
+    dt: DType, span: Int
+](
+    output: Pointer[Scalar[dt], MutAnyOrigin],
+    y: Scalar[dt],
+    z: Scalar[dt],
+    m: Scalar[dt],
+    v: Scalar[dt],
+    base: Int,
+    h: Int,
+    w: Int,
+    count: Int,
+):
+    comptime coord = DType.float64 if dt == DType.float64 else DType.float32
+    var yl = Int(floor(y))
+    var zl = Int(floor(z))
+    comptime start = -1 if span == 3 else 0
+    comptime for dy in range(span):
+        comptime for dx in range(span):
+            var yy = yl + dy + start
+            var xx = zl + dx + start
+            if yy >= 0 and yy < h and xx >= 0 and xx < w:
+                # std::abs promotes Half to float before the weight product.
+                var a = 1 - abs((y - Scalar[dt](yy)).cast[coord]())
+                var b = 1 - abs((z - Scalar[dt](xx)).cast[coord]())
+                if a > 0 and b > 0:
+                    var weight = (a * b).cast[dt]()
+                    _ps_add(output, base + yy * w + xx, m * weight * v, count)
 
 
 @__name("deformable_col2im_scatter_" + String(dt) + "_fast" + String(fast))
@@ -343,6 +363,7 @@ def _scatter[
     dw: SIMD[DType.uint32, 4],
     dkw: SIMD[DType.uint32, 4],
 ):
+    comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     var s = Int(p.oh) * Int(p.ow)
     var ks = Int(p.kh) * Int(p.kw)
     var count = Int(p.c) * ks * Int(p.n) * s
@@ -363,34 +384,31 @@ def _scatter[
         )
         if (
             y > -1
-            and y < Scalar[acc](Int(p.h))
+            and y.cast[coord]() < Scalar[coord](p.h)
             and z > -1
-            and z < Scalar[acc](Int(p.w))
+            and z.cast[coord]() < Scalar[coord](p.w)
         ):
-            var yl = Int(floor(y))
-            var zl = Int(floor(z))
-            var ly = y - Scalar[acc](yl)
-            var lz = z - Scalar[acc](zl)
             var v = col[unsafe_offset=i].cast[acc]()
-            if Int(p.mask):
-                v *= mask[unsafe_offset=mi].cast[acc]()
-            comptime for dy in range(2):
-                comptime for dx in range(2):
-                    var yy = yl + dy
-                    var xx = zl + dx
-                    if yy >= 0 and yy < Int(p.h) and xx >= 0 and xx < Int(p.w):
-                        var a = ly if dy else 1 - ly
-                        var b = lz if dx else 1 - lz
-                        _ = Atomic[acc, scope=_scope()].fetch_add[
-                            ordering=Ordering.RELAXED
-                        ](
-                            output.unsafe_offset(
-                                (batch * Int(p.c) + ch) * Int(p.h) * Int(p.w)
-                                + yy * Int(p.w)
-                                + xx
-                            ),
-                            (v * a * b).cast[acc](),
-                        )
+            var m = mask[unsafe_offset=mi].cast[acc]() if Int(
+                p.mask
+            ) else Scalar[acc](1)
+            var base = (batch * Int(p.c) + ch) * Int(p.h) * Int(p.w)
+            var count = Int(p.n * p.c * p.h * p.w)
+            comptime if dt == DType.float16:
+                # Half(index +/- 1) can equal Half(index) beyond 2048.
+                if abs(y) >= 2048 or abs(z) >= 2048:
+                    _scatter_neighbors[acc, 3](
+                        output, y, z, m, v, base, Int(p.h), Int(p.w), count
+                    )
+                else:
+                    _scatter_neighbors[acc, 2](
+                        output, y, z, m, v, base, Int(p.h), Int(p.w), count
+                    )
+            else:
+                _scatter_neighbors[acc, 2](
+                    output, y, z, m, v, base, Int(p.h), Int(p.w), count
+                )
+
         i += Int(grid_dim.x) * BLOCK
 
 
@@ -406,7 +424,7 @@ def _offset_grad[
     gm: Pointer[Scalar[dt], MutAnyOrigin],
     p: Geometry,
 ):
-    comptime acc = DType.float64 if dt == DType.float64 else DType.float32
+    comptime acc = dt
     var s = Int(p.oh) * Int(p.ow)
     var ks = Int(p.kh) * Int(p.kw)
     var count = Int(p.n) * Int(p.og) * ks * s
@@ -448,9 +466,9 @@ def _offset_grad[
             var g = col[
                 unsafe_offset=((ch * ks + k) * Int(p.n) + batch) * s + pos
             ].cast[acc]()
-            gy += m * v[1] * g
-            gx += m * v[2] * g
-            gmask += v[0] * g
+            gy += _product(_product(m, v[1]), g)
+            gx += _product(_product(m, v[2]), g)
+            gmask += _product(v[0], g)
         go[unsafe_offset=oi] = gy.cast[dt]()
         go[unsafe_offset=oi + s] = gx.cast[dt]()
         if Int(p.mask):
@@ -572,7 +590,7 @@ def _enqueue_columns[
     ).as_unsafe_any_origin()
     var ctx = _raw_ctx(argv[unsafe_offset=8])
     comptime if scatter:
-        comptime acc = DType.float32 if dt == DType.float16 else dt
+        comptime acc = dt
         var output = _make_ptr[acc](
             _raw_int(argv[unsafe_offset=3])
         ).as_unsafe_any_origin()

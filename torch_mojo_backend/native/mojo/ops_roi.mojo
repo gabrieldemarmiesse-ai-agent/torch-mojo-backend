@@ -4,7 +4,6 @@ from std.utils import IndexList
 
 from abi import (
     ST_INT32,
-    ST_FLOAT32,
     T,
     Values,
     alert_not_deterministic,
@@ -21,7 +20,7 @@ from abi import (
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from ops_common import cast_to, contiguous
+from ops_common import contiguous
 from registry import Site, impl, op_address_of
 
 
@@ -174,12 +173,7 @@ def _backward[pool: Bool](args: Values, rets: Values) raises:
         )
     var g = own_if_new(contiguous(grad), grad)
     var r = own_if_new(contiguous(rois), rois)
-    var half_workspace = grad.dtype == DType.float16
-    comptime if pool:
-        var ctx = ctx_for(grad.device)
-        half_workspace = half_workspace and ctx.api() != "cuda"
-        _ = ctx
-    var accumulation_type = ST_FLOAT32 if half_workspace else grad.stype
+    var accumulation_type = grad.stype
     var out = own(
         new_tensor(_shape(n, c, h, w), 4, accumulation_type, grad.device)
     )
@@ -235,11 +229,7 @@ def _backward[pool: Bool](args: Values, rets: Values) raises:
                 v_int(args[unsafe_offset=9]),
                 v_bool(args[unsafe_offset=10]),
             )
-    if half_workspace:
-        var result = own(cast_to(out.t, grad.stype))
-        ret_tensor(rets, 0, result.take())
-    else:
-        ret_tensor(rets, 0, out.take())
+    ret_tensor(rets, 0, out.take())
     _ = out^
     _ = g^
     _ = r^
@@ -358,12 +348,11 @@ def _ps_backward[pool: Bool](args: Values, rets: Values) raises:
     var r = own_if_new(contiguous(rois), rois)
     var m = own_if_new(contiguous(mapping), mapping)
     var ctx = ctx_for(grad.device)
-    var half_workspace = grad.dtype == DType.float16 and ctx.api() != "cuda"
     var out = own(
         new_tensor(
             _shape(n, c, h, w),
             4,
-            ST_FLOAT32 if half_workspace else grad.stype,
+            grad.stype,
             grad.device,
         )
     )
@@ -387,11 +376,7 @@ def _ps_backward[pool: Bool](args: Values, rets: Values) raises:
             sampling,
             True,
         )
-    if half_workspace:
-        var result = own(cast_to(out.t, grad.stype))
-        ret_tensor(rets, 0, result.take())
-    else:
-        ret_tensor(rets, 0, out.take())
+    ret_tensor(rets, 0, out.take())
     _ = out^
     _ = g^
     _ = r^

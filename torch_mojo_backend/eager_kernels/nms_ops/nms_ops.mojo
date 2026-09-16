@@ -84,7 +84,6 @@ def _mask[
     n64: Int64,
     columns64: Int64,
     threshold: Scalar[acc],
-    inclusive: Int32,
 ):
     var n = Int(n64)
     var columns = Int(columns64)
@@ -110,7 +109,7 @@ def _mask[
                 var ay1 = boxes[unsafe_offset=bi + 1].cast[acc]()
                 var ax2 = boxes[unsafe_offset=bi + 2].cast[acc]()
                 var ay2 = boxes[unsafe_offset=bi + 3].cast[acc]()
-                var area = (ax2 - ax1) * (ay2 - ay1)
+                var area = (ax2 - ax1) * (ay2 - ay1).cast[dt]().cast[acc]()
                 var bits = UInt64(0)
                 var start = lane + 1 if row == col else 0
                 for j in range(start, col_count):
@@ -119,17 +118,21 @@ def _mask[
                     var bx2 = tile[unsafe_offset=j * 4 + 2].cast[acc]()
                     var by2 = tile[unsafe_offset=j * 4 + 3].cast[acc]()
                     var width = max(
-                        Scalar[acc](0), min(ax2, bx2) - max(ax1, bx1)
+                        Scalar[acc](0),
+                        (min(ax2, bx2) - max(ax1, bx1)).cast[dt]().cast[acc](),
                     )
                     var height = max(
-                        Scalar[acc](0), min(ay2, by2) - max(ay1, by1)
+                        Scalar[acc](0),
+                        (min(ay2, by2) - max(ay1, by1)).cast[dt]().cast[acc](),
                     )
                     var inter = width * height
-                    var union = area + (bx2 - bx1) * (by2 - by1) - inter
+                    var union = (
+                        area
+                        + (bx2 - bx1) * (by2 - by1).cast[dt]().cast[acc]()
+                        - inter
+                    )
                     var overlap = inter / union
-                    if overlap > threshold or (
-                        inclusive != 0 and overlap == threshold
-                    ):
+                    if overlap > threshold:
                         bits |= UInt64(1) << UInt64(j)
                 mask[unsafe_offset=i * columns + col] = bits
             barrier()
@@ -200,9 +203,8 @@ def _run_mask[dt: DType](argv: Argv) raises:
         width *= 2
     var columns = (n + 63) // 64
     comptime acc = DType.float64 if dt == DType.float64 else DType.float32
-    var cutoff = Scalar[acc](threshold)
-    # Preserve comparison to the original double without f64 device arithmetic.
-    var inclusive = Int32(Float64(cutoff) > threshold)
+    # CUDA devIoU takes float even for double boxes.
+    var cutoff = Float32(threshold).cast[acc]()
     _enqueue_cached[_mask[dt, acc]](
         ctx,
         "nms_iou_mask_" + String(dt),
@@ -216,7 +218,6 @@ def _run_mask[dt: DType](argv: Argv) raises:
         Int64(n),
         Int64(columns),
         cutoff,
-        inclusive,
     )
 
 

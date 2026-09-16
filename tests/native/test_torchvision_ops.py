@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import fcntl
+import io
+import math
+import os
+from pathlib import Path
 import subprocess
 import sys
 import textwrap
@@ -65,6 +69,175 @@ def _assert_close(got: torch.Tensor, want: torch.Tensor, dtype: torch.dtype):
     )
 
 
+def _cuda_reference(
+    op: str,
+    tensors: tuple[torch.Tensor, ...],
+    kwargs: dict[str, int | float | bool | tuple[int, int]],
+    grad: torch.Tensor | None = None,
+    autocast: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    interpreter = Path("/home/gabriel/ddp_work/torch_cu128/bin/python")
+    if not interpreter.is_file():
+        pytest.skip("stock CUDA torchvision reference environment is absent")
+    payload = io.BytesIO()
+    torch.save((op, tensors, kwargs, grad, autocast), payload)
+    script = textwrap.dedent("""
+        import io
+        import sys
+        import torch
+        import torchvision
+        if not torch.cuda.is_available():
+            sys.exit(77)
+        op, tensors, kwargs, grad, autocast = torch.load(
+            io.BytesIO(sys.stdin.buffer.read()), weights_only=True)
+        inputs = tuple(t.detach().cuda().requires_grad_(t.requires_grad) for t in tensors)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+            if op == "deform_conv2d" and len(inputs) == 5:
+                output = torchvision.ops.deform_conv2d(*inputs[:4], mask=inputs[4], **kwargs)
+            else:
+                output = getattr(torchvision.ops, op)(*inputs, **kwargs)
+        if grad is not None:
+            output.backward(grad.cuda())
+        result = (output.detach().cpu(),) + tuple(
+            t.grad.cpu() for t in inputs if t.requires_grad)
+        stream = io.BytesIO()
+        torch.save(result, stream)
+        sys.stdout.buffer.write(stream.getvalue())
+    """)
+    result = subprocess.run(
+        [str(interpreter), "-c", script],
+        input=payload.getvalue(),
+        capture_output=True,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONHOME", "PYTHONEXECUTABLE"}
+        },
+        timeout=180,
+    )
+    if result.returncode == 77:
+        pytest.skip("stock CUDA reference has no CUDA GPU")
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    return torch.load(io.BytesIO(result.stdout), weights_only=True)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kind", ["roi_pool", "ps_roi_pool"])
+def test_roi_pool_rounding_neighbors(mojo_gpu: str, dtype: torch.dtype, kind: str):
+    _dtype_supported(mojo_gpu, dtype)
+    # Include the review's exact float32 predecessor of 0.5 and both signs.
+    centers = torch.arange(-4, 5, dtype=dtype) + 0.5
+    values = torch.stack(
+        (
+            torch.nextafter(centers, torch.full_like(centers, -math.inf)),
+            centers,
+            torch.nextafter(centers, torch.full_like(centers, math.inf)),
+        )
+    ).flatten()
+    data = torch.tensor([[[[10, 1], [10, 1]]]], dtype=dtype)
+    rois = torch.zeros(values.numel(), 5, dtype=dtype)
+    rois[:, 1] = values
+    rois[:, 3:] = 1
+    reference = data.requires_grad_()
+    grad = torch.ones(values.numel(), 1, 1, 1, dtype=dtype)
+    expected, expected_grad = _cuda_reference(
+        kind, (reference, rois), {"output_size": (1, 1)}, grad
+    )
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    result = getattr(vision.ops, kind)(ours, rois.to(mojo_gpu), (1, 1))
+    result.backward(grad.to(mojo_gpu))
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected_grad, rtol=0, atol=0)
+
+
+def test_nms_half_intersection_rounding(mojo_gpu: str):
+    boxes = torch.tensor(
+        [[0, 0, 1, 1], [0.2498779296875, 0, 1.5, 1]], dtype=torch.float16
+    )
+    scores = torch.tensor([2, 1], dtype=torch.float16)
+    (expected,) = _cuda_reference("nms", (boxes, scores), {"iou_threshold": 0.5})
+    assert expected.tolist() == [0, 1]
+    result = vision.ops.nms(boxes.to(mojo_gpu), scores.to(mojo_gpu), 0.5)
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("autocast", [False, True])
+def test_nms_threshold_sweep(mojo_gpu: str, dtype: torch.dtype, autocast: bool):
+    _dtype_supported(mojo_gpu, dtype)
+    boxes = torch.tensor([[0, 0, 2, 1], [1, 0, 3, 1]], dtype=dtype)
+    scores = torch.tensor([2, 1], dtype=dtype)
+    center = torch.tensor(1 / 3, dtype=torch.float32)
+    thresholds = [
+        math.nextafter(1 / 3, -math.inf),
+        1 / 3,
+        math.nextafter(1 / 3, math.inf),
+        torch.nextafter(center, torch.tensor(-math.inf)).item(),
+        center.item(),
+        torch.nextafter(center, torch.tensor(math.inf)).item(),
+    ]
+    for threshold in thresholds:
+        (expected,) = _cuda_reference(
+            "nms", (boxes, scores), {"iou_threshold": threshold}, autocast=autocast
+        )
+        with torch.autocast("mojo", dtype=torch.float16, enabled=autocast):
+            result = vision.ops.nms(boxes.to(mojo_gpu), scores.to(mojo_gpu), threshold)
+        torch.testing.assert_close(
+            result.cpu(), expected, rtol=0, atol=0, msg=f"threshold={threshold!r}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_roi_pool_integer_batch_bound(mojo_gpu: str, dtype: torch.dtype):
+    _dtype_supported(mojo_gpu, dtype)
+    data = torch.zeros(16777217, 1, 1, 1, dtype=dtype)
+    data[-1] = 7
+    data.requires_grad_()
+    rois = torch.tensor([[16777216, 0, 0, 0, 0]], dtype=dtype)
+    grad = torch.ones(1, 1, 1, 1, dtype=dtype)
+    expected, expected_grad = _cuda_reference(
+        "roi_pool", (data, rois), {"output_size": (1, 1)}, grad
+    )
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (1, 1))
+    result.backward(grad.to(mojo_gpu))
+    assert expected.item() == 7 and expected_grad[-1].item() == 1
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
+@pytest.mark.parametrize(
+    "kind", ["roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool"]
+)
+def test_roi_cuda_dtype_arithmetic(mojo_gpu: str, dtype: torch.dtype, kind: str):
+    _dtype_supported(mojo_gpu, dtype)
+    data = (
+        (torch.arange(100, dtype=torch.float64).reshape(1, 4, 5, 5) / 37)
+        .to(dtype)
+        .requires_grad_()
+    )
+    rois = torch.tensor([[0, 0.4999, 0.7501, 3.3, 3.7]], dtype=dtype)
+    kwargs = {"output_size": (2, 2), "spatial_scale": 0.73}
+    if "align" in kind:
+        kwargs["sampling_ratio"] = 1
+    channels = 1 if kind.startswith("ps") else 4
+    grad = torch.zeros(1, channels, 2, 2, dtype=dtype)
+    grad[0, 0, 0, 0] = 0.3
+    expected, expected_grad = _cuda_reference(kind, (data, rois), kwargs, grad)
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    result = getattr(vision.ops, kind)(ours, rois.to(mojo_gpu), **kwargs)
+    result.backward(grad.to(mojo_gpu))
+    tolerance = 0 if dtype == torch.float16 else 2e-15
+    torch.testing.assert_close(result.cpu(), expected, rtol=tolerance, atol=tolerance)
+    assert ours.grad is not None
+    torch.testing.assert_close(
+        ours.grad.cpu(), expected_grad, rtol=tolerance, atol=tolerance
+    )
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("count", [0, 1, 47, 3073])
 @pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0])
@@ -72,10 +245,10 @@ def test_nms(mojo_gpu: str, dtype: torch.dtype, count: int, threshold: float):
     _dtype_supported(mojo_gpu, dtype)
     boxes = _boxes(count, dtype)
     scores = torch.rand(count, generator=torch.Generator().manual_seed(171)).to(dtype)
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
-    want = vision.ops.nms(
-        boxes.to(reference_dtype), scores.to(reference_dtype), threshold
-    )
+    if dtype == torch.float16:
+        (want,) = _cuda_reference("nms", (boxes, scores), {"iou_threshold": threshold})
+    else:
+        want = vision.ops.nms(boxes, scores, threshold)
     got = vision.ops.nms(boxes.to(mojo_gpu), scores.to(mojo_gpu), threshold)
     assert got.dtype == torch.int64
     assert got.device.type == "mojo"
@@ -135,7 +308,7 @@ def _check_roi(
     data = torch.randn(3, 7, 37, 53, generator=torch.Generator().manual_seed(172)).to(
         dtype
     )
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     x = data.to(reference_dtype).detach().requires_grad_()
     ours = data.to(device).detach().requires_grad_()
     rois = _rois(scale, dtype)
@@ -182,7 +355,7 @@ def test_roi_backward_overlapping(
         [[0, 0, 0, 18, 16] if full_image else [0, -2, -3, 10.5, 12.25]], dtype=dtype
     ).repeat(count, 1)
     rois[:, 0] = torch.arange(count) % 2
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     reference = data.to(reference_dtype).requires_grad_()
     ours = data.detach().to(mojo_gpu).requires_grad_()
     expected = _roi_op(kind, reference, rois.to(reference_dtype), (3, 5))
@@ -258,16 +431,16 @@ def test_roi_pool_backward_half_odd_extent(
     data = data.half().reshape(batches, 3, 17, 19)
     rois = torch.tensor([[0, 0, 0, 18, 16]], dtype=data.dtype).repeat(count, 1)
     rois[:, 0] = torch.arange(count) % batches
-    reference = data.float().requires_grad_()
+    reference = data.detach().requires_grad_()
     ours = data.to(mojo_gpu).requires_grad_()
-    expected = vision.ops.roi_pool(reference, rois.float(), (3, 5))
+    expected = vision.ops.roi_pool(reference, rois, (3, 5))
     result = vision.ops.roi_pool(ours, rois.to(mojo_gpu), (3, 5))
     index = torch.arange(result.numel(), dtype=torch.int64)
     grad = ((index * 1103515245 + 12345) % 65521 % 17 - 8).float() / 16
     grad = grad.half().reshape(result.shape)
     if positive:
         grad.fill_(0.0625)
-    expected.backward(grad.float())
+    expected.backward(grad)
     result.backward(grad.to(mojo_gpu))
     assert ours.grad is not None and reference.grad is not None
     _assert_close(ours.grad, reference.grad, data.dtype)
@@ -387,7 +560,7 @@ def _check_ps_roi(
     rois[-1, 3:] += 1 / scale
     if empty:
         rois = rois[:0]
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     reference = data.to(reference_dtype).detach().requires_grad_()
     ours = data.to(device).detach().requires_grad_()
     reference_input, device_input = reference, ours
@@ -463,7 +636,7 @@ def test_ps_roi_channel_mapping(mojo_gpu: str, kind: str, dtype: torch.dtype):
     rois = torch.tensor([[0, 1, 1, 8, 7], [0, -9, -8, -6, -4]], dtype=dtype)
     op = getattr(torch.ops.torchvision, f"ps_roi_{kind}")
     args = (1.0, 3, 5, 2) if kind == "align" else (1.0, 3, 5)
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     expected, mapping = op(data.to(reference_dtype), rois.to(reference_dtype), *args)
     result, actual_mapping = op(
         data.contiguous().to(mojo_gpu), rois.to(mojo_gpu), *args
@@ -624,7 +797,7 @@ def _check_deform(
     tensors = _deform_data(
         dtype, groups, offset_groups, stride, padding, dilation, batch
     )
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = torch.float32 if autocast and dtype == torch.float16 else dtype
     reference = tuple(t.to(reference_dtype).detach().requires_grad_() for t in tensors)
     ours = tuple(t.to(device).detach().requires_grad_() for t in tensors)
     if noncontiguous:
@@ -789,7 +962,7 @@ def test_ps_roi_overlapping_backward(mojo_gpu: str, kind: str, dtype: torch.dtyp
     _dtype_supported(mojo_gpu, dtype)
     data = (torch.arange(30 * 11 * 13).reshape(1, 30, 11, 13) % 17).to(dtype) / 16
     rois = torch.tensor([[0, -2, -1, 10, 9]], dtype=dtype).repeat(257, 1)
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     reference = data.to(reference_dtype).detach().requires_grad_()
     ours = data.to(mojo_gpu).detach().requires_grad_()
     expected = _ps_roi_op(kind, reference, rois.to(reference_dtype))
@@ -887,9 +1060,7 @@ def test_deform_conv2d_large_spatial_sampling(mojo_gpu: str, dtype: torch.dtype)
         .to(dtype)
     )
     offset = torch.full((1, 8, height - 1, width - 1), 0.25, dtype=dtype)
-    reference = tuple(
-        t.float().detach().requires_grad_() for t in (data, offset, weight)
-    )
+    reference = tuple(t.detach().requires_grad_() for t in (data, offset, weight))
     ours = tuple(
         t.to(mojo_gpu).detach().requires_grad_() for t in (data, offset, weight)
     )
@@ -900,7 +1071,7 @@ def test_deform_conv2d_large_spatial_sampling(mojo_gpu: str, dtype: torch.dtype)
         .reshape(result.shape)
         .to(dtype)
     )
-    expected.backward(grad.float())
+    expected.backward(grad)
     result.backward(grad.to(mojo_gpu))
     _assert_close(result, expected, dtype)
     for actual, wanted in zip(ours, reference, strict=True):
@@ -921,7 +1092,7 @@ def test_deform_conv2d_ignored_mask_gradient(
     bias = torch.zeros(3, dtype=dtype)
     grad = torch.full((batch, 3, 3, 5), 0.125, dtype=dtype)
     tensors = (grad, data, weight, offset, mask, bias)
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
+    reference_dtype = dtype
     reference = tuple(t.to(reference_dtype) for t in tensors)
     ours = tuple(t.to(mojo_gpu) for t in tensors)
     parameters = (1, 1, 0, 0, 1, 1, 1, 1, False)
@@ -940,20 +1111,66 @@ def test_deform_conv2d_half_offset_knot(mojo_gpu: str, axis: int):
     offset = torch.zeros(1, 2, height, width, dtype=torch.float16)
     offset[0, axis, height // 2, width // 2] = -(2**-12)
     weight = torch.ones(1, 1, 1, 1, dtype=torch.float16)
-    reference_offset = offset.float().requires_grad_()
-    device_offset = offset.to(mojo_gpu).requires_grad_()
-    expected = vision.ops.deform_conv2d(data.float(), reference_offset, weight.float())
-    result = vision.ops.deform_conv2d(
-        data.to(mojo_gpu), device_offset, weight.to(mojo_gpu)
-    )
+    inputs = tuple(t.requires_grad_() for t in (data, offset, weight))
     grad = torch.zeros_like(data)
     grad[0, 0, height // 2, width // 2] = 1
-    expected.backward(grad.float())
+    expected = _cuda_reference("deform_conv2d", inputs, {}, grad)
+    ours = tuple(t.detach().to(mojo_gpu).requires_grad_() for t in inputs)
+    result = vision.ops.deform_conv2d(*ours)
     result.backward(grad.to(mojo_gpu))
-    assert reference_offset.grad is not None and device_offset.grad is not None
-    assert reference_offset.grad[0, axis, height // 2, width // 2] == 1
-    _assert_close(result, expected, data.dtype)
-    _assert_close(device_offset.grad, reference_offset.grad, data.dtype)
+    assert expected[2][0, axis, height // 2, width // 2] == 4
+    assert all(t.grad is not None for t in ours)
+    actual = (result.cpu(),) + tuple(t.grad.cpu() for t in ours if t.grad is not None)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
+def test_deform_conv2d_cuda_dtype_arithmetic(mojo_gpu: str, dtype: torch.dtype):
+    _dtype_supported(mojo_gpu, dtype)
+    data = (torch.arange(24, dtype=torch.float64) / 13).to(dtype).reshape(1, 2, 3, 4)
+    offset = torch.full((1, 2, 3, 4), 0.23, dtype=dtype)
+    weight = torch.tensor([0.3, -0.7], dtype=dtype).reshape(1, 2, 1, 1)
+    bias = torch.tensor([0.13], dtype=dtype)
+    mask = torch.full((1, 1, 3, 4), 0.73, dtype=dtype)
+    tensors = tuple(t.requires_grad_() for t in (data, offset, weight, bias, mask))
+    grad = torch.zeros(1, 1, 3, 4, dtype=dtype)
+    grad[0, 0, 1, 1] = 0.37
+    # A single contributing output makes all five gradients order-independent.
+    script_tensors = tensors[:4]
+    expected = _cuda_reference("deform_conv2d", script_tensors + (mask,), {}, grad)
+    ours = tuple(t.detach().to(mojo_gpu).requires_grad_() for t in tensors)
+    result = vision.ops.deform_conv2d(*ours[:4], mask=ours[4])
+    result.backward(grad.to(mojo_gpu))
+    assert all(t.grad is not None for t in ours)
+    actual = (result.cpu(),) + tuple(t.grad.cpu() for t in ours if t.grad is not None)
+    tolerance = 0 if dtype == torch.float16 else 2e-15
+    for index, (got, want) in enumerate(zip(actual, expected, strict=True)):
+        torch.testing.assert_close(
+            got, want, rtol=tolerance, atol=tolerance, msg=f"output/gradient {index}"
+        )
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_deform_conv2d_half_integer_neighbors(mojo_gpu: str, axis: int):
+    height, width = (2053, 1) if axis == 0 else (1, 2053)
+    data = torch.zeros(1, 1, height, width, dtype=torch.float16)
+    data[0, 0, -1, -1] = 1
+    data.requires_grad_()
+    offset = torch.zeros(1, 2, height, width, dtype=data.dtype)
+    weight = torch.ones(1, 1, 1, 1, dtype=data.dtype)
+    grad = torch.zeros_like(data)
+    grad[0, 0, -1, -1] = 1
+    expected, expected_grad = _cuda_reference(
+        "deform_conv2d", (data, offset, weight), {}, grad
+    )
+    ours = data.detach().to(mojo_gpu).requires_grad_()
+    result = vision.ops.deform_conv2d(ours, offset.to(mojo_gpu), weight.to(mojo_gpu))
+    result.backward(grad.to(mojo_gpu))
+    assert expected_grad.flatten()[-2:].tolist() == [1, 1]
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    assert ours.grad is not None
+    torch.testing.assert_close(ours.grad.cpu(), expected_grad, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("axis", [0, 1])
@@ -963,22 +1180,18 @@ def test_deform_conv2d_half_spatial_bound(mojo_gpu: str, axis: int):
     data[0, 0, -1, -1] = 2
     offset = torch.zeros(1, 2, height, width, dtype=torch.float16)
     weight = torch.full((1, 1, 1, 1), 3.0, dtype=torch.float16)
-    reference = data.float().requires_grad_()
-    reference_offset = offset.float().requires_grad_()
-    ours = data.to(mojo_gpu).requires_grad_()
-    device_offset = offset.to(mojo_gpu).requires_grad_()
-    expected = vision.ops.deform_conv2d(reference, reference_offset, weight.float())
-    result = vision.ops.deform_conv2d(ours, device_offset, weight.to(mojo_gpu))
+    inputs = tuple(t.requires_grad_() for t in (data, offset, weight))
     grad = torch.zeros_like(data)
     grad[0, 0, -1, -1] = 1
-    expected.backward(grad.float())
+    expected = _cuda_reference("deform_conv2d", inputs, {}, grad)
+    ours = tuple(t.detach().to(mojo_gpu).requires_grad_() for t in inputs)
+    result = vision.ops.deform_conv2d(*ours)
     result.backward(grad.to(mojo_gpu))
-    assert expected[0, 0, -1, -1] == 6
-    _assert_close(result, expected, data.dtype)
-    assert ours.grad is not None and reference.grad is not None
-    assert device_offset.grad is not None and reference_offset.grad is not None
-    _assert_close(ours.grad, reference.grad, data.dtype)
-    _assert_close(device_offset.grad, reference_offset.grad, data.dtype)
+    assert expected[0][0, 0, -1, -1] == 6
+    assert all(t.grad is not None for t in ours)
+    actual = (result.cpu(),) + tuple(t.grad.cpu() for t in ours if t.grad is not None)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("axis", [0, 1])
@@ -1265,10 +1478,10 @@ def test_nms_identical_boxes(
     scores = (
         torch.ones(9, dtype=dtype) if tied else torch.linspace(0.1, 0.9, 9).to(dtype)
     )
-    reference_dtype = torch.float32 if dtype == torch.float16 else dtype
-    want = vision.ops.nms(
-        boxes.to(reference_dtype), scores.to(reference_dtype), threshold
-    )
+    if dtype == torch.float16:
+        (want,) = _cuda_reference("nms", (boxes, scores), {"iou_threshold": threshold})
+    else:
+        want = vision.ops.nms(boxes, scores, threshold)
     got = vision.ops.nms(boxes.to(mojo_gpu), scores.to(mojo_gpu), threshold)
     assert want.numel() == (9 if threshold == 1.0 else 1)
     torch.testing.assert_close(got.cpu(), want)

@@ -2,7 +2,6 @@
 from abi import (
     T,
     Values,
-    ST_FLOAT32,
     new_like,
     own,
     ret_tensor,
@@ -16,7 +15,7 @@ from abi import (
 )
 from device import ctx_for, ctx_ptr, dev
 from kernels import KernelCall
-from ops_common import fill_value, cast_to, copy_strided_into
+from ops_common import fill_value, copy_strided_into
 from ops_matmul import (
     Tmp,
     _new,
@@ -224,7 +223,7 @@ def _deform[backward: Bool](args: Values, rets: Values) raises:
         var gx = own(
             _new(
                 input.logical_shape(),
-                ST_FLOAT32 if input.dtype == DType.float16 else st,
+                st,
                 device,
             )
         )
@@ -350,11 +349,7 @@ def _deform[backward: Bool](args: Values, rets: Values) raises:
             [g.t.ptr, gm.t.ptr, gm.t.numel if not p[16] else 0, gb.t.ptr],
             p,
         )
-        if input.dtype == DType.float16:
-            var result = own(cast_to(gx.t, st))
-            ret_tensor(rets, 0, result.take())
-        else:
-            ret_tensor(rets, 0, gx.take())
+        ret_tensor(rets, 0, gx.take())
         ret_tensor(rets, 1, gw.take())
         ret_tensor(rets, 2, go.take())
         ret_tensor(rets, 3, gm.take())
