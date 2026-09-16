@@ -23,7 +23,9 @@ comptime TORCH_MOJO_BACKEND_TEST_PEER_COPY = "TORCH_MOJO_BACKEND_TEST_PEER_COPY"
 
 # Test hook: a file descriptor the peer-copy path blocks on, so a test can
 # hold a copy open and observe the state around it.
-comptime TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD = "TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD"
+comptime TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD = (
+    "TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD"
+)
 
 # Not ours: the OS scratch directory, where the loader stages the
 # intermediate files of a build before installing them into the cache.

@@ -4,10 +4,10 @@
 That list is what ``register_mojo_devices()`` holds the user's environment up
 against, so a variable missing from it costs the user the typo check on it:
 they export a name with a letter wrong, nothing reads it, nothing complains,
-and the default it was meant to override quietly stays in force. Hence a test
-rather than a convention.
+and the default it was meant to override stays in force. Hence a test rather
+than a convention.
 
-Two checks, over every tracked ``.py`` / ``.mojo`` / ``.c`` / ``.cpp`` /
+Three checks, over every tracked ``.py`` / ``.mojo`` / ``.c`` / ``.cpp`` /
 ``.h`` file in the repository:
 
 * any token spelled like one of ours -- ``TORCH_MOJO_BACKEND_*``,
@@ -16,16 +16,32 @@ Two checks, over every tracked ``.py`` / ``.mojo`` / ``.c`` / ``.cpp`` /
   is the check that reaches the Mojo side: the two ``env_vars.mojo`` files
   build separately from Python and cannot import the table, so this is what
   keeps all three in step.
-* any literal name handed to ``os.environ`` / ``getenv`` inside the shipped
-  package must be registered too, as one of ours or as somebody else's
+* any name handed to ``os.environ`` / ``getenv`` **inside the shipped
+  package** must be registered too, as one of ours or as somebody else's
   (``ROCM_PATH``, ``CXX``, ...) that we happen to read.
+* the reverse: a registered name that no longer reaches the environment
+  anywhere in the repository is a knob the table promises and the code
+  dropped.
 
-Shell scripts and CI workflows are not scanned: they set variables for our
+Names reached through a constant -- ``getenv(TMPDIR)``,
+``os.environ.get(_NCCL_LIB_ENV)`` -- are resolved through the module-level
+string constants of every scanned file, so moving a name off the call site
+does not move it out of the check. That is not a stylistic nicety: both
+``env_vars.mojo`` files exist precisely to hold such constants.
+
+Scope is deliberately asymmetric. Our own namespace is enforced everywhere,
+because a user can export any of those names. Foreign names are enforced only
+in the shipped package: the ad hoc knobs of a multinode probe script
+(``BUCKETS``, ``STEPS``, ``N``) are not things a user sets on us, and
+registering them would turn a user-facing table into a junk drawer. Shell
+scripts and CI workflows are not scanned at all -- they set variables for our
 processes rather than read any, and their own locals share the prefix.
 """
 
+import os
 import re
 import subprocess
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pytest
@@ -34,8 +50,8 @@ from torch_mojo_backend import env_vars
 
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE = REPO / "torch_mojo_backend"
-# The table itself names every variable by construction, so it can neither
-# offend the checks below nor stand in for a real use in the one above.
+# The table names every variable by construction, so it can neither offend the
+# checks below nor stand in for a real use in the reverse one.
 REGISTRY = PACKAGE / "env_vars.py"
 # This file spells deliberate misspellings.
 THIS_FILE = Path(__file__).resolve()
@@ -48,18 +64,27 @@ OURS = re.compile(
     r"\b(?:PYTORCH_MOJO_BACKEND|TORCH_MOJO_BACKEND|MOJOCCL)_[A-Z0-9_]*[A-Z0-9]\b"
 )
 
-# A literal name handed to something that reads the environment. Names reached
-# through a constant are caught by OURS instead (ours), or are unreachable
-# statically (everyone else's) -- which is why the package keeps foreign names
-# as literals at the call site.
-READS = tuple(
+# A module-level `NAME = "VALUE"` (Python) or `comptime NAME = "VALUE"` (Mojo)
+# whose value could be an environment variable name. Anything with a dot or a
+# dash in it -- `FABRIC_SONAME = "libfabric.so.1"` -- is not one, and `\w+`
+# leaves it out.
+CONSTANT = re.compile(
+    r"""^(?:comptime\s+)?(\w+)\s*(?::[^=\n]+)?=\s*["'](\w+)["']\s*$""", re.M
+)
+
+# A name handed to something that names a variable to the environment, quoted
+# or through a constant. Reads and writes both count: `os.environ["CUDA_VISIBLE
+# _DEVICES"] = ...` is as much a reason to register the name as reading it.
+# `os.` is not required, so `from os import environ` and Mojo's and C's bare
+# `getenv` are all caught.
+_ARGUMENT = r"""(?:["'](\w+)["']|(\w+))"""
+TOUCHES = tuple(
     re.compile(pattern)
     for pattern in (
-        r"""os\.environ\.(?:get|pop|setdefault)\(\s*["'](\w+)["']""",
-        r"""os\.environ\[\s*["'](\w+)["']\s*\]""",
-        r"""os\.getenv\(\s*["'](\w+)["']""",
-        r"""["'](\w+)["']\s+(?:not\s+)?in\s+os\.environ""",
-        r"""(?:std::)?getenv\(\s*"(\w+)\"""",
+        rf"""environ\.(?:get|pop|setdefault)\(\s*{_ARGUMENT}""",
+        rf"""environ\[\s*{_ARGUMENT}\s*\]""",
+        rf"""getenv\s*\(\s*{_ARGUMENT}""",
+        r"""["'](\w+)["']\s+(?:not\s+)?in\s+\w*\.?environ\b""",
     )
 )
 
@@ -82,14 +107,58 @@ def _tracked_sources(root: Path) -> list[Path]:
     )
 
 
-def _names_in(path: Path, patterns) -> set[str]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if isinstance(patterns, re.Pattern):
-        return set(patterns.findall(text))
-    return {name for pattern in patterns for name in pattern.findall(text)}
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _fix_it(offenders: dict[str, list[str]], kind: str) -> str:
+def _constants(paths: Iterable[Path]) -> dict[str, str]:
+    """Every module-level string constant in `paths`, as one map.
+
+    One map rather than one per file because that is how the code is written:
+    `getenv(MOJOCCL_REGION_MB)` in mojoccl.mojo reads a constant declared in
+    env_vars.mojo, and `os.environ.get(_NCCL_LIB_ENV)` reads one declared at
+    the top of its own.
+    """
+    found = {}
+    for path in paths:
+        found.update(CONSTANT.findall(_read(path)))
+    return found
+
+
+def _names_in_namespace(path: Path) -> set[str]:
+    return set(OURS.findall(_read(path)))
+
+
+def _env_names_touched(path: Path, constants: Mapping[str, str]) -> set[str]:
+    """Variable names `path` hands to the environment, constants resolved.
+
+    An argument that is neither a literal nor a known constant -- a parameter,
+    an element of a tuple -- cannot be resolved statically and is dropped.
+    """
+    text = _read(path)
+    names = set()
+    for pattern in TOUCHES:
+        for match in pattern.finditer(text):
+            literal = match.group(1) or ""
+            symbol = (match.group(2) or "") if pattern.groups > 1 else ""
+            if literal:
+                names.add(literal)
+            elif symbol in constants:
+                names.add(constants[symbol])
+    return names
+
+
+def _offenders(
+    found: Iterable[tuple[str, Path]], known: frozenset[str] | set[str]
+) -> dict[str, list[str]]:
+    offenders: dict[str, list[str]] = {}
+    for name, path in found:
+        if name not in known:
+            offenders.setdefault(name, []).append(str(path.relative_to(REPO)))
+    return offenders
+
+
+def _fix_it(offenders: Mapping[str, list[str]], kind: str) -> str:
     lines = [
         f"{name} is {kind} but is not registered (used in "
         + ", ".join(sorted(set(where)))
@@ -109,50 +178,86 @@ def _fix_it(offenders: dict[str, list[str]], kind: str) -> str:
 
 def test_the_scanner_recognizes_the_registered_names():
     """A broken regex must fail loudly rather than pass everything."""
-    assert "TORCH_MOJO_BACKEND_VERBOSE" in _names_in(PACKAGE / "flags.py", OURS)
-    assert "MOJOCCL_REGION_MB" in _names_in(
-        PACKAGE / "distributed" / "mojoccl" / "env_vars.mojo", OURS
+    sources = _tracked_sources(REPO)
+    constants = _constants(sources)
+    assert len(sources) > 100
+    assert "TORCH_MOJO_BACKEND_VERBOSE" in _names_in_namespace(PACKAGE / "flags.py")
+    assert "MOJOCCL_REGION_MB" in _names_in_namespace(
+        PACKAGE / "distributed" / "mojoccl" / "env_vars.mojo"
     )
-    assert "TORCH_MOJO_BACKEND_TESTING" in _names_in(
-        PACKAGE / "is_running_tests.py", READS
+    assert "TORCH_MOJO_BACKEND_TESTING" in _env_names_touched(
+        PACKAGE / "is_running_tests.py", constants
     )
-    assert "ROCM_PATH" in _names_in(PACKAGE / "mojo_device" / "hip_peer.py", READS)
-    assert len(_tracked_sources(REPO)) > 100
+    assert "ROCM_PATH" in _env_names_touched(
+        PACKAGE / "mojo_device" / "hip_peer.py", constants
+    )
+
+
+def test_the_scanner_resolves_names_reached_through_a_constant():
+    """The two env_vars.mojo files exist to hold such constants, so a scanner
+    that only saw literals would stop seeing the Mojo side entirely."""
+    constants = _constants(_tracked_sources(REPO))
+    # Mojo, through `comptime TMPDIR = "TMPDIR"` in a different file.
+    assert "TMPDIR" in _env_names_touched(
+        PACKAGE / "native/mojo/loader.mojo", constants
+    )
+    assert "TORCH_MOJO_BACKEND_TEST_PEER_COPY" in _env_names_touched(
+        PACKAGE / "native/mojo/device.mojo", constants
+    )
+    assert "MOJOCCL_REGION_MB" in _env_names_touched(
+        PACKAGE / "distributed/mojoccl/mojoccl.mojo", constants
+    )
+    # Python, through a constant at the top of its own module.
+    assert "TORCH_MOJO_BACKEND_NCCL_LIB" in _env_names_touched(
+        PACKAGE / "distributed/nccl.py", constants
+    )
+    assert "MODULAR_NVPTX_COMPILER_PATH" in _env_names_touched(
+        PACKAGE / "_ptxas.py", constants
+    )
 
 
 def test_every_name_in_our_namespace_is_registered():
-    offenders: dict[str, list[str]] = {}
-    for path in _tracked_sources(REPO):
-        for name in _names_in(path, OURS) - set(env_vars.OWN_ENV_VARS):
-            offenders.setdefault(name, []).append(str(path.relative_to(REPO)))
+    found = [
+        (name, path)
+        for path in _tracked_sources(REPO)
+        for name in _names_in_namespace(path)
+    ]
+    offenders = _offenders(found, set(env_vars.OWN_ENV_VARS))
     assert not offenders, _fix_it(offenders, "spelled like one of ours")
 
 
-def test_every_environment_read_in_the_package_is_registered():
-    known = env_vars.known_env_vars()
-    offenders: dict[str, list[str]] = {}
-    for path in _tracked_sources(PACKAGE):
-        if path == REGISTRY:
-            continue
-        for name in _names_in(path, READS) - known:
-            offenders.setdefault(name, []).append(str(path.relative_to(REPO)))
-    assert not offenders, _fix_it(offenders, "read from the environment")
+def test_every_environment_name_in_the_package_is_registered():
+    constants = _constants(_tracked_sources(REPO))
+    found = [
+        (name, path)
+        for path in _tracked_sources(PACKAGE)
+        if path != REGISTRY
+        for name in _env_names_touched(path, constants)
+    ]
+    offenders = _offenders(found, env_vars.known_env_vars())
+    assert not offenders, _fix_it(offenders, "named to the environment")
 
 
 def test_no_registered_name_has_gone_stale():
-    """The reverse: a name nothing mentions any more is a knob the docs
-    promise and the code dropped."""
-    mentioned: set[str] = set()
-    for path in _tracked_sources(REPO):
-        if path == REGISTRY:
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        mentioned.update(re.findall(r"\b\w+\b", text))
-    stale = sorted(env_vars.known_env_vars() - mentioned)
+    """A name nothing reaches the environment with any more is a knob the
+    table promises and the code dropped.
+
+    Liveness is the resolved name set, not a word search: a name that survives
+    only in a docstring is exactly the dead entry this is looking for. A
+    constant declared for the purpose counts as live -- that is what an
+    `env_vars.mojo` declaration is -- so the check is about reachability, not
+    about where the string happens to sit.
+    """
+    sources = [p for p in _tracked_sources(REPO) if p != REGISTRY]
+    constants = _constants(sources)
+    live = set(constants.values())
+    for path in sources:
+        live |= _env_names_touched(path, constants)
+    stale = sorted(env_vars.known_env_vars() - live)
     assert not stale, (
-        "registered in torch_mojo_backend/env_vars.py but read nowhere: "
-        + ", ".join(stale)
-        + ". Drop the entry, or spell the name where it is read."
+        "registered in torch_mojo_backend/env_vars.py but nothing reaches the "
+        "environment with it: " + ", ".join(stale) + ". Drop the entry, or "
+        "spell the name where it is read."
     )
 
 
@@ -189,8 +294,6 @@ def test_nothing_else_draws_a_warning(environment, recwarn):
 
 def test_the_real_environment_is_checked_at_registration():
     """The default argument reads `os.environ`, which is the whole point."""
-    import os  # noqa: PLC0415 -- monkeypatching os.environ needs the module here
-
     name = "TORCH_MOJO_BACKEND_NOT_A_REAL_KNOB"
     os.environ[name] = "1"
     try:

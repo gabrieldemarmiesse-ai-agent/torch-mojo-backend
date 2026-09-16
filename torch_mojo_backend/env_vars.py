@@ -271,7 +271,10 @@ def unknown_env_vars(
 
 
 def warn_about_unknown_env_vars(environment: Mapping[str, str] | None = None):
-    """Warn once per misspelled variable. Called by `register_mojo_devices()`.
+    """Warn about each misspelled variable. Called by `register_mojo_devices()`
+    under its lock, so a normal process warns once; a registration that failed
+    and is retried from another source line warns again, which is the right
+    way round -- the second attempt is a second chance to read it.
 
     A warning, not an error: the environment is not always the user's to
     clean — a scheduler prologue or a shared module file can export anything
