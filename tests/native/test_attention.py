@@ -377,7 +377,7 @@ def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
     assert aten._fused_sdp_choice(q, k, v, None, 0.25, True) == MATH
 
 
-def test_public_sdpa_takes_the_supported_route_and_trains(mojo_gpu):
+def test_public_sdpa_takes_the_supported_route_and_trains(mojo_gpu: str):
     """F.scaled_dot_product_attention picks its backend through a C++
     DispatchStub the shim registers for this device, then calls the
     supported flash overloads on Hopper/gfx942 and math attention on Metal."""

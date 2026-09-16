@@ -5,6 +5,7 @@ profiler records the CPU-side timeline and exports a Chrome trace."""
 
 import json
 
+import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
@@ -19,7 +20,9 @@ def _mul_loop(device: str):
     torch.accelerator.synchronize()
 
 
-def test_legacy_profiler_reports_time_or_unsupported_events(mojo_gpu, capfd):
+def test_legacy_profiler_reports_time_or_unsupported_events(
+    mojo_gpu: str, capfd: pytest.CaptureFixture[str]
+):
     _mul_loop(mojo_gpu)  # warm the kernel build outside the profiled region
     with torch.autograd.profiler.profile(use_device="mojo") as prof:
         _mul_loop(mojo_gpu)

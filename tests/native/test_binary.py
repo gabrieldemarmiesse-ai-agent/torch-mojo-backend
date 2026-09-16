@@ -798,7 +798,9 @@ def test_inplace_scalar_every_dtype_and_rank(mojo_device, dtype, shape):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scalar", [0.9, 1.0001, -0.33333])
 @pytest.mark.parametrize("strided", [False, True])
-def test_mul_inplace_preserves_scalar_precision(mojo_device, dtype, scalar, strided):
+def test_mul_inplace_preserves_scalar_precision(
+    mojo_device: str, dtype: torch.dtype, scalar: float, strided: bool
+):
     cpu = (torch.arange(515, dtype=torch.float32) / 37 - 7).to(dtype)
     actual = cpu.to(mojo_device)
     if strided:
