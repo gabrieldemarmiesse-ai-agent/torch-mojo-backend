@@ -29,7 +29,7 @@ def test_legacy_profiler_reports_time_or_unsupported_events(
     if list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])].api == "metal":
         # MAX has no Metal timing events. The callback must report the
         # failure without dereferencing a null event and crashing Python.
-        assert "eventCreate is not supported on this device" in capfd.readouterr().err
+        assert "events are not supported on Apple GPU" in capfd.readouterr().err
         return
     rows = {e.key: e for e in prof.key_averages()}
     assert "aten::mul" in rows

@@ -20,7 +20,7 @@ import pytest
 import torch
 from torch.utils._mode_utils import no_dispatch
 
-from tests.native.conftest import side_stream_or_skip
+from tests.native.conftest import side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.native import device_module
 
@@ -46,8 +46,8 @@ def test_stream_construction_and_identity(mojo_gpu: str):
     assert stream.device == torch.device("mojo", 0)
     assert stream.device_index == 0
     assert stream.native_handle != 0  # ty: ignore[unresolved-attribute] -- torch's Stream stub lacks native_handle
-    # stream_id is the MAX DeviceContext pointer (see docs/streams.md), a
-    # different value from the underlying native CUstream/hipStream_t.
+    # stream_id indexes the device's MAX context views (see docs/streams.md),
+    # independently of the underlying native CUstream/hipStream_t.
     assert stream.stream_id != stream.native_handle  # ty: ignore[unresolved-attribute]
     assert stream.stream_id != torch.accelerator.current_stream().stream_id
     assert stream == stream
@@ -66,6 +66,50 @@ def test_current_stream_and_context_manager(mojo_gpu: str):
     assert device_module.current_stream() == side
     device_module.set_stream(default)
     assert device_module.current_stream() == default
+
+
+@pytest.mark.parametrize("priority", [0, -1, 1])
+def test_metal_streams_share_the_default_stream(mojo_gpu: str, priority: int):
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU stream semantics")
+    default = device_module.default_stream(mojo_gpu)
+    first = torch.Stream(device="mojo", priority=priority)
+    second = device_module.Stream(device=mojo_gpu, priority=priority)
+    assert type(first) is torch.Stream
+    assert first == second == default
+    assert first.stream_id == second.stream_id == 0
+    assert first.device == torch.device(mojo_gpu)
+    x = torch.ones(32, device=mojo_gpu)
+    with first:
+        assert torch.accelerator.current_stream() == default
+        with second:
+            y = x + 2
+            y.record_stream(second)
+        assert device_module.current_stream() == default
+    first.synchronize()
+    assert second.query()
+    torch.testing.assert_close(y.cpu(), torch.full((32,), 3.0))
+    assert device_module.current_stream() == default
+
+
+@pytest.mark.parametrize("enable_timing", [False, True])
+def test_metal_events_raise_on_record(mojo_gpu: str, enable_timing: bool):
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU event semantics")
+    stream = device_module.default_stream(mojo_gpu)
+    event = torch.Event(device=mojo_gpu, enable_timing=enable_timing)
+    # Generic torch events allocate lazily; a failed recording must leave
+    # the object safe to retry, query, synchronize and destroy.
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+            event.record(stream)
+    assert event.query()
+    event.synchronize()
+    with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+        stream.record_event()
+    with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+        stream.wait_stream(stream)
+    stream.synchronize()
 
 
 def test_documented_device_agnostic_pattern(mojo_gpu: str):
@@ -95,6 +139,7 @@ def test_wait_stream_orders_real_work(mojo_gpu: str):
 
 
 def test_event_semantics(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "Apple GPU events are tested as unsupported separately")
     unrecorded = torch.Event(device=mojo_gpu)
     assert unrecorded.query() is True
     unrecorded.synchronize()  # no-op by contract
@@ -104,12 +149,7 @@ def test_event_semantics(mojo_gpu: str):
     end = torch.Event(device=mojo_gpu, enable_timing=True)
     stream = torch.accelerator.current_stream()
     torch.accelerator.synchronize()
-    try:
-        start.record(stream)
-    except RuntimeError as error:
-        if "eventCreate is not supported on this device" in str(error):
-            pytest.skip(f"MAX has no events on this device: {error}")
-        raise
+    start.record(stream)
     x = torch.full((1024, 1024), 3.0, device=mojo_gpu)
     (x * x).cpu()  # forces the work through the queue and the device
     end.record(stream)

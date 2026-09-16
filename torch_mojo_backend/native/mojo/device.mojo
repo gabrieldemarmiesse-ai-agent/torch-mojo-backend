@@ -986,7 +986,9 @@ def _add_stream(
 def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
     try:
         var d = dev(Int(device))
-        if d[].is_cpu:
+        # Like PyTorch MPS, Metal stream objects all identify the default
+        # queue; priorities do not create independent streams.
+        if d[].is_cpu or d[].api == "metal":
             return 0
         return Int64(_add_stream(d, Int(priority)))
     except e:
@@ -997,7 +999,7 @@ def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
 def h_stream_from_pool(device: Int32, high_priority: Int32) abi("C") -> Int64:
     try:
         var d = dev(Int(device))
-        if d[].is_cpu:
+        if d[].is_cpu or d[].api == "metal":
             return 0
         if len(d[].pool) < POOL_STREAMS:
             d[].pool.append(_add_stream(d, 0))
@@ -1057,8 +1059,14 @@ struct Ev(Movable):
 def h_event_create(device: Int32, enable_timing: Int32) abi("C") -> Int:
     try:
         var d = dev(Int(device))
-        # Creating an event can fail on Metal. Do this before allocating the
-        # box (or a vendor event), so that failure cannot leak either owner.
+        if d[].api == "metal":
+            raise Error(
+                "events are not supported on Apple GPU (Metal): MAX does"
+                " not implement Metal events; use stream.synchronize() or"
+                " torch.mojo.synchronize() instead"
+            )
+        # Create before allocating the box or vendor event so a failure
+        # cannot leak either owner.
         var max_ev = d[].ctx.create_event()
         var raw = 0
         if be()[].vendor and d[].raw[0] != 0:
