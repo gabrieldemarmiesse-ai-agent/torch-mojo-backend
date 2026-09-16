@@ -6,13 +6,14 @@ MAX stream of the device's base context; kernels get the context *view* bound
 to it (`DeviceContext.select_stream`), so real multi-stream execution costs
 nothing at launch time. Everything here runs under the shim's mutex.
 """
-from std.ffi import _get_global_or_null, c_char, external_call
+from std.ffi import _get_global_or_null, c_char, c_size_t, external_call
 from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
 from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
 
 from max.gpu.host import (
+    DeviceAttribute,
     DeviceBuffer,
     DeviceContext,
     DeviceEvent,
@@ -27,6 +28,44 @@ comptime EvP = Pointer[Ev, MutUntrackedOrigin]
 comptime StagingP = Pointer[Staging, MutUntrackedOrigin]
 comptime U8P = Pointer[UInt8, MutUntrackedOrigin]
 comptime POOL_STREAMS = 4
+
+
+struct MemoryStat(Copyable, Movable):
+    var current: Int64
+    var peak: Int64
+    var allocated: Int64
+    var freed: Int64
+
+    def __init__(out self):
+        self.current = 0
+        self.peak = 0
+        self.allocated = 0
+        self.freed = 0
+
+    def add(mut self, n: Int64):
+        self.current += n
+        self.peak = max(self.peak, self.current)
+        self.allocated += n
+
+    def remove(mut self, n: Int64):
+        self.current -= n
+        self.freed += n
+
+    def reset_accumulated(mut self):
+        self.allocated = 0
+        self.freed = 0
+
+    def write(self, dst: Pointer[Int64, MutUntrackedOrigin]):
+        dst[unsafe_offset=0] = self.current
+        dst[unsafe_offset=1] = self.peak
+        dst[unsafe_offset=2] = self.allocated
+        dst[unsafe_offset=3] = self.freed
+
+
+@fieldwise_init
+struct Properties(Movable):
+    var values: List[Int64]
+    var text: String
 
 
 def _warn(what: StaticString, e: Error):
@@ -45,6 +84,13 @@ struct Dev(Movable):
     var pool: List[Int]
     var pool_next: Int
     var staging: List[Int]  # pending pageable-H2D staging boxes (addresses)
+    var allocated_bytes: MemoryStat
+    var allocation: MemoryStat
+    var num_device_alloc: Int64
+    var num_device_free: Int64
+    var num_alloc_retries: Int64
+    var num_ooms: Int64
+    var properties: Optional[Properties]
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -59,6 +105,13 @@ struct Dev(Movable):
         self.pool = List[Int]()
         self.pool_next = 0
         self.staging = List[Int]()
+        self.allocated_bytes = MemoryStat()
+        self.allocation = MemoryStat()
+        self.num_device_alloc = 0
+        self.num_device_free = 0
+        self.num_alloc_retries = 0
+        self.num_ooms = 0
+        self.properties = None
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -151,6 +204,7 @@ def init_backend() raises -> Int:
 struct Buf(Movable):
     var buf: DeviceBuffer[DType.uint8]
     var device: Int
+    var nbytes: Int
     var stream: Int  # owner stream: where MAX orders the release
     var users: List[Int]  # other streams that used the buffer (record_stream)
 
@@ -171,7 +225,12 @@ def _create_retry(
     except e:
         for i in range(len(d[].views)):
             d[].views[i].synchronize()
-        return _create(ctx, nbytes)
+        d[].num_alloc_retries += 1
+        try:
+            return _create(ctx, nbytes)
+        except retry_error:
+            d[].num_ooms += 1
+            raise retry_error^
 
 
 def h_alloc(
@@ -186,7 +245,12 @@ def h_alloc(
         var buf = _create_retry(d, ctx, nbytes)
         data[] = Int(buf.unsafe_ptr())
         var box = unsafe_alloc[Buf](1)
-        box.unsafe_write(Buf(buf^, Int(device), Int(stream), List[Int]()))
+        box.unsafe_write(
+            Buf(buf^, Int(device), nbytes, Int(stream), List[Int]())
+        )
+        d[].allocated_bytes.add(Int64(nbytes))
+        d[].allocation.add(1)
+        d[].num_device_alloc += 1
         return Int(box)
     except e:
         set_error(String(e))
@@ -211,9 +275,187 @@ def h_free(handle: Int) abi("C"):
             # let MAX reuse memory another stream may still be reading.
             set_error(String(e))
             return
+    # Account for storage returned to MAX, whose own arena and stream-ordered
+    # release are opaque to us. A deliberately leaked block above stays live.
+    ref d = be()[].devices[box[].device]
+    d.allocated_bytes.remove(Int64(box[].nbytes))
+    d.allocation.remove(1)
+    d.num_device_free += 1
     var moved = box.unsafe_take_pointee()
     box.unsafe_free()
     _ = moved^
+
+
+def h_mem_stats(
+    device: Int32, dst: Pointer[Int64, MutUntrackedOrigin], n: Int32
+) abi("C"):
+    try:
+        var d = dev(Int(device))
+        if n != 20:
+            raise Error("memory stats ABI mismatch: expected 20 slots")
+        # tmb.h's flat contract. No rounding, splitting or arena of our own:
+        # requested and reserved equal allocated, entirely in the 'all' pool.
+        d[].allocated_bytes.write(dst)
+        d[].allocation.write(dst.unsafe_offset(4))
+        d[].allocated_bytes.write(dst.unsafe_offset(8))
+        d[].allocated_bytes.write(dst.unsafe_offset(12))
+        dst[unsafe_offset=16] = d[].num_device_alloc
+        dst[unsafe_offset=17] = d[].num_device_free
+        dst[unsafe_offset=18] = d[].num_alloc_retries
+        dst[unsafe_offset=19] = d[].num_ooms
+    except e:
+        set_error(String(e))
+
+
+def h_mem_reset_peak(device: Int32) abi("C"):
+    try:
+        var d = dev(Int(device))
+        d[].allocated_bytes.peak = d[].allocated_bytes.current
+        d[].allocation.peak = d[].allocation.current
+    except e:
+        set_error(String(e))
+
+
+def h_mem_reset_accumulated(device: Int32) abi("C"):
+    try:
+        var d = dev(Int(device))
+        d[].allocated_bytes.reset_accumulated()
+        d[].allocation.reset_accumulated()
+        d[].num_device_alloc = 0
+        d[].num_device_free = 0
+        d[].num_alloc_retries = 0
+        d[].num_ooms = 0
+    except e:
+        set_error(String(e))
+
+
+def h_empty_cache() abi("C"):
+    # Only release completed host staging buffers. MAX owns the device arena
+    # and exposes no trim API; never synchronize to imitate a cache flush.
+    for i in range(len(be()[].devices)):
+        _drain_staging(
+            Pointer(to=be()[].devices[i]).unsafe_origin_cast[
+                MutUntrackedOrigin
+            ]()
+        )
+
+
+def h_mem_get_info(
+    device: Int32,
+    free: Pointer[c_size_t, MutUntrackedOrigin],
+    total: Pointer[c_size_t, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    try:
+        var d = dev(Int(device))
+        var info: Tuple[c_size_t, c_size_t]
+        try:
+            info = d[].ctx.get_memory_info()
+        except e:
+            set_error(
+                "MAX "
+                + d[].api
+                + " device memory information is unavailable: "
+                + String(e)
+            )
+            return 2
+        if info[1] == 0:
+            set_error("MAX does not expose memory capacity on this device")
+            return 2
+        free[] = info[0]
+        total[] = info[1]
+        return 0
+    except e:
+        set_error(String(e))
+        return 1
+
+
+def _attribute(ctx: DeviceContext, attr: DeviceAttribute) -> Int64:
+    try:
+        return Int64(ctx.get_attribute(attr))
+    except:
+        return -1
+
+
+def _properties(d: Pointer[Dev, MutUntrackedOrigin]) -> Properties:
+    var ctx = d[].ctx
+    var values = List[Int64]()
+    # Capability is CUDA-specific; HIP uses the architecture string instead.
+    values.append(
+        _attribute(ctx, DeviceAttribute.COMPUTE_CAPABILITY_MAJOR) if d[].api
+        == "cuda" else -1
+    )
+    values.append(
+        _attribute(ctx, DeviceAttribute.COMPUTE_CAPABILITY_MINOR) if d[].api
+        == "cuda" else -1
+    )
+    var total = Int64(-1)
+    try:
+        var info = ctx.get_memory_info()
+        if info[1] > 0:
+            total = Int64(info[1])
+    except:
+        # A MAX runtime that cannot report capacity leaves it unknown; the
+        # properties call itself still succeeds, and mem_get_info() is the
+        # entry point that surfaces the error.
+        total = Int64(-1)
+    values.append(total)
+    var attrs: List[DeviceAttribute] = [
+        DeviceAttribute.MULTIPROCESSOR_COUNT,
+        DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR,
+        DeviceAttribute.WARP_SIZE,
+        DeviceAttribute.MAX_REGISTERS_PER_MULTIPROCESSOR,
+        DeviceAttribute.MAX_THREADS_PER_BLOCK,
+        DeviceAttribute.MAX_REGISTERS_PER_BLOCK,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_BLOCK,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        DeviceAttribute.MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+        DeviceAttribute.MAX_BLOCKS_PER_MULTIPROCESSOR,
+        DeviceAttribute.CLOCK_RATE,
+        DeviceAttribute.MAX_GRID_DIM_X,
+    ]
+    for attr in attrs:
+        # MAX CPU returns successful zeroes for GPU attributes. They do not
+        # describe CPU hardware, so expose them as unknown, not as capacities.
+        values.append(-1 if d[].is_cpu else _attribute(ctx, attr))
+    values.append(Int64(d[].is_cpu))
+    var arch: String
+    try:
+        arch = ctx.arch_name()
+    except:
+        # Only AMD reports one; elsewhere the empty string means "no gfx
+        # architecture", which Python exposes as None.
+        arch = String()
+    var text = ctx.name() + "\0" + d[].api + "\0" + arch + "\0"
+    return Properties(values^, text^)
+
+
+def h_device_props(
+    device: Int32,
+    dst: Pointer[Int64, MutUntrackedOrigin],
+    n: Int32,
+    text: Pointer[c_char, MutUntrackedOrigin],
+    text_cap: Int32,
+) abi("C") -> Int32:
+    try:
+        var d = dev(Int(device))
+        if n != 16:
+            raise Error("device properties ABI mismatch: expected 16 slots")
+        if not d[].properties:
+            d[].properties = _properties(d)
+        ref props = d[].properties.value()
+        if Int(text_cap) < props.text.byte_length():
+            raise Error("device properties text buffer too small")
+        for i in range(16):
+            dst[unsafe_offset=i] = props.values[i]
+        unsafe_memcpy(
+            dest=text,
+            src=props.text.as_c_string_slice().unsafe_ptr(),
+            count=props.text.byte_length(),
+        )
+        return 0
+    except e:
+        set_error(String(e))
+        return 1
 
 
 def h_copy_data(
@@ -598,9 +840,9 @@ def set_error(msg: String):
 
 
 def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
-    """The TmbBackendHooks struct (tmb.h): a u32 size then 23 function pointers.
+    """The TmbBackendHooks struct (tmb.h): a u32 size then 28 function pointers.
     """
-    comptime N = 24
+    comptime N = 29
     var t = unsafe_alloc[Int](N)
     for i in range(N):
         t[unsafe_offset=i] = 0
@@ -632,6 +874,24 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     var f_evq: def(Int) thin abi("C") -> Int32 = h_event_query
     var f_evs: def(Int) thin abi("C") -> None = h_event_synchronize
     var f_eve: def(Int, Int) thin abi("C") -> Float64 = h_event_elapsed_ms
+    var f_stats: def(Int32, Pointer[Int64, MutUntrackedOrigin], Int32) thin abi(
+        "C"
+    ) -> None = h_mem_stats
+    var f_peak: def(Int32) thin abi("C") -> None = h_mem_reset_peak
+    var f_accum: def(Int32) thin abi("C") -> None = h_mem_reset_accumulated
+    var f_empty: def() thin abi("C") -> None = h_empty_cache
+    var f_info: def(
+        Int32,
+        Pointer[c_size_t, MutUntrackedOrigin],
+        Pointer[c_size_t, MutUntrackedOrigin],
+    ) thin abi("C") -> Int32 = h_mem_get_info
+    var f_props: def(
+        Int32,
+        Pointer[Int64, MutUntrackedOrigin],
+        Int32,
+        Pointer[c_char, MutUntrackedOrigin],
+        Int32,
+    ) thin abi("C") -> Int32 = h_device_props
     t[unsafe_offset=1] = Pointer(to=f_alloc).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f_free).unsafe_bitcast[Int]()[]
     t[unsafe_offset=3] = Pointer(to=f_copy).unsafe_bitcast[Int]()[]
@@ -652,6 +912,12 @@ def hooks_table() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=18] = Pointer(to=f_evs).unsafe_bitcast[Int]()[]
     t[unsafe_offset=19] = Pointer(to=f_eve).unsafe_bitcast[Int]()[]
     # 20..22: prof_mark / prof_range_push / prof_range_pop stay NULL for now
+    t[unsafe_offset=23] = Pointer(to=f_stats).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=24] = Pointer(to=f_peak).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=25] = Pointer(to=f_accum).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=26] = Pointer(to=f_empty).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=27] = Pointer(to=f_info).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=28] = Pointer(to=f_props).unsafe_bitcast[Int]()[]
     return t
 
 

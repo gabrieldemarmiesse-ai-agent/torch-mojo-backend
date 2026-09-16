@@ -71,7 +71,7 @@ classes, each forwarding to a Mojo function pointer:
 | file | what |
 |---|---|
 | `shim_dispatch.cpp` | `tmb_library_impl` / `tmb_library_impl_lazy`: registers a Mojo function (or a resolver that produces one at the first call) as a boxed kernel. `MojoBoxedKernel` converts the IValue stack to `TmbValue` records (Scalar included, no heap boxing) and back, and caches the resolved kernel pointer. `tmb_call_op` calls any aten op from Mojo. |
-| `shim_runtime.cpp` | allocator (`c10::Allocator` over Mojo alloc/free), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
+| `shim_runtime.cpp` | allocator (`c10::DeviceAllocator` forwarding allocation and memory APIs to Mojo), `PrivateUse1HooksInterface`, the device guard (devices/streams/events), the Philox generator, `ProfilerStubs`, the tensor C API (`tmb_tensor_*`, `tmb_empty_strided`, `tmb_as_strided`). The current device and per-device current stream are C++ thread-locals (`tmb_current_device/stream`). |
 | `shim_autocast.cpp` | `AutocastPrivateUse1` as one boxed fallback with a policy table filled from torch's own CUDA op lists. |
 
 Three translation units compile in parallel: about 7 s wall cold.
@@ -83,7 +83,7 @@ Three translation units compile in parallel: about 7 s wall cold.
 | `backend.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
 | `registry.mojo` | `impl[op, "name"]`: registers the name behind a lazy trampoline in the backend, *or* is the selected op in that op's extension — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
-| `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, `record_stream` fences), transfers |
+| `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
 | `loader.mojo` | on-demand builds of op extensions and kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
 | `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
@@ -225,6 +225,105 @@ workers that only touch CPU tensors run normally
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count
 boxed-kernel calls per op (the `CallChecker` in `torch_mojo_backend/testing.py`
 uses them to assert that an op ran natively).
+
+## Memory accounting
+
+`torch.accelerator` memory APIs need torch 2.9+; `get_memory_info` needs 2.10+; this package requires torch 2.10+.
+
+`torch.mojo.memory_allocated(device=None)` reports the bytes of live tensor
+storage allocated by this backend, per device. Views, slices and
+`as_strided` share a storage and count once; a zero-byte storage counts
+nothing. CPU tensors, pinned host staging, foreign storage aliases and
+MAX's internal workspaces/context memory do not appear in these counters.
+Tensors on the MAX CPU device (the last mojo index) do count, under that
+index only. Releasing a storage decrements its device's counters when the
+block is handed back to MAX; MAX orders physical reuse on the owning stream.
+This happens at final storage release, before device synchronization, including
+when `record_stream` has fenced pending consumers; it does not wait for physical
+reuse or a host retirement queue.
+
+`memory_stats()` is a sorted `OrderedDict` with torch.cuda's keys;
+`memory_stats_as_nested_dict()` returns the same data before flattening.
+`memory_summary(abbreviated=False)` formats those counters. Every counter
+and reset lives in Mojo, serialized by the shim mutex. The C++ allocator
+only forwards and marshals torch's `DeviceStats`, so `torch.accelerator`'s
+memory APIs and Inductor's `MojoInterface.memory_allocated()` read the same
+accounting.
+
+Registration eagerly initializes MAX's contexts and the allocator, before any
+tensor allocation. Before `register_mojo_devices()` there is no `torch.mojo`
+module; after it, `initialized()` is true and even zero-usage queries validate
+their device arguments. There is no public registered-but-uninitialized window.
+
+| statistic | meaning here |
+|---|---|
+| `allocated_bytes.all` | live storage bytes (`current`), their high-water mark (`peak`), and cumulative bytes allocated/freed (`allocated`/`freed`) |
+| `allocation.all` | the same four counters, in nonempty storage allocations |
+| `requested_bytes.all` | equals allocated bytes: we do not round or split requests |
+| `reserved_bytes.all` | **equals allocated bytes**: there is no caching allocator of ours; MAX owns the arena and does not expose its reservation/slack |
+| `num_device_alloc`, `num_device_free` | successful buffer allocations/releases at our boundary with MAX, not driver malloc/free calls inside its arena |
+| `num_alloc_retries` | initial MAX allocation failures for which we drain the device and retry once |
+| `num_ooms` | allocations that still fail on that recovery path |
+
+`memory_reserved() - memory_allocated()` is therefore **structurally zero**.
+It does not measure MAX's cached slack as the corresponding CUDA expression
+measures torch's caching allocator. `small_pool`/`large_pool`, `segment`,
+`active*`, `inactive_split*`, `oversize_*`, `max_split_size` and
+`num_sync_all_streams` are also structurally zero: this backend has none
+of those allocator concepts. All measured activity is under `all`.
+
+`max_memory_allocated()` and `max_memory_reserved()` retain the peaks after
+a free. `reset_peak_memory_stats()` resets peaks to **current usage**, not
+zero. `reset_accumulated_memory_stats()` zeroes cumulative allocated/freed
+values and allocation/free/retry/OOM event counts, leaving current usage and
+peaks alone. Both resets apply only to the requested device.
+
+`empty_cache()` releases **completed pinned host staging buffers** on every
+device. Pending copies keep their buffers. It neither waits nor synchronizes,
+and cannot return cached device memory to the OS: **MAX owns the arena and
+exposes no trim API**. Calling it twice, or before any allocation, is safe;
+live storage and its accounting are unchanged.
+
+`mem_get_info()` (spelled `get_memory_info()` on `torch.accelerator`) returns
+MAX's current `(free, total)` bytes, which are separate from our per-process
+storage accounting. MAX may report its arena budget rather than physical
+installed VRAM: on the H100 tested, its total was smaller than `nvidia-smi`'s
+and a 4 MiB tensor consumed a 256 MiB arena chunk. These are MAX's numbers,
+not a replacement implementation of CUDA's `cudaMemGetInfo`. Do not infer
+our reserved bytes from `total - free`.
+The MAX CPU device returns **host** memory information (verified with MAX
+26.5 on Linux), not zeroes. A MAX implementation that supplies no memory
+capacity raises an explicit `NotImplementedError` instead of fabricating it.
+
+`get_device_properties()` returns a frozen dataclass, gathered and cached
+per device in Mojo through MAX, without CUDA/HIP probing in Python.
+`get_device_name()` and `get_device_capability()` read that cache. Field
+names follow torch.cuda where possible; `api`, `is_cpu`, `arch_name`, shared
+memory limits and `clock_rate` (kHz) provide additional MAX information.
+Unavailable fields are `None`. MAX's CPU returns zero for GPU attributes;
+we expose those as `None` because they do not describe CPU hardware.
+Compute capability is a CUDA `(major, minor)` pair; other APIs return
+`(None, None)`, with HIP's architecture in `gcnArchName` and `arch_name`.
+This dataclass is separate from Inductor's Triton autotuner property contract.
+`torch.accelerator.get_device_capability()` describes dtype support and raises
+the default unsupported-capability error, just as CUDA does; we do not advertise
+an unverified dtype support list.
+
+There is no counterpart for CUDA allocator snapshots/history
+(`memory_snapshot`, `_record_memory_history`, `_dump_snapshot`), raw caching
+allocator pointers (`caching_allocator_alloc`/`caching_allocator_delete`),
+per-process limits (`set_per_process_memory_fraction`), process listings
+(`list_gpu_processes`), or host/pinned allocator statistics
+(`host_memory_stats`, `host_memory_stats_as_nested_dict`,
+`reset_accumulated_host_memory_stats`, `reset_peak_host_memory_stats`).
+These names raise `NotImplementedError` with a reason: MAX does not expose
+the necessary arena/process information, and we keep counters, not allocation
+histories or a raw-pointer allocator.
+
+After `fork()`, memory queries/resets and property reads reject device use
+before taking the shim mutex, with the same `spawn` guidance as allocations.
+`empty_cache()` is a no-op. Torch's accelerator wrappers additionally return
+empty/zero statistics when `initialized()` is false, as it is in the child.
 
 ## Streams and events
 

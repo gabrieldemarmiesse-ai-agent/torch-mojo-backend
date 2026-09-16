@@ -90,6 +90,8 @@ class MojoDeviceProperties:
     CUDA, the bare gfx string (e.g. "gfx942") for HIP. `major` is CUDA-only
     (`is_triton_capable`'s pre-Volta gate); HIP has no such generation split."""
 
+    # native.device_module.MojoDeviceProperties is the public MAX view;
+    # this separate field set is the Triton autotuner's contract.
     name: str
     cc: int | str
     multi_processor_count: int
@@ -243,7 +245,7 @@ class MojoInterface(DeviceInterface):
 
     @staticmethod
     def memory_allocated(device: torch.types.Device = None) -> int:
-        return 0
+        return device_module.memory_allocated(device)
 
     @staticmethod
     def get_compute_capability(device: torch.types.Device = None) -> int | str:
