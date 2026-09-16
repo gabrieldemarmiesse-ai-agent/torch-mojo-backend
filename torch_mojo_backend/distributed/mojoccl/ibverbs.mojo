@@ -25,6 +25,7 @@ from std.ffi import OwnedDLHandle
 from std.os import getenv
 from std.sys import size_of
 
+from env_vars import MOJOCCL_IB_HCA, MOJOCCL_IB_RELAXED_ORDERING
 from netutil import (
     MAX_NODES,
     NC_FLUSH,
@@ -715,7 +716,7 @@ def verbs_available() -> Bool:
     closed again before it returns."""
     try:
         var ibv = Ibv()
-        var ports = list_ib_ports(ibv, getenv("MOJOCCL_IB_HCA", ""))
+        var ports = list_ib_ports(ibv, getenv(MOJOCCL_IB_HCA, ""))
         var n = len(ports)
         for i in range(n):
             ibv.close_device(ports[i].ctx)
@@ -737,7 +738,7 @@ def vrb_setup(
     gathered, so `vrb_connect_peer` finishes the job.
     """
     var ibv = Ibv()
-    var want = getenv("MOJOCCL_IB_HCA", "")
+    var want = getenv(MOJOCCL_IB_HCA, "")
     var ports = list_ib_ports(ibv, want)
     if len(ports) == 0:
         raise Error(
@@ -767,7 +768,7 @@ def vrb_setup(
         v.pd = v.ibv.alloc_pd(v.ctx)
         if v.pd == 0:
             raise Error("mojoccl: ibv_alloc_pd failed on " + v.hca)
-        var ro = getenv("MOJOCCL_IB_RELAXED_ORDERING", "1") != "0"
+        var ro = getenv(MOJOCCL_IB_RELAXED_ORDERING, "1") != "0"
         var acc = (
             IBV_ACCESS_LOCAL_WRITE
             | IBV_ACCESS_REMOTE_WRITE

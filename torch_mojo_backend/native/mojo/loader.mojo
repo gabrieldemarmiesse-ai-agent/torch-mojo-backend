@@ -22,6 +22,7 @@ from std.subprocess import run as run_command
 from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
+from env_vars import TMPDIR, TORCH_MOJO_BACKEND_WERROR
 from op_utils import Argv
 
 
@@ -57,7 +58,7 @@ def _local_dir(prefix: String) raises -> String:
     the command quotes its paths, so the shell took that spelling literally
     and made a directory of that name inside the caller's working
     directory."""
-    var tmp = getenv("TMPDIR")
+    var tmp = getenv(TMPDIR)
     if tmp == "":
         tmp = String("/tmp")
     var d = tmp + "/" + prefix + String(external_call["getuid", UInt32]())
@@ -312,7 +313,7 @@ struct Loader(Movable):
         # default, on under pytest); native/__init__.py's
         # mojo_diagnostic_flags is the same switch for the Python-driven
         # builds.
-        if getenv("TORCH_MOJO_BACKEND_WERROR") == "1":
+        if getenv(TORCH_MOJO_BACKEND_WERROR) == "1":
             cmd += " --Werror"
         cmd += (
             " -o '"

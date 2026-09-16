@@ -22,6 +22,10 @@ from max.gpu.host import (
     HostBuffer,
 )
 
+from env_vars import (
+    TORCH_MOJO_BACKEND_TEST_PEER_COPY,
+    TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
+)
 from vendor import Vendor, raw_stream
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
@@ -189,9 +193,9 @@ def init_backend() raises -> Int:
     for i in range(n):
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
-    var gate = getenv("TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD")
+    var gate = getenv(TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD)
     var gate_fd = Int(gate) if gate != "" else -1
-    var modes = getenv("TORCH_MOJO_BACKEND_TEST_PEER_COPY")
+    var modes = getenv(TORCH_MOJO_BACKEND_TEST_PEER_COPY)
     # Delimit once so mode checks match whole tokens without getenv or splitting.
     var test_peer_copy = "," + modes + "," if modes != "" else ""
     var box = unsafe_alloc[Backend](1)
