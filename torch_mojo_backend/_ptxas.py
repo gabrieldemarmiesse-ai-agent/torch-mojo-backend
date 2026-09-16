@@ -16,9 +16,15 @@ constraints that pull in opposite directions:
   *dropped* everything below sm_75, so newer is not always better.
 
 So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
-system CUDA), ask each one its release and which architectures it targets,
-and keep the ones that satisfy both bounds -- preferring the wheel
-``pyproject.toml`` pins for development, since that is what this project tests.
+system CUDA, and the ``libnvptxcompiler`` MAX links into itself), ask each
+one its release and which architectures it targets, and keep the ones that
+satisfy both bounds -- preferring the wheel ``pyproject.toml`` pins for
+development, since that is what this project tests. MAX's own compiler is
+what runs when ``MODULAR_NVPTX_COMPILER_PATH`` is unset; it cannot be asked
+anything from Python, so its release is looked up by MAX version
+(:data:`BUILTIN_NVPTX`) and it ranks below every external ptxas that fits --
+but above a refusal, because on a machine where it is the only thing that
+fits, the right answer is to leave the variable alone.
 :func:`apply_default` does the driver half at import, before ``max`` is
 loaded; :func:`check` does the GPU half at ``register_mojo_devices()``, where
 the device can be asked what it is. When nothing qualifies the user gets
@@ -34,6 +40,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -58,6 +65,19 @@ WHEELS: dict[int, tuple[str, str]] = {
     13: ("nvidia-cuda-nvcc", "13.0.*"),
 }
 PINNED_WHEEL = WHEELS[12]
+
+# The libnvptxcompiler linked into `max`, used when MODULAR_NVPTX_COMPILER_PATH
+# is unset. It exports nothing Python can ask its version, so this is read
+# off the release notes: 26.2 moved it from CUDA 12.9 to 13.1
+# (modular/docs/releases/v26.2.md). First match by MAX version wins.
+BUILTIN_NVPTX: tuple[tuple[tuple[int, int], tuple[int, int, int]], ...] = (
+    ((26, 2), (13, 1, 0)),
+    ((0, 0), (12, 9, 0)),
+)
+BUILTIN_SOURCE = "MAX built-in libnvptxcompiler"
+# What TORCH_MOJO_BACKEND_PTXAS_AUTO holds when our pick was "no ptxas at all":
+# not a path, since the variable it marks is then absent.
+BUILTIN_MARK = "<max built-in>"
 
 # The driver each CUDA major needs, from NVIDIA's minor version compatibility
 # table: one number per major, because within a major any toolkit's cubins
@@ -136,6 +156,34 @@ class Ptxas:
     @property
     def is_pinned_wheel(self) -> bool:
         return self.source == f"{PINNED_WHEEL[0]} wheel"
+
+    @property
+    def is_builtin(self) -> bool:
+        """MAX's own compiler: selected by *unsetting* the variable."""
+        return self.source == BUILTIN_SOURCE
+
+    @property
+    def label(self) -> str:
+        """How a message names this assembler."""
+        return "MAX's built-in assembler" if self.is_builtin else str(self.path)
+
+    @property
+    def mark(self) -> str:
+        """The value ``adopt`` records for this choice."""
+        return BUILTIN_MARK if self.is_builtin else str(self.path)
+
+
+def table_arches(version: tuple[int, int, int]) -> frozenset[str]:
+    """The targets a CUDA release supports, per the tables above.
+
+    For the built-in compiler only, which has no ``--help`` to ask; every
+    external ptxas is judged by :func:`arches_of` instead.
+    """
+    return frozenset(
+        target_name(arch)
+        for arch, first in ARCH_MIN_CUDA.items()
+        if first <= version[:2] and version[0] <= ARCH_LAST_MAJOR.get(arch, 99)
+    )
 
 
 def _version_of(path: Path) -> tuple[int, int, int] | None:
@@ -240,6 +288,26 @@ def _triton_ptxas() -> Path | None:
     return None
 
 
+def builtin_ptxas() -> Ptxas | None:
+    """The compiler linked into the installed ``max``, or None without one.
+
+    Found without importing ``max`` -- this runs at import, before it loads.
+    """
+    try:
+        release = importlib.metadata.version("max")
+        spec = importlib.util.find_spec("max")
+    except (importlib.metadata.PackageNotFoundError, ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    parts = tuple(int(part) for part in re.findall(r"\d+", release)[:2])
+    if len(parts) < 2:
+        return None
+    version = next(cuda for floor, cuda in BUILTIN_NVPTX if parts >= floor)
+    path = Path(next(iter(spec.submodule_search_locations)))
+    return Ptxas(path=path, source=BUILTIN_SOURCE, version=version)
+
+
 def _system_ptxas() -> list[tuple[Path, str]]:
     """ptxas from a CUDA toolkit installed on the machine."""
     found = []
@@ -270,6 +338,23 @@ def adopt(path: str):
     os.environ[AUTO_ENV_VAR] = path
 
 
+def adopt_builtin():
+    """Assemble with MAX's own compiler: the variable *absent*, and marked so.
+
+    A child that inherits the environment then sees no setting and the mark,
+    and re-selects for its own GPU like the parent did.
+    """
+    os.environ.pop(ENV_VAR, None)
+    os.environ[AUTO_ENV_VAR] = BUILTIN_MARK
+
+
+def _adopt(ptxas: Ptxas):
+    if ptxas.is_builtin:
+        adopt_builtin()
+    else:
+        adopt(str(ptxas.path))
+
+
 def explicit_choice() -> str | None:
     """``MODULAR_NVPTX_COMPILER_PATH`` as the user set it, not as we did."""
     value = os.environ.get(ENV_VAR)
@@ -283,7 +368,8 @@ def candidates() -> list[Ptxas]:
 
     The environment's own choice comes first so a report always explains the
     setting in force; the pinned wheel comes before the rest so the tested
-    combination is what an equal-in-every-way comparison lands on.
+    combination is what an equal-in-every-way comparison lands on; MAX's own
+    compiler comes last, since it is what runs when nothing is set.
     """
     found: list[tuple[Path, str]] = []
     explicit = explicit_choice()
@@ -311,6 +397,9 @@ def candidates() -> list[Ptxas]:
             continue
         seen.add(resolved)
         result.append(Ptxas(path=path, source=source, version=_version_of(path)))
+    builtin = builtin_ptxas()
+    if builtin is not None:
+        result.append(builtin)
     return result
 
 
@@ -403,7 +492,9 @@ def rejection(
             f"cubins need driver {floor} or newer; "
             f"this driver supports CUDA {driver[0]}.{driver[1]}"
         )
-    supported = arches_of(ptxas.path)
+    supported = (
+        table_arches(ptxas.version) if ptxas.is_builtin else arches_of(ptxas.path)
+    )
     if supported:  # empty means --help could not be parsed: not a rejection
         missing = {target_name(arch) for arch in arches} - supported
         if missing:
@@ -419,10 +510,11 @@ def choose(
     """The best usable ptxas, and every rejected one with its reason.
 
     Among usable ones the pinned wheel wins -- it is the assembler this
-    project's kernels are tested and tuned with -- then one no newer than the
-    driver, then the highest release. Newest-wins would silently move an
-    existing machine to a different assembler the moment a torch wheel
-    shipped one.
+    project's kernels are tested and tuned with -- then any external ptxas
+    over MAX's built-in compiler (whose release is a table entry, not an
+    answer it gave), then one no newer than the driver, then the highest
+    release. Newest-wins would silently move an existing machine to a
+    different assembler the moment a torch wheel shipped one.
     """
     if found is None:
         found = candidates()
@@ -436,10 +528,10 @@ def choose(
     if not usable:
         return None, rejected
 
-    def rank(ptxas: Ptxas) -> tuple[bool, bool, tuple[int, int, int]]:
+    def rank(ptxas: Ptxas) -> tuple[bool, bool, bool, tuple[int, int, int]]:
         version = ptxas.version or (0, 0, 0)
         no_newer = driver is None or version[:2] <= driver
-        return (ptxas.is_pinned_wheel, no_newer, version)
+        return (ptxas.is_pinned_wheel, not ptxas.is_builtin, no_newer, version)
 
     return max(usable, key=rank), rejected
 
@@ -540,6 +632,8 @@ def report(
         else:
             mark = "ok"
         detail = f"{ptxas.release}, from {ptxas.source}"
+        if ptxas.is_builtin:
+            detail += f" (release per MAX version, in force when {ENV_VAR} is unset)"
         lines.append(f"    [{mark:>4}] {ptxas.path}")
         lines.append(f"           {detail}" + (f" -- {why}" if why else ""))
     if chosen is None:
@@ -586,7 +680,7 @@ def apply_default():
         return
     chosen, _ = choose(driver)
     if chosen is not None:
-        adopt(str(chosen.path))
+        _adopt(chosen)
 
 
 class PtxasError(RuntimeError):
@@ -639,19 +733,19 @@ def _check_now():
         message = f"{ENV_VAR}={explicit} cannot be used here: {why}.\n"
         if chosen is not None:
             message += (
-                f"Unset it and {chosen.path} ({chosen.release}) is used "
+                f"Unset it and {chosen.label} ({chosen.release}) is used "
                 f"instead, which works on this machine.\n"
             )
         message += "\n" + report(driver, devices, found)
     elif chosen is not None:
         previous = os.environ.get(AUTO_ENV_VAR)
-        adopt(str(chosen.path))
-        if previous is not None and previous != str(chosen.path):
+        _adopt(chosen)
+        if previous is not None and previous != chosen.mark:
             # Silently assembling with something other than the wheel we ship
             # is exactly the kind of thing a bug report needs to mention.
-            before = next((p for p in found if str(p.path) == previous), None)
+            before = next((p for p in found if p.mark == previous), None)
             why = rejection(before, driver, arches) if before else "is gone"
-            _trace(f"ptxas: using {chosen.path} ({chosen.release}); {previous} {why}")
+            _trace(f"ptxas: using {chosen.label} ({chosen.release}); {previous} {why}")
         return
     else:
         message = (

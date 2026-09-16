@@ -64,7 +64,8 @@ OWN_ENV_VARS: dict[str, str] = {
     ),
     "TORCH_MOJO_BACKEND_PTXAS_AUTO": (
         "Set by the package, not by you: the MODULAR_NVPTX_COMPILER_PATH it "
-        "chose itself. Every child process inherits the environment, and this "
+        "chose itself, or `<max built-in>` when it chose to leave that unset "
+        "for MAX's own compiler. Every child process inherits the environment, and this "
         "is what lets one tell an inherited automatic choice from a setting "
         "of yours, which is never overridden."
     ),
@@ -225,7 +226,8 @@ FOREIGN_ENV_VARS: dict[str, str] = {
     "MODULAR_NVPTX_COMPILER_PATH": (
         "The ptxas MAX assembles with. Defaulted to the one on this machine "
         "that suits both the driver and the GPU -- the nvidia-cuda-nvcc-cu12 "
-        "wheel's where it fits. An explicit value wins and is only checked; "
+        "wheel's where it fits, and left unset for MAX's own compiler when "
+        "only that one does. An explicit value wins and is only checked; "
         "`torch-mojo-backend ptxas` shows the choice and the alternatives."
     ),
     "ROCM_PATH": "ROCm install root, searched for the HIP runtime and librccl.",

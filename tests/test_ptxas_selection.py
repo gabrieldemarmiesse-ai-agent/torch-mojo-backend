@@ -30,6 +30,7 @@ SYSTEM_11_8 = _ptxas.Ptxas(
     Path("/usr/local/cuda-11.8/bin/ptxas"), "system CUDA", (11, 8, 89)
 )
 MISSING = _ptxas.Ptxas(Path("/nonexistent/ptxas"), _ptxas.ENV_VAR, None)
+BUILTIN_13_1 = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, (13, 1, 0))
 
 # What each of those really lists in `ptxas --help`, abbreviated to the
 # architectures these tests reason about.
@@ -108,6 +109,47 @@ def test_an_unparsable_help_output_is_not_a_rejection(arches):
     unknown = _ptxas.Ptxas(Path("/unknown/ptxas"), "system CUDA", (12, 6, 0))
     chosen, _ = _ptxas.choose((12, 8), (90,), [unknown])
     assert chosen is unknown
+
+
+# -- MAX's own compiler: what runs when nothing is set -------------------------
+
+
+def test_the_builtin_compiler_is_judged_by_the_tables():
+    """It has no --help to ask, so it is read off ARCH_MIN_CUDA and
+    ARCH_LAST_MAJOR: a CUDA 13 release knows sm_110a and has dropped sm_70."""
+    supported = _ptxas.table_arches((13, 1, 0))
+    assert {"sm_90a", "sm_110a"} <= supported
+    assert "sm_70" not in supported and "sm_101a" not in supported
+    assert "sm_70" in _ptxas.table_arches((12, 9, 0))
+
+
+def test_any_external_ptxas_that_fits_beats_the_builtin(arches):
+    """Its release is a table entry, not an answer it gave, so anything we
+    could actually ask ranks above it -- the pinned wheel most of all."""
+    chosen, _ = _ptxas.choose((13, 0), (90,), [BUILTIN_13_1, TORCH_13_0, WHEEL_12_8])
+    assert chosen is WHEEL_12_8
+    chosen, _ = _ptxas.choose((13, 0), (110,), [BUILTIN_13_1, TORCH_13_0])
+    assert chosen is TORCH_13_0
+
+
+def test_the_builtin_is_bound_by_the_driver_like_any_other(arches):
+    chosen, rejected = _ptxas.choose((12, 8), (90,), [BUILTIN_13_1])
+    assert chosen is None
+    assert "driver r580" in rejected[0][1]
+
+
+def test_the_builtin_is_chosen_over_a_refusal(arches):
+    """An r580 box with a Blackwell and only the cu12 wheel installed used to
+    be refused, though leaving the variable unset would have worked."""
+    chosen, _ = _ptxas.choose((13, 0), (110,), [WHEEL_12_8, BUILTIN_13_1])
+    assert chosen is BUILTIN_13_1
+
+
+def test_the_installed_max_has_a_builtin_entry():
+    builtin = _ptxas.builtin_ptxas()
+    assert builtin is not None and builtin.is_builtin
+    assert builtin.version is not None and builtin.version >= (12, 9, 0)
+    assert builtin in _ptxas.candidates()
 
 
 # -- what the user is told when nothing works ---------------------------------
@@ -332,6 +374,48 @@ def test_the_refusal_can_be_turned_into_a_warning(monkeypatch):
             devices=((90, "NVIDIA H100 80GB HBM3"),),
             found=[TORCH_13_0],
         )
+
+
+def test_choosing_the_builtin_unsets_the_variable_and_marks_it(monkeypatch):
+    _check(
+        monkeypatch,
+        driver=(13, 0),
+        devices=((110, "NVIDIA B300"),),
+        found=[WHEEL_12_8, BUILTIN_13_1],
+        ours=str(WHEEL_12_8.path),
+    )
+    assert _ptxas.ENV_VAR not in os.environ
+    assert os.environ[_ptxas.AUTO_ENV_VAR] == _ptxas.BUILTIN_MARK
+
+
+def test_an_inherited_builtin_mark_is_not_a_setting(monkeypatch):
+    """A rank spawned after the parent settled on the built-in sees no
+    variable and the mark -- and the mark alone must not read as a choice."""
+    monkeypatch.delenv(_ptxas.ENV_VAR, raising=False)
+    monkeypatch.setenv(_ptxas.AUTO_ENV_VAR, _ptxas.BUILTIN_MARK)
+    assert _ptxas.explicit_choice() is None
+    _check(
+        monkeypatch,
+        driver=(13, 0),
+        devices=((90, "NVIDIA H100 80GB HBM3"),),
+        found=[WHEEL_12_8, BUILTIN_13_1],
+    )
+    assert os.environ[_ptxas.ENV_VAR] == str(WHEEL_12_8.path)
+
+
+def test_a_broken_setting_is_told_the_builtin_would_work(monkeypatch):
+    with pytest.raises(_ptxas.PtxasError) as excinfo:
+        _check(
+            monkeypatch,
+            driver=(13, 0),
+            devices=((110, "NVIDIA B300"),),
+            found=[
+                _ptxas.Ptxas(WHEEL_12_8.path, _ptxas.ENV_VAR, WHEEL_12_8.version),
+                BUILTIN_13_1,
+            ],
+            env=str(WHEEL_12_8.path),
+        )
+    assert "Unset it and MAX's built-in assembler (CUDA 13.1)" in str(excinfo.value)
 
 
 # -- the tables, against the assemblers actually installed here ---------------
