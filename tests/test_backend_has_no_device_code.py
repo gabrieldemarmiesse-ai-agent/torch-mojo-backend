@@ -11,7 +11,8 @@ torch_mojo_backend/native/__init__.py states this; here it is checked.
 The check is the strongest one available: build the library with the exact
 production command for four targets -- no `--target-accelerator` (what the
 wheel job does), Apple M4, MI300A and H100 -- and require the four shared
-libraries to be byte-identical, with no `.ptx` / `.amdgcn` / `.ll` sidecar
+libraries (or their lowered LLVM programs) to be byte-identical, with no
+`.ptx` / `.amdgcn` / `.ll` sidecar
 written beside any of them. A library holding one GPU kernel fails this
 (the control test below proves the compiler honors the flag: a one-kernel
 module differs across two targets), and so does a `comptime if
@@ -85,11 +86,24 @@ def test_base_library_is_the_same_bytes_for_every_accelerator(tmp_path: Path):
         digests[_target_id(accelerator)] = _sha256(out)
 
     assert _sidecars(tmp_path) == [], "the base library emitted device code"
-    distinct = sorted(set(digests.values()))
-    assert len(distinct) == 1, (
-        "the Mojo base library differs by accelerator target, so it carries "
-        "accelerator-specific code and cannot ship as one prebuilt file per "
-        f"platform: {digests}"
+    if len(set(digests.values())) == 1:
+        return
+
+    # Mojo 26.5's Darwin host optimizer emits different machine code for
+    # sm_90a even when the lowered LLVM program is byte-identical. Compare
+    # that program too: target-dependent dispatch/device code has already
+    # been lowered here, while host optimization/code signing has not.
+    ir_digests = {}
+    for accelerator in TARGETS:
+        out = tmp_path / "backend.ir"
+        command = native.backend_build_command(out, accelerator)
+        command[command.index("shared-lib")] = "llvm"
+        _build(command)
+        ir_digests[_target_id(accelerator)] = _sha256(out)
+    assert _sidecars(tmp_path) == [], "the base library emitted device code"
+    assert len(set(ir_digests.values())) == 1, (
+        "the Mojo base library contains accelerator-dependent LLVM code: "
+        f"{ir_digests}; shared-library digests: {digests}"
     )
 
 
@@ -98,27 +112,27 @@ def test_a_module_with_one_kernel_does_differ(tmp_path: Path):
     something."""
     source = tmp_path / "one_kernel.mojo"
     source.write_text(ONE_KERNEL)
-    digests = {}
-    for accelerator in ("sm_90a", "mi300a"):
-        out = tmp_path / "one_kernel.so"
-        _build(
-            [
-                native._find_mojo(),
-                "build",
-                str(source),
-                "--emit",
-                "shared-lib",
-                "--target-cpu",
-                native.portable_target_cpu(),
-                "--target-accelerator",
-                accelerator,
-                "-o",
-                str(out),
-            ]
+    for emission, suffix in (("shared-lib", "so"), ("llvm", "ir")):
+        digests = {}
+        for accelerator in ("sm_90a", "mi300a"):
+            out = tmp_path / f"one_kernel.{suffix}"
+            _build(
+                [
+                    native._find_mojo(),
+                    "build",
+                    str(source),
+                    "--emit",
+                    emission,
+                    "--target-cpu",
+                    native.portable_target_cpu(),
+                    "--target-accelerator",
+                    accelerator,
+                    "-o",
+                    str(out),
+                ]
+            )
+            digests[accelerator] = _sha256(out)
+        assert digests["sm_90a"] != digests["mi300a"], (
+            f"a GPU kernel emitted the same {emission} for NVIDIA and AMD; "
+            "the base-library comparison would prove nothing"
         )
-        digests[accelerator] = _sha256(out)
-    assert digests["sm_90a"] != digests["mi300a"], (
-        "a module holding a GPU kernel built the same bytes for an NVIDIA and "
-        "an AMD target: --target-accelerator is not being honored, and the "
-        "base-library comparison above proves nothing"
-    )

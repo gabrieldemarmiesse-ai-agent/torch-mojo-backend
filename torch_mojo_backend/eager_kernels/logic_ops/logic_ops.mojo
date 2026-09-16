@@ -25,6 +25,7 @@ from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
+from std.memory import bitcast
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -356,19 +357,32 @@ def _bin_vec_op[
             # fp32 unconditionally: fp64 is not just slower there, it is
             # outright unsupported on Apple's Metal backend, so this same
             # widen-to-fp64 fix cannot apply to a GPU kernel at all.
-            # Checked against this same input on an NVIDIA GPU (no flush,
-            # correct answer) and on Apple's Metal GPU (DOES flush this fp32
-            # intermediate to zero -- `test_floor_divide_subnormal_quotient_
-            # underflow` skips there, unresolved: see that test).
+            # Metal flushes a negative subnormal quotient to zero. Inspect
+            # the input bits to retain its sign and distinguish it from a
+            # genuine zero numerator or an infinite divisor, without fp64.
             comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-                comptime if cpu_floordiv_f64:
-                    return (
-                        a.cast[DType.float64]() // b.cast[DType.float64]()
-                    ).cast[out_dtype]()
-                else:
-                    return (
-                        a.cast[DType.float32]() // b.cast[DType.float32]()
-                    ).cast[out_dtype]()
+                comptime wide = DType.float64 if cpu_floordiv_f64 else DType.float32
+                var quotient = (a.cast[wide]() // b.cast[wide]()).cast[
+                    DType.float32
+                ]()
+                var abits = bitcast[DType.uint16, width](a)
+                var bbits = bitcast[DType.uint16, width](b)
+                comptime infinity = 0x7C00 if dtype == DType.float16 else 0x7F80
+                var amag = abits & 0x7FFF
+                var bmag = bbits & 0x7FFF
+                # ATen's div_floor_floating also returns -1 for finite,
+                # nonzero operands divided by an opposite-sign infinity.
+                var negative_zero = (
+                    quotient.eq(0)
+                    & amag.ne(0)
+                    & amag.lt(SIMD[DType.uint16, width](infinity))
+                    & bmag.ne(0)
+                    & bmag.le(SIMD[DType.uint16, width](infinity))
+                    & ((abits ^ bbits) & 0x8000).ne(0)
+                )
+                return negative_zero.select(
+                    SIMD[DType.float32, width](-1), quotient
+                ).cast[out_dtype]()
             else:
                 return (a // b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV:

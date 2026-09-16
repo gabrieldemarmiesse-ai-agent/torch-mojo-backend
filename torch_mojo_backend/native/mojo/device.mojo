@@ -27,6 +27,8 @@ from env_vars import (
     TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
 )
 from vendor import Vendor, raw_stream
+from kernels import KernelCall
+from op_utils import MAX_RANK
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
 comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
@@ -665,7 +667,30 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
         return
     var d = wrap_raw(ctx, dst, nbytes)
     var s = wrap_raw(ctx, src, nbytes)
-    d.enqueue_copy_from(s)
+    try:
+        d.enqueue_copy_from(s)
+    except e:
+        if ctx.api() != "metal" or "Invalid Metal buffer pointer" not in String(
+            e
+        ):
+            raise e
+        # MAX 26.5 accepts DLPack-imported Metal addresses in kernels but its
+        # raw DeviceBuffer D2D path rejects them. Copy on the same queue with
+        # the existing byte-preserving kernel; other transfer errors propagate.
+        var shape = List[Int]()
+        var strides = List[Int]()
+        for i in range(MAX_RANK):
+            shape.append(nbytes if i == MAX_RANK - 1 else 1)
+            strides.append(1 if i == MAX_RANK - 1 else 0)
+        var call = KernelCall("memory_ops", "CopyStrided")
+        call.int(dst)
+        call.int(src)
+        call.tuple(shape)
+        call.tuple(strides)
+        call.tuple(strides)
+        call.int(1)
+        call.int(ctx_ptr(ctx))
+        call.run()
     if ctx.api() == "cpu":
         ctx.synchronize()
 

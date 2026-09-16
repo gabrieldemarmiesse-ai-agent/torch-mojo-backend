@@ -652,22 +652,17 @@ def test_floor_divide_narrow_float_boundary(mojo_device, dtype):
 
 
 def test_floor_divide_subnormal_quotient_underflow(mojo_device):
-    """2**-126 / -4.71875 is an fp32 SUBNORMAL; flushing it to zero answers 0
-    where the floor is -1. bf16-only: fp16's normal range bottoms out at
-    2**-14, far above the fp32 subnormal cliff.
-
-    Apple's Metal GPU DOES flush this fp32 intermediate to zero (unlike
-    every device this was checked against before -- see the FTZ comment on
-    `BOP_FLOORDIV` in logic_ops.mojo), and fp64 -- the CPU path's fix -- is
-    not available there to widen into, so this is a real, currently
-    unresolved precision gap on Apple GPUs, not a decline.
-    """
-    skip_if_metal(mojo_device, "Apple GPU flushes this fp32 subnormal to zero")
-    a_cpu = torch.tensor([2.0**-126], dtype=torch.bfloat16)
-    b_cpu = torch.tensor([-4.71875], dtype=torch.bfloat16)
+    """Floor must retain the sign of a quotient flushed to zero by Metal."""
+    a_cpu = torch.tensor(
+        [2.0**-126, -(2.0**-126), 0.0, -0.0, 1.0, -1.0], dtype=torch.bfloat16
+    )
+    b_cpu = torch.tensor(
+        [-4.71875, -4.71875, -2.0, 2.0, -float("inf"), float("inf")],
+        dtype=torch.bfloat16,
+    )
     a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
     expected = torch.floor_divide(a_cpu, b_cpu)
-    assert expected.item() == -1.0, expected  # the CPU reference itself
+    assert expected[0].item() == -1.0, expected  # the CPU reference itself
     torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
 
 

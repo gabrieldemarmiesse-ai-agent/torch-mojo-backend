@@ -118,7 +118,7 @@ def _is_sum_dtype(dt: DType) -> Bool:
 def _is_cumsum_dtype(dt: DType, fast_ok: Bool) -> Bool:
     """cumsum_kernels CUMSUM_DTYPES, minus the bf16/f16 entries on a device
     where the bf16/f16 route was never measured. Measured correct on NVIDIA
-    (H100, the fast block.prefix_sum kernels) and on AMD MI300A (gfx942, the
+    (H100, the fast block.prefix_sum kernels) and on AMD MI300A and Apple M4 (gfx942/Metal, the
     portable one-thread-per-line fallback -- see `_cumsum_inner_into` /
     `_cumsum_outer_into` in nn_ops.mojo)."""
     if dt == DType.float32 or dt == DType.int32 or dt == DType.int64:
@@ -1211,15 +1211,10 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _require_mojo(a)
     if a.numel == 0 or a.rank == 0:
         unsupported("cumsum of an empty or rank-0 tensor")
-    # The bf16/f16 dtypes and the OUTER (dim=0, rank-2) route were only ever
-    # MEASURED on NVIDIA (the fast block.prefix_sum kernels) until MI300A
-    # (gfx942) measurement widened this to HIP too -- see
-    # `_cumsum_inner_into` / `_cumsum_outer_into` in nn_ops.mojo, which pick
-    # the fast CUDA kernels or the portable one-thread-per-line fallback per
-    # `ctx.api()`, both exercised here. Anything else (Metal, CPU) gets
-    # exactly the pre-existing surface (int64/int32/float32, trailing dim),
-    # and the Mojo-side dispatch gates the same way.
-    var fast_ok = dev(a.device)[].api == "cuda" or dev(a.device)[].api == "hip"
+    # CUDA uses block prefix sums; HIP and Metal use the portable per-line
+    # route. Half dtypes and rank-2 dim 0 are validated on all three APIs.
+    # Preserve the CPU device's existing trailing-dimension surface.
+    var fast_ok = dev(a.device)[].api != "cpu"
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=2])
     if want >= 0:

@@ -23,7 +23,11 @@ install, we bring the GPU stack" motto:
   warns about it (untested; use the CPU wheel).
 
 Collectives on CPU tensors (object collectives, `barrier()`) are served by a
-private gloo backend inside the same process group.
+private gloo backend inside the same process group. This works on arm64 Macs
+without NCCL/RCCL: when the current device is CPU or Metal, constructing the
+group does not initialize the native GPU communicator.
+Collectives on Metal tensors remain unsupported; the native GPU communicator
+requires CUDA/HIP and its current unique-ID ABI requires x86-64.
 
 ## Usage
 
