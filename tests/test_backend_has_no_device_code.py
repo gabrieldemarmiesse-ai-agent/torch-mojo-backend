@@ -78,7 +78,9 @@ def _sidecars(directory: Path) -> list[str]:
 def test_base_library_is_the_same_bytes_for_every_accelerator(tmp_path: Path):
     digests = {}
     for accelerator in TARGETS:
-        out = tmp_path / f"backend-{_target_id(accelerator)}.so"
+        # Mach-O embeds the output name in its install name and signature.
+        # Hold it fixed so only the accelerator flag varies.
+        out = tmp_path / "backend.so"
         _build(native.backend_build_command(out, accelerator))
         digests[_target_id(accelerator)] = _sha256(out)
 
@@ -98,7 +100,7 @@ def test_a_module_with_one_kernel_does_differ(tmp_path: Path):
     source.write_text(ONE_KERNEL)
     digests = {}
     for accelerator in ("sm_90a", "mi300a"):
-        out = tmp_path / f"one_kernel-{accelerator}.so"
+        out = tmp_path / "one_kernel.so"
         _build(
             [
                 native._find_mojo(),

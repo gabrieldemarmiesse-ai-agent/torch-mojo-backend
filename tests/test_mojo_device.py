@@ -213,6 +213,7 @@ def test_non_blocking_cpu_source_lifetime(mojo_device):
 
 def test_non_blocking_h2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     """An async upload returns without waiting for older default-stream work."""
+    skip_if_metal(mojo_gpu, "MAX Metal uploads intentionally synchronize")
     a = torch.full((4096, 4096), 1.0, device=mojo_gpu)
     b = torch.full((4096, 4096), 2.0, device=mojo_gpu)
     torch.accelerator.synchronize(mojo_gpu)
@@ -1235,7 +1236,11 @@ def test_same_device_d2d_does_not_drain_prior_gpu_work(mojo_gpu: str):
     # Warm every copy path before measuring Python return latency.
     contiguous_destination.copy_(contiguous_source)
     strided_destination.copy_(strided_source)
-    repeats = 200
+    # Retaining 200 outputs consumes 12.5 GiB, exceeding small GPUs and
+    # the working set of a 16 GiB Mac. Bound live outputs to 1/8 of memory.
+    total_memory = device_module.get_device_properties(mojo_gpu).total_memory
+    output_bytes = a.numel() * a.element_size()
+    repeats = min(200, max(1, (total_memory or (2 << 30)) // (8 * output_bytes)))
     for _ in range(repeats):
         _ = a * b
     torch.accelerator.synchronize(mojo_gpu)

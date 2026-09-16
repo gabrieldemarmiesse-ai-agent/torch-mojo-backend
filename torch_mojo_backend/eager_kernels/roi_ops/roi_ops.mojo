@@ -26,6 +26,9 @@ from variant_gates import (
     _tmb_entry_error,
 )
 
+# Vector kernel arguments lack Metal buffer metadata; use an aggregate.
+comptime DivisorArgs = InlineArray[UInt32, 4]
+
 comptime BLOCK = 256
 # Measured on H100: 32 forward blocks/SM, 8 scatter blocks/SM.
 comptime FORWARD_BLOCKS_PER_SM = 32
@@ -132,19 +135,18 @@ def _round_away[dt: DType](value: Scalar[dt]) -> Int:
 
 
 @always_inline
-def _divisor(divisor: Int) -> SIMD[DType.uint32, 4]:
+def _divisor(divisor: Int) -> DivisorArgs:
     # FastDiv is not DevicePassable; pack its pinned multiplier/shift fields.
     var d = FastDiv[DType.uint32](divisor)
-    return SIMD[DType.uint32, 4](
-        UInt32(d._mprime),
-        UInt32(d._sh1),
-        UInt32(d._log2_shift) if d._is_pow2 else UInt32(d._sh2),
-        0,
-    )
+    var result = DivisorArgs(fill=UInt32(0))
+    result[0] = UInt32(d._mprime)
+    result[1] = UInt32(d._sh1)
+    result[2] = UInt32(d._log2_shift) if d._is_pow2 else UInt32(d._sh2)
+    return result^
 
 
 @always_inline
-def _divide(value: UInt32, divisor: SIMD[DType.uint32, 4]) -> UInt32:
+def _divide(value: UInt32, divisor: DivisorArgs) -> UInt32:
     var high = mulhi(divisor[0], value)
     return (high + ((value - high) >> divisor[1])) >> divisor[2]
 
@@ -157,9 +159,9 @@ def _coordinates[
     c: Int,
     ph: Int,
     pw: Int,
-    div_pw: SIMD[DType.uint32, 4],
-    div_ph: SIMD[DType.uint32, 4],
-    div_c: SIMD[DType.uint32, 4],
+    div_pw: DivisorArgs,
+    div_ph: DivisorArgs,
+    div_c: DivisorArgs,
 ) -> Tuple[Int, Int, Int, Int]:
     comptime if fast:
         var q0 = _divide(UInt32(index), div_pw)
@@ -266,9 +268,9 @@ def _align_forward[
     scale: Scalar[acc],
     sampling64: Int64,
     aligned64: Int64,
-    div_pw: SIMD[DType.uint32, 4],
-    div_ph: SIMD[DType.uint32, 4],
-    div_c: SIMD[DType.uint32, 4],
+    div_pw: DivisorArgs,
+    div_ph: DivisorArgs,
+    div_c: DivisorArgs,
 ):
     var aligned = aligned64 != 0
     var n = Int(n64)
@@ -360,9 +362,9 @@ def _pool_forward[
     ph64: Int64,
     pw64: Int64,
     scale: Scalar[acc],
-    div_pw: SIMD[DType.uint32, 4],
-    div_ph: SIMD[DType.uint32, 4],
-    div_c: SIMD[DType.uint32, 4],
+    div_pw: DivisorArgs,
+    div_ph: DivisorArgs,
+    div_c: DivisorArgs,
 ):
     var n = Int(n64)
     var c = Int(c64)
@@ -718,9 +720,9 @@ def _enqueue_forward[
     var pw = Int64(_raw_int(argv[unsafe_offset=10]))
     var scale = _roi_scale[acc](_raw_f64(argv[unsafe_offset=11]))
     var ctx = _raw_ctx(argv[unsafe_offset=14])
-    var div_pw = SIMD[DType.uint32, 4](0)
-    var div_ph = SIMD[DType.uint32, 4](0)
-    var div_c = SIMD[DType.uint32, 4](0)
+    var div_pw = DivisorArgs(fill=UInt32(0))
+    var div_ph = DivisorArgs(fill=UInt32(0))
+    var div_c = DivisorArgs(fill=UInt32(0))
     comptime if fast:
         div_pw = _divisor(Int(pw))
         div_ph = _divisor(Int(ph))
@@ -951,9 +953,9 @@ def _ps_roi[
     pw64: Int64,
     scale: Scalar[acc],
     sampling64: Int64,
-    div_pw: SIMD[DType.uint32, 4],
-    div_ph: SIMD[DType.uint32, 4],
-    div_c: SIMD[DType.uint32, 4],
+    div_pw: DivisorArgs,
+    div_ph: DivisorArgs,
+    div_c: DivisorArgs,
 ):
     comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     var n = Int(n64)
@@ -1114,9 +1116,9 @@ def _enqueue_ps[
     var scale = _roi_scale[acc](_raw_f64(argv[unsafe_offset=11]))
     var sampling = Int64(_raw_int(argv[unsafe_offset=12]))
     var ctx = _raw_ctx(argv[unsafe_offset=14])
-    var div_pw = SIMD[DType.uint32, 4](0)
-    var div_ph = SIMD[DType.uint32, 4](0)
-    var div_c = SIMD[DType.uint32, 4](0)
+    var div_pw = DivisorArgs(fill=UInt32(0))
+    var div_ph = DivisorArgs(fill=UInt32(0))
+    var div_c = DivisorArgs(fill=UInt32(0))
     comptime if fast:
         div_pw = _divisor(Int(pw))
         div_ph = _divisor(Int(ph))

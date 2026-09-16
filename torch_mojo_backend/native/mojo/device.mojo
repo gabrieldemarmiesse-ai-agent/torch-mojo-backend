@@ -1032,6 +1032,9 @@ struct Ev(Movable):
 def h_event_create(device: Int32, enable_timing: Int32) abi("C") -> Int:
     try:
         var d = dev(Int(device))
+        # Creating an event can fail on Metal. Do this before allocating the
+        # box (or a vendor event), so that failure cannot leak either owner.
+        var max_ev = d[].ctx.create_event()
         var raw = 0
         if be()[].vendor and d[].raw[0] != 0:
             raw = (
@@ -1043,7 +1046,7 @@ def h_event_create(device: Int32, enable_timing: Int32) abi("C") -> Int:
                 Int(device),
                 enable_timing != 0,
                 False,
-                d[].ctx.create_event(),
+                max_ev^,
                 raw,
                 0,
             )

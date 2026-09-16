@@ -43,6 +43,7 @@ from libdevice_port import (
     nv_tan,
 )
 from op_utils import _enqueue_cached, _make_ptr
+from rng_metadata import I64x8
 
 comptime DIST_UNIFORM = 0
 comptime DIST_NORMAL = 1
@@ -57,7 +58,6 @@ comptime DIST_RANDOM_FULL_64 = 9
 comptime DIST_RANDOM_32 = 10
 comptime DIST_RANDOM_64 = 11
 
-comptime I64x8 = SIMD[DType.int64, 8]
 comptime BLOCK = 256
 
 comptime _EPS_F32 = Float32(1.1920929e-07)
@@ -532,8 +532,6 @@ def enqueue_distribution[
         dst,
         total,
         ndim,
-        sizes,
-        strides,
         p_out0,
         p_out1,
         p_acc0,
@@ -545,6 +543,8 @@ def enqueue_distribution[
         trivial,
     )
     def cpu_one[width: Int, alignment: Int = 1](c: Coord):
+        # sizes/strides are borrowed only on the CPU: elementwise's CPU
+        # implementation waits for all its worker tasks before returning.
         var li = Int(c[0].value())
         var k = li // (total * N)
         var rem = li % (total * N)
@@ -706,8 +706,9 @@ def enqueue_bernoulli_tensor[
 
     @always_inline
     @parameter
-    @__copy_capture(dst, p, ndim, sizes, dst_strides, p_strides, seed, total)
+    @__copy_capture(dst, p, ndim, seed, offset, total)
     def cpu_one[width: Int, alignment: Int = 1](c: Coord):
+        # These metadata arrays are borrowed only by synchronous CPU work.
         var li = Int(c[0].value())
         var t = (li % total) // 4
         var j = li % 4

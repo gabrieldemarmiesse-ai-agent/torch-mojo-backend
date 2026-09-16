@@ -1511,7 +1511,11 @@ def test_properties_and_memory_info(mojo_device: str):
         assert (
             props.multi_processor_count is not None and props.multi_processor_count > 0
         )
-        assert props.warp_size in (32, 64)
+        if props.api == "metal":
+            # MAX does not expose Metal's SIMD-group width as a device attribute.
+            assert props.warp_size is None
+        else:
+            assert props.warp_size in (32, 64)
         if props.api == "cuda":
             assert props.major is not None and props.major > 0
             if torch.cuda.is_available():

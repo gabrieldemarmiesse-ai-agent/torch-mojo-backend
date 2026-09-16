@@ -32,6 +32,7 @@ from torch_mojo_backend import native
 pytestmark = pytest.mark.xdist_group(name="group1")
 
 _WORKTREE = Path(__file__).resolve().parents[2]
+_SHIM_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
 
 # One tiny script, run in a fresh process: register the backend and run one
 # op (`add`) on the mojo GPU device. Real correctness is covered elsewhere;
@@ -41,9 +42,12 @@ _RUN_ADD = """
 import torch
 from torch_mojo_backend import register_mojo_devices
 register_mojo_devices()
-x = torch.tensor([1.0, 2.0], device="mojo:0")
-result = (x + x).cpu().tolist()
-assert result == [2.0, 4.0], result
+# Broadcasting exercises logic_ops on Metal too; equal-shape contiguous
+# add uses a different Metal kernel family.
+x = torch.tensor([[1.0], [2.0]], device="mojo:0")
+y = torch.tensor([[1.0, 2.0]], device="mojo:0")
+result = (x + y).cpu().tolist()
+assert result == [[2.0, 3.0], [3.0, 4.0]], result
 print("OK")
 """
 
@@ -88,8 +92,10 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
     proc = _run(cache_dir)
     _assert_ok(proc)
 
-    assert list(cache_dir.glob("libtmb_shim.hash-*.so")), "C++ shim not cached here"
-    assert list(cache_dir.glob("libtmb_backend.hash-*.so")), (
+    assert list(cache_dir.glob(f"libtmb_shim.hash-*{_SHIM_SUFFIX}")), (
+        "C++ shim not cached here"
+    )
+    assert list(cache_dir.glob(f"libtmb_backend.hash-*{_SHIM_SUFFIX}")), (
         "Mojo backend not cached here"
     )
     family_sos = _family_sos(cache_dir)
@@ -113,7 +119,11 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     cache_dir = tmp_path / "cache"
     first = _run(cache_dir)
     _assert_ok(first)
-    mtimes_before = {p: p.stat().st_mtime_ns for p in cache_dir.glob("*.so")}
+    mtimes_before = {
+        p: p.stat().st_mtime_ns
+        for p in cache_dir.iterdir()
+        if p.suffix in (".so", ".dylib")
+    }
     assert mtimes_before
 
     second = _run(cache_dir)
@@ -124,7 +134,11 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     assert "built Mojo backend" not in combined
     assert "built  logic_ops" not in combined
     assert "built  ops_" not in combined, "an op extension was rebuilt warm"
-    mtimes_after = {p: p.stat().st_mtime_ns for p in cache_dir.glob("*.so")}
+    mtimes_after = {
+        p: p.stat().st_mtime_ns
+        for p in cache_dir.iterdir()
+        if p.suffix in (".so", ".dylib")
+    }
     assert mtimes_after == mtimes_before, "a warm run rewrote a cached .so"
 
 
@@ -140,8 +154,8 @@ def test_missing_family_so_is_rebuilt(tmp_path: Path):
     shim_mtimes_before = {
         p: p.stat().st_mtime_ns
         for p in (
-            *cache_dir.glob("libtmb_shim.hash-*.so"),
-            *cache_dir.glob("libtmb_backend.hash-*.so"),
+            *cache_dir.glob(f"libtmb_shim.hash-*{_SHIM_SUFFIX}"),
+            *cache_dir.glob(f"libtmb_backend.hash-*{_SHIM_SUFFIX}"),
         )
     }
 
@@ -160,8 +174,8 @@ def test_missing_family_so_is_rebuilt(tmp_path: Path):
     shim_mtimes_after = {
         p: p.stat().st_mtime_ns
         for p in (
-            *cache_dir.glob("libtmb_shim.hash-*.so"),
-            *cache_dir.glob("libtmb_backend.hash-*.so"),
+            *cache_dir.glob(f"libtmb_shim.hash-*{_SHIM_SUFFIX}"),
+            *cache_dir.glob(f"libtmb_backend.hash-*{_SHIM_SUFFIX}"),
         )
     }
     assert shim_mtimes_after == shim_mtimes_before
@@ -208,7 +222,8 @@ def test_missing_op_extension_is_rebuilt_alone(tmp_path: Path):
         so.unlink()
     others_before = {
         p: p.stat().st_mtime_ns
-        for p in cache_dir.glob("*.so")
+        for p in cache_dir.iterdir()
+        if p.suffix in (".so", ".dylib")
         if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
     }
 
@@ -222,7 +237,8 @@ def test_missing_op_extension_is_rebuilt_alone(tmp_path: Path):
     assert sorted(cache_dir.glob("tmbop.ops_binary.add.Tensor.*.so"))
     others_after = {
         p: p.stat().st_mtime_ns
-        for p in cache_dir.glob("*.so")
+        for p in cache_dir.iterdir()
+        if p.suffix in (".so", ".dylib")
         if not p.name.startswith("tmbop.ops_binary.add.Tensor.")
     }
     assert others_after == others_before

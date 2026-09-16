@@ -26,7 +26,8 @@ import torch.distributed.distributed_c10d as c10d
 import torch.utils._triton
 
 if TYPE_CHECKING:
-    from triton.backends.driver import DriverBase
+    # Optional Triton dependency: its wheels are unavailable on macOS.
+    from triton.backends.driver import DriverBase  # ty: ignore[unresolved-import]
 
 
 def fix_privateuse1_dlpack_device_type():
@@ -213,8 +214,8 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
     equivalent), so without an entry of ours the import of the generated
     module raises "Could not find an active GPU backend".
     """
-    import triton.backends  # noqa: PLC0415 -- triton is optional
-    from triton.backends.compiler import (  # noqa: PLC0415 -- triton is optional
+    import triton.backends  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+    from triton.backends.compiler import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
         GPUTarget,
     )
 
@@ -222,7 +223,7 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
         return
 
     if api == "hip":
-        from triton.backends.amd.compiler import (  # noqa: PLC0415 -- triton is optional
+        from triton.backends.amd.compiler import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
             HIPBackend,
         )
 
@@ -231,7 +232,7 @@ def register_the_mojo_triton_target(driver: "type[DriverBase]", api: str):
             def supports_target(target: GPUTarget) -> bool:
                 return getattr(target, "backend", None) == "mojo"
     else:
-        from triton.backends.nvidia.compiler import (  # noqa: PLC0415 -- triton is optional
+        from triton.backends.nvidia.compiler import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
             CUDABackend,
         )
 

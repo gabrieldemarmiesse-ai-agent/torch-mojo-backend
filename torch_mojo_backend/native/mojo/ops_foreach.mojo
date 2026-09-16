@@ -202,6 +202,10 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
     var first = a[0].copy()
     if not first.on_mojo() or _is_max_cpu(first.device):
         return False
+    # Metal's batched kernels accept only float32. Half lists must use the
+    # existing per-tensor scalar operations instead of entering that kernel.
+    if dev(first.device)[].api == "metal" and first.dtype != DType.float32:
+        return False
     if allow_half:
         if (
             first.dtype != DType.float32

@@ -13,7 +13,11 @@ caller (native/mojo/ops_random.mojo).
 """
 from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_apple_gpu,
+)
 
 from curand_philox import (
     U32x4,
@@ -24,8 +28,8 @@ from curand_philox import (
     philox4x32_10,
 )
 from op_utils import _enqueue_cached, _fill_blocks, _make_ptr, FILL_THREADS
+from rng_metadata import I64x8
 
-comptime I64x8 = SIMD[DType.int64, 8]
 comptime BLOCK = 256
 
 
@@ -55,7 +59,12 @@ def _acc[dtype: DType]() -> DType:
 @always_inline
 def _scale_of[ACC: DType](p: Scalar[ACC]) -> Scalar[ACC]:
     """`accscalar_t scale = 1.0 / p`: a double division, then narrowed."""
-    return (Float64(1.0) / p.cast[DType.float64]()).cast[ACC]()
+    comptime if is_apple_gpu():
+        # Metal has no float64 arithmetic. Its supported dropout dtypes all
+        # accumulate in float32; keep the reciprocal in that type here.
+        return Scalar[ACC](1.0) / p
+    else:
+        return (Float64(1.0) / p.cast[DType.float64]()).cast[ACC]()
 
 
 @always_inline

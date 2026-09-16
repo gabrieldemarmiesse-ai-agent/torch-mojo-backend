@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch.utils._mode_utils import no_dispatch
 
+from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.native import device_module
 
@@ -40,7 +41,7 @@ def test_dispatch_installed_and_cpu_delegation():
 
 
 def test_stream_construction_and_identity(mojo_gpu: str):
-    stream = torch.Stream(device=mojo_gpu)
+    stream = side_stream_or_skip(mojo_gpu)
     assert isinstance(stream, torch.Stream)
     assert stream.device == torch.device("mojo", 0)
     assert stream.device_index == 0
@@ -56,7 +57,7 @@ def test_stream_construction_and_identity(mojo_gpu: str):
 def test_current_stream_and_context_manager(mojo_gpu: str):
     default = torch.accelerator.current_stream()
     assert device_module.current_stream() == default
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     with side:
         assert torch.accelerator.current_stream() == side
         assert device_module.current_stream() == side
@@ -68,6 +69,7 @@ def test_current_stream_and_context_manager(mojo_gpu: str):
 
 
 def test_documented_device_agnostic_pattern(mojo_gpu: str):
+    side_stream_or_skip(mojo_gpu)
     stream = torch.Stream(device=torch.accelerator.current_accelerator())
     current = torch.accelerator.current_stream()
     stream.wait_stream(current)
@@ -84,7 +86,7 @@ def test_wait_stream_orders_real_work(mojo_gpu: str):
     x = torch.full((2048, 2048), 2.0, device=mojo_gpu)
     y = x * x
 
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     side.wait_stream(torch.accelerator.current_stream())
     event = side.record_event()
     event.synchronize()
@@ -102,7 +104,12 @@ def test_event_semantics(mojo_gpu: str):
     end = torch.Event(device=mojo_gpu, enable_timing=True)
     stream = torch.accelerator.current_stream()
     torch.accelerator.synchronize()
-    start.record(stream)
+    try:
+        start.record(stream)
+    except RuntimeError as error:
+        if "eventCreate is not supported on this device" in str(error):
+            pytest.skip(f"MAX has no events on this device: {error}")
+        raise
     x = torch.full((1024, 1024), 3.0, device=mojo_gpu)
     (x * x).cpu()  # forces the work through the queue and the device
     end.record(stream)
@@ -138,7 +145,7 @@ def test_record_stream_prevents_pool_reuse_corruption(mojo_gpu: str):
     reused_any = False
     for _ in range(20):
         source = torch.full((n,), 1.0, device=mojo_gpu)
-        side = torch.Stream(device=mojo_gpu)
+        side = side_stream_or_skip(mojo_gpu)
         side.wait_stream(torch.accelerator.current_stream())
         with side:
             sink = source * source
@@ -165,7 +172,7 @@ def test_record_stream_under_no_dispatch(mojo_gpu: str):
     """record_stream must work under no_dispatch(), as torch.distributed
     calls it (e.g. from the c10d reducer / process group bucket views)."""
     tensor = torch.ones(64, device=mojo_gpu)
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     with no_dispatch():
         tensor.record_stream(side)
     assert tensor.cpu().sum().item() == 64.0

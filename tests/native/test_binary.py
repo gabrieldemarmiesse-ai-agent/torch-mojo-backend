@@ -795,6 +795,18 @@ def test_inplace_scalar_every_dtype_and_rank(mojo_device, dtype, shape):
         torch.testing.assert_close(x.cpu(), cpu.mul_(scalar), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scalar", [0.9, 1.0001, -0.33333])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mul_inplace_preserves_scalar_precision(mojo_device, dtype, scalar, strided):
+    cpu = (torch.arange(515, dtype=torch.float32) / 37 - 7).to(dtype)
+    actual = cpu.to(mojo_device)
+    if strided:
+        cpu, actual = cpu[1::2], actual[1::2]
+    assert actual.mul_(scalar) is actual
+    torch.testing.assert_close(actual.cpu(), cpu.mul_(scalar), rtol=0, atol=0)
+
+
 def test_add_above_last_level_cache(mojo_gpu):
     """24_000_003 fp32 elements: past a 256 MiB L2, and not a multiple of the
     4-element vector, so the scalar tail rides the streaming grid too. The
