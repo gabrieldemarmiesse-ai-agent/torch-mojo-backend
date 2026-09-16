@@ -18,8 +18,7 @@ constraints that pull in opposite directions:
 So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
 system CUDA, and the ``libnvptxcompiler`` MAX links into itself), ask each
 one its release and which architectures it targets, keep the ones that
-satisfy both bounds, and take the newest of those that is no newer than the
-driver. MAX's own compiler is a candidate like the others -- it is what runs
+satisfy both bounds, and take the newest of those. MAX's own compiler is a candidate like the others -- it is what runs
 when ``MODULAR_NVPTX_COMPILER_PATH`` is unset, and choosing it means leaving
 the variable unset. It cannot be asked anything from Python, so its release
 is looked up by MAX version (:data:`BUILTIN_NVPTX`).
@@ -502,9 +501,10 @@ def choose(
 ) -> tuple[Ptxas | None, list[tuple[Ptxas, str]]]:
     """The best usable ptxas, and every rejected one with its reason.
 
-    Among usable ones, one no newer than the driver wins over one relying
-    on minor version compatibility, then the highest release. Where it came
-    from -- a wheel, the system, MAX itself -- does not enter into it.
+    Among usable ones the highest release wins: it carries NVIDIA's latest
+    fixes, and every usable one is guaranteed to load on this driver (minor
+    version compatibility) and to target these GPUs. Where it came from -- a
+    wheel, the system, MAX itself -- does not enter into it.
     """
     if found is None:
         found = candidates()
@@ -518,12 +518,7 @@ def choose(
     if not usable:
         return None, rejected
 
-    def rank(ptxas: Ptxas) -> tuple[bool, tuple[int, int, int]]:
-        version = ptxas.version or (0, 0, 0)
-        no_newer = driver is None or version[:2] <= driver
-        return (no_newer, version)
-
-    return max(usable, key=rank), rejected
+    return max(usable, key=lambda ptxas: ptxas.version or (0, 0, 0)), rejected
 
 
 def install_advice(

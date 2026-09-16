@@ -59,15 +59,13 @@ def test_a_cuda_13_assembler_is_refused_on_an_r570_driver(arches):
     assert "r580" in rejected[0][1] and "CUDA 12.8" in rejected[0][1]
 
 
-def test_the_newest_no_newer_than_the_driver_wins(arches):
+def test_the_newest_that_fits_wins(arches):
     chosen, rejected = _ptxas.choose((13, 0), (90,), [WHEEL_12_8, TORCH_13_0])
     assert chosen is TORCH_13_0
     assert rejected == []
-    # 13.1 loads on an r580 driver reporting 13.0 (minor version
-    # compatibility), but one that needs no such leniency is preferred.
+    # 13.1 is newer than the 13.0 the driver reports, and still wins: any
+    # 13.x cubin loads on an r580 driver (minor version compatibility).
     chosen, _ = _ptxas.choose((13, 0), (90,), [WHEEL_12_8, TORCH_13_0, BUILTIN_13_1])
-    assert chosen is TORCH_13_0
-    chosen, _ = _ptxas.choose((13, 1), (90,), [WHEEL_12_8, TORCH_13_0, BUILTIN_13_1])
     assert chosen is BUILTIN_13_1
 
 
@@ -131,9 +129,11 @@ def test_the_builtin_compiler_is_judged_by_the_tables():
 def test_the_builtin_is_ranked_like_any_other(arches):
     """Where an assembler came from does not enter the ranking."""
     chosen, _ = _ptxas.choose((13, 0), (110,), [BUILTIN_13_1, TORCH_13_0])
-    assert chosen is TORCH_13_0
+    assert chosen is BUILTIN_13_1
     chosen, _ = _ptxas.choose((12, 9), (90,), [WHEEL_12_8, BUILTIN_12_9])
     assert chosen is BUILTIN_12_9
+    chosen, _ = _ptxas.choose((13, 0), (90,), [BUILTIN_12_9, TORCH_13_0])
+    assert chosen is TORCH_13_0
 
 
 def test_the_builtin_is_bound_by_the_driver_like_any_other(arches):
@@ -403,9 +403,9 @@ def test_an_inherited_builtin_mark_is_not_a_setting(monkeypatch):
         monkeypatch,
         driver=(13, 0),
         devices=((90, "NVIDIA H100 80GB HBM3"),),
-        found=[WHEEL_12_8, BUILTIN_13_1],
+        found=[WHEEL_12_8, BUILTIN_12_9, TORCH_13_0],
     )
-    assert os.environ[_ptxas.ENV_VAR] == str(WHEEL_12_8.path)
+    assert os.environ[_ptxas.ENV_VAR] == str(TORCH_13_0.path)
 
 
 def test_a_broken_setting_is_told_the_builtin_would_work(monkeypatch):

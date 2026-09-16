@@ -123,9 +123,9 @@ into `max`, which is what runs when the variable is unset. It exports
 nothing Python can ask, so its release is looked up by MAX version
 (`BUILTIN_NVPTX` in `_ptxas.py`, from the MAX release notes: 26.2 moved it
 from CUDA 12.9 to 13.1) and its targets come from the architecture tables
-rather than a `--help`. Among the ones that fit, the newest no newer than
-the driver wins, then the newest outright; where it came from does not enter
-into it. Picking the built-in means *unsetting* the variable (the mark then
+rather than a `--help`. Among the ones that fit — and every one of them
+has to load on this driver and target every GPU present — the newest wins;
+where it came from does not enter into it. Picking the built-in means *unsetting* the variable (the mark then
 reads `<max built-in>`). The nvcc wheel is optional at runtime and pinned only
 in the development dependencies in `pyproject.toml`; it is one candidate
 among the others.
