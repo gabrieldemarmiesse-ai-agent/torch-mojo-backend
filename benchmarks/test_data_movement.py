@@ -17,6 +17,7 @@ import torch
 from bench_lib.cases import DTYPES, both
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
+from bench_lib.measure import gpu_lock
 
 # (pieces, elements per piece).  The piece COUNT is a regime axis of its own:
 # CatN batches up to CAT_SEG_CAP inputs per launch, so 64 is the last count
@@ -74,6 +75,7 @@ COVERS: dict[str, str] = {
         "test_arange (torch.arange reaches the device through the out overload)"
     ),
     "aten::_to_copy": "test_to_copy_cast (dtype-cast regime only)",
+    "aten::_index_put_impl_": "test_index_put",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -209,4 +211,32 @@ def test_to_copy_cast(
     x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
         lambda: x_ref.to(target), lambda: x_our.to(target), flops=float(x_ref.numel())
+    )
+
+
+INDEX_PUT_SHAPES = {
+    "N1000C256H7W7_K500": ((1000, 256, 7, 7), 500),
+    "N357C789_K119": ((357, 789), 119),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ["bf16", "f32"])
+@pytest.mark.parametrize("shape_id", INDEX_PUT_SHAPES)
+@pytest.mark.bench_op("_index_put_impl_")
+def test_index_put(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, count = INDEX_PUT_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    data = torch.zeros(shape, dtype=dtype)
+    indices = torch.arange(count, dtype=torch.int64) * 2
+    values = torch.randn((count, *shape[1:]), dtype=dtype)
+    with gpu_lock():
+        d_ref, d_our = both(data, hw, mojo_device)
+        i_ref, i_our = both(indices, hw, mojo_device)
+        v_ref, v_our = both(values, hw, mojo_device)
+    bench.run(
+        lambda: d_ref.index_put_((i_ref,), v_ref),
+        lambda: d_our.index_put_((i_our,), v_our),
+        flops=float(values.numel()),
     )

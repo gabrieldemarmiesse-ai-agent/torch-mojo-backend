@@ -3373,6 +3373,23 @@ def test_aten_triu_dynamic_batch_dimension(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(), (3, 7)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_log2(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, shape: tuple[int, ...]
+):
+    call_checker.register(aten_functions.aten_log2)
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return aten.log2(x)
+
+    data = torch.full(shape, 8, dtype=dtype)
+    check_outputs(fn, conf, [data])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

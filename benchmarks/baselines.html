@@ -4702,6 +4702,516 @@ document.addEventListener("DOMContentLoaded", boot);
         }
       }
     },
+    "NVIDIA H100 80GB HBM3 | cuda | kineto-device-time | torch 2.11.0+cu128": {
+      "ops": {
+        "_index_put_impl_": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N1000C256H7W7_K500": {
+                  "layouts": {
+                    "contig": 0.325
+                  }
+                },
+                "N357C789_K119": {
+                  "layouts": {
+                    "contig": 1.088
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N1000C256H7W7_K500": {
+                  "layouts": {
+                    "contig": 0.589
+                  }
+                },
+                "N357C789_K119": {
+                  "layouts": {
+                    "contig": 1.086
+                  }
+                }
+              }
+            }
+          }
+        },
+        "log2": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.884
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.949
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.903
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.997
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_deform_conv2d_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 1.068
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.497
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 0.929
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.962
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_ps_roi_align_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.652
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.587
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.839
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.622
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_ps_roi_pool_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.636
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.543
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.675
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.645
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_roi_align_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_adaptive": {
+                  "layouts": {
+                    "contig": 0.528
+                  }
+                },
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 0.581
+                  }
+                },
+                "N2C256H200W272K1000_o7_adaptive": {
+                  "layouts": {
+                    "contig": 0.572
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.548
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.681
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_adaptive": {
+                  "layouts": {
+                    "contig": 1.026
+                  }
+                },
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "N2C256H200W272K1000_o7_adaptive": {
+                  "layouts": {
+                    "contig": 1.034
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.986
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.668
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::_roi_pool_backward": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 0.868
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.901
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.489
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 1.006
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.932
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.539
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::deform_conv2d": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 0.918
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.747
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N3C12O10H17W23_k3_s2_p2_d2_g2_og3_nomask": {
+                  "layouts": {
+                    "contig": 1.024
+                  }
+                },
+                "N8C256O256H64W64_k3_s1_p1_d1_g1_og1_mask": {
+                  "layouts": {
+                    "contig": 0.927
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::nms": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "K1000": {
+                  "layouts": {
+                    "contig": 0.154
+                  }
+                },
+                "K20000": {
+                  "layouts": {
+                    "contig": 0.11
+                  }
+                },
+                "K5000": {
+                  "layouts": {
+                    "contig": 0.087
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "K1000": {
+                  "layouts": {
+                    "contig": 0.162
+                  }
+                },
+                "K20000": {
+                  "layouts": {
+                    "contig": 0.11
+                  }
+                },
+                "K5000": {
+                  "layouts": {
+                    "contig": 0.086
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::ps_roi_align": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.753
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.542
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.882
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.577
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::ps_roi_pool": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.695
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C490H64W64K300_o7_s2": {
+                  "layouts": {
+                    "contig": 0.72
+                  }
+                },
+                "N3C105H37W53K19_o7x5_adaptive": {
+                  "layouts": {
+                    "contig": 0.651
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::roi_align": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_adaptive": {
+                  "layouts": {
+                    "contig": 0.676
+                  }
+                },
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 0.722
+                  }
+                },
+                "N2C256H200W272K1000_o7_adaptive": {
+                  "layouts": {
+                    "contig": 0.619
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.714
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.602
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_adaptive": {
+                  "layouts": {
+                    "contig": 1.029
+                  }
+                },
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "N2C256H200W272K1000_o7_adaptive": {
+                  "layouts": {
+                    "contig": 0.989
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.905
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.676
+                  }
+                }
+              }
+            }
+          }
+        },
+        "torchvision::roi_pool": {
+          "dtypes": {
+            "f16": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 0.818
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.975
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.508
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2C256H200W272K1000_o14_s2": {
+                  "layouts": {
+                    "contig": 0.899
+                  }
+                },
+                "N2C256H200W272K1000_o7_s2": {
+                  "layouts": {
+                    "contig": 0.95
+                  }
+                },
+                "N3C7H37W53K19_o7x5_s2": {
+                  "layouts": {
+                    "contig": 0.548
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "NVIDIA H100 PCIe | cuda | kineto-device-time@1395MHz | torch 2.11.0+cu130": {
       "ops": {
         "_adaptive_avg_pool2d": {

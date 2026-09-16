@@ -22,12 +22,15 @@ from ops_compare import register_compare
 from ops_composed import register_composed
 from ops_core import register_core
 from ops_data_movement import register_data_movement
+from ops_deform_conv import register_deform_conv
 from ops_factories import register_factories
 from ops_foreach import register_foreach
 from ops_matmul import register_matmul
 from ops_nn import register_nn
+from ops_nms import register_nms
 from ops_random import register_random
 from ops_reductions import register_reductions
+from ops_roi import register_roi
 from ops_unary import register_unary
 from pg import Locked, pg_vtable
 from registry import Lib, RegisterFn, Site
@@ -66,6 +69,12 @@ def _register_ops(lib: Int, prebuild: Bool = False) raises:
     _group[register_foreach](lib, "ops_foreach", prebuild)
 
 
+def _register_detection(lib: Int, prebuild: Bool = False) raises:
+    _group[register_deform_conv](lib, "ops_deform_conv", prebuild)
+    _group[register_nms](lib, "ops_nms", prebuild)
+    _group[register_roi](lib, "ops_roi", prebuild)
+
+
 @export
 def tmb_native_init(
     kernels_dir: Pointer[c_char, MutUntrackedOrigin],
@@ -98,6 +107,14 @@ def tmb_native_init(
         if Int(lib) == 0:
             raise Error("tmb_library_new failed")
         _register_ops(Int(lib))
+        ns = String("torchvision")
+        var detection_lib = external_call["tmb_library_new", Lib](
+            ns.as_c_string_slice().unsafe_ptr(),
+            key.as_c_string_slice().unsafe_ptr(),
+        )
+        if Int(detection_lib) == 0:
+            raise Error("tmb_library_new(torchvision) failed")
+        _register_detection(Int(detection_lib))
         return Int32(n)
     except e:
         set_shim_error(String(e))
@@ -113,6 +130,7 @@ def tmb_prebuild_ops() abi("C") -> Int32:
     try:
         with Locked():  # the loader's tables are shared with the lazy first calls
             _register_ops(0, prebuild=True)
+            _register_detection(0, prebuild=True)
         return 0
     except e:
         set_shim_error(String(e))

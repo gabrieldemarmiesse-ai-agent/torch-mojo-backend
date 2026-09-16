@@ -84,12 +84,12 @@ def _register_lazy(
         box.unsafe_bitcast[NoneType](),
     )
     if rc != 0:
-        raise Error("registering aten::", name, " failed")
+        raise Error("registering ", name, " failed")
 
 
 def impl[op: OpFn, name: StaticString](site: Site) raises:
-    """Register `op` as the PrivateUse1 kernel of aten::<name> ("add.Tensor",
-    "view", "fill_.Scalar", ...)."""
+    """Register a kernel in site's library namespace. External namespaces
+    use qualified names, also preserved in TMB_OP and the extension cache."""
     comptime if TARGET_OP == "":
         _register_lazy(site.lib, site.group, name, site.prebuild)
     elif TARGET_OP == name:

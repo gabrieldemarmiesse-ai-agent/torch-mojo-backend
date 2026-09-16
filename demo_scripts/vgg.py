@@ -4,10 +4,7 @@ from io import BytesIO
 import requests
 import torch
 from PIL import Image
-
-# torchvision is a demo-only extra, not a project dependency (pip install it
-# yourself to run this script).
-from torchvision import models, transforms  # ty: ignore[unresolved-import]
+from torchvision import models, transforms
 
 from torch_mojo_backend import register_mojo_devices
 

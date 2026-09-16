@@ -24,6 +24,8 @@ from std.os import getenv, listdir
 from std.random import random_ui64
 from std.time import perf_counter_ns, sleep
 
+from env_vars import MOJOCCL_SOCKET_IFNAME
+
 comptime UID_BYTES = 128
 comptime HANDLE_BYTES = 64
 
@@ -271,7 +273,7 @@ def local_ipv4() raises -> UInt32:
     carries a default route and has an IPv4 address; otherwise any UP
     non-loopback IPv4 interface.
     """
-    var want = getenv("MOJOCCL_SOCKET_IFNAME", "")
+    var want = getenv(MOJOCCL_SOCKET_IFNAME, "")
     if want.byte_length() > 0:
         var a = _ipv4_of_iface(want)
         if a == 0:

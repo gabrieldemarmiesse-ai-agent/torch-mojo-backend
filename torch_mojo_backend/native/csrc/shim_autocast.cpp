@@ -32,6 +32,7 @@ enum Policy : int32_t {
   PROMOTE = 4,
   BANNED = 5,
   FP32_APPEND_DTYPE = 6,
+  FP32_RESTORE = 7,
 };
 
 std::mutex g_policy_mutex;
@@ -134,6 +135,9 @@ void autocast_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet ks, to
   const std::string key = policy_key(schema);
   const int32_t policy = lookup_policy(key);
   c10::impl::ExcludeDispatchKeyGuard no_autocast(c10::DispatchKey::AutocastPrivateUse1);
+  const size_t base = stack->size() - schema.arguments().size();
+  const auto original_dtype = policy == FP32_RESTORE
+      ? (*stack)[base].toTensor().scalar_type() : at::kFloat;
   if (policy == FP32_APPEND_DTYPE) {
     // AT_FORALL_DIFFERENT_REDISPATCH_SIGNATURE (CUDA's norm overloads):
     // append the result dtype and redispatch to the overload of the same op
@@ -154,8 +158,8 @@ void autocast_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet ks, to
     c10::IValue* args = stack->data() + (stack->size() - n);
     if (policy == BANNED) {
       TORCH_CHECK(false, schema.name(), " is unsafe to autocast. Run it in float32 outside the autocast region.");
-    } else if (policy == LOWER_PRECISION_FP || policy == FP32) {
-      const auto to = policy == FP32 ? at::kFloat : lower_precision_fp();
+    } else if (policy == LOWER_PRECISION_FP || policy == FP32 || policy == FP32_RESTORE) {
+      const auto to = policy == LOWER_PRECISION_FP ? lower_precision_fp() : at::kFloat;
       for (size_t i = 0; i < n; ++i) args[i] = cast_value(args[i], to);
     } else if (policy == PROMOTE) {
       // torch starts from the lower-precision type and widens to float32 when
@@ -179,6 +183,11 @@ void autocast_fallback(const c10::OperatorHandle& op, c10::DispatchKeySet ks, to
   }
   (void)ks;
   op.callBoxed(stack);  // recomputed key set skips AutocastPrivateUse1 via the TLS exclude above
+  if (policy == FP32_RESTORE) {
+    for (size_t i = base; i < stack->size(); ++i) {
+      if ((*stack)[i].isTensor()) (*stack)[i] = (*stack)[i].toTensor().to(original_dtype);
+    }
+  }
 }
 
 // `redispatch` is the target overload of an FP32_APPEND_DTYPE entry, null for
@@ -223,7 +232,15 @@ TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
 
 TORCH_LIBRARY_IMPL(aten, AutocastPrivateUse1, m) {
   for (const auto& e : kCudaPolicies) {
-    m.impl(e.name + 6 /* strip "aten::" */, torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
+    if (std::string(e.name).rfind("aten::", 0) == 0)
+      m.impl(e.name, torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
   }
   m.impl("binary_cross_entropy", torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
+}
+
+TORCH_LIBRARY_IMPL(torchvision, AutocastPrivateUse1, m) {
+  for (const auto& e : kCudaPolicies) {
+    if (std::string(e.name).rfind("torchvision::", 0) == 0)
+      m.impl(e.name, torch::CppFunction::makeFromBoxedFunction<&autocast_fallback>());
+  }
 }

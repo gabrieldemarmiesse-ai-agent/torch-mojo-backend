@@ -254,7 +254,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "log": ("int64", "bool"),
     "log10": ("float32", "bfloat16", "float16", "int64", "bool"),
     "log1p": ("int64", "bool"),
-    "log2": ("float32", "bfloat16", "float16", "int64", "bool"),
     "log_softmax_with_dtype": ("float32", "bfloat16", "float16", "int64", "bool"),
     "logaddexp": ("float32", "bfloat16", "float16"),
     "logaddexp2": ("float32", "bfloat16", "float16"),

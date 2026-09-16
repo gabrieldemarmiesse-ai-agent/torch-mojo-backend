@@ -11,6 +11,7 @@ from std.memory import unsafe_memcpy
 from std.memory.alloc import unsafe_alloc
 from std.atomic.atomic import Atomic
 from std.time import perf_counter_ns
+from std.os import getenv
 
 from max.gpu.host import (
     DeviceAttribute,
@@ -21,6 +22,10 @@ from max.gpu.host import (
     HostBuffer,
 )
 
+from env_vars import (
+    TORCH_MOJO_BACKEND_TEST_PEER_COPY,
+    TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
+)
 from vendor import Vendor, raw_stream
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
@@ -91,6 +96,8 @@ struct Dev(Movable):
     var num_alloc_retries: Int64
     var num_ooms: Int64
     var properties: Optional[Properties]
+    var peers: Dict[Int, Bool]  # access from this device to each peer
+    var quarantine: Bool  # failed drain: allocations must not be reused
 
     def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
         self.api = ctx.api()
@@ -112,6 +119,8 @@ struct Dev(Movable):
         self.num_alloc_retries = 0
         self.num_ooms = 0
         self.properties = None
+        self.peers = Dict[Int, Bool]()
+        self.quarantine = False
         self.ctx = ctx^
 
     def view(self, s: Int) raises -> DeviceContext:
@@ -125,6 +134,8 @@ struct Backend(Movable):
     var devices: List[Dev]
     var vendor: Optional[Vendor]
     var n_accel: Int
+    var test_peer_copy: String
+    var test_peer_gate: Int
     var pinned: List[Int]  # Pinned box addresses, sorted by buffer base
 
 
@@ -183,8 +194,22 @@ def init_backend() raises -> Int:
     for i in range(n):
         devs.append(Dev(DeviceContext(i, api=api), False))
     devs.append(Dev(DeviceContext(api="cpu"), True))
+    var gate = getenv(TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD)
+    var gate_fd = Int(gate) if gate != "" else -1
+    var modes = getenv(TORCH_MOJO_BACKEND_TEST_PEER_COPY)
+    # Delimit once so mode checks match whole tokens without getenv or splitting.
+    var test_peer_copy = "," + modes + "," if modes != "" else ""
     var box = unsafe_alloc[Backend](1)
-    box.unsafe_write(Backend(devs^, vendor^, n, List[Int]()))
+    box.unsafe_write(
+        Backend(
+            devs^,
+            vendor^,
+            n,
+            test_peer_copy^,
+            gate_fd,
+            List[Int](),
+        )
+    )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(BACKEND_GLOBAL), box.unsafe_bitcast[NoneType]()
     )
@@ -252,6 +277,8 @@ def h_alloc(
         d[].allocated_bytes.add(Int64(nbytes))
         d[].allocation.add(1)
         d[].num_device_alloc += 1
+        if be()[].test_peer_copy != "":
+            print("P2P_ALLOC", Int(device), data[], nbytes)
         return Int(box)
     except e:
         set_error(String(e))
@@ -262,6 +289,10 @@ def h_free(handle: Int) abi("C"):
     if handle == 0:
         return
     var box = BufP(unsafe_from_address=handle)
+    if be()[].devices[box[].device].quarantine:
+        if be()[].test_peer_copy != "":
+            print("P2P_RETAIN", box[].device, Int(box[].buf.unsafe_ptr()))
+        return
     # MAX releases the block stream-ordered on the OWNER stream only. Every
     # other stream that used it (torch.Tensor.record_stream) gets fenced now,
     # at release time: the owner waits for all of that stream's work so far.
@@ -282,6 +313,8 @@ def h_free(handle: Int) abi("C"):
     d.allocated_bytes.remove(Int64(box[].nbytes))
     d.allocation.remove(1)
     d.num_device_free += 1
+    if be()[].test_peer_copy != "":
+        print("P2P_FREE", box[].device, Int(box[].buf.unsafe_ptr()))
     var moved = box.unsafe_take_pointee()
     box.unsafe_free()
     _ = moved^
@@ -637,6 +670,103 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
         ctx.synchronize()
 
 
+def _peer_access(device: Int, peer: Int) raises -> Bool:
+    var d = dev(device)
+    if peer in d[].peers:
+        return d[].peers[peer]
+    var other = dev(peer)
+    var enabled = False
+    if (d[].api == "cuda" or d[].api == "hip") and d[].api == other[].api:
+        try:
+            if ",host," not in be()[].test_peer_copy and d[].ctx.can_access(
+                other[].ctx
+            ):
+                if ",enable_error," in be()[].test_peer_copy:
+                    raise Error("injected peer enable failure")
+                d[].ctx.enable_peer_access(other[].ctx)
+                enabled = True
+        except e:
+            if be()[].test_peer_copy != "":
+                print("peer enable failed", String(e))
+            enabled = False
+    if be()[].test_peer_copy != "":
+        print("peer probe", device, peer, enabled)
+    d[].peers[peer] = enabled
+    return enabled
+
+
+def _test_peer_gate(p: Pointer[NoneType, MutAnyOrigin]):
+    # The test releases the pipe even on failure.
+    var byte = UInt8(0)
+    _ = external_call["read", Int](Int(p), Pointer(to=byte), 1)
+
+
+def _test_peer_submit(
+    dst_ctx: DeviceContext,
+    src_ctx: DeviceContext,
+    d: DeviceBuffer[DType.uint8],
+    s: DeviceBuffer[DType.uint8],
+) raises:
+    var mode = be()[].test_peer_copy
+    if ",gate," in mode:
+        dst_ctx.stream().enqueue_host_func(
+            _test_peer_gate,
+            Pointer[NoneType, MutAnyOrigin](
+                unsafe_from_address=be()[].test_peer_gate
+            ),
+        )
+    elif ",submit_error," in mode or ",drain_error," in mode:
+        dst_ctx.enqueue_wait_for(src_ctx)
+        dst_ctx.enqueue_copy_no_cross_stream_sync(d, s)
+        print("P2P_SUBMITTED", Int(d.unsafe_ptr()), Int(s.unsafe_ptr()))
+        raise Error("injected failure after DMA, before reverse event")
+
+
+def copy_peer(
+    dst_device: Int, dst: Int, src_device: Int, src: Int, nbytes: Int
+) raises -> Bool:
+    """False requests host staging; caller fences storage and drains on error.
+    """
+    if nbytes == 0:
+        return True
+    if not _peer_access(dst_device, src_device):
+        if be()[].test_peer_copy != "":
+            print("peer copy host", dst_device, src_device)
+        return False
+    var dst_ctx = ctx_for(dst_device)
+    var src_ctx = ctx_for(src_device)
+    var d = wrap_raw(dst_ctx, dst, nbytes)
+    var s = wrap_raw(src_ctx, src, nbytes)
+    if be()[].test_peer_copy != "":
+        _test_peer_submit(dst_ctx, src_ctx, d, s)
+    d.enqueue_copy_from(s)
+    if be()[].test_peer_copy != "":
+        print("peer copy direct", dst_device, src_device)
+    _ = s^
+    _ = d^
+    return True
+
+
+def drain_copy(dst_device: Int, src_device: Int) -> Bool:
+    """Error cleanup only; a failed drain quarantines both devices' storage."""
+    var drained = True
+    for i in range(2):
+        var device = dst_device if i == 0 else src_device
+        try:
+            if ",drain_error," in be()[].test_peer_copy and i == 0:
+                raise Error("injected destination drain failure")
+            ctx_for(device).synchronize()
+            if be()[].test_peer_copy != "":
+                print("P2P_DRAINED", device)
+        except e:
+            _warn("transfer drain failed; retaining storage", e)
+            drained = False
+    if not drained:
+        be()[].devices[dst_device].quarantine = True
+        be()[].devices[src_device].quarantine = True
+    return drained
+
+
 def copy_to_host(
     ctx: DeviceContext,
     dev_ptr: Int,
@@ -724,14 +854,29 @@ def copy_from_host(
         src=U8P(unsafe_from_address=host_ptr),
         count=nbytes,
     )
-    dst.enqueue_copy_from(host)
     var box = unsafe_alloc[Pinned](1)
     var base = Int(host.unsafe_ptr())
     box.unsafe_write(
         Pinned(host^, base, nbytes, device, List[Int](), Atomic[DType.int32](1))
     )
+    # Own pinned staging before submission, including partial-submit errors.
     d[].pending_host.append(Int(box))
-    _defer_host_free(ctx, box)
+    try:
+        dst.enqueue_copy_from(box[].buf.value())
+    except e:
+        try:
+            ctx.synchronize()
+            box[].remaining.store(0)
+        except drain_error:
+            d[].quarantine = True
+            _warn("H2D drain failed; retaining staging", drain_error)
+        raise e
+    try:
+        _defer_host_free(ctx, box)
+    except e:
+        d[].quarantine = True
+        _warn("H2D drain failed; retaining staging", e)
+        raise e
     # The synchronous snapshot already lets the caller reuse its source.
     _drain_host(d)
 

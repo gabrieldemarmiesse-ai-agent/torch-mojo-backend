@@ -6,6 +6,7 @@ import torch
 
 from torch_mojo_backend import native
 from torch_mojo_backend.distributed import register_distributed_backend
+from torch_mojo_backend.env_vars import warn_about_unknown_env_vars
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 from torch_mojo_backend.monkeypatching import (
     fix_batch_isend_irecv_for_python_process_groups,
@@ -30,6 +31,9 @@ def register_mojo_devices():
     with _lock:
         if _registered:
             return
+        # Before anything reads one: a misspelled knob is otherwise silent,
+        # and the default it meant to override stays in force unnoticed.
+        warn_about_unknown_env_vars()
         if not _torch_registered:
             # Module._apply otherwise replaces a shared CPU Parameter
             # independently in each child module; swapping preserves tied

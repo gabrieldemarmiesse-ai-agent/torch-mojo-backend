@@ -146,6 +146,70 @@ A new group file needs three things: the `register_<group>` list, the
 `_group[register_<group>](lib, "ops_<group>", prebuild)` line in
 `backend.mojo`.
 
+External operator namespaces use their own `tmb_library_new` handle and
+fully qualified registration names, such as `torchvision::roi_align`.
+The dispatcher accepts these implementations before the extension defining
+their schemas is imported. Qualified names also select `TMB_OP`; the loader
+escapes colons in extension filenames while retaining the full name in cache
+keys. Torchvision remains optional at runtime.
+
+The native detection groups are `ops_roi.mojo` (ROI align/pool, their
+position-sensitive variants, and backwards), `ops_nms.mojo` (non-maximum
+suppression), and `ops_deform_conv.mojo` (deformable convolution). They support
+float16/float32/float64 GPU inputs (float64 requires device support). ROI
+inputs are made contiguous; NMS declines non-contiguous inputs. ROI backward
+uses relaxed atomic scatter and
+honors PyTorch's deterministic-algorithms error/warning policy. NMS uses a
+stable device sort, device IoU masks, a host greedy pass, and device index
+gathering.
+
+Torchvision 0.26 CUDA autocast policies are included in the shim's generated
+table: NMS casts eligible inputs to float32 and returns int64 indices; ROI
+align/pool, PS-ROI align/pool, and deformable convolution compute in float32
+and restore the input dtype. As in upstream 0.26, autocast also converts ROI
+pool's argmax and PS-ROI's channel mapping; normal ROI/PS-ROI dispatch keeps
+these in int32. Float64 inputs are not narrowed.
+
+Deformable convolution composes deformable im2col with the existing Mojo
+GEMM routes. It supports independent convolution and offset groups, optional
+mask/bias, and gradients for input, weight, offset, mask, and bias. Its input
+gradient scatter follows upstream's nondeterminism policy. No vendor BLAS
+library is required.
+
+Arithmetic follows torchvision 0.26 CUDA, including its intermediate rounding:
+
+- NMS rounds half intersection widths/heights and each box's height difference
+  in half, then computes areas and IoU in float32. Double boxes retain double
+  IoU arithmetic. Every dtype uses a float32 threshold and strict `>`.
+- ROI align/pool and PS ROI align/pool use the input dtype for scale, geometry,
+  interpolation, pooling, and gradient contributions. Half products round
+  before additions; host scales round through float32 before half, matching
+  `c10::Half(float)`. Backward accumulates into the input dtype. ROI pool uses
+  ties-away coordinate rounding; PS pool follows CUDA's `roundf`, including
+  its float32 conversion for double coordinates.
+- Deformable convolution uses the input dtype for coordinates, interpolation,
+  mask products, and offset/mask gradient accumulation. Input-gradient weights
+  follow CUDA's promoted `std::abs` expression before rounding to the input
+  dtype. GEMM and bias reduction accumulate half inputs in float32; their
+  stored results are half. At large half coordinates, input gradients retain
+  CUDA's three-neighbor scan where adjacent integer indices round together.
+  Double arithmetic remains double.
+
+CUDA is the oracle where CPU differs: CPU NMS has no half kernel and compares
+against the original double threshold; CPU PS pool uses `round`, not `roundf`.
+CPU and CUDA can also differ in half gradients through accumulation order.
+Parallel backward scatter has CUDA's nondeterministic accumulation order, so
+general gradients need numeric comparison; the boundary regressions use
+order-independent exact comparisons.
+
+The CUDA-reference tests in `tests/native/test_torchvision_ops.py` accept
+`TORCHVISION_CUDA_REFERENCE_PYTHON=/path/to/cuda-venv/bin/python`. They try that
+interpreter first, then the current interpreter, `python`/`python3` on `PATH`,
+and `.venv-cuda`/`torch_cu*` environments in the working directory and its parent.
+Each candidate must import torch/torchvision, provide the detection CUDA kernels,
+and execute on a CUDA GPU. If none works, the skip reason lists each interpreter
+and its failure. Once selected, reference execution failures fail the test.
+
 Read arguments with the `v_*` helpers by schema position, build outputs with
 `new_tensor` / `new_like` / `view_strided`, set results with `ret_tensor`
 (owned output), `ret_ref` (an input handed back: in-place ops),
@@ -195,9 +259,40 @@ the op decides whether to try another route or propagate.
 
 **Streams.** Ops launch on the device's current stream (`ctx_for`), so
 `with torch.Stream(...)` really moves execution. Memory is allocated on the
-current stream; a tensor used by another stream gets `record_stream`ed by
-torch (`recordDataPtrOnStream`), which the backend turns into an event the
-owner stream waits on before the buffer is released.
+current stream; callers using a tensor on another stream must record that
+use (`Tensor.record_stream`, or torch's internal `recordDataPtrOnStream`),
+which the backend turns into an event the owner stream waits on before
+the buffer is released.
+
+### Transfers
+
+`.to("mojo:j")` and `dst.copy_(src)` automatically use MAX
+`DeviceBuffer.enqueue_copy_from` for CUDA/HIP peer-capable pairs. Peer access
+is enabled lazily per ordered pair; success and failure are cached under the
+shim mutex. CPU, Metal, inaccessible pairs, and enable errors use host staging.
+ROCm correctness and performance remain unmeasured.
+
+Direct copies run on the destination's current stream, with MAX events in
+both directions and no host completion wait for either `non_blocking` value.
+Destination consumers are ordered after the copy; `.cpu()` and `.item()` wait
+for readback. Callers must order producers on unrelated streams.
+
+Original source, staging, and destination storage are recorded on their own
+device's current stream. At release, allocation-owner streams wait for those
+streams; MAX's reverse event fences the remote source read. Transfer errors
+drain both streams before release. A failed drain retains both devices'
+allocations until exit; pinned staging is retained unless completion is known.
+
+`.to` borrows contiguous, unchanged-dtype sources, otherwise packs/casts on
+the source, then restores destination memory format. `copy_` packs and moves
+before casting or copying into destination strides. Dtype pairs outside the
+fast cast kernel use CPU torch to preserve exact integer conversions.
+
+`TORCH_MOJO_BACKEND_TEST_PEER_COPY` and `TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD`
+are test-only hooks cached at initialization; unset leaves no-op checks.
+See `tests/native/test_peer_copy.py` for modes and usage.
+
+### Threads and fork
 
 **Threads.** The shim's recursive mutex serializes every call into Mojo, so
 ops need no locking of their own; the autograd engine's thread and the main

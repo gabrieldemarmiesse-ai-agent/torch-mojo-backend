@@ -54,6 +54,7 @@ from abi import (
     strides_for_memory_format,
     unsupported,
     tensor_arg,
+    v_bool,
     v_device_index,
     v_bool_or,
     v_device_type,
@@ -79,6 +80,7 @@ from device import (
 from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import (
+    is_cast_dtype,
     cast_into,
     fill_value,
     cast_to,
@@ -88,6 +90,7 @@ from ops_common import (
     resize_out,
 )
 from registry import Site, impl, op_address_of
+from ops_core import cast_for_copy, copy_between_devices, record_tensor_stream
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -136,20 +139,6 @@ def _row_major(shape: List[Int]) -> List[Int]:
         strides[i] = acc
         acc *= shape[i]
     return strides^
-
-
-def _is_cast_dtype(dt: DType) -> Bool:
-    """The dtypes the fast CastSpec kernel supports on either end (mirrors
-    data_movement_ops.mojo's `CAST_DTYPES`)."""
-    return (
-        dt == DType.float32
-        or dt == DType.float16
-        or dt == DType.bfloat16
-        or dt == DType.int64
-        or dt == DType.int32
-        or dt == DType.uint8
-        or dt == DType.bool
-    )
 
 
 def _is_scatter_dtype(dt: DType) -> Bool:
@@ -411,11 +400,7 @@ def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
-# _to_copy: dtype casts (same mojo device) and device moves. A genuine
-# device CHANGE is handled here too (this op is only ever reached when
-# `self` already carries the PrivateUse1 dispatch key -- a CPU tensor
-# arriving here would already be a bug in the dispatcher), by the same
-# host-bounce `_copy_from` uses on its mojo<->cpu paths.
+# _to_copy: dtype casts, layouts and device moves.
 # ---------------------------------------------------------------------------
 
 
@@ -434,7 +419,7 @@ def _to_copy_same_device(
     if stype == t.stype:
         return _materialize_as(t, want)
     var dst_dtype = max_dtype(stype)
-    if not (_is_cast_dtype(t.dtype) and _is_cast_dtype(dst_dtype)):
+    if not (is_cast_dtype(t.dtype) and is_cast_dtype(dst_dtype)):
         return _relayout_owned(own(_host_cast(t, stype)), want)
     if (
         not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank)
@@ -471,49 +456,10 @@ def _relayout_owned(var contig: Owned, want: IndexList[MAX_RANK]) raises -> T:
 
 
 def _host_cast(t: T, stype: Int32) raises -> T:
-    """Exotic dtype pair (outside CastSpec's dtype set, e.g. float64,
-    int8/16, uint16/32/64): cast element-by-element on the host through a
-    Float64 bridge -- the same precision tradeoff `_read_f64_at` documents.
-    """
-    var src = contiguous(t)
-    var numel = src.numel
-    var src_dtype = src.dtype
-    var src_shape = src.shape
-    var src_rank = src.rank
-    var src_device = src.device
-    var host_src = own(cpu_empty(src_shape, src_rank, src.stype))
-    if numel > 0:
-        var ctx = ctx_for(src_device)
-        copy_to_host(ctx, src.ptr, host_src.t.ptr, numel * src.itemsize)
-        _ = ctx
-    release_if_new(src, t)
-    var host_dst = own(cpu_empty(src_shape, src_rank, stype))
-    var dst_dtype = max_dtype(stype)
-    for i in range(numel):
-        _write_f64_at(
-            host_dst.t.ptr,
-            i,
-            _read_f64_at(host_src.t.ptr, i, src_dtype),
-            dst_dtype,
-        )
-    var out = new_tensor(src_shape, src_rank, stype, src_device)
-    if numel > 0:
-        var ctx2 = ctx_for(src_device)
-        copy_from_host(
-            src_device,
-            ctx2,
-            out.ptr,
-            host_dst.t.ptr,
-            numel * dtype_itemsize(dst_dtype),
-        )
-        _ = ctx2
-    # `host_src`/`host_dst` are plain CPU allocations (not this backend's
-    # stream-ordered device allocator): keep them alive through their last
-    # read above, or a hot allocator can reuse the bytes underneath a
-    # "finished" copy that only just enqueued.
-    _ = host_src
-    _ = host_dst
-    return out^
+    var dense = own_if_new(contiguous(t), t)
+    var out = own(cast_for_copy(dense.t, stype))
+    _ = dense^
+    return out.take()
 
 
 def _download_to_cpu(
@@ -530,18 +476,9 @@ def _download_to_cpu(
 
 
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
-    var host = own(_download_to_cpu(t))
-    var out = new_tensor(t.shape, t.rank, t.stype, target_device)
-    if t.numel > 0:
-        var ctx = ctx_for(target_device)
-        copy_from_host(
-            target_device, ctx, out.ptr, host.t.ptr, t.numel * t.itemsize
-        )
-        _ = ctx
-    # A plain CPU allocation: keep it alive through the read above (see the
-    # comment in `_host_cast`).
-    _ = host
-    return out^
+    var out = own(new_tensor(t.shape, t.rank, t.stype, target_device))
+    copy_between_devices(out.t, t)
+    return out.take()
 
 
 def _host_materialize_contiguous(t: T) raises -> T:
@@ -700,10 +637,20 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if dev_type == DEVICE_TYPE_PRIVATEUSE1:
         target_index2 = v_device_index(dev_v)
     var cross = target_index2 >= 0 and target_index2 != t.device
-    # A device move copies the whole dense buffer verbatim, so `want` is laid
-    # out where kernels can run: on the source for a download to the host, on
-    # the destination for a move to another mojo device.
-    var staged = own(_to_copy_same_device(t, stype, contig if cross else want))
+    if cross:
+        record_tensor_stream(t)
+        var dense = own_if_new(
+            t.copy() if t.contig
+            and stype == t.stype else _to_copy_same_device(t, stype, contig),
+            t,
+        )
+        var moved = own(_upload_cross_device(dense.t, target_index2))
+        _ = dense^
+        var result = own(_relayout_owned(moved^, want))
+        ret_owned(rets, 0, result)
+        return
+    # Downloads materialize the requested memory order before copying bytes.
+    var staged = own(_to_copy_same_device(t, stype, want))
     if dev_type == DEVICE_TYPE_CPU:
         # TensorConversions.cpp's pin_out rule: PrivateUse1 is an accelerator
         # other than MPS, and layout was checked strided above (also in 2.7).
@@ -713,7 +660,7 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # fallback blocking; GPU casts/relayouts can remain stream-ordered.
         var async_download = non_blocking and (
             stype == t.stype
-            or (_is_cast_dtype(t.dtype) and _is_cast_dtype(max_dtype(stype)))
+            or (is_cast_dtype(t.dtype) and is_cast_dtype(max_dtype(stype)))
         )
         var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
         _ = staged^
@@ -723,13 +670,7 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             set_sizes_strides(host.t, t.shape, want, t.rank, 0)
         ret_owned(rets, 0, host)
         return
-    if not cross:
-        ret_owned(rets, 0, staged)
-        return
-    var moved = own(_upload_cross_device(staged.t, target_index2))
-    _ = staged^
-    var out3 = own(_relayout_owned(moved^, want))
-    ret_owned(rets, 0, out3)
+    ret_owned(rets, 0, staged)
 
 
 # ---------------------------------------------------------------------------
@@ -1494,6 +1435,203 @@ def op_index_tensor(
     unsupported("aten::index.Tensor with a non-integer, non-bool index dtype")
 
 
+def _overlaps_contiguous_target(target: T, source: T) -> Bool:
+    if target.numel == 0 or source.numel == 0:
+        return False
+    var extent = 1
+    for d in range(source.rank):
+        extent += (source.dim(d) - 1) * source.stride(d)
+    return (
+        target.ptr < source.ptr + extent * source.itemsize
+        and source.ptr < target.ptr + target.numel * target.itemsize
+    )
+
+
+# aten::_index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values,
+#                      bool accumulate=False, bool unsafe=False) -> Tensor(a!)
+def op_index_put_impl_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var target = v_tensor(args[unsafe_offset=0])
+    var present = v_opt_tensor_list_present(args[unsafe_offset=1])
+    var indices = v_tensor_list(args[unsafe_offset=1])
+    var values = v_tensor(args[unsafe_offset=2])
+    if v_bool(args[unsafe_offset=3]):
+        unsupported("_index_put_impl_: accumulate=True is not supported")
+    if target.rank == 0 or target.rank > 4 or not target.contig:
+        unsupported(
+            "_index_put_impl_: requires a contiguous rank-1 to rank-4"
+            " destination"
+        )
+    if len(present) > target.rank or len(indices) != 1:
+        unsupported("_index_put_impl_: requires exactly one advanced index")
+    var axis = -1
+    for d in range(len(present)):
+        if present[d]:
+            axis = d
+    if axis < 0:
+        unsupported("_index_put_impl_: requires one tensor index")
+    var index = indices[0].copy()
+    if index.rank != 1 or index.dtype != DType.int64:
+        unsupported("_index_put_impl_: requires a one-dimensional int64 index")
+    if (
+        not target.on_mojo()
+        or not values.on_mojo()
+        or not index.on_mojo()
+        or target.device != values.device
+        or target.device != index.device
+    ):
+        unsupported(
+            "_index_put_impl_: all tensors must be on the same mojo device"
+        )
+    if not _is_scatter_dtype(target.dtype) or values.dtype != target.dtype:
+        unsupported(
+            "_index_put_impl_: requires matching supported source and"
+            " destination dtypes"
+        )
+    if values.rank > target.rank:
+        unsupported(
+            "_index_put_impl_: values rank exceeds the indexed result rank"
+        )
+    if _overlaps_contiguous_target(
+        target, values
+    ) or _overlaps_contiguous_target(target, index):
+        unsupported(
+            "_index_put_impl_: source or index overlaps destination storage"
+        )
+
+    var shape = List[Int](capacity=target.rank)
+    var total = 1
+    var value_pad = target.rank - values.rank
+    for d in range(target.rank):
+        var extent = index.numel if d == axis else target.dim(d)
+        shape.append(extent)
+        total *= extent
+        if (
+            d >= value_pad
+            and values.dim(d - value_pad) != 1
+            and values.dim(d - value_pad) != extent
+        ):
+            raise Error(
+                "_index_put_impl_: values cannot broadcast to the indexed"
+                " result"
+            )
+    if total == 0:
+        ret_ref(rets, 0, target)
+        return
+    var ctx = ctx_for(target.device)
+    if target.dtype == DType.float64 and ctx.api() == "metal":
+        unsupported("_index_put_impl_: float64 is not supported on Apple GPU")
+    var pad4 = 4 - target.rank
+    var params = List[Int](capacity=18)
+    for d in range(4):
+        params.append(1 if d < pad4 else shape[d - pad4])
+    for d in range(4):
+        params.append(0 if d < pad4 else target.stride(d - pad4))
+    for d in range(4):
+        var source_axis = d - pad4 - value_pad
+        params.append(
+            0 if source_axis < 0
+            or values.dim(source_axis) == 1 else values.stride(source_axis)
+        )
+    for d in range(4):
+        params.append(index.stride(0) if d == axis + pad4 else 0)
+    params.append(axis + pad4)
+    params.append(target.dim(axis))
+    # Validate K indices before writing the destination. Each valid lane writes
+    # its own scratch word; the scatter axis has zero stride. Last word: flag.
+    var check_shape = IndexList[MAX_RANK](1)
+    check_shape[MAX_RANK - 1] = index.numel + 1
+    var flag = own(new_tensor(check_shape, 1, ST_INT32, target.device))
+    fill_value(flag.t, 0.0)
+    var validation = List[Int](capacity=18)
+    for d in range(4):
+        validation.append(index.numel if d == 0 else 1)
+    for d in range(4):
+        validation.append(1 if d == 0 else 0)
+    for _ in range(4):
+        validation.append(0)
+    for d in range(4):
+        validation.append(index.stride(0) if d == 0 else 0)
+    validation.append(3)
+    validation.append(target.dim(axis))
+    var validate = KernelCall("data_movement_ops", "ScatterDim")
+    validate.arg_dtype(0, DType.int32)
+    validate.arg_dtype(1, DType.int64)
+    validate.arg_dtype(2, DType.int32)
+    validate.out_dtype(DType.int32)
+    validate.int(flag.t.ptr)
+    validate.int(index.ptr)
+    validate.int(flag.t.ptr)
+    validate.tuple(validation)
+    validate.int(flag.t.ptr + index.numel * 4)
+    validate.int(1)
+    validate.f64(0.0)
+    validate.int(dtype_code(DType.int32))
+    validate.int(ctx_ptr(ctx))
+    validate.run()
+    var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr + index.numel * 4, host_flag.t.ptr, 4)
+    var bad_index = (
+        Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host_flag.t.ptr
+        )[]
+        != 0
+    )
+    _ = flag^
+    _ = host_flag^
+    if bad_index:
+        unsupported(
+            "_index_put_impl_: indices must be nonnegative and less than the"
+            " indexed dimension; negative wrapping is not supported"
+        )
+    var row_copy = (
+        axis == 0
+        and index.stride(0) == 1
+        and values.contig
+        and values.rank == target.rank
+        and (target.dtype == DType.float32 or target.dtype == DType.bfloat16)
+        and ctx.api() == "cuda"
+    )
+    if row_copy:
+        for d in range(target.rank):
+            row_copy = row_copy and values.dim(d) == shape[d]
+    if row_copy:
+        var rowlen = 1
+        for d in range(1, target.rank):
+            rowlen *= target.dim(d)
+        var rows = KernelCall("data_movement_ops", "IndexPutRows")
+        rows.arg_dtype(0, target.dtype)
+        rows.int(target.ptr)
+        rows.int(index.ptr)
+        rows.int(values.ptr)
+        rows.int(target.dim(0))
+        rows.int(index.numel)
+        rows.int(rowlen)
+        rows.int(ctx_ptr(ctx))
+        rows.run()
+        _ = ctx
+        ret_ref(rets, 0, target)
+        return
+    var call = KernelCall("data_movement_ops", "ScatterDim")
+    call.arg_dtype(0, target.dtype)
+    call.arg_dtype(1, index.dtype)
+    call.arg_dtype(2, values.dtype)
+    call.out_dtype(target.dtype)
+    call.int(target.ptr)
+    call.int(index.ptr)
+    call.int(values.ptr)
+    call.tuple(params)
+    call.int(0)
+    call.int(0)
+    call.f64(0.0)
+    call.int(dtype_code(target.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    ret_ref(rets, 0, target)
+
+
 # aten::nonzero(Tensor self) -> Tensor
 def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
@@ -1654,6 +1792,7 @@ def register_data_movement(site: Site) raises:
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_value, "scatter.value"](site)
     impl[op_index_tensor, "index.Tensor"](site)
+    impl[op_index_put_impl_, "_index_put_impl_"](site)
     impl[op_nonzero, "nonzero"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_empty_permuted, "empty_permuted"](site)
