@@ -780,6 +780,22 @@ def _fail_submission(mut state: CommState):
     )
 
 
+def _submission_exception_code(mut state: CommState) -> Int32:
+    """Preserve a transport failure raised while the host enqueued work.
+
+    A split collective can fill the work ring before returning to Python.
+    Its ring wait then raises on a peer deadline. Classify that transport
+    error before marking the submission failed: the marker makes *later*
+    calls remote errors, but an unrelated launch exception must still be
+    INTERNAL on its first reporting call.
+    """
+    var rc = NCCL_INTERNAL_ERROR
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        rc = NCCL_REMOTE_ERROR
+    _fail_submission(state)
+    return rc
+
+
 def _submission_failed(state: CommState) -> Bool:
     return (
         Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
@@ -2586,9 +2602,10 @@ def ncclAllReduce(
                 comm, sendbuff, recvbuff, count, datatype, op, stream
             )
         except e:
-            _fail_submission(state)
+            rc = _submission_exception_code(state)
             _unlock(state)
-            raise e
+            print("mojoccl: ncclAllReduce failed:", e)
+            return rc
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)
@@ -2700,9 +2717,10 @@ def ncclBroadcast(
                 comm, sendbuff, recvbuff, Int(count) * item, root, stream
             )
         except e:
-            _fail_submission(state)
+            rc = _submission_exception_code(state)
             _unlock(state)
-            raise e
+            print("mojoccl: ncclBroadcast failed:", e)
+            return rc
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)
@@ -2918,9 +2936,10 @@ def ncclAllGather(
                 comm, sendbuff, recvbuff, Int(sendcount) * item, stream
             )
         except e:
-            _fail_submission(state)
+            rc = _submission_exception_code(state)
             _unlock(state)
-            raise e
+            print("mojoccl: ncclAllGather failed:", e)
+            return rc
         if rc == NCCL_SUCCESS:
             try:
                 _order_after(state, stream)

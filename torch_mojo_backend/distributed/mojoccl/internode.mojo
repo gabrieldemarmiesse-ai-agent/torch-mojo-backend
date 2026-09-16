@@ -1749,6 +1749,15 @@ def _await_ring_slot(mut st: IbState, seq: Int) raises:
                 + _ring_state(st, seq)
             )
         if perf_counter_ns() > deadline:
+            # No exchange may have reached the engine (request == done),
+            # so its own progress deadline need not fire. Publish this host
+            # timeout as a transport failure for the C ABI and proxy. Only
+            # the proxy releases outstanding work; preserve any earlier error.
+            var expected = Int64(0)
+            _ = Atomic[DType.int64].compare_exchange[
+                success_ordering=Ordering.RELEASE,
+                failure_ordering=Ordering.RELAXED,
+            ](_err_ptr(st).unsafe_bitcast[Int64](), expected, 3)
             raise Error(
                 "mojoccl: waited "
                 + String(st.timeout_ns // 1_000_000_000)
