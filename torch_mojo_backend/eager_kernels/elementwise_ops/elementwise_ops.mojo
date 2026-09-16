@@ -628,47 +628,23 @@ def _unary_elementwise[
             )
         else:
             comptime if has_accelerator():
-                comptime if dtype != DType.float64 or (
+                comptime if (
+                    op_code == UOP_LOG2
+                    and (dtype == DType.float32 or dtype == DType.bfloat16)
+                    and has_nvidia_gpu_accelerator()
+                ):
+                    if _flat_vec_unary[
+                        dtype,
+                        dtype,
+                        _unary_apply[dtype, _, op_code],
+                        "log2",
+                    ](Int(out_ptr), Int(in_ptr), size, ctx):
+                        return
+                comptime if (
                     op_code == UOP_LOG2 and not has_apple_gpu_accelerator()
                 ):
-                    comptime if (
-                        op_code == UOP_LOG2
-                        and (dtype == DType.float32 or dtype == DType.bfloat16)
-                        and has_nvidia_gpu_accelerator()
-                    ):
-                        if _flat_vec_unary[
-                            dtype,
-                            dtype,
-                            _unary_apply[dtype, _, op_code],
-                            "log2",
-                        ](Int(out_ptr), Int(in_ptr), size, ctx):
-                            return
-                    comptime if has_apple_gpu_accelerator():
-                        # Apple: 4-wide vector body when both pointers are
-                        # vector-aligned; the scalar grid-stride tail in the
-                        # same kernel keeps arbitrary sizes and unproven
-                        # alignment correct.
-                        comptime vec_align = 4 * size_of[dtype]()
-                        var aligned = (
-                            Int(out_ptr) | Int(in_ptr)
-                        ) % vec_align == 0
-                        var vec_count = size // 4 if aligned else 0
-                        var span = (
-                            max(vec_count // 4, 1) if vec_count > 0 else size
-                        )
-                        _enqueue_cached[_unary_contig_kernel4[dtype, op_code]](
-                            ctx,
-                            String(t"ew_unary4_{op_code}_{dtype}"),
-                            _gs_blocks(span),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            in_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(size),
-                            Int64(vec_count),
-                        )
-                        return
+                    # Preserve log2's upstream scalar fallback, including
+                    # float64; the existing unary ops keep their 4-wide route.
                     _enqueue_cached[_unary_contig_kernel[dtype, op_code]](
                         ctx,
                         String(t"ew_unary_{op_code}_{dtype}"),
@@ -679,6 +655,28 @@ def _unary_elementwise[
                         out_ptr.as_unsafe_any_origin(),
                         in_ptr.as_unsafe_any_origin().as_imm(),
                         Int64(size),
+                    )
+                elif dtype != DType.float64:
+                    # 4-wide vector body when both pointers are vector-
+                    # aligned; the scalar grid-stride tail in the same kernel
+                    # keeps arbitrary sizes and unproven alignment correct.
+                    # (Was Apple-only: on H100 the scalar kernel streamed a
+                    # bf16 gelu at 1.65 TB/s against cuDNN's 2.8.)
+                    comptime vec_align = 4 * size_of[dtype]()
+                    var aligned = (Int(out_ptr) | Int(in_ptr)) % vec_align == 0
+                    var vec_count = size // 4 if aligned else 0
+                    var span = max(vec_count // 4, 1) if vec_count > 0 else size
+                    _enqueue_cached[_unary_contig_kernel4[dtype, op_code]](
+                        ctx,
+                        String(t"ew_unary4_{op_code}_{dtype}"),
+                        _gs_blocks(span),
+                        1,
+                        1,
+                        GS_THREADS,
+                        out_ptr.as_unsafe_any_origin(),
+                        in_ptr.as_unsafe_any_origin().as_imm(),
+                        Int64(size),
+                        Int64(vec_count),
                     )
                 else:
                     raise Error("float64 is not supported on GPU")
@@ -779,28 +777,47 @@ def _scalar_elementwise[
         @always_inline
         @parameter
         @__copy_capture(out_ptr, in_ptr, scalar)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var a = in_ptr.unsafe_load[width=width](i).cast[DType.float32]()
+        def body[width: Int, al: Int](i: Int):
+            var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
+                DType.float32
+            ]()
             var s = SIMD[DType.float32, width](scalar)
             comptime if op_code == SOP_ADD:
-                out_ptr.unsafe_store[width=width](i, (a + s).cast[dtype]())
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (a + s).cast[dtype]()
+                )
             comptime if op_code == SOP_MUL:
-                out_ptr.unsafe_store[width=width](i, (a * s).cast[dtype]())
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (a * s).cast[dtype]()
+                )
             comptime if op_code == SOP_POW:
                 # float32 through float64, as in logic_ops' BOP_POW (the
                 # float32 exp(y * log x) is up to 16 ulp off on H100)
                 comptime if dtype == DType.float32 and not has_apple_gpu_accelerator():
-                    out_ptr.unsafe_store[width=width](
+                    out_ptr.unsafe_store[width=width, alignment=al](
                         i,
                         pow(
                             a.cast[DType.float64](), s.cast[DType.float64]()
                         ).cast[dtype](),
                     )
                 else:
-                    out_ptr.unsafe_store[width=width](
+                    out_ptr.unsafe_store[width=width, alignment=al](
                         i, pow(a, s).cast[dtype]()
                     )
+
+        # Element alignment only: the CPU lanes and the GPU scalar lanes may
+        # start at any element (a bucket view starts wherever the previous
+        # parameter ended).
+        @always_inline
+        @parameter
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            body[width, size_of[dtype]()](Int(idx[0].value()))
+
+        # 16-byte vectors, launched only once both bases proved aligned.
+        @always_inline
+        @parameter
+        def func_vec[width: Int, alignment: Int = 1](idx: Coord):
+            body[width, 16](Int(idx[0].value()))
 
         if ctx.api() == "cpu":
             elementwise[func, simd_width=simd_width_of[dtype]()](
@@ -808,7 +825,22 @@ def _scalar_elementwise[
             )
         else:
             comptime if has_accelerator():
-                elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
+                # 16-byte vectors when both bases allow them and there is no
+                # tail (a bucket view starts wherever the previous parameter
+                # ended): scalar lanes moved 1.5 TB/s on H100, vectors ~3.
+                comptime vec = 16 // size_of[dtype]()
+                if (
+                    Int(out_ptr) % 16 == 0
+                    and Int(in_ptr) % 16 == 0
+                    and size % vec == 0
+                ):
+                    elementwise[func_vec, simd_width=vec, target="gpu"](
+                        Coord(size), ctx
+                    )
+                else:
+                    elementwise[func, simd_width=1, target="gpu"](
+                        Coord(size), ctx
+                    )
             else:
                 raise Error("no GPU accelerator available at compile time")
 

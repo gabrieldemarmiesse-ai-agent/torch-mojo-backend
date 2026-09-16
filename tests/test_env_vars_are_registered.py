@@ -278,6 +278,34 @@ def test_a_name_resembling_nothing_is_reported_without_one():
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "MOJOCCL_FUSED",
+        "MOJOCCL_FUSED_BLOCKS",
+        "MOJOCCL_FUSED_BIG_BLOCKS",
+        "MOJOCCL_FUSED_BIG_MB",
+        "MOJOCCL_IB_PROXY",
+        "MOJOCCL_IB_PROXY_CPU",
+        "MOJOCCL_IB_PROXY_IDLE_US",
+        "MOJOCCL_NVLS_GRANULARITY",
+        "MOJOCCL_NVLS_MIN_MB",
+        "MOJOCCL_PIPE_SPLIT_UNIT",
+        "MOJOCCL_FABRIC_HMEM",
+        "MOJOCCL_FABRIC_FLUSH",
+        "MOJOCCL_FABRIC_SETUP_RETRY_S",
+        "MOJOCCL_SOCKET_DIR",
+        "MOJOCCL_BUILD_DEFINES",
+    ],
+)
+def test_removed_mojoccl_controls_are_unknown(name: str):
+    """Code defaults must not leave silent, apparently supported overrides."""
+    assert name not in env_vars.known_env_vars()
+    assert list(dict(env_vars.unknown_env_vars({name: "1"}))) == [name]
+    with pytest.warns(env_vars.UnknownEnvVarWarning, match=name + " is set"):
+        env_vars.warn_about_unknown_env_vars({name: "1"})
+
+
+@pytest.mark.parametrize(
     "environment",
     [
         {},

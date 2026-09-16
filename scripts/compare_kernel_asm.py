@@ -234,14 +234,15 @@ def emit_asm(
 def find_entry_modules(tree: Path, kernel_dir: Path) -> dict[str, Path]:
     """Map each entry module's stem to its path relative to ``tree``.
 
-    Only the modules that export the family's `tmb_call` C entry are built on
-    their own (see docs/native_backend.md); the rest are libraries whose
+    Modules that export a family's `tmb_call` C entry or mojoccl's
+    `ncclAllReduce` are built on their own; the rest are libraries whose
     kernels are instantiated by an importer of theirs, and building one in
     isolation emits no sidecars at all.
     """
     entries: dict[str, Path] = {}
     for path in sorted((tree / kernel_dir).rglob("*.mojo")):
-        if "def tmb_call" not in path.read_text():
+        source = path.read_text()
+        if "def tmb_call" not in source and "def ncclAllReduce(" not in source:
             continue
         relative = path.relative_to(tree)
         if path.stem in entries:
@@ -444,7 +445,7 @@ def parse_args() -> argparse.Namespace:
         "--modules",
         nargs="*",
         default=None,
-        help="module stems to check; default is every tmb_call module in --kernel-dir",
+        help="entry module stems; default is every eager/CCL entry in --kernel-dir",
     )
     parser.add_argument(
         "--ops",
