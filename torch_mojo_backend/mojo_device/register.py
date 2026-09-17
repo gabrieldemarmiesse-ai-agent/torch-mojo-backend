@@ -4,7 +4,7 @@ import threading
 
 import torch
 
-from torch_mojo_backend import native
+from torch_mojo_backend import _ptxas, native
 from torch_mojo_backend.distributed import register_distributed_backend
 from torch_mojo_backend.env_vars import warn_about_unknown_env_vars
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
@@ -34,6 +34,10 @@ def register_mojo_devices():
         # Before anything reads one: a misspelled knob is otherwise silent,
         # and the default it meant to override stays in force unnoticed.
         warn_about_unknown_env_vars()
+        # The GPUs can be asked what they are now, which import time could
+        # not: confirm the assembler suits them before the first build, or a
+        # mismatch only shows up as CUDA_ERROR_INVALID_IMAGE at the first op.
+        _ptxas.check()
         if not _torch_registered:
             # Module._apply otherwise replaces a shared CPU Parameter
             # independently in each child module; swapping preserves tied

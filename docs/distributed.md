@@ -10,8 +10,10 @@ no ctypes calls into NCCL/RCCL happen in Python any more. No CUDA/ROCm torch
 build and no libcudart needed, in keeping with the project's "CPU-only torch
 install, we bring the GPU stack" motto:
 
-- NVIDIA: `libnccl.so.2` comes from the `nvidia-nccl-cu12` wheel (a
-  dependency of this package).
+- NVIDIA: install `libnccl.so.2` with `pip install "nvidia-nccl-cu12>=2.27"`,
+  or use an existing system library. Set `TORCH_MOJO_BACKEND_NCCL_LIB` to
+  select a specific library path. The wheel is included in development
+  dependencies only; installing this package does not directly require NCCL.
 - AMD: `librccl.so.1` comes from the ROCm install MAX itself already loads
   its HIP runtime from — the one at `$ROCM_PATH` or `/opt/rocm`, or a
   path in `TORCH_MOJO_BACKEND_RCCL_LIB`. Nothing extra to install: every
@@ -200,10 +202,12 @@ communicators and does the actual library calls.
 
 ## Cluster notes (SLURM, IB — NVIDIA)
 
-- ptxas needs no configuration: the package defaults
-  `MODULAR_NVPTX_COMPILER_PATH` to the CUDA 12.8 ptxas of the
-  `nvidia-cuda-nvcc-cu12` wheel it depends on, whose cubins load on r570+
-  drivers (`torch_mojo_backend/_ptxas.py`). Export the variable yourself
+- ptxas needs no configuration: the package sets
+  `MODULAR_NVPTX_COMPILER_PATH` itself, to the assembler on the node that
+  suits both the driver and the GPU — the `nvidia-cuda-nvcc-cu12` wheel's
+  CUDA 12.8 one wherever it fits (`torch_mojo_backend/_ptxas.py`,
+  docs/native_backend.md "Which ptxas assembles the kernels").
+  `torch-mojo-backend ptxas` prints the choice; export the variable yourself
   only to use another ptxas.
 - `NCCL_DEBUG=WARN` (or `INFO` during bring-up) is the first knob for
   diagnosing init hangs; on multi-homed nodes set `NCCL_SOCKET_IFNAME` if

@@ -655,18 +655,23 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
 
 
 def _build_backend_locked(key: str, out: Path) -> Path:
+    from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
+        _ptxas,
+    )
+
     t0 = time.monotonic()
     tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
     cmd = backend_build_command(tmp)
     proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
+        log = proc.stdout + proc.stderr
         raise RuntimeError(
             "building the Mojo backend failed:\n"
             + " ".join(cmd)
             + "\n"
-            + proc.stdout
-            + proc.stderr
+            + log
+            + _ptxas.diagnose(log)
         )
     _atomic_install(tmp, out)
     _trace(f"built Mojo backend in {time.monotonic() - t0:.2f}s")
@@ -700,6 +705,10 @@ def build_library(
 ) -> Path:
     """Compile a plain Mojo shared library (a C-ABI export set, e.g. the mojoccl
     collectives) once per closure/toolchain, cached like the backend."""
+    from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
+        _ptxas,
+    )
+
     roots = [entry.parent, *(roots or [])]
     closure = _mojo_import_closure(entry, roots)
     tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))
@@ -721,8 +730,9 @@ def build_library(
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)
+            log = proc.stdout + proc.stderr
             raise RuntimeError(
-                f"building {entry.name} failed:\n" + proc.stdout + proc.stderr
+                f"building {entry.name} failed:\n" + log + _ptxas.diagnose(log)
             )
         _atomic_install(tmp, out)
         _trace(f"built {entry.name} in {time.monotonic() - t0:.2f}s")

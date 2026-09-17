@@ -62,6 +62,18 @@ OWN_ENV_VARS: dict[str, str] = {
     "TORCH_MOJO_BACKEND_PROFILE": (
         "`1` prints per-op timings from the torch.compile backend."
     ),
+    "TORCH_MOJO_BACKEND_PTXAS_AUTO": (
+        "Set by the package, not by you: the MODULAR_NVPTX_COMPILER_PATH it "
+        "chose itself, or `<max built-in>` when it chose to leave that unset "
+        "for MAX's own compiler. Every child process inherits the environment, and this "
+        "is what lets one tell an inherited automatic choice from a setting "
+        "of yours, which is never overridden."
+    ),
+    "TORCH_MOJO_BACKEND_PTXAS_CHECK": (
+        "`0` downgrades the refusal to register a device whose ptxas cannot "
+        "assemble for this driver and GPU into a warning, for a machine whose "
+        "assembler rules we got wrong. The build then fails on its own terms."
+    ),
     "TORCH_MOJO_BACKEND_RCCL_LIB": (
         "Absolute path of librccl.so.1, overriding the ROCm search order "
         "($ROCM_PATH, /opt/rocm, then the system loader)."
@@ -193,9 +205,13 @@ FOREIGN_ENV_VARS: dict[str, str] = {
         "The Mojo compiler's module cache. Defaulted to node-local scratch so "
         "concurrent compilers on an NFS $HOME cannot evict each other."
     ),
+    "CUDA_HOME": "A CUDA toolkit root, searched for a ptxas to assemble with.",
+    "CUDA_PATH": "Older spelling of CUDA_HOME, searched the same way.",
     "MODULAR_NVPTX_COMPILER_PATH": (
-        "The ptxas MAX assembles with. Defaulted to the nvidia-cuda-nvcc-cu12 "
-        "wheel's, whose cubins load on older drivers; an explicit value wins."
+        "The ptxas MAX assembles with. Defaulted to the newest on this "
+        "machine that suits both the driver and the GPU, and left unset when "
+        "that is MAX's own compiler. An explicit value wins and is only checked; "
+        "`torch-mojo-backend ptxas` shows the choice and the alternatives."
     ),
     "ROCM_PATH": "ROCm install root, searched for the HIP runtime and librccl.",
     "ROCR_VISIBLE_DEVICES": "HSA-level device visibility; narrowed per rank.",
