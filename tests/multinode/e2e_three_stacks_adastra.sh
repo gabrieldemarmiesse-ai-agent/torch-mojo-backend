@@ -9,7 +9,7 @@ echo "=== job $J nodes $NODES master $MASTER $(date +%T) tree $(git -C $W log --
 module load aws-ofi-rccl/1.18.0_rocm6 2>/dev/null   # site RCCL plugin: NCCL_NET_PLUGIN, FI_MR_CACHE_MONITOR=kdreg2, FI_CXI_DISABLE_HOST_REGISTER=1, libfabric 1.23.1
 NANOGPT=$S/nanoGPT
 NCCLDBG="NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET"
-MOJOCCL_ENV="TORCH_MOJO_BACKEND_CCL=mojo TORCH_MOJO_BACKEND_TRACE=1 MOJOCCL_NET=fabric MOJOCCL_REGION_MB=64 FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1"
+MOJOCCL_ENV="TORCH_MOJO_BACKEND_CCL=mojo TORCH_MOJO_BACKEND_TRACE=1 FI_CXI_DISABLE_EQ_HUGETLB=1 FI_CXI_DISABLE_CQ_HUGETLB=1"
 RCCL_ENV="$NCCLDBG TORCH_MOJO_BACKEND_TRACE=1 MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1"   # RCCL inside the mojo backend needs the VMM allocator on 2 MI300A nodes (see review/honest_table.md)
 launch() { # launch CFG RDZV LOG ARGS...   -> one torchrun per node over the 2 nodes
   local cfg=$1 rdzv=$2 log=$3; shift 3

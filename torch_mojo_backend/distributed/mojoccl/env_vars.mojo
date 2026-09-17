@@ -21,8 +21,6 @@
 comptime MOJOCCL_NET = "MOJOCCL_NET"
 # Absolute path of libfabric.so.1, overriding the search.
 comptime MOJOCCL_LIBFABRIC = "MOJOCCL_LIBFABRIC"
-# Directory for the node-local AF_UNIX bootstrap sockets.
-comptime MOJOCCL_SOCKET_DIR = "MOJOCCL_SOCKET_DIR"
 # Interface the TCP bootstrap binds to, when the automatic choice is wrong.
 comptime MOJOCCL_SOCKET_IFNAME = "MOJOCCL_SOCKET_IFNAME"
 # Seconds the TCP bootstrap waits for every rank to check in.
@@ -32,12 +30,6 @@ comptime MOJOCCL_BOOTSTRAP_TIMEOUT_S = "MOJOCCL_BOOTSTRAP_TIMEOUT_S"
 
 # Keeps only the named IB device, when a host has several.
 comptime MOJOCCL_IB_HCA = "MOJOCCL_IB_HCA"
-# `0` drives the queue pairs from the calling thread, not the progress thread.
-comptime MOJOCCL_IB_PROXY = "MOJOCCL_IB_PROXY"
-# CPU index the progress thread pins to; `none` opts out of pinning.
-comptime MOJOCCL_IB_PROXY_CPU = "MOJOCCL_IB_PROXY_CPU"
-# Microseconds the progress thread sleeps between idle polls.
-comptime MOJOCCL_IB_PROXY_IDLE_US = "MOJOCCL_IB_PROXY_IDLE_US"
 # `0` registers memory regions without IBV_ACCESS_RELAXED_ORDERING.
 comptime MOJOCCL_IB_RELAXED_ORDERING = "MOJOCCL_IB_RELAXED_ORDERING"
 # Seconds a collective waits for its peers before raising the abort word.
@@ -50,23 +42,13 @@ comptime MOJOCCL_IB_TRACE = "MOJOCCL_IB_TRACE"
 # Keeps only the named libfabric domain, so one process per NIC can each
 # drive their own.
 comptime MOJOCCL_FABRIC_DOMAIN = "MOJOCCL_FABRIC_DOMAIN"
-# `0` drops the post-RMA read-back flush.
-comptime MOJOCCL_FABRIC_FLUSH = "MOJOCCL_FABRIC_FLUSH"
-# `auto` (default), `system`, `rocr` or `cuda`.
-comptime MOJOCCL_FABRIC_HMEM = "MOJOCCL_FABRIC_HMEM"
 # libfabric provider name; defaults to `cxi`.
 comptime MOJOCCL_FABRIC_PROVIDER = "MOJOCCL_FABRIC_PROVIDER"
-# Wall-clock -FI_ENOMEM retry budget during endpoint setup, in seconds.
-comptime MOJOCCL_FABRIC_SETUP_RETRY_S = "MOJOCCL_FABRIC_SETUP_RETRY_S"
 
 # --- NVLink SHARP (multicast) ---------------------------------------------
 
 # `0` turns the multicast path off, region and all.
 comptime MOJOCCL_NVLS = "MOJOCCL_NVLS"
-# `rec` sizes the multicast object with the recommended granularity.
-comptime MOJOCCL_NVLS_GRANULARITY = "MOJOCCL_NVLS_GRANULARITY"
-# MiB at or above which an allreduce takes the multicast path.
-comptime MOJOCCL_NVLS_MIN_MB = "MOJOCCL_NVLS_MIN_MB"
 
 # --- Staging memory -------------------------------------------------------
 

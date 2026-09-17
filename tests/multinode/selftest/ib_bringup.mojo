@@ -102,6 +102,7 @@ def main() raises:
         region_bytes,
         2,
         net_off,
+        _synchronous_test=True,
     )
     var b2 = _p(IB_BLOB_BYTES)
     ib_local_info(ib, b2)

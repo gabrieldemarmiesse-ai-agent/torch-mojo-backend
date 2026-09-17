@@ -42,8 +42,8 @@
 # a thread and restart it, and that delay does NOT cancel between the two
 # nodes (each side ends up measuring the other's dispatch jitter; both
 # reported ~390 us of "waiting for the peer" on a transfer worth 3 us). It
-# survives behind `MOJOCCL_IB_PROXY=0`: same exchange body, one fewer core
-# burned, several hundred microseconds slower.
+# remains an internal callback implementation of the same exchange body.
+# Production uses the proxy; host-only tests drive the exchange directly.
 #
 # The GPUDirect flush. Seeing the RDMA_WRITE_WITH_IMM completion does NOT
 # mean the payload is visible in GPU memory: the completion lands in host
@@ -98,15 +98,12 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import size_of
 from std.os import getenv
 from std.time import perf_counter_ns, sleep
+from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 
 from std.atomic import Atomic, Ordering
 
 from env_vars import (
-    MOJOCCL_FABRIC_FLUSH,
-    MOJOCCL_IB_PROXY,
-    MOJOCCL_IB_PROXY_CPU,
-    MOJOCCL_IB_PROXY_IDLE_US,
     MOJOCCL_IB_TIMEOUT_S,
     MOJOCCL_IB_TRACE,
     MOJOCCL_NET,
@@ -208,6 +205,13 @@ comptime CREDIT_SLOT_BYTES = 64
 comptime CREDIT_AREA_BYTES = 4096
 comptime CREDIT_PAYLOAD_BYTES = 4
 
+# Payload a rank sends when it has nothing to contribute to an exchange:
+# a broadcast, or an allreduce whose shard table leaves this rank empty
+# (7 of 8 local ranks on DDP's 4-byte AVG allreduce). Every exchange has to
+# be all-to-all because an arrival tally of `npeers` is what completes one,
+# so a rank that stayed silent would hang its peers.
+comptime EMPTY_SHARD_BYTES = 16
+
 comptime OP_UNKNOWN = 0
 comptime OP_ALLREDUCE = 1
 comptime OP_BROADCAST = 2
@@ -226,14 +230,21 @@ def _op_name(kind: Int) -> String:
     return String("?")
 
 
-# The proxy mailbox: two 64-bit words the GPU and the progress thread
-# pass the exchange counter through, plus a stop word the host sets at
-# teardown. A cache line apart so the GPU's writes to REQUEST never
-# invalidate the line the CPU is writing DONE into.
+# The proxy mailbox: 64-bit words the GPU and the progress thread pass
+# exchange counters through, plus a stop word the host sets at teardown. A
+# cache line apart so the GPU's writes to REQUEST never invalidate the line
+# the CPU is writing DONE into.
+#
+# REQUEST and CONSUMED are written by the device, DONE by the thread, STOP by
+# the host. CONSUMED exists for the fused kernel (internode_fused.mojo): it is
+# "my consumer for exchange e has RUN", the credit that frees the inbox slot
+# group, published from the kernel rather than inferred on the host from the
+# order kernels were enqueued in.
 comptime MB_REQUEST = 0
 comptime MB_DONE = 64
 comptime MB_STOP = 128
-comptime MB_BYTES = 192
+comptime MB_CONSUMED = 192
+comptime MB_BYTES = 256
 
 
 struct IbPeer(Copyable, Movable):
@@ -354,6 +365,10 @@ struct IbState(Movable):
     # e's source for the slow peer.
     var send_done: List[Int]
     var credit_sent: Int  # highest credit published to the peers
+    # Highest "my consumer has run" the fused kernel published in MB_CONSUMED.
+    # Device-attested, unlike `consumed_enqueued`, so it may be used directly
+    # (see `ib_drive`), and monotone because one thread stores it in order.
+    var credit_device: Int
     var tally: List[Int]  # arrivals, indexed by `seq % nslots`
     var credit_recv: List[Int]  # per peer, highest credit it published
     var last_progress_ns: Int
@@ -430,7 +445,7 @@ struct IbState(Movable):
         self.fab = 0
         self.netdev = String("")
         self.peers = List[IbPeer]()
-        self.do_flush = getenv(MOJOCCL_FABRIC_FLUSH, "1") != "0"
+        self.do_flush = True
         self.region = region
         self.my_node = my_node
         self.nnodes = nnodes
@@ -447,6 +462,7 @@ struct IbState(Movable):
         self.flush_t0 = 0
         self.send_done = List[Int]()
         self.credit_sent = 0
+        self.credit_device = 0
         self.tally = List[Int]()
         for _ in range(nslots):
             self.tally.append(0)
@@ -474,7 +490,10 @@ struct IbState(Movable):
         self.error_word = region
         self.status_host = 0
         self.abort_dev = 0
-        self.proxy = getenv(MOJOCCL_IB_PROXY, "1") != "0"
+        # Fused + proxy is the measured production schedule on H100 and
+        # MI300A (Adastra job 5417296, 2026-09-15: disabling it loses 22.31%
+        # in full-model ABBA). Only synchronous selftests opt out below.
+        self.proxy = True
         self.thread_id = 0
         self.trace = getenv(MOJOCCL_IB_TRACE, "0") != "0"
         self.t_post_ns = 0
@@ -510,7 +529,7 @@ def _comp(st: IbState, i: Int) -> Pointer[NetCompletion, MutAnyOrigin]:
 
 
 # `IbState.error` and `IbWork.status` are written by the proxy thread (or the
-# `MOJOCCL_IB_PROXY=0` callback thread) inside `ib_drive` and read by
+# internal callback thread) inside `ib_drive` and read by
 # the calling thread -- `ib_error` from the torch-facing calling thread,
 # `ib_enqueue`'s ring-reuse check from the same -- with no other
 # synchronization between the two. Every access goes through these two
@@ -547,7 +566,7 @@ def _status_ptr(mut w: IbWork) -> Pointer[Int, MutAnyOrigin]:
 # ===-------------------------------------------------------------------=== #
 #
 # One non-blocking step function, `ib_drive`, shared by all three drivers:
-# the progress thread, the `MOJOCCL_IB_PROXY=0` stream callback and the
+# the progress thread, the internal stream callback and the
 # GPU-free self-tests. They differ only in who advances `request_seq` (the
 # mailbox, the callback, the calling thread) and who reads `done_seq`.
 #
@@ -861,6 +880,13 @@ def ib_drive(mut st: IbState) -> Bool:
         _release_on_error(st)
         return False
     var moved = False
+    # The fused kernel publishes "my consumer for e has run" itself, so a
+    # credit can be due with nothing of our own left to post. Send it anyway:
+    # a peer blocked on `_can_post` is waiting for exactly this, and riding
+    # the next request out (the only way the split path had) would make that
+    # wait last until this rank's host issued another collective.
+    if _send_credits(st, st.credit_device):
+        moved = True
     if st.posted_seq < st.request_seq:
         var e = st.posted_seq + 1
         ref w = _work(st, e)[]
@@ -953,7 +979,7 @@ def ib_drive(mut st: IbState) -> Bool:
 
 
 def _ib_progress(user: OpaquePointer[MutAnyOrigin]) abi("C"):
-    """`cuLaunchHostFunc` entry point -- the MOJOCCL_IB_PROXY=0 path.
+    """Internal `cuLaunchHostFunc` exchange implementation.
 
     Runs on a driver-owned thread with the stream stalled behind it, so it
     must never call the CUDA/HIP driver, and it cannot pipeline: it drives
@@ -1017,7 +1043,7 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
     aten launches on the Python main thread) shares this core's SMT sibling,
     and measured end to end (job 234072, 2x8 H100) an unconditional hot spin
     here cost nanoGPT DDP ~20% of its steady-state tok/s against real NCCL.
-    `MOJOCCL_IB_PROXY_IDLE_US` tunes the backoff quantum.
+    The idle backoff quantum is fixed at 20 us.
 
     THE STOPPED-COMMUNICATOR GUARD LIVES HERE, not in the request kernel.
     Once a kernel on this communicator has given up (`publish_fault` raises
@@ -1046,6 +1072,13 @@ def _proxy_main(arg: OpaquePointer[MutAnyOrigin]) abi("C"):
             != 0
         ):
             return
+        var consumed = Int(
+            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
+                _mb(st, MB_CONSUMED)
+            )
+        )
+        if consumed > st.credit_device:
+            st.credit_device = consumed
         var req = Int(
             Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](
                 _mb(st, MB_REQUEST)
@@ -1083,7 +1116,7 @@ def _set_thread_affinity(tid: Int, cpu: Int) raises:
     var byte_idx = cpu // 8
     if cpu < 0 or byte_idx >= CPU_SET_BYTES:
         raise Error(
-            "mojoccl: MOJOCCL_IB_PROXY_CPU=" + String(cpu) + " out of range"
+            "mojoccl: progress thread cpu=" + String(cpu) + " out of range"
         )
     var mask = alloc_bytes(CPU_SET_BYTES)
     mask[unsafe_offset=byte_idx] = UInt8(1) << UInt8(cpu % 8)
@@ -1151,8 +1184,7 @@ def _smt_sibling_free(cpu: Int, reserved: List[Int]) -> Bool:
 
 
 def _default_proxy_cpu(local_rank: Int, local_world: Int) -> Int:
-    """Default pin when `MOJOCCL_IB_PROXY_CPU` is unset, or -1 for "don't
-    pin".
+    """Topology-based proxy placement, or -1 when pinning would crowd ranks.
 
     torchrun gives every rank of a node the same affinity mask, so taking
     that mask's CPUs in descending order and indexing by `local_rank` spreads
@@ -1210,38 +1242,25 @@ def _start_proxy(ib: Int, local_rank: Int, local_world: Int) raises:
     st.thread_id = Int(tid[unsafe_offset=0])
     # A best-effort placement hint, not load-bearing for correctness, so a
     # bad CPU index or a failed syscall only prints rather than failing
-    # communicator init. MOJOCCL_IB_PROXY_CPU=none opts out of the default
-    # policy below (unpinned, like every release before this one); any other
-    # value overrides it with an exact CPU.
-    var cpu_s = getenv(MOJOCCL_IB_PROXY_CPU, "")
-    if cpu_s == "none":
+    # communicator init. Placement follows the process affinity mask.
+    var cpu = _default_proxy_cpu(local_rank, local_world)
+    if cpu < 0:
+        if st.trace:
+            print(
+                (
+                    "mojoccl: progress thread left unpinned (affinity mask too"
+                    " small for"
+                ),
+                local_world,
+                "local ranks)",
+            )
         return
-    var cpu: Int
-    if cpu_s.byte_length() > 0:
-        try:
-            cpu = Int(cpu_s)
-        except e:
-            print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
-            return
-    else:
-        cpu = _default_proxy_cpu(local_rank, local_world)
-        if cpu < 0:
-            if st.trace:
-                print(
-                    (
-                        "mojoccl: progress thread left unpinned (affinity mask"
-                        " too small for"
-                    ),
-                    local_world,
-                    "local ranks)",
-                )
-            return
     try:
         _set_thread_affinity(st.thread_id, cpu)
         if st.trace:
             print("mojoccl: progress thread pinned to cpu", cpu)
     except e:
-        print("mojoccl: MOJOCCL_IB_PROXY_CPU pinning failed:", e)
+        print("mojoccl: progress thread pinning failed:", e)
 
 
 def _stop_proxy(mut st: IbState):
@@ -1353,6 +1372,7 @@ def ib_setup(
     region_bytes: Int,
     nslots: Int,
     credit_off: Int,
+    _synchronous_test: Bool = False,
 ) raises -> Int:
     """Open a NIC and register the region on whichever transport this
     machine has.
@@ -1366,6 +1386,12 @@ def ib_setup(
     is the region offset of the credit landing pad. Both must be identical on
     every rank -- they are part of the wire layout. `local_world` only feeds
     the progress thread's default CPU pin (`_default_proxy_cpu`).
+
+    `_synchronous_test` is private to the ib_bringup, ib_pipeline and
+    fabric_hmem selftests. They drive `ib_drive` from the calling thread;
+    starting a proxy would race that driver. The two host-only probes also
+    pass libc as their driver and cannot allocate a GPU-visible mailbox.
+    Production always uses the proxy; this is not an environment setting.
     """
     if nslots < 1 or nslots > PIPE_MAX_SLOTS:
         raise Error(
@@ -1393,6 +1419,7 @@ def ib_setup(
     var st = IbState(
         _select_backend(), region, my_node, nnodes, nslots, credit_off
     )
+    st.proxy = not _synchronous_test
     st.timeout_ns = Int(_ib_timeout_s() * 1.0e9)
 
     # Every step below can raise after an earlier one already allocated a
@@ -1451,19 +1478,8 @@ def _ib_timeout_s() -> Float64:
 
 
 def _proxy_idle_ns() -> Int:
-    """`MOJOCCL_IB_PROXY_IDLE_US`, read once at thread start (not from inside
-    the progress-thread loop -- a `getenv` per idle iteration would defeat
-    the point of backing off)."""
-    var s = getenv(MOJOCCL_IB_PROXY_IDLE_US, String(DEFAULT_IB_PROXY_IDLE_US))
-    var us = DEFAULT_IB_PROXY_IDLE_US
-    try:
-        var parsed = Int(s)
-        if parsed > 0:
-            us = parsed
-    except:
-        # Unparseable value: keep the default quantum.
-        us = DEFAULT_IB_PROXY_IDLE_US
-    return us * 1000
+    """Idle quantum; no measured improvement justifies changing 20 us."""
+    return DEFAULT_IB_PROXY_IDLE_US * 1000
 
 
 def _nanosleep_ns(ts_addr: Int, ns: Int):
@@ -1562,6 +1578,91 @@ def ib_next_seq(ib: Int) -> Int:
     return st.exchanges
 
 
+def ib_reserve_seqs(ib: Int, n: Int) -> Int:
+    """Consume `n` consecutive exchange counters and return the first.
+
+    `ib_next_seq` for a collective that knows up front how many exchanges it
+    will make -- the fused multi-node allreduce, which fills all of its work
+    items on the host and then launches one kernel that publishes the
+    counters in order."""
+    ref st = _st(ib)[]
+    st.exchanges += n
+    return st.exchanges - n + 1
+
+
+def ib_mailbox_dev(ib: Int) -> StaticTuple[Int, 3]:
+    """Device addresses of `(MB_REQUEST, MB_DONE, MB_CONSUMED)`.
+
+    The fused kernel writes the first and the third and spins on the second,
+    doing from inside the collective what `proxy_request` / `proxy_wait` did
+    as kernels of their own."""
+    ref st = _st(ib)[]
+    return StaticTuple[Int, 3](
+        st.mailbox_dev + MB_REQUEST,
+        st.mailbox_dev + MB_DONE,
+        st.mailbox_dev + MB_CONSUMED,
+    )
+
+
+def ib_uses_proxy(ib: Int) -> Bool:
+    """Whether the progress thread drives the engine. Always true in
+    production; only synchronous transport probes disable it."""
+    return _st(ib)[].proxy
+
+
+def ib_timeout_ns(ib: Int) -> Int:
+    return _st(ib)[].timeout_ns
+
+
+def ib_prepare_request(
+    ib: Int,
+    send_addr: Int,
+    send_bytes: Int,
+    inbox_base: Int,
+    slot_bytes: Int,
+    do_send: Bool,
+    nrecv: Int,
+    flush_addr: Int,
+    seq: Int,
+    op_kind: Int = OP_UNKNOWN,
+    op_chunk: Int = 0,
+    op_nchunks: Int = 0,
+    op_numel: Int = 0,
+) raises:
+    """Describe exchange `seq` for the engine without releasing it.
+
+    `ib_enqueue_request` minus the release: the fused kernel publishes the
+    counter itself when its reduce-scatter for that chunk has completed, so
+    the host only has to have the work item ready before the kernel runs.
+    Filling every chunk's item before the launch is what makes the whole
+    collective one `cuLaunchKernelEx`.
+
+    The credit carried here is the host's own `consumed_enqueued`, which on
+    the fused path never advances (the kernel publishes credits through
+    MB_CONSUMED instead); it is still the right value for a communicator that
+    mixes fused allreduces with the unfused broadcast/allgather paths.
+    """
+    ref st = _st(ib)[]
+    _fill_work(
+        st,
+        ib,
+        send_addr,
+        send_bytes,
+        inbox_base,
+        slot_bytes,
+        do_send,
+        nrecv,
+        flush_addr,
+        seq,
+        st.consumed_enqueued,
+        True,
+        op_kind,
+        op_chunk,
+        op_nchunks,
+        op_numel,
+    )
+
+
 def ib_note_consumed(ib: Int, seq: Int):
     """Record that the consumer kernel for exchange `seq` has just been
     ENQUEUED on the stream.
@@ -1625,7 +1726,7 @@ def _await_ring_slot(mut st: IbState, seq: Int) raises:
     ordinary back-pressure, not an error: wait for the slot.
 
     Waiting here cannot deadlock. The engine is driven by the progress thread
-    (default) or, under `MOJOCCL_IB_PROXY=0`, by a stream callback -- neither
+    (default) or by an internal stream callback -- neither
     needs this thread, and the stream already holds every kernel the
     outstanding exchanges need. The inline self-test path is the one caller
     that drives the engine itself, and it does not come through here (see
@@ -1653,6 +1754,15 @@ def _await_ring_slot(mut st: IbState, seq: Int) raises:
                 + _ring_state(st, seq)
             )
         if perf_counter_ns() > deadline:
+            # No exchange may have reached the engine (request == done),
+            # so its own progress deadline need not fire. Publish this host
+            # timeout as a transport failure for the C ABI and proxy. Only
+            # the proxy releases outstanding work; preserve any earlier error.
+            var expected = Int64(0)
+            _ = Atomic[DType.int64].compare_exchange[
+                success_ordering=Ordering.RELEASE,
+                failure_ordering=Ordering.RELAXED,
+            ](_err_ptr(st).unsafe_bitcast[Int64](), expected, 3)
             raise Error(
                 "mojoccl: waited "
                 + String(st.timeout_ns // 1_000_000_000)
@@ -1741,7 +1851,7 @@ def ib_enqueue_request(
     is the stronger place for it -- and the stream runs on: several exchanges
     may be in flight, and `ib_enqueue_wait` is what eventually stops the
     stream.
-    Without the proxy (`MOJOCCL_IB_PROXY=0`) it is a `cuLaunchHostFunc` that
+    The internal non-proxy implementation uses a `cuLaunchHostFunc` that
     runs the whole exchange inline -- correct with the same schedule, but
     with no overlap and several hundred microseconds of driver latency per
     exchange.
@@ -1780,7 +1890,7 @@ def ib_enqueue_wait(
     ib: Int, ctx: DeviceContext, stream: DeviceStream, seq: Int
 ) raises:
     """Hold the stream until exchange `seq` has been retired, so the kernel
-    enqueued next may read the inbox. A no-op on the `MOJOCCL_IB_PROXY=0`
+    enqueued next may read the inbox. A no-op on the internal callback
     path, where `ib_enqueue_request`'s callback already waited."""
     ref st = _st(ib)[]
     if not st.proxy:
@@ -1865,7 +1975,7 @@ def ib_exchange_now(
     The bring-up self-test uses it: the transport can then be exercised on
     a host with InfiniBand but no GPU (registered host memory, no stream to
     hang kernels on), which is where the bootstrap/QP/immediate wiring is
-    cheapest to debug -- run it with `MOJOCCL_IB_PROXY=0`, since the proxy
+    cheapest to debug. Pass `_synchronous_test=True` to `ib_setup`, since the proxy
     mailbox needs a driver that can pin host memory.
     """
     ib_submit_now(

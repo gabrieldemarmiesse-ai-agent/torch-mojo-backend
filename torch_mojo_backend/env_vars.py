@@ -62,6 +62,18 @@ OWN_ENV_VARS: dict[str, str] = {
     "TORCH_MOJO_BACKEND_PROFILE": (
         "`1` prints per-op timings from the torch.compile backend."
     ),
+    "TORCH_MOJO_BACKEND_PTXAS_AUTO": (
+        "Set by the package, not by you: the MODULAR_NVPTX_COMPILER_PATH it "
+        "chose itself, or `<max built-in>` when it chose to leave that unset "
+        "for MAX's own compiler. Every child process inherits the environment, and this "
+        "is what lets one tell an inherited automatic choice from a setting "
+        "of yours, which is never overridden."
+    ),
+    "TORCH_MOJO_BACKEND_PTXAS_CHECK": (
+        "`0` downgrades the refusal to register a device whose ptxas cannot "
+        "assemble for this driver and GPU into a warning, for a machine whose "
+        "assembler rules we got wrong. The build then fails on its own terms."
+    ),
     "TORCH_MOJO_BACKEND_RCCL_LIB": (
         "Absolute path of librccl.so.1, overriding the ROCm search order "
         "($ROCM_PATH, /opt/rocm, then the system loader)."
@@ -120,78 +132,62 @@ OWN_ENV_VARS: dict[str, str] = {
         "`verbs` or `fabric` pins the inter-node transport. Unset probes: "
         "verbs first (the measured path), then libfabric."
     ),
-    "MOJOCCL_LIBFABRIC": "Absolute path of libfabric.so.1, overriding the search.",
-    "MOJOCCL_SOCKET_DIR": (
-        "Directory for the node-local AF_UNIX bootstrap sockets. Must be "
-        "node-local, never a shared filesystem."
+    "MOJOCCL_LIBFABRIC": (
+        "Absolute path of libfabric.so.1, overriding the search. Unset tries "
+        "the system loader, then the Cray installation."
     ),
     "MOJOCCL_SOCKET_IFNAME": (
         "Network interface the TCP bootstrap binds to, when the automatic "
-        "choice picks the wrong one."
+        "choice picks the wrong one. Unset prefers an up, non-loopback "
+        "interface with a default route."
     ),
     "MOJOCCL_BOOTSTRAP_TIMEOUT_S": (
-        "Seconds the TCP bootstrap waits for every rank to check in."
+        "Seconds the TCP bootstrap waits for every rank to check in; defaults to 120."
     ),
     # -- mojoccl: InfiniBand / verbs --------------------------------------
     "MOJOCCL_IB_HCA": (
         "Keeps only the named IB device, when a host has several and the "
-        "automatic pick is wrong."
-    ),
-    "MOJOCCL_IB_PROXY": (
-        "`0` drives the queue pairs from the calling thread instead of the "
-        "progress thread. Debugging aid; slower."
-    ),
-    "MOJOCCL_IB_PROXY_CPU": (
-        "CPU index the progress thread is pinned to; `none` opts out of "
-        "pinning entirely. A hint — a bad value only prints."
-    ),
-    "MOJOCCL_IB_PROXY_IDLE_US": (
-        "Microseconds the progress thread sleeps between idle polls. Read "
-        "once per process: the loop must not call getenv."
+        "automatic pick is wrong. Unset uses GPU/NIC PCI affinity and "
+        "the local rank as a tiebreaker."
     ),
     "MOJOCCL_IB_RELAXED_ORDERING": (
         "`0` registers memory regions without IBV_ACCESS_RELAXED_ORDERING, "
-        "for fabrics where it misbehaves."
+        "for fabrics where it misbehaves. Enabled by default."
     ),
     "MOJOCCL_IB_TIMEOUT_S": (
         "Seconds a collective waits for its peers before raising the abort "
-        "word. Raising it releases every waiter, so it is process-wide."
+        "word. Defaults to 60. Raising it releases every waiter, so it is "
+        "process-wide."
     ),
     "MOJOCCL_IB_TRACE": (
         "`1` prints what each rank negotiated — transport, device, ports, "
-        "credit counters — one line per communicator."
+        "credit counters — one line per communicator. Defaults to `0`."
     ),
     # -- mojoccl: libfabric -----------------------------------------------
     "MOJOCCL_FABRIC_DOMAIN": (
         "Keeps only the named libfabric domain, so one process per NIC can "
-        "each drive their own (`cxi0`, `cxi1`, ...)."
-    ),
-    "MOJOCCL_FABRIC_FLUSH": (
-        "`0` drops the post-RMA read-back flush, trading a memory-ordering "
-        "guarantee the provider only promises with it."
-    ),
-    "MOJOCCL_FABRIC_HMEM": (
-        "`auto` (default), `system`, `rocr` or `cuda`: which HMEM interface "
-        "buffers are registered with."
+        "each drive their own (`cxi0`, `cxi1`, ...). Unset uses PCI affinity, "
+        "then the local rank modulo the available domains."
     ),
     "MOJOCCL_FABRIC_PROVIDER": "libfabric provider name; defaults to `cxi`.",
-    "MOJOCCL_FABRIC_SETUP_RETRY_S": (
-        "Wall-clock budget, in seconds, for retrying -FI_ENOMEM during "
-        "endpoint setup while co-tenants on the node release resources."
-    ),
     # -- mojoccl: NVLink SHARP (multicast) ---------------------------------
-    "MOJOCCL_NVLS": "`0` turns the NVLink-SHARP multicast path off, region and all.",
-    "MOJOCCL_NVLS_GRANULARITY": (
-        "`rec` sizes the multicast object with the driver's recommended "
-        "granularity instead of the minimum."
-    ),
-    "MOJOCCL_NVLS_MIN_MB": (
-        "Message size, in MiB, at or above which an allreduce takes the "
-        "multicast path. Defaults to the measured crossover."
+    "MOJOCCL_NVLS": (
+        "`0` turns the NVLink-SHARP multicast path off, region and all. "
+        "Enabled by default when every rank supports it."
     ),
     "MOJOCCL_REGION_MB": (
         "Size of the registered staging region, in MiB. Any positive 4 KiB "
-        "multiple; rounded up to the allocation granularity."
+        "multiple; rounded up to the allocation granularity. Defaults to "
+        "64 MiB on gfx942 (MI300A), 256 MiB elsewhere, including NVIDIA."
+    ),
+    # -- mojoccl: standalone probe artifacts (not library controls) --------
+    "MOJOCCL_LIBRARY": (
+        "Path of the prebuilt mojoccl library for the standalone stream-order "
+        "probe. Required by that probe; the production library never reads it."
+    ),
+    "MOJOCCL_STATE_PROBE_LIBRARY": (
+        "Path of the prebuilt communicator-state helper for the standalone "
+        "stream-order probe. Required by that probe; not a library control."
     ),
 }
 
@@ -209,9 +205,13 @@ FOREIGN_ENV_VARS: dict[str, str] = {
         "The Mojo compiler's module cache. Defaulted to node-local scratch so "
         "concurrent compilers on an NFS $HOME cannot evict each other."
     ),
+    "CUDA_HOME": "A CUDA toolkit root, searched for a ptxas to assemble with.",
+    "CUDA_PATH": "Older spelling of CUDA_HOME, searched the same way.",
     "MODULAR_NVPTX_COMPILER_PATH": (
-        "The ptxas MAX assembles with. Defaulted to the nvidia-cuda-nvcc-cu12 "
-        "wheel's, whose cubins load on older drivers; an explicit value wins."
+        "The ptxas MAX assembles with. Defaulted to the newest on this "
+        "machine that suits both the driver and the GPU, and left unset when "
+        "that is MAX's own compiler. An explicit value wins and is only checked; "
+        "`torch-mojo-backend ptxas` shows the choice and the alternatives."
     ),
     "ROCM_PATH": "ROCm install root, searched for the HIP runtime and librccl.",
     "ROCR_VISIBLE_DEVICES": "HSA-level device visibility; narrowed per rank.",

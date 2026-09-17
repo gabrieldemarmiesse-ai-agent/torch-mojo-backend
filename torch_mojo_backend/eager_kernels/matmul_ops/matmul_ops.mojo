@@ -2084,6 +2084,115 @@ def _nt_mfma_kernel[
     k_per_arg: Int64,
     xcds_arg: Int64,
 ):
+    _nt_mfma_body[
+        dtype,
+        BM,
+        BN,
+        BK,
+        WM,
+        WN,
+        STAGES,
+        SWIZZLE,
+        MASK_LOAD,
+        MASK_STORE,
+        A_KMAJOR,
+        B_KMAJOR,
+        SPLITK,
+        otype,
+        PAIR,
+        FILL_AT,
+        WBODY,
+    ](c, a, b, m_arg, n_arg, k_arg, k_per_arg, xcds_arg, a)
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32((BM // WM) * (BN // WN) * 64)
+    ),
+)
+@__name(
+    t"nt_mfma_bias_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_f{FILL_AT}_body{WBODY}_scalar{SCALAR_LOAD}"
+)
+def _nt_bias_mfma_kernel[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    BK: Int,
+    WM: Int,
+    WN: Int,
+    STAGES: Int,
+    SWIZZLE: Bool,
+    MASK_LOAD: Bool,
+    MASK_STORE: Bool,
+    FILL_AT: Int,
+    WBODY: Bool,
+    SCALAR_LOAD: Bool,
+](
+    c: Pointer[Scalar[dtype], MutAnyOrigin],
+    a: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    bias: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    k_per_arg: Int64,
+    xcds_arg: Int64,
+):
+    _nt_mfma_body[
+        dtype,
+        BM,
+        BN,
+        BK,
+        WM,
+        WN,
+        STAGES,
+        SWIZZLE,
+        MASK_LOAD,
+        MASK_STORE,
+        True,
+        True,
+        False,
+        dtype,
+        False,
+        FILL_AT,
+        WBODY,
+        True,
+        SCALAR_LOAD,
+    ](c, a, b, m_arg, n_arg, k_arg, k_per_arg, xcds_arg, bias)
+
+
+@always_inline
+def _nt_mfma_body[
+    dtype: DType,
+    BM: Int,
+    BN: Int,
+    BK: Int,
+    WM: Int,
+    WN: Int,
+    STAGES: Int,
+    SWIZZLE: Bool,
+    MASK_LOAD: Bool,
+    MASK_STORE: Bool,
+    A_KMAJOR: Bool = True,
+    B_KMAJOR: Bool = True,
+    SPLITK: Bool = False,
+    otype: DType = dtype,
+    PAIR: Bool = not A_KMAJOR and not B_KMAJOR,
+    FILL_AT: Int = 0,
+    WBODY: Bool = False,
+    FUSE_BIAS: Bool = False,
+    SCALAR_LOAD: Bool = False,
+](
+    c: Pointer[Scalar[otype], MutAnyOrigin],
+    a: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    b: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    m_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    k_per_arg: Int64,
+    xcds_arg: Int64,
+    bias: Pointer[Scalar[dtype], ImmutAnyOrigin],
+):
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var m = Int(m_arg)
@@ -2374,7 +2483,16 @@ def _nt_mfma_kernel[
                         live = live and m0 + trow + p * ROWS < m
                     var v = SIMD[dtype, NT_VEC](0)
                     if live:
-                        v = a_ptr.unsafe_load[width=NT_VEC](p * pass_step)
+                        comptime if SCALAR_LOAD:
+                            # Offset views and a non-vector K tail cannot use a
+                            # whole-vector load. Zero each out-of-range element.
+                            comptime for e in range(NT_VEC):
+                                if k0 + kt * BK + tcol + e < k:
+                                    v[e] = a_ptr[
+                                        unsafe_offset=p * pass_step + e
+                                    ]
+                        else:
+                            v = a_ptr.unsafe_load[width=NT_VEC](p * pass_step)
                     areg.unsafe_store(p * NT_VEC, v)
             else:
                 comptime for p in range(APASS):
@@ -2419,7 +2537,16 @@ def _nt_mfma_kernel[
                         live = live and n0 + trow + p * ROWS < n
                     var v = SIMD[dtype, NT_VEC](0)
                     if live:
-                        v = b_ptr.unsafe_load[width=NT_VEC](p * pass_step)
+                        comptime if SCALAR_LOAD:
+                            # Offset views and a non-vector K tail cannot use a
+                            # whole-vector load. Zero each out-of-range element.
+                            comptime for e in range(NT_VEC):
+                                if k0 + kt * BK + tcol + e < k:
+                                    v[e] = b_ptr[
+                                        unsafe_offset=p * pass_step + e
+                                    ]
+                        else:
+                            v = b_ptr.unsafe_load[width=NT_VEC](p * pass_step)
                     breg.unsafe_store(p * NT_VEC, v)
             else:
                 comptime for p in range(BPASS):
@@ -2815,14 +2942,24 @@ def _nt_mfma_kernel[
         # read fenced on both sides, which keeps the invariant that matters
         # (no read of an MFMA destination adjacent to a branch) at a sixteenth
         # of the peak register cost.
+        comptime assert not FUSE_BIAS or (
+            not SPLITK and otype == dtype and A_KMAJOR and B_KMAJOR
+        ), "bias belongs in the final unsplit k-major epilogue"
         comptime OUT_ALL = size_of[otype]() <= size_of[dtype]()
         _nt_sched_fence()
         var out = stack_allocation[(MT * NTL if OUT_ALL else 1) * 16, otype]()
         comptime if OUT_ALL:
             comptime for i in range(MT * NTL):
-                out.unsafe_store(
-                    i * 16, acc.unsafe_load[width=16](i * 16).cast[otype]()
-                )
+                var value = acc.unsafe_load[width=16](i * 16)
+                comptime if FUSE_BIAS:
+                    # Add in the fp32 accumulator, before the sole bf16 cast.
+                    # MAX's generic epilogue receives an already-rounded value.
+                    var col = n0 + wn0 + lo + (i % NTL) * NT_MMA
+                    var bvalue = Float32(0)
+                    if not MASK_STORE or col < n:
+                        bvalue = bias[unsafe_offset=col].cast[DType.float32]()
+                    value += bvalue
+                out.unsafe_store(i * 16, value.cast[otype]())
         llvm_intrinsic["llvm.amdgcn.sched.barrier", NoneType](Int32(0))
 
         # Register p of accumulator (i, j) is row
@@ -3051,6 +3188,8 @@ def _nt_mfma_gemm[
     FILL_AT: Int = 0,
     WBODY: Bool = False,
     NOMASK: Bool = False,
+    FUSE_BIAS: Bool = False,
+    SCALAR_LOAD: Bool = False,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -3061,6 +3200,7 @@ def _nt_mfma_gemm[
     parts: Int,
     xcds: Int,
     ctx: DeviceContext,
+    bias_addr: Int = 0,
 ) raises:
     """Enqueue the MFMA GEMM, dropping the edge guards when they are unused.
 
@@ -3091,40 +3231,77 @@ def _nt_mfma_gemm[
     @always_inline
     @parameter
     def _go[MASKED: Bool, BODY2: Bool]() raises:
-        ctx.enqueue_function[
-            _nt_mfma_kernel[
-                dtype,
-                BM,
-                BN,
-                BK,
-                WM,
-                WN,
-                STAGES,
-                SWIZZLE,
-                MASKED,
-                MASKED,
-                A_KMAJOR,
-                B_KMAJOR,
-                SPLITK,
-                otype,
-                PAIR,
-                FILL_AT,
-                BODY2,
-            ]
-        ](
-            _make_ptr[otype](c_addr),
-            _make_ptr[dtype](a_addr).as_imm(),
-            _make_ptr[dtype](b_addr).as_imm(),
-            Int64(m),
-            Int64(n),
-            Int64(k),
-            Int64(k_per),
-            Int64(xcds),
-            grid_dim=grid,
-            block_dim=(THREADS,),
-        )
+        comptime if FUSE_BIAS:
+            _enqueue_cached[
+                _nt_bias_mfma_kernel[
+                    dtype,
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    STAGES,
+                    SWIZZLE,
+                    MASKED,
+                    MASKED,
+                    FILL_AT,
+                    BODY2,
+                    SCALAR_LOAD,
+                ]
+            ](
+                ctx,
+                String(
+                    t"nt_mfma_bias_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASKED}_t{MASKED}_f{FILL_AT}_body{BODY2}_scalar{SCALAR_LOAD}"
+                ),
+                grid[0],
+                grid[1],
+                grid[2],
+                THREADS,
+                _make_ptr[dtype](c_addr),
+                _make_ptr[dtype](a_addr).as_imm(),
+                _make_ptr[dtype](b_addr).as_imm(),
+                _make_ptr[dtype](bias_addr).as_imm(),
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(k_per),
+                Int64(xcds),
+            )
+        else:
+            ctx.enqueue_function[
+                _nt_mfma_kernel[
+                    dtype,
+                    BM,
+                    BN,
+                    BK,
+                    WM,
+                    WN,
+                    STAGES,
+                    SWIZZLE,
+                    MASKED,
+                    MASKED,
+                    A_KMAJOR,
+                    B_KMAJOR,
+                    SPLITK,
+                    otype,
+                    PAIR,
+                    FILL_AT,
+                    BODY2,
+                ]
+            ](
+                _make_ptr[otype](c_addr),
+                _make_ptr[dtype](a_addr).as_imm(),
+                _make_ptr[dtype](b_addr).as_imm(),
+                Int64(m),
+                Int64(n),
+                Int64(k),
+                Int64(k_per),
+                Int64(xcds),
+                grid_dim=grid,
+                block_dim=(THREADS,),
+            )
 
-    if NOMASK or (m >= BM and n >= BN and k % BK == 0):
+    if not SCALAR_LOAD and (NOMASK or (m >= BM and n >= BN and k % BK == 0)):
         # The wide-k body needs an EVEN number of k tiles in every slab, which
         # is a runtime property of the shape, so both bodies are instantiated
         # and the launch picks between them.  Both the full slabs and the short
@@ -3139,6 +3316,112 @@ def _nt_mfma_gemm[
     else:
         comptime if not NOMASK:
             _go[True, False]()
+
+
+@always_inline
+def _nt_bias_mfma_route(
+    c: Int,
+    a: Int,
+    b: Int,
+    bias: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises:
+    """Dynamic gfx942 bf16 NT GEMM with one rounding after the row bias."""
+    comptime DT = DType.bfloat16
+    var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var xcds = max(1, cus // 38)
+    if k % NT_VEC != 0 or a % 16 != 0 or b % 16 != 0:
+        _nt_mfma_gemm[
+            DT,
+            32,
+            64,
+            32,
+            32,
+            32,
+            2,
+            True,
+            True,
+            True,
+            False,
+            DT,
+            False,
+            NT_BODY2_FILL,
+            False,
+            False,
+            True,
+            True,
+        ](c, a, b, m, n, k, 1, xcds, ctx, bias)
+        return
+    if m >= 256 and n >= 256 and ceildiv(m, 128) * ceildiv(n, 128) >= cus:
+        var kt = ceildiv(k, 32)
+        if _nt_plan_cost(256, 256, m, n, 2, kt, 1, cus) <= _nt_plan_cost(
+            128, 128, m, n, 2, kt, 1, cus
+        ):
+            # FILL_AT=2 was measured on MI300A (228 CUs). Ranking whole
+            # grid waves admits a near-full 256 tile wave without a fitted
+            # shape cutoff, while the 128 tile can still win on other grids.
+            _nt_mfma_gemm[
+                DT,
+                256,
+                256,
+                32,
+                64,
+                64,
+                2,
+                True,
+                True,
+                True,
+                False,
+                DT,
+                False,
+                2,
+                True,
+                False,
+                True,
+            ](c, a, b, m, n, k, 1, xcds, ctx, bias)
+        else:
+            _nt_mfma_gemm[
+                DT,
+                128,
+                128,
+                32,
+                64,
+                64,
+                2,
+                True,
+                True,
+                True,
+                False,
+                DT,
+                False,
+                NT_BODY2_FILL,
+                True,
+                False,
+                True,
+            ](c, a, b, m, n, k, 1, xcds, ctx, bias)
+    else:
+        _nt_mfma_gemm[
+            DT,
+            32,
+            64,
+            32,
+            32,
+            32,
+            2,
+            True,
+            True,
+            True,
+            False,
+            DT,
+            False,
+            NT_BODY2_FILL,
+            True,
+            False,
+            True,
+        ](c, a, b, m, n, k, 1, xcds, ctx, bias)
 
 
 @always_inline
@@ -3566,6 +3849,13 @@ def _amd_dynamic_mfma_dispatch[
     bias_addr: Int,
     ctx: DeviceContext,
 ) raises -> Bool:
+    comptime if _accelerator_arch() == "amdgpu:gfx942":
+        comptime if dtype == DType.bfloat16 and transpose_b and fuse_bias:
+            if batch == 1 and a_bstride != 0:
+                _nt_bias_mfma_route(
+                    c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+                )
+                return True
     # The cutoffs describe reusable workload regimes. All tensor dimensions
     # stay runtime-dynamic inside every selected kernel.
     if a_bstride == 0 or k % 32 != 0:
@@ -6382,6 +6672,13 @@ def _matmul_bias_run(
         )
         return
 
+    # Keep the bias in fp32 even for decode and irregular/offset NT inputs.
+    # This branch is absent on other architectures and for all other dtypes.
+    comptime if _accelerator_arch() == "amdgpu:gfx942":
+        if dtype == DType.bfloat16 and transpose_b != 0:
+            _nt_bias_mfma_route(c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
+            return
+
     # Single-token (m == 1) decode: gemv_gpu + row-broadcast bias. gemv beats
     # our smallm split-K path on every decode shape; the bias add is the same
     # cheap epilogue either way. No unsupported-dtype raise needed here:
@@ -6771,6 +7068,23 @@ def _matmul_spec_operands_launch(
     """Launch with Mojo-side temporaries for strided operands: the hot
     (contiguous) path is branch-only; a strided a/b materializes into a
     scratch buffer that lives until its launch is enqueued."""
+    comptime if _accelerator_arch() == "amdgpu:gfx942":
+        # addmm passes B's transpose view with logical TRANSPOSE_B=0.
+        # Read its physical (n, k) storage directly, just as linear does,
+        # keeping the bias in fp32 and avoiding a materialized transpose.
+        if (
+            ctx.api() != "cpu"
+            and has_bias
+            and batch == 1
+            and a.contig
+            and a.dtype == DType.bfloat16
+            and transpose_b == 0
+            and b.rank == 2
+            and b.strides[MAX_RANK - 2] == 1
+            and b.strides[MAX_RANK - 1] == k
+        ):
+            _nt_bias_mfma_route(c_addr, a.ptr, b.ptr, bias_addr, m, n, k, ctx)
+            return
     if a.contig and b.contig:
         _matmul_spec_launch(
             a.dtype,

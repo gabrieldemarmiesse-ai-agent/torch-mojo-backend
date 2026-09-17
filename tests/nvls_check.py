@@ -4,7 +4,7 @@
 This runs the same kind of check at whatever `WORLD_SIZE` torchrun gives it
 -- 2 and 4 are the interesting ones, since the reducer/copy block split and
 the per-rank slice arithmetic are both functions of `world` -- over sizes
-that straddle the `MOJOCCL_NVLS_MIN_MB` dispatch threshold and the staging
+that straddle the 48 MiB NVLS dispatch threshold and the staging
 arena, including one element past it so the ABI layer's chunking loop runs.
 
     TORCH_MOJO_BACKEND_CCL=mojo torchrun --nproc-per-node=2 tests/nvls_check.py

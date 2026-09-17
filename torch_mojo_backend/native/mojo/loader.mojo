@@ -339,6 +339,18 @@ struct Loader(Movable):
             var defs = String()
             for d in defines:
                 defs += " -D " + d
+            var log = String(output[byte=:marker]) if marker > 0 else output
+            # The assembler is chosen for us (torch_mojo_backend/_ptxas.py),
+            # and when it is the wrong one for this driver or this GPU that
+            # shows up here as a ptxas line in someone else's log. Say where
+            # the answer is; Mojo cannot work it out, Python can.
+            var hint = String()
+            if "ptxas" in log or "MODULAR_NVPTX_COMPILER_PATH" in log:
+                hint = String(
+                    "\n\n`torch-mojo-backend ptxas` shows which assembler was"
+                    " chosen for this driver and GPU, and what to install if"
+                    " none fits."
+                )
             raise Error(
                 "mojo build of ",
                 label,
@@ -348,7 +360,8 @@ struct Loader(Movable):
                 ", ",
                 ms,
                 " ms):\n",
-                String(output[byte=:marker]) if marker > 0 else output,
+                log,
+                hint,
             )
         if exists(
             out_path

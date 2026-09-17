@@ -551,6 +551,30 @@ def test_gelu_forward_every_layout_and_dtype(mojo_gpu, approximate, layout):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_vector_body_tail_and_offset(
+    mojo_gpu: str, dtype: torch.dtype, offset: int, approximate: str
+):
+    """The 4-wide route handles aligned bodies and unaligned scalar tails."""
+    count = 1027
+    source = torch.linspace(-5, 5, count + offset + 3).to(dtype)
+    device_source = source.to(mojo_gpu)
+    input_view = device_source[offset : offset + count]
+    output = torch.full_like(source, -123).to(mojo_gpu)
+    output_view = output[offset : offset + count]
+    with torch.no_grad():
+        torch.ops.aten.gelu.out(input_view, approximate=approximate, out=output_view)
+    expected = torch.full_like(source, -123)
+    expected[offset : offset + count] = F.gelu(
+        source[offset : offset + count].float(), approximate=approximate
+    ).to(dtype)
+    tolerance = 3e-2 if dtype != torch.float32 else 5e-5
+    torch.testing.assert_close(output.cpu(), expected, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(device_source.cpu(), source, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("step", [1, 2])
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_gelu_backward_runtime_layouts(mojo_gpu, approximate, step):
