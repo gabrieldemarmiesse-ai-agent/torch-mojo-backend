@@ -415,13 +415,18 @@ class MojoProcessGroup(dist.ProcessGroup):
     def _same_device(self, tensors: list[torch.Tensor]) -> int:
         if not tensors:
             raise ValueError("no tensors")
-        index = self._index(tensors[0])
+        first = tensors[0]
+        if self._is_cpu(first):
+            raise ValueError(
+                "all tensors of a collective must be on the same mojo device"
+            )
+        device = first.device
         for t in tensors:
-            if self._is_cpu(t) or self._index(t) != index:
+            if t is not first and t.device != device:
                 raise ValueError(
                     "all tensors of a collective must be on the same mojo device"
                 )
-        return index
+        return self._index(first)
 
     @contextlib.contextmanager
     def _group(self):
