@@ -352,6 +352,226 @@ def test_scalar_mul_out_aliasing_self(mojo_device, dtype):
     torch.testing.assert_close(x.cpu(), x_cpu * 0.5)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n,offset", [(0, 1), (1, 0), (357 * 789, 1)])
+def test_mul_inplace_device_scalar_preserves_storage(mojo_gpu, dtype, n, offset):
+    cpu = (torch.arange(n + offset + 3, dtype=torch.float32) % 29 - 14).to(dtype)
+    base = cpu.to(mojo_gpu)
+    value = base[offset : offset + n]
+    scalar = torch.tensor(0.375, dtype=dtype, device=mojo_gpu)
+    scalar_version, version, ptr = scalar._version, value._version, value.data_ptr()
+    result = value.mul_(scalar)
+    cpu[offset : offset + n].mul_(0.375)
+    assert result is value
+    assert value.data_ptr() == ptr
+    assert value._version == version + 1
+    assert scalar._version == scalar_version
+    assert scalar.cpu().item() == 0.375
+    torch.testing.assert_close(base.cpu(), cpu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["strided", "promoted", "broadcast", "alias"])
+def test_mul_inplace_device_scalar_fallbacks(mojo_gpu, layout):
+    cpu = torch.arange(1, 13, dtype=torch.float32).reshape(3, 4)
+    value = cpu.to(mojo_gpu)
+    if layout == "strided":
+        cpu, value = cpu[:, ::2], value[:, ::2]
+    if layout == "alias":
+        with pytest.raises(RuntimeError, match="single memory location|overlap"):
+            value.mul_(value[0, 0])
+        torch.testing.assert_close(value.cpu(), cpu)
+        return
+    dtype = torch.float16 if layout == "promoted" else torch.float32
+    scalar_cpu = torch.tensor(0.375, dtype=dtype)
+    if layout == "broadcast":
+        scalar_cpu = scalar_cpu.expand(3, 1).clone()
+    scalar = scalar_cpu.to(mojo_gpu)
+    version = value._version
+    value.mul_(scalar)
+    cpu.mul_(scalar_cpu)
+    assert value._version == version + 1
+    torch.testing.assert_close(value.cpu(), cpu)
+
+
+@pytest.mark.parametrize("divisor", [3.0, -0.03162277660168379, 7, 1e-20, 1e20])
+@pytest.mark.parametrize("out_kind", ["functional", "offset", "alias", "strided"])
+def test_div_host_scalar_direct(mojo_gpu, divisor, out_kind):
+    cpu = torch.linspace(-17, 19, 359, dtype=torch.float32)
+    source = cpu.to(mojo_gpu)
+    source_before = source.cpu()
+    expected = cpu / divisor
+    if out_kind == "functional":
+        result = source / divisor
+    else:
+        backing = torch.full((2 * cpu.numel() + 3,), 71.0, device=mojo_gpu)
+        if out_kind == "alias":
+            result = source
+        elif out_kind == "strided":
+            result = backing[1 : 2 * cpu.numel() + 1 : 2]
+        else:
+            result = backing[1 : cpu.numel() + 1]
+        version, ptr = result._version, result.data_ptr()
+        assert torch.div(source, divisor, out=result) is result
+        assert result.data_ptr() == ptr
+        assert result._version == version + 1
+        if out_kind != "alias":
+            expected_backing = torch.full_like(backing.cpu(), 71.0)
+            if out_kind == "strided":
+                expected_backing[1 : 2 * cpu.numel() + 1 : 2] = expected
+            else:
+                expected_backing[1 : cpu.numel() + 1] = expected
+            torch.testing.assert_close(backing.cpu(), expected_backing)
+    torch.testing.assert_close(result.cpu(), expected)
+    if out_kind != "alias":
+        torch.testing.assert_close(source.cpu(), source_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("divisor", [0.0, -0.0, float("inf"), -float("inf")])
+def test_div_host_scalar_special_values(mojo_gpu, divisor):
+    cpu = torch.tensor([-float("inf"), -3.0, -0.0, 0.0, 5.0, float("inf")])
+    torch.testing.assert_close(
+        (cpu.to(mojo_gpu) / divisor).cpu(), cpu / divisor, equal_nan=True
+    )
+
+
+_SCALAR_MUL_PATTERNS = [
+    0,
+    0x80000000,
+    1,
+    0x80000001,
+    0x007FFFFF,
+    0x807FFFFF,
+    0x00800000,
+    0x80800000,
+    0x3F800000,
+    0x3F800001,
+    0x3F7FFFFF,
+    0xBF800001,
+    0x7F7FFFFF,
+    0xFF7FFFFF,
+    0x7F800000,
+    0xFF800000,
+    0x7FC00000,
+    0xFFC00000,
+    0x7F800001,
+    0xFFFFFFFF,
+]
+
+
+def _check_scalar_mul_peel(
+    device, size, source_offset, destination_offset, bits, inplace
+):
+    indices = torch.arange(size + 16, dtype=torch.int64)
+    source_bits = indices * 2654435761
+    for i, pattern in enumerate(_SCALAR_MUL_PATTERNS):
+        source_bits[indices % 32 == i] = pattern
+    source_bits = source_bits.to(torch.int32)
+    host = source_bits.view(torch.float32)
+    scalar = (
+        torch.tensor(bits, dtype=torch.int64).to(torch.int32).view(torch.float32).item()
+    )
+    source = host.to(device)
+    destination = source if inplace else torch.full_like(source, 17.0)
+    expected = host.clone() if inplace else torch.full_like(host, 17.0)
+    value = source[source_offset : source_offset + size]
+    output = destination[destination_offset : destination_offset + size]
+    before, pointer = output._version, output.data_ptr()
+    assert torch.mul(value, scalar, out=output) is output
+    expected[destination_offset : destination_offset + size] = (
+        host[source_offset : source_offset + size] * scalar
+    )
+    actual = destination.cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    finite_or_inf = ~torch.isnan(expected)
+    torch.testing.assert_close(
+        actual.view(torch.int32)[finite_or_inf],
+        expected.view(torch.int32)[finite_or_inf],
+        rtol=0,
+        atol=0,
+    )
+    assert output._version == before + 1
+    assert output.data_ptr() == pointer
+    if not inplace:
+        torch.testing.assert_close(
+            source.cpu().view(torch.int32), source_bits, rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("source_offset", range(4))
+@pytest.mark.parametrize("destination_offset", range(4))
+def test_scalar_mul_peel_alignment(mojo_gpu, source_offset, destination_offset):
+    _check_scalar_mul_peel(
+        mojo_gpu, 1025, source_offset, destination_offset, 0x41FCFB72, False
+    )
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        15,
+        16,
+        17,
+        255,
+        256,
+        257,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        1028,
+        1029,
+    ],
+)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_boundaries(mojo_gpu, size, inplace):
+    offset, scalar = (3, 0xBF800001) if inplace else (1, 0x3F800001)
+    _check_scalar_mul_peel(mojo_gpu, size, offset, offset, scalar, inplace)
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        0,
+        0x80000000,
+        0x3F800000,
+        0xBF800000,
+        0x3F000000,
+        0x40000000,
+        1,
+        0x00800000,
+        0x7F800000,
+        0xFF800000,
+        0x7FC00000,
+        0x7F7FFFFF,
+    ],
+)
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_special_values(mojo_gpu, bits, inplace):
+    offset = int(inplace)
+    _check_scalar_mul_peel(mojo_gpu, 1025, offset, offset, bits, inplace)
+
+
+@pytest.mark.parametrize("offset", [0, 1, 3])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_scalar_mul_peel_large(mojo_gpu, offset, inplace):
+    _check_scalar_mul_peel(
+        mojo_gpu,
+        357 * 789,
+        offset,
+        offset,
+        0xBF800001 if inplace else 0x41FCFB72,
+        inplace,
+    )
+
+
 def test_out_resizes(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)

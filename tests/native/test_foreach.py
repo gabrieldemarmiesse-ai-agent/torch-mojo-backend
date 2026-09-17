@@ -65,6 +65,36 @@ def test_foreach_copy_cast_lists(mojo_gpu: str, sizes: list[int], non_blocking: 
     _check_foreach_copy_cast(mojo_gpu, sizes, 3, 5, non_blocking)
 
 
+@pytest.mark.parametrize("sizes", _COPY_CAST_LISTS)
+def test_foreach_copy_bf16_bits(mojo_gpu: str, sizes: list[int]):
+    hosts = [
+        (torch.arange(n + 9, dtype=torch.int64) * 7919 + 13).to(torch.int16)
+        for n in sizes
+    ]
+    sources = [bits.view(torch.bfloat16).to(mojo_gpu) for bits in hosts]
+    guards = [
+        torch.full((n + 11,), -9, dtype=torch.bfloat16, device=mojo_gpu) for n in sizes
+    ]
+    srcs = [t[3 : 3 + n] for t, n in zip(sources, sizes, strict=True)]
+    dsts = [t[5 : 5 + n] for t, n in zip(guards, sizes, strict=True)]
+    versions = [t._version for t in dsts]
+    _watch("aten::_foreach_copy_")
+    torch._foreach_copy_(dsts, srcs)
+    _assert_ran("aten::_foreach_copy_")
+    for dst, src, host, guard, n, version in zip(
+        dsts, sources, hosts, guards, sizes, versions, strict=True
+    ):
+        torch.testing.assert_close(
+            dst.cpu().view(torch.int16), host[3 : 3 + n], rtol=0, atol=0
+        )
+        torch.testing.assert_close(src.cpu().view(torch.int16), host, rtol=0, atol=0)
+        observed = guard.cpu()
+        assert bool((observed[:5] == -9).all()) and bool(
+            (observed[5 + n :] == -9).all()
+        )
+        assert dst._version == version + 1
+
+
 @pytest.mark.parametrize("source_offset", range(4))
 @pytest.mark.parametrize("destination_offset", range(4))
 def test_foreach_copy_cast_alignment(
@@ -73,6 +103,95 @@ def test_foreach_copy_cast_alignment(
     _check_foreach_copy_cast(
         mojo_gpu, _COPY_CAST_LISTS[0], source_offset, destination_offset, False
     )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.uint8]
+)
+@pytest.mark.parametrize("sizes", [[0, 357, 789, 17, 1, 0], [800] * 12, [0, 0, 0]])
+@pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
+def test_foreach_copy_adjacent_views(mojo_gpu: str, dtype, sizes, offsets):
+    source_offset, destination_offset = offsets
+    size = sum(sizes)
+    host = ((torch.arange(size + 8) * 7919 + 13) % 127).to(dtype)
+    source = host.to(mojo_gpu)
+    destination = torch.full((size + 8,), 53, dtype=dtype, device=mojo_gpu)
+    srcs = source[source_offset : source_offset + size].split(sizes)
+    dsts = destination[destination_offset : destination_offset + size].split(sizes)
+    pointers = [tensor.data_ptr() for tensor in dsts]
+    source_version, destination_version = source._version, destination._version
+    returned = torch._foreach_copy_(dsts, srcs)
+    # The torch 2.11 stub says None, but its Python binding returns dsts.
+    assert isinstance(returned, tuple)
+    assert all(a is b for a, b in zip(returned, dsts, strict=True))
+    expected = torch.full((size + 8,), 53, dtype=dtype)
+    expected[destination_offset : destination_offset + size] = host[
+        source_offset : source_offset + size
+    ]
+    torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(source.cpu(), host, rtol=0, atol=0)
+    assert [tensor.data_ptr() for tensor in dsts] == pointers
+    assert source._version == source_version
+    assert destination._version == destination_version + len(dsts)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "self",
+        "disjoint",
+        "dependency",
+        "reversed",
+        "strided",
+        "source_gap",
+        "destination_gap",
+    ],
+)
+def test_foreach_copy_adjacent_aliases_and_fallbacks(mojo_gpu: str, mode: str):
+    host = torch.arange(1, 25, dtype=torch.float32)
+    base = host.to(mojo_gpu)
+
+    def views(tensor):
+        if mode == "self":
+            return tensor[:12].split(3), tensor[:12].split(3)
+        if mode == "disjoint":
+            return tensor[12:].split(3), tensor[:12].split(3)
+        if mode == "dependency":
+            return [tensor[1:2], tensor[2:3]], [tensor[:1], tensor[1:2]]
+        if mode == "reversed":
+            return tensor[12:].split(3), list(reversed(tensor[:12].split(3)))
+        if mode == "source_gap":
+            return tensor[12:16].split(2), [tensor[:2], tensor[4:6]]
+        if mode == "destination_gap":
+            return [tensor[12:14], tensor[16:18]], tensor[:4].split(2)
+        return tensor[1::2].split(3), tensor[::2].split(3)
+
+    dsts, srcs = views(base)
+    expected_dsts, expected_srcs = views(host)
+    version = base._version
+    for destination, source in zip(expected_dsts, expected_srcs, strict=True):
+        destination.copy_(source)
+    torch._foreach_copy_(dsts, srcs)
+    torch.testing.assert_close(base.cpu(), host, rtol=0, atol=0)
+    assert base._version == version + len(dsts)
+
+
+def test_foreach_copy_adjacent_later_shape_error(mojo_gpu: str):
+    source_cpu = torch.arange(5, dtype=torch.float32)
+    destination_cpu = torch.full((4,), 53.0)
+    source = source_cpu.to(mojo_gpu)
+    destination = destination_cpu.to(mojo_gpu)
+    reference_before = destination_cpu._version
+    with pytest.raises(RuntimeError):
+        for dst, src in zip(
+            destination_cpu.split(2), source_cpu.split([2, 3]), strict=True
+        ):
+            dst.copy_(src)
+    before = destination._version
+    with pytest.raises(RuntimeError):
+        torch._foreach_copy_(destination.split(2), source.split([2, 3]))
+    torch.testing.assert_close(destination.cpu(), destination_cpu, rtol=0, atol=0)
+    assert destination._version - before == destination_cpu._version - reference_before
 
 
 def _check_foreach_copy_cast(

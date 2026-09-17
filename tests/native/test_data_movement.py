@@ -186,6 +186,208 @@ def test_copy_row_strided_fallback(mojo_gpu: str, dtype: torch.dtype, layout: st
     torch.testing.assert_close(source_base.cpu(), host, rtol=0, atol=0)
 
 
+_SPLIT_ROW_CASES = [
+    (2, [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800]),
+    (2, [800] * 12),
+    (7, [357, 789, 17, 1, 0]),
+    (1, [1048576]),
+    (3, [513] * 65),
+    (65536, [1, 0, 2]),
+    (0, [17, 0, 1025]),
+    (3, []),
+    (3, [0, 0, 0]),
+    (1, [2049] * 129),
+    (3, [17] * 80),
+    (3, [513] * 81),
+    (3, [0 if i % 3 == 0 else i * 357 % 5001 for i in range(197)]),
+]
+
+
+@pytest.mark.parametrize("rows,sizes", _SPLIT_ROW_CASES)
+def test_split_copy_row_cases(mojo_gpu: str, rows: int, sizes: list[int]):
+    _check_split_copy_bits(mojo_gpu, rows, sizes, 3, 5)
+
+
+@pytest.mark.parametrize("source_offset", range(4))
+@pytest.mark.parametrize("destination_offset", range(4))
+def test_split_copy_row_alignment(
+    mojo_gpu: str, source_offset: int, destination_offset: int
+):
+    _check_split_copy_bits(
+        mojo_gpu,
+        3,
+        [0, 1, 2, 7, 8, 9, 2047, 2048, 2049, 4095, 4096, 4097],
+        source_offset,
+        destination_offset,
+    )
+
+
+def _check_split_copy_bits(
+    device: str,
+    rows: int,
+    sizes: list[int],
+    source_offset: int,
+    destination_offset: int,
+):
+    count = rows * sum(sizes)
+    bits = (torch.arange(count + source_offset + 7, dtype=torch.int64) * 7919 + 13).to(
+        torch.int16
+    )
+    host = bits.view(torch.bfloat16)
+    source_base = host.to(device)
+    source = source_base[source_offset : source_offset + count].view(rows, sum(sizes))
+    guards = [
+        torch.full(
+            (rows * n + destination_offset + 7,),
+            -9,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        for n in sizes
+    ]
+    outputs = [
+        base[destination_offset : destination_offset + rows * n].view(rows, n)
+        for base, n in zip(guards, sizes, strict=True)
+    ]
+    versions = [out._version for out in outputs]
+    assert (
+        torch.ops.aten.split_with_sizes_copy.out(source, sizes, 1, out=outputs) is None
+    )
+    expected = (
+        host[source_offset : source_offset + count]
+        .view(rows, sum(sizes))
+        .split(sizes, dim=1)
+    )
+    for actual, want, guard, n, version in zip(
+        outputs, expected, guards, sizes, versions, strict=True
+    ):
+        torch.testing.assert_close(
+            actual.cpu().view(torch.int16),
+            want.contiguous().view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
+        observed = guard.cpu()
+        assert bool((observed[:destination_offset] == -9).all())
+        assert bool((observed[destination_offset + rows * n :] == -9).all())
+        assert actual._version == version + 1
+    torch.testing.assert_close(
+        source_base.cpu().view(torch.int16), bits, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,dim,sizes",
+    [
+        ((2, 5, 3), 1, [2, 0, 3]),
+        ((2, 5, 3), -2, [1, 4]),
+        ((2, 3, 4), 0, [1, 1]),
+        ((2, 3, 4), -1, [1, 3]),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_split_copy_dimensions(
+    mojo_gpu: str,
+    shape: tuple[int, ...],
+    dim: int,
+    sizes: list[int],
+    dtype: torch.dtype,
+):
+    host = _fill(shape, dtype)
+    expected = list(host.split(sizes, dim))
+    outputs = [torch.empty(t.shape, dtype=dtype, device=mojo_gpu) for t in expected]
+    torch.ops.aten.split_with_sizes_copy.out(host.to(mojo_gpu), sizes, dim, out=outputs)
+    for actual, want in zip(outputs, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "strided_input",
+        "strided_output",
+        "resize",
+        "resize_empty",
+        "duplicate",
+        "source_alias",
+        "source_dependency",
+    ],
+)
+def test_split_copy_fallback(mojo_device: str, mode: str):
+    def operands(device: str) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        source = torch.arange(12, dtype=torch.bfloat16).view(3, 4).to(device)
+        outputs = [
+            torch.empty((3, 2), dtype=torch.bfloat16, device=device) for _ in range(2)
+        ]
+        if mode == "strided_input":
+            source = (
+                torch.arange(24, dtype=torch.bfloat16).view(3, 8).to(device)[:, ::2]
+            )
+        elif mode == "strided_output":
+            outputs = [
+                torch.zeros((3, 4), dtype=torch.bfloat16, device=device)[:, ::2]
+                for _ in range(2)
+            ]
+        elif mode == "resize":
+            outputs = [
+                torch.empty(1, dtype=torch.bfloat16, device=device) for _ in range(2)
+            ]
+        elif mode == "resize_empty":
+            outputs = [
+                torch.empty(0, dtype=torch.bfloat16, device=device) for _ in range(2)
+            ]
+        elif mode == "duplicate":
+            outputs[1] = outputs[0]
+        elif mode == "source_alias":
+            outputs = list(source.split([2, 2], dim=1))
+        elif mode == "source_dependency":
+            outputs[0] = source[:, 2:]
+        return source, outputs
+
+    host, reference = operands("cpu")
+    source, outputs = operands(mojo_device)
+    ref_versions, versions = (
+        [t._version for t in reference],
+        [t._version for t in outputs],
+    )
+    torch.ops.aten.split_with_sizes_copy.out(host, [2, 2], 1, out=reference)
+    torch.ops.aten.split_with_sizes_copy.out(source, [2, 2], 1, out=outputs)
+    for actual, want, before, ref_before in zip(
+        outputs, reference, versions, ref_versions, strict=True
+    ):
+        torch.testing.assert_close(actual.cpu(), want, rtol=0, atol=0)
+        assert actual._version - before == want._version - ref_before
+    torch.testing.assert_close(source.cpu(), host, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["negative_size", "sum", "dimension", "scalar", "output_count", "dtype", "device"],
+)
+def test_split_copy_errors(mojo_gpu: str, mode: str):
+    source = torch.ones((2, 4), dtype=torch.bfloat16, device=mojo_gpu)
+    sizes, dim = [2, 2], 1
+    outputs = [
+        torch.empty((2, 2), dtype=torch.bfloat16, device=mojo_gpu) for _ in range(2)
+    ]
+    if mode == "negative_size":
+        sizes = [-1, 5]
+    elif mode == "sum":
+        sizes = [1, 2]
+    elif mode == "dimension":
+        dim = 2
+    elif mode == "scalar":
+        source = source[0, 0]
+    elif mode == "output_count":
+        outputs.pop()
+    elif mode == "dtype":
+        outputs[1] = torch.empty((2, 2), dtype=torch.float32, device=mojo_gpu)
+    elif mode == "device":
+        outputs[1] = torch.empty((2, 2), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.aten.split_with_sizes_copy.out(source, sizes, dim, out=outputs)
+
+
 @pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
 def mojo_pair(request: pytest.FixtureRequest) -> tuple[str, str]:
     if len(get_accelerators()) - 1 < 2:

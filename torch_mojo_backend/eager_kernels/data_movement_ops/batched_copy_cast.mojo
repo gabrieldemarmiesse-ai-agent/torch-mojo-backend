@@ -9,13 +9,14 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from op_utils import _enqueue_cached, _make_ptr
+from copy_segments import CopyTileSegment, copy_segment_index
 
 comptime COPY_CAST_CAP = 64
 comptime COPY_CAST_THREADS = 256
 comptime COPY_CAST_TILE = 2048
 
 
-struct CopyCastSeg(DevicePassable, ImplicitlyCopyable, TrivialRegisterPassable):
+struct CopyCastSeg(CopyTileSegment, DevicePassable):
     comptime device_type: AnyType = Self
     var src: Int
     var dst: Int
@@ -27,6 +28,10 @@ struct CopyCastSeg(DevicePassable, ImplicitlyCopyable, TrivialRegisterPassable):
         self.dst = dst
         self.size = size
         self.tile_end = tile_end
+
+    @always_inline
+    def tile_limit(self) -> Int:
+        return self.tile_end
 
     def _to_device_type(
         self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
@@ -46,14 +51,7 @@ def _copy_cast_kernel(
 ):
     var tile = Int(block_idx.x)
     while tile < Int(tiles_arg):
-        var lo = 0
-        var hi = Int(count_arg) - 1
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if segs[mid].tile_end <= tile:
-                lo = mid + 1
-            else:
-                hi = mid
+        var lo = copy_segment_index(segs, Int(count_arg), tile)
         var seg = segs[lo]
         var first = 0 if lo == 0 else segs[lo - 1].tile_end
         var start = (tile - first) * COPY_CAST_TILE
