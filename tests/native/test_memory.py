@@ -1254,6 +1254,9 @@ def test_views_and_strided_storage(mojo_device: str):
 
 @pytest.mark.parametrize("non_blocking", [False, True])
 def test_host_memory_is_excluded(mojo_device: str, non_blocking: bool):
+    # Unreachable tensor cycles from earlier tests must not be collected
+    # after we snapshot the live-storage baseline.
+    _settle(mojo_device)
     base = device_module.memory_allocated(mojo_device)
     host = torch.arange(513, dtype=torch.float32)
     pinned = torch.empty(4096, pin_memory=True)
