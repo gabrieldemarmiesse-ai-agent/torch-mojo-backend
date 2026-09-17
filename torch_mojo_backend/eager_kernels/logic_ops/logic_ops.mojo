@@ -39,7 +39,6 @@ from op_utils import (
     MAX_RANK,
     _bw_flat_blocks,
     _enqueue_cached,
-    _flat_vec_unary,
     _gs_blocks,
     _l2_wave_blocks,
     _make_ptr,
@@ -875,12 +874,40 @@ def _not_vec[dtype: DType, w: Int](a: SIMD[dtype, w]) -> SIMD[dtype, w]:
 def _bitwise_not[
     dtype: DType
 ](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
-    # 16-byte vectorized when both bases are aligned; the closure below
-    # keeps offset views (and the CPU context) correct.
-    if _flat_vec_unary[dtype, dtype, _not_vec[dtype, _], "bitwise_not"](
-        out_addr, in_addr, size, ctx
-    ):
-        return
+    comptime if has_accelerator():
+        # Preserve the previous 16-byte alignment regime for int64 views.
+        comptime vector_width = min(4, 16 // size_of[dtype]())
+        if (
+            ctx.api() != "cpu"
+            and (out_addr | in_addr) % (vector_width * size_of[dtype]()) == 0
+        ):
+            # Bool storage is a byte, not a packed vector of i1 values.
+            comptime storage_dtype = DType.uint8 if dtype == DType.bool else dtype
+            var dst = _make_ptr[storage_dtype](out_addr)
+            var src = _make_ptr[storage_dtype](in_addr)
+
+            @always_inline
+            @parameter
+            @__copy_capture(dst, src)
+            def gpu_func[width: Int, alignment: Int = 1](idx: Coord):
+                var i = Int(idx[0].value())
+                comptime byte_alignment = width * size_of[storage_dtype]()
+                var a = src.unsafe_load[width=width, alignment=byte_alignment](
+                    i
+                )
+                var result: SIMD[storage_dtype, width]
+                comptime if dtype == DType.bool:
+                    result = a.eq(0).cast[storage_dtype]()
+                else:
+                    result = _not_vec[storage_dtype, width](a)
+                dst.unsafe_store[width=width, alignment=byte_alignment](
+                    i, result
+                )
+
+            elementwise[gpu_func, simd_width=vector_width, target="gpu"](
+                Coord(size), ctx
+            )
+            return
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 

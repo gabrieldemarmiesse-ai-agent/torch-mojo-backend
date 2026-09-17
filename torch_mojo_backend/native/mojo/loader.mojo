@@ -170,13 +170,23 @@ struct Loader(Movable):
 
     def _closure(self, entry: String, own_dir: String) raises -> List[String]:
         """Every .mojo file `entry` reaches through `from X import` /
-        `import X` (resolved in `own_dir`, then the package root), plus every
-        op_utils/*.mojo, in a deterministic order."""
+        `import X` (resolved in `own_dir`, then the eager kernel root), plus
+        every op_utils/*.mojo and the sibling mojo_kernels package when
+        imported, in a deterministic order. Shared graph/native math must
+        participate in the hash too, so editing it invalidates native builds."""
         var fam_dir = own_dir
         var files = List[String]()
         var seen = Dict[String, Bool]()
         var todo = List[String]()
         todo.append(entry)
+        # op_utils is a package: hash its files AND follow their imports.
+        # In particular, its numerical helpers now live in mojo_kernels.
+        var op_utils = self.kernels_dir + "/op_utils"
+        if isdir(op_utils):
+            for p in Path(op_utils).listdir():
+                var ps = String(p)
+                if ps.endswith(".mojo"):
+                    todo.append(op_utils + "/" + ps)
         while len(todo) > 0:
             var f = todo.pop()
             if f in seen:
@@ -199,6 +209,16 @@ struct Loader(Movable):
                 if dot > 0:
                     var short = String(name[byte=:dot])
                     name = short^
+                if name == "mojo_kernels":
+                    # Mojo resolves this as a package, including its __init__.
+                    # Hash its modules so both shared math and graph adapters
+                    # that the package imports invalidate the native build.
+                    var shared = self.kernels_dir + "/../mojo_kernels"
+                    for p in Path(shared).listdir():
+                        var ps = String(p)
+                        if ps.endswith(".mojo"):
+                            todo.append(shared + "/" + ps)
+                    continue
                 if (
                     name == ""
                     or name == "std"
@@ -213,17 +233,6 @@ struct Loader(Movable):
                     cand = self.kernels_dir + "/" + name + ".mojo"
                 if exists(cand) and cand not in seen:
                     todo.append(cand)
-        var op_utils = self.kernels_dir + "/op_utils"
-        if isdir(op_utils):
-            var names = List[String]()
-            for p in Path(op_utils).listdir():
-                var ps = String(p)
-                if ps.endswith(".mojo"):
-                    names.append(op_utils + "/" + ps)
-            sort(names)
-            for n in names:
-                if n not in seen:
-                    files.append(n)
         sort(files)
         return files^
 
@@ -301,6 +310,9 @@ struct Loader(Movable):
             + own_dir
             + "' -I '"
             + self.kernels_dir
+            + "' -I '"
+            + self.kernels_dir
+            + "/.."
             + "'"
         )
         comptime if CompilationTarget.is_macos():
