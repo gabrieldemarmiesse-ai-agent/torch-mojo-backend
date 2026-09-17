@@ -90,14 +90,14 @@ fully_shard(model, mesh=mesh)
 optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
 ```
 
-Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. Its initial reduce-scatter
-implementation reduces successive destination chunks using the existing
-allreduce transport and keeps only the destination's result. It uses at
-most 1 MiB of temporary MAX-allocated memory, handles offset buffers and
-SUM/AVG, and synchronizes before releasing scratch. This is a correctness
-implementation: it sends more data than a dedicated reduce-scatter and
-blocks the CPU during that collective. It does not modify the input, except
-when the caller explicitly uses its own input shard as the output.
+Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. On one node its
+reduce-scatter is a real reduce-scatter — one kernel per call, `(world-1)/
+world × bytes` on the wire, nothing allocated and no stream synchronized —
+and its all-gather is the unicast minimum; both are measured against NCCL at
+FSDP2's sizes in "Mojo collectives" below. Multi-node reduce-scatter still
+takes the placeholder schedule described there. Neither modifies the input,
+except when the caller explicitly uses its own input shard as the output
+(which NCCL also allows).
 
 `demo_scripts/gpt2_fsdp2.py` exercises GPT-2 124M and XL without downloading
 weights or a dataset. It uses the standard architecture, random initial
@@ -651,6 +651,62 @@ DDP bucket) 164 vs 181, 168 MiB 988 vs 756, 512 MiB 2.99 vs 2.15 ms. The last
 two rows are where the multicast path takes over — next subsection. AMD: the
 same source cross-compiles for gfx942, and it now runs there — see the
 subsection after that.
+
+### Reduce-scatter: push, then reduce into the caller's output
+
+FSDP2 asks for exactly two collectives and nothing else — a reduce-scatter of
+the gradients and an all-gather of the parameters, 146 calls per GPT-2 XL
+step at two ranks — so the reduce-scatter is a real one on a single node,
+not the allreduce transport in a costume:
+
+- **PUSH** rank r reads chunk s of its own input and writes it into peer s's
+  staging slot. That write is the wire transfer, as in the allreduce's
+  phase 1;
+- **REDUCE** every rank sums its own chunk, straight out of user memory,
+  with the `world-1` pushed slots, scales (AVG is NCCL's PreMulSum shape,
+  applied in the fp32 accumulator before the narrowing store) and writes the
+  result into the caller's output.
+
+`(world-1)/world × bytes` per GPU on the wire, the unicast minimum; nothing
+allocated, no stream synchronized, and one kernel per call at every size
+FSDP2 asks for — the push slots are `world-1` compacted slots that may use
+the whole `2 × MOJOCCL_REGION_MB` arena (512 MiB at the default region), for
+the same reason the NVLS allreduce may: the start barrier is what orders a
+generation's writes after every peer's previous reads.
+`reduce_scatter_max_count` is that bound and a larger message is chunked
+against it. In place is safe in NCCL's sense (`recvbuff == sendbuff +
+rank*count`): the push never reads chunk `rank`, and in the reduce each
+thread writes only the elements it just read. Any alignment is accepted —
+16-byte vectors where the pointers and the input stride allow them, and the
+same W-element groups moved one element at a time where they do not, so two
+ranks may disagree about it and stay block-matched.
+
+Every cross-link byte goes in the **write** direction, so unlike the
+allreduce and the all-gather this schedule needs no separate AMD variant.
+
+What it replaced (`_reduce_scatter_multinode`, still the multi-node path)
+all-reduced 1 MiB chunks of *every* destination's slice through a scratch
+buffer and synchronized the host on every call: `world ×` the traffic, ~122
+launches per call, and 5978 reduce-scatter plus 8967 copy kernels on the comm
+stream per GPT-2 XL step (117 ms of the step). It is kept for multi-node
+because it is correct at any node count and no multi-node reduce-scatter
+workload has been measured; a hierarchical schedule (node-local push/reduce,
+one RDMA exchange, place) is the replacement.
+
+Measured through the library's own exported entry points on 2×H100 SXM
+(NV18), one process per GPU, 20 back-to-back calls per burst, four bursts in
+ABBA order, median CUPTI kernel time, against NCCL 2.28.9 on the same node
+and the same buffers (job 257033, `tmp/fsdp2-mojoccl-harness`):
+
+| reduce-scatter | per rank out | NCCL µs | mojoccl µs | ratio |
+|---|---:|---:|---:|---:|
+| fp32, one XL block | 61.4 MB | 277.2 | 263.8 | **0.95** |
+| fp32, the XL root | 164.1 MB | 676.2 | 687.0 | **1.02** |
+| fp32, 1 MiB | 1.0 MB | 16.2 | 12.7 | **0.78** |
+| fp32, 357×789 at an odd offset | 1.1 MB | 20.7 | 23.0 | 1.11 |
+
+Host enqueue, the same call measured on the host (median of 30, queue
+short): 5.0 µs against NCCL's 9.6 µs.
 
 ### AMD MI300A: every cross-link byte goes in the write direction
 

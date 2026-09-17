@@ -58,7 +58,10 @@ def check_reduce_scatter():
         torch.int32,
         torch.int64,
     ):
-        for count in (0, 1, 13, 357 * 789):
+        # 700k elements is over mojoccl's staging arena at
+        # MOJOCCL_REGION_MB=1, which is how test_distributed.py reaches the
+        # chunk loop of a collective that is one launch at the default region.
+        for count in (0, 1, 13, 357 * 789, 700_000):
             for op in (dist.ReduceOp.SUM, dist.ReduceOp.AVG):
                 if not dtype.is_floating_point and op == dist.ReduceOp.AVG:
                     continue

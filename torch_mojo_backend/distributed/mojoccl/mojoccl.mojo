@@ -117,6 +117,7 @@ from collectives_kernels import (
     ERR_FUSED_GRID,
     ERR_HOST_LAUNCH,
     ERR_PROXY_WAIT,
+    ERR_REDUCE_SCATTER_SYNC,
     ERR_RS_STAGE_SYNC,
     FAULT_ARENA,
     FAULT_BLOCK,
@@ -141,6 +142,8 @@ from collectives_kernels import (
     error_offset,
     install_status_page,
     region_init,
+    reduce_scatter,
+    reduce_scatter_max_count,
     reduce_scatter_stage,
     shard_range,
     signal_bytes,
@@ -966,6 +969,8 @@ def _fault_kind(code: UInt64) -> String:
         return String("the broadcast")
     if c == ERR_ALLGATHER_SYNC:
         return String("the allgather")
+    if c == ERR_REDUCE_SCATTER_SYNC:
+        return String("the reduce-scatter")
     if c == ERR_RS_STAGE_SYNC:
         return String("the multi-node allreduce's reduce-scatter stage")
     if c == ERR_AG_FINISH_SYNC:
@@ -3229,18 +3234,12 @@ def _reduce_scatter_locked(
     op: Int32,
     stream: Int64,
 ) raises -> Int32:
-    """Bounded-memory reduce-scatter using the existing allreduce transport.
+    """ncclReduceScatter: push + reduce on one node, chunked allreduce across.
 
-    Reduce successive chunks of each destination's slice, retaining the
-    result only on that destination. This deliberately trades communication
-    for a simple correctness path on both single- and multi-node groups.
-    Scratch is at most 1 MiB, independent of model size or world size; input
-    buffers are never modified. Staging also accepts offset/unaligned views,
-    while the existing allreduce requires 16-byte-aligned pointers.
-
-    This initial implementation synchronizes before releasing MAX-owned
-    scratch. It satisfies async Work's ordering contract but does not overlap
-    communication with the caller's CPU work.
+    Single node is the real schedule (`reduce_scatter` in
+    collectives_kernels.mojo): (world-1)/world x bytes on the wire, one launch
+    per call at every size FSDP2 asks for, nothing allocated and no stream
+    synchronized. Multi-node keeps the placeholder below.
     """
     ref state = _comm_ptr(comm)[]
     if state.aborted:
@@ -3250,14 +3249,99 @@ def _reduce_scatter_locked(
         return latched
     if state.order_incomplete:
         return NCCL_REMOTE_ERROR
-    # Order before the staging copy: the previous collective may have
-    # produced sendbuff on another stream. The exported wrapper records
-    # completion after all chunks and their destination copies, even when
-    # count is zero.
+    # Order before the first launch: the previous collective may have produced
+    # sendbuff on another stream. The exported wrapper records completion
+    # after every chunk, even when count is zero.
     _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if count == 0:
         return NCCL_SUCCESS
+    if state.nnodes == 1:
+        var scale = Float32(1.0)
+        if op == NCCL_AVG:
+            scale = Float32(1.0) / Float32(state.world)
+        if datatype == NCCL_INT32:
+            _do_reduce_scatter[DType.int32](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_INT64:
+            _do_reduce_scatter[DType.int64](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_FLOAT16:
+            _do_reduce_scatter[DType.float16](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        elif datatype == NCCL_FLOAT32:
+            _do_reduce_scatter[DType.float32](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        else:  # NCCL_BFLOAT16, ruled in by _dtype_item_bytes above
+            _do_reduce_scatter[DType.bfloat16](
+                state, s, Int(sendbuff), Int(recvbuff), count, scale
+            )
+        return NCCL_SUCCESS
+    return _reduce_scatter_multinode(
+        state, s, sendbuff, recvbuff, count, datatype, op, stream
+    )
+
+
+def _do_reduce_scatter[
+    dtype: DType
+](
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+) raises:
+    """One node's reduce-scatter, chunked only if the arena cannot hold it."""
+    comptime item = size_of[dtype]()
+    var max_count = reduce_scatter_max_count(
+        state.cap_bytes, state.local_world, item
+    )
+    var done = 0
+    while done < count:
+        var chunk = min(max_count, count - done)
+        state.generation += 1
+        reduce_scatter[dtype](
+            state.ctx,
+            s,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff + done * item,
+            recvbuff + done * item,
+            chunk,
+            state.cap_bytes,
+            scale,
+            state.generation,
+            in_stride=count,
+        )
+        done += chunk
+
+
+def _reduce_scatter_multinode(
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises -> Int32:
+    """Bounded-memory reduce-scatter using the multi-node allreduce transport.
+
+    Reduce successive chunks of each destination's slice, retaining the
+    result only on that destination: `world`x the traffic of a real
+    reduce-scatter, and a host synchronize per call to release the MAX-owned
+    scratch (whose free is ordered on the owner stream, not this one). Kept
+    because it is correct on any node count and because no multi-node
+    reduce-scatter workload has been measured; a hierarchical schedule
+    (node-local push/reduce, one RDMA exchange, place) is the replacement.
+    """
     var item = _dtype_item_bytes(datatype)
     var chunk_elems = min(count, (1024 * 1024) // item)
     var scratch = state.ctx.enqueue_create_buffer[DType.uint8](

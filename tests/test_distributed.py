@@ -425,3 +425,20 @@ def test_two_rank_fsdp2(mode: str, ccl: str):
         pytest.skip("needs at least 2 GPUs")
     extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
     _run_torchrun(2, mode, extra_env, Path(__file__).parent / "fsdp_worker.py")
+
+
+def test_two_rank_reduce_scatter_chunked():
+    """mojoccl's reduce-scatter over a region too small to hold the message.
+
+    One launch per call is the normal case (the push slots may use the whole
+    staging arena, 512 MiB at the default region), so the chunk loop —
+    offsets into the input, a `generation` per chunk — is only reached by a
+    message larger than that. A 1 MiB region puts the 700k-element cases of
+    `check_reduce_scatter` over it.
+    """
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": "mojo", "MOJOCCL_REGION_MB": "1"}
+    _run_torchrun(
+        2, "reduce_scatter", extra_env, Path(__file__).parent / "fsdp_worker.py"
+    )
