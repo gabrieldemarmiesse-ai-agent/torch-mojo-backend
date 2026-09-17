@@ -20,12 +20,14 @@ from torch_mojo_backend.distributed import use_local_rank_gpu
 use_local_rank_gpu()
 
 import argparse
+import cProfile
 import datetime
 import json
 import math
 import os
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -50,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--windows", type=int, default=3)
+    parser.add_argument(
+        "--nsys", action="store_true", help="capture timed windows with Nsight Systems"
+    )
+    parser.add_argument(
+        "--profile", type=Path, help="write per-rank traces after timing"
+    )
     args = parser.parse_args()
     if args.steps < 1 or args.batch_size < 1 or not 2 <= args.sequence_length <= 1024:
         parser.error(
@@ -177,15 +185,28 @@ def benchmark(
     control = dist.new_group(backend="gloo")
     device_module = torch.get_device_module(args.device)
 
+    def phase(name: str):
+        if args.nsys:
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(name)
+
     def step() -> torch.Tensor:
+        if args.nsys:
+            torch.cuda.nvtx.range_push("forward")
         with torch.autocast(
             args.device, dtype=torch.bfloat16, enabled=args.dtype == "bfloat16"
         ):
             loss = model(tokens, labels=tokens).loss
+        phase("backward")
         loss.backward()
+        phase("clip_grad_norm")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=False)
+        phase("optimizer")
         optimizer.step()
+        phase("zero_grad")
         optimizer.zero_grad(set_to_none=True)
+        if args.nsys:
+            torch.cuda.nvtx.range_pop()
         return loss.detach()
 
     warmup_losses = []
@@ -197,6 +218,9 @@ def benchmark(
             print(f"warmup={index + 1} loss={value:.6f}", flush=True)
     elapsed_windows = []
     losses = []
+    if args.nsys:
+        torch.cuda.profiler.start()
+        torch.cuda.nvtx.range_push("fsdp2_timed_windows")
     for index in range(args.windows):
         device_module.synchronize()
         dist.barrier(group=control)
@@ -217,6 +241,9 @@ def benchmark(
                 f"window={index + 1} seconds={elapsed.item():.6f} loss={value:.6f}",
                 flush=True,
             )
+    if args.nsys:
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.profiler.stop()
     token_count = (
         args.steps * args.batch_size * args.sequence_length * dist.get_world_size()
     )
@@ -251,7 +278,37 @@ def benchmark(
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
+    if args.profile:
+        profile_step(args.profile, step, device_module.synchronize)
     dist.destroy_process_group(control)
+
+
+def profile_step(
+    directory: Path, step: Callable[[], torch.Tensor], synchronize: Callable[[], None]
+):
+    """Capture diagnostics separately so profiler overhead cannot affect timing."""
+    directory.mkdir(parents=True, exist_ok=True)
+    prefix = directory / f"rank{dist.get_rank()}"
+    synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+    ) as prof:
+        step()
+        synchronize()
+    prof.export_chrome_trace(str(prefix) + ".json")
+    averages = prof.key_averages(group_by_input_shape=True)
+    for kind in ("cpu", "device"):
+        Path(str(prefix) + f"_{kind}.txt").write_text(
+            averages.table(sort_by=f"self_{kind}_time_total", row_limit=80)
+        )
+    cpu = cProfile.Profile()
+    cpu.runcall(step)
+    synchronize()
+    cpu.dump_stats(str(prefix) + ".pstats")
 
 
 if __name__ == "__main__":

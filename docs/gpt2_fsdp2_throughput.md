@@ -2,8 +2,8 @@
 
 Measured on 2026-09-17 with two NVIDIA H100 80GB HBM3 GPUs connected by NVLink,
 on an exclusive Slurm node (`par2dc5-ai-prd-cl02s02dgx23`, job 256161).
-These are end-to-end training measurements of the current implementation,
-including the correctness-first MojoCCL reduce-scatter.
+These are the initial end-to-end training measurements taken before the
+throughput optimizations, including the correctness-first MojoCCL reduce-scatter.
 
 ## Results
 
@@ -46,7 +46,8 @@ Mojo + NCCL throughput (32.4% lower throughput when replacing NCCL).
   `foreach=False`, gradient norm clipping at 1.0 with `foreach=False`.
 - Eager execution, without `torch.compile`; Transformers selects its SDPA
   interface on both devices, with each device using its current dispatch.
-  Mojo currently uses the differentiable math decomposition for SDPA.
+  Supported Hopper inputs use Mojo's flash-attention path; other inputs use
+  its math decomposition. The original timing runs did not capture traces.
 - PyTorch 2.11.0+cu128, Transformers 5.4.0, MAX/Mojo 26.5.0,
   NCCL 2.28.9 for both vendor-library configurations; driver 570.211.01.
 - Same CPU allocation and `OMP_NUM_THREADS=1`; physical GPUs 0 and 1,
@@ -97,3 +98,24 @@ The working tree was based on `46ce5ba8da4361eb24b71a28f252eedf4dbed740`,
 with the FSDP2/MojoCCL support and benchmark additions present. The source
 snapshot and raw run records are retained locally under
 `current_bench_train/fsdp2_throughput/`.
+
+## Profiling
+
+`--profile profiles/` writes per-rank PyTorch traces, operator tables, and
+cProfile data after the timed windows. `--nsys` marks the timed windows for
+Nsight Systems capture and labels forward, backward, clipping, optimizer,
+and gradient clearing. Use a CUDA-enabled torch environment for Nsight:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop --export=sqlite \
+  -o fsdp2_mojo \
+  uv run --no-project --python /path/to/cu128-venv/bin/python \
+  python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  demo_scripts/gpt2_fsdp2.py --model gpt2-xl --device mojo \
+  --dtype bfloat16 --sequence-length 1024 --batch-size 1 \
+  --benchmark --warmup 5 --steps 5 --windows 1 --nsys
+```
+
+Acquire the same GPU locks as in the timing command. Profiling adds overhead;
+use separate unprofiled runs for throughput comparisons.

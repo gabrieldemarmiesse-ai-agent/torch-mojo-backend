@@ -82,44 +82,75 @@ def _mix_bytes(mut h: UInt64, s: String):
         _mix(h, UInt64(b))
 
 
+@fieldwise_init
+struct Define(Movable):
+    var kind: Int
+    var index: Int
+    var dtype: DType
+    var name: String
+    var value: Int
+
+
 struct Defines(Movable):
     """The -D set of one specialization, in the canonical (sorted) order the
     cache key uses. `key` is a running hash of the same information so the
     loader's hot path never builds a string: the strings are only produced
     on a miss (`sorted()`)."""
 
-    var items: List[String]
+    var op: String
+    var items: List[Define]
     var key: UInt64
 
     def __init__(out self, op: String):
-        self.items = List[String]()
-        self.items.append("OP=" + op)
+        self.op = op
+        self.items = List[Define]()
         self.key = 14695981039346656037
         _mix_bytes(self.key, op)
 
     def arg(mut self, i: Int, dt: DType):
-        self.items.append("DTYPE_ARG_" + String(i) + "=" + dtype_name(dt))
+        self.items.append(Define(1, i, dt, String(), 0))
         _mix(self.key, UInt64(0x1000 + i))
         _mix(self.key, UInt64(dtype_code(dt)))
 
     def out(mut self, dt: DType):
-        self.items.append("DTYPE_OUT=" + dtype_name(dt))
+        self.items.append(Define(2, 0, dt, String(), 0))
         _mix(self.key, UInt64(0x2000))
         _mix(self.key, UInt64(dtype_code(dt)))
 
     def out_i(mut self, i: Int, dt: DType):
-        self.items.append("DTYPE_OUT_" + String(i) + "=" + dtype_name(dt))
+        self.items.append(Define(3, i, dt, String(), 0))
         _mix(self.key, UInt64(0x3000 + i))
         _mix(self.key, UInt64(dtype_code(dt)))
 
     def flag(mut self, name: String, value: Int):
-        self.items.append(name + "=" + String(value))
+        self.items.append(Define(4, 0, DType.float32, name, value))
         _mix(self.key, UInt64(0x4000))
         _mix_bytes(self.key, name)
         _mix(self.key, UInt64(value))
 
     def sorted(self) -> List[String]:
-        var out = self.items.copy()
+        var out = List[String](capacity=len(self.items) + 1)
+        out.append("OP=" + self.op)
+        for i in range(len(self.items)):
+            ref item = self.items[i]
+            if item.kind == 1:
+                out.append(
+                    "DTYPE_ARG_"
+                    + String(item.index)
+                    + "="
+                    + dtype_name(item.dtype)
+                )
+            elif item.kind == 2:
+                out.append("DTYPE_OUT=" + dtype_name(item.dtype))
+            elif item.kind == 3:
+                out.append(
+                    "DTYPE_OUT_"
+                    + String(item.index)
+                    + "="
+                    + dtype_name(item.dtype)
+                )
+            else:
+                out.append(item.name + "=" + String(item.value))
         sort(out)
         return out^
 
@@ -145,9 +176,7 @@ struct KernelCall(Movable):
     def __init__(out self, family: String, op: String):
         self.family = family
         self.defines = Defines(op)
-        self.specs = List[TensorSpec](
-            capacity=MAX_CALL_SPECS
-        )  # never reallocates: addresses stay put
+        self.specs = List[TensorSpec]()
         self.tuples = List[List[Int]]()
         self.slots = List[Int]()
 
@@ -166,6 +195,10 @@ struct KernelCall(Movable):
     def spec(mut self, var s: TensorSpec) raises:
         if len(self.specs) >= MAX_CALL_SPECS:
             raise Error("too many spec arguments in one kernel call")
+        if len(self.specs) == 0:
+            # Calls with only raw pointers/scalars need no TensorSpec storage.
+            # Reserve before exposing any address, then never reallocate it.
+            self.specs.reserve(MAX_CALL_SPECS)
         self.specs.append(s^)
         self.slots.append(Int(Pointer(to=self.specs[len(self.specs) - 1])))
 
