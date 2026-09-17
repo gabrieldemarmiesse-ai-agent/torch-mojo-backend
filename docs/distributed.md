@@ -1,4 +1,4 @@
-# Distributed training (DDP) on the mojo device
+# Distributed training on the mojo device
 
 The mojo device supports `torch.nn.parallel.DistributedDataParallel` through
 a c10d backend named `"mojo"`, registered automatically by
@@ -69,6 +69,103 @@ entry, and a `HIP_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` list next to it
 an index into the HSA-visible set) is rewritten to `0`. Call it before
 anything touches the GPU runtime or enumerates MAX devices.
 
+## FSDP2
+
+Use PyTorch's `fully_shard` directly with a mojo device mesh. FSDP1 is not
+required. Create the optimizer **after** sharding, and apply `fully_shard`
+to blocks before applying it to the root (shared embeddings/output weights
+remain in the root group):
+
+```python
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+
+# After use_local_rank_gpu(), register_mojo_devices(), and
+# dist.init_process_group("mojo") as above:
+mesh = init_device_mesh("mojo", (dist.get_world_size(),))
+model = MyModel().to("mojo")
+for block in model.blocks:
+    fully_shard(block, mesh=mesh)
+fully_shard(model, mesh=mesh)
+optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+```
+
+Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. Its initial reduce-scatter
+implementation reduces successive destination chunks using the existing
+allreduce transport and keeps only the destination's result. It uses at
+most 1 MiB of temporary MAX-allocated memory, handles offset buffers and
+SUM/AVG, and synchronizes before releasing scratch. This is a correctness
+implementation: it sends more data than a dedicated reduce-scatter and
+blocks the CPU during that collective. It does not modify the input, except
+when the caller explicitly uses its own input shard as the output.
+
+`demo_scripts/gpt2_fsdp2.py` exercises GPT-2 124M and XL without downloading
+weights or a dataset. It uses the standard architecture, random initial
+weights, and fixed rank-specific synthetic token batches; it checks finite
+losses/gradient norms, parameter sharding, and loss reduction after AdamW
+updates. Launch one process per GPU:
+
+```bash
+TORCH_MOJO_BACKEND_CCL=mojo uv run torchrun --standalone --nproc-per-node=2 \
+    demo_scripts/gpt2_fsdp2.py --model gpt2
+TORCH_MOJO_BACKEND_CCL=mojo uv run torchrun --standalone --nproc-per-node=2 \
+    demo_scripts/gpt2_fsdp2.py --model gpt2-xl
+```
+
+Validated with PyTorch 2.11.0 and two H100 80GB GPUs (Slurm job 256073):
+FP32, batch size 1 per rank, sequence length 64, dropout disabled, five
+AdamW steps on the fixed synthetic batches above:
+
+| Model | Parameters | First loss | Fifth loss |
+|---|---:|---:|---:|
+| GPT-2 | 124,439,808 | 11.028627 | 6.929632 |
+| GPT-2 XL | 1,557,611,200 | 11.163113 | 4.367539 |
+
+Both runs used MojoCCL and had finite gradient norms at every step.
+
+`--dtype bfloat16` uses bf16 parameters for the transformer blocks, fp32
+reductions, and autocast to keep normalization in fp32. The root retains
+fp32 embedding/head parameters because the device's embedding backward
+currently requires fp32 gradients. GPT-2 also passed five steps in this
+configuration (loss 11.028791 → 6.922672), as did GPT-2 XL
+(11.165338 → 4.369543). These
+are training smoke tests, not performance measurements or pretrained-model
+quality results. Runtime behavior on AMD and multi-node FSDP2 remains
+unvalidated; the MojoCCL addition also cross-compiles for gfx942.
+
+The two-rank regression worker (`tests/fsdp_worker.py`) compares full
+gradients and AdamW updates against CPU PyTorch on uneven layer shapes,
+checks reduce-scatter dtypes/chunk boundaries/offset buffers, and saves and
+reloads a sharded model/optimizer checkpoint before another reference-checked
+update. The gradient/update and checkpoint checks also passed on two H100s
+with a CPU-only `torch==2.11.0+cpu` wheel (Slurm job 256133): CUDA-enabled
+torch is not required for FSDP2 on the mojo device.
+
+For a throughput comparison, the same demo also supports stock CUDA and a
+timed mode. Run each command on the same allocated GPUs, under the GPU
+locks, using a PyTorch CUDA wheel compatible with the installed driver:
+
+```bash
+# Stock PyTorch CUDA + NCCL
+uv run torchrun --standalone --nproc-per-node=2 demo_scripts/gpt2_fsdp2.py \
+    --model gpt2-xl --device cuda --dtype bfloat16 --sequence-length 1024 \
+    --benchmark --warmup 5 --steps 10 --windows 3 --output cuda.json
+# Mojo device + vendor NCCL: use the same arguments with --device mojo
+# and TORCH_MOJO_BACKEND_CCL=vendor. For MojoCCL, set CCL=mojo instead.
+```
+
+Timed windows include forward, backward, gradient clipping, AdamW, and
+gradient clearing. They exclude initialization, compilation, warmup, and
+loss reporting. Each window synchronizes the device before and after the
+steps, and uses the slowest rank's elapsed wall time. Tokens/second is
+aggregate across ranks: `world_size * batch_size * sequence_length * steps
+/ elapsed_seconds`. Both devices use the same FSDP precision policy
+(including the fp32 root), dropout-free model, and `foreach=False` AdamW.
+This measures that explicit training configuration, without `torch.compile`
+or an optimizer tuning search.
+See [the two-H100 GPT-2 XL comparison](gpt2_fsdp2_throughput.md) for measured
+CUDA, Mojo + NCCL, and Mojo + MojoCCL throughput.
+
 ## What works, what to avoid
 
 - `DDP(model)` with the defaults; keep `device_ids=None` (the default for a
@@ -91,8 +188,8 @@ anything touches the GPU runtime or enumerates MAX devices.
   work; `ReduceOp` SUM/PROD/MIN/MAX/AVG map to NCCL/RCCL for float and int
   tensors (PREMUL_SUM does not); a bool tensor maps SUM/MAX to `ncclMax` and
   PRODUCT/MIN to `ncclMin` and rejects AVG, matching `ProcessGroupNCCL`. Mojo
-  collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement only allreduce,
-  broadcast and all_gather — see "Mojo collectives" below.
+  collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement allreduce,
+  broadcast, all_gather and reduce_scatter (SUM/AVG) — see "Mojo collectives" below.
 - The MAX **CPU pseudo-device** (`mojo:{N-1}`, the last index —
   `torch.mojo.cpu()`) cannot take part in a collective at all: construction
   itself needs a real accelerator (communicators are created eagerly, see
@@ -179,8 +276,9 @@ communicators and does the actual library calls.
   NCCL and mojoccl, so the bug is in the Future/event plumbing shared by
   both, not in either collectives library. `tests/ddp_worker.py`'s
   `stream_ordering` mode (`stream_ordering.side_stream`) is the repro;
-  it currently fails and is left failing on purpose rather than weakened,
-  since passing it is the point.
+  it is retained as a regression test. It passed with both vendor NCCL and
+  MojoCCL on two H100s during the FSDP2 bring-up, but the historical
+  intermittent failure has no confirmed root cause or fix.
 - **The Python PG still replaces the whole process group** (torch ≥ 2.10
   behavior), so torch cannot compose `cpu:gloo` alongside it;
   `MojoProcessGroup` keeps its own private `ProcessGroupGloo` for CPU tensors
@@ -484,7 +582,8 @@ NCCL-class collectives, not a general library:
   "Multi-node" below;
 - `ncclAllReduce` (float32/float16/bfloat16/int32/int64, SUM and AVG),
   `ncclBroadcast` and `ncclAllGather` (every dtype, byte-granular);
-  `ncclReduce`, `ncclReduceScatter`, `ncclSend`, `ncclRecv` return
+  `ncclReduceScatter` (the same dtypes; SUM, and floating-point AVG).
+  `ncclReduce`, `ncclSend`, `ncclRecv` return
   `ncclInvalidUsage`, so DDP works and anything needing them does not;
 - the rendezvous is a TCP socket that `ncclGetUniqueId` opens on rank 0;
   the 128-byte `ncclUniqueId` carries its address, port and a random magic

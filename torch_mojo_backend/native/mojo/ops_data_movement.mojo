@@ -822,7 +822,7 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """DDP's reducer flattens its buckets with this overload."""
+    """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
     var all_tensors = v_tensor_list(args[unsafe_offset=0])
     var dim_in = v_int_or(args[unsafe_offset=1], 0)
     var out = v_tensor(args[unsafe_offset=2])
@@ -835,8 +835,13 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
     var result = _cat_impl(real, dim)
-    if result.t.dtype != out.dtype:
-        raise Error("cat.out: out dtype must match the inputs")
+    if result.t.dtype != out.dtype and not (
+        result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
+    ):
+        raise Error(
+            "cat.out: out dtype must match the inputs or both must be floating"
+            " point"
+        )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
     # Only a mismatching `out` is resized. Resizing resets sizes, strides and
@@ -844,7 +849,14 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
-    copy_strided_into(out, result.t)
+    if result.t.dtype == out.dtype:
+        copy_strided_into(out, result.t)
+    elif out.contig:
+        cast_into(out, result.t)
+    else:
+        var converted = own(cast_to(result.t, out.stype))
+        copy_strided_into(out, converted.t)
+        _ = converted^
     _ = result^  # alive past the launch
     ret_ref(rets, 0, out)
 

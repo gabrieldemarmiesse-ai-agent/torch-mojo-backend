@@ -6,7 +6,7 @@
 # Signatures, enum values and ncclResult_t codes are pinned to
 # /home/gabriel/projects/nccl/src/nccl.h.in (2.31.2) -- the source of truth
 # is nccl.py's `_declare()`, which this library's exports were written
-# against. AllReduce/Broadcast/AllGather are real; Reduce/ReduceScatter/
+# against. AllReduce/Broadcast/AllGather/ReduceScatter are real; Reduce/
 # Send/Recv return ncclInvalidUsage (GPT-2 DDP needs only the first three;
 # tests/ddp_worker.py skips the checks that need them when
 # TORCH_MOJO_BACKEND_CCL=mojo is set).
@@ -3133,7 +3133,7 @@ def _place_node_block(
 
 
 # ---------------------------------------------------------------------------
-# Not implemented: DDP on GPT-2 needs only AllReduce/Broadcast/AllGather (+
+# Not implemented: Reduce and point-to-point operations (+
 # barrier, which routes to gloo -- see process_group.py). Returning
 # ncclInvalidUsage rather than silently mis-computing is the point.
 # ---------------------------------------------------------------------------
@@ -3163,7 +3163,107 @@ def ncclReduceScatter(
     comm: Int64,
     stream: Int64,
 ) abi("C") -> Int32:
-    return NCCL_INVALID_USAGE
+    try:
+        var item = _dtype_item_bytes(datatype)
+        if item == 0 or count < 0:
+            return NCCL_INVALID_ARGUMENT
+        if op != NCCL_SUM and op != NCCL_AVG:
+            return NCCL_INVALID_USAGE
+        if op == NCCL_AVG and (
+            datatype == NCCL_INT32 or datatype == NCCL_INT64
+        ):
+            return NCCL_INVALID_USAGE
+        ref state = _comm_ptr(comm)[]
+        _lock(state)
+        var rc = NCCL_INTERNAL_ERROR
+        try:
+            rc = _reduce_scatter_locked(
+                comm, sendbuff, recvbuff, Int(count), datatype, op, stream
+            )
+        except e:
+            _unlock(state)
+            raise e
+        _unlock(state)
+        return rc
+    except e:
+        print("mojoccl: ncclReduceScatter failed:", e)
+        return NCCL_INTERNAL_ERROR
+
+
+def _reduce_scatter_locked(
+    comm: Int64,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises -> Int32:
+    """Bounded-memory reduce-scatter using the existing allreduce transport.
+
+    Reduce successive chunks of each destination's slice, retaining the
+    result only on that destination. This deliberately trades communication
+    for a simple correctness path on both single- and multi-node groups.
+    Scratch is at most 1 MiB, independent of model size or world size; input
+    buffers are never modified. Staging also accepts offset/unaligned views,
+    while the existing allreduce requires 16-byte-aligned pointers.
+
+    This initial implementation synchronizes before releasing MAX-owned
+    scratch. It satisfies async Work's ordering contract but does not overlap
+    communication with the caller's CPU work.
+    """
+    ref state = _comm_ptr(comm)[]
+    if state.aborted:
+        return NCCL_INVALID_USAGE
+    var latched = _latched_error(state)
+    if latched != NCCL_SUCCESS:
+        return latched
+    state.last_stream = stream
+    _ensure_stream_cached(state, stream)
+    ref s = state.stream_cache[stream]
+    if count == 0:
+        return NCCL_SUCCESS
+    var item = _dtype_item_bytes(datatype)
+    var chunk_elems = min(count, (1024 * 1024) // item)
+    var scratch = state.ctx.enqueue_create_buffer[DType.uint8](
+        _align_up(chunk_elems * item, 16)
+    )
+    var ptr = Int(scratch.unsafe_ptr())
+    var allocated = state.ctx.create_event()
+    state.ctx.stream().record_event(allocated)
+    s.enqueue_wait_for(allocated)
+    var rc = NCCL_SUCCESS
+    try:
+        for dst in range(state.world):
+            var done = 0
+            while done < count:
+                var n = min(chunk_elems, count - done)
+                copy_bytes(
+                    state.ctx,
+                    s,
+                    ptr,
+                    Int(sendbuff) + (dst * count + done) * item,
+                    n * item,
+                )
+                rc = _allreduce_locked(
+                    comm, Int64(ptr), Int64(ptr), Int64(n), datatype, op, stream
+                )
+                if rc != NCCL_SUCCESS:
+                    break
+                if dst == state.rank:
+                    copy_bytes(
+                        state.ctx, s, Int(recvbuff) + done * item, ptr, n * item
+                    )
+                done += n
+            if rc != NCCL_SUCCESS:
+                break
+    except e:
+        s.synchronize()
+        _ = scratch
+        raise e
+    s.synchronize()
+    _ = scratch
+    return rc
 
 
 @export
