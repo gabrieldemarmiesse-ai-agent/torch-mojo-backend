@@ -95,6 +95,32 @@ def check_reduce_scatter():
         + world * (world - 1) // 2
     )
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+    # Mix collective types and caller streams, including a zero-size scope.
+    # A reduce-scatter must close its communicator ordering state so that
+    # the next collective can submit, and Work.wait must order its reader.
+    source = (torch.arange(world * 13, dtype=torch.float32) + rank).to("mojo")
+    first, second = torch.Stream(device="mojo"), torch.Stream(device="mojo")
+    first.wait_stream(torch.accelerator.current_stream())
+    with device_module.stream(first):
+        initial = dist.all_reduce(source, async_op=True)
+    with device_module.stream(second):
+        initial.wait()
+        empty = source[:0]
+        dist.reduce_scatter_tensor(empty, empty, async_op=True).wait()
+        output = torch.empty(13, device="mojo")
+        scattered = dist.reduce_scatter_tensor(output, source, async_op=True)
+    with device_module.stream(first):
+        scattered.wait()
+        observed = output.clone()
+        sentinel = torch.ones(13, device="mojo")
+        dist.all_reduce(sentinel, async_op=True).wait()
+    first.synchronize()
+    expected = (
+        torch.arange(rank * 13, (rank + 1) * 13, dtype=torch.float32) * world
+        + world * (world - 1) // 2
+    ) * world
+    torch.testing.assert_close(observed.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(sentinel.cpu(), torch.full((13,), float(world)))
     print(f"rank={rank} reduce-scatter correctness OK", flush=True)
 
 

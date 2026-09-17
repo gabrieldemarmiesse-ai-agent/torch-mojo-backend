@@ -2644,6 +2644,28 @@ def _allreduce_locked(
         return NCCL_REMOTE_ERROR
     _order_before(state, stream)
     ref s = state.stream_cache[stream]
+    _enqueue_allreduce(
+        state, s, sendbuff, recvbuff, count, datatype, op, stream
+    )
+    return NCCL_SUCCESS
+
+
+def _enqueue_allreduce(
+    mut state: CommState,
+    s: DeviceStream,
+    sendbuff: Int64,
+    recvbuff: Int64,
+    count: Int64,
+    datatype: Int32,
+    op: Int32,
+    stream: Int64,
+) raises:
+    """Enqueue one reduction within an already-open collective order scope.
+
+    Reduce-scatter invokes this repeatedly while its outer operation owns
+    the communicator lock and completion event. It must not reopen the
+    submission scope between chunks.
+    """
     var scale = Float32(1.0)
     if op == NCCL_AVG:
         scale = Float32(1.0) / Float32(state.world)
@@ -2697,7 +2719,6 @@ def _allreduce_locked(
             Int(count),
             scale,
         )
-    return NCCL_SUCCESS
 
 
 @export
@@ -3181,8 +3202,17 @@ def ncclReduceScatter(
                 comm, sendbuff, recvbuff, Int(count), datatype, op, stream
             )
         except e:
+            rc = _submission_exception_code(state)
             _unlock(state)
-            raise e
+            print("mojoccl: ncclReduceScatter failed:", e)
+            return rc
+        if rc == NCCL_SUCCESS:
+            try:
+                _order_after(state, stream)
+            except e:
+                _fail_submission(state)
+                _unlock(state)
+                raise e
         _unlock(state)
         return rc
     except e:
@@ -3218,8 +3248,13 @@ def _reduce_scatter_locked(
     var latched = _latched_error(state)
     if latched != NCCL_SUCCESS:
         return latched
-    state.last_stream = stream
-    _ensure_stream_cached(state, stream)
+    if state.order_incomplete:
+        return NCCL_REMOTE_ERROR
+    # Order before the staging copy: the previous collective may have
+    # produced sendbuff on another stream. The exported wrapper records
+    # completion after all chunks and their destination copies, even when
+    # count is zero.
+    _order_before(state, stream)
     ref s = state.stream_cache[stream]
     if count == 0:
         return NCCL_SUCCESS
@@ -3237,6 +3272,9 @@ def _reduce_scatter_locked(
         for dst in range(state.world):
             var done = 0
             while done < count:
+                rc = _latched_error(state)
+                if rc != NCCL_SUCCESS:
+                    break
                 var n = min(chunk_elems, count - done)
                 copy_bytes(
                     state.ctx,
@@ -3245,11 +3283,16 @@ def _reduce_scatter_locked(
                     Int(sendbuff) + (dst * count + done) * item,
                     n * item,
                 )
-                rc = _allreduce_locked(
-                    comm, Int64(ptr), Int64(ptr), Int64(n), datatype, op, stream
+                _enqueue_allreduce(
+                    state,
+                    s,
+                    Int64(ptr),
+                    Int64(ptr),
+                    Int64(n),
+                    datatype,
+                    op,
+                    stream,
                 )
-                if rc != NCCL_SUCCESS:
-                    break
                 if dst == state.rank:
                     copy_bytes(
                         state.ctx, s, Int(recvbuff) + done * item, ptr, n * item
@@ -3263,7 +3306,9 @@ def _reduce_scatter_locked(
         raise e
     s.synchronize()
     _ = scratch
-    return rc
+    # The final chunk can fail after its host submission returned. This
+    # synchronous implementation must report that fault on this call.
+    return _latched_error(state) if rc == NCCL_SUCCESS else rc
 
 
 @export
