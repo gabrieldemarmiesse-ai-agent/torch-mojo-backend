@@ -4,11 +4,10 @@ process-group core (native/mojo/pg.mojo).
 Every collective runs on a per-device comm stream: Mojo makes that stream
 wait for the caller's current stream, issues the NCCL / RCCL / mojoccl call
 on it, and the adapter records the touched buffers on it (their release is
-then fenced) and wraps a device-typed torch Future whose completion events
-are recorded on the comm stream, so whoever waits on the returned Work (the
-DDP reducer, a user) orders their own stream after the collective without
-blocking the host — the contract ProcessGroupNCCL implements. CPU tensors
-go to a private gloo group.
+then fenced) and returns a Work tied to an event on the comm stream, so
+whoever waits on it, or on its device Future (the DDP reducer), orders their
+own stream after the collective without blocking the host — the contract
+ProcessGroupNCCL implements. CPU tensors go to a private gloo group.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ from torch._C._distributed_c10d import (
     ScatterOptions,
     Store,
     Work,
-    _create_work_from_future,  # ty: ignore[unresolved-import] -- in torch 2.11's C module, absent from its stub
 )
 
 from torch_mojo_backend import native
@@ -122,6 +120,39 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             raise
 
     return wrapper
+
+
+class _StreamWork(Work):
+    """Completion is a point on the comm stream: `wait()` makes the waiter's
+    current stream follow it. The device Future (completion events recorded
+    on the comm stream) is only built for callers that ask for one."""
+
+    def __init__(self, comm: torch.Stream, index: int, result: list[torch.Tensor]):
+        super().__init__()
+        self._comm = comm
+        self._index = index
+        self._result = result
+        self._event = comm.record_event()
+        self._future: torch.futures.Future[list[torch.Tensor]] | None = None
+
+    def wait(self, timeout: datetime.timedelta | None = None) -> bool:
+        torch.accelerator.current_stream(self._index).wait_event(self._event)
+        return True
+
+    def is_completed(self) -> bool:
+        return self._event.query()
+
+    def result(self) -> list[torch.Tensor]:
+        return self._result
+
+    def get_future(self) -> torch.futures.Future[list[torch.Tensor]]:
+        if self._future is None:
+            self._future = torch.futures.Future(
+                devices=[torch.device("mojo", self._index)]
+            )
+            with device_module.stream(self._comm):
+                self._future.set_result(self._result)
+        return self._future
 
 
 class _Core:
@@ -264,13 +295,15 @@ class MojoProcessGroup(dist.ProcessGroup):
             pass
 
     def _is_cpu(self, tensor: torch.Tensor) -> bool:
-        if tensor.device.type == "cpu":
+        device = tensor.device
+        if device.type == "cpu":
             return True
-        if tensor.device.type != "mojo":
+        if device.type != "mojo":
             raise ValueError(
                 f"the mojo distributed backend handles mojo and cpu tensors, got {tensor.device}"
             )
-        if tensor.device == device_module.cpu():
+        # the MAX CPU device is the last mojo index (device_module.cpu())
+        if device.index == device_module.device_count() - 1:
             raise NotImplementedError(
                 "collectives on the MAX CPU device are not supported: use plain CPU tensors (gloo) or a GPU"
             )
@@ -316,14 +349,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         return stream
 
     def _work(self, index: int, result: list[torch.Tensor]) -> Work:
-        """A Work whose wait() makes the waiter's stream follow the comm stream:
-        the Future's completion events are recorded on the comm stream."""
-        future: torch.futures.Future[list[torch.Tensor]] = torch.futures.Future(
-            devices=[torch.device("mojo", index)]
-        )
-        with device_module.stream(self._ready[index]):
-            future.set_result(result)
-        return _create_work_from_future(future)
+        return _StreamWork(self._ready[index], index, result)
 
     def _stage_in(self, index: int, tensor: torch.Tensor) -> torch.Tensor:
         """A dense copy of a non-contiguous input, made on the comm stream after
@@ -350,8 +376,11 @@ class MojoProcessGroup(dist.ProcessGroup):
             self._coalesced_records.extend(tensors)
             return
         comm = self._ready[index]
+        previous = None
         for t in tensors:
-            t.record_stream(comm)
+            if t is not previous:  # a contiguous input is its own staging buffer
+                t.record_stream(comm)
+            previous = t
 
     def _finish(self, index: int, *pairs: tuple[torch.Tensor, torch.Tensor]):
         """Outputs: copy staged results back on the comm stream and record
@@ -367,12 +396,14 @@ class MojoProcessGroup(dist.ProcessGroup):
             self._coalesced_pairs.extend(pairs)
             return
         comm = self._ready[index]
-        with device_module.stream(comm):
-            for tensor, staged in pairs:
-                if staged is not tensor:
-                    tensor.copy_(staged)
-                    staged.record_stream(comm)
-                tensor.record_stream(comm)
+        if any(staged is not tensor for tensor, staged in pairs):
+            with device_module.stream(comm):
+                for tensor, staged in pairs:
+                    if staged is not tensor:
+                        tensor.copy_(staged)
+                        staged.record_stream(comm)
+        for tensor, _ in pairs:
+            tensor.record_stream(comm)
 
     @staticmethod
     def _one_per_rank(tensors: list[torch.Tensor]):

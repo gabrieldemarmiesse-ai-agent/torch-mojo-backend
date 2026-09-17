@@ -308,7 +308,8 @@ def run_collectives(failures: list[str]):
         at = torch.full((1000,), float(rank + 1), device="mojo")
         work = dist.all_reduce(at, async_op=True)
         assert work is not None
-        work.wait()
+        work.wait()  # orders the current stream, does not block the host
+        torch.accelerator.synchronize()
         _check(failures, "async_work.is_completed", work.is_completed())
         _check(failures, "async_work.result", bool((at.cpu() == total).all()))
 
