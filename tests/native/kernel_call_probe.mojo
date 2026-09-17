@@ -1,6 +1,6 @@
 from std.testing import assert_equal, assert_true
 from std.utils import IndexList
-from kernels import Defines, KernelCall, MAX_CALL_SPECS
+from kernels import Defines, KernelCall, MAX_CALL_SPECS, TUPLE_POOL_WORDS
 from op_utils import MAX_RANK, TensorSpec
 
 
@@ -38,7 +38,7 @@ def main() raises:
 
     var call = KernelCall("data_movement_ops", "Cast")
     call.int(42)
-    assert_equal(len(call.specs), 0)
+    assert_equal(call.nspecs, 0)
     for i in range(MAX_CALL_SPECS):
         call.spec(
             TensorSpec(
@@ -61,3 +61,43 @@ def main() raises:
         )
         assert_equal(p[].ptr, i)
         assert_equal(p[].dtype, DType.float32)
+    # One spec too many is reported by run(), not by the builder.
+    assert_equal(call.defines.bad, "")
+    call.spec(
+        TensorSpec(
+            0,
+            1,
+            IndexList[MAX_RANK](1),
+            IndexList[MAX_RANK](0),
+            0,
+            DType.float32,
+            4,
+            1,
+            True,
+            0,
+        )
+    )
+    assert_true(call.defines.bad != "")
+
+    # Tuple slots read back as `[len, e0, ...]`, from the inline pool and
+    # from the heap spill a tuple longer than the pool takes.
+    var tuples = KernelCall("data_movement_ops", "Cast")
+    var small = List[Int]()
+    small.append(3)
+    small.append(5)
+    small.append(7)
+    var big = List[Int]()
+    for i in range(TUPLE_POOL_WORDS + 5):
+        big.append(i)
+    tuples.tuple(small)
+    tuples.tuple(big)
+    tuples.tuple(small)
+    assert_equal(tuples.defines.bad, "")
+    for slot in range(3):
+        ref expected = big if slot == 1 else small
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=tuples.slots[slot]
+        )
+        assert_equal(p[], len(expected))
+        for i in range(len(expected)):
+            assert_equal(p[unsafe_offset = i + 1], expected[i])
