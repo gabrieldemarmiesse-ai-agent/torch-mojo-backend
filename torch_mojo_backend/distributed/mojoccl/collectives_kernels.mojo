@@ -1260,6 +1260,26 @@ def _copy_span_scaled[
     _copy_span[dtype, W, U](dst, src, count, tid, stride)
 
 
+@always_inline
+def _share[
+    accum: DType, W: Int
+](v: SIMD[accum, W], scale: Float32) -> SIMD[accum, W]:
+    """One rank's contribution to an AVG: scaled BEFORE it joins the sum.
+
+    Scaling the finished sum instead overflows where NCCL does not -- two fp32
+    ranks contributing 2**127 average to inf rather than to 2**127 -- and for
+    a power-of-two world x/world is exact, so pre-scaling rounds no more than
+    the sum did. This is NCCL's PreMulSum for AVG
+    (nccl:src/enqueue/enqueue.cc:2517), and what the NVLS path already does at
+    copy-in. Integer dtypes ignore `scale`, as ncclAvg does; `scale` is 1 for
+    SUM, and the multiply by it is exact.
+    """
+    comptime if accum.is_floating_point():
+        return v * SIMD[accum, W](scale.cast[accum]())
+    else:
+        return v
+
+
 # ===-------------------------------------------------------------------=== #
 # Shard partition. Every rank derives the same table from (numel, world).
 # ===-------------------------------------------------------------------=== #
@@ -1483,31 +1503,33 @@ def _ar_twoshot_kernel[
             )
 
     for v in range(tid, my_vc, stride):
-        var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](), scale
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         var res = acc.cast[dtype]()
         comptime if not _AMD:
             shard.unsafe_store[width=W, alignment=16](v * W, res)
@@ -1523,18 +1545,17 @@ def _ar_twoshot_kernel[
 
     for i in range(tid, my_tail, stride):
         var k = my_vc * W + i
-        var a = uin[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * p)
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         comptime if not _AMD:
             shard[unsafe_offset=k] = a.cast[dtype]()
         uout[unsafe_offset=k] = a.cast[dtype]()
@@ -1663,47 +1684,49 @@ def _ar_oneshot_kernel[
     var slots = regions[rank].unsafe_offset(push_off)
 
     for v in range(tid, nvec, stride):
-        var acc = in_ptr.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            in_ptr.unsafe_load[width=W, alignment=16](v * W).cast[accum](),
+            scale,
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(slot_stride * p)
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         out_ptr.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
 
     for i in range(tid, tail, stride):
         var k = nvec * W + i
-        var a = in_ptr[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](in_ptr[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * p)
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         out_ptr[unsafe_offset=k] = a.cast[dtype]()
 
 
@@ -1850,12 +1873,11 @@ def _rs_stage_body[
         return False
 
     # --- phase 2: sum the `world` contributions to my shard into stage_out --
-    # Times `scale`, applied in the fp32 accumulator BEFORE the store narrows
-    # to the wire dtype: the inter-node step sums these node partials again in
-    # that dtype, and an unscaled fp16 sum of 8 x 10000 is already inf. This
-    # is NCCL's PreMulSum for AVG (nccl:src/enqueue/enqueue.cc:2517), and for
-    # a power-of-two communicator x/world is exact, so it rounds no more than
-    # the plain sum would. `allgather_finish` then runs with scale 1.
+    # Every contribution is scaled as it enters the fp32 accumulator
+    # (`_share`), so the store to the wire dtype carries an average and never
+    # a sum: the inter-node step sums these node partials again in that dtype,
+    # and an unscaled fp16 sum of 8 x 10000 is already inf.
+    # `allgather_finish` then runs with scale 1.
     var my_off = _shard_off(n, per, rank)
     var my_cnt = _shard_cnt(n, per, rank)
     if my_cnt <= 0:
@@ -1873,51 +1895,52 @@ def _rs_stage_body[
     var my_vc = my_cnt // W
 
     for v in range(tid, my_vc, stride):
-        var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[accum]()
+        var acc = _share(
+            uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](), scale
+        )
         comptime if NW > 0:
             comptime for j in range(1, NW):
                 var p = rank + j
                 if p >= NW:
                     p -= NW
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(
                         slot_stride * (p if p < rank else p - 1)
                     )
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
         else:
             for j in range(1, world):
                 var p = rank + j
                 if p >= world:
                     p -= world
-                acc += (
+                acc += _share(
                     slots.unsafe_offset(
                         slot_stride * (p if p < rank else p - 1)
                     )
                     .unsafe_bitcast[Scalar[dtype]]()
                     .unsafe_load[width=W, alignment=16](v * W)
-                    .cast[accum]()
+                    .cast[accum](),
+                    scale,
                 )
-        comptime if accum.is_floating_point():
-            acc *= SIMD[accum, W](scale.cast[accum]())
         shard.unsafe_store[width=W, alignment=16](v * W, acc.cast[dtype]())
 
     for i in range(tid, my_cnt - my_vc * W, stride):
         var k = my_vc * W + i
-        var a = uin[unsafe_offset=k].cast[accum]()
+        var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
         for j in range(1, world):
             var p = rank + j
             if p >= world:
                 p -= world
-            a += (
+            a += _share[accum, 1](
                 slots.unsafe_offset(slot_stride * (p if p < rank else p - 1))
                 .unsafe_bitcast[Scalar[dtype]]()[unsafe_offset=k]
-                .cast[accum]()
+                .cast[accum](),
+                scale,
             )
-        comptime if accum.is_floating_point():
-            a *= scale.cast[accum]()
         shard[unsafe_offset=k] = a.cast[dtype]()
     return True
 
@@ -2121,16 +2144,17 @@ def _rs_one[
     scale: Float32,
 ) -> Scalar[dtype]:
     """Element `k` of my reduced chunk: my own input plus the pushed slots."""
-    var a = uin[unsafe_offset=k].cast[accum]()
+    var a = _share[accum, 1](uin[unsafe_offset=k].cast[accum](), scale)
     for j in range(1, world):
         var p = rank + j
         if p >= world:
             p -= world
-        a += _rs_slot[dtype](slots, slot_stride, p, rank)[unsafe_offset=k].cast[
-            accum
-        ]()
-    comptime if accum.is_floating_point():
-        a *= scale.cast[accum]()
+        a += _share[accum, 1](
+            _rs_slot[dtype](slots, slot_stride, p, rank)[unsafe_offset=k].cast[
+                accum
+            ](),
+            scale,
+        )
     return a.cast[dtype]()
 
 
@@ -2209,16 +2233,17 @@ def _rs_kernel[
         return
 
     # --- phase 2: sum the `world` contributions to my chunk into the output -
-    # Times `scale` in the fp32 accumulator before the store narrows, which is
-    # NCCL's PreMulSum shape for AVG and is exact for a power-of-two world.
+    # Each contribution is scaled as it enters the fp32 accumulator
+    # (`_share`), not the finished sum.
     var uin = in_ptr.unsafe_offset(rank * in_stride)
     var slots = regions[rank].unsafe_offset(push_off)
     var vc = n // W
     if vec:
         for v in range(tid, vc, stride):
-            var acc = uin.unsafe_load[width=W, alignment=16](v * W).cast[
-                accum
-            ]()
+            var acc = _share(
+                uin.unsafe_load[width=W, alignment=16](v * W).cast[accum](),
+                scale,
+            )
             # Slot pointers are formed by arithmetic, never held in a stack
             # array: such an array is demoted to local memory (MOCO-1431).
             comptime if NW > 0:
@@ -2226,23 +2251,23 @@ def _rs_kernel[
                     var p = rank + j
                     if p >= NW:
                         p -= NW
-                    acc += (
+                    acc += _share(
                         _rs_slot[dtype](slots, slot_stride, p, rank)
                         .unsafe_load[width=W, alignment=16](v * W)
-                        .cast[accum]()
+                        .cast[accum](),
+                        scale,
                     )
             else:
                 for j in range(1, world):
                     var p = rank + j
                     if p >= world:
                         p -= world
-                    acc += (
+                    acc += _share(
                         _rs_slot[dtype](slots, slot_stride, p, rank)
                         .unsafe_load[width=W, alignment=16](v * W)
-                        .cast[accum]()
+                        .cast[accum](),
+                        scale,
                     )
-            comptime if accum.is_floating_point():
-                acc *= SIMD[accum, W](scale.cast[accum]())
             out_ptr.unsafe_store[width=W, alignment=16](
                 v * W, acc.cast[dtype]()
             )

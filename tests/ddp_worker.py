@@ -113,6 +113,12 @@ def run_collectives(failures: list[str]):
     dist.all_reduce(tb)
     _check(failures, "all_reduce.bf16", bool((tb.float().cpu() == total).all()))
 
+    # AVG scales each contribution before summing (NCCL's PreMulSum), so the
+    # average of values whose SUM overflows is still finite.
+    hot = torch.full((1024,), 3.0e38, device="mojo")
+    dist.all_reduce(hot, op=dist.ReduceOp.AVG)
+    _check(failures, "all_reduce.AVG.no_overflow", bool((hot.cpu() == 3.0e38).all()))
+
     i64 = torch.tensor([rank + 1], dtype=torch.int64, device="mojo")
     dist.all_reduce(i64)
     _check(failures, "all_reduce.int64", i64.cpu().item() == int(total))

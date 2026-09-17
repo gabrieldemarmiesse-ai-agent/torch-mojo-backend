@@ -89,6 +89,12 @@ def check_reduce_scatter():
                 )
                 torch.testing.assert_close(source.cpu(), before, rtol=0, atol=0)
                 assert storage[0].cpu().item() == storage[-1].cpu().item() == -123
+    # AVG scales each contribution before summing (NCCL's PreMulSum), so the
+    # average of values whose SUM overflows is still finite.
+    hot = torch.full((world * 8,), 3.0e38, dtype=torch.float32, device="mojo")
+    avg = torch.zeros(8, dtype=torch.float32, device="mojo")
+    dist.reduce_scatter_tensor(avg, hot, op=dist.ReduceOp.AVG)
+    torch.testing.assert_close(avg.cpu(), torch.full((8,), 3.0e38), rtol=0, atol=0)
     # NCCL also permits the result to alias this rank's input shard.
     source = (torch.arange(world * 13, dtype=torch.float32) + rank).to("mojo")
     output = source[rank * 13 : (rank + 1) * 13]
