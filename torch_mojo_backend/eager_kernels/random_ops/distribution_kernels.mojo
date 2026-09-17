@@ -438,10 +438,14 @@ def _uniform_int_modulus[dtype: DType]() -> UInt64:
 @always_inline
 def _offset_of[
     TRIVIAL: Bool
-](li: Int, sizes: I64x8, strides: I64x8, ndim: Int) -> Int:
-    """Element offset of iterator index `li` (dims fastest-first)."""
+](li: Int, sizes: I64x8, strides: I64x8, ndim: Int, stride0: Int = 0) -> Int:
+    """Element offset of iterator index `li` (dims fastest-first).
+
+    `stride0` is the contiguous case's whole answer, and the caller passes it
+    already loaded: see `_dist_kernel` for why it cannot be read here.
+    """
     comptime if TRIVIAL:
-        return li * Int(strides[0])
+        return li * stride0
     else:
         var rem = li
         var off = 0
@@ -480,6 +484,12 @@ def _dist_kernel[
     var rounded = ((numel - 1) // (total * N) + 1) * total * N
     var linear = idx
     var k: UInt64 = 0
+    # `strides[0]` is loop-invariant, but it lives in parameter space and the
+    # backend does not hoist that load out of the grid-stride loop: it reloaded
+    # it once per unrolled lane, N times an iteration, which cost ~10% on the
+    # large contiguous cases (H100 sm_90a). A SIMD argument was hoisted for
+    # free, being a value rather than an aggregate; this reads it once instead.
+    var stride0 = Int(strides[0])
     while linear < rounded:
         var vals = dist_draw[dtype, DIST](
             curand4(ctr, key, k), p_out0, p_out1, p_acc0, p_acc1, i0, i1
@@ -489,7 +499,9 @@ def _dist_kernel[
             var li = linear + total * ii
             if li < numel:
                 dst[
-                    unsafe_offset=_offset_of[TRIVIAL](li, sizes, strides, ndim)
+                    unsafe_offset=_offset_of[TRIVIAL](
+                        li, sizes, strides, ndim, stride0
+                    )
                 ] = vals[ii]
         k += 1
         linear += total * N
@@ -562,7 +574,7 @@ def enqueue_distribution[
             i1,
         )
         var off = _offset_of[True](
-            li, sizes, strides, ndim
+            li, sizes, strides, ndim, Int(strides[0])
         ) if trivial else _offset_of[False](li, sizes, strides, ndim)
         dst[unsafe_offset=off] = vals[ii]
 
