@@ -698,15 +698,78 @@ Measured through the library's own exported entry points on 2×H100 SXM
 ABBA order, median CUPTI kernel time, against NCCL 2.28.9 on the same node
 and the same buffers (job 257033, `tmp/fsdp2-mojoccl-harness`):
 
-| reduce-scatter | per rank out | NCCL µs | mojoccl µs | ratio |
-|---|---:|---:|---:|---:|
-| fp32, one XL block | 61.4 MB | 277.2 | 263.8 | **0.95** |
-| fp32, the XL root | 164.1 MB | 676.2 | 687.0 | **1.02** |
-| fp32, 1 MiB | 1.0 MB | 16.2 | 12.7 | **0.78** |
-| fp32, 357×789 at an odd offset | 1.1 MB | 20.7 | 23.0 | 1.11 |
+| reduce-scatter | per rank out | NCCL µs | placeholder µs | this µs | ratio |
+|---|---:|---:|---:|---:|---:|
+| fp32, one XL block | 61.4 MB | 277.3 | 2236.9 | 263.4 | **0.95** |
+| fp32, the XL root | 164.1 MB | 673.4 | 5988.9 | 689.0 | **1.02** |
+| fp32, 1 MiB | 1.0 MB | 16.2 | 35.2 | 13.0 | **0.80** |
+| fp32, 357×789 at an odd offset | 1.1 MB | 21.0 | 88.6 | 22.8 | 1.09 |
 
 Host enqueue, the same call measured on the host (median of 30, queue
-short): 5.0 µs against NCCL's 9.6 µs.
+short): 6.4 µs, against NCCL's 12.4 µs and the placeholder's 2553 µs — it
+synchronized the stream, so its enqueue was the whole collective.
+
+The unaligned row is the one that does not clear 10%: its scalar path
+reduces one element at a time where the vector path does a whole 16-byte
+group with one SIMD accumulate. It reads 1.09 through the library and 1.12
+through the process group, i.e. 2 µs, and FSDP2 never issues an unaligned
+reduce-scatter.
+
+### All-gather: one read of the contribution, two stores
+
+The all-gather was already the unicast minimum (a local stage into my own
+region, then every peer's slot read into my output — NVIDIA cannot do
+better, because a peer may read my library region but may not write my
+MAX-allocated output). Two things in it were not minimal:
+
+- the local half copied my contribution **twice**, once into the region and
+  once into my own slice of the output, so it read it twice. One read and
+  two stores is a quarter less HBM traffic in that phase
+  (`_copy_bytes2`) — worth 5 µs of 141 on an XL block gather and 31 of 686
+  on the root's;
+- the byte copy's unaligned fallback moved **one byte at a time**, sixteen
+  loads and stores per 16-byte chunk. An offset view is still 4-byte
+  aligned for every dtype wider than a byte, so there is now a 4-byte path
+  between the two, which halves the time of an unaligned gather
+  (32.3 → 18.2 µs at 1.1 MB). Both paths walk the same 16-byte chunks in the
+  same grid-stride order as the vector path, which is what keeps a writer
+  and a reader that disagree about alignment block-matched.
+
+Same conditions as the reduce-scatter table above:
+
+| all-gather | per rank in | NCCL µs | before µs | this µs | ratio |
+|---|---:|---:|---:|---:|---:|
+| bf16, one XL block | 30.7 MB | 147.1 | 140.8 | 135.5 | **0.92** |
+| fp32, the XL root | 164.1 MB | 663.5 | 697.9 | 655.8 | **0.99** |
+| bf16, 0.5 MiB | 0.5 MB | 11.5 | 11.1 | 11.3 | **0.98** |
+| fp32, 357×789 at an odd offset | 1.1 MB | 28.3 | 32.2 | 18.2 | **0.65** |
+
+Host enqueue 6.1 µs against NCCL's 12.2.
+
+At 0.5 MiB the two libraries read the same within their own run-to-run
+spread (NCCL's own 0.5 MiB number was 10.1, 11.5 and 15.6 µs in three
+runs), and roughly 9 µs of our 11.3 is fixed cost: two system-scope
+barriers — the start barrier, and the one between the stage and the pull —
+plus the launch. NCCL needs neither, because below a few megabytes it runs
+LL, whose flags travel inside the payload. Closing that would take an
+LL-style protocol; the smallest all-gather GPT-2 XL FSDP2 issues is 30 MB.
+
+For the architectures that are not present here (`gfx942`, `sm_80`, through
+`scripts/compare_kernel_asm.py --kernel-dir torch_mojo_backend/distributed`
+against the tree before this work): the twenty new reduce-scatter
+specializations appear, the four users of `_copy_bytes` change — the
+all-gather, the broadcast, and the inter-node copy and place kernels, all
+for its new 4-byte path — and nothing else moves. **Unmeasured on AMD**: the
+reduce-scatter's cross-link direction is the one gfx942 wants and the 4-byte
+path only removes instructions, but neither of those is a measurement.
+
+**End to end**, GPT-2 XL FSDP2 on 2×H100 (bf16 blocks, fp32 root, sequence
+1024, batch 1 per rank, `demo_scripts/gpt2_fsdp2.py --benchmark`), four legs
+in palindromic order mojo/vendor/vendor/mojo, median tokens/s per leg:
+mojoccl 7870 and 7861, NCCL 7164 and 7786. MojoCCL was at 5134 tok/s before
+this work against NCCL's 7786 — the reduce-scatter was the whole gap. The
+124M five-step loss trajectory is bit-identical under the two libraries in
+both precisions (11.028627 → 6.929632 fp32, 11.028791 → 6.923096 bf16).
 
 ### AMD MI300A: every cross-link byte goes in the write direction
 

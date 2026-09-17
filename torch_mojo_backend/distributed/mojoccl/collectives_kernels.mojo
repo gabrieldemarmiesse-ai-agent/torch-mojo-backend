@@ -1078,11 +1078,85 @@ def _copy_bytes[
     var nvec = nbytes // 16
     if (Int(dst) | Int(src)) % 16 == 0:
         _copy_vec[DType.uint8, 16, U](dst, src, nvec, tid, stride)
+    elif (Int(dst) | Int(src)) % 4 == 0:
+        # Four 4-byte accesses per chunk instead of sixteen 1-byte ones: the
+        # common miss is a view whose element offset is not a multiple of the
+        # 16-byte width, which is still 4-byte aligned for every dtype wider
+        # than a byte.
+        var d4 = dst.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
+        for v in range(tid, nvec, stride):
+            comptime for j in range(4):
+                d4[unsafe_offset=v * 4 + j] = s4[unsafe_offset=v * 4 + j]
     else:
         for v in range(tid, nvec, stride):
             comptime for j in range(16):
                 dst[unsafe_offset=v * 16 + j] = src[unsafe_offset=v * 16 + j]
     _copy_scalar_tail(dst, src, nvec * 16, nbytes - nvec * 16, tid, stride)
+
+
+@always_inline
+def _copy_bytes2[
+    U: Int
+](
+    dst_a: Pointer[UInt8, MutAnyOrigin],
+    dst_b: Pointer[UInt8, MutAnyOrigin],
+    src: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int,
+    tid: Int,
+    stride: Int,
+):
+    """`_copy_bytes` to two destinations, reading the source once.
+
+    The all-gather's local half writes my contribution both into my own
+    region (for the peers to read) and into my own slice of the output, and
+    the two copies together were two reads of it. One read and two stores
+    is a quarter less HBM traffic in that phase. Same 16-byte chunk ->
+    thread mapping as `_copy_bytes`, whatever path any of them takes.
+    """
+    var nvec = nbytes // 16
+    if (Int(dst_a) | Int(dst_b) | Int(src)) % 16 == 0:
+        var v = tid
+        var lim = nvec - (U - 1) * stride
+        while v < lim:
+            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            comptime for u in range(U):
+                tmp[u] = src.unsafe_load[width=16, alignment=16](
+                    (v + u * stride) * 16
+                )
+            comptime for u in range(U):
+                dst_a.unsafe_store[width=16, alignment=16](
+                    (v + u * stride) * 16, tmp[u]
+                )
+                dst_b.unsafe_store[width=16, alignment=16](
+                    (v + u * stride) * 16, tmp[u]
+                )
+            v += U * stride
+        while v < nvec:
+            var x = src.unsafe_load[width=16, alignment=16](v * 16)
+            dst_a.unsafe_store[width=16, alignment=16](v * 16, x)
+            dst_b.unsafe_store[width=16, alignment=16](v * 16, x)
+            v += stride
+    elif (Int(dst_a) | Int(dst_b) | Int(src)) % 4 == 0:
+        var a4 = dst_a.unsafe_bitcast[UInt32]()
+        var b4 = dst_b.unsafe_bitcast[UInt32]()
+        var s4 = src.unsafe_bitcast[UInt32]()
+        for v in range(tid, nvec, stride):
+            comptime for j in range(4):
+                var x = s4[unsafe_offset=v * 4 + j]
+                a4[unsafe_offset=v * 4 + j] = x
+                b4[unsafe_offset=v * 4 + j] = x
+    else:
+        for v in range(tid, nvec, stride):
+            comptime for j in range(16):
+                var x = src[unsafe_offset=v * 16 + j]
+                dst_a[unsafe_offset=v * 16 + j] = x
+                dst_b[unsafe_offset=v * 16 + j] = x
+    var base = nvec * 16
+    for i in range(tid, nbytes - base, stride):
+        var x = src[unsafe_offset=base + i]
+        dst_a[unsafe_offset=base + i] = x
+        dst_b[unsafe_offset=base + i] = x
 
 
 @always_inline
@@ -2437,11 +2511,15 @@ def _allgather_kernel[
     ):
         return
 
-    _copy_bytes[U](
-        regions[rank].unsafe_offset(stage_off), in_ptr, n, tid, stride
-    )
-    _copy_bytes[U](
-        out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
+    # One read of my contribution, two stores: my region (what the peers
+    # read) and my own slice of the output.
+    _copy_bytes2[U](
+        regions[rank].unsafe_offset(stage_off),
+        out_ptr.unsafe_offset(rank * out_stride),
+        in_ptr,
+        n,
+        tid,
+        stride,
     )
 
     if not _sync(
