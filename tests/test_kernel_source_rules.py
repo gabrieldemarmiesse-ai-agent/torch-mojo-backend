@@ -19,7 +19,11 @@ from pathlib import Path
 import pytest
 
 PACKAGE = Path(__file__).resolve().parent.parent / "torch_mojo_backend"
-KERNEL_ROOTS = (PACKAGE / "eager_kernels", PACKAGE / "eager_flash_attention")
+KERNEL_ROOTS = (
+    PACKAGE / "eager_kernels",
+    PACKAGE / "eager_flash_attention",
+    PACKAGE / "mojo_kernels",
+)
 
 # Lowercased substrings that must not appear in kernel CODE. Prose is
 # exempt: a comment or docstring recording that a kernel was benchmarked

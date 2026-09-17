@@ -16,6 +16,17 @@ def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
     )
 
 
+def acos(input: MaxTensor) -> MaxTensor:
+    """Use the native backend's SIMD math as a fusible MAX elementwise op."""
+    return F.custom(
+        name="tmb_acos",
+        device=input.device,
+        values=[input],
+        out_types=[TensorType(input.dtype, input.shape, input.device)],
+        custom_extensions=compiler.paths_to_mojo_kernels,
+    )[0]
+
+
 def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_and operation.

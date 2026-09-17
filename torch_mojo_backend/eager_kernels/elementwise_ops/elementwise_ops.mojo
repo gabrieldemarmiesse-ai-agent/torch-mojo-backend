@@ -25,7 +25,6 @@ from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import (
-    acos,
     atanh,
     ceil,
     ceildiv,
@@ -55,6 +54,7 @@ from std.utils.coord import Coord
 from std.utils.numerics import isnan, max_or_inf
 
 from max.algorithm import elementwise
+from mojo_kernels.unary_math import acos_value
 
 from op_utils import (
     Arg,
@@ -369,7 +369,7 @@ def _float_unary[
     comptime if op_code == UOP_FLOOR:
         res = floor(a)
     comptime if op_code == UOP_ACOS:
-        res = acos(a)
+        res = acos_value(a)
     comptime if op_code == UOP_ASINH:
         # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
         res = log(a + ieee_sqrt(a * a + 1))

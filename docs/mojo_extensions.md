@@ -69,7 +69,8 @@ Unchanged: dtypes, operation mode, output dtype, and implementation-selecting
 flags belong in the defines; shapes, strides, pointers, scalar values, and
 device contexts are runtime data. The loader hashes the family's *source
 closure* (every `.mojo` file it `from X import`s, resolved family-dir-first
-then package-root, plus every `op_utils/*.mojo`) together with the defines
+then eager-kernel-root, plus every `op_utils/*.mojo` and, when imported,
+the sibling `mojo_kernels` package) together with the defines
 and the toolchain identity (`native/__init__.py`'s `toolchain_identity()`:
 torch/mojo/max/python/platform/machine versions) into the cache filename
 `<family>.<defines-slug>.hash-<source-hash>.so` under

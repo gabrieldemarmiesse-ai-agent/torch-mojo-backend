@@ -1102,71 +1102,7 @@ def aten_abs(x: MaxTensor) -> MaxTensor:
 # acos(Tensor self) -> Tensor
 @map_to(aten.acos)
 def aten_acos(x: MaxTensor) -> MaxTensor:
-    """Computes the arccosine (inverse cosine) of the input tensor.
-
-    Returns values in the range [0, π] for inputs in [-1, 1].
-    Uses polynomial approximation based on the Mojo stdlib implementation.
-
-    Args:
-        x: Input tensor with values in [-1, 1]
-
-    Returns:
-        Arccosine of the input in radians [0, π]
-    """
-    # Create constants as tensors for use in _where()
-    zero = F.constant(0.0, dtype=x.dtype, device=x.device)
-    one = F.constant(1.0, dtype=x.dtype, device=x.device)
-    neg_one = F.constant(-1.0, dtype=x.dtype, device=x.device)
-
-    # Clamp input to valid domain [-1, 1]
-    x_clamped = F.max(F.min(x, 1.0), -1.0)
-    x_abs = F.abs(x_clamped)
-
-    # Domain split at 0.5
-    small_domain = x_abs < 0.5
-
-    # Compute x_squared and d based on domain
-    # Small domain: x_squared = x², d = |x|
-    # Large domain: x_squared = (1 - |x|) / 2, d = sqrt(x_squared)
-    x_squared_small = x_clamped * x_clamped
-    x_squared_large = (1.0 - x_abs) * 0.5
-    x_squared = _where(small_domain, x_squared_small, x_squared_large)
-
-    d_small = x_abs
-    d_large = F.sqrt(x_squared_large)
-    d = _where(small_domain, d_small, d_large)
-
-    # Handle special case |x| = 1 (d should be 0)
-    is_one = x_abs >= 1.0
-    d = _where(is_one, zero, d)
-
-    # Polynomial evaluation using Horner's method
-    # Coefficients from Mojo stdlib (Remez approximation)
-    poly = 0.4197454825e-1
-    poly = poly * x_squared + 0.2424046025e-1
-    poly = poly * x_squared + 0.4547423869e-1
-    poly = poly * x_squared + 0.7495029271e-1
-    poly = poly * x_squared + 0.1666677296
-    poly = poly * x_squared * d
-
-    # Small domain: π/2 - (d + poly) with sign preservation
-    # copysign(d, x) is implemented as d * sign(x)
-    is_negative = x_clamped < 0.0
-    sign_x = _where(is_negative, neg_one, one)
-    d_signed = d * sign_x
-    poly_signed = poly * sign_x
-    result_small = (math.pi * 0.5) - (d_signed + poly_signed)
-
-    # Large domain: 2 * (d + poly)
-    result_large = 2.0 * (d + poly)
-
-    # For large domain with negative x: π - result
-    result_large = _where(is_negative, math.pi - result_large, result_large)
-
-    # Select based on domain
-    result = _where(small_domain, result_small, result_large)
-
-    return result
+    return custom_mojo_ops.acos(x)
 
 
 # acosh(Tensor self) -> Tensor

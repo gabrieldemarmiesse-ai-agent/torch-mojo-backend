@@ -117,6 +117,32 @@ def test_unary_noncontiguous_input(mojo_gpu):
     torch.testing.assert_close(y.cpu(), torch.exp(x_cpu.t()))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_acos_domain(mojo_device: str, dtype: torch.dtype):
+    """The shared math must keep ATen's NaN semantics on the native route."""
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -1.01,
+            -1,
+            -0.999,
+            -0.5,
+            -0.0,
+            0.0,
+            0.5,
+            0.999,
+            1,
+            1.01,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=dtype,
+    )
+    torch.testing.assert_close(
+        torch.acos(x.to(mojo_device)).cpu(), torch.acos(x), equal_nan=True
+    )
+
+
 _DIRECT_OPS = [
     ("abs", torch.abs),
     ("neg", torch.neg),

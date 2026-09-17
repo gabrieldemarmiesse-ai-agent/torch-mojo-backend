@@ -170,8 +170,10 @@ struct Loader(Movable):
 
     def _closure(self, entry: String, own_dir: String) raises -> List[String]:
         """Every .mojo file `entry` reaches through `from X import` /
-        `import X` (resolved in `own_dir`, then the package root), plus every
-        op_utils/*.mojo, in a deterministic order."""
+        `import X` (resolved in `own_dir`, then the eager kernel root), plus
+        every op_utils/*.mojo and the sibling mojo_kernels package when
+        imported, in a deterministic order. Shared graph/native math must
+        participate in the hash too, so editing it invalidates native builds."""
         var fam_dir = own_dir
         var files = List[String]()
         var seen = Dict[String, Bool]()
@@ -199,6 +201,16 @@ struct Loader(Movable):
                 if dot > 0:
                     var short = String(name[byte=:dot])
                     name = short^
+                if name == "mojo_kernels":
+                    # Mojo resolves this as a package, including its __init__.
+                    # Hash its modules so both shared math and graph adapters
+                    # that the package imports invalidate the native build.
+                    var shared = self.kernels_dir + "/../mojo_kernels"
+                    for p in Path(shared).listdir():
+                        var ps = String(p)
+                        if ps.endswith(".mojo"):
+                            todo.append(shared + "/" + ps)
+                    continue
                 if (
                     name == ""
                     or name == "std"
@@ -301,6 +313,9 @@ struct Loader(Movable):
             + own_dir
             + "' -I '"
             + self.kernels_dir
+            + "' -I '"
+            + self.kernels_dir
+            + "/.."
             + "'"
         )
         comptime if CompilationTarget.is_macos():

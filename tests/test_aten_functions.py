@@ -4,6 +4,7 @@ from collections.abc import Callable
 import pytest
 import torch
 import torch.nn.functional
+from max.experimental.tensor import Tensor as MaxEagerTensor
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
 
@@ -660,6 +661,84 @@ def test_aten_acos_single_element(conf: Conf):
 
     x = torch.tensor([0.5], dtype=torch.float32)
     check_outputs(fn, conf, [x])
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_acos_shared_math(dtype: torch.dtype, mode: str, device: str):
+    """Exercise both compile-backend value types, including ATen domain rules."""
+    if device == "cuda" and dtype == torch.float64:
+        pytest.skip("Mojo's float64 acos uses a CPU-only LLVM intrinsic")
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_acos)
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -1.01,
+            -1,
+            -0.999,
+            -0.5,
+            -0.0,
+            0,
+            0.5,
+            0.999,
+            1,
+            1.01,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=dtype,
+    )
+    input = x.to(device)
+    if mode == "compile":
+        actual = torch.compile(aten.acos.default, backend=mojo_backend, fullgraph=True)(
+            input
+        )
+    else:
+        actual = torch.from_dlpack(
+            aten_functions.aten_acos(MaxEagerTensor.from_dlpack(input))
+        )
+    assert actual.device == input.device
+    torch.testing.assert_close(actual.cpu(), torch.acos(x), equal_nan=True)
+    call_checker.check_was_called()
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (2, 0, 3), (357, 17)])
+def test_aten_acos_compile_shapes(
+    shape: tuple[int, ...], device: str, call_checker: CallChecker
+):
+    call_checker.register(aten_functions.aten_acos)
+    x = torch.rand(shape) * 2 - 1
+    fn = torch.compile(aten.acos.default, backend=mojo_backend, fullgraph=True)
+    torch.testing.assert_close(fn(x.to(device)).cpu(), torch.acos(x))
+
+
+def test_aten_acos_compile_dynamic_strides(device: str, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_acos)
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        # Also exercise a transpose inside the graph, where MAX owns layouts.
+        return aten.acos(x.t()) + 0.25
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True, dynamic=True)
+    for rows, cols in [(7, 13), (11, 19)]:
+        x = torch.linspace(-1, 1, rows * cols * 2, device=device).reshape(
+            rows, cols * 2
+        )[:, 1::2]
+        torch.testing.assert_close(compiled(x), fn(x))
+
+
+def test_aten_acos_compile_backward(call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_acos)
+    x = torch.linspace(-0.95, 0.95, 17, requires_grad=True)
+    reference = x.detach().clone().requires_grad_()
+    grad = torch.linspace(0.25, 1.5, 17)
+    compiled = torch.compile(torch.acos, backend=mojo_backend, fullgraph=True)
+    compiled(x).backward(grad)
+    torch.acos(reference).backward(grad)
+    torch.testing.assert_close(x.grad, reference.grad)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
