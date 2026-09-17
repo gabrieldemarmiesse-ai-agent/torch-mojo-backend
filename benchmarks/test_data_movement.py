@@ -86,6 +86,7 @@ SKIPPED: dict[str, str] = {}
 # Few wide rows exercise all-gather unpacking; odd pitches and offsets cover
 # scalar tails and unaligned views without making launch shapes model-specific.
 ROW_COPY_SHAPES = {
+    "S_2x40206400_p41027200_o0x0": (2, 40206400, 41027200, 0, 0),
     "S_2x5120000_p15370400_o0x0": (2, 5120000, 15370400, 0, 0),
     "S_2x3840000_p15370400_o1600x0": (2, 3840000, 15370400, 1600, 0),
     "S_2x800_p15370400_o0x0": (2, 800, 15370400, 0, 0),
@@ -117,6 +118,30 @@ def test_copy_row_strided(
         lambda: destination_ref.copy_(source_ref),
         lambda: destination_our.copy_(source_our),
         flops=float(rows * cols),
+    )
+
+
+@pytest.mark.bench_op("cat.out")
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("R2_W41027200_P1",))
+@pytest.mark.parametrize("layout", ("contiguous_out",))
+def test_cat_out_contiguous_fp32(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    # The backend's existing cat.out reaches an internal contiguous copy.
+    # Measure the complete public op here; isolated copy time belongs to the
+    # pure Mojo harness. Plain contiguous copy_ continues to use DMA.
+    source_ref, source_our = both(torch.randn(2, 41027200), hw, mojo_device)
+    out_ref, out_our = both(torch.empty(2, 41027200), hw, mojo_device)
+    bench.run(
+        lambda: torch.cat([source_ref], 1, out=out_ref),
+        lambda: torch.cat([source_our], 1, out=out_our),
+        flops=float(source_ref.numel()),
     )
 
 
