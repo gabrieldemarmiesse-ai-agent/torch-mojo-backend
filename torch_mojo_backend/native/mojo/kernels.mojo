@@ -80,7 +80,8 @@ def _mix(mut h: UInt64, x: UInt64):
     h *= 1099511628211
 
 
-comptime NAME_CAP = 48
+comptime NAME_WORDS = 6
+comptime NAME_CAP = NAME_WORDS * 8  # bytes, NUL included
 
 
 struct Name(Copyable, Movable):
@@ -91,27 +92,38 @@ struct Name(Copyable, Movable):
     family names already exceed the 23 bytes a `String` keeps inline.
     """
 
-    var bytes: InlineArray[UInt8, NAME_CAP]  # NUL-terminated
+    # 64-bit words, so the hash below can read them eight bytes at a time;
+    # a byte array would not be aligned for that.
+    var words: InlineArray[UInt64, NAME_WORDS]  # NUL-terminated bytes
     var count: Int
-    var hash: UInt64  # FNV-1a of the bytes, folded in while copying them
+    var hash: UInt64
     var whole: Bool  # False if the name did not fit; `run()` reports it
 
     def __init__(out self, s: StringSlice):
         var b = s.as_bytes()
         var n = min(len(b), NAME_CAP - 1)
-        self.bytes = InlineArray[UInt8, NAME_CAP](uninitialized=True)
-        var h = UInt64(14695981039346656037)
+        self.words = InlineArray[UInt64, NAME_WORDS](uninitialized=True)
+        # `used` covers the NUL at index n; zeroing first makes the padding
+        # after it deterministic, which the word-wise hash relies on.
+        var used = n // 8 + 1
+        var w = self.words.unsafe_ptr()
+        for i in range(used):
+            w[unsafe_offset=i] = 0
+        var p = w.unsafe_bitcast[UInt8]()
         for i in range(n):
-            self.bytes[i] = b[i]
-            _mix(h, UInt64(b[i]))
-        self.bytes[n] = 0
+            p[unsafe_offset=i] = b[i]
+        var h = UInt64(14695981039346656037)
+        for i in range(used):
+            _mix(h, w[unsafe_offset=i])
         self.count = n
         self.hash = h
         self.whole = n == len(b)
 
     def text(self) -> String:
         """The name as a `String` — miss path only."""
-        return String(unsafe_from_utf8_ptr=self.bytes.unsafe_ptr())
+        return String(
+            unsafe_from_utf8_ptr=self.words.unsafe_ptr().unsafe_bitcast[UInt8]()
+        )
 
 
 # Define kinds. `OP` is not one of them: it is always present and lives in

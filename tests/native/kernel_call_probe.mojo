@@ -100,4 +100,4 @@ def main() raises:
         )
         assert_equal(p[], len(expected))
         for i in range(len(expected)):
-            assert_equal(p[unsafe_offset = i + 1], expected[i])
+            assert_equal(p[unsafe_offset=i + 1], expected[i])
