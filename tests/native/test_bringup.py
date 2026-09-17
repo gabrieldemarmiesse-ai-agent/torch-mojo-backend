@@ -3,6 +3,8 @@ views, fills, item, autograd, streams, events, RNG (public torch API only)."""
 
 import pytest
 import torch
+from torch._dynamo.source import ConstantSource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import native
@@ -269,6 +271,38 @@ def test_view_ops_metadata_and_aliasing(mojo_device):
     view = base.view(24)
     view[0] = 99.0
     assert base.cpu()[0, 0].item() == 99.0
+
+
+def test_boxed_adapter_finds_a_warm_plan_by_value(mojo_device):
+    """A warm op's conversion plan is accepted by the hot-path identity check,
+    so no call after the first re-interns it (shim_dispatch.cpp, Plan)."""
+    a = _arange(6, mojo_device)
+    ops = (lambda: a.add(1.0), lambda: a.mul(2.0), lambda: a.view(2, 3), a.sum)
+    for op in ops:
+        op()
+    before = native.plan_builds()
+    assert before > 0
+    for _ in range(20):
+        for op in ops:
+            op()
+    assert native.plan_builds() == before
+
+
+def test_view_ops_guard_a_backed_symbolic_size(mojo_device):
+    """A backed symbolic size specializes at the view boundary (`guard_int`)
+    rather than being rejected, as the boxed adapter did for the same
+    argument."""
+    env = ShapeEnv()
+    six = env.create_symintnode(
+        env.create_symbol(6, ConstantSource("v"), dynamic_dim=DimDynamic.DYNAMIC),
+        hint=6,
+    )
+    t = _arange(6, mojo_device)
+    assert t.view([six]).shape == (6,)
+    assert t.view([six]).cpu().tolist() == list(range(6))
+    strided = t.as_strided([six - 3], [2], six - 6)
+    assert strided.shape == (3,) and strided.storage_offset() == 0
+    assert torch.ops.aten._reshape_alias(t, [six], [1]).shape == (6,)
 
 
 def test_empty_strided_metadata(mojo_device):

@@ -120,47 +120,84 @@ struct RetConv {
   bool none_is_undefined_tensor;
 };
 
-// One schema's conversions, interned at that op's first call. `schema` is the
-// dispatcher's own FunctionSchema, which outlives every call through it, and
-// so are the two name strings.
+// One schema's conversions, interned at that op's first call.
+//
+// A plan is identified BY VALUE, not by its schema's address: torch lets a
+// schema be deregistered and another registered (a torch.library Library
+// destroyed and redefined; a fallback functor serving ops registered later),
+// possibly at the same address, and a plan describing the old op would then
+// convert the new one's arguments. `matches` compares what the conversions
+// are derived from -- the qualified name, owned here, the argument and return
+// counts, and the identity of the types -- and holds the types alive, which
+// is what makes comparing their addresses mean anything.
+//
+// The two name strings are owned for the same reason: they reach the kernel
+// and the error path, and a deregistered schema's would dangle.
 struct Plan {
-  const c10::FunctionSchema* schema;
-  const char* name;
+  std::string name_str;
+  std::string overload_str;
+  const char* name;  // into name_str: a Plan is immortal and never moves
   const char* overload;
   size_t n_args;
   size_t n_rets;
   bool arena;
   std::vector<uint8_t> args;
   std::vector<RetConv> rets;
+  std::vector<c10::TypePtr> types;  // the arguments', then the returns'
+
+  bool matches(const c10::FunctionSchema& s) const {
+    const auto& as = s.arguments();
+    const auto& rs = s.returns();
+    if (as.size() != n_args || rs.size() != n_rets) return false;
+    for (size_t i = 0; i < n_args; ++i) {
+      if (types[i].get() != as[i].real_type().get()) return false;
+    }
+    for (size_t i = 0; i < n_rets; ++i) {
+      if (types[n_args + i].get() != rs[i].real_type().get()) return false;
+    }
+    return name_str == s.name() && overload_str == s.overload_name();
+  }
 };
 
 std::mutex g_plans_mutex;
 std::unordered_map<const c10::FunctionSchema*, Plan*> g_plans;
+// Plans built since the process started (test support: a warm op must not
+// re-intern, which is what makes `matches` a hot-path check and not a cost).
+std::atomic<int64_t> g_plan_builds{0};
 
-// Immortal: a plan is reachable from a registration that lives as long as the
-// dispatcher entry it describes.
+// Every read and write of the table happens under g_plans_mutex, so a first
+// call from the main thread and one from the autograd thread cannot both
+// build: the loser finds the winner's plan.
+//
+// A plan is immortal, and a stale one is replaced rather than freed: another
+// functor may still hold it, and will re-intern when its own `matches` fails.
 const Plan* plan_for(const c10::FunctionSchema& schema) {
   std::lock_guard<std::mutex> g(g_plans_mutex);
-  auto it = g_plans.find(&schema);
-  if (it != g_plans.end()) return it->second;
+  Plan*& slot = g_plans[&schema];
+  if (slot && slot->matches(schema)) return slot;
   auto* p = new Plan();
-  p->schema = &schema;
-  p->name = schema.name().c_str();
-  p->overload = schema.overload_name().c_str();
+  p->name_str = schema.name();
+  p->overload_str = schema.overload_name();
+  p->name = p->name_str.c_str();
+  p->overload = p->overload_str.c_str();
   p->n_args = schema.arguments().size();
   p->n_rets = schema.returns().size();
   p->arena = false;
   p->args.reserve(p->n_args);
+  p->types.reserve(p->n_args + p->n_rets);
   for (const auto& a : schema.arguments()) {
     p->args.push_back(conv_of(a.real_type()));
     p->arena |= arena_kind(p->args.back());
+    p->types.push_back(a.real_type());
   }
   p->rets.reserve(p->n_rets);
   for (const auto& r : schema.returns()) {
     p->rets.push_back(
         {conv_of(r.real_type()), r.real_type()->kind() == c10::TypeKind::TensorType});
+    p->types.push_back(r.real_type());
   }
-  g_plans.emplace(&schema, p);
+  slot = p;
+  g_plan_builds.fetch_add(1, std::memory_order_relaxed);
   return p;
 }
 
@@ -457,10 +494,10 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
     tmb_check_not_forked();
     const auto& schema = op.schema();
     const Plan* plan = plan_.load(std::memory_order_acquire);
-    // Identity is enough: one registration serves one dispatcher entry, whose
-    // FunctionSchema never moves. A fallback (one functor, many ops) takes the
-    // interning path on every call.
-    if (C10_UNLIKELY(!plan || plan->schema != &schema)) {
+    // Checked by value (see Plan): a schema can be deregistered and another
+    // registered at the same address. A fallback (one functor, many ops)
+    // fails this check per op and takes the interning path on every call.
+    if (C10_UNLIKELY(!plan || !plan->matches(schema))) {
       plan = plan_for(schema);
       plan_.store(plan, std::memory_order_release);
     }
@@ -541,6 +578,8 @@ class MojoBoxedKernel final : public c10::OperatorKernel {
 }  // namespace
 
 extern "C" {
+
+int64_t tmb_plan_builds(void) { return g_plan_builds.load(std::memory_order_relaxed); }
 
 void tmb_op_counting(int32_t enabled) { g_count_calls.store(enabled != 0); }
 void tmb_op_counts_reset(void) { std::lock_guard<std::mutex> g(g_counts_mutex); g_counts.clear(); }
