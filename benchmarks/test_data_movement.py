@@ -66,6 +66,7 @@ ARANGE_N = 16777216
 
 COVERS: dict[str, str] = {
     "aten::_copy_from": "test_copy_row_strided (same-device strided copies; contiguous/device moves are memcpy)",
+    "aten::split_with_sizes_copy.out": "test_split_copy_rows",
     "aten::cat": "test_cat",
     "aten::stack": "test_stack",
     "aten::repeat": "test_repeat",
@@ -116,6 +117,46 @@ def test_copy_row_strided(
         lambda: destination_ref.copy_(source_ref),
         lambda: destination_our.copy_(source_our),
         flops=float(rows * cols),
+    )
+
+
+SPLIT_COPY_SHAPES = {
+    "S_2x15370400_mixed": (
+        2,
+        [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800],
+    ),
+    "S_2x9600_12pieces": (2, [800] * 12),
+    "S_7x1164_awkward": (7, [357, 789, 17, 1, 0]),
+    "S_1x1048576_single": (1, [1048576]),
+    "S_3x33345_65pieces": (3, [513] * 65),
+    "S_65536x3_empty_piece": (65536, [1, 0, 2]),
+}
+
+
+@pytest.mark.bench_op("split_with_sizes_copy.out")
+@pytest.mark.parametrize("dtype_id", ("bf16",))
+@pytest.mark.parametrize("shape_id", SPLIT_COPY_SHAPES)
+def test_split_copy_rows(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    rows, sizes = SPLIT_COPY_SHAPES[shape_id]
+    src_ref, src_our = both(
+        torch.randn(rows, sum(sizes), dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    outputs = [
+        both(torch.empty(rows, n, dtype=DTYPES[dtype_id]), hw, mojo_device)
+        for n in sizes
+    ]
+    dst_ref = [pair[0] for pair in outputs]
+    dst_our = [pair[1] for pair in outputs]
+    bench.run(
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_ref, sizes, 1, out=dst_ref
+        ),
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_our, sizes, 1, out=dst_our
+        ),
+        flops=float(rows * sum(sizes)),
     )
 
 

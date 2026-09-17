@@ -1139,6 +1139,25 @@ def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _b_scalar_inplace("MulScalarInplace", self, s.f)
             ret_ref(rets, 0, self)
             return
+    if rhs.is_t and self.contig and _b_float3(self.stype):
+        var scalar = rhs.t.value().copy()
+        if (
+            scalar.rank == 0
+            and scalar.contig
+            and scalar.stype == self.stype
+            and scalar.device == self.device
+            and dev(self.device)[].api == "cuda"
+            and (
+                scalar.ptr + scalar.itemsize <= self.ptr
+                or self.ptr + self.numel * self.itemsize <= scalar.ptr
+            )
+        ):
+            # A separate device scalar is read by every output element.
+            # Writing the contiguous input directly is pointwise safe; an
+            # overlapping scalar would instead race with those reads.
+            _b_binary_spec("MulSpec", self, scalar, self)
+            ret_ref(rets, 0, self)
+            return
     _b_store_inplace(rets, self, _b_mul(_b_tside(self), rhs, None))
 
 
@@ -1229,6 +1248,24 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     # that pair on its own.
     var num = _b_cast(a, common)
     if not rhs.is_t:
+        var scalar = rhs.s.value().copy()
+        if (
+            a.stype == ST_FLOAT32
+            and a.contig
+            and dev(a.device)[].api == "cuda"
+            and not scalar.is_bool
+            and scalar.f != 0
+        ):
+            # ATen's CUDA div_true cpu-scalar route computes the reciprocal
+            # in float64, then rounds to opmath float32 before multiplying.
+            # Reuse that route without allocating/filling a device scalar.
+            var inverse = Scal(1.0 / scalar.f, 0, False, False)
+            var direct = _b_try_scalar(
+                "MulScalarSpec", _b_tside(num.t), _b_sside(inverse), False, dst
+            )
+            if direct:
+                _ = num
+                return direct.value().copy()
         var r1 = _b_binary("DivSpec", _b_tside(num.t), rhs, Int32(-1), dst)
         _ = num
         return r1^
