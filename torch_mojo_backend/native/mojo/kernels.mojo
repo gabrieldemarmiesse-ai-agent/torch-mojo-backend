@@ -95,7 +95,6 @@ struct Name(Copyable, Movable):
     # 64-bit words, so the hash below can read them eight bytes at a time;
     # a byte array would not be aligned for that.
     var words: InlineArray[UInt64, NAME_WORDS]  # NUL-terminated bytes
-    var count: Int
     var hash: UInt64
     var whole: Bool  # False if the name did not fit; `run()` reports it
 
@@ -115,7 +114,6 @@ struct Name(Copyable, Movable):
         var h = UInt64(14695981039346656037)
         for i in range(used):
             _mix(h, w[unsafe_offset=i])
-        self.count = n
         self.hash = h
         self.whole = n == len(b)
 
@@ -133,7 +131,8 @@ comptime DEF_OUT = 2
 comptime DEF_OUT_I = 3
 comptime DEF_FLAG = 4
 
-comptime MAX_DEFINES = 12
+# Headroom over the widest call in the tree, which is FusedAdamW's eleven.
+comptime MAX_DEFINES = 20
 
 
 @fieldwise_init
@@ -226,9 +225,9 @@ struct Defines(Movable):
 
 
 comptime MAX_CALL_SPECS = 16
-# One more than the widest `_spec_dispatcher`: an argument list longer than
-# that cannot be read back by any family.
-comptime MAX_CALL_SLOTS = 17
+# Headroom over the widest `_spec_dispatcher` (16) and over the widest call in
+# the tree, which is the FA4 forward's sixteen slots.
+comptime MAX_CALL_SLOTS = 24
 # Words for the `[len, e0, ...]` tuple slots of one call. Anything longer
 # (a foreach launch over many tensors) spills to the heap.
 comptime TUPLE_POOL_WORDS = 96
