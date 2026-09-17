@@ -17,6 +17,7 @@ inside main().
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import contextlib
+import datetime
 import os
 import sys
 import time
@@ -26,8 +27,6 @@ from collections.abc import Iterator
 from torch_mojo_backend.distributed import use_local_rank_gpu
 
 use_local_rank_gpu()
-
-import datetime
 
 import torch
 import torch.distributed as dist
@@ -319,6 +318,18 @@ def run_collectives(failures: list[str]):
         torch.accelerator.synchronize()
         _check(failures, "async_work.is_completed", work.is_completed())
         _check(failures, "async_work.result", bool((at.cpu() == total).all()))
+        ft = torch.full((1000,), float(rank + 1), device="mojo")
+        later = torch.zeros(8, device="mojo")
+        work = dist.all_reduce(ft, async_op=True)
+        assert work is not None
+        dist.all_reduce(later)  # queued behind: the Future must not depend on it
+        value = work.get_future().wait()[0]
+        _check(failures, "async_work.future", bool((value.cpu() == total).all()))
+        try:
+            work.wait(datetime.timedelta(seconds=1))
+            _check(failures, "async_work.finite_timeout_rejected", False)
+        except RuntimeError:
+            _check(failures, "async_work.finite_timeout_rejected", True)
 
     # ---- object collectives (route through the internal gloo group) -------
     with _tolerate_missing_ops(rank, "all_gather_object"):
