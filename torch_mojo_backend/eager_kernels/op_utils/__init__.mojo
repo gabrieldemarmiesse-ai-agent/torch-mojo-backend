@@ -489,6 +489,28 @@ def _launch_tag[
     pass
 
 
+def _far_device_slot[
+    name: StaticString
+](dev: Int) raises -> Pointer[Int, MutUntrackedOrigin]:
+    """One `Int` slot per (name, ordinal) past the inline table.
+
+    Keyed by a formatted registry name, the way the whole cache was before
+    the inline table: correct for a device count nothing else bounds, at a
+    cost only a seventeenth device pays.
+    """
+    var key = String(t"{name}_{dev}")
+    var g = _get_global_or_null(key)
+    if g:
+        return g.value().unsafe_bitcast[Int]()
+    var one = unsafe_alloc[Int](1)
+    one[] = 0
+    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
+        StringSlice(key), one.unsafe_bitcast[NoneType]()
+    )
+    # Re-read rather than trust our own insert, as below.
+    return _get_global_or_null(key).value().unsafe_bitcast[Int]()
+
+
 @always_inline
 def _device_slot[
     name: StaticString
@@ -498,13 +520,16 @@ def _device_slot[
 
     `name` is a comptime constant, so a warm lookup is one registry probe of
     a fixed-size string: nothing formatted, nothing allocated.
+
+    `dev` is `DeviceContext.id()`, the ordinal within one accelerator api:
+    the MAX CPU context answers 0, the same as GPU 0, so a caller that can
+    hold a CPU context must not consult these tables (`ops_random._grid` is
+    the one that could and now declines first).
     """
-    if dev < 0 or dev >= _KCACHE_DEVICES:
-        raise Error(
-            "mojo device cache: device ordinal ",
-            dev,
-            " is out of range (raise _KCACHE_DEVICES)",
-        )
+    if dev < 0:
+        raise Error("mojo device cache: negative device ordinal ", dev)
+    if dev >= _KCACHE_DEVICES:
+        return _far_device_slot[name](dev)
     var g = _get_global_or_null(name)
     if g:
         return g.value().unsafe_bitcast[Int]().unsafe_offset(dev)
