@@ -482,7 +482,7 @@ def build_shim(*, prebuilt: bool = True) -> Path:
     cxx = _find_cxx()  # None is fine as long as a prebuilt shim matches
     abi = f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"
     cflags = [
-        "-O1",
+        "-O2",
         _cxx_standard(),
         "-fPIC",
         "-fvisibility=hidden",  # tmb.h re-exports the C entries; 40% smaller library
