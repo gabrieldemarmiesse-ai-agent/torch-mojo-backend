@@ -119,6 +119,44 @@ def test_unary_unaligned(
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
 
 
+@pytest.mark.bench_op("gelu")
+@pytest.mark.parametrize("layout", ("contig", "offset_1"))
+@pytest.mark.parametrize("dtype_id", ("f16", "bf16", "f32"))
+@pytest.mark.parametrize("shape_id", ("C_16777216_tanh", "A_357x789_tanh"))
+def test_gelu_tanh(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    # Approximation is a separate benchmark regime, encoded in the shape key
+    # without renaming the existing default-GELU baseline entries.
+    shape = SHAPES[shape_id.removesuffix("_tanh")]
+    cpu = unit_interval(shape, DTYPES[dtype_id])
+    with gpu_lock():
+        if layout == "offset_1":
+            storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
+            ref_storage, our_storage = both(storage, hw, mojo_device)
+            x_ref, x_our = (
+                value[1:].view(shape) for value in (ref_storage, our_storage)
+            )
+        else:
+            x_ref, x_our = both(cpu, hw, mojo_device)
+        for value in (x_ref, x_our):
+            expected_offset = cpu.element_size() if layout == "offset_1" else 0
+            assert value.data_ptr() % (4 * cpu.element_size()) == expected_offset
+        torch.testing.assert_close(
+            F.gelu(x_our, approximate="tanh").cpu(), F.gelu(cpu, approximate="tanh")
+        )
+    bench.run(
+        lambda: F.gelu(x_ref, approximate="tanh"),
+        lambda: F.gelu(x_our, approximate="tanh"),
+        flops=float(cpu.numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("i32",))
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_bitwise_not(

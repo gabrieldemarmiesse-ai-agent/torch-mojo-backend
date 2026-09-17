@@ -13,6 +13,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
     CallChecker,
@@ -954,6 +955,120 @@ def test_aten_shared_elementwise_batch(dtype: torch.dtype, device: str):
             )
     for checker in checkers:
         checker.check_was_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "target,kinds",
+    [
+        pytest.param(
+            "cuda",
+            (
+                "acos",
+                "asinh",
+                "atanh",
+                "ceil",
+                "cos",
+                "cosh",
+                "erf",
+                "exp",
+                "floor",
+                "log",
+                "log1p",
+                "log2",
+                "reciprocal",
+                "rsqrt",
+                "sigmoid",
+                "silu",
+                "sin",
+                "sinh",
+                "sqrt",
+                "tan",
+                "tanh",
+                "gelu_none",
+                "gelu_tanh",
+            ),
+            id="gpu",
+        ),
+        pytest.param("cpu", ("exp", "tanh", "cosh"), id="cpu"),
+    ],
+)
+def test_aten_shared_elementwise_special_batch(
+    dtype: torch.dtype, target: str, kinds: tuple[str, ...], cuda_available: bool
+):
+    """GPU fast math preserves edge semantics without removing CPU NaN fixes."""
+    if target == "cuda" and not cuda_available:
+        pytest.skip("CUDA not available")
+    operators = []
+    checkers = []
+    for kind in kinds:
+        aten_kind = "gelu" if kind.startswith("gelu_") else kind
+        kwargs = (
+            {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
+        )
+        operators.append((getattr(aten, aten_kind).default, kwargs))
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{aten_kind}"))
+        checkers.append(checker)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(op(x, **kwargs) for op, kwargs in operators)
+
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -2,
+            -1,
+            -0.5,
+            -0.0,
+            0.0,
+            0.125,
+            0.5,
+            1,
+            2,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=dtype,
+        device=target,
+    )
+    actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+    # Use the same device for the reference: CUDA and CPU differ at +Inf GELU.
+    for kind, result, expected in zip(kinds, actual, fn(x), strict=True):
+        torch.testing.assert_close(
+            result, expected, equal_nan=True, msg=lambda message: f"{kind}: {message}"
+        )
+    for checker in checkers:
+        checker.check_was_called()
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_aten_shared_elementwise_log1p_near_zero(
+    mode: str, dtype: torch.dtype, cuda_available: bool, call_checker: CallChecker
+):
+    if not cuda_available:
+        pytest.skip("CUDA not available")
+    call_checker.register(aten_functions.aten_log1p)
+    cpu = log1p_edge_input(dtype)
+    x = cpu.to("cuda")
+    if mode == "compile":
+        actual = torch.compile(
+            aten.log1p.default, backend=mojo_backend, fullgraph=True
+        )(x)
+    else:
+        actual = torch.from_dlpack(
+            aten_functions.aten_log1p(MaxEagerTensor.from_dlpack(x))
+        )
+    expected = torch.log1p(cpu.double()).to(dtype)
+    actual_cpu = actual.cpu()
+    torch.testing.assert_close(
+        actual_cpu, expected, rtol=log1p_rtol(dtype), atol=0, equal_nan=True
+    )
+    zeros = cpu == 0
+    torch.testing.assert_close(
+        torch.signbit(actual_cpu[zeros]), torch.signbit(cpu[zeros])
+    )
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])

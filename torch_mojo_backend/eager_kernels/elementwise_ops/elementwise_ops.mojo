@@ -517,7 +517,10 @@ def _unary_elementwise[
                         var i = Int(idx[0].value())
                         # Only the aligned branch requests width > 1. The
                         # launcher calls the same body at width 1 for tails.
-                        comptime byte_alignment = width * size_of[dtype]()
+                        comptime byte_alignment = (
+                            min(16, width * size_of[dtype]()) if width
+                            > 4 else width * size_of[dtype]()
+                        )
                         var a = in_ptr.unsafe_load[
                             width=width, alignment=byte_alignment
                         ](i)
@@ -525,6 +528,40 @@ def _unary_elementwise[
                             width=width, alignment=byte_alignment
                         ](i, _unary_apply[dtype, width, op_code](a))
 
+                    # Measured on H100: these wider public bodies avoid excess
+                    # waves for expensive half math and the float32 log1p body.
+                    # Keep SIMD4 for 8-byte-aligned half views and other GPUs.
+                    comptime wider_nvidia = has_nvidia_gpu_accelerator() and (
+                        (
+                            (dtype == DType.float16 or dtype == DType.bfloat16)
+                            and (
+                                op_code == UOP_ACOS
+                                or op_code == UOP_GELU_NONE
+                                or op_code == UOP_GELU_TANH
+                                or op_code == UOP_LOG2
+                            )
+                        )
+                        or (
+                            (
+                                dtype == DType.float16
+                                or dtype == DType.bfloat16
+                                or dtype == DType.float32
+                            )
+                            and op_code == UOP_LOG1P
+                        )
+                    )
+                    comptime preferred_width = (
+                        16 if op_code == UOP_ACOS else 8
+                    )
+                    comptime if wider_nvidia:
+                        if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                            elementwise[
+                                gpu_func,
+                                simd_width=preferred_width,
+                                target="gpu",
+                                _trace_description="modular_unary",
+                            ](Coord(size), ctx)
+                            return
                     if (Int(out_ptr) | Int(in_ptr)) % (
                         4 * size_of[dtype]()
                     ) == 0:
@@ -655,12 +692,26 @@ def _unary_bool[
                 def gpu_bool[width: Int, alignment: Int = 1](idx: Coord):
                     var i = Int(idx[0].value())
                     var a = in_ptr.unsafe_load[
-                        width=width, alignment=width * size_of[dtype]()
+                        width=width, alignment=min(16, width * size_of[dtype]())
                     ](i)
                     out_ptr.unsafe_bitcast[UInt8]().unsafe_store[
-                        width=width, alignment=width
+                        width=width, alignment=min(16, width)
                     ](i, _unary_bool_vec[dtype, op_code, width](a))
 
+                # H100 measurements favor 16 input bytes for half predicates,
+                # and 32 byte-sized inputs per thread for logical_not.
+                comptime preferred_width = 32 if size_of[
+                    dtype
+                ]() == 1 else 16 // size_of[dtype]()
+                comptime if has_nvidia_gpu_accelerator() and preferred_width > 4:
+                    if (
+                        Int(in_ptr) % 16 == 0
+                        and Int(out_ptr) % min(16, preferred_width) == 0
+                    ):
+                        elementwise[
+                            gpu_bool, simd_width=preferred_width, target="gpu"
+                        ](Coord(size), ctx)
+                        return
                 # Keep 64-bit inputs on the previous 16-byte/SIMD2 regime.
                 comptime vector_width = min(4, 16 // size_of[dtype]())
                 if (

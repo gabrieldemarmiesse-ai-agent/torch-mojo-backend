@@ -17,7 +17,8 @@ from std.math import (
     sinh,
     tanh,
 )
-from std.sys.info import is_apple_gpu
+from std.memory import bitcast
+from std.sys.info import is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import isnan, max_or_inf, nan
 from .math_utils import custom_tan, ieee_sqrt
 
@@ -68,9 +69,17 @@ def _float_unary[
     comptime if kind == "acos":
         res = acos(a)
         # std.math.acos clamps outside [-1, 1]; ATen requires NaN.
-        res = (abs(a).gt(1) | isnan(a)).select(
-            SIMD[dtype, width](nan[dtype]()), res
-        )
+        comptime if is_nvidia_gpu() and dtype == DType.float32:
+            # Integer masking keeps NVIDIA's packed float32-to-half conversion;
+            # a floating select lets LLVM split it into scalar conversions.
+            var magnitude = bitcast[DType.uint32](a) & 0x7FFFFFFF
+            var invalid = magnitude.gt(0x3F800000)
+            var nan_bits = invalid.cast[DType.uint32]() * 0x7FC00000
+            res = bitcast[dtype](bitcast[DType.uint32](res) | nan_bits)
+        else:
+            res = (abs(a).gt(1) | isnan(a)).select(
+                SIMD[dtype, width](nan[dtype]()), res
+            )
     comptime if kind == "asinh":
         # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
         res = log(a + ieee_sqrt(a * a + 1))
@@ -92,15 +101,29 @@ def _float_unary[
             # std.math.log2's double approximation omits the +inf case.
             res = a.eq(max_or_inf[dtype]()).select(a, res)
     comptime if kind == "log1p":
-        comptime if is_apple_gpu():
-            # Mojo's log1p currently upcasts to float64, which Metal rejects.
-            # Use the compensated float32 algorithm from PyTorch's Metal
-            # support so small nonzero inputs do not collapse to zero.
+        comptime if is_apple_gpu() or (
+            is_nvidia_gpu() and dtype == DType.float32
+        ):
+            # std.log1p promotes to float64: unsupported on Metal and costly
+            # on NVIDIA. Reuse the compensated float32 Metal algorithm;
+            # the NVIDIA near-zero polynomial below handles lg2.approx error.
             var xp1 = 1 + a
             var rc = log(xp1)
             var corrected = rc * (a / (xp1 - 1))
             rc = (a.gt(-0.5) & a.lt(0.5)).select(corrected, rc)
             res = xp1.eq(1).select(a, rc)
+            comptime if is_nvidia_gpu() and dtype == DType.float32:
+                # Avoid lg2.approx's absolute error near one. The degree-eight
+                # Taylor remainder is below 7e-9 relative for |x| < 1/8.
+                var p = SIMD[dtype, width](-1 / 8)
+                p = p.fma(a, 1 / 7)
+                p = p.fma(a, -1 / 6)
+                p = p.fma(a, 1 / 5)
+                p = p.fma(a, -1 / 4)
+                p = p.fma(a, 1 / 3)
+                p = p.fma(a, -1 / 2)
+                var small = a.fma(a * p, a)
+                res = abs(a).lt(0.125).select(small, res)
         else:
             res = log1p(a)
         res = a.eq(max_or_inf[dtype]()).select(a, res)
@@ -137,8 +160,13 @@ def _float_unary[
         comptime sqrt_2_over_pi = 0.79788456080286535588
         var inner = sqrt_2_over_pi * (a + 0.044715 * a * a * a)
         res = 0.5 * a * (1 + tanh(inner))
-    # Several stdlib approximations omit NaN handling (exp/tanh/cosh).
-    return isnan(a).select(a, res)
+    # CPU stdlib approximations omit NaNs for exp/tanh/cosh. NVIDIA's float32
+    # math preserves them already, so avoid an extra select on every lane.
+    # Retain the existing correction on other backends and float64.
+    comptime if not (is_nvidia_gpu() and dtype == DType.float32):
+        return isnan(a).select(a, res)
+    else:
+        return res
 
 
 @always_inline
