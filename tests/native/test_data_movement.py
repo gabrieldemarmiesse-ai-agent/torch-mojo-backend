@@ -65,6 +65,37 @@ def test_clone_strided(mojo_device, call_checker):
     torch.testing.assert_close(cloned.cpu(), x.t())
 
 
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.int32, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("shape", [(357, 789), (0,), (17,)])
+def test_copy_cast_into_offset_destination(mojo_gpu, src_dtype, dst_dtype, shape):
+    source = _fill(shape, src_dtype)
+    n = source.numel()
+    src_storage = torch.full((n + 8,), 3, dtype=src_dtype, device=mojo_gpu)
+    src = src_storage[3 : 3 + n].view(shape)
+    src.copy_(source)
+    before_source = src_storage.cpu()
+    dst_storage = torch.full((n + 12,), -7, dtype=dst_dtype, device=mojo_gpu)
+    dst = dst_storage[5 : 5 + n].view(shape)
+    version = dst._version
+    ptr = dst.data_ptr()
+    result = dst.copy_(src)
+    assert result is dst
+    assert dst.data_ptr() == ptr
+    assert dst._version == version + 1
+    expected = torch.full((n + 12,), -7, dtype=dst_dtype)
+    expected[5 : 5 + n].copy_(source.flatten())
+    torch.testing.assert_close(dst_storage.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(src_storage.cpu(), before_source, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rank", [1, 2, 3, 4, 5])
 def test_clone_every_rank(mojo_gpu, rank):
     """rank<=4 takes the PermuteCopy fast path, rank>4 the general one."""
@@ -72,6 +103,87 @@ def test_clone_every_rank(mojo_gpu, rank):
     x = _fill(shape, torch.bfloat16)
     dev = x.to(mojo_gpu).permute(*reversed(range(rank)))
     torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int16])
+@pytest.mark.parametrize(
+    "rows,cols,pitch,source_offset,destination_offset",
+    [
+        (2, 5120000, 15370400, 0, 0),
+        (2, 3840000, 15370400, 1600, 0),
+        (2, 800, 15370400, 0, 0),
+        (357, 789, 811, 3, 5),
+        (7, 1025, 1041, 1, 3),
+        (5, 32768, 32781, 0, 0),
+        (0, 17, 19, 1, 3),
+        (7, 0, 9, 2, 3),
+        (1, 1, 1, 0, 0),
+        (2, 7, 9, 0, 0),
+        (2, 8, 16, 1, 0),
+        (2, 8, 16, 0, 1),
+        (2, 9, 17, 3, 5),
+        (3, 2049, 2056, 0, 0),
+        (3, 2048, 2056, 8, 16),
+        (65536, 1, 2, 1, 3),
+    ],
+)
+def test_copy_row_strided_storage_bits(
+    mojo_gpu: str,
+    dtype: torch.dtype,
+    rows: int,
+    cols: int,
+    pitch: int,
+    source_offset: int,
+    destination_offset: int,
+):
+    # All 16-bit patterns, including floating NaNs/subnormals, must survive
+    # unchanged. Compare storage bits after returning to CPU.
+    size = max(1, rows * pitch + source_offset + 7)
+    bits = (torch.arange(size, dtype=torch.int64) * 7919 + 13).to(torch.int16)
+    source_base = bits.view(dtype).to(mojo_gpu)
+    source = source_base.as_strided((rows, cols), (pitch, 1), source_offset)
+    guard = torch.full((rows * cols + destination_offset + 7,), -535, dtype=torch.int16)
+    destination_base = guard.view(dtype).to(mojo_gpu)
+    destination = destination_base[
+        destination_offset : destination_offset + rows * cols
+    ].view(rows, cols)
+    expected = guard.clone()
+    expected[destination_offset : destination_offset + rows * cols].view(
+        rows, cols
+    ).copy_(bits.as_strided((rows, cols), (pitch, 1), source_offset))
+    assert destination.copy_(source) is destination
+    torch.testing.assert_close(
+        destination_base.cpu().view(torch.int16), expected, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        source_base.cpu().view(torch.int16), bits, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "layout", ["leading_batch", "transpose", "strided_output", "broadcast", "alias"]
+)
+def test_copy_row_strided_fallback(mojo_gpu: str, dtype: torch.dtype, layout: str):
+    host = _fill((2, 3, 7), dtype)
+    source_base = host.to(mojo_gpu)
+    if layout == "leading_batch":
+        source, expected = source_base, host
+    elif layout == "transpose":
+        source, expected = source_base[0].t(), host[0].t()
+    elif layout == "broadcast":
+        source, expected = source_base[0, :1].expand(3, 7), host[0, :1].expand(3, 7)
+    else:
+        source, expected = source_base[0], host[0]
+    if layout == "alias":
+        destination = source
+    elif layout == "strided_output":
+        destination = torch.full((3, 14), -9, dtype=dtype, device=mojo_gpu)[:, ::2]
+    else:
+        destination = torch.empty(source.shape, dtype=dtype, device=mojo_gpu)
+    destination.copy_(source)
+    torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(source_base.cpu(), host, rtol=0, atol=0)
 
 
 @pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])

@@ -8,6 +8,7 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
+import math
 
 import pytest
 import torch
@@ -550,6 +551,57 @@ def test_addcmul_broadcast(mojo_device):
     torch.testing.assert_close(
         out.cpu(), torch.addcmul(a_cpu, b_cpu, c_cpu, value=-1.0)
     )
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+@pytest.mark.parametrize("shape", [(0,), (7,), (17, 19)])
+@pytest.mark.parametrize("value", [-0.25, 0.5 - 2**-30, 0.75])
+def test_optimizer_inplace_offset_storage(mojo_gpu, operation, shape, value):
+    count = math.prod(shape)
+    storage_cpu = torch.linspace(-1.0, 1.0, count + 10)
+    storage = storage_cpu.to(mojo_gpu)
+    a_cpu = storage_cpu[3 : 3 + count].view(shape)
+    a = storage[3 : 3 + count].view(shape)
+    b_cpu = torch.linspace(0.25, 1.25, count).view(shape)
+    c_cpu = torch.linspace(1.0, 2.0, count).view(shape)
+    b, c = b_cpu.to(mojo_gpu), c_cpu.to(mojo_gpu)
+    version = a._version
+    if operation == "lerp":
+        result = a.lerp_(b, value)
+        a_cpu.lerp_(b_cpu, value)
+    else:
+        result = getattr(a, operation + "_")(b, c, value=value)
+        getattr(a_cpu, operation + "_")(b_cpu, c_cpu, value=value)
+    assert result is a
+    assert a._version == version + 1
+    torch.testing.assert_close(storage.cpu(), storage_cpu)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
+def test_optimizer_out_partial_overlap(mojo_gpu, operation):
+    storage = torch.arange(10, dtype=torch.float32, device=mojo_gpu)
+    a, dest = storage[:-1], storage[1:]
+    b = torch.ones_like(a)
+    with pytest.raises(RuntimeError, match="overlap|single memory location"):
+        if operation == "lerp":
+            torch.lerp(dest, a, 0.25, out=dest)
+        else:
+            getattr(torch, operation)(a, b, b, out=dest)
+
+
+@pytest.mark.parametrize("operation", ["addcmul", "addcdiv"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("alias", [False, True])
+def test_addc_out_contiguous(mojo_gpu, operation, dtype, alias):
+    a_cpu = torch.linspace(-1, 1, 357, dtype=dtype)
+    b_cpu = torch.linspace(0.25, 1.25, 357, dtype=dtype)
+    c_cpu = torch.linspace(1, 2, 357, dtype=dtype)
+    a, b, c = [t.to(mojo_gpu) for t in (a_cpu, b_cpu, c_cpu)]
+    dest = a if alias else torch.empty_like(a)
+    result = getattr(torch, operation)(a, b, c, value=0.125, out=dest)
+    assert result is dest
+    expected = getattr(torch, operation)(a_cpu, b_cpu, c_cpu, value=0.125)
+    torch.testing.assert_close(result.cpu(), expected)
 
 
 @pytest.mark.parametrize("weight", [0.25, 0.75])

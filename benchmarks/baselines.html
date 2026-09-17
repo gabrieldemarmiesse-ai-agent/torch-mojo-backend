@@ -4704,6 +4704,150 @@ document.addEventListener("DOMContentLoaded", boot);
     },
     "NVIDIA H100 80GB HBM3 | cuda | kineto-device-time | torch 2.11.0+cu128": {
       "ops": {
+        "_copy_from": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 0.45
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.482
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 0.897
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 0.688
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 0.594
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 0.454
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.481
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 0.891
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 0.689
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 0.593
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 6.203
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 6.282
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 1.399
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 3.444
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 2.547
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 1.337
+                  }
+                }
+              }
+            }
+          }
+        },
+        "_foreach_copy_": {
+          "dtypes": {
+            "f32_to_bf16": {
+              "shapes": {
+                "L_12x800": {
+                  "layouts": {
+                    "contig": 0.983
+                  }
+                },
+                "L_1x1048576": {
+                  "layouts": {
+                    "contig": 0.299
+                  }
+                },
+                "L_65x513": {
+                  "layouts": {
+                    "contig": 0.846
+                  }
+                },
+                "L_awkward_357x789": {
+                  "layouts": {
+                    "contig": 0.271
+                  }
+                },
+                "L_empty_mixed": {
+                  "layouts": {
+                    "contig": 0.965
+                  }
+                },
+                "L_mixed_15370400": {
+                  "layouts": {
+                    "contig": 0.861
+                  }
+                }
+              }
+            }
+          }
+        },
         "_index_put_impl_": {
           "dtypes": {
             "bf16": {
@@ -4730,6 +4874,60 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N357C789_K119": {
                   "layouts": {
                     "contig": 1.086
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcdiv.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.31
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.087
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcmul.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.385
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.088
+                  }
+                }
+              }
+            }
+          }
+        },
+        "lerp.Scalar_out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.306
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.084
                   }
                 }
               }
