@@ -1,38 +1,9 @@
-"""Pick the ptxas that this driver and this GPU can both live with.
+"""Select the newest PTX assembler compatible with the NVIDIA driver and GPUs.
 
-MAX assembles every kernel with ptxas, and the choice has two hard
-constraints that pull in opposite directions:
-
-* the **driver** sets an upper bound. A cubin from a CUDA 13 ptxas needs an
-  r580 driver; on r570 it loads as ``CUDA_ERROR_INVALID_IMAGE (device kernel
-  image is invalid)`` -- at the first op, long after everything looked fine.
-  Within one major release the bound is loose (CUDA's minor version
-  compatibility), so a 12.x cubin loads on any r525+ driver. "Loads" is all
-  that is claimed: a kernel wanting something the driver does not have still
-  fails, at its own call, saying so.
-* the **GPU** sets a lower bound. sm_100 needs CUDA 12.8, sm_110 needs 13.0,
-  and an assembler that does not know the architecture fails the build with
-  ``Value 'sm_100a' is not defined for option 'gpu-name'``. CUDA 13 also
-  *dropped* everything below sm_75, so newer is not always better.
-
-So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
-system CUDA, and the ``libNVPTX.so`` MAX bundles), ask each
-one its release and which architectures it targets, keep the ones that
-satisfy both bounds, and take the newest of those. MAX's own compiler is a candidate like the others -- it is what runs
-when ``MODULAR_NVPTX_COMPILER_PATH`` is unset, and choosing it means leaving
-the variable unset. Its ``nvPTXCompilerGetVersion`` API reports the CUDA
-major.minor version without importing MAX or initializing a GPU. If that
-query is unavailable, it is a last-resort fallback, used only when no known
-assembler fits.
-:func:`apply_default` does the driver half at import, before ``max`` is
-loaded; :func:`check` does the GPU half at ``register_mojo_devices()``, where
-the device can be asked what it is. When nothing qualifies the user gets
-:func:`report` -- the candidates, the reason each was rejected, and the wheel
-to install -- instead of a CUDA error code at the first op.
-
-An explicit ``MODULAR_NVPTX_COMPILER_PATH`` always wins; it is only checked,
-never overridden. ``apply_triton_default`` extends the same choice to Triton,
-for the code paths that run Triton kernels on the mojo device.
+Discover installed assemblers and MAX's bundled compiler; an unknown MAX
+compiler version is a last resort. Check the driver at import and the GPUs
+at device registration, preserving explicit ``MODULAR_NVPTX_COMPILER_PATH``
+settings. Report rejected candidates and installation advice when none fits.
 """
 
 from __future__ import annotations
