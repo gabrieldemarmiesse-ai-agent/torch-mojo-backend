@@ -138,6 +138,25 @@ snapshot and raw run records are retained locally under
 
 ## Profiling
 
+Nsight Systems identified excess copies and launches as well as slower
+compute kernels. The optimizer now launches 4,640 kernels per rank-step,
+matching CUDA, after removing 580 redundant scalar-fill launches. Gradient
+clipping's 581 device-to-device copies were reduced to one, and batched FSDP
+split-copy reduced 1,152 row-copy launches to 96. These counts describe the
+captured phases; overlapping GPU durations must not be added as step time.
+
+Remaining measured targets include BF16 NT matrix multiplications, FP32
+activation backward and square root, mixed-dtype gradient packing, and two
+large root FP32 copies that take about 1.75 ms each in the generic strided
+copy implementation. Longer NCCL GPU spans include waiting for other ranks;
+they do not by themselves demonstrate a collective-bandwidth bottleneck.
+
+Nsight Compute hardware counters are unavailable on this allocation
+(`ERR_NVGPUCTRPERM`). Kernel timing uses Nsight Systems; exported PTX and
+assembler diagnostics revealed serialization and register spills in some
+GEMM variants. The experimental GEMM changes have not passed the per-kernel
+acceptance checks and are not included in the reported throughput.
+
 `--profile profiles/` writes per-rank PyTorch traces, operator tables, and
 cProfile data after the timed windows. `--nsys` marks the timed windows for
 Nsight Systems capture and labels forward, backward, clipping, optimizer,
