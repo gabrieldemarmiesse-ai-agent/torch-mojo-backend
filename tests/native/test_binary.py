@@ -821,9 +821,9 @@ def _optimizer_update(a: torch.Tensor, b: torch.Tensor, operation: str) -> torch
 @pytest.mark.parametrize(
     "layout", ["broadcast", "transpose", "interleaved", "alias", "empty_expanded"]
 )
-def test_optimizer_inplace_layout_contract(mojo_gpu, operation, layout):
+def test_optimizer_inplace_layout_contract(mojo_device, operation, layout):
     host = torch.arange(1, 41, dtype=torch.float32).reshape(5, 8) / 40
-    device = host.to(mojo_gpu)
+    device = host.to(mojo_device)
 
     def views(base: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if layout == "broadcast":
@@ -848,9 +848,9 @@ def test_optimizer_inplace_layout_contract(mojo_gpu, operation, layout):
 
 @pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
 @pytest.mark.parametrize("invalid", ["grow", "expand", "partial", "transpose_alias"])
-def test_optimizer_inplace_rejects_before_write(mojo_gpu, operation, invalid):
+def test_optimizer_inplace_rejects_before_write(mojo_device, operation, invalid):
     expected = torch.arange(1, 17, dtype=torch.float32).reshape(4, 4)
-    storage = expected.to(mojo_gpu)
+    storage = expected.to(mojo_device)
     if invalid == "grow":
         a, b = storage[:1], storage
     elif invalid == "expand":
@@ -867,11 +867,11 @@ def test_optimizer_inplace_rejects_before_write(mojo_gpu, operation, invalid):
 
 
 @pytest.mark.parametrize("operation", ["addcmul", "addcdiv", "lerp"])
-def test_optimizer_inplace_autograd_contract(mojo_gpu, operation):
+def test_optimizer_inplace_autograd_contract(mojo_device, operation):
     host = torch.linspace(0.25, 1.0, 7, requires_grad=True)
-    leaf = host.detach().to(mojo_gpu).requires_grad_()
+    leaf = host.detach().to(mojo_device).requires_grad_()
     b_host = torch.full((7,), 0.5)
-    b = b_host.to(mojo_gpu)
+    b = b_host.to(mojo_device)
     for invalid in (leaf, leaf.view_as(leaf)):
         version = invalid._version
         with pytest.raises(RuntimeError, match="leaf"):
