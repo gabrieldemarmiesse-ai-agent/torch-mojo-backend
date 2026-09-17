@@ -501,6 +501,26 @@ def _b_scalar_inplace(op: StaticString, a: T, value: Float64) raises:
     _ = ctx
 
 
+def _b_raw_add_ok(dst: T, a: T, b: T) -> Bool:
+    """Whether the raw `Add` route can run these pointers.
+
+    That kernel switches to a 4-wide body with `alignment = 4 * itemsize` as
+    soon as numel % 4 == 0 and checks no pointer, so a contiguous operand
+    that is not 4-element aligned -- any offset view, `x[3:].add_(y)` --
+    faults the context with CUDA_ERROR_MISALIGNED_ADDRESS (reproduced on an
+    H100, and the fault poisons every later call in the process). Those go to
+    the broadcast spec route instead, which tests the addresses itself.
+
+    float64 keeps this route unconditionally: the kernel refuses that dtype
+    on GPU before reading anything, and the spec route must not start
+    answering calls that raise today.
+    """
+    if dst.dtype == DType.float64 or a.numel % 4 != 0:
+        return True
+    var align = 4 * a.itemsize
+    return (dst.ptr | a.ptr | b.ptr) % align == 0
+
+
 def _b_raw_add(dst: T, a: T, b: T) raises:
     """elementwise_ops `Add`: contiguous, equal shapes, one dtype. `dst` may
     be `a` — that is the in-place route, and the kernel is a flat elementwise
@@ -1005,6 +1025,8 @@ def _b_try_apple_add(
     ):
         return None
     var out = own(new_like(a))
+    if not _b_raw_add_ok(out.t, a, b):
+        return None
     _b_raw_add(out.t, a, b)
     return Res(out.take(), True)
 
@@ -1295,6 +1317,7 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             and self.device == b.device
             and _b_bcast_dtype(self.stype)
             and _b_fits(self, b.shape)
+            and _b_raw_add_ok(self, self, b)
         ):
             _b_raw_add(self, self, b)
             ret_ref(rets, 0, self)
