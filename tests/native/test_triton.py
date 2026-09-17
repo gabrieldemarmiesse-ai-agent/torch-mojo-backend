@@ -21,7 +21,7 @@ tl = pytest.importorskip("triton.language")
 from torch._library.triton import triton_op, wrap_triton  # noqa: E402 -- after the skip
 
 # Optional Triton dependency: its wheels are unavailable on macOS.
-from triton.runtime import (  # ty: ignore[unresolved-import]  # noqa: E402 -- after importorskip
+from triton.runtime import (  # noqa: E402 -- after importorskip
     driver as active_driver,
 )
 

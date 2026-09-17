@@ -41,12 +41,9 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     # Optional Triton dependency: its wheels are unavailable on macOS.
-    from triton.backends.amd.driver import HIPUtils  # ty: ignore[unresolved-import]
-    from triton.backends.driver import (  # ty: ignore[unresolved-import]
-        DriverBase,
-        GPUDriver,
-    )
-    from triton.backends.nvidia.driver import CudaUtils  # ty: ignore[unresolved-import]
+    from triton.backends.amd.driver import HIPUtils
+    from triton.backends.driver import DriverBase, GPUDriver
+    from triton.backends.nvidia.driver import CudaUtils
 
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
@@ -252,7 +249,7 @@ class _MojoUtils(Generic[_Previous]):
 
 
 def _cuda_driver_class() -> type[DriverBase]:
-    from triton.backends.nvidia.driver import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+    from triton.backends.nvidia.driver import (  # noqa: PLC0415 -- triton is optional
         CudaDriver,
         CudaLauncher,
         CudaUtils,
@@ -313,7 +310,7 @@ def _hip_driver_class() -> type[DriverBase]:
     so the launcher needs no guard (a launch on device 1's stream works with
     device 0 current -- checked on MI300A), but a module is loaded for the
     thread's current device, so `load_binary` runs under `hipSetDevice`."""
-    from triton.backends.amd.driver import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+    from triton.backends.amd.driver import (  # noqa: PLC0415 -- triton is optional
         HIPDriver,
         HIPLauncher,
         HIPUtils,
@@ -376,7 +373,7 @@ def enable_triton():
     itself only where that cannot happen -- a torch with no working CUDA/ROCm
     build (see `install_triton_hook`).
     """
-    from triton.runtime import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+    from triton.runtime import (  # noqa: PLC0415 -- triton is optional
         driver,
     )
 

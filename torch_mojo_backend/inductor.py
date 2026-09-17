@@ -139,7 +139,7 @@ def _hip_device_properties(index: int) -> MojoDeviceProperties:
     (e.g. "gfx942:sramecc+:xnack-"); `HIPDriver.get_current_target` strips
     them the same way before handing the bare gfx string to Triton."""
     # Optional Triton dependency: its wheels are unavailable on macOS.
-    from triton.backends.amd.driver import (  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+    from triton.backends.amd.driver import (  # noqa: PLC0415 -- triton is optional
         HIPUtils,
     )
 
@@ -261,7 +261,7 @@ class MojoInterface(DeviceInterface):
 
     @classmethod
     def raise_if_triton_unavailable(cls, device: torch.types.Device = None):
-        import triton.backends  # ty: ignore[unresolved-import]  # noqa: PLC0415 -- triton is optional
+        import triton.backends  # noqa: PLC0415 -- triton is optional
 
         if not cls.is_triton_capable(device):
             raise RuntimeError("the mojo device is too old for Triton (pre-Volta)")
