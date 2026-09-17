@@ -1,18 +1,55 @@
 # GPT-2 XL FSDP2 throughput
 
+## Current optimization snapshot
+
+Commit `4e3fe5d`, measured on 2026-09-17 on two H100 80GB HBM3 GPUs
+(`par2dc5-ai-prd-cl02s04dgx30`, Slurm job 256255). The training configuration
+below is unchanged. These sequence-length-1024 results combine six windows
+from two independent launches per stack, in CUDA/Mojo/MojoCCL order followed
+by the reverse order. Every window is retained.
+
+| Configuration | Tokens/s | Step time (ms) | Window range (tokens/s) |
+|---|---:|---:|---:|
+| Stock PyTorch CUDA + NCCL | 7,231.8 | 283.19 | 6,937.7–7,289.5 |
+| Torch Mojo + NCCL | 6,135.3 | 333.80 | 6,086.3–6,159.4 |
+| Torch Mojo + MojoCCL | 4,294.7 | 476.87 | 4,252.3–4,326.9 |
+
+Mojo + NCCL reaches **84.8%** of the matched CUDA throughput; the 97% target
+is not yet met. Mojo + MojoCCL reaches 59.4% of CUDA and 70.0% of Mojo + NCCL.
+The primary changes batch FSDP split copies, combine adjacent foreach copies,
+and remove temporary tensors from scalar division and gradient clipping.
+The experimental GEMM and further elementwise kernels are not in this snapshot.
+
+This allocation reserves the two GPUs and 32 CPUs; each model launch uses
+12 CPUs and both GPU locks. Other jobs can use the rest of the node. Clocks
+could not be locked. Absolute throughput also changed for unchanged code
+during this allocation, so comparisons with the initial measurements below
+do not isolate the effect of the code changes. Use the matched rows above.
+Raw records are `current_bench_train/fsdp2_opt/current_{cuda,mojo,mojoccl}_{a,b}.json`.
+
+All six XL runs completed with finite losses. GPT-2 124M also completed five
+BF16 training steps with NCCL and MojoCCL, with matching printed losses.
+The four two-rank FSDP tests pass, including gradient/update parity,
+checkpoint round trips, reduce-scatter tails and aliases, and successive
+collectives across caller streams. Commit `92ac158` fixes the MojoCCL
+reduce-scatter ordering scope and checkpoint staging when CUDA and Mojo
+are both available.
+
+## Initial measurements
+
 Measured on 2026-09-17 with two NVIDIA H100 80GB HBM3 GPUs connected by NVLink,
 on an exclusive Slurm node (`par2dc5-ai-prd-cl02s02dgx23`, job 256161).
 These are the initial end-to-end training measurements taken before the
 throughput optimizations, including the correctness-first MojoCCL reduce-scatter.
 
-## Results
+### Initial results
 
 Throughput is aggregate input tokens/second across both GPUs. Higher is better.
 Each result is the median of six synchronized 10-step windows: three windows
 from each of two independent torchrun launches, with the order reversed in the
 second round. The range includes every window; no samples were discarded.
 
-### Sequence length 1024
+#### Sequence length 1024
 
 | Configuration | Tokens/s | Step time (ms) | Window range (tokens/s) |
 |---|---:|---:|---:|
@@ -20,7 +57,7 @@ second round. The range includes every window; no samples were discarded.
 | Torch Mojo + NCCL | 6,088.0 | 336.40 | 5,741.0–6,110.3 |
 | Torch Mojo + MojoCCL | 4,114.8 | 497.72 | 4,023.3–4,130.4 |
 
-### Sequence length 64
+#### Sequence length 64
 
 | Configuration | Tokens/s | Step time (ms) | Window range (tokens/s) |
 |---|---:|---:|---:|
