@@ -590,9 +590,6 @@ def _v4c_enqueue_nt_bias_persistent[
         dyn_smem=DYN_SMEM,
     ](
         ctx,
-        String(
-            t"g16ntbias_{_GEMM16_TAG}_n{bn}_s{stages}_r{raster_h}_{Int(defer_release)}{Int(_NT_ROLLING)}"
-        ),
         grid_x,
         1,
         1,

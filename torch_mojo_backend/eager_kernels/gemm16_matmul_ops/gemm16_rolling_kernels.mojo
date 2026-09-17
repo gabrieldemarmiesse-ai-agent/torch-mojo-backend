@@ -952,9 +952,6 @@ def enqueue_rolling_persistent[
             dyn_smem=DYN_SMEM,
         ](
             ctx,
-            String(
-                t"ntbroll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_g{group}"
-            ),
             grid_x,
             1,
             1,
@@ -986,9 +983,6 @@ def enqueue_rolling_persistent[
             dyn_smem=DYN_SMEM,
         ](
             ctx,
-            String(
-                t"g16roll2_{_GEMM16_TAG}_s{stages}c{cluster_m}m{bm}n{bn}w{consumers}_{Int(tma_store)}{Int(col_a)}{Int(kmaj_b)}{Int(ragged_n)}_g{group}_p{Int(_ROLL_PAIR_CAST)}"
-            ),
             grid_x,
             1,
             1,

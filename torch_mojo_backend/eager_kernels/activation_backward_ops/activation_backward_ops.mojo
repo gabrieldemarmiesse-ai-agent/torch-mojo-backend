@@ -296,7 +296,6 @@ def enqueue_gelu_backward_f32(
             if tanh_approx:
                 _enqueue_cached[_gelu_backward_f32_g4[True]](
                     ctx,
-                    "gelu_bwd_tanh_g4",
                     grid_g4,
                     1,
                     1,
@@ -310,7 +309,6 @@ def enqueue_gelu_backward_f32(
             else:
                 _enqueue_cached[_gelu_backward_f32_g4[False]](
                     ctx,
-                    "gelu_bwd_exact_g4",
                     grid_g4,
                     1,
                     1,
@@ -331,7 +329,6 @@ def enqueue_gelu_backward_f32(
         if tanh_approx:
             _enqueue_cached[_gelu_backward_tanh](
                 ctx,
-                "gelu_bwd_tanh",
                 grid,
                 1,
                 1,
@@ -345,7 +342,6 @@ def enqueue_gelu_backward_f32(
         else:
             _enqueue_cached[_gelu_backward_exact](
                 ctx,
-                "gelu_bwd_exact",
                 grid,
                 1,
                 1,
@@ -382,7 +378,6 @@ def enqueue_gelu_backward_bf16(
         if tanh_approx:
             _enqueue_cached[_gelu_backward_tanh_bf16](
                 ctx,
-                "gelu_bwd_tanh_bf16",
                 grid,
                 1,
                 1,
@@ -396,7 +391,6 @@ def enqueue_gelu_backward_bf16(
         else:
             _enqueue_cached[_gelu_backward_exact_bf16](
                 ctx,
-                "gelu_bwd_exact_bf16",
                 grid,
                 1,
                 1,
