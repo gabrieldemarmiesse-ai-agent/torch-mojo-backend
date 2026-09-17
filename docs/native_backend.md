@@ -118,14 +118,17 @@ again at `register_mojo_devices()` from the architecture, which only the
 initialized driver can answer. Candidates are the `nvidia-cuda-nvcc*` wheels
 (`nvidia/cuda_nvcc/bin/ptxas` for cu12, `nvidia/cu13/bin/ptxas` for CUDA 13),
 torch's `torch/bin/ptxas`, Triton's, `$CUDA_HOME`, `$PATH` and
-`/usr/local/cuda*`, plus MAX's own compiler: the `libnvptxcompiler` linked
-into `max`, which is what runs when the variable is unset. It exports
-nothing Python can ask, so its release is looked up by MAX version
-(`BUILTIN_NVPTX` in `_ptxas.py`, from the MAX release notes: 26.2 moved it
-from CUDA 12.9 to 13.1) and its targets come from the architecture tables
-rather than a `--help`. Among the ones that fit — and every one of them
-has to load on this driver and target every GPU present — the newest wins;
-where it came from does not enter into it. Picking the built-in means *unsetting* the variable (the mark then
+`/usr/local/cuda*`, plus MAX's own compiler, which runs when the variable is
+unset. The `max-core` wheel ships it as `modular/lib/libNVPTX.so`.
+We query its `nvPTXCompilerGetVersion` API through `ctypes` to read the actual
+CUDA major.minor version, without importing MAX or initializing CUDA.
+Its targets come from the architecture tables rather than a `--help`.
+Among known versions that fit the driver and every GPU present, the newest
+wins. If the library or its version API is unavailable, or the query fails,
+MAX's compiler has the lowest priority: it is tried only when no known
+assembler fits. The report
+labels it as an unknown CUDA version, and MAX checks compatibility at runtime.
+Picking the built-in means *unsetting* the variable (the mark then
 reads `<max built-in>`). The nvcc wheel is optional at runtime and pinned only
 in the development dependencies in `pyproject.toml`; it is one candidate
 among the others.

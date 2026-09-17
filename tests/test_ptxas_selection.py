@@ -8,9 +8,13 @@ needs a newer assembler than the one pinned, a Volta on a driver new enough
 that the newest assembler has dropped it.
 """
 
+from __future__ import annotations
+
+import ctypes
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +36,7 @@ SYSTEM_11_8 = _ptxas.Ptxas(
 MISSING = _ptxas.Ptxas(Path("/nonexistent/ptxas"), _ptxas.ENV_VAR, None)
 BUILTIN_13_1 = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, (13, 1, 0))
 BUILTIN_12_9 = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, (12, 9, 0))
+BUILTIN_UNKNOWN = _ptxas.Ptxas(Path("/wheel/max"), _ptxas.BUILTIN_SOURCE, None)
 
 # What each of those really lists in `ptxas --help`, abbreviated to the
 # architectures these tests reason about.
@@ -149,10 +154,84 @@ def test_the_builtin_is_chosen_over_a_refusal(arches):
     assert chosen is BUILTIN_13_1
 
 
-def test_the_installed_max_has_a_builtin_entry():
+@pytest.mark.parametrize(
+    "status,major,minor,expected",
+    [(0, 13, 3, (13, 3, 0)), (0, 12, 9, (12, 9, 0)), (4, 13, 3, None), (0, 0, 0, None)],
+)
+def test_builtin_version_comes_from_the_compiler_api(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    major: int,
+    minor: int,
+    expected: tuple[int, int, int] | None,
+):
+    @ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)
+    )
+    def get_version(
+        major_out: ctypes._Pointer[ctypes.c_uint],
+        minor_out: ctypes._Pointer[ctypes.c_uint],
+    ) -> int:
+        major_out[0], minor_out[0] = major, minor
+        return status
+
+    lib = SimpleNamespace(nvPTXCompilerGetVersion=get_version)
+    monkeypatch.setattr(_ptxas.ctypes, "CDLL", lambda path: lib)
     builtin = _ptxas.builtin_ptxas()
     assert builtin is not None and builtin.is_builtin
-    assert builtin.version is not None and builtin.version >= (12, 9, 0)
+    assert builtin.version == expected
+    assert builtin.path.name == "libNVPTX.so"
+
+
+def test_builtin_with_no_version_symbol_stays_a_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(_ptxas.ctypes, "CDLL", lambda path: SimpleNamespace())
+    builtin = _ptxas.builtin_ptxas()
+    assert builtin is not None and builtin.is_builtin and builtin.version is None
+
+
+def test_builtin_that_cannot_be_loaded_stays_a_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def cannot_load(path: str) -> ctypes.CDLL:
+        raise OSError("cannot load library")
+
+    monkeypatch.setattr(_ptxas.ctypes, "CDLL", cannot_load)
+    builtin = _ptxas.builtin_ptxas()
+    assert builtin is not None and builtin.is_builtin and builtin.version is None
+
+
+@pytest.mark.parametrize("known", [SYSTEM_11_8, WHEEL_12_8, TORCH_13_0, BUILTIN_13_1])
+def test_unknown_builtin_has_lower_priority_than_every_known_match(
+    arches: None, known: _ptxas.Ptxas
+):
+    for found in ([BUILTIN_UNKNOWN, known], [known, BUILTIN_UNKNOWN]):
+        chosen, _ = _ptxas.choose((13, 0), (80,), found)
+        assert chosen is known
+
+
+@pytest.mark.parametrize(
+    "found", [[BUILTIN_UNKNOWN], [MISSING, TORCH_13_0, SYSTEM_11_8, BUILTIN_UNKNOWN]]
+)
+def test_unknown_builtin_is_used_when_no_known_assembler_matches(
+    arches: None, found: list[_ptxas.Ptxas]
+):
+    chosen, rejected = _ptxas.choose((12, 8), (90,), found)
+    assert chosen is BUILTIN_UNKNOWN
+    assert len(rejected) == len(found) - 1
+
+
+def test_unknown_builtin_report_does_not_claim_a_cuda_version(arches: None):
+    text = _ptxas.report((12, 8), ((90, "H100"),), [BUILTIN_UNKNOWN])
+    assert "[USED] /wheel/max" in text
+    assert "CUDA version unknown (last-resort fallback)" in text
+    assert "no such file" not in text
+
+
+def test_the_installed_max_has_a_builtin_candidate():
+    builtin = _ptxas.builtin_ptxas()
+    assert builtin is not None and builtin.is_builtin
     assert builtin in _ptxas.candidates()
 
 
@@ -403,6 +482,35 @@ def test_choosing_the_builtin_unsets_the_variable_and_marks_it(monkeypatch):
     assert os.environ[_ptxas.AUTO_ENV_VAR] == _ptxas.BUILTIN_MARK
 
 
+def test_unknown_builtin_fallback_unsets_the_previous_assembler(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _check(
+        monkeypatch,
+        driver=(12, 8),
+        devices=((90, "H100"),),
+        found=[TORCH_13_0, BUILTIN_UNKNOWN],
+        ours=str(TORCH_13_0.path),
+    )
+    assert _ptxas.ENV_VAR not in os.environ
+    assert os.environ[_ptxas.AUTO_ENV_VAR] == _ptxas.BUILTIN_MARK
+
+
+def test_unknown_builtin_advice_does_not_promise_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with pytest.raises(_ptxas.PtxasError) as excinfo:
+        _check(
+            monkeypatch,
+            driver=(12, 8),
+            devices=((90, "H100"),),
+            found=[MISSING, BUILTIN_UNKNOWN],
+            env=str(MISSING.path),
+        )
+    assert "compatibility is unknown" in str(excinfo.value)
+    assert "which works on this machine" not in str(excinfo.value)
+
+
 def test_an_inherited_builtin_mark_is_not_a_setting(monkeypatch):
     """A rank spawned after the parent settled on the built-in sees no
     variable and the mark -- and the mark alone must not read as a choice."""
@@ -439,7 +547,11 @@ def test_a_broken_setting_is_told_the_builtin_would_work(monkeypatch):
 def _real_ptxas() -> dict[tuple[int, int], Path]:
     found = {}
     for candidate in _ptxas.candidates():
-        if candidate.version is not None and _ptxas.arches_of(candidate.path):
+        if (
+            not candidate.is_builtin
+            and candidate.version is not None
+            and _ptxas.arches_of(candidate.path)
+        ):
             found.setdefault(candidate.version[:2], candidate.path)
     return found
 

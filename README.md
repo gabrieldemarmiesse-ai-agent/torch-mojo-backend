@@ -48,7 +48,9 @@ uv add torch-mojo-backend
 
 On NVIDIA GPUs the package discovers a `ptxas` assembler compatible with
 the driver and GPU among installed wheels, CUDA toolkits and the compiler
-MAX ships, and uses the newest that fits. The nvcc wheel is optional at
+MAX ships, and uses the newest known version that fits. If MAX's compiler
+version is unknown, it is tried only when no known assembler fits.
+The nvcc wheel is optional at
 runtime; only the development dependencies install
 `nvidia-cuda-nvcc-cu12==12.8.*`. When no assembler fits, an error names the
 wheel to install.

@@ -16,12 +16,14 @@ constraints that pull in opposite directions:
   *dropped* everything below sm_75, so newer is not always better.
 
 So: collect every ptxas on the machine (the wheels, torch's, Triton's, the
-system CUDA, and the ``libnvptxcompiler`` MAX links into itself), ask each
+system CUDA, and the ``libNVPTX.so`` MAX bundles), ask each
 one its release and which architectures it targets, keep the ones that
 satisfy both bounds, and take the newest of those. MAX's own compiler is a candidate like the others -- it is what runs
 when ``MODULAR_NVPTX_COMPILER_PATH`` is unset, and choosing it means leaving
-the variable unset. It cannot be asked anything from Python, so its release
-is looked up by MAX version (:data:`BUILTIN_NVPTX`).
+the variable unset. Its ``nvPTXCompilerGetVersion`` API reports the CUDA
+major.minor version without importing MAX or initializing a GPU. If that
+query is unavailable, it is a last-resort fallback, used only when no known
+assembler fits.
 :func:`apply_default` does the driver half at import, before ``max`` is
 loaded; :func:`check` does the GPU half at ``register_mojo_devices()``, where
 the device can be asked what it is. When nothing qualifies the user gets
@@ -63,14 +65,6 @@ WHEELS: dict[int, tuple[str, str]] = {
 }
 PINNED_WHEEL = WHEELS[12]
 
-# The libnvptxcompiler linked into `max`, used when MODULAR_NVPTX_COMPILER_PATH
-# is unset. It exports nothing Python can ask its version, so this is read
-# off the release notes: 26.2 moved it from CUDA 12.9 to 13.1
-# (modular/docs/releases/v26.2.md). First match by MAX version wins.
-BUILTIN_NVPTX: tuple[tuple[tuple[int, int], tuple[int, int, int]], ...] = (
-    ((26, 2), (13, 1, 0)),
-    ((0, 0), (12, 9, 0)),
-)
 BUILTIN_SOURCE = "MAX built-in libnvptxcompiler"
 # What TORCH_MOJO_BACKEND_PTXAS_AUTO holds when our pick was "no ptxas at all":
 # not a path, since the variable it marks is then absent.
@@ -142,11 +136,14 @@ class Ptxas:
 
     path: Path
     source: str  # where it came from, for the report
-    version: tuple[int, int, int] | None  # None when it would not run
+    # None for an unversioned built-in compiler or an external one that failed.
+    version: tuple[int, int, int] | None
 
     @property
     def release(self) -> str:
         if self.version is None:
+            if self.is_builtin:
+                return "CUDA version unknown (last-resort fallback)"
             return "no such file" if not self.path.is_file() else "--version failed"
         return f"CUDA {self.version[0]}.{self.version[1]}"
 
@@ -281,24 +278,49 @@ def _triton_ptxas() -> Path | None:
     return None
 
 
+def _builtin_version(path: Path) -> tuple[int, int, int] | None:
+    """Query MAX's bundled compiler without importing MAX or initializing CUDA.
+
+    NVIDIA's API reports the CUDA Toolkit major.minor, not the PTX ISA
+    version. It exposes no patch version, so use zero for that component.
+    Older wheels may not expose a shared library or this symbol.
+    """
+    try:
+        lib = ctypes.CDLL(str(path))
+        get_version = lib.nvPTXCompilerGetVersion
+    except (OSError, AttributeError):
+        return None
+    get_version.argtypes = [
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    get_version.restype = ctypes.c_int
+    major, minor = ctypes.c_uint(), ctypes.c_uint()
+    if get_version(ctypes.byref(major), ctypes.byref(minor)) != 0 or major.value == 0:
+        return None
+    return major.value, minor.value, 0
+
+
 def builtin_ptxas() -> Ptxas | None:
-    """The compiler linked into the installed ``max``, or None without one.
+    """The compiler bundled with the installed ``max``, or None without MAX.
 
     Found without importing ``max`` -- this runs at import, before it loads.
     """
     try:
-        release = importlib.metadata.version("max")
         spec = importlib.util.find_spec("max")
-    except (importlib.metadata.PackageNotFoundError, ImportError, ValueError):
+    except (ImportError, ValueError):
         return None
     if spec is None or not spec.submodule_search_locations:
         return None
-    parts = tuple(int(part) for part in re.findall(r"\d+", release)[:2])
-    if len(parts) < 2:
-        return None
-    version = next(cuda for floor, cuda in BUILTIN_NVPTX if parts >= floor)
-    path = Path(next(iter(spec.submodule_search_locations)))
-    return Ptxas(path=path, source=BUILTIN_SOURCE, version=version)
+    try:
+        dist = importlib.metadata.distribution("max-core")
+    except importlib.metadata.PackageNotFoundError:
+        # Older layouts may embed the compiler in MAX instead of shipping
+        # libNVPTX.so. Keep them as candidates with unknown compatibility.
+        path = Path(next(iter(spec.submodule_search_locations)))
+        return Ptxas(path=path, source=BUILTIN_SOURCE, version=None)
+    path = Path(str(dist.locate_file("modular/lib/libNVPTX.so")))
+    return Ptxas(path=path, source=BUILTIN_SOURCE, version=_builtin_version(path))
 
 
 def _system_ptxas() -> list[tuple[Path, str]]:
@@ -474,6 +496,10 @@ def rejection(
 ) -> str | None:
     """Why this ptxas cannot be used here, or None when it can."""
     if ptxas.version is None:
+        if ptxas.is_builtin:
+            # Compatibility is unknown, so allow it only as a last resort
+            # through choose()'s ranking, without inventing version bounds.
+            return None
         return ptxas.release  # "no such file" or "--version failed"
     major, minor, _ = ptxas.version
     if driver is not None and major > driver[0]:
@@ -499,10 +525,9 @@ def choose(
 ) -> tuple[Ptxas | None, list[tuple[Ptxas, str]]]:
     """The best usable ptxas, and every rejected one with its reason.
 
-    Among usable ones the highest release wins: it carries NVIDIA's latest
-    fixes, and every usable one is guaranteed to load on this driver (minor
-    version compatibility) and to target these GPUs. Where it came from -- a
-    wheel, the system, MAX itself -- does not enter into it.
+    Among known versions that fit, the highest release wins. An unversioned
+    MAX compiler ranks last: try it only when no known assembler fits,
+    leaving MAX to check compatibility at runtime.
     """
     if found is None:
         found = candidates()
@@ -516,7 +541,7 @@ def choose(
     if not usable:
         return None, rejected
 
-    return max(usable, key=lambda ptxas: ptxas.version or (0, 0, 0)), rejected
+    return max(usable, key=lambda ptxas: ptxas.version or (-1, -1, -1)), rejected
 
 
 def install_advice(
@@ -718,9 +743,14 @@ def _check_now():
             return  # the user's choice works here; nothing to say
         message = f"{ENV_VAR}={explicit} cannot be used here: {why}.\n"
         if chosen is not None:
+            compatibility = (
+                "compatibility is unknown"
+                if chosen.version is None
+                else "which works on this machine"
+            )
             message += (
                 f"Unset it and {chosen.label} ({chosen.release}) is used "
-                f"instead, which works on this machine.\n"
+                f"instead, {compatibility}.\n"
             )
         message += "\n" + report(driver, devices, found)
     elif chosen is not None:
