@@ -663,9 +663,10 @@ not the allreduce transport in a costume:
   staging slot. That write is the wire transfer, as in the allreduce's
   phase 1;
 - **REDUCE** every rank sums its own chunk, straight out of user memory,
-  with the `world-1` pushed slots, scales (AVG is NCCL's PreMulSum shape,
-  applied in the fp32 accumulator before the narrowing store) and writes the
-  result into the caller's output.
+  with the `world-1` pushed slots, and writes the result into the caller's
+  output. AVG scales each contribution as it enters the fp32 accumulator,
+  never the finished sum (NCCL's PreMulSum): two fp32 ranks contributing
+  2**127 average to 2**127, not to inf.
 
 `(world-1)/world × bytes` per GPU on the wire, the unicast minimum; nothing
 allocated, no stream synchronized, and one kernel per call at every size
