@@ -235,7 +235,9 @@ def test_addmm(mojo_device, dtype, call_checker: CallChecker):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1024, 1600, 1600), (256, 1600, 6400), (512, 256, 256)])
+@pytest.mark.parametrize(
+    "shape", [(1024, 1600, 1600), (256, 1600, 6400), (512, 256, 256)]
+)
 def test_addmm_adds_its_bias_without_the_dispatcher(mojo_gpu, dtype, shape):
     """The shapes whose bias is added after an unbiased mm: that add is one
     launch into the product, not a second `aten::add` and a second buffer."""

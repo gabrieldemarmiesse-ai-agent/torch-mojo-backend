@@ -750,7 +750,6 @@ def _fast_operands(shape, dtype, device, layout):
         return cpu[..., ::2], dev[..., ::2]
     if layout == "offset":
         flat_cpu, flat = _both((math.prod(shape) + 3,), dtype, device)
-        n = math.prod(shape)
         return flat_cpu[3:].view(shape), flat[3:].view(shape)
     raise AssertionError(layout)
 
@@ -783,7 +782,9 @@ def test_elementwise_tensor_routes_match_cpu(mojo_device, dtype, shape, layout):
         for which in ("self", "other"):
             alias_cpu = (a_cpu if which == "self" else b_cpu).clone()
             alias = (a if which == "self" else b).clone()
-            getattr(torch, op)(*(alias, b) if which == "self" else (a, alias), out=alias)
+            getattr(torch, op)(
+                *(alias, b) if which == "self" else (a, alias), out=alias
+            )
             getattr(torch, op)(
                 *(alias_cpu, b_cpu) if which == "self" else (a_cpu, alias_cpu),
                 out=alias_cpu,
