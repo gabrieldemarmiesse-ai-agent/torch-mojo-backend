@@ -48,6 +48,7 @@ from abi import (
     default_dtype,
     dtype_code,
     f64_bits,
+    is_dense,
     new_like,
     new_scalar,
     new_tensor,
@@ -1609,6 +1610,51 @@ def _b_addc(
     return Res(out.take(), True)
 
 
+def _b_inplace_destination(dest: T) raises:
+    # TensorIterator rejects known internal overlap, but empty expanded
+    # tensors are valid. Preserve this meta check when bypassing its wrapper.
+    if dest.numel > 0 and not dest.contig:
+        for i in range(dest.rank):
+            if dest.dim(i) > 1 and dest.stride(i) == 0:
+                raise Error(
+                    "more than one element refers to a single memory location"
+                )
+
+
+def _b_inplace_operand(dest: T, other: T) raises:
+    if other.rank > dest.rank:
+        raise Error("an in-place result cannot change the output shape")
+    for i in range(MAX_RANK):
+        if other.shape[i] != 1 and other.shape[i] != dest.shape[i]:
+            raise Error("an in-place result cannot change the output shape")
+    # ATen/MemoryOverlap.cpp treats non-dense views as TooHard, allowing
+    # disjoint interleaved slices. Only dense spans admit this overlap test.
+    if (dest.contig or is_dense(dest.shape, dest.strides, dest.rank)) and (
+        other.contig or is_dense(other.shape, other.strides, other.rank)
+    ):
+        _b_no_partial_overlap(dest, other)
+
+
+def _b_addc_inplace(
+    op: StaticString, args: Values, rets: Values, allow_int: Bool
+) raises:
+    var dest = _b_self(args[unsafe_offset=0], "addc in-place")
+    _b_inplace_destination(dest)
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=2]))
+    _b_store_inplace(rets, dest, _b_addc(op, args, allow_int, dest.copy()))
+
+
+# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_addc_inplace("AddcmulBcast", args, rets, True)
+
+
+# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _b_addc_inplace("AddcdivBcast", args, rets, False)
+
+
 def _b_addc_into(
     op: StaticString,
     a: T,
@@ -1748,6 +1794,16 @@ def op_lerp_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(rets, _b_lerp(args))
 
 
+# aten::lerp_.Scalar(Tensor(a!) self, Tensor end, Scalar weight) -> Tensor(a!)
+def op_lerp_scalar_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _b_self(args[unsafe_offset=0], "lerp in-place")
+    _b_inplace_destination(dest)
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
+    _b_store_inplace(rets, dest, _b_lerp(args, dest.copy()))
+
+
 # aten::lerp.Scalar_out(Tensor self, Tensor end, Scalar weight, *, Tensor(a!) out) -> Tensor(a!)
 def op_lerp_scalar_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1766,8 +1822,10 @@ def register_binary(site: Site) raises:
     impl[op_add_, "add_.Tensor"](site)
     impl[op_add_out, "add.out"](site)
     impl[op_addcdiv, "addcdiv"](site)
+    impl[op_addcdiv_, "addcdiv_"](site)
     impl[op_addcdiv_out, "addcdiv.out"](site)
     impl[op_addcmul, "addcmul"](site)
+    impl[op_addcmul_, "addcmul_"](site)
     impl[op_addcmul_out, "addcmul.out"](site)
     impl[op_bitwise_and, "bitwise_and.Scalar"](site)
     impl[op_bitwise_and, "bitwise_and.Tensor"](site)
@@ -1783,6 +1841,7 @@ def register_binary(site: Site) raises:
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
     impl[op_lerp_scalar, "lerp.Scalar"](site)
+    impl[op_lerp_scalar_, "lerp_.Scalar"](site)
     impl[op_lerp_scalar_out, "lerp.Scalar_out"](site)
     impl[op_logical_and, "logical_and"](site)
     impl[op_logical_xor, "logical_xor"](site)

@@ -90,12 +90,17 @@ COVERS: dict[str, str] = (
             "test_remainder (same kernel, scalar lhs plumbing)"
         ),
         "aten::lerp.Scalar": "test_lerp",
+        # In-place and aliased out= share the same native launch helper and
+        # device code. Keep the recorded out= keys for these device-time cases.
         "aten::lerp.Scalar_out": "test_lerp_inplace",
+        "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
+        "aten::addcdiv_": "test_addcdiv_inplace",
         "aten::addcmul": "test_addcmul",
         "aten::addcmul.out": "test_addcmul_inplace",
+        "aten::addcmul_": "test_addcmul_inplace",
         "aten::where.self": "test_where",
         "aten::masked_fill.Scalar": "test_masked_fill[Scalar]",
         "aten::masked_fill.Tensor": "test_masked_fill[Tensor]",
