@@ -1,7 +1,53 @@
+from std.sys import size_of
 from std.testing import assert_equal, assert_true
 from std.utils import IndexList
-from kernels import Defines, KernelCall, MAX_CALL_SPECS, TUPLE_POOL_WORDS
+from kernels import (
+    Defines,
+    KernelCall,
+    MAX_CALL_SLOTS,
+    MAX_CALL_SPECS,
+    TUPLE_POOL_WORDS,
+)
 from op_utils import MAX_RANK, TensorSpec
+
+
+def _spec(ptr: Int) -> TensorSpec:
+    return TensorSpec(
+        ptr,
+        1,
+        IndexList[MAX_RANK](1),
+        IndexList[MAX_RANK](0),
+        0,
+        DType.float32,
+        4,
+        1,
+        True,
+        0,
+    )
+
+
+def _resolved(call: KernelCall) -> InlineArray[Int, MAX_CALL_SLOTS]:
+    var argv = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+    call._resolve(argv)
+    return argv^
+
+
+def _built_elsewhere() -> KernelCall:
+    """A call built in one frame and returned: the move must not leave any
+    slot pointing into the frame it was built in."""
+    var call = KernelCall("data_movement_ops", "Cast")
+    call.spec(_spec(11))
+    call.int(5)
+    var t = List[Int]()
+    t.append(3)
+    t.append(4)
+    call.tuple(t)
+    call.spec(_spec(22))
+    var big = List[Int]()
+    for i in range(TUPLE_POOL_WORDS + 5):
+        big.append(i)
+    call.tuple(big)
+    return call^
 
 
 def main() raises:
@@ -40,43 +86,19 @@ def main() raises:
     call.int(42)
     assert_equal(call.nspecs, 0)
     for i in range(MAX_CALL_SPECS):
-        call.spec(
-            TensorSpec(
-                i,
-                1,
-                IndexList[MAX_RANK](1),
-                IndexList[MAX_RANK](0),
-                0,
-                DType.float32,
-                4,
-                1,
-                True,
-                0,
-            )
-        )
+        call.spec(_spec(i))
     # Every exposed pointer must remain valid after all subsequent appends.
+    var argv = _resolved(call)
+    assert_equal(argv[0], 42)
     for i in range(MAX_CALL_SPECS):
         var p = Pointer[TensorSpec, MutUntrackedOrigin](
-            unsafe_from_address=call.slots[i + 1]
+            unsafe_from_address=argv[i + 1]
         )
         assert_equal(p[].ptr, i)
         assert_equal(p[].dtype, DType.float32)
     # One spec too many is reported by run(), not by the builder.
     assert_equal(call.defines.bad, "")
-    call.spec(
-        TensorSpec(
-            0,
-            1,
-            IndexList[MAX_RANK](1),
-            IndexList[MAX_RANK](0),
-            0,
-            DType.float32,
-            4,
-            1,
-            True,
-            0,
-        )
-    )
+    call.spec(_spec(0))
     assert_true(call.defines.bad != "")
 
     # Tuple slots read back as `[len, e0, ...]`, from the inline pool and
@@ -93,11 +115,49 @@ def main() raises:
     tuples.tuple(big)
     tuples.tuple(small)
     assert_equal(tuples.defines.bad, "")
+    var targv = _resolved(tuples)
     for slot in range(3):
         ref expected = big if slot == 1 else small
         var p = Pointer[Int, MutUntrackedOrigin](
-            unsafe_from_address=tuples.slots[slot]
+            unsafe_from_address=targv[slot]
         )
         assert_equal(p[], len(expected))
         for i in range(len(expected)):
             assert_equal(p[unsafe_offset=i + 1], expected[i])
+    # The call owns the storage the slots point at, and Mojo destroys it after
+    # its last use: reading a resolved slot past that reads freed memory.
+    _ = tuples^
+
+    # A call built in another frame and moved out of it: every slot must
+    # resolve into the call as it stands now, not where it was built.
+    var moved = _built_elsewhere()
+    assert_equal(moved.defines.bad, "")
+    assert_equal(moved.nslots, 5)
+    var margv = _resolved(moved)
+    var first = Pointer[TensorSpec, MutUntrackedOrigin](
+        unsafe_from_address=margv[0]
+    )
+    assert_equal(first[].ptr, 11)
+    assert_equal(margv[1], 5)
+    var small_tuple = Pointer[Int, MutUntrackedOrigin](
+        unsafe_from_address=margv[2]
+    )
+    assert_equal(small_tuple[], 2)
+    assert_equal(small_tuple[unsafe_offset=1], 3)
+    assert_equal(small_tuple[unsafe_offset=2], 4)
+    var second = Pointer[TensorSpec, MutUntrackedOrigin](
+        unsafe_from_address=margv[3]
+    )
+    assert_equal(second[].ptr, 22)
+    var spilled = Pointer[Int, MutUntrackedOrigin](
+        unsafe_from_address=margv[4]
+    )
+    assert_equal(spilled[], TUPLE_POOL_WORDS + 5)
+    assert_equal(spilled[unsafe_offset=1], 0)
+    assert_equal(spilled[unsafe_offset=TUPLE_POOL_WORDS + 5], TUPLE_POOL_WORDS + 4)
+    # The specs and the pooled tuple must live inside the moved struct.
+    var base = Int(Pointer(to=moved))
+    var span = size_of[KernelCall]()
+    assert_true(margv[0] >= base and margv[0] < base + span)
+    assert_true(margv[2] >= base and margv[2] < base + span)
+    _ = moved^

@@ -232,6 +232,12 @@ comptime MAX_CALL_SLOTS = 24
 # (a foreach launch over many tensors) spills to the heap.
 comptime TUPLE_POOL_WORDS = 96
 
+# What a relocatable slot holds until `_resolve` turns it into an address:
+# a spec index, a word offset into the tuple pool, or a spill index.
+comptime FIX_SPEC = 0
+comptime FIX_POOL = 1
+comptime FIX_SPILL = 2
+
 
 struct KernelCall(Movable):
     """One kernel invocation: the specialization defines plus the argument
@@ -240,6 +246,11 @@ struct KernelCall(Movable):
     address was taken and then handed over as an Int would be gone by the
     time the kernel reads it; owning everything here and calling `run()` on
     the struct keeps every address valid for exactly the call.
+
+    A slot pointing into that storage records an INDEX, not an address, and
+    `_resolve` turns it into an address at run time: the struct is movable, so
+    an address taken when the slot was appended would name the location the
+    call was built in, not the one it is run from.
 
     Every buffer is inline, so a warm call allocates nothing; the capacities
     are therefore fixed, and a builder that does not fit records the reason
@@ -253,9 +264,14 @@ struct KernelCall(Movable):
     var nspecs: Int
     var pool: InlineArray[Int, TUPLE_POOL_WORDS]
     var npool: Int
-    var spill: List[List[Int]]  # tuples too long for `pool`
+    # Tuples too long for `pool`, end to end. One arena rather than a list per
+    # tuple: the slots are resolved in `run()`, so a reallocation here moves
+    # nothing a slot has recorded.
+    var spill: List[Int]
     var slots: InlineArray[Int, MAX_CALL_SLOTS]
     var nslots: Int
+    var fixups: InlineArray[Int, MAX_CALL_SLOTS]  # (slot << 2) | FIX_*
+    var nfix: Int
 
     def __init__(out self, family: StringSlice, op: StringSlice):
         self.family = Name(family)
@@ -264,9 +280,11 @@ struct KernelCall(Movable):
         self.nspecs = 0
         self.pool = InlineArray[Int, TUPLE_POOL_WORDS](uninitialized=True)
         self.npool = 0
-        self.spill = List[List[Int]]()
+        self.spill = List[Int]()
         self.slots = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
         self.nslots = 0
+        self.fixups = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+        self.nfix = 0
         if not self.family.whole:
             self.defines.bad = "family name too long"
         _mix(self.defines.key, self.family.hash)
@@ -291,14 +309,25 @@ struct KernelCall(Movable):
         self.slots[self.nslots] = v
         self.nslots += 1
 
+    @always_inline
+    def _reloc_slot(mut self, index: Int, kind: Int):
+        """A slot holding `index` now and, at run time, the address `kind`
+        derives from it. `fixups` is as wide as `slots`, so it cannot fill
+        before the slot itself is refused."""
+        var at = self.nslots
+        self._slot(index)
+        if self.nslots == at:  # did not fit; `bad` is set
+            return
+        self.fixups[self.nfix] = (at << 2) | kind
+        self.nfix += 1
+
     def spec(mut self, var s: TensorSpec):
         if self.nspecs >= MAX_CALL_SPECS:
             self.defines.bad = "too many spec arguments in one kernel call"
             return
-        var at = self.specs.unsafe_ptr().unsafe_offset(self.nspecs)
-        at.unsafe_write(s^)
+        self.specs.unsafe_ptr().unsafe_offset(self.nspecs).unsafe_write(s^)
+        self._reloc_slot(self.nspecs, FIX_SPEC)
         self.nspecs += 1
-        self._slot(Int(at))
 
     def int(mut self, v: Int):
         self._slot(v)
@@ -315,15 +344,31 @@ struct KernelCall(Movable):
             at[] = len(values)
             for i in range(len(values)):
                 at[unsafe_offset=i + 1] = values[i]
+            self._reloc_slot(self.npool, FIX_POOL)
             self.npool += words
-            self._slot(Int(at))
             return
-        var t = List[Int](capacity=words)
-        t.append(len(values))
+        var at = len(self.spill)
+        self.spill.reserve(at + words)
+        self.spill.append(len(values))
         for v in values:
-            t.append(v)
-        self.spill.append(t^)
-        self._slot(Int(self.spill[len(self.spill) - 1].unsafe_ptr()))
+            self.spill.append(v)
+        self._reloc_slot(at, FIX_SPILL)
+
+    def _resolve(self, mut argv: InlineArray[Int, MAX_CALL_SLOTS]):
+        """The slots as the kernel reads them: every relocatable one becomes
+        an address inside `self` here, so a call that was moved after it was
+        built still hands over live storage."""
+        for i in range(self.nslots):
+            argv[i] = self.slots[i]
+        for i in range(self.nfix):
+            var at = self.fixups[i] >> 2
+            var kind = self.fixups[i] & 3
+            if kind == FIX_SPEC:
+                argv[at] = Int(self.specs.unsafe_ptr().unsafe_offset(argv[at]))
+            elif kind == FIX_POOL:
+                argv[at] = Int(self.pool.unsafe_ptr().unsafe_offset(argv[at]))
+            else:
+                argv[at] = Int(self.spill.unsafe_ptr().unsafe_offset(argv[at]))
 
     def run(self) raises:
         if self.defines.bad:
@@ -336,8 +381,11 @@ struct KernelCall(Movable):
         else:
             entry = l[].entry(self.family.text(), self.defines.sorted())
             l[].fast[self.defines.key] = entry
+        var argv = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+        self._resolve(argv)
         invoke_family(
             entry,
-            Argv(unsafe_from_address=Int(self.slots.unsafe_ptr())),
+            Argv(unsafe_from_address=Int(argv.unsafe_ptr())),
             self.nslots,
         )
+        _ = argv^  # the slots must outlive the call, not the last read of one
