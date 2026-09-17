@@ -37,8 +37,6 @@ from typing import Protocol, cast
 import platformdirs
 import torch
 
-from torch_mojo_backend import _ptxas
-
 _HERE = Path(__file__).resolve().parent
 _PACKAGE = _HERE.parent
 _KERNELS_DIR = _PACKAGE / "eager_kernels"
@@ -657,6 +655,10 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
 
 
 def _build_backend_locked(key: str, out: Path) -> Path:
+    from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
+        _ptxas,
+    )
+
     t0 = time.monotonic()
     tmp = _scratch_dir() / f"backend-{os.getpid()}-{key}.so"
     cmd = backend_build_command(tmp)
@@ -703,6 +705,10 @@ def build_library(
 ) -> Path:
     """Compile a plain Mojo shared library (a C-ABI export set, e.g. the mojoccl
     collectives) once per closure/toolchain, cached like the backend."""
+    from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
+        _ptxas,
+    )
+
     roots = [entry.parent, *(roots or [])]
     closure = _mojo_import_closure(entry, roots)
     tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))

@@ -50,15 +50,21 @@ def _import_and_read(env_value: str | None, var: str | None = None) -> str:
     return next(line for line in out.splitlines() if line.startswith("PTXAS="))[6:]
 
 
-def _expected() -> _ptxas.Ptxas:
-    chosen, _ = _ptxas.choose(_ptxas.driver_cuda_version())
+def _expected() -> tuple[str, str]:
+    driver = _ptxas.driver_cuda_version()
+    if driver is None:
+        # Import does not probe assemblers without a driver. It only uses
+        # the optional wheel's path so CPU build hosts can cross-compile.
+        wheel = _ptxas.wheel_ptxas()
+        path = str(wheel) if wheel is not None else ""
+        return path, path
+    chosen, _ = _ptxas.choose(driver)
     assert chosen is not None, "this machine has to have an assembler that fits"
-    return chosen
+    return "" if chosen.is_builtin else str(chosen.path), chosen.mark
 
 
 def test_import_sets_the_default_when_unset():
-    expected = _expected()
-    path = "" if expected.is_builtin else str(expected.path)
+    path, _ = _expected()
     assert _import_and_read(None) == path
 
 
@@ -70,5 +76,6 @@ def test_the_default_is_marked_as_ours_for_the_children_to_read():
     """A child inherits the environment and nothing else, so the pick is
     marked there: without it every torchrun rank would read an inherited
     default as a setting of the user's (tests/test_ptxas_selection.py)."""
-    assert _import_and_read(None, _ptxas.AUTO_ENV_VAR) == _expected().mark
+    _, mark = _expected()
+    assert _import_and_read(None, _ptxas.AUTO_ENV_VAR) == mark
     assert _import_and_read("/custom/ptxas", _ptxas.AUTO_ENV_VAR) == ""
