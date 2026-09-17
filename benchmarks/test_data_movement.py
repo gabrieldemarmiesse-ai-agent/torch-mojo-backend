@@ -177,6 +177,67 @@ def test_cat(
     )
 
 
+CAT_CAST_SHAPES: dict[str, tuple[int, tuple[int, ...], int]] = {
+    "R2_W15370400_P12": (
+        2,
+        (800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800),
+        0,
+    ),
+    "R2_W3543936_P12": (
+        2,
+        (384, 384, 884736, 1152, 294912, 384, 384, 384, 1179648, 1536, 1179648, 384),
+        0,
+    ),
+    "R1_W16777216_P2": (1, (8388608, 8388608), 0),
+    "R3_W2760_P4": (3, (357, 789, 13, 1601), 0),
+    "R2_W2760_P4_offset1": (2, (357, 789, 13, 1601), 1),
+    "R1_W1038_P4_empty": (1, (0, 7, 0, 1031), 0),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16_f32",))
+@pytest.mark.parametrize("shape_id", CAT_CAST_SHAPES)
+@pytest.mark.parametrize("layout", ("contiguous_cast_out",))
+@pytest.mark.bench_op("cat.out")
+def test_cat_cast_out(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    rows, widths, offset = CAT_CAST_SHAPES[shape_id]
+    refs, ours = [], []
+    for index, width in enumerate(widths):
+        host = (
+            (
+                (
+                    (torch.arange(rows * width, dtype=torch.int64) * 7919 + 13 + index)
+                    % 65521
+                ).float()
+                / 65536
+                - 0.5
+            )
+            .bfloat16()
+            .view(rows, width)
+        )
+        ref, our = both(host, hw, mojo_device)
+        refs.append(ref)
+        ours.append(our)
+    size = rows * sum(widths)
+    ref_base, our_base = both(
+        torch.empty(size + 16, dtype=torch.float32), hw, mojo_device
+    )
+    ref_out = ref_base[offset : offset + size].view(rows, sum(widths))
+    our_out = our_base[offset : offset + size].view(rows, sum(widths))
+    bench.run(
+        lambda: torch.cat(refs, 1, out=ref_out),
+        lambda: torch.cat(ours, 1, out=our_out),
+        flops=float(size),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", STACK_SHAPES)
 def test_stack(
