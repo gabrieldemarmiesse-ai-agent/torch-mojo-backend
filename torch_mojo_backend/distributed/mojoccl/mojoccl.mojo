@@ -315,6 +315,20 @@ def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
 
 
+comptime AG_NODE_BLOCKS = 96
+"""Grid cap of the node-local gathers of a multi-node all-gather, in place
+of the single-node copy cap (432). The gathers run under the forward's and
+backward's GEMMs, so the cap is fitted end to end, not on the isolated
+collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
+reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
+96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
+62.4k. Isolated, 64 blocks still beat NCCL (block bf16 0.92x, root fp32
+0.94x)."""
+comptime AG_NODE_UNROLL = 4
+"""16-byte vectors in flight per thread in those gathers; 8 measured
+66.1k tok/s against 67.3-67.6k at 96 blocks."""
+
+
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
 # reservation conflict (Adastra 124M measurements in docs/distributed.md),
 # and the GPT-2 XL five-round series at 0.9873x stock used it, job 5417296,
@@ -3069,7 +3083,7 @@ def _allgather_node_mapped(
     for l in range(state.local_world):
         ranks[l] = Int32(state.rank_at[node * state.local_world + l])
     state.generation += 1
-    allgather_mapped(
+    allgather_mapped[AG_NODE_UNROLL](
         state.ctx,
         stream,
         state.local_rank,
@@ -3082,6 +3096,7 @@ def _allgather_node_mapped(
         state.generation,
         stride,
         ranks,
+        AG_NODE_BLOCKS,
     )
 
 

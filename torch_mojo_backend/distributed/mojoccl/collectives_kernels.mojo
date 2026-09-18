@@ -3669,7 +3669,9 @@ def allgather(
     )
 
 
-def allgather_mapped(
+def allgather_mapped[
+    U: Int = _UNROLL
+](
     ctx: DeviceContext,
     stream: DeviceStream,
     rank: Int,
@@ -3682,6 +3684,7 @@ def allgather_mapped(
     generation: Int,
     stride_bytes: Int,
     rank_at: StaticTuple[Int32, MAX_WORLD],
+    max_blocks: Int = _COPY_MAX_BLOCKS,
 ) raises:
     """Gather local ranks directly into their mapped global output slots."""
     _check_common(rank, world, cap_bytes, generation)
@@ -3694,18 +3697,20 @@ def allgather_mapped(
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:
         raise Error("collectives: stride_bytes < nbytes_per_rank")
+    if max_blocks < 1 or max_blocks > MAX_BLOCKS:
+        raise Error("collectives: allgather grid cap out of range")
     var rp = _region_ptrs(regions, rank, world)
     var blocks = min(
-        _COPY_MAX_BLOCKS,
+        max_blocks,
         max(1, (nbytes_per_rank // 16 + BLOCK - 1) // BLOCK),
     )
     var ranks = InlineArray[Int32, MAX_WORLD](fill=0)
     for i in range(world):
         ranks[i] = rank_at[i]
-    _enqueue_cached[_allgather_mapped_kernel[_UNROLL]](
+    _enqueue_cached[_allgather_mapped_kernel[U]](
         ctx,
         stream,
-        "allgather_mapped",
+        String(t"allgather_mapped_u{U}"),
         blocks,
         rp,
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=in_ptr),
