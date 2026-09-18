@@ -97,7 +97,8 @@ and its all-gather is the unicast minimum; both are measured against NCCL at
 FSDP2's sizes in "Mojo collectives" below. Across nodes the reduce-scatter
 reduces node-locally and exchanges one destination shard per rank over RDMA,
 and the all-gather sends one contribution per NIC; both are pipelined and
-their grids are sized so the GEMMs keep their SMs (same section). Neither
+their grids are sized so the GEMMs keep their SMs (same section); both
+schedules cross-compile for gfx942 but are measured on H100 only. Neither
 modifies the input, except when the caller explicitly uses its own input
 shard as the output (which NCCL also allows).
 
