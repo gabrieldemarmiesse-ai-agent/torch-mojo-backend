@@ -36,25 +36,25 @@ medians above include those windows.
 ### Two nodes, sixteen GPUs (sequence length 1024, batch 1 per GPU)
 
 Nodes `par2dc5-ai-prd-cl02s03dgx28` + `dgx29` (Slurm job 259332, InfiniBand,
-64 CPUs per node), commit `64d3d24` (hierarchical multi-node reduce-scatter,
-per-NIC all-gather, in-kernel RDMA release, rank gate). 24 windows per stack:
-four palindromes of CUDA, NCCL, MojoCCL, MojoCCL, NCCL, CUDA, three windows
-per launch; raw records under
-`~/projects/tmp/fsdp2-2node/results/int2_xl/` (outside the repo).
+64 CPUs per node), commit `096979a0` (hierarchical multi-node reduce-scatter
+with the streaming kernel, per-NIC all-gather with in-kernel RDMA release,
+rank gate). 18 windows per stack: three palindromes of CUDA, NCCL, MojoCCL,
+MojoCCL, NCCL, CUDA, three windows per launch; raw records under
+`~/projects/tmp/fsdp2-2node/results/int4_xl/` (outside the repo).
 
 | Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
 |---|---:|---:|---:|
-| Stock PyTorch CUDA + NCCL | 70,766.3 | 100% | 63,998.7–71,413.6 |
-| Torch Mojo + NCCL | 67,487.0 | 95.4% | 59,707.5–69,467.2 |
-| Torch Mojo + MojoCCL | 66,174.8 | 93.5% | 61,188.5–69,419.7 |
+| Stock PyTorch CUDA + NCCL | 70,819.0 | 100% | 61,649.5–71,346.7 |
+| Torch Mojo + NCCL | 68,692.2 | 97.0% | 60,166.0–69,621.3 |
+| Torch Mojo + MojoCCL | 67,173.7 | 94.9% | 60,854.9–70,288.5 |
 
-MojoCCL is within 2% of NCCL as the collective library (98.1%); the Mojo
-device itself is 4.6% behind stock CUDA at 16 ranks, so neither Mojo stack
-is inside the 4% bar here yet. Earlier six-window runs on other node pairs
-(dgx01 + dgx12) read NCCL at 97.5% and 100.5% and MojoCCL at 96.6% and
-93.4%: two-node windows spread ±5% and the node pair matters, so only long
-interleaved runs like this one are comparable. The step before the
-hierarchical reduce-scatter was 14,608.6 tok/s (20.9%) with MojoCCL.
+MojoCCL is at 97.8% of NCCL as the collective library. Two-node windows
+spread ±7% on every stack (each stack has ~1 in 6 windows 10% below its
+median), so single six-window runs on this node pair have read NCCL
+anywhere from 95.4% to 100.5% and MojoCCL from 92.6% to 96.6%; only long
+interleaved runs like this one are comparable, and 2–3% differences are at
+the noise floor. The step before the hierarchical reduce-scatter was
+14,608.6 tok/s (20.9%) with MojoCCL.
 
 What closed the gap from the 84.8% snapshot below (both stacks are
 host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every
