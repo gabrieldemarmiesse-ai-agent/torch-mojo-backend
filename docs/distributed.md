@@ -688,6 +688,23 @@ ranks may disagree about it and stay block-matched.
 Every cross-link byte goes in the **write** direction, so unlike the
 allreduce and the all-gather this schedule needs no separate AMD variant.
 
+On one node, at the FSDP2 shapes and against NCCL on the same GPUs (H100
+SXM, `--core`, CUPTI device time, median over ranks, unlocked clocks, us):
+
+| single node, per rank | NCCL | mojoccl | ratio |
+|---|---:|---:|---:|
+| 2 ranks, XL block fp32 (61.4 MB) | 276 | 262 | **0.95** |
+| 2 ranks, XL root fp32 (164 MB) | 677 | 688 | **1.02** |
+| 8 ranks, XL block fp32 (15.4 MB) | 345 | 370 | **1.07** |
+| 8 ranks, XL root fp32 (41 MB) | 864 | 1000 | 1.16 |
+| 8 ranks, 357x789 at an odd offset (1.1 MB) | 51 | 104 | 2.03 |
+| 8 ranks, 256 KB | 19 | 15 | **0.80** |
+
+The 8-rank root is this same push-then-reduce shape one node down: 7 shard
+pushes of 41 MB at the fabric's rate, then an 8-way HBM reduce that only
+starts once every rank's push is in. At 2 ranks there is one push and the
+reduce is two streams, so there is nothing to hide and it is at parity.
+
 Across nodes, each local rank reduces the chunks destined for that local
 rank on every node, using the bootstrap topology table to address input
 chunks. Each remote node receives only its own partial through the existing
