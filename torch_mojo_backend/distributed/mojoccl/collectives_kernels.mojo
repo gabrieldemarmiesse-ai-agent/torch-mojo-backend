@@ -1268,9 +1268,11 @@ def _share[
 
     Scaling the finished sum instead overflows where NCCL does not -- two fp32
     ranks contributing 2**127 average to inf rather than to 2**127 -- and for
-    a power-of-two world x/world is exact, so pre-scaling rounds no more than
-    the sum did. This is NCCL's PreMulSum for AVG
-    (nccl:src/enqueue/enqueue.cc:2517), and what the NVLS path already does at
+    a power-of-two world x/world is exact away from the subnormal range (a
+    contribution below 2**-149 * world rounds to zero before the sum), so the
+    result matches post-scaling everywhere else. This is NCCL's PreMulSum for
+    AVG (nccl:src/enqueue/enqueue.cc:2517) applied in the fp32 accumulator
+    rather than in the tensor dtype, and what the NVLS path already does at
     copy-in. Integer dtypes ignore `scale`, as ncclAvg does; `scale` is 1 for
     SUM, and the multiply by it is exact.
     """
