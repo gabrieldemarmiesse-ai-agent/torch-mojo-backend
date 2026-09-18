@@ -582,9 +582,10 @@ def _build_shim_locked(
 
 def _mojo_closure() -> list[Path]:
     """Everything the backend build reads: its own sources plus the shared
-    eager_kernels modules it imports (op_utils, variant_gates)."""
+    eager_kernels modules and the graph/native SIMD math they import."""
     files = sorted(_MOJO_SRC.glob("*.mojo"))
     files += sorted((_KERNELS_DIR / "op_utils").glob("*.mojo"))
+    files += sorted((_KERNELS_DIR.parent / "mojo_kernels").glob("*.mojo"))
     files.append(_KERNELS_DIR / "variant_gates.mojo")
     return files
 
@@ -639,6 +640,8 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
         str(_MOJO_SRC),
         "-I",
         str(_KERNELS_DIR),
+        "-I",
+        str(_KERNELS_DIR.parent),
         "--target-cpu",
         portable_target_cpu(),
         "-o",
