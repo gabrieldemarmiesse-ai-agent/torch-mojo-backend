@@ -35,19 +35,22 @@ medians above include those windows.
 
 ### Two nodes, sixteen GPUs (sequence length 1024, batch 1 per GPU)
 
-Nodes `par2dc5-ai-prd-cl02s01dgx01` + `cl02s02dgx12` (Slurm job 258042,
-InfiniBand), six windows per stack; raw records under
-`~/projects/tmp/fsdp2-2node/results/fsdp2_2node_258042/` (outside the repo).
+Nodes `par2dc5-ai-prd-cl02s01dgx01` + `cl02s02dgx12` (Slurm job 258050,
+InfiniBand, 64 CPUs per node), six windows per stack in palindromic order
+(CUDA, NCCL, MojoCCL, MojoCCL, NCCL, CUDA); raw records under
+`~/projects/tmp/fsdp2-2node/harness/results_final/xl/` (outside the repo).
 
 | Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
 |---|---:|---:|---:|
-| Stock PyTorch CUDA + NCCL | 69,751.3 | 100% | 62,429.7–70,851.6 |
-| Torch Mojo + NCCL | 68,012.9 | 97.5% | 63,082.2–69,424.4 |
-| Torch Mojo + MojoCCL | 14,608.6 | 20.9% | 14,498.5–14,762.9 |
+| Stock PyTorch CUDA + NCCL | 68,768.8 | 100% | 65,253.9–71,466.0 |
+| Torch Mojo + NCCL | 69,134.5 | 100.5% | 62,403.5–69,833.8 |
+| Torch Mojo + MojoCCL | 66,405.6 | 96.6% | 60,757.7–69,933.3 |
 
-MojoCCL's multi-node reduce-scatter is still the correctness-first
-placeholder (chunked all-reduce of every destination's slice plus a host
-synchronize per call); its hierarchical replacement is in progress.
+The step before this was the multi-node reduce-scatter placeholder
+(14,608.6 tok/s, 20.9%); the hierarchical schedule with its isolated-best
+grids (128 reduce-scatter CTAs, 432-block gathers) measured 62,367 (88.8%),
+and fitting both grids end to end (32 and 96) the 66,406 above -- see
+"Reduce-scatter" in [distributed.md](distributed.md).
 
 What closed the gap from the 84.8% snapshot below (both stacks are
 host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every

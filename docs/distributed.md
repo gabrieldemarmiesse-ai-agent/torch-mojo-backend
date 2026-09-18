@@ -94,10 +94,12 @@ Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. On one node its
 reduce-scatter is a real reduce-scatter — one kernel per call, `(world-1)/
 world × bytes` on the wire, nothing allocated and no stream synchronized —
 and its all-gather is the unicast minimum; both are measured against NCCL at
-FSDP2's sizes in "Mojo collectives" below. Multi-node reduce-scatter reduces
-node-local contributions and exchanges destination shards over RDMA. Neither modifies the input,
-except when the caller explicitly uses its own input shard as the output
-(which NCCL also allows).
+FSDP2's sizes in "Mojo collectives" below. Across nodes the reduce-scatter
+reduces node-locally and exchanges one destination shard per rank over RDMA,
+and the all-gather sends one contribution per NIC; both are pipelined and
+their grids are sized so the GEMMs keep their SMs (same section). Neither
+modifies the input, except when the caller explicitly uses its own input
+shard as the output (which NCCL also allows).
 
 `demo_scripts/gpt2_fsdp2.py` exercises GPT-2 124M and XL without downloading
 weights or a dataset. It uses the standard architecture, random initial
@@ -693,15 +695,28 @@ directly into the caller's output. On two nodes each rank sends `count`
 elements, with no all-gather phase, temporary allocation, or host stream
 synchronization. Larger messages use the existing staging arenas and inbox
 credits to pipeline chunks. AVG scales each input before the node-local sum.
-NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
-mailbox release, bounded completion wait, output sum, and credit return.
-Other dtypes and targets use separate kernels for these phases. Calls whose
-chunk count exceeds the existing work ring also use the split schedule.
+NVIDIA fp32 runs the pipeline in one persistent kernel (`rs_fused.mojo`):
+local reduction, mailbox release, bounded completion wait, output sum, and
+credit return, two chunks per call so only the second exchange is exposed
+(`RS_FUSED_TARGET_CHUNKS`). Other dtypes and targets use separate kernels
+for these phases (`rs_multinode.mojo`). Calls whose chunk count exceeds the
+existing work ring also use the split schedule.
+
+Its grid is fitted end to end, not on the isolated collective, and the two
+fits disagree: 128 CTAs make the isolated root reduce-scatter 1.2x NCCL and
+32 CTAs 1.5x, but every CTA holds an SM's register file for the call and the
+backward's GEMMs lose those SMs, so GPT-2 XL FSDP2 on 2x8 H100 runs 62.4k
+tok/s at 128 CTAs and 67.0-67.6k at 32 (`RS_FUSED_BIG_BLOCKS`, with the
+sweep). The node-local gathers of the multi-node all-gather are capped the
+same way (`AG_NODE_BLOCKS`, 96 against the single-node 432) and the progress
+thread keeps polling between the chunks of one call instead of sleeping
+(`BATCH_POLL_NS`). NCCL's kernels here are 16 CTAs of 544 threads.
 
 The former multi-node implementation all-reduced 1 MiB chunks of every
-destination's slice and synchronized the host to release temporary memory.
-The single-node measurements below compare against that former schedule;
-they are not measurements of the hierarchical multi-node path.
+destination's slice and synchronized the host to release temporary memory
+(16 ranks: 32x NCCL's device time on an XL block, 39x on the root). The
+single-node measurements below compare against that former schedule; the
+16-rank numbers are under "Multi-node".
 
 Measured through the library's own exported entry points on 2×H100 SXM
 (NV18), one process per GPU, 20 back-to-back calls per burst, four bursts in
@@ -1037,6 +1052,36 @@ follow each chunk's remote consumers; the source arena is reused only after
 its send and consumers complete. Broadcast and the other-target all-gather
 schedule remain unpipelined. Single-node
 communicators keep the fused intra-node path and never touch IB.
+
+Measured at 16 ranks (2x8 H100 SXM, InfiniBand, job 258050) through the
+library's exported entry points, CUPTI device time of the comm stream,
+median over ranks of complete-call sums, vendor/mojo ABBA in one process
+(`tmp/fsdp2-2node/harness`, `results_final/bench_abba.json`); NCCL 2.28
+picked RING_LL for both collectives. The reduce-scatter grid is 32 CTAs
+because the GEMMs it runs under decide the step, not this table (see
+"Reduce-scatter" above): the same kernel at 128 CTAs measures root 1263 us.
+
+| 16 ranks, per rank | NCCL us | mojoccl us | ratio | launches | host us NCCL / mojo |
+|---|---:|---:|---:|---:|---:|
+| all-gather bf16, XL block (3.84 MB) | 398 | 350 | **0.88** | 4 | 12.0 / 13.1 |
+| all-gather fp32, XL root (20.5 MB) | 1086 | 1027 | **0.95** | 8 | 12.0 / 22.2 |
+| reduce-scatter fp32 SUM, XL block (7.68 MB) | 523 | 669 | 1.28 | 1 | 12.3 / 6.5 |
+| reduce-scatter fp32 AVG, XL block | 524 | 666 | 1.27 | 1 | 12.1 / 6.4 |
+| reduce-scatter fp32 SUM, XL root (20.5 MB) | 1052 | 1566 | 1.49 | 1 | 11.9 / 6.6 |
+| reduce-scatter fp32, 357x789 at an odd offset | 164 | 312 | 1.90 | 1 | 12.2 / 6.2 |
+| all-gather fp32, 357x789 at an odd offset | 168 | 179 | 1.07 | 4 | 12.0 / 12.5 |
+
+The placeholder these replaced measured 16,623 / 41,256 us on the block /
+root reduce-scatter (32x / 39x) with a host synchronize per call; the
+Nsight probe of the new paths sees no synchronize or query inside any
+reduce-scatter or all-gather enqueue. End to end, GPT-2 XL FSDP2 on those
+two nodes: CUDA + NCCL 68,769, Mojo + NCCL 69,134, Mojo + MojoCCL 66,406
+tok/s (96.6% of stock; six windows each, palindromic order). The 124M
+five-step fp32 loss trajectory matches NCCL's exactly at four steps and
+differs by one fp32 ULP at one (9.151466 vs 9.151465): AVG's 1/16 is
+applied to every input before either sum, as NCCL does, but the eight
+node-local terms and two node partials associate differently from a
+16-step ring, so the last bit of an fp32 sum can differ.
 
 **The three phases overlap, inside one kernel.** The bucket is cut into K
 chunks, with at most `PIPE_ARENAS` chunks alive:
