@@ -94,8 +94,8 @@ Set `TORCH_MOJO_BACKEND_CCL=mojo` to use MojoCCL. On one node its
 reduce-scatter is a real reduce-scatter — one kernel per call, `(world-1)/
 world × bytes` on the wire, nothing allocated and no stream synchronized —
 and its all-gather is the unicast minimum; both are measured against NCCL at
-FSDP2's sizes in "Mojo collectives" below. Multi-node reduce-scatter still
-takes the placeholder schedule described there. Neither modifies the input,
+FSDP2's sizes in "Mojo collectives" below. Multi-node reduce-scatter reduces
+node-local contributions and exchanges destination shards over RDMA. Neither modifies the input,
 except when the caller explicitly uses its own input shard as the output
 (which NCCL also allows).
 
@@ -685,14 +685,23 @@ ranks may disagree about it and stay block-matched.
 Every cross-link byte goes in the **write** direction, so unlike the
 allreduce and the all-gather this schedule needs no separate AMD variant.
 
-What it replaced (`_reduce_scatter_multinode`, still the multi-node path)
-all-reduced 1 MiB chunks of *every* destination's slice through a scratch
-buffer and synchronized the host on every call: `world ×` the traffic, ~122
-launches per call, and 5978 reduce-scatter plus 8967 copy kernels on the comm
-stream per GPT-2 XL step (117 ms of the step). It is kept for multi-node
-because it is correct at any node count and no multi-node reduce-scatter
-workload has been measured; a hierarchical schedule (node-local push/reduce,
-one RDMA exchange, place) is the replacement.
+Across nodes, each local rank reduces the chunks destined for that local
+rank on every node, using the bootstrap topology table to address input
+chunks. Each remote node receives only its own partial through the existing
+RDMA exchange; an add kernel combines incoming partials with the local one
+directly into the caller's output. On two nodes each rank sends `count`
+elements, with no all-gather phase, temporary allocation, or host stream
+synchronization. Larger messages use the existing staging arenas and inbox
+credits to pipeline chunks. AVG scales each input before the node-local sum.
+NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
+mailbox release, bounded completion wait, output sum, and credit return.
+Other dtypes and targets use separate kernels for these phases. Calls whose
+chunk count exceeds the existing work ring also use the split schedule.
+
+The former multi-node implementation all-reduced 1 MiB chunks of every
+destination's slice and synchronized the host to release temporary memory.
+The single-node measurements below compare against that former schedule;
+they are not measurements of the hierarchical multi-node path.
 
 Measured through the library's own exported entry points on 2×H100 SXM
 (NV18), one process per GPU, 20 back-to-back calls per burst, four bursts in
@@ -1009,10 +1018,24 @@ small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
 the user output. AVG's 1/world is applied by the reduce-scatter to each input
 (NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
-in a half dtype. Broadcast and all-gather use the same RDMA
-path with a simpler schedule (root's node fans out to its counterparts, then
-intra-node; node blocks exchanged, then placed by global rank) and stay
-unpipelined — they run at DDP init, not in the step. Single-node
+in a half dtype. Broadcast uses the same RDMA path: the root's node fans
+out to its counterparts, then each node broadcasts locally. All-gather
+first gathers local contributions into a node block, then each rank sends
+only its own contribution to the same local rank on each remote node.
+After the exchange, node-local all-gathers disseminate the received
+contributions, and placement follows the bootstrap global-rank table.
+On NVIDIA each local all-gather writes directly into the mapped global
+output slots, and its local staging supplies the RDMA send. Other targets
+place the local block while the network transfer runs. Staging is reused
+only after send completion. NVIDIA all-gather pipelines two chunks through
+separate existing arenas, overlapping a network exchange with the next local
+gather and the earlier remote gather. Messages at least
+`PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
+chunks unless region capacity requires more. This threshold was measured on
+2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
+follow each chunk's remote consumers; the source arena is reused only after
+its send and consumers complete. Broadcast and the other-target all-gather
+schedule remain unpipelined. Single-node
 communicators keep the fused intra-node path and never touch IB.
 
 **The three phases overlap, inside one kernel.** The bucket is cut into K

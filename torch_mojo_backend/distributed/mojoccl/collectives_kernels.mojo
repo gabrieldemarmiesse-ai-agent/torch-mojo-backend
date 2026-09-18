@@ -2446,12 +2446,18 @@ def _bcast_kernel[
             )
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
-)
-@__name("ccl_allgather_bytes")
-def _allgather_kernel[
-    U: Int
+@always_inline
+def _allgather_rank[
+    MAPPED: Bool
+](rank_at: InlineArray[Int32, MAX_WORLD], rank: Int) -> Int:
+    comptime if MAPPED:
+        return Int(rank_at[rank])
+    return rank
+
+
+@always_inline
+def _allgather_body[
+    U: Int, MAPPED: Bool
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
@@ -2463,6 +2469,7 @@ def _allgather_kernel[
     rank_i: Int32,
     flag_base: UInt64,
     timeout_ns: UInt64,
+    rank_at: InlineArray[Int32, MAX_WORLD],
 ):
     """Local stage + peer gather -- already the unicast minimum: `nbytes` of
     local copy and `(world-1)*nbytes` of peer reads per GPU.
@@ -2493,7 +2500,13 @@ def _allgather_kernel[
         ):
             return
         _copy_bytes[U](
-            out_ptr.unsafe_offset(rank * out_stride), in_ptr, n, tid, stride
+            out_ptr.unsafe_offset(
+                _allgather_rank[MAPPED](rank_at, rank) * out_stride
+            ),
+            in_ptr,
+            n,
+            tid,
+            stride,
         )
         for i in range(1, world):
             var p = rank + _peer_step(i, world)
@@ -2523,7 +2536,9 @@ def _allgather_kernel[
             if p >= world:
                 p -= world
             _copy_bytes[U](
-                out_ptr.unsafe_offset(p * out_stride),
+                out_ptr.unsafe_offset(
+                    _allgather_rank[MAPPED](rank_at, p) * out_stride
+                ),
                 regions[rank].unsafe_offset(
                     stage_off + slot * _gather_slot(p, rank)
                 ),
@@ -2542,7 +2557,9 @@ def _allgather_kernel[
     # read) and my own slice of the output.
     _copy_bytes2[U](
         regions[rank].unsafe_offset(stage_off),
-        out_ptr.unsafe_offset(rank * out_stride),
+        out_ptr.unsafe_offset(
+            _allgather_rank[MAPPED](rank_at, rank) * out_stride
+        ),
         in_ptr,
         n,
         tid,
@@ -2559,12 +2576,81 @@ def _allgather_kernel[
         if p >= world:
             p -= world
         _copy_bytes[U](
-            out_ptr.unsafe_offset(p * out_stride),
+            out_ptr.unsafe_offset(
+                _allgather_rank[MAPPED](rank_at, p) * out_stride
+            ),
             regions[p].unsafe_offset(stage_off),
             n,
             tid,
             stride,
         )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_allgather_bytes")
+def _allgather_kernel[
+    U: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[UInt8, MutAnyOrigin],
+    out_ptr: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int64,
+    stride_b: Int64,
+    stage_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    timeout_ns: UInt64,
+):
+    _allgather_body[U, False](
+        regions,
+        in_ptr,
+        out_ptr,
+        nbytes,
+        stride_b,
+        stage_off_b,
+        world_i,
+        rank_i,
+        flag_base,
+        timeout_ns,
+        InlineArray[Int32, MAX_WORLD](fill=0),
+    )
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_allgather_mapped_bytes")
+def _allgather_mapped_kernel[
+    U: Int
+](
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    in_ptr: Pointer[UInt8, MutAnyOrigin],
+    out_ptr: Pointer[UInt8, MutAnyOrigin],
+    nbytes: Int64,
+    stride_b: Int64,
+    stage_off_b: Int64,
+    world_i: Int32,
+    rank_i: Int32,
+    flag_base: UInt64,
+    timeout_ns: UInt64,
+    rank_at: InlineArray[Int32, MAX_WORLD],
+):
+    _allgather_body[U, True](
+        regions,
+        in_ptr,
+        out_ptr,
+        nbytes,
+        stride_b,
+        stage_off_b,
+        world_i,
+        rank_i,
+        flag_base,
+        timeout_ns,
+        rank_at,
+    )
 
 
 # ===-------------------------------------------------------------------=== #
@@ -3580,4 +3666,56 @@ def allgather(
         Int32(rank),
         _flag_target(generation, 0),
         spin_timeout_ns(),
+    )
+
+
+def allgather_mapped(
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    in_ptr: Int,
+    out_ptr: Int,
+    nbytes_per_rank: Int,
+    cap_bytes: Int,
+    generation: Int,
+    stride_bytes: Int,
+    rank_at: StaticTuple[Int32, MAX_WORLD],
+) raises:
+    """Gather local ranks directly into their mapped global output slots."""
+    _check_common(rank, world, cap_bytes, generation)
+    if nbytes_per_rank == 0:
+        return
+    if nbytes_per_rank < 0:
+        raise Error("collectives: nbytes_per_rank must be >= 0")
+    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
+        raise Error("collectives: allgather message exceeds cap_bytes")
+    var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
+    if stride < nbytes_per_rank:
+        raise Error("collectives: stride_bytes < nbytes_per_rank")
+    var rp = _region_ptrs(regions, rank, world)
+    var blocks = min(
+        _COPY_MAX_BLOCKS,
+        max(1, (nbytes_per_rank // 16 + BLOCK - 1) // BLOCK),
+    )
+    var ranks = InlineArray[Int32, MAX_WORLD](fill=0)
+    for i in range(world):
+        ranks[i] = rank_at[i]
+    _enqueue_cached[_allgather_mapped_kernel[_UNROLL]](
+        ctx,
+        stream,
+        "allgather_mapped",
+        blocks,
+        rp,
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=in_ptr),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=out_ptr),
+        Int64(nbytes_per_rank),
+        Int64(stride),
+        Int64(_SIGNAL_BYTES),
+        Int32(world),
+        Int32(rank),
+        _flag_target(generation, 0),
+        spin_timeout_ns(),
+        ranks,
     )

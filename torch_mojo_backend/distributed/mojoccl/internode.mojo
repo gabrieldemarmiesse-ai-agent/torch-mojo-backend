@@ -216,6 +216,7 @@ comptime OP_UNKNOWN = 0
 comptime OP_ALLREDUCE = 1
 comptime OP_BROADCAST = 2
 comptime OP_ALLGATHER = 3
+comptime OP_REDUCE_SCATTER = 4
 """Which collective an exchange belongs to, carried in its work item for the
 stall messages only. `mojoccl.mojo` passes it to `ib_enqueue_request`."""
 
@@ -227,6 +228,8 @@ def _op_name(kind: Int) -> String:
         return String("broadcast")
     if kind == OP_ALLGATHER:
         return String("allgather")
+    if kind == OP_REDUCE_SCATTER:
+        return String("reduce_scatter")
     return String("?")
 
 
@@ -281,6 +284,7 @@ struct IbWork(Copyable, Movable):
     var state: Int
     var send_addr: Int
     var send_bytes: Int
+    var send_node_stride: Int  # zero broadcasts; otherwise one payload per node
     var inbox_base: Int  # region offset of this exchange's inbox slot group
     var slot_bytes: Int
     var do_send: Int
@@ -312,6 +316,7 @@ struct IbWork(Copyable, Movable):
         self.state = 0
         self.send_addr = 0
         self.send_bytes = 0
+        self.send_node_stride = 0
         self.inbox_base = 0
         self.slot_bytes = 0
         self.do_send = 0
@@ -684,7 +689,7 @@ def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
             rc = vrb_post_payload(
                 _vn(st)[],
                 i,
-                w.send_addr,
+                w.send_addr + p.node * w.send_node_stride,
                 w.send_bytes,
                 raddr,
                 p.remote_key,
@@ -695,7 +700,7 @@ def _post_data(mut st: IbState, mut w: IbWork) -> Bool:
             rc = fab_post_write(
                 _fn(st)[],
                 i,
-                w.send_addr,
+                w.send_addr + p.node * w.send_node_stride,
                 w.send_bytes,
                 raddr,
                 p.remote_key,
@@ -1628,6 +1633,7 @@ def ib_prepare_request(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     """Describe exchange `seq` for the engine without releasing it.
 
@@ -1660,6 +1666,7 @@ def ib_prepare_request(
         op_chunk,
         op_nchunks,
         op_numel,
+        send_node_stride,
     )
 
 
@@ -1792,6 +1799,7 @@ def _fill_work(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     ref w = _work(st, seq)[]
     if may_wait:
@@ -1807,6 +1815,7 @@ def _fill_work(
     w.state = ib
     w.send_addr = send_addr
     w.send_bytes = send_bytes
+    w.send_node_stride = send_node_stride
     w.inbox_base = inbox_base
     w.slot_bytes = slot_bytes
     w.do_send = 1 if do_send else 0
@@ -1841,6 +1850,7 @@ def ib_enqueue_request(
     op_chunk: Int = 0,
     op_nchunks: Int = 0,
     op_numel: Int = 0,
+    send_node_stride: Int = 0,
 ) raises:
     """Release exchange `seq` to the network, at this point in stream order.
 
@@ -1874,6 +1884,7 @@ def ib_enqueue_request(
         op_chunk,
         op_nchunks,
         op_numel,
+        send_node_stride,
     )
     if st.proxy:
         proxy_request(ctx, stream, st.mailbox_dev + MB_REQUEST, seq)
