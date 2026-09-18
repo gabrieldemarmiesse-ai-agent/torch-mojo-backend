@@ -385,8 +385,8 @@ def _float_unary[
         res = log(a)
     comptime if op_code == UOP_LOG2:
         res = log2(a)
-        comptime if dtype == DType.float64:
-            # std.math.log2's double approximation omits the +inf case.
+        comptime if dtype == DType.float64 or is_apple_gpu():
+            # The double approximation and Metal's float log2 omit +inf.
             res = a.eq(max_or_inf[dtype]()).select(a, res)
     comptime if op_code == UOP_LOG1P:
         comptime if is_apple_gpu():

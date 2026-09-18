@@ -713,7 +713,9 @@ That one base library per platform can drive any GPU only because it holds
 no device code, and `tests/test_backend_has_no_device_code.py` holds it to
 that on every commit: it builds the library with the production command for
 no accelerator, Apple M4, MI300A and H100, and requires the four shared
-libraries to be byte-identical with no `.ptx`/`.amdgcn`/`.ll` sidecar. A
+libraries (or their lowered LLVM programs) to be byte-identical with no
+`.ptx`/`.amdgcn`/`.ll` sidecar. Mojo 26.5's Darwin host optimizer can emit
+different machine code from identical LLVM for different accelerator flags. A
 control in the same file builds a one-kernel module for two targets and
 requires those to differ, so the equality cannot pass vacuously.
 
@@ -763,13 +765,30 @@ The build-failure message names the `-D` set of the specialization, so a
 failing family can be rebuilt by hand with the same `mojo build` line.
 
 What MAX 26.5's Metal backend does not have: user-created streams
-(`createStream is not supported on this device`) and therefore events on
-them, so `torch.mojo.Stream()` raises and everything runs on the device's
-default stream; and host callbacks, which is why host-to-device copies take
+(`createStream is not supported on this device`) or device events
+(`eventCreate is not supported on this device`, including the default stream).
+`torch.Stream(device="mojo")` therefore always identifies the default stream
+(`stream_id == 0`, matching MPS — see `docs/streams.md`), while recording an
+event still raises; and host callbacks, which is why host-to-device copies take
 the synchronous route there (`copy_from_host`; unified memory makes the
 pinned staging pointless anyway). Checked on an M4 (macOS 26.6.1): the
-bring-up tests pass except the stream/event ones, and the op groups run
+bring-up tests pass except the event ones, and the op groups run
 against CPU torch like on CUDA.
+
+`torch.compile(backend=mojo_backend)` exchanges allocations with the native
+Metal device through DLPack without host staging. MAX does not support external
+Metal streams, so the handoff synchronizes the producing queue. MAX 26.5's raw
+D2D copy routine rejects imported Metal buffers that its kernels can read;
+that specific failure uses the existing byte-copy kernel on the current queue.
+Other copy errors still propagate.
+
+Metal half-precision ROI/PSROI and deformable-convolution backward scatter use
+one float32 workspace word per half accumulator because Metal has no 16-bit
+atomic add/CAS. Each atomic update rounds to half before storing, preserving
+half accumulation semantics, then a final kernel casts to the output tensor.
+Cumulative sums use the portable per-line kernels, including half/bfloat16 and
+rank-2 dimension 0. Operations requiring float64, such as `float_power`, remain
+unavailable on Metal.
 
 ## Triton
 
@@ -983,6 +1002,11 @@ with torch.autograd.profiler.profile(use_device="mojo") as prof:
     ...
 prof.key_averages().table(sort_by="self_device_time_total")   # "Self MOJO" columns
 ```
+
+MAX 26.5 cannot create timed events on Metal. The legacy profiler reports
+that unsupported operation through PyTorch's callback warnings; it does not
+provide Metal device timings. Failed event creation is checked before use
+so profiling cannot dereference a null event.
 
 `torch.profiler.profile(activities=[CPU, PrivateUse1])` records the CPU-side
 op timeline and exports Chrome traces; device kernel rows need the Kineto

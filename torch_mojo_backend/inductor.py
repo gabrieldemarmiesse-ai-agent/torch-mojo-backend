@@ -138,6 +138,7 @@ def _hip_device_properties(index: int) -> MojoDeviceProperties:
     new native code. Its dict's `arch` carries ROCm feature suffixes
     (e.g. "gfx942:sramecc+:xnack-"); `HIPDriver.get_current_target` strips
     them the same way before handing the bare gfx string to Triton."""
+    # Optional Triton dependency: its wheels are unavailable on macOS.
     from triton.backends.amd.driver import (  # noqa: PLC0415 -- triton is optional
         HIPUtils,
     )

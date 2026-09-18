@@ -259,8 +259,8 @@ def _run_gpu_probe() -> str:
 
 def test_collective_library_matches_the_gpu_vendor():
     """NCCL on NVIDIA, RCCL on AMD — one binding, the vendor picks the .so."""
-    if _gpu_count() < 1:
-        pytest.skip("needs a GPU")
+    if not any(d.api in ("cuda", "hip") for d in get_accelerators()):
+        pytest.skip("NCCL/RCCL requires a CUDA or HIP GPU")
     out = _run_gpu_probe()
     vendor = out.split("vendor ", 1)[1].split()[0]
     assert vendor in ("nccl", "rccl"), out
@@ -271,8 +271,8 @@ def test_hip_pointer_ordinal_identifies_the_owning_gpu():
     """hip_peer reads device identity off the POINTER, like cuda_peer does:
     the ordinal RCCL binds a communicator to is a fact about the allocation,
     not an assumption that MAX and HIP enumerate alike."""
-    if _gpu_count() < 1:
-        pytest.skip("needs a GPU")
+    if not any(d.api == "hip" for d in get_accelerators()):
+        pytest.skip("needs an AMD GPU")
     out = _run_gpu_probe()
     if "vendor rccl" not in out:
         pytest.skip("needs an AMD GPU")

@@ -453,13 +453,6 @@ def test_foreach_norm_scalar_ord_one_uses_fallback(mojo_gpu: str):
         torch.testing.assert_close(a.cpu(), e, rtol=2e-6, atol=2e-7)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "sequential fallback needs mul_.Scalar registered by the binary"
-        " group; not yet present in this worktree"
-    ),
-    strict=False,
-)
 def test_batched_foreach_falls_back_for_non_f32(mojo_gpu: str):
     """Unsupported regimes (here: integer dtype) reach ATen's ordinary
     per-tensor semantics unchanged, via the sequential fallback."""
@@ -471,13 +464,6 @@ def test_batched_foreach_falls_back_for_non_f32(mojo_gpu: str):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "sequential fallback needs mul_.Scalar registered by the binary"
-        " group; not yet present in this worktree"
-    ),
-    strict=False,
-)
 def test_batched_foreach_mixed_dtype_list_falls_back(mojo_gpu: str):
     """A two-dtype list is not one launch; still gets ATen's answer via the
     per-tensor fallback."""
