@@ -1045,10 +1045,11 @@ def test_aten_shared_elementwise_special_batch(
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_aten_shared_elementwise_log1p_near_zero(
-    mode: str, dtype: torch.dtype, cuda_available: bool, call_checker: CallChecker
+    mode: str, dtype: torch.dtype, cuda_available: bool
 ):
     if not cuda_available:
         pytest.skip("CUDA not available")
+    call_checker = CallChecker()
     call_checker.register(aten_functions.aten_log1p)
     cpu = log1p_edge_input(dtype)
     x = cpu.to("cuda")
@@ -1069,14 +1070,14 @@ def test_aten_shared_elementwise_log1p_near_zero(
     torch.testing.assert_close(
         torch.signbit(actual_cpu[zeros]), torch.signbit(cpu[zeros])
     )
+    call_checker.check_was_called()
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
-def test_aten_shared_elementwise_acos_float64_gpu(
-    mode: str, cuda_available: bool, call_checker: CallChecker
-):
+def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: bool):
     if not cuda_available:
         pytest.skip("CUDA not available")
+    call_checker = CallChecker()
     call_checker.register(aten_functions.aten_acos)
     x = torch.tensor(
         [
@@ -1106,15 +1107,17 @@ def test_aten_shared_elementwise_acos_float64_gpu(
             aten_functions.aten_acos(MaxEagerTensor.from_dlpack(x))
         )
     torch.testing.assert_close(actual, torch.acos(x), equal_nan=True)
+    call_checker.check_was_called()
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.bool, torch.int64])
 def test_aten_shared_elementwise_acos_gpu_integer_default_float64(
-    mode: str, dtype: torch.dtype, cuda_available: bool, call_checker: CallChecker
+    mode: str, dtype: torch.dtype, cuda_available: bool
 ):
     if not cuda_available:
         pytest.skip("CUDA not available")
+    call_checker = CallChecker()
     call_checker.register(aten_functions.aten_acos)
     x = torch.tensor(
         [False, True] if dtype == torch.bool else [-1, 0, 1, 2],
@@ -1135,6 +1138,7 @@ def test_aten_shared_elementwise_acos_gpu_integer_default_float64(
         torch.testing.assert_close(actual, torch.acos(x), equal_nan=True)
     finally:
         torch.set_default_dtype(original)
+    call_checker.check_was_called()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
