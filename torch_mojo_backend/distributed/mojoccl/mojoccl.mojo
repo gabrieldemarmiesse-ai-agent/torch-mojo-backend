@@ -194,6 +194,7 @@ from internode_fused import (
 )
 from internode_kernels import copy_bytes, inbox_add, inbox_sum_out, place_blocks
 from rs_fused import (
+    RS_FUSED_BIG_BLOCKS,
     reduce_scatter_fused,
     reduce_scatter_fused_blocks,
     reduce_scatter_fused_plan,
@@ -3557,9 +3558,8 @@ def _do_reduce_scatter_fused(
     var group = _inbox_group_bytes(state)
     if npeers * _align_up(min(chunk_elems, count) * 4, 16) > group:
         raise Error("mojoccl: fused reduce-scatter inbox overflow")
-    # Reuse the agreed caps; RS tuning is measured independently of allreduce.
     var cap = (
-        state.fused_big_cap if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
+        RS_FUSED_BIG_BLOCKS if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
     )
     var blocks = reduce_scatter_fused_blocks(
         state.ctx,

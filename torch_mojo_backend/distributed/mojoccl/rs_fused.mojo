@@ -37,6 +37,29 @@ from collectives_kernels import (
 
 comptime RS_FUSED_THREADS = FUSED_THREADS
 
+comptime RS_FUSED_UNROLL = 8
+"""16-byte vectors in flight per thread in the node-local push. At 32 CTAs
+(below) 4 -> 8 took the isolated block/root fp32 reduce-scatter from
+682/1579 us to 668/1567 on 2x8 H100."""
+
+comptime RS_FUSED_TARGET_CHUNKS = 2
+"""Chunks a reduce-scatter of at least `PIPE_SPLIT_UNIT` bytes per rank is
+cut into (geometry may force more). Every chunk costs two 8-way start
+barriers and four grid barriers, and only the last chunk's exchange is
+exposed. Fitted on 2x8 H100, 128 CTAs, isolated root/block fp32 us:
+2 -> 1181/534, 4 -> 1331/535, 8 -> 1403/655 (NCCL 1051/522); 3 chunks
+measured no different end to end (GPT-2 XL FSDP2, 66.5k vs 66.8k tok/s)."""
+
+comptime RS_FUSED_BIG_BLOCKS = 32
+"""Grid cap of the fused reduce-scatter at `PIPE_SPLIT_UNIT` bytes per rank
+and above; smaller calls keep the allreduce's `fused_cap`. Every block holds
+an SM's whole register file for the call, so this is also how many SMs the
+backward's GEMMs lose while a reduce-scatter runs, and the end-to-end fit
+is the opposite of the isolated one. Isolated root fp32 on 2x8 H100: 128
+CTAs 1263 us, 64 -> 1383, 32 -> 1567 (NCCL 1051). GPT-2 XL FSDP2 on the
+same nodes, mojo+mojoccl tok/s (CUDA+NCCL 70.2k): 128 -> 62.4k,
+64 -> 66.3k, 48 -> 64.5k, 32 -> 67.0-67.6k, 24 -> 66.1k, 16 -> 62.4k."""
+
 
 @always_inline
 def _sum_out(
@@ -130,7 +153,9 @@ def _fused_rs_kernel[
             var slot = _align_up(cnt * 4, 16)
             var arena_off = (k % narenas) * Int(arena_stride)
             var out_off = _SIGNAL_BYTES + (world - 1) * nnodes * slot
-            if not _rs_nodes_body[DType.float32, 4, 4, NW, RS_FUSED_THREADS](
+            if not _rs_nodes_body[
+                DType.float32, 4, RS_FUSED_UNROLL, NW, RS_FUSED_THREADS
+            ](
                 regions,
                 in_ptr.unsafe_offset(off),
                 me.unsafe_offset(arena_off + out_off).unsafe_bitcast[Float32](),
@@ -235,8 +260,9 @@ def reduce_scatter_fused_plan(
         raise Error("mojoccl: invalid fused reduce-scatter geometry")
     var chunk = min(count, chunk_cap)
     if count * 4 >= split_unit_bytes:
+        var target = min(narenas, RS_FUSED_TARGET_CHUNKS)
         chunk = min(
-            chunk, _align_up((count + narenas - 1) // narenas * 4, 16) // 4
+            chunk, _align_up((count + target - 1) // target * 4, 16) // 4
         )
     var nchunks = (count + chunk - 1) // chunk
     return Tuple(chunk, nchunks, min(narenas, nchunks))
