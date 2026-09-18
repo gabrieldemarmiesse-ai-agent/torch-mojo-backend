@@ -696,12 +696,106 @@ directly into the caller's output. On two nodes each rank sends `count`
 elements, with no all-gather phase, temporary allocation, or host stream
 synchronization. Larger messages use the existing staging arenas and inbox
 credits to pipeline chunks. AVG scales each input before the node-local sum.
-NVIDIA fp32 runs the pipeline in one persistent kernel (`rs_fused.mojo`):
-local reduction, mailbox release, bounded completion wait, output sum, and
-credit return, two chunks per call so only the second exchange is exposed
-(`RS_FUSED_TARGET_CHUNKS`). Other dtypes and targets use separate kernels
-for these phases (`rs_multinode.mojo`). Calls whose chunk count exceeds the
-existing work ring also use the split schedule.
+NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
+mailbox release, bounded completion wait, output sum, and credit return.
+Two such kernels exist. `rs_stream.mojo` takes every call of at least
+`PIPE_SPLIT_UNIT` bytes per rank (see "Streaming reduce-scatter" below);
+`rs_fused.mojo` runs everything smaller, two chunks per call so only the
+second exchange is exposed (`RS_FUSED_TARGET_CHUNKS`), and stays the
+fallback for every geometry the streaming kernel declines. Other dtypes and
+targets use separate kernels for these phases (`rs_multinode.mojo`). Calls
+whose chunk count exceeds the existing work ring also use the split
+schedule.
+
+#### Streaming reduce-scatter
+
+`rs_fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
+reducing before every rank has finished pushing the whole chunk, so the
+NVLink push and the HBM-bound reduce never overlap, the barrier exposes the
+slowest rank's whole push, and the chunk's RDMA exchange only starts once
+all of that is done. It also spends four grid barriers per chunk. NCCL's
+ring has none of that: its unit of "has data arrived" is a 1 MiB slice
+checked by four threads of the block against the neighbour's step counter,
+with an eight-deep credit pipeline and no grid barrier anywhere
+(nccl:src/device/prims_simple.h `waitPeer`/`postPeer`,
+src/device/reduce_scatter.h; at these sizes NCCL 2.28 picks RING/SIMPLE,
+16 CTAs of 544 threads = 512 workers plus one post warp).
+
+`rs_stream.mojo` keeps the hierarchical schedule -- its bytes are already
+NCCL's: `(local_world-1) * nnodes` shard pushes on NVLink and one shard on
+the wire per rank, against a 16-rank ring's 14/15 NVLink and 1/15 network
+hops, which is 287 MB and 20.5 MB for the XL root at 16 ranks either way --
+and replaces every rendezvous in it with a one-directional flag:
+
+- each block owns a contiguous range of the chunk and walks it in pieces of
+  `RS_STREAM_UNROLL * RS_STREAM_SLICE_UNROLLS` 16-byte vectors per thread.
+  It pushes piece `j`, publishes `DATA[peer][block][me] = ordinal(chunk, j)`
+  and waits for every peer's `DATA[me][block][peer]` to reach
+  `ordinal(chunk, j - RS_STREAM_DEPTH)` before reducing that piece;
+- `FREE[peer][block][me]`, published once this block has reduced chunk `k`,
+  is the credit that lets peers overwrite the arena at chunk `k + narenas`.
+  In steady state it is already there -- it is `narenas` chunks of slack --
+  so nothing waits for it;
+- a rank-local arrival counter per chunk releases that chunk's RDMA exchange
+  and returns the inbox credit. Blocks arrive and keep going; only the last
+  one stores into the mailbox.
+
+Both counters are generation-tagged, monotone, never reset and compared with
+`>=`, like the block barrier's flags; the host reserves
+`ceil(nchunks * pieces / PHASES_PER_GEN)` generations per call so a later
+call's values cannot collide with them. The block-matched invariant is
+unchanged: block `b` of every rank derives the same range and the same
+pieces from `(chunk, grid)` alone, so it still consumes only what block `b`
+of a peer produced, whatever the two ranks decide about 16-byte alignment.
+In-place, `count == 0`, arbitrary alignment, bounded spins, the error word
+and the status page work exactly as in the fused kernel.
+
+One thing did not survive dropping the grid barriers. With no barrier left,
+every block polled the pinned mailbox for the exchange itself, and 32
+threads reading host memory over the link the NIC is moving the shard on
+cost far more than the barrier ever did: isolated root fp32 measured 2511 us
+that way (NCCL 993). Block 0 now polls and republishes what it saw into a
+device word the other blocks spin on out of L2 -- the same transitive
+acquire of the NIC's writes that the grid barrier used to give them.
+
+What the streaming bought, measured on 2x8 H100 SXM over InfiniBand
+(job 259332, 16 ranks, `--core`, CUPTI device time of the comm stream,
+median over ranks, vendor/mojo ABBA and BAAB in one process,
+**unlocked clocks** -- `nvidia-smi -lgc` is not permitted on these nodes):
+
+| isolated, us | NCCL | rs_fused | rs_stream |
+|---|---:|---:|---:|
+| reduce-scatter fp32 SUM, XL block (7.68 MB/rank) | 463 | 645 (1.39x) | 512-519 (**1.10-1.12x**) |
+| reduce-scatter fp32 AVG, XL block | 465 | 640 (1.38x) | 502-507 (**1.08-1.09x**) |
+| reduce-scatter fp32 SUM, XL root (20.5 MB/rank) | 990-1007 | 1470 (1.48x) | 1273-1281 (1.26-1.28x) |
+| reduce-scatter fp32 AVG, XL root | 1001-1007 | 1468 (1.46x) | 1283-1294 (1.28x) |
+
+`RS_STREAM_TARGET_CHUNKS = 4` is fitted on the same nodes, block / root
+fp32 SUM in us: 2 chunks 617/1292, **4 chunks 500/1299**, 8 chunks
+571/1413. More chunks shorten the one exposed exchange (the last chunk's)
+and add about 50 us of proxy time each, and 8 is already the wrong side of
+that. Two variants measured and not taken: one piece per block per chunk
+(`RS_STREAM_SLICE_UNROLLS = 8`, which degenerates the streaming to the
+fused schedule minus its grid barriers) 517/1279, and pushing piece `j` and
+reducing piece `j-1` back to back with no barrier between them, so the
+warps drift apart and one SM holds NVLink stores and HBM loads at once,
+520/1274. Both sit inside this unlocked-clock box's run-to-run spread
+(+-4% on the mojo leg, +-1% on NCCL's).
+
+**The root reduce-scatter is still 1.28x NCCL and this schedule cannot
+close that.** Its floor is the node-local push: 287 MB per GPU at the
+326 GB/s a 32-CTA push gets from this fabric is 880 us, already 89% of
+NCCL's whole call. NCCL fits the same 288 MB of NVLink traffic, the
+reduction and the network hop into 990 us because its ring fuses them --
+`recvReduceSend` is one pass that loads the neighbour's slice, adds the
+local contribution and stores to the next neighbour, so the NVLink store
+and the HBM read of every byte belong to one instruction stream. Ours are
+two passes over the data (push, then an 8-way reduce out of the staging
+slots) and inside a block they serialize whatever the flags do: 880 us of
+push, 123 us of reduce, 28 us of output sum and the one exposed 122 us
+exchange is 1153 us before any skew, against 1089 us for 1.10x. Closing it
+means a node-local **ring** whose hop fuses load, add and store, not a
+finer handoff on the direct schedule.
 
 Its grid is fitted end to end, not on the isolated collective, and the two
 fits disagree: 128 CTAs make the isolated root reduce-scatter 1.2x NCCL and
@@ -1111,6 +1205,11 @@ peer rotation (same day, same nodes).
 | reduce-scatter fp32, 357x789 at an odd offset | 159 | 312 | 299 | 1.88 | 2 | 13.9 / 8.2 |
 | all-gather fp32, 357x789 at an odd offset | 169 | 179 | 159 | **0.94** | 4 | 12.0 / 11.7 |
 
+The reduce-scatter rows of that table are `rs_fused.mojo`'s and are now
+only what calls below `PIPE_SPLIT_UNIT` bytes per rank take; "Streaming
+reduce-scatter" above has the current numbers (block 1.10x, root 1.28x) and
+a fresh NCCL column measured beside them.
+
 The reduce-scatter's device time is not where its step cost is. Its
 per-phase trace (block fp32, 32 CTAs, per 3.84 MB chunk): push 165-185 us
 at 326 GB/s per GPU, 8-way phase-1 barrier 5-35 us of rank skew, reduce
@@ -1119,6 +1218,19 @@ barriers 4-7 us each. The push is bound by the fabric from 16 CTAs up, so
 the isolated gap to NCCL (a 16-rank ring that never waits for a whole
 node's push before reducing) is the reduce and the barriers, and closing it
 with more CTAs costs the step more than it returns.
+
+The streaming kernel confirms that from the other side. It cut the isolated
+block reduce-scatter from 1.39x NCCL to 1.10x and the root from 1.48x to
+1.28x, and GPT-2 XL FSDP2 on these two nodes did not notice: three six-leg
+palindromes of the streaming tree against two of the tree before it, same
+allocation, alternated before/after/before/after, 18 and 12 windows per
+stack, median tok/s -- Mojo + MojoCCL 65,448 before and 66,007 after
+(+0.9%), against -0.6% and -0.3% on the two stacks whose code is
+byte-identical between the trees (Mojo + NCCL 67,571 -> 67,139, CUDA + NCCL
+71,021 -> 70,789). Per-window spread is 60-71k on every stack, so +0.9% is
+inside the noise and the honest reading is "nothing lost": the SM footprint
+is the same 32 CTAs, and a reduce-scatter FSDP2 has already overlapped with
+the next layer's backward does not get cheaper by finishing sooner.
 
 The placeholder these replaced measured 16,623 / 41,256 us on the block /
 root reduce-scatter (32x / 39x) with a host synchronize per call; the
