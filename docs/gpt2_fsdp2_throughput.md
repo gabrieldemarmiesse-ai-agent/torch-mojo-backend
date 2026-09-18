@@ -33,6 +33,22 @@ Every mojo launch has one window ~10% below the others (the last one in
 three launches, the first in one); CUDA launches do not. Unexplained; the
 medians above include those windows.
 
+### Two nodes, sixteen GPUs (sequence length 1024, batch 1 per GPU)
+
+Nodes `par2dc5-ai-prd-cl02s01dgx01` + `cl02s02dgx12` (Slurm job 258042,
+InfiniBand), six windows per stack; raw records under
+`~/projects/tmp/fsdp2-2node/results/fsdp2_2node_258042/` (outside the repo).
+
+| Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
+|---|---:|---:|---:|
+| Stock PyTorch CUDA + NCCL | 69,751.3 | 100% | 62,429.7–70,851.6 |
+| Torch Mojo + NCCL | 68,012.9 | 97.5% | 63,082.2–69,424.4 |
+| Torch Mojo + MojoCCL | 14,608.6 | 20.9% | 14,498.5–14,762.9 |
+
+MojoCCL's multi-node reduce-scatter is still the correctness-first
+placeholder (chunked all-reduce of every destination's slice plus a host
+synchronize per call); its hierarchical replacement is in progress.
+
 What closed the gap from the 84.8% snapshot below (both stacks are
 host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every
 change is host work per op or per collective):
