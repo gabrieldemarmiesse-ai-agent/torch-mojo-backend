@@ -46,6 +46,11 @@ InfiniBand, 64 CPUs per node), six windows per stack in palindromic order
 | Torch Mojo + NCCL | 69,134.5 | 100.5% | 62,403.5–69,833.8 |
 | Torch Mojo + MojoCCL | 66,405.6 | 96.6% | 60,757.7–69,933.3 |
 
+A second six-leg run of the same tree on the same nodes (order CUDA, MojoCCL,
+NCCL, NCCL, MojoCCL, CUDA) gave CUDA 70,402.3 / NCCL 68,111.3 (96.7%) /
+MojoCCL 65,730.5 (93.4%): two-node windows spread ±5%, so the MojoCCL leg
+sits between 93% and 97% of CUDA and is not yet reliably inside the 4% bar.
+
 The step before this was the multi-node reduce-scatter placeholder
 (14,608.6 tok/s, 20.9%); the hierarchical schedule with its isolated-best
 grids (128 reduce-scatter CTAs, 432-block gathers) measured 62,367 (88.8%),
