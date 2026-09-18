@@ -489,14 +489,20 @@ def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
 
     The graph runs on MAX's own stream, not a mojo one, and is still running
     when `execute` returns: `__dlpack__(stream=...)` makes the mojo stream
-    wait for it. MAX tags the capsule with the vendor device code (a `cuda`
+    wait for it. Metal lacks external streams, so synchronize that handoff.
+    MAX tags the capsule with the vendor device code (a `cuda`
     tensor on import); retagging it kDLExtDev imports it as PrivateUse1.
     """
     index = _mojo_index_for_max_device(buffer.device)
-    stream = torch.accelerator.current_stream(torch.device("mojo", index))
-    # 0: a device with no native stream (the MAX CPU device), nothing to hand off
-    handle = device_module.stream_native_handle(stream) or None
-    capsule = buffer.__dlpack__(stream=handle)
+    if device_module.get_device_properties(index).api == "metal":
+        # MAX does not import/export external Metal streams. Complete graph
+        # work before the native queue can consume its output allocation.
+        buffer.device.synchronize()
+        capsule = buffer.__dlpack__()
+    else:
+        stream = torch.accelerator.current_stream(torch.device("mojo", index))
+        handle = device_module.stream_native_handle(stream) or None
+        capsule = buffer.__dlpack__(stream=handle)
     return torch.from_dlpack(
         mojo_dlpack.retag_capsule(capsule, mojo_dlpack.KDL_EXT_DEV, index)
     )
@@ -673,6 +679,20 @@ dummy_backend = aot_autograd(fw_compiler=dummy_compiler)
 # - Generally users shouldn't be putting this marshalling into their
 #   inner loop. Gains are much more substantial for larger graphs
 #   which can take advantage of MAX's automatic kernel fusion.
+class _MetalDLPackInput:
+    """Expose a synchronized PrivateUse1 allocation using Metal's device tag."""
+
+    def __init__(self, tensor: torch.Tensor, device_id: int):
+        self.tensor = tensor
+        self.device_id = device_id
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return (8, self.device_id)
+
+    def __dlpack__(self, stream: int | None = None) -> object:
+        return mojo_dlpack.retag_capsule(self.tensor.__dlpack__(), 8, self.device_id)
+
+
 def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
     if t.device.type == "cuda":
         stream = torch.cuda.current_stream(t.device).cuda_stream
@@ -707,6 +727,9 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
             # (a plain host-to-host copy, not the zero-copy exchange the
             # GPU case below gets).
             return max.driver.Buffer.from_dlpack(t.cpu())
+        if device_module.get_device_properties(t.device).api == "metal":
+            device_module.synchronize(t.device)
+            return max.driver.Buffer.from_dlpack(_MetalDLPackInput(t, device.id))
         # the vendor handle of the current mojo stream (torch.Stream's own
         # native_handle exists only from torch 2.11)
         stream = device_module.stream_native_handle(

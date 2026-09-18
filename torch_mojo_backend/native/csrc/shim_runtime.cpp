@@ -480,24 +480,24 @@ struct MojoProfilerStubs final : torch::profiler::impl::ProfilerStubs {
     int32_t index = tls_device;
     void* ev = nullptr;
     if (tmb_ready) {
-      Lock g(tmb_mutex);
-      ev = H.event_create(index, 1);
-      H.event_record(ev, index, tls_stream_slot(index));
+      HOOK(ev = H.event_create(index, 1));
+      TORCH_CHECK(ev, "mojo backend: profiler event creation failed");
     }
+    const int32_t dev = index;
+    auto owned = torch::profiler::impl::ProfilerVoidEventStub(ev, [dev](void* p) {
+      if (p && tmb_ready) { Lock g(tmb_mutex); H.event_destroy(p, dev); }
+    });
+    if (tmb_ready) HOOK(H.event_record(ev, index, tls_stream_slot(index)));
     if (device) *device = static_cast<c10::DeviceIndex>(index);
-    if (event) {
-      const int32_t dev = index;
-      *event = torch::profiler::impl::ProfilerVoidEventStub(ev, [dev](void* p) {
-        if (p && tmb_ready) { Lock g(tmb_mutex); H.event_destroy(p, dev); }
-      });
-    }
+    if (event) *event = std::move(owned);
   }
   float elapsed(const torch::profiler::impl::ProfilerVoidEventStub* a,
                 const torch::profiler::impl::ProfilerVoidEventStub* b) const override {
     if (!a || !b || !*a || !*b || !tmb_ready) return 0.0f;
-    Lock g(tmb_mutex);
-    H.event_synchronize(b->get());
-    return static_cast<float>(H.event_elapsed_ms(a->get(), b->get()) * 1000.0);
+    HOOK(H.event_synchronize(b->get()));
+    double ms = 0.0;
+    HOOK(ms = H.event_elapsed_ms(a->get(), b->get()));
+    return static_cast<float>(ms * 1000.0);
   }
   void mark(const char* name) const override { if (H.prof_mark) { Lock g(tmb_mutex); H.prof_mark(name); } }
   void rangePush(const char* name) const override { if (H.prof_range_push) { Lock g(tmb_mutex); H.prof_range_push(name); } }

@@ -27,6 +27,8 @@ from env_vars import (
     TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD,
 )
 from vendor import Vendor, raw_stream
+from kernels import KernelCall
+from op_utils import MAX_RANK
 
 comptime BufP = Pointer[Buf, MutUntrackedOrigin]
 comptime PinnedP = Pointer[Pinned, MutUntrackedOrigin]
@@ -665,7 +667,30 @@ def copy_d2d(ctx: DeviceContext, dst: Int, src: Int, nbytes: Int) raises:
         return
     var d = wrap_raw(ctx, dst, nbytes)
     var s = wrap_raw(ctx, src, nbytes)
-    d.enqueue_copy_from(s)
+    try:
+        d.enqueue_copy_from(s)
+    except e:
+        if ctx.api() != "metal" or "Invalid Metal buffer pointer" not in String(
+            e
+        ):
+            raise e
+        # MAX 26.5 accepts DLPack-imported Metal addresses in kernels but its
+        # raw DeviceBuffer D2D path rejects them. Copy on the same queue with
+        # the existing byte-preserving kernel; other transfer errors propagate.
+        var shape = List[Int]()
+        var strides = List[Int]()
+        for i in range(MAX_RANK):
+            shape.append(nbytes if i == MAX_RANK - 1 else 1)
+            strides.append(1 if i == MAX_RANK - 1 else 0)
+        var call = KernelCall("memory_ops", "CopyStrided")
+        call.int(dst)
+        call.int(src)
+        call.tuple(shape)
+        call.tuple(strides)
+        call.tuple(strides)
+        call.int(1)
+        call.int(ctx_ptr(ctx))
+        call.run()
     if ctx.api() == "cpu":
         ctx.synchronize()
 
@@ -961,7 +986,9 @@ def _add_stream(
 def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
     try:
         var d = dev(Int(device))
-        if d[].is_cpu:
+        # Like PyTorch MPS, Metal stream objects all identify the default
+        # queue; priorities do not create independent streams.
+        if d[].is_cpu or d[].api == "metal":
             return 0
         return Int64(_add_stream(d, Int(priority)))
     except e:
@@ -972,7 +999,7 @@ def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
 def h_stream_from_pool(device: Int32, high_priority: Int32) abi("C") -> Int64:
     try:
         var d = dev(Int(device))
-        if d[].is_cpu:
+        if d[].is_cpu or d[].api == "metal":
             return 0
         if len(d[].pool) < POOL_STREAMS:
             d[].pool.append(_add_stream(d, 0))
@@ -1032,6 +1059,15 @@ struct Ev(Movable):
 def h_event_create(device: Int32, enable_timing: Int32) abi("C") -> Int:
     try:
         var d = dev(Int(device))
+        if d[].api == "metal":
+            raise Error(
+                "events are not supported on Apple GPU (Metal): MAX does"
+                " not implement Metal events; use stream.synchronize() or"
+                " torch.mojo.synchronize() instead"
+            )
+        # Create before allocating the box or vendor event so a failure
+        # cannot leak either owner.
+        var max_ev = d[].ctx.create_event()
         var raw = 0
         if be()[].vendor and d[].raw[0] != 0:
             raw = (
@@ -1043,7 +1079,7 @@ def h_event_create(device: Int32, enable_timing: Int32) abi("C") -> Int:
                 Int(device),
                 enable_timing != 0,
                 False,
-                d[].ctx.create_event(),
+                max_ev^,
                 raw,
                 0,
             )

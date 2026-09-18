@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch.utils._mode_utils import no_dispatch
 
+from tests.native.conftest import side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.native import device_module
 
@@ -40,13 +41,13 @@ def test_dispatch_installed_and_cpu_delegation():
 
 
 def test_stream_construction_and_identity(mojo_gpu: str):
-    stream = torch.Stream(device=mojo_gpu)
+    stream = side_stream_or_skip(mojo_gpu)
     assert isinstance(stream, torch.Stream)
     assert stream.device == torch.device("mojo", 0)
     assert stream.device_index == 0
     assert stream.native_handle != 0  # ty: ignore[unresolved-attribute] -- torch's Stream stub lacks native_handle
-    # stream_id is the MAX DeviceContext pointer (see docs/streams.md), a
-    # different value from the underlying native CUstream/hipStream_t.
+    # stream_id indexes the device's MAX context views (see docs/streams.md),
+    # independently of the underlying native CUstream/hipStream_t.
     assert stream.stream_id != stream.native_handle  # ty: ignore[unresolved-attribute]
     assert stream.stream_id != torch.accelerator.current_stream().stream_id
     assert stream == stream
@@ -56,7 +57,7 @@ def test_stream_construction_and_identity(mojo_gpu: str):
 def test_current_stream_and_context_manager(mojo_gpu: str):
     default = torch.accelerator.current_stream()
     assert device_module.current_stream() == default
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     with side:
         assert torch.accelerator.current_stream() == side
         assert device_module.current_stream() == side
@@ -67,7 +68,88 @@ def test_current_stream_and_context_manager(mojo_gpu: str):
     assert device_module.current_stream() == default
 
 
+@pytest.mark.parametrize("priority", [0, -1, 1])
+def test_metal_streams_share_the_default_stream(mojo_gpu: str, priority: int):
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU stream semantics")
+    default = device_module.default_stream(mojo_gpu)
+    first = torch.Stream(device="mojo", priority=priority)
+    second = device_module.Stream(device=mojo_gpu, priority=priority)
+    assert type(first) is torch.Stream
+    assert first == second == default
+    assert first.stream_id == second.stream_id == 0
+    assert first.device == torch.device(mojo_gpu)
+    x = torch.ones(32, device=mojo_gpu)
+    with first:
+        assert torch.accelerator.current_stream() == default
+        with second:
+            y = x + 2
+            y.record_stream(second)
+        assert device_module.current_stream() == default
+    first.synchronize()
+    assert second.query()
+    torch.testing.assert_close(y.cpu(), torch.full((32,), 3.0))
+    assert device_module.current_stream() == default
+
+
+@pytest.mark.parametrize("shape", [(1024,), (257, 129)])
+def test_metal_independent_stream_workflows_read_back_without_explicit_sync(
+    mojo_gpu: str, shape: tuple[int, ...]
+):
+    """Both workflows finish before CPU readback without user-inserted fences.
+
+    Separately constructed Metal streams share the default queue, so CPU
+    readback outside their contexts is ordered after both producers. This
+    would require explicit ordering on a backend with independent queues.
+    """
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU stream semantics")
+    first = torch.Stream(device=mojo_gpu)
+    second = torch.Stream(device=mojo_gpu)
+    # Repeat so first-use kernel compilation cannot hide a readback race.
+    for iteration in range(2):
+        with first:
+            x = torch.full(shape, 2.0 + iteration, device=mojo_gpu)
+            first_result = (x * x + 3.0) * 0.5
+        with second:
+            y = torch.full(shape, -3.0 - iteration, device=mojo_gpu)
+            shifted = y * 2.0 - 1.0
+            second_result = shifted * shifted
+
+        # No synchronize(), query(), events or stream waits: blocking .cpu()
+        # copies on the default queue are the only readback barriers.
+        first_cpu = first_result.cpu()
+        second_cpu = second_result.cpu()
+        torch.testing.assert_close(
+            first_cpu, torch.full(shape, ((2.0 + iteration) ** 2 + 3.0) * 0.5)
+        )
+        torch.testing.assert_close(
+            second_cpu, torch.full(shape, ((-3.0 - iteration) * 2.0 - 1.0) ** 2)
+        )
+
+
+@pytest.mark.parametrize("enable_timing", [False, True])
+def test_metal_events_raise_on_record(mojo_gpu: str, enable_timing: bool):
+    if device_module.get_device_properties(mojo_gpu).api != "metal":
+        pytest.skip("Apple GPU event semantics")
+    stream = device_module.default_stream(mojo_gpu)
+    event = torch.Event(device=mojo_gpu, enable_timing=enable_timing)
+    # Generic torch events allocate lazily; a failed recording must leave
+    # the object safe to retry, query, synchronize and destroy.
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+            event.record(stream)
+    assert event.query()
+    event.synchronize()
+    with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+        stream.record_event()
+    with pytest.raises(RuntimeError, match="events are not supported on Apple GPU"):
+        stream.wait_stream(stream)
+    stream.synchronize()
+
+
 def test_documented_device_agnostic_pattern(mojo_gpu: str):
+    side_stream_or_skip(mojo_gpu)
     stream = torch.Stream(device=torch.accelerator.current_accelerator())
     current = torch.accelerator.current_stream()
     stream.wait_stream(current)
@@ -84,7 +166,7 @@ def test_wait_stream_orders_real_work(mojo_gpu: str):
     x = torch.full((2048, 2048), 2.0, device=mojo_gpu)
     y = x * x
 
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     side.wait_stream(torch.accelerator.current_stream())
     event = side.record_event()
     event.synchronize()
@@ -93,6 +175,7 @@ def test_wait_stream_orders_real_work(mojo_gpu: str):
 
 
 def test_event_semantics(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "Apple GPU events are tested as unsupported separately")
     unrecorded = torch.Event(device=mojo_gpu)
     assert unrecorded.query() is True
     unrecorded.synchronize()  # no-op by contract
@@ -138,7 +221,7 @@ def test_record_stream_prevents_pool_reuse_corruption(mojo_gpu: str):
     reused_any = False
     for _ in range(20):
         source = torch.full((n,), 1.0, device=mojo_gpu)
-        side = torch.Stream(device=mojo_gpu)
+        side = side_stream_or_skip(mojo_gpu)
         side.wait_stream(torch.accelerator.current_stream())
         with side:
             sink = source * source
@@ -165,7 +248,7 @@ def test_record_stream_under_no_dispatch(mojo_gpu: str):
     """record_stream must work under no_dispatch(), as torch.distributed
     calls it (e.g. from the c10d reducer / process group bucket views)."""
     tensor = torch.ones(64, device=mojo_gpu)
-    side = torch.Stream(device=mojo_gpu)
+    side = side_stream_or_skip(mojo_gpu)
     with no_dispatch():
         tensor.record_stream(side)
     assert tensor.cpu().sum().item() == 64.0

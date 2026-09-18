@@ -15,20 +15,13 @@ def _mojo_devices_registered():
 def side_stream_or_skip(device: str) -> torch.Stream:
     """A second stream on `device`, or a skip when the runtime has none.
 
-    MAX's Metal backend has no user-created streams
-    (`DeviceContext.create_stream` raises "createStream is not supported on
-    this device"), so `torch.Stream(device=...)` is unusable there and every
-    test that needs a side stream to prove cross-stream ordering has nothing
-    to test on Apple GPUs. The match string is Metal's own error text, so
-    this cannot mask a real regression on CUDA/ROCm, where side streams are
-    supported and this is never raised.
+    On Metal, torch.Stream returns the default stream, as PyTorch MPS does.
+    Tests requiring independent queues cannot establish cross-stream
+    ordering there. Check the backend explicitly so CUDA/ROCm construction
+    failures remain test failures.
     """
-    try:
-        return torch.Stream(device=device)
-    except RuntimeError as e:
-        if "createStream is not supported" in str(e):
-            pytest.skip(f"no user-created streams on this device ({device}): {e}")
-        raise
+    skip_if_metal(device, "Apple GPU stream objects share the default stream")
+    return torch.Stream(device=device)
 
 
 def skip_if_metal(device: str, reason: str):

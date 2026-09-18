@@ -377,10 +377,10 @@ def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
     assert aten._fused_sdp_choice(q, k, v, None, 0.25, True) == MATH
 
 
-def test_public_sdpa_takes_the_flash_route_and_trains(mojo_gpu):
+def test_public_sdpa_takes_the_supported_route_and_trains(mojo_gpu: str):
     """F.scaled_dot_product_attention picks its backend through a C++
     DispatchStub the shim registers for this device, then calls the
-    `_for_cpu` flash overloads (non-CUDA devices), which wrap the flash ops."""
+    supported flash overloads on Hopper/gfx942 and math attention on Metal."""
     native.op_counting(True)
     before = native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
     before_bwd = native.op_count(
@@ -393,13 +393,15 @@ def test_public_sdpa_takes_the_flash_route_and_trains(mojo_gpu):
     v = torch.randn_like(q, requires_grad=True)
     out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
     out.float().sum().backward()
+    # Metal uses math attention; the flash kernels support Hopper and gfx942.
+    flash_calls = int(_arch(mojo_gpu) in ("sm_90a", "gfx942"))
     assert (
         native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu")
-        == before + 1
+        == before + flash_calls
     )
     assert (
         native.op_count("aten::_scaled_dot_product_flash_attention_for_cpu_backward")
-        == before_bwd + 1
+        == before_bwd + flash_calls
     )
     ref_q = q.detach().cpu().float().requires_grad_(True)
     ref_k = k.detach().cpu().float().requires_grad_(True)

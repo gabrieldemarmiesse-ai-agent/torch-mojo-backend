@@ -3,7 +3,15 @@ from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.gpu import block_idx, grid_dim, thread_idx
 from std.math import ceildiv, floor
 from max.gpu.primitives import block
-from roi_ops.roi_ops import _divisor, _divide, _ps_add
+from roi_ops.roi_ops import (
+    DivisorArgs,
+    _divisor,
+    _divide,
+    _ps_add,
+    _scatter_storage_dtype,
+    _scatter_buffer,
+    _finish_scatter,
+)
 from dtype_arithmetic import _product
 from std.sys import has_nvidia_gpu_accelerator
 from op_utils import (
@@ -159,12 +167,12 @@ def _column_coordinates[
 ](
     i: Int,
     p: Geometry,
-    ds: SIMD[DType.uint32, 4],
-    dn: SIMD[DType.uint32, 4],
-    dk: SIMD[DType.uint32, 4],
-    dc: SIMD[DType.uint32, 4],
-    dw: SIMD[DType.uint32, 4],
-    dkw: SIMD[DType.uint32, 4],
+    ds: DivisorArgs,
+    dn: DivisorArgs,
+    dk: DivisorArgs,
+    dc: DivisorArgs,
+    dw: DivisorArgs,
+    dkw: DivisorArgs,
 ) -> Tuple[Int, Int, Int, Int, Int, Int, Int, Int, Int]:
     var s = Int(p.oh) * Int(p.ow)
     var ks = Int(p.kh) * Int(p.kw)
@@ -209,12 +217,12 @@ def _im2col[
     mask: Pointer[Scalar[dt], MutAnyOrigin],
     col: Pointer[Scalar[dt], MutAnyOrigin],
     p: Geometry,
-    ds: SIMD[DType.uint32, 4],
-    dn: SIMD[DType.uint32, 4],
-    dk: SIMD[DType.uint32, 4],
-    dc: SIMD[DType.uint32, 4],
-    dw: SIMD[DType.uint32, 4],
-    dkw: SIMD[DType.uint32, 4],
+    ds: DivisorArgs,
+    dn: DivisorArgs,
+    dk: DivisorArgs,
+    dc: DivisorArgs,
+    dw: DivisorArgs,
+    dkw: DivisorArgs,
 ):
     comptime acc = dt
     var s = Int(p.oh) * Int(p.ow)
@@ -254,10 +262,10 @@ def _im2col_pixel_loop[
     mask: Pointer[Scalar[dt], MutAnyOrigin],
     col: Pointer[Scalar[dt], MutAnyOrigin],
     p: Geometry,
-    ds: SIMD[DType.uint32, 4],
-    dn: SIMD[DType.uint32, 4],
-    dc: SIMD[DType.uint32, 4],
-    dw: SIMD[DType.uint32, 4],
+    ds: DivisorArgs,
+    dn: DivisorArgs,
+    dc: DivisorArgs,
+    dw: DivisorArgs,
 ):
     var n = Int32(p.n)
     var channels = Int32(p.c)
@@ -318,9 +326,9 @@ def _im2col_pixel_loop[
 
 @always_inline
 def _scatter_neighbors[
-    dt: DType, span: Int
+    dt: DType, span: Int, storage: DType
 ](
-    output: Pointer[Scalar[dt], MutAnyOrigin],
+    output: Pointer[Scalar[storage], MutAnyOrigin],
     y: Scalar[dt],
     z: Scalar[dt],
     m: Scalar[dt],
@@ -349,19 +357,19 @@ def _scatter_neighbors[
 
 @__name("deformable_col2im_scatter_" + String(dt) + "_fast" + String(fast))
 def _scatter[
-    dt: DType, acc: DType, fast: Bool
+    dt: DType, acc: DType, fast: Bool, storage: DType
 ](
     col: Pointer[Scalar[dt], MutAnyOrigin],
     off: Pointer[Scalar[dt], MutAnyOrigin],
     mask: Pointer[Scalar[dt], MutAnyOrigin],
-    output: Pointer[Scalar[acc], MutAnyOrigin],
+    output: Pointer[Scalar[storage], MutAnyOrigin],
     p: Geometry,
-    ds: SIMD[DType.uint32, 4],
-    dn: SIMD[DType.uint32, 4],
-    dk: SIMD[DType.uint32, 4],
-    dc: SIMD[DType.uint32, 4],
-    dw: SIMD[DType.uint32, 4],
-    dkw: SIMD[DType.uint32, 4],
+    ds: DivisorArgs,
+    dn: DivisorArgs,
+    dk: DivisorArgs,
+    dc: DivisorArgs,
+    dw: DivisorArgs,
+    dkw: DivisorArgs,
 ):
     comptime coord = DType.float64 if acc == DType.float64 else DType.float32
     var s = Int(p.oh) * Int(p.ow)
@@ -405,15 +413,15 @@ def _scatter[
             comptime if dt == DType.float16:
                 # Half(index +/- 1) can equal Half(index) beyond 2048.
                 if abs(y) >= 2048 or abs(z) >= 2048:
-                    _scatter_neighbors[acc, 3](
+                    _scatter_neighbors[acc, 3, storage](
                         output, y, z, m, v, base, Int(p.h), Int(p.w), count
                     )
                 else:
-                    _scatter_neighbors[acc, 2](
+                    _scatter_neighbors[acc, 2, storage](
                         output, y, z, m, v, base, Int(p.h), Int(p.w), count
                     )
             else:
-                _scatter_neighbors[acc, 2](
+                _scatter_neighbors[acc, 2, storage](
                     output, y, z, m, v, base, Int(p.h), Int(p.w), count
                 )
 
@@ -499,8 +507,8 @@ def _layout[
     b: Pointer[Scalar[dt], MutAnyOrigin],
     output: Pointer[Scalar[dt], MutAnyOrigin],
     p: Geometry,
-    ds: SIMD[DType.uint32, 4],
-    dd: SIMD[DType.uint32, 4],
+    ds: DivisorArgs,
+    dd: DivisorArgs,
     add: Int64,
 ):
     var s = Int(p.oh) * Int(p.ow)
@@ -574,12 +582,12 @@ def _bias_reduce[
 def _enqueue_columns[
     dt: DType, scatter: Bool, fast: Bool
 ](argv: Argv, p: Geometry, blocks: Int) raises:
-    var ds = SIMD[DType.uint32, 4](0)
-    var dn = ds
-    var dk = ds
-    var dc = ds
-    var dw = ds
-    var dkw = ds
+    var ds = DivisorArgs(fill=UInt32(0))
+    var dn = ds.copy()
+    var dk = ds.copy()
+    var dc = ds.copy()
+    var dw = ds.copy()
+    var dkw = ds.copy()
     comptime if fast:
         ds = _divisor(Int(p.oh) * Int(p.ow))
         dn = _divisor(Int(p.n))
@@ -602,7 +610,14 @@ def _enqueue_columns[
         var output = _make_ptr[acc](
             _raw_int(argv[unsafe_offset=3])
         ).as_unsafe_any_origin()
-        _enqueue_cached[_scatter[dt, acc, fast]](
+        comptime storage = _scatter_storage_dtype[dt]()
+        var count = Int(p.n * p.c * p.h * p.w)
+        if count == 0:
+            return
+        # col2im adds to its caller's accumulator, which can already contain
+        # contributions from previous column tiles.
+        var buffer = _scatter_buffer(ctx, output, count, initialize=False)
+        _enqueue_cached[_scatter[dt, acc, fast, storage]](
             ctx,
             "deform_col2im_" + String(dt) + String(fast),
             blocks,
@@ -612,7 +627,7 @@ def _enqueue_columns[
             a,
             b,
             c,
-            output,
+            buffer.unsafe_ptr().as_unsafe_any_origin(),
             p,
             ds,
             dn,
@@ -621,6 +636,8 @@ def _enqueue_columns[
             dw,
             dkw,
         )
+        _finish_scatter(ctx, buffer, output, count)
+        _ = buffer
     else:
         var output = _make_ptr[dt](
             _raw_int(argv[unsafe_offset=3])
@@ -733,8 +750,8 @@ def _enqueue_layout[
     var out = _make_ptr[dt](
         _raw_int(argv[unsafe_offset=3])
     ).as_unsafe_any_origin()
-    var ds = SIMD[DType.uint32, 4](0)
-    var dd = ds
+    var ds = DivisorArgs(fill=UInt32(0))
+    var dd = ds.copy()
     comptime if fast:
         ds = _divisor(Int(p.oh) * Int(p.ow))
         dd = _divisor(Int(p.oc) if op == 3 else Int(p.n))

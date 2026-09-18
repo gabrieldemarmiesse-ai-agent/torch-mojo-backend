@@ -97,8 +97,8 @@ def _float_unary[
         res = a.eq(max_or_inf[dtype]()).select(a, log(a))
     comptime if kind == "log2":
         res = log2(a)
-        comptime if dtype == DType.float64:
-            # std.math.log2's double approximation omits the +inf case.
+        comptime if dtype == DType.float64 or is_apple_gpu():
+            # The double approximation and Metal's float log2 omit +inf.
             res = a.eq(max_or_inf[dtype]()).select(a, res)
     comptime if kind == "log1p":
         comptime if is_apple_gpu() or (

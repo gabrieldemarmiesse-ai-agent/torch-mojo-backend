@@ -1128,6 +1128,7 @@ def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+# aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
 def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "mul_")
     var rhs = _b_side(args[unsafe_offset=1])
@@ -1683,6 +1684,7 @@ def register_binary(site: Site) raises:
     impl[op_minimum, "minimum"](site)
     impl[op_mul_tensor, "mul.Tensor"](site)
     impl[op_mul_, "mul_.Tensor"](site)
+    impl[op_mul_, "mul_.Scalar"](site)
     impl[op_mul_out, "mul.out"](site)
     impl[op_pow_scalar, "pow.Tensor_Scalar"](site)
     impl[op_pow_tensor, "pow.Tensor_Tensor"](site)
