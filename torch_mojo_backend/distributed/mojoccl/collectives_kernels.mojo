@@ -1032,11 +1032,21 @@ def _copy_vec[
                 (v + u * stride) * W, tmp[u]
             )
         v += U * stride
-    while v < nvec:
-        dst.unsafe_store[width=W, alignment=16](
-            v * W, src.unsafe_load[width=W, alignment=16](v * W)
-        )
-        v += stride
+    # The remainder is at most U-1 vectors per thread: issue every load
+    # before the first store, as the main loop does, rather than one round
+    # trip per vector. Same vector -> thread mapping either way.
+    if v < nvec:
+        var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+        comptime for u in range(U):
+            if v + u * stride < nvec:
+                tmp[u] = src.unsafe_load[width=W, alignment=16](
+                    (v + u * stride) * W
+                )
+        comptime for u in range(U):
+            if v + u * stride < nvec:
+                dst.unsafe_store[width=W, alignment=16](
+                    (v + u * stride) * W, tmp[u]
+                )
 
 
 @always_inline
@@ -1132,11 +1142,21 @@ def _copy_bytes2[
                     (v + u * stride) * 16, tmp[u]
                 )
             v += U * stride
-        while v < nvec:
-            var x = src.unsafe_load[width=16, alignment=16](v * 16)
-            dst_a.unsafe_store[width=16, alignment=16](v * 16, x)
-            dst_b.unsafe_store[width=16, alignment=16](v * 16, x)
-            v += stride
+        if v < nvec:
+            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            comptime for u in range(U):
+                if v + u * stride < nvec:
+                    tmp[u] = src.unsafe_load[width=16, alignment=16](
+                        (v + u * stride) * 16
+                    )
+            comptime for u in range(U):
+                if v + u * stride < nvec:
+                    dst_a.unsafe_store[width=16, alignment=16](
+                        (v + u * stride) * 16, tmp[u]
+                    )
+                    dst_b.unsafe_store[width=16, alignment=16](
+                        (v + u * stride) * 16, tmp[u]
+                    )
     elif (Int(dst_a) | Int(dst_b) | Int(src)) % 4 == 0:
         var a4 = dst_a.unsafe_bitcast[UInt32]()
         var b4 = dst_b.unsafe_bitcast[UInt32]()
@@ -1240,17 +1260,19 @@ def _copy_span_scaled[
                         (tmp[u].cast[accum]() * sv).cast[dtype](),
                     )
                 v += U * stride
-            while v < vc:
-                dst.unsafe_store[width=W, alignment=16](
-                    v * W,
-                    (
-                        src.unsafe_load[width=W, alignment=16](v * W).cast[
-                            accum
-                        ]()
-                        * sv
-                    ).cast[dtype](),
-                )
-                v += stride
+            if v < vc:
+                var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+                comptime for u in range(U):
+                    if v + u * stride < vc:
+                        tmp[u] = src.unsafe_load[width=W, alignment=16](
+                            (v + u * stride) * W
+                        )
+                comptime for u in range(U):
+                    if v + u * stride < vc:
+                        dst.unsafe_store[width=W, alignment=16](
+                            (v + u * stride) * W,
+                            (tmp[u].cast[accum]() * sv).cast[dtype](),
+                        )
             for i in range(tid, count - vc * W, stride):
                 var k = vc * W + i
                 dst[unsafe_offset=k] = (

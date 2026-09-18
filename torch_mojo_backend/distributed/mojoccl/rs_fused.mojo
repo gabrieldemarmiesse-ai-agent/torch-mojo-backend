@@ -36,6 +36,13 @@ from collectives_kernels import (
 )
 
 comptime RS_FUSED_THREADS = FUSED_THREADS
+"""Threads per block, the allreduce's. 256 was measured and not taken: at
+512 the kernel is capped at 128 registers and spills (ptxas: 468 B of spill
+stores on sm_90a), at 256 it takes 252 and spills nothing, and the isolated
+block fp32 reduce-scatter on 2x8 H100 at 32 CTAs improves 618 -> 576 us
+(NCCL 522) -- but the block still owns the SM's whole register file, and
+GPT-2 XL FSDP2 measured 65.8k tok/s against 66.1-69.1k at 512 (one leg
+each, noise +-2k), so the isolated gain did not survive the step."""
 
 comptime RS_FUSED_UNROLL = 8
 """16-byte vectors in flight per thread in the node-local push. At 32 CTAs
@@ -55,10 +62,15 @@ comptime RS_FUSED_BIG_BLOCKS = 32
 and above; smaller calls keep the allreduce's `fused_cap`. Every block holds
 an SM's whole register file for the call, so this is also how many SMs the
 backward's GEMMs lose while a reduce-scatter runs, and the end-to-end fit
-is the opposite of the isolated one. Isolated root fp32 on 2x8 H100: 128
-CTAs 1263 us, 64 -> 1383, 32 -> 1567 (NCCL 1051). GPT-2 XL FSDP2 on the
-same nodes, mojo+mojoccl tok/s (CUDA+NCCL 70.2k): 128 -> 62.4k,
-64 -> 66.3k, 48 -> 64.5k, 32 -> 67.0-67.6k, 24 -> 66.1k, 16 -> 62.4k."""
+is the opposite of the isolated one. Isolated root fp32 on 2x8 H100 at 512
+threads: 128 CTAs 1263 us, 64 -> 1383, 32 -> 1567 (NCCL 1051). GPT-2 XL
+FSDP2 on the same nodes, mojo+mojoccl tok/s (CUDA+NCCL 70.2k): 128 ->
+62.4k, 64 -> 66.3k, 48 -> 64.5k, 32 -> 67.0-67.6k, 24 -> 66.1k, 16 -> 62.4k.
+At 256 threads the isolated block fp32 reads 32 -> 576 us, 28 -> 599,
+16 -> 716 (NCCL 522): the push runs at the fabric's rate from 16 CTAs up
+(140-170 us per 53.8 MB chunk at every grid), but fewer CTAs leave the
+8-way phase-1 barrier waiting 40-50 us on the slowest rank's push and
+slow the HBM-bound reduce (41 -> 76 us)."""
 
 
 @always_inline
@@ -72,15 +84,29 @@ def _sum_out(
     tid: Int,
     stride: Int,
 ):
-    for v in range(tid, count // 4, stride):
-        var acc = partial.unsafe_load[width=4, alignment=16](v * 4)
+    var vc = count // 4
+    var v = tid
+    while v < vc:
+        # Four rows per iteration so 4 * (1 + npeers) loads are in flight.
+        var acc = InlineArray[SIMD[DType.float32, 4], 4](uninitialized=True)
+        comptime for u in range(4):
+            if v + u * stride < vc:
+                acc[u] = partial.unsafe_load[width=4, alignment=16](
+                    (v + u * stride) * 4
+                )
         for j in range(npeers):
-            acc += (
-                inbox.unsafe_offset(j * slot_bytes)
-                .unsafe_bitcast[Float32]()
-                .unsafe_load[width=4, alignment=16](v * 4)
-            )
-        output.unsafe_store[width=4](v * 4, acc)
+            var src = inbox.unsafe_offset(j * slot_bytes).unsafe_bitcast[
+                Float32
+            ]()
+            comptime for u in range(4):
+                if v + u * stride < vc:
+                    acc[u] += src.unsafe_load[width=4, alignment=16](
+                        (v + u * stride) * 4
+                    )
+        comptime for u in range(4):
+            if v + u * stride < vc:
+                output.unsafe_store[width=4]((v + u * stride) * 4, acc[u])
+        v += 4 * stride
     for i in range(count // 4 * 4 + tid, count, stride):
         var acc = partial[unsafe_offset=i]
         for j in range(npeers):
