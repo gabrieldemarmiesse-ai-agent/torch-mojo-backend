@@ -8,7 +8,7 @@ Commit `2194826`, measured on 2026-09-18 on an exclusive node
 six synchronized 10-step windows: three per launch, two launches per stack,
 in CUDA/Mojo/MojoCCL then MojoCCL/Mojo/CUDA order, nothing else on the node,
 every window retained. Raw records:
-`current_bench_train/fsdp2_opt/fresh/runs/q{2,8}_{cuda,mojo,mojoccl}_{a,b}.json`.
+`current_bench_train/fsdp2_opt/fresh/runs/q2_{cuda,mojo,mojoccl}_{a,b}.json`.
 
 ### Two GPUs (sequence length 1024)
 
@@ -20,11 +20,18 @@ every window retained. Raw records:
 
 ### Eight GPUs (sequence length 1024, batch 1 per GPU)
 
+Ten windows per stack (five per launch, two launches, palindromic order);
+raw records `.../runs/r8_{cuda,mojo,mojoccl}_{a,b}.json`.
+
 | Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
 |---|---:|---:|---:|
-| Stock PyTorch CUDA + NCCL | 35,867.7 | 100% | 32,742.6–36,023.5 |
-| Torch Mojo + NCCL | 34,651.6 | 96.6% | 33,874.7–35,120.7 |
-| Torch Mojo + MojoCCL | 34,596.2 | 96.5% | 32,977.1–34,731.6 |
+| Stock PyTorch CUDA + NCCL | 35,582.6 | 100% | 35,357.9–36,043.0 |
+| Torch Mojo + NCCL | 34,648.6 | 97.4% | 31,404.0–34,977.2 |
+| Torch Mojo + MojoCCL | 34,399.4 | 96.7% | 31,208.4–34,592.8 |
+
+Every mojo launch has one window ~10% below the others (the last one in
+three launches, the first in one); CUDA launches do not. Unexplained; the
+medians above include those windows.
 
 What closed the gap from the 84.8% snapshot below (both stacks are
 host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every
