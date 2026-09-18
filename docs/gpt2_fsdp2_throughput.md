@@ -35,27 +35,26 @@ medians above include those windows.
 
 ### Two nodes, sixteen GPUs (sequence length 1024, batch 1 per GPU)
 
-Nodes `par2dc5-ai-prd-cl02s01dgx01` + `cl02s02dgx12` (Slurm job 258050,
-InfiniBand, 64 CPUs per node), six windows per stack in palindromic order
-(CUDA, NCCL, MojoCCL, MojoCCL, NCCL, CUDA); raw records under
-`~/projects/tmp/fsdp2-2node/harness/results_final/xl/` (outside the repo).
+Nodes `par2dc5-ai-prd-cl02s03dgx28` + `dgx29` (Slurm job 259332, InfiniBand,
+64 CPUs per node), commit `64d3d24` (hierarchical multi-node reduce-scatter,
+per-NIC all-gather, in-kernel RDMA release, rank gate). 24 windows per stack:
+four palindromes of CUDA, NCCL, MojoCCL, MojoCCL, NCCL, CUDA, three windows
+per launch; raw records under
+`~/projects/tmp/fsdp2-2node/results/int2_xl/` (outside the repo).
 
 | Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
 |---|---:|---:|---:|
-| Stock PyTorch CUDA + NCCL | 68,768.8 | 100% | 65,253.9–71,466.0 |
-| Torch Mojo + NCCL | 69,134.5 | 100.5% | 62,403.5–69,833.8 |
-| Torch Mojo + MojoCCL | 66,405.6 | 96.6% | 60,757.7–69,933.3 |
+| Stock PyTorch CUDA + NCCL | 70,766.3 | 100% | 63,998.7–71,413.6 |
+| Torch Mojo + NCCL | 67,487.0 | 95.4% | 59,707.5–69,467.2 |
+| Torch Mojo + MojoCCL | 66,174.8 | 93.5% | 61,188.5–69,419.7 |
 
-A second six-leg run of the same tree on the same nodes (order CUDA, MojoCCL,
-NCCL, NCCL, MojoCCL, CUDA) gave CUDA 70,402.3 / NCCL 68,111.3 (96.7%) /
-MojoCCL 65,730.5 (93.4%): two-node windows spread ±5%, so the MojoCCL leg
-sits between 93% and 97% of CUDA and is not yet reliably inside the 4% bar.
-
-The step before this was the multi-node reduce-scatter placeholder
-(14,608.6 tok/s, 20.9%); the hierarchical schedule with its isolated-best
-grids (128 reduce-scatter CTAs, 432-block gathers) measured 62,367 (88.8%),
-and fitting both grids end to end (32 and 96) the 66,406 above -- see
-"Reduce-scatter" in [distributed.md](distributed.md).
+MojoCCL is within 2% of NCCL as the collective library (98.1%); the Mojo
+device itself is 4.6% behind stock CUDA at 16 ranks, so neither Mojo stack
+is inside the 4% bar here yet. Earlier six-window runs on other node pairs
+(dgx01 + dgx12) read NCCL at 97.5% and 100.5% and MojoCCL at 96.6% and
+93.4%: two-node windows spread ±5% and the node pair matters, so only long
+interleaved runs like this one are comparable. The step before the
+hierarchical reduce-scatter was 14,608.6 tok/s (20.9%) with MojoCCL.
 
 What closed the gap from the 84.8% snapshot below (both stacks are
 host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every
