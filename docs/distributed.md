@@ -789,6 +789,15 @@ median over ranks, vendor/mojo ABBA and BAAB in one process,
 | reduce-scatter fp32 SUM, XL root (20.5 MB/rank) | 990-1007 | 1470 (1.48x) | 1273-1281 (1.26-1.28x) |
 | reduce-scatter fp32 AVG, XL root | 1001-1007 | 1468 (1.46x) | 1283-1294 (1.28x) |
 
+The grid is 32 CTAs and, unlike `rs_fused.mojo`'s, that is also its
+isolated fit: the handoff is per block, so a larger grid multiplies the
+seven remote flag stores and the 8-way rendezvous per piece while leaving
+each block less to push between them. Block / root fp32 SUM in us:
+**32 CTAs 515/1277**, 128 CTAs 602-628/1370-1383. The fused kernel wants
+the opposite (128 CTAs 1263 us on the root, 32 CTAs 1567) and has to be
+held down to 32 by the step; this one does not, and it matches the fused
+kernel's 128-CTA root time on a quarter of the SMs.
+
 `RS_STREAM_TARGET_CHUNKS = 4` is fitted on the same nodes, block / root
 fp32 SUM in us: 2 chunks 617/1292, **4 chunks 500/1299**, 8 chunks
 571/1413. More chunks shorten the one exposed exchange (the last chunk's)

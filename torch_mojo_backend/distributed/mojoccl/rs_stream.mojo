@@ -125,7 +125,13 @@ comptime RS_STREAM_BIG_BLOCKS = 32
 """Grid cap at `PIPE_SPLIT_UNIT` bytes per rank and above. Every block holds
 an SM's whole register file for the call, so this is also how many SMs the
 backward's GEMMs lose while a reduce-scatter runs; `rs_fused.mojo`'s
-RS_FUSED_BIG_BLOCKS records the end-to-end sweep that chose 32."""
+RS_FUSED_BIG_BLOCKS records the end-to-end sweep that chose 32.
+
+Unlike that kernel, this one wants the same number in isolation: the handoff
+is per block, so a larger grid multiplies the 7 remote flag stores and the
+8-way rendezvous it costs per piece while giving each block less to push
+between them. Isolated block / root fp32 on 2x8 H100, 16 ranks, us:
+32 CTAs 515/1277, 128 CTAs 602-628/1370-1383 (NCCL 465-479/998-1000)."""
 
 comptime RS_STREAM_ROWS = 128
 """Flag rows (blocks) the streaming tables hold. The grids here are capped at
