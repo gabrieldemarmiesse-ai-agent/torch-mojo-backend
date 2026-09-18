@@ -788,6 +788,18 @@ the broken kernel. What keeps it shut is that every block waits on the same
 released, which holds the blocks of a rank inside one chunk of each other.
 Nothing promises that.
 
+Neither benchmark shape below can reach the bug -- both plan exactly four
+chunks over four arenas, so no arena is reused -- and for the block size the
+two layouts are bit-identical (four chunks of exactly 480,000 elements),
+while the root's differ only in a 48-byte slot stride on its last chunk.
+The fixed kernel nevertheless measures about 3% slower on the root in both
+leg orders (1.269/1.286 -> 1.316/1.326 against NCCL). That is either this
+unlocked-clock box's build-to-build spread, which the earlier variants put
+at +-4% on the mojo leg, or those 48 bytes moving the RDMA source's page
+offset; it is not attributed. Rounding the slot stride to 4 KiB instead of
+16 B would make every slot base page-aligned for every message and settle
+the question, and it needs the arena and inbox bounds widened to match.
+
 One thing did not survive dropping the grid barriers. With no barrier left,
 every block polled the pinned mailbox for the exchange itself, and 32
 threads reading host memory over the link the NIC is moving the shard on
