@@ -221,6 +221,12 @@ give up (internode_fused.mojo). Device memory, unlike the status page's abort
 word: every block reads it once per chunk, and that read has to be an L2 hit
 rather than a PCIe round trip."""
 
+comptime _AG_ARRIVE_OFFSET = 4032
+"""Arrival counter of the mapped all-gather's stage phase: the last block to
+finish staging this rank's contribution releases the chunk's RDMA exchange
+(`_allgather_body`). Per arena, rank-local, zeroed with the signal area and
+reset by the last arriver, so nothing carries across launches."""
+
 comptime _SIGNAL_BYTES = 128 * 1024
 """Signal-area size: 4 KiB header + MAX_BLOCKS*MAX_WORLD*8 B of flags = 68 KiB,
 rounded to 128 KiB. Two orders of magnitude below MAX's 24.75 MiB `Signal`."""
@@ -2487,6 +2493,8 @@ def _allgather_body[
     flag_base: UInt64,
     timeout_ns: UInt64,
     rank_at: InlineArray[Int32, MAX_WORLD],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
 ):
     """Local stage + peer gather -- already the unicast minimum: `nbytes` of
     local copy and `(world-1)*nbytes` of peer reads per GPU.
@@ -2494,6 +2502,14 @@ def _allgather_body[
     Rank r's contribution lands at `out_ptr + r*stride_b`; `stride_b` is the
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
+
+    `seq != 0` (mapped, NVIDIA): the staged contribution is also this
+    chunk's RDMA payload, and the last block to finish staging stores `seq`
+    into the proxy mailbox `mb_req`, so the NIC reads it while the peer pulls
+    run instead of after them. The arrival RMWs are release, the last one
+    acquire-release, so every block's stage stores are ordered before that
+    mailbox store; the counter is reset by the last arriver and the next
+    launch on this arena is stream-ordered behind this kernel.
     """
     var t0 = device_now_ns()
     var world = Int(world_i)
@@ -2582,6 +2598,23 @@ def _allgather_body[
         tid,
         stride,
     )
+    comptime if MAPPED:
+        if seq != 0:
+            barrier()
+            if thread_idx.x == 0:
+                var arrive = regions[rank].unsafe_offset(
+                    _AG_ARRIVE_OFFSET
+                ).unsafe_bitcast[UInt64]()
+                var was = Atomic[DType.uint64].fetch_add[
+                    ordering=Ordering.ACQUIRE_RELEASE
+                ](arrive, UInt64(1))
+                if Int(was) == Int(grid_dim.x) - 1:
+                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                        arrive, UInt64(0)
+                    )
+                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                        mb_req, seq
+                    )
 
     if not _sync(
         regions, world, rank, ERR_ALLGATHER_SYNC, flag_base + 1, t0, timeout_ns
@@ -2633,6 +2666,8 @@ def _allgather_kernel[
         flag_base,
         timeout_ns,
         InlineArray[Int32, MAX_WORLD](fill=0),
+        regions[0].unsafe_bitcast[UInt64](),
+        UInt64(0),
     )
 
 
@@ -2654,6 +2689,8 @@ def _allgather_mapped_kernel[
     flag_base: UInt64,
     timeout_ns: UInt64,
     rank_at: InlineArray[Int32, MAX_WORLD],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
 ):
     _allgather_body[U, True](
         regions,
@@ -2667,6 +2704,8 @@ def _allgather_mapped_kernel[
         flag_base,
         timeout_ns,
         rank_at,
+        mb_req,
+        seq,
     )
 
 
@@ -3702,8 +3741,13 @@ def allgather_mapped[
     stride_bytes: Int,
     rank_at: StaticTuple[Int32, MAX_WORLD],
     max_blocks: Int = _COPY_MAX_BLOCKS,
+    mb_req: Int = 0,
+    seq: Int = 0,
 ) raises:
-    """Gather local ranks directly into their mapped global output slots."""
+    """Gather local ranks directly into their mapped global output slots.
+
+    `seq != 0`: release RDMA exchange `seq` through the mailbox at `mb_req`
+    once the contribution is staged (see `_allgather_body`)."""
     _check_common(rank, world, cap_bytes, generation)
     if nbytes_per_rank == 0:
         return
@@ -3740,4 +3784,8 @@ def allgather_mapped[
         _flag_target(generation, 0),
         spin_timeout_ns(),
         ranks,
+        Pointer[UInt64, MutAnyOrigin](
+            unsafe_from_address=mb_req if seq != 0 else regions[rank]
+        ),
+        UInt64(seq),
     )

@@ -323,7 +323,12 @@ collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
 reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
 96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
 62.4k. Isolated, 64 blocks still beat NCCL (block bf16 0.92x, root fp32
-0.94x)."""
+0.94x). NCCL's 16 CTAs are not the answer for a pull: 16 blocks x 16
+vectors in flight measures the same isolated time as 96 x 4 on the XL sizes
+(block 360 vs 348 us, root 1031 vs 1027) yet 63.1-64.8k tok/s end to end
+against 66.1-69.1k -- a latency-bound pull under the compute stream's HBM
+traffic loses far more from 6x fewer CTAs than the GEMMs gain from the
+freed SMs, and the compute stream waits on this gather."""
 comptime AG_NODE_UNROLL = 4
 """16-byte vectors in flight per thread in those gathers; 8 measured
 66.1k tok/s against 67.3-67.6k at 96 blocks."""
@@ -3078,11 +3083,13 @@ def _allgather_node_mapped(
     dst: Int,
     count: Int,
     stride: Int,
+    seq: Int = 0,
 ) raises:
     var ranks = StaticTuple[Int32, MAX_WORLD](fill=0)
     for l in range(state.local_world):
         ranks[l] = Int32(state.rank_at[node * state.local_world + l])
     state.generation += 1
+    var mb_req = ib_mailbox_dev(state.ib)[0] if seq != 0 else 0
     allgather_mapped[AG_NODE_UNROLL](
         state.ctx,
         stream,
@@ -3097,6 +3104,8 @@ def _allgather_node_mapped(
         stride,
         ranks,
         AG_NODE_BLOCKS,
+        mb_req,
+        seq,
     )
 
 
@@ -3148,25 +3157,13 @@ def _allgather_multinode_mapped(
             var off = k * chunk_bytes
             var count = min(chunk_bytes, per_rank_bytes - off)
             var arena = k % depth
-            _allgather_node_mapped(
-                state,
-                stream,
-                arena,
-                state.my_node,
-                sendbuff + off,
-                recvbuff + off,
-                count,
-                per_rank_bytes,
-            )
+            # The work item is filled before the gather launches; the gather
+            # itself releases the exchange once the contribution is staged.
             var seq = ib_next_seq(state.ib)
             var slot_bytes = _align_up(count, 16)
             var inbox_base = _inbox_base(state, seq)
-            ib_enqueue_request(
+            ib_prepare_request(
                 state.ib,
-                state.driver,
-                state.ctx,
-                stream,
-                Int(raw_stream),
                 state.owned_base + arena * state.arena_stride + signal_bytes(),
                 count,
                 inbox_base,
@@ -3179,6 +3176,17 @@ def _allgather_multinode_mapped(
                 k,
                 nchunks,
                 count,
+            )
+            _allgather_node_mapped(
+                state,
+                stream,
+                arena,
+                state.my_node,
+                sendbuff + off,
+                recvbuff + off,
+                count,
+                per_rank_bytes,
+                seq,
             )
             seqs[k % depth] = seq
         var j = k - (depth - 1)
