@@ -665,12 +665,21 @@ def _stream_rs_kernel[
     # Every spin of this call compares the poison word against `flag_base`,
     # which strictly increases per call, so a previous call's value is not one.
     var tag = flag_base
+    # THE ARENA LAYOUT IS THE SAME FOR EVERY CHUNK, AND THAT IS LOAD-BEARING.
+    # The FREE credit is per block index: before writing the arena at chunk
+    # k a block waits only for the SAME block index on every peer to have
+    # released chunk k-narenas. That is sound exactly while block b owns the
+    # same bytes in both, so the slot stride and the partition come from the
+    # full `chunk_elems`, never from a short last chunk's `cnt`, and a short
+    # chunk simply leaves the tail of the layout unwritten.
+    var slot = _align_up(ce * 4, 16)
+    var vc_full = ce // 4
+    var vpb = max(1, (vc_full + nblocks - 1) // nblocks)
 
     for k in range(nchunks + depth - 1):
         if k < nchunks:
             var off = k * ce
             var cnt = min(ce, total - off)
-            var slot = _align_up(cnt * 4, 16)
             var arena_off = (k % narenas) * Int(arena_stride)
             var push_off = arena_off + _SIGNAL_BYTES
             var out_off = push_off + (world - 1) * nnodes * slot
@@ -688,14 +697,17 @@ def _stream_rs_kernel[
                     timeout_ns,
                 ):
                     return
-            # This block's contiguous range of the chunk, in 16-byte vectors;
-            # the `cnt % 4` tail rides on the last block's last piece.
+            # This block's slice of the fixed partition, clipped to what this
+            # chunk actually carries; the `cnt % 4` tail rides on whichever
+            # block owns the vector it starts at.
             var vc = cnt // 4
             var tailn = cnt - vc * 4
-            var vpb = (vc + nblocks - 1) // nblocks
             var vlo = min(vc, b * vpb)
-            var vhi = min(vc, vlo + vpb)
-            var mine_tail = tailn if b == nblocks - 1 else 0
+            var vhi = min(vc, (b + 1) * vpb)
+            # Only a `count` that is not a multiple of four has a tail, so
+            # the division stays off the hot path.
+            var tail_owner = min(nblocks - 1, vc // vpb) if tailn > 0 else 0
+            var mine_tail = tailn if b == tail_owner else 0
             var npieces = (vhi - vlo + pv - 1) // pv
             if mine_tail > 0 and npieces == 0:
                 npieces = 1
@@ -782,7 +794,6 @@ def _stream_rs_kernel[
         if j >= 0 and nnodes > 1:
             var off = j * ce
             var cnt = min(ce, total - off)
-            var slot = _align_up(cnt * 4, 16)
             var arena_off = (j % narenas) * Int(arena_stride)
             var out_off = (
                 arena_off + _SIGNAL_BYTES + (world - 1) * nnodes * slot
@@ -793,10 +804,11 @@ def _stream_rs_kernel[
             ):
                 return
             var vc = cnt // 4
-            var vpb = (vc + nblocks - 1) // nblocks
             var vlo = min(vc, b * vpb)
-            var vhi = min(vc, vlo + vpb)
-            var n = (vhi - vlo) * 4 + (cnt - vc * 4 if b == nblocks - 1 else 0)
+            var vhi = min(vc, (b + 1) * vpb)
+            var tailn = cnt - vc * 4
+            var tail_owner = min(nblocks - 1, vc // vpb) if tailn > 0 else 0
+            var n = (vhi - vlo) * 4 + (tailn if b == tail_owner else 0)
             _sum_out(
                 out_ptr.unsafe_offset(off + vlo * 4),
                 me.unsafe_offset(
@@ -875,7 +887,7 @@ def reduce_scatter_stream_pieces(
     does every rank, because both follow from the agreed (chunk, grid)."""
     var pv = RS_STREAM_UNROLL * RS_STREAM_SLICE_UNROLLS * RS_STREAM_THREADS
     var vc = chunk_elems // 4
-    var vpb = (vc + blocks - 1) // blocks
+    var vpb = max(1, (vc + blocks - 1) // blocks)
     return Tuple(pv, max(1, (vpb + pv - 1) // pv))
 
 

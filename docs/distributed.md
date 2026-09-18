@@ -767,6 +767,27 @@ of a peer produced, whatever the two ranks decide about 16-byte alignment.
 In-place, `count == 0`, arbitrary alignment, bounded spins, the error word
 and the status page work exactly as in the fused kernel.
 
+**The arena layout is the same for every chunk of a call, and that is what
+makes the per-block credit sound.** The slot stride and the partition come
+from the full `chunk_elems`; a short last chunk leaves the tail of the
+layout unwritten instead of re-cutting it. Deriving either from a chunk's
+own `cnt` -- which is what the kernel first did -- moves every slot base and
+every block boundary for the last chunk, so block `b`'s write lands on bytes
+block `b-1` of a peer is still reducing while `b` has waited only for the
+peer's block `b`. `rs_fused.mojo` gets away with a per-chunk stride because
+its rank-local grid barrier makes one block's cross-rank sync transitively
+cover every block of the peer; this kernel gave that up, so it owes the
+invariant instead. Reachable at ordinary sizes -- the default 256 MiB region
+caps a chunk at 2,097,152 fp32, so 36 MiB per rank is five chunks over four
+arenas with a half-size last one -- and `tests/test_mojoccl_reduce_scatter_layout.py`
+pins it in source, because the failure is a race: 1000 mojo-leg collectives
+per rank at 16 ranks over 5, 9 and 35 chunks, with half-size and
+single-element last chunks, at both region sizes, did not reproduce it on
+the broken kernel. What keeps it shut is that every block waits on the same
+`_RS_STREAM_DONE` word once per chunk and must arrive before the exchange is
+released, which holds the blocks of a rank inside one chunk of each other.
+Nothing promises that.
+
 One thing did not survive dropping the grid barriers. With no barrier left,
 every block polled the pinned mailbox for the exchange itself, and 32
 threads reading host memory over the link the NIC is moving the shard on

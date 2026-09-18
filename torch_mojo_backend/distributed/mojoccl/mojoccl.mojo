@@ -3736,9 +3736,13 @@ def _do_reduce_scatter_stream(
     # `+ nchunks*pieces` and are never reset, so the call reserves that many.
     state.generation += reduce_scatter_stream_generations(nchunks, pieces[1])
     var seq0 = ib_reserve_seqs(state.ib, nchunks)
+    # One layout for every chunk of the call: the kernel's FREE credit is per
+    # block index and only covers the peers' same-indexed block, which is
+    # sound exactly while a short last chunk cannot re-cut the arena. The
+    # payload it sends is still its own `cnt`.
+    var slot = _align_up(chunk_elems * 4, 16)
     for k in range(nchunks):
         var cnt = min(chunk_elems, count - k * chunk_elems)
-        var slot = _align_up(cnt * 4, 16)
         var seq = seq0 + k
         var inbox_base = _inbox_base(state, seq)
         ib_prepare_request(
