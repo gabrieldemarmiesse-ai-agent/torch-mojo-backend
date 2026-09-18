@@ -2,38 +2,59 @@
 
 ## Current optimization snapshot
 
-Commit `4e3fe5d`, measured on 2026-09-17 on two H100 80GB HBM3 GPUs
-(`par2dc5-ai-prd-cl02s04dgx30`, Slurm job 256255). The training configuration
-below is unchanged. These sequence-length-1024 results combine six windows
-from two independent launches per stack, in CUDA/Mojo/MojoCCL order followed
-by the reverse order. Every window is retained.
+Commit `2194826`, measured on 2026-09-18 on an exclusive node
+(`par2dc5-ai-prd-cl02s04dgx27`, Slurm job 257966, H100 80GB HBM3, driver
+570.211.01). Same training configuration as below. Each row is the median of
+six synchronized 10-step windows: three per launch, two launches per stack,
+in CUDA/Mojo/MojoCCL then MojoCCL/Mojo/CUDA order, nothing else on the node,
+every window retained. Raw records:
+`current_bench_train/fsdp2_opt/fresh/runs/q{2,8}_{cuda,mojo,mojoccl}_{a,b}.json`.
 
-| Configuration | Tokens/s | Step time (ms) | Window range (tokens/s) |
+### Two GPUs (sequence length 1024)
+
+| Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
 |---|---:|---:|---:|
-| Stock PyTorch CUDA + NCCL | 7,231.8 | 283.19 | 6,937.7–7,289.5 |
-| Torch Mojo + NCCL | 6,135.3 | 333.80 | 6,086.3–6,159.4 |
-| Torch Mojo + MojoCCL | 4,294.7 | 476.87 | 4,252.3–4,326.9 |
+| Stock PyTorch CUDA + NCCL | 9,062.8 | 100% | 8,289.2–9,093.4 |
+| Torch Mojo + NCCL | 9,141.7 | 100.9% | 9,046.6–9,253.1 |
+| Torch Mojo + MojoCCL | 9,186.1 | 101.4% | 8,198.6–9,267.1 |
 
-Mojo + NCCL reaches **84.8%** of the matched CUDA throughput; the 97% target
-is not yet met. Mojo + MojoCCL reaches 59.4% of CUDA and 70.0% of Mojo + NCCL.
-The primary changes batch FSDP split copies, combine adjacent foreach copies,
-and remove temporary tensors from scalar division and gradient clipping.
-The experimental GEMM and further elementwise kernels are not in this snapshot.
+### Eight GPUs (sequence length 1024, batch 1 per GPU)
 
-This allocation reserves the two GPUs and 32 CPUs; each model launch uses
-12 CPUs and both GPU locks. Other jobs can use the rest of the node. Clocks
-could not be locked. Absolute throughput also changed for unchanged code
-during this allocation, so comparisons with the initial measurements below
-do not isolate the effect of the code changes. Use the matched rows above.
-Raw records are `current_bench_train/fsdp2_opt/current_{cuda,mojo,mojoccl}_{a,b}.json`.
+| Configuration | Tokens/s | vs CUDA | Window range (tokens/s) |
+|---|---:|---:|---:|
+| Stock PyTorch CUDA + NCCL | 35,867.7 | 100% | 32,742.6–36,023.5 |
+| Torch Mojo + NCCL | 34,651.6 | 96.6% | 33,874.7–35,120.7 |
+| Torch Mojo + MojoCCL | 34,596.2 | 96.5% | 32,977.1–34,731.6 |
 
-All six XL runs completed with finite losses. GPT-2 124M also completed five
-BF16 training steps with NCCL and MojoCCL, with matching printed losses.
-The four two-rank FSDP tests pass, including gradient/update parity,
-checkpoint round trips, reduce-scatter tails and aliases, and successive
-collectives across caller streams. Commit `92ac158` fixes the MojoCCL
-reduce-scatter ordering scope and checkpoint staging when CUDA and Mojo
-are both available.
+What closed the gap from the 84.8% snapshot below (both stacks are
+host-bound: GPU compute-stream time is ~110 ms of a ~224 ms step, so every
+change is host work per op or per collective):
+
+- The process group returns an event-backed `Work` instead of building a
+  device Future per collective (all_gather_into_tensor 105 → 71 µs in-model).
+- The boxed-kernel adapter decides a schema's argument conversions once, reads
+  a tensor's metadata in one call, and lets ATen's own device-agnostic kernels
+  serve `view`/`_unsafe_view`/`_reshape_alias`/`as_strided`.
+- The kernel launch cache is keyed by the kernel function's compile-time
+  identity: a warm launch formats and allocates nothing; `KernelCall` uses
+  inline storage.
+- Functional elementwise ops take one fast route for the common case;
+  `mul_`/`sub_` write in place; `addmm` adds its bias inside the op.
+- MojoCCL reduce-scatter is one push+reduce kernel per call (was ~122 chunked
+  all-reduces and a host synchronize per call); all-gather reads its local
+  contribution once. Per-collective device time is within 10% of NCCL at every
+  FSDP2 size for 2 ranks; at 8 ranks the once-per-step root collectives are
+  1.11–1.16x NCCL.
+
+Remaining at 8 GPUs (under investigation): the optimizer phase's host time is
+still a few ms behind CUDA per step, and MojoCCL's comm kernels contend with
+compute for SMs (its grid is far larger than NCCL's).
+
+Correctness: the two-rank distributed suite (NCCL and MojoCCL: collectives,
+DDP parity, stream ordering, stress, abort, both FSDP2 modes, chunked
+reduce-scatter, AVG overflow) and the targeted native suites pass; GPT-2 124M
+prints the same five-step loss trajectory under both collective libraries as
+before these changes.
 
 ## Initial measurements
 
@@ -103,9 +124,9 @@ count is `world_size * batch_size * sequence_length * steps`.
 All runs completed with finite losses. Synthetic repeated batches make this
 a throughput comparison, not an assessment of model quality. These results
 apply to the stated configuration, not maximum throughput after batch-size,
-optimizer, or compiler tuning. MojoCCL reduce-scatter currently performs
-extra communication and synchronizes the CPU; its implementation prioritizes
-correctness over performance.
+optimizer, or compiler tuning. The initial MojoCCL reduce-scatter performed
+extra communication and synchronized the CPU (see the snapshot above for the
+current one).
 
 ## Reproduction
 
