@@ -801,20 +801,27 @@ warps drift apart and one SM holds NVLink stores and HBM loads at once,
 520/1274. Both sit inside this unlocked-clock box's run-to-run spread
 (+-4% on the mojo leg, +-1% on NCCL's).
 
-**The root reduce-scatter is still 1.28x NCCL and this schedule cannot
-close that.** Its floor is the node-local push: 287 MB per GPU at the
-326 GB/s a 32-CTA push gets from this fabric is 880 us, already 89% of
-NCCL's whole call. NCCL fits the same 288 MB of NVLink traffic, the
-reduction and the network hop into 990 us because its ring fuses them --
-`recvReduceSend` is one pass that loads the neighbour's slice, adds the
-local contribution and stores to the next neighbour, so the NVLink store
-and the HBM read of every byte belong to one instruction stream. Ours are
-two passes over the data (push, then an 8-way reduce out of the staging
-slots) and inside a block they serialize whatever the flags do: 880 us of
-push, 123 us of reduce, 28 us of output sum and the one exposed 122 us
-exchange is 1153 us before any skew, against 1089 us for 1.10x. Closing it
-means a node-local **ring** whose hop fuses load, add and store, not a
-finer handoff on the direct schedule.
+**The root reduce-scatter is still 1.28x NCCL, and the reduce is not most
+of what is left.** Deleting both HBM passes -- the 8-way reduce and the
+output sum -- from an otherwise final kernel, keeping every flag, exchange
+and arrival so the schedule is unchanged, measures block 469 us and root
+1155 us against 515 and 1277 with them. So the two passes cost 46 and 122
+us, and the rest (the push, the handoff and the one exposed exchange) is
+already 1.01x NCCL at the block size and **1.17x at the root**.
+
+That bounds what the obvious next step buys. A node-local **ring** whose
+hop fuses load, add and store -- NCCL's `recvReduceSend`, one pass that
+loads the neighbour's slice, adds the local contribution and stores to the
+next neighbour -- moves exactly the same NVLink bytes as this push and
+makes the reduce free, so it would land near that 469 / 1155: parity at the
+block size, 1.17x at the root. The other 17% is the push itself. 287 MB per
+GPU at the 326 GB/s the fused kernel's push measured on this fabric would be
+880 us, and 880 plus the last chunk's 122 us exchange is 1002; the
+push-only build measures 1155, i.e. about 281 GB/s all in. Recovering the
+fused kernel's push rate inside the streaming schedule -- the two differ in
+that a block here owns a contiguous range instead of grid-striding the
+chunk, and publishes a release flag per piece -- is worth as much as the
+ring, and neither has been tried.
 
 Its grid is fitted end to end, not on the isolated collective, and the two
 fits disagree: 128 CTAs make the isolated root reduce-scatter 1.2x NCCL and
