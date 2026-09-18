@@ -766,12 +766,13 @@ failing family can be rebuilt by hand with the same `mojo build` line.
 
 What MAX 26.5's Metal backend does not have: user-created streams
 (`createStream is not supported on this device`) or device events
-(`eventCreate is not supported on this device`, including the default stream),
-so `torch.Stream(device="mojo")` raises and work runs on the default stream;
-and host callbacks, which is why host-to-device copies take
+(`eventCreate is not supported on this device`, including the default stream).
+`torch.Stream(device="mojo")` therefore always identifies the default stream
+(`stream_id == 0`, matching MPS — see `docs/streams.md`), while recording an
+event still raises; and host callbacks, which is why host-to-device copies take
 the synchronous route there (`copy_from_host`; unified memory makes the
 pinned staging pointless anyway). Checked on an M4 (macOS 26.6.1): the
-bring-up tests pass except the stream/event ones, and the op groups run
+bring-up tests pass except the event ones, and the op groups run
 against CPU torch like on CUDA.
 
 `torch.compile(backend=mojo_backend)` exchanges allocations with the native
