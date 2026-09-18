@@ -753,10 +753,12 @@ and the status page work exactly as in the fused kernel.
 One thing did not survive dropping the grid barriers. With no barrier left,
 every block polled the pinned mailbox for the exchange itself, and 32
 threads reading host memory over the link the NIC is moving the shard on
-cost far more than the barrier ever did: isolated root fp32 measured 2511 us
-that way (NCCL 993). Block 0 now polls and republishes what it saw into a
-device word the other blocks spin on out of L2 -- the same transitive
-acquire of the NIC's writes that the grid barrier used to give them.
+cost far more than the barrier ever did: that one line, changed back on an
+otherwise final tree, takes the isolated root fp32 reduce-scatter from
+1273 us to 2195 (NCCL 982-1007). Block 0 now polls and republishes what it
+saw into a device word the other blocks spin on out of L2 -- the same
+transitive acquire of the NIC's writes that the grid barrier used to give
+them.
 
 What the streaming bought, measured on 2x8 H100 SXM over InfiniBand
 (job 259332, 16 ranks, `--core`, CUPTI device time of the comm stream,
