@@ -675,8 +675,12 @@ def _sync(
     t0: UInt64,
     timeout_ns: UInt64,
     arena_off: Int = 0,
+    row: Int = -1,
 ) -> Bool:
     """Block-scoped barrier across the same block index on every rank.
+
+    `row` >= 0 uses that flag row instead of the block index: the gate
+    (`_rs_gate_kernel`) barriers a whole rank from one block on `GATE_ROW`.
 
     Thread `p` (p < world) publishes `target` into peer p's flags[bid][rank]
     -- after every payload write this block made into peer memory has landed,
@@ -732,7 +736,7 @@ def _sync(
 
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
-        var bid = Int(block_idx.x)
+        var bid = Int(block_idx.x) if row < 0 else row
         # The acquire stays an acquire *load*, per iteration. Spinning on a
         # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
         # invalidating once after the wait looks exactly as strong, is worth
@@ -2480,7 +2484,7 @@ def _allgather_rank[
 
 @always_inline
 def _allgather_body[
-    U: Int, MAPPED: Bool
+    U: Int, MAPPED: Bool, GATED: Bool
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
@@ -2581,10 +2585,12 @@ def _allgather_body[
             )
         return
 
-    if not _sync(
-        regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-    ):
-        return
+    # A GATED caller ran `_gate_kernel` ahead of the grid instead.
+    comptime if not GATED:
+        if not _sync(
+            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+        ):
+            return
 
     # One read of my contribution, two stores: my region (what the peers
     # read) and my own slice of the output.
@@ -2654,7 +2660,7 @@ def _allgather_kernel[
     flag_base: UInt64,
     timeout_ns: UInt64,
 ):
-    _allgather_body[U, False](
+    _allgather_body[U, False, False](
         regions,
         in_ptr,
         out_ptr,
@@ -2676,7 +2682,7 @@ def _allgather_kernel[
 )
 @__name("ccl_allgather_mapped_bytes")
 def _allgather_mapped_kernel[
-    U: Int
+    U: Int, GATED: Bool
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
@@ -2692,7 +2698,7 @@ def _allgather_mapped_kernel[
     mb_req: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
 ):
-    _allgather_body[U, True](
+    _allgather_body[U, True, GATED](
         regions,
         in_ptr,
         out_ptr,
@@ -2706,6 +2712,81 @@ def _allgather_mapped_kernel[
         rank_at,
         mb_req,
         seq,
+    )
+
+
+comptime GATE_ROW = MAX_BLOCKS - 1
+"""Flag row of the reduce-scatter gate. A multi-node communicator's grids
+are at most the SM count (fused kernels) or `_COPY_MAX_BLOCKS` (432), so
+the last row is never a block's own; single-node communicators, whose
+grids may reach MAX_BLOCKS, never gate."""
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
+)
+@__name("ccl_rank_gate")
+def _gate_kernel(
+    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    world_i: Int32,
+    rank_i: Int32,
+    code: Int32,
+    target: UInt64,
+    timeout_ns: UInt64,
+):
+    """A collective's start barrier, by one block ahead of the grid.
+
+    In a training step the collectives are where the ranks' skew shows: the
+    kernel of an early rank sat in its start barrier for most of its
+    in-situ life (GPT-2 XL FSDP2 on 2x8 H100: the fused reduce-scatter
+    1.8 ms resident for 0.6 ms of work, the remote all-gather up to 2 ms)
+    holding all of its SMs' register files, and the compute stream's GEMMs
+    could not use them. This block waits instead, on one SM; the worker
+    grid is stream-ordered behind it and skips its phase-0 barrier
+    (`GATED=True`). The guarantee is the same one those barriers gave: my
+    flag is published after every collective before this one on my stream
+    has completed, and I wait for every peer's, so when the worker starts
+    every rank has finished reading and pushing the arenas of the previous
+    collective -- including every peer's pulls from my staging, since those
+    peers have completed too. `_sync` records a deadline or an abort the
+    way it does for any other barrier, under the caller's `code`.
+    """
+    var t0 = device_now_ns()
+    _ = _sync(
+        regions,
+        Int(world_i),
+        Int(rank_i),
+        Int(code),
+        target,
+        t0,
+        timeout_ns,
+        0,
+        GATE_ROW,
+    )
+
+
+def rank_gate(
+    ctx: DeviceContext,
+    stream: DeviceStream,
+    rank: Int,
+    world: Int,
+    regions: StaticTuple[Int, MAX_WORLD],
+    code: Int,
+    generation: Int,
+) raises:
+    _enqueue_cached_dim[_gate_kernel](
+        ctx,
+        stream,
+        "rank_gate",
+        1,
+        32,
+        False,
+        _region_ptrs(regions, rank, world),
+        Int32(world),
+        Int32(rank),
+        Int32(code),
+        _flag_target(generation, 0),
+        spin_timeout_ns(),
     )
 
 
@@ -3726,7 +3807,7 @@ def allgather(
 
 
 def allgather_mapped[
-    U: Int = _UNROLL
+    U: Int = _UNROLL, GATED: Bool = False
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
@@ -3747,7 +3828,9 @@ def allgather_mapped[
     """Gather local ranks directly into their mapped global output slots.
 
     `seq != 0`: release RDMA exchange `seq` through the mailbox at `mb_req`
-    once the contribution is staged (see `_allgather_body`)."""
+    once the contribution is staged (see `_allgather_body`). `GATED`: the
+    caller ran `rank_gate` just before, so the kernel skips its start
+    barrier."""
     _check_common(rank, world, cap_bytes, generation)
     if nbytes_per_rank == 0:
         return
@@ -3768,10 +3851,10 @@ def allgather_mapped[
     var ranks = InlineArray[Int32, MAX_WORLD](fill=0)
     for i in range(world):
         ranks[i] = rank_at[i]
-    _enqueue_cached[_allgather_mapped_kernel[U]](
+    _enqueue_cached[_allgather_mapped_kernel[U, GATED]](
         ctx,
         stream,
-        String(t"allgather_mapped_u{U}"),
+        String(t"allgather_mapped_u{U}_g{GATED}"),
         blocks,
         rp,
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=in_ptr),

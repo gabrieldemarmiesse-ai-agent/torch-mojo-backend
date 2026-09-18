@@ -180,7 +180,7 @@ def _fused_rs_kernel[
             var arena_off = (k % narenas) * Int(arena_stride)
             var out_off = _SIGNAL_BYTES + (world - 1) * nnodes * slot
             if not _rs_nodes_body[
-                DType.float32, 4, RS_FUSED_UNROLL, NW, RS_FUSED_THREADS
+                DType.float32, 4, RS_FUSED_UNROLL, NW, RS_FUSED_THREADS, True
             ](
                 regions,
                 in_ptr.unsafe_offset(off),

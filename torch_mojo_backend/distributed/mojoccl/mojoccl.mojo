@@ -146,6 +146,7 @@ from collectives_kernels import (
     install_status_page,
     region_init,
     reduce_scatter,
+    rank_gate,
     reduce_scatter_max_count,
     reduce_scatter_stage,
     shard_range,
@@ -3084,12 +3085,32 @@ def _allgather_node_mapped(
     count: Int,
     stride: Int,
     seq: Int = 0,
+    gated: Bool = False,
 ) raises:
     var ranks = StaticTuple[Int32, MAX_WORLD](fill=0)
     for l in range(state.local_world):
         ranks[l] = Int32(state.rank_at[node * state.local_world + l])
     state.generation += 1
     var mb_req = ib_mailbox_dev(state.ib)[0] if seq != 0 else 0
+    if gated:
+        allgather_mapped[AG_NODE_UNROLL, True](
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            _arena_regions(state, arena),
+            src,
+            dst,
+            count,
+            state.arena_cap,
+            state.generation,
+            stride,
+            ranks,
+            AG_NODE_BLOCKS,
+            mb_req,
+            seq,
+        )
+        return
     allgather_mapped[AG_NODE_UNROLL](
         state.ctx,
         stream,
@@ -3199,6 +3220,19 @@ def _allgather_multinode_mapped(
             # Send completion protects this arena before the remote gathers
             # reuse it; the next chunk reuses it only after those consumers.
             ib_enqueue_wait(state.ib, state.ctx, stream, seq)
+            # The peers' exchanges retire at different times: wait for them
+            # on one SM (`rank_gate`), not in the first remote gather's
+            # start barrier with the whole grid resident.
+            state.generation += 1
+            rank_gate(
+                state.ctx,
+                stream,
+                state.local_rank,
+                state.local_world,
+                state.regions,
+                ERR_ALLGATHER_SYNC,
+                state.generation,
+            )
             var slot = 0
             for node in range(state.nnodes):
                 if node == state.my_node:
@@ -3214,6 +3248,8 @@ def _allgather_multinode_mapped(
                     recvbuff + off,
                     count,
                     per_rank_bytes,
+                    0,
+                    slot == 0,
                 )
                 slot += 1
             ib_note_consumed(state.ib, seq)
@@ -3617,6 +3653,15 @@ def _do_reduce_scatter_fused(
             send_node_stride=slot,
         )
     try:
+        rank_gate(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            ERR_REDUCE_SCATTER_SYNC,
+            g0,
+        )
         reduce_scatter_fused(
             state.ctx,
             stream,

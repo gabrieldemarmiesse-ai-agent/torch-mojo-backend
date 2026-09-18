@@ -54,7 +54,7 @@ def _rs_nodes_kernel[
     rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int32,
 ):
-    _ = _rs_nodes_body[dtype, W, U, NW, BLOCK](
+    _ = _rs_nodes_body[dtype, W, U, NW, BLOCK, False](
         regions,
         in_ptr,
         out_ptr,
@@ -76,7 +76,7 @@ def _rs_nodes_kernel[
 
 @always_inline
 def _rs_nodes_body[
-    dtype: DType, W: Int, U: Int, NW: Int, THREADS: Int
+    dtype: DType, W: Int, U: Int, NW: Int, THREADS: Int, GATED: Bool
 ](
     regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
@@ -110,17 +110,19 @@ def _rs_nodes_body[
     var vec = vector_ok != 0
 
     # --- phase 0: start barrier (the arena-reuse invariant) -----------------
-    if not _sync(
-        regions,
-        world,
-        rank,
-        ERR_REDUCE_SCATTER_SYNC,
-        flag_base,
-        t0,
-        timeout_ns,
-        arena_off,
-    ):
-        return False
+    # A GATED caller ran `_gate_kernel` ahead of the whole grid instead.
+    comptime if not GATED:
+        if not _sync(
+            regions,
+            world,
+            rank,
+            ERR_REDUCE_SCATTER_SYNC,
+            flag_base,
+            t0,
+            timeout_ns,
+            arena_off,
+        ):
+            return False
 
     # Each node contributes one destination chunk per local rank.
     for d in range(Int(node_count)):
