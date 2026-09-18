@@ -711,7 +711,44 @@ tok/s at 128 CTAs and 67.0-67.6k at 32 (`RS_FUSED_BIG_BLOCKS`, with the
 sweep). The node-local gathers of the multi-node all-gather are capped the
 same way (`AG_NODE_BLOCKS`, 96 against the single-node 432) and the progress
 thread keeps polling between the chunks of one call instead of sleeping
-(`BATCH_POLL_NS`). NCCL's kernels here are 16 CTAs of 544 threads.
+(`BATCH_POLL_NS`). NCCL's kernels here are 16 CTAs of 544 threads at 96
+registers.
+
+What the SMs cost, from a torch trace of one step (`tmp/fsdp2-parity/prof0`,
+both stacks): a persistent GEMM (132 CTAs, 168 registers x 384 threads,
+214 KB of shared memory) cannot share an SM with any collective CTA, so the
+GEMMs launched while NCCL's 16-CTA kernel is resident run at their solo
+speed (41.2 vs 41.0 us), those launched under a 96-CTA gather took 1.8x and
+under a 32-CTA reduce-scatter 1.46x; and both stacks' collectives are
+resident about three times their isolated duration, because the kernel of
+an early rank waits in its start barrier for the slowest one (our fused
+reduce-scatter 1.8 ms resident for 0.65 ms of work, NCCL's 1.6 ms for
+0.52). Two things follow. The start barrier is now run by one block ahead
+of the grid (`ccl_rank_gate`, `_sync` on the spare flag row `GATE_ROW`), so
+the skew is absorbed on one SM and the 32 (reduce-scatter) or 96 (remote
+gather) CTAs behind it only ever hold their SMs while moving bytes; the
+grid skips its phase-0 barrier (`GATED`), on the same guarantee -- a
+rank's gate flag is published after everything before it on its stream
+completed, and every peer's is awaited. And the mapped local gather
+releases its chunk's RDMA exchange from inside the kernel, the moment the
+last block has staged this rank's contribution (arrival counter at
+`_AG_ARRIVE_OFFSET`), so the network transfer runs under the peer pulls
+instead of after them: block bf16 all-gather 350 -> 249 us and one launch
+fewer per chunk.
+
+Two isolated wins that did not survive the step, recorded so they are not
+retried blind: NCCL's 16-CTA grid for the gathers (16 blocks x 16 loads in
+flight measure the same isolated time as 96 x 4 on the XL sizes, but a
+latency-bound pull under the compute stream's HBM traffic loses far more
+from 6x fewer CTAs than the GEMMs gain, 63.1-64.8k tok/s against
+66.1-69.1k), and 256 threads per reduce-scatter block (no register spills,
+isolated block 618 -> 576 us, but the block still owns the whole register
+file and the step measured no better). The push itself is bound by the
+fabric, not by the SMs: rotating the peer each block stores into by its
+block index took it from 291 to 326 GB/s per GPU (`_peer_step`, now on
+both vendors), and it runs at 140-170 us per 53.8 MB chunk from 16 CTAs
+up; what fewer CTAs cost is the HBM-bound reduce and the phase-1 barrier's
+wait on the slowest rank's push.
 
 The former multi-node implementation all-reduced 1 MiB chunks of every
 destination's slice and synchronized the host to release temporary memory
@@ -1057,27 +1094,42 @@ communicators keep the fused intra-node path and never touch IB.
 Measured at 16 ranks (2x8 H100 SXM, InfiniBand, job 258050) through the
 library's exported entry points, CUPTI device time of the comm stream,
 median over ranks of complete-call sums, vendor/mojo ABBA in one process
-(`tmp/fsdp2-2node/harness`, `results_final/bench_abba.json`); NCCL 2.28
-picked RING_LL for both collectives. The reduce-scatter grid is 32 CTAs
+(`tmp/fsdp2-2node/harness`, `tmp/fsdp2-parity/final/bench_abba.json`); NCCL
+2.28 picked RING_LL for both collectives. The reduce-scatter grid is 32 CTAs
 because the GEMMs it runs under decide the step, not this table (see
 "Reduce-scatter" above): the same kernel at 128 CTAs measures root 1263 us.
+"Before" is the tree before the gate, the in-kernel RDMA release and the
+peer rotation (same day, same nodes).
 
-| 16 ranks, per rank | NCCL us | mojoccl us | ratio | launches | host us NCCL / mojo |
-|---|---:|---:|---:|---:|---:|
-| all-gather bf16, XL block (3.84 MB) | 398 | 350 | **0.88** | 4 | 12.0 / 13.1 |
-| all-gather fp32, XL root (20.5 MB) | 1086 | 1027 | **0.95** | 8 | 12.0 / 22.2 |
-| reduce-scatter fp32 SUM, XL block (7.68 MB) | 523 | 669 | 1.28 | 1 | 12.3 / 6.5 |
-| reduce-scatter fp32 AVG, XL block | 524 | 666 | 1.27 | 1 | 12.1 / 6.4 |
-| reduce-scatter fp32 SUM, XL root (20.5 MB) | 1052 | 1566 | 1.49 | 1 | 11.9 / 6.6 |
-| reduce-scatter fp32, 357x789 at an odd offset | 164 | 312 | 1.90 | 1 | 12.2 / 6.2 |
-| all-gather fp32, 357x789 at an odd offset | 168 | 179 | 1.07 | 4 | 12.0 / 12.5 |
+| 16 ranks, per rank | NCCL us | before us | mojoccl us | ratio | launches | host us NCCL / mojo |
+|---|---:|---:|---:|---:|---:|---:|
+| all-gather bf16, XL block (3.84 MB) | 394 | 350 | 272 | **0.69** | 4 | 12.8 / 18.5 |
+| all-gather fp32, XL root (20.5 MB) | 1084 | 1027 | 977 | **0.90** | 8 | 12.3 / 21.3 |
+| reduce-scatter fp32 SUM, XL block (7.68 MB) | 520 | 669 | 658 | 1.27 | 2 | 12.3 / 8.5 |
+| reduce-scatter fp32 AVG, XL block | 524 | 666 | 654 | 1.25 | 2 | 12.4 / 8.5 |
+| reduce-scatter fp32 SUM, XL root (20.5 MB) | 1068 | 1566 | 1499 | 1.40 | 2 | 12.2 / 8.7 |
+| reduce-scatter fp32, 357x789 at an odd offset | 159 | 312 | 299 | 1.88 | 2 | 13.9 / 8.2 |
+| all-gather fp32, 357x789 at an odd offset | 169 | 179 | 159 | **0.94** | 4 | 12.0 / 11.7 |
+
+The reduce-scatter's device time is not where its step cost is. Its
+per-phase trace (block fp32, 32 CTAs, per 3.84 MB chunk): push 165-185 us
+at 326 GB/s per GPU, 8-way phase-1 barrier 5-35 us of rank skew, reduce
+41-51 us, output sum 13 us, exposed last RDMA 55-60 us (42 GB/s), grid
+barriers 4-7 us each. The push is bound by the fabric from 16 CTAs up, so
+the isolated gap to NCCL (a 16-rank ring that never waits for a whole
+node's push before reducing) is the reduce and the barriers, and closing it
+with more CTAs costs the step more than it returns.
 
 The placeholder these replaced measured 16,623 / 41,256 us on the block /
 root reduce-scatter (32x / 39x) with a host synchronize per call; the
 Nsight probe of the new paths sees no synchronize or query inside any
 reduce-scatter or all-gather enqueue. End to end, GPT-2 XL FSDP2 on those
-two nodes: CUDA + NCCL 68,769, Mojo + NCCL 69,134, Mojo + MojoCCL 66,406
-tok/s (96.6% of stock; six windows each, palindromic order). The 124M
+two nodes, six-leg palindrome, six windows per leg, median tok/s of all
+twelve windows per stack: CUDA + NCCL 70,993, Mojo + NCCL 65,444, Mojo +
+MojoCCL 65,760 (`tmp/fsdp2-parity/final/xl`) -- MojoCCL and NCCL on the
+Mojo device within noise of each other (the Mojo + NCCL legs of that run
+spread 57.0-68.8k; the same stack measured 69,134 on job 258050 the day
+before with the untouched tree, when Mojo + MojoCCL measured 66,406). The 124M
 five-step fp32 loss trajectory matches NCCL's exactly at four steps and
 differs by one fp32 ULP at one (9.151466 vs 9.151465): AVG's 1/16 is
 applied to every input before either sum, as NCCL does, but the eight
