@@ -205,6 +205,16 @@ from rs_multinode import (
     reduce_scatter_nodes_max_count,
     reduce_scatter_rank_ids,
 )
+from rs_stream import (
+    RS_STREAM_BIG_BLOCKS,
+    RS_STREAM_ENABLED,
+    reduce_scatter_stream,
+    reduce_scatter_stream_blocks,
+    reduce_scatter_stream_generations,
+    reduce_scatter_stream_pieces,
+    reduce_scatter_stream_plan,
+    reduce_scatter_stream_wanted,
+)
 from nvls_kernels import (
     ERR_NVLS_SYNC,
     nvls_allreduce,
@@ -3695,6 +3705,103 @@ def _do_reduce_scatter_fused(
         raise e
 
 
+def _do_reduce_scatter_stream(
+    mut state: CommState,
+    stream: DeviceStream,
+    sendbuff: Int,
+    recvbuff: Int,
+    count: Int,
+    scale: Float32,
+    chunk_elems: Int,
+    nchunks: Int,
+    depth: Int,
+) raises:
+    # Called only for fp32, after packed arena and inbox geometry validation.
+    if count <= 0 or chunk_elems <= 0 or nchunks <= 0 or nchunks > WORK_SLOTS:
+        raise Error("mojoccl: invalid streaming reduce-scatter plan")
+    var npeers = ib_npeers(state.ib)
+    var group = _inbox_group_bytes(state)
+    if npeers * _align_up(min(chunk_elems, count) * 4, 16) > group:
+        raise Error("mojoccl: streaming reduce-scatter inbox overflow")
+    var cap = (
+        RS_STREAM_BIG_BLOCKS if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
+    )
+    var blocks = reduce_scatter_stream_blocks(
+        state.ctx, state.local_world, state.sm_count, chunk_elems, cap
+    )
+    var pieces = reduce_scatter_stream_pieces(chunk_elems, blocks)
+    var rank_ids = reduce_scatter_rank_ids(state.rank_at)
+    var g0 = state.generation + 1
+    # The handoff counters run from `g0*PHASES_PER_GEN + 1` to
+    # `+ nchunks*pieces` and are never reset, so the call reserves that many.
+    state.generation += reduce_scatter_stream_generations(nchunks, pieces[1])
+    var seq0 = ib_reserve_seqs(state.ib, nchunks)
+    for k in range(nchunks):
+        var cnt = min(chunk_elems, count - k * chunk_elems)
+        var slot = _align_up(cnt * 4, 16)
+        var seq = seq0 + k
+        var inbox_base = _inbox_base(state, seq)
+        ib_prepare_request(
+            state.ib,
+            _reduce_scatter_partial(state, k % state.narenas, slot),
+            cnt * 4,
+            inbox_base,
+            slot,
+            True,
+            npeers,
+            state.owned_base + inbox_base,
+            seq,
+            OP_REDUCE_SCATTER,
+            k,
+            nchunks,
+            cnt,
+            send_node_stride=slot,
+        )
+    try:
+        rank_gate(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            ERR_REDUCE_SCATTER_SYNC,
+            g0,
+        )
+        reduce_scatter_stream(
+            state.ctx,
+            stream,
+            state.local_rank,
+            state.local_world,
+            state.regions,
+            sendbuff,
+            recvbuff,
+            ib_mailbox_dev(state.ib),
+            count,
+            chunk_elems,
+            nchunks,
+            depth,
+            state.narenas,
+            state.arena_stride,
+            seq0,
+            state.net_off + state.cap_bytes // 2,
+            group,
+            state.nslots,
+            npeers,
+            state.nnodes,
+            state.my_node,
+            g0,
+            scale,
+            blocks,
+            pieces[0],
+            pieces[1],
+            spin_timeout_ns(),
+            rank_ids,
+        )
+    except e:
+        _latch_host_fault(state, ERR_HOST_LAUNCH, seq0)
+        raise e
+
+
 def _do_reduce_scatter_nodes[
     dtype: DType
 ](
@@ -3728,6 +3835,27 @@ def _do_reduce_scatter_nodes[
     var depth = min(state.narenas, nchunks)
     comptime if dtype == DType.float32 and has_nvidia_gpu_accelerator():
         if state.fused:
+            comptime if RS_STREAM_ENABLED:
+                if reduce_scatter_stream_wanted(count, PIPE_SPLIT_UNIT):
+                    var plan = reduce_scatter_stream_plan(
+                        count,
+                        chunk_elems,
+                        state.narenas,
+                        PIPE_SPLIT_UNIT,
+                    )
+                    if plan[1] <= WORK_SLOTS:
+                        _do_reduce_scatter_stream(
+                            state,
+                            stream,
+                            sendbuff,
+                            recvbuff,
+                            count,
+                            scale,
+                            plan[0],
+                            plan[1],
+                            plan[2],
+                        )
+                        return
             var plan = reduce_scatter_fused_plan(
                 count,
                 chunk_elems,
