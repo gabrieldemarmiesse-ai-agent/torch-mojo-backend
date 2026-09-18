@@ -943,24 +943,19 @@ def _peer_step(i: Int, world: Int) -> Int:
     as the MI300A's xGMI mesh (one link per GPU pair): with the plain order
     the whole grid queues on one peer's link at a time and the other
     `world-2` links sit idle; rotated, the blocks spread over all of them at
-    once. Behind a switch (NVSwitch) the order is irrelevant. Measured on
-    4x MI300A: see docs/distributed.md, "Cluster notes (AMD MI300A)".
+    once. Measured on 4x MI300A: see docs/distributed.md, "Cluster notes
+    (AMD MI300A)". Behind NVSwitch it is not irrelevant either: with every
+    block of a rank storing into the same peer at once the 2x8 H100 fused
+    reduce-scatter's push ran at 291 GB/s per GPU, rotated 326 (block fp32
+    isolated 632 -> 618 us), so both vendors rotate.
     """
-    comptime if has_amd_gpu_accelerator():
-        return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
-    else:
-        # Behind NVSwitch the order is irrelevant; keep the H100-measured
-        # device code byte-identical.
-        return i
+    return 1 + (i - 1 + Int(block_idx.x)) % (world - 1)
 
 
 @always_inline
 def _peer_step0(i: Int, world: Int) -> Int:
     """`_peer_step` for loops that include the rank itself (0 <= i < world)."""
-    comptime if has_amd_gpu_accelerator():
-        return (i + Int(block_idx.x)) % world
-    else:
-        return i
+    return (i + Int(block_idx.x)) % world
 
 
 @always_inline
