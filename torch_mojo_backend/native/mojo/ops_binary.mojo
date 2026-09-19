@@ -1565,9 +1565,7 @@ def _b_no_mode() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
-def _b_fast_div_scalar(
-    a: T, s: Scal, rets: Values, dest_h: Int
-) raises -> Bool:
+def _b_fast_div_scalar(a: T, s: Scal, rets: Values, dest_h: Int) raises -> Bool:
     """The reciprocal route `_b_div` takes for a CUDA float32 tensor over a
     nonzero scalar -- same gates, same rounding, no cascade."""
     if (
