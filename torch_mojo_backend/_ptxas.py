@@ -356,7 +356,7 @@ def candidates() -> list[Ptxas]:
     setting in force; MAX's own compiler comes last, since it is what runs
     when nothing is set.
     """
-    found: list[tuple[Path, str]] = []
+    found = list[tuple[Path, str]]()
     explicit = explicit_choice()
     if explicit:
         found.append((Path(explicit), ENV_VAR))
@@ -369,7 +369,7 @@ def candidates() -> list[Ptxas]:
         found.append((triton_ptxas, "triton wheel"))
     found += _system_ptxas()
 
-    seen: set[Path] = set()
+    seen = set[Path]()
     result = []
     for path, source in found:
         try:

@@ -90,6 +90,7 @@ def _candidate_libnccl_paths() -> list[str]:
         return [override]
     candidates = []
     try:
+        # Optional Linux-only dependency: no NCCL wheel is installed on macOS.
         import nvidia.nccl  # noqa: PLC0415 -- optional: the wheel may not be installed
 
         # nvidia.nccl is a namespace package: no __file__, only __path__.

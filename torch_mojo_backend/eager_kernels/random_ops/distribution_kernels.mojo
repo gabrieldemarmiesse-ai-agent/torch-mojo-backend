@@ -43,6 +43,7 @@ from libdevice_port import (
     nv_tan,
 )
 from op_utils import _enqueue_cached, _make_ptr
+from rng_metadata import I64x8
 
 comptime DIST_UNIFORM = 0
 comptime DIST_NORMAL = 1
@@ -57,7 +58,6 @@ comptime DIST_RANDOM_FULL_64 = 9
 comptime DIST_RANDOM_32 = 10
 comptime DIST_RANDOM_64 = 11
 
-comptime I64x8 = SIMD[DType.int64, 8]
 comptime BLOCK = 256
 
 comptime _EPS_F32 = Float32(1.1920929e-07)
@@ -438,10 +438,14 @@ def _uniform_int_modulus[dtype: DType]() -> UInt64:
 @always_inline
 def _offset_of[
     TRIVIAL: Bool
-](li: Int, sizes: I64x8, strides: I64x8, ndim: Int) -> Int:
-    """Element offset of iterator index `li` (dims fastest-first)."""
+](li: Int, sizes: I64x8, strides: I64x8, ndim: Int, stride0: Int = 0) -> Int:
+    """Element offset of iterator index `li` (dims fastest-first).
+
+    `stride0` is the contiguous case's whole answer, and the caller passes it
+    already loaded: see `_dist_kernel` for why it cannot be read here.
+    """
     comptime if TRIVIAL:
-        return li * Int(strides[0])
+        return li * stride0
     else:
         var rem = li
         var off = 0
@@ -480,6 +484,12 @@ def _dist_kernel[
     var rounded = ((numel - 1) // (total * N) + 1) * total * N
     var linear = idx
     var k: UInt64 = 0
+    # `strides[0]` is loop-invariant, but it lives in parameter space and the
+    # backend does not hoist that load out of the grid-stride loop: it reloaded
+    # it once per unrolled lane, N times an iteration, which cost ~10% on the
+    # large contiguous cases (H100 sm_90a). A SIMD argument was hoisted for
+    # free, being a value rather than an aggregate; this reads it once instead.
+    var stride0 = Int(strides[0])
     while linear < rounded:
         var vals = dist_draw[dtype, DIST](
             curand4(ctr, key, k), p_out0, p_out1, p_acc0, p_acc1, i0, i1
@@ -489,7 +499,9 @@ def _dist_kernel[
             var li = linear + total * ii
             if li < numel:
                 dst[
-                    unsafe_offset=_offset_of[TRIVIAL](li, sizes, strides, ndim)
+                    unsafe_offset=_offset_of[TRIVIAL](
+                        li, sizes, strides, ndim, stride0
+                    )
                 ] = vals[ii]
         k += 1
         linear += total * N
@@ -532,8 +544,6 @@ def enqueue_distribution[
         dst,
         total,
         ndim,
-        sizes,
-        strides,
         p_out0,
         p_out1,
         p_acc0,
@@ -545,6 +555,8 @@ def enqueue_distribution[
         trivial,
     )
     def cpu_one[width: Int, alignment: Int = 1](c: Coord):
+        # sizes/strides are borrowed only on the CPU: elementwise's CPU
+        # implementation waits for all its worker tasks before returning.
         var li = Int(c[0].value())
         var k = li // (total * N)
         var rem = li % (total * N)
@@ -562,7 +574,7 @@ def enqueue_distribution[
             i1,
         )
         var off = _offset_of[True](
-            li, sizes, strides, ndim
+            li, sizes, strides, ndim, Int(strides[0])
         ) if trivial else _offset_of[False](li, sizes, strides, ndim)
         dst[unsafe_offset=off] = vals[ii]
 
@@ -704,8 +716,9 @@ def enqueue_bernoulli_tensor[
 
     @always_inline
     @parameter
-    @__copy_capture(dst, p, ndim, sizes, dst_strides, p_strides, seed, total)
+    @__copy_capture(dst, p, ndim, seed, offset, total)
     def cpu_one[width: Int, alignment: Int = 1](c: Coord):
+        # These metadata arrays are borrowed only by synchronous CPU work.
         var li = Int(c[0].value())
         var t = (li % total) // 4
         var j = li % 4

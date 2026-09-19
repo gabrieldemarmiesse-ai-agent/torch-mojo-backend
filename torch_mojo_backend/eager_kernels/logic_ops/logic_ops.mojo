@@ -25,6 +25,7 @@ from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
+from std.memory import bitcast
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -39,7 +40,6 @@ from op_utils import (
     MAX_RANK,
     _bw_flat_blocks,
     _enqueue_cached,
-    _flat_vec_unary,
     _gs_blocks,
     _l2_wave_blocks,
     _make_ptr,
@@ -355,19 +355,32 @@ def _bin_vec_op[
             # fp32 unconditionally: fp64 is not just slower there, it is
             # outright unsupported on Apple's Metal backend, so this same
             # widen-to-fp64 fix cannot apply to a GPU kernel at all.
-            # Checked against this same input on an NVIDIA GPU (no flush,
-            # correct answer) and on Apple's Metal GPU (DOES flush this fp32
-            # intermediate to zero -- `test_floor_divide_subnormal_quotient_
-            # underflow` skips there, unresolved: see that test).
+            # Metal flushes a negative subnormal quotient to zero. Inspect
+            # the input bits to retain its sign and distinguish it from a
+            # genuine zero numerator or an infinite divisor, without fp64.
             comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-                comptime if cpu_floordiv_f64:
-                    return (
-                        a.cast[DType.float64]() // b.cast[DType.float64]()
-                    ).cast[out_dtype]()
-                else:
-                    return (
-                        a.cast[DType.float32]() // b.cast[DType.float32]()
-                    ).cast[out_dtype]()
+                comptime wide = DType.float64 if cpu_floordiv_f64 else DType.float32
+                var quotient = (a.cast[wide]() // b.cast[wide]()).cast[
+                    DType.float32
+                ]()
+                var abits = bitcast[DType.uint16, width](a)
+                var bbits = bitcast[DType.uint16, width](b)
+                comptime infinity = 0x7C00 if dtype == DType.float16 else 0x7F80
+                var amag = abits & 0x7FFF
+                var bmag = bbits & 0x7FFF
+                # ATen's div_floor_floating also returns -1 for finite,
+                # nonzero operands divided by an opposite-sign infinity.
+                var negative_zero = (
+                    quotient.eq(0)
+                    & amag.ne(0)
+                    & amag.lt(SIMD[DType.uint16, width](infinity))
+                    & bmag.ne(0)
+                    & bmag.le(SIMD[DType.uint16, width](infinity))
+                    & ((abits ^ bbits) & 0x8000).ne(0)
+                )
+                return negative_zero.select(
+                    SIMD[DType.float32, width](-1), quotient
+                ).cast[out_dtype]()
             else:
                 return (a // b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV:
@@ -865,12 +878,40 @@ def _not_vec[dtype: DType, w: Int](a: SIMD[dtype, w]) -> SIMD[dtype, w]:
 def _bitwise_not[
     dtype: DType
 ](out_addr: Int, in_addr: Int, size: Int, ctx: DeviceContext) raises:
-    # 16-byte vectorized when both bases are aligned; the closure below
-    # keeps offset views (and the CPU context) correct.
-    if _flat_vec_unary[dtype, dtype, _not_vec[dtype, _], "bitwise_not"](
-        out_addr, in_addr, size, ctx
-    ):
-        return
+    comptime if has_accelerator():
+        # Preserve the previous 16-byte alignment regime for int64 views.
+        comptime vector_width = min(4, 16 // size_of[dtype]())
+        if (
+            ctx.api() != "cpu"
+            and (out_addr | in_addr) % (vector_width * size_of[dtype]()) == 0
+        ):
+            # Bool storage is a byte, not a packed vector of i1 values.
+            comptime storage_dtype = DType.uint8 if dtype == DType.bool else dtype
+            var dst = _make_ptr[storage_dtype](out_addr)
+            var src = _make_ptr[storage_dtype](in_addr)
+
+            @always_inline
+            @parameter
+            @__copy_capture(dst, src)
+            def gpu_func[width: Int, alignment: Int = 1](idx: Coord):
+                var i = Int(idx[0].value())
+                comptime byte_alignment = width * size_of[storage_dtype]()
+                var a = src.unsafe_load[width=width, alignment=byte_alignment](
+                    i
+                )
+                var result: SIMD[storage_dtype, width]
+                comptime if dtype == DType.bool:
+                    result = a.eq(0).cast[storage_dtype]()
+                else:
+                    result = _not_vec[storage_dtype, width](a)
+                dst.unsafe_store[width=width, alignment=byte_alignment](
+                    i, result
+                )
+
+            elementwise[gpu_func, simd_width=vector_width, target="gpu"](
+                Coord(size), ctx
+            )
+            return
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 

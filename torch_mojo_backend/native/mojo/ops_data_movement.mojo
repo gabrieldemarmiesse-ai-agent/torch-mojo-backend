@@ -91,7 +91,7 @@ from ops_common import (
     release_if_new,
     resize_out,
 )
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 from ops_foreach import _overlaps, _self_overlaps
 from ops_matmul import _sm90_cuda
 from ops_core import cast_for_copy, copy_between_devices, record_tensor_stream
@@ -2055,10 +2055,3 @@ def register_data_movement(site: Site) raises:
     impl[op_nonzero, "nonzero"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_empty_permuted, "empty_permuted"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_data_movement]()

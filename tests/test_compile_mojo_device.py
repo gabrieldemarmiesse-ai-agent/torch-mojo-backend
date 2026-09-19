@@ -443,5 +443,26 @@ def test_dlpack_export_keeps_memory_alive(mojo_device):
     # Churn some allocations to surface use-after-free if the pin is broken.
     for _ in range(4):
         _ = torch.randn(100).to(mojo_device)
-    roundtrip = torch.from_dlpack(buffer.to(max.driver.CPU()))
+    # Use the production consumer too. MAX 26.5's raw imported Metal
+    # Buffer.to(CPU) rejects a live external buffer; the native copy path
+    # can read it, and still requires this Buffer to keep the producer alive.
+    roundtrip = compiler._mojo_tensor_from_buffer(buffer).cpu()
     torch.testing.assert_close(roundtrip, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int64])
+def test_max_buffer_copy_preserves_alias(mojo_gpu: str, dtype: torch.dtype):
+    """Imported storage must support copies in both directions without detaching."""
+    source = torch.arange(359, dtype=dtype)
+    buffer = max.driver.Buffer.from_dlpack(source).to(
+        compiler._max_device_for_mojo(torch.device(mojo_gpu))
+    )
+    imported = compiler._mojo_tensor_from_buffer(buffer)
+    assert imported.data_ptr() == buffer._data_ptr()
+    torch.testing.assert_close(imported.clone().cpu(), source, rtol=0, atol=0)
+    replacement = source + 1
+    imported.copy_(replacement.to(mojo_gpu))
+    device_module.synchronize(mojo_gpu)
+    torch.testing.assert_close(
+        torch.from_dlpack(buffer.to(max.driver.CPU())), replacement, rtol=0, atol=0
+    )

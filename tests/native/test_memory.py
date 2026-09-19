@@ -1235,6 +1235,8 @@ def test_reset_orders_are_idempotent_with_live_storage(
 
 
 def test_views_and_strided_storage(mojo_device: str):
+    # Collect tensors left in cycles by earlier tests before recording the baseline.
+    _settle(mojo_device)
     base = device_module.memory_allocated(mojo_device)
     x = torch.empty_strided((5, 7), (19, 2), device=mojo_device)
     reference = torch.empty_strided((5, 7), (19, 2))
@@ -1254,6 +1256,9 @@ def test_views_and_strided_storage(mojo_device: str):
 
 @pytest.mark.parametrize("non_blocking", [False, True])
 def test_host_memory_is_excluded(mojo_device: str, non_blocking: bool):
+    # Unreachable tensor cycles from earlier tests must not be collected
+    # after we snapshot the live-storage baseline.
+    _settle(mojo_device)
     base = device_module.memory_allocated(mojo_device)
     host = torch.arange(513, dtype=torch.float32)
     pinned = torch.empty(4096, pin_memory=True)
@@ -1511,7 +1516,11 @@ def test_properties_and_memory_info(mojo_device: str):
         assert (
             props.multi_processor_count is not None and props.multi_processor_count > 0
         )
-        assert props.warp_size in (32, 64)
+        if props.api == "metal":
+            # MAX does not expose Metal's SIMD-group width as a device attribute.
+            assert props.warp_size is None
+        else:
+            assert props.warp_size in (32, 64)
         if props.api == "cuda":
             assert props.major is not None and props.major > 0
             if torch.cuda.is_available():

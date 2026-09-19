@@ -213,11 +213,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         self, store: Store, rank: int, world_size: int, timeout: datetime.timedelta
     ):
         super().__init__(rank, world_size)  # ty: ignore[missing-argument, invalid-argument-type] -- the 2-arg base ctor is the one a Python subclass can use
-        if platform.machine() not in ("x86_64", "AMD64"):
-            raise NotImplementedError(
-                "the mojo process group passes ncclUniqueId with the x86-64 SysV layout; "
-                f"{platform.machine()} is not supported yet"
-            )
         self._store = store
         self._timeout = timeout
         # CPU tensors (object collectives, barriers on CPU groups) go to gloo.
@@ -227,21 +222,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 PrefixStore("mojo-cpu-gloo", store), rank, world_size, timeout
             ),
         )
-        self._core = _Core()
-        self._path = nccl.library_path()
-        self._handle = self._core.create(str(self._path).encode(), rank, world_size)
-        if not self._handle:
-            raise RuntimeError(
-                f"could not load the collectives library: {native.last_error()}"
-            )
-        version = self._core.version(self._handle)
-        name = "mojoccl" if nccl.uses_mojoccl() else nccl.vendor_name()
-        if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
-            print(
-                f"[TRACE] collectives via {self._path} ({name} version {version})",
-                file=sys.stderr,
-                flush=True,
-            )
+        self._handle = None
         self._ready: dict[int, torch.Stream] = {}
         self._future_streams: dict[int, torch.Stream] = {}
         self._seq = 0
@@ -262,8 +243,36 @@ class MojoProcessGroup(dist.ProcessGroup):
         # A machine with no accelerator (the MAX CPU pseudo-device is current)
         # gets no communicator: only the gloo delegation for CPU tensors works.
         current = device_module.current_device()
-        if torch.device("mojo", current) != device_module.cpu():
+        if device_module.get_device_properties(current).api in ("cuda", "hip"):
             self._ensure(current)
+
+    @functools.cached_property
+    def _core(self) -> _Core:
+        # The native communicator ABI is irrelevant to CPU/Gloo collectives.
+        if platform.machine() not in ("x86_64", "AMD64"):
+            raise NotImplementedError(
+                "the mojo process group passes ncclUniqueId with the x86-64 SysV layout; "
+                f"{platform.machine()} is not supported yet"
+            )
+        return _Core()
+
+    def _initialize_collectives(self):
+        self._path = nccl.library_path()
+        self._handle = self._core.create(
+            str(self._path).encode(), self.rank(), self.size()
+        )
+        if not self._handle:
+            raise RuntimeError(
+                f"could not load the collectives library: {native.last_error()}"
+            )
+        version = self._core.version(self._handle)
+        name = "mojoccl" if nccl.uses_mojoccl() else nccl.vendor_name()
+        if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
+            print(
+                f"[TRACE] collectives via {self._path} ({name} version {version})",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # ---- plumbing ------------------------------------------------------------
 
@@ -339,6 +348,14 @@ class MojoProcessGroup(dist.ProcessGroup):
             return stream
         if self._coalescing_open():
             raise RuntimeError("cannot create a communicator inside a coalescing block")
+        api = device_module.get_device_properties(index).api
+        if api not in ("cuda", "hip"):
+            raise NotImplementedError(
+                f"mojo GPU collectives require CUDA or HIP, got {api}; "
+                "CPU tensors can use Gloo"
+            )
+        if self._handle is None:
+            self._initialize_collectives()
         key = f"mojo-ccl-unique-id-{self._seq}"
         self._seq += 1
         if self.rank() == 0:

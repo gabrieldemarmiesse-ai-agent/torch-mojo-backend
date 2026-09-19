@@ -9,10 +9,13 @@ Public torch API only, run against the mojo device: `mojo_gpu`/`mojo_device`
 `native.register()`) rather than the old Python eager path.
 """
 
+from collections.abc import Callable
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
@@ -33,12 +36,8 @@ def _tol(dtype: torch.dtype) -> tuple[float | None, float | None]:
     return None, None
 
 
-# One dtype (bfloat16) sweeps every op below for correctness + native-dispatch
-# coverage; a handful of ops are re-exercised in float32 by the .out/relu_/
-# call_checker tests further down, so float32 kernel specializations for
-# those get built too without a second full sweep. float16 shares the exact
-# same dtype-gate code path as bfloat16 (`_is_float_dtype`), so it is not
-# spot-checked separately.
+# The original native-dispatch sweep uses bfloat16. The launcher tests below
+# exercise fp16, bf16 and fp32 across alignment, tail and output-view regimes.
 SWEEP_DTYPE = torch.bfloat16
 
 # (native op name, torch callable, input-domain key)
@@ -115,6 +114,260 @@ def test_unary_noncontiguous_input(mojo_gpu):
     assert not x.is_contiguous()
     y = torch.exp(x)
     torch.testing.assert_close(y.cpu(), torch.exp(x_cpu.t()))
+
+
+_ALIGNED_UNARY_OPS = _UNARY_OPS + [
+    ("ceil", torch.ceil, "signed"),
+    ("floor", torch.floor, "signed"),
+    ("log2", torch.log2, "positive"),
+    ("gelu", F.gelu, "signed"),
+    ("isnan", torch.isnan, "signed"),
+]
+
+
+@pytest.mark.parametrize("op_name,fn,domain", _ALIGNED_UNARY_OPS)
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("layout", ("aligned", "offset_1", "strided"))
+def test_unary_launcher_layouts(
+    mojo_gpu: str,
+    op_name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    domain: str,
+    dtype: torch.dtype,
+    layout: str,
+):
+    """The vector launcher and its fallback handle every tail and view."""
+    for count in (0, 1, 2, 3, 256, 257, 357 * 789):
+        cpu = _sample(domain, (count,)).to(dtype)
+        if layout == "aligned":
+            x = cpu.to(mojo_gpu)
+            if count:
+                assert x.data_ptr() % (4 * x.element_size()) == 0
+        elif layout == "offset_1":
+            storage = torch.cat((torch.zeros(1, dtype=dtype), cpu)).to(mojo_gpu)
+            x = storage[1:]
+            if count:
+                assert x.data_ptr() % (4 * x.element_size()) == x.element_size()
+        else:
+            storage = torch.stack((cpu, torch.zeros_like(cpu)), dim=1).to(mojo_gpu)
+            x = storage[:, 0]
+        _reset_native_counts()
+        actual = fn(x)
+        assert _native_count(op_name) > 0
+        torch.testing.assert_close(actual.cpu(), fn(cpu))
+
+
+@pytest.mark.parametrize(
+    "op_name,fn,domain",
+    [op for op in _ALIGNED_UNARY_OPS if op[0] not in {"silu", "gelu", "relu", "isnan"}],
+)
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("input_offset", (0, 1))
+def test_unary_launcher_offset_out(
+    mojo_gpu: str,
+    op_name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    domain: str,
+    dtype: torch.dtype,
+    input_offset: int,
+):
+    """An aligned input cannot justify vector stores into an offset output."""
+    cpu = _sample(domain, (257,)).to(dtype)
+    input_storage = torch.cat((torch.zeros(input_offset, dtype=dtype), cpu)).to(
+        mojo_gpu
+    )
+    x = input_storage[input_offset:]
+    output_storage = torch.full((259,), 37.0, dtype=dtype, device=mojo_gpu)
+    out = output_storage[1:-1]
+    assert out.data_ptr() % (4 * out.element_size()) == out.element_size()
+    result = getattr(torch, op_name)(x, out=out)
+    assert result.data_ptr() == out.data_ptr()
+    actual = output_storage.cpu()
+    torch.testing.assert_close(actual[1:-1], fn(cpu))
+    assert actual[0].item() == actual[-1].item() == 37.0
+
+
+@pytest.mark.parametrize(
+    "op_name,dtype",
+    [("log2", torch.float64)]
+    + [
+        (name, dtype)
+        for name in ("abs", "neg", "sign", "ceil", "floor")
+        for dtype in (torch.int32, torch.uint8)
+    ],
+)
+@pytest.mark.parametrize("offset", (0, 1))
+def test_unary_launcher_other_dtypes(
+    mojo_gpu: str, op_name: str, dtype: torch.dtype, offset: int
+):
+    """SIMD alignment is measured in elements for every supported dtype."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    cpu = (torch.arange(261) % 13 + 1).to(dtype)
+    if dtype != torch.uint8 and op_name not in {"rsqrt", "log2"}:
+        cpu[::2].neg_()
+    x = cpu.to(mojo_gpu)[offset : offset + 257]
+    expected = getattr(torch, op_name)(cpu[offset : offset + 257])
+    actual = getattr(torch, op_name)(x)
+    torch.testing.assert_close(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    "dtype", (torch.float16, torch.bfloat16, torch.float32, torch.bool)
+)
+@pytest.mark.parametrize("input_offset,output_offset", ((0, 0), (0, 1), (1, 0), (1, 1)))
+def test_unary_launcher_bool_output(
+    mojo_gpu: str, dtype: torch.dtype, input_offset: int, output_offset: int
+):
+    """Boolean vector stores must use the output's one-byte element size."""
+    cpu = torch.tensor([0, -1, float("inf"), float("nan")], dtype=dtype).repeat(65)
+    x = cpu.to(mojo_gpu)[input_offset : input_offset + 257]
+    storage = torch.ones(259, dtype=torch.bool, device=mojo_gpu)
+    out = storage[output_offset : output_offset + 257]
+    torch.logical_not(x, out=out)
+    expected = torch.ones(259, dtype=torch.bool)
+    expected[output_offset : output_offset + 257] = torch.logical_not(
+        cpu[input_offset : input_offset + 257]
+    )
+    torch.testing.assert_close(storage.cpu(), expected)
+
+
+@pytest.mark.parametrize("op_name", ("exp", "log"))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("offset", (0, 1))
+def test_unary_launcher_exp_log_special_values(
+    mojo_gpu: str, op_name: str, dtype: torch.dtype, offset: int
+):
+    cpu = torch.tensor(
+        [-float("inf"), -1, -0.0, 0.0, 1, float("inf"), float("nan")], dtype=dtype
+    ).repeat(37)
+    storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
+    actual = getattr(torch, op_name)(storage[offset:])
+    torch.testing.assert_close(
+        actual.cpu(), getattr(torch, op_name)(cpu), equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("dtype", (torch.int32, torch.int64, torch.uint8, torch.bool))
+@pytest.mark.parametrize(
+    "input_offset,output_offset", ((0, 0), (0, 1), (1, 0), (1, 1), (2, 2))
+)
+def test_unary_launcher_bitwise_not_offsets(
+    mojo_gpu: str, dtype: torch.dtype, input_offset: int, output_offset: int
+):
+    cpu = (torch.arange(260) % 17).to(dtype)
+    if dtype in (torch.int32, torch.int64):
+        cpu[::2].neg_()
+    x = cpu.to(mojo_gpu)[input_offset : input_offset + 257]
+    storage = torch.full((261,), 37, dtype=dtype, device=mojo_gpu)
+    out = storage[output_offset : output_offset + 257]
+    torch.bitwise_not(x, out=out)
+    expected = torch.full((261,), 37, dtype=dtype)
+    expected[output_offset : output_offset + 257] = torch.bitwise_not(
+        cpu[input_offset : input_offset + 257]
+    )
+    torch.testing.assert_close(storage.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", (torch.int64, torch.float64))
+def test_unary_launcher_predicate_offset_two(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    cpu = (torch.arange(260) % 13).to(dtype)
+    if dtype == torch.float64:
+        cpu[::7] = float("nan")
+    x = cpu.to(mojo_gpu)[2:259]
+    assert x.data_ptr() % 16 == 0
+    assert x.data_ptr() % 32 == 16
+    torch.testing.assert_close(torch.isnan(x).cpu(), torch.isnan(cpu[2:259]))
+    storage = torch.ones(261, dtype=torch.bool, device=mojo_gpu)
+    out = storage[2:259]
+    torch.logical_not(x, out=out)
+    expected = torch.ones(261, dtype=torch.bool)
+    expected[2:259] = torch.logical_not(cpu[2:259])
+    torch.testing.assert_close(storage.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    "op_name,dtype,offset,count",
+    [
+        (*case, count)
+        for case in [
+            (name, dtype, 4)
+            for name in ("gelu", "gelu_tanh")
+            for dtype in (torch.float16, torch.bfloat16)
+        ]
+        + [
+            ("log1p", torch.float32, 4),
+            ("log2", torch.float32, 4),
+            ("logical_not", torch.bool, 16),
+            ("bitwise_not", torch.int32, 4),
+        ]
+        for count in (257, 513)
+    ]
+    + [
+        ("acos", dtype, offset, count)
+        for dtype in (torch.float16, torch.bfloat16)
+        for offset in (0, 4, 8)
+        for count in (0, 1, 15, 16, 17, 255, 256, 257, 513)
+    ],
+)
+def test_unary_launcher_intermediate_alignment(
+    mojo_gpu: str, op_name: str, dtype: torch.dtype, offset: int, count: int
+):
+    """Wider SIMD must retain the older alignment regimes and guarded tails."""
+    if dtype in (torch.bool, torch.int32):
+        cpu = (torch.arange(count) % 7 - 3).to(dtype)
+    else:
+        cpu = _sample("positive" if op_name.startswith("log") else "unit", (count,))
+        cpu = cpu.to(dtype)
+    input_storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
+    x = input_storage[offset:]
+    storage = torch.full((offset + count + 3,), 37, dtype=dtype, device=mojo_gpu)
+    out = storage[offset : offset + count]
+    if count:
+        for tensor in (x, out):
+            if offset:
+                old_alignment = offset * tensor.element_size()
+                assert tensor.data_ptr() % (2 * old_alignment) == old_alignment
+            else:
+                assert tensor.data_ptr() % 16 == 0
+    if op_name.startswith("gelu"):
+        approximate = "tanh" if op_name == "gelu_tanh" else "none"
+        result = torch.ops.aten.gelu.out(x, approximate=approximate, out=out)
+        reference = F.gelu(cpu, approximate=approximate)
+    else:
+        result = getattr(torch, op_name)(x, out=out)
+        reference = getattr(torch, op_name)(cpu)
+    assert result.data_ptr() == out.data_ptr()
+    expected = torch.full((offset + count + 3,), 37, dtype=dtype)
+    expected[offset : offset + count] = reference
+    torch.testing.assert_close(storage.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("offset", (0, 1))
+def test_unary_launcher_log1p_near_zero(mojo_gpu: str, dtype: torch.dtype, offset: int):
+    cpu = log1p_edge_input(dtype)
+    storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
+    actual = torch.log1p(storage[offset:]).cpu()
+    expected = torch.log1p(cpu.double()).to(dtype)
+    torch.testing.assert_close(
+        actual, expected, rtol=log1p_rtol(dtype), atol=0, equal_nan=True
+    )
+    zeros = cpu == 0
+    torch.testing.assert_close(torch.signbit(actual[zeros]), torch.signbit(cpu[zeros]))
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("offset", (0, 1))
+def test_unary_launcher_asinh_zero(mojo_gpu: str, dtype: torch.dtype, offset: int):
+    cpu = torch.tensor([-0.0, 0.0, -0.0, 0.0, 1.0], dtype=dtype)
+    storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
+    actual = torch.asinh(storage[offset:]).cpu()
+    expected = torch.asinh(cpu)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(torch.signbit(actual), torch.signbit(expected))
 
 
 _DIRECT_OPS = [

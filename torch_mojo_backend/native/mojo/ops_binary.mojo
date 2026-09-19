@@ -69,7 +69,7 @@ from kernels import KernelCall
 from op_utils import MAX_RANK
 from ops_common import cast_to, contiguous, copy_strided_into, resize_out
 from ops_foreach import _foreach_addc_launch, _foreach_lerp_launch
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -1413,6 +1413,7 @@ def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)
+# aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
 def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "mul_")
     var rhs = _b_side(args[unsafe_offset=1])
@@ -2180,6 +2181,7 @@ def register_binary(site: Site) raises:
     impl[op_minimum, "minimum"](site)
     impl[op_mul_tensor, "mul.Tensor"](site)
     impl[op_mul_, "mul_.Tensor"](site)
+    impl[op_mul_, "mul_.Scalar"](site)
     impl[op_mul_out, "mul.out"](site)
     impl[op_pow_scalar, "pow.Tensor_Scalar"](site)
     impl[op_pow_tensor, "pow.Tensor_Tensor"](site)
@@ -2189,10 +2191,3 @@ def register_binary(site: Site) raises:
     impl[op_sub_tensor, "sub.Tensor"](site)
     impl[op_sub_, "sub_.Tensor"](site)
     impl[op_sub_out, "sub.out"](site)
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_binary]()

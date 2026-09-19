@@ -29,6 +29,7 @@ COVERS: dict[str, str] = {
     "aten::add_.Tensor": "test_add_",
     "aten::sub_.Tensor": "test_sub_",
     "aten::mul_.Tensor": "test_mul_",
+    "aten::mul_.Scalar": "test_mul_scalar_",
     "aten::relu_": "test_relu_",
     "aten::fill_.Scalar": "test_fill_",
     "aten::masked_fill_.Scalar": "test_masked_fill_[Scalar]",
@@ -85,6 +86,22 @@ def test_mul_(
     )
     bench.run(
         lambda: x_ref.mul_(m_ref), lambda: x_our.mul_(m_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("mul_.Scalar")
+def test_mul_scalar_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: x_ref.mul_(1.00001),
+        lambda: x_our.mul_(1.00001),
+        flops=float(x_ref.numel()),
     )
 
 

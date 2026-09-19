@@ -61,7 +61,7 @@ from device import copy_d2d, ctx_for, ctx_ptr, dev
 from foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from kernels import KernelCall
 from op_utils import MAX_RANK
-from registry import Site, impl, op_address_of
+from registry import Site, impl
 from ops_matmul import _sm90_cuda
 
 
@@ -202,6 +202,10 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
         return False
     var first = a[0].copy()
     if not first.on_mojo() or _is_max_cpu(first.device):
+        return False
+    # Metal's batched kernels accept only float32. Half lists must use the
+    # existing per-tensor scalar operations instead of entering that kernel.
+    if dev(first.device)[].api == "metal" and first.dtype != DType.float32:
         return False
     if allow_half:
         if (
@@ -964,10 +968,3 @@ def register_foreach(site: Site) raises:
     # _foreach_div_.ScalarList / _foreach_addcdiv_.ScalarList: intentionally
     # unregistered -- see the module docstring (Scalar[] cannot be marshalled
     # by the current C++ shim).
-
-
-@export
-def tmb_op_address() abi("C") -> Int:
-    """Entry of this file's one-op extension: the address of the op the
-    TMB_OP define selected (registry.mojo)."""
-    return op_address_of[register_foreach]()

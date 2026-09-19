@@ -21,39 +21,23 @@
 # key, so one compiled variant serves every shape with zero recompilation.
 # ===----------------------------------------------------------------------=== #
 
+from mojo_kernels.math_utils import ieee_sqrt
+from mojo_kernels.unary_math import elementwise_predicate, elementwise_unary
+
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
-from std.math import (
-    acos,
-    atanh,
-    ceil,
-    ceildiv,
-    cos,
-    cosh,
-    erf,
-    exp,
-    floor,
-    log,
-    log1p,
-    log2,
-    pow,
-    sin,
-    sinh,
-    tanh,
-)
+from std.math import ceildiv, pow
 from std.sys.info import (
     _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
-    is_apple_gpu,
     simd_width_of,
     size_of,
 )
 from std.utils.index import IndexList
 from std.utils.coord import Coord
-from std.utils.numerics import isnan, max_or_inf
 
 from max.algorithm import elementwise
 
@@ -81,8 +65,6 @@ from op_utils import (
     _spec_dispatcher2,
     _spec_dispatcher3,
     _spec_ptr,
-    custom_tan,
-    ieee_sqrt,
 )
 
 from variant_gates import (
@@ -323,14 +305,14 @@ def _bin_go[
 # Opcodes fall in three buckets:
 #   * RELU / ABS / NEG / SIGN work on integer *and* float dtypes and compute
 #     directly in the tensor dtype (no float round-trip).
-#   * every other opcode is float-only (`_float_unary` below): half-precision
+#   * every other opcode is float-only (shared `unary_math._float_unary`): half-precision
 #     inputs are promoted to float32, computed, and cast back — matching
 #     torch's numerics and keeping the polynomial math accurate.
 # Two of the ops deserve a note: `tan` and `asinh` cannot call the std.math
 # primitive of the same name, because those lower to libm (`_call_libm`) which
 # `comptime assert`s CPU-only and would refuse to compile for the GPU target.
-# `asinh` is composed from log/sqrt right here; `tan` goes through
-# `op_utils.custom_tan`, which routes per target and dtype.
+# `asinh` is composed from log/sqrt in shared math; `tan` routes through
+# the shared `custom_tan`, which selects math per target and dtype.
 # ---------------------------------------------------------------------------
 
 comptime UOP_RELU = 0
@@ -362,86 +344,6 @@ comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
 
 
-@always_inline
-def _float_unary[
-    dtype: DType, width: Int, op_code: Int
-](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
-    """The float-only unary math, evaluated in `dtype` (float32 or float64).
-
-    Only instantiated for float32/float64 (half inputs are promoted before
-    the call), so every std.math call below sees a supported dtype.
-    """
-    var res = a
-    comptime if op_code == UOP_EXP:
-        res = exp(a)
-    comptime if op_code == UOP_TANH:
-        res = tanh(a)
-    comptime if op_code == UOP_CEIL:
-        res = ceil(a)
-    comptime if op_code == UOP_FLOOR:
-        res = floor(a)
-    comptime if op_code == UOP_ACOS:
-        res = acos(a)
-    comptime if op_code == UOP_ASINH:
-        # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
-        res = log(a + ieee_sqrt(a * a + 1))
-    comptime if op_code == UOP_ATANH:
-        res = atanh(a)
-    comptime if op_code == UOP_COS:
-        res = cos(a)
-    comptime if op_code == UOP_COSH:
-        res = cosh(a)
-    comptime if op_code == UOP_ERF:
-        res = erf(a)
-    comptime if op_code == UOP_LOG:
-        res = log(a)
-    comptime if op_code == UOP_LOG2:
-        res = log2(a)
-        comptime if dtype == DType.float64:
-            # std.math.log2's double approximation omits the +inf case.
-            res = a.eq(max_or_inf[dtype]()).select(a, res)
-    comptime if op_code == UOP_LOG1P:
-        comptime if is_apple_gpu():
-            # Mojo's log1p currently upcasts to float64, which Metal rejects.
-            # Use the compensated float32 algorithm from PyTorch's Metal
-            # support so small nonzero inputs do not collapse to zero.
-            var xp1 = 1 + a
-            var rc = log(xp1)
-            var corrected = rc * (a / (xp1 - 1))
-            rc = (a.gt(-0.5) & a.lt(0.5)).select(corrected, rc)
-            res = xp1.eq(1).select(a, rc)
-        else:
-            res = log1p(a)
-    comptime if op_code == UOP_RECIPROCAL:
-        res = 1 / a
-    comptime if op_code == UOP_RSQRT:
-        res = 1 / ieee_sqrt(a)
-    comptime if op_code == UOP_SIGMOID:
-        res = 1 / (1 + exp(-a))
-    comptime if op_code == UOP_SILU:
-        res = a / (1 + exp(-a))
-    comptime if op_code == UOP_SIN:
-        res = sin(a)
-    comptime if op_code == UOP_SINH:
-        res = sinh(a)
-    comptime if op_code == UOP_SQRT:
-        res = ieee_sqrt(a)
-    comptime if op_code == UOP_TAN:
-        # `custom_tan` picks libm, the argument-reduced polynomial or
-        # `sin / cos` from the compilation target and `dtype` on its own.
-        res = custom_tan(a)
-    comptime if op_code == UOP_GELU_NONE:
-        # 0.5 * x * (1 + erf(x / sqrt(2)))
-        comptime inv_sqrt2 = 0.70710678118654752440
-        res = 0.5 * a * (1 + erf(a * inv_sqrt2))
-    comptime if op_code == UOP_GELU_TANH:
-        # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        comptime sqrt_2_over_pi = 0.79788456080286535588
-        var inner = sqrt_2_over_pi * (a + 0.044715 * a * a * a)
-        res = 0.5 * a * (1 + tanh(inner))
-    return res
-
-
 def _unary_contig_kernel[
     dtype: DType, op_code: Int
 ](
@@ -452,37 +354,11 @@ def _unary_contig_kernel[
     # Int is not device-passable (host/device width mismatch); scalars cross
     # the launch ABI as Int64 and index math stays in Int.
     var size = Int(size_arg)
-    comptime is_direct = (
-        op_code == UOP_RELU
-        or op_code == UOP_ABS
-        or op_code == UOP_NEG
-        or op_code == UOP_SIGN
-    )
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var gstride = Int(grid_dim.x) * Int(block_dim.x)
     while i < size:
         var a = in_ptr[unsafe_offset=i]
-        comptime if op_code == UOP_RELU:
-            out_ptr[unsafe_offset=i] = max(a, Scalar[dtype](0))
-        comptime if op_code == UOP_ABS:
-            out_ptr[unsafe_offset=i] = abs(a)
-        comptime if op_code == UOP_NEG:
-            # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
-            out_ptr[unsafe_offset=i] = -a
-        comptime if op_code == UOP_SIGN:
-            var zero = Scalar[dtype](0)
-            var pos = a.gt(zero).cast[dtype]()
-            var neg = a.lt(zero).cast[dtype]()
-            # NaN compares false on both sides -> 0, matching torch.
-            out_ptr[unsafe_offset=i] = pos - neg
-        comptime if not is_direct:
-            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-                var af = a.cast[DType.float32]()
-                out_ptr[unsafe_offset=i] = _float_unary[
-                    DType.float32, 1, op_code
-                ](af).cast[dtype]()
-            elif dtype.is_floating_point():
-                out_ptr[unsafe_offset=i] = _float_unary[dtype, 1, op_code](a)
+        out_ptr[unsafe_offset=i] = _unary_apply[dtype, 1, op_code](a)
         i += gstride
 
 
@@ -490,36 +366,63 @@ def _unary_contig_kernel[
 def _unary_apply[
     dtype: DType, width: Int, op_code: Int
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width]:
-    """One unary op on a SIMD value; the width-generic body shared by the
-    scalar and vectorized contiguous GPU kernels."""
-    var res = a
+    """Dispatch a native opcode to the shared graph/native SIMD expression."""
     comptime if op_code == UOP_RELU:
-        res = max(a, SIMD[dtype, width](0))
-    comptime if op_code == UOP_ABS:
-        res = abs(a)
-    comptime if op_code == UOP_NEG:
-        # `-a` (pop.neg) wraps for unsigned/overflow exactly like torch.
-        res = -a
-    comptime if op_code == UOP_SIGN:
-        var zero = SIMD[dtype, width](0)
-        var pos = a.gt(zero).cast[dtype]()
-        var neg = a.lt(zero).cast[dtype]()
-        # NaN compares false on both sides -> 0, matching torch.
-        res = pos - neg
-    comptime is_direct = (
-        op_code == UOP_RELU
-        or op_code == UOP_ABS
-        or op_code == UOP_NEG
-        or op_code == UOP_SIGN
-    )
-    comptime if not is_direct:
-        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-            res = _float_unary[DType.float32, width, op_code](
-                a.cast[DType.float32]()
-            ).cast[dtype]()
-        elif dtype.is_floating_point():
-            res = _float_unary[dtype, width, op_code](a)
-    return res
+        return elementwise_unary["relu"](a)
+    elif op_code == UOP_EXP:
+        return elementwise_unary["exp"](a)
+    elif op_code == UOP_TANH:
+        return elementwise_unary["tanh"](a)
+    elif op_code == UOP_ABS:
+        return elementwise_unary["abs"](a)
+    elif op_code == UOP_NEG:
+        return elementwise_unary["neg"](a)
+    elif op_code == UOP_SIGN:
+        return elementwise_unary["sign"](a)
+    elif op_code == UOP_CEIL:
+        return elementwise_unary["ceil"](a)
+    elif op_code == UOP_FLOOR:
+        return elementwise_unary["floor"](a)
+    elif op_code == UOP_ACOS:
+        return elementwise_unary["acos"](a)
+    elif op_code == UOP_ASINH:
+        return elementwise_unary["asinh"](a)
+    elif op_code == UOP_ATANH:
+        return elementwise_unary["atanh"](a)
+    elif op_code == UOP_COS:
+        return elementwise_unary["cos"](a)
+    elif op_code == UOP_COSH:
+        return elementwise_unary["cosh"](a)
+    elif op_code == UOP_ERF:
+        return elementwise_unary["erf"](a)
+    elif op_code == UOP_LOG:
+        return elementwise_unary["log"](a)
+    elif op_code == UOP_LOG1P:
+        return elementwise_unary["log1p"](a)
+    elif op_code == UOP_RECIPROCAL:
+        return elementwise_unary["reciprocal"](a)
+    elif op_code == UOP_RSQRT:
+        return elementwise_unary["rsqrt"](a)
+    elif op_code == UOP_SIGMOID:
+        return elementwise_unary["sigmoid"](a)
+    elif op_code == UOP_SILU:
+        return elementwise_unary["silu"](a)
+    elif op_code == UOP_SIN:
+        return elementwise_unary["sin"](a)
+    elif op_code == UOP_SINH:
+        return elementwise_unary["sinh"](a)
+    elif op_code == UOP_SQRT:
+        return elementwise_unary["sqrt"](a)
+    elif op_code == UOP_TAN:
+        return elementwise_unary["tan"](a)
+    elif op_code == UOP_GELU_NONE:
+        return elementwise_unary["gelu_none"](a)
+    elif op_code == UOP_GELU_TANH:
+        return elementwise_unary["gelu_tanh"](a)
+    elif op_code == UOP_LOG2:
+        return elementwise_unary["log2"](a)
+    else:
+        comptime assert False, "unknown unary opcode"
 
 
 def _unary_contig_kernel4[
@@ -633,39 +536,81 @@ def _unary_elementwise[
             def func[width: Int, alignment: Int = 1](idx: Coord):
                 var i = Int(idx[0].value())
                 var a = in_ptr.unsafe_load[width=width](i)
-                comptime if op_code == UOP_RELU:
-                    out_ptr.unsafe_store[width=width](
-                        i, max(a, SIMD[dtype, width](0))
-                    )
-                comptime if op_code == UOP_ABS:
-                    out_ptr.unsafe_store[width=width](i, abs(a))
-                comptime if op_code == UOP_NEG:
-                    # `-a` (pop.neg) wraps for unsigned/overflow like torch.
-                    out_ptr.unsafe_store[width=width](i, -a)
-                comptime if op_code == UOP_SIGN:
-                    var zero = SIMD[dtype, width](0)
-                    var pos = a.gt(zero).cast[dtype]()
-                    var neg = a.lt(zero).cast[dtype]()
-                    # NaN compares false on both sides -> 0, matching torch.
-                    out_ptr.unsafe_store[width=width](i, pos - neg)
-                comptime if not is_direct:
-                    comptime if (
-                        dtype == DType.float16 or dtype == DType.bfloat16
-                    ):
-                        var af = a.cast[DType.float32]()
-                        out_ptr.unsafe_store[width=width](
-                            i, _float_unary[op_code=op_code](af).cast[dtype]()
-                        )
-                    elif dtype.is_floating_point():
-                        out_ptr.unsafe_store[width=width](
-                            i, _float_unary[op_code=op_code](a)
-                        )
+                out_ptr.unsafe_store[width=width](
+                    i, _unary_apply[dtype, width, op_code](a)
+                )
 
             elementwise[func, simd_width=simd_width_of[dtype]()](
                 Coord(size), ctx
             )
         else:
             comptime if has_accelerator():
+                comptime if dtype != DType.float64 or op_code == UOP_LOG2:
+                    # Public elementwise owns launch geometry on every GPU.
+                    # SIMD-4 needs BOTH pointers aligned; offset views retain the
+                    # existing scalar/vector fallback and its cached launch.
+                    @always_inline
+                    @parameter
+                    @__copy_capture(out_ptr, in_ptr)
+                    def gpu_func[width: Int, alignment: Int = 1](idx: Coord):
+                        var i = Int(idx[0].value())
+                        # Only the aligned branch requests width > 1. The
+                        # launcher calls the same body at width 1 for tails.
+                        comptime byte_alignment = (
+                            min(16, width * size_of[dtype]()) if width
+                            > 4 else width * size_of[dtype]()
+                        )
+                        var a = in_ptr.unsafe_load[
+                            width=width, alignment=byte_alignment
+                        ](i)
+                        out_ptr.unsafe_store[
+                            width=width, alignment=byte_alignment
+                        ](i, _unary_apply[dtype, width, op_code](a))
+
+                    # Measured on H100: these wider public bodies avoid excess
+                    # waves for expensive half math and the float32 log1p body.
+                    # Keep SIMD4 for 8-byte-aligned half views and other GPUs.
+                    comptime wider_nvidia = has_nvidia_gpu_accelerator() and (
+                        (
+                            (dtype == DType.float16 or dtype == DType.bfloat16)
+                            and (
+                                op_code == UOP_ACOS
+                                or op_code == UOP_GELU_NONE
+                                or op_code == UOP_GELU_TANH
+                                or op_code == UOP_LOG2
+                            )
+                        )
+                        or (
+                            (
+                                dtype == DType.float16
+                                or dtype == DType.bfloat16
+                                or dtype == DType.float32
+                            )
+                            and op_code == UOP_LOG1P
+                        )
+                    )
+                    comptime preferred_width = (
+                        16 if op_code == UOP_ACOS else 8
+                    )
+                    comptime if wider_nvidia:
+                        if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                            elementwise[
+                                gpu_func,
+                                simd_width=preferred_width,
+                                target="gpu",
+                                _trace_description="modular_unary",
+                            ](Coord(size), ctx)
+                            return
+                    if (Int(out_ptr) | Int(in_ptr)) % (
+                        4 * size_of[dtype]()
+                    ) == 0:
+                        elementwise[
+                            gpu_func,
+                            simd_width=4,
+                            target="gpu",
+                            _trace_description="modular_unary",
+                        ](Coord(size), ctx)
+                        return
                 comptime if (
                     op_code == UOP_SQRT
                     and dtype == DType.float32
@@ -775,9 +720,9 @@ def _unary_bool_vec[
         # `numerics.isnan` is bit-based (llvm.is.fpclass), so it survives the
         # fast-math flags that would fold `a != a` to False; it also returns
         # all-False for integer dtypes.
-        return isnan(a).cast[DType.uint8]()
+        return elementwise_predicate["isnan"](a).cast[DType.uint8]()
     else:
-        return a.eq(SIMD[dtype, w](0)).cast[DType.uint8]()
+        return elementwise_predicate["logical_not"](a).cast[DType.uint8]()
 
 
 @always_inline
@@ -812,14 +757,42 @@ def _unary_bool[
             ):
                 raise Error("float64 is not supported on Apple GPU")
             else:
-                # 16-byte loads, one byte written per element; declines
-                # unaligned bases, which keep the scalar closure below.
-                comptime name = (
-                    "isnan" if op_code == BUOP_ISNAN else "logical_not"
-                )
-                if _flat_vec_unary[
-                    dtype, DType.uint8, _unary_bool_vec[dtype, op_code, _], name
-                ](Int(out_ptr), Int(in_ptr), size, ctx):
+
+                @always_inline
+                @parameter
+                @__copy_capture(out_ptr, in_ptr)
+                def gpu_bool[width: Int, alignment: Int = 1](idx: Coord):
+                    var i = Int(idx[0].value())
+                    var a = in_ptr.unsafe_load[
+                        width=width, alignment=min(16, width * size_of[dtype]())
+                    ](i)
+                    out_ptr.unsafe_bitcast[UInt8]().unsafe_store[
+                        width=width, alignment=min(16, width)
+                    ](i, _unary_bool_vec[dtype, op_code, width](a))
+
+                # H100 measurements favor 16 input bytes for half predicates,
+                # and 32 byte-sized inputs per thread for logical_not.
+                comptime preferred_width = 32 if size_of[
+                    dtype
+                ]() == 1 else 16 // size_of[dtype]()
+                comptime if has_nvidia_gpu_accelerator() and preferred_width > 4:
+                    if (
+                        Int(in_ptr) % 16 == 0
+                        and Int(out_ptr) % min(16, preferred_width) == 0
+                    ):
+                        elementwise[
+                            gpu_bool, simd_width=preferred_width, target="gpu"
+                        ](Coord(size), ctx)
+                        return
+                # Keep 64-bit inputs on the previous 16-byte/SIMD2 regime.
+                comptime vector_width = min(4, 16 // size_of[dtype]())
+                if (
+                    Int(in_ptr) % (vector_width * size_of[dtype]()) == 0
+                    and Int(out_ptr) % vector_width == 0
+                ):
+                    elementwise[
+                        gpu_bool, simd_width=vector_width, target="gpu"
+                    ](Coord(size), ctx)
                     return
                 elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
         else:

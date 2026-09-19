@@ -42,11 +42,11 @@ def _join_u64(lo: Int, hi: Int) -> UInt64:
 
 @always_inline
 def _tuple_i64x8(t: Arg) -> I64x8:
-    var out = I64x8(0)
+    var out = I64x8(fill=Int64(0))
     var n = _raw_tuple_len(t)
     for i in range(min(n, 8)):
         out[i] = Int64(_raw_tuple_int(t, i))
-    return out
+    return out^
 
 
 def _native_dropout_go(

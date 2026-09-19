@@ -20,7 +20,7 @@ long as the sources and the toolchain are unchanged — dlopens the cached
 `.so`. `TORCH_MOJO_BACKEND_TRACE` (on by default; `0` silences it) prints a
 `[TRACE]` line for each variant build, with its duration.
 `TORCH_MOJO_BACKEND_WERROR=1` passes `--Werror` to every Mojo build (kernel
-variants, op extensions, the base library, mojoccl), so a compiler warning
+variants, the base library, mojoccl), so a compiler warning
 fails the build instead of scrolling past in captured stderr. It is off by
 default and `tests/conftest.py` turns it on, which is the repository's
 no-warnings check: a warning in any Mojo source fails the tests that build it.
@@ -80,7 +80,8 @@ Unchanged: dtypes, operation mode, output dtype, and implementation-selecting
 flags belong in the defines; shapes, strides, pointers, scalar values, and
 device contexts are runtime data. The loader hashes the family's *source
 closure* (every `.mojo` file it `from X import`s, resolved family-dir-first
-then package-root, plus every `op_utils/*.mojo`) together with the defines
+then package-root, plus every `op_utils/*.mojo` and the shared
+`mojo_kernels` package reached through their imports) together with the defines
 and the toolchain identity (`native/__init__.py`'s `toolchain_identity()`:
 torch/mojo/max/python/platform/machine versions) into the cache filename
 `<family>.<defines-slug>.hash-<source-hash>.so` under
@@ -116,3 +117,54 @@ outputs, in-place, and `out=` all pass through the same slot list — the op
 function on the Mojo side decides which tensor is the output before
 building the call, exactly as the old Python descriptor's
 `expected_output_specs` did.
+
+
+## Shared unary operations
+
+`mojo_kernels/unary_math.mojo` owns the SIMD expressions used by both native
+unary kernels and `torch.compile`. Half inputs are evaluated in float32 and
+rounded once on output. `math_utils.mojo` holds the existing accurate square
+root and tangent helpers; `op_utils` re-exports them for other native kernels.
+Edits to either shared module invalidate the native build cache.
+
+Native contiguous unary operations delegate aligned GPU work to Modular's
+public `max.algorithm.elementwise`, on NVIDIA, AMD, and Apple. The general
+route requires both pointers to be aligned for four elements of their
+respective storage dtypes (eight bytes for fp16/bf16 input, sixteen for fp32,
+and four for bool output). NVIDIA also uses measured vector widths for some
+operations; each route checks the alignment of both pointers before selecting
+that width. More narrowly aligned views still use the general public route.
+Predicates and bitwise-not use two lanes for 64-bit inputs, retaining their
+previous sixteen-byte input alignment requirement (two bytes for bool output).
+The launcher handles arbitrary lengths, including scalar tails, and chooses
+block/grid geometry. Unaligned inputs or outputs retain the existing
+fallback. Supported dtypes and CPU dispatch are unchanged.
+
+This public launcher is an intentional exception to the usual native
+`_enqueue_cached` wrapper: the earlier H100 comparison measured only about
+0.1–0.2 microseconds of extra host dispatch versus a cached adapter to
+Modular's private launcher. Delegating avoids maintaining that private API;
+the native specialization and Modular's underlying compilation still cache.
+GPU performance measurements cover H100; AMD and Apple are cross-compiled.
+
+NVIDIA float32 math (including promoted half inputs) avoids redundant NaN
+masks where the device implementation already preserves NaNs. Its `log1p`
+uses compensated float32 math with a small-input polynomial instead of the
+stdlib's float64 intermediate. Tests check domain boundaries, signed zero,
+subnormals, infinities, and NaNs. CPU, AMD, Apple, and float64 keep their
+existing math paths.
+
+The graph backend forwards through one generic
+`ElementwiseOp[kind: StaticString](ElementwiseUnaryMixedOp)`. The mixed-output
+trait also supports boolean predicates. In pinned MAX 26.5, fusion lowering
+does not forward parent-struct parameters, so concrete registrations are
+generated from one template in `scripts/generate_elementwise_ops.py`.
+These thin forwarders preserve graph fusion while keeping the math and
+registration template in one place. The generator reads the supported kinds
+from the Python helper's `Literal` annotation; run
+`uv run python scripts/generate_elementwise_ops.py` after adding a kind.
+Pre-commit checks that the checked-in registrations are current.
+
+GPU float64 `acos` retains its graph implementation because the pinned Mojo
+compiler cannot lower a float64 GPU `acos` call. Other supported routes use
+the shared SIMD implementation.

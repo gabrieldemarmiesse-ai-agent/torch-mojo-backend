@@ -1185,22 +1185,17 @@ def test_floor_divide_narrow_float_boundary(mojo_device, dtype):
 
 
 def test_floor_divide_subnormal_quotient_underflow(mojo_device):
-    """2**-126 / -4.71875 is an fp32 SUBNORMAL; flushing it to zero answers 0
-    where the floor is -1. bf16-only: fp16's normal range bottoms out at
-    2**-14, far above the fp32 subnormal cliff.
-
-    Apple's Metal GPU DOES flush this fp32 intermediate to zero (unlike
-    every device this was checked against before -- see the FTZ comment on
-    `BOP_FLOORDIV` in logic_ops.mojo), and fp64 -- the CPU path's fix -- is
-    not available there to widen into, so this is a real, currently
-    unresolved precision gap on Apple GPUs, not a decline.
-    """
-    skip_if_metal(mojo_device, "Apple GPU flushes this fp32 subnormal to zero")
-    a_cpu = torch.tensor([2.0**-126], dtype=torch.bfloat16)
-    b_cpu = torch.tensor([-4.71875], dtype=torch.bfloat16)
+    """Floor must retain the sign of a quotient flushed to zero by Metal."""
+    a_cpu = torch.tensor(
+        [2.0**-126, -(2.0**-126), 0.0, -0.0, 1.0, -1.0], dtype=torch.bfloat16
+    )
+    b_cpu = torch.tensor(
+        [-4.71875, -4.71875, -2.0, 2.0, -float("inf"), float("inf")],
+        dtype=torch.bfloat16,
+    )
     a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
     expected = torch.floor_divide(a_cpu, b_cpu)
-    assert expected.item() == -1.0, expected  # the CPU reference itself
+    assert expected[0].item() == -1.0, expected  # the CPU reference itself
     torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
 
 
@@ -1326,6 +1321,20 @@ def test_inplace_scalar_every_dtype_and_rank(mojo_device, dtype, shape):
         torch.testing.assert_close(x.cpu(), cpu.add_(scalar), rtol=2e-2, atol=2e-2)
         assert x.mul_(scalar) is x
         torch.testing.assert_close(x.cpu(), cpu.mul_(scalar), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scalar", [0.9, 1.0001, -0.33333])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mul_inplace_preserves_scalar_precision(
+    mojo_device: str, dtype: torch.dtype, scalar: float, strided: bool
+):
+    cpu = (torch.arange(515, dtype=torch.float32) / 37 - 7).to(dtype)
+    actual = cpu.to(mojo_device)
+    if strided:
+        cpu, actual = cpu[1::2], actual[1::2]
+    assert actual.mul_(scalar) is actual
+    torch.testing.assert_close(actual.cpu(), cpu.mul_(scalar), rtol=0, atol=0)
 
 
 def test_add_above_last_level_cache(mojo_gpu):

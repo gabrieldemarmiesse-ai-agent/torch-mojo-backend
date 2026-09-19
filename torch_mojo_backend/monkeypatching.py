@@ -27,6 +27,7 @@ import torch.distributed.distributed_c10d as c10d
 import torch.utils._triton
 
 if TYPE_CHECKING:
+    # Optional Triton dependency: its wheels are unavailable on macOS.
     from triton.backends.driver import DriverBase
 
 

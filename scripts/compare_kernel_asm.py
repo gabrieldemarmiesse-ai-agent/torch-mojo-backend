@@ -209,6 +209,8 @@ def emit_asm(
         str(module.parent),
         "-I",
         str(kernel_dir),
+        "-I",
+        str(kernel_dir.parent),
         "--emit",
         "asm",
         "--target-accelerator",

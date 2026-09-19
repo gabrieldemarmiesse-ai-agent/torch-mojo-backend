@@ -111,6 +111,9 @@ def _numa_bind(lr: int, lw: int, allowed: list[int]) -> list[int] | None:
     return sorted({c for core in chunk for c in core if c in allowed})
 
 
+if sys.platform != "linux":
+    raise SystemExit("rank_bind requires Linux CPU affinity and NUMA APIs")
+
 lr = int(os.environ["LOCAL_RANK"])
 lw = int(os.environ["LOCAL_WORLD_SIZE"])
 allowed = sorted(os.sched_getaffinity(0))
