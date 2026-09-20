@@ -5,7 +5,7 @@ reusing a build, and a missing/corrupt cached `.so`.
 Replaces the old `tests/test_eager_kernel_loader.py`, which unit-tested the
 Python `MojoExtensionLoader`/`MojoExtension`/`_DefinedUnit` machinery
 directly. That machinery does not exist in the native backend: builds are
-driven from Mojo (`native/mojo/loader.mojo`) and the two backend shims from
+driven from Mojo (`tmb/backend/loader.mojo`) and the two backend shims from
 `torch_mojo_backend/native/__init__.py`, with no Python-level descriptor or
 unit cache object to import and poke at. What is left to test is the cache's
 *observable* contract -- same one `TORCH_MOJO_BACKEND_CACHE_DIR`, same on-disk
@@ -36,12 +36,12 @@ _SHIM_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
 # One tiny script, run in a fresh process: register the backend and run one
 # op (`add`) on the mojo GPU device. Real correctness is covered elsewhere;
 # this only needs to exercise the build-or-reuse path for the two backend
-# shims and the `logic_ops` kernel family (AddSpec/float32).
+# shims and the `logic` kernel family (AddSpec/float32).
 _RUN_ADD = """
 import torch
 from torch_mojo_backend import register_mojo_devices
 register_mojo_devices()
-# Broadcasting exercises logic_ops on Metal too; equal-shape contiguous
+# Broadcasting exercises logic on Metal too; equal-shape contiguous
 # add uses a different Metal kernel family.
 x = torch.tensor([[1.0], [2.0]], device="mojo:0")
 y = torch.tensor([[1.0, 2.0]], device="mojo:0")
@@ -70,7 +70,7 @@ def _run(cache_dir: Path, *, trace: bool = True) -> subprocess.CompletedProcess[
 
 
 def _family_sos(cache_dir: Path) -> list[Path]:
-    return sorted(cache_dir.glob("logic_ops.*.so"))
+    return sorted(cache_dir.glob("logic.*.so"))
 
 
 def _assert_ok(proc: subprocess.CompletedProcess[str]):
@@ -92,14 +92,14 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
         "Mojo backend not cached here"
     )
     family_sos = _family_sos(cache_dir)
-    assert family_sos, "logic_ops (AddSpec) kernel variant not cached here"
+    assert family_sos, "logic (AddSpec) kernel variant not cached here"
     assert not list(cache_dir.glob("tmbop.*")), (
         "op bodies live in the backend library, nothing is built per op"
     )
     # A cold run must have actually built all of them, not found them by luck.
     assert "built C++ shim" in proc.stdout + proc.stderr
     assert "built Mojo backend" in proc.stdout + proc.stderr
-    assert "built  logic_ops" in proc.stdout + proc.stderr
+    assert "built  logic" in proc.stdout + proc.stderr
 
 
 def test_second_process_reuses_every_build(tmp_path: Path):
@@ -120,7 +120,7 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     combined = second.stdout + second.stderr
     assert "built C++ shim" not in combined
     assert "built Mojo backend" not in combined
-    assert "built  logic_ops" not in combined
+    assert "built  logic" not in combined
     mtimes_after = {
         p: p.stat().st_mtime_ns
         for p in cache_dir.iterdir()
@@ -150,7 +150,7 @@ def test_missing_family_so_is_rebuilt(tmp_path: Path):
     _assert_ok(proc)
 
     combined = proc.stdout + proc.stderr
-    assert "built  logic_ops" in combined, "missing kernel .so was not rebuilt"
+    assert "built  logic" in combined, "missing kernel .so was not rebuilt"
     assert "built C++ shim" not in combined, (
         "the shim was still on disk; it must not rebuild"
     )
@@ -194,7 +194,7 @@ def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(tmp_path: Pat
     corrupted.unlink()
     recovered = _run(cache_dir)
     _assert_ok(recovered)
-    assert "built  logic_ops" in recovered.stdout + recovered.stderr
+    assert "built  logic" in recovered.stdout + recovered.stderr
 
 
 def test_compiler_env_drops_the_runtime_interpreter_variables(monkeypatch):
@@ -217,9 +217,7 @@ def test_kernel_call_defines_and_owned_spec_lifetimes(tmp_path):
             "build",
             str(Path(__file__).with_name("kernel_call_probe.mojo")),
             "-I",
-            str(_WORKTREE / "torch_mojo_backend/native/mojo"),
-            "-I",
-            str(_WORKTREE / "torch_mojo_backend/eager_kernels"),
+            str(_WORKTREE / "torch_mojo_backend/mojo"),
             "--Werror",
             "-o",
             str(binary),

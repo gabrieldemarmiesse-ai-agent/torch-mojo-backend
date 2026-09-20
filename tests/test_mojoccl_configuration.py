@@ -42,7 +42,7 @@ def test_mojoccl_has_only_reviewed_environment_controls():
         "New collective controls need a reviewed NCCL/RCCL purpose analog; "
         f"unexpected={found - SUPPORTED.keys()}, missing={SUPPORTED.keys() - found}"
     )
-    registry = PACKAGE / "distributed/mojoccl/env_vars.mojo"
+    registry = PACKAGE / "mojo/tmb/ccl/env_vars.mojo"
     registered = set(
         re.findall(r"^comptime (MOJOCCL_\w+) =", registry.read_text(), re.M)
     )
@@ -51,13 +51,20 @@ def test_mojoccl_has_only_reviewed_environment_controls():
 
 
 def test_asm_discovery_covers_collective_entry_and_skips_helpers(tmp_path: Path):
-    kernel_dir = Path("collectives")
-    directory = tmp_path / kernel_dir
-    directory.mkdir()
-    (directory / "mojoccl.mojo").write_text("def ncclAllReduce(\n")
-    (directory / "family.mojo").write_text("def tmb_call(\n")
-    (directory / "helper.mojo").write_text("def helper(\n")
+    """An entry is any module exporting `tmb_call` or `ncclAllReduce`; an
+    `entry.mojo` is keyed by its package (tmb/ccl/entry.mojo -> "ccl")."""
+    kernel_dir = Path("tmb")
+    (tmp_path / kernel_dir / "ccl").mkdir(parents=True)
+    (tmp_path / kernel_dir / "kernels" / "family").mkdir(parents=True)
+    (tmp_path / kernel_dir / "ccl" / "entry.mojo").write_text("def ncclAllReduce(\n")
+    (tmp_path / kernel_dir / "ccl" / "helper.mojo").write_text("def helper(\n")
+    (tmp_path / kernel_dir / "kernels" / "family" / "entry.mojo").write_text(
+        "def tmb_call(\n"
+    )
+    (tmp_path / kernel_dir / "kernels" / "family" / "kernels.mojo").write_text(
+        "def kernel(\n"
+    )
     assert find_entry_modules(tmp_path, kernel_dir) == {
-        "mojoccl": kernel_dir / "mojoccl.mojo",
-        "family": kernel_dir / "family.mojo",
+        "ccl": kernel_dir / "ccl" / "entry.mojo",
+        "family": kernel_dir / "kernels" / "family" / "entry.mojo",
     }

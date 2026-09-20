@@ -62,7 +62,7 @@ NCCL_UNIQUE_ID_BYTES = 128
 _NCCL_LIB_ENV = "TORCH_MOJO_BACKEND_NCCL_LIB"
 _RCCL_LIB_ENV = "TORCH_MOJO_BACKEND_RCCL_LIB"
 # "mojo": build (first use only, cached) and use libmojoccl.so -- the
-# in-repo NCCL-API implementation (torch_mojo_backend/distributed/mojoccl) --
+# in-repo NCCL-API implementation (torch_mojo_backend/mojo/tmb/ccl) --
 # instead of vendor NCCL/RCCL. Same C ABI, same `_declare()` argtypes below.
 _CCL_ENV = "TORCH_MOJO_BACKEND_CCL"
 

@@ -36,7 +36,7 @@ from torch_mojo_backend import register_mojo_devices
 from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 from torch_mojo_backend.native import device_module
 
-# mojoccl (torch_mojo_backend/distributed/mojoccl) implements AllReduce/
+# mojoccl (torch_mojo_backend/mojo/tmb/ccl) implements AllReduce/
 # Broadcast/AllGather/ReduceScatter -- Reduce/Send/Recv/AllToAll/Gather/
 # Scatter return ncclInvalidUsage (DDP needs only the first three). Every mode
 # below skips the checks that need an op mojoccl does not implement.

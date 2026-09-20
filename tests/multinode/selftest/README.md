@@ -27,25 +27,25 @@ Build (from a checkout of this repo, no accelerator needed except where
 noted):
 
     uv run --no-sync mojo build tests/multinode/selftest/bs_test.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/bs_test
+        -I torch_mojo_backend/mojo -o /tmp/bs_test
     uv run --no-sync mojo build tests/multinode/selftest/ib_bringup.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_bringup
+        -I torch_mojo_backend/mojo -o /tmp/ib_bringup
     uv run --no-sync mojo build tests/multinode/selftest/ib_pipeline.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/ib_pipeline
+        -I torch_mojo_backend/mojo -o /tmp/ib_pipeline
     uv run --no-sync mojo build tests/multinode/selftest/geometry_test.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/geometry_test
+        -I torch_mojo_backend/mojo -o /tmp/geometry_test
     uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
+        -I torch_mojo_backend/mojo -o /tmp/fd_exchange
     uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/sock_deadline
+        -I torch_mojo_backend/mojo -o /tmp/sock_deadline
     uv run --no-sync mojo build tests/multinode/selftest/fabric_abi.mojo \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fabric_abi_check
+        -I torch_mojo_backend/mojo -o /tmp/fabric_abi_check
     # fabric_hmem picks libamdhip64 vs libcuda from the BUILD host's
     # accelerator (driver.mojo, comptime): build it on a GPU node, or name
     # the target.
     uv run --no-sync mojo build tests/multinode/selftest/fabric_hmem.mojo \
         --target-accelerator amdgpu:gfx942 \
-        -I torch_mojo_backend/distributed/mojoccl -o /tmp/fabric_hmem
+        -I torch_mojo_backend/mojo -o /tmp/fabric_hmem
 
 ## `bs_test.mojo` — the TCP bootstrap
 
@@ -239,7 +239,7 @@ observed source and host details remain latched. No GPU code runs.
 
 ```bash
 PYTHONPATH=$PWD uv run --no-sync mojo build tests/multinode/selftest/host_fault_test.mojo \
-    -I torch_mojo_backend/distributed/mojoccl --target-accelerator sm_90a \
+    -I torch_mojo_backend/mojo --target-accelerator sm_90a \
   -o /tmp/mojoccl_host_fault_test
 PYTHONPATH=$PWD uv run --no-sync /tmp/mojoccl_host_fault_test
 ```
@@ -251,7 +251,7 @@ Pass expected values independently of the implementation's architecture gate:
 
 ```bash
 uv run --no-sync mojo build tests/multinode/selftest/defaults.mojo \
-    -I torch_mojo_backend/distributed/mojoccl --target-accelerator gfx942 \
+    -I torch_mojo_backend/mojo --target-accelerator gfx942 \
     --Werror -o /tmp/mojoccl_defaults
 uv run --no-sync /tmp/mojoccl_defaults 8 16 64
 ```
@@ -270,6 +270,6 @@ and completion-event handles after abort.
 ```bash
 PYTHONPATH=$PWD uv run --no-sync mojo build --emit shared-lib \
     tests/multinode/selftest/comm_state_probe.mojo \
-    -I torch_mojo_backend/distributed/mojoccl -o /tmp/comm_state_probe.so
+    -I torch_mojo_backend/mojo -o /tmp/comm_state_probe.so
 export MOJOCCL_STATE_PROBE_LIBRARY=/tmp/comm_state_probe.so
 ```

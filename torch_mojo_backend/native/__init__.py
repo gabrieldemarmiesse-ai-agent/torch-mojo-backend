@@ -39,7 +39,10 @@ import torch
 
 _HERE = Path(__file__).resolve().parent
 _PACKAGE = _HERE.parent
-_KERNELS_DIR = _PACKAGE / "eager_kernels"
+# Every Mojo source lives under one root, the one `-I` of every Mojo build,
+# as one top-level package `tmb`: `from tmb.<pkg>.<module> import ...`.
+_MOJO_ROOT = _PACKAGE / "mojo"
+_BACKEND_ENTRY = _MOJO_ROOT / "tmb" / "backend" / "entry.mojo"
 # One cache for every checkout on a box (contents-addressed: every build is
 # keyed by its sources and toolchain), in the user's cache directory
 # (`~/.cache/torch-mojo-backend` on Linux, honoring XDG_CACHE_HOME;
@@ -58,7 +61,6 @@ def cache_dir() -> Path:
     return _CACHE_DIR
 
 
-_MOJO_SRC = _HERE / "mojo"
 # Libraries shipped in the wheel, built by scripts/build_prebuilt.py.
 _PREBUILT = _HERE / "prebuilt"
 _PREBUILT_MANIFEST = _PREBUILT / "manifest.json"
@@ -388,7 +390,7 @@ def shim_source_hash() -> str:
 
 def backend_source_hash() -> str:
     """The Mojo closure alone, same contract as shim_source_hash."""
-    return _hash_files(_mojo_closure(), "")
+    return _hash_files(mojo_import_closure(_BACKEND_ENTRY), "")
 
 
 def prebuilt_shim_spec() -> dict[str, object]:
@@ -580,20 +582,56 @@ def _build_shim_locked(
     return out
 
 
-def _mojo_closure() -> list[Path]:
-    """Everything the backend build reads: its own sources plus the shared
-    eager_kernels modules and the graph/native SIMD math they import."""
-    files = sorted(_MOJO_SRC.glob("*.mojo"))
-    files += sorted((_KERNELS_DIR / "op_utils").glob("*.mojo"))
-    files += sorted((_KERNELS_DIR.parent / "mojo_kernels").glob("*.mojo"))
-    files.append(_KERNELS_DIR / "variant_gates.mojo")
-    return files
+_IMPORT_RE = re.compile(r"^(?:from\s+(\S+)\s+import\b|import\s+(\S+))")
+
+
+def _module_file(dotted: str, importer_dir: Path) -> Path | None:
+    """The source file an import names, or None when it is not ours.
+
+    `tmb.a.b` is `<root>/tmb/a/b.mojo` (`<root>/tmb/a/b/__init__.mojo` for a
+    package); `.b` is `<importer_dir>/b.mojo` -- the graph package, which MAX
+    compiles without any -I, is the one place relative imports remain.
+    Everything else (std, max, nn, layout, ...) is the toolchain's, keyed by
+    its version rather than hashed."""
+    if dotted.startswith("."):
+        base = importer_dir / dotted[1:].replace(".", "/")
+    elif dotted == "tmb" or dotted.startswith("tmb."):
+        base = _MOJO_ROOT / dotted.replace(".", "/")
+    else:
+        return None
+    if base.with_suffix(".mojo").is_file():
+        return base.with_suffix(".mojo")
+    if (base / "__init__.mojo").is_file():
+        return base / "__init__.mojo"
+    return None
+
+
+def mojo_import_closure(entry: Path) -> list[Path]:
+    """Every .mojo file `entry` reaches through `from X import` / `import X`:
+    the sources one build compiles in, so touching any of them invalidates it
+    (loader.mojo's `_closure` is the same walk for the kernel builds)."""
+    seen: dict[Path, None] = {}
+    todo = [entry.resolve()]
+    while todo:
+        f = todo.pop()
+        if f in seen or not f.exists():
+            continue
+        seen[f] = None
+        for line in f.read_text().splitlines():
+            m = _IMPORT_RE.match(line)
+            if not m:
+                continue
+            cand = _module_file(m.group(1) or m.group(2), f.parent)
+            if cand is not None:
+                todo.append(cand.resolve())
+    return sorted(seen)
 
 
 def build_backend(*, prebuilt: bool = True) -> Path:
-    """Compile mojo/backend.mojo into a shared library, cached by its closure --
-    or copy the one the wheel ships for this MAX version and platform."""
-    key = _hash_files(_mojo_closure(), toolchain_identity())
+    """Compile tmb/backend/entry.mojo into a shared library, cached by its
+    import closure -- or copy the one the wheel ships for this MAX version
+    and platform."""
+    key = _hash_files(mojo_import_closure(_BACKEND_ENTRY), toolchain_identity())
     out = _CACHE_DIR / f"libtmb_backend.hash-{key}{_lib_suffix()}"
     if out.exists():
         return out
@@ -633,15 +671,11 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
     cmd = [
         _find_mojo(),
         "build",
-        str(_MOJO_SRC / "backend.mojo"),
+        str(_BACKEND_ENTRY),
         "--emit",
         "shared-lib",
         "-I",
-        str(_MOJO_SRC),
-        "-I",
-        str(_KERNELS_DIR),
-        "-I",
-        str(_KERNELS_DIR.parent),
+        str(_MOJO_ROOT),
         "--target-cpu",
         portable_target_cpu(),
         "-o",
@@ -681,52 +715,29 @@ def _build_backend_locked(key: str, out: Path) -> Path:
     return out
 
 
-def _mojo_import_closure(entry: Path, roots: list[Path]) -> list[Path]:
-    """Every .mojo file `entry` reaches through top-level imports resolved in
-    `roots` (the same rule the Mojo loader uses for kernel families)."""
-    seen: dict[Path, None] = {}
-    todo = [entry.resolve()]
-    while todo:
-        f = todo.pop()
-        if f in seen or not f.exists():
-            continue
-        seen[f] = None
-        for line in f.read_text().splitlines():
-            m = re.match(r"^(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
-            if not m or m.group(1) in ("std", "max", "nn", "linalg", "layout"):
-                continue
-            for root in [f.parent, *roots]:
-                cand = root / f"{m.group(1)}.mojo"
-                if cand.exists():
-                    todo.append(cand.resolve())
-                    break
-    return sorted(seen)
-
-
 def build_library(
-    entry: Path, roots: list[Path] | None = None, defines: dict[str, str] | None = None
+    entry: Path, name: str, defines: dict[str, str] | None = None
 ) -> Path:
     """Compile a plain Mojo shared library (a C-ABI export set, e.g. the mojoccl
-    collectives) once per closure/toolchain, cached like the backend."""
+    collectives) into `lib<name>.hash-<key>.so`, once per closure/toolchain,
+    cached like the backend."""
     from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
         _ptxas,
     )
 
-    roots = [entry.parent, *(roots or [])]
-    closure = _mojo_import_closure(entry, roots)
+    closure = mojo_import_closure(entry)
     tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))
     key = _hash_files(closure, kernel_identity() + "|" + tag)  # device code inside
-    out = _CACHE_DIR / f"lib{entry.stem}.hash-{key}.so"
+    out = _CACHE_DIR / f"lib{name}.hash-{key}.so"
     if out.exists():
         return out
     with _build_lock(out.name):
         if out.exists():
             return out
         t0 = time.monotonic()
-        tmp = _scratch_dir() / f"{entry.stem}-{os.getpid()}-{key}.so"
+        tmp = _scratch_dir() / f"{name}-{os.getpid()}-{key}.so"
         cmd = [_find_mojo(), "build", str(entry), "--emit", "shared-lib"]
-        for root in roots:
-            cmd += ["-I", str(root)]
+        cmd += ["-I", str(_MOJO_ROOT)]
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
         cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
@@ -735,10 +746,10 @@ def build_library(
             tmp.unlink(missing_ok=True)
             log = proc.stdout + proc.stderr
             raise RuntimeError(
-                f"building {entry.name} failed:\n" + log + _ptxas.diagnose(log)
+                f"building lib{name} failed:\n" + log + _ptxas.diagnose(log)
             )
         _atomic_install(tmp, out)
-        _trace(f"built {entry.name} in {time.monotonic() - t0:.2f}s")
+        _trace(f"built lib{name} in {time.monotonic() - t0:.2f}s")
         return out
 
 
@@ -872,13 +883,11 @@ def register():
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_char_p,
-            ctypes.c_char_p,
             ctypes.c_int32,
         ]
         shim_lib.tmb_get_error.restype = ctypes.c_char_p
         n = backend.tmb_native_init(
-            str(_KERNELS_DIR).encode(),
-            str(_MOJO_SRC).encode(),
+            str(_MOJO_ROOT).encode(),
             str(_CACHE_DIR).encode(),
             _find_mojo().encode(),
             kernel_identity().encode(),  # the loader keys kernel builds with it

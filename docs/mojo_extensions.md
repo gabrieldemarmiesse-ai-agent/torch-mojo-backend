@@ -1,7 +1,7 @@
 # Mojo kernel-family extensions
 
 > This describes the **native backend**'s on-demand kernel builds
-> (`torch_mojo_backend/native/mojo/loader.mojo`). See `docs/native_backend.md`
+> (`torch_mojo_backend/mojo/tmb/backend/loader.mojo`). See `docs/native_backend.md`
 > for the full architecture. The Python-level design this file used to
 > describe (`eager_kernels/__init__.py`'s `MojoExtensionLoader`,
 > `MojoExtension` descriptors, one Python-callable `call` per `.so`) was the
@@ -10,9 +10,9 @@
 
 ## Compiled at first call
 
-A kernel family under `torch_mojo_backend/eager_kernels/<family>/<family>.mojo`
+A kernel family `torch_mojo_backend/mojo/tmb/kernels/<family>/entry.mojo`
 exposes one C entry point, `tmb_call`, gated by `comptime if` on the `OP` and
-`DTYPE_ARG_*`/`DTYPE_OUT`/flag defines (`variant_gates.mojo`). The first call
+`DTYPE_ARG_*`/`DTYPE_OUT`/flag defines (`tmb/kernels/common/variant_gates.mojo`). The first call
 into a specialization not yet in the cache runs `mojo build --emit shared-lib`
 in a subprocess, at the call site in Mojo (`loader.mojo`'s `Loader.entry`),
 and the call waits for it; every later call — and every later process, as
@@ -28,17 +28,17 @@ no-warnings check: a warning in any Mojo source fails the tests that build it.
 This mirrors the old Python loader's behavior (same "one `.so` per exact
 specialization, built inline at first use" design, same rationale — see
 "Compile granularity" in `docs/fast_eager_design.md`), just driven from Mojo:
-the caller is now `native/mojo/ops_*.mojo`, not a Python `aten_fast.py`
+the caller is now `tmb/ops/*.mojo`, not a Python `aten_fast.py`
 composition function.
 
 ## KernelCall: the operation-side descriptor
 
 Where the old eager path had a stateless `MojoExtension` Python class per
-operation, the native backend has `KernelCall` (`native/mojo/kernels.mojo`),
-built fresh per call inside the op function (`native/mojo/ops_*.mojo`):
+operation, the native backend has `KernelCall` (`tmb/backend/kernel_call.mojo`),
+built fresh per call inside the op function (`tmb/ops/*.mojo`):
 
 ```mojo
-var call = KernelCall("logic_ops", "AddSpec")   # family, OP
+var call = KernelCall("logic", "AddSpec")       # family, OP
 call.arg_dtype(0, a.dtype)                       # DTYPE_ARG_0
 call.arg_dtype(1, b.dtype)                       # DTYPE_ARG_1
 call.out_dtype(dst.dtype)                        # DTYPE_OUT
@@ -79,9 +79,11 @@ one dtype tuple for a particular `.so`.
 Unchanged: dtypes, operation mode, output dtype, and implementation-selecting
 flags belong in the defines; shapes, strides, pointers, scalar values, and
 device contexts are runtime data. The loader hashes the family's *source
-closure* (every `.mojo` file it `from X import`s, resolved family-dir-first
-then package-root, plus every `op_utils/*.mojo` and the shared
-`mojo_kernels` package reached through their imports) together with the defines
+closure* (every `.mojo` file its `entry.mojo` reaches through `from tmb.a.b
+import`, resolved as `<root>/tmb/a/b.mojo`, plus the relative imports inside
+`tmb/graph`; `native.mojo_import_closure` is the same walk for the
+Python-driven builds, and `tests/test_shared_kernel_cache.py` checks the two
+agree) together with the defines
 and the toolchain identity (`native/__init__.py`'s `toolchain_identity()`:
 torch/mojo/max/python/platform/machine versions) into the cache filename
 `<family>.<defines-slug>.hash-<source-hash>.so` under
@@ -91,7 +93,7 @@ a miss builds it under a per-identity `flock` and installs it with an atomic
 rename, so an interrupted compiler cannot leave a partial file that looks
 valid, and concurrent requests for the same identity compile it once.
 
-The two backend shims (the C++ shim and the Mojo `backend.mojo` itself) are
+The two backend shims (the C++ shim and the Mojo `tmb/backend/entry.mojo` itself) are
 cached the same way, one level up, in `native/__init__.py`
 (`libtmb_shim.hash-*.so`, `libtmb_backend.hash-*.so`) -- or copied there
 from the ones the wheel ships prebuilt, which is the same cache entry by
@@ -121,11 +123,14 @@ building the call, exactly as the old Python descriptor's
 
 ## Shared unary operations
 
-`mojo_kernels/unary_math.mojo` owns the SIMD expressions used by both native
+`tmb/graph/unary_math.mojo` owns the SIMD expressions used by both native
 unary kernels and `torch.compile`. Half inputs are evaluated in float32 and
-rounded once on output. `math_utils.mojo` holds the existing accurate square
+rounded once on output. `tmb/graph/math_utils.mojo` holds the existing accurate square
 root and tangent helpers; `op_utils` re-exports them for other native kernels.
-Edits to either shared module invalidate the native build cache.
+They live in the graph package because MAX precompiles that directory on its
+own, without any `-I`, so it can only import its own siblings; the kernels
+import them as `from tmb.graph.unary_math import ...`. Edits to either
+shared module invalidate the native build cache.
 
 Native contiguous unary operations delegate aligned GPU work to Modular's
 public `max.algorithm.elementwise`, on NVIDIA, AMD, and Apple. The general

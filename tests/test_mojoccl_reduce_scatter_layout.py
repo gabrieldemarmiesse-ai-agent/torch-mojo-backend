@@ -14,9 +14,9 @@ pinned here, in source, where the check is deterministic and needs no GPU.
 import re
 from pathlib import Path
 
-MOJOCCL = Path(__file__).resolve().parents[1] / "torch_mojo_backend/distributed/mojoccl"
+MOJOCCL = Path(__file__).resolve().parents[1] / "torch_mojo_backend/mojo/tmb/ccl"
 STREAM = (MOJOCCL / "rs_stream.mojo").read_text()
-HOST = (MOJOCCL / "mojoccl.mojo").read_text()
+HOST = (MOJOCCL / "entry.mojo").read_text()
 
 
 def _body(source: str, start: str, end: str) -> str:

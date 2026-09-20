@@ -397,7 +397,7 @@ def _run_torchrun(
 )
 def test_two_rank_nccl(mode: str, ccl: str):
     """`ccl="mojo"` runs the same workers against mojoccl
-    (torch_mojo_backend/distributed/mojoccl), the in-repo NCCL-API library,
+    (torch_mojo_backend/mojo/tmb/ccl), the in-repo NCCL-API library,
     instead of vendor NCCL/RCCL — same process_group.py, same ddp_worker.py,
     only the loaded .so differs (nccl.py's `library_path()`). ddp_worker.py
     itself skips the collectives mojoccl does not implement yet (Reduce,

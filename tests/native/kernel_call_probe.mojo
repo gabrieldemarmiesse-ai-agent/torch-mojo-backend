@@ -1,14 +1,14 @@
 from std.sys import size_of
 from std.testing import assert_equal, assert_true
 from std.utils import IndexList
-from kernels import (
+from tmb.backend.kernel_call import (
     Defines,
     KernelCall,
     MAX_CALL_SLOTS,
     MAX_CALL_SPECS,
     TUPLE_POOL_WORDS,
 )
-from op_utils import MAX_RANK, TensorSpec
+from tmb.kernels.common.op_utils import MAX_RANK, TensorSpec
 
 
 def _spec(ptr: Int) -> TensorSpec:
@@ -35,7 +35,7 @@ def _resolved(call: KernelCall) -> InlineArray[Int, MAX_CALL_SLOTS]:
 def _built_elsewhere() -> KernelCall:
     """A call built in one frame and returned: the move must not leave any
     slot pointing into the frame it was built in."""
-    var call = KernelCall("data_movement_ops", "Cast")
+    var call = KernelCall("data_movement", "Cast")
     call.spec(_spec(11))
     call.int(5)
     var t = List[Int]()
@@ -82,7 +82,7 @@ def main() raises:
     flag_b.flag("SIGNED", 7)
     assert_true(flag_a.key != flag_b.key)
 
-    var call = KernelCall("data_movement_ops", "Cast")
+    var call = KernelCall("data_movement", "Cast")
     call.int(42)
     assert_equal(call.nspecs, 0)
     for i in range(MAX_CALL_SPECS):
@@ -103,7 +103,7 @@ def main() raises:
 
     # Tuple slots read back as `[len, e0, ...]`, from the inline pool and
     # from the heap spill a tuple longer than the pool takes.
-    var tuples = KernelCall("data_movement_ops", "Cast")
+    var tuples = KernelCall("data_movement", "Cast")
     var small = List[Int]()
     small.append(3)
     small.append(5)

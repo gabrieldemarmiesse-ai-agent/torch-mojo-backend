@@ -231,7 +231,9 @@ def test_boxed_adapter_returns_undefined_tensors_for_masked_gradients(mojo_gpu):
 
 def test_boxed_adapter_error_kinds(mojo_device):
     """A declined op is a NotImplementedError, a real failure a plain
-    RuntimeError, and every message names the op the adapter called."""
+    RuntimeError, and a message from the boxed adapter names the op it
+    called. `view` no longer passes through the adapter (ATen's own kernel
+    serves it since #482), so its bad-shape error is ATen's."""
     a = _arange(6, mojo_device).reshape(2, 3)
     with pytest.raises(NotImplementedError) as declined:
         torch.empty(2, dtype=torch.complex64, device=mojo_device)
@@ -241,7 +243,7 @@ def test_boxed_adapter_error_kinds(mojo_device):
     with pytest.raises(RuntimeError) as failed:
         a.view([4, 4])
     assert not isinstance(failed.value, NotImplementedError), failed.value
-    assert "aten::view" in str(failed.value)
+    assert "invalid for input of size 6" in str(failed.value)
 
     # a C++-side check inside the shim, not a declining kernel
     with pytest.raises(RuntimeError) as bounds:

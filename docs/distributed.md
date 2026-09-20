@@ -4,7 +4,7 @@ The mojo device supports `torch.nn.parallel.DistributedDataParallel` through
 a c10d backend named `"mojo"`, registered automatically by
 `register_mojo_devices()`. Collectives on mojo tensors run over the NCCL C
 API — **NCCL** on NVIDIA, **RCCL** on AMD — dlopened and called from Mojo
-(`torch_mojo_backend/native/mojo/pg.mojo`); `torch_mojo_backend/distributed/
+(`torch_mojo_backend/mojo/tmb/backend/pg.mojo`); `torch_mojo_backend/distributed/
 nccl.py` only resolves which library that is and the dtype/op constant maps —
 no ctypes calls into NCCL/RCCL happen in Python any more. No CUDA/ROCm torch
 build and no libcudart needed, in keeping with the project's "CPU-only torch
@@ -212,7 +212,7 @@ CUDA, Mojo + NCCL, and Mojo + MojoCCL throughput.
 The process group is split the way the rest of the native backend is
 (`docs/native_backend.md`): a thin Python adapter
 (`torch_mojo_backend/distributed/process_group.py`, `MojoProcessGroup`) over
-a Mojo core (`torch_mojo_backend/native/mojo/pg.mojo`, `PG`) that owns the
+a Mojo core (`torch_mojo_backend/mojo/tmb/backend/pg.mojo`, `PG`) that owns the
 communicators and does the actual library calls.
 
 - **One communicator and one dedicated comm stream per device, in Mojo.**
@@ -572,8 +572,9 @@ after model/DDP construction. Losses remain close, not bitwise identical.
 ## Mojo collectives (experimental): `TORCH_MOJO_BACKEND_CCL=mojo`
 
 An in-repo replacement for NCCL/RCCL's intra-node collectives, written in Mojo
-and exposed through **NCCL's own C ABI**: `torch_mojo_backend/distributed/mojoccl/`
-builds `libmojoccl.so` on first use (into the native backend's kernel cache,
+and exposed through **NCCL's own C ABI**: `torch_mojo_backend/mojo/tmb/ccl/`
+(`entry.mojo` exports the `nccl*` functions; `distributed/mojoccl_build.py`
+drives the build) builds `libmojoccl.so` on first use (into the native backend's kernel cache,
 same lock/atomic-rename machinery), and `nccl.py`'s `library_path()` resolves
 to it instead of `libnccl.so.2`/`librccl.so.1` when `TORCH_MOJO_BACKEND_CCL=mojo`
 — `pg.mojo` dlopens whichever path comes back, so neither it nor
@@ -1435,7 +1436,7 @@ The engine's dispatch is one `st.net == NET_VERBS` branch per post and one
 per poll batch -- loop-invariant and perfectly predicted -- so the verbs
 path costs what it always did.
 
-**Transport A, InfiniBand** (`torch_mojo_backend/distributed/mojoccl/{ibverbs,internode,
+**Transport A, InfiniBand** (`torch_mojo_backend/mojo/tmb/ccl/{ibverbs,internode,
 internode_kernels,bootstrap}.mojo`): libibverbs is dlopened; setup calls are
 symbols, the data path (`ibv_post_send`/`post_recv`/`poll_cq`) is reached
 through the `ibv_context_ops` table at the header's offsets, as NCCL's

@@ -1,5 +1,5 @@
 """Tests for the native `unary` op group
-(torch_mojo_backend/native/mojo/ops_unary.mojo): abs/neg/sign/relu, the
+(torch_mojo_backend/mojo/tmb/ops/unary.mojo): abs/neg/sign/relu, the
 transcendental unary ops, ceil/floor, gelu(+backward), isnan/logical_not/
 bitwise_not and fill.Scalar.
 
