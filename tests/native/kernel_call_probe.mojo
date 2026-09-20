@@ -149,12 +149,12 @@ def main() raises:
         unsafe_from_address=margv[3]
     )
     assert_equal(second[].ptr, 22)
-    var spilled = Pointer[Int, MutUntrackedOrigin](
-        unsafe_from_address=margv[4]
-    )
+    var spilled = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=margv[4])
     assert_equal(spilled[], TUPLE_POOL_WORDS + 5)
     assert_equal(spilled[unsafe_offset=1], 0)
-    assert_equal(spilled[unsafe_offset=TUPLE_POOL_WORDS + 5], TUPLE_POOL_WORDS + 4)
+    assert_equal(
+        spilled[unsafe_offset=TUPLE_POOL_WORDS + 5], TUPLE_POOL_WORDS + 4
+    )
     # The specs and the pooled tuple must live inside the moved struct.
     var base = Int(Pointer(to=moved))
     var span = size_of[KernelCall]()

@@ -11,7 +11,11 @@ kernel module name.
 """
 
 from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
-from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
+from max.gpu.host.device_context import (
+    _DeviceContextPtr,
+    _DeviceContextCpp,
+    _DumpPath,
+)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
@@ -31,9 +35,7 @@ from fa4_fwd_kernel import fwd_fa4_kernel
 from fa4_fwd_common import kFa4NThreads, kFa4BlockM, kFa4BlockN, kFa4KVStages
 from fa4_launch_cache import enqueue_fa4_cached
 
-comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
-    "MOJO_DUMP_PTX", ""
-]()
+comptime MOJO_DUMP_PTX: StaticString = get_defined_string["MOJO_DUMP_PTX", ""]()
 
 
 def _dump_ptx_path() -> _DumpPath:
@@ -109,9 +111,7 @@ def launch_fwd_fa4[
     # Smem: Q (BM x D) + kFa4KVStages ring slots (BN x D) bf16 +
     # mbarriers. head_dim=128: 32 KiB per tile -> 224 KiB (H100
     # opt-in cap is 227 KiB).
-    comptime q_bytes: Int = (
-        kFa4BlockM(head_dim) * head_dim * size_of[dtype]()
-    )
+    comptime q_bytes: Int = (kFa4BlockM(head_dim) * head_dim * size_of[dtype]())
     comptime kv_slot_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
     comptime mbar_bytes: Int = 128
     comptime smem_bytes: Int = (
@@ -127,14 +127,10 @@ def launch_fwd_fa4[
     var v_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
     )
-    var lse_ptr = Pointer[Float32, MutAnyOrigin](
-        unsafe_from_address=lse_addr
-    )
+    var lse_ptr = Pointer[Float32, MutAnyOrigin](unsafe_from_address=lse_addr)
     # 3D TMA descriptors over the (B*L, H, D) gmem view.
     comptime gmem_shape = IndexList[3](UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim)
-    comptime q_smem_shape = IndexList[3](
-        kFa4BlockM(head_dim), 1, head_dim
-    )
+    comptime q_smem_shape = IndexList[3](kFa4BlockM(head_dim), 1, head_dim)
     comptime kv_smem_shape = IndexList[3](kFa4BlockN, 1, head_dim)
 
     comptime if bhsd_qkv:
@@ -193,9 +189,7 @@ def launch_fwd_fa4[
             bhsd=True,
         ]
         # Same LPT scheduler as the dense causal rank-4 path.
-        var num_m_b: Int = ceildiv(
-            seqlen_int, Int(kFa4BlockM(head_dim))
-        )
+        var num_m_b: Int = ceildiv(seqlen_int, Int(kFa4BlockM(head_dim)))
         var size_one_kv_head_b: Int = (
             seqlen_int * 2 * head_dim * size_of[dtype]()
         )
@@ -237,9 +231,7 @@ def launch_fwd_fa4[
             ctx,
             ctx_handle_addr,
             stream_opaque,
-            String(
-                t"fwd_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"
-            ),
+            String(t"fwd_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"),
             (num_m_b * num_hb_b, 1, 1),
             kFa4NThreads(head_dim),
             smem_bytes,
@@ -321,9 +313,7 @@ def launch_fwd_fa4[
     comptime gmem_shape4 = IndexList[4](
         UNKNOWN_VALUE, UNKNOWN_VALUE, UNKNOWN_VALUE, head_dim
     )
-    comptime q_smem_shape4 = IndexList[4](
-        1, kFa4BlockM(head_dim), 1, head_dim
-    )
+    comptime q_smem_shape4 = IndexList[4](1, kFa4BlockM(head_dim), 1, head_dim)
 
     comptime if QO_RANK == 4:
         # Q keeps the rank-4 (B, S, H, D) form in BOTH modes so the
@@ -371,15 +361,9 @@ def launch_fwd_fa4[
             softcap_x1000,
         ]
         comptime assert not window, "window v1 is hdim128-only"
-        comptime assert softcap_x1000 == 0, (
-            "softcap v1 is hdim128-only"
-        )
-        var num_m: Int = ceildiv(
-            seqlen_int, Int(kFa4BlockM(head_dim))
-        )
-        var size_one_kv_head: Int = (
-            seqlen_int * 2 * head_dim * size_of[dtype]()
-        )
+        comptime assert softcap_x1000 == 0, "softcap v1 is hdim128-only"
+        var num_m: Int = ceildiv(seqlen_int, Int(kFa4BlockM(head_dim)))
+        var size_one_kv_head: Int = seqlen_int * 2 * head_dim * size_of[dtype]()
         var l2_ratio: Int = (50 * 1024 * 1024) // size_one_kv_head
         var sched_swizzle: Int = 1
         while sched_swizzle * 2 <= l2_ratio:
@@ -431,9 +415,7 @@ def launch_fwd_fa4[
     # the dense contiguous descriptor (strided_qkv only broadens Q/K/V).
     var q_tma: SplitLastDimTMATensorTile[dtype, q_smem_shape, swizzle]
     comptime if strided_qkv:
-        q_tma = create_split_tma_3d_strided[
-            q_smem_shape, swizzle_mode=swizzle
-        ](
+        q_tma = create_split_tma_3d_strided[q_smem_shape, swizzle_mode=swizzle](
             ctx,
             q_ptr,
             rows,

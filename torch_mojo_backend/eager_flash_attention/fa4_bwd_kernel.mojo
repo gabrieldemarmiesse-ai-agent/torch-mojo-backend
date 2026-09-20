@@ -51,13 +51,25 @@ from std.utils.index import StaticTuple, IndexList
 
 from std.sys._assembly import inlined_assembly
 from max.gpu.sync import barrier
-from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, block_idx, grid_dim, lane_id, thread_idx, warp_id
+from std.gpu import (
+    MAX_THREADS_PER_BLOCK_METADATA,
+    block_idx,
+    grid_dim,
+    lane_id,
+    thread_idx,
+    warp_id,
+)
 import std.gpu.primitives.warp as warp
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.gpu.intrinsics import warpgroup_reg_alloc, warpgroup_reg_dealloc
 from max.gpu.memory import external_memory, fence_async_view_proxy
 from std.memory import AddressSpace
-from max.gpu.sync import cp_async_bulk_commit_group, cp_async_bulk_wait_group, named_barrier, named_barrier_arrive
+from max.gpu.sync import (
+    cp_async_bulk_commit_group,
+    cp_async_bulk_wait_group,
+    named_barrier,
+    named_barrier_arrive,
+)
 from std.memory import bitcast, stack_allocation
 
 from max.gpu.compute.mma import st_matrix, wgmma_async
@@ -181,16 +193,12 @@ def bwd_main_kernel[
     comptime sds_layout = tile_layout_k_major[
         dtype, BM, BN, swizzle_mode=swizzle
     ]()
-    comptime sds_canonical = tile_to_descriptor[
-        dtype, sds_layout, True
-    ]()
+    comptime sds_canonical = tile_to_descriptor[dtype, sds_layout, True]()
     comptime sds_slab_bytes: Int = BM * 64 * size_of[dtype]()
     # A operand of dQ^T = K^T (D, BN) = the mn-major view of K's
     # bytes. TensorCoreAsync only supports k-major A, so the dQ^T
     # GEMM is hand-rolled with raw wgmma_async[layout_a="col"].
-    comptime kt_canonical = tile_to_descriptor[
-        dtype, kt_view_layout, False
-    ]()
+    comptime kt_canonical = tile_to_descriptor[dtype, kt_view_layout, False]()
     comptime kt_shape00: Int = kt_canonical[0].shape[0].value()
     comptime kt_stride01: Int = kt_canonical[0].stride[1].value()
     comptime kt_stride11: Int = kt_canonical[1].stride[1].value()
@@ -222,7 +230,9 @@ def bwd_main_kernel[
     # BM-f32 buffer per Q/dO slot pair, filled by the producer warp
     # and published by the Q slot's full barrier (init(2): TMA
     # expect + producer arrive); recycled with the slot's empties.
-    var lse_smem = (sds_base.unsafe_offset(2 * sds_size)).unsafe_bitcast[Float32]()
+    var lse_smem = (sds_base.unsafe_offset(2 * sds_size)).unsafe_bitcast[
+        Float32
+    ]()
     var dps_smem = lse_smem.unsafe_offset((STAGES // 2) * BM)
     # dQ mailbox (FA4): per MMA wg, the raw dQ^T c-frag dump
     # [chunk(BM/8)][tid(128)][4] f32 = 20 KiB; the producer's drain
@@ -314,7 +324,9 @@ def bwd_main_kernel[
         # stays identical to dense. Every per-CTA scalar is
         # warp.broadcast-laundered (tid-widening hazard class, see
         # HANDOFF.md).
-        var tbl = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(8 * Int(block_idx.x))
+        var tbl = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(
+            8 * Int(block_idx.x)
+        )
         n_block = Int(warp.broadcast(tbl[unsafe_offset=0]))
         vl_q_base = Int(warp.broadcast(tbl[unsafe_offset=1]))
         var vl_k_base: Int = Int(warp.broadcast(tbl[unsafe_offset=2]))
@@ -343,9 +355,7 @@ def bwd_main_kernel[
             # base for trip 0 — self-attn (offs == 0, m_start*BM ==
             # n*BN) reduces to 0, i.e. mask_d = it*BM as in dense.
             var vl_slq: Int = Int(warp.broadcast(tbl[unsafe_offset=3]))
-            vl_mask_base = (
-                m_start * BM - n_block * BN + (vl_slk - vl_slq)
-            )
+            vl_mask_base = m_start * BM - n_block * BN + (vl_slk - vl_slq)
     else:
         n_block = Int(block_idx.x)
         h_idx = Int(block_idx.y)
@@ -378,9 +388,7 @@ def bwd_main_kernel[
     # barrier ids: ~2 R2UR per HGMMA). The convergent shfl is
     # opaque to LLVM and a recognized broadcast to ptxas (probe:
     # tid7w vs tid7c vs shflroot in scripts/ptxas_ur_probe.py).
-    var wgid: Int = Int(
-        warp.broadcast(Int32(Int(thread_idx.x) >> 7))
-    )
+    var wgid: Int = Int(warp.broadcast(Int32(Int(thread_idx.x) >> 7)))
 
     if wgid == 0:
         # ================= producer =================
@@ -388,13 +396,21 @@ def bwd_main_kernel[
         if thread_idx.x < 32:
             var lane: Int = Int(thread_idx.x)
             if lane == 0:
-                mbar_k[unsafe_offset=0].expect_bytes(Int32(BN * D * size_of[dtype]()))
-                k_tma.async_copy_3d(
-                    k_smem, mbar_k[unsafe_offset=0], (0, h_idx // gqa_ratio, kv_row)
+                mbar_k[unsafe_offset=0].expect_bytes(
+                    Int32(BN * D * size_of[dtype]())
                 )
-                mbar_v[unsafe_offset=0].expect_bytes(Int32(BN * D * size_of[dtype]()))
+                k_tma.async_copy_3d(
+                    k_smem,
+                    mbar_k[unsafe_offset=0],
+                    (0, h_idx // gqa_ratio, kv_row),
+                )
+                mbar_v[unsafe_offset=0].expect_bytes(
+                    Int32(BN * D * size_of[dtype]())
+                )
                 v_tma.async_copy_3d(
-                    v_smem, mbar_v[unsafe_offset=0], (0, h_idx // gqa_ratio, kv_row)
+                    v_smem,
+                    mbar_v[unsafe_offset=0],
+                    (0, h_idx // gqa_ratio, kv_row),
                 )
 
             var slot: Int = 0
@@ -406,16 +422,13 @@ def bwd_main_kernel[
                 # Stats are (H, total_qpad), per-seq window at
                 # mpad_base*BM (seq_len carries num_mpad).
                 q_row = vl_q_base + m_start * BM
-                bh_stat = (
-                    (h_idx * slen + vl_mpad_base + m_start) * BM
-                ) * 4
+                bh_stat = ((h_idx * slen + vl_mpad_base + m_start) * BM) * 4
             else:
                 # lse_log2/dpsum are (B, H, Spad) — padded to a
                 # multiple of BM (pad rows +inf / 0; causal: spad == S).
                 q_row = b_idx * slen + m_start * BM
                 bh_stat = (
-                    (b_idx * Int(grid_dim.y) + h_idx)
-                    * (num_m_blocks * BM)
+                    (b_idx * Int(grid_dim.y) + h_idx) * (num_m_blocks * BM)
                     + m_start * BM
                 ) * 4
             var lse_byte: Int = Int(lse_log2_ptr) + bh_stat
@@ -447,7 +460,11 @@ def bwd_main_kernel[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ]((ring_base.unsafe_offset(slot * q_slot_size)).as_unsafe_any_origin())
+                    ](
+                        (
+                            ring_base.unsafe_offset(slot * q_slot_size)
+                        ).as_unsafe_any_origin()
+                    )
                     full[unsafe_offset=slot].expect_bytes(
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
@@ -475,7 +492,11 @@ def bwd_main_kernel[
                         MutAnyOrigin,
                         address_space=AddressSpace.SHARED,
                         alignment=128,
-                    ]((ring_base.unsafe_offset((slot + 1) * q_slot_size)).as_unsafe_any_origin())
+                    ](
+                        (
+                            ring_base.unsafe_offset((slot + 1) * q_slot_size)
+                        ).as_unsafe_any_origin()
+                    )
                     full[unsafe_offset=slot + 1].expect_bytes(
                         Int32(BM * D * size_of[dtype]() + BM * 4)
                     )
@@ -533,8 +554,7 @@ def bwd_main_kernel[
                 ) * (2 * DQ_MAIL_F32 * 4)
             else:
                 dq_byte_base = Int(dq_accum_ptr) + (
-                    (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks
-                    + m_start
+                    (b_idx * Int(grid_dim.y) + h_idx) * num_m_blocks + m_start
                 ) * (2 * DQ_MAIL_F32 * 4)
             var pk_md: Int = 0
             var pk_dq_adv: Int = 0
@@ -554,9 +574,7 @@ def bwd_main_kernel[
                             NoneType,
                             constraints="l,r,r",
                         ](
-                            Int64(
-                                dq_byte_base + w * DQ_MAIL_F32 * 4
-                            ),
+                            Int64(dq_byte_base + w * DQ_MAIL_F32 * 4),
                             Int32(Int(dq_mail.unsafe_offset(w * DQ_MAIL_F32))),
                             Int32(DQ_MAIL_F32 * 4),
                         )
@@ -596,7 +614,7 @@ def bwd_main_kernel[
         dtype,
         dtype,
         IndexList[3](WGMMA_M, D, WGMMA_K),
-        a_swizzle = TensorMapSwizzle.SWIZZLE_NONE,
+        a_swizzle=TensorMapSwizzle.SWIZZLE_NONE,
         b_swizzle=swizzle,
         transpose_b=False,
     ]()
@@ -610,9 +628,7 @@ def bwd_main_kernel[
     # the vendored m64n128k16 f32.f16.f16 emitter (_wgmma_f16.mojo)
     # replicates the TensorCoreAsync RS k-loop at the dV/dK sites.
     # bf16 keeps the stdlib path — byte-identical codegen.
-    comptime qt_canonical = tile_to_descriptor[
-        dtype, qt_view_layout, False
-    ]()
+    comptime qt_canonical = tile_to_descriptor[dtype, qt_view_layout, False]()
     comptime qt_k_stride: Int = (
         qt_canonical[1].stride[1].value() * 2 * size_of[dtype]()
     )
@@ -687,14 +703,11 @@ def bwd_main_kernel[
     comptime if softcap_on:
         comptime cap_f32: Float32 = Float32(softcap_x1000) / 1000
         t_scale = (softmax_scale / cap_f32).cast[accum_type]()
-        scale_log2 = (
-            cap_f32 * Scalar[DType.float32](log2e)
-        ).cast[accum_type]()
+        scale_log2 = (cap_f32 * Scalar[DType.float32](log2e)).cast[accum_type]()
 
     # ---- consumer state.
     mbar_k[unsafe_offset=0].wait(UInt32(0))
     mbar_v[unsafe_offset=0].wait(UInt32(0))
-
 
     var slot: Int = 0
     var phase: UInt32 = 0
@@ -725,14 +738,22 @@ def bwd_main_kernel[
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ]((ring_base.unsafe_offset((slot + 1) * q_slot_size)).as_unsafe_any_origin())
+        ](
+            (
+                ring_base.unsafe_offset((slot + 1) * q_slot_size)
+            ).as_unsafe_any_origin()
+        )
         var dot_view = LayoutTensor[
             dtype,
             qt_view_layout,
             MutAnyOrigin,
             address_space=AddressSpace.SHARED,
             alignment=128,
-        ]((ring_base.unsafe_offset((slot + 1) * q_slot_size)).as_unsafe_any_origin())
+        ](
+            (
+                ring_base.unsafe_offset((slot + 1) * q_slot_size)
+            ).as_unsafe_any_origin()
+        )
 
         # Launder the K/V tile pointers through a no-op asm so the
         # A-operand wgmma descriptors are REBUILT here every
@@ -805,7 +826,9 @@ def bwd_main_kernel[
             # entries — the GQA cp.reduce no-op rows and dS
             # exactness both rely on that.
             comptime for c in range(c_frag_sdp):
-                s_reg.ptr[unsafe_offset=c] = tanh(s_reg.ptr[unsafe_offset=c] * t_scale)
+                s_reg.ptr[unsafe_offset=c] = tanh(
+                    s_reg.ptr[unsafe_offset=c] * t_scale
+                )
 
         comptime if causal:
             comptime if varlen:
@@ -830,7 +853,9 @@ def bwd_main_kernel[
                         if vrow_lo + vrow_off > (
                             vcol_base + 2 * lane_pair + mask_dv
                         ):
-                            s_reg.ptr[unsafe_offset=c] = Scalar[accum_type](-1.0e30)
+                            s_reg.ptr[unsafe_offset=c] = Scalar[accum_type](
+                                -1.0e30
+                            )
             else:
                 if it < BN // BM:
                     var mask_d: Int = it * BM
@@ -843,7 +868,9 @@ def bwd_main_kernel[
                         if mrow_lo + crow_off > (
                             ccol_base + 2 * lane_pair + mask_d
                         ):
-                            s_reg.ptr[unsafe_offset=c] = Scalar[accum_type](-1.0e30)
+                            s_reg.ptr[unsafe_offset=c] = Scalar[accum_type](
+                                -1.0e30
+                            )
 
         comptime if window:
             # Trailing window-edge trips: q cols past kv row +
@@ -860,13 +887,9 @@ def bwd_main_kernel[
                     mw_it = pk_mc
                 mask_w = win_left - vl_mask_base - mw_it * BM
             else:
-                mask_w = (
-                    n_block * BN + win_left - (m_start + it) * BM
-                )
+                mask_w = n_block * BN + win_left - (m_start + it) * BM
             if mask_w < BM:
-                var wrow_lo: Int = (
-                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
-                )
+                var wrow_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
                 comptime for c in range(c_frag_sdp):
                     comptime wcol_base: Int = (c // 4) * 8 + (c & 1)
                     comptime wrow_off: Int = 8 if (c % 4) >= 2 else 0
@@ -883,9 +906,7 @@ def bwd_main_kernel[
             # garbage slots). P^T = exp2(-inf) = 0 zeroes their dV,
             # dS and dQ contributions.
             if vl_kv_tail < BN:
-                var trow_lo: Int = (
-                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
-                )
+                var trow_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
                 comptime for c in range(c_frag_sdp):
                     comptime trow_off: Int = 8 if (c % 4) >= 2 else 0
                     if trow_lo + trow_off >= vl_kv_tail:
@@ -902,9 +923,9 @@ def bwd_main_kernel[
             wgmma_sdp.wait_group[0]()
             warpgroup_fence(dp_reg)
             comptime for cc in range(c_frag_sdp // 4):
-                var dp2c = (dps_smem.unsafe_offset(stat_col + cc * 8)).unsafe_load[
-                    width=2, alignment=8
-                ]()
+                var dp2c = (
+                    dps_smem.unsafe_offset(stat_col + cc * 8)
+                ).unsafe_load[width=2, alignment=8]()
                 comptime for ic in range(4):
                     comptime c: Int = cc * 4 + ic
                     comptime j: Int = c & 1
@@ -914,11 +935,13 @@ def bwd_main_kernel[
                         ),
                         Scalar[accum_type](0),
                     )
-                    dp_reg.ptr[unsafe_offset=c] = (dp_reg.ptr[unsafe_offset=c] - dp2c[j]) * fac
+                    dp_reg.ptr[unsafe_offset=c] = (
+                        dp_reg.ptr[unsafe_offset=c] - dp2c[j]
+                    ) * fac
             comptime for cc in range(c_frag_sdp // 4):
-                var lp2c = (lse_smem.unsafe_offset(stat_col + cc * 8)).unsafe_load[
-                    width=2, alignment=8
-                ]()
+                var lp2c = (
+                    lse_smem.unsafe_offset(stat_col + cc * 8)
+                ).unsafe_load[width=2, alignment=8]()
                 comptime for ic in range(4):
                     comptime c: Int = cc * 4 + ic
                     comptime j: Int = c & 1
@@ -937,16 +960,16 @@ def bwd_main_kernel[
             # and keeps the dS multiply off a bf16->f32 unpack
             # critical path.
             comptime for cc in range(c_frag_sdp // 4):
-                var lp2 = (lse_smem.unsafe_offset(stat_col + cc * 8)).unsafe_load[
-                    width=2, alignment=8
-                ]()
+                var lp2 = (
+                    lse_smem.unsafe_offset(stat_col + cc * 8)
+                ).unsafe_load[width=2, alignment=8]()
                 comptime for ic in range(4):
                     comptime c: Int = cc * 4 + ic
                     comptime j: Int = c & 1
                     comptime if PROBE_NO_EXP2:
-                        s_reg.ptr[unsafe_offset=c] = s_reg.ptr[unsafe_offset=c].fma(
-                            scale_log2, -lp2[j]
-                        )
+                        s_reg.ptr[unsafe_offset=c] = s_reg.ptr[
+                            unsafe_offset=c
+                        ].fma(scale_log2, -lp2[j])
                     else:
                         s_reg.ptr[unsafe_offset=c] = exp2(
                             s_reg.ptr[unsafe_offset=c].fma(scale_log2, -lp2[j])
@@ -959,9 +982,9 @@ def bwd_main_kernel[
 
             # dS^T = P^T * (dP^T - dpsum[q col]); pack P and dS bf16.
             comptime for cc in range(c_frag_sdp // 4):
-                var dp2 = (dps_smem.unsafe_offset(stat_col + cc * 8)).unsafe_load[
-                    width=2, alignment=8
-                ]()
+                var dp2 = (
+                    dps_smem.unsafe_offset(stat_col + cc * 8)
+                ).unsafe_load[width=2, alignment=8]()
                 comptime for ic in range(4):
                     comptime c: Int = cc * 4 + ic
                     comptime j: Int = c & 1
@@ -970,13 +993,15 @@ def bwd_main_kernel[
                     )
         comptime for c2 in range(c_frag_sdp // 2):
             var pp = SIMD[accum_type, 2](
-                s_reg.ptr[unsafe_offset=2 * c2], s_reg.ptr[unsafe_offset=2 * c2 + 1]
+                s_reg.ptr[unsafe_offset=2 * c2],
+                s_reg.ptr[unsafe_offset=2 * c2 + 1],
             ).cast[dtype]()
             p_reg.ptr[unsafe_offset=2 * c2] = pp[0]
             p_reg.ptr[unsafe_offset=2 * c2 + 1] = pp[1]
         comptime for c2 in range(c_frag_sdp // 2):
             var dsp = SIMD[accum_type, 2](
-                dp_reg.ptr[unsafe_offset=2 * c2], dp_reg.ptr[unsafe_offset=2 * c2 + 1]
+                dp_reg.ptr[unsafe_offset=2 * c2],
+                dp_reg.ptr[unsafe_offset=2 * c2 + 1],
             ).cast[dtype]()
             ds_reg.ptr[unsafe_offset=2 * c2] = dsp[0]
             ds_reg.ptr[unsafe_offset=2 * c2 + 1] = dsp[1]
@@ -1019,7 +1044,10 @@ def bwd_main_kernel[
                 # bf16/f32; stmatrix.b16 is dtype-agnostic (no-op
                 # for bf16, unblocks fp16).
                 st_matrix[simd_width=4, transpose=True](
-                    (sds_ptr.unsafe_offset(i * 1024)).unsafe_bitcast[BFloat16](), packed
+                    (sds_ptr.unsafe_offset(i * 1024)).unsafe_bitcast[
+                        BFloat16
+                    ](),
+                    packed,
                 )
 
         # dV += P^T · dO — committed after the dS store (FA4's
@@ -1028,16 +1056,18 @@ def bwd_main_kernel[
         warpgroup_fence(dv_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
-            var dvb_desc = _wgmma_descriptor[
-                qt_canonical, False, swizzle
-            ](ring_base.unsafe_offset((slot + 1) * q_slot_size))
+            var dvb_desc = _wgmma_descriptor[qt_canonical, False, swizzle](
+                ring_base.unsafe_offset((slot + 1) * q_slot_size)
+            )
             var dv_simd = dv_acc.ptr.unsafe_load[width=c_frag_dkv]()
             comptime for k_mma in range(num_k_mmas_rs):
                 comptime if head_dim == 128:
                     dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
                         wgmma_rs_f16_m64n128(
                             rebind[SIMD[DType.float16, 8]](
-                                (p_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
+                                (
+                                    p_reg.ptr.unsafe_offset(8 * k_mma)
+                                ).unsafe_load[width=8]()
                             ),
                             (dvb_desc + k_mma * qt_k_stride).desc,
                             rebind[SIMD[DType.float32, 64]](dv_simd),
@@ -1047,7 +1077,9 @@ def bwd_main_kernel[
                     dv_simd = rebind[SIMD[accum_type, c_frag_dkv]](
                         wgmma_rs_f16_m64n64(
                             rebind[SIMD[DType.float16, 8]](
-                                (p_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
+                                (
+                                    p_reg.ptr.unsafe_offset(8 * k_mma)
+                                ).unsafe_load[width=8]()
                             ),
                             (dvb_desc + k_mma * qt_k_stride).desc,
                             rebind[SIMD[DType.float32, 32]](dv_simd),
@@ -1079,14 +1111,14 @@ def bwd_main_kernel[
                 # the existing fences keep guarding the regs.
                 warpgroup_fence(dq_reg)
                 wgmma_sdp.arrive()
-                var a_desc = _wgmma_descriptor[
-                    kt_canonical, False, swizzle
-                ](k_base_l)
+                var a_desc = _wgmma_descriptor[kt_canonical, False, swizzle](
+                    k_base_l
+                )
                 comptime if D == 128:
                     a_desc = a_desc + wg * a_wg_stride
-                var b_desc = _wgmma_descriptor[
-                    sds_canonical, True, swizzle
-                ](sds_stage_base)
+                var b_desc = _wgmma_descriptor[sds_canonical, True, swizzle](
+                    sds_stage_base
+                )
                 comptime if D == 64:
                     # N-split: each wg's B window is 64 sdS q-ROWS.
                     # The canonical (BM, BN) SW128 tile is COLUMN-
@@ -1094,9 +1126,7 @@ def bwd_main_kernel[
                     # k-steps below jump slabs), so 64 rows = 8 cores
                     # x 512 elems = 8 KiB within every slab.
                     b_desc = b_desc + wg * (64 * 64 * size_of[dtype]())
-                var dq_tup = StaticTuple[
-                    Scalar[accum_type], c_frag_dq
-                ]()
+                var dq_tup = StaticTuple[Scalar[accum_type], c_frag_dq]()
                 comptime for k_mma in range(BN // WGMMA_K):
                     dq_tup = wgmma_async[
                         WGMMA_M,
@@ -1108,14 +1138,11 @@ def bwd_main_kernel[
                         b_type=dtype,
                         layout_a="col",
                         layout_b="col",
-                        scale_d = 0 if k_mma == 0 else 1,
+                        scale_d=0 if k_mma == 0 else 1,
                     ](
                         a_desc + k_mma * a_k_stride,
                         b_desc
-                        + (
-                            (k_mma & 3) * 32
-                            + (k_mma >> 2) * sds_slab_bytes
-                        ),
+                        + ((k_mma & 3) * 32 + (k_mma >> 2) * sds_slab_bytes),
                         dq_tup,
                     )
                 comptime for c in range(c_frag_dq):
@@ -1133,16 +1160,18 @@ def bwd_main_kernel[
         warpgroup_fence(dk_acc)
         wgmma_dkv.arrive()
         comptime if dtype == DType.float16:
-            var dkb_desc = _wgmma_descriptor[
-                qt_canonical, False, swizzle
-            ](ring_base.unsafe_offset(slot * q_slot_size))
+            var dkb_desc = _wgmma_descriptor[qt_canonical, False, swizzle](
+                ring_base.unsafe_offset(slot * q_slot_size)
+            )
             var dk_simd = dk_acc.ptr.unsafe_load[width=c_frag_dkv]()
             comptime for k_mma in range(num_k_mmas_rs):
                 comptime if head_dim == 128:
                     dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
                         wgmma_rs_f16_m64n128(
                             rebind[SIMD[DType.float16, 8]](
-                                (ds_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
+                                (
+                                    ds_reg.ptr.unsafe_offset(8 * k_mma)
+                                ).unsafe_load[width=8]()
                             ),
                             (dkb_desc + k_mma * qt_k_stride).desc,
                             rebind[SIMD[DType.float32, 64]](dk_simd),
@@ -1152,7 +1181,9 @@ def bwd_main_kernel[
                     dk_simd = rebind[SIMD[accum_type, c_frag_dkv]](
                         wgmma_rs_f16_m64n64(
                             rebind[SIMD[DType.float16, 8]](
-                                (ds_reg.ptr.unsafe_offset(8 * k_mma)).unsafe_load[width=8]()
+                                (
+                                    ds_reg.ptr.unsafe_offset(8 * k_mma)
+                                ).unsafe_load[width=8]()
                             ),
                             (dkb_desc + k_mma * qt_k_stride).desc,
                             rebind[SIMD[DType.float32, 32]](dk_simd),
@@ -1175,7 +1206,9 @@ def bwd_main_kernel[
             named_barrier[Int32(DRAIN_BAR)](Int32(9 + wg))
             var mail = dq_mail.unsafe_offset(wg * DQ_MAIL_F32 + tid_in_wg * 4)
             comptime for ch in range(c_frag_dq // 4):
-                (mail.unsafe_offset(ch * 512)).unsafe_store[width=4, alignment=16](
+                (mail.unsafe_offset(ch * 512)).unsafe_store[
+                    width=4, alignment=16
+                ](
                     SIMD[accum_type, 4](
                         dq_reg.ptr[unsafe_offset=4 * ch],
                         dq_reg.ptr[unsafe_offset=4 * ch + 1],
@@ -1224,9 +1257,7 @@ def bwd_main_kernel[
             var dv_g = Pointer[Scalar[dtype], MutAnyOrigin](
                 unsafe_from_address=Int(taux[unsafe_offset=1])
             )
-            var vscale: Scalar[accum_type] = softmax_scale.cast[
-                accum_type
-            ]()
+            var vscale: Scalar[accum_type] = softmax_scale.cast[accum_type]()
             comptime for c in range(c_frag_dkv):
                 dk_acc.ptr[unsafe_offset=c] *= vscale
             var prow_lo: Int = wg * WGMMA_M + warp_in_wg * 16 + lane_group
@@ -1239,17 +1270,25 @@ def bwd_main_kernel[
                     # //gqa_ratio folds away at ratio==1. grid.y is
                     # the dk/dv head count in both modes.
                     var goff: Int = (
-                        (kv_row + prow) * Int(grid_dim.y)
-                        + h_idx // gqa_ratio
-                    ) * D + p_chunk * 8 + 2 * lane_pair
-                    (dv_g.unsafe_offset(goff)).unsafe_store[width=2, alignment=4](
+                        ((kv_row + prow) * Int(grid_dim.y) + h_idx // gqa_ratio)
+                        * D
+                        + p_chunk * 8
+                        + 2 * lane_pair
+                    )
+                    (dv_g.unsafe_offset(goff)).unsafe_store[
+                        width=2, alignment=4
+                    ](
                         SIMD[accum_type, 2](
-                            dv_acc.ptr[unsafe_offset=2 * c2], dv_acc.ptr[unsafe_offset=2 * c2 + 1]
+                            dv_acc.ptr[unsafe_offset=2 * c2],
+                            dv_acc.ptr[unsafe_offset=2 * c2 + 1],
                         ).cast[dtype]()
                     )
-                    (dk_g.unsafe_offset(goff)).unsafe_store[width=2, alignment=4](
+                    (dk_g.unsafe_offset(goff)).unsafe_store[
+                        width=2, alignment=4
+                    ](
                         SIMD[accum_type, 2](
-                            dk_acc.ptr[unsafe_offset=2 * c2], dk_acc.ptr[unsafe_offset=2 * c2 + 1]
+                            dk_acc.ptr[unsafe_offset=2 * c2],
+                            dk_acc.ptr[unsafe_offset=2 * c2 + 1],
                         ).cast[dtype]()
                     )
             return
@@ -1283,40 +1322,46 @@ def bwd_main_kernel[
         # is 32 KiB but dead K+V is also only 32 KiB COMBINED with
         # live mbarriers nearby — use the dead sdS stage 0 instead
         # (32 KiB, dead after the pre-epilogue barrier).
-        var acc32 = (
-            k_base if D == 128 else sds_base
-        ).unsafe_bitcast[Float32]()
+        var acc32 = (k_base if D == 128 else sds_base).unsafe_bitcast[Float32]()
         var kv_acc_base: Int = 0
         comptime if not varlen:
             kv_acc_base = (
                 (
-                    b_idx * (Int(grid_dim.y) // gqa_ratio)
-                    + h_idx // gqa_ratio
+                    (
+                        b_idx * (Int(grid_dim.y) // gqa_ratio)
+                        + h_idx // gqa_ratio
+                    )
+                    * slen
+                    + n_block * BN
                 )
-                * slen
-                + n_block * BN
-            ) * D * 4
+                * D
+                * 4
+            )
         comptime for t in range(2):  # 0 = dV, 1 = dK
             comptime for c2 in range(c_frag_dkv // 2):
                 comptime g_chunk: Int = c2 // 2
                 comptime g_bot: Int = c2 % 2
                 var g_row: Int = (
-                    wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                    wg * WGMMA_M
+                    + warp_in_wg * 16
+                    + lane_group
                     + (8 if g_bot == 1 else 0)
                 )
                 var g_col: Int = g_chunk * 8 + 2 * lane_pair
                 var g_pr: SIMD[accum_type, 2]
                 comptime if t == 0:
                     g_pr = SIMD[accum_type, 2](
-                        dv_acc.ptr[unsafe_offset=2 * c2], dv_acc.ptr[unsafe_offset=2 * c2 + 1]
+                        dv_acc.ptr[unsafe_offset=2 * c2],
+                        dv_acc.ptr[unsafe_offset=2 * c2 + 1],
                     )
                 else:
                     g_pr = SIMD[accum_type, 2](
-                        dk_acc.ptr[unsafe_offset=2 * c2], dk_acc.ptr[unsafe_offset=2 * c2 + 1]
+                        dk_acc.ptr[unsafe_offset=2 * c2],
+                        dk_acc.ptr[unsafe_offset=2 * c2 + 1],
                     )
-                (acc32.unsafe_offset(g_row * D + g_col)).unsafe_store[width=2, alignment=8](
-                    g_pr
-                )
+                (acc32.unsafe_offset(g_row * D + g_col)).unsafe_store[
+                    width=2, alignment=8
+                ](g_pr)
             fence_async_view_proxy()
             named_barrier[Int32(NWG * 128)](Int32(4))
             if thread_idx.x == 128:
@@ -1337,20 +1382,29 @@ def bwd_main_kernel[
                     # per-CTA scalar stays live across the main loop
                     # for the epilogue's sake — the combined vl +
                     # GQA liveness otherwise spills ~8 B.
-                    var tblr = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(
-                        8 * Int(block_idx.x)
+                    var tblr = dk_accum_ptr.unsafe_bitcast[
+                        Int32
+                    ]().unsafe_offset(8 * Int(block_idx.x))
+                    var kv_row_e: Int = (
+                        Int(tblr[unsafe_offset=2])
+                        + Int(tblr[unsafe_offset=0]) * BN
                     )
-                    var kv_row_e: Int = Int(tblr[unsafe_offset=2]) + Int(tblr[unsafe_offset=0]) * BN
-                    var taux64 = dk_accum_ptr.unsafe_bitcast[Int64]().unsafe_offset(
-                        4 * Int(grid_dim.x)
+                    var taux64 = dk_accum_ptr.unsafe_bitcast[
+                        Int64
+                    ]().unsafe_offset(4 * Int(grid_dim.x))
+                    var taux32 = dk_accum_ptr.unsafe_bitcast[
+                        Int32
+                    ]().unsafe_offset(8 * Int(grid_dim.x))
+                    red_dst = (
+                        Int(taux64[unsafe_offset=0 if t == 1 else 1])
+                        + (
+                            (Int(block_idx.y) // gqa_ratio)
+                            * Int(taux32[unsafe_offset=4])
+                            + kv_row_e
+                        )
+                        * D
+                        * 4
                     )
-                    var taux32 = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(
-                        8 * Int(grid_dim.x)
-                    )
-                    red_dst = Int(taux64[unsafe_offset=0 if t == 1 else 1]) + (
-                        (Int(block_idx.y) // gqa_ratio) * Int(taux32[unsafe_offset=4])
-                        + kv_row_e
-                    ) * D * 4
                 else:
                     red_dst = (
                         Int(dv_accum_ptr if t == 0 else dk_accum_ptr)
@@ -1374,7 +1428,9 @@ def bwd_main_kernel[
 
     var st_lane: Int = lane
     var st_row: Int = (
-        wg * WGMMA_M + warp_in_wg * 16 + ((st_lane // 8) % 2) * 8
+        wg * WGMMA_M
+        + warp_in_wg * 16
+        + ((st_lane // 8) % 2) * 8
         + (st_lane % 8)
     )
     var st_off_raw: Int = st_row * 64 + (st_lane // 16) * 8
@@ -1387,7 +1443,9 @@ def bwd_main_kernel[
             comptime e_chunk: Int = c2 // 2
             comptime e_bot: Int = c2 % 2
             var e_row: Int = (
-                wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                wg * WGMMA_M
+                + warp_in_wg * 16
+                + lane_group
                 + (8 if e_bot == 1 else 0)
             )
             var e_col: Int = e_chunk * 8 + 2 * lane_pair
@@ -1413,14 +1471,13 @@ def bwd_main_kernel[
                 comptime p: Int = 4 * i + jm
                 packed[jm] = bitcast[DType.float32, 1](
                     SIMD[accum_type, 2](
-                        dv_acc.ptr[unsafe_offset=2 * p], dv_acc.ptr[unsafe_offset=2 * p + 1]
+                        dv_acc.ptr[unsafe_offset=2 * p],
+                        dv_acc.ptr[unsafe_offset=2 * p + 1],
                     ).cast[dtype]()
                 )
             # XOR per call: the 32-B column steps live in the
             # swizzled bits, so the fold must apply per address.
-            var raw_i: Int = (
-                dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
-            )
+            var raw_i: Int = dv_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
             var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
             st_matrix[simd_width=4](
                 (
@@ -1449,7 +1506,9 @@ def bwd_main_kernel[
             comptime f_chunk: Int = c2 // 2
             comptime f_bot: Int = c2 % 2
             var f_row: Int = (
-                wg * WGMMA_M + warp_in_wg * 16 + lane_group
+                wg * WGMMA_M
+                + warp_in_wg * 16
+                + lane_group
                 + (8 if f_bot == 1 else 0)
             )
             var f_col: Int = f_chunk * 8 + 2 * lane_pair
@@ -1475,12 +1534,11 @@ def bwd_main_kernel[
                 comptime p: Int = 4 * i + jm
                 packed[jm] = bitcast[DType.float32, 1](
                     SIMD[accum_type, 2](
-                        dk_acc.ptr[unsafe_offset=2 * p], dk_acc.ptr[unsafe_offset=2 * p + 1]
+                        dk_acc.ptr[unsafe_offset=2 * p],
+                        dk_acc.ptr[unsafe_offset=2 * p + 1],
                     ).cast[dtype]()
                 )
-            var raw_i: Int = (
-                dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
-            )
+            var raw_i: Int = dk_raw + (i % 4) * 32 + (i // 4) * (BN * 128)
             var sw_i: Int = raw_i ^ ((raw_i >> 3) & 112)
             st_matrix[simd_width=4](
                 (
@@ -1511,9 +1569,7 @@ def bwd_main_kernel[
 # dpsum=0 so the main kernel's tail m-block contributes exact zeros.
 # ===================================================================
 @__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(kBwdPreThreads)
-    )
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kBwdPreThreads))
 )
 def bwd_preprocess_kernel[
     dtype: DType,
@@ -1554,7 +1610,9 @@ def bwd_preprocess_kernel[
         # dk_accum_ptr slot; seq_len carries total_q (packed (H,
         # total_q) LSE reads) and nheads carries total_qpad. stats
         # windows are per-seq at mpad_base*bm_main in (H, total_qpad).
-        var tbl = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(8 * Int(block_idx.x))
+        var tbl = dk_accum_ptr.unsafe_bitcast[Int32]().unsafe_offset(
+            8 * Int(block_idx.x)
+        )
         var m_local: Int = Int(tbl[unsafe_offset=0])
         var q_base: Int = Int(tbl[unsafe_offset=1])
         var slq: Int = Int(tbl[unsafe_offset=2])
@@ -1569,26 +1627,22 @@ def bwd_preprocess_kernel[
         var sub: Int = tid % LANES_PER_ROW
         var row_in_pass: Int = tid // LANES_PER_ROW
         comptime for p in range(bm_main // ROWS_PER_PASS):
-            var s_loc: Int = (
-                m_local * bm_main + p * ROWS_PER_PASS + row_in_pass
-            )
-            var stat_row: Int = (
-                h_idx * total_qpad + mpad_base * bm_main + s_loc
-            )
+            var s_loc: Int = m_local * bm_main + p * ROWS_PER_PASS + row_in_pass
+            var stat_row: Int = h_idx * total_qpad + mpad_base * bm_main + s_loc
             if s_loc < slq:
-                var off: Int = (
-                    (q_base + s_loc) * nh + h_idx
-                ) * D + sub * RVEC
-                var o_v = (o_ptr.unsafe_offset(off)).unsafe_load[width=RVEC]().cast[
-                    DType.float32
-                ]()
-                var do_v = (do_ptr.unsafe_offset(off)).unsafe_load[width=RVEC]().cast[
-                    DType.float32
-                ]()
-                var part: Float32 = (o_v * do_v).reduce_add()
-                var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](
-                    part
+                var off: Int = ((q_base + s_loc) * nh + h_idx) * D + sub * RVEC
+                var o_v = (
+                    (o_ptr.unsafe_offset(off))
+                    .unsafe_load[width=RVEC]()
+                    .cast[DType.float32]()
                 )
+                var do_v = (
+                    (do_ptr.unsafe_offset(off))
+                    .unsafe_load[width=RVEC]()
+                    .cast[DType.float32]()
+                )
+                var part: Float32 = (o_v * do_v).reduce_add()
+                var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](part)
                 if sub == 0:
                     dpsum_ptr[unsafe_offset=stat_row] = dps
                     lse_log2_ptr[unsafe_offset=stat_row] = (
@@ -1621,9 +1675,7 @@ def bwd_preprocess_kernel[
         # accumulates the group's dK/dV in registers and stores
         # bf16 directly — there are no f32 accumulators.)
         return
-    var num_main_blocks: Int = (
-        seq_len + bm_main - 1
-    ) // bm_main
+    var num_main_blocks: Int = (seq_len + bm_main - 1) // bm_main
     var spad: Int = num_main_blocks * bm_main
 
     # Coalesced: 8 threads per row, 16 rows per pass, 8 passes.
@@ -1640,22 +1692,24 @@ def bwd_preprocess_kernel[
             var off: Int = (
                 (b_idx * seq_len + s) * nheads + h_idx
             ) * D + sub * RVEC
-            var o_v = (o_ptr.unsafe_offset(off)).unsafe_load[width=RVEC]().cast[
-                DType.float32
-            ]()
-            var do_v = (do_ptr.unsafe_offset(off)).unsafe_load[width=RVEC]().cast[
-                DType.float32
-            ]()
+            var o_v = (
+                (o_ptr.unsafe_offset(off))
+                .unsafe_load[width=RVEC]()
+                .cast[DType.float32]()
+            )
+            var do_v = (
+                (do_ptr.unsafe_offset(off))
+                .unsafe_load[width=RVEC]()
+                .cast[DType.float32]()
+            )
             var part: Float32 = (o_v * do_v).reduce_add()
             var dps = warp.lane_group_sum[num_lanes=LANES_PER_ROW](part)
             if sub == 0:
-                var lse_row: Int = (
-                    b_idx * nheads + h_idx
-                ) * seq_len + s
+                var lse_row: Int = (b_idx * nheads + h_idx) * seq_len + s
                 dpsum_ptr[unsafe_offset=bh_row] = dps
-                lse_log2_ptr[unsafe_offset=bh_row] = (lse_ptr.unsafe_offset(lse_row))[unsafe_offset=
-                    0
-                ] * Float32(log2e)
+                lse_log2_ptr[unsafe_offset=bh_row] = (
+                    lse_ptr.unsafe_offset(lse_row)
+                )[unsafe_offset=0] * Float32(log2e)
         elif s < spad:
             # Pad rows: exp2(x - inf) = 0 kills P; dpsum = 0 keeps
             # dS = P * (dP - dpsum) = 0 * finite = 0.
@@ -1689,18 +1743,16 @@ def bwd_preprocess_kernel[
             var kvbase: Int = (
                 b_idx * (nheads // gqa_ratio) + h_idx // gqa_ratio
             ) * kvtot
-            var kpasses: Int = (
-                kvtot + nb * ZCHUNK - 1
-            ) // (nb * ZCHUNK)
+            var kpasses: Int = (kvtot + nb * ZCHUNK - 1) // (nb * ZCHUNK)
             var koff: Int = m_block * kpasses * ZCHUNK + tid * ZVEC
             for _ in range(kpasses):
                 if koff < kvtot:
-                    (dk_accum_ptr.unsafe_offset(kvbase + koff)).unsafe_store[width=ZVEC](
-                        SIMD[DType.float32, ZVEC](0)
-                    )
-                    (dv_accum_ptr.unsafe_offset(kvbase + koff)).unsafe_store[width=ZVEC](
-                        SIMD[DType.float32, ZVEC](0)
-                    )
+                    (dk_accum_ptr.unsafe_offset(kvbase + koff)).unsafe_store[
+                        width=ZVEC
+                    ](SIMD[DType.float32, ZVEC](0))
+                    (dv_accum_ptr.unsafe_offset(kvbase + koff)).unsafe_store[
+                        width=ZVEC
+                    ](SIMD[DType.float32, ZVEC](0))
                 koff += ZCHUNK
 
 
@@ -1709,9 +1761,7 @@ def bwd_preprocess_kernel[
 # Grid (ceil(S/kBwdBlockM), H, B) — one CTA per main-kernel m-block.
 # ===================================================================
 @__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(kBwdCvtThreads)
-    )
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kBwdCvtThreads))
 )
 def bwd_convert_kernel[
     dtype: DType,
@@ -1755,11 +1805,9 @@ def bwd_convert_kernel[
     var vl_slq: Int = 0
     var vl_mpad_base: Int = 0
     comptime if varlen:
-        var tbl = (
-            Pointer[Int32, ImmutAnyOrigin](
-                unsafe_from_address=seq_len
-            ).unsafe_offset(8 * Int(block_idx.x))
-        )
+        var tbl = Pointer[Int32, ImmutAnyOrigin](
+            unsafe_from_address=seq_len
+        ).unsafe_offset(8 * Int(block_idx.x))
         m_block = Int(tbl[unsafe_offset=0])
         vl_q_base = Int(tbl[unsafe_offset=1])
         vl_slq = Int(tbl[unsafe_offset=2])
@@ -1790,13 +1838,11 @@ def bwd_convert_kernel[
     var ft: Int = tid % 128
     var frag_base: Int
     comptime if varlen:
-        frag_base = (
-            h_idx * nheads + vl_mpad_base + m_block
-        ) * (2 * WG_F32)
+        frag_base = (h_idx * nheads + vl_mpad_base + m_block) * (2 * WG_F32)
     else:
-        frag_base = (
-            (b_idx * nheads + h_idx) * num_m_blocks + m_block
-        ) * (2 * WG_F32)
+        frag_base = ((b_idx * nheads + h_idx) * num_m_blocks + m_block) * (
+            2 * WG_F32
+        )
     var d_wl: Int = (ft // 32) * 16 + (ft % 32) // 4
     var q_lp: Int = 2 * (ft % 4)
     comptime for i in range(NCOMBO // 2):
@@ -1840,7 +1886,9 @@ def bwd_convert_kernel[
                     tile.unsafe_offset(s_local * (D + PAD) + d_base)
                 ).unsafe_load[width=OV, alignment=16]()
                 var out = (fv * softmax_scale).cast[dtype]()
-                (dq_ptr.unsafe_offset(dq_off)).unsafe_store[width=OV, alignment=32](out)
+                (dq_ptr.unsafe_offset(dq_off)).unsafe_store[
+                    width=OV, alignment=32
+                ](out)
         else:
             if s_local < BM and s < seq_len:
                 var dq_off: Int = (
@@ -1850,4 +1898,6 @@ def bwd_convert_kernel[
                     tile.unsafe_offset(s_local * (D + PAD) + d_base)
                 ).unsafe_load[width=OV, alignment=16]()
                 var out = (fv * softmax_scale).cast[dtype]()
-                (dq_ptr.unsafe_offset(dq_off)).unsafe_store[width=OV, alignment=32](out)
+                (dq_ptr.unsafe_offset(dq_off)).unsafe_store[
+                    width=OV, alignment=32
+                ](out)

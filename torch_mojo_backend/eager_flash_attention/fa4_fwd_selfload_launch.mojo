@@ -28,7 +28,11 @@ kernel module name.
 """
 
 from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
-from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
+from max.gpu.host.device_context import (
+    _DeviceContextPtr,
+    _DeviceContextCpp,
+    _DumpPath,
+)
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
@@ -48,9 +52,7 @@ from fa4_fwd_selfload_common import (
 )
 from fa4_launch_cache import enqueue_fa4_cached
 
-comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
-    "MOJO_DUMP_PTX", ""
-]()
+comptime MOJO_DUMP_PTX: StaticString = get_defined_string["MOJO_DUMP_PTX", ""]()
 
 
 def _dump_ptx_path() -> _DumpPath:
@@ -85,9 +87,10 @@ def launch_fwd_fa4_selfload[
     # instantiation; this one gives a clearer message for the rest of
     # the (today, unreachable) envelope this launcher's signature could
     # otherwise be asked to serve.
-    comptime assert (
-        (head_dim == 64) and causal and softcap_x1000 == 0
-    ), "self-load geometry is d64-only, dense-causal-bhsd only (d128/non-causal keep the phase-2b launcher)"
+    comptime assert (head_dim == 64) and causal and softcap_x1000 == 0, (
+        "self-load geometry is d64-only, dense-causal-bhsd only"
+        " (d128/non-causal keep the phase-2b launcher)"
+    )
     var raw_ctx_ptr = Pointer[_DeviceContextCpp, MutUntrackedOrigin](
         unsafe_from_address=ctx_handle_addr
     )
@@ -101,9 +104,7 @@ def launch_fwd_fa4_selfload[
     # Smem: Q (BM x D) + kFa4KVStages ring slots (BN x D) bf16/f16 +
     # mbarriers. d64: 8 KiB Q + 4*16 KiB ring = 72 KiB/CTA, so 3 CTAs/SM
     # fit the 227 KiB opt-in cap (see fa4_fwd_selfload_common.mojo).
-    comptime q_bytes: Int = (
-        kFa4BlockM(head_dim) * head_dim * size_of[dtype]()
-    )
+    comptime q_bytes: Int = (kFa4BlockM(head_dim) * head_dim * size_of[dtype]())
     comptime kv_slot_bytes: Int = kFa4BlockN * head_dim * size_of[dtype]()
     comptime mbar_bytes: Int = 128
     comptime smem_bytes: Int = (
@@ -119,9 +120,7 @@ def launch_fwd_fa4_selfload[
     var v_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=v_addr
     )
-    var lse_ptr = Pointer[Float32, MutAnyOrigin](
-        unsafe_from_address=lse_addr
-    )
+    var lse_ptr = Pointer[Float32, MutAnyOrigin](unsafe_from_address=lse_addr)
     # PUBLIC-layout consumption (the fix the phase-2 bhsd descriptors
     # bought): Q/K/V/O are the contiguous (B, H, S, D) tensors the ATen
     # op provides, viewed as (B*H, S, D). Planes are the TMA outer dim
@@ -173,12 +172,8 @@ def launch_fwd_fa4_selfload[
     # threshold undisturbed for shapes still dispatched there (see the
     # gate in fa4_ops.mojo and NOTES.md "Phase 2c" handoff item 4).
     var num_m: Int = ceildiv(seqlen_int, Int(kFa4BlockM(head_dim)))
-    var size_one_kv_head: Int = (
-        seqlen_int * 2 * head_dim * size_of[dtype]()
-    )
-    var sm_count: Int = ctx.get_attribute(
-        DeviceAttribute.MULTIPROCESSOR_COUNT
-    )
+    var size_one_kv_head: Int = seqlen_int * 2 * head_dim * size_of[dtype]()
+    var sm_count: Int = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     var ctas_per_sm: Int = kFa4CtasPerSm(head_dim)
     var waves: Int = (num_m * nheads_int * batch_int) // (
         ctas_per_sm * sm_count
@@ -202,9 +197,7 @@ def launch_fwd_fa4_selfload[
         ctx,
         ctx_handle_addr,
         stream_opaque,
-        String(
-            t"fwd_selfload_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"
-        ),
+        String(t"fwd_selfload_bhsd_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"),
         (num_m * num_hb, 1, 1),
         kFa4NThreads(head_dim),
         smem_bytes,

@@ -3724,7 +3724,8 @@ def _do_reduce_scatter_stream(
     if npeers * _align_up(min(chunk_elems, count) * 4, 16) > group:
         raise Error("mojoccl: streaming reduce-scatter inbox overflow")
     var cap = (
-        RS_STREAM_BIG_BLOCKS if count * 4 >= PIPE_SPLIT_UNIT else state.fused_cap
+        RS_STREAM_BIG_BLOCKS if count * 4
+        >= PIPE_SPLIT_UNIT else state.fused_cap
     )
     var blocks = reduce_scatter_stream_blocks(
         state.ctx, state.local_world, state.sm_count, chunk_elems, cap

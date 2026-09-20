@@ -21,6 +21,8 @@ def kBwdTileM(head_dim: Int, causal: Bool) -> Int:
     if head_dim == 64:
         return 128
     return 64 if causal else kBwdBlockM
+
+
 comptime kBwdNMmaWarpgroups: Int = 2
 comptime kBwdNThreads: Int = (kBwdNMmaWarpgroups + 1) * 128
 
