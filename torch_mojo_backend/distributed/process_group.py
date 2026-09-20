@@ -1,5 +1,5 @@
 """The `mojo` torch.distributed backend: a thin adapter over the Mojo
-process-group core (native/mojo/pg.mojo).
+process-group core (tmb/backend/pg.mojo).
 
 Every collective runs on a per-device comm stream: Mojo makes that stream
 wait for the caller's current stream, issues the NCCL / RCCL / mojoccl call

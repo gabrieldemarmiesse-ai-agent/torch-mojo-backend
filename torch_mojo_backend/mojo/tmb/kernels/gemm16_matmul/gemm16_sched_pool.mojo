@@ -485,7 +485,7 @@ def _sched_warn_exhausted(table: _SCHED_TABLE):
     routes have quietly stopped being chosen.
 
     Prefix and destination match the backend's only other runtime warning
-    (`_warn` in native/mojo/device.mojo), which prints to stdout; a decline is
+    (`_warn` in tmb/backend/device.mojo), which prints to stdout; a decline is
     a slowdown, not an error, so it must not raise.
     """
     var flag = table.unsafe_offset(1)

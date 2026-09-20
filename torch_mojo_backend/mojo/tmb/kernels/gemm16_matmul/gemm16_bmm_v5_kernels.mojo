@@ -107,7 +107,7 @@ comptime _B5_SWIZZLE = TensorMapSwizzle.SWIZZLE_128B
 # fails the whole `mojo build`, not just the offending kernel.  Those carve one
 # `external_memory` slab into their three tiles instead; the dynamic window
 # has never been subject to the cap (it is opted into per launch with
-# MAX_DYNAMIC_SHARED_SIZE_BYTES, the scheme eager_flash_attention uses).
+# MAX_DYNAMIC_SHARED_SIZE_BYTES, the scheme the FA4 family uses).
 #
 # The instantiations that FIT stay static, because the dynamic window is not
 # free: its base sits past the static mbarriers rounded up to the 1024-byte

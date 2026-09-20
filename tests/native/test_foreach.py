@@ -1,4 +1,4 @@
-"""Native `_foreach_*` / `_fused_adamw_` ops (`native/mojo/ops_foreach.mojo`).
+"""Native `_foreach_*` / `_fused_adamw_` ops (`tmb/ops/foreach.mojo`).
 
 Migrated from `tests/test_eager_optimizer_ops.py` (deleted): only the tests
 that exercise ops this group registers. That file also covered `lerp.Scalar`,

@@ -6,7 +6,7 @@
 # library spells an environment variable as a literal.
 #
 # `torch_mojo_backend/env_vars.py` is the project-wide union -- these, the
-# mojoccl ones (`distributed/mojoccl/env_vars.mojo`) and the Python ones --
+# mojoccl ones (`tmb/ccl/env_vars.mojo`) and the Python ones --
 # and is what `register_mojo_devices()` checks the user's environment
 # against. The three lists build separately and cannot import one another;
 # `tests/test_env_vars_are_registered.py` scans the sources and fails if one

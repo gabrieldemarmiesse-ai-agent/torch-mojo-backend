@@ -140,7 +140,7 @@ comptime _V4_PROD_TMA_STORE = True
 # 13, and ptxas fails the whole `mojo build` on the first kernel over the line
 # rather than the one kernel.  Dynamic shared memory is not capped that way:
 # it is opted into per function with MAX_DYNAMIC_SHARED_SIZE_BYTES and sized
-# by the launch's `shared_mem_bytes`, which is how eager_flash_attention fits
+# by the launch's `shared_mem_bytes`, which is how the FA4 family fits
 # its own ~200 KiB slabs (fa4_fwd_kernel.mojo / fa4_fwd_launch.mojo).
 #
 # The mbarriers stay static: tens of bytes, and keeping them out of the carve
