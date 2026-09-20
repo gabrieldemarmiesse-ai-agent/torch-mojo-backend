@@ -68,7 +68,7 @@ device through the ordinary generic path, exactly like CUDA, and
 ## Execution semantics
 
 Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
-`native/mojo/abi.mojo`/`device.mojo`). On CUDA/ROCm a new stream selects an
+`tmb/backend/abi.mojo`/`device.mojo`). On CUDA/ROCm a new stream selects an
 independent queue; on Metal it selects the same default queue.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one

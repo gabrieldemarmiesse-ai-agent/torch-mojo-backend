@@ -1,0 +1,329 @@
+"""Pure-Mojo H100 candidate for LayerNorm f32 affine parameter gradients.
+
+Two runtime regimes, both with deterministic fixed-order f32 reductions and no
+global atomics:
+
+  * direct: rows <= _DIRECT_MAX_ROWS, or a degenerate single-chunk geometry.
+    One launch; each thread owns one column and accumulates every row
+    sequentially.
+  * two-stage: a partial kernel where block_idx.y selects a fixed contiguous
+    row chunk (bounded chunk count) and each thread owns one column inside the
+    chunk, then a final kernel where _FINAL_TY chunk-lanes per column each sum
+    a fixed strided chunk subset and are combined in fixed lane order through
+    shared memory.  Chunk partials live in ordinary context-owned scratch
+    allocated and released inside the enqueue call.
+
+Column ownership makes every global load warp-coalesced; the chunk geometry
+depends only on (rows, cols), so repeated invocations produce identical f32
+bit patterns.
+"""
+
+from max.gpu.sync import barrier
+from std.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceContext
+from std.memory import AddressSpace
+from std.math import ceildiv
+from std.memory import stack_allocation
+from std.sys.info import has_accelerator
+
+from tmb.kernels.common.op_utils import _enqueue_cached, _enqueue_cached_2d
+
+comptime _BLOCK = 128
+comptime _DIRECT_MAX_ROWS = 128
+comptime _MIN_CHUNK_ROWS = 32
+comptime _MAX_PARTIALS = 512
+comptime _TARGET_BLOCKS = 1280
+comptime _UNROLL = 8
+comptime _FINAL_TX = 32
+comptime _FINAL_TY = 32
+
+
+@__name("layer_norm_backward_params_direct")
+def _direct_kernel(
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
+    var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
+    if col >= cols:
+        return
+    var weight_acc = Float32(0.0)
+    var bias_acc = Float32(0.0)
+    var index = col
+    if want_weight != 0:
+        for row in range(rows):
+            var dy = grad_output[unsafe_offset=index]
+            var xhat = (
+                input[unsafe_offset=index] - mean[unsafe_offset=row]
+            ) * rstd[unsafe_offset=row]
+            weight_acc += dy * xhat
+            bias_acc += dy
+            index += cols
+        grad_weight[unsafe_offset=col] = weight_acc
+    else:
+        for _ in range(rows):
+            bias_acc += grad_output[unsafe_offset=index]
+            index += cols
+    if want_bias != 0:
+        grad_bias[unsafe_offset=col] = bias_acc
+
+
+@__name("layer_norm_backward_params_partial")
+def _partial_kernel(
+    partial_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    chunk_rows_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var chunk_rows = Int(chunk_rows_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
+    var col = Int(block_idx.x) * _BLOCK + Int(thread_idx.x)
+    if col >= cols:
+        return
+    var chunk = Int(block_idx.y)
+    var row_start = chunk * chunk_rows
+    var row_end = min(row_start + chunk_rows, rows)
+    var weight_acc = Float32(0.0)
+    var bias_acc = Float32(0.0)
+    var row = row_start
+    var index = row_start * cols + col
+    if want_weight != 0:
+        while row + _UNROLL <= row_end:
+            comptime for k in range(_UNROLL):
+                var dy = grad_output[unsafe_offset=index + k * cols]
+                var x = input[unsafe_offset=index + k * cols]
+                weight_acc += dy * (
+                    (x - mean[unsafe_offset=row + k])
+                    * rstd[unsafe_offset=row + k]
+                )
+                bias_acc += dy
+            row += _UNROLL
+            index += _UNROLL * cols
+        while row < row_end:
+            var dy = grad_output[unsafe_offset=index]
+            weight_acc += dy * (
+                (input[unsafe_offset=index] - mean[unsafe_offset=row])
+                * rstd[unsafe_offset=row]
+            )
+            bias_acc += dy
+            row += 1
+            index += cols
+        partial_weight[unsafe_offset=chunk * cols + col] = weight_acc
+    else:
+        while row + _UNROLL <= row_end:
+            comptime for k in range(_UNROLL):
+                bias_acc += grad_output[unsafe_offset=index + k * cols]
+            row += _UNROLL
+            index += _UNROLL * cols
+        while row < row_end:
+            bias_acc += grad_output[unsafe_offset=index]
+            row += 1
+            index += cols
+    if want_bias != 0:
+        partial_bias[unsafe_offset=chunk * cols + col] = bias_acc
+
+
+@__name("layer_norm_backward_params_final")
+def _final_kernel(
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    partial_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    cols_arg: Int64,
+    num_chunks_arg: Int64,
+    want_weight_arg: Int64,
+    want_bias_arg: Int64,
+):
+    # Int is not device-passable (host/device width mismatch); scalars cross
+    # the launch ABI as Int64 and index math stays in Int.
+    var cols = Int(cols_arg)
+    var num_chunks = Int(num_chunks_arg)
+    var want_weight = Int(want_weight_arg)
+    var want_bias = Int(want_bias_arg)
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var col = Int(block_idx.x) * _FINAL_TX + tx
+    var shared_weight = stack_allocation[
+        _FINAL_TX * _FINAL_TY,
+        Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var shared_bias = stack_allocation[
+        _FINAL_TX * _FINAL_TY,
+        Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    var weight_acc = Float32(0.0)
+    var bias_acc = Float32(0.0)
+    if col < cols:
+        # Lane ty owns chunks ty, ty+_FINAL_TY, ... in ascending order.
+        var chunk = ty
+        while chunk < num_chunks:
+            var index = chunk * cols + col
+            if want_weight != 0:
+                weight_acc += partial_weight[unsafe_offset=index]
+            if want_bias != 0:
+                bias_acc += partial_bias[unsafe_offset=index]
+            chunk += _FINAL_TY
+    shared_weight[unsafe_offset=ty * _FINAL_TX + tx] = weight_acc
+    shared_bias[unsafe_offset=ty * _FINAL_TX + tx] = bias_acc
+    barrier()
+    if ty == 0 and col < cols:
+        if want_weight != 0:
+            var total = Float32(0.0)
+            comptime for lane in range(_FINAL_TY):
+                total += shared_weight[unsafe_offset=lane * _FINAL_TX + tx]
+            grad_weight[unsafe_offset=col] = total
+        if want_bias != 0:
+            var total = Float32(0.0)
+            comptime for lane in range(_FINAL_TY):
+                total += shared_bias[unsafe_offset=lane * _FINAL_TX + tx]
+            grad_bias[unsafe_offset=col] = total
+
+
+def enqueue_layer_norm_backward_params_f32(
+    grad_weight: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_bias: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    grad_output: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    input: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    mean: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rstd: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    want_weight: Bool,
+    want_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    comptime if has_accelerator():
+        if not want_weight and not want_bias:
+            return
+        var weight_flag = 1 if want_weight else 0
+        var bias_flag = 1 if want_bias else 0
+        var col_blocks = ceildiv(cols, _BLOCK)
+
+        if rows <= _DIRECT_MAX_ROWS:
+            _enqueue_cached[_direct_kernel](
+                ctx,
+                "layer_norm_backward_params_direct",
+                col_blocks,
+                1,
+                1,
+                _BLOCK,
+                grad_weight,
+                grad_bias,
+                grad_output,
+                input,
+                mean,
+                rstd,
+                Int64(rows),
+                Int64(cols),
+                Int64(weight_flag),
+                Int64(bias_flag),
+            )
+            return
+
+        # Bounded chunk count: fill a fixed block budget across the column
+        # blocks, never exceed the hard partial cap, and keep chunks at least
+        # _MIN_CHUNK_ROWS rows.  Rounding chunk_rows to the unroll width keeps
+        # the unrolled loop tail-free for interior chunks.  The geometry is a
+        # pure function of (rows, cols), so replays are bit-identical.
+        var num_chunks = max(1, _TARGET_BLOCKS // col_blocks)
+        num_chunks = min(num_chunks, _MAX_PARTIALS)
+        num_chunks = min(num_chunks, ceildiv(rows, _MIN_CHUNK_ROWS))
+        var chunk_rows = ceildiv(ceildiv(rows, num_chunks), _UNROLL) * _UNROLL
+        num_chunks = ceildiv(rows, chunk_rows)
+        if num_chunks == 1:
+            # A single chunk degenerates to the direct regime: no scratch needed.
+            _enqueue_cached[_direct_kernel](
+                ctx,
+                "layer_norm_backward_params_direct",
+                col_blocks,
+                1,
+                1,
+                _BLOCK,
+                grad_weight,
+                grad_bias,
+                grad_output,
+                input,
+                mean,
+                rstd,
+                Int64(rows),
+                Int64(cols),
+                Int64(weight_flag),
+                Int64(bias_flag),
+            )
+            return
+        var lane = num_chunks * cols
+        var lanes = weight_flag + bias_flag
+        var scratch = ctx.enqueue_create_buffer[DType.float32](lanes * lane)
+        var scratch_base = scratch.unsafe_ptr().as_unsafe_any_origin()
+        var partial_weight = scratch_base
+        var partial_bias = scratch_base.unsafe_offset(
+            lane if want_weight else 0
+        )
+
+        _enqueue_cached[_partial_kernel](
+            ctx,
+            "layer_norm_backward_params_partial",
+            col_blocks,
+            num_chunks,
+            1,
+            _BLOCK,
+            partial_weight,
+            partial_bias,
+            grad_output,
+            input,
+            mean,
+            rstd,
+            Int64(rows),
+            Int64(cols),
+            Int64(chunk_rows),
+            Int64(weight_flag),
+            Int64(bias_flag),
+        )
+        _enqueue_cached_2d[_final_kernel](
+            ctx,
+            "layer_norm_backward_params_final",
+            ceildiv(cols, _FINAL_TX),
+            1,
+            1,
+            _FINAL_TX,
+            _FINAL_TY,
+            grad_weight,
+            grad_bias,
+            partial_weight,
+            partial_bias,
+            Int64(cols),
+            Int64(num_chunks),
+            Int64(weight_flag),
+            Int64(bias_flag),
+        )
+        # Normal release after both queued consumers are enqueued in stream order.
+        _ = scratch^
+    else:
+        raise Error("no GPU accelerator available at compile time")

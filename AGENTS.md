@@ -63,7 +63,7 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
   `TORCH_MOJO_BACKEND_*` or `MOJOCCL_*` that is not in it, so a misspelled
   knob stops being silent. The Mojo side keeps the names it reads as
   constants in one file per compiled library
-  (`native/mojo/env_vars.mojo`, `distributed/mojoccl/env_vars.mojo`) rather
+  (`mojo/tmb/backend/env_vars.mojo`, `mojo/tmb/ccl/env_vars.mojo`) rather
   than as literals at the `getenv`. Adding a variable anywhere means adding
   it to the Python table too; `tests/test_env_vars_are_registered.py` scans
   the repo and fails otherwise.
@@ -248,10 +248,10 @@ directly, no Python on the op path. There is **no graph fallback**: an op is
 either implemented in Mojo or `NotImplementedError`.
 
 1. Write `op_<name>` in the matching
-   `torch_mojo_backend/native/mojo/ops_<group>.mojo` — `core`, `unary`,
+   `torch_mojo_backend/mojo/tmb/ops/<group>.mojo` — `core`, `unary`,
    `binary`, `compare`, `data_movement`, `factories`, `random`, `reductions`,
    `matmul`, `nn`, `attention`, `foreach`; generic helpers shared by several groups go
-   in `ops_common.mojo`. Read the arguments by schema position with the `v_*`
+   in `tmb/ops/common.mojo`. Read the arguments by schema position with the `v_*`
    helpers, build outputs with `new_tensor` / `new_like` / `view_strided`
    (never write into an input unless the schema says so), and set results with
    `ret_tensor` (owned), `ret_ref` (an input handed back: in-place ops),
@@ -268,7 +268,7 @@ either implemented in Mojo or `NotImplementedError`.
    impl[op_<name>](lib, "<name>.<overload>")
    ```
 
-   `backend.mojo` calls every `register_<group>`; only `ops_core.mojo`'s few
+   `tmb/backend/entry.mojo` calls every `register_<group>`; only `tmb/ops/core.mojo`'s few
    ops are registered there directly. Register the functional variant; an
    `out=` variant computes into the caller's tensor when its shape/dtype/
    contiguity allow and otherwise computes then `copy_strided_into`s. A
@@ -280,9 +280,11 @@ local's address over as a slot and let the local die before `run()` — that
 reads freed memory.
 
 If the op needs a new Mojo kernel, add it to the matching
-`eager_kernels/<family>/<family>.mojo` (variant-gated: the loader compiles
+`mojo/tmb/kernels/<family>/entry.mojo` (variant-gated: the loader compiles
 one specialization per (OP, DTYPE) on first use and caches it in
-`~/.cache/torch-mojo-backend/native/`). You may import kernels from the modular repo inside the
+`~/.cache/torch-mojo-backend/native/`); helpers of the family sit beside it
+in the same directory, code shared by several families in
+`tmb/kernels/common/` or in the family that owns the algorithm. You may import kernels from the modular repo inside the
 `.mojo` file (`from nn import ...`) only if they don't call
 CuBLAS/CuDNN/rocBLAS underneath. If a fully dynamic-shape function is not
 available in the modular repo, write the kernel yourself.
@@ -323,9 +325,9 @@ uvx pre-commit run --all-files
 When adding an operation, you typically update **two places** (three with a
 new kernel):
 1. **`aten_functions.py`**: torch.compile backend implementation (MAX ops composition)
-2. **`native/mojo/ops_<group>.mojo`**: `op_<name>` plus its `impl[op_<name>]`
+2. **`mojo/tmb/ops/<group>.mojo`**: `op_<name>` plus its `impl[op_<name>]`
    registration, for the mojo device
-3. **`eager_kernels/<family>/<family>.mojo`**: the kernel itself, when none of
+3. **`mojo/tmb/kernels/<family>/entry.mojo`**: the kernel itself, when none of
    the existing ones does the job
 
 This ensures the operation works in both `torch.compile()` and on the `mojo` device.
@@ -404,7 +406,8 @@ uv run python scripts/compare_kernel_asm.py \
 `mojo build --emit asm --target-accelerator <arch>` needs no such device
 present. It writes host assembly to `-o` and one sidecar per GPU kernel beside
 it (`.ptx` for NVIDIA, `.amdgcn` for AMD, `.ll` for Metal). The script builds
-both trees, pairs kernels by name, masks the mangling hash and reports which
+both trees, pairs kernels by name (same-named ones by body, a renamed
+module's `@__name`-less kernels by body too), masks the mangling hash and reports which
 ones differ. It takes about a minute per module against roughly ten for one
 end-to-end benchmark leg. `mojo --print-supported-accelerators` lists the
 architecture names.
@@ -552,22 +555,30 @@ Believe them before rediscovering them at GPU-hour prices.
 ### Build & integration gotchas
 
 - Define-gating silently no-ops standalone builds: the gates in
-  `variant_gates.mojo` (`_op_on`, `_dtype_arg_on`, ...) read compiler defines
+  `tmb/kernels/common/variant_gates.mojo` (`_op_on`, `_dtype_arg_on`, ...) read compiler defines
   and gate OFF when the define is absent. A standalone harness binary that
   calls a define-gated dispatcher (e.g. `_matmul_spec_launch`) without the
   matching `-D DTYPE_ARG_0=<dtype>` will decline or raise at runtime. Either
   pass the defines, or call the comptime-parameterized functions directly
   (e.g. `_gemm_enqueue[dtype, ...]`), which need no defines.
-- Directory shadows module on the import path: with
-  `-I torch_mojo_backend/eager_kernels`, a family directory such as
-  `matmul_ops/` resolves as a package and shadows the `matmul_ops.mojo` file
-  inside it. Import as `from matmul_ops.matmul_ops import ...`.
+- One root, one import grammar: every Mojo source is under
+  `torch_mojo_backend/mojo/`, the only `-I` any build passes, as the one
+  package `tmb`. In-repo imports are always absolute and name a module:
+  `from tmb.kernels.common.op_utils import Argv`,
+  `from tmb.kernels.roi.entry import bilinear`. No bare names, no relative
+  imports (the compiler rejects them in the file passed to `mojo build`,
+  and every `entry.mojo` is such a file) — except inside `tmb/graph`, the
+  MAX custom-op package, which MAX precompiles without any `-I`, so it may
+  only import its own siblings, relatively. `tests/test_mojo_imports.py`
+  enforces all of this. Never name a module after its directory: the
+  package shadows the file, which is why every built library is
+  `entry.mojo`.
 - Cache/source registration for new `.mojo` files: the extension loader
-  (`native/mojo/loader.mojo`) hashes the import closure of each family's entry
-  `.mojo` file, so a new file imported (even transitively) from the entry
+  (`tmb/backend/loader.mojo`) hashes the import closure of each family's
+  `entry.mojo`, so a new file imported (even transitively) from the entry
   module invalidates the compile cache automatically. Verify it anyway: touch
   the new file and confirm the source hash changes and a recompile happens.
 - `ctx.enqueue_function[f]` re-runs `compile_function` on every call (tens to
   hundreds of microseconds for large kernels). That is acceptable in a
   throwaway harness; production code must use the `_enqueue_cached` pattern
-  from `op_utils`, like the rest of the eager kernels.
+  from `tmb.kernels.common.op_utils`, like the rest of the eager kernels.

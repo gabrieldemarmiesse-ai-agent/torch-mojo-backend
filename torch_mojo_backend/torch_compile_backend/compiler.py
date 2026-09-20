@@ -48,7 +48,9 @@ class GlobalMaxObjects:
 
 _global_max_objects: GlobalMaxObjects | None = None
 
-paths_to_mojo_kernels = [Path(__file__).parent.parent / "mojo_kernels"]
+# The MAX custom ops of the graph backend: one Mojo source package that MAX
+# precompiles on its own (tmb/graph, the only package with an __init__.mojo).
+paths_to_mojo_kernels = [Path(__file__).parent.parent / "mojo" / "tmb" / "graph"]
 
 
 def global_max_objects() -> GlobalMaxObjects:

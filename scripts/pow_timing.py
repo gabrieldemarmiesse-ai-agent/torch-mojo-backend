@@ -31,7 +31,7 @@ def time_us(
 def main() -> int:
     register_mojo_devices()
     label = sys.argv[1]
-    print(f"[{label}] KERNELS_DIR {n._KERNELS_DIR}", flush=True)
+    print(f"[{label}] MOJO_ROOT {n._MOJO_ROOT}", flush=True)
     DEV = torch.device("mojo:0")
     sync = torch.mojo.synchronize  # ty: ignore[unresolved-attribute]
 

@@ -88,7 +88,7 @@ _OUT = (
 )
 
 _COMPOSED = (
-    "no kernel of its own: ops_composed.mojo builds it from ops this suite "
+    "no kernel of its own: tmb/ops/composed.mojo builds it from ops this suite "
     "already measures (a few extra launches, nothing new to regress against)"
 )
 _NORMAL_COMPOSITE = (

@@ -94,8 +94,8 @@ jobs:
       - name: Cache native builds
         uses: actions/cache@v4
         with:
-          path: torch_mojo_backend/eager_kernels/__mojocache__/native
-          key: native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-${{ hashFiles('torch_mojo_backend/native/**', 'torch_mojo_backend/eager_kernels/**/*.mojo', 'uv.lock') }}
+          path: ~/.cache/torch-mojo-backend/native
+          key: native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-${{ hashFiles('torch_mojo_backend/native/**', 'torch_mojo_backend/mojo/**/*.mojo', 'uv.lock') }}
           restore-keys: |
             native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-
 

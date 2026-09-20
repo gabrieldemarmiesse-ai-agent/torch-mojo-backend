@@ -9,10 +9,10 @@ directly. No Python runs on the op path.
 torch.add(a, b)  ->  dispatcher  ->  MojoBoxedKernel (C++, native/csrc)
                                          |  TmbValue records
                                          v
-                                  op_add_tensor (Mojo, libtmb_backend, native/mojo/ops_*.mojo)
+                                  op_add_tensor (Mojo, libtmb_backend, mojo/tmb/ops/*.mojo)
                                          |  KernelCall
                                          v
-                                  logic_ops.so::tmb_call  (built on first use)
+                                  logic.<defines>.so::tmb_call  (built on first use)
 ```
 
 The shim, the backend library and every op body are fixed-size and ship
@@ -68,18 +68,29 @@ classes, each forwarding to a Mojo function pointer:
 
 Three translation units compile in parallel: about 7 s wall cold.
 
-**Mojo backend (`native/mojo/`)** — `mojo build backend.mojo --emit shared-lib`:
+**Mojo backend (`mojo/tmb/backend/` + `mojo/tmb/ops/`)** — `mojo build
+tmb/backend/entry.mojo --emit shared-lib -I torch_mojo_backend/mojo`. Every
+Mojo source of the project lives under that one root as the one package
+`tmb` (`from tmb.backend.abi import T`), and that root is the only `-I` any
+build passes; `tests/test_mojo_imports.py` keeps the grammar:
 
-| file | what |
+| package | what |
 |---|---|
-| `backend.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
+| `tmb/backend/` | the runtime below |
+| `tmb/ops/<group>.mojo` | the aten ops, and each file's `register_<group>` list |
+| `tmb/kernels/<family>/entry.mojo` | one kernel family per directory: its `tmb_call` and its kernels; `tmb/kernels/common/` is what every family shares (`op_utils`, `variant_gates`) |
+| `tmb/ccl/entry.mojo` | libmojoccl, the in-repo collectives (`docs/distributed.md`) |
+| `tmb/graph/` | the MAX custom ops of the torch.compile backend, and the SIMD math they share with the kernels; the one package MAX precompiles on its own |
+
+| file (`tmb/backend/`) | what |
+|---|---|
+| `entry.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
 | `registry.mojo` | `impl[op, "name"]`: registers the op's boxed entry with torch's dispatcher — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
 | `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
 | `loader.mojo` | on-demand builds of kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
-| `kernels.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
-| `ops_*.mojo` | the aten ops, and each file's `register_<group>` list |
+| `kernel_call.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
 
 ## Which ptxas assembles the kernels (NVIDIA)
 
@@ -149,7 +160,7 @@ raises `NotImplementedError`.
 
 ## Kernel families: the C entry
 
-Every family under `eager_kernels/<family>/` exports one C function per
+Every family `tmb/kernels/<family>/entry.mojo` exports one C function per
 specialization build:
 
 ```mojo
@@ -167,19 +178,19 @@ its `_spec_dispatcherN[go, "Name"]`; a raised `Error` comes back as
 ## Writing an op
 
 An op is `def op_x(args: Values, n_args: Int, rets: Values, n_rets: Int)
-raises` in one `ops_<group>.mojo`, registered at the bottom of that same file
+raises` in one `tmb/ops/<group>.mojo`, registered at the bottom of that same file
 in `register_<group>` with `impl[op_x, "x.overload"](site)`. A new group
 file needs two things: the `register_<group>` list, and one
-`_group[register_<group>](lib)` line in `backend.mojo`.
+`_group[register_<group>](lib)` line in `tmb/backend/entry.mojo`.
 
 External operator namespaces use their own `tmb_library_new` handle and
 fully qualified registration names, such as `torchvision::roi_align`.
 The dispatcher accepts these implementations before the extension defining
 their schemas is imported. Torchvision remains optional at runtime.
 
-The native detection groups are `ops_roi.mojo` (ROI align/pool, their
-position-sensitive variants, and backwards), `ops_nms.mojo` (non-maximum
-suppression), and `ops_deform_conv.mojo` (deformable convolution). They support
+The native detection groups are `tmb/ops/roi.mojo` (ROI align/pool, their
+position-sensitive variants, and backwards), `tmb/ops/nms.mojo` (non-maximum
+suppression), and `tmb/ops/deform_conv.mojo` (deformable convolution). They support
 float16/float32/float64 GPU inputs (float64 requires device support). ROI
 inputs are made contiguous; NMS declines non-contiguous inputs. ROI backward
 uses relaxed atomic scatter and
@@ -244,7 +255,7 @@ To run a kernel:
 ```mojo
 var ctx = ctx_for(t.device)          # the device's CURRENT stream
 var cp = ctx_ptr(ctx)
-var call = KernelCall("logic_ops", "AddSpec")
+var call = KernelCall("logic", "AddSpec")   # tmb/kernels/logic/entry.mojo
 call.arg_dtype(0, a.dtype)
 call.arg_dtype(1, b.dtype)
 call.out_dtype(dst.dtype)
@@ -526,16 +537,16 @@ its events time with the host clock.
 The device generator is bit-compatible with CUDA's: `MojoGeneratorImpl`
 (shim_runtime.cpp) keeps a Philox seed and an offset counted in curand's unit,
 `get_rng_state()` is CUDA's 16 bytes (seed, offset), and every draw of
-`ops_random.mojo` -- `uniform_`, `normal_`, `log_normal_`, `cauchy_`,
+`tmb/ops/random.mojo` -- `uniform_`, `normal_`, `log_normal_`, `cauchy_`,
 `exponential_`, `geometric_`, `bernoulli_` (scalar and tensor p), the
 `random_` family, `native_dropout` -- reproduces the CUDA kernel it mirrors:
 same element order (TensorIterator's), same launch geometry (which makes
 draws above the grid cap of `sm_count * max_threads_per_sm / 256` blocks
 depend on the GPU model, as on CUDA), same counter reservation, same
 `curand4` / `curand_uniform4` / `curand_normal4` conversions
-(`eager_kernels/curand_philox.mojo`), same transforms and the same math -- the CUDA fast intrinsics ATen uses for
+(`tmb/kernels/random/philox.mojo`), same transforms and the same math -- the CUDA fast intrinsics ATen uses for
 float, the precise libdevice routines for double, both ported bit-exactly in
-`eager_kernels/libdevice_port.mojo`. `torch.manual_seed(s)` therefore gives
+`tmb/kernels/common/libdevice_port.mojo`. `torch.manual_seed(s)` therefore gives
 the same `torch.rand` / `randn` / `randint` / `bernoulli` / dropout values on
 the mojo device (NVIDIA; on AMD and Apple the float transforms fall back to
 std.math and only the integer draws are bit-exact) and on a CUDA device of
@@ -549,7 +560,7 @@ draws on the MAX CPU device (same kernels' closed form, no CUDA to match).
 
 `torch.distributed.init_process_group(backend="mojo")` registers
 `MojoProcessGroup` (distributed/process_group.py), a thin adapter over
-`native/mojo/pg.mojo`: one communicator and one dedicated comm stream per
+`tmb/backend/pg.mojo`: one communicator and one dedicated comm stream per
 device; every collective makes the comm stream wait for the caller's current
 stream, issues the NCCL / RCCL / mojoccl call on it (the three share the NCCL
 C ABI; `TORCH_MOJO_BACKEND_CCL=mojo` picks the in-repo Mojo collectives), and
@@ -686,8 +697,8 @@ different machine code from identical LLVM for different accelerator flags. A
 control in the same file builds a one-kernel module for two targets and
 requires those to differ, so the equality cannot pass vacuously.
 
-**Refreshing them** — after a change to `native/csrc/`, `native/mojo/`, or
-the MAX pin:
+**Refreshing them** — after a change to `native/csrc/`, `mojo/tmb/backend/`,
+`mojo/tmb/ops/`, or the MAX pin:
 
 ```bash
 # this machine's platform; a venv per torch version, holding that CPU wheel
