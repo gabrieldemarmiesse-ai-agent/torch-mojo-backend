@@ -1,6 +1,6 @@
 // ATen's own view kernels, registered for this device.
 //
-// `view`, `_reshape_alias` and `as_strided` produce a tensor that shares its
+// `view`, `_unsafe_view`, `_reshape_alias` and `as_strided` produce a tensor that shares its
 // input's storage and differs only in sizes, strides and storage offset.
 // There is no device code in them: ATen's kernels are what CPU, CUDA, MPS and
 // XPU all register (native_functions.yaml), and they are what this file
@@ -16,6 +16,7 @@
 
 #include <ATen/core/Tensor.h>
 #include <ATen/ops/_reshape_alias_native.h>
+#include <ATen/ops/_unsafe_view_native.h>
 #include <ATen/ops/as_strided_native.h>
 #include <ATen/ops/view_native.h>
 #include <c10/core/SymIntArrayRef.h>
@@ -33,11 +34,18 @@ namespace {
 // element instead. The DimVector holds five dimensions inline, so a guarded
 // size costs no allocation for the ranks that occur.
 at::Tensor view_pu1(const at::Tensor& self, c10::SymIntArrayRef size) {
+  tmb_count_op_call("aten::view");
   return at::native::view(self, C10_AS_INTARRAYREF_SLOW_ALLOC(size));
+}
+
+at::Tensor unsafe_view_pu1(const at::Tensor& self, c10::SymIntArrayRef size) {
+  tmb_count_op_call("aten::_unsafe_view");
+  return at::native::_unsafe_view(self, C10_AS_INTARRAYREF_SLOW_ALLOC(size));
 }
 
 at::Tensor reshape_alias_pu1(const at::Tensor& self, c10::SymIntArrayRef size,
                              c10::SymIntArrayRef stride) {
+  tmb_count_op_call("aten::_reshape_alias");
   return at::native::_reshape_alias(self, C10_AS_INTARRAYREF_SLOW_ALLOC(size),
                                     C10_AS_INTARRAYREF_SLOW_ALLOC(stride));
 }
@@ -45,6 +53,7 @@ at::Tensor reshape_alias_pu1(const at::Tensor& self, c10::SymIntArrayRef size,
 at::Tensor as_strided_pu1(const at::Tensor& self, c10::SymIntArrayRef size,
                           c10::SymIntArrayRef stride,
                           std::optional<c10::SymInt> storage_offset) {
+  tmb_count_op_call("aten::as_strided");
   return at::native::as_strided_tensorimpl(
       self, C10_AS_INTARRAYREF_SLOW_ALLOC(size),
       C10_AS_INTARRAYREF_SLOW_ALLOC(stride),
@@ -61,6 +70,8 @@ extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) 
     const std::string which(name ? name : "");
     if (which == "view") {
       m.impl("view", TORCH_FN(view_pu1));
+    } else if (which == "_unsafe_view") {
+      m.impl("_unsafe_view", TORCH_FN(unsafe_view_pu1));
     } else if (which == "_reshape_alias") {
       m.impl("_reshape_alias", TORCH_FN(reshape_alias_pu1));
     } else if (which == "as_strided") {

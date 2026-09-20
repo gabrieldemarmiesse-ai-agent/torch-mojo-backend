@@ -623,10 +623,11 @@ def register_core(site: Site) raises:
     impl[op_empty_memory_format, "empty.memory_format"](site)
     impl[op_empty_strided, "empty_strided"](site)
     impl[op_copy_from, "_copy_from"](site)
-    # The four metadata-only views are ATen's own kernels: `_unsafe_view` is
-    # CompositeExplicitAutograd there, so leaving it unregistered is enough,
-    # and the other three are registered through the shim.
+    # The four metadata-only views are ATen's own kernels, registered through
+    # the shim (`_unsafe_view` is CompositeExplicitAutograd upstream and would
+    # work unregistered, but the test suite counts native calls per op).
     _aten_view(site, "view")
+    _aten_view(site, "_unsafe_view")
     _aten_view(site, "_reshape_alias")
     _aten_view(site, "as_strided")
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)

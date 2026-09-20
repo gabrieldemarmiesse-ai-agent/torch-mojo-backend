@@ -35,6 +35,18 @@ void count_call(const c10::FunctionSchema& schema) {
   ++g_counts[key];
 }
 
+}  // namespace
+
+// The unboxed view kernels (shim_views.cpp) never pass through the boxed
+// adapter, so they report themselves here to keep CallChecker's accounting.
+void tmb_count_op_call(const char* qualified_name) {
+  if (!g_count_calls.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> g(g_counts_mutex);
+  ++g_counts[qualified_name];
+}
+
+namespace {
+
 // Backing store for list arguments. Nothing is allocated until a list
 // argument appears; inner buffers keep their address when an outer vector
 // grows (a moved std::vector keeps its heap block), generators live in a deque.
