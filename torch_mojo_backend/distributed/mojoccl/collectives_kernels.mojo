@@ -2608,9 +2608,11 @@ def _allgather_body[
         if seq != 0:
             barrier()
             if thread_idx.x == 0:
-                var arrive = regions[rank].unsafe_offset(
-                    _AG_ARRIVE_OFFSET
-                ).unsafe_bitcast[UInt64]()
+                var arrive = (
+                    regions[rank]
+                    .unsafe_offset(_AG_ARRIVE_OFFSET)
+                    .unsafe_bitcast[UInt64]()
+                )
                 var was = Atomic[DType.uint64].fetch_add[
                     ordering=Ordering.ACQUIRE_RELEASE
                 ](arrive, UInt64(1))

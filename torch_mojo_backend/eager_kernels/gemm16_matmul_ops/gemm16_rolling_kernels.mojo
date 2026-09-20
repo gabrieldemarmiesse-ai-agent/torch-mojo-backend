@@ -638,9 +638,7 @@ def _rolling_persistent_body[
                         # staging tile is overwritten.
                         c_tma.wait_group[0]()
                     named_barrier[NCONS](1)
-                    _store_accum_bm_boxes_stmatrix[
-                        bm, bn, has_bias, pair_cast
-                    ](
+                    _store_accum_bm_boxes_stmatrix[bm, bn, has_bias, pair_cast](
                         c_smem.ptr,
                         accum,
                         warp,

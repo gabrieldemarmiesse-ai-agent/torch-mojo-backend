@@ -935,8 +935,7 @@ def _spec_matmul(
 
 
 def _bias_add_dtype_ok(dt: DType) -> Bool:
-    """logic_ops SPEC_BCAST_DTYPES, minus bool: what its broadcast add takes.
-    """
+    """logic_ops SPEC_BCAST_DTYPES, minus bool: what its broadcast add takes."""
     return (
         dt == DType.float32
         or dt == DType.bfloat16

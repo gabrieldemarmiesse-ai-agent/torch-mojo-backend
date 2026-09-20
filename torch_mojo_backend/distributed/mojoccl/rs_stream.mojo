@@ -262,7 +262,7 @@ def _await(
     of this grid would otherwise burn its own full deadline."""
     var me = regions[rank]
     var failed = stack_allocation[
-        1, DType.uint32, address_space = AddressSpace.SHARED
+        1, DType.uint32, address_space=AddressSpace.SHARED
     ]()
     if thread_idx.x == 0:
         failed[unsafe_offset=0] = 0
@@ -333,23 +333,19 @@ def _await_exchange(
     give it -- and `seq` only grows, so a block 0 already further down the
     pipeline releases the blocks behind it."""
     var failed = stack_allocation[
-        1, DType.uint32, address_space = AddressSpace.SHARED
+        1, DType.uint32, address_space=AddressSpace.SHARED
     ]()
     if thread_idx.x == 0:
         failed[unsafe_offset=0] = 0
     barrier()
     if thread_idx.x == 0:
         var lead = block_idx.x == 0
-        var word = (
-            mb_done if lead else me.unsafe_offset(
-                _RS_STREAM_DONE
-            ).unsafe_bitcast[UInt64]()
-        )
+        var word = mb_done if lead else me.unsafe_offset(
+            _RS_STREAM_DONE
+        ).unsafe_bitcast[UInt64]()
         var page = status_page(me)
         var spins = 0
-        while (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](word) < seq
-        ):
+        while Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](word) < seq:
             spins += 1
             if spins < _MB_ABORT_CHECK:
                 continue
@@ -402,9 +398,9 @@ def _arrive(
     chunk cannot be mistaken for a straggler arriving at this one, and the
     last arriver clears it -- nothing carries across launches."""
     var arrive = me.unsafe_offset(table + chunk * 8).unsafe_bitcast[UInt64]()
-    var was = Atomic[DType.uint64].fetch_add[
-        ordering = Ordering.ACQUIRE_RELEASE
-    ](arrive, UInt64(1))
+    var was = Atomic[DType.uint64].fetch_add[ordering=Ordering.ACQUIRE_RELEASE](
+        arrive, UInt64(1)
+    )
     if Int(was) != nblocks - 1:
         return False
     Atomic[DType.uint64].store[ordering=Ordering.RELAXED](arrive, UInt64(0))
@@ -551,11 +547,11 @@ def _reduce_piece[
         else:
             for v in range(t, vc, RS_STREAM_THREADS):
                 comptime for e in range(4):
-                    dst[unsafe_offset = v * 4 + e] = _one(
+                    dst[unsafe_offset=v * 4 + e] = _one(
                         uin, slots, slot_stride, world, rank, v * 4 + e, scale
                     )
         for i in range(t, n - vc * 4, RS_STREAM_THREADS):
-            dst[unsafe_offset = vc * 4 + i] = _one(
+            dst[unsafe_offset=vc * 4 + i] = _one(
                 uin, slots, slot_stride, world, rank, vc * 4 + i, scale
             )
 
@@ -600,9 +596,9 @@ def _sum_out(
     for i in range(vc * 4 + t, n, RS_STREAM_THREADS):
         var acc = partial[unsafe_offset=i]
         for j in range(npeers):
-            acc += inbox.unsafe_offset(j * slot_bytes).unsafe_bitcast[Float32]()[
-                unsafe_offset=i
-            ]
+            acc += inbox.unsafe_offset(j * slot_bytes).unsafe_bitcast[
+                Float32
+            ]()[unsafe_offset=i]
         output[unsafe_offset=i] = acc
 
 
