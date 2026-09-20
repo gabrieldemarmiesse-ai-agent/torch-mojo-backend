@@ -27,7 +27,7 @@
 from std.sys import argv
 from std.time import sleep
 
-from bootstrap import (
+from tmb.ccl.bootstrap import (
     UID_BYTES,
     bootstrap_allgather,
     bootstrap_barrier,
@@ -36,8 +36,8 @@ from bootstrap import (
     host_hash,
     make_unique_id,
 )
-from driver import alloc_region, free_region, open_driver
-from internode import (
+from tmb.ccl.driver import alloc_region, free_region, open_driver
+from tmb.ccl.internode import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     ib_connect,
@@ -48,7 +48,7 @@ from internode import (
     ib_setup,
     ib_teardown,
 )
-from netutil import P8, alloc_bytes
+from tmb.ccl.netutil import P8, alloc_bytes
 
 
 def main() raises:

@@ -14,8 +14,8 @@ a name reachable through ``os.environ`` / ``getenv`` is missing from the
 tables below, so the list cannot quietly fall behind the code.
 
 The Mojo side keeps its own copy of the names it reads — one file per
-compiled library, ``native/mojo/env_vars.mojo`` and
-``distributed/mojoccl/env_vars.mojo``, since those two build separately and
+compiled library, ``mojo/tmb/backend/env_vars.mojo`` and
+``mojo/tmb/ccl/env_vars.mojo``, since those two build separately and
 neither can import Python. This file is the union of all three, and the
 scanner is what ties them together.
 """

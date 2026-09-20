@@ -2,7 +2,7 @@
 
 `register_mojo_devices()` needs two fixed libraries before any op runs: the
 C++ shim (`native/csrc/`, one g++ invocation against the installed torch
-headers) and the Mojo base library (`native/mojo/`, one `mojo build`). On a
+headers) and the Mojo base library (`mojo/tmb/backend/`, one `mojo build`). On a
 fresh install they cost ~5 s and ~13 s of compiling, and the shim needs a C++
 compiler on the box. Neither depends on the accelerator and neither contains
 device code, so both can be built here and shipped:

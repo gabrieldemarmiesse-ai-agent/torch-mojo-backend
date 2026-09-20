@@ -214,7 +214,7 @@ def test_record_stream_prevents_pool_reuse_corruption(mojo_gpu: str):
     note); a tensor a side stream is still reading must not have its backing
     memory handed to a new allocation on the default stream. `record_stream`
     is the public contract that prevents it. There is no more `_holder._events`
-    to introspect (that bookkeeping now lives in native/mojo/device.mojo), so
+    to introspect (that bookkeeping now lives in tmb/backend/device.mojo), so
     this is a stress/correctness test rather than a state-inspection one.
     """
     n = 1 << 20

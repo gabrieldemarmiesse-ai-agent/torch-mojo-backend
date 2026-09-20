@@ -21,7 +21,7 @@
 # and peer-free, by sock_deadline.mojo.
 #
 #   uv run --no-sync mojo build tests/multinode/selftest/fd_exchange.mojo \
-#       -I torch_mojo_backend/distributed/mojoccl -o /tmp/fd_exchange
+#       -I torch_mojo_backend/mojo -o /tmp/fd_exchange
 #   for r in 0 1 2 3 4 5 6 7; do /tmp/fd_exchange $r 8 /tmp/fdx 1234 & done; wait
 
 from std.ffi import OwnedDLHandle
@@ -30,7 +30,7 @@ from std.pathlib import Path
 from std.sys import argv
 from std.time import perf_counter_ns, sleep
 
-from vmm import (
+from tmb.ccl.vmm import (
     MSG_KIND_MC,
     MSG_KIND_UC,
     scm_bind,
