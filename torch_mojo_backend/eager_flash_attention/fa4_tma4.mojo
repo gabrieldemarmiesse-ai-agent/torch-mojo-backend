@@ -75,8 +75,8 @@ def create_split_tma_4d[
     res = create_tensor_tile[
         res.tile_shape,
         swizzle_mode=swizzle_mode,
-        __tile_shape=res.tile_shape,
-        __desc_shape=res.desc_shape,
+        __tile_shape = res.tile_shape,
+        __desc_shape = res.desc_shape,
     ](ctx, tensor)
 
 
@@ -111,8 +111,8 @@ def create_split_tma_3d_strided[
     res = create_tensor_tile[
         res.tile_shape,
         swizzle_mode=swizzle_mode,
-        __tile_shape=res.tile_shape,
-        __desc_shape=res.desc_shape,
+        __tile_shape = res.tile_shape,
+        __desc_shape = res.desc_shape,
     ](ctx, tensor)
 
 
@@ -151,6 +151,6 @@ def create_split_tma_4d_strided[
     res = create_tensor_tile[
         res.tile_shape,
         swizzle_mode=swizzle_mode,
-        __tile_shape=res.tile_shape,
-        __desc_shape=res.desc_shape,
+        __tile_shape = res.tile_shape,
+        __desc_shape = res.desc_shape,
     ](ctx, tensor)

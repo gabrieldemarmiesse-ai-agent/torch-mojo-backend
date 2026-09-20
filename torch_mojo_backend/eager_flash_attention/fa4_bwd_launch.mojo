@@ -11,11 +11,7 @@ PTX dump: `-D MOJO_DUMP_PTX=<path>` dumps the *main* kernel's PTX.
 """
 
 from max.gpu.host import DeviceContext, FuncAttribute
-from max.gpu.host.device_context import (
-    _DeviceContextPtr,
-    _DeviceContextCpp,
-    _DumpPath,
-)
+from max.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp, _DumpPath
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
@@ -27,11 +23,7 @@ from layout.tma_async import SplitLastDimTMATensorTile, create_split_tma
 
 from fa4_tma4 import create_split_tma_3d_strided
 
-from fa4_bwd_kernel import (
-    bwd_main_kernel,
-    bwd_preprocess_kernel,
-    bwd_convert_kernel,
-)
+from fa4_bwd_kernel import bwd_main_kernel, bwd_preprocess_kernel, bwd_convert_kernel
 from fa4_bwd_common import (
     kBwdTileM,
     kBwdBlockN,
@@ -44,7 +36,9 @@ from fa4_bwd_common import (
 )
 from fa4_launch_cache import enqueue_fa4_cached
 
-comptime MOJO_DUMP_PTX: StaticString = get_defined_string["MOJO_DUMP_PTX", ""]()
+comptime MOJO_DUMP_PTX: StaticString = get_defined_string[
+    "MOJO_DUMP_PTX", ""
+]()
 
 
 def _dump_ptx_path() -> _DumpPath:
@@ -117,7 +111,9 @@ def launch_bwd_preprocess[
     var do_ptr = Pointer[Scalar[dtype], ImmutAnyOrigin](
         unsafe_from_address=do_addr
     )
-    var lse_ptr = Pointer[Float32, ImmutAnyOrigin](unsafe_from_address=lse_addr)
+    var lse_ptr = Pointer[Float32, ImmutAnyOrigin](
+        unsafe_from_address=lse_addr
+    )
     var dpsum_ptr = Pointer[Float32, MutAnyOrigin](
         unsafe_from_address=dpsum_addr
     )
@@ -135,7 +131,9 @@ def launch_bwd_preprocess[
     # m-block size; pad rows get lse=+inf / dpsum=0). Varlen: one CTA
     # per main-kernel m-block (q-tile table row).
     comptime bm_main: Int = kBwdTileM(head_dim, causal)
-    var spad: Int = ceildiv(seqlen_int, Int(bm_main)) * Int(bm_main)
+    var spad: Int = (
+        ceildiv(seqlen_int, Int(bm_main)) * Int(bm_main)
+    )
     var grid: Tuple[Int, Int, Int]
     comptime if varlen:
         grid = (vl_num_q_tiles, nheads_int, 1)
@@ -154,7 +152,8 @@ def launch_bwd_preprocess[
         ctx_handle_addr,
         stream_opaque,
         String(
-            t"bwd_pre_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}_vl{varlen}"
+            t"bwd_pre_{dtype}_d{head_dim}_c{causal}_g{gqa_ratio}"
+            t"_vl{varlen}"
         ),
         grid,
         kBwdPreThreads,
@@ -249,7 +248,9 @@ def launch_bwd_main[
     # + per-MMA-wg dQ mailbox (64 x DQ_N f32 each, bulk-reduce-
     # drained; DQ_N = bm at D=128, bm/2 at D=64 — the N split).
     comptime dq_n: Int = bm if head_dim == 128 else bm // 2
-    comptime dq_mail_bytes: Int = (kBwdNMmaWarpgroups * 64 * dq_n * 4)
+    comptime dq_mail_bytes: Int = (
+        kBwdNMmaWarpgroups * 64 * dq_n * 4
+    )
     comptime smem_bytes: Int = (
         2 * kv_bytes
         + kBwdQdOStages * q_slot_bytes
@@ -329,7 +330,9 @@ def launch_bwd_main[
     var k_tma: SplitLastDimTMATensorTile[dtype, kv_smem_shape, swizzle]
     var v_tma: SplitLastDimTMATensorTile[dtype, kv_smem_shape, swizzle]
     comptime if strided_qkv:
-        q_tma = create_split_tma_3d_strided[q_smem_shape, swizzle_mode=swizzle](
+        q_tma = create_split_tma_3d_strided[
+            q_smem_shape, swizzle_mode=swizzle
+        ](
             ctx,
             q_ptr,
             rows,
@@ -490,7 +493,9 @@ def launch_bwd_convert[
     comptime bm_cvt: Int = kBwdTileM(head_dim, causal)
     comptime cvt_smem_bytes: Int = bm_cvt * (head_dim + 4) * 4
 
-    comptime kernel_inst = bwd_convert_kernel[dtype, head_dim, causal, varlen]
+    comptime kernel_inst = bwd_convert_kernel[
+        dtype, head_dim, causal, varlen
+    ]
     _ = gqa_ratio  # dq convert is ratio-independent
     # One CTA per main-kernel m-block.
     var grid: Tuple[Int, Int, Int]
@@ -510,11 +515,15 @@ def launch_bwd_convert[
         ctx,
         ctx_handle_addr,
         stream_opaque,
-        String(t"bwd_convert_{dtype}_d{head_dim}_c{causal}_vl{varlen}"),
+        String(
+            t"bwd_convert_{dtype}_d{head_dim}_c{causal}_vl{varlen}"
+        ),
         grid,
         kBwdCvtThreads,
         cvt_smem_bytes,
-        FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(UInt32(cvt_smem_bytes)),
+        FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+            UInt32(cvt_smem_bytes)
+        ),
         dq_accum_ptr,
         dq_ptr,
         Int64(seq_len_arg),
