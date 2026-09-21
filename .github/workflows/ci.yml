@@ -131,8 +131,8 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      # One L4: run suites serially and share its on-disk build caches.
-      max-parallel: 1
+      # Two L4 runners: at most one suite per runner.
+      max-parallel: 2
       matrix:
         include:
           - suite: cuda

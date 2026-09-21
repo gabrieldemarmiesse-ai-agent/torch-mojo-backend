@@ -1,7 +1,7 @@
 # Unit tests in CI
 
 The `CI` workflow runs CPU unit tests on self-hosted runners labeled
-`cpu-only` and GPU unit tests on the self-hosted runner labeled `L4`.
+`cpu-only` and GPU unit tests on the self-hosted runners labeled `L4`.
 Lint, type checking, and benchmark bookkeeping stay on GitHub-hosted runners.
 
 The CPU selection is `uv run pytest tests/ -m "not gpu"`, sharded 40 ways.
@@ -29,8 +29,9 @@ tests use `@pytest.mark.cuda`, which also implies `gpu`. For mixed parameter
 sets, put the marker on the GPU `pytest.param` only. Pure validation tests in
 GPU-related modules still belong to the CPU selection.
 
-The self-hosted jobs run serially (`max-parallel: 1`), so there is no need to
-flock the GPU against another job on this runner. They preserve the runner's
+Two runners carry the `L4` label, so two GPU suites run at a time
+(`max-parallel: 2`). A runner takes one job at a time, so there is no need to
+flock the GPU against another job on it. The jobs preserve the runner's
 uv, Mojo, and native build caches, using
 `UV_CACHE_DIR`, `MODULAR_HOME`, and `TORCH_MOJO_BACKEND_CACHE_DIR` if configured,
 otherwise persistent directories under the user's cache directory. No cache
