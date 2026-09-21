@@ -148,8 +148,6 @@ def as_cuda(t: torch.Tensor, unordered: bool = False) -> torch.Tensor:
     if t.device.type != _MOJO:
         raise ValueError(f"expected a mojo tensor, got {t.device}")
     index = _gpu_index(t.device)
-    if index >= device_module.device_count() - 1:
-        raise ValueError(f"mojo:{index} is the MAX CPU device, which has no CUDA alias")
     if index >= torch.cuda.device_count():
         raise ValueError(
             f"mojo:{index} has no CUDA counterpart: torch.cuda sees "
@@ -179,10 +177,10 @@ def as_mojo(t: torch.Tensor, unordered: bool = False) -> torch.Tensor:
     if t.device.type != "cuda":
         raise ValueError(f"expected a cuda tensor, got {t.device}")
     index = _gpu_index(t.device)
-    if index >= device_module.device_count() - 1:
+    if index >= device_module.device_count():
         raise ValueError(
             f"{t.device} has no mojo counterpart: MAX sees "
-            f"{device_module.device_count() - 1} GPU(s)"
+            f"{device_module.device_count()} GPU(s)"
         )
     _require_ordering(index, unordered, "as_mojo")
     capsule = torch.utils.dlpack.to_dlpack(t.detach())
@@ -286,10 +284,7 @@ def _external_stream(index: int) -> torch.cuda.Stream:
     if cached is None:
         handle = device_module.stream_native_handle(stream)
         if handle == 0:
-            raise RuntimeError(
-                f"mojo:{index} has no vendor stream handle (the MAX CPU device "
-                "cannot back a CUDA ExternalStream)"
-            )
+            raise RuntimeError(f"mojo:{index} has no vendor stream handle")
         cached = torch.cuda.ExternalStream(handle, device=index)
         _external_streams[(index, stream.stream_id)] = cached
     return cached

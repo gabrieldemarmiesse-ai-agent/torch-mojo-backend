@@ -316,101 +316,63 @@ def _permute_copy[
     var in_ptr = _make_ptr[dtype](in_addr)
     var total = d0 * d1 * d2 * d3
 
-    if ctx.api() == "cpu":
-
+    comptime if has_accelerator():
+        # The innermost extent contiguous in both operands: gather runs, in
+        # the widest vector the runtime extents, strides and addresses admit.
+        # Every candidate width is a compile-time regime; which one runs is a
+        # runtime decision, and when none fits the copy declines to the
+        # general element-at-a-time kernel below, which masks every extent.
         @always_inline
         @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var i3 = i % d3
-            var rest = i // d3
-            var i2 = rest % d2
-            rest = rest // d2
-            var i1 = rest % d1
-            var i0 = rest // d1
-            out_ptr[unsafe_offset=i] = in_ptr[
-                unsafe_offset=i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3
-            ]
+        def _try_run_gather[VEC: Int]() raises -> Bool:
+            comptime ALIGN = min(16, VEC * size_of[dtype]())
+            if (
+                d3 % VEC != 0
+                or s0 % VEC != 0
+                or s1 % VEC != 0
+                or s2 % VEC != 0
+                or out_addr % ALIGN != 0
+                or in_addr % ALIGN != 0
+            ):
+                return False
+            var slots = total // VEC
+            _enqueue_cached[_run_gather_kernel[dtype, VEC]](
+                ctx,
+                String(t"dm_rungather_{dtype}_v{VEC}"),
+                _gs_blocks(slots),
+                1,
+                1,
+                GS_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
+                Int64(d1),
+                Int64(d2),
+                Int64(d3 // VEC),
+                Int64(s0),
+                Int64(s1),
+                Int64(s2),
+                Int64(slots),
+            )
+            return True
 
-        elementwise[func, simd_width=1](Coord(total), ctx)
-    else:
-        comptime if has_accelerator():
-            # The innermost extent contiguous in both operands: gather runs, in
-            # the widest vector the runtime extents, strides and addresses admit.
-            # Every candidate width is a compile-time regime; which one runs is a
-            # runtime decision, and when none fits the copy declines to the
-            # general element-at-a-time kernel below, which masks every extent.
-            @always_inline
-            @parameter
-            def _try_run_gather[VEC: Int]() raises -> Bool:
-                comptime ALIGN = min(16, VEC * size_of[dtype]())
-                if (
-                    d3 % VEC != 0
-                    or s0 % VEC != 0
-                    or s1 % VEC != 0
-                    or s2 % VEC != 0
-                    or out_addr % ALIGN != 0
-                    or in_addr % ALIGN != 0
-                ):
-                    return False
-                var slots = total // VEC
-                _enqueue_cached[_run_gather_kernel[dtype, VEC]](
-                    ctx,
-                    String(t"dm_rungather_{dtype}_v{VEC}"),
-                    _gs_blocks(slots),
-                    1,
-                    1,
-                    GS_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_imm(),
-                    Int64(d1),
-                    Int64(d2),
-                    Int64(d3 // VEC),
-                    Int64(s0),
-                    Int64(s1),
-                    Int64(s2),
-                    Int64(slots),
-                )
-                return True
-
-            # Apple: the measured rows4/rowloop kernels beat the generic
-            # gather on the transpose-materialize hot case (0.39 vs 0.52 ms
-            # at the post-SDPA clone shape, pinned clocks); keep them first.
-            comptime if has_apple_gpu_accelerator():
-                comptime apple_vec_align = 4 * size_of[dtype]()
-                if (
-                    total > 0
-                    and s3 == 1
-                    and d3 % 4 == 0
-                    and (s0 | s1 | s2) % 4 == 0
-                    and (out_addr | in_addr) % apple_vec_align == 0
-                ):
-                    var nrows = d0 * d1 * d2
-                    if nrows >= 4096:
-                        _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
-                            ctx,
-                            String(t"dm_permute_rowloop_{dtype}"),
-                            _gs_blocks(nrows),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            in_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(d1),
-                            Int64(d2),
-                            Int64(d3 // 4),
-                            Int64(s0),
-                            Int64(s1),
-                            Int64(s2),
-                            Int64(nrows),
-                        )
-                        return
-                    var nchunks = total // 4
-                    _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
+        # Apple: the measured rows4/rowloop kernels beat the generic
+        # gather on the transpose-materialize hot case (0.39 vs 0.52 ms
+        # at the post-SDPA clone shape, pinned clocks); keep them first.
+        comptime if has_apple_gpu_accelerator():
+            comptime apple_vec_align = 4 * size_of[dtype]()
+            if (
+                total > 0
+                and s3 == 1
+                and d3 % 4 == 0
+                and (s0 | s1 | s2) % 4 == 0
+                and (out_addr | in_addr) % apple_vec_align == 0
+            ):
+                var nrows = d0 * d1 * d2
+                if nrows >= 4096:
+                    _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
                         ctx,
-                        String(t"dm_permute_rows4_{dtype}"),
-                        _gs_blocks(nchunks),
+                        String(t"dm_permute_rowloop_{dtype}"),
+                        _gs_blocks(nrows),
                         1,
                         1,
                         GS_THREADS,
@@ -422,88 +384,107 @@ def _permute_copy[
                         Int64(s0),
                         Int64(s1),
                         Int64(s2),
-                        Int64(nchunks),
+                        Int64(nrows),
                     )
                     return
-
-            comptime V32 = 32 // size_of[dtype]()
-            comptime V16 = 16 // size_of[dtype]()
-            comptime V8 = 8 // size_of[dtype]()
-            if s3 == 1 and d3 > 1 and total >= 1024:
-                # 32-byte gather accesses intermittently wedge the Metal
-                # driver queue (verified on M4; see tensor_holder.mojo), so
-                # Apple starts at the 16-byte regime.
-                comptime if not has_apple_gpu_accelerator():
-                    if _try_run_gather[V32]():
-                        return
-                comptime if V16 < V32:
-                    if _try_run_gather[V16]():
-                        return
-                comptime if V8 < V16:
-                    if _try_run_gather[V8]():
-                        return
-
-            # A batched transpose of the innermost two dims is by far the most
-            # common permutation -- the eager SDPA backward does four per layer --
-            # and the generic kernel below reads one element per thread down a
-            # column, so it never reaches a useful fraction of bandwidth. When the
-            # permutation is exactly that, hand it to the tiled LDS transpose,
-            # which stages a TILE x TILE block through shared memory so both the
-            # reads and the writes are contiguous.
-            #
-            # `s2 == 1` says the output's row index walks the source contiguously,
-            # i.e. source columns are output rows; `s3 >= d2` says the output's
-            # column index steps by the source's row pitch. The leading pair
-            # collapses into one batch axis only if its two strides are uniform,
-            # hence `s0 == d1 * s1`.
-            comptime TILE = _t2d_tile[dtype]()
-            var batch = d0 * d1
-            if (
-                d2 > 1
-                and d3 > 1
-                and total >= 1024
-                and s2 == 1
-                and s3 >= d2
-                and (d0 == 1 or s0 == d1 * s1)
-                and (batch == 1 or s1 >= d3 * s3)
-            ):
-                _enqueue_cached[_transpose2d_kernel[dtype]](
+                var nchunks = total // 4
+                _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
                     ctx,
-                    String(t"transpose2d_{dtype}"),
-                    (d3 + TILE - 1) // TILE,
-                    min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
-                    min(batch, _MAX_GRID_Y),
-                    TILE * _T2D_ROWS,
+                    String(t"dm_permute_rows4_{dtype}"),
+                    _gs_blocks(nchunks),
+                    1,
+                    1,
+                    GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_imm(),
+                    Int64(d1),
                     Int64(d2),
-                    Int64(d3),
-                    Int64(s3),
-                    Int64(batch),
-                    Int64(d2 * d3),
-                    Int64(s1 if batch > 1 else 0),
+                    Int64(d3 // 4),
+                    Int64(s0),
+                    Int64(s1),
+                    Int64(s2),
+                    Int64(nchunks),
                 )
                 return
-            _enqueue_cached[_permute_copy_kernel[dtype]](
+
+        comptime V32 = 32 // size_of[dtype]()
+        comptime V16 = 16 // size_of[dtype]()
+        comptime V8 = 8 // size_of[dtype]()
+        if s3 == 1 and d3 > 1 and total >= 1024:
+            # 32-byte gather accesses intermittently wedge the Metal
+            # driver queue (verified on M4; see tensor_holder.mojo), so
+            # Apple starts at the 16-byte regime.
+            comptime if not has_apple_gpu_accelerator():
+                if _try_run_gather[V32]():
+                    return
+            comptime if V16 < V32:
+                if _try_run_gather[V16]():
+                    return
+            comptime if V8 < V16:
+                if _try_run_gather[V8]():
+                    return
+
+        # A batched transpose of the innermost two dims is by far the most
+        # common permutation -- the eager SDPA backward does four per layer --
+        # and the generic kernel below reads one element per thread down a
+        # column, so it never reaches a useful fraction of bandwidth. When the
+        # permutation is exactly that, hand it to the tiled LDS transpose,
+        # which stages a TILE x TILE block through shared memory so both the
+        # reads and the writes are contiguous.
+        #
+        # `s2 == 1` says the output's row index walks the source contiguously,
+        # i.e. source columns are output rows; `s3 >= d2` says the output's
+        # column index steps by the source's row pitch. The leading pair
+        # collapses into one batch axis only if its two strides are uniform,
+        # hence `s0 == d1 * s1`.
+        comptime TILE = _t2d_tile[dtype]()
+        var batch = d0 * d1
+        if (
+            d2 > 1
+            and d3 > 1
+            and total >= 1024
+            and s2 == 1
+            and s3 >= d2
+            and (d0 == 1 or s0 == d1 * s1)
+            and (batch == 1 or s1 >= d3 * s3)
+        ):
+            _enqueue_cached[_transpose2d_kernel[dtype]](
                 ctx,
-                String(t"dm_permute_{dtype}"),
-                _gs_blocks(total),
-                1,
-                1,
-                GS_THREADS,
+                String(t"transpose2d_{dtype}"),
+                (d3 + TILE - 1) // TILE,
+                min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
+                min(batch, _MAX_GRID_Y),
+                TILE * _T2D_ROWS,
                 out_ptr.as_unsafe_any_origin(),
                 in_ptr.as_unsafe_any_origin().as_imm(),
-                Int64(d1),
                 Int64(d2),
                 Int64(d3),
-                Int64(s0),
-                Int64(s1),
-                Int64(s2),
                 Int64(s3),
-                Int64(total),
+                Int64(batch),
+                Int64(d2 * d3),
+                Int64(s1 if batch > 1 else 0),
             )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+            return
+        _enqueue_cached[_permute_copy_kernel[dtype]](
+            ctx,
+            String(t"dm_permute_{dtype}"),
+            _gs_blocks(total),
+            1,
+            1,
+            GS_THREADS,
+            out_ptr.as_unsafe_any_origin(),
+            in_ptr.as_unsafe_any_origin().as_imm(),
+            Int64(d1),
+            Int64(d2),
+            Int64(d3),
+            Int64(s0),
+            Int64(s1),
+            Int64(s2),
+            Int64(s3),
+            Int64(total),
+        )
+    else:
+        raise Error("no GPU accelerator available at compile time")
 
 
 def _permute_copy_go(
@@ -1124,7 +1105,7 @@ def _cat_n_go(
     var ctx = _raw_ctx(ctx_ptr)
     var n = _raw_tuple_len(srcs_o)
 
-    if ctx.api() == "cpu" or n <= 0 or outer <= 0 or dst_stride <= 0:
+    if n <= 0 or outer <= 0 or dst_stride <= 0:
         raise Error("batched cat preconditions not met")
     comptime if has_accelerator():
         comptime if _dtype_arg_width_on[0, 32]():
@@ -1280,97 +1261,65 @@ def _narrow_copy_dst[
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
-    if ctx.api() != "cpu":
-        comptime if has_accelerator():
-            if (
-                copy_len % 4 == 0
-                and dst_stride % 4 == 0
-                and dst_offset % 4 == 0
-            ):
-                # Vector fast path: float4 loads/stores (buffer bases are
-                # over-aligned and every index below is a multiple of 4
-                # elements). KV-cache concatenation hits this on each
-                # decode step. One grid row per outer block keeps the
-                # indexing division-free; the 1D chunk kernel covers the
-                # (rare) outer counts past the grid-dim cap.
-                var copy_len4 = copy_len // 4
-                if outer <= 65535:
-                    var gx = min((copy_len4 + GS_THREADS - 1) // GS_THREADS, 32)
-                    _enqueue_cached[_narrow_copy_dst_kernel2d[dtype]](
-                        ctx,
-                        String(t"dm_narrowdst2d_{dtype}"),
-                        max(gx, 1),
-                        outer,
-                        1,
-                        GS_THREADS,
-                        out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_imm(),
-                        Int64(dst_stride),
-                        Int64(copy_len4),
-                        Int64(dst_offset),
-                    )
-                    return
-                var nchunks = outer * copy_len4
-                _enqueue_cached[_narrow_copy_dst_kernel4[dtype]](
+    comptime if has_accelerator():
+        if copy_len % 4 == 0 and dst_stride % 4 == 0 and dst_offset % 4 == 0:
+            # Vector fast path: float4 loads/stores (buffer bases are
+            # over-aligned and every index below is a multiple of 4
+            # elements). KV-cache concatenation hits this on each
+            # decode step. One grid row per outer block keeps the
+            # indexing division-free; the 1D chunk kernel covers the
+            # (rare) outer counts past the grid-dim cap.
+            var copy_len4 = copy_len // 4
+            if outer <= 65535:
+                var gx = min((copy_len4 + GS_THREADS - 1) // GS_THREADS, 32)
+                _enqueue_cached[_narrow_copy_dst_kernel2d[dtype]](
                     ctx,
-                    String(t"dm_narrowdst4_{dtype}"),
-                    _gs_blocks(nchunks),
-                    1,
+                    String(t"dm_narrowdst2d_{dtype}"),
+                    max(gx, 1),
+                    outer,
                     1,
                     GS_THREADS,
                     out_ptr.as_unsafe_any_origin(),
                     in_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(dst_stride),
-                    Int64(copy_len),
+                    Int64(copy_len4),
                     Int64(dst_offset),
-                    Int64(nchunks),
                 )
-            else:
-                var total = outer * copy_len
-                _enqueue_cached[_narrow_copy_dst_kernel1[dtype]](
-                    ctx,
-                    String(t"dm_narrowdst1_{dtype}"),
-                    _gs_blocks(total),
-                    1,
-                    1,
-                    GS_THREADS,
-                    out_ptr.as_unsafe_any_origin(),
-                    in_ptr.as_unsafe_any_origin().as_imm(),
-                    Int64(dst_stride),
-                    Int64(copy_len),
-                    Int64(dst_offset),
-                    Int64(total),
-                )
-            return
+                return
+            var nchunks = outer * copy_len4
+            _enqueue_cached[_narrow_copy_dst_kernel4[dtype]](
+                ctx,
+                String(t"dm_narrowdst4_{dtype}"),
+                _gs_blocks(nchunks),
+                1,
+                1,
+                GS_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
+                Int64(dst_stride),
+                Int64(copy_len),
+                Int64(dst_offset),
+                Int64(nchunks),
+            )
         else:
-            raise Error("no GPU accelerator available at compile time")
-
-    # No CPU-side "func4" fast path here (there was one, briefly): CPU
-    # `elementwise[..., simd_width=1]` does not guarantee exactly
-    # `Coord(outer * copy_len // 4)` calls to the callback with no overrun --
-    # observed writing one extra width-4 store (4 elements) past `out`'s
-    # allocation on this host. Silent when it lands in slack space, a
-    # segfault when it does not: reproduced deterministically via
-    # `test_matches_cpu_stack_mojo_int64`, which concatenates several small
-    # int64 tensors back to back so a later allocation lands where an
-    # earlier call's overrun wrote. The accelerator path above is untouched
-    # -- its "float4" fast path launches a real GPU kernel
-    # (`_narrow_copy_dst_kernel2d` / `kernel4`) with its own explicit
-    # grid/thread bounds, not this CPU `elementwise` call, so it does not
-    # share this bug. One scalar store per element is what CPU gets until
-    # the overrun is root-caused inside `elementwise` itself.
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, in_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var o = i // copy_len
-        var j = i % copy_len
-        out_ptr[unsafe_offset=o * dst_stride + dst_offset + j] = in_ptr[
-            unsafe_offset=i
-        ]
-
-    elementwise[func, simd_width=1](Coord(outer * copy_len), ctx)
+            var total = outer * copy_len
+            _enqueue_cached[_narrow_copy_dst_kernel1[dtype]](
+                ctx,
+                String(t"dm_narrowdst1_{dtype}"),
+                _gs_blocks(total),
+                1,
+                1,
+                GS_THREADS,
+                out_ptr.as_unsafe_any_origin(),
+                in_ptr.as_unsafe_any_origin().as_imm(),
+                Int64(dst_stride),
+                Int64(copy_len),
+                Int64(dst_offset),
+                Int64(total),
+            )
+        return
+    else:
+        raise Error("no GPU accelerator available at compile time")
 
 
 def _narrow_copy_dst_go(
@@ -1638,29 +1587,6 @@ def _where_bcast[
     var a_ptr = _make_ptr[dtype](a_addr)
     var b_ptr = _make_ptr[dtype](b_addr)
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, cond_ptr, a_ptr, b_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var i3 = i % d3
-            var rest = i // d3
-            var i2 = rest % d2
-            rest = rest // d2
-            var i1 = rest % d1
-            var i0 = rest // d1
-            var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
-            var abase = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
-            var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-            out_ptr[unsafe_offset=i] = a_ptr[unsafe_offset=abase] if cond_ptr[
-                unsafe_offset=cbase
-            ] else b_ptr[unsafe_offset=bbase]
-
-        elementwise[func, simd_width=1](Coord(total), ctx)
-        return
-
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
         raise Error("float64 is not supported on Apple GPU")
     else:
@@ -1913,28 +1839,6 @@ def _masked_fill_scalar_bcast[
     var out_ptr = _make_ptr[dtype](out_addr)
     var cond_ptr = _make_ptr[DType.bool](cond_addr)
     var b_ptr = _make_ptr[dtype](b_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, cond_ptr, b_ptr, value)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var i3 = i % d3
-            var rest = i // d3
-            var i2 = rest % d2
-            rest = rest // d2
-            var i1 = rest % d1
-            var i0 = rest // d1
-            var cbase = i0 * cs0 + i1 * cs1 + i2 * cs2 + i3 * cs3
-            var bbase = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
-            out_ptr[unsafe_offset=i] = value if cond_ptr[
-                unsafe_offset=cbase
-            ] else b_ptr[unsafe_offset=bbase]
-
-        elementwise[func, simd_width=1](Coord(total), ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
@@ -2343,26 +2247,6 @@ def _cast[
     var out_ptr = _make_ptr[dst](out_addr)
     var in_ptr = _make_ptr[src](in_addr)
     if size == 0:
-        return
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            var a = in_ptr[unsafe_offset=i]
-            comptime if dst == DType.bool:
-                # rc1: Scalar[dst](Bool) requires an integral dtype; build the
-                # concrete bool scalar first (cast is the identity here).
-                out_ptr[unsafe_offset=i] = Scalar[DType.bool](
-                    a != Scalar[src](0)
-                ).cast[dst]()
-            else:
-                out_ptr[unsafe_offset=i] = a.cast[dst]()
-
-        elementwise[func, simd_width=1](Coord(size), ctx)
         return
 
     comptime if not has_accelerator():

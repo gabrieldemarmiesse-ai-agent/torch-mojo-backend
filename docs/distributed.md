@@ -97,12 +97,6 @@ anything touches the GPU runtime or enumerates MAX devices.
   PRODUCT/MIN to `ncclMin` and rejects AVG, matching `ProcessGroupNCCL`. Mojo
   collectives (`TORCH_MOJO_BACKEND_CCL=mojo`) implement only allreduce,
   broadcast and all_gather — see "Mojo collectives" below.
-- The MAX **CPU pseudo-device** (`mojo:{N-1}`, the last index —
-  `torch.mojo.cpu()`) cannot take part in a collective at all: construction
-  itself needs a real accelerator (communicators are created eagerly, see
-  Design notes), and a collective call on a tensor living there raises
-  `NotImplementedError`. Use a real GPU, or a plain `torch.device("cpu")`
-  tensor (routed to the internal gloo group).
 - Per-rank randomness: seed the device RNG per rank
   (`torch.mojo.manual_seed_all(seed + rank)`); weight init runs on the CPU
   RNG (`torch.manual_seed`) and DDP broadcasts rank 0's weights anyway.
@@ -131,12 +125,9 @@ communicators and does the actual library calls.
   `MojoProcessGroup.__init__` calls `_ensure(device_module.current_device())`
   itself, collectively, while every rank is still inside
   `init_process_group` — rather than lazily on a rank's first collective.
-  `pg.mojo` refuses to build one on the MAX CPU device
-  (`tmb_pg_init_device`: "the mojo process group needs an accelerator
-  device"), and the Python side refuses a collective on the MAX CPU
-  *pseudo*-device the same way (`_is_cpu`: `NotImplementedError` for a
-  tensor whose device equals `device_module.cpu()`) — use plain CPU tensors
-  (routed to the internal gloo group) or a real GPU.
+  Every mojo device is a real accelerator, so construction always has one to
+  build the communicator on; a plain `torch.device("cpu")` tensor is instead
+  routed to the internal gloo group (`_is_cpu`).
 - **Every collective: sync-in, issue, fence.** `PG.sync_in` makes the comm
   stream wait for the caller's current stream before the library call is
   issued on it, so every producer kernel is ordered before the collective

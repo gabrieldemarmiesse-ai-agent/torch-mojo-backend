@@ -33,7 +33,7 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_int,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
+from tmb.backend.device import ctx_for, ctx_ptr, memset_bytes, memset_typed
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 
@@ -251,27 +251,17 @@ def fill_value(t: T, value: Value) raises:
 
 
 def _fill(t: T, s: FillScalar) raises:
-    """A memset when contiguous on an accelerator, else the strided fill
-    kernel. On the MAX CPU device a memset is not ordered against kernel
-    launches (measured: a kernel reading a just-filled buffer saw stale
-    memory 4 times in 50), so that device always fills with the kernel."""
+    """A memset when contiguous, else the strided fill kernel."""
     if t.numel == 0:
         return
-    if t.contig and not dev(t.device)[].is_cpu:
+    if t.contig:
         _fill_contiguous(t, s)
         return
     if s.integral and t.itemsize == 8 and not t.dtype.is_floating_point():
         # The StridedFill kernel narrows a Float64 into the destination
         # dtype, which cannot carry a 64-bit integer past 2**53. Fill a dense
-        # buffer exactly (memset) and lay that out instead -- except on the
-        # MAX CPU device, where a memset is not ordered against the strided
-        # copy that would read it.
+        # buffer exactly (memset) and lay that out instead.
         if abs(s.i) > _MAX_EXACT_INT:
-            if dev(t.device)[].is_cpu:
-                unsupported(
-                    "filling a strided 64-bit integer tensor on the MAX CPU"
-                    " device with a magnitude above 2**53"
-                )
             var dense = own(new_like(t))
             _fill_contiguous(dense.t, s)
             copy_strided_into(t, dense.t)
