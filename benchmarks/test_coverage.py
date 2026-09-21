@@ -35,9 +35,9 @@ from bench_lib import baselines
 from conftest import KEY_DUMP_ENV
 
 BENCH_DIR = Path(__file__).resolve().parent
-NATIVE_MOJO_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "native" / "mojo"
+OPS_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "mojo" / "tmb" / "ops"
 
-# `impl[op_add_tensor](lib, "add.Tensor")` in an ops_*.mojo file IS the
+# `impl[op_add_tensor](lib, "add.Tensor")` in a tmb/ops/*.mojo file IS the
 # registration (see docs/native_backend.md): the backend registers its ops
 # from Mojo, so the list is read from the source rather than imported.
 # `impl[op_x, "name.overload"](site)` in each register_<group> (registry.mojo);
@@ -47,13 +47,13 @@ _IMPL_RE = re.compile(r'impl\[\s*\w+\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S)
 
 def registered_ops() -> set[str]:
     names: set[str] = set()
-    for path in sorted(NATIVE_MOJO_DIR.glob("*.mojo")):
+    for path in sorted(OPS_DIR.glob("*.mojo")):
         names |= {
             name if "::" in name else f"aten::{name}"
             for name in _IMPL_RE.findall(path.read_text())
         }
     if not names:
-        raise AssertionError(f"no aten op registrations found under {NATIVE_MOJO_DIR}")
+        raise AssertionError(f"no aten op registrations found under {OPS_DIR}")
     return names
 
 
@@ -88,7 +88,7 @@ _OUT = (
 )
 
 _COMPOSED = (
-    "no kernel of its own: ops_composed.mojo builds it from ops this suite "
+    "no kernel of its own: tmb/ops/composed.mojo builds it from ops this suite "
     "already measures (a few extra launches, nothing new to regress against)"
 )
 _NORMAL_COMPOSITE = (
@@ -103,11 +103,9 @@ _RNG_TRANSFORM = (
 # Registered ops that are deliberately NOT benchmarked, with the defense.
 SKIPPED_OPS: dict[str, str] = {
     "aten::log2.out": _OUT,
-    # -- views ------------------------------------------------------------
-    "aten::as_strided": _VIEW,
-    "aten::view": _VIEW,
-    "aten::_unsafe_view": _VIEW,
-    "aten::_reshape_alias": _VIEW,
+    # `view`, `_unsafe_view`, `_reshape_alias` and `as_strided` are ATen's own
+    # kernels on this device (native/csrc/shim_views.cpp), so they are not in
+    # the Mojo registration list this reconciles against.
     # -- allocation -------------------------------------------------------
     "aten::empty.memory_format": _ALLOC,
     "aten::empty_strided": _ALLOC,
@@ -123,7 +121,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::record_stream": (
         "stream-lifetime bookkeeping, not compute: records a MAX event on "
         "the named stream so a buffer's free is fenced behind a foreign "
-        "reader (native/mojo/device.mojo). No kernel launches, so there is "
+        "reader (tmb/backend/device.mojo). No kernel launches, so there is "
         "no device time to measure"
     ),
     # -- metadata-only mutation -------------------------------------------

@@ -634,6 +634,14 @@ TABLE_NAMES: dict[str, str] = {
 # this table, and it will keep failing (or crashing whatever process runs
 # it, CI shard included) until fixed at the kernel level.
 _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
+    # float_power promotes even integer/half inputs to float64 (ATen
+    # native/Pow.cpp); Metal has no float64 device arithmetic or storage.
+    "4-metal4": {
+        "test_matches_cpu": {
+            "float_power": ("float32", "bfloat16", "float16", "int64", "bool")
+        },
+        "test_errors_match": {},
+    },
     "cpu": {
         "test_matches_cpu": {
             "bmm": ("float32", "int64"),

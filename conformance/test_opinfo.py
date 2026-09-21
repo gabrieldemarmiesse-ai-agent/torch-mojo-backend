@@ -309,6 +309,22 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
 # survived an empty sample (see the entries below); `pow` float32 was a real
 # precision gap until float32 pow went through float64 (logic_ops.mojo).
 _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
+    # M4: validate these CPU vector/scalar rounding differences against the
+    # same float64 oracle used for the corresponding CUDA/HIP cases.
+    "4-metal4": frozenset(
+        {("addr", torch.float16), ("sub", torch.float16)}
+        | {
+            (op, dtype)
+            for op in (
+                "log_softmax",
+                "masked_log_softmax",
+                "nn_functional_batch_norm",
+                "nn_functional_conv2d",
+                "nn_functional_instance_norm",
+            )
+            for dtype in (torch.bfloat16, torch.float16)
+        }
+    ),
     # sm_90a (H100), measured 2026-09-14 after the base tables were regenerated
     # for the native backend: the same last-ulp class as gfx942's below (a
     # reduction-order or one-ulp difference against CPU torch, no farther from

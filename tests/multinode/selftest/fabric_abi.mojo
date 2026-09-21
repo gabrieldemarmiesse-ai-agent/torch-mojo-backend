@@ -6,7 +6,7 @@
 #         -o /tmp/fabric_abi tests/multinode/selftest/fabric_abi.c
 #     /tmp/fabric_abi > /tmp/fabric_abi.txt
 #     mojo build tests/multinode/selftest/fabric_abi.mojo \
-#         -I torch_mojo_backend/distributed/mojoccl -o /tmp/fabric_abi_check
+#         -I torch_mojo_backend/mojo -o /tmp/fabric_abi_check
 #     /tmp/fabric_abi_check /tmp/fabric_abi.txt      # must print PASS
 #
 # Needs no libfabric at run time, no NIC and no peers: it compares two lists
@@ -16,7 +16,7 @@
 # passes a garbage pointer to the NIC.
 from std.sys import argv
 
-from libfabric import (
+from tmb.ccl.libfabric import (
     AVA_COUNT,
     AVA_TYPE,
     CMOPS_GETNAME,

@@ -16,7 +16,7 @@
 # anywhere, in one process, in a few seconds.
 #
 #   uv run --no-sync mojo build tests/multinode/selftest/sock_deadline.mojo \
-#       -I torch_mojo_backend/distributed/mojoccl -o /tmp/sock_deadline
+#       -I torch_mojo_backend/mojo -o /tmp/sock_deadline
 #   /tmp/sock_deadline
 
 from std.ffi import OwnedDLHandle, external_call
@@ -24,14 +24,14 @@ from std.memory.alloc import unsafe_alloc
 from std.random import random_ui64
 from std.time import perf_counter_ns
 
-from bootstrap import (
+from tmb.ccl.bootstrap import (
     UID_BYTES,
     _encode_id,
     bootstrap_connect,
     local_ipv4,
     make_unique_id,
 )
-from vmm import (
+from tmb.ccl.vmm import (
     MSG_KIND_UC,
     _fd_msghdr,
     _send_once,

@@ -19,3 +19,4 @@ extern bool tmb_ready;
 extern bool tmb_in_bad_fork;
 void tmb_check_not_forked();
 std::string& tmb_thread_error();
+void tmb_count_op_call(const char* qualified_name);  // shim_dispatch.cpp

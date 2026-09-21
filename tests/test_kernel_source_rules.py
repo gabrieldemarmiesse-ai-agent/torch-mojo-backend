@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 
 PACKAGE = Path(__file__).resolve().parent.parent / "torch_mojo_backend"
-KERNEL_ROOTS = (PACKAGE / "eager_kernels", PACKAGE / "eager_flash_attention")
+KERNEL_ROOTS = (
+    PACKAGE / "mojo" / "tmb" / "kernels",
+    PACKAGE / "mojo" / "tmb" / "graph",
+)
 
 # Lowercased substrings that must not appear in kernel CODE. Prose is
 # exempt: a comment or docstring recording that a kernel was benchmarked
@@ -70,6 +73,6 @@ def test_kernel_source_does_not_synchronize(path: Path):
     code = _code_only(path.read_text())
     assert ".synchronize(" not in code, (
         f"{path.relative_to(PACKAGE)} synchronizes: a kernel runs on the "
-        "DeviceContext its caller hands it (native/mojo/abi.mojo's `ctx_for`) "
+        "DeviceContext its caller hands it (tmb/backend/abi.mojo's `ctx_for`) "
         "and returns; blocking inside an op serializes the caller's stream."
     )

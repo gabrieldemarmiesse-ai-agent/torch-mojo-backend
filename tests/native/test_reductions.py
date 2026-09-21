@@ -13,7 +13,6 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 from torch_mojo_backend.native import device_module
 
@@ -762,12 +761,6 @@ _CUMSUM_LOWP_ATOL = 3e-2
 
 @pytest.mark.parametrize("shape,dim", _CUMSUM_SHAPES)
 def test_cumsum_shapes_match_cpu(mojo_gpu, shape, dim):
-    if dim == 0:
-        skip_if_metal(
-            mojo_gpu,
-            "cumsum over dim 0 of a rank-2 tensor is a CUDA-only fast path "
-            "(ops_reductions.mojo: 'only ever measured on NVIDIA')",
-        )
     torch.manual_seed(0)
     x = torch.randn(shape)
     result = torch.cumsum(x.to(mojo_gpu), dim=dim).cpu().double()
@@ -780,13 +773,6 @@ def test_cumsum_shapes_match_cpu(mojo_gpu, shape, dim):
 )
 @pytest.mark.parametrize("shape,dim", [((4096, 4096), 1), ((4096, 4096), 0)])
 def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
-    if dim == 0 or dtype in (torch.bfloat16, torch.float16):
-        skip_if_metal(
-            mojo_gpu,
-            "cumsum over dim 0, and cumsum of bfloat16/float16, are "
-            "CUDA-only fast paths (ops_reductions.mojo: 'only ever measured "
-            "on NVIDIA')",
-        )
     torch.manual_seed(0)
     if dtype.is_floating_point:
         x = torch.randn(shape).to(dtype)
@@ -809,12 +795,6 @@ def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
 @pytest.mark.parametrize("shape,dim", [((4, 5120), 1), ((8, 100_003), 1)])
 def test_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     """The long-line 3-pass workspace path (few rows), per dtype."""
-    if dtype in (torch.bfloat16, torch.float16):
-        skip_if_metal(
-            mojo_gpu,
-            "cumsum of bfloat16/float16 is a CUDA-only fast path "
-            "(ops_reductions.mojo: 'only ever measured on NVIDIA')",
-        )
     torch.manual_seed(0)
     if dtype.is_floating_point:
         x = torch.randn(shape).to(dtype)
@@ -833,12 +813,6 @@ def test_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
 
 @pytest.mark.parametrize("dim", [-1, -2])
 def test_cumsum_negative_dim(mojo_gpu, dim):
-    if dim == -2:
-        skip_if_metal(
-            mojo_gpu,
-            "cumsum over dim 0 (dim=-2 on a rank-2 tensor) is a CUDA-only "
-            "fast path (ops_reductions.mojo: 'only ever measured on NVIDIA')",
-        )
     torch.manual_seed(0)
     x = torch.randn(64, 4096)
     result = torch.cumsum(x.to(mojo_gpu), dim=dim).cpu().double()
