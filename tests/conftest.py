@@ -22,7 +22,7 @@ from torch_mojo_backend.testing import CallChecker, Conf
 os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "1"
 
 
-@pytest.fixture(params=["cpu", "cuda"])
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
 def device(request, cuda_available: bool):
     device_name = request.param
     if not cuda_available and device_name == "cuda":
