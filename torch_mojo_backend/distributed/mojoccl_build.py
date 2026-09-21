@@ -5,9 +5,9 @@ from pathlib import Path
 
 from torch_mojo_backend import native
 
-_ENTRY = Path(__file__).parent / "mojoccl" / "mojoccl.mojo"
+_ENTRY = Path(__file__).parents[1] / "mojo" / "tmb" / "ccl" / "entry.mojo"
 
 
 def ensure_built() -> str:
     """Build (if needed) and return the path to libmojoccl.so."""
-    return str(native.build_library(_ENTRY))
+    return str(native.build_library(_ENTRY, "mojoccl"))

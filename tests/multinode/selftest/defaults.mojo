@@ -4,8 +4,8 @@ from std.sys.info import _accelerator_arch
 from std.sys import argv
 from std.testing import assert_equal
 
-from internode import _proxy_idle_ns
-from internode_fused import (
+from tmb.ccl.internode import _proxy_idle_ns
+from tmb.ccl.internode_fused import (
     FUSED_THREADS,
     FUSED_UNROLL,
     FUSED_PUSH_UNROLL,
@@ -14,7 +14,7 @@ from internode_fused import (
     fused_big_block_cap,
     fused_big_bytes,
 )
-from mojoccl import (
+from tmb.ccl.entry import (
     _region_cap_bytes,
     _pipe_split_unit,
     _fused_enabled,

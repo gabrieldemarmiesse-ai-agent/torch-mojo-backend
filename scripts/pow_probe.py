@@ -158,7 +158,7 @@ def time_us(
 
 def main() -> int:
     register_mojo_devices()
-    print("KERNELS_DIR", n._KERNELS_DIR, "torch", torch.__version__, flush=True)
+    print("MOJO_ROOT", n._MOJO_ROOT, "torch", torch.__version__, flush=True)
     # 1. Random sample x in [0.5, 50], y in [0, 6].
     rng = np.random.default_rng(0)
     N = 1 << 20

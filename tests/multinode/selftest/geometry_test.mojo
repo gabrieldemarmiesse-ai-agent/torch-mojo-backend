@@ -9,9 +9,9 @@
 # of the shipped code and not of a copy of it.
 from std.sys import size_of
 
-from collectives_kernels import MAX_WORLD, shard_range, signal_bytes
-from internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
-from mojoccl import (
+from tmb.ccl.collectives_kernels import MAX_WORLD, shard_range, signal_bytes
+from tmb.ccl.internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
+from tmb.ccl.entry import (
     EMPTY_SHARD_BYTES,
     INBOX_SLOTS,
     PIPE_ARENAS,

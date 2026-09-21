@@ -6,7 +6,7 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import argv
 from std.time import sleep
 
-from bootstrap import (
+from tmb.ccl.bootstrap import (
     UID_BYTES,
     bootstrap_allgather,
     bootstrap_barrier,
@@ -15,7 +15,7 @@ from bootstrap import (
     host_hash,
     make_unique_id,
 )
-from internode import (
+from tmb.ccl.internode import (
     CREDIT_AREA_BYTES,
     IB_BLOB_BYTES,
     ib_connect,
