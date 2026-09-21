@@ -75,7 +75,6 @@ from std.gpu import (
 from std.math import ceildiv
 from std.memory import stack_allocation
 from std.sys.info import has_accelerator, size_of
-from std.utils.coord import Coord
 from std.utils.static_tuple import StaticTuple
 
 from tmb.kernels.common.op_utils import (
@@ -85,7 +84,6 @@ from tmb.kernels.common.op_utils import (
     _device_sm_count,
     _enqueue_cached,
     _make_ptr,
-    _parallel_for,
 )
 
 from tmb.kernels.common.variant_gates import _dtype_arg_on
@@ -545,38 +543,6 @@ def _minmax_merge_kernel[
         idx_ptr[unsafe_offset=p] = best_idx
 
 
-# ---------------------------------------------------------------------------
-# Host-side dispatch
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _ar_cpu_scan[
-    dtype: DType, is_min: Bool
-](
-    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
-    base: Int,
-    stride: Int,
-    n: Int,
-) -> Tuple[Scalar[dtype], Int]:
-    """One slice, sequentially: the CPU branch of both entry points.
-
-    Factored out so the `with_values` and index-only closures below can be
-    written separately -- which they must be, because a `@__copy_capture` list
-    is not comptime-conditional, and capturing an unused values pointer would
-    change the parallel-for kernel argmin/argmax emit for no reason -- without
-    the scan itself existing twice.
-    """
-    var best = in_ptr[unsafe_offset=base]
-    var best_idx = 0
-    for r in range(1, n):
-        var v = in_ptr[unsafe_offset=base + r * stride]
-        if _ar_take_next[dtype, is_min](v, best):
-            best = v
-            best_idx = r
-    return (best, best_idx)
-
-
 @always_inline
 def _ar_splits(
     blocks: Int, reduce_n: Int, min_chunk: Int, ctx: DeviceContext
@@ -656,36 +622,6 @@ def _argreduce_rows[
     var out_ptr = _make_ptr[DType.int64](out_addr)
     var val_ptr = _make_ptr[dtype](val_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-
-    if ctx.api() == "cpu":
-        comptime if with_values:
-
-            @always_inline
-            @parameter
-            @__copy_capture(out_ptr, val_ptr, in_ptr)
-            def func_v[width: Int, alignment: Int = 1](idx: Coord):
-                var r = Int(idx[0].value())
-                var best, best_idx = _ar_cpu_scan[dtype, is_min](
-                    in_ptr, r * cols, 1, cols
-                )
-                out_ptr[unsafe_offset=r] = Int64(best_idx)
-                val_ptr[unsafe_offset=r] = best
-
-            _parallel_for[func_v](rows, ctx)
-        else:
-
-            @always_inline
-            @parameter
-            @__copy_capture(out_ptr, in_ptr)
-            def func[width: Int, alignment: Int = 1](idx: Coord):
-                var r = Int(idx[0].value())
-                var _best, best_idx = _ar_cpu_scan[dtype, is_min](
-                    in_ptr, r * cols, 1, cols
-                )
-                out_ptr[unsafe_offset=r] = Int64(best_idx)
-
-            _parallel_for[func](rows, ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
@@ -791,38 +727,6 @@ def _argreduce_cols[
     var val_ptr = _make_ptr[dtype](val_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var outputs = outer * inner
-
-    if ctx.api() == "cpu":
-        comptime if with_values:
-
-            @always_inline
-            @parameter
-            @__copy_capture(out_ptr, val_ptr, in_ptr)
-            def func_v[width: Int, alignment: Int = 1](idx: Coord):
-                var p = Int(idx[0].value())
-                var base = (p // inner) * reduce_n * inner + (p % inner)
-                var best, best_idx = _ar_cpu_scan[dtype, is_min](
-                    in_ptr, base, inner, reduce_n
-                )
-                out_ptr[unsafe_offset=p] = Int64(best_idx)
-                val_ptr[unsafe_offset=p] = best
-
-            _parallel_for[func_v](outputs, ctx)
-        else:
-
-            @always_inline
-            @parameter
-            @__copy_capture(out_ptr, in_ptr)
-            def func[width: Int, alignment: Int = 1](idx: Coord):
-                var p = Int(idx[0].value())
-                var base = (p // inner) * reduce_n * inner + (p % inner)
-                var _best, best_idx = _ar_cpu_scan[dtype, is_min](
-                    in_ptr, base, inner, reduce_n
-                )
-                out_ptr[unsafe_offset=p] = Int64(best_idx)
-
-            _parallel_for[func](outputs, ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")

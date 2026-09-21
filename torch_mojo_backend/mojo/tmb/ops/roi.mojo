@@ -27,8 +27,6 @@ from tmb.backend.registry import Site, impl
 def _check_pair(input: T, rois: T) raises:
     if not input.on_mojo() or not rois.on_mojo() or input.device != rois.device:
         unsupported("ROI operands must be on the same mojo device")
-    if dev(input.device)[].is_cpu:
-        unsupported("ROI operations require a mojo GPU")
     if (
         input.dtype != DType.float16
         and input.dtype != DType.float32

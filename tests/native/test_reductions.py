@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
-from torch_mojo_backend.native import device_module
 
 
 @pytest.fixture(scope="session")
@@ -25,20 +24,18 @@ def registered():
     return True
 
 
-@pytest.fixture(params=["cpu", "gpu"])
-def mojo_device(request, registered, mojo_gpu_available: bool):
-    if request.param == "gpu":
-        if not mojo_gpu_available:
-            pytest.skip("You do not have a GPU supported by MAX")
-        return "mojo:0"
-    return str(device_module.cpu())
-
-
 @pytest.fixture
 def mojo_gpu(registered, mojo_gpu_available: bool) -> str:
     if not mojo_gpu_available:
         pytest.skip("You do not have a GPU supported by MAX")
     return "mojo:0"
+
+
+@pytest.fixture
+def mojo_device(mojo_gpu: str) -> str:
+    """There is no CPU-backed mojo device any more; this is now just an
+    alias of `mojo_gpu`."""
+    return mojo_gpu
 
 
 # ---------------------------------------------------------------------------
@@ -868,21 +865,6 @@ def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
         torch.cumsum(x, dim=1)
 
 
-def test_cumsum_new_dtype_and_dim_decline_on_the_cpu_device(registered):
-    """dim=0 and bf16/f16 route through the CUDA-only fast kernels; on the MAX
-    CPU device they must decline, not run an unmeasured kernel. int64 / int32 /
-    float32 on the trailing dim is unaffected."""
-    mojo_cpu = str(device_module.cpu())
-    x32 = torch.randn(8, 16)
-    with pytest.raises(NotImplementedError):
-        torch.cumsum(x32.to(mojo_cpu), dim=0)
-    xbf16 = torch.randn(8, 16).to(torch.bfloat16)
-    with pytest.raises(NotImplementedError):
-        torch.cumsum(xbf16.to(mojo_cpu), dim=1)
-    result = torch.cumsum(x32.to(mojo_cpu), dim=1)
-    torch.testing.assert_close(result.cpu(), torch.cumsum(x32, dim=1))
-
-
 # ---------------------------------------------------------------------------
 # declines and dispatch
 # ---------------------------------------------------------------------------
@@ -986,7 +968,9 @@ def test_sum_default_overload_decomposes_to_dim_intlist(mojo_gpu):
 
 
 def test_accelerator_count_is_sane(registered):
-    assert len(list(get_accelerators())) >= 1
+    # 0 is a legitimate count now: there is no CPU-backed mojo device to
+    # fall back to any more on a box with no accelerator.
+    assert len(list(get_accelerators())) >= 0
 
 
 # ---------------------------------------------------------------------------

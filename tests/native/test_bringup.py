@@ -15,10 +15,9 @@ def _arange(n: int, device: str) -> torch.Tensor:
 
 def test_registration_and_devices(mojo_device):
     assert native.is_registered()
-    assert device_module.device_count() >= 1
-    assert device_module.cpu() == torch.device(
-        f"mojo:{device_module.device_count() - 1}"
-    )
+    # 0 is a legitimate count on a box with no accelerator: there is no
+    # CPU-backed mojo device to fall back to any more.
+    assert device_module.device_count() >= 0
 
 
 def test_empty_to_and_back(mojo_device):
@@ -84,10 +83,9 @@ def test_fill_keeps_the_scalar_tag(mojo_device, contiguous: bool):
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_fill_keeps_int64_bits_past_2_53(mojo_gpu: str, contiguous: bool):
     """An integer Scalar reaches an int64 destination exactly; a Float64
-    round-trip would round it. Accelerators only: on the MAX CPU device every
-    fill goes through the kernel, which takes a Float64, and a memset into a
-    dense temporary is not ordered against the copy that would lay it out --
-    that combination declines instead of rounding silently."""
+    round-trip would round it. Past 2**53 the fill goes through a dense
+    temporary (memset) plus a strided copy rather than the kernel, which
+    only takes a Float64."""
     big = 2**60 + 1
     if contiguous:
         i = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
