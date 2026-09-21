@@ -20,7 +20,6 @@ from std.gpu import (
 )
 from max.gpu.host import DeviceContext
 from std.sys.info import has_accelerator
-from std.utils.coord import Coord
 from std.utils.static_tuple import StaticTuple
 
 from tmb.kernels.common.op_utils import (
@@ -30,7 +29,6 @@ from tmb.kernels.common.op_utils import (
     _enqueue_cached,
     _gs_blocks,
     _make_ptr,
-    _parallel_for,
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
@@ -177,36 +175,6 @@ def _searchsorted[
     var sorter = (
         _make_ptr[DType.int64](sorter_addr).as_unsafe_any_origin().as_imm()
     )
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(
-            out,
-            boundaries,
-            values,
-            sorter,
-            boundary_size,
-            values_per_batch,
-        )
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var i = Int(idx[0].value())
-            out[unsafe_offset=i] = _binary_search_position[
-                dtype, boundaries_are_1d, has_sorter, right
-            ](
-                boundaries,
-                values,
-                sorter,
-                i,
-                boundary_size,
-                values_per_batch,
-            ).cast[
-                out_dtype
-            ]()
-
-        _parallel_for[func](num_values, ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")

@@ -460,8 +460,8 @@ def _graph_uses_mojo_device(
 @functools.cache
 def _mojo_accelerators() -> tuple[max.driver.Device, ...]:
     """The concrete MAX devices backing each `mojo:<index>`, in the same
-    order (GPUs, then the MAX CPU device) the native backend's
-    `device.mojo` assigns them -- see `get_accelerators()`."""
+    order the native backend's `device.mojo` assigns them -- see
+    `get_accelerators()`."""
     return tuple(get_accelerators())
 
 
@@ -478,8 +478,6 @@ def _mojo_index_for_max_device(device: max.driver.Device) -> int:
     """The inverse of `_max_device_for_mojo`: which `mojo:<index>` a MAX
     device (as reported by a MAX output buffer) corresponds to."""
     for index, accelerator in enumerate(_mojo_accelerators()):
-        if accelerator.label == "cpu" and device.label == "cpu":
-            return index
         if accelerator.label == device.label and accelerator.id == device.id:
             return index
     raise ValueError(f"MAX device {device} has no corresponding mojo index")
