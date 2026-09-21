@@ -19,6 +19,7 @@ from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
+from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
@@ -48,16 +49,24 @@ class GlobalMaxObjects:
 
 _global_max_objects: GlobalMaxObjects | None = None
 
-# The MAX custom ops of the graph backend: one Mojo source package that MAX
-# precompiles on its own (tmb/graph, the only package with an __init__.mojo).
-paths_to_mojo_kernels = [Path(__file__).parent.parent / "mojo" / "tmb" / "graph"]
+# Custom-op packages user code registered on top of this repository's own
+# (`make_torch_op_from_mojo`): Mojo source directories or `.mojoc` files.
+extra_kernel_paths: list[Path] = []
+
+
+def kernel_extension_paths() -> list[Path]:
+    """Every custom-op package the graph backend loads: this repository's own
+    (`tmb/graph`, precompiled once per source closure), then whatever user
+    code registered. Passed as `custom_extensions` by every `F.custom` call
+    and loaded into the session's kernel library."""
+    return [native.build_graph_package(), *extra_kernel_paths]
 
 
 def global_max_objects() -> GlobalMaxObjects:
     global _global_max_objects
     if _global_max_objects is None:
         kernel_library = KernelLibrary()
-        kernel_library.load_paths(paths_to_mojo_kernels)
+        kernel_library.load_paths(kernel_extension_paths())
         session = engine.InferenceSession(devices=list(get_accelerators()))
         debug.set_print_options(session)
 

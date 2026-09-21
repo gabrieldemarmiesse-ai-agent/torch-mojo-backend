@@ -33,7 +33,7 @@ def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -56,7 +56,7 @@ def bitwise_not(input: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -72,7 +72,7 @@ def bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -95,7 +95,7 @@ def bitwise_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -169,7 +169,7 @@ def elementwise(
         out_types=[
             TensorType(dtype=output_dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -187,5 +187,5 @@ def gelu_backward(
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
