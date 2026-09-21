@@ -55,6 +55,13 @@ target-version = "py311"
 # part of this project.
 extend-exclude = ["deeplink"]
 
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
+    "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
+    "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
+]
+
 [tool.ruff.lint]
 # extend-select keeps ruff's default rule set (E4, E7, E9, F) enabled.
 extend-select = [
