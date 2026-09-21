@@ -74,7 +74,7 @@ jobs:
   # whole suite and they all take about the same time; cutting collection order
   # into contiguous chunks instead gave shards between 41 s and 1416 s.
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, cpu-only]
 
     strategy:
       fail-fast: false
@@ -127,7 +127,7 @@ jobs:
 
   test-gpu:
     name: GPU (${{ matrix.suite }})
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, L4]
     timeout-minutes: 360
     strategy:
       fail-fast: false

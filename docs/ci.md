@@ -1,8 +1,7 @@
 # Unit tests in CI
 
-The `CI` workflow runs CPU unit tests on GitHub-hosted `ubuntu-latest` runners
-and GPU unit tests on the self-hosted L4 runner. The L4 uses the default
-`self-hosted`, `linux`, and `x64` labels; these should identify the GPU runner.
+The `CI` workflow runs CPU unit tests on self-hosted runners labeled
+`cpu-only` and GPU unit tests on the self-hosted runner labeled `L4`.
 Lint, type checking, and benchmark bookkeeping stay on GitHub-hosted runners.
 
 The CPU selection is `uv run pytest tests/ -m "not gpu"`, sharded 40 ways.
