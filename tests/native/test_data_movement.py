@@ -16,13 +16,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, get_accelerators, register_mojo_devices
+from torch_mojo_backend import aten_functions, get_accelerators
 
-# The `mojo_device` fixture (tests/conftest.py) yields a "mojo:N" string but,
-# unlike `mojo_gpu`, never registers the backend itself -- it assumes some
-# other test using the `conf` fixture ran first in the same session. Running
-# this file on its own needs the same idempotent call `mojo_gpu` makes.
-register_mojo_devices()
+# tests/native/conftest.py registers devices at fixture setup. Registration
+# during collection would also affect deselected tests and break CUDA autograd
+# in the separate CUDA compiler job.
 
 
 def _fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -787,6 +785,7 @@ def test_channels_last_survives_a_device_round_trip(mojo_device):
     assert torch.equal(back, x)
 
 
+@pytest.mark.gpu
 def test_channels_last_survives_a_move_between_mojo_devices():
     """The cross-device leg stages a contiguous buffer and lays the layout out
     again on the destination."""

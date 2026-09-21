@@ -26,14 +26,9 @@ from pathlib import Path
 
 import pytest
 
-from torch_mojo_backend import get_accelerators, native
+from torch_mojo_backend import native
 
-pytestmark = [
-    pytest.mark.xdist_group(name="group1"),
-    pytest.mark.skipif(
-        not list(get_accelerators()), reason="You do not have a GPU supported by MAX"
-    ),
-]
+pytestmark = pytest.mark.xdist_group(name="group1")
 
 _WORKTREE = Path(__file__).resolve().parents[2]
 _SHIM_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
@@ -83,7 +78,7 @@ def _assert_ok(proc: subprocess.CompletedProcess[str]):
     assert "OK" in proc.stdout, proc.stdout + proc.stderr
 
 
-def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
+def test_cache_dir_env_var_relocates_every_build(tmp_path: Path, mojo_gpu: str):
     """`TORCH_MOJO_BACKEND_CACHE_DIR` is the only place anything is written:
     the C++ shim, the Mojo backend, and the per-family kernel variant."""
     cache_dir = tmp_path / "cache"
@@ -107,7 +102,7 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path):
     assert "built  logic" in proc.stdout + proc.stderr
 
 
-def test_second_process_reuses_every_build(tmp_path: Path):
+def test_second_process_reuses_every_build(tmp_path: Path, mojo_gpu: str):
     """A warm second process dlopens the cached `.so`s; it builds nothing."""
     cache_dir = tmp_path / "cache"
     first = _run(cache_dir)
@@ -134,7 +129,7 @@ def test_second_process_reuses_every_build(tmp_path: Path):
     assert mtimes_after == mtimes_before, "a warm run rewrote a cached .so"
 
 
-def test_missing_family_so_is_rebuilt(tmp_path: Path):
+def test_missing_family_so_is_rebuilt(tmp_path: Path, mojo_gpu: str):
     """Deleting the cached kernel-variant `.so` (but not the two backend
     shims) makes the next process rebuild only that piece."""
     cache_dir = tmp_path / "cache"
@@ -173,7 +168,9 @@ def test_missing_family_so_is_rebuilt(tmp_path: Path):
     assert shim_mtimes_after == shim_mtimes_before
 
 
-def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(tmp_path: Path):
+def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(
+    tmp_path: Path, mojo_gpu: str
+):
     """A corrupted-but-present `.so` is not silently used: the loader only
     rebuilds a *missing* file (`if not exists(so): build`), so a file that
     exists but fails to load surfaces a clear error instead of running
