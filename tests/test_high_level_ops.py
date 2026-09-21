@@ -2137,6 +2137,7 @@ def test_change_device_to_cpu_by_device(device: str):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_change_device_to_cuda(device: str, cuda_available: bool):
     """Test changing device to CUDA"""
     if not cuda_available:
@@ -2150,6 +2151,7 @@ def test_change_device_to_cuda(device: str, cuda_available: bool):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_change_device_to_cuda_by_device(device: str, cuda_available: bool):
     """Test changing device to CUDA"""
     if not cuda_available:
@@ -2207,6 +2209,7 @@ def test_to_with_torch_device_object(device: str):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_to_with_torch_device_object_cuda(device: str, cuda_available: bool):
     """Test tensor.to() with torch.device object for CUDA"""
     if not cuda_available:
