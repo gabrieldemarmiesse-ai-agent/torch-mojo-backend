@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
-from torch_mojo_backend.native import device_module
 
 
 def _native_count(name: str) -> int:
@@ -95,9 +94,8 @@ def test_unary_matches_cpu(mojo_gpu, op_name, fn, domain):
 @pytest.mark.parametrize(
     "op_name,fn", [("abs", torch.abs), ("exp", torch.exp), ("sign", torch.sign)]
 )
-def test_unary_on_cpu_and_gpu_device(mojo_device, op_name, fn):
-    """The elementwise spec kernels run on the MAX CPU device too (mojo:cpu),
-    not only accelerators — `mojo_device` covers both legs."""
+def test_unary_on_mojo_device(mojo_device, op_name, fn):
+    """The elementwise spec kernels run correctly on a mojo device."""
     x64 = torch.randn(3, 5, dtype=torch.float64) * 2
     expected = fn(x64).to(torch.float32)
     x = x64.to(torch.float32).to(mojo_device)
@@ -540,16 +538,6 @@ def test_gelu_backward_matches_cpu(mojo_gpu, approximate):
 
 def test_gelu_backward_declines_float16(mojo_gpu):
     x = torch.randn(3, 4, dtype=torch.float16).to(mojo_gpu).requires_grad_()
-    y = F.gelu(x)
-    with pytest.raises(NotImplementedError):
-        y.backward(torch.ones_like(y))
-
-
-def test_gelu_backward_declines_on_cpu_device(mojo_gpu):
-    # `mojo_gpu` only guarantees registration + a real accelerator exists;
-    # this test deliberately targets the MAX CPU device instead.
-    cpu_device = f"mojo:{device_module.device_count() - 1}"
-    x = torch.randn(3, 4).to(cpu_device).requires_grad_()
     y = F.gelu(x)
     with pytest.raises(NotImplementedError):
         y.backward(torch.ones_like(y))

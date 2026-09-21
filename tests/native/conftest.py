@@ -28,9 +28,8 @@ def skip_if_metal(device: str, reason: str):
     """Skip a case that is correct and by design on Apple's Metal backend.
 
     `device` is a `mojo:<index>` string; the index selects which entry of
-    `get_accelerators()` to check, so a `mojo_device` fixture value pointing
-    at the MAX CPU device (not an accelerator) is never skipped by mistake.
-    Several declines are real Apple-GPU-only limits (no float64 on the GPU)
+    `get_accelerators()` to check. Several declines are real Apple-GPU-only
+    limits (no float64 on the GPU)
     and one (cumsum's non-trailing-dim / bf16-f16 route) is really "only
     ever measured on NVIDIA" and happens to show up as Metal on this box --
     see the call sites for which. Never a blanket try/except: every call

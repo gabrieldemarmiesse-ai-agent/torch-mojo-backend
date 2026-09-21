@@ -202,125 +202,6 @@ def _batch_norm_go(
 
 
 # ---------------------------------------------------------------------------
-# Layer norm over the last dim; also writes the per-row mean and rstd
-# (float32), matching aten.native_layer_norm outputs. CPU DEVICE ONLY, one
-# parallel task per row: the accelerator route lives in
-# `normalization_forward`, whose kernels serve layer norm, group norm and
-# batch norm from one register-cached / shifted-moment mechanism. Python picks
-# between them in `aten_fast.fast_aten_native_layer_norm`.
-# ---------------------------------------------------------------------------
-
-comptime ROWRED_THREADS = 256
-# log2(ROWRED_THREADS): halving steps in the shared-memory reduction trees.
-comptime ROWRED_STAGES = 8
-
-
-@always_inline
-def _layer_norm[
-    dtype: DType
-](
-    out_addr: Int,
-    mean_out_addr: Int,
-    rstd_out_addr: Int,
-    in_addr: Int,
-    gamma_addr: Int,
-    beta_addr: Int,
-    eps: Float32,
-    rows: Int,
-    cols: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var mean_out_ptr = _make_ptr[DType.float32](mean_out_addr)
-    var rstd_out_ptr = _make_ptr[DType.float32](rstd_out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-    var gamma_ptr = _make_ptr[dtype](gamma_addr)
-    var beta_ptr = _make_ptr[dtype](beta_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(
-            out_ptr, mean_out_ptr, rstd_out_ptr, in_ptr, gamma_ptr, beta_ptr
-        )
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var total = Float32(0)
-            for j in range(cols):
-                total += in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-            var mean = total / Float32(cols)
-            var var_sum = Float32(0)
-            for j in range(cols):
-                var d = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - mean
-                )
-                var_sum += d * d
-            var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
-            for j in range(cols):
-                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                var g = gamma_ptr[unsafe_offset=j].cast[DType.float32]()
-                var b = beta_ptr[unsafe_offset=j].cast[DType.float32]()
-                out_ptr[unsafe_offset=base + j] = (
-                    (x - mean) * rstd * g + b
-                ).cast[dtype]()
-            mean_out_ptr[unsafe_offset=r] = mean
-            rstd_out_ptr[unsafe_offset=r] = rstd
-
-        _parallel_for[func](rows, ctx)
-    else:
-        raise Error(
-            "GPU layer norm belongs to normalization_forward"
-            " (LayerNormForward); this bridge serves the CPU device"
-        )
-
-
-def _layer_norm_go(
-    out_ptr_obj: Arg,
-    mean_out_ptr_obj: Arg,
-    rstd_out_ptr_obj: Arg,
-    in_ptr_obj: Arg,
-    gamma_ptr_obj: Arg,
-    beta_ptr_obj: Arg,
-    params: Arg,  # (eps, rows, cols)
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var mean_out_addr = _raw_int(mean_out_ptr_obj)
-    var rstd_out_addr = _raw_int(rstd_out_ptr_obj)
-    var in_addr = _raw_int(in_ptr_obj)
-    var gamma_addr = _raw_int(gamma_ptr_obj)
-    var beta_addr = _raw_int(beta_ptr_obj)
-    var eps_val = Float32(_raw_tuple_f64(params, 0))
-    var rows_val = _raw_tuple_int(params, 1)
-    var cols_val = _raw_tuple_int(params, 2)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _layer_norm[dt](
-                    out_addr,
-                    mean_out_addr,
-                    rstd_out_addr,
-                    in_addr,
-                    gamma_addr,
-                    beta_addr,
-                    eps_val,
-                    rows_val,
-                    cols_val,
-                    ctx,
-                )
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast layer_norm: " + String(dtype))
-
-
-# ---------------------------------------------------------------------------
 # Row-wise softmax with optional scaling and causal masking, for attention.
 # Input is (rows, cols) where rows = batch * q_len. With causal=1, row r
 # (query index r % q_len) only attends to columns j <= r % q_len — the
@@ -921,8 +802,7 @@ def enqueue_softmax_rows_dropout_f32(
         # The Python caller gates on all of this; re-checked here because the
         # dispatcher cannot report failure.
         if (
-            ctx.api() == "cpu"
-            or not (p > 0.0 and p < 1.0)
+            not (p > 0.0 and p < 1.0)
             or cols % 4 != 0
             or cols > WARP_SIZE * _APPLE_SM_MAX_VPT * 4
             or probs_addr % 16 != 0
@@ -1144,118 +1024,80 @@ def _softmax_rows[
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
-    if ctx.api() == "cpu":
+    comptime if has_apple_gpu_accelerator():
+        _softmax_rows_apple[dtype](
+            out_ptr, in_ptr, rows, cols, scale, causal, q_len, ctx
+        )
+    elif has_accelerator():
+        # Causal regime: half the score matrix is masked and the reference
+        # kernel still reads, exponentiates and writes all of it.  A
+        # warp-per-row kernel whose extent is the live prefix does the same
+        # arithmetic over half the bytes.  Rows must be long enough for a
+        # warp to vectorize and short enough that one warp per row is not
+        # itself the bottleneck; both are runtime comparisons.
+        comptime WIDE = _SM_VECTOR_BYTES // size_of[dtype]()
+        if causal != 0 and cols <= 8192 and rows >= 256:
+            var wide_ok = (
+                cols % WIDE == 0
+                and Int(out_ptr) % _SM_VECTOR_BYTES == 0
+                and Int(in_ptr) % _SM_VECTOR_BYTES == 0
+            )
+            if wide_ok:
+                _enqueue_softmax_warp[dtype, True, WIDE](
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    rows,
+                    cols,
+                    scale,
+                    q_len,
+                    ctx,
+                )
+            else:
+                _enqueue_softmax_warp[dtype, True, 1](
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    rows,
+                    cols,
+                    scale,
+                    q_len,
+                    ctx,
+                )
+            return
 
-        @always_inline
         @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var allowed = cols
+        @always_inline
+        @__copy_capture(in_ptr)
+        def input_fn[
+            _simd_width: Int
+        ](coords: Coord) -> SIMD[dtype, _simd_width]:
+            var r = Int(coords[0].value())
+            var c = Int(coords[1].value())
+            var v = (
+                in_ptr.unsafe_load[width=_simd_width](r * cols + c).cast[
+                    DType.float32
+                ]()
+                * scale
+            )
             if causal != 0:
-                allowed = min(cols, r % q_len + 1)
-            var m = Float32.MIN
-            for j in range(allowed):
-                var x = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
-                )
-                if x > m:
-                    m = x
-            var denom = Float32(0)
-            for j in range(allowed):
-                var x = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
-                )
-                denom += exp(x - m)
-            for j in range(cols):
-                if j < allowed:
-                    var x = (
-                        in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                        * scale
-                    )
-                    out_ptr[unsafe_offset=base + j] = (exp(x - m) / denom).cast[
-                        dtype
-                    ]()
-                else:
-                    out_ptr[unsafe_offset=base + j] = Scalar[dtype](0)
+                var allowed = min(cols, r % q_len + 1)
 
-        _parallel_for[func](rows, ctx)
+                comptime for lane in range(_simd_width):
+                    if c + lane >= allowed:
+                        v[lane] = min_or_neg_inf[DType.float32]()
+            # Known trade-off: for float16 input with scale > 1 this
+            # f32 -> dtype round-trip can overflow to +inf where the old
+            # all-f32 kernel didn't (unreachable with the default
+            # 1/sqrt(head_dim) scales).
+            return v.cast[dtype]()
+
+        softmax[dtype, 1, 2, input_fn, target="gpu"](
+            Coord(rows, cols),
+            TileTensor(out_ptr, row_major(rows, cols)),
+            1,
+            ctx,
+        )
     else:
-        comptime if has_apple_gpu_accelerator():
-            _softmax_rows_apple[dtype](
-                out_ptr, in_ptr, rows, cols, scale, causal, q_len, ctx
-            )
-        elif has_accelerator():
-            # Causal regime: half the score matrix is masked and the reference
-            # kernel still reads, exponentiates and writes all of it.  A
-            # warp-per-row kernel whose extent is the live prefix does the same
-            # arithmetic over half the bytes.  Rows must be long enough for a
-            # warp to vectorize and short enough that one warp per row is not
-            # itself the bottleneck; both are runtime comparisons.
-            comptime WIDE = _SM_VECTOR_BYTES // size_of[dtype]()
-            if causal != 0 and cols <= 8192 and rows >= 256:
-                var wide_ok = (
-                    cols % WIDE == 0
-                    and Int(out_ptr) % _SM_VECTOR_BYTES == 0
-                    and Int(in_ptr) % _SM_VECTOR_BYTES == 0
-                )
-                if wide_ok:
-                    _enqueue_softmax_warp[dtype, True, WIDE](
-                        out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_imm(),
-                        rows,
-                        cols,
-                        scale,
-                        q_len,
-                        ctx,
-                    )
-                else:
-                    _enqueue_softmax_warp[dtype, True, 1](
-                        out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_imm(),
-                        rows,
-                        cols,
-                        scale,
-                        q_len,
-                        ctx,
-                    )
-                return
-
-            @parameter
-            @always_inline
-            @__copy_capture(in_ptr)
-            def input_fn[
-                _simd_width: Int
-            ](coords: Coord) -> SIMD[dtype, _simd_width]:
-                var r = Int(coords[0].value())
-                var c = Int(coords[1].value())
-                var v = (
-                    in_ptr.unsafe_load[width=_simd_width](r * cols + c).cast[
-                        DType.float32
-                    ]()
-                    * scale
-                )
-                if causal != 0:
-                    var allowed = min(cols, r % q_len + 1)
-
-                    comptime for lane in range(_simd_width):
-                        if c + lane >= allowed:
-                            v[lane] = min_or_neg_inf[DType.float32]()
-                # Known trade-off: for float16 input with scale > 1 this
-                # f32 -> dtype round-trip can overflow to +inf where the old
-                # all-f32 kernel didn't (unreachable with the default
-                # 1/sqrt(head_dim) scales).
-                return v.cast[dtype]()
-
-            softmax[dtype, 1, 2, input_fn, target="gpu"](
-                Coord(rows, cols),
-                TileTensor(out_ptr, row_major(rows, cols)),
-                1,
-                ctx,
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error("no GPU accelerator available at compile time")
 
 
 def _softmax_rows_go(
@@ -1303,10 +1145,7 @@ def _softmax_rows_go(
 # @ V for q_len == 1, one thread block per (batch * head). Replaces the
 # bmm + softmax + bmm chain, whose m=1 GEMMs read K one row per thread
 # (uncoalesced) and which costs three kernel launches plus two scratch
-# buffers per call. The one-thread-block-per-row launch (with the ATTN_MAX_KV
-# / ATTN_MAX_HD shared-memory caps below) is GPU only; on the CPU MAX device
-# `_attn_decode_cpu` below computes the identical math with plain per-row
-# loops and no size caps.
+# buffers per call.
 # ---------------------------------------------------------------------------
 
 comptime ATTN_THREADS = 256
@@ -1484,103 +1323,6 @@ def _attn_decode_kernel[
 
 
 @always_inline
-def _attn_decode_cpu[
-    dtype: DType
-](
-    out_addr: Int,
-    q_addr: Int,
-    k_addr: Int,
-    v_addr: Int,
-    bh: Int,
-    kv_len: Int,
-    head_dim: Int,
-    scale: Float32,
-    heads: Int,
-    q_b_stride: Int,
-    q_h_stride: Int,
-    k_b_stride: Int,
-    k_h_stride: Int,
-    k_s_stride: Int,
-    v_b_stride: Int,
-    v_h_stride: Int,
-    v_s_stride: Int,
-    ctx: DeviceContext,
-) raises:
-    """Same math as `_attn_decode_kernel`, one sequential task per (batch *
-    head) row: a max pass over the scores followed by a fused exp-sum /
-    weighted-V pass. `acc_out` is a per-row float32 scratch buffer (dynamic
-    size, so it cannot live in `stack_allocation` like the GPU version's
-    shared memory) that accumulates the output in the same precision the
-    GPU kernel uses before the final per-dtype cast.
-    """
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var q_ptr = _make_ptr[dtype](q_addr)
-    var k_ptr = _make_ptr[dtype](k_addr)
-    var v_ptr = _make_ptr[dtype](v_addr)
-
-    @always_inline
-    @parameter
-    @__copy_capture(out_ptr, q_ptr, k_ptr, v_ptr)
-    def func[width: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        var out_base = i * head_dim
-        var batch = i // heads
-        var head = i % heads
-        var q_base = batch * q_b_stride + head * q_h_stride
-        var k_base = batch * k_b_stride + head * k_h_stride
-        var v_base = batch * v_b_stride + head * v_h_stride
-
-        var m = Float32.MIN
-        for j in range(kv_len):
-            var krow = k_base + j * k_s_stride
-            var dot = Float32(0)
-            for d in range(head_dim):
-                dot += (
-                    q_ptr[unsafe_offset=q_base + d].cast[DType.float32]()
-                    * k_ptr[unsafe_offset=krow + d].cast[DType.float32]()
-                )
-            var s = dot * scale
-            if s > m:
-                m = s
-
-        var acc_out = unsafe_alloc[Float32](head_dim)
-        for d in range(head_dim):
-            acc_out[unsafe_offset=d] = Float32(0)
-        var denom = Float32(0)
-        for j in range(kv_len):
-            var krow = k_base + j * k_s_stride
-            var dot = Float32(0)
-            for d in range(head_dim):
-                dot += (
-                    q_ptr[unsafe_offset=q_base + d].cast[DType.float32]()
-                    * k_ptr[unsafe_offset=krow + d].cast[DType.float32]()
-                )
-            var s = dot * scale
-            var p = exp(s - m)
-            denom += p
-            var vrow = v_base + j * v_s_stride
-            for d in range(head_dim):
-                acc_out[unsafe_offset=d] += (
-                    p * v_ptr[unsafe_offset=vrow + d].cast[DType.float32]()
-                )
-
-        for d in range(head_dim):
-            out_ptr[unsafe_offset=out_base + d] = (
-                acc_out[unsafe_offset=d] / denom
-            ).cast[dtype]()
-        acc_out.unsafe_free()
-
-    # CPU-only launch: `func` uses a host `alloc()`/`free()` for its per-row
-    # scratch, and `_parallel_for` would also compile a `target="gpu"`
-    # instantiation of it. That device instantiation pulls host malloc/free
-    # into the GPU binary -- a no-op on NVIDIA (device malloc exists) but a
-    # link failure on AMDGPU ("undefined symbol: malloc"). This kernel is only
-    # ever reached with a CPU context (see `_attn_decode`), so emit only the
-    # CPU form and the GPU instantiation is never generated on any platform.
-    elementwise[func, simd_width=1](Coord(bh), ctx)
-
-
-@always_inline
 def _attn_decode[
     dtype: DType
 ](
@@ -1603,28 +1345,6 @@ def _attn_decode[
     v_s_stride: Int,
     ctx: DeviceContext,
 ) raises:
-    if ctx.api() == "cpu":
-        _attn_decode_cpu[dtype](
-            out_addr,
-            q_addr,
-            k_addr,
-            v_addr,
-            bh,
-            kv_len,
-            head_dim,
-            scale,
-            heads,
-            q_b_stride,
-            q_h_stride,
-            k_b_stride,
-            k_h_stride,
-            k_s_stride,
-            v_b_stride,
-            v_h_stride,
-            v_s_stride,
-            ctx,
-        )
-        return
     comptime if has_accelerator():
         comptime if has_apple_gpu_accelerator():
             if kv_len <= APPLE_ATTN_MAX_KV and head_dim <= APPLE_ATTN_MAX_HD:
@@ -2016,29 +1736,20 @@ def _any_bool_go(
 #
 # `_cumsum_rows_portable`/`_cumsum_cols_portable` below are a DIFFERENT,
 # simpler thing: a plain one-task-per-line serial accumulate through
-# `_parallel_for`, which is what's used for
-#   (a) true CPU (`ctx.api() == "cpu"`, e.g. the `mojo:cpu` test device —
-#       there is no warp coalescing to lose in the first place, and this is
-#       what the small int tensors of the generation loop, position ids
-#       from attention-mask cumsum, hit today), and
-#   (b) any GPU `ctx.api()` is not `"cuda"` (AMD, Apple): `block.
-#       prefix_sum`/`block.sum` are portable MAX primitives and this whole
-#       kernel family DOES cross-compile for gfx942 (verified with
-#       scripts/compare_kernel_asm.py), but the fast kernels were only ever
-#       MEASURED on NVIDIA (H100) — see the PR that added this file. Per
-#       AGENTS.md's "To check a kernel change against a GPU you do not
-#       have", an unmeasured architecture gets the change gated off, not
-#       shipped on faith, so non-CUDA GPUs keep running the exact naive
-#       kernel `main` ran for cumsum before this file existed. AMD (gfx942)
-#       was later measured correct on this portable path for every dtype
-#       and both routes (INNER and OUTER dim=0) -- see `_is_cumsum_dtype`'s
-#       `fast_ok` gate in ops_reductions.mojo, which is where "cuda" or
-#       "hip" reaches the OUTER route and the bf16/f16 dtypes at all; Metal
-#       stays on the pre-existing (int64/int32/float32, trailing-dim)
-#       surface, unmeasured.
-#       `_parallel_for` itself already knows how to target a non-CPU
-#       device (`elementwise[..., target="gpu"]`), so this same function
-#       serves both (a) and (b) — "portable", not "CPU-only".
+# `_parallel_for`, used whenever the GPU `ctx.api()` is not `"cuda"` (AMD,
+# Apple): `block.prefix_sum`/`block.sum` are portable MAX primitives and this
+# whole kernel family DOES cross-compile for gfx942 (verified with
+# scripts/compare_kernel_asm.py), but the fast kernels were only ever
+# MEASURED on NVIDIA (H100) — see the PR that added this file. Per
+# AGENTS.md's "To check a kernel change against a GPU you do not have", an
+# unmeasured architecture gets the change gated off, not shipped on faith, so
+# non-CUDA GPUs keep running the exact naive kernel `main` ran for cumsum
+# before this file existed. AMD (gfx942) was later measured correct on this
+# portable path for every dtype and both routes (INNER and OUTER dim=0) --
+# see `_is_cumsum_dtype`'s `fast_ok` gate in ops_reductions.mojo, which is
+# where "cuda" or "hip" reaches the OUTER route and the bf16/f16 dtypes at
+# all; Metal stays on the pre-existing (int64/int32/float32, trailing-dim)
+# surface, unmeasured.
 # ---------------------------------------------------------------------------
 
 
@@ -2381,129 +2092,6 @@ def _adaptive_avg_pool2d_go(
 
 
 # ---------------------------------------------------------------------------
-# Group norm: like layer norm, but the affine parameters are per channel.
-# CPU DEVICE ONLY, one task per (sample, group) row; the accelerator route is
-# `normalization_forward`'s GroupNormForward.
-# ---------------------------------------------------------------------------
-
-
-@always_inline
-def _group_norm[
-    dtype: DType
-](
-    out_addr: Int,
-    mean_out_addr: Int,
-    rstd_out_addr: Int,
-    in_addr: Int,
-    gamma_addr: Int,
-    beta_addr: Int,
-    eps: Float32,
-    rows: Int,
-    cols: Int,
-    hxw: Int,
-    group: Int,
-    cpg: Int,
-    ctx: DeviceContext,
-) raises:
-    var out_ptr = _make_ptr[dtype](out_addr)
-    var mean_out_ptr = _make_ptr[DType.float32](mean_out_addr)
-    var rstd_out_ptr = _make_ptr[DType.float32](rstd_out_addr)
-    var in_ptr = _make_ptr[dtype](in_addr)
-    var gamma_ptr = _make_ptr[dtype](gamma_addr)
-    var beta_ptr = _make_ptr[dtype](beta_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(
-            out_ptr, mean_out_ptr, rstd_out_ptr, in_ptr, gamma_ptr, beta_ptr
-        )
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var g = r % group
-            var base = r * cols
-            var total = Float32(0)
-            for j in range(cols):
-                total += in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-            var mean = total / Float32(cols)
-            var var_sum = Float32(0)
-            for j in range(cols):
-                var d = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - mean
-                )
-                var_sum += d * d
-            var rstd = 1.0 / ieee_sqrt(var_sum / Float32(cols) + eps)
-            for j in range(cols):
-                var c = g * cpg + j // hxw
-                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                var gm = gamma_ptr[unsafe_offset=c].cast[DType.float32]()
-                var bt = beta_ptr[unsafe_offset=c].cast[DType.float32]()
-                out_ptr[unsafe_offset=base + j] = (
-                    (x - mean) * rstd * gm + bt
-                ).cast[dtype]()
-            mean_out_ptr[unsafe_offset=r] = mean
-            rstd_out_ptr[unsafe_offset=r] = rstd
-
-        _parallel_for[func](rows, ctx)
-    else:
-        raise Error(
-            "GPU group norm belongs to normalization_forward"
-            " (GroupNormForward); this bridge serves the CPU device"
-        )
-
-
-def _group_norm_go(
-    out_ptr_obj: Arg,
-    mean_out_ptr_obj: Arg,
-    rstd_out_ptr_obj: Arg,
-    in_ptr_obj: Arg,
-    gamma_ptr_obj: Arg,
-    beta_ptr_obj: Arg,
-    params: Arg,  # (eps, rows, cols, hxw, group, cpg)
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var dtype = _raw_dtype_int(dtype_obj)
-    var out_addr = _raw_int(out_ptr_obj)
-    var mean_out_addr = _raw_int(mean_out_ptr_obj)
-    var rstd_out_addr = _raw_int(rstd_out_ptr_obj)
-    var in_addr = _raw_int(in_ptr_obj)
-    var gamma_addr = _raw_int(gamma_ptr_obj)
-    var beta_addr = _raw_int(beta_ptr_obj)
-    var eps_val = Float32(_raw_tuple_f64(params, 0))
-    var rows_val = _raw_tuple_int(params, 1)
-    var cols_val = _raw_tuple_int(params, 2)
-    var hxw_val = _raw_tuple_int(params, 3)
-    var group_val = _raw_tuple_int(params, 4)
-    var cpg_val = _raw_tuple_int(params, 5)
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _group_norm[dt](
-                    out_addr,
-                    mean_out_addr,
-                    rstd_out_addr,
-                    in_addr,
-                    gamma_addr,
-                    beta_addr,
-                    eps_val,
-                    rows_val,
-                    cols_val,
-                    hxw_val,
-                    group_val,
-                    cpg_val,
-                    ctx,
-                )
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast group_norm: " + String(dtype))
-
-
-# ---------------------------------------------------------------------------
 # Bilinear upsample 2D over NCHW contiguous input. The per-axis scale ratio and
 # the align_corners flag are resolved Python-side (area_pixel_compute_scale);
 # the kernel computes the source coordinate, the two neighbor indices, and the
@@ -2662,21 +2250,6 @@ def _batch_norm_dispatcher(argv: Argv, argc: Int) raises:
     )
 
 
-def _layer_norm_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _layer_norm_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
 def _softmax_rows_dispatcher(argv: Argv, argc: Int) raises:
     var args = argv
     _softmax_rows_go(
@@ -2744,21 +2317,6 @@ def _adaptive_avg_pool2d_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=2],
         args[unsafe_offset=3],
         args[unsafe_offset=4],
-    )
-
-
-def _group_norm_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _group_norm_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
     )
 
 
@@ -3030,9 +2588,6 @@ def _attn_decode_spec_into_go(
         raise Error("mojo spec attn_decode: unsupported q/k/v strides")
 
     var ctx = q.ctx()
-    if ctx.api() == "cpu":
-        # The CPU device takes the bmm+softmax+bmm chain today; keep it.
-        raise Error("mojo spec attn_decode: GPU only")
     if head_dim % 4 != 0 or head_dim > ATTN_MAX_HD or kv_len > ATTN_MAX_KV:
         raise Error("mojo spec attn_decode: size caps")
 
@@ -3114,9 +2669,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["BatchNormInference"]():
             _batch_norm_dispatcher(argv, argc)
             return 0
-        comptime if _op_on["LayerNorm"]():
-            _layer_norm_dispatcher(argv, argc)
-            return 0
         comptime if _op_on["SoftmaxRows"]():
             _softmax_rows_dispatcher(argv, argc)
             return 0
@@ -3131,9 +2683,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["AdaptiveAvgPool2d"]():
             _adaptive_avg_pool2d_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["GroupNorm"]():
-            _group_norm_dispatcher(argv, argc)
             return 0
         comptime if _op_on["UpsampleBilinear2d"]():
             _upsample_bilinear2d_dispatcher(argv, argc)

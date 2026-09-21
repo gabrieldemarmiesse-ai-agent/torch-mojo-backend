@@ -281,7 +281,7 @@ _SPLIT_ROW_CASES = [
 
 @pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
 def mojo_pair(request: pytest.FixtureRequest) -> tuple[str, str]:
-    if len(get_accelerators()) - 1 < 2:
+    if len(get_accelerators()) < 2:
         pytest.skip("requires two mojo GPUs")
     src, dst = request.param
     return f"mojo:{src}", f"mojo:{dst}"
@@ -635,18 +635,6 @@ for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
     route = "direct" if mode == "trace" else "host"
     assert output.count(f"peer copy {route}") == 12, output
     assert f"peer copy {'host' if route == 'direct' else 'direct'}" not in output
-
-
-def test_cross_device_cpu_fallback(mojo_gpu: str):
-    cpu_device = f"mojo:{len(get_accelerators()) - 1}"
-    expected = _fill((17, 23), torch.float32).t()
-    source = _fill((17, 23), torch.float32).to(mojo_gpu).t()
-    moved = source.to(cpu_device).to(mojo_gpu)
-    torch.testing.assert_close(moved.cpu(), expected)
-    for target, source_device in [(cpu_device, mojo_gpu), (mojo_gpu, cpu_device)]:
-        actual = torch.empty((23, 34), device=target)[:, ::2]
-        actual.copy_(expected.to(source_device))
-        torch.testing.assert_close(actual.cpu(), expected)
 
 
 # ---------------------------------------------------------------------------

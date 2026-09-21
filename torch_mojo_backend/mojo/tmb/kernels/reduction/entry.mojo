@@ -50,7 +50,6 @@ from std.sys.info import (
     is_nvidia_gpu,
     size_of,
 )
-from std.utils.coord import Coord
 from std.utils.index import IndexList
 from std.utils.numerics import min_or_neg_inf, max_or_inf
 from std.utils.static_tuple import StaticTuple
@@ -80,7 +79,6 @@ from tmb.kernels.common.op_utils import (
     _moment_cancels,
     _moment_partition,
     _moments_scan_contig,
-    _parallel_for,
     _raw_f64,
     _raw_tuple_int,
     _raw_tuple_len,
@@ -614,41 +612,6 @@ def _var_moments[
     var in_ptr = _make_ptr[dtype](in_addr)
     var outputs = outer * inner
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var o = Int(idx[0].value())
-            var base = _moment_slice_base(o, reduce_n, inner)
-            var shift = in_ptr[unsafe_offset=base].cast[DType.float32]()
-            var s = Float32(0)
-            var q = Float32(0)
-            # Same adaptive re-pass as the GPU path: a second read only when
-            # the first element turned out to be a poor stand-in for the mean.
-            for _ in range(2):
-                s = Float32(0)
-                q = Float32(0)
-                for r in range(reduce_n):
-                    var d = (
-                        in_ptr[unsafe_offset=base + r * inner].cast[
-                            DType.float32
-                        ]()
-                        - shift
-                    )
-                    s += d
-                    q += d * d
-                if not _moment_cancels(s, q, reduce_n):
-                    break
-                shift += s / Float32(reduce_n)
-            out_ptr[unsafe_offset=o] = _moment_finish[dtype](
-                s, q, reduce_n, correction
-            )
-
-        _parallel_for[func](outputs, ctx)
-        return
-
     comptime if has_accelerator():
         comptime sm_count = ctx.default_device_info.sm_count
         var target = MOMENT_BLOCKS_PER_SM * sm_count
@@ -1036,75 +999,48 @@ def _log_softmax_rows[
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var m = Float32.MIN
-            for j in range(cols):
-                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                if x > m:
-                    m = x
-            var denom = Float32(0)
-            for j in range(cols):
-                denom += exp(
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() - m
-                )
-            var log_denom = log(denom)
-            for j in range(cols):
-                var x = in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                out_ptr[unsafe_offset=base + j] = (x - m - log_denom).cast[
-                    dtype
-                ]()
-
-        _parallel_for[func](rows, ctx)
-    else:
-        comptime if has_accelerator():
-            # Cap concurrent rows so their input bytes stay resident in L2 for
-            # the pass-2 re-read; grid-stride over the rest.
-            comptime FILL = LSM_BLOCKS_PER_CU * ctx.default_device_info.sm_count
-            var esize = size_of[dtype]()
-            var blocks = min(rows, max(1, LSM_L2_BUDGET // (cols * esize)))
-            var mout = out_ptr.as_unsafe_any_origin()
-            var min_ = in_ptr.as_unsafe_any_origin().as_imm()
-            # Big rows: 1024-thread blocks so the small (L2-capped) grid still
-            # saturates memory. Small rows: 256 threads keep every thread busy.
-            if cols * esize > LSM_BIG_ROW_BYTES:
-                # ...but the budget alone cannot be allowed to leave the device
-                # idle. See LSM_BLOCKS_PER_CU: at the nanoGPT logits row it
-                # admits 228 blocks on a 304-CU part and that costs 27%.
-                blocks = min(rows, max(blocks, FILL))
-                _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 1024]](
-                    ctx,
-                    String(t"log_softmax_rows_{dtype}_1024"),
-                    blocks,
-                    1,
-                    1,
-                    1024,
-                    mout,
-                    min_,
-                    Int64(cols),
-                    Int64(rows),
-                )
-            else:
-                _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 256]](
-                    ctx,
-                    String(t"log_softmax_rows_{dtype}_256"),
-                    blocks,
-                    1,
-                    1,
-                    256,
-                    mout,
-                    min_,
-                    Int64(cols),
-                    Int64(rows),
-                )
+    comptime if has_accelerator():
+        # Cap concurrent rows so their input bytes stay resident in L2 for
+        # the pass-2 re-read; grid-stride over the rest.
+        comptime FILL = LSM_BLOCKS_PER_CU * ctx.default_device_info.sm_count
+        var esize = size_of[dtype]()
+        var blocks = min(rows, max(1, LSM_L2_BUDGET // (cols * esize)))
+        var mout = out_ptr.as_unsafe_any_origin()
+        var min_ = in_ptr.as_unsafe_any_origin().as_imm()
+        # Big rows: 1024-thread blocks so the small (L2-capped) grid still
+        # saturates memory. Small rows: 256 threads keep every thread busy.
+        if cols * esize > LSM_BIG_ROW_BYTES:
+            # ...but the budget alone cannot be allowed to leave the device
+            # idle. See LSM_BLOCKS_PER_CU: at the nanoGPT logits row it
+            # admits 228 blocks on a 304-CU part and that costs 27%.
+            blocks = min(rows, max(blocks, FILL))
+            _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 1024]](
+                ctx,
+                String(t"log_softmax_rows_{dtype}_1024"),
+                blocks,
+                1,
+                1,
+                1024,
+                mout,
+                min_,
+                Int64(cols),
+                Int64(rows),
+            )
         else:
-            raise Error("no GPU accelerator available at compile time")
+            _enqueue_cached[_log_softmax_rows_block_kernel[dtype, 256]](
+                ctx,
+                String(t"log_softmax_rows_{dtype}_256"),
+                blocks,
+                1,
+                1,
+                256,
+                mout,
+                min_,
+                Int64(cols),
+                Int64(rows),
+            )
+    else:
+        raise Error("no GPU accelerator available at compile time")
 
 
 # ---------------------------------------------------------------------------

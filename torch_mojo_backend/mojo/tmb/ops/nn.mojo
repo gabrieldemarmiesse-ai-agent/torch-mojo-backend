@@ -49,7 +49,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev
+from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
@@ -72,8 +72,8 @@ def _is_float(dt: DType) -> Bool:
 
 
 def _on_gpu(t: T) raises -> Bool:
-    """True on an accelerator; the MAX CPU device is the last mojo index."""
-    return t.on_mojo() and not dev(t.device)[].is_cpu
+    """True on a mojo device -- every mojo device is an accelerator."""
+    return t.on_mojo()
 
 
 def _require_mojo(t: T, what: StaticString) raises:
@@ -531,78 +531,34 @@ def op_native_layer_norm(
     var mean = own(new_tensor(stats, a.rank, ST_FLOAT32, a.device))
     var rstd = own(new_tensor(stats, a.rank, ST_FLOAT32, a.device))
     var ctx = ctx_for(a.device)
-    if _on_gpu(a):
-        var call = KernelCall("normalization_forward", "LayerNormForward")
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, gamma_dtype)
-        call.arg_dtype(2, beta_dtype)
-        call.out_dtype_i(0, out.t.dtype)
-        call.out_dtype_i(1, DType.float32)
-        call.out_dtype_i(2, DType.float32)
-        call.flag("HAS_WEIGHT", 1 if has_w else 0)
-        call.flag("HAS_BIAS", 1 if has_b else 0)
-        call.int(out.t.ptr)
-        call.int(mean.t.ptr)
-        call.int(rstd.t.ptr)
-        call.int(am.t.ptr)
-        call.int(gamma_ptr)
-        call.int(beta_ptr)
-        call.int(rows)
-        call.int(cols)
-        call.f64(eps)
-        call.int(1 if has_w else 0)
-        call.int(1 if has_b else 0)
-        # hxw / cpg / group: read only by the group-norm affine.
-        call.int(1)
-        call.int(1)
-        call.int(1)
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = am.t.ptr
-        _ = len(keep)
-    else:
-        # The classic nn route has no optional-affine ABI: synthesize the
-        # neutral parameters the same way the Python path did.
-        var ones = own(_filled(a, cols, 1.0))
-        var zeros = own(_filled(a, cols, 0.0))
-        if not has_w:
-            gamma_ptr = ones.t.ptr
-        if not has_b:
-            beta_ptr = zeros.t.ptr
-        # `fill_value` writes the two synthesized parameters with
-        # `DeviceContext.enqueue_memset`, which the MAX *CPU* context queues,
-        # while the nn kernel below runs inline on this thread: without
-        # this drain the kernel reads uninitialized gamma/beta about one call
-        # in ten (measured). Accelerators order both on the same stream and
-        # never reach this branch.
-        ctx.synchronize()
-        var call = KernelCall("nn", "LayerNorm")
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, gamma_dtype)
-        call.arg_dtype(2, beta_dtype)
-        call.out_dtype_i(0, out.t.dtype)
-        call.out_dtype_i(1, DType.float32)
-        call.out_dtype_i(2, DType.float32)
-        call.flag("HAS_WEIGHT", 1 if has_w else 0)
-        call.flag("HAS_BIAS", 1 if has_b else 0)
-        call.int(out.t.ptr)
-        call.int(mean.t.ptr)
-        call.int(rstd.t.ptr)
-        call.int(am.t.ptr)
-        call.int(gamma_ptr)
-        call.int(beta_ptr)
-        var params = List[Int]()
-        params.append(_f64_slot(eps))
-        params.append(rows)
-        params.append(cols)
-        call.tuple(params)
-        call.int(dtype_code(a.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = am.t.ptr
-        _ = len(keep)
-        _ = ones.t.ptr
-        _ = zeros.t.ptr
+    var call = KernelCall("normalization_forward", "LayerNormForward")
+    call.arg_dtype(0, a.dtype)
+    call.arg_dtype(1, gamma_dtype)
+    call.arg_dtype(2, beta_dtype)
+    call.out_dtype_i(0, out.t.dtype)
+    call.out_dtype_i(1, DType.float32)
+    call.out_dtype_i(2, DType.float32)
+    call.flag("HAS_WEIGHT", 1 if has_w else 0)
+    call.flag("HAS_BIAS", 1 if has_b else 0)
+    call.int(out.t.ptr)
+    call.int(mean.t.ptr)
+    call.int(rstd.t.ptr)
+    call.int(am.t.ptr)
+    call.int(gamma_ptr)
+    call.int(beta_ptr)
+    call.int(rows)
+    call.int(cols)
+    call.f64(eps)
+    call.int(1 if has_w else 0)
+    call.int(1 if has_b else 0)
+    # hxw / cpg / group: read only by the group-norm affine.
+    call.int(1)
+    call.int(1)
+    call.int(1)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = am.t.ptr
+    _ = len(keep)
     _ = ctx
     ret_owned(rets, 0, out)
     # float32 statistics whatever the input dtype is, matching the CUDA
@@ -613,14 +569,6 @@ def op_native_layer_norm(
     # the precision the forward accumulated.
     ret_owned(rets, 1, mean)
     ret_owned(rets, 2, rstd)
-
-
-def _filled(like: T, n: Int, value: Float64) raises -> T:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    var t = new_tensor(shape, 1, like.stype, like.device)
-    fill_value(t, value)
-    return t^
 
 
 # aten::native_layer_norm_backward(Tensor grad_out, Tensor input,
@@ -962,48 +910,6 @@ def _bn_set_saved_stats(rets: Values, mean: T, var_t: T, eps: Float64) raises:
     ret_owned(rets, 2, save_invstd)
 
 
-def _bn_inference_cpu(
-    rets: Values, a: T, gamma: T, beta: T, mean: T, var_t: T, eps: Float64
-) raises:
-    """The MAX CPU device's inference route: nn `BatchNormSpec`, one
-    elementwise pass over the whole tensor."""
-    if (
-        mean.stype != a.stype
-        or var_t.stype != a.stype
-        or gamma.stype != a.stype
-        or beta.stype != a.stype
-    ):
-        # `_batch_norm_spec_into_go` carries a single dtype for the input and
-        # every parameter; only the accelerator kernel takes them apart.
-        unsupported(
-            "batch norm on the CPU device needs the running statistics and"
-            " the affine parameters in the input's own dtype"
-        )
-    var am = _mat(a)
-    var out = own(new_like(a))
-    var ctx = ctx_for(a.device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("nn", "BatchNormSpec")
-    call.arg_dtype(0, a.dtype)
-    call.arg_dtype(1, mean.dtype)
-    call.arg_dtype(2, var_t.dtype)
-    call.arg_dtype(3, gamma.dtype)
-    call.arg_dtype(4, beta.dtype)
-    call.out_dtype(out.t.dtype)
-    call.spec(am.t.spec(cp))
-    call.spec(mean.spec(cp))
-    call.spec(var_t.spec(cp))
-    call.spec(gamma.spec(cp))
-    call.spec(beta.spec(cp))
-    call.f64(eps)
-    call.spec(out.t.spec(cp))
-    call.run()
-    _ = am.t.ptr
-    _ = ctx
-    ret_owned(rets, 0, out)
-    _bn_set_saved_stats(rets, mean, var_t, eps)
-
-
 def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     """`training=False` batch norm: one elementwise pass that also emits the
     two saved statistics torch's CUDA path fills (Normalization.cu:454)."""
@@ -1033,9 +939,6 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     _bn_param(var_t, a, channels, "batch norm running_var")
     if mean.stype != var_t.stype or gamma.stype != beta.stype:
         unsupported("batch norm: running statistics (and affine) must pair up")
-    if not _on_gpu(a):
-        _bn_inference_cpu(rets, a, gamma, beta, mean, var_t, eps)
-        return
     var inner = 1
     for i in range(2, a.rank):
         inner *= a.dim(i)
@@ -1118,73 +1021,6 @@ def _bn_update_running(running: T, batch: Owned, momentum: Float64) raises:
     _ = delta.t.h
 
 
-def _bn_training_cpu(
-    args: Values,
-    rets: Values,
-    a: T,
-    channels: Int,
-    has_w: Bool,
-    has_b: Bool,
-    has_mean: Bool,
-    momentum: Float64,
-    eps: Float64,
-) raises:
-    """The MAX CPU device's training route.
-
-    nn has no training kernel, so the whole forward is composed through
-    the dispatcher, the way tmb/ops/composed.mojo builds the batch norm BACKWARD:
-    per-channel statistics over every dim but 1, then
-    `(x - mean) * rsqrt(var + eps) * weight + bias`. Reduced precision
-    accumulates in float32 (ATen's `opmath_t`, and what the accelerator
-    kernel does) and rounds once, at the final cast.
-    """
-    var rank = a.rank
-    if rank > 4:
-        # The broadcast binary kernels stop at rank 4; the accelerator kernel
-        # reduces any rank itself.
-        unsupported(
-            "training batch norm of rank > 4 on the CPU device (the"
-            " accelerator kernel takes any rank)"
-        )
-    var n = a.numel // channels
-    if n < 2:
-        # ATen's unbiased running variance divides by N-1.
-        unsupported("training batch norm over a single sample")
-    var dims = List[Int64](capacity=rank - 1)
-    dims.append(0)
-    for i in range(2, rank):
-        dims.append(Int64(i))
-
-    var ain = _nn_hold(a)
-    var af = _nn_cast(ain, ST_FLOAT32)
-    var total = _nn_sum_dims(af, dims)
-    var mean = _nn_div_scalar(total, Float64(n))
-    var mean_b = _nn_channel_view(mean, rank)
-    var centered = _nn_sub(af, mean_b)
-    var squared = _nn_mul(centered, centered)
-    var sq_total = _nn_sum_dims(squared, dims)
-    # Biased (divided by N), which is what the normalization uses; the
-    # running variance takes the unbiased one below.
-    var variance = _nn_div_scalar(sq_total, Float64(n))
-    var shifted = _nn_add_scalar(variance, eps)
-    var invstd = _nn_rsqrt(shifted)
-    var invstd_b = _nn_channel_view(invstd, rank)
-    var normed = _nn_mul(centered, invstd_b)
-    var scaled = _bn_affine_step(args, normed, 1, rank, has_w, True)
-    var biased = _bn_affine_step(args, scaled, 2, rank, has_b, False)
-    var out = _nn_cast(biased, a.stype)
-
-    if has_mean:
-        _bn_update_running(v_tensor(args[unsafe_offset=3]), mean, momentum)
-        var unbiased = _nn_div_scalar(variance, Float64(n - 1) / Float64(n))
-        _bn_update_running(v_tensor(args[unsafe_offset=4]), unbiased, momentum)
-    # float32 statistics whatever the input dtype is, like the accelerator
-    # kernel and `at::acc_type`.
-    ret_owned(rets, 0, out)
-    ret_owned(rets, 1, mean)
-    ret_owned(rets, 2, invstd)
-
-
 def _bn_training(args: Values, rets: Values) raises:
     """`aten::native_batch_norm` with `training=True`: per-channel statistics
     over N*HxW, ATen's running-stat update, then the elementwise pass."""
@@ -1232,11 +1068,6 @@ def _bn_training(args: Values, rets: Values) raises:
         stat_dtype = m.dtype
         mean_ptr = m.ptr
         var_ptr = v.ptr
-    if not _on_gpu(a):
-        _bn_training_cpu(
-            args, rets, a, channels, has_w, has_b, has_mean, momentum, eps
-        )
-        return
     var hxw = 1
     for i in range(2, a.rank):
         hxw *= a.dim(i)
@@ -1368,78 +1199,33 @@ def op_native_group_norm(
     var mean = own(new_tensor(stats, 2, ST_FLOAT32, a.device))
     var rstd = own(new_tensor(stats, 2, ST_FLOAT32, a.device))
     var ctx = ctx_for(a.device)
-    if _on_gpu(a):
-        var call = KernelCall("normalization_forward", "GroupNormForward")
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, gamma_dtype)
-        call.arg_dtype(2, beta_dtype)
-        call.out_dtype_i(0, out.t.dtype)
-        call.out_dtype_i(1, DType.float32)
-        call.out_dtype_i(2, DType.float32)
-        call.flag("HAS_WEIGHT", 1 if has_w else 0)
-        call.flag("HAS_BIAS", 1 if has_b else 0)
-        call.int(out.t.ptr)
-        call.int(mean.t.ptr)
-        call.int(rstd.t.ptr)
-        call.int(am.t.ptr)
-        call.int(gamma_ptr)
-        call.int(beta_ptr)
-        call.int(rows)
-        call.int(cols)
-        call.f64(eps)
-        call.int(1 if has_w else 0)
-        call.int(1 if has_b else 0)
-        call.int(hxw)
-        call.int(cpg)
-        call.int(group)
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = am.t.ptr
-        _ = len(keep)
-    else:
-        var ones = own(_filled(a, c, 1.0))
-        var zeros = own(_filled(a, c, 0.0))
-        if not has_w:
-            gamma_ptr = ones.t.ptr
-        if not has_b:
-            beta_ptr = zeros.t.ptr
-        # `fill_value` writes the two synthesized parameters with
-        # `DeviceContext.enqueue_memset`, which the MAX *CPU* context queues,
-        # while the nn kernel below runs inline on this thread: without
-        # this drain the kernel reads uninitialized gamma/beta about one call
-        # in ten (measured). Accelerators order both on the same stream and
-        # never reach this branch.
-        ctx.synchronize()
-        var call = KernelCall("nn", "GroupNorm")
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, gamma_dtype)
-        call.arg_dtype(2, beta_dtype)
-        call.out_dtype_i(0, out.t.dtype)
-        call.out_dtype_i(1, DType.float32)
-        call.out_dtype_i(2, DType.float32)
-        call.flag("HAS_WEIGHT", 1 if has_w else 0)
-        call.flag("HAS_BIAS", 1 if has_b else 0)
-        call.int(out.t.ptr)
-        call.int(mean.t.ptr)
-        call.int(rstd.t.ptr)
-        call.int(am.t.ptr)
-        call.int(gamma_ptr)
-        call.int(beta_ptr)
-        var params = List[Int]()
-        params.append(_f64_slot(eps))
-        params.append(rows)
-        params.append(cols)
-        params.append(hxw)
-        params.append(group)
-        params.append(cpg)
-        call.tuple(params)
-        call.int(dtype_code(a.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = am.t.ptr
-        _ = len(keep)
-        _ = ones.t.ptr
-        _ = zeros.t.ptr
+    var call = KernelCall("normalization_forward", "GroupNormForward")
+    call.arg_dtype(0, a.dtype)
+    call.arg_dtype(1, gamma_dtype)
+    call.arg_dtype(2, beta_dtype)
+    call.out_dtype_i(0, out.t.dtype)
+    call.out_dtype_i(1, DType.float32)
+    call.out_dtype_i(2, DType.float32)
+    call.flag("HAS_WEIGHT", 1 if has_w else 0)
+    call.flag("HAS_BIAS", 1 if has_b else 0)
+    call.int(out.t.ptr)
+    call.int(mean.t.ptr)
+    call.int(rstd.t.ptr)
+    call.int(am.t.ptr)
+    call.int(gamma_ptr)
+    call.int(beta_ptr)
+    call.int(rows)
+    call.int(cols)
+    call.f64(eps)
+    call.int(1 if has_w else 0)
+    call.int(1 if has_b else 0)
+    call.int(hxw)
+    call.int(cpg)
+    call.int(group)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = am.t.ptr
+    _ = len(keep)
     _ = ctx
     ret_owned(rets, 0, out)
     ret_owned(rets, 1, mean)

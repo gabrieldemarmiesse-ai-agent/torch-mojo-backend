@@ -3,9 +3,6 @@
 # cuDNN. Convolution is lowered to (batched) im2col + the pure-Mojo GEMM in
 # `matmul`: the torch (K, C, R, S) weight is used as-is (the im2col row
 # order matches its reduction order) and the matmul output is already NCHW.
-#
-# Both GPU and CPU MAX devices are supported: `_parallel_for` runs the
-# `elementwise` framework on the host when `ctx.api() == "cpu"`.
 # ===----------------------------------------------------------------------=== #
 
 from std.os import abort

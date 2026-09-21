@@ -3,8 +3,7 @@
 MAX's DeviceEvent can be recorded, waited on and synchronized but not queried
 or timed, so the two things torch.Event needs beyond ordering come from the
 CUDA / HIP driver on the CUstream / hipStream_t behind each MAX stream. Metal
-and the CPU device have no driver here; device.mojo answers those from host
-clocks instead.
+has no driver here; device.mojo raises instead of answering those requests.
 """
 from std.ffi import OwnedDLHandle, external_call
 

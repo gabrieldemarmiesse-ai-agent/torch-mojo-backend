@@ -54,15 +54,15 @@ _Previous = TypeVar("_Previous")
 
 @functools.cache
 def accelerator_api() -> str:
-    """ "cuda", "hip", "metal" or "cpu": what MAX drives on this machine."""
+    """ "cuda", "hip" or "metal": what MAX drives on this machine, or "cpu"
+    if it has no accelerator at all."""
     from torch_mojo_backend.torch_compile_backend.utils import (  # noqa: PLC0415 -- imports max.driver; keep it off the import path
         get_accelerators,
     )
 
-    for d in get_accelerators():
-        api = getattr(d, "api", "")
-        if api != "cpu":
-            return str(api)
+    accelerators = get_accelerators()
+    if accelerators:
+        return str(getattr(accelerators[0], "api", ""))
     return "cpu"
 
 
