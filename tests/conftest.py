@@ -30,7 +30,7 @@ compiler.paths_to_mojo_kernels[0] = _build_mojo_source_package(
 )
 
 
-@pytest.fixture(params=["cpu", "cuda"])
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
 def device(request, cuda_available: bool):
     device_name = request.param
     if not cuda_available and device_name == "cuda":

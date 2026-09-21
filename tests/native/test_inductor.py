@@ -15,6 +15,8 @@ from torch_mojo_backend.native import (
     device_module,  # noqa: E402 -- `torch.mojo` itself, under a name ty can resolve
 )
 
+pytestmark = pytest.mark.cpu_torch
+
 
 @pytest.fixture
 def mojo_inductor(mojo_gpu):

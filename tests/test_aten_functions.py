@@ -1,9 +1,10 @@
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import pytest
 import torch
 import torch.nn.functional
+from max.experimental import functional as F
 from max.experimental.tensor import Tensor as MaxEagerTensor
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
@@ -664,19 +665,70 @@ def test_aten_acos_single_element(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["abs", "ceil", "erf", "exp", "floor", "log", "rsqrt", "sign", "silu", "tan"],
+SHARED_ELEMENTWISE_KINDS = (
+    "abs",
+    "ceil",
+    "erf",
+    "exp",
+    "floor",
+    "log",
+    "rsqrt",
+    "sign",
+    "silu",
+    "tan",
 )
+
+
+# TODO: Make this a normal parametrized test once
+# https://github.com/modular/modular/issues/7167 is fixed
+def run_shared_elementwise_kinds(
+    kinds: Sequence[str], x: torch.Tensor, mode: str
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+    """Run every kind in ONE MAX graph and return (kind, actual, expected).
+
+    Loading a MAX graph costs over a second even on a warm cache, so a test
+    per kind pays that once per kind; one graph per test pays it once.
+    """
+    operators = []
+    implementations = []
+    checkers = []
+    for kind in kinds:
+        aten_kind = "gelu" if kind.startswith("gelu_") else kind
+        kwargs = (
+            {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
+        )
+        operators.append((getattr(aten, aten_kind).default, kwargs))
+        implementations.append(getattr(aten_functions, f"aten_{aten_kind}"))
+        checker = CallChecker()
+        checker.register(implementations[-1])
+        checkers.append(checker)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(op(x, **kwargs) for op, kwargs in operators)
+
+    if mode == "compile":
+        actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+    else:
+        with F.lazy():
+            max_x = MaxEagerTensor.from_dlpack(x)
+            lazy_outputs = [
+                implementation(max_x, **kwargs)
+                for implementation, (_, kwargs) in zip(implementations, operators)
+            ]
+        actual = tuple(torch.from_dlpack(output) for output in lazy_outputs)
+    for checker in checkers:
+        checker.check_was_called()
+    return list(zip(kinds, actual, fn(x)))
+
+
+def kind_message(kind: str) -> Callable[[str], str]:
+    return lambda message: f"{kind}: {message}"
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
-def test_aten_shared_elementwise(
-    kind: str, dtype: torch.dtype, mode: str, device: str, call_checker: CallChecker
-):
+def test_aten_shared_elementwise(dtype: torch.dtype, mode: str, device: str):
     """Both MAX value types use the shared math, including domains and SIMD tails."""
-    implementation = getattr(aten_functions, f"aten_{kind}")
-    call_checker.register(implementation)
-    op = getattr(aten, kind).default
     x = torch.tensor(
         [
             -float("inf"),
@@ -694,71 +746,56 @@ def test_aten_shared_elementwise(
         dtype=dtype,
         device=device,
     )
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x)
-    else:
-        actual = torch.from_dlpack(implementation(MaxEagerTensor.from_dlpack(x)))
-    expected = op(x)
-    torch.testing.assert_close(actual, expected, equal_nan=True)
-    # assert_close equates signed zeros; preserve the signs explicitly as well.
-    zeros = (expected == 0) & (actual == 0)
-    assert torch.equal(torch.signbit(actual[zeros]), torch.signbit(expected[zeros]))
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        SHARED_ELEMENTWISE_KINDS, x, mode
+    ):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
+        # assert_close equates signed zeros; preserve the signs explicitly as well.
+        zeros = (expected == 0) & (actual == 0)
+        assert torch.equal(
+            torch.signbit(actual[zeros]), torch.signbit(expected[zeros])
+        ), kind
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["abs", "ceil", "erf", "exp", "floor", "log", "rsqrt", "sign", "silu", "tan"],
-)
 @pytest.mark.parametrize("shape", [(), (0,), (357, 17)])
-def test_aten_shared_elementwise_compile_shapes(
-    kind: str, shape: tuple[int, ...], device: str, call_checker: CallChecker
-):
-    call_checker.register(getattr(aten_functions, f"aten_{kind}"))
-    op = getattr(aten, kind).default
+def test_aten_shared_elementwise_compile_shapes(shape: tuple[int, ...], device: str):
     x = torch.linspace(0.25, 1.25, math.prod(shape), device=device).reshape(shape)
-    compiled = torch.compile(op, backend=mojo_backend, fullgraph=True)
-    torch.testing.assert_close(compiled(x), op(x))
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        SHARED_ELEMENTWISE_KINDS, x, "compile"
+    ):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
 
 
-@pytest.mark.parametrize(
-    "kind", ["abs", "ceil", "floor", "sign", "erf", "exp", "log", "rsqrt", "tan"]
-)
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
-def test_aten_shared_elementwise_integer(
-    kind: str, mode: str, call_checker: CallChecker
-):
-    implementation = getattr(aten_functions, f"aten_{kind}")
-    call_checker.register(implementation)
-    op = getattr(aten, kind).default
+def test_aten_shared_elementwise_integer(mode: str):
+    kinds = ["abs", "ceil", "floor", "sign", "erf", "exp", "log", "rsqrt", "tan"]
     x = torch.tensor([-3, -1, 0, 1, 3], dtype=torch.int64)
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x)
-    else:
-        actual = torch.from_dlpack(implementation(MaxEagerTensor.from_dlpack(x)))
-    torch.testing.assert_close(actual, op(x), equal_nan=True)
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
 
 
-@pytest.mark.parametrize("kind", ["erf", "exp", "log", "rsqrt", "tan", "sign"])
-def test_aten_shared_elementwise_bool(kind: str, call_checker: CallChecker):
-    call_checker.register(getattr(aten_functions, f"aten_{kind}"))
-    op = getattr(aten, kind).default
+def test_aten_shared_elementwise_bool():
+    kinds = ["erf", "exp", "log", "rsqrt", "tan", "sign"]
     x = torch.tensor([False, True])
-    compiled = torch.compile(op, backend=mojo_backend, fullgraph=True)
-    torch.testing.assert_close(compiled(x), op(x))
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, "compile"):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
 
 
-@pytest.mark.parametrize("kind", ["erf", "exp", "log", "rsqrt", "tan"])
-def test_aten_shared_elementwise_default_dtype(kind: str, call_checker: CallChecker):
-    call_checker.register(getattr(aten_functions, f"aten_{kind}"))
-    op = getattr(aten, kind).default
+def test_aten_shared_elementwise_default_dtype():
+    kinds = ["erf", "exp", "log", "rsqrt", "tan"]
     x = torch.tensor([1, 2, 3], dtype=torch.int32)
     original = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.float64)
-        compiled = torch.compile(op, backend=mojo_backend, fullgraph=True)
-        torch.testing.assert_close(compiled(x), op(x))
+        results = run_shared_elementwise_kinds(kinds, x, "compile")
     finally:
         torch.set_default_dtype(original)
+    for kind, actual, expected in results:
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
 
 
 def test_aten_shared_elementwise_dynamic_strides(
@@ -777,9 +814,10 @@ def test_aten_shared_elementwise_dynamic_strides(
         torch.testing.assert_close(compiled(x), fn(x))
 
 
-@pytest.mark.parametrize(
-    "kind",
-    [
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_remaining(dtype: torch.dtype, mode: str, device: str):
+    kinds = [
         "acos",
         "asinh",
         "atanh",
@@ -797,94 +835,61 @@ def test_aten_shared_elementwise_dynamic_strides(
         "tanh",
         "gelu_none",
         "gelu_tanh",
-    ],
-)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("mode", ["compile", "max_eager"])
-def test_aten_shared_elementwise_remaining(
-    kind: str, dtype: torch.dtype, mode: str, device: str, call_checker: CallChecker
-):
-    aten_kind = "gelu" if kind.startswith("gelu_") else kind
-    implementation = getattr(aten_functions, f"aten_{aten_kind}")
-    call_checker.register(implementation)
-    kwargs = {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
-    op = getattr(aten, aten_kind).default
+    ]
     x = torch.linspace(0.125, 0.875, 23, dtype=dtype, device=device)
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x, **kwargs)
-    else:
-        actual = torch.from_dlpack(
-            implementation(MaxEagerTensor.from_dlpack(x), **kwargs)
-        )
-    torch.testing.assert_close(actual, op(x, **kwargs))
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
 
 
-@pytest.mark.parametrize("kind", ["isnan", "logical_not"])
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.bool]
 )
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
-def test_aten_shared_elementwise_predicate(
-    kind: str, dtype: torch.dtype, mode: str, device: str, call_checker: CallChecker
-):
-    implementation = getattr(aten_functions, f"aten_{kind}")
-    call_checker.register(implementation)
-    op = getattr(aten, kind).default
+def test_aten_shared_elementwise_predicate(dtype: torch.dtype, mode: str, device: str):
     values = [0.0, 1.0, -1.0, 0.0, 2.0]
     if dtype.is_floating_point:
         values += [float("nan"), float("inf"), -float("inf"), -0.0]
     x = torch.tensor(values, dtype=dtype, device=device)
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x)
-    else:
-        actual = torch.from_dlpack(implementation(MaxEagerTensor.from_dlpack(x)))
-    torch.testing.assert_close(actual, op(x))
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        ["isnan", "logical_not"], x, mode
+    ):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
 
 
-@pytest.mark.parametrize("kind", ["relu", "asinh"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 def test_aten_shared_elementwise_activation_edges(
-    kind: str, dtype: torch.dtype, mode: str, device: str, call_checker: CallChecker
+    dtype: torch.dtype, mode: str, device: str
 ):
-    implementation = getattr(aten_functions, f"aten_{kind}")
-    call_checker.register(implementation)
-    op = getattr(aten, kind).default
     x = torch.tensor(
         [-float("inf"), -2.0, -0.0, 0.0, 2.0, float("inf"), float("nan")],
         dtype=dtype,
         device=device,
     )
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x)
-    else:
-        actual = torch.from_dlpack(implementation(MaxEagerTensor.from_dlpack(x)))
-    expected = op(x)
-    torch.testing.assert_close(actual, expected, equal_nan=True)
-    zeros = expected == 0
-    # PyTorch CUDA relu returns +0 for -0, while CPU preserves -0. The shared
-    # expression preserves the CPU convention on every device.
-    expected_signs = torch.signbit(op(x.cpu())).to(device)
-    assert torch.equal(torch.signbit(actual[zeros]), expected_signs[zeros])
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        ["relu", "asinh"], x, mode
+    ):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
+        zeros = expected == 0
+        # PyTorch CUDA relu returns +0 for -0, while CPU preserves -0. The shared
+        # expression preserves the CPU convention on every device.
+        expected_signs = torch.signbit(getattr(aten, kind).default(x.cpu())).to(device)
+        assert torch.equal(torch.signbit(actual[zeros]), expected_signs[zeros]), kind
 
 
 @pytest.mark.parametrize(
-    "kind, dtype", [("ceil", torch.int64), ("floor", torch.int64), ("sign", torch.bool)]
+    "kinds, dtype", [(["ceil", "floor"], torch.int64), (["sign"], torch.bool)]
 )
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 def test_aten_shared_elementwise_identity_allocation(
-    kind: str, dtype: torch.dtype, mode: str, call_checker: CallChecker
+    kinds: list[str], dtype: torch.dtype, mode: str
 ):
-    implementation = getattr(aten_functions, f"aten_{kind}")
-    call_checker.register(implementation)
-    op = getattr(aten, kind).default
     x = torch.tensor([0, 1, 2], dtype=dtype)
-    if mode == "compile":
-        actual = torch.compile(op, backend=mojo_backend, fullgraph=True)(x)
-    else:
-        actual = torch.from_dlpack(implementation(MaxEagerTensor.from_dlpack(x)))
-    torch.testing.assert_close(actual, op(x))
-    assert actual.data_ptr() != x.data_ptr()
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+        assert actual.data_ptr() != x.data_ptr(), kind
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -989,6 +994,7 @@ def test_aten_shared_elementwise_batch(dtype: torch.dtype, device: str):
                 "gelu_tanh",
             ),
             id="gpu",
+            marks=pytest.mark.cuda,
         ),
         pytest.param("cpu", ("exp", "tanh", "cosh"), id="cpu"),
     ],
@@ -1044,6 +1050,7 @@ def test_aten_shared_elementwise_special_batch(
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_log1p_near_zero(
     mode: str, dtype: torch.dtype, cuda_available: bool
 ):
@@ -1074,6 +1081,7 @@ def test_aten_shared_elementwise_log1p_near_zero(
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: bool):
     if not cuda_available:
         pytest.skip("CUDA not available")
@@ -1112,6 +1120,7 @@ def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: boo
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.bool, torch.int64])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_acos_gpu_integer_default_float64(
     mode: str, dtype: torch.dtype, cuda_available: bool
 ):

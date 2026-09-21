@@ -33,6 +33,7 @@ def setup_mojo_device():
     register_mojo_devices()
 
 
+@pytest.mark.gpu
 def test_indexless_mojo_device_uses_current_device():
     if device_module.device_count() < 2:
         pytest.skip("requires two GPUs")
@@ -61,6 +62,7 @@ def test_mojo_rng_state_round_trips_a_high_bit_seed(mojo_device):
     torch.testing.assert_close(device_module.get_rng_state(device), state)
 
 
+@pytest.mark.gpu
 def test_mojo_rng_state_is_per_device():
     """Seeding one Mojo device's generator does not perturb another's."""
     if device_module.device_count() < 2:
