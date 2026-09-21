@@ -131,8 +131,6 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      # Two L4 runners: at most one suite per runner.
-      max-parallel: 2
       matrix:
         include:
           - suite: cuda
