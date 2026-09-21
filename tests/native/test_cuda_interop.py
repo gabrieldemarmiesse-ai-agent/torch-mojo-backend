@@ -8,8 +8,8 @@ mojo current stream really does order a torch.cuda kernel with ours. They also
 pin the contract that binds the two -- an alias carries no ordering of its
 own, so it is refused outside an `on_mojo_stream()` block for its own device.
 
-Every test needs a CUDA build of torch whose driver initializes, so the whole
-module skips on the CPU wheel the project normally uses.
+Device tests need a CUDA build of torch whose driver initializes. The argument
+validation test also runs on CPU-only CI.
 """
 
 import inspect
@@ -26,13 +26,11 @@ from torch_mojo_backend import cuda_interop
 # the module object here to keep the file legible to the type checker.
 from torch_mojo_backend.native import device_module as mojo
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a working CUDA build of torch"
-)
-
 
 @pytest.fixture
-def gpu(mojo_gpu):
+def gpu(mojo_gpu: str) -> str:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a working CUDA build of torch")
     return mojo_gpu
 
 
