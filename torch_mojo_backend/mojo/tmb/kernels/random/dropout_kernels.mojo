@@ -210,8 +210,6 @@ def enqueue_native_dropout[
     comptime ACC = _acc[dtype]()
     if numel <= 0:
         return
-    if ctx.api() == "cpu":
-        raise Error("native_dropout runs on the GPU device only")
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
         raise Error("float64 is not supported on Apple GPU")
     else:
@@ -305,8 +303,6 @@ def enqueue_native_dropout_backward[
     comptime ACC = _acc[dtype]()
     if numel <= 0:
         return
-    if ctx.api() == "cpu":
-        raise Error("native_dropout_backward runs on the GPU device only")
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
         raise Error("float64 is not supported on Apple GPU")
     else:

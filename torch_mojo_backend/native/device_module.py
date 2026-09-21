@@ -128,8 +128,8 @@ def empty_cache():
 def mem_get_info(device: int | str | torch.device | None = None) -> tuple[int, int]:
     """MAX's reported (free, total) bytes, separate from our storage counters.
 
-    The MAX CPU device reports host memory. A device whose MAX runtime cannot
-    supply capacity raises explicitly rather than returning fabricated zeros.
+    A device whose MAX runtime cannot supply capacity raises explicitly
+    rather than returning fabricated zeros.
     """
     _require_memory_binding("_accelerator_getMemoryInfo", minimum_version="2.10")
     return torch._C._accelerator_getMemoryInfo(_index(device))
@@ -187,7 +187,6 @@ class MojoDeviceProperties:
     regs_per_multiprocessor: int | None
     gcnArchName: str | None
     api: str
-    is_cpu: bool
     arch_name: str | None
     max_threads_per_block: int | None
     regs_per_block: int | None
@@ -202,9 +201,9 @@ class MojoDeviceProperties:
 def get_device_properties(
     device: int | str | torch.device | None = None,
 ) -> MojoDeviceProperties:
-    """Properties cached per device in Mojo, including the MAX CPU device."""
+    """Properties cached per device in Mojo."""
     idx = _index(device)
-    values = (ctypes.c_int64 * 16)()
+    values = (ctypes.c_int64 * 15)()
     text = ctypes.create_string_buffer(4096)
     fn = native.shim().tmb_device_properties
     fn.argtypes = [
@@ -235,7 +234,6 @@ def get_device_properties(
         regs_per_multiprocessor=value(6),
         gcnArchName=(arch or None) if api == "hip" else None,
         api=api,
-        is_cpu=bool(values[15]),
         arch_name=arch or None,
         max_threads_per_block=value(7),
         regs_per_block=value(8),
@@ -365,11 +363,6 @@ def _is_in_bad_fork() -> bool:
 
 def device_count() -> int:
     return native.device_count()
-
-
-def cpu() -> torch.device:
-    """The MAX CPU device is the last mojo index."""
-    return torch.device(f"mojo:{device_count() - 1}")
 
 
 def current_device() -> int:

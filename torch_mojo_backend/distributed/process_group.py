@@ -196,11 +196,12 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._coalesced_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         # Communicator creation is collective: do it now, while every rank is
         # here, on the rank's current device (one visible GPU per torchrun rank).
-        # A machine with no accelerator (the MAX CPU pseudo-device is current)
-        # gets no communicator: only the gloo delegation for CPU tensors works.
-        current = device_module.current_device()
-        if device_module.get_device_properties(current).api in ("cuda", "hip"):
-            self._ensure(current)
+        # A machine with no mojo device at all gets no communicator: only the
+        # gloo delegation for CPU tensors works.
+        if device_module.device_count() > 0:
+            current = device_module.current_device()
+            if device_module.get_device_properties(current).api in ("cuda", "hip"):
+                self._ensure(current)
 
     @functools.cached_property
     def _core(self) -> _Core:
@@ -278,10 +279,6 @@ class MojoProcessGroup(dist.ProcessGroup):
         if tensor.device.type != "mojo":
             raise ValueError(
                 f"the mojo distributed backend handles mojo and cpu tensors, got {tensor.device}"
-            )
-        if tensor.device == device_module.cpu():
-            raise NotImplementedError(
-                "collectives on the MAX CPU device are not supported: use plain CPU tensors (gloo) or a GPU"
             )
         return False
 
