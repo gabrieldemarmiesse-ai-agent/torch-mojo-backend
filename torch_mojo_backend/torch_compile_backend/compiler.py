@@ -21,6 +21,7 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
+    CURRENT_ARG_RESOLVER,
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
     MAPPING_TORCH_ATEN_TO_MOJO,
@@ -308,9 +309,11 @@ class _GraphFactory:
         try:
             mapping_func = MAPPING_TORCH_ATEN_TO_MOJO[key]
             token = CURRENT_FX_NODE.set(node)
+            resolver_token = CURRENT_ARG_RESOLVER.set(self.tensor_book.convert_to_max)
             try:
                 func_output = mapping_func(*func_args, **func_kwargs)
             finally:
+                CURRENT_ARG_RESOLVER.reset(resolver_token)
                 CURRENT_FX_NODE.reset(token)
         except Exception as e:
             raise MojoCompilerError(

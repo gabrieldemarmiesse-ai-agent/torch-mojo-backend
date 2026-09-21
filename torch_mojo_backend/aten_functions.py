@@ -24,7 +24,7 @@ from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
 from max.graph import Dim, StaticDim, TensorValue
-from max.graph.type import DeviceRef
+from max.graph.type import DeviceKind, DeviceRef
 from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu
 from torch._decomp import core_aten_decompositions
@@ -37,7 +37,7 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
-from torch_mojo_backend.flags import verbose_enabled
+from torch_mojo_backend.flags import compile_native_kernels_enabled, verbose_enabled
 from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
@@ -136,6 +136,115 @@ def _only_first_output_used() -> bool:
         return False
     return all(
         user.target is operator.getitem and user.args[1] == 0 for user in node.users
+    )
+
+
+# The compiler's fx-node -> MAX-value resolver (`TensorsBook.convert_to_max`),
+# set next to CURRENT_FX_NODE. Lets a mapping read a *different* MAX value for
+# one of its arguments than the one it was handed: `_transposed_source` looks
+# through an `aten.t` node so a Linear's `input @ weight.T` reaches the native
+# GEMM as the stored weight plus a transpose flag.
+CURRENT_ARG_RESOLVER: contextvars.ContextVar[
+    Callable[[torch.fx.Node], object] | None
+] = contextvars.ContextVar("CURRENT_ARG_RESOLVER", default=None)
+
+
+def _transposed_source(arg_index: int, rank: int) -> MaxTensor | None:
+    """The MAX value whose transpose of the two trailing dims is the current
+    node's `arg_index`-th argument, when that argument is such a transpose
+    (`aten.t`, `transpose` of the last two dims, the matching `permute`) of a
+    rank-`rank` tensor; else None.
+
+    MAX materializes a transposed producer before an opaque custom op, so a
+    GEMM handed `W.T` would copy the weight on every call; handed `W` and
+    `transpose_b=True` it reads the stored matrix, as the eager kernel does.
+    """
+    node = CURRENT_FX_NODE.get()
+    resolve = CURRENT_ARG_RESOLVER.get()
+    if node is None or resolve is None or arg_index >= len(node.args):
+        return None
+    arg = node.args[arg_index]
+    if not isinstance(arg, torch.fx.Node) or arg.op != "call_function":
+        return None
+    if arg.target is aten.t.default:
+        if rank != 2:
+            return None
+    elif arg.target is aten.transpose.int:
+        if len(arg.args) < 3:
+            return None
+        d0, d1 = arg.args[1], arg.args[2]
+        if not (isinstance(d0, int) and isinstance(d1, int)):
+            return None
+        if {d0 % rank, d1 % rank} != {rank - 2, rank - 1}:
+            return None
+    elif arg.target is aten.permute.default:
+        perm = arg.args[1] if len(arg.args) > 1 else None
+        if not isinstance(perm, list | tuple):
+            return None
+        if list(perm) != [*range(rank - 2), rank - 1, rank - 2]:
+            return None
+    else:
+        return None
+    source_node = arg.args[0]
+    if not isinstance(source_node, torch.fx.Node):
+        return None
+    source = resolve(source_node)
+    if not isinstance(source, TensorValue | MaxEagerTensor):
+        return None
+    if len(source.shape) != rank:
+        return None
+    return source
+
+
+# --- The eager kernels in the graph (custom_mojo_ops.native_*) --------------
+#
+# For the ops below, torch.compile calls the same Mojo kernels the mojo device
+# runs in eager mode (tmb/graph/gemm.mojo and nn.mojo) rather than MAX's own:
+# one set of kernels, one set of numerics, in both modes. They are accelerator
+# routes, so every operand has to sit on one GPU; anything else keeps the MAX
+# composition.
+
+_NATIVE_FLOAT_DTYPES = (DType.float32, DType.float16, DType.bfloat16)
+
+
+def _device_key(device: DeviceRef | max_driver.Device) -> tuple[str, int]:
+    """(kind, index) of a graph DeviceRef or an eager driver Device."""
+    if isinstance(device, DeviceRef):
+        return (str(device.device_type), device.id)
+    return (device.label, device.id)
+
+
+def _native_kernel_operands(*tensors: MaxTensor) -> bool:
+    """Whether these operands go to the eager kernels: the switch is on and
+    they share one accelerator. Dtypes are the caller's to check."""
+    if not compile_native_kernels_enabled() or not tensors:
+        return False
+    keys = {_device_key(t.device) for t in tensors}
+    if len(keys) != 1:
+        return False
+    return next(iter(keys))[0] == str(DeviceKind.GPU)
+
+
+def _tf32_allowed() -> bool:
+    """The numerics decision behind the TF32 GEMM bridge, taken the way
+    tmb/ops/matmul.mojo's `_tf32_enabled` takes it for eager mode: any setting
+    but torch's default "highest" allows it."""
+    return torch.get_float32_matmul_precision() != "highest"
+
+
+def _native_matmul(
+    a: MaxTensor, b: MaxTensor, bias: MaxTensor | None, *, mat2_arg_index: int
+) -> MaxTensor:
+    """`a @ b [+ bias]` on the eager GEMM ladder, reading a `b` the torch
+    program transposed (argument `mat2_arg_index` of the current node) as
+    the stored matrix plus a transpose flag."""
+    source = _transposed_source(mat2_arg_index, 2)
+    if source is not None and source.dtype == b.dtype:
+        return custom_mojo_ops.native_gemm(
+            a, source, bias, transpose_b=True, tf32=_tf32_allowed()
+        )
+    return custom_mojo_ops.native_gemm(
+        a, b, bias, transpose_b=False, tf32=_tf32_allowed()
     )
 
 
@@ -935,6 +1044,19 @@ def aten_softmax(
     if dim < 0:
         dim = len(input.shape) + dim
 
+    if (
+        len(input.shape) >= 1
+        and dim == len(input.shape) - 1
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and not (isinstance(input.shape[-1], StaticDim) and int(input.shape[-1]) == 0)
+        and _native_kernel_operands(input)
+    ):
+        # The eager `SoftmaxSpec` kernel over rows of the trailing dim (any
+        # other dim keeps the composition below; the eager op transposes).
+        cols = input.shape[-1]
+        rows = custom_mojo_ops.native_softmax_rows(F.reshape(input, [-1, cols]))
+        return F.reshape(rows, input.shape)
+
     # Manual implementation
     # Compute max along the specified axis for numerical stability, keeping dimensions
     x_max = aten_amax(input, dim=[dim], keepdim=True)
@@ -1185,6 +1307,24 @@ def aten_addmm(
     alpha: Scalar = 1.0,
 ) -> MaxTensor:
     # addmm computes: beta * input + alpha * mat1 @ mat2
+    if (
+        alpha == 1.0
+        and beta == 1.0
+        and len(mat1.shape) == 2
+        and len(mat2.shape) == 2
+        and mat1.dtype == mat2.dtype
+        and mat1.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(input, mat1, mat2)
+    ):
+        # tmb/ops/matmul.mojo's `_bias_fits`: one row of n in the operands' dtype
+        # is fused into the GEMM; any other broadcastable `self` is added after.
+        fused = (
+            len(input.shape) == 1
+            and input.shape[0] == mat2.shape[1]
+            and input.dtype == mat1.dtype
+        )
+        result = _native_matmul(mat1, mat2, input if fused else None, mat2_arg_index=2)
+        return result if fused else operator.add(input, result)
     matmul_result = operator.matmul(mat1, mat2)
 
     # Apply scaling factors
@@ -1626,6 +1766,21 @@ def aten_bmm(input: MaxTensor, mat2: MaxTensor) -> MaxTensor:
     Returns:
         3D tensor of shape [batch_size, n, p]
     """
+    if (
+        len(input.shape) == 3
+        and len(mat2.shape) == 3
+        and input.dtype == mat2.dtype
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(input, mat2)
+    ):
+        source = _transposed_source(1, 3)
+        if source is not None and source.dtype == mat2.dtype:
+            return custom_mojo_ops.native_bmm(
+                input, source, transpose_b=True, tf32=_tf32_allowed()
+            )
+        return custom_mojo_ops.native_bmm(
+            input, mat2, transpose_b=False, tf32=_tf32_allowed()
+        )
     # MAX's matmul handles batch dimensions automatically through broadcasting
     return F.matmul(input, mat2)
 
@@ -2018,6 +2173,18 @@ def aten_embedding(
     sparse: bool = False,
 ) -> MaxTensor:
     # For some reason with aten, input and weight are inverted.
+    table, indices = input, weight
+    if (
+        not scale_grad_by_freq
+        and len(table.shape) == 2
+        and table.dtype in _NATIVE_FLOAT_DTYPES
+        and indices.dtype in (DType.int32, DType.int64)
+        and _native_kernel_operands(table, indices)
+    ):
+        # The eager `Gather0` kernel over the flattened indices. padding_idx
+        # only shapes the backward; the forward reads that row like any other.
+        rows = custom_mojo_ops.native_embedding(table, F.reshape(indices, [-1]))
+        return F.reshape(rows, [*indices.shape, table.shape[1]])
     return torch_embedding_equivalent(
         weight,
         input,
@@ -2860,6 +3027,14 @@ def aten_minimum(x: MaxTensor, y: MaxTensor) -> MaxTensor:
 # mm(Tensor self, Tensor mat2) -> Tensor
 @map_to(aten.mm)
 def aten_mm(x: MaxTensor, y: MaxTensor) -> MaxTensor:
+    if (
+        len(x.shape) == 2
+        and len(y.shape) == 2
+        and x.dtype == y.dtype
+        and x.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(x, y)
+    ):
+        return _native_matmul(x, y, None, mat2_arg_index=1)
     return operator.matmul(x, y)
 
 
@@ -3075,6 +3250,33 @@ def aten_native_layer_norm(
     bias: MaxTensor | None,
     eps: float,
 ) -> tuple[MaxTensor, MaxTensor | None, MaxTensor | None]:
+    k = len(normalized_shape)
+    if (
+        weight is not None
+        and bias is not None
+        and 1 <= k <= len(input.shape)
+        and input.dtype == weight.dtype == bias.dtype
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and all(isinstance(d, StaticDim) for d in input.shape[-k:])
+        and _native_kernel_operands(input, weight, bias)
+    ):
+        # The eager `LayerNormForward` kernel over rows of the normalized
+        # dims, returning the float32 statistics ATen's accelerator kernel
+        # returns (so a backward graph can consume them too).
+        cols = math.prod(int(d) for d in input.shape[-k:])
+        if cols > 0:
+            out, mean, rstd = custom_mojo_ops.native_layer_norm(
+                F.reshape(input, [-1, cols]),
+                F.reshape(weight, [cols]),
+                F.reshape(bias, [cols]),
+                eps,
+            )
+            stats_shape = [*input.shape[:-k], *([1] * k)]
+            return (
+                F.reshape(out, input.shape),
+                F.reshape(mean, stats_shape),
+                F.reshape(rstd, stats_shape),
+            )
     # Fused MAX kernel for the common last-dim case. The two aten_mean
     # reductions below lower to a generic reduction kernel that costs
     # ~150us per launch on GPU (7.5ms/step on gpt2 decode, 73% of GPU

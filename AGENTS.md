@@ -231,6 +231,19 @@ feed it:
 
 Use the type hint `MaxTensor = TensorValue | MaxEagerTensor` for tensor parameters.
 
+When the op already has a mojo-device kernel (Step 7) and it is one the
+graph should run too, do not re-compose it from MAX ops: register the eager
+kernel as a MAX custom op in `tmb/graph/` (`gemm.mojo`, `nn.mojo`), wrap it
+in `custom_mojo_ops.native_<name>`, and route to it from `aten_functions.py`
+when every operand sits on one GPU (see `_native_matmul` and
+`docs/mojo_extensions.md`, "The eager kernels in the graph backend"). Call
+the kernel's comptime-dtype entry point, never a `_spec_*` / runtime-dtype
+dispatcher: those read `-D` defines a MAX-compiled package does not have.
+Import it from a module without the family's `@export tmb_call` (one graph
+may import that symbol once; `tmb/kernels/matmul/entry.mojo` already does),
+moving the kernel into a sibling `tmb/kernels/<family>/<name>_kernels.mojo`
+if it lives in the entry module.
+
 Example implementation:
 ```python
 # aten::_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
