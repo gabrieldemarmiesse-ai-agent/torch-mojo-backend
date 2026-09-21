@@ -1,6 +1,11 @@
 """Repo-root pytest hooks.
 
-CI shards the whole suite 40 ways with `pytest-split` (`--splits 40 --group N`).
+CI selects CPU tests with `-m 'not gpu'` and GPU tests with `-m gpu`.
+GPU requirements are inferred from the shared device fixtures, including
+transitive dependencies; tests managing their own devices use an explicit
+`pytest.mark.gpu`. Parametrized CPU/CUDA fixtures mark only the CUDA case.
+
+CI shards the CPU selection 40 ways with `pytest-split` (`--splits 40 --group N`).
 pytest-split has no durations file, so it falls back to cutting the *collection
 order* into 40 equal-count chunks -- and collection order is the worst possible
 order to cut, because cost is clustered in it: a file's tests, and above all the
@@ -35,18 +40,45 @@ SHARD_DEAL_SEED = 20260915
 
 _COLLECTION_INDEX = pytest.StashKey[int]()
 
+# These fixtures require an accelerator, even when they skip because none
+# was found. Never classify by hardware availability: both CI pools must
+# collect the same partition on machines with and without a GPU.
+_GPU_FIXTURES = frozenset(
+    {
+        "mojo_gpu",
+        "mojo_device",
+        "mojo_gpu_available",
+        "mojo_pair",
+        "two_gpus",
+        "mojo_h100",
+        "cuda_device",
+    }
+)
+
 
 def _sharding(config: pytest.Config) -> bool:
     """Is this run one shard of a pytest-split run?"""
     return getattr(config.option, "splits", None) is not None
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]):
-    """Deal the tests out before pytest-split cuts them into chunks.
+    """Mark device requirements before `-m` filtering, then deal the shards.
 
     pytest-split's own hook is `trylast`, so this one runs first and it chunks
-    the dealt order. Un-sharded runs are left alone entirely.
+    the dealt order. Un-sharded runs keep their original order.
     """
+    for item in items:
+        if isinstance(item, pytest.Function) and _GPU_FIXTURES.intersection(
+            item.fixturenames
+        ):
+            item.add_marker(pytest.mark.gpu)
+        # CUDA graph tests need a process without PrivateUse1 registration;
+        # CPU-torch integration tests need a different torch wheel, but still
+        # execute on the GPU. Both belong to the GPU partition.
+        if item.get_closest_marker("cuda") is not None:
+            item.add_marker(pytest.mark.gpu)
+
     if not _sharding(config):
         return
     for index, item in enumerate(items):

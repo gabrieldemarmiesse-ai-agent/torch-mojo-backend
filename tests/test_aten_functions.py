@@ -989,6 +989,7 @@ def test_aten_shared_elementwise_batch(dtype: torch.dtype, device: str):
                 "gelu_tanh",
             ),
             id="gpu",
+            marks=pytest.mark.cuda,
         ),
         pytest.param("cpu", ("exp", "tanh", "cosh"), id="cpu"),
     ],
@@ -1044,6 +1045,7 @@ def test_aten_shared_elementwise_special_batch(
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_log1p_near_zero(
     mode: str, dtype: torch.dtype, cuda_available: bool
 ):
@@ -1074,6 +1076,7 @@ def test_aten_shared_elementwise_log1p_near_zero(
 
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: bool):
     if not cuda_available:
         pytest.skip("CUDA not available")
@@ -1112,6 +1115,7 @@ def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: boo
 
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.bool, torch.int64])
+@pytest.mark.cuda
 def test_aten_shared_elementwise_acos_gpu_integer_default_float64(
     mode: str, dtype: torch.dtype, cuda_available: bool
 ):
