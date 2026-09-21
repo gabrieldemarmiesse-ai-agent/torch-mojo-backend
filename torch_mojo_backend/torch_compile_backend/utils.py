@@ -2,7 +2,7 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 
 import torch
-from max.driver import CPU, Accelerator, Device, accelerator_count
+from max.driver import Accelerator, Device, accelerator_count
 
 from torch_mojo_backend import _ptxas
 
@@ -10,7 +10,7 @@ from torch_mojo_backend import _ptxas
 def get_accelerators() -> list[Device]:
     # MAX refuses a device outright when its assembler does not match the
     # driver ("Your current NVIDIA GPU driver version is not supported"), and
-    # the warning below would then leave the user on the CPU with no idea why.
+    # the warning below would then leave the user with no idea why.
     _ptxas.check()
     result = []
     if accelerator_count() > 0:
@@ -21,9 +21,6 @@ def get_accelerators() -> list[Device]:
                 warnings.warn(
                     f"Failed to create accelerator {i}. {e}" + _ptxas.diagnose(str(e))
                 )
-    # This way, people can do torch.device("mojo:0") even if there is
-    # no accelerator and get gpu or cpu automatically.
-    result.append(CPU())
     return result
 
 

@@ -241,10 +241,6 @@ def tmb_pg_init_device(
             if pg[].comms.find(Int(device)):
                 raise Error("mojo:", device, " already has a communicator")
             var d = dev(Int(device))
-            if d[].is_cpu:
-                raise Error(
-                    "the mojo process group needs an accelerator device"
-                )
             var sid = _add_stream(d, 0)
             var raw = d[].raw[sid]
             if raw == 0:

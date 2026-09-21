@@ -33,10 +33,8 @@ def device(request, cuda_available: bool):
 @pytest.fixture(
     params=[
         # Enable when pytorch supports it
-        # Conf("mojo:cpu", True),
         # Conf("mojo:gpu", True),
-        Conf("mojo:cpu", False)
-        # Conf("mojo:gpu", False),
+        Conf("mojo:gpu", False)
         # Conf("cpu", True),
         # Conf("cuda", True),
     ]
@@ -55,7 +53,6 @@ def conf(request, mojo_gpu_available: bool, cuda_available: bool):
 
     if conf.device.startswith("mojo"):
         conf.device = conf.device.replace("gpu", "0")
-        conf.device = conf.device.replace("cpu", str(len(list(get_accelerators())) - 1))
         # Make sure the device is initialized
         register_mojo_devices()
 
@@ -72,7 +69,7 @@ def cuda_available() -> bool:
 
 @pytest.fixture
 def mojo_gpu_available() -> bool:
-    return len(list(get_accelerators())) > 1
+    return len(list(get_accelerators())) > 0
 
 
 @pytest.fixture(params=[(3,), (2, 3)])
@@ -86,15 +83,11 @@ def reset_compiler():
     yield
 
 
-@pytest.fixture(params=["cpu", "gpu"])
-def mojo_device(request, mojo_gpu_available: bool):
-    register_mojo_devices()  # idempotent
-    if request.param == "cpu":
-        yield (f"mojo:{len(get_accelerators()) - 1}")
-    else:
-        if not mojo_gpu_available:
-            pytest.skip("You do not have a GPU supported by MAX")
-        yield ("mojo:0")
+@pytest.fixture
+def mojo_device(mojo_gpu: str) -> str:
+    """There is no CPU-backed mojo device any more; this is now just an
+    alias of `mojo_gpu`, kept so every existing caller stays unchanged."""
+    return mojo_gpu
 
 
 @pytest.fixture

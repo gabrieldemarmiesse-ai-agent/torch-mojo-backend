@@ -102,21 +102,14 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
 
 def torch_device_to_max_device(x: torch.device) -> DeviceRef:
     if x.type == "mojo":
-        # get_accelerators() is already ordered GPU first, CPU last -- the
-        # same order the native backend's device.mojo assigns mojo indices.
-        # index None or 0 = first accelerator (first GPU or CPU if no GPU)
-        # higher indices = additional GPUs, with CPU at the highest index
+        # index None or 0 = first accelerator; higher indices = additional GPUs.
         index = x.index if x.index is not None else 0
 
         accelerators = get_accelerators()
         if index >= len(accelerators):
             raise ValueError(f"Invalid mojo index {index}")
 
-        device = accelerators[index]
-        if device.label == "cpu":
-            return DeviceRef.CPU()
-        else:
-            return DeviceRef.GPU(device.id)  # Use the actual GPU ID
+        return DeviceRef.GPU(accelerators[index].id)  # Use the actual GPU ID
     else:
         return max_device_ref(x)
 
