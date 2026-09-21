@@ -676,189 +676,155 @@ def _binary_bcast[
             var l_ptr = _make_ptr[dtype](l_addr)
             var r_ptr = _make_ptr[dtype](r_addr)
 
-            if ctx.api() == "cpu":
-
-                @always_inline
-                @parameter
-                @__copy_capture(out_ptr, l_ptr, r_ptr)
-                def func[width: Int, alignment: Int = 1](idx: Coord):
-                    var i = Int(idx[0].value())
-                    var i3 = i % d3
-                    var rest = i // d3
-                    var i2 = rest % d2
-                    rest = rest // d2
-                    var i1 = rest % d1
-                    var i0 = rest // d1
-                    var a = l_ptr[
-                        unsafe_offset=i0 * ls0 + i1 * ls1 + i2 * ls2 + i3 * ls3
-                    ]
-                    var b = r_ptr[
-                        unsafe_offset=i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3
-                    ]
-                    out_ptr[unsafe_offset=i] = _bin_vec_op[
-                        dtype,
-                        out_dtype,
-                        op_code,
-                        is_cmp,
-                        1,
-                        cpu_floordiv_f64=True,
-                    ](a, b)[0]
-
-                elementwise[func, simd_width=1](Coord(total), ctx)
+            comptime if (
+                dtype == DType.float64 and has_apple_gpu_accelerator()
+            ):
+                raise Error("float64 is not supported on Apple GPU")
             else:
-                comptime if (
-                    dtype == DType.float64 and has_apple_gpu_accelerator()
-                ):
-                    raise Error("float64 is not supported on Apple GPU")
-                else:
-                    comptime if has_accelerator():
-                        # Tiered dispatch: the generic scalar kernel pays
-                        # three integer divisions and strided scalar loads
-                        # per element, which is division-bound at large
-                        # sizes. Prefer 16-byte vector kernels whenever the
-                        # layout allows them.
-                        comptime itemsize = size_of[dtype]()
-                        comptime out_itemsize = size_of[out_dtype]()
-                        comptime VW = 16 // itemsize
-                        var d0 = total // max(1, d1 * d2 * d3)
-                        var cont3 = d3
-                        var cont2 = d2 * d3
-                        var cont1 = d1 * d2 * d3
-                        # An operand whose every stride is 0 is a single
-                        # element -- what `x < 0.5` and `x & 21` look like
-                        # once Python has materialized the scalar operand.
-                        # The flat kernel reads it once and splats it, so it
-                        # neither breaks the flat layout nor needs 16B
-                        # alignment, and the whole scalar-overload family
-                        # stops falling through to the strided kernel.
-                        var l_scalar = (
-                            ls0 == 0 and ls1 == 0 and ls2 == 0 and ls3 == 0
+                comptime if has_accelerator():
+                    # Tiered dispatch: the generic scalar kernel pays
+                    # three integer divisions and strided scalar loads
+                    # per element, which is division-bound at large
+                    # sizes. Prefer 16-byte vector kernels whenever the
+                    # layout allows them.
+                    comptime itemsize = size_of[dtype]()
+                    comptime out_itemsize = size_of[out_dtype]()
+                    comptime VW = 16 // itemsize
+                    var d0 = total // max(1, d1 * d2 * d3)
+                    var cont3 = d3
+                    var cont2 = d2 * d3
+                    var cont1 = d1 * d2 * d3
+                    # An operand whose every stride is 0 is a single
+                    # element -- what `x < 0.5` and `x & 21` look like
+                    # once Python has materialized the scalar operand.
+                    # The flat kernel reads it once and splats it, so it
+                    # neither breaks the flat layout nor needs 16B
+                    # alignment, and the whole scalar-overload family
+                    # stops falling through to the strided kernel.
+                    var l_scalar = (
+                        ls0 == 0 and ls1 == 0 and ls2 == 0 and ls3 == 0
+                    )
+                    var r_scalar = (
+                        rs0 == 0 and rs1 == 0 and rs2 == 0 and rs3 == 0
+                    )
+                    var aligned16 = (
+                        out_addr % 16 == 0
+                        and (l_scalar or l_addr % 16 == 0)
+                        and (r_scalar or r_addr % 16 == 0)
+                    )
+                    var l_flat = l_scalar or (
+                        (ls3 == 1 or d3 == 1)
+                        and (ls2 == cont3 or d2 == 1)
+                        and (ls1 == cont2 or d1 == 1)
+                        and (ls0 == cont1 or d0 == 1)
+                    )
+                    var r_flat = r_scalar or (
+                        (rs3 == 1 or d3 == 1)
+                        and (rs2 == cont3 or d2 == 1)
+                        and (rs1 == cont2 or d1 == 1)
+                        and (rs0 == cont1 or d0 == 1)
+                    )
+                    var rows_aligned = (
+                        ls3 == 1
+                        and rs3 == 1
+                        and d3 % VW == 0
+                        and d3 >= VW
+                        and (ls0 * itemsize) % 16 == 0
+                        and (ls1 * itemsize) % 16 == 0
+                        and (ls2 * itemsize) % 16 == 0
+                        and (rs0 * itemsize) % 16 == 0
+                        and (rs1 * itemsize) % 16 == 0
+                        and (rs2 * itemsize) % 16 == 0
+                    )
+                    if aligned16 and l_flat and r_flat:
+                        # Bytes actually moved: a splatted operand reads
+                        # one element for the whole launch, so it does
+                        # not count toward the residency decision.
+                        var traffic = total * (
+                            (0 if l_scalar else itemsize)
+                            + (0 if r_scalar else itemsize)
+                            + out_itemsize
                         )
-                        var r_scalar = (
-                            rs0 == 0 and rs1 == 0 and rs2 == 0 and rs3 == 0
+                        var slots = max(1, total // VW)
+                        # A comparison's thread moves fewer bytes than an
+                        # arithmetic one (16 + 16 read, 4 written), and
+                        # the residency crossover follows the bytes per
+                        # thread, so the two arms keep the grid rule each
+                        # was measured on -- see `_l2_wave_blocks` and
+                        # `_bw_flat_blocks`.
+                        var blocks = _l2_wave_blocks(
+                            slots, traffic, ctx
+                        ) if is_cmp else _bw_flat_blocks(slots, traffic)
+                        _enqueue_cached[
+                            _bin_flat_vec_kernel[
+                                dtype, out_dtype, op_code, is_cmp
+                            ]
+                        ](
+                            ctx,
+                            blocks,
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            l_ptr.as_unsafe_any_origin().as_imm(),
+                            r_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(total),
+                            Int64(l_scalar),
+                            Int64(r_scalar),
                         )
-                        var aligned16 = (
-                            out_addr % 16 == 0
-                            and (l_scalar or l_addr % 16 == 0)
-                            and (r_scalar or r_addr % 16 == 0)
+                    elif aligned16 and rows_aligned:
+                        var rows = total // d3
+                        _enqueue_cached[
+                            _bin_rowvec_kernel[
+                                dtype, out_dtype, op_code, is_cmp
+                            ]
+                        ](
+                            ctx,
+                            max(1, min(rows, 65535)),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            l_ptr.as_unsafe_any_origin().as_imm(),
+                            r_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(d1),
+                            Int64(d2),
+                            Int64(d3),
+                            Int64(ls0),
+                            Int64(ls1),
+                            Int64(ls2),
+                            Int64(rs0),
+                            Int64(rs1),
+                            Int64(rs2),
+                            Int64(rows),
                         )
-                        var l_flat = l_scalar or (
-                            (ls3 == 1 or d3 == 1)
-                            and (ls2 == cont3 or d2 == 1)
-                            and (ls1 == cont2 or d1 == 1)
-                            and (ls0 == cont1 or d0 == 1)
-                        )
-                        var r_flat = r_scalar or (
-                            (rs3 == 1 or d3 == 1)
-                            and (rs2 == cont3 or d2 == 1)
-                            and (rs1 == cont2 or d1 == 1)
-                            and (rs0 == cont1 or d0 == 1)
-                        )
-                        var rows_aligned = (
-                            ls3 == 1
-                            and rs3 == 1
-                            and d3 % VW == 0
-                            and d3 >= VW
-                            and (ls0 * itemsize) % 16 == 0
-                            and (ls1 * itemsize) % 16 == 0
-                            and (ls2 * itemsize) % 16 == 0
-                            and (rs0 * itemsize) % 16 == 0
-                            and (rs1 * itemsize) % 16 == 0
-                            and (rs2 * itemsize) % 16 == 0
-                        )
-                        if aligned16 and l_flat and r_flat:
-                            # Bytes actually moved: a splatted operand reads
-                            # one element for the whole launch, so it does
-                            # not count toward the residency decision.
-                            var traffic = total * (
-                                (0 if l_scalar else itemsize)
-                                + (0 if r_scalar else itemsize)
-                                + out_itemsize
-                            )
-                            var slots = max(1, total // VW)
-                            # A comparison's thread moves fewer bytes than an
-                            # arithmetic one (16 + 16 read, 4 written), and
-                            # the residency crossover follows the bytes per
-                            # thread, so the two arms keep the grid rule each
-                            # was measured on -- see `_l2_wave_blocks` and
-                            # `_bw_flat_blocks`.
-                            var blocks = _l2_wave_blocks(
-                                slots, traffic, ctx
-                            ) if is_cmp else _bw_flat_blocks(slots, traffic)
-                            _enqueue_cached[
-                                _bin_flat_vec_kernel[
-                                    dtype, out_dtype, op_code, is_cmp
-                                ]
-                            ](
-                                ctx,
-                                blocks,
-                                1,
-                                1,
-                                GS_THREADS,
-                                out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_imm(),
-                                r_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(total),
-                                Int64(l_scalar),
-                                Int64(r_scalar),
-                            )
-                        elif aligned16 and rows_aligned:
-                            var rows = total // d3
-                            _enqueue_cached[
-                                _bin_rowvec_kernel[
-                                    dtype, out_dtype, op_code, is_cmp
-                                ]
-                            ](
-                                ctx,
-                                max(1, min(rows, 65535)),
-                                1,
-                                1,
-                                GS_THREADS,
-                                out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_imm(),
-                                r_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(d1),
-                                Int64(d2),
-                                Int64(d3),
-                                Int64(ls0),
-                                Int64(ls1),
-                                Int64(ls2),
-                                Int64(rs0),
-                                Int64(rs1),
-                                Int64(rs2),
-                                Int64(rows),
-                            )
-                        else:
-                            _enqueue_cached[
-                                _bin_bcast_kernel[
-                                    dtype, out_dtype, op_code, is_cmp
-                                ]
-                            ](
-                                ctx,
-                                _gs_blocks(total),
-                                1,
-                                1,
-                                GS_THREADS,
-                                out_ptr.as_unsafe_any_origin(),
-                                l_ptr.as_unsafe_any_origin().as_imm(),
-                                r_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(d1),
-                                Int64(d2),
-                                Int64(d3),
-                                Int64(ls0),
-                                Int64(ls1),
-                                Int64(ls2),
-                                Int64(ls3),
-                                Int64(rs0),
-                                Int64(rs1),
-                                Int64(rs2),
-                                Int64(rs3),
-                                Int64(total),
-                            )
                     else:
-                        raise Error(
-                            "no GPU accelerator available at compile time"
+                        _enqueue_cached[
+                            _bin_bcast_kernel[dtype, out_dtype, op_code, is_cmp]
+                        ](
+                            ctx,
+                            _gs_blocks(total),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            l_ptr.as_unsafe_any_origin().as_imm(),
+                            r_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(d1),
+                            Int64(d2),
+                            Int64(d3),
+                            Int64(ls0),
+                            Int64(ls1),
+                            Int64(ls2),
+                            Int64(ls3),
+                            Int64(rs0),
+                            Int64(rs1),
+                            Int64(rs2),
+                            Int64(rs3),
+                            Int64(total),
                         )
+                else:
+                    raise Error("no GPU accelerator available at compile time")
 
 
 # ---------------------------------------------------------------------------
@@ -881,10 +847,7 @@ def _bitwise_not[
     comptime if has_accelerator():
         # Preserve the previous 16-byte alignment regime for int64 views.
         comptime vector_width = min(4, 16 // size_of[dtype]())
-        if (
-            ctx.api() != "cpu"
-            and (out_addr | in_addr) % (vector_width * size_of[dtype]()) == 0
-        ):
+        if (out_addr | in_addr) % (vector_width * size_of[dtype]()) == 0:
             # Bool storage is a byte, not a packed vector of i1 values.
             comptime storage_dtype = DType.uint8 if dtype == DType.bool else dtype
             var dst = _make_ptr[storage_dtype](out_addr)
@@ -1421,32 +1384,10 @@ def _ternary_bcast_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
 # *more* accurate but that makes it a worse match for this specific
 # imperfectly-rounded reference (confirmed empirically: it still failed
 # ~8% of elements at fp16). Reproducing CPU's exact op order and rounding
-# granularity below matches it exactly.
-#
-# Hard-won, separate from the above: getting the arithmetic right was not
-# enough on its own. With that arithmetic launched through `_parallel_for`
-# (== `elementwise[func, simd_width=1]` on CPU), a couple of percent of
-# fp16/bf16 elements still came out wrong -- reproducible, deterministic,
-# and unaffected by which equivalent arithmetic formula or branch style
-# (`if`/`else` statement vs. the branch-free `... if ... else ...`
-# expression below) was used. Replacing `_parallel_for` with a plain
-# sequential loop over the *same* closure on CPU (below) made it exact
-# (0 mismatches over 100k+ randomized elements across both dtypes and two
-# shape/beta/alpha combinations). Root cause not traced further than that;
-# treat it as a MAX/Mojo `elementwise` CPU-backend issue specific to this
-# closure's shape (six captured values incl. a Bool, three independently
-# strided pointer reads) rather than a correctness property of the
-# arithmetic. GPU still goes through `elementwise[..., target="gpu"]` via
-# `_parallel_for`, same as every other kernel in this file, and was not
-# rewritten to match: on an actual H100
+# granularity below matches it exactly: on an actual H100
 # (test_matches_cpu_addr_mojo_float16/bfloat16), it landed exactly one
 # element out of 50 just outside tolerance (down from up to 18% before
-# this fix), where the arithmetic above reproduces CPU exactly to the bit
-# on every sample tried. A hand-written grid-stride GPU kernel (bypassing
-# `elementwise` entirely, mirroring `_bin_bcast_kernel` above) was tried
-# and closed the CPU path back down to the pre-workaround failure rate
-# when the same restructuring was applied there, so it was not safe to
-# ship blind without more GPU time to verify; left as the next step.
+# this fix).
 # ---------------------------------------------------------------------------
 
 
@@ -1523,12 +1464,7 @@ def _addr_bcast[
         )
         out_ptr[unsafe_offset=i_flat] = (t1 + t3).cast[dtype]()
 
-    # Not `_parallel_for` on CPU -- see the module comment above.
-    if ctx.api() == "cpu":
-        for i in range(total):
-            func[1](Coord(i))
-    else:
-        _parallel_for[func](total, ctx)
+    _parallel_for[func](total, ctx)
 
 
 def _addr_bcast_go(
@@ -1648,8 +1584,6 @@ def _add_f32_bf16_spec_into_go(a_o: Arg, b_o: Arg, out_o: Arg) raises:
         raise Error("mojo spec add f32 bf16 into: output must be FP32")
 
     var ctx = a.ctx()
-    if ctx.api() == "cpu":
-        raise Error("mojo spec add f32 bf16 into: accelerator context required")
 
     var fp32_addr = a.ptr if a.dtype == DType.float32 else b.ptr
     var bf16_addr = a.ptr if a.dtype == DType.bfloat16 else b.ptr

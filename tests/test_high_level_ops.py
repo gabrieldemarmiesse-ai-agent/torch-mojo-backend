@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
 
 from torch_mojo_backend import mojo_backend
-from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import (
     Conf,
     check_functions_are_equivalent,
@@ -2138,6 +2137,7 @@ def test_change_device_to_cpu_by_device(device: str):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_change_device_to_cuda(device: str, cuda_available: bool):
     """Test changing device to CUDA"""
     if not cuda_available:
@@ -2151,6 +2151,7 @@ def test_change_device_to_cuda(device: str, cuda_available: bool):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_change_device_to_cuda_by_device(device: str, cuda_available: bool):
     """Test changing device to CUDA"""
     if not cuda_available:
@@ -2208,6 +2209,7 @@ def test_to_with_torch_device_object(device: str):
     check_functions_are_equivalent(fn, device, [x])
 
 
+@pytest.mark.cuda
 def test_to_with_torch_device_object_cuda(device: str, cuda_available: bool):
     """Test tensor.to() with torch.device object for CUDA"""
     if not cuda_available:
@@ -5297,10 +5299,6 @@ def test_aten_index_select_basic(conf: Conf):
 
 def test_aten_index_select_second_dim(conf: Conf):
     """Test basic torch.index_select operation"""
-    if torch.device(conf.device) == device_module.cpu():
-        pytest.xfail(
-            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
-        )
 
     def fn(x, indices):
         return x[:, indices]
@@ -5314,10 +5312,6 @@ def test_aten_index_select_second_dim(conf: Conf):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_aten_index_select_multiple_dtypes(conf: Conf, dtype):
     """Test basic torch.index_select operation"""
-    if torch.device(conf.device) == device_module.cpu():
-        pytest.xfail(
-            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
-        )
 
     def fn(x, indices):
         return x[:, indices]
@@ -5343,10 +5337,6 @@ def test_aten_index_select_multiple_dims(conf: Conf):
 
 def test_aten_index_select_multiple_dims_start_nonzero(conf: Conf):
     """Test basic torch.index_select operation"""
-    if torch.device(conf.device) == device_module.cpu():
-        pytest.xfail(
-            "index_select on the MAX CPU device: the index.Tensor route reads a tensor without storage (native backend gap)"
-        )
 
     def fn(x, indices1, indices2):
         return x[:, indices1, indices2, indices2]

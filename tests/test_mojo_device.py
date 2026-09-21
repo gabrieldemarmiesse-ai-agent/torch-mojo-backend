@@ -56,13 +56,19 @@ def setup_max_device():
     register_mojo_devices()
 
 
-def test_mojo_is_the_default_torch_accelerator():
+def test_mojo_is_the_default_torch_accelerator(mojo_gpu_available: bool):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     assert torch.accelerator.current_accelerator(check_available=True) == torch.device(
         "mojo"
     )
 
 
-def test_torch_accelerator_synchronize_dispatches_and_validates_device():
+def test_torch_accelerator_synchronize_dispatches_and_validates_device(
+    mojo_gpu_available: bool,
+):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     original_device = device_module.current_device()
     try:
         torch.accelerator.synchronize()
@@ -127,19 +133,22 @@ def test_factory_empty(mojo_device):
     assert tensor.shape == (2, 3)
 
 
-def test_device_string_variations():
+def test_device_string_variations(mojo_gpu_available: bool):
     """Test different mojo device string formats"""
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     t1 = torch.tensor([1.0]).to("mojo")
     assert t1.device.type == "mojo"
     t2 = torch.tensor([1.0]).to("mojo:0")
     assert t2.device.type == "mojo"
 
 
+@pytest.mark.gpu
 def test_indexless_mojo_device_uses_and_restores_current_device():
     """An indexless mojo target follows the current device (see also the
     more focused version of this test in test_mojo_device_runtime.py)."""
     if device_module.device_count() < 2:
-        pytest.skip("requires two Mojo devices, including the MAX CPU device")
+        pytest.skip("requires two GPUs")
 
     original_index = device_module.current_device()
     alternate_index = (original_index + 1) % device_module.device_count()
@@ -416,12 +425,7 @@ def test_non_blocking_pinned_transfer_survives_host_destruction(
 ):
     """Free a pinned block used on two streams; neither may lose its DMA data."""
     expected = torch.arange(1 << 20, dtype=torch.float32)
-    is_cpu = torch.device(mojo_device) == device_module.cpu()
-    streams = (
-        [device_module.current_stream(mojo_device)]
-        if is_cpu
-        else [side_stream_or_skip(mojo_device) for _ in range(2)]
-    )
+    streams = [side_stream_or_skip(mojo_device) for _ in range(2)]
     with device_module.device(mojo_device):
         host = torch.cat((expected, expected)).pin_memory()
         source = expected.to(mojo_device)
@@ -433,8 +437,7 @@ def test_non_blocking_pinned_transfer_survives_host_destruction(
         delayed = []
         for index, stream in enumerate(streams):
             with device_module.stream(stream):
-                if not is_cpu:
-                    delayed.extend(a * b for _ in range(64))
+                delayed.extend(a * b for _ in range(64))
                 view = host[index * expected.numel() : (index + 1) * expected.numel()]
                 if direction == "upload":
                     # Repeated use of one stream must be deduplicated.
@@ -518,7 +521,9 @@ def test_non_blocking_pinned_upload_skips_staging_memcpy(
                 pytest.skip("requires CUDA's foreign pinned allocator")
             storage = torch.full_like(storage, 17, pin_memory=True)
         elif host_class == "other-device":
-            with device_module.device(device_module.cpu()):
+            if device_module.device_count() < 2:
+                pytest.skip("requires two GPUs")
+            with device_module.device(1):
                 storage = storage.pin_memory()
         source = storage[offset : offset + 4096]
         destination = source.to(mojo_gpu, non_blocking=True)
@@ -644,7 +649,9 @@ def test_blocking_transfer_completes_selected_stream(
                 pytest.skip("requires CUDA's foreign pinned allocator")
             host = torch.empty_like(host, pin_memory=True).copy_(expected)
         elif host_class == "other-device":
-            with device_module.device(device_module.cpu()):
+            if device_module.device_count() < 2:
+                pytest.skip("requires two GPUs")
+            with device_module.device(1):
                 host = host.pin_memory()
         storage = expected.to(mojo_gpu)
         gpu = storage.t() if strided else storage
@@ -727,20 +734,18 @@ def test_to_cpu_explicit_pin_memory(
     """
     expected = torch.arange(257, dtype=torch.float32)
     source = expected.to(mojo_device)
-    with device_module.device(device_module.cpu()):
-        result = torch.ops.aten._to_copy.default(
-            source,
-            device=torch.device("cpu"),
-            pin_memory=pin_memory,
-            non_blocking=non_blocking,
-        )
-        assert result.is_pinned() == non_blocking
-        if result.is_pinned():
-            assert pin_allocator_probe.uses_mojo_allocator(result)
-        assert device_module.current_device() == device_module.cpu().index
-        if not non_blocking:
-            torch.testing.assert_close(result, expected)
-        torch.accelerator.synchronize(mojo_device)
+    result = torch.ops.aten._to_copy.default(
+        source,
+        device=torch.device("cpu"),
+        pin_memory=pin_memory,
+        non_blocking=non_blocking,
+    )
+    assert result.is_pinned() == non_blocking
+    if result.is_pinned():
+        assert pin_allocator_probe.uses_mojo_allocator(result)
+    if not non_blocking:
+        torch.testing.assert_close(result, expected)
+    torch.accelerator.synchronize(mojo_device)
     torch.testing.assert_close(result, expected)
 
 
@@ -774,9 +779,7 @@ def test_to_cpu_device_conversion_stays_asynchronous(
         stream.synchronize()
         with _held_transfer_stream(stream):
             pending = stream.record_event()
-            with device_module.device(device_module.cpu()):
-                downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
-                assert device_module.current_device() == device_module.cpu().index
+            downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
             assert downloaded.is_pinned()
             assert not pending.query()
         assert downloaded.stride() == expected.stride()
@@ -1084,21 +1087,6 @@ def test_blocking_transfer_does_not_synchronize_other_streams(mojo_gpu: str):
             assert not pending.query()
 
 
-@pytest.mark.parametrize("non_blocking", [False, True])
-def test_max_cpu_transfer_is_synchronous(non_blocking: bool):
-    """The MAX CPU device completes host DMA and conversion before returning."""
-    expected = torch.arange(257, dtype=torch.float32)
-    with device_module.device("mojo:0"):
-        host = expected.pin_memory()
-    cpu = device_module.cpu()
-    uploaded = host.to(cpu, dtype=torch.float64, non_blocking=non_blocking)
-    host.zero_()
-    result = uploaded.to("cpu", non_blocking=non_blocking)
-    torch.testing.assert_close(result, expected.double())
-    host.copy_(uploaded, non_blocking=non_blocking)
-    torch.testing.assert_close(host, expected)
-
-
 @pytest.mark.parametrize("direction", ["upload", "download"])
 def test_transfer_repeated_use_keeps_last_fence(mojo_gpu: str, direction: str):
     """A completed first use must not free storage before a later use finishes."""
@@ -1119,8 +1107,7 @@ def test_transfer_repeated_use_keeps_last_fence(mojo_gpu: str, direction: str):
                 host.copy_(next_gpu, non_blocking=True)
                 # The write and read must share a lifetime and be ordered.
                 gpu.copy_(host, non_blocking=True)
-            with device_module.device(device_module.cpu()):
-                del host
+            del host
             replacements = [torch.full_like(first, -1).pin_memory() for _ in range(8)]
         torch.testing.assert_close(gpu.cpu(), second)
         assert all(torch.all(block == -1) for block in replacements)
@@ -1171,10 +1158,11 @@ def test_transfer_unsupported_complex_is_explicit(mojo_device: str, dtype: torch
 
 
 @pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.gpu
 def test_transfer_other_gpu_requires_snapshot_and_host_wait(reverse: bool):
     """A GPU event wait cannot order a host snapshot across allocation devices."""
-    if len(get_accelerators()) < 3:
-        pytest.skip("requires two GPUs plus the MAX CPU device")
+    if len(get_accelerators()) < 2:
+        pytest.skip("requires two GPUs")
     first, second = ("mojo:1", "mojo:0") if reverse else ("mojo:0", "mojo:1")
     expected = torch.arange(8192, dtype=torch.float32)
     with device_module.device(first):
@@ -1206,9 +1194,11 @@ def test_non_blocking_foreign_pinned_transfers(mojo_gpu: str, cuda_available: bo
 
 
 def test_non_blocking_pinned_other_device(mojo_gpu: str):
-    """A block pinned on the MAX CPU device takes the conservative GPU path."""
+    """A block pinned on another mojo device takes the conservative GPU path."""
+    if device_module.device_count() < 2:
+        pytest.skip("requires two GPUs")
     expected = torch.arange(1 << 20, dtype=torch.float32)
-    with device_module.device(device_module.cpu()):
+    with device_module.device(1):
         host = expected.pin_memory()
     with device_module.device(mojo_gpu):
         uploaded = host.to(mojo_gpu, non_blocking=True)
@@ -1276,8 +1266,10 @@ def test_dtype_preservation(mojo_device):
         torch.testing.assert_close(result, original)
 
 
-def test_multiple_conversions():
+def test_multiple_conversions(mojo_gpu_available: bool):
     """Test multiple to() calls don't cause issues"""
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     tensor = torch.tensor([1.0, 2.0])
     max1 = tensor.to("mojo")
     max2 = max1.to("mojo")  # Should return same tensor
@@ -1287,6 +1279,7 @@ def test_multiple_conversions():
 
 
 @pytest.mark.xfail(strict=False, reason="op not ported yet: aten::sub.Tensor")
+@pytest.mark.gpu
 def test_multiple_conversions_arithmetic():
     """Operate on the round-tripped tensors: a same-device sub then square."""
     tensor = torch.tensor([1.0, 2.0])
@@ -1462,7 +1455,12 @@ def pin_allocator_probe(tmp_path_factory: pytest.TempPathFactory) -> _PinAllocat
 
 @pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
 @pytest.mark.parametrize(
-    "configuration", ["cpu-only-wheel", "cuda-available", "cuda-unavailable"]
+    "configuration",
+    [
+        pytest.param("cpu-only-wheel", marks=pytest.mark.cpu_torch),
+        "cuda-available",
+        "cuda-unavailable",
+    ],
 )
 def test_pinned_allocator_provenance_follows_runtime_cuda_availability(
     mojo_device: str,
@@ -1822,7 +1820,9 @@ def test_mojo_tensor_is_not_host_pinned_and_cannot_be_pinned(
     assert tensor.device == torch.device(mojo_device)
 
 
-@pytest.mark.parametrize("target", ["meta", "cuda"])
+@pytest.mark.parametrize(
+    "target", ["meta", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize("size", [0, 17])
 def test_other_non_cpu_tensors_are_not_host_pinned(target: str, size: int):
     if target == "cuda" and not torch.cuda.is_available():
@@ -1859,21 +1859,6 @@ def test_is_pinned_explicit_device_type_routing(mojo_device: str, query_device: 
                 # with false before looking up a hook (Context.h).
                 assert not pinned.is_pinned(device=query_device)
         assert device_module.current_device() == int(mojo_device.split(":")[1])
-
-
-def test_is_pinned_explicit_cuda_bypasses_mojo_hook():
-    # A MAX CPU HostBuffer is known to Mojo but is not CUDA-registered. Using
-    # it distinguishes the hooks even on a machine with a working CUDA wheel.
-    if torch.cuda.is_available():
-        torch.cuda.init()  # Context::isPinnedPtr otherwise has its own cold guard.
-    with device_module.device(device_module.device_count() - 1):
-        pinned = torch.arange(17).pin_memory()
-        assert pinned.is_pinned()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            assert not pinned.is_pinned(device="cuda")
-            assert pinned.is_pinned(device="mojo")
-        assert pinned.is_pinned()
 
 
 def test_pinned_query_does_not_depend_on_current_device(mojo_device: str):
@@ -2040,10 +2025,10 @@ def test_method_pinned_storage_cannot_grow(mojo_device: str):
         assert torch.equal(pinned, torch.arange(17))
 
 
-def test_pinned_pointer_query_exact_live_range_on_max_cpu(
-    pin_allocator_probe: _PinAllocatorProbe,
+def test_pinned_pointer_query_exact_live_range(
+    mojo_device: str, pin_allocator_probe: _PinAllocatorProbe
 ):
-    with device_module.device(device_module.device_count() - 1):
+    with device_module.device(mojo_device):
         pinned = torch.arange(257, dtype=torch.uint8).pin_memory()
         base = pinned.data_ptr()
         end = base + pinned.untyped_storage().nbytes()
@@ -2103,6 +2088,10 @@ def test_pinned_factories_without_runtime_cuda(
 ):
     # Hiding accelerators exercises a CUDA wheel with hasCUDA()==false. The
     # same test also works with a CPU-only wheel; no wheel-branding oracle.
+    # There is no mojo device at all in this state (no CPU-backed mojo
+    # device to fall back to any more), but pinning still works: a lazily
+    # built, unregistered MAX CPU context backs it (device.mojo's
+    # `host_only_ctx`).
     script = textwrap.dedent("""
         import ctypes
         import sys
@@ -2112,7 +2101,7 @@ def test_pinned_factories_without_runtime_cuda(
 
         assert not torch.cuda.is_available()
         register_mojo_devices()
-        assert device_module.device_count() == 1
+        assert device_module.device_count() == 0
         probe = ctypes.CDLL(sys.argv[1])
         probe.uses_mojo_allocator.argtypes = [ctypes.c_void_p]
         probe.uses_mojo_allocator.restype = ctypes.c_bool
@@ -2126,9 +2115,12 @@ def test_pinned_factories_without_runtime_cuda(
         assert pinned.is_pinned()
         assert probe.uses_mojo_allocator(pinned.untyped_storage()._cdata)
         assert pinned.pin_memory() is pinned
-        for batch in torch.utils.data.DataLoader([source], batch_size=None, pin_memory=True):
-            assert batch.is_pinned()
-            assert torch.equal(batch, source)
+        # DataLoader(pin_memory=True) is deliberately not exercised here any
+        # more: with 0 mojo devices (no CPU-backed mojo device to fall back
+        # to), torch's own DataLoader sees no accelerator at all and turns
+        # its pinning off (a real, upstream torch heuristic, not a decision
+        # of this backend) -- the factory functions above still pin, through
+        # this backend's allocator, regardless of that heuristic.
     """)
     if any(device.api == "metal" for device in get_accelerators()):
         pytest.skip("CUDA/HIP visibility variables cannot hide a Metal accelerator")
@@ -2149,7 +2141,7 @@ def test_pinned_factories_without_runtime_cuda(
 
 
 def _cuda_pinned_allocation_device(tensor: torch.Tensor) -> int | None:
-    """Driver registration ordinal; None for the MAX CPU's host allocation."""
+    """Driver registration ordinal; None when the pointer has none."""
     cuda = ctypes.CDLL("libcuda.so.1")
     query = cuda.cuPointerGetAttribute
     query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
@@ -2162,32 +2154,27 @@ def _cuda_pinned_allocation_device(tensor: torch.Tensor) -> int | None:
     return ordinal.value
 
 
-@pytest.mark.parametrize("two_gpus", [False, True], ids=["gpu-vs-max-cpu", "two-gpus"])
-def test_explicit_pin_device_index_does_not_override_current_device(
-    mojo_gpu: str, two_gpus: bool
-):
+def test_explicit_pin_device_index_does_not_override_current_device(mojo_gpu: str):
     if get_accelerators()[0].api != "cuda":
         pytest.skip("allocation-device conformance probe requires the CUDA driver")
-    if two_gpus and device_module.device_count() < 3:
-        pytest.skip("requires two physical Mojo GPUs; MAX CPU is not a second GPU")
-    other = 1 if two_gpus else device_module.device_count() - 1
+    if device_module.device_count() < 2:
+        pytest.skip("requires two physical Mojo GPUs")
+    other = 1
     for current, argument in ((0, other), (other, 0)):
         with device_module.device(current), warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             pinned = torch.arange(17).pin_memory(device=f"mojo:{argument}")
             assert pinned.is_pinned(device=f"mojo:{argument}")
             assert device_module.current_device() == current
-            expected = None if current == device_module.device_count() - 1 else current
-            assert _cuda_pinned_allocation_device(pinned) == expected
+            assert _cuda_pinned_allocation_device(pinned) == current
 
 
-@pytest.mark.parametrize("two_gpus", [False, True], ids=["gpu-vs-max-cpu", "two-gpus"])
-def test_pinned_threads_keep_their_own_allocation_device(mojo_gpu: str, two_gpus: bool):
+def test_pinned_threads_keep_their_own_allocation_device(mojo_gpu: str):
     if get_accelerators()[0].api != "cuda":
         pytest.skip("thread allocation-device probe requires the CUDA driver")
-    if two_gpus and device_module.device_count() < 3:
+    if device_module.device_count() < 2:
         pytest.skip("requires two physical Mojo GPUs")
-    other = 1 if two_gpus else device_module.device_count() - 1
+    other = 1
     barrier = Barrier(2, timeout=30)
 
     def allocate(index: int) -> torch.Tensor:
@@ -2201,7 +2188,7 @@ def test_pinned_threads_keep_their_own_allocation_device(mojo_gpu: str, two_gpus
     with ThreadPoolExecutor(max_workers=2) as executor:
         gpu, alternate = list(executor.map(allocate, (0, other)))
     assert _cuda_pinned_allocation_device(gpu) == 0
-    assert _cuda_pinned_allocation_device(alternate) == (other if two_gpus else None)
+    assert _cuda_pinned_allocation_device(alternate) == other
     assert gpu.is_pinned() and alternate.is_pinned()
 
 
@@ -2708,6 +2695,7 @@ def test_pinned_dataloader_persistent_workers_and_early_shutdown(mojo_device: st
             assert torch.equal(first, source[:3])
 
 
+@pytest.mark.gpu
 def test_pinned_dataloader_foreign_cuda_batch_keeps_allocator(
     pin_allocator_probe: _PinAllocatorProbe,
 ):
@@ -2920,25 +2908,20 @@ def test_mojo_clip_grad_norm_matches_cpu(mojo_gpu_available, foreach):
         torch.testing.assert_close(actual.grad.cpu(), expected.grad)
 
 
-def test_device_ordering_gpu_first_cpu_last():
-    """The mojo device convention: index 0 is the first GPU (when present),
-    the highest index is the MAX CPU device. `get_accelerators()` (MAX's own
-    accelerator list, unrelated to the old TorchMojoTensor/torch_mojo_tensor
-    machinery) carries the `.label` used to check this without any private
-    import."""
+@pytest.mark.gpu
+def test_every_mojo_device_is_a_real_accelerator():
+    """There is no CPU-backed mojo device: every `mojo:<index>` is a real
+    accelerator, and `device_count()` is exactly `len(get_accelerators())`.
+    `get_accelerators()` (MAX's own accelerator list, unrelated to the old
+    TorchMojoTensor/torch_mojo_tensor machinery) carries the `.label` used to
+    check this without any private import."""
     accelerators = list(get_accelerators())
-    assert len(accelerators) > 0
-    assert accelerators[-1].label == "cpu"
-    assert device_module.cpu() == torch.device(f"mojo:{len(accelerators) - 1}")
+    assert all(a.label == "gpu" for a in accelerators)
+    assert device_module.device_count() == len(accelerators)
 
-    gpu_labels = [a.label for a in accelerators if a.label == "gpu"]
-    if gpu_labels:
-        assert accelerators[0].label == "gpu"
+    if accelerators:
         t_gpu = torch.tensor([1.0]).to("mojo")
         assert t_gpu.device.type == "mojo" and t_gpu.device.index == 0
-    cpu_index = len(accelerators) - 1
-    t_cpu = torch.tensor([1.0]).to(f"mojo:{cpu_index}")
-    assert t_cpu.device.type == "mojo"
 
 
 # Original tests from the existing file

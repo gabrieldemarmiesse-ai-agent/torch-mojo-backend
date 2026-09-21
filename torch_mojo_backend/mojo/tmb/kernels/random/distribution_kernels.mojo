@@ -11,7 +11,6 @@ fast intrinsics for float and the precise libdevice routines for double
 (ATen/NumericUtils.h). The grid, the counter reservation and the TensorIterator
 element order are the caller's (tmb/ops/random.mojo).
 """
-from max.algorithm import elementwise
 from max.gpu.host import DeviceContext
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceil, fma
@@ -20,7 +19,6 @@ from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
 )
-from std.utils.coord import Coord
 
 from tmb.kernels.random.philox import (
     U32x2,
@@ -534,54 +532,6 @@ def enqueue_distribution[
     var dst = _make_ptr[dtype](dst_addr)
     var trivial = ndim == 1
 
-    # Closed form of the grid-stride schedule for the MAX CPU device:
-    # element li is lane ii of iteration k of thread idx.
-    var total = BLOCK * grid
-
-    @always_inline
-    @parameter
-    @__copy_capture(
-        dst,
-        total,
-        ndim,
-        p_out0,
-        p_out1,
-        p_acc0,
-        p_acc1,
-        i0,
-        i1,
-        seed,
-        offset,
-        trivial,
-    )
-    def cpu_one[width: Int, alignment: Int = 1](c: Coord):
-        # sizes/strides are borrowed only on the CPU: elementwise's CPU
-        # implementation waits for all its worker tasks before returning.
-        var li = Int(c[0].value())
-        var k = li // (total * N)
-        var rem = li % (total * N)
-        var ii = rem // total
-        var idx = rem % total
-        var vals = dist_draw[dtype, DIST](
-            curand4(
-                curand_ctr(offset, UInt64(idx)), curand_key(seed), UInt64(k)
-            ),
-            p_out0,
-            p_out1,
-            p_acc0,
-            p_acc1,
-            i0,
-            i1,
-        )
-        var off = _offset_of[True](
-            li, sizes, strides, ndim, Int(strides[0])
-        ) if trivial else _offset_of[False](li, sizes, strides, ndim)
-        dst[unsafe_offset=off] = vals[ii]
-
-    if ctx.api() == "cpu":
-        elementwise[cpu_one, simd_width=1](Coord(numel), ctx)
-        return
-
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
         raise Error("float64 is not supported on Apple GPU")
     else:
@@ -712,30 +662,6 @@ def enqueue_bernoulli_tensor[
         return
     var dst = _make_ptr[dtype](dst_addr)
     var p = _make_ptr[PDT](p_addr)
-    var total = APPLY_BLOCK * grid * 4
-
-    @always_inline
-    @parameter
-    @__copy_capture(dst, p, ndim, seed, offset, total)
-    def cpu_one[width: Int, alignment: Int = 1](c: Coord):
-        # These metadata arrays are borrowed only by synchronous CPU work.
-        var li = Int(c[0].value())
-        var t = (li % total) // 4
-        var j = li % 4
-        var r = curand_uniform4(
-            curand4(curand_ctr(offset, UInt64(t)), curand_key(seed), 0)
-        )
-        var keep = (
-            r[j].cast[PDT]()
-            <= p[unsafe_offset=_offset_of[False](li, sizes, p_strides, ndim)]
-        )
-        dst[
-            unsafe_offset=_offset_of[False](li, sizes, dst_strides, ndim)
-        ] = _bool_to[dtype](keep)
-
-    if ctx.api() == "cpu":
-        elementwise[cpu_one, simd_width=1](Coord(numel), ctx)
-        return
 
     comptime if (
         dtype == DType.float64 or PDT == DType.float64

@@ -234,12 +234,6 @@ def test_compile_shape_int_output(mojo_device):
 def test_compile_input_mutated_between_calls(mojo_device):
     """The cross-call buffer cache aliases input memory: in-place updates
     between calls (optimizer-step pattern) must be visible to the graph."""
-    if torch.device(mojo_device) == device_module.cpu():
-        pytest.xfail(
-            "the MAX-CPU input path of the compile backend stages through a "
-            "host copy and does not see an in-place mutation of the input "
-            "between calls (passes on gpu)"
-        )
 
     def fn(x, w):
         return x @ w
@@ -305,15 +299,6 @@ def test_compile_device_attribute(mojo_device):
 
 
 def test_compile_backward(mojo_device):
-    if torch.device(mojo_device) == device_module.cpu():
-        pytest.xfail(
-            "The MAX-CPU-target backward graph for this op combination "
-            "(matmul + relu + pow + sum grads) fails inside MAX itself: "
-            "'Graph compilation failed: error occurred while lowering KGEN "
-            "to LLVM in the graph compiler' -- a MAX/CPU graph-compiler "
-            "limitation, not a compile_backend bug (passes on gpu)."
-        )
-
     def fn(x, w):
         return ((x @ w).relu() ** 2).sum()
 

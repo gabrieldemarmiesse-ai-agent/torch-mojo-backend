@@ -23,6 +23,8 @@ import pytest
 from scripts.compare_kernel_asm import build_env, mojo_cli
 from torch_mojo_backend import get_accelerators
 
+pytestmark = pytest.mark.gpu
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROBE = Path(__file__).resolve().parent / "fa4_selfload_soak_probe.mojo"
 _MOJO_ROOT = _REPO_ROOT / "torch_mojo_backend" / "mojo"

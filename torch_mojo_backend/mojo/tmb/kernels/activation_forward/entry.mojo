@@ -43,8 +43,6 @@ def _gelu_forward_bf16_go(
     if output_addr == 0 or input_addr == 0:
         raise Error("GELU pointers must be nonzero")
     var ctx = _raw_ctx(context_obj)
-    if ctx.api() == "cpu":
-        raise Error("optimized BF16 GELU requires an accelerator device")
 
     enqueue_gelu_forward_bf16(
         _make_ptr[DType.bfloat16](output_addr).as_unsafe_any_origin(),

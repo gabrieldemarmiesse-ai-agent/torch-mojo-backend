@@ -168,13 +168,15 @@ def test_expansion_and_empty_alias_own_storage(mojo_device: str):
     "first",
     ["allocation", "generic_allocation", "info", "properties", "name", "capability"],
 )
-def test_registration_and_first_memory_operation(first: str):
+def test_registration_and_first_memory_operation(first: str, mojo_gpu_available: bool):
     """09/10: registration eagerly initializes MAX, before any storage exists.
 
     There is no public registered-but-cold mojo allocator. Before registration
     torch.mojo is absent and generic accelerator queries target another backend.
     The genuinely cold generic early returns are exercised in the fork test.
     """
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     _fresh(
         """
 import sys
@@ -359,19 +361,17 @@ def test_valid_device_arguments_and_resets(mojo_device: str, form: str):
     _assert_shared(idx, base)
 
 
-@pytest.mark.skipif(
-    len(list(get_accelerators())) < 2, reason="needs a GPU plus the MAX CPU device"
-)
+@pytest.mark.skipif(len(list(get_accelerators())) < 2, reason="needs two GPUs")
 @pytest.mark.parametrize("outer_api", ["mojo", "accelerator"])
 def test_nested_contexts_and_per_device_resets(mojo_gpu: str, outer_api: str):
-    """13/35: unequal GPU/CPU histories reject a single global counter."""
-    cpu = device_module.cpu()
-    devices = (mojo_gpu, cpu)
+    """13/35: unequal per-device histories reject a single global counter."""
+    second = torch.device("mojo:1")
+    devices = (mojo_gpu, second)
     for dev in devices:
         _settle(dev)
     bases = [device_module.memory_allocated(dev) for dev in devices]
     x = torch.empty(513, dtype=torch.uint8, device=mojo_gpu)
-    y = torch.empty(4097, dtype=torch.uint8, device=cpu)
+    y = torch.empty(4097, dtype=torch.uint8, device=second)
     for dev, size in zip(devices, (8193, 16385), strict=True):
         temp = torch.empty(size, dtype=torch.uint8, device=dev)
         del temp
@@ -387,25 +387,25 @@ def test_nested_contexts_and_per_device_resets(mojo_gpu: str, outer_api: str):
     with outer(torch.device(mojo_gpu).index):
         assert device_module.memory_allocated() == bases[0] + 513
         with pytest.raises(RuntimeError, match="context exit"):
-            with inner(cpu.index):
+            with inner(second.index):
                 assert device_module.memory_allocated() == bases[1] + 4097
                 z = torch.empty(7, dtype=torch.uint8, device="mojo")
-                assert z.device == cpu
+                assert z.device == second
                 del z
-                _settle(cpu)
+                _settle(second)
                 with device_module.device(None):
-                    assert device_module.current_device() == cpu.index
+                    assert device_module.current_device() == second.index
                 torch.accelerator.reset_peak_memory_stats(mojo_gpu)
                 assert device_module.max_memory_allocated(mojo_gpu) == bases[0] + 513
                 assert (
-                    device_module.max_memory_allocated(cpu)
+                    device_module.max_memory_allocated(second)
                     == snapshots[1]["allocated_bytes.all.peak"]
                 )
                 gpu_reset = device_module.memory_stats(mojo_gpu)
                 device_module.reset_accumulated_memory_stats()
                 assert device_module.memory_stats(mojo_gpu) == gpu_reset
                 assert (
-                    device_module.memory_stats(cpu)["allocated_bytes.all.allocated"]
+                    device_module.memory_stats(second)["allocated_bytes.all.allocated"]
                     == 0
                 )
                 raise RuntimeError("context exit")
@@ -417,8 +417,8 @@ def test_nested_contexts_and_per_device_resets(mojo_gpu: str, outer_api: str):
         with device_module.device(dev):
             assert [device_module.memory_stats(d) for d in devices] == stable
     del y
-    _settle(cpu)
-    _assert_shared(cpu, bases[1])
+    _settle(second)
+    _assert_shared(second, bases[1])
     _assert_shared(mojo_gpu, bases[0] + 513)
     del x
     _settle(mojo_gpu)
@@ -480,6 +480,7 @@ def test_capability_contracts_and_inductor_properties(mojo_device: str):
         torch.accelerator.get_device_capability(torch.device(mojo_device).index)
 
 
+@pytest.mark.cpu_torch
 def test_inductor_properties_after_explicit_enable(mojo_gpu: str):
     """18: Inductor registration is opt-in, separate from device registration."""
     if torch.cuda.is_available():
@@ -606,19 +607,17 @@ def test_set_replaces_only_one_storage_owner(mojo_device: str, keep_alias: bool)
     _assert_shared(mojo_device, base)
 
 
-@pytest.mark.skipif(
-    len(list(get_accelerators())) < 2, reason="needs a GPU plus the MAX CPU device"
-)
+@pytest.mark.skipif(len(list(get_accelerators())) < 2, reason="needs two GPUs")
 def test_set_cross_device_failure_preserves_both_ledgers(mojo_gpu: str):
-    cpu = device_module.cpu()
+    second = torch.device("mojo:1")
     x = torch.ones(17, device=mojo_gpu)
-    y = torch.ones(31, device=cpu)
-    for dev in (mojo_gpu, cpu):
+    y = torch.ones(31, device=second)
+    for dev in (mojo_gpu, second):
         _settle(dev)
-    before = [device_module.memory_stats(dev) for dev in (mojo_gpu, cpu)]
+    before = [device_module.memory_stats(dev) for dev in (mojo_gpu, second)]
     with pytest.raises((RuntimeError, NotImplementedError), match="same mojo|device"):
         torch.ops.aten.set_.source_Tensor(x, y)
-    assert [device_module.memory_stats(dev) for dev in (mojo_gpu, cpu)] == before
+    assert [device_module.memory_stats(dev) for dev in (mojo_gpu, second)] == before
     torch.testing.assert_close(x.cpu(), torch.ones(17))
     torch.testing.assert_close(y.cpu(), torch.ones(31))
 
@@ -723,29 +722,12 @@ def test_factory_final_storage_cost(mojo_device: str, factory: str):
     _assert_shared(mojo_device, base)
 
 
-@pytest.mark.skipif(
-    len(list(get_accelerators())) < 2, reason="needs a GPU plus the MAX CPU device"
-)
+@pytest.mark.skipif(len(list(get_accelerators())) < 2, reason="needs two GPUs")
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("source_first", [False, True])
-@pytest.mark.parametrize(
-    "peer",
-    [
-        "cpu",
-        pytest.param(
-            "gpu",
-            marks=pytest.mark.skipif(
-                len(list(get_accelerators())) < 3,
-                reason="needs two physical GPUs; the last mojo device is CPU",
-            ),
-        ),
-    ],
-)
-def test_cross_device_copy_ownership(
-    mojo_gpu: str, reverse: bool, source_first: bool, peer: str
-):
-    """30: GPU <-> mojo CPU covers independent owners without a second GPU."""
-    other = device_module.cpu() if peer == "cpu" else torch.device("mojo:1")
+def test_cross_device_copy_ownership(mojo_gpu: str, reverse: bool, source_first: bool):
+    """30: two real mojo GPUs cover independent owners."""
+    other = torch.device("mojo:1")
     src, dst = (
         (other, torch.device(mojo_gpu)) if reverse else (torch.device(mojo_gpu), other)
     )
@@ -1096,15 +1078,9 @@ import torch
 from torch_mojo_backend import register_mojo_devices
 register_mojo_devices()
 d = sys.argv[1]
-is_cpu = torch.mojo.get_device_properties(d).is_cpu
 size, count = 1024**2, 32
 def batch():
     tensors = [torch.empty(size, dtype=torch.uint8, device=d) for _ in range(count)]
-    if is_cpu:
-        # Commit host pages: virtual address space is not current residency.
-        for tensor in tensors:
-            tensor.zero_()
-        del tensor
     tensors.clear()
     gc.collect()
     torch.mojo.synchronize(d)
@@ -1122,11 +1098,10 @@ for _ in range(64):
     assert stats["allocation.all.current"] == base["allocation.all.current"]
     # A bounded diagnostic allowance for host/runtime arenas and metadata.
     assert rss() <= rss_before + size * count
-    if not is_cpu:
-        free, current_total = torch.mojo.mem_get_info(d)
-        assert current_total == total
-        # MAX's observed minimum arena chunk is 256 MiB (see docs).
-        assert free >= free_before - 256 * 1024**2
+    free, current_total = torch.mojo.mem_get_info(d)
+    assert current_total == total
+    # MAX's observed minimum arena chunk is 256 MiB (see docs).
+    assert free >= free_before - 256 * 1024**2
 """,
         mojo_device,
     )
@@ -1323,7 +1298,9 @@ def test_stats_identities_and_summary(mojo_device: str):
     del x
 
 
-def test_empty_cache_before_any_allocation():
+def test_empty_cache_before_any_allocation(mojo_gpu_available: bool):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     code = """
 import torch
 from torch_mojo_backend import register_mojo_devices
@@ -1506,30 +1483,19 @@ def test_properties_and_memory_info(mojo_device: str):
     assert props.total_memory == total
     with pytest.raises(FrozenInstanceError):
         setattr(props, "name", "changed")
-    if props.is_cpu:
-        assert torch.device(mojo_device).index == device_module.device_count() - 1
-        assert props.api == "cpu"
-        assert props.multi_processor_count is None
+    assert props.multi_processor_count is not None and props.multi_processor_count > 0
+    if props.api == "metal":
+        # MAX does not expose Metal's SIMD-group width as a device attribute.
         assert props.warp_size is None
-        assert props.major is None and props.minor is None
     else:
-        assert (
-            props.multi_processor_count is not None and props.multi_processor_count > 0
-        )
-        if props.api == "metal":
-            # MAX does not expose Metal's SIMD-group width as a device attribute.
-            assert props.warp_size is None
-        else:
-            assert props.warp_size in (32, 64)
-        if props.api == "cuda":
-            assert props.major is not None and props.major > 0
-            if torch.cuda.is_available():
-                idx = torch.device(mojo_device).index
-                assert (props.major, props.minor) == torch.cuda.get_device_capability(
-                    idx
-                )
-            assert props.arch_name is not None
-            assert props.arch_name.startswith(f"sm_{props.major}{props.minor}")
+        assert props.warp_size in (32, 64)
+    if props.api == "cuda":
+        assert props.major is not None and props.major > 0
+        if torch.cuda.is_available():
+            idx = torch.device(mojo_device).index
+            assert (props.major, props.minor) == torch.cuda.get_device_capability(idx)
+        assert props.arch_name is not None
+        assert props.arch_name.startswith(f"sm_{props.major}{props.minor}")
 
 
 @pytest.mark.parametrize("name", _DEVICE_APIS)
@@ -1631,14 +1597,6 @@ def test_gpu_isolation(mojo_gpu: str):
     del x
     device_module.synchronize(1)
     assert device_module.memory_allocated(1) == other_before
-
-
-def test_cpu_device_isolation(mojo_gpu: str):
-    before = device_module.memory_stats(mojo_gpu)
-    x = torch.empty(12345, dtype=torch.uint8, device=device_module.cpu())
-    assert device_module.memory_stats(mojo_gpu) == before
-    assert device_module.memory_allocated(device_module.cpu()) >= 12345
-    del x
 
 
 def test_record_stream_does_not_double_count(mojo_gpu: str):
@@ -1756,6 +1714,10 @@ def test_memory_apis_after_fork(mojo_device: str):
         ("reset_peak_host_memory_stats", ()),
     ],
 )
-def test_unsupported_memory_apis(name: str, args: tuple[int | float, ...]):
+def test_unsupported_memory_apis(
+    name: str, args: tuple[int | float, ...], mojo_gpu_available: bool
+):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     with pytest.raises(NotImplementedError, match="MAX|Mojo"):
         getattr(device_module, name)(*args)

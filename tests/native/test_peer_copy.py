@@ -26,7 +26,7 @@ from torch_mojo_backend import get_accelerators, register_mojo_devices
 
 @pytest.fixture(autouse=True)
 def two_gpus():
-    if len(get_accelerators()) - 1 < 2:
+    if len(get_accelerators()) < 2:
         pytest.skip("requires two mojo GPUs")
 
 

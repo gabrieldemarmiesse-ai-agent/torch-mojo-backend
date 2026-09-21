@@ -228,24 +228,15 @@ def _pieces(p: Plan, itemsize: Int, mut out: List[Plan]):
 # ---------------------------------------------------------------------------
 
 
-comptime _CPU_SM = 132  # an H100 SXM: the constants the CPU device answers with
-comptime _CPU_MAX_THREADS = 2048
-
-
 def _grid(device: Int, numel: Int) raises -> Int:
-    # The MAX CPU device answers the constants without asking, and without
-    # touching the per-device attribute cache: that cache is indexed by
-    # `DeviceContext.id()`, which is 0 for the CPU context AND for GPU 0, so
-    # asking here would write the CPU's answer into GPU 0's slot (and every
-    # grid derived from `_device_sm_count` would then read it).
-    if dev(device)[].is_cpu:
-        return min(ceildiv(numel, BLOCK), _CPU_SM * (_CPU_MAX_THREADS // BLOCK))
+    # Constant fallbacks (an H100 SXM) for a query that fails to answer;
+    # every real accelerator answers these, so they are not expected to fire.
     var ctx = ctx_for(device)
     var max_threads = _device_attr_cached["maxthr"](
-        ctx, DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, _CPU_MAX_THREADS
+        ctx, DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, 2048
     )
     var sm = _device_attr_cached["sm"](
-        ctx, DeviceAttribute.MULTIPROCESSOR_COUNT, _CPU_SM
+        ctx, DeviceAttribute.MULTIPROCESSOR_COUNT, 132
     )
     return min(ceildiv(numel, BLOCK), sm * (max_threads // BLOCK))
 
@@ -1066,7 +1057,7 @@ def op_native_dropout(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    if not _dropout_dtype_ok(a.dtype) or dev(a.device)[].is_cpu:
+    if not _dropout_dtype_ok(a.dtype):
         unsupported(
             "native_dropout is only implemented for floating tensors on the"
             " mojo GPU device"
@@ -1168,7 +1159,6 @@ def op_native_dropout_backward(
     if (
         not _dropout_dtype_ok(grad.dtype)
         or keep.dtype != DType.bool
-        or dev(grad.device)[].is_cpu
         or keep.device != grad.device
         or not grad.same_shape(keep)
     ):

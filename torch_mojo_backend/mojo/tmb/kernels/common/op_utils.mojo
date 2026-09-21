@@ -1563,7 +1563,7 @@ def _flat_vec_unary[
     else:
         comptime VW = 16 // size_of[dtype]()
         comptime out_align = min(16, VW * size_of[out_dtype]())
-        if ctx.api() == "cpu" or total <= 0:
+        if total <= 0:
             return False
         if in_addr % 16 != 0 or out_addr % out_align != 0:
             return False
@@ -1585,13 +1585,10 @@ def _flat_vec_unary[
 def _parallel_for[
     func: def[width: Int, alignment: Int = 1](Coord) capturing[_] -> None
 ](count: Int, ctx: DeviceContext) raises:
-    if ctx.api() == "cpu":
-        elementwise[func, simd_width=1](Coord(count), ctx)
+    comptime if has_accelerator():
+        elementwise[func, simd_width=1, target="gpu"](Coord(count), ctx)
     else:
-        comptime if has_accelerator():
-            elementwise[func, simd_width=1, target="gpu"](Coord(count), ctx)
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error("no GPU accelerator available at compile time")
 
 
 @always_inline
@@ -1926,208 +1923,168 @@ def _copy_strided[
     if total == 0:
         return
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(dst_ptr, src_ptr, shape, dst_strides, src_strides)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var rest = Int(idx[0].value())
-            var dst_off = 0
-            var src_off = 0
-
-            comptime for d in range(MAX_RANK - 1, 0, -1):
-                var coord = rest % shape[d]
-                rest = rest // shape[d]
-                dst_off += coord * dst_strides[d]
-                src_off += coord * src_strides[d]
-            dst_off += rest * dst_strides[0]
-            src_off += rest * src_strides[0]
-            dst_ptr[unsafe_offset=dst_off] = src_ptr[unsafe_offset=src_off]
-
-        elementwise[func, simd_width=1](Coord(total), ctx)
-    else:
-        comptime if has_accelerator():
-            comptime TILE = _t2d_tile[dtype]()
-            var rows = shape[MAX_RANK - 2]
-            var cols = shape[MAX_RANK - 1]
-            comptime if (
-                dtype == DType.uint16 or dtype == DType.uint32
-            ) and _has_sm_9x():
-                var row_outer_trivial = True
-                comptime for d in range(MAX_RANK - 2):
-                    if shape[d] != 1:
-                        row_outer_trivial = False
-                var pitch = src_strides[MAX_RANK - 2]
-                var row_api = True
-                comptime if dtype == DType.uint32:
-                    row_api = ctx.api() == "cuda"
-                if (
-                    row_api
-                    and row_outer_trivial
-                    and dst_strides[MAX_RANK - 1] == 1
-                    and dst_strides[MAX_RANK - 2] == cols
-                    and src_strides[MAX_RANK - 1] == 1
-                    and pitch >= cols
-                ):
-                    comptime if dtype == DType.uint16:
-                        # Every row and both pointer offsets must retain 16-byte
-                        # alignment. Unaligned views and tails use scalar accesses.
-                        if (
-                            dst_addr % 16 == 0
-                            and src_addr % 16 == 0
-                            and cols % 8 == 0
-                            and pitch % 8 == 0
-                        ):
-                            _enqueue_cached[_copy_row_strided_u16_kernel[8]](
-                                ctx,
-                                ceildiv(cols, 256 * 8),
-                                min(rows, _MAX_GRID_Y),
-                                1,
-                                256,
-                                dst_ptr.as_unsafe_any_origin(),
-                                src_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(rows),
-                                Int64(cols),
-                                Int64(pitch),
-                            )
-                        else:
-                            _enqueue_cached[_copy_row_strided_u16_kernel[1]](
-                                ctx,
-                                ceildiv(cols, 256),
-                                min(rows, _MAX_GRID_Y),
-                                1,
-                                256,
-                                dst_ptr.as_unsafe_any_origin(),
-                                src_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(rows),
-                                Int64(cols),
-                                Int64(pitch),
-                            )
-                    else:
-                        # Every row and both pointer offsets must retain 16-byte
-                        # alignment. Unaligned views and tails use scalar accesses.
-                        if (
-                            dst_addr % 16 == 0
-                            and src_addr % 16 == 0
-                            and cols % 4 == 0
-                            and pitch % 4 == 0
-                        ):
-                            _enqueue_cached[_copy_row_strided_u32_kernel[4, 1]](
-                                ctx,
-                                ceildiv(cols, 256 * 4),
-                                min(rows, _MAX_GRID_Y),
-                                1,
-                                256,
-                                dst_ptr.as_unsafe_any_origin(),
-                                src_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(rows),
-                                Int64(cols),
-                                Int64(pitch),
-                            )
-                        else:
-                            _enqueue_cached[_copy_row_strided_u32_kernel[1, 4]](
-                                ctx,
-                                ceildiv(cols, 256 * 4),
-                                min(rows, _MAX_GRID_Y),
-                                1,
-                                256,
-                                dst_ptr.as_unsafe_any_origin(),
-                                src_ptr.as_unsafe_any_origin().as_imm(),
-                                Int64(rows),
-                                Int64(cols),
-                                Int64(pitch),
-                            )
-                    return
-            # Transposed read into a contiguous destination, optionally batched:
-            # the innermost two dims are a (rows, cols) row-major destination
-            # whose source is a (cols, rows) matrix read down its columns, and at
-            # most one leading dim -- the batch -- may be non-trivial. Batching
-            # matters because the SDPA backward transposes
-            # [batch*heads, seq, head_dim] four times per layer; without it those
-            # fall to the generic strided copy and run at a fraction of
-            # bandwidth.
-            var batch = shape[MAX_RANK - 3]
-            var outer_trivial = True
-            for d in range(MAX_RANK - 3):
+    comptime if has_accelerator():
+        comptime TILE = _t2d_tile[dtype]()
+        var rows = shape[MAX_RANK - 2]
+        var cols = shape[MAX_RANK - 1]
+        comptime if (
+            dtype == DType.uint16 or dtype == DType.uint32
+        ) and _has_sm_9x():
+            var row_outer_trivial = True
+            comptime for d in range(MAX_RANK - 2):
                 if shape[d] != 1:
-                    outer_trivial = False
+                    row_outer_trivial = False
+            var pitch = src_strides[MAX_RANK - 2]
+            var row_api = True
+            comptime if dtype == DType.uint32:
+                row_api = ctx.api() == "cuda"
             if (
-                outer_trivial
-                and rows > 1
-                and cols > 1
-                and total >= 1024
+                row_api
+                and row_outer_trivial
                 and dst_strides[MAX_RANK - 1] == 1
                 and dst_strides[MAX_RANK - 2] == cols
-                and src_strides[MAX_RANK - 2] == 1
-                and src_strides[MAX_RANK - 1] >= rows
-                # A batch of one leaves the strides unconstrained; anything more
-                # needs both operands to repeat their matrix at a fixed pitch,
-                # and the destination's must be exactly one dense matrix so the
-                # writes stay contiguous.
-                and (
-                    batch == 1
-                    or (
-                        dst_strides[MAX_RANK - 3] == rows * cols
-                        and src_strides[MAX_RANK - 3]
-                        >= cols * src_strides[MAX_RANK - 1]
-                    )
-                )
+                and src_strides[MAX_RANK - 1] == 1
+                and pitch >= cols
             ):
-                # Wide regime: 16 bytes per access on both sides, which needs
-                # every run this kernel touches to be a whole number of vectors
-                # and both bases 16-byte aligned.  Those are properties of the
-                # strides and the allocator, not of a particular shape, so it
-                # serves every shape they admit; the scalar tile below serves the
-                # rest.
-                comptime VEC = _t2dv_vec[dtype]()
-                comptime VBLK = VEC * _T2DV_LANE_C
-                if (
-                    size_of[dtype]() >= 2
-                    and rows % VEC == 0
-                    and cols % VEC == 0
-                    and src_strides[MAX_RANK - 1] % VEC == 0
-                    and dst_addr % 16 == 0
-                    and src_addr % 16 == 0
-                    and (batch == 1 or src_strides[MAX_RANK - 3] % VEC == 0)
-                ):
-                    _enqueue_cached[_transpose2d_vec_kernel[dtype]](
-                        ctx,
-                        # One wave per VBLK x VBLK region, unclamped.  A clamp
-                        # makes the grid-stride loop give some waves one region
-                        # and some two, and the makespan is the larger; measured
-                        # it is worth 0.6-2.4% at the weight-gradient shapes, so
-                        # it is small, but there is nothing to trade it against
-                        # -- the kernel holds no LDS and its state is per-region.
-                        max(
+                comptime if dtype == DType.uint16:
+                    # Every row and both pointer offsets must retain 16-byte
+                    # alignment. Unaligned views and tails use scalar accesses.
+                    if (
+                        dst_addr % 16 == 0
+                        and src_addr % 16 == 0
+                        and cols % 8 == 0
+                        and pitch % 8 == 0
+                    ):
+                        _enqueue_cached[_copy_row_strided_u16_kernel[8]](
+                            ctx,
+                            ceildiv(cols, 256 * 8),
+                            min(rows, _MAX_GRID_Y),
                             1,
-                            ceildiv(
-                                ceildiv(cols, VBLK) * ceildiv(rows, VBLK) * 64,
-                                _T2DV_THREADS,
-                            ),
-                        ),
-                        1,
-                        min(batch, _MAX_GRID_Y),
-                        _T2DV_THREADS,
-                        dst_ptr.as_unsafe_any_origin(),
-                        src_ptr.as_unsafe_any_origin().as_imm(),
-                        Int64(rows),
-                        Int64(cols),
-                        Int64(src_strides[MAX_RANK - 1]),
-                        Int64(batch),
-                        Int64(dst_strides[MAX_RANK - 3] if batch > 1 else 0),
-                        Int64(src_strides[MAX_RANK - 3] if batch > 1 else 0),
-                    )
-                    return
-                _enqueue_cached[_transpose2d_kernel[dtype]](
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                    else:
+                        _enqueue_cached[_copy_row_strided_u16_kernel[1]](
+                            ctx,
+                            ceildiv(cols, 256),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                else:
+                    # Every row and both pointer offsets must retain 16-byte
+                    # alignment. Unaligned views and tails use scalar accesses.
+                    if (
+                        dst_addr % 16 == 0
+                        and src_addr % 16 == 0
+                        and cols % 4 == 0
+                        and pitch % 4 == 0
+                    ):
+                        _enqueue_cached[_copy_row_strided_u32_kernel[4, 1]](
+                            ctx,
+                            ceildiv(cols, 256 * 4),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                    else:
+                        _enqueue_cached[_copy_row_strided_u32_kernel[1, 4]](
+                            ctx,
+                            ceildiv(cols, 256 * 4),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                return
+        # Transposed read into a contiguous destination, optionally batched:
+        # the innermost two dims are a (rows, cols) row-major destination
+        # whose source is a (cols, rows) matrix read down its columns, and at
+        # most one leading dim -- the batch -- may be non-trivial. Batching
+        # matters because the SDPA backward transposes
+        # [batch*heads, seq, head_dim] four times per layer; without it those
+        # fall to the generic strided copy and run at a fraction of
+        # bandwidth.
+        var batch = shape[MAX_RANK - 3]
+        var outer_trivial = True
+        for d in range(MAX_RANK - 3):
+            if shape[d] != 1:
+                outer_trivial = False
+        if (
+            outer_trivial
+            and rows > 1
+            and cols > 1
+            and total >= 1024
+            and dst_strides[MAX_RANK - 1] == 1
+            and dst_strides[MAX_RANK - 2] == cols
+            and src_strides[MAX_RANK - 2] == 1
+            and src_strides[MAX_RANK - 1] >= rows
+            # A batch of one leaves the strides unconstrained; anything more
+            # needs both operands to repeat their matrix at a fixed pitch,
+            # and the destination's must be exactly one dense matrix so the
+            # writes stay contiguous.
+            and (
+                batch == 1
+                or (
+                    dst_strides[MAX_RANK - 3] == rows * cols
+                    and src_strides[MAX_RANK - 3]
+                    >= cols * src_strides[MAX_RANK - 1]
+                )
+            )
+        ):
+            # Wide regime: 16 bytes per access on both sides, which needs
+            # every run this kernel touches to be a whole number of vectors
+            # and both bases 16-byte aligned.  Those are properties of the
+            # strides and the allocator, not of a particular shape, so it
+            # serves every shape they admit; the scalar tile below serves the
+            # rest.
+            comptime VEC = _t2dv_vec[dtype]()
+            comptime VBLK = VEC * _T2DV_LANE_C
+            if (
+                size_of[dtype]() >= 2
+                and rows % VEC == 0
+                and cols % VEC == 0
+                and src_strides[MAX_RANK - 1] % VEC == 0
+                and dst_addr % 16 == 0
+                and src_addr % 16 == 0
+                and (batch == 1 or src_strides[MAX_RANK - 3] % VEC == 0)
+            ):
+                _enqueue_cached[_transpose2d_vec_kernel[dtype]](
                     ctx,
-                    ceildiv(cols, TILE),
-                    # gridDim.y and .z are both capped at 65535; the kernel
-                    # grid-strides row tiles and batch, so clamping here only
-                    # costs extra iterations.
-                    min(ceildiv(rows, TILE), _MAX_GRID_Y),
+                    # One wave per VBLK x VBLK region, unclamped.  A clamp
+                    # makes the grid-stride loop give some waves one region
+                    # and some two, and the makespan is the larger; measured
+                    # it is worth 0.6-2.4% at the weight-gradient shapes, so
+                    # it is small, but there is nothing to trade it against
+                    # -- the kernel holds no LDS and its state is per-region.
+                    max(
+                        1,
+                        ceildiv(
+                            ceildiv(cols, VBLK) * ceildiv(rows, VBLK) * 64,
+                            _T2DV_THREADS,
+                        ),
+                    ),
+                    1,
                     min(batch, _MAX_GRID_Y),
-                    TILE * _T2D_ROWS,
+                    _T2DV_THREADS,
                     dst_ptr.as_unsafe_any_origin(),
                     src_ptr.as_unsafe_any_origin().as_imm(),
                     Int64(rows),
@@ -2138,21 +2095,40 @@ def _copy_strided[
                     Int64(src_strides[MAX_RANK - 3] if batch > 1 else 0),
                 )
                 return
-            _enqueue_cached[_copy_strided_kernel[dtype]](
+            _enqueue_cached[_transpose2d_kernel[dtype]](
                 ctx,
-                _gs_blocks(total),
-                1,
-                1,
-                GS_THREADS,
+                ceildiv(cols, TILE),
+                # gridDim.y and .z are both capped at 65535; the kernel
+                # grid-strides row tiles and batch, so clamping here only
+                # costs extra iterations.
+                min(ceildiv(rows, TILE), _MAX_GRID_Y),
+                min(batch, _MAX_GRID_Y),
+                TILE * _T2D_ROWS,
                 dst_ptr.as_unsafe_any_origin(),
                 src_ptr.as_unsafe_any_origin().as_imm(),
-                shape,
-                dst_strides,
-                src_strides,
-                Int64(total),
+                Int64(rows),
+                Int64(cols),
+                Int64(src_strides[MAX_RANK - 1]),
+                Int64(batch),
+                Int64(dst_strides[MAX_RANK - 3] if batch > 1 else 0),
+                Int64(src_strides[MAX_RANK - 3] if batch > 1 else 0),
             )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+            return
+        _enqueue_cached[_copy_strided_kernel[dtype]](
+            ctx,
+            _gs_blocks(total),
+            1,
+            1,
+            GS_THREADS,
+            dst_ptr.as_unsafe_any_origin(),
+            src_ptr.as_unsafe_any_origin().as_imm(),
+            shape,
+            dst_strides,
+            src_strides,
+            Int64(total),
+        )
+    else:
+        raise Error("no GPU accelerator available at compile time")
 
 
 # ===========================================================================
@@ -2410,19 +2386,6 @@ def _fill_contig[
         return
     var dst_ptr = _make_ptr[dtype](dst_addr)
 
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(dst_ptr, value)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            dst_ptr.unsafe_store[width=width](
-                Int(idx[0].value()), SIMD[dtype, width](value)
-            )
-
-        elementwise[func, simd_width=simd_width_of[dtype]()](Coord(size), ctx)
-        return
-
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
@@ -2469,24 +2432,6 @@ def _fill_strided[
     """`dst[coords] = value` over a COLLAPSED rank-`RANK` layout in VEC units.
     """
     var dst_ptr = _make_ptr[dtype](dst_addr)
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(dst_ptr, value, shape, strides)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var rest = Int(idx[0].value())
-            var off = 0
-
-            comptime for d in range(RANK - 1, 0, -1):
-                off += (rest % shape[d]) * strides[d]
-                rest = rest // shape[d]
-            off += rest * strides[0]
-            dst_ptr.unsafe_store[width=VEC](off * VEC, SIMD[dtype, VEC](value))
-
-        elementwise[func, simd_width=1](Coord(total), ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")

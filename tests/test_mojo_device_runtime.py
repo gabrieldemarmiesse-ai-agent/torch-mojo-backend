@@ -33,9 +33,10 @@ def setup_mojo_device():
     register_mojo_devices()
 
 
+@pytest.mark.gpu
 def test_indexless_mojo_device_uses_current_device():
     if device_module.device_count() < 2:
-        pytest.skip("requires two Mojo devices, including the MAX CPU device")
+        pytest.skip("requires two GPUs")
     original_index = device_module.current_device()
     alternate_index = (original_index + 1) % device_module.device_count()
     try:
@@ -61,10 +62,11 @@ def test_mojo_rng_state_round_trips_a_high_bit_seed(mojo_device):
     torch.testing.assert_close(device_module.get_rng_state(device), state)
 
 
+@pytest.mark.gpu
 def test_mojo_rng_state_is_per_device():
     """Seeding one Mojo device's generator does not perturb another's."""
     if device_module.device_count() < 2:
-        pytest.skip("requires two Mojo devices, including the MAX CPU device")
+        pytest.skip("requires two GPUs")
     first = torch.device("mojo:0")
     second = torch.device("mojo", device_module.device_count() - 1)
     device_module.manual_seed_all(20260718)
@@ -99,7 +101,9 @@ def test_mojo_rng_seed_is_masked_to_64_bits_rather_than_rejected(mojo_device):
         assert stored == seed & mask
 
 
-def test_torch_fork_rng_restores_mojo_state():
+def test_torch_fork_rng_restores_mojo_state(mojo_gpu_available: bool):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     device = torch.device("mojo:0")
     device_module.manual_seed_all(91)
     before = device_module.get_rng_state(device)

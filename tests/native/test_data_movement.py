@@ -16,13 +16,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, get_accelerators, register_mojo_devices
+from torch_mojo_backend import aten_functions, get_accelerators
 
-# The `mojo_device` fixture (tests/conftest.py) yields a "mojo:N" string but,
-# unlike `mojo_gpu`, never registers the backend itself -- it assumes some
-# other test using the `conf` fixture ran first in the same session. Running
-# this file on its own needs the same idempotent call `mojo_gpu` makes.
-register_mojo_devices()
+# tests/native/conftest.py registers devices at fixture setup. Registration
+# during collection would also affect deselected tests and break CUDA autograd
+# in the separate CUDA compiler job.
 
 
 def _fill(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -497,7 +495,7 @@ def test_split_copy_errors(mojo_gpu: str, mode: str):
 
 @pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
 def mojo_pair(request: pytest.FixtureRequest) -> tuple[str, str]:
-    if len(get_accelerators()) - 1 < 2:
+    if len(get_accelerators()) < 2:
         pytest.skip("requires two mojo GPUs")
     src, dst = request.param
     return f"mojo:{src}", f"mojo:{dst}"
@@ -853,18 +851,6 @@ for src, dst in [("mojo:0", "mojo:1"), ("mojo:1", "mojo:0")]:
     assert f"peer copy {'host' if route == 'direct' else 'direct'}" not in output
 
 
-def test_cross_device_cpu_fallback(mojo_gpu: str):
-    cpu_device = f"mojo:{len(get_accelerators()) - 1}"
-    expected = _fill((17, 23), torch.float32).t()
-    source = _fill((17, 23), torch.float32).to(mojo_gpu).t()
-    moved = source.to(cpu_device).to(mojo_gpu)
-    torch.testing.assert_close(moved.cpu(), expected)
-    for target, source_device in [(cpu_device, mojo_gpu), (mojo_gpu, cpu_device)]:
-        actual = torch.empty((23, 34), device=target)[:, ::2]
-        actual.copy_(expected.to(source_device))
-        torch.testing.assert_close(actual.cpu(), expected)
-
-
 # ---------------------------------------------------------------------------
 # memory formats (empty.memory_format / clone / _to_copy)
 # ---------------------------------------------------------------------------
@@ -1015,6 +1001,7 @@ def test_channels_last_survives_a_device_round_trip(mojo_device):
     assert torch.equal(back, x)
 
 
+@pytest.mark.gpu
 def test_channels_last_survives_a_move_between_mojo_devices():
     """The cross-device leg stages a contiguous buffer and lays the layout out
     again on the destination."""

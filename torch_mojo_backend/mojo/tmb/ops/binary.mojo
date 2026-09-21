@@ -363,10 +363,10 @@ def _b_scalar_tensor(value: Float64, st: Int32, device: Int) raises -> Held:
     """A 0-d tensor holding `value`: what a scalar operand becomes.
 
     Written with the FillSpec kernel, like the old path, and deliberately
-    not with a device memset: on the MAX CPU device a memset enqueued on the
-    context does not order against the `elementwise` launch that reads it,
-    and the binary kernel then saw uninitialized memory (flaky wrong results
-    on `mojo:cpu` only). Both halves have to be the same kind of launch.
+    not with a device memset: a memset enqueued on the context is not
+    guaranteed to order against the `elementwise` launch that reads it, which
+    once produced flaky wrong results (uninitialized memory read by the
+    binary kernel). Both halves have to be the same kind of launch.
     """
     var t = new_scalar(st, device)
     try:
@@ -637,7 +637,7 @@ def _b_fast_tt(
     var kernel = op
     var out_stype = a.stype
     if a.stype != b.stype:
-        if op != "AddSpec" or dev(a.device)[].is_cpu:
+        if op != "AddSpec":
             return False
         if not (
             (a.stype == ST_FLOAT32 and b.stype == ST_BFLOAT16)
@@ -971,7 +971,6 @@ def _b_try_add_f32_bf16(lhs: Side, rhs: Side) raises -> Optional[Res]:
     var b = rhs.t.value().copy()
     if (
         a.device != b.device
-        or dev(a.device)[].is_cpu
         or not a.contig
         or not b.contig
         or not _b_fits(a, b.shape)
@@ -1915,11 +1914,7 @@ def _b_addc(
             _b_no_partial_overlap(dest, a)
             _b_no_partial_overlap(dest, b)
             _b_no_partial_overlap(dest, c)
-            if (
-                dest.ptr == a.ptr
-                and a.dtype == DType.float32
-                and not dev(a.device)[].is_cpu
-            ):
+            if dest.ptr == a.ptr and a.dtype == DType.float32:
                 var selves = List[T]()
                 var firsts = List[T]()
                 var seconds = List[T]()
@@ -2083,7 +2078,6 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
             and finish.contig
             and dest.same_shape(start)
             and start.same_shape(finish)
-            and not dev(start.device)[].is_cpu
         ):
             _b_no_partial_overlap(dest, finish)
             # The single-tensor in-place decomposition reaches Scalar_out.
