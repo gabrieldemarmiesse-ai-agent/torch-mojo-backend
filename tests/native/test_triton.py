@@ -18,12 +18,15 @@ from torch_mojo_backend.triton_driver import enable_triton
 
 triton = pytest.importorskip("triton")
 tl = pytest.importorskip("triton.language")
+
 from torch._library.triton import triton_op, wrap_triton  # noqa: E402 -- after the skip
 
 # Optional Triton dependency: its wheels are unavailable on macOS.
 from triton.runtime import (  # noqa: E402 -- after importorskip
     driver as active_driver,
 )
+
+pytestmark = pytest.mark.cpu_torch
 
 
 @pytest.fixture

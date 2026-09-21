@@ -831,6 +831,7 @@ def test_out_on_the_cpu_raises(mojo_device, op):
         run(torch.empty(ref.shape))
 
 
+@pytest.mark.gpu
 def test_out_on_another_mojo_device_raises():
     """A cross-device `out=` would launch the copy in the destination's
     context with no ordering against the stream that produced the result;
