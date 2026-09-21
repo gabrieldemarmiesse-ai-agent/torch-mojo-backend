@@ -15,19 +15,11 @@ pytest.register_assert_rewrite("torch_mojo_backend.testing")
 
 
 import torch
-from mojo.paths import _build_mojo_source_package
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker, Conf
-from torch_mojo_backend.torch_compile_backend import compiler
 
 os.environ["TORCH_MOJO_BACKEND_VERBOSE"] = "1"
-
-# TODO: remove this when
-# https://github.com/modular/modular/issues/5495 is fixed
-compiler.paths_to_mojo_kernels[0] = _build_mojo_source_package(
-    compiler.paths_to_mojo_kernels[0]
-)
 
 
 @pytest.fixture(params=["cpu", "cuda"])
