@@ -189,8 +189,8 @@ jobs:
         env:
           TORCH_WHEEL: ${{ matrix.torch-wheel }}
         run: |
-          flock /tmp/gpu_lock_0.lock nvidia-smi
-          flock /tmp/gpu_lock_0.lock uv run --no-sync python - <<'PY'
+          nvidia-smi
+          uv run --no-sync python - <<'PY'
           import os
           import torch
           from torch_mojo_backend import get_accelerators
@@ -207,4 +207,4 @@ jobs:
 
       - name: Run GPU unit tests
         run: |
-          flock /tmp/gpu_lock_0.lock uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -v -ra
+          uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -v -ra

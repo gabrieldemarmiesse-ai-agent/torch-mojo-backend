@@ -30,8 +30,9 @@ tests use `@pytest.mark.cuda`, which also implies `gpu`. For mixed parameter
 sets, put the marker on the GPU `pytest.param` only. Pure validation tests in
 GPU-related modules still belong to the CPU selection.
 
-The self-hosted jobs run serially and take `/tmp/gpu_lock_0.lock` around GPU
-commands. They preserve the runner's uv, Mojo, and native build caches, using
+The self-hosted jobs run serially (`max-parallel: 1`), so there is no need to
+flock the GPU against another job on this runner. They preserve the runner's
+uv, Mojo, and native build caches, using
 `UV_CACHE_DIR`, `MODULAR_HOME`, and `TORCH_MOJO_BACKEND_CACHE_DIR` if configured,
 otherwise persistent directories under the user's cache directory. No cache
 cleanup or pruning runs between jobs. The dependency environment is synced
