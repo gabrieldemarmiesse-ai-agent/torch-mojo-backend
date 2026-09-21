@@ -54,9 +54,7 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not boxes.contig or not scores.contig:
         unsupported("nms: boxes and scores must be contiguous")
     var ctx = ctx_for(boxes.device)
-    if ctx.api() == "cpu" or (
-        ctx.api() == "metal" and boxes.dtype == DType.float64
-    ):
+    if ctx.api() == "metal" and boxes.dtype == DType.float64:
         unsupported("nms: requires a GPU supporting the input dtype")
     var n = boxes.dim(0)
     if n == 0:

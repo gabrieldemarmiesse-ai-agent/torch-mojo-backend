@@ -281,10 +281,6 @@ def _trailing_dims(rank: Int, n: Int) -> List[Int]:
     return dims^
 
 
-def _on_accelerator(device: Int) raises -> Bool:
-    return not dev(device)[].is_cpu
-
-
 def _middle_direct_ok(a: T, dims: List[Int]) raises -> Bool:
     """Whether the scalar reductions read this layout in place.
 
@@ -293,7 +289,7 @@ def _middle_direct_ok(a: T, dims: List[Int]) raises -> Bool:
     ascending, NON-trailing dim interval on an accelerator. Trailing dims are
     excluded because the ordinary rows/cols path already owns them.
     """
-    if not a.contig or not _on_accelerator(a.device):
+    if not a.contig:
         return False
     if _is_trailing(dims, a.rank):
         return False

@@ -1,10 +1,11 @@
 """Devices, streams, events and memory of the native backend.
 
-One `Dev` per mojo index: the accelerators MAX enumerates, then the MAX CPU
-device last (so `mojo:N` is the CPU on an N-GPU box, as before). A stream is a
-MAX stream of the device's base context; kernels get the context *view* bound
-to it (`DeviceContext.select_stream`), so real multi-stream execution costs
-nothing at launch time. Everything here runs under the shim's mutex.
+One `Dev` per mojo index: the accelerators MAX enumerates (`mojo:N` is always
+a real accelerator; there is no CPU-backed mojo device -- users who want the
+CPU use `device="cpu"` directly). A stream is a MAX stream of the device's
+base context; kernels get the context *view* bound to it
+(`DeviceContext.select_stream`), so real multi-stream execution costs nothing
+at launch time. Everything here runs under the shim's mutex.
 """
 from std.ffi import _get_global_or_null, c_char, c_size_t, external_call
 from std.memory import unsafe_memcpy
@@ -87,7 +88,6 @@ struct Dev(Movable):
     var streams: List[DeviceStream]  # created streams, kept alive
     var raw: List[Int]  # vendor stream handle per stream (0 when unknown)
     var api: String
-    var is_cpu: Bool
     var pool: List[Int]
     var pool_next: Int
     var pending_host: List[Int]  # freed pinned / H2D staging boxes (addresses)
@@ -101,9 +101,8 @@ struct Dev(Movable):
     var peers: Dict[Int, Bool]  # access from this device to each peer
     var quarantine: Bool  # failed drain: allocations must not be reused
 
-    def __init__(out self, var ctx: DeviceContext, is_cpu: Bool) raises:
+    def __init__(out self, var ctx: DeviceContext) raises:
         self.api = ctx.api()
-        self.is_cpu = is_cpu
         self.views = List[DeviceContext]()
         self.views.append(ctx)
         self.streams = List[DeviceStream]()
@@ -139,6 +138,10 @@ struct Backend(Movable):
     var test_peer_copy: String
     var test_peer_gate: Int
     var pinned: List[Int]  # Pinned box addresses, sorted by buffer base
+    # A MAX CPU context for pinned host memory on a process with no
+    # accelerator at all (`devices` empty): lazily built, never exposed as a
+    # selectable mojo device -- see `host_only_ctx`.
+    var host_ctx: Optional[DeviceContext]
 
 
 comptime BACKEND_GLOBAL = "TMB_NATIVE_BACKEND"
@@ -178,7 +181,7 @@ def _probe_api() -> Tuple[String, Int]:
 
 
 def init_backend() raises -> Int:
-    """Enumerate devices once; returns the mojo device count (GPUs + CPU)."""
+    """Enumerate devices once; returns the mojo device count (GPUs only)."""
     if _get_global_or_null(BACKEND_GLOBAL):
         return len(be()[].devices)
     var probed = _probe_api()
@@ -194,8 +197,7 @@ def init_backend() raises -> Int:
             )
     var devs = List[Dev]()
     for i in range(n):
-        devs.append(Dev(DeviceContext(i, api=api), False))
-    devs.append(Dev(DeviceContext(api="cpu"), True))
+        devs.append(Dev(DeviceContext(i, api=api)))
     var gate = getenv(TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD)
     var gate_fd = Int(gate) if gate != "" else -1
     var modes = getenv(TORCH_MOJO_BACKEND_TEST_PEER_COPY)
@@ -210,6 +212,7 @@ def init_backend() raises -> Int:
             test_peer_copy^,
             gate_fd,
             List[Int](),
+            None,
         )
     )
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
@@ -222,7 +225,7 @@ def init_backend() raises -> Int:
                 d[].raw[0] = raw_stream(be()[].vendor.value(), d[].ctx)
             except e:
                 _warn("no raw stream handle", e)
-    return n + 1
+    return n
 
 
 # --- memory -------------------------------------------------------------------
@@ -450,10 +453,7 @@ def _properties(d: Pointer[Dev, MutUntrackedOrigin]) -> Properties:
         DeviceAttribute.MAX_GRID_DIM_X,
     ]
     for attr in attrs:
-        # MAX CPU returns successful zeroes for GPU attributes. They do not
-        # describe CPU hardware, so expose them as unknown, not as capacities.
-        values.append(-1 if d[].is_cpu else _attribute(ctx, attr))
-    values.append(Int64(d[].is_cpu))
+        values.append(_attribute(ctx, attr))
     var arch: String
     try:
         arch = ctx.arch_name()
@@ -474,14 +474,14 @@ def h_device_props(
 ) abi("C") -> Int32:
     try:
         var d = dev(Int(device))
-        if n != 16:
-            raise Error("device properties ABI mismatch: expected 16 slots")
+        if n != 15:
+            raise Error("device properties ABI mismatch: expected 15 slots")
         if not d[].properties:
             d[].properties = _properties(d)
         ref props = d[].properties.value()
         if Int(text_cap) < props.text.byte_length():
             raise Error("device properties text buffer too small")
-        for i in range(16):
+        for i in range(15):
             dst[unsafe_offset=i] = props.values[i]
         unsafe_memcpy(
             dest=text,
@@ -518,19 +518,37 @@ def _pinned_lower_bound(base: Int) -> Int:
     return lo
 
 
+def host_only_ctx() raises -> DeviceContext:
+    """A MAX CPU context for pinned host memory on a process with no
+    accelerator at all: lazily built once, never registered as a `Dev` and
+    never exposed as a selectable mojo device (`device_count()` excludes
+    it)."""
+    if not be()[].host_ctx:
+        be()[].host_ctx = DeviceContext(api="cpu")
+    return be()[].host_ctx.value()
+
+
 def h_host_alloc(
     nbytes: Int, device: Int32, data: Pointer[Int, MutUntrackedOrigin]
 ) abi("C") -> Int:
     try:
         var index = Int(device)
-        if index < 0 or index >= len(be()[].devices):
-            index = len(be()[].devices) - 1
-        var d = dev(index)
-        _drain_host(d)
+        var ctx: DeviceContext
+        if len(be()[].devices) == 0:
+            # No accelerator in this process: there is no `Dev` to track this
+            # block under (and none needed -- with no device or stream ever
+            # created, nothing can record an async use of host memory).
+            ctx = host_only_ctx()
+            index = -1
+        else:
+            if index < 0 or index >= len(be()[].devices):
+                index = len(be()[].devices) - 1
+            var d = dev(index)
+            _drain_host(d)
+            ctx = d[].ctx
         var buf = Optional[HostBuffer[DType.uint8]]()
         var base = 0
         if nbytes != 0:
-            var ctx = d[].ctx
             buf = ctx.enqueue_create_host_buffer[DType.uint8](nbytes)
             base = Int(buf.value().unsafe_ptr())
         # Zero bytes still need a handle to free, but have no address to pin.
@@ -606,8 +624,6 @@ def _record_pinned_use(ctx: DeviceContext, ptr: Int) raises -> Bool:
         return False
     var box = found.value()
     var d = dev(box[].device)
-    if d[].is_cpu:
-        return False
     # Match the actual context view, not the thread's current device/stream.
     # This also rejects pinned blocks belonging to another mojo device.
     for stream in range(len(d[].views)):
@@ -988,7 +1004,7 @@ def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
         var d = dev(Int(device))
         # Like PyTorch MPS, Metal stream objects all identify the default
         # queue; priorities do not create independent streams.
-        if d[].is_cpu or d[].api == "metal":
+        if d[].api == "metal":
             return 0
         return Int64(_add_stream(d, Int(priority)))
     except e:
@@ -999,7 +1015,7 @@ def h_new_stream(device: Int32, priority: Int32) abi("C") -> Int64:
 def h_stream_from_pool(device: Int32, high_priority: Int32) abi("C") -> Int64:
     try:
         var d = dev(Int(device))
-        if d[].is_cpu or d[].api == "metal":
+        if d[].api == "metal":
             return 0
         if len(d[].pool) < POOL_STREAMS:
             d[].pool.append(_add_stream(d, 0))
@@ -1167,14 +1183,10 @@ def h_event_elapsed_ms(start: Int, end: Int) abi("C") -> Float64:
             )
         if a[].raw != 0 and b[].raw != 0:
             return be()[].vendor.value().event_elapsed_ms(a[].raw, b[].raw)
-        if not dev(a[].device)[].is_cpu:
-            raise Error(
-                "elapsed_time: device timing needs the vendor driver (not"
-                " available on this device)"
-            )
-        a[].max_ev.synchronize()
-        b[].max_ev.synchronize()
-        return Float64(b[].host_ns - a[].host_ns) / 1.0e6
+        raise Error(
+            "elapsed_time: device timing needs the vendor driver (not"
+            " available on this device)"
+        )
     except e:
         set_error(String(e))
         return 0.0

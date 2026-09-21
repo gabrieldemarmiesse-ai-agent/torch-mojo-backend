@@ -92,8 +92,6 @@ def _norm_rows_go[
     if has_bias and bias_addr == 0:
         raise Error("normalization enabled bias pointer must be nonzero")
     var ctx = _raw_ctx(context_obj)
-    if ctx.api() == "cpu":
-        raise Error("the normalization forward kernels require an accelerator")
 
     var handled = False
     comptime for dt in FLOAT_DTYPES:
@@ -229,8 +227,6 @@ def _batch_norm_infer_go(
     if (has_weight and weight_addr == 0) or (has_bias and bias_addr == 0):
         raise Error("batch norm enabled affine pointers must be nonzero")
     var ctx = _raw_ctx(context_obj)
-    if ctx.api() == "cpu":
-        raise Error("the batch norm forward kernels require an accelerator")
 
     var handled = False
     comptime for dt in FLOAT_DTYPES:
@@ -305,8 +301,6 @@ def _batch_norm_train_go(
     if (has_weight and weight_addr == 0) or (has_bias and bias_addr == 0):
         raise Error("batch norm enabled affine pointers must be nonzero")
     var ctx = _raw_ctx(context_obj)
-    if ctx.api() == "cpu":
-        raise Error("the batch norm forward kernels require an accelerator")
 
     var handled = False
     comptime for dt in FLOAT_DTYPES:

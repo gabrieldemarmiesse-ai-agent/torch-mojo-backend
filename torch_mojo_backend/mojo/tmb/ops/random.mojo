@@ -229,8 +229,8 @@ def _pieces(p: Plan, itemsize: Int, mut out: List[Plan]):
 
 
 def _grid(device: Int, numel: Int) raises -> Int:
-    # Constant fallbacks (an H100 SXM) only ever answer for the MAX CPU
-    # device, which no CUDA card is compared against.
+    # Constant fallbacks (an H100 SXM) for a query that fails to answer;
+    # every real accelerator answers these, so they are not expected to fire.
     var ctx = ctx_for(device)
     var max_threads = _device_attr_cached(
         ctx, "maxthr", DeviceAttribute.MAX_THREADS_PER_MULTIPROCESSOR, 2048
@@ -1057,7 +1057,7 @@ def op_native_dropout(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    if not _dropout_dtype_ok(a.dtype) or dev(a.device)[].is_cpu:
+    if not _dropout_dtype_ok(a.dtype):
         unsupported(
             "native_dropout is only implemented for floating tensors on the"
             " mojo GPU device"
@@ -1159,7 +1159,6 @@ def op_native_dropout_backward(
     if (
         not _dropout_dtype_ok(grad.dtype)
         or keep.dtype != DType.bool
-        or dev(grad.device)[].is_cpu
         or keep.device != grad.device
         or not grad.same_shape(keep)
     ):
