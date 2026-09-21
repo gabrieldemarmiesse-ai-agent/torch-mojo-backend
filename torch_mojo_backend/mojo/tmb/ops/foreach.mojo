@@ -184,12 +184,8 @@ def _scalar_overlaps_any(ts: List[T], scalar: T) -> Bool:
 
 
 # --- fast-path qualification (aten_fast._foreach_lists): every tensor across
-# every list mojo-resident, contiguous, on one shared (non-MAX-cpu) device,
-# one shared dtype, with index-aligned tensors sharing a shape ------------
-
-
-def _is_max_cpu(device: Int) raises -> Bool:
-    return dev(device)[].is_cpu
+# every list mojo-resident, contiguous, on one shared device, one shared
+# dtype, with index-aligned tensors sharing a shape ------------
 
 
 def _tensor_qualifies(t: T, device: Int, dtype: DType) -> Bool:
@@ -200,7 +196,7 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
     if len(a) == 0:
         return False
     var first = a[0].copy()
-    if not first.on_mojo() or _is_max_cpu(first.device):
+    if not first.on_mojo():
         return False
     # Metal's batched kernels accept only float32. Half lists must use the
     # existing per-tensor scalar operations instead of entering that kernel.

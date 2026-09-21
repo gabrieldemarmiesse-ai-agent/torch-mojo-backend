@@ -234,13 +234,13 @@ jobs:
             --index-strategy unsafe-best-match \
             dist/*.whl "torch==${{ matrix.torch }}.*"
 
-      - name: Prebuilt libraries used, nothing compiled, one op on the CPU device
+      - name: Prebuilt libraries used, nothing compiled
         env:
           MODULAR_HOME: /tmp/modular
           # A CI runner has no accelerator, so the triton driver hook has
-          # nothing to bind to and refuses to install. The mojo device is
-          # then its MAX CPU pseudo-device alone, which is what the smoke
-          # test runs its op on.
+          # nothing to bind to and refuses to install. There is also no mojo
+          # device to run an op on any more (no CPU-backed mojo device); the
+          # smoke test then only checks that registration itself succeeds.
           TORCH_MOJO_BACKEND_TRITON: "0"
         run: |
           "${RUNNER_TEMP}/venv/bin/python" scripts/smoke_prebuilt_wheel.py

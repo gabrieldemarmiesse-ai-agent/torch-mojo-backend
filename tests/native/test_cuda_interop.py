@@ -100,13 +100,6 @@ def test_the_alias_keeps_the_mojo_tensor_alive(gpu):
         assert float(alias.sum().cpu()) == 7168.0
 
 
-def test_the_mojo_cpu_device_has_no_cuda_alias():
-    cpu_index = mojo.device_count() - 1
-    m = torch.ones(4, device=f"mojo:{cpu_index}")
-    with pytest.raises(ValueError, match="CPU device"):
-        cuda_interop.as_cuda(m)
-
-
 def test_on_mojo_stream_installs_the_mojo_stream(gpu):
     s = torch.Stream(device=gpu)
     with mojo.stream(s):
@@ -120,7 +113,7 @@ def test_on_mojo_stream_installs_the_mojo_stream(gpu):
 def test_a_second_gpu_maps_to_its_cuda_ordinal(gpu):
     """The mojo device index is the CUDA ordinal. `on_mojo_stream` selects
     that device for the duration and restores the previous one."""
-    if mojo.device_count() - 1 < 2:  # the last index is the MAX CPU device
+    if mojo.device_count() < 2:
         pytest.skip("needs two GPUs")
     x = torch.arange(8, dtype=torch.float32, device="mojo:1")
     before = torch.cuda.current_device()
@@ -172,7 +165,7 @@ def test_an_alias_never_names_a_device_other_than_its_own(gpu):
     memory that GPU cannot address."""
     assert "index" not in inspect.signature(cuda_interop.as_cuda).parameters
     assert "index" not in inspect.signature(cuda_interop.as_mojo).parameters
-    if mojo.device_count() - 1 < 2:
+    if mojo.device_count() < 2:
         pytest.skip("needs two GPUs")
     with cuda_interop.on_mojo_stream(1):
         m = torch.ones(4, device="mojo:1")
@@ -184,7 +177,7 @@ def test_an_alias_never_names_a_device_other_than_its_own(gpu):
 def test_an_alias_of_another_device_than_the_stream_is_refused(gpu):
     """One `on_mojo_stream` block is one device: another device's stream
     orders nothing here."""
-    if mojo.device_count() - 1 < 2:
+    if mojo.device_count() < 2:
         pytest.skip("needs two GPUs")
     x = torch.ones(4, device="mojo:1")
     with (

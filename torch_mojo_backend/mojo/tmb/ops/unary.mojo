@@ -805,8 +805,6 @@ def op_gelu_backward(
             "gelu_backward requires grad_output and self on the same mojo"
             " device"
         )
-    if dev(self_t.device)[].is_cpu:
-        unsupported("gelu_backward requires an accelerator device")
     if self_t.dtype != DType.float32 and self_t.dtype != DType.bfloat16:
         unsupported(
             "gelu_backward: dtype "
