@@ -257,6 +257,7 @@ def _run_gpu_probe() -> str:
     return result.stdout
 
 
+@pytest.mark.gpu
 def test_collective_library_matches_the_gpu_vendor():
     """NCCL on NVIDIA, RCCL on AMD — one binding, the vendor picks the .so."""
     if not any(d.api in ("cuda", "hip") for d in get_accelerators()):
@@ -267,6 +268,7 @@ def test_collective_library_matches_the_gpu_vendor():
     assert "library " in out, out
 
 
+@pytest.mark.gpu
 def test_hip_pointer_ordinal_identifies_the_owning_gpu():
     """hip_peer reads device identity off the POINTER, like cuda_peer does:
     the ordinal RCCL binds a communicator to is a fact about the allocation,
@@ -391,6 +393,7 @@ def _run_torchrun(nproc: int, mode: str, extra_env: dict[str, str] | None = None
 @pytest.mark.parametrize(
     "mode", ["collectives", "ddp_parity", "stream_ordering", "stress", "abort"]
 )
+@pytest.mark.gpu
 def test_two_rank_nccl(mode: str, ccl: str):
     """`ccl="mojo"` runs the same workers against mojoccl
     (torch_mojo_backend/mojo/tmb/ccl), the in-repo NCCL-API library,

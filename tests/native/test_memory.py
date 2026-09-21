@@ -480,6 +480,7 @@ def test_capability_contracts_and_inductor_properties(mojo_device: str):
         torch.accelerator.get_device_capability(torch.device(mojo_device).index)
 
 
+@pytest.mark.cpu_torch
 def test_inductor_properties_after_explicit_enable(mojo_gpu: str):
     """18: Inductor registration is opt-in, separate from device registration."""
     if torch.cuda.is_available():
