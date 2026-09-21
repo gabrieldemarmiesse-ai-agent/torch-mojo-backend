@@ -3,12 +3,12 @@ views, fills, item, autograd, streams, events, RNG (public torch API only)."""
 
 import pytest
 import torch
+from torch._dynamo.source import ConstantSource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 from tests.native.conftest import side_stream_or_skip
 from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module
-from torch._dynamo.source import ConstantSource
-from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
 
 def _arange(n: int, device: str) -> torch.Tensor:
