@@ -45,12 +45,12 @@ def _xfail_if_unsupported(device: str) -> Iterator[None]:
 #
 #   *_like and fill.Scalar are CompositeExplicitAutograd upstream, so they
 #   reach the device as `empty.memory_format` (+ `fill_.Scalar` when they
-#   write a value) -- see the module docstring of native/mojo/ops_factories.mojo.
+#   write a value) -- see the module docstring of tmb/ops/factories.mojo.
 #
 #   scaled_dot_product_attention and _scaled_dot_product_attention_math are
 #   CompositeImplicitAutograd. Registering either would take it out of reach
 #   of the decomposition autograd differentiates and silently drop the
-#   gradient, so native/mojo/ops_attention.mojo registers only the lower ops:
+#   gradient, so tmb/ops/attention.mojo registers only the lower ops:
 #   a route with no fused kernel (a mask, the CPU device, an unsupported
 #   shape) runs ATen's own math composition, two batched matmuls around one
 #   softmax.

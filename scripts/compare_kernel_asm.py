@@ -10,11 +10,18 @@ measurement there or an arch gate.
 
 `--emit asm` writes host assembly to the `-o` path and one sidecar per GPU
 kernel beside it: `.ptx` for NVIDIA, `.amdgcn` for AMD, `.ll` for Metal.  Each
-is named `<module>_<kernel>_<hash>.ptx`, and that hash also mangles every symbol
-inside.  Kernels are paired by name with the hash stripped and the hash is
-masked in the body, so a kernel whose mangling moved but whose code did not
-still compares equal.  Both trees are built into one shared directory per
-specialization, which is load-bearing: see `build_both_sides`.
+is named `<entry module stem>_<kernel>_<hash>.ptx`, and that hash also mangles
+every symbol inside.  Kernels are paired by name with the stem and the hash
+stripped, and the hash and the kernel's own symbol are masked in the body, so
+a kernel whose mangling moved but whose code did not still compares equal.
+Two things a name cannot tell apart are handled by body: kernels that share
+one name inside a build (a `@__name` used by two `comptime` variants, MAX's
+generic `elementwise_*`) are paired in sorted-body order, and a kernel found
+on one side only whose body matches one found only on the other is reported
+as renamed, not as new plus gone (a kernel without `@__name` is named by the
+compiler after its module path, so moving the module renames it).  Both trees
+are built into one shared directory per specialization, which is load-bearing:
+see `build_both_sides`.
 
 Specializations, and why a module is never built bare
 -----------------------------------------------------
@@ -53,7 +60,7 @@ Usage:
 
     # one module, one dtype: the fast loop while iterating on a kernel
     uv run python scripts/compare_kernel_asm.py --before .. --after . \\
-        --modules matmul_ops --dtypes bfloat16
+        --modules matmul --dtypes bfloat16
 
 A full default run is a few hundred `mojo build` invocations per tree; they run
 `--jobs` at a time (each peaks near 4.5 GB RSS).  Narrow it with `--modules`,
@@ -81,7 +88,12 @@ from pathlib import Path
 
 import max as max_package
 
-DEFAULT_KERNEL_DIR = Path("torch_mojo_backend/eager_kernels")
+# Every Mojo source sits under torch_mojo_backend/mojo as the one package
+# `tmb`; the entry modules are `tmb/**/entry.mojo`. Trees from before that
+# layout (kernel families under eager_kernels/<f>/<f>.mojo, three -I roots)
+# are still understood, so a change can be compared against them.
+DEFAULT_KERNEL_DIR = Path("torch_mojo_backend/mojo/tmb")
+LEGACY_KERNEL_DIR = Path("torch_mojo_backend/eager_kernels")
 SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
 # Mangling hash, on the file name and on every symbol inside it. The hash is
 # derived from the Mojo symbol, so it moves whenever a function is renamed --
@@ -90,9 +102,13 @@ SIDECAR_SUFFIXES = (".ptx", ".amdgcn", ".ll")
 # `\b` is wrong here: it never fires between a hex digit and the `_` of
 # `<kernel>_<hash>_param_0` or `<kernel>_<hash>_$__global_alloc_...`, so those
 # occurrences leaked into the diff and reported every renamed kernel as
-# changed. Match exactly eight hex digits not followed by a ninth, which also
-# leaves longer auto-mangled hashes alone rather than truncating them.
-HASH_RE = re.compile(r"_[0-9a-f]{8}(?![0-9a-f])")
+# changed. Match exactly eight hex digits (an explicit `@__name`) or sixteen
+# (a compiler-mangled name), not followed by another, so nothing is truncated.
+HASH_RE = re.compile(r"_[0-9a-f]{8}(?:[0-9a-f]{8})?(?![0-9a-f])")
+# The kernel's own symbol, after HASH_RE masked its hash: `.entry NAME_HASH(`,
+# `NAME_HASH_param_3`. For a kernel without `@__name` that symbol spells the
+# module path, so it must not take part in the comparison of the body.
+SYMBOL_RE = re.compile(r"\b[A-Za-z_]\w*?_HASH")
 # The compile-time gates of variant_gates.mojo, as written at the call sites.
 OP_GATE_RE = re.compile(r'_op_on\["(\w+)"\]')
 ARG_GATE_RE = re.compile(r"_dtype_arg(?:_abi|_width)?_on\[\s*(\d+)")
@@ -201,19 +217,10 @@ def emit_asm(
     the trees pin, or a toolchain difference shows up as kernel churn.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    command = [
-        str(mojo_cli()),
-        "build",
-        str(module),
-        "-I",
-        str(module.parent),
-        "-I",
-        str(kernel_dir),
-        "--emit",
-        "asm",
-        "--target-accelerator",
-        accelerator,
-    ]
+    command = [str(mojo_cli()), "build", str(module)]
+    for root in import_roots(tree, kernel_dir, module):
+        command += ["-I", str(root)]
+    command += ["--emit", "asm", "--target-accelerator", accelerator]
     for name, value in defines:
         command += ["-D", f"{name}={value}"]
     command += ["-o", str(out_dir / f"{module.stem}.s")]
@@ -231,8 +238,37 @@ def emit_asm(
     return None
 
 
+def scan_dir(tree: Path, kernel_dir: Path) -> Path:
+    """The directory holding the entry modules, in this tree's layout."""
+    if kernel_dir == DEFAULT_KERNEL_DIR and not (tree / kernel_dir).is_dir():
+        return LEGACY_KERNEL_DIR
+    return kernel_dir
+
+
+def import_roots(tree: Path, kernel_dir: Path, module: Path) -> list[Path]:
+    """The `-I` list a build of ``module`` in ``tree`` needs: the one Mojo
+    root in the current layout, the three roots of the legacy one."""
+    if (tree / "torch_mojo_backend" / "mojo").is_dir():
+        return [tree / "torch_mojo_backend" / "mojo"]
+    legacy = tree / scan_dir(tree, kernel_dir)
+    return [tree / module.parent, legacy, legacy.parent]
+
+
+def module_key(path: Path) -> str:
+    """The name a module is paired by across trees: its package for an
+    `entry.mojo` (tmb/kernels/matmul/entry.mojo -> "matmul"), its stem
+    otherwise, with the legacy `_ops` suffix and `mojoccl` name normalized
+    so a legacy tree pairs with a current one."""
+    if path.stem == "entry":
+        return path.parent.name
+    if path.stem == "mojoccl":
+        return "ccl"
+    return path.stem.removesuffix("_ops")
+
+
 def find_entry_modules(tree: Path, kernel_dir: Path) -> dict[str, Path]:
-    """Map each entry module's stem to its path relative to ``tree``.
+    """Map each entry module's key (see ``module_key``) to its path relative
+    to ``tree``.
 
     Modules that export a family's `tmb_call` C entry or mojoccl's
     `ncclAllReduce` are built on their own; the rest are libraries whose
@@ -240,17 +276,17 @@ def find_entry_modules(tree: Path, kernel_dir: Path) -> dict[str, Path]:
     isolation emits no sidecars at all.
     """
     entries: dict[str, Path] = {}
-    for path in sorted((tree / kernel_dir).rglob("*.mojo")):
+    for path in sorted((tree / scan_dir(tree, kernel_dir)).rglob("*.mojo")):
         source = path.read_text()
         if "def tmb_call" not in source and "def ncclAllReduce(" not in source:
             continue
         relative = path.relative_to(tree)
-        if path.stem in entries:
+        key = module_key(path)
+        if key in entries:
             raise ValueError(
-                f"multiple entry modules named {path.stem!r}: "
-                f"{entries[path.stem]}, {relative}"
+                f"multiple entry modules named {key!r}: {entries[key]}, {relative}"
             )
-        entries[path.stem] = relative
+        entries[key] = relative
     return entries
 
 
@@ -263,7 +299,7 @@ def gate_sources(tree: Path, kernel_dir: Path, module: Path) -> list[Path]:
     shared libraries, including variant_gates.mojo.
     """
     entry = tree / module
-    if entry.parent.resolve() == (tree / kernel_dir).resolve():
+    if entry.parent.resolve() == (tree / scan_dir(tree, kernel_dir)).resolve():
         return [entry]
     return sorted(entry.parent.glob("*.mojo"))
 
@@ -374,12 +410,31 @@ def plan_module(
     return ModulePlan(stem, modules, merged, variants, notes)
 
 
-def collect(out_dir: Path) -> dict[str, str]:
-    """Map each kernel's hash-stripped name to its hash-masked assembly."""
-    kernels = {}
+def collect(out_dir: Path, module_stem: str) -> dict[str, str]:
+    """Map each kernel's hash-stripped name to its hash-masked assembly.
+
+    A sidecar is named `<entry module stem>_<kernel symbol>_<hash>`; the
+    kernel symbol itself (the `.entry` in the PTX) carries no module name.
+    The stem is dropped so a kernel pairs across trees whose entry module
+    was renamed (`logic_ops.mojo` -> `logic/entry.mojo`), and the hash is
+    masked because it mangles the module path, which moved too.
+    """
+    groups: dict[str, list[str]] = {}
     for path in sorted(out_dir.iterdir()):
         if path.suffix in SIDECAR_SUFFIXES:
-            kernels[HASH_RE.sub("", path.stem)] = HASH_RE.sub("_HASH", path.read_text())
+            name = HASH_RE.sub("", path.stem).removeprefix(module_stem + "_")
+            body = SYMBOL_RE.sub("SYMBOL", HASH_RE.sub("_HASH", path.read_text()))
+            groups.setdefault(name, []).append(body)
+    kernels = {}
+    for name, bodies in groups.items():
+        if len(bodies) == 1:
+            kernels[name] = bodies[0]
+            continue
+        # Same name, several kernels (two comptime variants under one
+        # @__name): pair them across trees in sorted-body order, so equal
+        # sets compare equal instead of variant A meeting variant B.
+        for index, body in enumerate(sorted(bodies), 1):
+            kernels[f"{name}#{index}"] = body
     return kernels
 
 
@@ -594,7 +649,7 @@ def build_both_sides(
         if error is not None:
             errors[side] = error
             continue
-        kernels[side] = collect(out_dir)
+        kernels[side] = collect(out_dir, plan.modules[side].stem)
         if args.keep:
             shutil.copytree(
                 out_dir, args.work_dir / "keep" / side / plan.stem / variant.label
@@ -693,7 +748,7 @@ def main() -> int:
     empty = []
     for plan in plans:
         changed_names = []
-        counts = {"kernels": 0, "changed": 0, "added": 0, "removed": 0}
+        counts = {"kernels": 0, "changed": 0, "added": 0, "removed": 0, "renamed": 0}
         broken = []
         for variant in plan.variants:
             sides = {}
@@ -723,8 +778,22 @@ def main() -> int:
                 if before[name] != after[name]
             )
             counts["changed"] += len(changed)
-            counts["added"] += len(after.keys() - before.keys())
-            counts["removed"] += len(before.keys() - after.keys())
+            only_before = before.keys() - after.keys()
+            only_after = after.keys() - before.keys()
+            # A kernel without @__name is named after its module path, so a
+            # moved or renamed module renames it while its code is identical:
+            # pair the leftovers by body and report those as renamed.
+            twins: dict[str, list[str]] = {}
+            for name in sorted(only_after):
+                twins.setdefault(after[name], []).append(name)
+            renamed = 0
+            for name in sorted(only_before):
+                if twins.get(before[name]):
+                    twins[before[name]].pop()
+                    renamed += 1
+            counts["renamed"] += renamed
+            counts["added"] += len(only_after) - renamed
+            counts["removed"] += len(only_before) - renamed
             changed_names += [f"{variant.label}/{name}" for name in changed]
             for name in changed if args.show_diff else []:
                 print_diff(
@@ -737,6 +806,8 @@ def main() -> int:
         detail = ", ".join(changed_names[:3]) + (
             " ..." if len(changed_names) > 3 else ""
         )
+        if not detail and counts["renamed"]:
+            detail = f"{counts['renamed']} renamed (module path in the symbol), code identical"
         if not detail and broken:
             detail = f"{len(broken)} variant(s) FAILED to build"
         if not detail and not plan.variants:

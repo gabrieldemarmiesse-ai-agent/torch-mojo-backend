@@ -1,5 +1,5 @@
 """Native backend: data_movement group (see docs/native_backend.md and
-torch_mojo_backend/native/mojo/ops_data_movement.mojo).
+torch_mojo_backend/mojo/tmb/ops/data_movement.mojo).
 
 Public-API checks only (no `TorchMojoTensor`/`aten_fast`/old-eager
 internals): every op is exercised through ordinary `torch` calls on tensors
@@ -1733,6 +1733,23 @@ def test_cat_out_resizes_a_mismatching_out(mojo_gpu):
     parts = [torch.ones(2, device=mojo_gpu), torch.full((3,), 2.0, device=mojo_gpu)]
     torch.cat(parts, 0, out=out)
     assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0, 2.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
+def test_chunk_cat_mixed_precision_out(
+    mojo_device: str, dtype: torch.dtype, strided: bool
+):
+    """FSDP2 packs half-precision, uneven parameter gradients into fp32."""
+    inputs = [_fill((5, 3), dtype), _fill((7,), dtype)]
+    expected = torch.empty(2, 13, dtype=torch.float32)
+    torch._chunk_cat(inputs, dim=0, num_chunks=2, out=expected)
+    storage = torch.full((2, 15 if strided else 13), -123.0, device=mojo_device)
+    out = storage[:, 1:-1] if strided else storage
+    torch._chunk_cat([x.to(mojo_device) for x in inputs], dim=0, num_chunks=2, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    if strided:
+        assert (storage.cpu()[:, (0, -1)] == -123).all()
 
 
 def test_nonzero_int_dtype(mojo_gpu):

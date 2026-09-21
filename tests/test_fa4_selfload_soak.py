@@ -25,7 +25,7 @@ from torch_mojo_backend import get_accelerators
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROBE = Path(__file__).resolve().parent / "fa4_selfload_soak_probe.mojo"
-_FA4_DIR = _REPO_ROOT / "torch_mojo_backend" / "eager_flash_attention"
+_MOJO_ROOT = _REPO_ROOT / "torch_mojo_backend" / "mojo"
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +49,7 @@ def selfload_soak_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "build",
         str(_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "-o",
         str(out_path),
     ]

@@ -1,6 +1,7 @@
 # Streams and events on the mojo device
 
-The mojo device supports the device-generic accelerator stream API:
+The mojo device supports the device-generic accelerator stream API. On
+CUDA and ROCm, streams and events support asynchronous coordination:
 
 ```python
 s = torch.Stream(device=torch.accelerator.current_accelerator())
@@ -13,7 +14,8 @@ cur.wait_event(e)
 e.synchronize()
 ```
 
-`torch.Stream(device="mojo")`, `torch.Event(device="mojo", enable_timing=True)`,
+On CUDA/ROCm, `torch.Stream(device="mojo")`,
+`torch.Event(device="mojo", enable_timing=True)`,
 `torch.accelerator.current_stream()` / `set_stream()`, and the `torch.mojo`
 module equivalents (`Stream`, `Event`, `current_stream`, `default_stream`,
 `set_stream`, `stream`, all in `torch_mojo_backend/native/device_module.py`)
@@ -27,9 +29,27 @@ through yet), and graph capture (there is no CUDA-graph equivalent; a
 generic PrivateUse1 `torch.Stream` in this torch version exposes no
 `is_capturing()` at all, so there is nothing to stub).
 
-`Stream.stream_id` is the stream's MAX `DeviceContext` pointer (torch treats
-a stream id as an opaque int); the native `CUstream`/`hipStream_t` is
+`Stream.stream_id` is an index into the device's MAX context views, with 0
+identifying the default stream; the native `CUstream`/`hipStream_t` is
 `Stream.native_handle`.
+
+## Apple GPU (Metal)
+
+`torch.Stream(device="mojo")` always identifies the device's default stream
+on Apple GPUs, matching PyTorch's MPS stream behavior. Repeated construction
+returns equal stream objects with `stream_id == 0`; priorities are accepted
+and ignored. Context managers, current/default stream selection,
+`stream.synchronize()`, and `stream.query()` work. Query currently waits for
+the stream to finish before returning `True`.
+
+MAX does not implement Metal events. Recording an event raises
+`RuntimeError: mojo backend: events are not supported on Apple GPU (Metal)`.
+This includes `event.record()`, `stream.record_event()`, and
+`stream.wait_stream()`, which PyTorch implements using an event. Use
+`stream.synchronize()` or `torch.mojo.synchronize()` for a CPU barrier.
+PyTorch creates generic `torch.Event` objects lazily, so construction alone
+succeeds; querying, synchronizing or waiting on an unrecorded event retains
+PyTorch's no-op behavior. No event is emulated.
 
 ## Why no Python patch is needed
 
@@ -48,8 +68,8 @@ device through the ordinary generic path, exactly like CUDA, and
 ## Execution semantics
 
 Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
-`native/mojo/abi.mojo`/`device.mojo`), so `with torch.Stream(...):` really
-moves execution, not just bookkeeping.
+`tmb/backend/abi.mojo`/`device.mojo`). On CUDA/ROCm a new stream selects an
+independent queue; on Metal it selects the same default queue.
 
 One rule carried over from CUDA applies unchanged: a tensor produced on one
 stream must be ordered (event or `wait_stream`) before another stream —

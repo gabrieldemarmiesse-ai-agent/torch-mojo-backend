@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
 
+    # Optional Triton dependency: its wheels are unavailable on macOS.
     from triton.backends.amd.driver import HIPUtils
     from triton.backends.driver import DriverBase, GPUDriver
     from triton.backends.nvidia.driver import CudaUtils
@@ -372,7 +373,9 @@ def enable_triton():
     itself only where that cannot happen -- a torch with no working CUDA/ROCm
     build (see `install_triton_hook`).
     """
-    from triton.runtime import driver  # noqa: PLC0415 -- triton is optional
+    from triton.runtime import (  # noqa: PLC0415 -- triton is optional
+        driver,
+    )
 
     driver.set_active(make_driver())
 

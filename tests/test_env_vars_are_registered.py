@@ -115,7 +115,7 @@ def _constants(paths: Iterable[Path]) -> dict[str, str]:
     """Every module-level string constant in `paths`, as one map.
 
     One map rather than one per file because that is how the code is written:
-    `getenv(MOJOCCL_REGION_MB)` in mojoccl.mojo reads a constant declared in
+    `getenv(MOJOCCL_REGION_MB)` in tmb/ccl/entry.mojo reads a constant declared in
     env_vars.mojo, and `os.environ.get(_NCCL_LIB_ENV)` reads one declared at
     the top of its own.
     """
@@ -183,7 +183,7 @@ def test_the_scanner_recognizes_the_registered_names():
     assert len(sources) > 100
     assert "TORCH_MOJO_BACKEND_VERBOSE" in _names_in_namespace(PACKAGE / "flags.py")
     assert "MOJOCCL_REGION_MB" in _names_in_namespace(
-        PACKAGE / "distributed" / "mojoccl" / "env_vars.mojo"
+        PACKAGE / "mojo" / "tmb" / "ccl" / "env_vars.mojo"
     )
     assert "TORCH_MOJO_BACKEND_TESTING" in _env_names_touched(
         PACKAGE / "is_running_tests.py", constants
@@ -199,13 +199,13 @@ def test_the_scanner_resolves_names_reached_through_a_constant():
     constants = _constants(_tracked_sources(REPO))
     # Mojo, through `comptime TMPDIR = "TMPDIR"` in a different file.
     assert "TMPDIR" in _env_names_touched(
-        PACKAGE / "native/mojo/loader.mojo", constants
+        PACKAGE / "mojo/tmb/backend/loader.mojo", constants
     )
     assert "TORCH_MOJO_BACKEND_TEST_PEER_COPY" in _env_names_touched(
-        PACKAGE / "native/mojo/device.mojo", constants
+        PACKAGE / "mojo/tmb/backend/device.mojo", constants
     )
     assert "MOJOCCL_REGION_MB" in _env_names_touched(
-        PACKAGE / "distributed/mojoccl/mojoccl.mojo", constants
+        PACKAGE / "mojo/tmb/ccl/entry.mojo", constants
     )
     # Python, through a constant at the top of its own module.
     assert "TORCH_MOJO_BACKEND_NCCL_LIB" in _env_names_touched(
