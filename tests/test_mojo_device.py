@@ -143,6 +143,7 @@ def test_device_string_variations(mojo_gpu_available: bool):
     assert t2.device.type == "mojo"
 
 
+@pytest.mark.gpu
 def test_indexless_mojo_device_uses_and_restores_current_device():
     """An indexless mojo target follows the current device (see also the
     more focused version of this test in test_mojo_device_runtime.py)."""
@@ -1157,6 +1158,7 @@ def test_transfer_unsupported_complex_is_explicit(mojo_device: str, dtype: torch
 
 
 @pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.gpu
 def test_transfer_other_gpu_requires_snapshot_and_host_wait(reverse: bool):
     """A GPU event wait cannot order a host snapshot across allocation devices."""
     if len(get_accelerators()) < 2:
@@ -1277,6 +1279,7 @@ def test_multiple_conversions(mojo_gpu_available: bool):
 
 
 @pytest.mark.xfail(strict=False, reason="op not ported yet: aten::sub.Tensor")
+@pytest.mark.gpu
 def test_multiple_conversions_arithmetic():
     """Operate on the round-tripped tensors: a same-device sub then square."""
     tensor = torch.tensor([1.0, 2.0])
@@ -1452,7 +1455,12 @@ def pin_allocator_probe(tmp_path_factory: pytest.TempPathFactory) -> _PinAllocat
 
 @pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
 @pytest.mark.parametrize(
-    "configuration", ["cpu-only-wheel", "cuda-available", "cuda-unavailable"]
+    "configuration",
+    [
+        pytest.param("cpu-only-wheel", marks=pytest.mark.cpu_torch),
+        "cuda-available",
+        "cuda-unavailable",
+    ],
 )
 def test_pinned_allocator_provenance_follows_runtime_cuda_availability(
     mojo_device: str,
@@ -1812,7 +1820,9 @@ def test_mojo_tensor_is_not_host_pinned_and_cannot_be_pinned(
     assert tensor.device == torch.device(mojo_device)
 
 
-@pytest.mark.parametrize("target", ["meta", "cuda"])
+@pytest.mark.parametrize(
+    "target", ["meta", pytest.param("cuda", marks=pytest.mark.gpu)]
+)
 @pytest.mark.parametrize("size", [0, 17])
 def test_other_non_cpu_tensors_are_not_host_pinned(target: str, size: int):
     if target == "cuda" and not torch.cuda.is_available():
@@ -2685,6 +2695,7 @@ def test_pinned_dataloader_persistent_workers_and_early_shutdown(mojo_device: st
             assert torch.equal(first, source[:3])
 
 
+@pytest.mark.gpu
 def test_pinned_dataloader_foreign_cuda_batch_keeps_allocator(
     pin_allocator_probe: _PinAllocatorProbe,
 ):
@@ -2897,6 +2908,7 @@ def test_mojo_clip_grad_norm_matches_cpu(mojo_gpu_available, foreach):
         torch.testing.assert_close(actual.grad.cpu(), expected.grad)
 
 
+@pytest.mark.gpu
 def test_every_mojo_device_is_a_real_accelerator():
     """There is no CPU-backed mojo device: every `mojo:<index>` is a real
     accelerator, and `device_count()` is exactly `len(get_accelerators())`.
