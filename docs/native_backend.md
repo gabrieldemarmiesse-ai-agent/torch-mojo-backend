@@ -87,7 +87,7 @@ build passes; `tests/test_mojo_imports.py` keeps the grammar:
 | `entry.mojo` | `tmb_native_init`: hooks table + the registration list (one `_group[register_x]` per ops file) |
 | `registry.mojo` | `impl[op, "name"]`: registers the op's boxed entry with torch's dispatcher — see below |
 | `abi.mojo` | `Value` records, tag constants, `T` (tensor view), result setters, `new_tensor` / `view_strided`, `unsupported()` |
-| `device.mojo` | `Dev` per mojo index (accelerators, then the MAX CPU device), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
+| `device.mojo` | `Dev` per mojo index (the accelerators MAX enumerates), cached MAX properties, stream views, events (MAX events for ordering, vendor driver for query/timing), memory (`Buf` boxes behind DataPtr, per-device accounting, `record_stream` fences), transfers and deferred host staging |
 | `vendor.mojo` | CUDA / HIP driver calls on MAX's raw streams |
 | `loader.mojo` | on-demand builds of kernel families: closure hash, cache lookup, `mojo build` in a subprocess under a flock, dlopen |
 | `kernel_call.mojo` | `KernelCall`: defines + slots + owned specs for one kernel invocation |
@@ -365,8 +365,7 @@ storage allocated by this backend, per device. Views, slices and
 `as_strided` share a storage and count once; a zero-byte storage counts
 nothing. CPU tensors, pinned host staging, foreign storage aliases and
 MAX's internal workspaces/context memory do not appear in these counters.
-Tensors on the MAX CPU device (the last mojo index) do count, under that
-index only. Releasing a storage decrements its device's counters when the
+Releasing a storage decrements its device's counters when the
 block is handed back to MAX; MAX orders physical reuse on the owning stream.
 This happens at final storage release, before device synchronization, including
 when `record_stream` has fenced pending consumers; it does not wait for physical
@@ -420,18 +419,16 @@ storage accounting. MAX may report its arena budget rather than physical
 installed VRAM: on the H100 tested, its total was smaller than `nvidia-smi`'s
 and a 4 MiB tensor consumed a 256 MiB arena chunk. These are MAX's numbers,
 not a replacement implementation of CUDA's `cudaMemGetInfo`. Do not infer
-our reserved bytes from `total - free`.
-The MAX CPU device returns **host** memory information (verified with MAX
-26.5 on Linux), not zeroes. A MAX implementation that supplies no memory
-capacity raises an explicit `NotImplementedError` instead of fabricating it.
+our reserved bytes from `total - free`. A MAX implementation that supplies
+no memory capacity raises an explicit `NotImplementedError` instead of
+fabricating it.
 
 `get_device_properties()` returns a frozen dataclass, gathered and cached
 per device in Mojo through MAX, without CUDA/HIP probing in Python.
 `get_device_name()` and `get_device_capability()` read that cache. Field
-names follow torch.cuda where possible; `api`, `is_cpu`, `arch_name`, shared
+names follow torch.cuda where possible; `api`, `arch_name`, shared
 memory limits and `clock_rate` (kHz) provide additional MAX information.
-Unavailable fields are `None`. MAX's CPU returns zero for GPU attributes;
-we expose those as `None` because they do not describe CPU hardware.
+Unavailable fields are `None`.
 Compute capability is a CUDA `(major, minor)` pair; other APIs return
 `(None, None)`, with HIP's architecture in `gcnArchName` and `arch_name`.
 This dataclass is separate from Inductor's Triton autotuner property contract.
@@ -510,8 +507,8 @@ The following conservative policies deliberately differ from CUDA:
 
 Blocking direct uploads finish reading the caller's memory before returning.
 Staged uploads take a synchronous snapshot, so the caller can reuse its source
-without waiting for queued DMA or device relayout. CPU and Metal uploads always
-finish synchronously; `non_blocking` is a no-op on the MAX CPU device.
+without waiting for queued DMA or device relayout. Metal uploads always
+finish synchronously.
 
 Async copies record each stream on the pinned block. Free removes the block
 from the live registry and queues one completion callback per recorded
@@ -529,8 +526,9 @@ objects driven by the shim's device guard. A stream is a MAX stream of the
 device's base context (`DeviceContext.create_stream`, then a `select_stream`
 view kernels launch on); events pair a MAX event (ordering: record / wait /
 synchronize on every backend) with a CUDA / HIP driver event on the same raw
-stream for `query()` and `elapsed_time()`. The MAX CPU device has one stream;
-its events time with the host clock.
+stream for `query()` and `elapsed_time()`. Metal has no raw stream (no
+driver here): `query()` falls back to a blocking synchronize, and
+`elapsed_time()` raises (no vendor driver to time against).
 
 ## RNG
 
@@ -553,8 +551,7 @@ std.math and only the integer draws are bit-exact) and on a CUDA device of
 the same model, and
 `tests/native/test_random_parity.py` holds it to that against recorded CUDA
 digests (`rng_golden.json`, refreshed with `rng_parity_dump.py`). Not covered:
-`multinomial`, `randperm`, `poisson`, `rrelu_with_noise` (unregistered), and
-draws on the MAX CPU device (same kernels' closed form, no CUDA to match).
+`multinomial`, `randperm`, `poisson`, `rrelu_with_noise` (unregistered).
 
 ## Distributed
 
@@ -686,7 +683,8 @@ on `v*` tags: each run builds the shims for every supported torch series on
 Linux x86_64, Linux aarch64 and macOS arm64, checks their glibc floors, builds
 the wheel, then installs it in a fresh venv and runs
 `scripts/smoke_prebuilt_wheel.py` against two torch versions, which fails
-unless both prebuilt libraries were used and an op ran on the CPU device.
+unless both prebuilt libraries were used (and, on a runner with an
+accelerator, an op ran on `mojo:0`).
 That one base library per platform can drive any GPU only because it holds
 no device code, and `tests/test_backend_has_no_device_code.py` holds it to
 that on every commit: it builds the library with the production command for

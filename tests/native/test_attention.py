@@ -239,8 +239,7 @@ def test_fused_flash_backward_partial_tail_gfx942(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_efficient_attention_decode_step(mojo_gpu, counting, dtype):
-    """q_len == 1: one fused kernel instead of bmm + softmax + bmm (GPU only;
-    the MAX CPU device takes the decomposition instead)."""
+    """q_len == 1: one fused kernel instead of bmm + softmax + bmm."""
     qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 2, 4, 1, 130, 64)
     with torch.no_grad():
         out = aten._scaled_dot_product_efficient_attention(

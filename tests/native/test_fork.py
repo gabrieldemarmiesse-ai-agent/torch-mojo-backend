@@ -236,7 +236,11 @@ def test_fork_during_concurrent_pinned_allocations_does_not_lock_child(
         assert torch.equal(pinned, torch.arange(17))
 
 
-def test_fork_before_import_allows_fresh_child_pinned_allocator():
+def test_fork_before_import_allows_fresh_child_pinned_allocator(
+    mojo_gpu_available: bool,
+):
+    if not mojo_gpu_available:
+        pytest.skip("You do not have a GPU supported by MAX")
     # This outer interpreter has imported neither torch nor MAX before fork.
     script = textwrap.dedent("""
         import os
@@ -251,7 +255,7 @@ def test_fork_before_import_allows_fresh_child_pinned_allocator():
 
             register_mojo_devices()
             assert not device_module._is_in_bad_fork()
-            with device_module.device(device_module.device_count() - 1):
+            with device_module.device(0):
                 for pinned in (torch.arange(17).pin_memory(),
                                torch.empty(17, device='cpu', pin_memory=True),
                                torch.empty_like(torch.arange(17), device='cpu', pin_memory=True)):

@@ -81,7 +81,7 @@ def _run(
 def _parameters(
     args: Values, start: Int, x: T, w: T, off: T, mask: T, bias: T
 ) raises -> List[Int]:
-    if not x.on_mojo() or dev(x.device)[].is_cpu:
+    if not x.on_mojo():
         unsupported("deform_conv2d requires mojo GPU tensors")
     if (
         x.dtype != DType.float16

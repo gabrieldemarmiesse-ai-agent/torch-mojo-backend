@@ -359,10 +359,10 @@ def _b_scalar_tensor(value: Float64, st: Int32, device: Int) raises -> Held:
     """A 0-d tensor holding `value`: what a scalar operand becomes.
 
     Written with the FillSpec kernel, like the old path, and deliberately
-    not with a device memset: on the MAX CPU device a memset enqueued on the
-    context does not order against the `elementwise` launch that reads it,
-    and the binary kernel then saw uninitialized memory (flaky wrong results
-    on `mojo:cpu` only). Both halves have to be the same kind of launch.
+    not with a device memset: a memset enqueued on the context is not
+    guaranteed to order against the `elementwise` launch that reads it, which
+    once produced flaky wrong results (uninitialized memory read by the
+    binary kernel). Both halves have to be the same kind of launch.
     """
     var t = new_scalar(st, device)
     try:
@@ -720,7 +720,6 @@ def _b_try_add_f32_bf16(lhs: Side, rhs: Side) raises -> Optional[Res]:
     var b = rhs.t.value().copy()
     if (
         a.device != b.device
-        or dev(a.device)[].is_cpu
         or not a.contig
         or not b.contig
         or not _b_fits(a, b.shape)
