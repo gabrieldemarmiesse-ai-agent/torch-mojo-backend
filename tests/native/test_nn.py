@@ -14,12 +14,7 @@ import math
 import pytest
 import torch
 
-from torch_mojo_backend import (
-    aten_functions,
-    get_accelerators,
-    native,
-    register_mojo_devices,
-)
+from torch_mojo_backend import aten_functions, native, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
 FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
@@ -423,14 +418,9 @@ def test_batch_norm_inference(mojo_gpu, call_checker: CallChecker, dtype):
 
 
 def test_batch_norm_inference_uniform_dtype(mojo_device, call_checker: CallChecker):
-    """Inference batch norm with every parameter in the input's own dtype.
-
-    That is the shape nn_ops' `BatchNormSpec` takes, which is the MAX CPU
-    device's only route (its accelerator twin carries the input, the
-    statistics and the affine dtypes apart, as `test_batch_norm_inference`
-    covers). The two saved statistics come out of a composition there, not
-    out of the kernel, so they are checked on both devices.
-    """
+    """Inference batch norm with every parameter in the input's own dtype
+    (`test_batch_norm_inference` covers the input/statistics/affine dtypes
+    carried apart instead)."""
     call_checker.register(aten_functions.aten_native_batch_norm)
     torch.manual_seed(0)
     x = torch.randn(3, 8, 5, 7)
@@ -474,16 +464,9 @@ def test_batch_norm_module_inference(mojo_gpu):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(3, 8, 5, 7), (2, 5, 13), (4, 3, 8, 8, 2)])
 def test_batch_norm_training(mojo_device, dtype, shape):
-    """The accelerator runs one fused kernel; the MAX CPU device has none and
-    composes the forward through the dispatcher, so both are checked here.
-
-    `ran` rather than the `call_checker` fixture, whose teardown asserts even
-    for the parametrizations skipped below."""
-    if len(shape) > 4 and mojo_device == f"mojo:{len(list(get_accelerators())) - 1}":
-        pytest.skip(
-            "rank > 4 training batch norm is accelerator-only: the CPU route "
-            "composes through the rank-4 broadcast binary kernels"
-        )
+    """The accelerator runs one fused kernel for the forward, including
+    rank > 4 (`ran` rather than the `call_checker` fixture, whose teardown
+    asserts even for parametrizations that would otherwise be skipped)."""
     torch.manual_seed(0)
     channels = shape[1]
     x = torch.randn(shape, dtype=dtype)

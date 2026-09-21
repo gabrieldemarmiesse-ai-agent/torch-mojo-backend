@@ -480,7 +480,7 @@ def _softmax_rows_apple[
 # and dropout, saving one full read of the (rows, cols) matrix plus a launch
 # versus SoftmaxRows + NativeDropoutF32.
 #
-# RNG contract: identical to dropout_kernels (Philox4x32-10, element
+# RNG contract: identical to native_dropout_kernels (Philox4x32-10, element
 # i belongs to block (base_offset + i // 4), lane i % 4, keep iff
 # u32 < floor(Float32(1 - p) * 2^32)). cols % 4 == 0 and 16B-aligned
 # pointers (host-checked) make each vec4 exactly one Philox block, so the
@@ -655,8 +655,7 @@ def enqueue_softmax_rows_dropout_f32(
         # The Python caller gates on all of this; re-checked here because the
         # dispatcher cannot report failure.
         if (
-            ctx.api() == "cpu"
-            or not (p > 0.0 and p < 1.0)
+            not (p > 0.0 and p < 1.0)
             or cols % 4 != 0
             or cols > WARP_SIZE * _APPLE_SM_MAX_VPT * 4
             or probs_addr % 16 != 0
@@ -665,7 +664,7 @@ def enqueue_softmax_rows_dropout_f32(
             or in_addr % 16 != 0
         ):
             raise Error("SoftmaxRowsDropoutF32: unsupported configuration")
-        # Same threshold arithmetic as dropout_kernels (Float64
+        # Same threshold arithmetic as native_dropout_kernels (Float64
         # subtraction, one narrowing, all 32 random bits compared).
         var keep_f32 = Float32(1.0 - p)
         var keep_scale = Float32(1.0) / keep_f32
@@ -878,115 +877,77 @@ def _softmax_rows[
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
 
-    if ctx.api() == "cpu":
+    comptime if has_apple_gpu_accelerator():
+        _softmax_rows_apple[dtype](
+            out_ptr, in_ptr, rows, cols, scale, causal, q_len, ctx
+        )
+    elif has_accelerator():
+        # Causal regime: half the score matrix is masked and the reference
+        # kernel still reads, exponentiates and writes all of it.  A
+        # warp-per-row kernel whose extent is the live prefix does the same
+        # arithmetic over half the bytes.  Rows must be long enough for a
+        # warp to vectorize and short enough that one warp per row is not
+        # itself the bottleneck; both are runtime comparisons.
+        comptime WIDE = _SM_VECTOR_BYTES // size_of[dtype]()
+        if causal != 0 and cols <= 8192 and rows >= 256:
+            var wide_ok = (
+                cols % WIDE == 0
+                and Int(out_ptr) % _SM_VECTOR_BYTES == 0
+                and Int(in_ptr) % _SM_VECTOR_BYTES == 0
+            )
+            if wide_ok:
+                _enqueue_softmax_warp[dtype, True, WIDE](
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    rows,
+                    cols,
+                    scale,
+                    q_len,
+                    ctx,
+                )
+            else:
+                _enqueue_softmax_warp[dtype, True, 1](
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    rows,
+                    cols,
+                    scale,
+                    q_len,
+                    ctx,
+                )
+            return
 
-        @always_inline
         @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var r = Int(idx[0].value())
-            var base = r * cols
-            var allowed = cols
+        @always_inline
+        @__copy_capture(in_ptr)
+        def input_fn[
+            _simd_width: Int
+        ](coords: Coord) -> SIMD[dtype, _simd_width]:
+            var r = Int(coords[0].value())
+            var c = Int(coords[1].value())
+            var v = (
+                in_ptr.unsafe_load[width=_simd_width](r * cols + c).cast[
+                    DType.float32
+                ]()
+                * scale
+            )
             if causal != 0:
-                allowed = min(cols, r % q_len + 1)
-            var m = Float32.MIN
-            for j in range(allowed):
-                var x = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
-                )
-                if x > m:
-                    m = x
-            var denom = Float32(0)
-            for j in range(allowed):
-                var x = (
-                    in_ptr[unsafe_offset=base + j].cast[DType.float32]() * scale
-                )
-                denom += exp(x - m)
-            for j in range(cols):
-                if j < allowed:
-                    var x = (
-                        in_ptr[unsafe_offset=base + j].cast[DType.float32]()
-                        * scale
-                    )
-                    out_ptr[unsafe_offset=base + j] = (exp(x - m) / denom).cast[
-                        dtype
-                    ]()
-                else:
-                    out_ptr[unsafe_offset=base + j] = Scalar[dtype](0)
+                var allowed = min(cols, r % q_len + 1)
 
-        _parallel_for[func](rows, ctx)
+                comptime for lane in range(_simd_width):
+                    if c + lane >= allowed:
+                        v[lane] = min_or_neg_inf[DType.float32]()
+            # Known trade-off: for float16 input with scale > 1 this
+            # f32 -> dtype round-trip can overflow to +inf where the old
+            # all-f32 kernel didn't (unreachable with the default
+            # 1/sqrt(head_dim) scales).
+            return v.cast[dtype]()
+
+        softmax[dtype, 1, 2, input_fn, target="gpu"](
+            Coord(rows, cols),
+            TileTensor(out_ptr, row_major(rows, cols)),
+            1,
+            ctx,
+        )
     else:
-        comptime if has_apple_gpu_accelerator():
-            _softmax_rows_apple[dtype](
-                out_ptr, in_ptr, rows, cols, scale, causal, q_len, ctx
-            )
-        elif has_accelerator():
-            # Causal regime: half the score matrix is masked and the reference
-            # kernel still reads, exponentiates and writes all of it.  A
-            # warp-per-row kernel whose extent is the live prefix does the same
-            # arithmetic over half the bytes.  Rows must be long enough for a
-            # warp to vectorize and short enough that one warp per row is not
-            # itself the bottleneck; both are runtime comparisons.
-            comptime WIDE = _SM_VECTOR_BYTES // size_of[dtype]()
-            if causal != 0 and cols <= 8192 and rows >= 256:
-                var wide_ok = (
-                    cols % WIDE == 0
-                    and Int(out_ptr) % _SM_VECTOR_BYTES == 0
-                    and Int(in_ptr) % _SM_VECTOR_BYTES == 0
-                )
-                if wide_ok:
-                    _enqueue_softmax_warp[dtype, True, WIDE](
-                        out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_imm(),
-                        rows,
-                        cols,
-                        scale,
-                        q_len,
-                        ctx,
-                    )
-                else:
-                    _enqueue_softmax_warp[dtype, True, 1](
-                        out_ptr.as_unsafe_any_origin(),
-                        in_ptr.as_unsafe_any_origin().as_imm(),
-                        rows,
-                        cols,
-                        scale,
-                        q_len,
-                        ctx,
-                    )
-                return
-
-            @parameter
-            @always_inline
-            @__copy_capture(in_ptr)
-            def input_fn[
-                _simd_width: Int
-            ](coords: Coord) -> SIMD[dtype, _simd_width]:
-                var r = Int(coords[0].value())
-                var c = Int(coords[1].value())
-                var v = (
-                    in_ptr.unsafe_load[width=_simd_width](r * cols + c).cast[
-                        DType.float32
-                    ]()
-                    * scale
-                )
-                if causal != 0:
-                    var allowed = min(cols, r % q_len + 1)
-
-                    comptime for lane in range(_simd_width):
-                        if c + lane >= allowed:
-                            v[lane] = min_or_neg_inf[DType.float32]()
-                # Known trade-off: for float16 input with scale > 1 this
-                # f32 -> dtype round-trip can overflow to +inf where the old
-                # all-f32 kernel didn't (unreachable with the default
-                # 1/sqrt(head_dim) scales).
-                return v.cast[dtype]()
-
-            softmax[dtype, 1, 2, input_fn, target="gpu"](
-                Coord(rows, cols),
-                TileTensor(out_ptr, row_major(rows, cols)),
-                1,
-                ctx,
-            )
-        else:
-            raise Error("no GPU accelerator available at compile time")
+        raise Error("no GPU accelerator available at compile time")

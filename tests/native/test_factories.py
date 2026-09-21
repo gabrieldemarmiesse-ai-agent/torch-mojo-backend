@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tests.native.conftest import skip_if_metal
-from torch_mojo_backend import aten_functions, get_accelerators, native
+from torch_mojo_backend import aten_functions, native
 from torch_mojo_backend.native import device_module
 
 
@@ -467,16 +467,6 @@ def test_native_dropout_declines_integer_dtypes(mojo_gpu):
         torch.ops.aten.native_dropout.default(input, 0.5, True)
 
 
-def test_native_dropout_declines_on_the_cpu_device(mojo_device):
-    """`mojo:cpu` (the MAX CPU device) is declined too -- old eager path's
-    `_on_gpu` gate, ported verbatim."""
-    if torch.device(mojo_device) != device_module.cpu():
-        pytest.skip("only meaningful on the mojo:cpu device")
-    input = torch.randn(4, dtype=torch.float32, device=mojo_device)
-    with pytest.raises(NotImplementedError, match="native_dropout"):
-        torch.ops.aten.native_dropout.default(input, 0.5, True)
-
-
 def test_native_dropout_backward_multiplication_semantics(mojo_gpu):
     grad_output = torch.tensor([-0.0, -2.0, float("nan"), float("inf")])
     mask = torch.tensor([True, False, False, False])
@@ -573,24 +563,16 @@ def test_torch_manual_seed_reaches_the_device_generator(mojo_gpu):
     assert not torch.equal(torch.rand(1000, device=mojo_gpu).cpu(), first)
 
 
-def test_arange_needs_a_wide_accumulator(mojo_device):
+def test_arange_needs_a_wide_accumulator(mojo_gpu):
     """Past 2**24 an fp32 running sum can no longer add 1.0.
 
-    The reference depends on the device, because the accumulator width does:
-    torch's CPU kernel specifies float64 for a float32 arange, so the MAX CPU
-    device is compared against that scalar sequence (built explicitly --
-    arm64's vectorized kernel rounds differently at this boundary); an
-    accelerator is compared against the vendor backend's own answer, and the
-    test skips where there is none to compare with rather than inventing one.
+    The reference is the vendor backend's own answer for this accelerator;
+    the test skips where there is none to compare with rather than inventing
+    one.
     """
     args = (16_777_217.0, 16_777_227.0, 1.0)
-    result = torch.arange(*args, dtype=torch.float32, device=mojo_device).cpu()
-    cpu_index = len(list(get_accelerators())) - 1
-    if mojo_device == f"mojo:{cpu_index}":
-        expected = torch.tensor(
-            [args[0] + i * args[2] for i in range(10)], dtype=torch.float32
-        )
-    elif torch.cuda.is_available():
+    result = torch.arange(*args, dtype=torch.float32, device=mojo_gpu).cpu()
+    if torch.cuda.is_available():
         expected = torch.arange(*args, dtype=torch.float32, device="cuda").cpu()
     elif torch.backends.mps.is_available():
         expected = torch.arange(*args, dtype=torch.float32, device="mps").cpu()
