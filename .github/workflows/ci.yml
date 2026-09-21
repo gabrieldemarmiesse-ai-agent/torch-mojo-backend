@@ -137,7 +137,7 @@ jobs:
           - suite: mojo
             selection: "gpu and not cuda and not cpu_torch"
             torch-wheel: cuda
-          - suite: inductor-triton
+          - suite: cpu-torch
             selection: "gpu and cpu_torch"
             torch-wheel: cpu
 
@@ -166,7 +166,7 @@ jobs:
       # Triton driver. Keep the locked versions and the installed Triton, but
       # use the CPU torch/torchvision wheels for this suite. --no-sync below
       # keeps uv from replacing them with the locked CUDA wheels again.
-      - name: Install CPU torch for Mojo Inductor and Triton
+      - name: Install CPU torch for Mojo integration tests
         if: matrix.torch-wheel == 'cpu'
         run: |
           uv run --no-sync python - <<'PY'

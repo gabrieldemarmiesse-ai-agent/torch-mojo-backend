@@ -1455,7 +1455,12 @@ def pin_allocator_probe(tmp_path_factory: pytest.TempPathFactory) -> _PinAllocat
 
 @pytest.mark.parametrize("entry", _PIN_ENTRY_POINTS)
 @pytest.mark.parametrize(
-    "configuration", ["cpu-only-wheel", "cuda-available", "cuda-unavailable"]
+    "configuration",
+    [
+        pytest.param("cpu-only-wheel", marks=pytest.mark.cpu_torch),
+        "cuda-available",
+        "cuda-unavailable",
+    ],
 )
 def test_pinned_allocator_provenance_follows_runtime_cuda_availability(
     mojo_device: str,

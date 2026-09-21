@@ -12,7 +12,7 @@ The GPU selection is `uv run pytest tests/ -m gpu`, divided into three jobs:
 | --- | --- | --- |
 | CUDA compiler | `gpu and cuda` | Locked CUDA wheel |
 | Mojo device | `gpu and not cuda and not cpu_torch` | Locked CUDA wheel |
-| Mojo Inductor/Triton | `gpu and cpu_torch` | CPU wheel, same version |
+| Mojo with CPU torch (Inductor/Triton and allocator) | `gpu and cpu_torch` | CPU wheel, same version |
 
 CUDA compiler tests run in a separate process because registering Mojo as
 PyTorch's accelerator breaks CUDA autograd. Inductor/Triton integration needs
