@@ -100,8 +100,6 @@ def _fused_adamw_go(
         raise Error("invalid fused AdamW flags")
 
     var ctx = _raw_ctx(device_context_ptr)
-    if ctx.api() == "cpu":
-        raise Error("fused AdamW requires a Mojo accelerator device")
     var lr_scalar = Float32(_raw_tuple_f64(scalars_obj, 0))
     var beta1 = Float32(_raw_tuple_f64(scalars_obj, 1))
     var beta2 = Float32(_raw_tuple_f64(scalars_obj, 2))
@@ -196,8 +194,6 @@ def _foreach_l2_norm_go(
         raise Error("foreach norm scratch pointer must be nonzero")
 
     var ctx = _raw_ctx(device_context_ptr)
-    if ctx.api() == "cpu":
-        raise Error("foreach norm fast path requires a Mojo accelerator device")
     var partial_offset = 0
     var record = 0
     while record < record_count:
@@ -316,10 +312,6 @@ def _foreach_ew_go[
             raise Error("mojo foreach multiply scalar pointer must be nonzero")
 
     var ctx = _raw_ctx(device_context_ptr)
-    if ctx.api() == "cpu":
-        raise Error(
-            "mojo foreach ", label, " requires a Mojo accelerator device"
-        )
 
     # The chunk size is what fills the device, so it is derived from the whole
     # list's element count once, before any descriptor batch is packed.
@@ -395,8 +387,6 @@ def _foreach_gather_scalars_go(
         if _raw_tuple_int(metadata_obj, record) == 0:
             raise Error("foreach gather input pointers must be nonzero")
     var ctx = _raw_ctx(device_context_ptr)
-    if ctx.api() == "cpu":
-        raise Error("foreach gather requires a Mojo accelerator device")
 
     var record = 0
     while record < record_count:

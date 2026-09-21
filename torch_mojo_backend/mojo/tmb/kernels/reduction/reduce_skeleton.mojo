@@ -57,7 +57,6 @@ from std.gpu.primitives.warp import shuffle_down
 from std.math import ceildiv, isnan, sqrt
 from std.memory import stack_allocation
 from std.sys.info import has_accelerator, size_of
-from std.utils.coord import Coord
 from std.utils.numerics import max_or_inf, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
 
@@ -72,7 +71,6 @@ from tmb.kernels.common.op_utils import (
     _device_sm_count,
     _enqueue_cached,
     _make_ptr,
-    _parallel_for,
     _reduce_spec_geom,
     _spec_ptr,
     _vec16_phase,
@@ -970,25 +968,6 @@ def _reduce_generic[
     var out_ptr = _make_ptr[out_dt](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var outputs = outer * inner
-
-    if ctx.api() == "cpu":
-
-        @always_inline
-        @parameter
-        @__copy_capture(out_ptr, in_ptr)
-        def func[width: Int, alignment: Int = 1](idx: Coord):
-            var o = Int(idx[0].value())
-            var base = (o // inner) * reduce_n * inner + (o % inner)
-            var total = Op.identity[acc, 1]()[0]
-            for r in range(reduce_n):
-                total = Op.combine(
-                    total,
-                    Op.map[acc=acc](in_ptr[unsafe_offset=base + r * inner]),
-                )
-            out_ptr[unsafe_offset=o] = Op.finish[out_dt=out_dt](total, reduce_n)
-
-        _parallel_for[func](outputs, ctx)
-        return
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")

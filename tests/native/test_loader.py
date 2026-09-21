@@ -26,9 +26,14 @@ from pathlib import Path
 
 import pytest
 
-from torch_mojo_backend import native
+from torch_mojo_backend import get_accelerators, native
 
-pytestmark = pytest.mark.xdist_group(name="group1")
+pytestmark = [
+    pytest.mark.xdist_group(name="group1"),
+    pytest.mark.skipif(
+        not list(get_accelerators()), reason="You do not have a GPU supported by MAX"
+    ),
+]
 
 _WORKTREE = Path(__file__).resolve().parents[2]
 _SHIM_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
