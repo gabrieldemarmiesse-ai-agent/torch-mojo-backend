@@ -238,3 +238,24 @@ def test_empty_strided_metadata(mojo_device):
     assert cl.stride() == (60, 1, 15, 3)
     assert torch.empty((), device=mojo_device).shape == ()
     assert torch.empty((0, 3), device=mojo_device).numel() == 0
+
+
+def test_boxed_adapter_returns_undefined_tensors_for_masked_gradients(mojo_gpu):
+    """bool[] argument, three returns, and the None-record rule: a masked-off
+    gradient of a `Tensor` (not `Tensor?`) return must come back as an
+    UNDEFINED tensor, which torch shows as None -- not as an error.
+
+    Accelerators only: the layer-norm backward kernel has no CPU route."""
+    x = _arange(6, mojo_gpu).reshape(2, 3)
+    w = torch.full((3,), 1.0).to(mojo_gpu)
+    bias = torch.zeros(3).to(mojo_gpu)
+    out, mean, rstd = torch.ops.aten.native_layer_norm(x, [3], w, bias, 1e-5)
+    grad = torch.ones_like(out)
+    full = torch.ops.aten.native_layer_norm_backward(
+        grad, x, [3], mean, rstd, w, bias, [True, True, True]
+    )
+    assert all(t is not None for t in full)
+    masked = torch.ops.aten.native_layer_norm_backward(
+        grad, x, [3], mean, rstd, w, bias, [True, False, False]
+    )
+    assert masked[0] is not None and masked[1] is None and masked[2] is None
