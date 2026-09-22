@@ -180,15 +180,8 @@ def test_tanh_backward_generic_fallback(mojo_gpu, dtype, layout):
         g, y, gm, ym = g.t(), y.t(), gm.t(), ym.t()
     elif layout == "broadcast":
         g, gm = g[:1], gm[:1]
-    if dtype == torch.float64:
-        # The unchanged composed route reaches GPU neg, which declines f64.
-        with pytest.raises(RuntimeError, match="float64 is not supported on GPU"):
-            torch.ops.aten.tanh_backward(gm, ym)
-        out = torch.full(y.shape, 17.0, dtype=dtype, device=mojo_gpu)
-        with pytest.raises(RuntimeError, match="float64 is not supported on GPU"):
-            torch.ops.aten.tanh_backward.grad_input(gm, ym, grad_input=out)
-        assert torch.all(out.cpu() == 17)
-        return
+    # float64 stays on the unchanged composed route (GPU neg accepts it
+    # since #499), so every dtype is checked against CPU the same way.
     expected = torch.ops.aten.tanh_backward(g, y)
     result = torch.ops.aten.tanh_backward(gm, ym)
     rtol, atol = (
