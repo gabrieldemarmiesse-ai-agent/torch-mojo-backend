@@ -52,6 +52,7 @@ from tmb.kernels.common.op_utils import (
     _fill_contig,
     _flat_vec_unary,
     _gs_blocks,
+    _l2_wave_blocks,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
@@ -74,6 +75,8 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.graph.math_utils import ieee_sqrt
+from std.sys.info import _has_sm_9x
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +186,18 @@ def _bin_elementwise[
     else:
         comptime if has_accelerator():
             comptime if dtype != DType.float64:
-                if size % 4 == 0:
+                # The 4-wide body loads and stores at `4 * itemsize`, so
+                # it needs the runtime addresses aligned, not just a numel
+                # divisible by 4: a contiguous operand at an odd storage
+                # offset (any offset view) would fault the context with
+                # CUDA_ERROR_MISALIGNED_ADDRESS. The unary twin gates the
+                # same way; unaligned operands take the scalar body.
+                comptime vec_align = 4 * size_of[dtype]()
+                if (
+                    size % 4 == 0
+                    and (Int(out_ptr) | Int(lhs_ptr) | Int(rhs_ptr)) % vec_align
+                    == 0
+                ):
                     var n4 = size // 4
                     _enqueue_cached[_bin_contig_kernel4[dtype, op_code]](
                         ctx,
@@ -442,6 +456,32 @@ def _unary_contig_kernel4[
         i += gstride
 
 
+@__name("sqrt_contig_f32_v4_peel")
+def _sqrt_peel_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    src: Pointer[Float32, ImmutAnyOrigin],
+    size_arg: Int64,
+    head_arg: Int64,
+):
+    var size = Int(size_arg)
+    var head = Int(head_arg)
+    var vectors = (size - head) // 4
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var vector = tid
+    while vector < vectors:
+        var index = head + vector * 4
+        dst.unsafe_store[width=4, alignment=16](
+            index, ieee_sqrt(src.unsafe_load[width=4, alignment=16](index))
+        )
+        vector += Int(grid_dim.x) * Int(block_dim.x)
+    if tid < head:
+        dst[unsafe_offset=tid] = ieee_sqrt(src[unsafe_offset=tid])
+    var tail = head + vectors * 4
+    if tid < size - tail:
+        var index = tail + tid
+        dst[unsafe_offset=index] = ieee_sqrt(src[unsafe_offset=index])
+
+
 @always_inline
 def _unary_elementwise[
     dtype: DType, op_code: Int
@@ -526,6 +566,40 @@ def _unary_elementwise[
                         _trace_description="modular_unary",
                     ](Coord(size), ctx)
                     return
+            comptime if (
+                op_code == UOP_SQRT and dtype == DType.float32 and _has_sm_9x()
+            ):
+                # Measured on H100: one vector per thread with the shared
+                # L2/HBM grid improves sqrt while retaining ieee_sqrt.
+                if ctx.api() == "cuda":
+                    if _flat_vec_unary[
+                        dtype,
+                        dtype,
+                        _unary_apply[dtype, _, op_code],
+                        "sqrt",
+                    ](Int(out_ptr), Int(in_ptr), size, ctx):
+                        return
+                    if size > 0 and Int(out_ptr) % 16 == Int(in_ptr) % 16:
+                        var head = min(
+                            size, ((16 - Int(in_ptr) % 16) % 16) // 4
+                        )
+                        # Equal residues permit a common scalar prefix,
+                        # making both vector bases 16-byte aligned.
+                        _enqueue_cached[_sqrt_peel_kernel](
+                            ctx,
+                            "sqrt_contig_f32_v4_peel",
+                            _l2_wave_blocks(
+                                max(1, (size - head) // 4), size * 8, ctx
+                            ),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(size),
+                            Int64(head),
+                        )
+                        return
             comptime if (
                 op_code == UOP_LOG2
                 and (dtype == DType.float32 or dtype == DType.bfloat16)
@@ -683,6 +757,35 @@ comptime SOP_MUL = 1
 comptime SOP_POW = 2
 
 
+@__name("scalar_mul_contig_f32_v4_peel")
+def _scalar_mul_peel_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    src: Pointer[Float32, ImmutAnyOrigin],
+    scalar: Float32,
+    size_arg: Int64,
+    head_arg: Int64,
+):
+    var size = Int(size_arg)
+    var head = Int(head_arg)
+    var nvec = (size - head) // 4
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var index = tid
+    while index < nvec:
+        var i = head + index * 4
+        dst.unsafe_store[width=4, alignment=16](
+            i,
+            src.unsafe_load[width=4, alignment=16](i)
+            * SIMD[DType.float32, 4](scalar),
+        )
+        index += Int(grid_dim.x) * Int(block_dim.x)
+    if tid < head:
+        dst[unsafe_offset=tid] = src[unsafe_offset=tid] * scalar
+    var tail = head + nvec * 4
+    if tid < size - tail:
+        var i = tail + tid
+        dst[unsafe_offset=i] = src[unsafe_offset=i] * scalar
+
+
 @always_inline
 def _scalar_elementwise[
     dtype: DType, op_code: Int
@@ -696,6 +799,32 @@ def _scalar_elementwise[
     comptime if not dtype.is_floating_point():
         raise Error("scalar elementwise ops require a floating point dtype")
     else:
+        comptime if dtype == DType.float32 and op_code == SOP_MUL and _has_sm_9x():
+            # H100 measurements select a common alignment peel for arrays
+            # of at least 1024 elements. Keep the original aligned/divisible
+            # route, other operations/dtypes and non-Hopper targets intact.
+            if (
+                ctx.api() == "cuda"
+                and size >= 1024
+                and Int(in_ptr) % 16 == Int(out_ptr) % 16
+                and (Int(in_ptr) % 16 != 0 or size % 4 != 0)
+            ):
+                var head = min(size, ((16 - Int(in_ptr) % 16) % 16) // 4)
+                var nvec = (size - head) // 4
+                _enqueue_cached[_scalar_mul_peel_kernel](
+                    ctx,
+                    "scalar_mul_contig_f32_v4_peel",
+                    min(ceildiv(nvec, 256), 1 << 22),
+                    1,
+                    1,
+                    256,
+                    out_ptr.as_unsafe_any_origin(),
+                    in_ptr.as_unsafe_any_origin().as_imm(),
+                    scalar,
+                    Int64(size),
+                    Int64(head),
+                )
+                return
 
         @always_inline
         @parameter

@@ -114,7 +114,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::zero_": _FILL + " (delegates to fill_)",
     "aten::fill.Scalar": _FILL,
     # -- transfers / sync -------------------------------------------------
-    "aten::_copy_from": _MEMCPY + " (H2D/D2H/D2D)",
     "aten::_local_scalar_dense": (
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
     ),
@@ -147,8 +146,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::abs.out": _OUT,
     "aten::acos.out": _OUT,
     "aten::add.out": _OUT,
-    "aten::addcdiv.out": _OUT,
-    "aten::addcmul.out": _OUT,
     "aten::addmm.out": _OUT,
     "aten::any.out": _OUT,
     "aten::asinh.out": _OUT,
@@ -177,7 +174,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::isnan.out": _OUT,
     "aten::le.Scalar_out": _OUT,
     "aten::le.Tensor_out": _OUT,
-    "aten::lerp.Scalar_out": _OUT,
     "aten::log.out": _OUT,
     "aten::log1p.out": _OUT,
     "aten::logical_not.out": _OUT,
@@ -202,7 +198,6 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::silu.out": _OUT,
     "aten::sin.out": _OUT,
     "aten::sinh.out": _OUT,
-    "aten::sqrt.out": _OUT,
     "aten::sub.out": _OUT,
     "aten::where.self_out": _OUT,
     "aten::tan.out": _OUT,
