@@ -1394,11 +1394,26 @@ def _ternary_bcast_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
 # *more* accurate but that makes it a worse match for this specific
 # imperfectly-rounded reference (confirmed empirically: it still failed
 # ~8% of elements at fp16). Reproducing CPU's exact op order and rounding
-# granularity below matches it exactly: on an actual H100
-# (test_matches_cpu_addr_mojo_float16/bfloat16), it landed exactly one
-# element out of 50 just outside tolerance (down from up to 18% before
-# this fix).
+# granularity below is bit-identical to it (0 of 40000 fp16/bf16 elements
+# differ on an H100), provided the compiler is kept from contracting the
+# products into the sum: see `_round_through`.
 # ---------------------------------------------------------------------------
+
+
+@always_inline
+def _round_through[dtype: DType](x: Float32, zero: UInt16) -> Float32:
+    """`x` rounded to `dtype` and widened back, opaquely.
+
+    `zero` is 0, but only at run time. Without it the compiler narrows the
+    two products and the sum of `_addr_bcast` to `dtype` and contracts them
+    (`fma.rn.f16` in the PTX), which drops the rounding of the product: 15-23%
+    of fp16/bf16 elements then differ from CPU (measured on an H100). An XOR
+    the compiler cannot fold keeps each product a rounded value of its own."""
+    comptime if dtype == DType.float32:
+        return x
+    else:
+        var bits = bitcast[DType.uint16, 1](x.cast[dtype]()) ^ zero
+        return bitcast[dtype, 1](bits).cast[DType.float32]()
 
 
 @always_inline
@@ -1434,11 +1449,13 @@ def _addr_bcast[
     # it entirely for float32 dtype (where these casts are no-ops).
     var beta_f32 = beta_dt.cast[DType.float32]()
     var alpha_f32 = alpha_dt.cast[DType.float32]()
+    # Half tensors are 2-byte aligned, so this is 0 -- see `_round_through`.
+    var zero = UInt16(out_addr & 1)
 
     @always_inline
     @parameter
     @__copy_capture(
-        out_ptr, a_ptr, b_ptr, c_ptr, beta_f32, alpha_f32, beta_is_zero
+        out_ptr, a_ptr, b_ptr, c_ptr, beta_f32, alpha_f32, beta_is_zero, zero
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i_flat = Int(idx[0].value())
@@ -1453,24 +1470,18 @@ def _addr_bcast[
         # float32 multiplies with a single final rounding is *more*
         # accurate but drifts from this specific imperfectly-rounded
         # reference (see the module comment above).
-        var t2 = (
-            (alpha_f32 * bv.cast[DType.float32]())
-            .cast[dtype]()
-            .cast[DType.float32]()
+        var t2 = _round_through[dtype](
+            alpha_f32 * bv.cast[DType.float32](), zero
         )
-        var t3 = (
-            (t2 * cv.cast[DType.float32]()).cast[dtype]().cast[DType.float32]()
-        )
+        var t3 = _round_through[dtype](t2 * cv.cast[DType.float32](), zero)
         # `self` is masked to 0 rather than branched around: beta==0 must
         # not propagate nan/inf from `self` (matches CPU), and a select on
         # an already-loaded value keeps this branch-free per element.
         var av = Scalar[dtype](0) if beta_is_zero else a_ptr[
             unsafe_offset=i * as0 + j * as1
         ]
-        var t1 = (
-            (beta_f32 * av.cast[DType.float32]())
-            .cast[dtype]()
-            .cast[DType.float32]()
+        var t1 = _round_through[dtype](
+            beta_f32 * av.cast[DType.float32](), zero
         )
         out_ptr[unsafe_offset=i_flat] = (t1 + t3).cast[dtype]()
 

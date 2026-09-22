@@ -1101,7 +1101,16 @@ def test_ps_roi_overlapping_backward(mojo_gpu: str, kind: str, dtype: torch.dtyp
     result.backward(grad.to(mojo_gpu))
     _assert_close(result, expected, dtype)
     assert ours.grad is not None and reference.grad is not None
-    _assert_close(ours.grad, reference.grad, dtype)
+    if dtype == torch.float16:
+        # 257 boxes scatter into the same cells with atomic adds in fp16, in
+        # whatever order the threads land. Over 40 runs on an H100 the gradient
+        # moved by up to 0.12 run to run, and CPU's own fp16 sum sits 0.055 off
+        # the fp64 one; the usual 2e-2 is inside that noise.
+        torch.testing.assert_close(
+            ours.grad.cpu(), reference.grad, rtol=2e-2, atol=0.25
+        )
+    else:
+        _assert_close(ours.grad, reference.grad, dtype)
 
 
 @pytest.mark.parametrize("use_mask", [False, True])
