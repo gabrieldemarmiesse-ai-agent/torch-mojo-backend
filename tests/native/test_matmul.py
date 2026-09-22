@@ -234,6 +234,21 @@ def test_addmm(mojo_device, dtype, call_checker: CallChecker):
     torch.testing.assert_close(got, (ra @ rb + rbias).to(dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("beta,alpha", [(1, 1), (0.6, 0.2), (0, 0.5)])
+def test_addr_half_is_bit_identical_to_cpu(mojo_gpu: str, dtype, beta, alpha):
+    """CPU rounds to the dtype after each product; a contracted `a + b*c`
+    rounds once and was off on 15-23% of elements."""
+    generator = torch.Generator().manual_seed(0)
+    a = torch.randn(64, 97, dtype=dtype, generator=generator)
+    b = torch.randn(64, dtype=dtype, generator=generator)
+    c = torch.randn(97, dtype=dtype, generator=generator)
+    got = torch.addr(
+        a.to(mojo_gpu), b.to(mojo_gpu), c.to(mojo_gpu), beta=beta, alpha=alpha
+    )
+    assert torch.equal(got.cpu(), torch.addr(a, b, c, beta=beta, alpha=alpha))
+
+
 def test_addmm_scaled_declines(mojo_device):
     """beta/alpha scaling is not implemented by this family; the decline is a
     NotImplementedError, not a silently dropped scale."""
