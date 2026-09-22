@@ -103,6 +103,194 @@ def test_clone_every_rank(mojo_gpu, rank):
     torch.testing.assert_close(dev.clone().cpu(), x.permute(*reversed(range(rank))))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int16])
+@pytest.mark.parametrize(
+    "rows,cols,pitch,source_offset,destination_offset",
+    [
+        (2, 5120000, 15370400, 0, 0),
+        (2, 3840000, 15370400, 1600, 0),
+        (2, 800, 15370400, 0, 0),
+        (357, 789, 811, 3, 5),
+        (7, 1025, 1041, 1, 3),
+        (5, 32768, 32781, 0, 0),
+        (0, 17, 19, 1, 3),
+        (7, 0, 9, 2, 3),
+        (1, 1, 1, 0, 0),
+        (2, 7, 9, 0, 0),
+        (2, 8, 16, 1, 0),
+        (2, 8, 16, 0, 1),
+        (2, 9, 17, 3, 5),
+        (3, 2049, 2056, 0, 0),
+        (3, 2048, 2056, 8, 16),
+        (65536, 1, 2, 1, 3),
+    ],
+)
+def test_copy_row_strided_storage_bits(
+    mojo_gpu: str,
+    dtype: torch.dtype,
+    rows: int,
+    cols: int,
+    pitch: int,
+    source_offset: int,
+    destination_offset: int,
+):
+    _check_row_copy_storage_bits(
+        mojo_gpu, dtype, rows, cols, pitch, source_offset, destination_offset
+    )
+
+
+def _check_row_copy_storage_bits(
+    mojo_gpu: str,
+    dtype: torch.dtype,
+    rows: int,
+    cols: int,
+    pitch: int,
+    source_offset: int,
+    destination_offset: int,
+):
+    # Compare storage words so NaN payloads, signed zero and subnormals survive.
+    word = (
+        torch.int32
+        if dtype in (torch.float32, torch.int32, torch.uint32)
+        else torch.int16
+    )
+    multiplier = 2654435761 if word == torch.int32 else 7919
+    size = max(1, rows * pitch + source_offset + 7)
+    bits = (torch.arange(size, dtype=torch.int64) * multiplier + 13).to(word)
+    if word == torch.int32:
+        special = torch.tensor(
+            [
+                0,
+                0x80000000,
+                0x7F800000,
+                0xFF800000,
+                0x7FC00001,
+                0x7F800001,
+                1,
+                0x7FFFFF,
+            ],
+            dtype=torch.int64,
+        ).to(word)
+        bits[: min(8, size)] = special[: min(8, size)]
+    source_base = bits.view(dtype).to(mojo_gpu)
+    source = source_base.as_strided((rows, cols), (pitch, 1), source_offset)
+    guard = torch.full((rows * cols + destination_offset + 7,), -535, dtype=word)
+    destination_base = guard.view(dtype).to(mojo_gpu)
+    destination = destination_base[
+        destination_offset : destination_offset + rows * cols
+    ].view(rows, cols)
+    expected = guard.clone()
+    expected[destination_offset : destination_offset + rows * cols].view(
+        rows, cols
+    ).copy_(bits.as_strided((rows, cols), (pitch, 1), source_offset))
+    version, pointer = destination._version, destination.data_ptr()
+    assert destination.copy_(source) is destination
+    assert destination._version == version + 1
+    assert destination.data_ptr() == pointer
+    torch.testing.assert_close(
+        destination_base.cpu().view(word), expected, rtol=0, atol=0
+    )
+    torch.testing.assert_close(source_base.cpu().view(word), bits, rtol=0, atol=0)
+
+
+_FP32_ROW_COPY_CASES = [
+    (2, 40206400, 41027200, 0, 0),
+    (2, 41027200, 41027200, 0, 0),
+    (2, 5120000, 15370400, 0, 0),
+    (357, 789, 811, 3, 5),
+    (7, 1025, 1041, 1, 3),
+    (5, 32768, 32781, 0, 0),
+    (0, 17, 19, 1, 3),
+    (7, 0, 9, 2, 3),
+    (1, 1, 1, 0, 0),
+    *[
+        (3, n, n + 4, 0, 0)
+        for n in (
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1023,
+            1024,
+            1025,
+            2047,
+            2048,
+            2049,
+        )
+    ],
+    *[(3, 2048, 2056, src, dst) for src in range(4) for dst in range(4)],
+    (65536, 1, 2, 1, 3),
+    (65536, 4, 8, 0, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "rows,cols,pitch,source_offset,destination_offset", _FP32_ROW_COPY_CASES
+)
+def test_copy_row_strided_fp32_storage_bits(
+    mojo_gpu: str,
+    rows: int,
+    cols: int,
+    pitch: int,
+    source_offset: int,
+    destination_offset: int,
+):
+    _check_row_copy_storage_bits(
+        mojo_gpu, torch.float32, rows, cols, pitch, source_offset, destination_offset
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint32])
+@pytest.mark.parametrize("aligned", [False, True])
+def test_copy_row_strided_word32_alias_dtypes(
+    mojo_gpu: str, dtype: torch.dtype, aligned: bool
+):
+    # CopyStrided dispatches by storage width, so integer32 uses this kernel too.
+    _check_row_copy_storage_bits(
+        mojo_gpu,
+        dtype,
+        7,
+        2048 if aligned else 2049,
+        2056 if aligned else 2057,
+        0 if aligned else 1,
+        0 if aligned else 3,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "layout", ["leading_batch", "transpose", "strided_output", "broadcast", "alias"]
+)
+def test_copy_row_strided_fallback(mojo_gpu: str, dtype: torch.dtype, layout: str):
+    host = _fill((2, 3, 7), dtype)
+    source_base = host.to(mojo_gpu)
+    if layout == "leading_batch":
+        source, expected = source_base, host
+    elif layout == "transpose":
+        source, expected = source_base[0].t(), host[0].t()
+    elif layout == "broadcast":
+        source, expected = source_base[0, :1].expand(3, 7), host[0, :1].expand(3, 7)
+    else:
+        source, expected = source_base[0], host[0]
+    if layout == "alias":
+        destination = source
+    elif layout == "strided_output":
+        destination = torch.full((3, 14), -9, dtype=dtype, device=mojo_gpu)[:, ::2]
+    else:
+        destination = torch.empty(source.shape, dtype=dtype, device=mojo_gpu)
+    destination.copy_(source)
+    torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(source_base.cpu(), host, rtol=0, atol=0)
+
+
 _SPLIT_ROW_CASES = [
     (2, [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800]),
     (2, [800] * 12),
