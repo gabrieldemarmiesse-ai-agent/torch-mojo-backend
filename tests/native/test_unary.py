@@ -267,6 +267,15 @@ def test_unary_launcher_bitwise_not_offsets(
     torch.testing.assert_close(storage.cpu(), expected)
 
 
+@pytest.mark.parametrize("op", [torch.abs, torch.neg, torch.sign, torch.relu])
+def test_direct_unary_float64(mojo_gpu: str, op):
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    cpu = torch.randn(259, dtype=torch.float64) * 3
+    cpu[::11] = 0.0
+    assert torch.equal(op(cpu.to(mojo_gpu)).cpu(), op(cpu))
+    assert torch.equal(op(cpu.to(mojo_gpu)[3:]).cpu(), op(cpu[3:]))
+
+
 @pytest.mark.parametrize("dtype", (torch.int64, torch.float64))
 def test_unary_launcher_predicate_offset_two(mojo_gpu: str, dtype: torch.dtype):
     if dtype == torch.float64:
