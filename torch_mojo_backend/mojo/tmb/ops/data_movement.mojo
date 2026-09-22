@@ -29,6 +29,7 @@ from tmb.backend.abi import (
     TAG_BOOL,
     IntList,
     Owned,
+    dtype_name,
     T,
     Value,
     Values,
@@ -84,6 +85,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     is_cast_dtype,
     cast_into,
+    device_str,
     fill_value,
     cast_to,
     contiguous,
@@ -836,11 +838,19 @@ def _split_rows_qualifies(
     src: T, outs: List[T], sizes: IntList, dim: Int
 ) raises -> Bool:
     # A singleton contiguous span already uses a faster device memcpy.
+    # The kernel moves bits through uint16 and never does arithmetic, so every
+    # 2-byte dtype is the same work and the same compiled variant.
+    # TODO: parametrize the kernel on the element width so 4- and 8-byte dtypes
+    # can use it too. That needs a DTYPE_ARG_0 define to select the
+    # specialization (`KernelCall.arg_dtype`), a vector width of
+    # `16 // size_of[dtype]()` in place of the hard-coded 8, and a re-measure:
+    # COPY_ROWS_TILE and COPY_SMALL_ROWS count elements, not bytes, and were
+    # fitted to bf16 on an H100.
     if (
         len(outs) <= 1
         or not src.on_mojo()
         or not src.contig
-        or src.dtype != DType.bfloat16
+        or src.itemsize != 2
     ):
         return False
     if not _sm90_cuda(src.device):
@@ -919,32 +929,58 @@ def _split_resize_out(mut out: T, src: T) raises:
         out = T(out.h)
 
 
+def _sizes_str(sizes: IntList) raises -> String:
+    """`split_sizes` the way TORCH_CHECK prints an IntArrayRef."""
+    var s = String("[")
+    for i in range(len(sizes)):
+        if i:
+            s += ", "
+        s += String(sizes[i])
+    return s + "]"
+
+
 # aten::split_with_sizes_copy.out(Tensor self, SymInt[] split_sizes, int dim=0, *, Tensor(a!)[] out) -> ()
 def op_split_with_sizes_copy_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var src = v_tensor(args[unsafe_offset=0])
     var sizes = IntList(args[unsafe_offset=1])
-    var dim = v_int(args[unsafe_offset=2])
+    var dim_in = v_int(args[unsafe_offset=2])
     var outs = v_tensor_list(args[unsafe_offset=3])
     if src.rank == 0:
         raise Error("split expects at least a 1-dimensional tensor")
-    if dim < 0:
-        dim += src.rank
-    if dim < 0 or dim >= src.rank:
-        raise Error("Dimension out of range")
+    # Every message below is ATen's own text: this op is registered, so its
+    # composite kernel no longer runs and these are the only ones a user sees.
+    if dim_in < -src.rank or dim_in >= src.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -src.rank,
+            ", ",
+            src.rank - 1,
+            "], but got ",
+            dim_in,
+            ")",
+        )
+    var dim = dim_in + src.rank if dim_in < 0 else dim_in
     var total = 0
     for i in range(len(sizes)):
         if sizes[i] < 0:
             raise Error(
-                "split_with_sizes expects split_sizes have only non-negative"
-                " entries"
+                (
+                    "split_with_sizes expects split_sizes have only"
+                    " non-negative entries, but got split_sizes="
+                ),
+                _sizes_str(sizes),
             )
         total += sizes[i]
     if total != src.dim(dim):
         raise Error(
-            "split_with_sizes expects split_sizes to sum exactly to the input"
-            " dimension"
+            "split_with_sizes expects split_sizes to sum exactly to ",
+            src.dim(dim),
+            " (input tensor's size at dimension ",
+            dim,
+            "), but got split_sizes=",
+            _sizes_str(sizes),
         )
     if len(outs) != len(sizes):
         raise Error(
@@ -970,13 +1006,19 @@ def op_split_with_sizes_copy_out(
         if out.dtype != src.dtype:
             raise Error(
                 "Expected out tensor to have dtype ",
-                src.dtype,
+                dtype_name(src.stype),
                 ", but got ",
-                out.dtype,
+                dtype_name(out.stype),
                 " instead",
             )
         if out.device_type != src.device_type or out.device != src.device:
-            raise Error("Expected out tensor to have device matching the input")
+            raise Error(
+                "Expected out tensor to have device ",
+                device_str(src),
+                ", but got ",
+                device_str(out),
+                " instead",
+            )
         var copy_args = List[Value]()
         copy_args.append(tensor_arg(out))
         copy_args.append(tensor_arg(view))

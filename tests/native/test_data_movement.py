@@ -8,6 +8,7 @@ some other route) actually ran.
 """
 
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -302,21 +303,17 @@ def _check_split_copy_bits(
     sizes: list[int],
     source_offset: int,
     destination_offset: int,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     count = rows * sum(sizes)
     bits = (torch.arange(count + source_offset + 7, dtype=torch.int64) * 7919 + 13).to(
         torch.int16
     )
-    host = bits.view(torch.bfloat16)
+    host = bits.view(dtype)
     source_base = host.to(device)
     source = source_base[source_offset : source_offset + count].view(rows, sum(sizes))
     guards = [
-        torch.full(
-            (rows * n + destination_offset + 7,),
-            -9,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        torch.full((rows * n + destination_offset + 7,), -9, dtype=dtype, device=device)
         for n in sizes
     ]
     outputs = [
@@ -348,6 +345,17 @@ def _check_split_copy_bits(
     torch.testing.assert_close(
         source_base.cpu().view(torch.int16), bits, rtol=0, atol=0
     )
+
+
+# The kernel moves bits through uint16, so every 2-byte dtype is the same work.
+# One small-kernel case (rows <= 8, cols <= the tile) and one that straddles the
+# tile and exercises the 16-byte vector path.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int16])
+@pytest.mark.parametrize("rows,sizes", [(3, [17] * 80), (2, [2049, 1, 0, 4096])])
+def test_split_copy_row_other_16_bit_dtypes(
+    mojo_gpu: str, dtype: torch.dtype, rows: int, sizes: list[int]
+):
+    _check_split_copy_bits(mojo_gpu, rows, sizes, 3, 5, dtype)
 
 
 @pytest.mark.parametrize(
@@ -434,15 +442,13 @@ def test_split_copy_fallback(mojo_device: str, mode: str):
     torch.testing.assert_close(source.cpu(), host, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "mode",
-    ["negative_size", "sum", "dimension", "scalar", "output_count", "dtype", "device"],
-)
-def test_split_copy_errors(mojo_gpu: str, mode: str):
-    source = torch.ones((2, 4), dtype=torch.bfloat16, device=mojo_gpu)
+def _split_copy_error_operands(
+    mode: str, device: str
+) -> tuple[torch.Tensor, list[int], int, list[torch.Tensor]]:
+    source = torch.ones((2, 4), dtype=torch.bfloat16, device=device)
     sizes, dim = [2, 2], 1
     outputs = [
-        torch.empty((2, 2), dtype=torch.bfloat16, device=mojo_gpu) for _ in range(2)
+        torch.empty((2, 2), dtype=torch.bfloat16, device=device) for _ in range(2)
     ]
     if mode == "negative_size":
         sizes = [-1, 5]
@@ -450,16 +456,63 @@ def test_split_copy_errors(mojo_gpu: str, mode: str):
         sizes = [1, 2]
     elif mode == "dimension":
         dim = 2
+    elif mode == "negative_dimension":
+        dim = -3
     elif mode == "scalar":
         source = source[0, 0]
     elif mode == "output_count":
         outputs.pop()
     elif mode == "dtype":
-        outputs[1] = torch.empty((2, 2), dtype=torch.float32, device=mojo_gpu)
-    elif mode == "device":
-        outputs[1] = torch.empty((2, 2), dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        torch.ops.aten.split_with_sizes_copy.out(source, sizes, dim, out=outputs)
+        outputs[1] = torch.empty((2, 2), dtype=torch.float32, device=device)
+    return source, sizes, dim, outputs
+
+
+def _message(error: pytest.ExceptionInfo[BaseException]) -> str:
+    """The first line, without the ` [aten::<op>]` the shim appends to every
+    error a mojo op raises (`shim_dispatch.cpp`)."""
+    return re.sub(r" \[aten::[^]]+\]$", "", str(error.value).splitlines()[0])
+
+
+# Registering the op retires ATen's composite kernel, so these messages are no
+# longer ATen's by construction -- they are ours, and a user reads them instead
+# of the ones CPU torch prints. Compare the text against CPU rather than only
+# the exception type, or a message can silently lose the sizes or the dim.
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "negative_size",
+        "sum",
+        "dimension",
+        "negative_dimension",
+        "scalar",
+        "output_count",
+        "dtype",
+    ],
+)
+def test_split_copy_errors_read_like_cpu(mojo_gpu: str, mode: str):
+    # ATen raises the dim check with TORCH_CHECK_INDEX, which reaches python as
+    # IndexError; every error out of a mojo op is a RuntimeError, so the type
+    # differs for that one case and only the text is compared.
+    messages = []
+    for device in ("cpu", mojo_gpu):
+        source, sizes, dim, outputs = _split_copy_error_operands(mode, device)
+        with pytest.raises((RuntimeError, IndexError)) as error:
+            torch.ops.aten.split_with_sizes_copy.out(source, sizes, dim, out=outputs)
+        messages.append(_message(error))
+    assert messages[1] == messages[0]
+
+
+def test_split_copy_error_names_the_wrong_device(mojo_gpu: str):
+    source = torch.ones((2, 4), dtype=torch.bfloat16, device=mojo_gpu)
+    outputs = [
+        torch.empty((2, 2), dtype=torch.bfloat16, device=mojo_gpu),
+        torch.empty((2, 2), dtype=torch.bfloat16),
+    ]
+    with pytest.raises(RuntimeError) as error:
+        torch.ops.aten.split_with_sizes_copy.out(source, [2, 2], 1, out=outputs)
+    assert _message(error) == (
+        f"Expected out tensor to have device {source.device}, but got cpu instead"
+    )
 
 
 @pytest.fixture(params=[(0, 1), (1, 0)], ids=["0-to-1", "1-to-0"])
