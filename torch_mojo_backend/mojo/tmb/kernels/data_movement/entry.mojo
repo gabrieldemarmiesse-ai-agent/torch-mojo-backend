@@ -66,6 +66,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
+from tmb.kernels.data_movement.batched_copy_cast import copy_batched_cast
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
@@ -3628,6 +3629,28 @@ def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
             _ = tmp^
 
 
+def _copy_batched_cast_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 2:
+        raise Error("CopyBatchedCast expects metadata and context")
+    comptime if _has_sm_9x():
+        var metadata = argv[unsafe_offset=0]
+        var count = _raw_tuple_len(metadata)
+        if count % 3 != 0:
+            raise Error(
+                "CopyBatchedCast metadata must contain pointer/size triples"
+            )
+        var srcs = List[Int]()
+        var dsts = List[Int]()
+        var sizes = List[Int]()
+        for i in range(count // 3):
+            srcs.append(_raw_tuple_int(metadata, i * 3))
+            dsts.append(_raw_tuple_int(metadata, i * 3 + 1))
+            sizes.append(_raw_tuple_int(metadata, i * 3 + 2))
+        copy_batched_cast(srcs, dsts, sizes, _raw_ctx(argv[unsafe_offset=1]))
+    else:
+        raise Error("CopyBatchedCast requires Hopper")
+
+
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -3639,6 +3662,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
+        comptime if _op_on["CopyBatchedCast"]():
+            _copy_batched_cast_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["CastSpec"]():
             _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
             return 0
