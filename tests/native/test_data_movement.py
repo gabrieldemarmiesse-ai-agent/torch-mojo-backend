@@ -64,6 +64,37 @@ def test_clone_strided(mojo_device, call_checker):
     torch.testing.assert_close(cloned.cpu(), x.t())
 
 
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.int32, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("shape", [(357, 789), (0,), (17,)])
+def test_copy_cast_into_offset_destination(mojo_gpu, src_dtype, dst_dtype, shape):
+    source = _fill(shape, src_dtype)
+    n = source.numel()
+    src_storage = torch.full((n + 8,), 3, dtype=src_dtype, device=mojo_gpu)
+    src = src_storage[3 : 3 + n].view(shape)
+    src.copy_(source)
+    before_source = src_storage.cpu()
+    dst_storage = torch.full((n + 12,), -7, dtype=dst_dtype, device=mojo_gpu)
+    dst = dst_storage[5 : 5 + n].view(shape)
+    version = dst._version
+    ptr = dst.data_ptr()
+    result = dst.copy_(src)
+    assert result is dst
+    assert dst.data_ptr() == ptr
+    assert dst._version == version + 1
+    expected = torch.full((n + 12,), -7, dtype=dst_dtype)
+    expected[5 : 5 + n].copy_(source.flatten())
+    torch.testing.assert_close(dst_storage.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(src_storage.cpu(), before_source, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rank", [1, 2, 3, 4, 5])
 def test_clone_every_rank(mojo_gpu, rank):
     """rank<=4 takes the PermuteCopy fast path, rank>4 the general one."""
@@ -1529,6 +1560,202 @@ def test_nonzero_scalar_has_no_coordinate_column(mojo_gpu, value):
     assert got.cpu().tolist() == want.tolist()
 
 
+def _check_cat_cast(device, rows, widths, source_offset=0, destination_offset=0):
+    hosts, sources, source_bases = [], [], []
+    for index, width in enumerate(widths):
+        bits = (
+            (
+                torch.arange(rows * width + 32, dtype=torch.int64) * 7919
+                + index * 357
+                + 13
+            )
+            % 65536
+        ).to(torch.int16)
+        host = bits.view(torch.bfloat16)
+        base = host.to(device)
+        hosts.append(
+            host[source_offset : source_offset + rows * width].view(rows, width)
+        )
+        sources.append(
+            base[source_offset : source_offset + rows * width].view(rows, width)
+        )
+        source_bases.append((base, bits))
+    size = rows * sum(widths)
+    backing = torch.full((size + 32,), 17.0, device=device)
+    output = backing[destination_offset : destination_offset + size].view(
+        rows, sum(widths)
+    )
+    version, pointer = output._version, output.data_ptr()
+    assert torch.cat(sources, 1, out=output) is output
+    expected = torch.cat(hosts, 1).float()
+    actual = output.cpu()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    valid = ~torch.isnan(expected)
+    torch.testing.assert_close(
+        actual.view(torch.int32)[valid],
+        expected.view(torch.int32)[valid],
+        rtol=0,
+        atol=0,
+    )
+    assert output._version == version + 1
+    assert output.data_ptr() == pointer
+    assert torch.all(backing[:destination_offset].cpu() == 17)
+    assert torch.all(backing[destination_offset + size :].cpu() == 17)
+    for source, bits in source_bases:
+        torch.testing.assert_close(source.cpu().view(torch.int16), bits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("source_offset", range(8))
+@pytest.mark.parametrize("destination_offset", range(4))
+def test_cat_cast_offsets(mojo_gpu, source_offset, destination_offset):
+    _check_cat_cast(
+        mojo_gpu,
+        3,
+        [0, 1, 2, 3, 4, 7, 8, 9, 255, 256, 257, 1023, 1024, 1025, 4095, 4096, 4097],
+        source_offset,
+        destination_offset,
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,widths,source_offset,destination_offset",
+    [
+        (3, [0, 0, 0], 3, 1),
+        (0, [17, 0, 1025], 3, 1),
+        (1, [8] * 64, 0, 0),
+        (3, [513] * 65, 1, 3),
+        (2, [1031] * 129, 3, 1),
+        (2, [0 if i % 3 == 0 else (i * 357) % 5001 for i in range(197)], 7, 3),
+        (65536, [1, 0, 2], 1, 1),
+        (
+            2,
+            [
+                800,
+                800,
+                3840000,
+                2400,
+                1280000,
+                800,
+                800,
+                800,
+                5120000,
+                3200,
+                5120000,
+                800,
+            ],
+            0,
+            0,
+        ),
+        (
+            2,
+            [
+                384,
+                384,
+                884736,
+                1152,
+                294912,
+                384,
+                384,
+                384,
+                1179648,
+                1536,
+                1179648,
+                384,
+            ],
+            0,
+            0,
+        ),
+        (1, [8388608, 8388608], 0, 0),
+        (3, [357, 789, 13, 1601], 0, 0),
+        (2, [357, 789, 13, 1601], 0, 1),
+        (1, [0, 7, 0, 1031], 0, 0),
+        (2, [8] * 65, 0, 0),
+        (3, [0 if i % 3 == 0 else 8 * (i % 17 + 1) for i in range(129)], 0, 0),
+        (65536, [8, 0, 16], 0, 0),
+    ],
+)
+def test_cat_cast_regimes(mojo_gpu, rows, widths, source_offset, destination_offset):
+    _check_cat_cast(mojo_gpu, rows, widths, source_offset, destination_offset)
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2, -1])
+def test_cat_cast_dimensions(mojo_gpu, dim):
+    parts = [
+        torch.arange(2 * 3 * 5, dtype=torch.float32).view(2, 3, 5).bfloat16(),
+        torch.ones(2, 3, 5, dtype=torch.bfloat16),
+    ]
+    expected = torch.cat(parts, dim).float()
+    out = torch.empty_like(expected, device=mojo_gpu)
+    torch.cat([x.to(mojo_gpu) for x in parts], dim, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "resized",
+        "strided_input",
+        "strided_output",
+        "same_dtype",
+        "overlap",
+        "shared_inputs",
+    ],
+)
+def test_cat_cast_fallbacks(mojo_gpu, kind):
+    hosts = [
+        torch.arange(24, dtype=torch.float32).reshape(3, 8).bfloat16(),
+        torch.ones(3, 8, dtype=torch.bfloat16),
+    ]
+    parts = [x.to(mojo_gpu) for x in hosts]
+    if kind == "shared_inputs":
+        parts[1] = parts[0]
+        hosts[1] = hosts[0]
+    if kind == "strided_input":
+        parts = [x[:, ::2] for x in parts]
+        hosts = [x[:, ::2] for x in hosts]
+    expected = torch.cat(hosts, 1)
+    dtype = torch.bfloat16 if kind == "same_dtype" else torch.float32
+    if kind == "resized":
+        out = torch.empty(1, device=mojo_gpu, dtype=dtype)
+    elif kind == "strided_output":
+        out = torch.empty(expected.numel() * 2, device=mojo_gpu, dtype=dtype)[::2].view(
+            expected.shape
+        )
+    elif kind == "overlap":
+        # Existing temporary route safely reads BF16 views before writing
+        # overlapping FP32 output. Preserve that backend behavior.
+        out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
+        source = out.view(torch.bfloat16).reshape(-1)[:48].view(3, 16)
+        source.copy_(torch.cat(hosts, 1).to(mojo_gpu))
+        parts = [source]
+    else:
+        out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
+    torch.cat(parts, 1, out=out)
+    torch.testing.assert_close(out.cpu(), expected.to(dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kind", ["empty_list", "wrong_shape", "wrong_dtype", "wrong_device"]
+)
+def test_cat_cast_rejects_before_writing(mojo_gpu, kind):
+    parts = [
+        torch.ones(3, 8, dtype=torch.bfloat16, device=mojo_gpu),
+        torch.ones(3, 8, dtype=torch.bfloat16, device=mojo_gpu),
+    ]
+    out = torch.full((3, 16), 17.0, device=mojo_gpu)
+    if kind == "empty_list":
+        parts = []
+    elif kind == "wrong_shape":
+        parts[1] = torch.ones(4, 8, dtype=torch.bfloat16, device=mojo_gpu)
+    elif kind == "wrong_dtype":
+        parts[1] = parts[1].float()
+    else:
+        parts[1] = parts[1].cpu()
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.cat(parts, 1, out=out)
+    assert torch.all(out.cpu() == 17)
+
+
 def test_cat_out_keeps_a_matching_out_where_it_is(mojo_gpu):
     """`cat.out` must not resize an out that already has the right shape:
     resizing resets sizes, strides AND offset, which would send the result to
@@ -1546,6 +1773,23 @@ def test_cat_out_resizes_a_mismatching_out(mojo_gpu):
     parts = [torch.ones(2, device=mojo_gpu), torch.full((3,), 2.0, device=mojo_gpu)]
     torch.cat(parts, 0, out=out)
     assert out.cpu().tolist() == [1.0, 1.0, 2.0, 2.0, 2.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
+def test_chunk_cat_mixed_precision_out(
+    mojo_device: str, dtype: torch.dtype, strided: bool
+):
+    """FSDP2 packs half-precision, uneven parameter gradients into fp32."""
+    inputs = [_fill((5, 3), dtype), _fill((7,), dtype)]
+    expected = torch.empty(2, 13, dtype=torch.float32)
+    torch._chunk_cat(inputs, dim=0, num_chunks=2, out=expected)
+    storage = torch.full((2, 15 if strided else 13), -123.0, device=mojo_device)
+    out = storage[:, 1:-1] if strided else storage
+    torch._chunk_cat([x.to(mojo_device) for x in inputs], dim=0, num_chunks=2, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    if strided:
+        assert (storage.cpu()[:, (0, -1)] == -123).all()
 
 
 def test_nonzero_int_dtype(mojo_gpu):
