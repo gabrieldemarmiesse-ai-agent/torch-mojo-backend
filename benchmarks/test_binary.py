@@ -474,6 +474,54 @@ def test_addcmul(
 
 @pytest.mark.parametrize("dtype_id", ("f32",))
 @pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("lerp.Scalar_out")
+def test_lerp_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.lerp_(b_ref, 0.1),
+        lambda: a_our.lerp_(b_our, 0.1),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("addcmul.out")
+def test_addcmul_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.addcmul_(b_ref, b_ref, value=1e-5),
+        lambda: a_our.addcmul_(b_our, b_our, value=1e-5),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("addcdiv.out")
+def test_addcdiv_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1, hw, mojo_device)
+    bench.run(
+        lambda: a_ref.addcdiv_(b_ref, b_ref, value=1e-5),
+        lambda: a_our.addcdiv_(b_our, b_our, value=1e-5),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.parametrize("layout", ("host_scalar",))
 @pytest.mark.bench_op("div.Tensor")
 def test_div_host_scalar(
@@ -541,54 +589,6 @@ def test_mul_host_scalar_offset(
         lambda: torch.mul(src_ref, 0.375, out=dst_ref),
         lambda: torch.mul(src_our, 0.375, out=dst_our),
         flops=float(size),
-    )
-
-
-@pytest.mark.parametrize("dtype_id", ("f32",))
-@pytest.mark.parametrize("shape_id", SHAPES)
-@pytest.mark.bench_op("lerp.Scalar_out")
-def test_lerp_inplace(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-):
-    shape = SHAPES[shape_id]
-    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: a_ref.lerp_(b_ref, 0.1),
-        lambda: a_our.lerp_(b_our, 0.1),
-        flops=3.0 * a_ref.numel(),
-    )
-
-
-@pytest.mark.parametrize("dtype_id", ("f32",))
-@pytest.mark.parametrize("shape_id", SHAPES)
-@pytest.mark.bench_op("addcmul.out")
-def test_addcmul_inplace(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-):
-    shape = SHAPES[shape_id]
-    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: a_ref.addcmul_(b_ref, b_ref, value=1e-5),
-        lambda: a_our.addcmul_(b_our, b_our, value=1e-5),
-        flops=3.0 * a_ref.numel(),
-    )
-
-
-@pytest.mark.parametrize("dtype_id", ("f32",))
-@pytest.mark.parametrize("shape_id", SHAPES)
-@pytest.mark.bench_op("addcdiv.out")
-def test_addcdiv_inplace(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-):
-    shape = SHAPES[shape_id]
-    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1, hw, mojo_device)
-    bench.run(
-        lambda: a_ref.addcdiv_(b_ref, b_ref, value=1e-5),
-        lambda: a_our.addcdiv_(b_our, b_our, value=1e-5),
-        flops=3.0 * a_ref.numel(),
     )
 
 

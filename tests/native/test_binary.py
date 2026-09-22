@@ -715,22 +715,6 @@ def test_clamp(mojo_device, call_checker):
     torch.testing.assert_close(a.clamp(max=0.0).cpu(), a_cpu.clamp(max=0.0))
 
 
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_clamp_with_a_float_bound_promotes_an_integer_tensor(mojo_gpu, dtype):
-    """ATen's clamp iterator promotes its inputs to a common dtype:
-    `torch.clamp(int_tensor, min=0.5)` is a FLOAT tensor, not an integer one
-    with the bound truncated away."""
-    a_cpu, a = _both((10,), dtype, mojo_gpu, low=0, high=5)
-    for kwargs in ({"min": 0.5}, {"max": 3.5}, {"min": 0.5, "max": 3.5}):
-        want = a_cpu.clamp(**kwargs)
-        got = a.clamp(**kwargs)
-        assert got.dtype == want.dtype == torch.get_default_dtype()
-        torch.testing.assert_close(got.cpu(), want)
-    # An INTEGER bound keeps the tensor's own dtype, as it does on CPU.
-    assert a.clamp(min=1).dtype == a_cpu.clamp(min=1).dtype == dtype
-    torch.testing.assert_close(a.clamp(min=1).cpu(), a_cpu.clamp(min=1))
-
-
 # --------------------------------------------------------------------------
 # the fast common-case route (`_b_fast_route` / `_b_fast_inplace_t`), against
 # the cascade it stands in front of
@@ -875,6 +859,22 @@ def test_inplace_binary_rejects_a_partially_overlapping_operand(mojo_device):
             getattr(storage[1:], op)(storage[:-1])
     with pytest.raises(RuntimeError, match="single memory location"):
         torch.add(storage[:-1], storage[:-1], out=storage[1:])
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_clamp_with_a_float_bound_promotes_an_integer_tensor(mojo_gpu, dtype):
+    """ATen's clamp iterator promotes its inputs to a common dtype:
+    `torch.clamp(int_tensor, min=0.5)` is a FLOAT tensor, not an integer one
+    with the bound truncated away."""
+    a_cpu, a = _both((10,), dtype, mojo_gpu, low=0, high=5)
+    for kwargs in ({"min": 0.5}, {"max": 3.5}, {"min": 0.5, "max": 3.5}):
+        want = a_cpu.clamp(**kwargs)
+        got = a.clamp(**kwargs)
+        assert got.dtype == want.dtype == torch.get_default_dtype()
+        torch.testing.assert_close(got.cpu(), want)
+    # An INTEGER bound keeps the tensor's own dtype, as it does on CPU.
+    assert a.clamp(min=1).dtype == a_cpu.clamp(min=1).dtype == dtype
+    torch.testing.assert_close(a.clamp(min=1).cpu(), a_cpu.clamp(min=1))
 
 
 # --------------------------------------------------------------------------
