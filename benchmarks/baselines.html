@@ -4883,6 +4883,66 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "cat": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "P_2x8388608": {
+                  "layouts": {
+                    "contig": 0.978
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "P_2x8388608": {
+                  "layouts": {
+                    "contig": 0.974
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cat.out": {
+          "dtypes": {
+            "bf16_f32": {
+              "shapes": {
+                "R1_W1038_P4_empty": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.518
+                  }
+                },
+                "R1_W16777216_P2": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.743
+                  }
+                },
+                "R2_W15370400_P12": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.484
+                  }
+                },
+                "R2_W2760_P4_offset1": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.185
+                  }
+                },
+                "R2_W3543936_P12": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.273
+                  }
+                },
+                "R3_W2760_P4": {
+                  "layouts": {
+                    "contiguous_cast_out": 0.197
+                  }
+                }
+              }
+            }
+          }
+        },
         "div.Tensor": {
           "dtypes": {
             "f32": {
