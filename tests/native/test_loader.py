@@ -20,6 +20,7 @@ every other native test.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -78,12 +79,37 @@ def _assert_ok(proc: subprocess.CompletedProcess[str]):
     assert "OK" in proc.stdout, proc.stdout + proc.stderr
 
 
-def test_cache_dir_env_var_relocates_every_build(tmp_path: Path, mojo_gpu: str):
+_COLD = []
+
+
+@pytest.fixture
+def cold(
+    tmp_path_factory: pytest.TempPathFactory, mojo_gpu: str
+) -> tuple[Path, subprocess.CompletedProcess[str]]:
+    """The one cold build of the module: an empty cache directory filled by a
+    single process. Building it per test was 15-60 s, four times over."""
+    if not _COLD:
+        cache_dir = tmp_path_factory.mktemp("cold") / "cache"
+        proc = _run(cache_dir)
+        _assert_ok(proc)
+        _COLD.append((cache_dir, proc))
+    return _COLD[0]
+
+
+@pytest.fixture
+def built_cache(
+    cold: tuple[Path, subprocess.CompletedProcess[str]], tmp_path: Path
+) -> Path:
+    """A private copy of the cold build (mtimes kept) for a test to damage."""
+    return Path(shutil.copytree(cold[0], tmp_path / "cache"))
+
+
+def test_cache_dir_env_var_relocates_every_build(
+    cold: tuple[Path, subprocess.CompletedProcess[str]],
+):
     """`TORCH_MOJO_BACKEND_CACHE_DIR` is the only place anything is written:
     the C++ shim, the Mojo backend, and the per-family kernel variant."""
-    cache_dir = tmp_path / "cache"
-    proc = _run(cache_dir)
-    _assert_ok(proc)
+    cache_dir, proc = cold
 
     assert list(cache_dir.glob(f"libtmb_shim.hash-*{_SHIM_SUFFIX}")), (
         "C++ shim not cached here"
@@ -102,11 +128,9 @@ def test_cache_dir_env_var_relocates_every_build(tmp_path: Path, mojo_gpu: str):
     assert "built  logic" in proc.stdout + proc.stderr
 
 
-def test_second_process_reuses_every_build(tmp_path: Path, mojo_gpu: str):
+def test_second_process_reuses_every_build(built_cache: Path):
     """A warm second process dlopens the cached `.so`s; it builds nothing."""
-    cache_dir = tmp_path / "cache"
-    first = _run(cache_dir)
-    _assert_ok(first)
+    cache_dir = built_cache
     mtimes_before = {
         p: p.stat().st_mtime_ns
         for p in cache_dir.iterdir()
@@ -129,11 +153,10 @@ def test_second_process_reuses_every_build(tmp_path: Path, mojo_gpu: str):
     assert mtimes_after == mtimes_before, "a warm run rewrote a cached .so"
 
 
-def test_missing_family_so_is_rebuilt(tmp_path: Path, mojo_gpu: str):
+def test_missing_family_so_is_rebuilt(built_cache: Path):
     """Deleting the cached kernel-variant `.so` (but not the two backend
     shims) makes the next process rebuild only that piece."""
-    cache_dir = tmp_path / "cache"
-    _assert_ok(_run(cache_dir))
+    cache_dir = built_cache
     family_sos = _family_sos(cache_dir)
     assert family_sos
     for so in family_sos:
@@ -168,9 +191,7 @@ def test_missing_family_so_is_rebuilt(tmp_path: Path, mojo_gpu: str):
     assert shim_mtimes_after == shim_mtimes_before
 
 
-def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(
-    tmp_path: Path, mojo_gpu: str
-):
+def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(built_cache: Path):
     """A corrupted-but-present `.so` is not silently used: the loader only
     rebuilds a *missing* file (`if not exists(so): build`), so a file that
     exists but fails to load surfaces a clear error instead of running
@@ -178,8 +199,7 @@ def test_corrupt_family_so_fails_clearly_and_recovers_once_removed(
     build/transfer) lets the very next process rebuild and succeed, so the
     cache is never permanently wedged by one bad file.
     """
-    cache_dir = tmp_path / "cache"
-    _assert_ok(_run(cache_dir))
+    cache_dir = built_cache
     family_sos = _family_sos(cache_dir)
     assert family_sos
     corrupted = family_sos[0]
