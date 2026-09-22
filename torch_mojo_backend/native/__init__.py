@@ -903,3 +903,78 @@ def register():
         _trace(
             f"native mojo backend ready in {time.monotonic() - t0:.2f}s ({n} devices)"
         )
+
+
+# --- The custom-op package of the graph backend -------------------------------
+
+_GRAPH_SRC = _MOJO_ROOT / "tmb" / "graph"
+
+
+def mojo_import_roots() -> list[Path]:
+    """The import roots every Mojo build of this package resolves `tmb.`
+    against -- one, the Mojo source root. `loader.mojo`'s `mojo build` lines
+    and `build_backend` pass it as `-I`, and so does the graph package's
+    precompile below."""
+    return [_MOJO_ROOT]
+
+
+def _precompile_package(src: Path, key_sources: list[Path], roots: list[Path]) -> Path:
+    """`mojo precompile` a source package into `<cache>/<name>.hash-<key>/<name>.mojoc`.
+
+    MAX imports a custom-extension package by its file stem and `mojo
+    precompile` bakes the output stem in as the package name, so the stem has
+    to be the package's own name, a Mojo identifier: the key goes on the
+    directory, and the scratch file carries the final name too. A `.mojoc` is
+    tied to the compiler that wrote it, hence the toolchain in the key."""
+    key = _hash_files(key_sources, toolchain_identity())
+    out = _CACHE_DIR / f"{src.name}.hash-{key}" / f"{src.name}.mojoc"
+    if out.exists():
+        return out
+    with _build_lock(out.parent.name):
+        if out.exists():
+            return out
+        t0 = time.monotonic()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = _scratch_dir() / f"{src.name}-{os.getpid()}-{key}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp = tmp_dir / out.name
+        cmd = [_find_mojo(), "precompile", str(src)]
+        for root in roots:
+            cmd += ["-I", str(root)]
+        cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
+        if proc.returncode != 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise RuntimeError(
+                f"precompiling {src.name} (the custom-op package of the graph "
+                "backend) failed:\n" + proc.stdout + proc.stderr
+            )
+        _atomic_install(tmp, out)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _trace(f"built {src.name} in {time.monotonic() - t0:.2f}s")
+        return out
+
+
+@functools.cache
+def build_graph_package() -> Path:
+    """Precompile `tmb/graph/` -- the MAX custom ops the torch.compile backend
+    builds its graphs from -- once per source closure and toolchain, under its
+    own name.
+
+    Handing MAX the source directory instead makes it precompile the package
+    again at every `F.custom` call (modular/modular#5495) and names it after a
+    hash. A precompiled package is not elaborated, so the build takes seconds
+    and the file stays small: MAX compiles the op bodies for the device when it
+    compiles a graph that uses them. The key is the whole import closure of the
+    package's modules, so an edit to anything they reach rebuilds it.
+
+    Cached for the process: every `F.custom` call asks for the path, hashing
+    the sources each time would cost milliseconds per op, and MAX loads a
+    package by its name exactly once -- a rebuilt `.mojoc` under the same name
+    (sources edited while the process runs) cannot replace the loaded one."""
+    modules = sorted(_GRAPH_SRC.glob("*.mojo"))
+    closure: dict[Path, None] = {}
+    for module in modules:
+        for path in mojo_import_closure(module):
+            closure[path] = None
+    return _precompile_package(_GRAPH_SRC, sorted(closure), mojo_import_roots())
