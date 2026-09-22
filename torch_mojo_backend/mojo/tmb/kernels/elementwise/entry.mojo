@@ -53,6 +53,7 @@ from tmb.kernels.common.op_utils import (
     _fill_contig,
     _flat_vec_unary,
     _gs_blocks,
+    _l2_wave_blocks,
     _make_ptr,
     _raw_ctx,
     _raw_dtype_int,
@@ -75,6 +76,8 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.graph.math_utils import ieee_sqrt
+from std.sys.info import _has_sm_9x
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +457,32 @@ def _unary_contig_kernel4[
         i += gstride
 
 
+@__name("sqrt_contig_f32_v4_peel")
+def _sqrt_peel_kernel(
+    dst: Pointer[Float32, MutAnyOrigin],
+    src: Pointer[Float32, ImmutAnyOrigin],
+    size_arg: Int64,
+    head_arg: Int64,
+):
+    var size = Int(size_arg)
+    var head = Int(head_arg)
+    var vectors = (size - head) // 4
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var vector = tid
+    while vector < vectors:
+        var index = head + vector * 4
+        dst.unsafe_store[width=4, alignment=16](
+            index, ieee_sqrt(src.unsafe_load[width=4, alignment=16](index))
+        )
+        vector += Int(grid_dim.x) * Int(block_dim.x)
+    if tid < head:
+        dst[unsafe_offset=tid] = ieee_sqrt(src[unsafe_offset=tid])
+    var tail = head + vectors * 4
+    if tid < size - tail:
+        var index = tail + tid
+        dst[unsafe_offset=index] = ieee_sqrt(src[unsafe_offset=index])
+
+
 @always_inline
 def _unary_elementwise[
     dtype: DType, op_code: Int
@@ -538,6 +567,40 @@ def _unary_elementwise[
                         _trace_description="modular_unary",
                     ](Coord(size), ctx)
                     return
+            comptime if (
+                op_code == UOP_SQRT and dtype == DType.float32 and _has_sm_9x()
+            ):
+                # Measured on H100: one vector per thread with the shared
+                # L2/HBM grid improves sqrt while retaining ieee_sqrt.
+                if ctx.api() == "cuda":
+                    if _flat_vec_unary[
+                        dtype,
+                        dtype,
+                        _unary_apply[dtype, _, op_code],
+                        "sqrt",
+                    ](Int(out_ptr), Int(in_ptr), size, ctx):
+                        return
+                    if size > 0 and Int(out_ptr) % 16 == Int(in_ptr) % 16:
+                        var head = min(
+                            size, ((16 - Int(in_ptr) % 16) % 16) // 4
+                        )
+                        # Equal residues permit a common scalar prefix,
+                        # making both vector bases 16-byte aligned.
+                        _enqueue_cached[_sqrt_peel_kernel](
+                            ctx,
+                            "sqrt_contig_f32_v4_peel",
+                            _l2_wave_blocks(
+                                max(1, (size - head) // 4), size * 8, ctx
+                            ),
+                            1,
+                            1,
+                            GS_THREADS,
+                            out_ptr.as_unsafe_any_origin(),
+                            in_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(size),
+                            Int64(head),
+                        )
+                        return
             comptime if (
                 op_code == UOP_LOG2
                 and (dtype == DType.float32 or dtype == DType.bfloat16)

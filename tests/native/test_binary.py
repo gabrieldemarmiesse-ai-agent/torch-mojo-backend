@@ -352,88 +352,6 @@ def test_scalar_mul_out_aliasing_self(mojo_device, dtype):
     torch.testing.assert_close(x.cpu(), x_cpu * 0.5)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("n,offset", [(0, 1), (1, 0), (357 * 789, 1)])
-def test_mul_inplace_device_scalar_preserves_storage(mojo_gpu, dtype, n, offset):
-    cpu = (torch.arange(n + offset + 3, dtype=torch.float32) % 29 - 14).to(dtype)
-    base = cpu.to(mojo_gpu)
-    value = base[offset : offset + n]
-    scalar = torch.tensor(0.375, dtype=dtype, device=mojo_gpu)
-    scalar_version, version, ptr = scalar._version, value._version, value.data_ptr()
-    result = value.mul_(scalar)
-    cpu[offset : offset + n].mul_(0.375)
-    assert result is value
-    assert value.data_ptr() == ptr
-    assert value._version == version + 1
-    assert scalar._version == scalar_version
-    assert scalar.cpu().item() == 0.375
-    torch.testing.assert_close(base.cpu(), cpu, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["strided", "promoted", "broadcast", "alias"])
-def test_mul_inplace_device_scalar_fallbacks(mojo_gpu, layout):
-    cpu = torch.arange(1, 13, dtype=torch.float32).reshape(3, 4)
-    value = cpu.to(mojo_gpu)
-    if layout == "strided":
-        cpu, value = cpu[:, ::2], value[:, ::2]
-    if layout == "alias":
-        with pytest.raises(RuntimeError, match="single memory location|overlap"):
-            value.mul_(value[0, 0])
-        torch.testing.assert_close(value.cpu(), cpu)
-        return
-    dtype = torch.float16 if layout == "promoted" else torch.float32
-    scalar_cpu = torch.tensor(0.375, dtype=dtype)
-    if layout == "broadcast":
-        scalar_cpu = scalar_cpu.expand(3, 1).clone()
-    scalar = scalar_cpu.to(mojo_gpu)
-    version = value._version
-    value.mul_(scalar)
-    cpu.mul_(scalar_cpu)
-    assert value._version == version + 1
-    torch.testing.assert_close(value.cpu(), cpu)
-
-
-@pytest.mark.parametrize("divisor", [3.0, -0.03162277660168379, 7, 1e-20, 1e20])
-@pytest.mark.parametrize("out_kind", ["functional", "offset", "alias", "strided"])
-def test_div_host_scalar_direct(mojo_gpu, divisor, out_kind):
-    cpu = torch.linspace(-17, 19, 359, dtype=torch.float32)
-    source = cpu.to(mojo_gpu)
-    source_before = source.cpu()
-    expected = cpu / divisor
-    if out_kind == "functional":
-        result = source / divisor
-    else:
-        backing = torch.full((2 * cpu.numel() + 3,), 71.0, device=mojo_gpu)
-        if out_kind == "alias":
-            result = source
-        elif out_kind == "strided":
-            result = backing[1 : 2 * cpu.numel() + 1 : 2]
-        else:
-            result = backing[1 : cpu.numel() + 1]
-        version, ptr = result._version, result.data_ptr()
-        assert torch.div(source, divisor, out=result) is result
-        assert result.data_ptr() == ptr
-        assert result._version == version + 1
-        if out_kind != "alias":
-            expected_backing = torch.full_like(backing.cpu(), 71.0)
-            if out_kind == "strided":
-                expected_backing[1 : 2 * cpu.numel() + 1 : 2] = expected
-            else:
-                expected_backing[1 : cpu.numel() + 1] = expected
-            torch.testing.assert_close(backing.cpu(), expected_backing)
-    torch.testing.assert_close(result.cpu(), expected)
-    if out_kind != "alias":
-        torch.testing.assert_close(source.cpu(), source_before, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("divisor", [0.0, -0.0, float("inf"), -float("inf")])
-def test_div_host_scalar_special_values(mojo_gpu, divisor):
-    cpu = torch.tensor([-float("inf"), -3.0, -0.0, 0.0, 5.0, float("inf")])
-    torch.testing.assert_close(
-        (cpu.to(mojo_gpu) / divisor).cpu(), cpu / divisor, equal_nan=True
-    )
-
-
 _SCALAR_MUL_PATTERNS = [
     0,
     0x80000000,
@@ -569,6 +487,88 @@ def test_scalar_mul_peel_large(mojo_gpu, offset, inplace):
         offset,
         0xBF800001 if inplace else 0x41FCFB72,
         inplace,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n,offset", [(0, 1), (1, 0), (357 * 789, 1)])
+def test_mul_inplace_device_scalar_preserves_storage(mojo_gpu, dtype, n, offset):
+    cpu = (torch.arange(n + offset + 3, dtype=torch.float32) % 29 - 14).to(dtype)
+    base = cpu.to(mojo_gpu)
+    value = base[offset : offset + n]
+    scalar = torch.tensor(0.375, dtype=dtype, device=mojo_gpu)
+    scalar_version, version, ptr = scalar._version, value._version, value.data_ptr()
+    result = value.mul_(scalar)
+    cpu[offset : offset + n].mul_(0.375)
+    assert result is value
+    assert value.data_ptr() == ptr
+    assert value._version == version + 1
+    assert scalar._version == scalar_version
+    assert scalar.cpu().item() == 0.375
+    torch.testing.assert_close(base.cpu(), cpu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", ["strided", "promoted", "broadcast", "alias"])
+def test_mul_inplace_device_scalar_fallbacks(mojo_gpu, layout):
+    cpu = torch.arange(1, 13, dtype=torch.float32).reshape(3, 4)
+    value = cpu.to(mojo_gpu)
+    if layout == "strided":
+        cpu, value = cpu[:, ::2], value[:, ::2]
+    if layout == "alias":
+        with pytest.raises(RuntimeError, match="single memory location|overlap"):
+            value.mul_(value[0, 0])
+        torch.testing.assert_close(value.cpu(), cpu)
+        return
+    dtype = torch.float16 if layout == "promoted" else torch.float32
+    scalar_cpu = torch.tensor(0.375, dtype=dtype)
+    if layout == "broadcast":
+        scalar_cpu = scalar_cpu.expand(3, 1).clone()
+    scalar = scalar_cpu.to(mojo_gpu)
+    version = value._version
+    value.mul_(scalar)
+    cpu.mul_(scalar_cpu)
+    assert value._version == version + 1
+    torch.testing.assert_close(value.cpu(), cpu)
+
+
+@pytest.mark.parametrize("divisor", [3.0, -0.03162277660168379, 7, 1e-20, 1e20])
+@pytest.mark.parametrize("out_kind", ["functional", "offset", "alias", "strided"])
+def test_div_host_scalar_direct(mojo_gpu, divisor, out_kind):
+    cpu = torch.linspace(-17, 19, 359, dtype=torch.float32)
+    source = cpu.to(mojo_gpu)
+    source_before = source.cpu()
+    expected = cpu / divisor
+    if out_kind == "functional":
+        result = source / divisor
+    else:
+        backing = torch.full((2 * cpu.numel() + 3,), 71.0, device=mojo_gpu)
+        if out_kind == "alias":
+            result = source
+        elif out_kind == "strided":
+            result = backing[1 : 2 * cpu.numel() + 1 : 2]
+        else:
+            result = backing[1 : cpu.numel() + 1]
+        version, ptr = result._version, result.data_ptr()
+        assert torch.div(source, divisor, out=result) is result
+        assert result.data_ptr() == ptr
+        assert result._version == version + 1
+        if out_kind != "alias":
+            expected_backing = torch.full_like(backing.cpu(), 71.0)
+            if out_kind == "strided":
+                expected_backing[1 : 2 * cpu.numel() + 1 : 2] = expected
+            else:
+                expected_backing[1 : cpu.numel() + 1] = expected
+            torch.testing.assert_close(backing.cpu(), expected_backing)
+    torch.testing.assert_close(result.cpu(), expected)
+    if out_kind != "alias":
+        torch.testing.assert_close(source.cpu(), source_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("divisor", [0.0, -0.0, float("inf"), -float("inf")])
+def test_div_host_scalar_special_values(mojo_gpu, divisor):
+    cpu = torch.tensor([-float("inf"), -3.0, -0.0, 0.0, 5.0, float("inf")])
+    torch.testing.assert_close(
+        (cpu.to(mojo_gpu) / divisor).cpu(), cpu / divisor, equal_nan=True
     )
 
 
@@ -715,22 +715,6 @@ def test_clamp(mojo_device, call_checker):
     torch.testing.assert_close(a.clamp(max=0.0).cpu(), a_cpu.clamp(max=0.0))
 
 
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_clamp_with_a_float_bound_promotes_an_integer_tensor(mojo_gpu, dtype):
-    """ATen's clamp iterator promotes its inputs to a common dtype:
-    `torch.clamp(int_tensor, min=0.5)` is a FLOAT tensor, not an integer one
-    with the bound truncated away."""
-    a_cpu, a = _both((10,), dtype, mojo_gpu, low=0, high=5)
-    for kwargs in ({"min": 0.5}, {"max": 3.5}, {"min": 0.5, "max": 3.5}):
-        want = a_cpu.clamp(**kwargs)
-        got = a.clamp(**kwargs)
-        assert got.dtype == want.dtype == torch.get_default_dtype()
-        torch.testing.assert_close(got.cpu(), want)
-    # An INTEGER bound keeps the tensor's own dtype, as it does on CPU.
-    assert a.clamp(min=1).dtype == a_cpu.clamp(min=1).dtype == dtype
-    torch.testing.assert_close(a.clamp(min=1).cpu(), a_cpu.clamp(min=1))
-
-
 # --------------------------------------------------------------------------
 # the fast common-case route (`_b_fast_route` / `_b_fast_inplace_t`), against
 # the cascade it stands in front of
@@ -875,6 +859,22 @@ def test_inplace_binary_rejects_a_partially_overlapping_operand(mojo_device):
             getattr(storage[1:], op)(storage[:-1])
     with pytest.raises(RuntimeError, match="single memory location"):
         torch.add(storage[:-1], storage[:-1], out=storage[1:])
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_clamp_with_a_float_bound_promotes_an_integer_tensor(mojo_gpu, dtype):
+    """ATen's clamp iterator promotes its inputs to a common dtype:
+    `torch.clamp(int_tensor, min=0.5)` is a FLOAT tensor, not an integer one
+    with the bound truncated away."""
+    a_cpu, a = _both((10,), dtype, mojo_gpu, low=0, high=5)
+    for kwargs in ({"min": 0.5}, {"max": 3.5}, {"min": 0.5, "max": 3.5}):
+        want = a_cpu.clamp(**kwargs)
+        got = a.clamp(**kwargs)
+        assert got.dtype == want.dtype == torch.get_default_dtype()
+        torch.testing.assert_close(got.cpu(), want)
+    # An INTEGER bound keeps the tensor's own dtype, as it does on CPU.
+    assert a.clamp(min=1).dtype == a_cpu.clamp(min=1).dtype == dtype
+    torch.testing.assert_close(a.clamp(min=1).cpu(), a_cpu.clamp(min=1))
 
 
 # --------------------------------------------------------------------------
