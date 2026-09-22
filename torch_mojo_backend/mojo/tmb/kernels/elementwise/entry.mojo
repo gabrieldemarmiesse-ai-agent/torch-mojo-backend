@@ -77,6 +77,8 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.graph.math_utils import ieee_sqrt
+from std.sys.info import _has_sm_9x
 
 
 # ---------------------------------------------------------------------------

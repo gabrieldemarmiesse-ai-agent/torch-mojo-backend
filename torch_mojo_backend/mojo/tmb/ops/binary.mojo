@@ -68,7 +68,7 @@ from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import cast_to, contiguous, copy_strided_into, resize_out
-from tmb.backend.registry import Site, impl, op_address_of
+from tmb.backend.registry import Site, impl
 from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
 
 # ---------------------------------------------------------------------------
