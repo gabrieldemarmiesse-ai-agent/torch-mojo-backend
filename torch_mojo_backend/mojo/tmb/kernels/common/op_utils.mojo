@@ -24,6 +24,7 @@ from std.math import ceildiv
 from std.memory import OpaquePointer, bitcast, stack_allocation
 from std.memory.alloc import unsafe_alloc
 from std.sys.info import (
+    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     simd_width_of,
@@ -1446,6 +1447,67 @@ def _parallel_for_dt[
         _parallel_for[func](count, ctx)
 
 
+# Row-contiguous reads avoid the generic rank-eight coordinate divisions.
+# The 256-thread policies were measured on Hopper. Other architectures and
+# storage widths retain their existing paths.
+@always_inline
+def _copy_row_strided_body[
+    dtype: DType, VEC: Int, ITEMS: Int = 1, THREADS: Int = 0
+](
+    dst: Pointer[Scalar[dtype], MutAnyOrigin],
+    src: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    pitch_arg: Int64,
+):
+    var cols = Int(cols_arg)
+    var row = Int(block_idx.y)
+    var col = (Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)) * VEC
+    comptime if THREADS != 0:
+        col = Int(block_idx.x) * THREADS * VEC * ITEMS + Int(thread_idx.x) * VEC
+    while row < Int(rows_arg):
+        comptime for item in range(ITEMS):
+            var column = col + item * THREADS * VEC
+            if column + VEC <= cols:
+                dst.unsafe_store[width=VEC, alignment=VEC * size_of[dtype]()](
+                    row * cols + column,
+                    src.unsafe_load[
+                        width=VEC, alignment=VEC * size_of[dtype]()
+                    ](row * Int(pitch_arg) + column),
+                )
+        row += Int(grid_dim.y)
+
+
+@__name(t"copy_row_strided_u16_v{VEC}")
+def _copy_row_strided_u16_kernel[
+    VEC: Int
+](
+    dst: Pointer[UInt16, MutAnyOrigin],
+    src: Pointer[UInt16, ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    pitch_arg: Int64,
+):
+    _copy_row_strided_body[DType.uint16, VEC](
+        dst, src, rows_arg, cols_arg, pitch_arg
+    )
+
+
+@__name(t"copy_row_strided_u32_v{VEC}_i{ITEMS}_t256")
+def _copy_row_strided_u32_kernel[
+    VEC: Int, ITEMS: Int
+](
+    dst: Pointer[UInt32, MutAnyOrigin],
+    src: Pointer[UInt32, ImmutAnyOrigin],
+    rows_arg: Int64,
+    cols_arg: Int64,
+    pitch_arg: Int64,
+):
+    _copy_row_strided_body[DType.uint32, VEC, ITEMS, 256](
+        dst, src, rows_arg, cols_arg, pitch_arg
+    )
+
+
 def _copy_strided_kernel[
     dtype: DType
 ](
@@ -1707,6 +1769,98 @@ def _copy_strided[
         comptime TILE = _t2d_tile[dtype]()
         var rows = shape[MAX_RANK - 2]
         var cols = shape[MAX_RANK - 1]
+        comptime if (
+            dtype == DType.uint16 or dtype == DType.uint32
+        ) and _has_sm_9x():
+            var row_outer_trivial = True
+            comptime for d in range(MAX_RANK - 2):
+                if shape[d] != 1:
+                    row_outer_trivial = False
+            var pitch = src_strides[MAX_RANK - 2]
+            var row_api = True
+            comptime if dtype == DType.uint32:
+                row_api = ctx.api() == "cuda"
+            if (
+                row_api
+                and row_outer_trivial
+                and dst_strides[MAX_RANK - 1] == 1
+                and dst_strides[MAX_RANK - 2] == cols
+                and src_strides[MAX_RANK - 1] == 1
+                and pitch >= cols
+            ):
+                comptime if dtype == DType.uint16:
+                    # Every row and both pointer offsets must retain 16-byte
+                    # alignment. Unaligned views and tails use scalar accesses.
+                    if (
+                        dst_addr % 16 == 0
+                        and src_addr % 16 == 0
+                        and cols % 8 == 0
+                        and pitch % 8 == 0
+                    ):
+                        _enqueue_cached[_copy_row_strided_u16_kernel[8]](
+                            ctx,
+                            "row_copy_u16_vec8",
+                            ceildiv(cols, 256 * 8),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                    else:
+                        _enqueue_cached[_copy_row_strided_u16_kernel[1]](
+                            ctx,
+                            "row_copy_u16_scalar",
+                            ceildiv(cols, 256),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                else:
+                    # Every row and both pointer offsets must retain 16-byte
+                    # alignment. Unaligned views and tails use scalar accesses.
+                    if (
+                        dst_addr % 16 == 0
+                        and src_addr % 16 == 0
+                        and cols % 4 == 0
+                        and pitch % 4 == 0
+                    ):
+                        _enqueue_cached[_copy_row_strided_u32_kernel[4, 1]](
+                            ctx,
+                            "row_copy_u32_vec4",
+                            ceildiv(cols, 256 * 4),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                    else:
+                        _enqueue_cached[_copy_row_strided_u32_kernel[1, 4]](
+                            ctx,
+                            "row_copy_u32_scalar4",
+                            ceildiv(cols, 256 * 4),
+                            min(rows, _MAX_GRID_Y),
+                            1,
+                            256,
+                            dst_ptr.as_unsafe_any_origin(),
+                            src_ptr.as_unsafe_any_origin().as_imm(),
+                            Int64(rows),
+                            Int64(cols),
+                            Int64(pitch),
+                        )
+                return
         # Transposed read into a contiguous destination, optionally batched:
         # the innermost two dims are a (rows, cols) row-major destination
         # whose source is a (cols, rows) matrix read down its columns, and at
