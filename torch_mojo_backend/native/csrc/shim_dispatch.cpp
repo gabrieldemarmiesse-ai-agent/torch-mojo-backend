@@ -49,7 +49,8 @@ void tmb_count_op_call(const char* qualified_name) {
 namespace {
 
 // Backing store for list arguments, built only for a schema that has one
-// (Plan::needs_arena). Inner buffers keep their address when an outer vector
+// (Plan::needs_arena). A std::deque allocates on construction, which is why
+// one is not used here; inner buffers keep their address when an outer vector
 // grows (a moved std::vector keeps its heap block); a generator is boxed so
 // that its address survives a reallocation too.
 struct Arena {
