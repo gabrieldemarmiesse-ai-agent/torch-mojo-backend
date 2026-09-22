@@ -21,6 +21,7 @@ from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.sys.info import (
+    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
@@ -65,6 +66,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
+from tmb.kernels.data_movement.batched_copy_rows import copy_batched_rows
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
@@ -3486,6 +3488,35 @@ def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
             _ = tmp^
 
 
+def _copy_batched_rows_dispatcher(argv: Argv, argc: Int) raises:
+    if argc != 2:
+        raise Error("CopyBatchedRows expects metadata and context")
+    comptime if _has_sm_9x():
+        var metadata = argv[unsafe_offset=0]
+        var count = _raw_tuple_len(metadata)
+        if count % 5 != 0:
+            raise Error(
+                "CopyBatchedRows expects source/destination/rows/columns/pitch"
+                " records"
+            )
+        var srcs = List[Int]()
+        var dsts = List[Int]()
+        var rows = List[Int]()
+        var cols = List[Int]()
+        var pitches = List[Int]()
+        for i in range(count // 5):
+            srcs.append(_raw_tuple_int(metadata, i * 5))
+            dsts.append(_raw_tuple_int(metadata, i * 5 + 1))
+            rows.append(_raw_tuple_int(metadata, i * 5 + 2))
+            cols.append(_raw_tuple_int(metadata, i * 5 + 3))
+            pitches.append(_raw_tuple_int(metadata, i * 5 + 4))
+        copy_batched_rows(
+            srcs, dsts, rows, cols, pitches, _raw_ctx(argv[unsafe_offset=1])
+        )
+    else:
+        raise Error("CopyBatchedRows requires Hopper")
+
+
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -3497,6 +3528,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
+        comptime if _op_on["CopyBatchedRows"]():
+            _copy_batched_rows_dispatcher(argv, argc)
+            return 0
         comptime if _op_on["CastSpec"]():
             _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
             return 0
