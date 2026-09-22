@@ -83,6 +83,46 @@ COVERS: dict[str, str] = {
 SKIPPED: dict[str, str] = {}
 
 
+SPLIT_COPY_SHAPES = {
+    "S_2x15370400_mixed": (
+        2,
+        [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800],
+    ),
+    "S_2x9600_12pieces": (2, [800] * 12),
+    "S_7x1164_awkward": (7, [357, 789, 17, 1, 0]),
+    "S_1x1048576_single": (1, [1048576]),
+    "S_3x33345_65pieces": (3, [513] * 65),
+    "S_65536x3_empty_piece": (65536, [1, 0, 2]),
+}
+
+
+@pytest.mark.bench_op("split_with_sizes_copy.out")
+@pytest.mark.parametrize("dtype_id", ("bf16",))
+@pytest.mark.parametrize("shape_id", SPLIT_COPY_SHAPES)
+def test_split_copy_rows(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    rows, sizes = SPLIT_COPY_SHAPES[shape_id]
+    src_ref, src_our = both(
+        torch.randn(rows, sum(sizes), dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    outputs = [
+        both(torch.empty(rows, n, dtype=DTYPES[dtype_id]), hw, mojo_device)
+        for n in sizes
+    ]
+    dst_ref = [pair[0] for pair in outputs]
+    dst_our = [pair[1] for pair in outputs]
+    bench.run(
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_ref, sizes, 1, out=dst_ref
+        ),
+        lambda: torch.ops.aten.split_with_sizes_copy.out(
+            src_our, sizes, 1, out=dst_our
+        ),
+        flops=float(rows * sum(sizes)),
+    )
+
+
 # Few wide rows exercise all-gather unpacking; odd pitches and offsets cover
 # scalar tails and unaligned views without making launch shapes model-specific.
 ROW_COPY_SHAPES = {
@@ -142,46 +182,6 @@ def test_cat_out_contiguous_fp32(
         lambda: torch.cat([source_ref], 1, out=out_ref),
         lambda: torch.cat([source_our], 1, out=out_our),
         flops=float(source_ref.numel()),
-    )
-
-
-SPLIT_COPY_SHAPES = {
-    "S_2x15370400_mixed": (
-        2,
-        [800, 800, 3840000, 2400, 1280000, 800, 800, 800, 5120000, 3200, 5120000, 800],
-    ),
-    "S_2x9600_12pieces": (2, [800] * 12),
-    "S_7x1164_awkward": (7, [357, 789, 17, 1, 0]),
-    "S_1x1048576_single": (1, [1048576]),
-    "S_3x33345_65pieces": (3, [513] * 65),
-    "S_65536x3_empty_piece": (65536, [1, 0, 2]),
-}
-
-
-@pytest.mark.bench_op("split_with_sizes_copy.out")
-@pytest.mark.parametrize("dtype_id", ("bf16",))
-@pytest.mark.parametrize("shape_id", SPLIT_COPY_SHAPES)
-def test_split_copy_rows(
-    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-):
-    rows, sizes = SPLIT_COPY_SHAPES[shape_id]
-    src_ref, src_our = both(
-        torch.randn(rows, sum(sizes), dtype=DTYPES[dtype_id]), hw, mojo_device
-    )
-    outputs = [
-        both(torch.empty(rows, n, dtype=DTYPES[dtype_id]), hw, mojo_device)
-        for n in sizes
-    ]
-    dst_ref = [pair[0] for pair in outputs]
-    dst_our = [pair[1] for pair in outputs]
-    bench.run(
-        lambda: torch.ops.aten.split_with_sizes_copy.out(
-            src_ref, sizes, 1, out=dst_ref
-        ),
-        lambda: torch.ops.aten.split_with_sizes_copy.out(
-            src_our, sizes, 1, out=dst_our
-        ),
-        flops=float(rows * sum(sizes)),
     )
 
 
