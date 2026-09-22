@@ -4704,6 +4704,117 @@ document.addEventListener("DOMContentLoaded", boot);
     },
     "NVIDIA H100 80GB HBM3 | cuda | kineto-device-time | torch 2.11.0+cu128": {
       "ops": {
+        "_copy_from": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 0.45
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.482
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 0.897
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 0.688
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 0.594
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 0.454
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.481
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.601
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 0.891
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 0.689
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 0.593
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S_2x3840000_p15370400_o1600x0": {
+                  "layouts": {
+                    "contig": 0.792
+                  }
+                },
+                "S_2x40206400_p41027200_o0x0": {
+                  "layouts": {
+                    "contig": 0.81
+                  }
+                },
+                "S_2x5120000_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.809
+                  }
+                },
+                "S_2x800_p15370400_o0x0": {
+                  "layouts": {
+                    "contig": 0.737
+                  }
+                },
+                "S_357x789_p811_o3x5": {
+                  "layouts": {
+                    "contig": 0.701
+                  }
+                },
+                "S_5x32768_p32781_o0x0": {
+                  "layouts": {
+                    "contig": 0.709
+                  }
+                },
+                "S_7x1025_p1041_o1x3": {
+                  "layouts": {
+                    "contig": 0.716
+                  }
+                }
+              }
+            }
+          }
+        },
         "_index_put_impl_": {
           "dtypes": {
             "bf16": {
@@ -4736,6 +4847,78 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "addcdiv.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.31
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.087
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcmul.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.385
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.088
+                  }
+                }
+              }
+            }
+          }
+        },
+        "div.Tensor": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "host_scalar": 1.059
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "host_scalar": 1.02
+                  }
+                }
+              }
+            }
+          }
+        },
+        "lerp.Scalar_out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.306
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.084
+                  }
+                }
+              }
+            }
+          }
+        },
         "log2": {
           "dtypes": {
             "bf16": {
@@ -4762,6 +4945,92 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 0.997
+                  }
+                }
+              }
+            }
+          }
+        },
+        "mul.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.616
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.461
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.619
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.469
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "host_scalar_offset1": 1.034,
+                    "inplace_device_scalar": 0.727
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "host_scalar_offset1": 0.959,
+                    "inplace_device_scalar": 0.847
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sqrt.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "awkward_281673": {
+                  "layouts": {
+                    "contig": 1.017
+                  }
+                },
+                "l2_3840000": {
+                  "layouts": {
+                    "contig": 0.965
+                  }
+                },
+                "l2_5120000": {
+                  "layouts": {
+                    "contig": 0.935
+                  }
+                },
+                "offset_281673": {
+                  "layouts": {
+                    "contig": 1.047
+                  }
+                },
+                "small_800": {
+                  "layouts": {
+                    "contig": 0.798
+                  }
+                },
+                "stream_40206400": {
+                  "layouts": {
+                    "contig": 0.996
                   }
                 }
               }
