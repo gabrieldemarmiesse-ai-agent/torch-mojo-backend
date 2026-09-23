@@ -15,10 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
-# torchvision is a demo-only extra, not a project dependency (pip install it
-# yourself to run this script).
-from torchvision import datasets, transforms  # ty: ignore[unresolved-import]
+from torchvision import datasets, transforms
 
 from torch_mojo_backend import mojo_backend
 

@@ -9,12 +9,12 @@
 #
 # Build (never under the GPU lock -- this never touches a GPU):
 #   <mojo> build tests/fa4_selfload_ptx_probe.mojo \
-#       -I torch_mojo_backend/eager_flash_attention \
+#       -I torch_mojo_backend/mojo \
 #       --emit asm --target-accelerator sm_90a -o <out>.s
 from max.gpu.host import DeviceContext
 from std.memory.unsafe_pointer import pointer_to_int
 
-from fa4_fwd_selfload_launch import launch_fwd_fa4_selfload
+from tmb.kernels.fa4.fwd_selfload_launch import launch_fwd_fa4_selfload
 
 
 def main() raises:
