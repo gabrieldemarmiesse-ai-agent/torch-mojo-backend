@@ -913,6 +913,38 @@ def test_upsample_bilinear2d_explicit_scales(mojo_device):
 
 
 # ---------------------------------------------------------------------------
+# Nearest-neighbor upsampling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,output_size",
+    [((2, 3, 8, 8), (16, 16)), ((1, 2, 7, 9), (16, 21)), ((2, 1, 9, 7), (4, 3))],
+    ids=["2x", "odd_up", "down"],
+)
+def test_upsample_nearest2d(mojo_device, dtype, shape, output_size):
+    """A pure gather: the output is bit-identical to CPU torch's."""
+    x = torch.randn(shape).to(dtype)
+    want = torch.ops.aten.upsample_nearest2d(x, list(output_size))
+    with ran("aten::upsample_nearest2d"):
+        got = torch.ops.aten.upsample_nearest2d(x.to(mojo_device), list(output_size))
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("scale", [2.0, 1.5, 0.7])
+def test_upsample_nearest2d_scale_factor(mojo_device, scale):
+    """`F.interpolate(scale_factor=)` passes the scale itself, which torch uses
+    instead of the size ratio when the product is not integral."""
+    x = torch.randn(1, 2, 5, 7)
+    want = torch.nn.functional.interpolate(x, scale_factor=scale, mode="nearest")
+    got = torch.nn.functional.interpolate(
+        x.to(mojo_device), scale_factor=scale, mode="nearest"
+    )
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
 # End to end: the two ops F.cross_entropy composes
 # ---------------------------------------------------------------------------
 

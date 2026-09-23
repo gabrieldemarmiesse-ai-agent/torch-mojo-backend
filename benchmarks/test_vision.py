@@ -151,7 +151,7 @@ def test_upsample_bilinear2d(
 @pytest.mark.bench_op("upsample_nearest2d")
 def test_upsample_nearest2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w = UPSAMPLE_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device

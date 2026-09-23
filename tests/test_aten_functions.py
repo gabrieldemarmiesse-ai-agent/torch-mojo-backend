@@ -1,6 +1,5 @@
 import math
 from collections.abc import Callable, Sequence
-from typing import Any
 
 import pytest
 import torch
@@ -4425,39 +4424,32 @@ def test_aten_linear_backward_degenerate_features(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    ("kwargs", "shape"),
+    ("size", "scale_factor"),
     [
-        pytest.param(
-            {"scale_factor": 2, "mode": "nearest"}, (2, 3, 8, 8), id="scale_factor_2x"
-        ),
-        pytest.param(
-            {"size": (20, 20), "mode": "nearest"},
-            (2, 3, 8, 8),
-            id="output_size_8_to_20",
-        ),
+        pytest.param(None, 2.0, id="2x"),
+        pytest.param((20, 20), None, id="8_to_20"),
+        pytest.param(None, 1.5, id="scale_1.5"),
+        pytest.param((4, 3), None, id="down"),
     ],
 )
-def test_aten_upsample_nearest2d(
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_upsample_nearest2d_compiles(
     conf: Conf,
     dtype: torch.dtype,
-    kwargs: dict[str, Any],
-    shape: tuple[int, ...],
-    call_checker: CallChecker,
+    size: tuple[int, int] | None,
+    scale_factor: float | None,
 ):
-    """F.interpolate(..., mode="nearest") dispatches to
-    aten::upsample_nearest2d.vec. Covers an integer scale_factor (2x, an exact
-    ratio) and an explicit non-integer-scale output_size (8 -> 20), which is
-    nearest-neighbor's own index formula (no interpolation weights, unlike
-    bilinear), so the output must be an exact copy of the source elements --
-    no tolerance needed.
-    """
-    call_checker.register(aten_functions.aten_upsample_nearest2d)
+    """torch.compile traces nearest upsampling through torch's own Python
+    decomposition (an `index` gather), which runs under compile for both
+    `upsample_nearest2d` overloads, so no graph op of that name exists to map.
+    The eager mojo op is tested in tests/native/test_nn.py."""
 
     def fn(x):
-        return torch.nn.functional.interpolate(x, **kwargs)
+        return torch.nn.functional.interpolate(
+            x, size=size, scale_factor=scale_factor, mode="nearest"
+        )
 
-    x = torch.randn(shape, dtype=dtype)
-    check_outputs(fn, conf, [x], atol=0, rtol=0)
+    check_outputs(fn, conf, [torch.randn(2, 3, 8, 8, dtype=dtype)], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
