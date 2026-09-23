@@ -38,7 +38,7 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
 from torch_mojo_backend.flags import verbose_enabled
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
 # F.functional's stub returns Callable[..., Any], incompatible with the
@@ -59,16 +59,14 @@ _reduce_argmin = F.functional(max_ops.argmin)
 # F.transfer_to is eager-only (reads Tensor.real); re-wrap the graph op so it
 # also works on graph TensorValues in the torch.compile backend.
 _transfer_to = F.functional(max_ops.transfer_to)
-# F.where asserts its result is an eager Tensor; F.broadcast_to/split/sigmoid/
-# gelu are typed `Tensor`-only even though their `_impl`s already forward to
-# the dual-path graph op. Re-wrap all five the same way, both to restore
+# F.where asserts its result is an eager Tensor; F.broadcast_to/split are
+# typed `Tensor`-only even though their `_impl`s already forward to
+# the dual-path graph op. Re-wrap all three the same way, both to restore
 # graph-mode support and to get a stable, precise-enough Callable[..., Any]
 # signature instead of each thin wrapper's narrower stub.
 _broadcast_to = F.functional(max_ops.broadcast_to)
 _where = F.functional(max_ops.where)
 _split = F.functional(max_ops.split)
-_sigmoid = F.functional(max_ops.sigmoid)
-_gelu = F.functional(max_ops.gelu)
 
 
 def _scalar_constant(
@@ -104,20 +102,14 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
 
 def torch_device_to_max_device(x: torch.device) -> DeviceRef:
     if x.type == "mojo":
-        # For mojo, use ordered accelerators (GPU first, CPU last)
-        # index None or 0 = first accelerator (first GPU or CPU if no GPU)
-        # higher indices = additional GPUs, with CPU at the highest index
+        # index None or 0 = first accelerator; higher indices = additional GPUs.
         index = x.index if x.index is not None else 0
 
-        accelerators = get_ordered_accelerators()
+        accelerators = get_accelerators()
         if index >= len(accelerators):
             raise ValueError(f"Invalid mojo index {index}")
 
-        device = accelerators[index]
-        if device.label == "cpu":
-            return DeviceRef.CPU()
-        else:
-            return DeviceRef.GPU(device.id)  # Use the actual GPU ID
+        return DeviceRef.GPU(accelerators[index].id)  # Use the actual GPU ID
     else:
         return max_device_ref(x)
 
@@ -1095,77 +1087,39 @@ def aten__to_copy(
 # abs(Tensor self) -> Tensor
 @map_to(aten.abs)
 def aten_abs(x: MaxTensor) -> MaxTensor:
-    return F.abs(x)
+    return custom_mojo_ops.elementwise(x, "abs")
+
+
+def _acos_float64_gpu(x: MaxTensor) -> MaxTensor:
+    """Retain the graph polynomial where Mojo's float64 acos cannot lower.
+
+    MAX 26.5 lowers Mojo float64 acos to llvm.acos, which has no NVPTX
+    libcall. These are the previous graph implementation's Remez coefficients.
+    Floating dtypes up to float32 use the shared Mojo registration instead.
+    """
+    magnitude = F.abs(x)
+    small = magnitude < 0.5
+    square = _where(small, x * x, (1.0 - magnitude) * 0.5)
+    d = _where(small, magnitude, F.sqrt(square))
+    poly = 0.4197454825e-1
+    poly = poly * square + 0.2424046025e-1
+    poly = poly * square + 0.4547423869e-1
+    poly = poly * square + 0.7495029271e-1
+    poly = poly * square + 0.1666677296
+    correction = poly * square * d
+    positive = _where(small, math.pi * 0.5 - (d + correction), 2.0 * (d + correction))
+    # Outside [-1, 1], sqrt(square) already yields NaN rather than clamping.
+    return _where(x < 0.0, math.pi - positive, positive)
 
 
 # acos(Tensor self) -> Tensor
 @map_to(aten.acos)
 def aten_acos(x: MaxTensor) -> MaxTensor:
-    """Computes the arccosine (inverse cosine) of the input tensor.
-
-    Returns values in the range [0, π] for inputs in [-1, 1].
-    Uses polynomial approximation based on the Mojo stdlib implementation.
-
-    Args:
-        x: Input tensor with values in [-1, 1]
-
-    Returns:
-        Arccosine of the input in radians [0, π]
-    """
-    # Create constants as tensors for use in _where()
-    zero = F.constant(0.0, dtype=x.dtype, device=x.device)
-    one = F.constant(1.0, dtype=x.dtype, device=x.device)
-    neg_one = F.constant(-1.0, dtype=x.dtype, device=x.device)
-
-    # Clamp input to valid domain [-1, 1]
-    x_clamped = F.max(F.min(x, 1.0), -1.0)
-    x_abs = F.abs(x_clamped)
-
-    # Domain split at 0.5
-    small_domain = x_abs < 0.5
-
-    # Compute x_squared and d based on domain
-    # Small domain: x_squared = x², d = |x|
-    # Large domain: x_squared = (1 - |x|) / 2, d = sqrt(x_squared)
-    x_squared_small = x_clamped * x_clamped
-    x_squared_large = (1.0 - x_abs) * 0.5
-    x_squared = _where(small_domain, x_squared_small, x_squared_large)
-
-    d_small = x_abs
-    d_large = F.sqrt(x_squared_large)
-    d = _where(small_domain, d_small, d_large)
-
-    # Handle special case |x| = 1 (d should be 0)
-    is_one = x_abs >= 1.0
-    d = _where(is_one, zero, d)
-
-    # Polynomial evaluation using Horner's method
-    # Coefficients from Mojo stdlib (Remez approximation)
-    poly = 0.4197454825e-1
-    poly = poly * x_squared + 0.2424046025e-1
-    poly = poly * x_squared + 0.4547423869e-1
-    poly = poly * x_squared + 0.7495029271e-1
-    poly = poly * x_squared + 0.1666677296
-    poly = poly * x_squared * d
-
-    # Small domain: π/2 - (d + poly) with sign preservation
-    # copysign(d, x) is implemented as d * sign(x)
-    is_negative = x_clamped < 0.0
-    sign_x = _where(is_negative, neg_one, one)
-    d_signed = d * sign_x
-    poly_signed = poly * sign_x
-    result_small = (math.pi * 0.5) - (d_signed + poly_signed)
-
-    # Large domain: 2 * (d + poly)
-    result_large = 2.0 * (d + poly)
-
-    # For large domain with negative x: π - result
-    result_large = _where(is_negative, math.pi - result_large, result_large)
-
-    # Select based on domain
-    result = _where(small_domain, result_small, result_large)
-
-    return result
+    if x.dtype.is_integral() or x.dtype == DType.bool:
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if x.dtype == DType.float64 and x.type.device.is_gpu():
+        return _acos_float64_gpu(x)
+    return custom_mojo_ops.elementwise(x, "acos")
 
 
 # acosh(Tensor self) -> Tensor
@@ -1511,8 +1465,7 @@ def aten_argmin(
 # asinh(Tensor self) -> Tensor
 @map_to(aten.asinh)
 def aten_asinh(x: MaxTensor) -> MaxTensor:
-    """Computes inverse hyperbolic sine using asinh(x) = log(x + sqrt(x² + 1))"""
-    return F.log(x + F.sqrt(x * x + 1))
+    return custom_mojo_ops.elementwise(x, "asinh")
 
 
 # atan(Tensor self) -> Tensor
@@ -1523,7 +1476,7 @@ def aten_asinh(x: MaxTensor) -> MaxTensor:
 # atanh(Tensor self) -> Tensor
 @map_to(aten.atanh)
 def aten_atanh(x: MaxTensor) -> MaxTensor:
-    return F.atanh(x)
+    return custom_mojo_ops.elementwise(x, "atanh")
 
 
 # avg_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, bool ceil_mode=False, bool count_include_pad=True) -> Tensor
@@ -1714,16 +1667,7 @@ def aten_cat(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
 # ceil(Tensor self) -> Tensor
 @map_to(aten.ceil)
 def aten_ceil(input: MaxTensor) -> MaxTensor:
-    """
-    Ceiling of the input tensor, element-wise.
-
-    For floating-point inputs: Uses MAX's native ceil op.
-    For integer inputs: Returns it (no mathematical change needed, following PyTorch behavior).
-    """
-    if input.type.dtype.is_integral():
-        return input
-    else:
-        return F.ceil(input)
+    return custom_mojo_ops.elementwise(input, "ceil")
 
 
 # clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
@@ -1993,14 +1937,13 @@ def aten_copy(
 # cos(Tensor self) -> Tensor
 @map_to(aten.cos)
 def aten_cos(x: MaxTensor) -> MaxTensor:
-    return F.cos(x)
+    return custom_mojo_ops.elementwise(x, "cos")
 
 
 # cosh(Tensor self) -> Tensor
 @map_to(aten.cosh)
 def aten_cosh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic cosine using cosh(x) = (exp(x) + exp(-x)) / 2"""
-    return (F.exp(x) + F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "cosh")
 
 
 # cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor
@@ -2191,13 +2134,13 @@ def aten_eq(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # erf(Tensor self) -> Tensor
 @map_to(aten.erf)
 def aten_erf(input: MaxTensor) -> MaxTensor:
-    return F.erf(input)
+    return custom_mojo_ops.elementwise(input, "erf")
 
 
 # exp(Tensor self) -> Tensor
 @map_to(aten.exp)
 def aten_exp(input: MaxTensor) -> MaxTensor:
-    return F.exp(input)
+    return custom_mojo_ops.elementwise(input, "exp")
 
 
 # expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)
@@ -2265,11 +2208,7 @@ def aten_fill__scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
 # floor(Tensor self) -> Tensor
 @map_to(aten.floor)
 def aten_floor(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the floor of the elements of input,
-    the largest integer less than or equal to each element.
-    """
-    return F.floor(input)
+    return custom_mojo_ops.elementwise(input, "floor")
 
 
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2347,7 +2286,11 @@ def aten_ge(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
 def aten_gelu(
     input: MaxTensor, approximate: Literal["tanh", "none"] = "none"
 ) -> MaxTensor:
-    return _gelu(input, approximate=approximate)
+    if approximate not in ("none", "tanh"):
+        raise ValueError("approximate must be none or tanh")
+    return custom_mojo_ops.elementwise(
+        input, "gelu_tanh" if approximate == "tanh" else "gelu_none"
+    )
 
 
 # gelu_backward(Tensor grad_output, Tensor self, *, str approximate='none') -> Tensor
@@ -2584,10 +2527,7 @@ def aten_isin(
 # isnan(Tensor self) -> Tensor
 @map_to(aten.isnan)
 def aten_isnan(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with boolean elements representing if each element is NaN or not.
-    """
-    return F.is_nan(input)
+    return custom_mojo_ops.elementwise(input, "isnan")
 
 
 # le.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2675,10 +2615,7 @@ def aten_lift_fresh_copy(input: MaxTensor) -> MaxTensor:
 # log(Tensor self) -> Tensor
 @map_to(aten.log)
 def aten_log(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of the elements of input.
-    """
-    return F.log(input)
+    return custom_mojo_ops.elementwise(input, "log")
 
 
 # log10(Tensor self) -> Tensor
@@ -2687,14 +2624,13 @@ def aten_log(input: MaxTensor) -> MaxTensor:
 # log1p(Tensor self) -> Tensor
 @map_to(aten.log1p)
 def aten_log1p(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of (1 + input).
-    This function is more numerically stable than log(1 + input) for small values of input.
-    """
-    return F.log1p(input)
+    return custom_mojo_ops.elementwise(input, "log1p")
 
 
-# log2(Tensor self) -> Tensor
+# aten::log2(Tensor self) -> Tensor
+@map_to(aten.log2)
+def aten_log2(input: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(input, "log2")
 
 
 # logical_and(Tensor self, Tensor other) -> Tensor
@@ -2722,14 +2658,7 @@ def aten_logical_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 # logical_not(Tensor self) -> Tensor
 @map_to(aten.logical_not)
 def aten_logical_not(input: MaxTensor) -> MaxTensor:
-    """
-    PyTorch's logical_not treats any non-zero value as True and returns the logical negation.
-    MAX's logical_not requires boolean input, so we need to convert first.
-    """
-    # Convert input to boolean (non-zero -> True, zero -> False)
-    input_bool = F.not_equal(input, 0)
-    # Apply logical not
-    return F.logical_not(input_bool)
+    return custom_mojo_ops.elementwise(input, "logical_not")
 
 
 # logical_or(Tensor self, Tensor other) -> Tensor
@@ -3209,7 +3138,7 @@ def aten_ne(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # neg(Tensor self) -> Tensor
 @map_to(aten.neg)
 def aten_neg(x: MaxTensor) -> MaxTensor:
-    return operator.neg(x)
+    return custom_mojo_ops.elementwise(x, "neg")
 
 
 # nonzero(Tensor self) -> Tensor
@@ -3260,7 +3189,7 @@ def aten_pow(x: Scalar | MaxTensor, y: Scalar | MaxTensor) -> MaxTensor:
 # reciprocal(Tensor self) -> Tensor
 @map_to(aten.reciprocal)
 def aten_reciprocal(tensor: MaxTensor) -> MaxTensor:
-    return 1.0 / tensor
+    return custom_mojo_ops.elementwise(tensor, "reciprocal")
 
 
 # reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
@@ -3271,8 +3200,7 @@ def aten_reciprocal(tensor: MaxTensor) -> MaxTensor:
 # relu(Tensor self) -> Tensor
 @map_to(aten.relu)
 def aten_relu(tensor: MaxTensor) -> MaxTensor:
-    # inplace has no meaning in max since it's graph-based
-    return F.relu(tensor)
+    return custom_mojo_ops.elementwise(tensor, "relu")
 
 
 # remainder.Scalar(Tensor self, Scalar other) -> Tensor
@@ -3317,7 +3245,7 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 # rsqrt(Tensor self) -> Tensor
 @map_to(aten.rsqrt)
 def aten_rsqrt(x: MaxTensor) -> MaxTensor:
-    return F.rsqrt(x)
+    return custom_mojo_ops.elementwise(x, "rsqrt")
 
 
 # scalar_tensor(Scalar s, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -3356,37 +3284,6 @@ def aten_scaled_dot_product_attention(
         neg_inf = F.constant(float("-inf"), dtype=query.dtype, device=query.device)
         zero = F.constant(0.0, dtype=query.dtype, device=query.device)
         attn_mask = _where(attn_mask, zero, neg_inf)
-
-    query_device = query.device
-    is_gpu = (
-        not query_device.is_cpu()
-        if isinstance(query_device, DeviceRef)
-        else query_device.label != "cpu"
-    )
-
-    if (
-        is_gpu
-        and attn_mask is not None
-        and dropout_p == 0.0
-        and not is_causal
-        and scale in (None, 0.125)
-        and not enable_gqa
-        and query.dtype == key.dtype == value.dtype == attn_mask.dtype == DType.float32
-        and len(query.shape)
-        == len(key.shape)
-        == len(value.shape)
-        == len(attn_mask.shape)
-        == 4
-        and query.shape[2] == 1
-        and query.shape[3] == 64
-        and query.shape[0] == key.shape[0] == value.shape[0]
-        and query.shape[1] == key.shape[1] == value.shape[1]
-        and key.shape == value.shape
-        and attn_mask.shape[-1] == key.shape[2]
-        and attn_mask.shape[0] in (1, query.shape[0])
-        and attn_mask.shape[1] == attn_mask.shape[2] == 1
-    ):
-        return custom_mojo_ops.gpt2_decode_attention(query, key, value, attn_mask)
 
     output, _ = aten__scaled_dot_product_attention_math(
         query,
@@ -3535,48 +3432,43 @@ def aten_select_scatter(
 # sigmoid(Tensor self) -> Tensor
 @map_to(aten.sigmoid)
 def aten_sigmoid(input: MaxTensor) -> MaxTensor:
-    return _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "sigmoid")
 
 
 # sign(Tensor self) -> Tensor
 @map_to(aten.sign)
 def aten_sign(x: MaxTensor) -> MaxTensor:
-    # sign(x) = (x > 0) + (x < 0) * (-1)
-    # This returns 1.0 for positive, -1.0 for negative, 0.0 for zero
-    positive = F.cast(x > 0, dtype=x.dtype)
-    negative = F.cast(x < 0, dtype=x.dtype)
-    return positive + negative * (-1)
+    return custom_mojo_ops.elementwise(x, "sign")
 
 
 # silu(Tensor self) -> Tensor
 @map_to(aten.silu)
 def aten_silu(input: MaxTensor) -> MaxTensor:
-    return input * _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "silu")
 
 
 # sin(Tensor self) -> Tensor
 @map_to(aten.sin)
 def aten_sin(x: MaxTensor) -> MaxTensor:
-    return F.sin(x)
+    return custom_mojo_ops.elementwise(x, "sin")
 
 
 # tan(Tensor self) -> Tensor
 @map_to(aten.tan)
 def aten_tan(x: MaxTensor) -> MaxTensor:
-    return F.sin(x) / F.cos(x)
+    return custom_mojo_ops.elementwise(x, "tan")
 
 
 # tanh(Tensor self) -> Tensor
 @map_to(aten.tanh)
 def aten_tanh(x: MaxTensor) -> MaxTensor:
-    return F.tanh(x)
+    return custom_mojo_ops.elementwise(x, "tanh")
 
 
 # sinh(Tensor self) -> Tensor
 @map_to(aten.sinh)
 def aten_sinh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic sine using sin(x) = (exp(x) - exp(-x)) / 2"""
-    return (F.exp(x) - F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "sinh")
 
 
 # slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
@@ -3616,7 +3508,7 @@ def aten_split_with_sizes(
 # sqrt(Tensor self) -> Tensor
 @map_to(aten.sqrt)
 def aten_sqrt(x: MaxTensor) -> MaxTensor:
-    return F.sqrt(x)
+    return custom_mojo_ops.elementwise(x, "sqrt")
 
 
 # squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)

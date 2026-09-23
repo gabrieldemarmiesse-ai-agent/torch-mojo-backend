@@ -38,6 +38,69 @@ SHAPES = {
     "S5_357x789x333": (357, 789, 333),  # awkward, exercises edge tiles
     "S6_32768x768x768": (32768, 768, 768),  # tall-skinny
     "S7_768x50304x49152": (768, 50304, 49152),  # lm_head wgrad: tiny-M/huge-N/huge-K
+    # GPT-2 XL (1600 embedding, B=16 x T=1024 tokens) projection sites, as
+    # aten::linear sees them: M x out_features x in_features.  1600, 4800 and
+    # 6400 are all 64 modulo 128 -- a residue no shape above has in ANY
+    # dimension, and the one the gemm16 candidates (rolling NN, the widened TN
+    # selection, the fused-bias NT) are gated on.  test_linear measures the
+    # fused forward; test_linear_backward's two legs are the dX (M x K x N) and
+    # dW (N x K x M) products, which is where the NN and TN candidates run.
+    "S8_16384x4800x1600": (16384, 4800, 1600),  # c_attn
+    "S9_16384x1600x1600": (16384, 1600, 1600),  # attn.c_proj
+    "S10_16384x6400x1600": (16384, 6400, 1600),  # mlp.c_fc
+    "S11_16384x1600x6400": (16384, 1600, 6400),  # mlp.c_proj
+    # lm_head, the fifth site of the same step and bias-free in the model:
+    # measured at parity with cuda before the candidates went in, and outside
+    # every one of their gates (the aspect limits reject a 50304-wide
+    # projection). A regression guard for the routes it already had, not a
+    # candidate target. test_linear passes a bias on every shape, so this node
+    # measures the biased call rather than the model's bias-free one.
+    "S12_16384x50304x1600": (16384, 50304, 1600),
+    # The TN persistent-rolling geometry dispatcher's own six shapes
+    # (gemm16_tn_v4_kernels.mojo::_try_enqueue_tn_rolling_geom), as the
+    # wgrad GEMM itself sees them: out_features x in_features x tokens (S8
+    # above uses the SAME weights but as test_linear's tokens x out x in --
+    # a "TN"-layout test_mm case here reduces over tokens directly, which is
+    # what the standalone engagement measured with a bare torch.mm(g.t(), x)
+    # and what test_linear_backward's dW leg bundles in with dX and dbias).
+    "S13_4800x1600x8192": (4800, 1600, 8192),  # c_attn dW
+    "S14_1600x1600x8192": (1600, 1600, 8192),  # attn.c_proj dW
+    "S15_6400x1600x8192": (6400, 1600, 8192),  # mlp.c_fc dW
+    "S16_1600x6400x8192": (1600, 6400, 8192),  # mlp.c_proj dW
+    "S17_4800x1600x16384": (4800, 1600, 16384),  # c_attn dW, the deeper batch
+    # Ragged M: 4808 % 64 == 8, so every aligned TN rung declines and only
+    # the rolling dispatcher's TMA clip (m % 8 == 0) reaches it -- measured
+    # 942 us (generic fallback) -> 149 us (rolling route) on H100 SXM.
+    "S18_4808x1600x6592": (4808, 1600, 6592),
+    # Low-occupancy TN regression guards (agent-C review of dff066a): an
+    # aligned m (% 128 == 0) whose rolling-geometry work census barely
+    # dents the available clusters must fall through to split-K / the
+    # narrow-tile-192 rung / v3, not take the rolling dispatcher
+    # unconditionally.  Measured H100 SXM, sm:1500 MHz, before the
+    # dispatcher's occupancy decline -> after:
+    "S19_768x768x12288": (768, 768, 12288),  # 35.3 -> 89.0 us (+152%)
+    "S20_256x256x65536": (256, 256, 65536),  # 84.4 -> 443.1 us (+425%);
+    # also a split-K case (m % 128 == 0, n % 256 == 0) that must be tried
+    # before the rolling dispatcher, not after.
+    "S21_128x128x8192": (128, 128, 8192),  # 37.1 -> 59.8 us (+61%)
+}
+
+# Batched, these four would be 2-3 TFLOP and several GB per leg for a regime
+# the candidates never serve: the single-matrix GEMM entry is where they are
+# installed, so every BMM item keeps its existing route by construction.
+BMM_EXCLUDED = {
+    "S7_768x50304x49152",  # ~40 GB per leg
+    "S8_16384x4800x1600",
+    "S9_16384x1600x1600",
+    "S10_16384x6400x1600",
+    "S11_16384x1600x6400",
+    "S13_4800x1600x8192",
+    "S14_1600x1600x8192",
+    "S15_6400x1600x8192",
+    "S16_1600x6400x8192",
+    "S17_4800x1600x16384",
+    "S18_4808x1600x6592",
+    "S12_16384x50304x1600",  # tens of GB per leg batched
 }
 
 LAYOUTS = ("NN", "NT", "TN", "TT")
@@ -61,11 +124,10 @@ COVERS: dict[str, str] = {
 SKIPPED: dict[str, str] = {}
 
 BMM_BATCH = 8
-# S7 batched would need ~40 GB per leg; every other shape fits everywhere.
 BMM_SHAPES = {
     f"{tag.split('_')[0]}_{BMM_BATCH}x{tag.split('_')[1]}": dims
     for tag, dims in SHAPES.items()
-    if tag != "S7_768x50304x49152"
+    if tag not in BMM_EXCLUDED
 }
 
 
@@ -208,6 +270,35 @@ def test_linear(
             lambda: torch.nn.functional.linear(x_our, w_our, bias_our),
             flops=2.0 * m * n * k,
         )
+
+
+NT_BIAS_SHAPES = {
+    "NTB1_8192x1600x1600": (8192, 1600, 1600),
+    "NTB2_8192x4800x1600": (8192, 4800, 1600),
+    "NTB3_8192x6400x1600": (8192, 6400, 1600),
+    "NTB4_8192x1600x6400": (8192, 1600, 6400),
+    "NTB5_4096x1536x3072": (4096, 1536, 3072),
+    "NTB6_357x789x544": (357, 789, 544),
+}
+
+
+@pytest.mark.bench_op("linear")
+@pytest.mark.parametrize("dtype_id", ["bf16"])
+@pytest.mark.parametrize("shape_id", NT_BIAS_SHAPES)
+def test_linear_nt_bias(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """The six NT+bias tuning regimes, including a masked output edge."""
+    m, n, k = NT_BIAS_SHAPES[shape_id]
+    dtype, _ = DTYPES[dtype_id]
+    operands = [torch.randn(*shape, dtype=dtype) for shape in ((m, k), (n, k), (n,))]
+    reference = [t.to(hw.stock_device) for t in operands]
+    native = [t.to(mojo_device) for t in operands]
+    bench.run(
+        lambda: torch.nn.functional.linear(*reference),
+        lambda: torch.nn.functional.linear(*native),
+        flops=2.0 * m * n * k,
+    )
 
 
 # aten::linear_backward has no CUDA registration in stock PyTorch (CUDA
