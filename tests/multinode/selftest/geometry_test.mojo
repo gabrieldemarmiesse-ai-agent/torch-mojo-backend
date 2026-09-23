@@ -11,8 +11,8 @@ from std.sys import size_of
 
 from tmb.ccl.collectives_kernels import MAX_WORLD, shard_range, signal_bytes
 from tmb.ccl.internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
-from tmb.ccl.rs_fused import reduce_scatter_fused_plan
-from tmb.ccl.rs_multinode import (
+from tmb.ccl.reduce_scatter.fused import reduce_scatter_fused_plan
+from tmb.ccl.reduce_scatter.multinode import (
     reduce_scatter_nodes_max_count,
     reduce_scatter_rank_ids,
 )

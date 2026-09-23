@@ -1,6 +1,6 @@
 """The streaming reduce-scatter's arena layout may not depend on the chunk.
 
-`rs_stream.mojo` hands a chunk's staging slots to its peers under a credit
+`reduce_scatter/stream.mojo` hands a chunk's staging slots to its peers under a credit
 that is per BLOCK INDEX: before writing the arena at chunk k a block waits
 only for the SAME block index on every peer to have released chunk
 `k - narenas`. That is sound exactly while block b owns the same bytes of the
@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 MOJOCCL = Path(__file__).resolve().parents[1] / "torch_mojo_backend/mojo/tmb/ccl"
-STREAM = (MOJOCCL / "rs_stream.mojo").read_text()
+STREAM = (MOJOCCL / "reduce_scatter" / "stream.mojo").read_text()
 HOST = (MOJOCCL / "entry.mojo").read_text()
 
 

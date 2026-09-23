@@ -199,18 +199,18 @@ from tmb.ccl.internode_kernels import (
     inbox_sum_out,
     place_blocks,
 )
-from tmb.ccl.rs_fused import (
+from tmb.ccl.reduce_scatter.fused import (
     RS_FUSED_BIG_BLOCKS,
     reduce_scatter_fused,
     reduce_scatter_fused_blocks,
     reduce_scatter_fused_plan,
 )
-from tmb.ccl.rs_multinode import (
+from tmb.ccl.reduce_scatter.multinode import (
     reduce_scatter_nodes,
     reduce_scatter_nodes_max_count,
     reduce_scatter_rank_ids,
 )
-from tmb.ccl.rs_stream import (
+from tmb.ccl.reduce_scatter.stream import (
     RS_STREAM_BIG_BLOCKS,
     RS_STREAM_ENABLED,
     reduce_scatter_stream,

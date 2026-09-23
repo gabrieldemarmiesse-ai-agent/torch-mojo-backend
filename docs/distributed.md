@@ -711,18 +711,18 @@ synchronization. Larger messages use the existing staging arenas and inbox
 credits to pipeline chunks. AVG scales each input before the node-local sum.
 NVIDIA fp32 runs the pipeline in one persistent kernel: local reduction,
 mailbox release, bounded completion wait, output sum, and credit return.
-Two such kernels exist. `rs_stream.mojo` takes every call of at least
+Two such kernels exist. `reduce_scatter/stream.mojo` takes every call of at least
 `PIPE_SPLIT_UNIT` bytes per rank (see "Streaming reduce-scatter" below);
-`rs_fused.mojo` runs everything smaller, two chunks per call so only the
+`reduce_scatter/fused.mojo` runs everything smaller, two chunks per call so only the
 second exchange is exposed (`RS_FUSED_TARGET_CHUNKS`), and stays the
 fallback for every geometry the streaming kernel declines. Other dtypes and
-targets use separate kernels for these phases (`rs_multinode.mojo`). Calls
+targets use separate kernels for these phases (`reduce_scatter/multinode.mojo`). Calls
 whose chunk count exceeds the existing work ring also use the split
 schedule.
 
 #### Streaming reduce-scatter
 
-`rs_fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
+`reduce_scatter/fused.mojo` runs a chunk as push, 8-way barrier, reduce: no rank starts
 reducing before every rank has finished pushing the whole chunk, so the
 NVLink push and the HBM-bound reduce never overlap, the barrier exposes the
 slowest rank's whole push, and the chunk's RDMA exchange only starts once
@@ -734,7 +734,7 @@ with an eight-deep credit pipeline and no grid barrier anywhere
 src/device/reduce_scatter.h; at these sizes NCCL 2.28 picks RING/SIMPLE,
 16 CTAs of 544 threads = 512 workers plus one post warp).
 
-`rs_stream.mojo` keeps the hierarchical schedule -- its bytes are already
+`reduce_scatter/stream.mojo` keeps the hierarchical schedule -- its bytes are already
 NCCL's: `(local_world-1) * nnodes` shard pushes on NVLink and one shard on
 the wire per rank, against a 16-rank ring's 14/15 NVLink and 1/15 network
 hops, which is 287 MB and 20.5 MB for the XL root at 16 ranks either way --
@@ -770,7 +770,7 @@ layout unwritten instead of re-cutting it. Deriving either from a chunk's
 own `cnt` -- which is what the kernel first did -- moves every slot base and
 every block boundary for the last chunk, so block `b`'s write lands on bytes
 block `b-1` of a peer is still reducing while `b` has waited only for the
-peer's block `b`. `rs_fused.mojo` gets away with a per-chunk stride because
+peer's block `b`. `reduce_scatter/fused.mojo` gets away with a per-chunk stride because
 its rank-local grid barrier makes one block's cross-rank sync transitively
 cover every block of the peer; this kernel gave that up, so it owes the
 invariant instead. Reachable at ordinary sizes -- the default 256 MiB region
@@ -811,14 +811,14 @@ What the streaming bought, measured on 2x8 H100 SXM over InfiniBand
 median over ranks, vendor/mojo ABBA and BAAB in one process,
 **unlocked clocks** -- `nvidia-smi -lgc` is not permitted on these nodes):
 
-| isolated, us | NCCL | rs_fused | rs_stream |
+| isolated, us | NCCL | fused | stream |
 |---|---:|---:|---:|
 | reduce-scatter fp32 SUM, XL block (7.68 MB/rank) | 463 | 645 (1.39x) | 512-519 (**1.10-1.12x**) |
 | reduce-scatter fp32 AVG, XL block | 465 | 640 (1.38x) | 502-507 (**1.08-1.09x**) |
 | reduce-scatter fp32 SUM, XL root (20.5 MB/rank) | 990-1007 | 1470 (1.48x) | 1273-1281 (1.26-1.28x) |
 | reduce-scatter fp32 AVG, XL root | 1001-1007 | 1468 (1.46x) | 1283-1294 (1.28x) |
 
-The grid is 32 CTAs and, unlike `rs_fused.mojo`'s, that is also its
+The grid is 32 CTAs and, unlike `reduce_scatter/fused.mojo`'s, that is also its
 isolated fit: the handoff is per block, so a larger grid multiplies the
 seven remote flag stores and the 8-way rendezvous per piece while leaving
 each block less to push between them. Block / root fp32 SUM in us:
@@ -1269,7 +1269,7 @@ peer rotation (same day, same nodes).
 | reduce-scatter fp32, 357x789 at an odd offset | 159 | 312 | 299 | 1.88 | 2 | 13.9 / 8.2 |
 | all-gather fp32, 357x789 at an odd offset | 169 | 179 | 159 | **0.94** | 4 | 12.0 / 11.7 |
 
-The reduce-scatter rows of that table are `rs_fused.mojo`'s and are now
+The reduce-scatter rows of that table are `reduce_scatter/fused.mojo`'s and are now
 only what calls below `PIPE_SPLIT_UNIT` bytes per rank take; "Streaming
 reduce-scatter" above has the current numbers (block 1.10x, root 1.28x) and
 a fresh NCCL column measured beside them.

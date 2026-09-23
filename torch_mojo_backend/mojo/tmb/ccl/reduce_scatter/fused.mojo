@@ -11,7 +11,7 @@ from std.gpu import (
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext, DeviceStream
 from tmb.ccl.netutil import MAX_NODES
-from tmb.ccl.rs_multinode import _rs_nodes_body
+from tmb.ccl.reduce_scatter.multinode import _rs_nodes_body
 from tmb.ccl.internode import WORK_SLOTS
 from tmb.ccl.internode_fused import (
     _await_exchange,

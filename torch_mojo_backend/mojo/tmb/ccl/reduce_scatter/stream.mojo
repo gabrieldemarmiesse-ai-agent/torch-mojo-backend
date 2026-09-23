@@ -1,6 +1,6 @@
 # Streaming hierarchical fp32 reduce-scatter: reduce as the pushes land.
 #
-# `rs_fused.mojo` runs a chunk as push -> 8-way barrier -> reduce: no rank
+# `reduce_scatter/fused.mojo` runs a chunk as push -> 8-way barrier -> reduce: no rank
 # starts reducing before every rank finished pushing the whole chunk, so the
 # NVLink push (fabric bound) and the 8-way reduce (HBM bound) never overlap,
 # the barrier exposes the slowest rank's whole push, and the chunk's RDMA
@@ -89,7 +89,7 @@ from tmb.ccl.collectives_kernels import (
 
 comptime RS_STREAM_ENABLED = True
 """Whether the multi-node fp32 reduce-scatter streams. `False` sends it back
-to `rs_fused.mojo`'s push-barrier-reduce kernel, which stays the fallback for
+to `reduce_scatter/fused.mojo`'s push-barrier-reduce kernel, which stays the fallback for
 every geometry this one declines; it is also how the two were measured against
 each other, one build each."""
 
@@ -119,12 +119,12 @@ comptime RS_STREAM_TARGET_CHUNKS = 4
 """Chunks a reduce-scatter of at least `PIPE_SPLIT_UNIT` bytes per rank is cut
 into (geometry may force more). Only the last chunk's RDMA exchange is
 exposed, and streaming made a chunk boundary cheap -- one credit and one
-arrival, no barrier -- which is why this is twice `rs_fused.mojo`'s."""
+arrival, no barrier -- which is why this is twice `reduce_scatter/fused.mojo`'s."""
 
 comptime RS_STREAM_BIG_BLOCKS = 32
 """Grid cap at `PIPE_SPLIT_UNIT` bytes per rank and above. Every block holds
 an SM's whole register file for the call, so this is also how many SMs the
-backward's GEMMs lose while a reduce-scatter runs; `rs_fused.mojo`'s
+backward's GEMMs lose while a reduce-scatter runs; `reduce_scatter/fused.mojo`'s
 RS_FUSED_BIG_BLOCKS records the end-to-end sweep that chose 32.
 
 Unlike that kernel, this one wants the same number in isolation: the handoff
@@ -847,7 +847,7 @@ def reduce_scatter_stream_wanted(count: Int, split_unit_bytes: Int) -> Bool:
     fused kernel's schedule exactly, minus its grid barriers and plus the
     exchange's extra device-word hop -- and it measured 128 us against 124 for
     a 512 KiB fp32 reduce-scatter at 16 ranks on 2x8 H100 (NCCL 76). So the
-    small end keeps `rs_fused.mojo`."""
+    small end keeps `reduce_scatter/fused.mojo`."""
     return count * 4 >= split_unit_bytes
 
 
