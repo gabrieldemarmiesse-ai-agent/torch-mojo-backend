@@ -2545,113 +2545,35 @@ def test_aten_isin_3d_tensor(conf: Conf):
 
 
 # ---------------------------------------------------------------------------
-# constant_pad_nd / reflection_pad2d / replication_pad2d
+# constant_pad_nd / reflection_pad2d / replication_pad2d (compile backend; the
+# mojo device's native kernels are tested in tests/native/test_data_movement.py)
 # ---------------------------------------------------------------------------
 
 _PAD_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
-# Asymmetric on every side -- F.pad's normal 4-tuple usage, not just the
-# symmetric special case.
+# Asymmetric on every side -- F.pad's normal 4-tuple usage.
 _PAD_ASYM = (1, 2, 0, 3)
 
 
-def _check_values_only(
-    fn: Callable, conf: Conf, inputs: list[torch.Tensor], **tol: float
-) -> None:
-    """Like `check_outputs`, minus its exact-device-object assertion.
-
-    constant_pad_nd stays deliberately un-fast-kernelled in eager mode (see
-    `test_aten_constant_pad_nd_asymmetric`'s docstring): it reaches the mojo
-    device purely through ATen's own CompositeExplicitAutograd decomposition
-    (`empty.memory_format` -> `fill_` -> `slice` -> `copy_`). That C++
-    algorithm allocates its intermediate output via `self.options()`, which
-    reads the tensor's *TensorImpl*-level device -- hardcoded to index 0 for
-    every `TorchMojoTensor` by design
-    (`torch_mojo_tensor.py`'s `_WRAPPER_TENSORIMPL_DEVICE`) -- rather than
-    the *logical* per-tensor index this backend otherwise tracks in Python
-    (`_torch_device`, what `.device` reports). On a host where "mojo:cpu" is
-    not itself index 0 (this repo's test env: a real GPU at index 0 plus a
-    CPU MAX device at index 1), the composite's intermediate silently lands
-    on index 0 instead of the input's index -- confirmed with a minimal
-    repro (`torch.tril`, which has its own fast kernel, correctly stays on
-    the input's index; `F.pad(..., mode="constant")` does not). That is a
-    pre-existing device-index gap in composite decomposition generally, well
-    outside this PR's padding scope, so this check verifies values (what
-    padding correctness actually depends on) without asserting on it.
-    """
-    inputs_cpu = [t.detach().clone().to("cpu") for t in inputs]
-    expected = fn(*inputs_cpu)
-    fn_to_run = torch.compile(fn, backend=mojo_backend) if conf.compile else fn
-    inputs_on_device = [t.detach().clone().to(conf.device) for t in inputs]
-    actual = fn_to_run(*inputs_on_device)
-    if isinstance(expected, torch.Tensor):
-        expected, actual = [expected], [actual]
-    for e, a in zip(expected, actual):
-        assert a.shape == e.shape
-        assert a.dtype == e.dtype
-        torch.testing.assert_close(a.cpu(), e, **tol)
-
-
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("dtype", _PAD_DTYPES)
-def test_aten_constant_pad_nd_asymmetric(conf: Conf, dtype: torch.dtype):
-    """Regression test locking in constant_pad_nd's current, correct eager
-    behavior.
-
-    `grep`ing eager_kernels/aten_fast.py and mojo_device_aten_ops.py for
-    "constant_pad_nd" finds zero hits, on purpose: aten::constant_pad_nd is
-    CompositeExplicitAutograd in ATen (PadNd.cpp), so it decomposes -- for
-    every backend, including ours -- into ops this backend already has fast
-    kernels for (`empty.memory_format`, `fill_`, a `slice` view, and a
-    strided `copy_` into that view). Confirmed directly: tracing the call
-    with `torch._C._DisableTorchDispatch` patched to a no-op shows exactly
-    those sub-ops firing, and their result matches CPU bit-for-bit modulo
-    the usual float tolerance. There is no single function to
-    CallChecker-register: no `fast_aten_constant_pad_nd` exists in
-    aten_fast.py, and none is needed. (See `_check_values_only` for a
-    pre-existing, unrelated device-index quirk of this decomposition path
-    that this test deliberately does not assert on.)
-    """
-
-    def fn(x):
-        return torch.nn.functional.pad(x, _PAD_ASYM, mode="constant", value=2.5)
-
-    x = torch.randn(2, 3, 4, 5, dtype=dtype)
-    _check_values_only(fn, conf, [x])
-
-
-@pytest.mark.parametrize("dtype", _PAD_DTYPES)
-def test_aten_constant_pad_nd_compile_backend(
-    dtype: torch.dtype, call_checker: CallChecker
+def test_aten_constant_pad_nd_compile(
+    conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     call_checker.register(aten_functions.aten_constant_pad_nd)
 
     def fn(x):
         return torch.nn.functional.pad(x, _PAD_ASYM, mode="constant", value=2.5)
 
-    x = torch.randn(2, 3, 4, 5, dtype=dtype)
-    check_outputs(fn, Conf("cpu", True), [x])
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5, dtype=dtype)])
 
 
-def test_aten_constant_pad_nd_negative_padding_eager(conf: Conf):
-    """Cropping (negative padding) already works in eager mode for free,
-    through the same CompositeExplicitAutograd decomposition (narrow +
-    copy_) that positive padding uses -- narrow is itself a view (slice),
-    which this backend already has a fast kernel for."""
-
-    def fn(x):
-        return torch.nn.functional.pad(x, (-1, -1, 0, -2), mode="constant", value=0.0)
-
-    x = torch.randn(2, 3, 4, 5)
-    _check_values_only(fn, conf, [x])
-
-
-def test_aten_constant_pad_nd_compile_backend_negative_padding(
-    call_checker: CallChecker,
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_constant_pad_nd_compile_negative_padding(
+    conf: Conf, call_checker: CallChecker
 ):
-    """The compile backend crops (narrows) negative entries first, then
-    pads only what remains non-negative -- mirroring ATen's own
-    constant_pad_nd algorithm, since MAX's ops.pad rejects negative
-    paddings outright. Mixed on purpose: one dim purely cropped, one dim
-    cropped on one side and padded on the other, one dim untouched."""
+    """Negative entries crop first, then the rest pads (ATen's algorithm;
+    MAX's ops.pad rejects negative paddings). One dim purely cropped, one
+    cropped on one side and padded on the other, one untouched."""
     call_checker.register(aten_functions.aten_constant_pad_nd)
 
     def fn(x):
@@ -2659,121 +2581,72 @@ def test_aten_constant_pad_nd_compile_backend_negative_padding(
             x, (-1, 2, 0, -2, 0, 0), mode="constant", value=1.5
         )
 
-    x = torch.randn(2, 3, 4, 5)
-    check_outputs(fn, Conf("cpu", True), [x])
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5)])
 
 
-def test_aten_constant_pad_nd_backward(mojo_gpu: str):
-    """A real .backward() on the mojo device: the grad is a narrow/slice of
-    grad_output back to the original (unpadded) region, composed the same
-    way the forward is -- verified against CPU rather than assumed."""
-    x_cpu = torch.randn(2, 3, 4, 5, requires_grad=True)
-    x_dev = x_cpu.detach().clone().to(mojo_gpu).requires_grad_()
-
-    y_cpu = torch.nn.functional.pad(x_cpu, _PAD_ASYM, mode="constant", value=1.0)
-    y_dev = torch.nn.functional.pad(x_dev, _PAD_ASYM, mode="constant", value=1.0)
-
-    grad_out = torch.randn_like(y_cpu)
-    y_cpu.backward(grad_out)
-    y_dev.backward(grad_out.to(mojo_gpu))
-
-    torch.testing.assert_close(x_dev.grad.cpu(), x_cpu.grad, atol=1e-5, rtol=1e-5)
-
-
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("dtype", _PAD_DTYPES)
-@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
 def test_aten_reflection_pad2d(
-    conf: Conf, dtype: torch.dtype, rank: int, call_checker: CallChecker
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
 ):
     call_checker.register(aten_functions.aten_reflection_pad2d)
 
     def fn(x):
+        if mode == "aten":
+            return aten.reflection_pad2d(x, list(_PAD_ASYM))
         return torch.nn.functional.pad(x, _PAD_ASYM, mode="reflect")
 
-    shape = (3, 6, 7) if rank == 3 else (2, 3, 6, 7)
-    x = torch.randn(shape, dtype=dtype)
-    check_outputs(fn, conf, [x])
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("dtype", _PAD_DTYPES)
-def test_aten_reflection_pad2d_compile_backend(
-    dtype: torch.dtype, call_checker: CallChecker
-):
-    call_checker.register(aten_functions.aten_reflection_pad2d)
-
-    def fn(x):
-        return torch.nn.functional.pad(x, _PAD_ASYM, mode="reflect")
-
-    x = torch.randn(2, 3, 6, 7, dtype=dtype)
-    check_outputs(fn, Conf("cpu", True), [x])
-
-
-def test_aten_reflection_pad2d_rejects_padding_ge_input_dim(mojo_gpu: str):
-    """Matches ATen's own validation (ReflectionPad.cpp): a reflected index
-    needs a pivot strictly inside the padded dimension, so padding equal to
-    (let alone greater than) the input dimension must raise, not silently
-    wrap/produce a wrong result."""
-    x = torch.randn(2, 3, 4, 4, device=mojo_gpu)
-    with pytest.raises(RuntimeError, match="Padding size should be less than"):
-        torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
-
-
-def test_aten_reflection_pad2d_compile_backend_rejects_padding_ge_input_dim():
-    """Dynamo's own meta registration for reflection_pad2d (which fake-tensor
-    shape propagation runs before our backend compiles anything) already
-    performs this exact check and raises first -- our aten_reflection_pad2d
-    validation is a second line of defense for callers that reach it without
-    going through Dynamo's fake-tensor pass. Either way the caller sees a
-    RuntimeError naming the same problem CPU does.
-    """
-    x = torch.randn(2, 3, 4, 4)
-
-    def fn(x):
-        return torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
-
-    with pytest.raises(RuntimeError, match="Padding size should be less than"):
-        torch.compile(fn, backend=mojo_backend)(x)
-
-
-@pytest.mark.parametrize("dtype", _PAD_DTYPES)
-@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
 def test_aten_replication_pad2d(
-    conf: Conf, dtype: torch.dtype, rank: int, call_checker: CallChecker
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
 ):
     call_checker.register(aten_functions.aten_replication_pad2d)
 
     def fn(x):
+        if mode == "aten":
+            return aten.replication_pad2d(x, list(_PAD_ASYM))
         return torch.nn.functional.pad(x, _PAD_ASYM, mode="replicate")
 
-    shape = (3, 6, 7) if rank == 3 else (2, 3, 6, 7)
-    x = torch.randn(shape, dtype=dtype)
-    check_outputs(fn, conf, [x])
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
 
 
-@pytest.mark.parametrize("dtype", _PAD_DTYPES)
-def test_aten_replication_pad2d_compile_backend(
-    dtype: torch.dtype, call_checker: CallChecker
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_replication_pad2d_compile_large_padding(
+    conf: Conf, call_checker: CallChecker
 ):
-    call_checker.register(aten_functions.aten_replication_pad2d)
-
-    def fn(x):
-        return torch.nn.functional.pad(x, _PAD_ASYM, mode="replicate")
-
-    x = torch.randn(2, 3, 6, 7, dtype=dtype)
-    check_outputs(fn, Conf("cpu", True), [x])
-
-
-def test_aten_replication_pad2d_large_padding(conf: Conf, call_checker: CallChecker):
-    """Unlike reflection padding, replication padding has no upper bound on
-    the padding size relative to the input dimension (ReplicationPadding.cpp
-    places no such check): every padded cell just repeats the nearest edge."""
+    """Replication padding has no upper bound relative to the input size."""
     call_checker.register(aten_functions.aten_replication_pad2d)
 
     def fn(x):
         return torch.nn.functional.pad(x, (5, 5, 5, 5), mode="replicate")
 
-    x = torch.randn(2, 3, 3, 3)
-    check_outputs(fn, conf, [x])
+    check_outputs(fn, conf, [torch.randn(2, 3, 3, 3)])
+
+
+def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
+    """The meta kernel raises during fake-tensor propagation, as CPU does."""
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
+
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
