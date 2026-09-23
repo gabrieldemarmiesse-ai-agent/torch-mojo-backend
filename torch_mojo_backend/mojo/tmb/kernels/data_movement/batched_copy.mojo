@@ -204,7 +204,6 @@ def copy_batched[
                     if largest <= TILE:
                         _enqueue_cached[_copy_batch_small_kernel[src, dst]](
                             ctx,
-                            String(t"copy_batched_contig_{src}_{dst}_small"),
                             count,
                             1,
                             1,
@@ -221,7 +220,6 @@ def copy_batched[
                             segs[i].tile_end = tiles
                         _enqueue_cached[_copy_batch_kernel[src, dst, V]](
                             ctx,
-                            String(t"copy_batched_contig_{src}_{dst}_v{V}"),
                             min(tiles, 1 << 22),
                             1,
                             1,
