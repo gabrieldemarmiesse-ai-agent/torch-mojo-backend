@@ -2544,6 +2544,111 @@ def test_aten_isin_3d_tensor(conf: Conf):
     check_outputs(fn, conf, [elements, test_elements])
 
 
+# ---------------------------------------------------------------------------
+# constant_pad_nd / reflection_pad2d / replication_pad2d (compile backend; the
+# mojo device's native kernels are tested in tests/native/test_data_movement.py)
+# ---------------------------------------------------------------------------
+
+_PAD_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Asymmetric on every side -- F.pad's normal 4-tuple usage.
+_PAD_ASYM = (1, 2, 0, 3)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+def test_aten_constant_pad_nd_compile(
+    conf: Conf, dtype: torch.dtype, call_checker: CallChecker
+):
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="constant", value=2.5)
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_constant_pad_nd_compile_negative_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Negative entries crop first, then the rest pads (ATen's algorithm;
+    MAX's ops.pad rejects negative paddings). One dim purely cropped, one
+    cropped on one side and padded on the other, one untouched."""
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(
+            x, (-1, 2, 0, -2, 0, 0), mode="constant", value=1.5
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_reflection_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_reflection_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.reflection_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="reflect")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_replication_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.replication_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_replication_pad2d_compile_large_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Replication padding has no upper bound relative to the input size."""
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (5, 5, 5, 5), mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 3, 3)])
+
+
+def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
+    """The meta kernel raises during fake-tensor propagation, as CPU does."""
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
+
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(("shape", "dim"), [((64, 40), -1), ((4, 5, 64), 1)])
 def test_aten__log_softmax_backward_data_autograd(

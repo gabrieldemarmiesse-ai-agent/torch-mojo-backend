@@ -1,7 +1,9 @@
+import contextlib
+
 import pytest
 import torch
 
-from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -40,3 +42,18 @@ def skip_if_metal(device: str, reason: str):
     accelerators = list(get_accelerators())
     if idx < len(accelerators) and accelerators[idx].api == "metal":
         pytest.skip(reason)
+
+
+@contextlib.contextmanager
+def ran(*op_names: str):
+    """Assert that at least one of `op_names` ran as a native boxed kernel.
+
+    Used for the ops with no `aten_functions` twin for `CallChecker` to key
+    on.
+    """
+    native.op_counting(True)
+    before = {name: native.op_count(name) for name in op_names}
+    yield
+    assert any(native.op_count(name) > before[name] for name in op_names), (
+        f"none of {op_names} ran natively"
+    )

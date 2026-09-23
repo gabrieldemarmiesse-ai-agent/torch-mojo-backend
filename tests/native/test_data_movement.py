@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.native.conftest import ran
 from torch_mojo_backend import aten_functions, get_accelerators
 
 # tests/native/conftest.py registers devices at fixture setup. Registration
@@ -1353,6 +1354,95 @@ def test_triu_every_dtype(mojo_gpu):
     for dtype in (torch.bfloat16, torch.int64, torch.uint8, torch.bool):
         x = (_fill((6, 6), torch.int64) % 2).to(dtype)
         torch.testing.assert_close(x.to(mojo_gpu).triu(1).cpu(), x.triu(1))
+
+
+# ---------------------------------------------------------------------------
+# reflection_pad2d / replication_pad2d
+# ---------------------------------------------------------------------------
+
+_PAD2D_MODES = {
+    "reflect": "aten::reflection_pad2d",
+    "replicate": "aten::replication_pad2d",
+}
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.uint8]
+)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7), (1, 2, 37, 53)])
+@pytest.mark.parametrize(
+    "padding", [(1, 2, 0, 3), (0, 0, 0, 0), (5, 1, 2, 5), (1, 1, 1, 1)]
+)
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d(mojo_device, mode, padding, shape, dtype):
+    x = _fill(shape, dtype)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), padding, mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, padding, mode=mode), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d_largest_padding(mojo_device, mode):
+    """Reflect's edge case: padding == dim - 1 (the largest allowed); for
+    replicate, padding far past the input size (no upper bound)."""
+    x = _fill((2, 3, 4, 5), torch.float32)
+    padding = (4, 4, 3, 3) if mode == "reflect" else (9, 7, 11, 6)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), padding, mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, padding, mode=mode)
+    )
+
+
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d_strided_input(mojo_device, mode):
+    x = _fill((2, 3, 9, 8), torch.float32).transpose(-1, -2)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), (2, 3, 1, 4), mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, (2, 3, 1, 4), mode=mode)
+    )
+
+
+def test_pad2d_direct_aten_call(mojo_device):
+    x = _fill((2, 5, 6), torch.bfloat16)
+    dev = x.to(mojo_device)
+    with ran("aten::reflection_pad2d"):
+        out = torch.ops.aten.reflection_pad2d(dev, [2, 1, 3, 0])
+    torch.testing.assert_close(
+        out.cpu(), torch.ops.aten.reflection_pad2d(x, [2, 1, 3, 0])
+    )
+    with ran("aten::replication_pad2d"):
+        out = torch.ops.aten.replication_pad2d(dev, [0, 4, 1, 2])
+    torch.testing.assert_close(
+        out.cpu(), torch.ops.aten.replication_pad2d(x, [0, 4, 1, 2])
+    )
+
+
+def test_pad2d_empty_batch(mojo_device):
+    x = torch.empty(0, 3, 4, 5)
+    out = torch.nn.functional.pad(x.to(mojo_device), (1, 2, 3, 1), mode="replicate")
+    assert out.shape == (0, 3, 8, 8)
+
+
+@pytest.mark.parametrize("pad", [(1, 2, 0, 3), (-1, 2, 0, -2, 0, 0)])
+def test_constant_pad_nd(mojo_device, pad):
+    """No native kernel: ATen's CompositeExplicitAutograd constant_pad_nd
+    decomposes into ops the device has (empty, fill_, slice, copy_)."""
+    x = _fill((2, 3, 4, 5), torch.float32)
+    out = torch.nn.functional.pad(x.to(mojo_device), pad, mode="constant", value=2.5)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, pad, mode="constant", value=2.5)
+    )
+
+
+def test_reflection_pad2d_rejects_padding_ge_input_dim(mojo_device):
+    """Like CPU: a reflected index needs a pivot strictly inside the dim."""
+    x = torch.randn(2, 3, 4, 4, device=mojo_device)
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
 
 
 # ---------------------------------------------------------------------------

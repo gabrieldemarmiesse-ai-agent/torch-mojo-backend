@@ -8,13 +8,13 @@ because the native backend registers ops group by group and a module-level
 forward would pull in ops from groups that are not ported yet.
 """
 
-import contextlib
 import math
 
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native, register_mojo_devices
+from tests.native.conftest import ran
+from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
 FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
@@ -24,21 +24,6 @@ FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
 def _registered():
     """`mojo_device` yields a device string without registering the backend."""
     register_mojo_devices()
-
-
-@contextlib.contextmanager
-def ran(*op_names: str):
-    """Assert that at least one of `op_names` ran as a native boxed kernel.
-
-    Used for the ops with no `aten_functions` twin for `CallChecker` to key
-    on (the loss and the backward ops).
-    """
-    native.op_counting(True)
-    before = {name: native.op_count(name) for name in op_names}
-    yield
-    assert any(native.op_count(name) > before[name] for name in op_names), (
-        f"none of {op_names} ran natively"
-    )
 
 
 def _tol(dtype: torch.dtype) -> tuple[float, float]:
