@@ -14,9 +14,16 @@ the autograd fallback then silently produces no gradient at all.
 | decode step (q_len == 1) | `_scaled_dot_product_efficient_attention` | nn AttnDecodeSpec |
 | math (bmm + fused causal softmax + bmm) | same | matmul Bmm + nn SoftmaxRows |
 
-Everything else -- an explicit mask, dropout, GQA, a shape no fused route
-takes -- is left to ATen's own math decomposition, which composes ordinary
-aten ops this backend already implements and differentiates itself.
+Grouped-query attention (`enable_gqa=True`, K/V with fewer heads than Q) is
+served for inference by `_scaled_dot_product_efficient_attention`: K and V
+are repeated up to Q's head count with one strided copy each (ATen's own
+`repeat_interleave`), then the cascade above runs unchanged -- so a GQA call
+still reaches FA4 or the fused gfx942 kernels. `enable_gqa=True` with equal
+head counts is plain attention and takes every route above, training included.
+
+Everything else -- an explicit mask, dropout, GQA under autograd, a shape no
+fused route takes -- is left to ATen's own math decomposition, which composes
+ordinary aten ops this backend already implements and differentiates itself.
 """
 from std.ffi import external_call
 from std.math import sqrt
@@ -58,6 +65,8 @@ from tmb.ops.common import (
     release_if_new,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.data_movement import _batched_copy_run
+from tmb.ops.foreach import _batch_copy_dtype, _batched_copy_device
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
 comptime SDP_MATH = 0
@@ -169,6 +178,101 @@ def _needs_grad(q: T, k: T, v: T) -> Bool:
     if external_call["tmb_grad_enabled", Int32]() == 0:
         return False
     return q.requires_grad() or k.requires_grad() or v.requires_grad()
+
+
+def _gqa_heads_divide(q: T, k: T, v: T) -> Bool:
+    """Whether K and V each carry a head count that divides Q's, over
+    otherwise matching 4-D (B, H, S, D) shapes -- the grouped-query layout
+    `enable_gqa=True` allows (query head `i` reads K/V head `i // n_rep`)."""
+    if q.rank != 4 or k.rank != 4 or v.rank != 4:
+        return False
+    var hq = q.dim(1)
+    var hk = k.dim(1)
+    var hv = v.dim(1)
+    if hk <= 0 or hv <= 0 or hq % hk != 0 or hq % hv != 0:
+        return False
+    return (
+        q.dim(0) == k.dim(0)
+        and q.dim(0) == v.dim(0)
+        and k.dim(2) == v.dim(2)
+        and q.dim(3) == k.dim(3)
+    )
+
+
+def _gqa_expand(t: T, q_heads: Int) raises -> Owned:
+    """K or V `(B, Hkv, S, D)` as a dense `(B, q_heads, S, D)`: each KV head
+    repeated `q_heads // Hkv` times in place, exactly ATen's
+    `repeat_interleave(n_rep, dim=1)`; the borrowed input when nothing
+    repeats.
+
+    A KV head whose (S, D) plane is dense is one row of `S * D` elements,
+    and the repeat is `n_rep` rectangles over those rows -- one batched
+    rectangle copy (CopyBatched, 16-byte accesses) at copy bandwidth. Any
+    other layout takes the generic strided copy from a stride-0
+    `(B, Hkv, n_rep, S, D)` view, which is several times slower."""
+    var kv_heads = t.dim(1)
+    if kv_heads == q_heads:
+        return _borrowed(t)
+    var rep = q_heads // kv_heads
+    var b = t.dim(0)
+    var s = t.dim(2)
+    var d = t.dim(3)
+    var out = own(_alloc(t.device, t.stype, [b, q_heads, s, d]))
+    var plane = s * d
+    # One source pitch walks every (batch, kv head) row.
+    var rows = b * kv_heads
+    var pitch = -1
+    if b == 1 or t.stride(0) == kv_heads * t.stride(1):
+        pitch = t.stride(1)
+    elif kv_heads == 1:
+        pitch = t.stride(0)
+    if (
+        pitch > 0
+        and (t.stride(3) == 1 or d == 1)
+        and (t.stride(2) == d or s == 1)
+        and pitch < 1 << 31
+        and rep * plane < 1 << 31
+        and _batch_copy_dtype(t.dtype)
+        and _batched_copy_device(t.device)
+    ):
+        var srcs = List[Int](capacity=rep)
+        var dsts = List[Int](capacity=rep)
+        var cols = List[Int](capacity=rep)
+        for r in range(rep):
+            srcs.append(t.ptr)
+            dsts.append(out.t.ptr + r * plane * t.itemsize)
+            cols.append(plane)
+        _batched_copy_run(
+            t.device,
+            t.dtype,
+            t.dtype,
+            t.itemsize,
+            srcs,
+            dsts,
+            rows,
+            cols,
+            pitch,
+            rep * plane,
+        )
+        return out^
+    var dst = own(
+        _view(
+            out.t,
+            [b, kv_heads, rep, s, d],
+            [q_heads * s * d, rep * s * d, s * d, d, 1],
+        )
+    )
+    var src = own(
+        _view(
+            t,
+            [b, kv_heads, rep, s, d],
+            [t.stride(0), t.stride(1), 0, t.stride(2), t.stride(3)],
+        )
+    )
+    copy_strided_into(dst.t, src.t)
+    _ = dst
+    _ = src
+    return out^
 
 
 # ===========================================================================
@@ -898,6 +1002,29 @@ def op_fused_sdp_choice(
     if n_args > 7 and not v_is_none(args[unsafe_offset=7]):
         enable_gqa = v_bool(args[unsafe_offset=7])
     var needs_grad = _needs_grad(q, k, v)
+    if enable_gqa and q.rank == 4 and k.rank == 4 and v.rank == 4:
+        if k.dim(1) == q.dim(1) and v.dim(1) == q.dim(1):
+            # Equal head counts: GQA is a no-op, and ATen hands the chosen
+            # op the same K/V either way.
+            enable_gqa = False
+        elif (
+            not needs_grad
+            and not has_mask
+            and dropout_p == 0.0
+            and _same_device(q, k, v)
+            and _is_float(q)
+            and k.stype == q.stype
+            and v.stype == q.stype
+            and q.numel > 0
+            and k.numel > 0
+            and _gqa_heads_divide(q, k, v)
+        ):
+            # The efficient op repeats K/V up to Q's heads, then runs the
+            # fused cascade on dense tensors every route accepts. Training
+            # stays on the math decomposition, whose repeat_interleave
+            # autograd sums each query group's gradient back onto its KV head.
+            ret_int(rets, 0, SDP_EFFICIENT)
+            return
     # The backward tile machinery is unproven on a partial last tile, so a
     # grad-requiring call only takes the flash route at a full seqlen.
     var fa4 = _fa4_plan(
@@ -1096,7 +1223,29 @@ def op_efficient_attention(
         unsupported("efficient attention expects 4-D query/key/value")
     var scale = _scale_of(args[unsafe_offset=7], q.dim(3))
 
-    var out = own(_efficient_forward(q, k, v, is_causal, dropout_p, scale))
+    # Grouped-query K/V (what `_fused_sdp_choice` sends here for
+    # `enable_gqa=True`): repeat them up to Q's heads, then run the ordinary
+    # equal-head cascade.
+    var ke = _borrowed(k)
+    var ve = _borrowed(v)
+    if (
+        k.rank == 4
+        and v.rank == 4
+        and (k.dim(1) != q.dim(1) or v.dim(1) != q.dim(1))
+    ):
+        if not _gqa_heads_divide(q, k, v):
+            unsupported(
+                "efficient attention: the key/value head counts must divide"
+                " the query's"
+            )
+        ke = _gqa_expand(k, q.dim(1))
+        ve = _gqa_expand(v, q.dim(1))
+
+    var out = own(
+        _efficient_forward(q, ke.t, ve.t, is_causal, dropout_p, scale)
+    )
+    _ = ke
+    _ = ve
     var lse = own(_alloc(q.device, ST_FLOAT32, [q.dim(0), q.dim(1), 0]))
     var seed = own(_alloc(q.device, ST_INT64, List[Int]()))
     var offset = own(_alloc(q.device, ST_INT64, List[Int]()))

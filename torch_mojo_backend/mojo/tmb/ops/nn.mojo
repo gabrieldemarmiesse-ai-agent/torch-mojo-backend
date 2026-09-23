@@ -1780,6 +1780,58 @@ def op_upsample_bilinear2d(
     ret_owned(rets, 0, out)
 
 
+# aten::upsample_nearest2d(Tensor self, SymInt[2] output_size,
+#   float? scales_h=None, float? scales_w=None) -> Tensor
+def op_upsample_nearest2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """`F.interpolate(mode="nearest")`: the `.vec` overload is composite over
+    this one. torch_mojo_backend has no `upsample_nearest2d_backward` yet, so
+    a backward through it declines there."""
+    var a = v_tensor(args[unsafe_offset=0])
+    _nchw(a, "upsample_nearest2d")
+    var osize = _pair(IntList(args[unsafe_offset=1]), "output_size")
+    if osize[0] <= 0 or osize[1] <= 0:
+        unsupported("upsample_nearest2d: empty output")
+    var in_h = a.dim(2)
+    var in_w = a.dim(3)
+    # torch's compute_scales_value: the given scale's reciprocal, else the
+    # size ratio.
+    var ratio_h = Float64(in_h) / Float64(osize[0])
+    var ratio_w = Float64(in_w) / Float64(osize[1])
+    if not v_is_none(args[unsafe_offset=2]):
+        var sh = v_f64(args[unsafe_offset=2])
+        if sh > 0.0:
+            ratio_h = 1.0 / sh
+    if not v_is_none(args[unsafe_offset=3]):
+        var sw = v_f64(args[unsafe_offset=3])
+        if sw > 0.0:
+            ratio_w = 1.0 / sw
+    var shape = _pool_shape(a.dim(0), a.dim(1), osize[0], osize[1])
+    var am = _mat(a)
+    var out = own(new_tensor(shape, 4, a.stype, a.device))
+    var ctx = ctx_for(a.device)
+    var call = KernelCall("nn", "UpsampleNearest2d")
+    call.arg_dtype(0, a.dtype)
+    call.int(out.t.ptr)
+    call.int(am.t.ptr)
+    var params = List[Int]()
+    params.append(_f64_slot(ratio_h))
+    params.append(_f64_slot(ratio_w))
+    params.append(in_h)
+    params.append(in_w)
+    params.append(osize[0])
+    params.append(osize[1])
+    params.append(a.dim(0) * a.dim(1))
+    call.tuple(params)
+    call.int(dtype_code(a.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = am.t.ptr
+    _ = ctx
+    ret_owned(rets, 0, out)
+
+
 def register_nn(site: Site) raises:
     impl[op_adaptive_avg_pool2d, "_adaptive_avg_pool2d"](site)
     impl[op_log_softmax, "_log_softmax"](site)
@@ -1799,3 +1851,4 @@ def register_nn(site: Site) raises:
     impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
     impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
     impl[op_upsample_bilinear2d, "upsample_bilinear2d"](site)
+    impl[op_upsample_nearest2d, "upsample_nearest2d"](site)

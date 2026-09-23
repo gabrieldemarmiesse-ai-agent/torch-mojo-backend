@@ -8,13 +8,13 @@ because the native backend registers ops group by group and a module-level
 forward would pull in ops from groups that are not ported yet.
 """
 
-import contextlib
 import math
 
 import pytest
 import torch
 
-from torch_mojo_backend import aten_functions, native, register_mojo_devices
+from tests.native.conftest import ran
+from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
 FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
@@ -24,21 +24,6 @@ FLOAT_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
 def _registered():
     """`mojo_device` yields a device string without registering the backend."""
     register_mojo_devices()
-
-
-@contextlib.contextmanager
-def ran(*op_names: str):
-    """Assert that at least one of `op_names` ran as a native boxed kernel.
-
-    Used for the ops with no `aten_functions` twin for `CallChecker` to key
-    on (the loss and the backward ops).
-    """
-    native.op_counting(True)
-    before = {name: native.op_count(name) for name in op_names}
-    yield
-    assert any(native.op_count(name) > before[name] for name in op_names), (
-        f"none of {op_names} ran natively"
-    )
 
 
 def _tol(dtype: torch.dtype) -> tuple[float, float]:
@@ -910,6 +895,38 @@ def test_upsample_bilinear2d_explicit_scales(mojo_device):
         x.to(mojo_device), [8, 10], False, 2.0, 2.0
     )
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Nearest-neighbor upsampling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,output_size",
+    [((2, 3, 8, 8), (16, 16)), ((1, 2, 7, 9), (16, 21)), ((2, 1, 9, 7), (4, 3))],
+    ids=["2x", "odd_up", "down"],
+)
+def test_upsample_nearest2d(mojo_device, dtype, shape, output_size):
+    """A pure gather: the output is bit-identical to CPU torch's."""
+    x = torch.randn(shape).to(dtype)
+    want = torch.ops.aten.upsample_nearest2d(x, list(output_size))
+    with ran("aten::upsample_nearest2d"):
+        got = torch.ops.aten.upsample_nearest2d(x.to(mojo_device), list(output_size))
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("scale", [2.0, 1.5, 0.7])
+def test_upsample_nearest2d_scale_factor(mojo_device, scale):
+    """`F.interpolate(scale_factor=)` passes the scale itself, which torch uses
+    instead of the size ratio when the product is not integral."""
+    x = torch.randn(1, 2, 5, 7)
+    want = torch.nn.functional.interpolate(x, scale_factor=scale, mode="nearest")
+    got = torch.nn.functional.interpolate(
+        x.to(mojo_device), scale_factor=scale, mode="nearest"
+    )
+    torch.testing.assert_close(got.cpu(), want, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

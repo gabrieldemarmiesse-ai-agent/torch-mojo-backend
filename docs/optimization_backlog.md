@@ -441,7 +441,12 @@ different kind of item.
   which is what AGENTS.md rule 4 asks for — not hardcoded shapes.
 * **Expected win.** head_dim=128: measured, see `benchmarks/baselines.html`
   (`B1H16S4096D128`). GQA / ragged-seqlen: **UNMEASURED**, bounded above by
-  the [A1](#a1) ratio for the shapes they would newly claim.
+  the [A1](#a1) ratio for the shapes they would newly claim. Update: GQA
+  inference now reaches FA4 through a materialized K/V repeat (one batched
+  rectangle copy per tensor, `_gqa_expand` in `tmb/ops/attention.mojo`):
+  1.08 at `B1H32KV8S4096D128`, 0.82 at `B1H8KV1S4096D128` (bf16, H100).
+  The in-kernel KV-head index would save those two copies (~24 us each at
+  the first shape); GQA under autograd still takes the math decomposition.
 * **How to measure it.** `tests/test_fa4_host_wiring.py` and
   `tests/test_eager_kernels.py` (`test_fa4_*[...-d128]`) cover the gate
   itself; for timing, `benchmarks/test_attention.py -k D128` and a

@@ -58,6 +58,31 @@ def test_scaled_dot_product_flash_attention_basic(
     check_outputs(fn, conf, [q, k, v], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("kv_heads", [2, 1], ids=["gqa", "mqa"])
+def test_scaled_dot_product_attention_enable_gqa(
+    conf: Conf, call_checker: CallChecker, kv_heads: int, is_causal: bool
+):
+    """enable_gqa=True under torch.compile: K/V carry fewer heads than Q.
+
+    On CPU float32 AOT decomposes SDPA (GQA or not) into the math graph --
+    unsqueeze/expand/clone for the head repeat, then bmm + softmax + bmm --
+    so the graph ops are what reaches the backend.
+    """
+    call_checker.register(aten_functions.aten_bmm, aten_functions.aten__softmax)
+
+    def fn(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, enable_gqa=True
+        )
+
+    q = torch.randn(2, 8, 9, 16)
+    k = torch.randn(2, kv_heads, 9, 16)
+    v = torch.randn(2, kv_heads, 9, 16)
+    check_outputs(fn, conf, [q, k, v], atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_scaled_dot_product_flash_attention_with_causal(conf: Conf, dtype: torch.dtype):
     """Test _scaled_dot_product_flash_attention with causal masking"""
@@ -1422,6 +1447,78 @@ def test_aten_bitwise_xor_broadcasting(conf: Conf):
     y = torch.randint(0, 10, (4, 5), dtype=torch.int32)
 
     check_outputs(fn, conf, [x, y])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("mode", ["public", "aten"])
+@pytest.mark.parametrize(
+    "in_c,out_c,length,k,stride,padding,dilation,groups",
+    [
+        (3, 8, 17, 3, 1, 0, 1, 1),  # basic, awkward/non-round length
+        (8, 8, 17, 3, 2, 1, 1, 1),  # stride
+        (8, 12, 25, 3, 1, 2, 2, 1),  # dilation
+        (8, 12, 25, 3, 1, 1, 1, 2),  # groups
+        (80, 16, 40, 3, 1, 1, 1, 1),  # Whisper-shaped channel counts
+    ],
+)
+def test_aten_conv1d(
+    conf: Conf,
+    call_checker: CallChecker,
+    mode: str,
+    in_c: int,
+    out_c: int,
+    length: int,
+    k: int,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+):
+    """aten::convolution with a rank-3 (conv1d) input under torch.compile:
+    the op reaches the graph (it is not decomposed), so `aten_convolution`'s
+    rank-3 branch runs. The mojo device's route is in tests/native/test_matmul.py.
+    """
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        if mode == "aten":
+            return aten.convolution(
+                x, w, b, [stride], [padding], [dilation], False, [0], groups
+            )
+        return torch.nn.functional.conv1d(
+            x, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups
+        )
+
+    x = torch.randn(2, in_c, length)
+    w = torch.randn(out_c, in_c // groups, k)
+    b = torch.randn(out_c)
+    check_outputs(fn, conf, [x, w, b], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_conv1d_no_bias(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w):
+        return torch.nn.functional.conv1d(x, w, padding=1)
+
+    x = torch.randn(2, 4, 13)
+    w = torch.randn(6, 4, 3)
+    check_outputs(fn, conf, [x, w], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_conv1d_dtypes(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        return torch.nn.functional.conv1d(x, w, b, stride=2, padding=1)
+
+    x = torch.randn(2, 8, 21, dtype=dtype)
+    w = torch.randn(12, 8, 3, dtype=dtype)
+    b = torch.randn(12, dtype=dtype)
+    check_outputs(fn, conf, [x, w, b], atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -2795,6 +2892,111 @@ def test_aten_isin_3d_tensor(conf: Conf):
 
     # Expected: [[[False, True], [False, True]], [[False, True], [False, True]]]
     check_outputs(fn, conf, [elements, test_elements])
+
+
+# ---------------------------------------------------------------------------
+# constant_pad_nd / reflection_pad2d / replication_pad2d (compile backend; the
+# mojo device's native kernels are tested in tests/native/test_data_movement.py)
+# ---------------------------------------------------------------------------
+
+_PAD_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Asymmetric on every side -- F.pad's normal 4-tuple usage.
+_PAD_ASYM = (1, 2, 0, 3)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+def test_aten_constant_pad_nd_compile(
+    conf: Conf, dtype: torch.dtype, call_checker: CallChecker
+):
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="constant", value=2.5)
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_constant_pad_nd_compile_negative_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Negative entries crop first, then the rest pads (ATen's algorithm;
+    MAX's ops.pad rejects negative paddings). One dim purely cropped, one
+    cropped on one side and padded on the other, one untouched."""
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(
+            x, (-1, 2, 0, -2, 0, 0), mode="constant", value=1.5
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_reflection_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_reflection_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.reflection_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="reflect")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_replication_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.replication_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_replication_pad2d_compile_large_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Replication padding has no upper bound relative to the input size."""
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (5, 5, 5, 5), mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 3, 3)])
+
+
+def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
+    """The meta kernel raises during fake-tensor propagation, as CPU does."""
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
+
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -4673,6 +4875,36 @@ def test_aten_linear_backward_degenerate_features(
 
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got.cpu(), want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("size", "scale_factor"),
+    [
+        pytest.param(None, 2.0, id="2x"),
+        pytest.param((20, 20), None, id="8_to_20"),
+        pytest.param(None, 1.5, id="scale_1.5"),
+        pytest.param((4, 3), None, id="down"),
+    ],
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_upsample_nearest2d_compiles(
+    conf: Conf,
+    dtype: torch.dtype,
+    size: tuple[int, int] | None,
+    scale_factor: float | None,
+):
+    """torch.compile traces nearest upsampling through torch's own Python
+    decomposition (an `index` gather), which runs under compile for both
+    `upsample_nearest2d` overloads, so no graph op of that name exists to map.
+    The eager mojo op is tested in tests/native/test_nn.py."""
+
+    def fn(x):
+        return torch.nn.functional.interpolate(
+            x, size=size, scale_factor=scale_factor, mode="nearest"
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 8, 8, dtype=dtype)], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
