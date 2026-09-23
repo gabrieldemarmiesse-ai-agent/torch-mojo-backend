@@ -3,6 +3,7 @@
 import max.engine
 import torch
 import torch.export
+from max.graph import DeviceRef
 from torch.export.graph_signature import InputKind
 
 from torch_mojo_backend.aten_functions import DECOMPOSITION_TABLE
@@ -13,7 +14,9 @@ from torch_mojo_backend.torch_compile_backend.compiler import (
 
 
 def export_to_max_graph(
-    model: torch.nn.Module, example_inputs: tuple[torch.Tensor, ...], force_device=None
+    model: torch.nn.Module,
+    example_inputs: tuple[torch.Tensor, ...],
+    force_device: DeviceRef | None = None,
 ) -> max.engine.Model:
     exported_program = torch.export.export(model, example_inputs, strict=True)
     with torch.no_grad():
@@ -22,7 +25,7 @@ def export_to_max_graph(
         )
     state_dict = model.state_dict()
     # embed weights into the graph
-    replace_inputs = {}
+    replace_inputs: dict[str, torch.Tensor] = {}
     for input_spec in exported_program.graph_signature.input_specs:
         if input_spec.kind != InputKind.PARAMETER:
             continue
@@ -31,5 +34,4 @@ def export_to_max_graph(
     factory = _GraphFactory(replace_inputs, force_device=force_device)
     graph, _ = factory.create_graph(exported_program.graph)
 
-    model = global_max_objects().session.load(graph)
-    return model
+    return global_max_objects().session.load(graph)

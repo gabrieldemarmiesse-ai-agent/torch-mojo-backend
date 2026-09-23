@@ -25,8 +25,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from bench_lib.check import Bench, bench_key, update_mode
+from _pytest.terminal import TerminalReporter
+from bench_lib.check import BENCH_NOTES_KEY, Bench, bench_key, update_mode
 from bench_lib.hw import Hardware, detect
+
+from torch_mojo_backend import register_mojo_devices
 
 # Set to a path to make collection write every benchmark node's baseline
 # key there, one per line, and measure nothing.  test_coverage.py drives
@@ -36,7 +39,7 @@ from bench_lib.hw import Hardware, detect
 KEY_DUMP_ENV = "TORCH_MOJO_BACKEND_BENCH_DUMP_KEYS"
 
 
-def pytest_collection_finish(session: pytest.Session) -> None:
+def pytest_collection_finish(session: pytest.Session):
     dump = os.environ.get(KEY_DUMP_ENV)
     if not dump:
         return
@@ -48,7 +51,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     Path(dump).write_text("".join(f"{key}\n" for key in keys))
 
 
-def pytest_configure(config: pytest.Config) -> None:
+def pytest_configure(config: pytest.Config):
     config.addinivalue_line(
         "markers",
         "bench_op(name): store this benchmark under the given op token in "
@@ -57,7 +60,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
+def pytest_addoption(parser: pytest.Parser):
     parser.addoption(
         "--update-baselines",
         nargs="?",
@@ -85,14 +88,12 @@ def hw() -> Hardware:
 
 @pytest.fixture(scope="session")
 def mojo_device(hw: Hardware) -> torch.device:
-    from torch_mojo_backend import register_mojo_devices
-
     register_mojo_devices()
     return torch.device("mojo")
 
 
 @pytest.fixture(autouse=True)
-def deterministic_operands() -> None:
+def deterministic_operands():
     # Same operand data in every process: a reproducible measurement should
     # feed reproducible inputs.  Tested on S1-tf32: data content is NOT the
     # driver of the residual ~2% between-process drift (that is allocator /
@@ -109,9 +110,11 @@ def bench(
 
 
 def pytest_terminal_summary(
-    terminalreporter, exitstatus: int, config: pytest.Config
-) -> None:
-    notes = getattr(config, "_bench_notes", [])
+    terminalreporter: TerminalReporter,
+    exitstatus: pytest.ExitCode,
+    config: pytest.Config,
+):
+    notes = config.stash.get(BENCH_NOTES_KEY, [])
     if not notes:
         return
     terminalreporter.section("benchmark baselines")

@@ -103,7 +103,7 @@ SKIPPED: dict[str, str] = {
 @pytest.mark.parametrize("shape_id", EMB_SHAPES)
 def test_embedding(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     vocab, dim, tokens = EMB_SHAPES[shape_id]
     w_ref, w_our = both(
         torch.randn(vocab, dim, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -121,7 +121,7 @@ def test_embedding(
 @pytest.mark.bench_op("embedding_dense_backward")
 def test_embedding_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     vocab, dim, tokens = EMB_SHAPES[shape_id]
     g_ref, g_our = both(
         torch.randn(tokens, dim, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -143,7 +143,7 @@ def test_embedding_backward(
 @pytest.mark.bench_op("index.Tensor")
 def test_index(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, width, gathered = INDEX_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(rows, width, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -173,7 +173,7 @@ def _scatter_case(
 @pytest.mark.bench_op("scatter.src")
 def test_scatter_src(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ref, our = _scatter_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: ref["base"].scatter(0, ref["index"], ref["src"]),
@@ -187,7 +187,7 @@ def test_scatter_src(
 @pytest.mark.bench_op("scatter.value")
 def test_scatter_value(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     ref, our = _scatter_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: ref["base"].scatter(0, ref["index"], 1.0),
@@ -301,7 +301,7 @@ def test_index_put(
 @pytest.mark.parametrize("shape_id", SELECT_SCATTER_SHAPES)
 def test_select_scatter(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     outer, rows, cols = SELECT_SCATTER_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(outer, rows, cols, dtype=dtype), hw, mojo_device)

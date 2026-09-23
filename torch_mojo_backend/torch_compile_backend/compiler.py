@@ -1,10 +1,13 @@
+import datetime as dt
+import functools
 import time
 import traceback
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import max.driver
 import max.graph.value
@@ -12,31 +15,30 @@ import torch
 from functorch.compile import make_boxed_func
 from max import engine
 from max.experimental.torch.torch import torch_dtype_to_max
-from max.graph import DeviceRef, Graph, KernelLibrary
-from max.graph import ops as max_ops
+from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
+from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
+    MAPPING_TORCH_ATEN_TO_MOJO,
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
+from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
+    get_accelerators,
     get_error_message,
     get_fully_qualified_name,
 )
 
-from ..aten_functions import MAPPING_TORCH_ATEN_TO_MOJO
-from .utils import get_accelerators
-
 
 class MojoCompilerError(Exception):
     pass
-
-
-import datetime as dt
 
 
 @dataclass
@@ -47,14 +49,24 @@ class GlobalMaxObjects:
 
 _global_max_objects: GlobalMaxObjects | None = None
 
-paths_to_mojo_kernels = [Path(__file__).parent.parent / "mojo_kernels"]
+# Custom-op packages user code registered on top of this repository's own
+# (`make_torch_op_from_mojo`): Mojo source directories or `.mojoc` files.
+extra_kernel_paths: list[Path] = []
+
+
+def kernel_extension_paths() -> list[Path]:
+    """Every custom-op package the graph backend loads: this repository's own
+    (`tmb/graph`, precompiled once per source closure), then whatever user
+    code registered. Passed as `custom_extensions` by every `F.custom` call
+    and loaded into the session's kernel library."""
+    return [native.build_graph_package(), *extra_kernel_paths]
 
 
 def global_max_objects() -> GlobalMaxObjects:
     global _global_max_objects
     if _global_max_objects is None:
         kernel_library = KernelLibrary()
-        kernel_library.load_paths(paths_to_mojo_kernels)
+        kernel_library.load_paths(kernel_extension_paths())
         session = engine.InferenceSession(devices=list(get_accelerators()))
         debug.set_print_options(session)
 
@@ -67,7 +79,7 @@ def global_max_objects() -> GlobalMaxObjects:
 def gather_stats_on_graph(gm: torch.fx.GraphModule):
     # count the number of times we see each function.
     # print and sort alphabetically.
-    function_counts = {}
+    function_counts: dict[str, int] = {}
     for node in gm.graph.nodes:
         if node.op == "call_function" or node.op == "call_method":
             name = get_fully_qualified_name(node.target)
@@ -83,10 +95,10 @@ class TensorsBook:
     def __init__(self):
         self.tensors: dict[str, Any] = {}
 
-    def __setitem__(self, name: str, tensor):
+    def __setitem__(self, name: str, tensor: object):
         self.tensors[name] = tensor
 
-    def convert_to_max(self, something):
+    def convert_to_max(self, something: object) -> object:
         if isinstance(something, torch.fx.Node):
             input_tensor = self.tensors[something.name]
             if isinstance(input_tensor, NotImplementedError):
@@ -129,7 +141,7 @@ class TensorsBook:
         raise ValueError(f"Unsupported type when reading the graph: {type(something)}")
 
 
-def fetch_attr(gm: torch.fx.GraphModule, target: str):
+def fetch_attr(gm: torch.fx.GraphModule, target: str) -> object:
     """Fetch an attribute from the Module hierarchy of self.gm.
     Args:
         target (str): The fully-qualified name of the attribute to fetch
@@ -269,17 +281,20 @@ class _GraphFactory:
             func_to_execute = MAPPING_TORCH_ATEN_TO_MOJO[normalized_name]
             # without hidden keys
             input_tensors = [v for k, v in func_kwargs.items() if not k.startswith("_")]
+            # AutoFunctionalizedV2's `_all_bases` kwarg is the list of mutated
+            # tensor arguments (torch._higher_order_ops.auto_functionalize).
+            all_bases = func_kwargs["_all_bases"]
+            assert isinstance(all_bases, list)
             # We pray the gods that the order is correct here
             # because we only work with positional arguments
-            self.tensor_book[node.name] = func_to_execute(
-                *func_kwargs["_all_bases"], *input_tensors
-            )
+            self.tensor_book[node.name] = func_to_execute(*all_bases, *input_tensors)
             return
         key = node.target
 
         # TODO: refactor this
         if (
-            key not in MAPPING_TORCH_ATEN_TO_MOJO
+            isinstance(key, torch._ops.OpOverload)
+            and key not in MAPPING_TORCH_ATEN_TO_MOJO
             and key.overloadpacket in MAPPING_TORCH_ATEN_TO_MOJO
         ):
             key = key.overloadpacket
@@ -309,15 +324,16 @@ class _GraphFactory:
         self.tensor_book[node.name] = func_output
 
     def handle_get_attr(self, node: torch.fx.Node):
-        attr_value = fetch_attr(node.graph.owning_module, node.target)
+        owning_module = node.graph.owning_module
+        assert owning_module is not None
+        assert isinstance(node.target, str)
+        attr_value = fetch_attr(owning_module, node.target)
         if isinstance(attr_value, torch.Tensor):
             # A tensor constant embedded in the graph (e.g. dynamo's
             # lift_fresh of a torch.tensor(...) created inside the traced
             # function). Bake it into the MAX graph as a constant. The
             # compiler runs under AOTAutograd's fake mode, which must not
             # intercept the reads of the real constant.
-            from torch._subclasses.fake_tensor import unset_fake_temporarily
-
             device = self.get_max_device(attr_value)
             with unset_fake_temporarily():
                 host = attr_value.detach().cpu()
@@ -341,14 +357,28 @@ class _GraphFactory:
         because MAX assumes that if your ouput is a Dim(), then you want a max tensor
         as output, not a simple python int.
         """
-        output_tensors = []
+        # create_graph always calls initialize_graph (which sets self.graph)
+        # before any node reaches handle_output.
+        assert self.graph is not None
+        # Elements are whatever convert_to_max returns for a graph-output
+        # leaf: in practice always a previously-converted MAX value (the
+        # Dim branch below is split out separately) -- narrowed with a
+        # single cast at the `graph.output` call below rather than
+        # scattering isinstance checks convert_to_max's broad return
+        # doesn't support per-branch.
+        output_tensors: list[object] = []
 
         # None outputs can be required. So we remember here if
         # we want an output tensor (and we reccord the tensor position)
         # or if we want None.
         output_blueprint: list[tuple[OutputBlueprintKind, int | None]] = []
 
-        for x in node.args[0]:
+        # An "output" fx node's args[0] is the traced function's actual
+        # return value structure, always a list/tuple of Nodes/constants
+        # (aot_autograd graphs always produce a flat tuple).
+        output_args = node.args[0]
+        assert isinstance(output_args, list | tuple)
+        for x in output_args:
             converted = self.tensor_book.convert_to_max(x)
             if converted is None:
                 output_blueprint.append((OutputBlueprintKind.NONE, None))
@@ -363,7 +393,9 @@ class _GraphFactory:
                 )
                 output_tensors.append(converted)
         # Store the none indices for runtime handling
-        self.graph.output(*output_tensors)
+        self.graph.output(
+            *cast("list[max.graph.value.TensorValueLike]", output_tensors)
+        )
         self.graph.__exit__(None, None, None)
         self._graph_open = False
         return output_blueprint
@@ -400,10 +432,15 @@ class _GraphFactory:
                 self.graph.__exit__(None, None, None)
                 self._graph_open = False
             raise
+        # handle_output (which ran to set output_blueprint above) asserts
+        # self.graph is set.
+        assert self.graph is not None
         return self.graph, output_blueprint
 
 
-def _graph_uses_mojo_device(gm: torch.fx.GraphModule, example_inputs: list) -> bool:
+def _graph_uses_mojo_device(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> bool:
     """Whether this graph computes on the eager "mojo" device.
 
     Checked at compile time (inputs may be fake tensors; factory-only graphs
@@ -420,28 +457,63 @@ def _graph_uses_mojo_device(gm: torch.fx.GraphModule, example_inputs: list) -> b
     return False
 
 
+@functools.cache
+def _mojo_accelerators() -> tuple[max.driver.Device, ...]:
+    """The concrete MAX devices backing each `mojo:<index>`, in the same
+    order the native backend's `device.mojo` assigns them -- see
+    `get_accelerators()`."""
+    return tuple(get_accelerators())
+
+
+def _max_device_for_mojo(device: torch.device) -> max.driver.Device:
+    """The concrete `max.driver.Device` a `mojo:<index>` torch device maps to."""
+    accelerators = _mojo_accelerators()
+    index = device.index if device.index is not None else 0
+    if index >= len(accelerators):
+        raise ValueError(f"Invalid mojo device index {index}")
+    return accelerators[index]
+
+
+def _mojo_index_for_max_device(device: max.driver.Device) -> int:
+    """The inverse of `_max_device_for_mojo`: which `mojo:<index>` a MAX
+    device (as reported by a MAX output buffer) corresponds to."""
+    for index, accelerator in enumerate(_mojo_accelerators()):
+        if accelerator.label == device.label and accelerator.id == device.id:
+            return index
+    raise ValueError(f"MAX device {device} has no corresponding mojo index")
+
+
+def _max_device_for_cuda(device: torch.device) -> max.driver.Device:
+    """The concrete MAX accelerator a real (non-mojo) `cuda`/`hip` torch
+    device maps to: the GPUs among `_mojo_accelerators()`, in order."""
+    gpu_accelerators = [a for a in _mojo_accelerators() if a.label == "gpu"]
+    index = device.index if device.index is not None else 0
+    if index >= len(gpu_accelerators):
+        raise RuntimeError(f"GPU index {index} not available in MAX")
+    return gpu_accelerators[index]
+
+
 def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
-    """Zero-copy wrap of a MAX output buffer as an eager mojo tensor.
+    """Zero-copy wrap of a MAX output buffer as a `mojo`-device tensor.
 
-    The buffer itself becomes the wrapper's ownership token (`_holder`):
-    MAX buffers release their device memory when the last Python reference
-    drops, exactly like the eager TensorHolder.
+    The graph runs on MAX's own stream, not a mojo one, and is still running
+    when `execute` returns: `__dlpack__(stream=...)` makes the mojo stream
+    wait for it. Metal lacks external streams, so synchronize that handoff.
+    MAX tags the capsule with the vendor device code (a `cuda`
+    tensor on import); retagging it kDLExtDev imports it as PrivateUse1.
     """
-    from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-        TorchMojoTensor,
-        _row_major_strides,
-    )
-
-    shape = tuple(buffer.shape)
-    return TorchMojoTensor._make(
-        buffer,
-        buffer._data_ptr(),
-        shape,
-        _row_major_strides(shape),
-        0,
-        buffer.dtype,
-        buffer.device,
-        contiguous=True,
+    index = _mojo_index_for_max_device(buffer.device)
+    if device_module.get_device_properties(index).api == "metal":
+        # MAX does not import/export external Metal streams. Complete graph
+        # work before the native queue can consume its output allocation.
+        buffer.device.synchronize()
+        capsule = buffer.__dlpack__()
+    else:
+        stream = torch.accelerator.current_stream(torch.device("mojo", index))
+        handle = device_module.stream_native_handle(stream) or None
+        capsule = buffer.__dlpack__(stream=handle)
+    return torch.from_dlpack(
+        mojo_dlpack.retag_capsule(capsule, mojo_dlpack.KDL_EXT_DEV, index)
     )
 
 
@@ -453,7 +525,12 @@ def _dim_buffer_to_cpu_tensor(buffer: max.driver.Buffer) -> torch.Tensor:
 
 
 class BaseMaxCompiler:
-    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list, mode=None):
+    def __init__(
+        self,
+        gm: torch.fx.GraphModule,
+        example_inputs: list[object],
+        mode: str | None = None,
+    ):
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
         if profiling_enabled():
@@ -483,17 +560,19 @@ class BaseMaxCompiler:
     def reconstruct_from_blueprint(
         self, max_ouptputs: list[torch.Tensor]
     ) -> list[torch.Tensor | int | float | None]:
-        result = []
+        result: list[torch.Tensor | int | float | None] = []
         for kind, index in self.output_blueprint:
             if kind is OutputBlueprintKind.NONE:
                 result.append(None)
             elif kind is OutputBlueprintKind.TENSOR:
+                assert index is not None
                 result.append(max_ouptputs[index])
             elif kind is OutputBlueprintKind.DIM:
+                assert index is not None
                 result.append(max_ouptputs[index].item())
         return result
 
-    def __call__(self, *args) -> list[torch.Tensor | int | float | None]:
+    def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
@@ -539,21 +618,15 @@ class BaseMaxCompiler:
 # (catches storage reallocation, e.g. `param.data = ...`), evicted when the
 # tensor dies. Buffers alias the tensor memory, so in-place updates
 # (optimizer steps) are seen without invalidation.
-_buffer_cache: dict[int, tuple] = {}
+# Quoted: `weakref.finalize` is not subscriptable at runtime.
+_buffer_cache: "dict[int, tuple[max.driver.Buffer, int, weakref.finalize[[int], torch.Tensor]]]" = {}
 
 
-def _evict_buffer(tensor_id: int) -> None:
+def _evict_buffer(tensor_id: int, /):
     _buffer_cache.pop(tensor_id, None)
 
 
-def _data_ptr_of(t: torch.Tensor) -> int:
-    ptr = getattr(t, "_ptr", None)  # TorchMojoTensor
-    if ptr is not None:
-        return ptr
-    return t.data_ptr()
-
-
-def _cached_buffer_for(t: torch.Tensor):
+def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     if not t.is_contiguous():
         # A MAX Buffer is dense row-major, and the graph input type only
         # carries a shape, so a strided input has to be materialized. The
@@ -566,33 +639,40 @@ def _cached_buffer_for(t: torch.Tensor):
     entry = _buffer_cache.get(key)
     if entry is not None:
         buffer, ptr, _finalizer = entry
-        if ptr == _data_ptr_of(t):
+        if ptr == t.data_ptr():
             return buffer
     buffer = fast_from_dlpack(t.detach())
     finalizer = weakref.finalize(t, _evict_buffer, key)
-    _buffer_cache[key] = (buffer, _data_ptr_of(t), finalizer)
+    _buffer_cache[key] = (buffer, t.data_ptr(), finalizer)
     return buffer
 
 
-def boxed_func(*args, **kwargs):
-    return make_boxed_func(BaseMaxCompiler(*args, **kwargs).__call__)
+GraphValue = torch.Tensor | int | float | None
+
+
+def boxed_func(
+    gm: torch.fx.GraphModule, example_inputs: list[object], mode: str | None = None
+) -> Callable[[list[GraphValue]], list[GraphValue]]:
+    return make_boxed_func(BaseMaxCompiler(gm, example_inputs, mode).__call__)
 
 
 class mojo_backend:
-    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list):
+    def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]):
         self.func_to_execute = aot_autograd(
             fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE
         )(gm, example_inputs)
 
-    def __call__(self, *args) -> list[torch.Tensor | int | float | None]:
+    def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         result = self.func_to_execute(*args)
         if isinstance(result, tuple):
             return list(result)
         return result
 
 
-def dummy_compiler(gm: torch.fx.GraphModule, example_inputs: list):
-    return make_boxed_func(gm.forward)
+def dummy_compiler(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> Callable[[list[GraphValue]], object]:
+    return make_boxed_func(gm.forward)  # returns whatever the graph returns
 
 
 # Can be used to check if it's the fault of the max backend or not.
@@ -608,10 +688,26 @@ dummy_backend = aot_autograd(fw_compiler=dummy_compiler)
 # - Generally users shouldn't be putting this marshalling into their
 #   inner loop. Gains are much more substantial for larger graphs
 #   which can take advantage of MAX's automatic kernel fusion.
+class _MetalDLPackInput:
+    """Expose a synchronized PrivateUse1 allocation using Metal's device tag."""
+
+    def __init__(self, tensor: torch.Tensor, device_id: int):
+        self.tensor = tensor
+        self.device_id = device_id
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return (8, self.device_id)
+
+    def __dlpack__(self, stream: int | None = None) -> object:
+        return mojo_dlpack.retag_capsule(self.tensor.__dlpack__(), 8, self.device_id)
+
+
 def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
     if t.device.type == "cuda":
         stream = torch.cuda.current_stream(t.device).cuda_stream
-        device = torch_device_to_max_device(t.device)
+        # _from_dlpack wants a concrete driver Device, not the graph-building
+        # DeviceRef torch_device_to_max_device returns.
+        device = _max_device_for_cuda(t.device)
         data = t.__dlpack__()
         try:
             return max.driver.Buffer._from_dlpack(data, device, stream)
@@ -619,4 +715,35 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
             # This approach fails when passing the tensor across threads.
             # Fall back to letting torch slowly sync streams.
             return max.driver.Buffer.from_dlpack(t)
+    if t.device.type == "mojo":
+        # `Tensor.__dlpack_device__` (torch/_tensor.py) checks the device
+        # type string literal "privateuse1", not the *renamed* backend name
+        # ("mojo") -- a real torch gap for a renamed PrivateUse1 backend, so
+        # it (and the 1-arg `Buffer.from_dlpack`, which calls it first) raise
+        # "Unknown device type mojo for Dlpack". `Tensor.__dlpack__()` itself
+        # is unaffected (its C++ implementation keys off the DeviceType enum,
+        # not the name), so build the capsule through it directly and hand
+        # MAX the device/stream explicitly, exactly like the CUDA branch
+        # above. No fallback: unlike CUDA, `Buffer.from_dlpack(t)` would hit
+        # the very same broken device query.
+        device = _max_device_for_mojo(t.device)
+        if device.label == "cpu":
+            # The explicit-device/stream `_from_dlpack` overload below is
+            # GPU-only (it raises "unsupported device type in dlpack
+            # implementation" for a CPU `device`), and the MAX-CPU mojo
+            # device's memory is already host RAM, so there is nothing to
+            # gain from a cleverer path: hand MAX a real torch CPU tensor
+            # (a plain host-to-host copy, not the zero-copy exchange the
+            # GPU case below gets).
+            return max.driver.Buffer.from_dlpack(t.cpu())
+        if device_module.get_device_properties(t.device).api == "metal":
+            device_module.synchronize(t.device)
+            return max.driver.Buffer.from_dlpack(_MetalDLPackInput(t, device.id))
+        # the vendor handle of the current mojo stream (torch.Stream's own
+        # native_handle exists only from torch 2.11)
+        stream = device_module.stream_native_handle(
+            torch.accelerator.current_stream(t.device)
+        )
+        data = t.__dlpack__()
+        return max.driver.Buffer._from_dlpack(data, device, stream)
     return max.driver.Buffer.from_dlpack(t)

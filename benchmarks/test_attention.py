@@ -10,6 +10,8 @@ single-sequence decode-prefill regime.  All cases are causal.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -23,10 +25,8 @@ SHAPES: dict[str, tuple[int, int, int, int]] = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::scaled_dot_product_attention": "test_sdpa",
     "aten::_scaled_dot_product_flash_attention": "test_sdpa_flash",
     "aten::_scaled_dot_product_efficient_attention": "test_sdpa_efficient",
-    "aten::_scaled_dot_product_attention_math": "test_sdpa_math",
     "aten::_scaled_dot_product_flash_attention_backward": "test_sdpa_flash_backward",
 }
 
@@ -35,16 +35,32 @@ SKIPPED: dict[str, str] = {}
 
 def _qkv(
     shape_id: str, dtype_id: str, hw: Hardware, mojo: torch.device
-) -> tuple[list[torch.Tensor], list[torch.Tensor], float]:
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    float,
+]:
     b, h, s, d = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
-    refs, ours = [], []
-    for _ in range(3):
-        ref, our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
-        refs.append(ref)
-        ours.append(our)
+    q_ref, q_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
+    k_ref, k_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
+    v_ref, v_our = both(torch.randn(b, h, s, d, dtype=dtype), hw, mojo)
     flops = 4.0 * b * h * s * s * d / 2.0  # causal halves the score matrix
-    return refs, ours, flops
+    return (q_ref, k_ref, v_ref), (q_our, k_our, v_our), flops
+
+
+# aten::_scaled_dot_product_flash_attention outputs (max_q / max_k are ints).
+_FlashForwardOut = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f16"))
@@ -52,7 +68,7 @@ def _qkv(
 @pytest.mark.bench_op("scaled_dot_product_attention")
 def test_sdpa(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: F.scaled_dot_product_attention(*refs, is_causal=True),
@@ -66,7 +82,7 @@ def test_sdpa(
 @pytest.mark.bench_op("_scaled_dot_product_flash_attention")
 def test_sdpa_flash(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_flash_attention(
@@ -84,7 +100,7 @@ def test_sdpa_flash(
 @pytest.mark.bench_op("_scaled_dot_product_efficient_attention")
 def test_sdpa_efficient(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_efficient_attention(
@@ -102,7 +118,7 @@ def test_sdpa_efficient(
 @pytest.mark.bench_op("_scaled_dot_product_attention_math")
 def test_sdpa_math(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.ops.aten._scaled_dot_product_attention_math(
@@ -120,14 +136,14 @@ def test_sdpa_math(
 @pytest.mark.bench_op("_scaled_dot_product_flash_attention_backward")
 def test_sdpa_flash_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     refs, ours, flops = _qkv(shape_id, dtype_id, hw, mojo_device)
     b, h, s, d = SHAPES[shape_id]
     g_ref, g_our = both(
         torch.randn(b, h, s, d, dtype=DTYPES[dtype_id]), hw, mojo_device
     )
 
-    def forward(leg: list[torch.Tensor]) -> tuple:
+    def forward(leg: Sequence[torch.Tensor]) -> _FlashForwardOut:
         return torch.ops.aten._scaled_dot_product_flash_attention(
             *leg, 0.0, True, False
         )
@@ -140,7 +156,9 @@ def test_sdpa_flash_backward(
     except NotImplementedError as exc:
         pytest.skip(f"not supported on the mojo device: {exc}")
 
-    def backward(grad: torch.Tensor, leg: list[torch.Tensor], fwd: tuple) -> tuple:
+    def backward(
+        grad: torch.Tensor, leg: Sequence[torch.Tensor], fwd: _FlashForwardOut
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         out, logsumexp, cum_q, cum_k, max_q, max_k, seed, offset, _ = fwd
         return torch.ops.aten._scaled_dot_product_flash_attention_backward(
             grad,

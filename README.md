@@ -8,7 +8,7 @@ You only need Torch CPU and a mojo compiler, and if your accelerator is supporte
 No need to match compiler versions, torch versions, cuda versions, multiple channels, etc... Just pip install and you're ready to go.
 
 Concretely, the backend provides two things:
-- It uses the PrivateUse1 device registration method purely in Python, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode.
+- It registers `mojo` as a PrivateUse1 device whose aten ops are Mojo functions torch's dispatcher calls directly, meaning you can just use the `mojo` device with `my_model.to("mojo")` to use your accelerator in eager mode. See [docs/native_backend.md](docs/native_backend.md).
 - This project also provides a backend for doing `@torch.compile(backend=mojo_backend)`, and it will use mojo (MAX graph) instead of triton to compile your model.
 
 ## Warning:
@@ -20,9 +20,19 @@ Concretely, the backend provides two things:
 
 You can see our benchmarks for the supported ops [here](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/benchmarks/baselines.html). It can give you an idea of where we're fast and where we're not. We recently tried running nanogpt eager mode on H100, MI300X and Apple M4 on 2.5B tokens, with torch autocast, and we got the same loss curve as stock PyTorch, while being ~2% faster.
 
+Distributed training with DDP works on NVIDIA and AMD GPUs — single node
+and multi-node under torchrun, over NCCL or RCCL — see
+[docs/distributed.md](docs/distributed.md). On AMD machines install the CPU
+wheel of torch (`--index-url https://download.pytorch.org/whl/cpu`): the
+CUDA wheel makes every first-use kernel load on HIP about 10x slower, and a
+ROCm wheel brings a second HIP runtime the collectives cannot serve.
+Who talks to whom in that stack, from your code down to the GPUs and the
+network, is drawn for NVIDIA and AMD in
+[docs/call_graph.html](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/call_graph.html).
+
 We don't support yet:
 * Using `torch.compile` with the mojo device, only the cuda device is supported for now. 
-* DDP to train on multiple gpus or nodes.
+* DDP on Apple (the process group needs an NCCL-API library: NCCL or RCCL).
 * Many GPUs (prefer H100, MI300X and Apple M4)
 * Many ops
 * Other mojo versions than 1.0
@@ -35,6 +45,17 @@ pip install torch-mojo-backend
 # or, with uv:
 uv add torch-mojo-backend
 ```
+
+On NVIDIA GPUs the package discovers a `ptxas` assembler compatible with
+the driver and GPU among installed wheels, CUDA toolkits and the compiler
+MAX ships, and uses the newest known version that fits. If MAX's compiler
+version is unknown, it is tried only when no known assembler fits.
+The nvcc wheel is optional at
+runtime; only the development dependencies install
+`nvidia-cuda-nvcc-cu12==12.8.*`. When no assembler fits, an error names the
+wheel to install.
+`torch-mojo-backend ptxas` shows which assembler was picked and why, and
+`MODULAR_NVPTX_COMPILER_PATH` overrides it.
 
 ## Quick Start
 
@@ -71,11 +92,9 @@ d = (a + b - c) * 8 / 16
 print(d.cpu())
 ```
 
-Ops are compiled on the fly, and compilation doesn't stop your code, as long as you don't request a host-device sync.
-Torch-mojo-backend uses this optimization to compile multiple ops in the background at the same time. E.g. all the 
-ops needed to perform `(a + b - c) * 8 / 16` will be sent to a compiler process pool to be compiled in parallel.
-A cache is on disk to make sure we don't recompile when the user restarts the process.
-You can look at [this animation](https://html-preview.github.io/?url=https://github.com/gabrieldemarmiesse/torch-mojo-backend/raw/refs/heads/main/docs/kernel_call_queue_animation.html) to understand better how it works.
+Ops are compiled on the fly: the first time an op runs with a given combination of dtypes, its Mojo kernel
+is compiled and the call waits for it. A cache is on disk to make sure we don't recompile when the user
+restarts the process.
 
 We guarantee that changing the shapes or the values of the tensors will not trigger a recompilation.
 

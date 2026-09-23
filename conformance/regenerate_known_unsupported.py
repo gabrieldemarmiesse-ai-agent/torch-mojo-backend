@@ -43,7 +43,14 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
 from typing import Any
+
+import pytest
+import torch
+from _pytest.runner import CallInfo
+
+import torch_mojo_backend
 
 _RECORD_DIR_ENV = "CONFORMANCE_UNSUPPORTED_RECORD_DIR"
 _HERE = Path(__file__).resolve().parent
@@ -90,10 +97,17 @@ def _looks_absent(exc: BaseException) -> bool:
     if any(isinstance(part, NotImplementedError) for part in chain):
         return True
     text = "\n".join(str(part) for part in chain).lower()
-    return "no fast implementation" in text or "unsupported torch dtype" in text
+    return (
+        "no fast implementation" in text
+        or "unsupported torch dtype" in text
+        # an error corpus built out of a tensor the device cannot hold (rank
+        # above its limit) fails before the operator is reached, like a dtype
+        # it does not have
+        or "exceeds the mojo device limit" in text
+    )
 
 
-def _record(event: dict[str, Any]) -> None:
+def _record(event: dict[str, Any]):
     """Append one event, if recording is on.
 
     One file per process: xdist workers never share one, and a segfaulting node
@@ -107,7 +121,11 @@ def _record(event: dict[str, Any]) -> None:
         handle.flush()
 
 
-def pytest_exception_interact(node: Any, call: Any, report: Any) -> None:
+def pytest_exception_interact(
+    node: pytest.Item | pytest.Collector,
+    call: CallInfo[Any],
+    report: pytest.CollectReport | pytest.TestReport,
+):
     """Record what a failing node raised."""
     if not report.failed or call.excinfo is None:
         return
@@ -127,7 +145,7 @@ def pytest_exception_interact(node: Any, call: Any, report: Any) -> None:
     )
 
 
-def pytest_runtest_logreport(report: Any) -> None:
+def pytest_runtest_logreport(report: pytest.TestReport):
     """Record every node's outcome, so a node that ran can be told from one that
     did not: only the first is evidence about the table."""
     if report.when != "call":
@@ -153,14 +171,12 @@ def pytest_runtest_logreport(report: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _import_suite() -> Any:
+def _import_suite() -> ModuleType:
     """The conformance test module, imported the way its conftest does."""
     os.environ.setdefault("PYTORCH_TESTING_DEVICE_FOR_CUSTOM", "privateuse1")
     sys.path.insert(0, str(_HERE))
-    import torch_mojo_backend
-
     torch_mojo_backend.register_mojo_devices()
-    import test_opinfo
+    import test_opinfo  # noqa: PLC0415 -- importable only via the sys.path insert above
 
     return test_opinfo
 
@@ -172,21 +188,20 @@ def _device_token() -> str:
     not after "privateuse1" -- "mojo" for us -- so it is read from torch rather
     than spelled out here.
     """
-    import torch
-
     return str(torch._C._get_privateuse1_backend_name())
 
 
-def _node_index(suite: Any) -> dict[str, tuple[str, str, str]]:
+def _node_index(suite: ModuleType) -> dict[str, tuple[str, str, str]]:
     """Generated node name -> (test name, operator token, dtype token).
 
     Built from the same op_db and dtypes the suite parametrizes over, so
     nothing has to be parsed back out of a node name whose operator token
     itself contains underscores.
     """
-    import known_unsupported
-    import torch
-    from torch.testing._internal.common_methods_invocations import op_db
+    import known_unsupported  # noqa: PLC0415 -- importable only via _import_suite's sys.path insert
+    from torch.testing._internal.common_methods_invocations import (  # noqa: PLC0415 -- pulls in common_device_type, which must not load before PYTORCH_TESTING_DEVICE_FOR_CUSTOM is set (conformance/conftest.py)
+        op_db,
+    )
 
     device = _device_token()
     index: dict[str, tuple[str, str, str]] = {}
@@ -309,7 +324,7 @@ def _splice(text: str, test: str, rendered: str) -> str:
 
 def _report_diff(
     test: str, merged: dict[str, set[str]], declared: dict[str, frozenset[str]]
-) -> None:
+):
     print(f"\n{test}:")
     pairs = {(op, d) for op, dtypes in merged.items() for d in dtypes}
     now = {(op, d) for op, dtypes in declared.items() for d in dtypes}
@@ -348,7 +363,7 @@ def main() -> int:
         raise SystemExit("--no-run needs --records DIR from an earlier run")
 
     suite = _import_suite()
-    import known_unsupported
+    import known_unsupported  # noqa: PLC0415 -- importable only via _import_suite's sys.path insert
 
     accelerator = known_unsupported.accelerator_key()
     if args.write and accelerator != known_unsupported.BASE_ACCELERATOR:
