@@ -1,40 +1,50 @@
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
-from max.driver import CPU, Accelerator, Device, accelerator_count
+from max.driver import Accelerator, Device, accelerator_count
+
+from torch_mojo_backend import _ptxas
 
 
 def get_accelerators() -> list[Device]:
+    # MAX refuses a device outright when its assembler does not match the
+    # driver ("Your current NVIDIA GPU driver version is not supported"), and
+    # the warning below would then leave the user with no idea why.
+    _ptxas.check()
     result = []
     if accelerator_count() > 0:
         for i in range(accelerator_count()):
             try:
                 result.append(Accelerator(i))
             except ValueError as e:
-                warnings.warn(f"Failed to create accelerator {i}. {e}")
-    # This way, people can do torch.device("mojo:0") even if there is
-    # no accelerator and get gpu or cpu automatically.
-    result.append(CPU())
+                warnings.warn(
+                    f"Failed to create accelerator {i}. {e}" + _ptxas.diagnose(str(e))
+                )
     return result
 
 
-def get_fully_qualified_name(func: Callable | str) -> str:
+def get_fully_qualified_name(func: Callable[..., object] | str) -> str:
     if isinstance(func, str):
         return f"torch.Tensor.{func}"
     result = ""
-    if hasattr(func, "__module__"):
-        result += func.__module__ + "."
+    module = getattr(func, "__module__", None)
+    if isinstance(module, str):
+        result += module + "."
 
-    if hasattr(func, "__qualname__"):
-        result += func.__qualname__
+    qualname = getattr(func, "__qualname__", None)
+    if isinstance(qualname, str):
+        result += qualname
 
     result += " of type " + str(type(func)) + " "
     return result
 
 
 def get_error_message(
-    node: torch.fx.Node, node_idx: int, func_args: list | tuple, func_kwargs: dict
+    node: torch.fx.Node,
+    node_idx: int,
+    func_args: Sequence[object],
+    func_kwargs: Mapping[str, object],
 ) -> str:
     if node.stack_trace is None:
         stack_trace = "No stack trace available, likely because this node is the result of a decomposition."

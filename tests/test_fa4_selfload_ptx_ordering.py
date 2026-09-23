@@ -42,7 +42,7 @@ _PROBE = Path(__file__).resolve().parent / "fa4_selfload_ptx_probe.mojo"
 _D128_GUARD_PROBE = (
     Path(__file__).resolve().parent / "fa4_selfload_d128_guard_probe.mojo"
 )
-_FA4_DIR = _REPO_ROOT / "torch_mojo_backend" / "eager_flash_attention"
+_MOJO_ROOT = _REPO_ROOT / "torch_mojo_backend" / "mojo"
 _BUILD_DIR = Path(__file__).resolve().parent / "__mojocache__" / "fa4_selfload_ptx"
 _D128_GUARD_BUILD_DIR = (
     Path(__file__).resolve().parent / "__mojocache__" / "fa4_selfload_d128_guard"
@@ -70,7 +70,7 @@ def _build_probe_ptx(out_dir: Path) -> str:
         "build",
         str(_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "--emit",
         "asm",
         "--target-accelerator",
@@ -115,9 +115,7 @@ def _line_numbers(pattern: re.Pattern[str], text: str) -> list[int]:
     return [i for i, line in enumerate(text.splitlines()) if pattern.search(line)]
 
 
-def _assert_every_event_follows_a_wait(
-    events: list[tuple[int, str]], event_label: str
-) -> None:
+def _assert_every_event_follows_a_wait(events: list[tuple[int, str]], event_label: str):
     """Walk (line_no, kind) events in line order: every 'event_label' kind
     must have a 'wait' kind since the previous 'event_label' (or since the
     start of the region, for the first one)."""
@@ -142,7 +140,7 @@ def _assert_every_event_follows_a_wait(
     )
 
 
-def test_selfload_refills_follow_their_wait_group(selfload_ptx: str) -> None:
+def test_selfload_refills_follow_their_wait_group(selfload_ptx: str):
     """Every K/V refill TMA copy is textually ordered after a wgmma.wait_group.
 
     The prologue's initial fill (Q plus the first PREFETCH tile-pairs) has
@@ -173,7 +171,7 @@ def test_selfload_refills_follow_their_wait_group(selfload_ptx: str) -> None:
     _assert_every_event_follows_a_wait(expect_events, "mbarrier.arrive.expect_tx")
 
 
-def test_selfload_rejects_d128_at_compile_time() -> None:
+def test_selfload_rejects_d128_at_compile_time():
     """Scope enforcement, not just documentation: instantiating the
     self-loading kernel at head_dim=128 must fail the BUILD (ported from
     agent A2's review artifact, d128_guard_v7.mojo)."""
@@ -188,7 +186,7 @@ def test_selfload_rejects_d128_at_compile_time() -> None:
         "build",
         str(_D128_GUARD_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "--emit",
         "asm",
         "--target-accelerator",

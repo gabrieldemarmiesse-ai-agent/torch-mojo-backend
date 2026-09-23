@@ -45,7 +45,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("native_dropout")
 def test_dropout(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = DROPOUT_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -60,7 +60,7 @@ def test_dropout(
 @pytest.mark.bench_op("native_dropout_backward")
 def test_dropout_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = DROPOUT_SHAPES[shape_id]
     g_ref, g_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     mask_ref, mask_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
@@ -89,7 +89,7 @@ def _nll_case(
 @pytest.mark.bench_op("nll_loss_forward")
 def test_nll_loss(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     lp_ref, lp_our, t_ref, t_our = _nll_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: F.nll_loss(lp_ref, t_ref),
@@ -103,7 +103,7 @@ def test_nll_loss(
 @pytest.mark.bench_op("nll_loss_backward")
 def test_nll_loss_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     lp_ref, lp_our, t_ref, t_our = _nll_case(shape_id, dtype_id, hw, mojo_device)
     # Synthetic grad/total_weight with the exact values nll_loss_forward
     # produces for mean reduction and no class weights (grad 1, total_weight

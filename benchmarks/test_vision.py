@@ -55,7 +55,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("convolution")
 def test_conv2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c_in, h, w, c_out, k, stride, pad = CONV_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(n, c_in, h, w, dtype=dtype), hw, mojo_device)
@@ -78,7 +78,7 @@ def test_conv2d(
 @pytest.mark.bench_op("_adaptive_avg_pool2d")
 def test_adaptive_avg_pool2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w, out = ADAPTIVE_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -95,7 +95,7 @@ def test_adaptive_avg_pool2d(
 @pytest.mark.bench_op("avg_pool2d")
 def test_avg_pool2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w, k, stride, pad = POOL_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -112,7 +112,7 @@ def test_avg_pool2d(
 @pytest.mark.bench_op("max_pool2d_with_indices")
 def test_max_pool2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w, k, stride, pad = POOL_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -129,7 +129,7 @@ def test_max_pool2d(
 @pytest.mark.bench_op("upsample_bilinear2d")
 def test_upsample_bilinear2d(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w = UPSAMPLE_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device

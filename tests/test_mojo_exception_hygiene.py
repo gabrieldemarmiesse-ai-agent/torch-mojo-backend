@@ -30,7 +30,7 @@ _SWALLOW_RE = re.compile(
 )
 
 
-def test_no_success_reporting_exception_handlers() -> None:
+def test_no_success_reporting_exception_handlers():
     sources = sorted(_BACKEND_DIR.rglob("*.mojo"))
     assert sources, f"no .mojo sources found under {_BACKEND_DIR}"
     offenders = []

@@ -1,4 +1,4 @@
-"""In-place elementwise benchmarks: add_, mul_, relu_, fill_, masked_fill_.
+"""In-place elementwise benchmarks: add_, sub_, mul_, relu_, fill_, masked_fill_.
 
 The in-place ops mutate their input across iterations, so operand values
 are chosen to stay numerically tame over thousands of calls (mul_ by
@@ -27,12 +27,15 @@ SHAPES: dict[str, tuple[int, ...]] = {
 
 COVERS: dict[str, str] = {
     "aten::add_.Tensor": "test_add_",
+    "aten::sub_.Tensor": "test_sub_",
     "aten::mul_.Tensor": "test_mul_",
+    "aten::mul_.Scalar": "test_mul_scalar_",
     "aten::relu_": "test_relu_",
     "aten::fill_.Scalar": "test_fill_",
     "aten::masked_fill_.Scalar": "test_masked_fill_[Scalar]",
     "aten::masked_fill_.Tensor": "test_masked_fill_[Tensor]",
     "aten::uniform_": "test_uniform_",
+    "aten::normal_": "test_normal_",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -43,7 +46,7 @@ SKIPPED: dict[str, str] = {}
 @pytest.mark.bench_op("add_.Tensor")
 def test_add_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -55,10 +58,25 @@ def test_add_(
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("sub_.Tensor")
+def test_sub_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
+    d_ref, d_our = both((unit_interval(shape, dtype) - 0.5) * 1e-4, hw, mojo_device)
+    bench.run(
+        lambda: x_ref.sub_(d_ref), lambda: x_our.sub_(d_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("mul_.Tensor")
 def test_mul_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -71,12 +89,28 @@ def test_mul_(
     )
 
 
+@pytest.mark.parametrize("dtype_id", ("bf16", "f16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("mul_.Scalar")
+def test_mul_scalar_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: x_ref.mul_(1.00001),
+        lambda: x_our.mul_(1.00001),
+        flops=float(x_ref.numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("relu_")
 def test_relu_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(lambda: x_ref.relu_(), lambda: x_our.relu_(), flops=float(x_ref.numel()))
@@ -87,7 +121,7 @@ def test_relu_(
 @pytest.mark.bench_op("fill_.Scalar")
 def test_fill_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -100,7 +134,7 @@ def test_fill_(
 @pytest.mark.bench_op("uniform_")
 def test_uniform_(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     """A generated fill: same write traffic as fill_, plus the generator.
 
     Both legs draw from their own device's default generator (there is no
@@ -128,7 +162,7 @@ def test_masked_fill_(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -146,3 +180,20 @@ def test_masked_fill_(
             lambda: x_our.masked_fill_(mask_our, v_our),
             flops=float(x_ref.numel()),
         )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("normal_")
+def test_normal_(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """uniform_'s kernel plus the Box-Muller transform (a log, a sqrt and a
+    sincos per pair): the compute-heaviest of the Philox fills."""
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: x_ref.normal_(0.0, 1.0),
+        lambda: x_our.normal_(0.0, 1.0),
+        flops=float(x_ref.numel()),
+    )

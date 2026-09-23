@@ -34,7 +34,6 @@ from __future__ import annotations
 import functools
 import unittest
 from collections.abc import Callable
-from typing import Any
 
 import known_unsupported
 import pytest
@@ -45,6 +44,9 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.common_utils import TestCase, run_tests
+from torch.testing._internal.opinfo.core import OpInfo, SampleInput
+
+from torch_mojo_backend.testing import assert_close_fp64_anchored
 
 # The dtypes worth exercising on an accelerator backend.  Deliberately not the
 # full OpInfo set: float64 is absent on some GPUs we target and complex is not
@@ -53,7 +55,7 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 _DTYPES = (torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.bool)
 
 
-def _to_cpu(value: Any) -> Any:
+def _to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu()
     if isinstance(value, list | tuple):
@@ -63,7 +65,7 @@ def _to_cpu(value: Any) -> Any:
     return value
 
 
-def _run_declared_unsupported(reason: str, run: Callable[[], None]) -> None:
+def _run_declared_unsupported(reason: str, run: Callable[[], None]):
     """Run a case `known_unsupported.py` declares cannot pass, and hold it to it.
 
     xfail-strict semantics, and the strictness is the entire reason a
@@ -113,7 +115,9 @@ def _declining_rather_than_rejecting(
     return not any(issubclass(kind, NotImplementedError) for kind in demanded)
 
 
-def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
+def _tensor_specs(
+    sample: SampleInput,
+) -> list[tuple[torch.Size, torch.dtype, torch.device]]:
     """Shape, dtype and device of every tensor in `sample`, in the order
     `SampleInput.transform` visits them.
 
@@ -122,7 +126,7 @@ def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.devi
     """
     specs: list[tuple[torch.Size, torch.dtype, torch.device]] = []
 
-    def record(value: Any) -> Any:
+    def record(value: object) -> object:
         if isinstance(value, torch.Tensor):
             specs.append((value.shape, value.dtype, value.device))
         return value
@@ -132,7 +136,7 @@ def _tensor_specs(sample: Any) -> list[tuple[torch.Size, torch.dtype, torch.devi
 
 
 def _opinfo_placements(
-    op: Any, dtype: torch.dtype
+    op: OpInfo, dtype: torch.dtype
 ) -> list[list[tuple[torch.Size, torch.dtype, torch.device]]] | None:
     """Where OpInfo itself puts each sample-input tensor when it builds this
     operator's samples for a device -- one entry per tensor, per sample.
@@ -183,10 +187,10 @@ def _opinfo_placements(
 
 
 def _to_device(
-    sample: Any,
+    sample: SampleInput,
     device: str,
     placement: list[tuple[torch.Size, torch.dtype, torch.device]] | None,
-) -> Any:
+) -> SampleInput:
     """`sample`, built on the CPU, with every tensor moved to `device` except
     the ones `placement` says OpInfo keeps on the CPU.
 
@@ -202,7 +206,7 @@ def _to_device(
         iter([p[2].type == "cpu" for p in placement]) if placement is not None else None
     )
 
-    def move(value: Any) -> Any:
+    def move(value: object) -> object:
         # transform() also visits torch.dtype values, which have no device.
         if not isinstance(value, torch.Tensor):
             return value
@@ -213,7 +217,7 @@ def _to_device(
     return sample.transform(move)
 
 
-def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | None:
+def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str | None:
     """None, or why `test_matches_cpu` should not compare this op's output.
 
     OpInfo already flags operators whose output is legitimately allowed to
@@ -273,11 +277,120 @@ def _cross_device_comparison_skip_reason(op: Any, dtype: torch.dtype) -> str | N
     return None
 
 
+# Nodes compared through `assert_close_fp64_anchored` instead of the default
+# bar: fp32 reductions whose result depends on summation order, so two correct
+# kernels differ by more than rtol 1.3e-6 / atol 1e-5 on a few elements, and
+# WHICH elements depends on the CPU's SIMD width (this node passed or failed
+# on GitHub's runners depending on the machine drawn). torch's own fp32
+# conv2d lands up to 4.6e-5 from the float64 answer on these very samples.
+# Kept to the nodes that have shown it; not a general policy.
+_FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
+    {("nn_functional_conv2d", torch.float32)}
+)
+
+# Per-accelerator extensions to `_FP64_ANCHORED`, keyed like
+# `known_unsupported._ACCELERATOR_DELTAS` (see `known_unsupported.accelerator_key()`).
+# The base set above holds one node measured on GitHub's CPU runners; an
+# accelerator that produces its own last-ulp differences records them here
+# instead of widening the base set for everyone.
+#
+# gfx942 (MI300A, ROCm 6.4.3), measured 2026-09-14. The regeneration run
+# (14 failed / 1112 passed / 236 skipped / 1424 xfailed, 0 operators absent)
+# flagged 14 (op, dtype) nodes as last-ulp mismatches; running them anchored
+# confirmed 6 as exactly that -- ordinary rounding/reduction-order
+# differences, no farther from float64 than torch's own result:
+#   bmm f32: 1/250 elements, abs 1.44e-5 vs 1e-5 allowed, rel 1.19e-5 vs 1.3e-6
+#     (sample (10,5,10)@(10,10,5)).
+#   addr f16: 1/50 elements, abs 3.9e-3, rel 1.045e-3 vs 1e-3.
+#   instance_norm bf16, f16 and conv2d bf16, f16: 1-7 elements, one bf16/f16
+#     ulp each.
+# The other 8 were anchored once `assert_close_fp64_anchored` anchored the
+# finite elements of a sample that also holds a masked -inf or a NaN and
+# survived an empty sample (see the entries below); `pow` float32 was a real
+# precision gap until float32 pow went through float64 (logic_ops.mojo).
+_FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
+    # M4: validate these CPU vector/scalar rounding differences against the
+    # same float64 oracle used for the corresponding CUDA/HIP cases.
+    "4-metal4": frozenset(
+        {("addr", torch.float16), ("sub", torch.float16)}
+        | {
+            (op, dtype)
+            for op in (
+                "log_softmax",
+                "masked_log_softmax",
+                "nn_functional_batch_norm",
+                "nn_functional_conv2d",
+                "nn_functional_instance_norm",
+            )
+            for dtype in (torch.bfloat16, torch.float16)
+        }
+    ),
+    # sm_90a (H100), measured 2026-09-14 after the base tables were regenerated
+    # for the native backend: the same last-ulp class as gfx942's below (a
+    # reduction-order or one-ulp difference against CPU torch, no farther from
+    # float64 than torch's own result), which the absence-based tables cannot
+    # express and CPU-only CI never sees.
+    "sm_90a": frozenset(
+        {
+            ("__rpow__", torch.float32),
+            ("addr", torch.bfloat16),
+            ("addr", torch.float16),
+            ("bmm", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
+            ("nn_functional_conv2d", torch.bfloat16),
+            ("nn_functional_conv2d", torch.float16),
+            ("nn_functional_instance_norm", torch.bfloat16),
+            ("nn_functional_instance_norm", torch.float16),
+            ("pow", torch.float32),
+        }
+    ),
+    "gfx942": frozenset(
+        {
+            ("bmm", torch.float32),
+            ("addr", torch.float16),
+            ("nn_functional_instance_norm", torch.bfloat16),
+            ("nn_functional_instance_norm", torch.float16),
+            ("nn_functional_conv2d", torch.bfloat16),
+            ("nn_functional_conv2d", torch.float16),
+            # The same one-ulp / summation-order class, anchorable only once
+            # `assert_close_fp64_anchored` anchored the finite elements of a
+            # sample that also holds a masked -inf or a NaN, and survived an
+            # empty sample: __rpow__ rel 1.4e-6 on one element (abs 38 on
+            # 1.4e7); masked_log_softmax and log_softmax one bf16/f16 ulp
+            # (3.8e-3 / 4.3e-4) where the CPU result is exactly 0; batch_norm
+            # one ulp on 1 to 7 of 125 elements.
+            ("__rpow__", torch.float32),
+            ("log_softmax", torch.bfloat16),
+            ("log_softmax", torch.float16),
+            ("masked_log_softmax", torch.bfloat16),
+            ("masked_log_softmax", torch.float16),
+            ("nn_functional_batch_norm", torch.bfloat16),
+            ("nn_functional_batch_norm", torch.float16),
+        }
+    ),
+}
+
+# Merged once at collection time: the base set plus this accelerator's own
+# extension, if it has one.
+_FP64_ANCHORED = _FP64_ANCHORED | _FP64_ANCHORED_BY_ACCELERATOR.get(
+    known_unsupported.accelerator_key(), frozenset()
+)
+
+
+def _to_float64(sample: SampleInput) -> SampleInput:
+    return sample.transform(lambda t: t.double() if t.is_floating_point() else t)
+
+
 class TestOpInfoConformance(TestCase):
     """One test per (operator, dtype), driven entirely by OpInfo metadata."""
 
     @ops(op_db, allowed_dtypes=_DTYPES)
-    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def test_matches_cpu(self, device: str, dtype: torch.dtype, op: OpInfo):
         """Same operator, same inputs, mojo vs CPU, at OpInfo's own tolerance.
 
         Samples are built on the CPU and moved, never built on the device.
@@ -308,7 +421,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def _compare_with_cpu(self, device: str, dtype: torch.dtype, op: OpInfo):
         """One `test_matches_cpu` case: every sample, device leg vs CPU leg."""
         placements = _opinfo_placements(op, dtype)
         checked = 0
@@ -321,9 +434,22 @@ class TestOpInfoConformance(TestCase):
             moved = _to_device(sample, device, placement)
             actual = op(moved.input, *moved.args, **moved.kwargs)
             expected = op(sample.input, *sample.args, **sample.kwargs)
-            # assertEqual carries the OpInfo precisionOverride for this dtype
-            # when the operator declares one; otherwise assert_close defaults.
-            self.assertEqual(_to_cpu(actual), expected, exact_dtype=True)
+            if (
+                (op.formatted_name, dtype) in _FP64_ANCHORED
+                and isinstance(actual, torch.Tensor)
+                and isinstance(expected, torch.Tensor)
+            ):
+                exact = _to_float64(sample)
+                reference = op(exact.input, *exact.args, **exact.kwargs)
+                assert isinstance(reference, torch.Tensor)
+                cpu_actual = _to_cpu(actual)
+                assert isinstance(cpu_actual, torch.Tensor)
+                assert_close_fp64_anchored(cpu_actual, expected, reference)
+            else:
+                # assertEqual carries the OpInfo precisionOverride for this
+                # dtype when the operator declares one; otherwise assert_close
+                # defaults.
+                self.assertEqual(_to_cpu(actual), expected, exact_dtype=True)
             checked += 1
         if checked == 0:
             self.skipTest("OpInfo produced no sample inputs for this dtype")
@@ -332,7 +458,7 @@ class TestOpInfoConformance(TestCase):
         [op for op in op_db if op.error_inputs_func is not None],
         allowed_dtypes=(torch.float32,),
     )
-    def test_errors_match(self, device: str, dtype: torch.dtype, op: Any) -> None:
+    def test_errors_match(self, device: str, dtype: torch.dtype, op: OpInfo):
         """The inputs PyTorch says must raise, must raise here too.
 
         A backend that silently accepts a malformed call is a worse failure
@@ -356,7 +482,7 @@ class TestOpInfoConformance(TestCase):
         else:
             _run_declared_unsupported(reason, run)
 
-    def _check_error_inputs(self, device: str, op: Any) -> None:
+    def _check_error_inputs(self, device: str, op: OpInfo):
         """One `test_errors_match` case: every error input OpInfo declares."""
         checked = 0
         for error_input in op.error_inputs(device):

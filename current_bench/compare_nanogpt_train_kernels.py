@@ -239,7 +239,7 @@ def attribute(events: list[dict[str, object]]) -> tuple[dict[str, RangeStats], f
     return stats, total
 
 
-def scale(stats: dict[str, RangeStats], steps: int) -> None:
+def scale(stats: dict[str, RangeStats], steps: int):
     for entry in stats.values():
         entry.us /= steps
         entry.kernels = round(entry.kernels / steps)
@@ -396,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     rocm_events = load_trace(args.rocm_dir / "trace_step.json")
     mojo_events = load_trace(args.mojo_dir / "trace_step.json")

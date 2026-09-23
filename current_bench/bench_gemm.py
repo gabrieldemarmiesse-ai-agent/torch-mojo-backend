@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
+from torch_mojo_backend.native import device_module
 
 MI300X_BF16_FLOPS = 1.3e15
 MI300X_HBM_BYTES = 5.3e12
@@ -131,7 +132,7 @@ def extract_cases(rocm_dir: Path, mojo_dir: Path) -> list[GemmCase]:
     return cases
 
 
-def rocm_smi_snapshot(label: str) -> None:
+def rocm_smi_snapshot(label: str):
     result = subprocess.run(
         [
             "rocm-smi",
@@ -286,7 +287,7 @@ def run_case(case: GemmCase, mojo_synchronize, warmup: int, iterations: int) -> 
     return result
 
 
-def write_table(path: Path, results: list[dict]) -> None:
+def write_table(path: Path, results: list[dict]):
     columns = [
         "case",
         "phase",
@@ -393,10 +394,9 @@ def main():
 
     register_mojo_devices()
     max_device = list(get_accelerators())[0]
-    from torch_mojo_backend.eager_kernels import _ctx_ptr, tensor_holder
 
     def mojo_synchronize():
-        tensor_holder.synchronize(_ctx_ptr(max_device))
+        device_module.synchronize(0)
 
     cases = extract_cases(args.rocm_profile_dir, args.mojo_profile_dir)
     if args.phase != "all":

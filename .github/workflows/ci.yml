@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -13,11 +20,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
+        with:
+          prune-cache: false
       
       - name: Install dependencies
         run: |
           uvx pre-commit run --all-files
+
+      - name: Type check with ty
+        run: |
+          uv run ty check
 
   # The one part of benchmarks/ that CI can gate on: it reconciles the
   # suite's bookkeeping — every registered op benchmarked or skipped with a
@@ -42,7 +55,9 @@ jobs:
             modular-bench-bookkeeping-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
+        with:
+          prune-cache: false
 
       - name: Install dependencies
         run: |
@@ -54,15 +69,18 @@ jobs:
         run: |
           uv run pytest benchmarks/test_coverage.py -v
 
+  # One shard of the CPU tests per job. The shards are dealt pseudo-randomly from a
+  # fixed seed (see the repo-root conftest.py) so each one is a sample of the
+  # whole suite and they all take about the same time; cutting collection order
+  # into contiguous chunks instead gave shards between 41 s and 1416 s.
   test:
-    runs-on: ubuntu-latest
-    
+    runs-on: [self-hosted, cpu-only]
+
     strategy:
       fail-fast: false
       matrix:
-        test-index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-        mojo-device: ["mojo_device", "not mojo_device"]
-    
+        test-index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -74,8 +92,27 @@ jobs:
           restore-keys: |
             modular-${{ matrix.test-index }}
       
+      # The native backend compiles its shim, base library, op extensions and
+      # kernel specializations on first use; keyed by their sources, so a run
+      # that changes nothing native reuses the previous run's builds -- and by
+      # the CPU: mojo builds for the host, and the runner pool mixes CPUs
+      # (a build from an AVX-512 runner restored on one without dies with
+      # SIGILL).
+      - name: Identify the runner's CPU
+        id: cpu
+        run: echo "id=$(grep -m1 flags /proc/cpuinfo | md5sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch-mojo-backend/native
+          key: native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-${{ hashFiles('torch_mojo_backend/native/**', 'torch_mojo_backend/mojo/**/*.mojo', 'uv.lock') }}
+          restore-keys: |
+            native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
+        with:
+          prune-cache: false
       
       - name: Install dependencies
         run: |
@@ -85,4 +122,47 @@ jobs:
         env:
           MODULAR_HOME: /tmp/modular/
         run: |
-          uv run pytest -v --splits 20 --group ${{ matrix.test-index }} -k "${{ matrix.mojo-device }}"
+          uv run pytest tests/ -m "not gpu" -x -v --splits 18 --group ${{ matrix.test-index }}
+
+  # The two big GPU suites, eight shards each, dealt like the CPU shards above.
+  test-gpu:
+    name: GPU (${{ matrix.suite }} ${{ matrix.test-index }}/8)
+    runs-on: [self-hosted, L4]
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [cuda, mojo]
+        test-index: [1, 2, 3, 4, 5, 6, 7, 8]
+        include:
+          - suite: cuda
+            selection: "gpu and cuda"
+          - suite: mojo
+            selection: "gpu and not cuda and not cpu_torch"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/gpu-runner-setup
+
+      - name: Run GPU unit tests
+        run: |
+          uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -x -v -ra --splits 8 --group ${{ matrix.test-index }}
+
+  # 19 tests, and the only suite that swaps the torch wheel: not worth sharding.
+  test-gpu-cpu-torch:
+    name: GPU (cpu-torch)
+    runs-on: [self-hosted, L4]
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/gpu-runner-setup
+        with:
+          torch-wheel: cpu
+
+      - name: Run GPU unit tests
+        run: |
+          uv run --no-sync pytest tests/ -m "gpu and cpu_torch" -x -v -ra
