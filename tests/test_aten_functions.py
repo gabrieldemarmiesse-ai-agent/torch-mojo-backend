@@ -4422,6 +4422,36 @@ def test_aten_linear_backward_degenerate_features(
         torch.testing.assert_close(got.cpu(), want)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("size", "scale_factor"),
+    [
+        pytest.param(None, 2.0, id="2x"),
+        pytest.param((20, 20), None, id="8_to_20"),
+        pytest.param(None, 1.5, id="scale_1.5"),
+        pytest.param((4, 3), None, id="down"),
+    ],
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_upsample_nearest2d_compiles(
+    conf: Conf,
+    dtype: torch.dtype,
+    size: tuple[int, int] | None,
+    scale_factor: float | None,
+):
+    """torch.compile traces nearest upsampling through torch's own Python
+    decomposition (an `index` gather), which runs under compile for both
+    `upsample_nearest2d` overloads, so no graph op of that name exists to map.
+    The eager mojo op is tested in tests/native/test_nn.py."""
+
+    def fn(x):
+        return torch.nn.functional.interpolate(
+            x, size=size, scale_factor=scale_factor, mode="nearest"
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 8, 8, dtype=dtype)], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_var_no_dim(conf: Conf, dtype: torch.dtype, call_checker: CallChecker):
     """Test aten.var over all dimensions (default correction=1)"""
