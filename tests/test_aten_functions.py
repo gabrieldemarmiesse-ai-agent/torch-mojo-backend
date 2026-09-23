@@ -58,6 +58,31 @@ def test_scaled_dot_product_flash_attention_basic(
     check_outputs(fn, conf, [q, k, v], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("kv_heads", [2, 1], ids=["gqa", "mqa"])
+def test_scaled_dot_product_attention_enable_gqa(
+    conf: Conf, call_checker: CallChecker, kv_heads: int, is_causal: bool
+):
+    """enable_gqa=True under torch.compile: K/V carry fewer heads than Q.
+
+    On CPU float32 AOT decomposes SDPA (GQA or not) into the math graph --
+    unsqueeze/expand/clone for the head repeat, then bmm + softmax + bmm --
+    so the graph ops are what reaches the backend.
+    """
+    call_checker.register(aten_functions.aten_bmm, aten_functions.aten__softmax)
+
+    def fn(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, enable_gqa=True
+        )
+
+    q = torch.randn(2, 8, 9, 16)
+    k = torch.randn(2, kv_heads, 9, 16)
+    v = torch.randn(2, kv_heads, 9, 16)
+    check_outputs(fn, conf, [q, k, v], atol=1e-4, rtol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_scaled_dot_product_flash_attention_with_causal(conf: Conf, dtype: torch.dtype):
     """Test _scaled_dot_product_flash_attention with causal masking"""

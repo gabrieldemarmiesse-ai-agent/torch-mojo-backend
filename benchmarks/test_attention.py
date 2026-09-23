@@ -7,10 +7,9 @@ additionally measures whatever backend selection stock PyTorch performs.
 Shapes are (batch, heads, seq, head_dim): a GPT-2-like block and a long
 single-sequence decode-prefill regime.  All cases are causal.
 
-GQA_SHAPES cover the enable_gqa=True regime (see fix/gqa-sdpa-enable-gqa):
-Q and K/V carry different head counts, so they get their own shape dict
-keyed as B{batch}H{q_heads}KV{kv_heads}S{seq}D{head_dim} — the KV token
-in the shape id is what lets a baseline diff show the ratio at a glance.
+GQA_SHAPES cover the enable_gqa=True regime: Q and K/V carry different
+head counts, so they get their own shape dict keyed as
+B{batch}H{q_heads}KV{kv_heads}S{seq}D{head_dim}.
 """
 
 from __future__ import annotations
@@ -114,7 +113,7 @@ def _qkv_gqa(
 @pytest.mark.bench_op("scaled_dot_product_attention")
 def test_sdpa_gqa(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     """enable_gqa=True: K/V carry fewer heads than Q (see GQA_SHAPES)."""
     refs, ours, flops = _qkv_gqa(shape_id, dtype_id, hw, mojo_device)
     bench.run(
