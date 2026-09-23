@@ -1652,23 +1652,35 @@ def _conv_forward(
         return None
     if input.device != weight.device:
         return None
-    if input.rank != 4 or weight.rank != 4:
+    # Rank 3 (conv1d) is the 2-D path with a unit H axis: a contiguous
+    # (N, C, L) input / (K, C, S) weight already has the memory layout of
+    # (N, C, 1, L) / (K, C, 1, S), so it runs with in_h = kh = 1 and the one
+    # stride/padding/dilation on W, then returns (N, K, out_w).
+    var conv1d = input.rank == 3
+    if input.rank != weight.rank or (input.rank != 4 and not conv1d):
         return None
     var strides = _pair(stride)
     var pads = _pair(padding)
     var dils = _pair(dilation)
+    if conv1d:
+        if len(stride) != 1 or len(padding) != 1 or len(dilation) != 1:
+            return None
+        # H is the unit axis: kernel 1, stride 1, no padding, no dilation.
+        strides[0] = 1
+        pads[0] = 0
+        dils[0] = 1
     if len(strides) != 2 or len(pads) != 2 or len(dils) != 2:
         return None
     var n = input.dim(0)
     var c = input.dim(1)
-    var in_h = input.dim(2)
-    var in_w = input.dim(3)
+    var in_h = 1 if conv1d else input.dim(2)
+    var in_w = input.dim(input.rank - 1)
     if n == 0 or c == 0 or in_h == 0 or in_w == 0:
         return None
     var out_c = weight.dim(0)
     var c_per_group = weight.dim(1)
-    var kh = weight.dim(2)
-    var kw = weight.dim(3)
+    var kh = 1 if conv1d else weight.dim(2)
+    var kw = weight.dim(weight.rank - 1)
     var sh = strides[0]
     var sw = strides[1]
     var ph = pads[0]
@@ -1728,7 +1740,13 @@ def _conv_forward(
         im.run()
         col_ptr = col.t.ptr
 
-    var out = own(_new([n, out_c, out_h, out_w], input.stype, device))
+    var out_shape = List[Int]()
+    out_shape.append(n)
+    out_shape.append(out_c)
+    if not conv1d:
+        out_shape.append(out_h)
+    out_shape.append(out_w)
+    var out = own(_new(out_shape, input.stype, device))
     if groups == 1:
         var mm = KernelCall("matmul", "Bmm")
         mm.arg_dtype(0, weight.dtype)

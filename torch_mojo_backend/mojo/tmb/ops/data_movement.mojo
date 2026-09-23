@@ -1,13 +1,16 @@
 """ATen ops: data_movement group (see docs/native_backend.md).
 
-clone / _to_copy / cat / stack / repeat / tril / triu / select_scatter /
-scatter.src / scatter.value / index.Tensor / nonzero / set_.source_Tensor /
+clone / _to_copy / cat / stack / repeat / tril / triu / reflection_pad2d /
+replication_pad2d / select_scatter / scatter.src / scatter.value /
+scatter_add / gather / index_select / index_add / index.Tensor /
+_index_put_impl_ / nonzero / set_.source_Tensor /
 empty_permuted -- ported from eager_kernels/aten_fast.py's
 fast_aten_cat/stack/repeat/tril/triu/select_scatter/scatter_src/
 scatter_value/index/nonzero/clone, mojo_device/aten_ops/inplace.py's
 set_.source_Tensor, factories.py's empty_permuted and transfer.py's
 _to_copy. Kernel families: data_movement (CatN, NarrowCopyDst, TileCopy,
-RepeatTiled, TriangularCopy, GatherRows, ScatterDim, PermuteCopy, CastSpec).
+RepeatTiled, TriangularCopy, Pad2D, GatherRows, GatherDim, ScatterDim,
+ScatterAddDim, IndexPutRows, PermuteCopy, CastSpec).
 
 `nonzero` and the boolean-mask branch of `index.Tensor` are data-dependent
 (the output shape depends on tensor CONTENTS, not just metadata) and have no
@@ -27,6 +30,8 @@ from tmb.backend.abi import (
     TAG_NONE,
     TAG_INT_LIST,
     TAG_BOOL,
+    TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     IntList,
     Owned,
     dtype_name,
@@ -41,6 +46,7 @@ from tmb.backend.abi import (
     dense_strides_like,
     dtype_code,
     dtype_itemsize,
+    f64_bits,
     is_dense,
     max_dtype,
     new_like,
@@ -78,6 +84,7 @@ from tmb.backend.device import (
     ctx_for,
     ctx_ptr,
     current_device,
+    dev,
     wait_for_host_read,
 )
 from tmb.backend.kernel_call import KernelCall
@@ -99,8 +106,13 @@ from tmb.ops.core import (
     copy_between_devices,
     record_tensor_stream,
 )
-from tmb.ops.foreach import _overlaps, _self_overlaps
-from tmb.ops.matmul import _sm90_cuda
+from tmb.ops.foreach import (
+    _batch_copy_dtype,
+    _batched_copy_device,
+    _overlaps,
+    _bits_dtype,
+    _self_overlaps,
+)
 
 # ---------------------------------------------------------------------------
 # Small shared helpers
@@ -164,6 +176,19 @@ def _is_scatter_dtype(dt: DType) -> Bool:
         or dt == DType.int32
         or dt == DType.int64
         or dt == DType.uint8
+        or dt == DType.bool
+    )
+
+
+def _is_scatter_add_dtype(dt: DType) -> Bool:
+    """ScatterAddDim's dtypes (`_atomic_add_ok` in the kernel family)."""
+    return (
+        dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.float64
+        or dt == DType.int32
+        or dt == DType.int64
         or dt == DType.bool
     )
 
@@ -834,26 +859,55 @@ def _cat_impl(ins: List[T], dim: Int) raises -> Owned:
     return out^
 
 
+def _batched_copy_run(
+    device: Int,
+    src_dtype: DType,
+    dst_dtype: DType,
+    itemsize: Int,
+    srcs: List[Int],
+    dsts: List[Int],
+    rows: Int,
+    cols: List[Int],
+    src_pitch: Int,
+    dst_pitch: Int,
+) raises:
+    """One CopyBatched call over rectangles sharing `rows` and the pitches;
+    a pitch of -1 means each rectangle's own `cols` (a contiguous side)."""
+    var src_dt = src_dtype
+    var dst_dt = dst_dtype
+    if src_dt == dst_dt:
+        # A same-dtype copy only moves bits: one build per element width.
+        src_dt = _bits_dtype(itemsize)
+        dst_dt = src_dt
+    var metadata = List[Int](capacity=6 * len(cols))
+    for i in range(len(cols)):
+        metadata.append(srcs[i])
+        metadata.append(dsts[i])
+        metadata.append(rows)
+        metadata.append(cols[i])
+        metadata.append(cols[i] if src_pitch < 0 else src_pitch)
+        metadata.append(cols[i] if dst_pitch < 0 else dst_pitch)
+    var ctx = ctx_for(device)
+    var call = KernelCall("data_movement", "CopyBatched")
+    call.arg_dtype(0, src_dt)
+    call.out_dtype(dst_dt)
+    call.tuple(metadata)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
 def _split_rows_qualifies(
     src: T, outs: List[T], sizes: IntList, dim: Int
 ) raises -> Bool:
     # A singleton contiguous span already uses a faster device memcpy.
-    # The kernel moves bits through uint16 and never does arithmetic, so every
-    # 2-byte dtype is the same work and the same compiled variant.
-    # TODO: parametrize the kernel on the element width so 4- and 8-byte dtypes
-    # can use it too. That needs a DTYPE_ARG_0 define to select the
-    # specialization (`KernelCall.arg_dtype`), a vector width of
-    # `16 // size_of[dtype]()` in place of the hard-coded 8, and a re-measure:
-    # COPY_ROWS_TILE and COPY_SMALL_ROWS count elements, not bytes, and were
-    # fitted to bf16 on an H100.
     if (
         len(outs) <= 1
         or not src.on_mojo()
         or not src.contig
-        or src.itemsize != 2
+        or not _batch_copy_dtype(src.dtype)
+        or not _batched_copy_device(src.device)
     ):
-        return False
-    if not _sm90_cuda(src.device):
         return False
     for i in range(len(outs)):
         var out = outs[i].copy()
@@ -870,6 +924,12 @@ def _split_rows_qualifies(
                 return False
         if _overlaps(out, src):
             return False
+    # The descriptors hold row pitches in 32 bits.
+    var inner = 1
+    for d in range(dim + 1, src.rank):
+        inner *= src.dim(d)
+    if src.dim(dim) * inner >= 1 << 31:
+        return False
     return not _self_overlaps(outs)
 
 
@@ -882,23 +942,28 @@ def _split_rows_launch(src: T, outs: List[T], sizes: IntList, dim: Int) raises:
         inner *= src.dim(d)
     var pitch = src.dim(dim) * inner
     var offset = 0
-    var metadata = List[Int]()
+    var srcs = List[Int](capacity=len(outs))
+    var dsts = List[Int](capacity=len(outs))
+    var cols = List[Int](capacity=len(outs))
     for i in range(len(outs)):
-        var cols = sizes[i] * inner
-        metadata.append(src.ptr + offset * src.itemsize)
-        metadata.append(outs[i].ptr)
-        metadata.append(rows)
-        metadata.append(cols)
-        metadata.append(pitch)
-        offset += cols
-    var ctx = ctx_for(src.device)
-    var call = KernelCall("data_movement", "CopyBatchedRows")
-    call.tuple(metadata)
-    call.int(ctx_ptr(ctx))
-    call.run()
+        srcs.append(src.ptr + offset * src.itemsize)
+        dsts.append(outs[i].ptr)
+        cols.append(sizes[i] * inner)
+        offset += sizes[i] * inner
+    _batched_copy_run(
+        src.device,
+        src.dtype,
+        src.dtype,
+        src.itemsize,
+        srcs,
+        dsts,
+        rows,
+        cols,
+        pitch,
+        -1,
+    )
     for dest in outs:
         dest.bump_version()
-    _ = ctx
 
 
 def _split_resize_out(mut out: T, src: T) raises:
@@ -1043,6 +1108,114 @@ def op_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _can_cast(src: DType, dst: DType) -> Bool:
+    """c10::canCast for the real dtypes: no float to integer, nothing but bool
+    to bool."""
+    if src.is_floating_point() and not dst.is_floating_point():
+        return False
+    return src == DType.bool or dst != DType.bool
+
+
+def _scalar_type_name(dt: DType) -> String:
+    """How torch names a ScalarType in an error message."""
+    if dt == DType.float64:
+        return "Double"
+    if dt == DType.float32:
+        return "Float"
+    if dt == DType.float16:
+        return "Half"
+    if dt == DType.bfloat16:
+        return "BFloat16"
+    if dt == DType.int64:
+        return "Long"
+    if dt == DType.int32:
+        return "Int"
+    if dt == DType.int16:
+        return "Short"
+    if dt == DType.int8:
+        return "Char"
+    if dt == DType.uint8:
+        return "Byte"
+    if dt == DType.bool:
+        return "Bool"
+    return String(dt)
+
+
+def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
+    """Write the concatenation straight into an existing contiguous `out` of
+    the result shape with one batched rectangle copy (converting when the
+    dtypes differ): input i's rows land at column offset sum(len[:i])."""
+    var first = ins[0].copy()
+    var rank = first.rank
+    if (
+        not first.on_mojo()
+        or not _batch_copy_dtype(first.dtype)
+        or not _batch_copy_dtype(out_t.dtype)
+        or not _can_cast(first.dtype, out_t.dtype)
+        or rank == 0
+        or dim < 0
+        or dim >= rank
+        or out_t.rank != rank
+        or not out_t.on_mojo()
+        or out_t.device != first.device
+        or not out_t.contig
+    ):
+        return False
+    var cat_size = 0
+    for x in ins:
+        if (
+            not x.on_mojo()
+            or x.dtype != first.dtype
+            or x.device != first.device
+            or x.rank != rank
+            or not x.contig
+        ):
+            return False
+        for d in range(rank):
+            if d != dim and x.dim(d) != first.dim(d):
+                return False
+        if _overlaps(out_t, x):
+            return False
+        cat_size += x.dim(dim)
+    for d in range(rank):
+        if out_t.dim(d) != (cat_size if d == dim else first.dim(d)):
+            # Preserve the existing resize and error ordering in the fallback.
+            return False
+    if not _batched_copy_device(first.device):
+        return False
+    var outer = 1
+    var inner = 1
+    for d in range(dim):
+        outer *= first.dim(d)
+    for d in range(dim + 1, rank):
+        inner *= first.dim(d)
+    if outer > 1 and cat_size * inner >= 1 << 31:
+        return False  # the descriptors hold row pitches in 32 bits
+    var srcs = List[Int](capacity=len(ins))
+    var dsts = List[Int](capacity=len(ins))
+    var cols = List[Int](capacity=len(ins))
+    var offset = 0
+    for x in ins:
+        srcs.append(x.ptr)
+        dsts.append(out_t.ptr + offset * out_t.itemsize)
+        cols.append(x.dim(dim) * inner)
+        offset += x.dim(dim) * inner
+    if out_t.numel > 0:
+        _batched_copy_run(
+            first.device,
+            first.dtype,
+            out_t.dtype,
+            first.itemsize,
+            srcs,
+            dsts,
+            outer,
+            cols,
+            -1,
+            cat_size * inner,
+        )
+    return True
+
+
 # aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
 def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """DDP bucket flattening and FSDP2 gradient packing (including fp32 out)."""
@@ -1057,13 +1230,14 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    if _cat_out_batched(real, dim, out):
+        ret_ref(rets, 0, out)
+        return
     var result = _cat_impl(real, dim)
-    if result.t.dtype != out.dtype and not (
-        result.t.dtype.is_floating_point() and out.dtype.is_floating_point()
-    ):
+    if not _can_cast(result.t.dtype, out.dtype):
         raise Error(
-            "cat.out: out dtype must match the inputs or both must be floating"
-            " point"
+            "torch.cat(): input types can't be cast to the desired output type "
+            + _scalar_type_name(out.dtype)
         )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
@@ -1280,6 +1454,96 @@ def op_triu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# reflection_pad2d / replication_pad2d
+# ---------------------------------------------------------------------------
+
+
+def _pad2d(t: T, padding: IntList, reflect: Int) raises -> Owned:
+    """Pad the last two dims of a 3D (C, H, W) or 4D (N, C, H, W) input by
+    (left, right, top, bottom), mirroring (`reflect` != 0, the edge element
+    not repeated) or clamping to the nearest edge. Everything before the last
+    two dims is one flattened batch for the Pad2D kernel."""
+    var name = "reflection_pad2d" if reflect != 0 else "replication_pad2d"
+    if t.rank != 3 and t.rank != 4:
+        unsupported(String("aten::", name, " on a ", t.rank, "D input"))
+    if len(padding) != 4:
+        raise Error(name, ": padding size is expected to be 4")
+    var pad_l = padding[0]
+    var pad_r = padding[1]
+    var pad_t = padding[2]
+    var pad_b = padding[3]
+    if pad_l < 0 or pad_r < 0 or pad_t < 0 or pad_b < 0:
+        unsupported(String("aten::", name, " with negative padding (cropping)"))
+    var in_h = t.dim(-2)
+    var in_w = t.dim(-1)
+    if reflect != 0 and (
+        pad_l >= in_w or pad_r >= in_w or pad_t >= in_h or pad_b >= in_h
+    ):
+        raise Error(
+            (
+                "Padding size should be less than the corresponding input"
+                " dimension, but got: padding ("
+            ),
+            pad_l,
+            ", ",
+            pad_r,
+            ", ",
+            pad_t,
+            ", ",
+            pad_b,
+            ") at dimension 3 of input ",
+            t.rank,
+        )
+    var out_h = in_h + pad_t + pad_b
+    var out_w = in_w + pad_l + pad_r
+    var shape = t.shape
+    shape[MAX_RANK - 2] = out_h
+    shape[MAX_RANK - 1] = out_w
+    var out = own(new_tensor(shape, t.rank, t.stype, t.device))
+    if out.t.numel > 0 and t.numel > 0:
+        var src = contiguous(t)
+        var ctx = ctx_for(t.device)
+        var cp = ctx_ptr(ctx)
+        var call = KernelCall("data_movement", "Pad2D")
+        call.arg_dtype(0, t.dtype)
+        call.out_dtype(t.dtype)
+        call.int(out.t.ptr)
+        call.int(src.ptr)
+        call.int(t.numel // (in_h * in_w))
+        call.int(in_h)
+        call.int(in_w)
+        call.int(pad_l)
+        call.int(pad_r)
+        call.int(pad_t)
+        call.int(pad_b)
+        call.int(reflect)
+        call.int(t.itemsize)
+        call.int(cp)
+        call.run()
+        _ = ctx
+        release_if_new(src, t)
+    return out^
+
+
+# aten::reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+def op_reflection_pad2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = _pad2d(t, IntList(args[unsafe_offset=1]), 1)
+    ret_owned(rets, 0, out)
+
+
+# aten::replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+def op_replication_pad2d(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = _pad2d(t, IntList(args[unsafe_offset=1]), 0)
+    ret_owned(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
 # select_scatter
 # ---------------------------------------------------------------------------
 
@@ -1358,6 +1622,223 @@ def op_select_scatter(
 # ---------------------------------------------------------------------------
 
 
+def _pad4(values: List[Int], fill: Int) -> List[Int]:
+    """`values` (rank <= 4) left-padded to the rank-4 index space the
+    Gather/ScatterDim kernels walk."""
+    var out = List[Int](capacity=4)
+    for _ in range(4 - len(values)):
+        out.append(fill)
+    for v in values:
+        out.append(v)
+    return out^
+
+
+def _strides_of(t: T) -> List[Int]:
+    """Element strides as kernel geometry (a 0-d tensor as shape (1,))."""
+    var out = List[Int](capacity=max(t.rank, 1))
+    for d in range(t.rank):
+        out.append(t.stride(d))
+    if t.rank == 0:
+        out.append(0)
+    return out^
+
+
+def _dims_of(t: T) -> List[Int]:
+    """Extents as kernel geometry (a 0-d tensor as shape (1,))."""
+    var out = List[Int](capacity=max(t.rank, 1))
+    for d in range(t.rank):
+        out.append(t.dim(d))
+    if t.rank == 0:
+        out.append(1)
+    return out^
+
+
+def _scatter_launch(
+    dest: T,
+    dest_strides: List[Int],
+    index: T,
+    idx_strides: List[Int],
+    src_ptr: Int,
+    src_dtype: DType,
+    src_strides: List[Int],
+    dims: List[Int],
+    dim: Int,
+    dim_size: Int,
+    is_value: Bool,
+    value: Float64,
+    accumulate: Bool,
+    what: String,
+) raises:
+    """One ScatterDim / ScatterAddDim launch over the rank-<=4 index space
+    `dims` (every stride list has its length), then the bad-index report.
+
+    The kernel skips a write whose index falls outside [0, dim_size) and
+    raises an int32 flag; the read back is one 4-byte D2H, after which a bad
+    index raises like CPU torch does (the in-range writes have landed).
+    """
+    var numel = 1
+    for d in dims:
+        numel *= d
+    if numel == 0:
+        return
+    var pad = 4 - len(dims)
+    var params = _pad4(dims, 1)
+    params += _pad4(dest_strides, 0)
+    params += _pad4(src_strides, 0)
+    params += _pad4(idx_strides, 0)
+    params.append(dim + pad)
+    params.append(dim_size)
+    var ctx = ctx_for(dest.device)
+    var flag = own(new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, dest.device))
+    fill_value(flag.t, 0.0)
+    var call = KernelCall(
+        "data_movement", "ScatterAddDim" if accumulate else "ScatterDim"
+    )
+    call.arg_dtype(0, dest.dtype)
+    call.arg_dtype(1, index.dtype)
+    call.arg_dtype(2, src_dtype)
+    call.out_dtype(dest.dtype)
+    call.int(dest.ptr)
+    call.int(index.ptr)
+    call.int(src_ptr)
+    call.tuple(params)
+    call.int(flag.t.ptr)
+    call.int(1 if is_value else 0)
+    call.f64(value)
+    call.int(dtype_code(dest.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
+    var bad_index = (
+        Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host_flag.t.ptr
+        )[]
+        != 0
+    )
+    _ = host_flag^
+    _ = flag^
+    _ = ctx
+    if bad_index:
+        raise Error(
+            "index out of range in aten::",
+            what,
+            (
+                ": every index must be in [0, self.size(dim)) with"
+                " self.size(dim) = "
+            ),
+            dim_size,
+        )
+
+
+def _dim_or1(t: T, d: Int) -> Int:
+    """`t.size(d)`, with a 0-d tensor read as shape (1,) (ATen's
+    `ensure_nonempty_size`)."""
+    return 1 if t.rank == 0 else t.dim(d)
+
+
+def _scatter_validate(
+    a: T, dim_in: Int, index: T, src: Optional[T], accumulate: Bool
+) raises -> Int:
+    """The checks shared by scatter.src / scatter.value / scatter_add
+    (ATen's scatter_gather_dtype_check + scatter_shape_check, which skip an
+    empty index); returns the normalized dim. A 0-d operand counts as 1-d."""
+    var what = String("scatter_add") if accumulate else String("scatter")
+    var rank = max(a.rank, 1)
+    if a.rank > 4:
+        unsupported("aten::" + what + " with rank greater than 4")
+    var dim = dim_in + rank if dim_in < 0 else dim_in
+    if dim < 0 or dim >= rank:
+        raise Error(what, ": dim out of range")
+    if src and src.value().dtype != a.dtype:
+        raise Error(what, "(): Expected self.dtype to be equal to src.dtype")
+    if not _is_scatter_dtype(a.dtype):
+        unsupported("aten::" + what + " of dtype " + String(a.dtype))
+    if accumulate and not _is_scatter_add_dtype(a.dtype):
+        unsupported(
+            "aten::scatter_add of dtype "
+            + String(a.dtype)
+            + " (no atomic add for it on the device)"
+        )
+    if index.numel == 0:
+        return dim
+    if index.dtype != DType.int64:
+        raise Error(what, "(): Expected dtype int64 for index")
+    if index.device != a.device or (src and src.value().device != a.device):
+        unsupported("aten::" + what + " with operands on different devices")
+    if max(index.rank, 1) != rank:
+        raise Error(
+            "Index tensor must have the same number of dimensions as self"
+            " tensor"
+        )
+    if src and max(src.value().rank, 1) != rank:
+        raise Error(
+            "Index tensor must have the same number of dimensions as src tensor"
+        )
+    # The index space must fit inside self on every non-scattered axis, and
+    # inside src on every axis -- restated before any pointer is read.
+    for d in range(rank):
+        if d != dim and _dim_or1(index, d) > _dim_or1(a, d):
+            raise Error(
+                "Expected index to be smaller than self apart from dimension ",
+                dim,
+            )
+        if src and _dim_or1(index, d) > _dim_or1(src.value(), d):
+            raise Error(
+                "Expected index to be smaller than src on dimension ", d
+            )
+    var ctx = ctx_for(a.device)
+    var metal = ctx.api() == "metal"
+    _ = ctx
+    if metal and (a.dtype == DType.float64 or (accumulate and a.itemsize == 2)):
+        unsupported(
+            "aten::" + what + " of " + String(a.dtype) + " on Apple GPU"
+        )
+    return dim
+
+
+def _scatter_into(
+    target: T,
+    dim: Int,
+    dim_size: Int,
+    index: T,
+    src: Optional[T],
+    value: Float64,
+    is_value: Bool,
+    accumulate: Bool,
+) raises:
+    """Scatter into `target` (shaped like self, any strides), which already
+    holds self's values."""
+    var idx_c = own_if_new(contiguous(index), index)
+    var src_ptr = target.ptr
+    var src_dtype = target.dtype
+    var src_strides = List[Int]()
+    for _ in range(max(target.rank, 1)):
+        src_strides.append(0)
+    if src:
+        # Read through its own strides: the kernel indexes src by stride.
+        src_ptr = src.value().ptr
+        src_dtype = src.value().dtype
+        src_strides = _strides_of(src.value())
+    _scatter_launch(
+        target,
+        _strides_of(target),
+        idx_c.t,
+        _strides_of(idx_c.t),
+        src_ptr,
+        src_dtype,
+        src_strides,
+        _dims_of(idx_c.t),
+        dim,
+        dim_size,
+        is_value,
+        value,
+        accumulate,
+        String("scatter_add") if accumulate else String("scatter"),
+    )
+    _ = idx_c^
+
+
 def _scatter_common(
     a: T,
     dim_in: Int,
@@ -1366,125 +1847,11 @@ def _scatter_common(
     value: Float64,
     is_value: Bool,
 ) raises -> Owned:
-    var rank = a.rank
-    if rank == 0 or rank > 4:
-        unsupported("aten::scatter with rank 0 or greater than 4")
-    var dim = dim_in + rank if dim_in < 0 else dim_in
-    if dim < 0 or dim >= rank:
-        raise Error("scatter: dim out of range")
-    if not _is_scatter_dtype(a.dtype):
-        unsupported("aten::scatter of dtype " + String(a.dtype))
-    if (
-        index.dtype != DType.int64
-        or index.device != a.device
-        or index.rank != rank
-    ):
-        unsupported("aten::scatter with an unsupported index tensor")
-    if src and (
-        src.value().dtype != a.dtype
-        or src.value().device != a.device
-        or src.value().rank != rank
-    ):
-        unsupported("aten::scatter with an unsupported src tensor")
-    # ATen's `scatter_shape_check`, restated before any pointer is read: the
-    # index space must fit inside self on every non-scattered axis, and
-    # inside src on every axis.
-    if index.numel > 0:
-        for d in range(rank):
-            if d != dim and index.dim(d) > a.dim(d):
-                raise Error(
-                    (
-                        "Expected index to be smaller than self apart from"
-                        " dimension "
-                    ),
-                    dim,
-                )
-            if src and index.dim(d) > src.value().dim(d):
-                raise Error(
-                    "Expected index to be smaller than src on dimension ", d
-                )
-
-    var ctx = ctx_for(a.device)
-    if a.dtype == DType.float64 and ctx.api() == "metal":
-        unsupported("aten::scatter of float64 on Apple GPU")
-
+    var dim = _scatter_validate(a, dim_in, index, src, False)
     var out = own(_materialize_contiguous(a))
-    var idx_c = contiguous(index)
-
-    var src_c: Optional[T] = None
-    var src_ptr = out.t.ptr
-    var src_dtype = a.dtype
-    if src:
-        var sc = contiguous(src.value())
-        src_ptr = sc.ptr
-        src_dtype = sc.dtype
-        src_c = sc^
-
-    var pad4 = 4 - rank
-    var params = List[Int](capacity=17)
-    for i in range(4):  # dims4 (index's own extents)
-        params.append(1 if i < pad4 else idx_c.dim(i - pad4))
-    for i in range(4):  # out_strides4
-        params.append(0 if i < pad4 else out.t.stride(i - pad4))
-    for i in range(4):  # src_strides4
-        if i < pad4:
-            params.append(0)
-        elif src_c:
-            params.append(src_c.value().stride(i - pad4))
-        else:
-            params.append(0)
-    for i in range(4):  # idx_strides4
-        params.append(0 if i < pad4 else idx_c.stride(i - pad4))
-    params.append(dim + pad4)
-    params.append(a.dim(dim))
-
-    var bad_index = False
-    if idx_c.numel > 0:
-        # The kernel skips a write whose index falls outside [0, self.size(dim))
-        # and raises this flag; the read back below is one 4-byte D2H, and
-        # scatter has already cloned the whole of `self` above.
-        var flag = own(
-            new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, a.device)
-        )
-        fill_value(flag.t, 0.0)
-        var cp = ctx_ptr(ctx)
-        var call = KernelCall("data_movement", "ScatterDim")
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, idx_c.dtype)
-        call.arg_dtype(2, src_dtype)
-        call.out_dtype(out.t.dtype)
-        call.int(out.t.ptr)
-        call.int(idx_c.ptr)
-        call.int(src_ptr)
-        call.tuple(params)
-        call.int(flag.t.ptr)
-        call.int(1 if is_value else 0)
-        call.f64(value)
-        call.int(dtype_code(a.dtype))
-        call.int(cp)
-        call.run()
-        var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
-        copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
-        bad_index = (
-            Pointer[Int32, MutUntrackedOrigin](
-                unsafe_from_address=host_flag.t.ptr
-            )[]
-            != 0
-        )
-        _ = host_flag
-        _ = flag
-    _ = ctx
-    if src_c:
-        release_if_new(src_c.value(), src.value())
-    release_if_new(idx_c, index)
-    if bad_index:
-        raise Error(
-            (
-                "index out of range in aten::scatter: every index must be in"
-                " [0, self.size(dim)) with self.size(dim) = "
-            ),
-            a.dim(dim),
-        )
+    _scatter_into(
+        out.t, dim, _dim_or1(a, dim), index, src, value, is_value, False
+    )
     return out^
 
 
@@ -1510,6 +1877,479 @@ def op_scatter_value(
         value = 1.0 if value != 0.0 else 0.0
     var out = _scatter_common(a, dim, index, None, value, True)
     ret_owned(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
+# gather / index_select (GatherDim, GatherRows) and scatter_add / index_add
+# (ScatterAddDim). The functional, in-place and out= overloads of each are
+# registered side by side: the kernels write through the destination's own
+# strides, so an out= tensor of the right shape is written where it lives
+# and an in-place call scatters straight into self.
+#
+# Bounds: the gathers CLAMP an out-of-range index (no report, like
+# GatherRows / embedding: a report costs a device sync per call); the
+# scatters skip it and raise afterwards, like scatter.src.
+# ---------------------------------------------------------------------------
+
+
+def _norm_dim(dim_in: Int, rank: Int, what: String) raises -> Int:
+    var r = max(rank, 1)
+    var dim = dim_in + r if dim_in < 0 else dim_in
+    if dim < 0 or dim >= r:
+        raise Error(
+            what,
+            ": Dimension out of range (expected to be in range of [",
+            -r,
+            ", ",
+            r - 1,
+            "], but got ",
+            dim_in,
+            ")",
+        )
+    return dim
+
+
+def _out_target(
+    mut out: T, shape: IndexList[MAX_RANK], rank: Int, like: T, what: String
+) raises:
+    """Validate a caller's `out=` against the result and resize it when its
+    shape differs (a matching one keeps its strides and offset)."""
+    if out.dtype != like.dtype:
+        raise Error(
+            what,
+            ": Expected out tensor to have dtype ",
+            _scalar_type_name(like.dtype),
+            ", but got ",
+            _scalar_type_name(out.dtype),
+            " instead",
+        )
+    if not out.on_mojo() or out.device != like.device:
+        unsupported(what + ": out must be on the inputs' mojo device")
+    var same = out.rank == rank
+    if same:
+        for d in range(rank):
+            if out.dim(d) != shape[MAX_RANK - rank + d]:
+                same = False
+    if not same:
+        resize_out(out, shape, rank)
+
+
+def _gather_dim_launch(
+    dst: T,
+    src: T,
+    index: T,
+    dims: List[Int],
+    out_strides: List[Int],
+    src_strides: List[Int],
+    idx_strides: List[Int],
+    dim: Int,
+    dim_size: Int,
+) raises:
+    """One GatherDim launch over the rank-<=4 index space `dims`."""
+    var params = _pad4(dims, 1)
+    params += _pad4(out_strides, 0)
+    params += _pad4(src_strides, 0)
+    params += _pad4(idx_strides, 0)
+    params.append(dim + 4 - len(dims))
+    params.append(dim_size)
+    var ctx = ctx_for(src.device)
+    var call = KernelCall("data_movement", "GatherDim")
+    call.arg_dtype(0, src.dtype)
+    call.arg_dtype(1, index.dtype)
+    call.out_dtype(dst.dtype)
+    call.int(dst.ptr)
+    call.int(src.ptr)
+    call.int(index.ptr)
+    call.tuple(params)
+    call.int(src.itemsize)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
+def _check_index(index: T, like: T, what: String) raises:
+    if index.dtype != DType.int64 and index.dtype != DType.int32:
+        raise Error(what, "(): Expected dtype int32/int64 for index")
+    if index.device != like.device:
+        unsupported(what + " with the index on a different device")
+
+
+def _gather_into(dst: T, a: T, dim_in: Int, index: T, what: String) raises:
+    var dim = _norm_dim(dim_in, a.rank, what)
+    if dst.numel == 0:
+        return
+    if _dim_or1(a, dim) == 0:
+        raise Error(what, ": index out of range for an empty dimension")
+    _gather_dim_launch(
+        dst,
+        a,
+        index,
+        _dims_of(index),
+        _strides_of(dst),
+        _strides_of(a),
+        _strides_of(index),
+        dim,
+        _dim_or1(a, dim),
+    )
+
+
+def _gather_check(a: T, dim_in: Int, index: T) raises -> IndexList[MAX_RANK]:
+    """ATen's gather_shape_check (skipped for an empty index, like the dtype
+    check); a 0-d operand counts as 1-d."""
+    if a.rank > 4:
+        unsupported("aten::gather of rank greater than 4")
+    var dim = _norm_dim(dim_in, a.rank, "gather")
+    if index.numel == 0:
+        return index.shape
+    _check_index(index, a, "gather")
+    var rank = max(a.rank, 1)
+    if max(index.rank, 1) != rank:
+        raise Error(
+            "Index tensor must have the same number of dimensions as input"
+            " tensor"
+        )
+    for d in range(rank):
+        if d != dim and _dim_or1(index, d) > _dim_or1(a, d):
+            raise Error(
+                "Size does not match at dimension ",
+                d,
+                (
+                    " expected index to be no larger than self apart from"
+                    " dimension "
+                ),
+                dim,
+            )
+    return index.shape
+
+
+# aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False)
+#   -> Tensor
+def op_gather(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int(args[unsafe_offset=1])
+    var index = v_tensor(args[unsafe_offset=2])
+    var shape = _gather_check(a, dim, index)
+    var out = own(new_tensor(shape, index.rank, a.stype, a.device))
+    _gather_into(out.t, a, dim, index, "gather")
+    ret_owned(rets, 0, out)
+
+
+# aten::gather.out(Tensor self, int dim, Tensor index, *,
+#   bool sparse_grad=False, Tensor(a!) out) -> Tensor(a!)
+def op_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int(args[unsafe_offset=1])
+    var index = v_tensor(args[unsafe_offset=2])
+    var out = v_tensor(args[unsafe_offset=4])
+    var shape = _gather_check(a, dim, index)
+    _out_target(out, shape, index.rank, a, "gather")
+    _gather_into(out, a, dim, index, "gather")
+    ret_ref(rets, 0, out)
+
+
+def _index_select_shape(
+    a: T, dim_in: Int, index: T
+) raises -> IndexList[MAX_RANK]:
+    _check_index(index, a, "index_select")
+    if index.rank > 1:
+        raise Error("index_select(): Index is supposed to be a vector")
+    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    var shape = a.shape
+    if a.rank == 0:
+        if index.numel != 1:
+            raise Error(
+                "index_select(): Index to scalar can have only 1 value, got ",
+                index.numel,
+                " value(s)",
+            )
+        return shape
+    shape[MAX_RANK - a.rank + dim] = index.numel
+    return shape
+
+
+def _index_select_into(dst: T, a: T, dim_in: Int, index: T) raises:
+    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    if dst.numel == 0:
+        return
+    if _dim_or1(a, dim) == 0:
+        raise Error("index_select(): index out of range in self")
+    var n = index.numel
+    var idx_stride = index.stride(0) if index.rank == 1 else 0
+    var outer = 1
+    for d in range(dim):
+        outer *= a.dim(d)
+    var inner = 1
+    for d in range(dim + 1, a.rank):
+        inner *= a.dim(d)
+    if a.contig and dst.contig:
+        if outer == 1 and (idx_stride == 1 or n == 1):
+            # Whole rows of the contiguous (dim, inner) view: GatherRows.
+            var ctx = ctx_for(a.device)
+            var call = KernelCall("data_movement", "GatherRows")
+            call.arg_dtype(0, a.dtype)
+            call.arg_dtype(1, index.dtype)
+            call.out_dtype(dst.dtype)
+            call.int(dst.ptr)
+            call.int(a.ptr)
+            call.int(index.ptr)
+            call.int(dtype_code(index.dtype))
+            call.int(n)
+            call.int(inner)
+            call.int(_dim_or1(a, dim))
+            call.int(a.itemsize)
+            call.int(ctx_ptr(ctx))
+            call.run()
+            _ = ctx
+            return
+        # Any rank: fold the dims around `dim` into (outer, n, inner).
+        var sd = _dim_or1(a, dim)
+        _gather_dim_launch(
+            dst,
+            a,
+            index,
+            [outer, n, inner],
+            [n * inner, inner, 1],
+            [sd * inner, inner, 1],
+            [0, idx_stride, 0],
+            1,
+            sd,
+        )
+        return
+    if a.rank > 4:
+        unsupported("aten::index_select of a strided tensor of rank > 4")
+    var idx_strides = List[Int](capacity=a.rank)
+    for d in range(a.rank):
+        idx_strides.append(idx_stride if d == dim else 0)
+    _gather_dim_launch(
+        dst,
+        a,
+        index,
+        _dims_of(dst),
+        _strides_of(dst),
+        _strides_of(a),
+        idx_strides,
+        dim,
+        _dim_or1(a, dim),
+    )
+
+
+# aten::index_select(Tensor self, int dim, Tensor index) -> Tensor
+def op_index_select(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int(args[unsafe_offset=1])
+    var index = v_tensor(args[unsafe_offset=2])
+    var shape = _index_select_shape(a, dim, index)
+    var out = own(new_tensor(shape, a.rank, a.stype, a.device))
+    _index_select_into(out.t, a, dim, index)
+    ret_owned(rets, 0, out)
+
+
+# aten::index_select.out(Tensor self, int dim, Tensor index, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_index_select_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int(args[unsafe_offset=1])
+    var index = v_tensor(args[unsafe_offset=2])
+    var out = v_tensor(args[unsafe_offset=3])
+    var shape = _index_select_shape(a, dim, index)
+    _out_target(out, shape, a.rank, a, "index_select")
+    _index_select_into(out, a, dim, index)
+    ret_ref(rets, 0, out)
+
+
+def _scatter_add_check(a: T, dim: Int, index: T, src: T) raises -> Int:
+    return _scatter_validate(a, dim, index, src.copy(), True)
+
+
+# aten::scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
+def op_scatter_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = v_tensor(args[unsafe_offset=3])
+    var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    var out = own(_materialize_contiguous(a))
+    _scatter_into(out.t, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
+    ret_owned(rets, 0, out)
+
+
+# aten::scatter_add_(Tensor(a!) self, int dim, Tensor index, Tensor src)
+#   -> Tensor(a!)
+def op_scatter_add_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = v_tensor(args[unsafe_offset=3])
+    var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
+    ret_ref(rets, 0, a)
+
+
+def _copy_self_into_out(mut out: T, a: T, what: String) raises:
+    """`out = self.clone()` for the out= overload of an accumulating op:
+    resize `out` to self's shape when it differs, then copy self over unless
+    `out` IS self."""
+    _out_target(out, a.shape, a.rank, a, what)
+    if out.ptr == a.ptr and strides_equal(out.strides, a.strides, a.rank):
+        return
+    if a.numel > 0:
+        copy_strided_into(out, a)
+
+
+# aten::scatter_add.out(Tensor self, int dim, Tensor index, Tensor src, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_scatter_add_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = v_tensor(args[unsafe_offset=3])
+    var out = v_tensor(args[unsafe_offset=4])
+    var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    _copy_self_into_out(out, a, "scatter_add")
+    _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
+    ret_ref(rets, 0, out)
+
+
+def _index_add_into(
+    target: T, a: T, dim_in: Int, index: T, source: T, alpha: Value
+) raises:
+    """`target[..., index[i], ...] += alpha * source[..., i, ...]` along
+    `dim`: ScatterAddDim over source's index space with the 1-D index
+    broadcast (stride 0) across every other coordinate."""
+    var dim = _norm_dim(dim_in, a.rank, "index_add")
+    var rank = max(a.rank, 1)
+    _check_index(index, a, "index_add")
+    if index.rank > 1:
+        raise Error("index_add_(): Index is supposed to be a vector")
+    if source.dtype != a.dtype:
+        raise Error(
+            "index_add_(): self (",
+            _scalar_type_name(a.dtype),
+            ") and source (",
+            _scalar_type_name(source.dtype),
+            ") must have the same scalar type",
+        )
+    if a.rank > 4 or max(source.rank, 1) != rank:
+        unsupported(
+            "aten::index_add needs self and source of the same rank, at most 4"
+        )
+    if source.device != a.device:
+        unsupported("aten::index_add with source on a different device")
+    if _dim_or1(source, dim) != index.numel:
+        raise Error(
+            "index_add_(): Number of indices (",
+            index.numel,
+            ") should be equal to source.size(dim) (",
+            _dim_or1(source, dim),
+            ")",
+        )
+    for d in range(rank):
+        if d != dim and _dim_or1(source, d) != _dim_or1(a, d):
+            raise Error(
+                "index_add_(): Source/destination tensor must have same"
+                " slice shapes."
+            )
+    if not _is_scatter_add_dtype(a.dtype):
+        unsupported(
+            "aten::index_add of dtype "
+            + String(a.dtype)
+            + " (no atomic add for it on the device)"
+        )
+    var ctx = ctx_for(a.device)
+    var metal = ctx.api() == "metal"
+    _ = ctx
+    if metal and (a.dtype == DType.float64 or a.itemsize == 2):
+        unsupported("aten::index_add of " + String(a.dtype) + " on Apple GPU")
+    if source.numel == 0:
+        return
+    # `alpha * source` through the dispatcher when alpha is not 1 (autograd's
+    # index_select backward always passes 1).
+    var scaled = Optional[Owned](None)
+    var src = source.copy()
+    if v_f64(alpha) != 1.0:
+        var r = call_op(
+            "aten::mul", "Scalar", [tensor_arg(source), alpha.copy()], 1
+        )
+        scaled = own(r.take_tensor(0))
+        src = scaled.value().t.copy()
+    var idx = own_if_new(cast_to(index, ST_INT64), index)
+    var idx_stride = idx.t.stride(0) if idx.t.rank == 1 else 0
+    var idx_strides = List[Int](capacity=rank)
+    for d in range(rank):
+        idx_strides.append(idx_stride if d == dim else 0)
+    _scatter_launch(
+        target,
+        _strides_of(target),
+        idx.t,
+        idx_strides,
+        src.ptr,
+        src.dtype,
+        _strides_of(src),
+        _dims_of(src),
+        dim,
+        _dim_or1(a, dim),
+        False,
+        0.0,
+        True,
+        "index_add",
+    )
+    _ = idx^
+    _ = scaled^
+
+
+# aten::index_add(Tensor self, int dim, Tensor index, Tensor source, *,
+#   Scalar alpha=1) -> Tensor
+def op_index_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = own(_materialize_contiguous(a))
+    _index_add_into(
+        out.t,
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_tensor(args[unsafe_offset=3]),
+        args[unsafe_offset=4],
+    )
+    ret_owned(rets, 0, out)
+
+
+# aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source, *,
+#   Scalar alpha=1) -> Tensor(a!)
+def op_index_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _index_add_into(
+        a,
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_tensor(args[unsafe_offset=3]),
+        args[unsafe_offset=4],
+    )
+    ret_ref(rets, 0, a)
+
+
+# aten::index_add.out(Tensor self, int dim, Tensor index, Tensor source, *,
+#   Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_index_add_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=5])
+    _copy_self_into_out(out, a, "index_add")
+    _index_add_into(
+        out,
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_tensor(args[unsafe_offset=3]),
+        args[unsafe_offset=4],
+    )
+    ret_ref(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -1682,6 +2522,68 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
     )
 
 
+def _index_put_mask_fill(target: T, mask: T, values: T) raises:
+    """`self[mask] = v` with a one-element `v`: what ATen's own
+    `_index_put_impl_` re-routes to `masked_fill_` (canDispatchToMaskedFill),
+    the one boolean-mask form whose work is not data dependent.
+
+    A mask covers self's LEADING dims while masked_fill broadcasts from the
+    right, so it is viewed with trailing size-1 dims first (on a square
+    tensor the unpadded mask would silently fill the wrong axis).
+    """
+    if mask.rank > target.rank:
+        unsupported("_index_put_impl_: the mask has more dims than self")
+    for d in range(mask.rank):
+        if mask.dim(d) != target.dim(d):
+            raise Error(
+                "The shape of the mask at index ",
+                d,
+                " does not match the shape of the indexed tensor",
+            )
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - target.rank
+    for d in range(mask.rank):
+        shape[pad + d] = mask.dim(d)
+        strides[pad + d] = mask.stride(d)
+    var mask_view = own(
+        view_strided(mask, shape, strides, target.rank, mask.offset)
+    )
+    if values.on_cpu():
+        # A python scalar assignment arrives as a one-element CPU tensor;
+        # reading it costs no device sync.
+        var v = _read_f64_at(values.ptr, 0, values.dtype)
+        var scalar = Value(
+            TAG_SCALAR_DOUBLE, 0, f64_bits(v), 0
+        ) if values.dtype.is_floating_point() else Value(
+            TAG_SCALAR_INT, 0, Int64(Int(v)), 0
+        )
+        _ = call_op(
+            "aten::masked_fill_",
+            "Scalar",
+            [tensor_arg(target), tensor_arg(mask_view.t), scalar^],
+            1,
+        )
+    else:
+        var value0 = own(
+            view_strided(
+                values,
+                IndexList[MAX_RANK](1),
+                IndexList[MAX_RANK](0),
+                0,
+                values.offset,
+            )
+        )
+        _ = call_op(
+            "aten::masked_fill_",
+            "Tensor",
+            [tensor_arg(target), tensor_arg(mask_view.t), tensor_arg(value0.t)],
+            1,
+        )
+        _ = value0^
+    _ = mask_view^
+
+
 # aten::_index_put_impl_(Tensor(a!) self, Tensor?[] indices, Tensor values,
 #                      bool accumulate=False, bool unsafe=False) -> Tensor(a!)
 def op_index_put_impl_(
@@ -1691,8 +2593,20 @@ def op_index_put_impl_(
     var present = v_opt_tensor_list_present(args[unsafe_offset=1])
     var indices = v_tensor_list(args[unsafe_offset=1])
     var values = v_tensor(args[unsafe_offset=2])
-    if v_bool(args[unsafe_offset=3]):
-        unsupported("_index_put_impl_: accumulate=True is not supported")
+    # accumulate=True sums colliding writes with ScatterAddDim's atomics
+    # (unspecified order, like torch's CUDA index_put_ with accumulate).
+    var accumulate = v_bool(args[unsafe_offset=3])
+    if (
+        len(indices) == 1
+        and len(present) >= 1
+        and present[0]
+        and indices[0].dtype == DType.bool
+        and not accumulate
+        and values.numel == 1
+    ):
+        _index_put_mask_fill(target, indices[0], values)
+        ret_ref(rets, 0, target)
+        return
     if target.rank == 0 or target.rank > 4 or not target.contig:
         unsupported(
             "_index_put_impl_: requires a contiguous rank-1 to rank-4"
@@ -1706,9 +2620,20 @@ def op_index_put_impl_(
             axis = d
     if axis < 0:
         unsupported("_index_put_impl_: requires one tensor index")
-    var index = indices[0].copy()
-    if index.rank != 1 or index.dtype != DType.int64:
-        unsupported("_index_put_impl_: requires a one-dimensional int64 index")
+    if indices[0].rank != 1 or (
+        indices[0].dtype != DType.int64 and indices[0].dtype != DType.int32
+    ):
+        unsupported(
+            "_index_put_impl_: requires a one-dimensional int32/int64 index"
+        )
+    if indices[0].device != target.device:
+        unsupported(
+            "_index_put_impl_: all tensors must be on the same mojo device"
+        )
+    # The scatter kernels read an int64 index: widen an int32 one (a fresh
+    # contiguous copy, released when this op returns).
+    var index_owned = own_if_new(cast_to(indices[0], ST_INT64), indices[0])
+    var index = index_owned.t.copy()
     if (
         not target.on_mojo()
         or not values.on_mojo()
@@ -1723,6 +2648,12 @@ def op_index_put_impl_(
         unsupported(
             "_index_put_impl_: requires matching supported source and"
             " destination dtypes"
+        )
+    if accumulate and not _is_scatter_add_dtype(target.dtype):
+        unsupported(
+            "_index_put_impl_: accumulate=True of dtype "
+            + String(target.dtype)
+            + " (no atomic add for it on the device)"
         )
     if values.rank > target.rank:
         unsupported(
@@ -1752,11 +2683,16 @@ def op_index_put_impl_(
                 " result"
             )
     if total == 0:
+        _ = index_owned^  # alive past the launches above
         ret_ref(rets, 0, target)
         return
     var ctx = ctx_for(target.device)
     if target.dtype == DType.float64 and ctx.api() == "metal":
         unsupported("_index_put_impl_: float64 is not supported on Apple GPU")
+    if accumulate and target.itemsize == 2 and ctx.api() == "metal":
+        unsupported(
+            "_index_put_impl_: 16-bit accumulate is not supported on Apple GPU"
+        )
     var pad4 = 4 - target.rank
     var params = List[Int](capacity=18)
     for d in range(4):
@@ -1821,7 +2757,8 @@ def op_index_put_impl_(
             " indexed dimension; negative wrapping is not supported"
         )
     var row_copy = (
-        axis == 0
+        not accumulate
+        and axis == 0
         and index.stride(0) == 1
         and values.contig
         and values.rank == target.rank
@@ -1846,9 +2783,12 @@ def op_index_put_impl_(
         rows.int(ctx_ptr(ctx))
         rows.run()
         _ = ctx
+        _ = index_owned^  # alive past the launches above
         ret_ref(rets, 0, target)
         return
-    var call = KernelCall("data_movement", "ScatterDim")
+    var call = KernelCall(
+        "data_movement", "ScatterAddDim" if accumulate else "ScatterDim"
+    )
     call.arg_dtype(0, target.dtype)
     call.arg_dtype(1, index.dtype)
     call.arg_dtype(2, values.dtype)
@@ -1864,6 +2804,7 @@ def op_index_put_impl_(
     call.int(ctx_ptr(ctx))
     call.run()
     _ = ctx
+    _ = index_owned^  # alive past the launches above
     ret_ref(rets, 0, target)
 
 
@@ -2024,9 +2965,21 @@ def register_data_movement(site: Site) raises:
     impl[op_repeat, "repeat"](site)
     impl[op_tril, "tril"](site)
     impl[op_triu, "triu"](site)
+    impl[op_reflection_pad2d, "reflection_pad2d"](site)
+    impl[op_replication_pad2d, "replication_pad2d"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_value, "scatter.value"](site)
+    impl[op_scatter_add, "scatter_add"](site)
+    impl[op_scatter_add_, "scatter_add_"](site)
+    impl[op_scatter_add_out, "scatter_add.out"](site)
+    impl[op_gather, "gather"](site)
+    impl[op_gather_out, "gather.out"](site)
+    impl[op_index_select, "index_select"](site)
+    impl[op_index_select_out, "index_select.out"](site)
+    impl[op_index_add, "index_add"](site)
+    impl[op_index_add_, "index_add_"](site)
+    impl[op_index_add_out, "index_add.out"](site)
     impl[op_index_tensor, "index.Tensor"](site)
     impl[op_index_put_impl_, "_index_put_impl_"](site)
     impl[op_nonzero, "nonzero"](site)

@@ -441,7 +441,12 @@ different kind of item.
   which is what AGENTS.md rule 4 asks for — not hardcoded shapes.
 * **Expected win.** head_dim=128: measured, see `benchmarks/baselines.html`
   (`B1H16S4096D128`). GQA / ragged-seqlen: **UNMEASURED**, bounded above by
-  the [A1](#a1) ratio for the shapes they would newly claim.
+  the [A1](#a1) ratio for the shapes they would newly claim. Update: GQA
+  inference now reaches FA4 through a materialized K/V repeat (one batched
+  rectangle copy per tensor, `_gqa_expand` in `tmb/ops/attention.mojo`):
+  1.08 at `B1H32KV8S4096D128`, 0.82 at `B1H8KV1S4096D128` (bf16, H100).
+  The in-kernel KV-head index would save those two copies (~24 us each at
+  the first shape); GQA under autograd still takes the math decomposition.
 * **How to measure it.** `tests/test_fa4_host_wiring.py` and
   `tests/test_eager_kernels.py` (`test_fa4_*[...-d128]`) cover the gate
   itself; for timing, `benchmarks/test_attention.py -k D128` and a
@@ -840,6 +845,16 @@ temporary** — **DONE** (`NormSpec`)
   broadcast index shape and per-dim index pointers as runtime data (rank ≤ 8,
   the descriptor style `CopyStrided` already uses), plus the boolean-mask case
   routed through `nonzero` + gather.
+* **Still open, but narrower than when this was written.** `aten::gather`,
+  `index_select`, `scatter_add` and `index_add` now run natively on `GatherDim`
+  (reads) and `ScatterAddDim` (ScatterDim with an atomic add) beside
+  `GatherRows`, `_index_put_impl_` takes `accumulate=True` and int32 indices,
+  and `x[mask] = scalar` reaches `masked_fill_`. What is left of D5 is
+  `aten::index` with several index tensors or one on a non-zero axis,
+  `index_put` with several index tensors, and a boolean mask whose write is not
+  a scalar fill. Both new kernels decode a rank-4 coordinate with 64-bit
+  div/mod per element and trail stock by 2-4x where the indexed dim is the
+  inner one (`benchmarks/test_embedding.py`, `*_D1` shapes).
 * **Expected win.** N/A (coverage).
 * **How to measure it.** `tests/test_aten_functions.py` with parametrized index
   patterns.
@@ -1477,7 +1492,7 @@ Stated explicitly so nobody reads this document as complete.
   other ~200 op implementations were not.
 * **Op *coverage* was inventoried only where it intersected performance.** No
   full "which ATen ops raise on the mojo device" list was produced. Holes noted
-  in passing: `topk`, `sort`, `gather`, `index_select`, `scatter_add`, `div` with
+  in passing: `topk`, `sort`, `div` with
   `rounding_mode` (`aten_fast.py:2498`), `softmax` with `dtype=`
   (`aten_fast.py:7714`), `conv1d`/`conv3d`/transposed conv, `ceil_mode` pooling,
   and the vision-training backwards.

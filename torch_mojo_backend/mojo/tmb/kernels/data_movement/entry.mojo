@@ -14,14 +14,15 @@
 # `_raw_dtype_int`.
 # ===----------------------------------------------------------------------=== #
 
+from std.atomic import Atomic, Ordering
 from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import InlineArray
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
+from std.sys import is_amd_gpu, is_nvidia_gpu
 from std.sys.info import (
-    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
@@ -66,8 +67,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
-from tmb.kernels.data_movement.batched_copy_cast import copy_batched_cast
-from tmb.kernels.data_movement.batched_copy_rows import copy_batched_rows
+from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
@@ -97,6 +97,28 @@ comptime SCATTER_DTYPES = [
     DType.uint8,
     DType.bool,
 ]
+
+
+# ScatterAddDim serves the subset of SCATTER_DTYPES with an atomic add on the
+# GPU targets (no sub-32-bit integer read-modify-write), plus bool, whose
+# saturating sum is a plain store.
+def _atomic_add_ok[dt: DType]() -> Bool:
+    return (
+        dt.is_floating_point()
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.bool
+    )
+
+
+@always_inline
+def _atomic_scope() -> StaticString:
+    comptime if is_nvidia_gpu():
+        return "device"
+    elif is_amd_gpu():
+        return "agent"
+    else:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +360,6 @@ def _permute_copy[
             var slots = total // VEC
             _enqueue_cached[_run_gather_kernel[dtype, VEC]](
                 ctx,
-                String(t"dm_rungather_{dtype}_v{VEC}"),
                 _gs_blocks(slots),
                 1,
                 1,
@@ -371,7 +392,6 @@ def _permute_copy[
                 if nrows >= 4096:
                     _enqueue_cached[_permute_copy_rowloop_kernel[dtype]](
                         ctx,
-                        String(t"dm_permute_rowloop_{dtype}"),
                         _gs_blocks(nrows),
                         1,
                         1,
@@ -390,7 +410,6 @@ def _permute_copy[
                 var nchunks = total // 4
                 _enqueue_cached[_permute_copy_rows4_kernel[dtype]](
                     ctx,
-                    String(t"dm_permute_rows4_{dtype}"),
                     _gs_blocks(nchunks),
                     1,
                     1,
@@ -450,7 +469,6 @@ def _permute_copy[
         ):
             _enqueue_cached[_transpose2d_kernel[dtype]](
                 ctx,
-                String(t"transpose2d_{dtype}"),
                 (d3 + TILE - 1) // TILE,
                 min((d2 + TILE - 1) // TILE, _MAX_GRID_Y),
                 min(batch, _MAX_GRID_Y),
@@ -467,7 +485,6 @@ def _permute_copy[
             return
         _enqueue_cached[_permute_copy_kernel[dtype]](
             ctx,
-            String(t"dm_permute_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -683,15 +700,10 @@ def _cat_owner(
 
 @always_inline
 def _cat_copy_rows[
-    mut: Bool,
-    src_origin: Origin[mut=mut],
-    //,
-    dtype: DType,
-    width: Int,
-    out_dtype: DType = dtype,
+    dtype: DType, width: Int
 ](
-    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
-    src_ptr: Pointer[Scalar[dtype], src_origin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    src_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
     seg: CatSeg,
     slot: Int,
     outer: Int,
@@ -709,36 +721,26 @@ def _cat_copy_rows[
     var src_index = slot * width
     var dst_index = seg.dst_off + slot * width
     var row = Int(block_idx.y)
-    comptime if dtype == out_dtype:
-        src_index += row * row_len
-        dst_index += row * dst_stride
-    else:
-        src_index = row * seg.nvec * width + slot * width
-        dst_index = row * dst_stride + seg.dst_off + slot * width
+    src_index += row * row_len
+    dst_index += row * dst_stride
     while row < outer:
         comptime for step in range(ilp):
             if slot + step * GS_THREADS < seg.nvec:
-                out_ptr.unsafe_store[
-                    width=width, alignment=min(16, width * size_of[out_dtype]())
-                ](
+                out_ptr.unsafe_store[width=width, alignment=align](
                     dst_index + step * GS_THREADS * width,
                     src_ptr.unsafe_load[width=width, alignment=align](
                         src_index + step * GS_THREADS * width
-                    ).cast[out_dtype](),
+                    ),
                 )
         row += Int(grid_dim.y)
-        comptime if dtype == out_dtype:
-            src_index += Int(grid_dim.y) * row_len
-        else:
-            src_index += Int(grid_dim.y) * seg.nvec * width
+        src_index += Int(grid_dim.y) * row_len
         dst_index += Int(grid_dim.y) * dst_stride
 
 
-@always_inline
-def _cat_batched_body[
-    dtype: DType, width: Int, out_dtype: DType = dtype
+def _cat_batched_kernel[
+    dtype: DType, width: Int
 ](
-    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     segs: InlineArray[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
@@ -758,61 +760,15 @@ def _cat_batched_body[
         var seg = segs[owner]
         var slot = (tile - first) * _cat_tile_slots[dtype, width]() + lane
         if slot < seg.nvec:
-            comptime if dtype == out_dtype or width == 1:
-                _cat_copy_rows[dtype, width, out_dtype](
-                    out_ptr,
-                    _make_ptr[dtype](seg.src_addr)
-                    .as_unsafe_any_origin()
-                    .as_imm(),
-                    seg,
-                    slot,
-                    outer,
-                    dst_stride,
-                )
-            else:
-                # Preserve the measured cast kernel's ordinary global loads.
-                # Immutable provenance lowers to ld.global.nc on Hopper and
-                # slows vector BF16-to-FP32 copies; scalar copies benefit from it.
-                _cat_copy_rows[dtype, width, out_dtype](
-                    out_ptr,
-                    _make_ptr[dtype](seg.src_addr).as_unsafe_any_origin(),
-                    seg,
-                    slot,
-                    outer,
-                    dst_stride,
-                )
+            _cat_copy_rows[dtype, width](
+                out_ptr,
+                _make_ptr[dtype](seg.src_addr).as_unsafe_any_origin().as_imm(),
+                seg,
+                slot,
+                outer,
+                dst_stride,
+            )
         tile += Int(grid_dim.x)
-
-
-def _cat_batched_kernel[
-    dtype: DType, width: Int
-](
-    out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
-    segs: InlineArray[CatSeg, CAT_CAP],
-    nseg_arg: Int64,
-    tiles_arg: Int64,
-    outer_arg: Int64,
-    dst_stride_arg: Int64,
-):
-    _cat_batched_body[dtype, width](
-        out_ptr, segs, nseg_arg, tiles_arg, outer_arg, dst_stride_arg
-    )
-
-
-@__name(t"cat_cast_rows_bf16_f32_v{width}")
-def _cat_cast_kernel[
-    width: Int
-](
-    out_ptr: Pointer[Float32, MutAnyOrigin],
-    segs: InlineArray[CatSeg, CAT_CAP],
-    nseg_arg: Int64,
-    tiles_arg: Int64,
-    outer_arg: Int64,
-    dst_stride_arg: Int64,
-):
-    _cat_batched_body[DType.bfloat16, width, DType.float32](
-        out_ptr, segs, nseg_arg, tiles_arg, outer_arg, dst_stride_arg
-    )
 
 
 @always_inline
@@ -909,7 +865,7 @@ def _cat_slot_ptr[
 
 @always_inline
 def _cat_launch_width[
-    dtype: DType, width: Int, out_dtype: DType = dtype
+    dtype: DType, width: Int
 ](
     out_addr: Int,
     srcs: Arg,
@@ -920,7 +876,7 @@ def _cat_launch_width[
     ctx: DeviceContext,
 ) raises:
     comptime tile_slots = _cat_tile_slots[dtype, width]()
-    var out_ptr = _make_ptr[out_dtype](out_addr).as_unsafe_any_origin()
+    var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
     var dst_off = 0
     var index = 0
     while index < n:
@@ -941,28 +897,9 @@ def _cat_launch_width[
             continue
         var gy = min(outer, _MAX_GRID_Y)
         var gx = min(tiles, max(1, CAT_MAX_BLOCKS // gy))
-        comptime if dtype != out_dtype:
-            comptime if dtype == DType.bfloat16 and out_dtype == DType.float32 and _has_sm_9x():
-                _enqueue_cached[_cat_cast_kernel[width]](
-                    ctx,
-                    String(t"cat_cast_rows_bf16_f32_v{width}"),
-                    gx,
-                    gy,
-                    1,
-                    GS_THREADS,
-                    out_ptr,
-                    segs,
-                    Int64(nseg),
-                    Int64(tiles),
-                    Int64(outer),
-                    Int64(dst_stride),
-                )
-            else:
-                raise Error("cat cast requires BF16 to FP32 on Hopper")
-        elif has_apple_gpu_accelerator():
+        comptime if has_apple_gpu_accelerator():
             _enqueue_cached[_cat_slots_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_slots_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -985,7 +922,6 @@ def _cat_launch_width[
         else:
             _enqueue_cached[_cat_batched_kernel[dtype, width]](
                 ctx,
-                String(t"dm_cat_batched_{dtype}_{width}"),
                 gx,
                 gy,
                 1,
@@ -1023,68 +959,6 @@ def _cat_launch[
         )
     else:
         raise Error("unsupported vector width for batched cat")
-
-
-def _cat_cast_into(
-    dst: Int,
-    sources: Arg,
-    lengths: Arg,
-    count: Int,
-    outer: Int,
-    stride: Int,
-    ctx: DeviceContext,
-) raises:
-    """Contiguous BF16 rows to disjoint FP32 output; metadata validated by caller.
-    """
-    if count == 0 or outer == 0 or stride == 0:
-        return
-    comptime if _has_sm_9x():
-        if ctx.api() != "cuda":
-            raise Error("cat cast requires CUDA")
-        var wide = dst % 16 == 0 and stride % 4 == 0
-        for index in range(count):
-            wide = (
-                wide
-                and _raw_tuple_int(lengths, index) % 8 == 0
-                and _raw_tuple_int(sources, index) % 16 == 0
-            )
-        if wide:
-            _cat_launch_width[DType.bfloat16, 8, DType.float32](
-                dst, sources, lengths, count, outer, stride, ctx
-            )
-        else:
-            _cat_launch_width[DType.bfloat16, 1, DType.float32](
-                dst, sources, lengths, count, outer, stride, ctx
-            )
-    else:
-        raise Error("cat cast requires Hopper")
-
-
-def _cat_cast_dispatcher(argv: Argv, argc: Int) raises:
-    if argc != 6:
-        raise Error(
-            "CatCast expects output, pointers, lengths, rows, stride, context"
-        )
-    comptime if _dtype_arg_on[0, DType.bfloat16]() and _dtype_out_on[
-        0, DType.float32
-    ]():
-        var sources = argv[unsafe_offset=1]
-        var lengths = argv[unsafe_offset=2]
-        var count = _raw_tuple_len(sources)
-        if count != _raw_tuple_len(lengths):
-            raise Error("CatCast metadata lengths differ")
-        var ctx = _raw_ctx(argv[unsafe_offset=5])
-        _cat_cast_into(
-            _raw_int(argv[unsafe_offset=0]),
-            sources,
-            lengths,
-            count,
-            _raw_int(argv[unsafe_offset=3]),
-            _raw_int(argv[unsafe_offset=4]),
-            ctx,
-        )
-    else:
-        raise Error("CatCast requires BF16 inputs and FP32 output")
 
 
 def _cat_n_go(
@@ -1274,7 +1148,6 @@ def _narrow_copy_dst[
                 var gx = min((copy_len4 + GS_THREADS - 1) // GS_THREADS, 32)
                 _enqueue_cached[_narrow_copy_dst_kernel2d[dtype]](
                     ctx,
-                    String(t"dm_narrowdst2d_{dtype}"),
                     max(gx, 1),
                     outer,
                     1,
@@ -1289,7 +1162,6 @@ def _narrow_copy_dst[
             var nchunks = outer * copy_len4
             _enqueue_cached[_narrow_copy_dst_kernel4[dtype]](
                 ctx,
-                String(t"dm_narrowdst4_{dtype}"),
                 _gs_blocks(nchunks),
                 1,
                 1,
@@ -1305,7 +1177,6 @@ def _narrow_copy_dst[
             var total = outer * copy_len
             _enqueue_cached[_narrow_copy_dst_kernel1[dtype]](
                 ctx,
-                String(t"dm_narrowdst1_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -1641,7 +1512,6 @@ def _where_bcast[
                 var slots = max(1, total // VW)
                 _enqueue_cached[_where_flat_vec_kernel[dtype]](
                     ctx,
-                    String(t"dm_where_fv_{dtype}"),
                     _bw_flat_blocks(slots, traffic),
                     1,
                     1,
@@ -1658,7 +1528,6 @@ def _where_bcast[
 
             _enqueue_cached[_where_bcast_kernel[dtype]](
                 ctx,
-                String(t"dm_where_bc_{dtype}"),
                 _gs_blocks(total),
                 1,
                 1,
@@ -1873,7 +1742,6 @@ def _masked_fill_scalar_bcast[
             var slots = max(1, total // VW)
             _enqueue_cached[_masked_fill_scalar_flat_vec_kernel[dtype]](
                 ctx,
-                String(t"dm_mfs_fv_{dtype}"),
                 _bw_flat_blocks(slots, traffic),
                 1,
                 1,
@@ -1889,7 +1757,6 @@ def _masked_fill_scalar_bcast[
 
         _enqueue_cached[_masked_fill_scalar_bcast_kernel[dtype]](
             ctx,
-            String(t"dm_mfs_bc_{dtype}"),
             _gs_blocks(total),
             1,
             1,
@@ -2272,7 +2139,6 @@ def _cast[
             )
             _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
                 ctx,
-                String(t"dm_cast_{src}_{dst}_v{VEC}"),
                 _bw_blocks(
                     nvec,
                     SLOTS,
@@ -2742,7 +2608,6 @@ def _repeat_seg_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_seg_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptseg_{dtype}_v{VEC}"),
         _repeat_quantize(ceildiv(nseg, tx), _BW_MAX_BLOCKS),
         gy,
         1,
@@ -2785,7 +2650,6 @@ def _repeat_flat_launch[
     var gy = _repeat_quantize(ceildiv(nout, ty), _MAX_GRID_Y)
     _enqueue_cached_2d[_repeat_flat_kernel[dtype, VEC]](
         ctx,
-        String(t"dm_rptflat_{dtype}_v{VEC}"),
         gx,
         gy,
         1,
@@ -3179,6 +3043,170 @@ def _gather_rows_go(
         raise Error("GatherRows: unsupported index dtype ", idx_dtype)
 
 
+# ---------------------------------------------------------------------------
+# GatherDim: out[coord] = in[coord with coord[dim] := index[coord]], the read
+# mirror of ScatterDim below, over a rank-<=4 index space described by
+# explicit element strides (padded to rank 4 with leading 1 / 0). Serves
+#   * aten::gather       -- dims = index.shape, real index strides
+#   * aten::index_select -- dims = out.shape, index strides 0 everywhere but
+#     `dim` (a 1-D index broadcast across the untouched coordinates)
+# Element-size dispatch for the payload (a pure copy), int32/int64 for the
+# index. Like GatherRows, an index outside [0, dim_size) is CLAMPED rather
+# than reported: reporting costs a device synchronization per gather, and the
+# access stays in bounds whatever the index holds.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _gather_dim[
+    dtype: DType, idx_dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    index_addr: Int,
+    params: Arg,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    var index_ptr = _make_ptr[idx_dtype](index_addr)
+    var d1 = _raw_tuple_int(params, 1)
+    var d2 = _raw_tuple_int(params, 2)
+    var d3 = _raw_tuple_int(params, 3)
+    var os0 = _raw_tuple_int(params, 4)
+    var os1 = _raw_tuple_int(params, 5)
+    var os2 = _raw_tuple_int(params, 6)
+    var os3 = _raw_tuple_int(params, 7)
+    var ss0 = _raw_tuple_int(params, 8)
+    var ss1 = _raw_tuple_int(params, 9)
+    var ss2 = _raw_tuple_int(params, 10)
+    var ss3 = _raw_tuple_int(params, 11)
+    var xs0 = _raw_tuple_int(params, 12)
+    var xs1 = _raw_tuple_int(params, 13)
+    var xs2 = _raw_tuple_int(params, 14)
+    var xs3 = _raw_tuple_int(params, 15)
+    var dim_padded = _raw_tuple_int(params, 16)
+    var dim_size = _raw_tuple_int(params, 17)
+    var total = _raw_tuple_int(params, 0) * d1 * d2 * d3
+
+    @always_inline
+    @parameter
+    @__copy_capture(
+        out_ptr,
+        in_ptr,
+        index_ptr,
+        d1,
+        d2,
+        d3,
+        os0,
+        os1,
+        os2,
+        os3,
+        ss0,
+        ss1,
+        ss2,
+        ss3,
+        xs0,
+        xs1,
+        xs2,
+        xs3,
+        dim_padded,
+        dim_size,
+    )
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var i = Int(coord[0].value())
+        var i3 = i % d3
+        var rest = i // d3
+        var i2 = rest % d2
+        rest = rest // d2
+        var i1 = rest % d1
+        var i0 = rest // d1
+        var source = Int(
+            index_ptr[unsafe_offset=i0 * xs0 + i1 * xs1 + i2 * xs2 + i3 * xs3]
+        )
+        if source < 0:
+            source = 0
+        elif source >= dim_size:
+            source = dim_size - 1
+        var in_off = i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+        # Replace the coordinate along `dim_padded` with the gather source.
+        if dim_padded == 0:
+            in_off += (source - i0) * ss0
+        elif dim_padded == 1:
+            in_off += (source - i1) * ss1
+        elif dim_padded == 2:
+            in_off += (source - i2) * ss2
+        else:
+            in_off += (source - i3) * ss3
+        out_ptr[
+            unsafe_offset=i0 * os0 + i1 * os1 + i2 * os2 + i3 * os3
+        ] = in_ptr[unsafe_offset=in_off]
+
+    _parallel_for[func](total, ctx)
+
+
+@always_inline
+def _gather_dim_idx[
+    idx_dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    index_addr: Int,
+    params: Arg,
+    itemsize: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime if _dtype_arg_width_on[0, 32]():
+        if itemsize != 4:
+            raise Error("GatherDim specialization/itemsize mismatch")
+        _gather_dim[DType.uint32, idx_dtype](
+            out_addr, in_addr, index_addr, params, ctx
+        )
+    elif _dtype_arg_width_on[0, 16]():
+        if itemsize != 2:
+            raise Error("GatherDim specialization/itemsize mismatch")
+        _gather_dim[DType.uint16, idx_dtype](
+            out_addr, in_addr, index_addr, params, ctx
+        )
+    elif _dtype_arg_width_on[0, 64]():
+        if itemsize != 8:
+            raise Error("GatherDim specialization/itemsize mismatch")
+        _gather_dim[DType.uint64, idx_dtype](
+            out_addr, in_addr, index_addr, params, ctx
+        )
+    elif _dtype_arg_width_on[0, 8]():
+        if itemsize != 1:
+            raise Error("GatherDim specialization/itemsize mismatch")
+        _gather_dim[DType.uint8, idx_dtype](
+            out_addr, in_addr, index_addr, params, ctx
+        )
+    else:
+        raise Error("GatherDim: unsupported element size ", itemsize)
+
+
+def _gather_dim_dispatcher(argv: Argv, argc: Int) raises:
+    """Slots: out, in, index, params (d0..d3, os0..os3, ss0..ss3, xs0..xs3,
+    dim_padded, dim_size), itemsize, ctx."""
+    if argc != 6:
+        raise Error("GatherDim expects 6 argument slots")
+    var out_addr = _raw_int(argv[unsafe_offset=0])
+    var in_addr = _raw_int(argv[unsafe_offset=1])
+    var index_addr = _raw_int(argv[unsafe_offset=2])
+    var params = argv[unsafe_offset=3]
+    var itemsize = _raw_int(argv[unsafe_offset=4])
+    var ctx = _raw_ctx(argv[unsafe_offset=5])
+    comptime if _dtype_arg_on[1, DType.int64]():
+        _gather_dim_idx[DType.int64](
+            out_addr, in_addr, index_addr, params, itemsize, ctx
+        )
+    elif _dtype_arg_on[1, DType.int32]():
+        _gather_dim_idx[DType.int32](
+            out_addr, in_addr, index_addr, params, itemsize, ctx
+        )
+    else:
+        raise Error("GatherDim: unsupported index dtype")
+
+
 @__name(
     "index_put_rows_"
     + ("f32" if dtype == DType.float32 else "bf16")
@@ -3258,7 +3286,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         if vector:
             _enqueue_cached[_index_put_rows_kernel[dtype, vector_width]](
                 ctx,
-                kernel_name + String(vector_width),
                 blocks,
                 1,
                 1,
@@ -3274,7 +3301,6 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
         else:
             _enqueue_cached[_index_put_rows_kernel[dtype, 1]](
                 ctx,
-                kernel_name + "1",
                 blocks,
                 1,
                 1,
@@ -3298,6 +3324,8 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
 # rank-<=4 index space; `out` is a contiguous clone of self, `index` is
 # int64, and everything is described by explicit strides (padded to rank 4
 # with leading 0). Last-write-wins on duplicate targets, like torch.
+# ScatterAddDim is the same body with `accumulate=True`: the write becomes a
+# relaxed atomic add (aten::scatter_add / index_add / index_put accumulate).
 #
 # An index outside `[0, dim_size)` would write arbitrary device memory: the
 # write is skipped and, when `err_addr` is non-zero, an int32 flag there is
@@ -3308,7 +3336,7 @@ def _index_put_rows_dispatcher(argv: Argv, argc: Int) raises:
 
 @always_inline
 def _scatter_dim[
-    dtype: DType
+    dtype: DType, accumulate: Bool = False
 ](
     out_addr: Int,
     index_addr: Int,
@@ -3374,17 +3402,40 @@ def _scatter_dim[
             out_off += (target - i2) * os2
         else:
             out_off += (target - i3) * os3
-        if is_value != 0:
-            out_ptr[unsafe_offset=out_off] = scalar
-        else:
-            out_ptr[unsafe_offset=out_off] = src_ptr[
+        comptime if accumulate and dtype == DType.bool:
+            # A bool sum saturates at True: every colliding writer stores the
+            # same value, so no read-modify-write is needed.
+            var v = src_ptr[
                 unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
             ]
+            if v != Scalar[dtype](0):
+                out_ptr[unsafe_offset=out_off] = v
+        elif accumulate:
+            # Colliding targets sum, in an unspecified order (torch's CUDA
+            # scatter_add is atomic too). Relaxed is enough: nothing else in
+            # the launch reads `out`.
+            _ = Atomic[dtype, scope=_atomic_scope()].fetch_add[
+                ordering=Ordering.RELAXED
+            ](
+                out_ptr.unsafe_offset(out_off),
+                src_ptr[
+                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+                ],
+            )
+        else:
+            if is_value != 0:
+                out_ptr[unsafe_offset=out_off] = scalar
+            else:
+                out_ptr[unsafe_offset=out_off] = src_ptr[
+                    unsafe_offset=i0 * ss0 + i1 * ss1 + i2 * ss2 + i3 * ss3
+                ]
 
     _parallel_for_dt[dtype, func](total, ctx)
 
 
-def _scatter_dim_go(
+def _scatter_dim_go[
+    accumulate: Bool = False
+](
     out_ptr: Arg,
     index_ptr: Arg,
     src_ptr: Arg,
@@ -3425,9 +3476,11 @@ def _scatter_dim_go(
 
     var handled = False
     comptime for dt in SCATTER_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
+        comptime if _dtype_arg_on[0, dt]() and (
+            not accumulate or _atomic_add_ok[dt]()
+        ):
             if dtype == dt:
-                _scatter_dim[dt](
+                _scatter_dim[dt, accumulate](
                     out_addr,
                     index_addr,
                     src_addr,
@@ -3457,6 +3510,187 @@ def _scatter_dim_go(
                 handled = True
     if not handled:
         raise Error("ScatterDim: unsupported dtype ", dtype)
+
+
+# ---------------------------------------------------------------------------
+# Pad2D: out[b, oh, ow] = in[b, ih, iw], where (ih, iw) come from reflecting
+# or clamping (oh - pad_t, ow - pad_l) into [0, in_h) x [0, in_w). Implements
+# aten::reflection_pad2d and aten::replication_pad2d over a contiguous
+# (batch, in_h, in_w) view (batch = product of the leading dims); `reflect`
+# is a runtime flag selecting the boundary rule, so one kernel body serves
+# both ops -- the same shared-body-plus-runtime-flag shape TriangularCopy
+# uses for tril/triu. Element-size dispatch, like GatherRows/TriangularCopy.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _reflect_index(x: Int, length: Int) -> Int:
+    """Fold a possibly out-of-[0, length) coordinate back in by mirroring at
+    each edge without repeating the boundary element (numpy's
+    mode="reflect"), matching ATen's CUDA `reflect_index` helper
+    (ReflectionPad.cu): period 2*(length-1), reduced modulo that period."""
+    if length <= 1:
+        return 0
+    var period = 2 * (length - 1)
+    var m = x % period
+    if m < 0:
+        m += period
+    return m if m < length else period - m
+
+
+@always_inline
+def _clamp_index(x: Int, length: Int) -> Int:
+    """Clamp a possibly out-of-[0, length) coordinate to the nearest edge
+    (numpy's mode="edge", i.e. ATen's replication padding)."""
+    if x < 0:
+        return 0
+    if x >= length:
+        return length - 1
+    return x
+
+
+def _pad2d[
+    dtype: DType
+](
+    out_addr: Int,
+    in_addr: Int,
+    batch: Int,
+    in_h: Int,
+    in_w: Int,
+    pad_l: Int,
+    pad_r: Int,
+    pad_t: Int,
+    pad_b: Int,
+    reflect: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    # out_h/out_w are recomputed inside the closure from its captured
+    # parameters: a GPU closure must not capture a local `var` by reference.
+    var out_h_ = in_h + pad_t + pad_b
+    var out_w_ = in_w + pad_l + pad_r
+
+    @always_inline
+    @parameter
+    @__copy_capture(out_ptr, in_ptr)
+    def func[width: Int, alignment: Int = 1](coord: Coord):
+        var out_h = in_h + pad_t + pad_b
+        var out_w = in_w + pad_l + pad_r
+        var is_reflect = reflect != 0
+        var i = Int(coord[0].value())
+        var ow = i % out_w
+        var rest = i // out_w
+        var oh = rest % out_h
+        var b = rest // out_h
+        var ih: Int
+        var iw: Int
+        if is_reflect:
+            ih = _reflect_index(oh - pad_t, in_h)
+            iw = _reflect_index(ow - pad_l, in_w)
+        else:
+            ih = _clamp_index(oh - pad_t, in_h)
+            iw = _clamp_index(ow - pad_l, in_w)
+        out_ptr[unsafe_offset=i] = in_ptr[
+            unsafe_offset=(b * in_h + ih) * in_w + iw
+        ]
+
+    _parallel_for[func](batch * out_h_ * out_w_, ctx)
+
+
+def _pad2d_go(
+    out_ptr: Arg,
+    in_ptr: Arg,
+    batch_o: Arg,
+    in_h_o: Arg,
+    in_w_o: Arg,
+    pad_l_o: Arg,
+    pad_r_o: Arg,
+    pad_t_o: Arg,
+    pad_b_o: Arg,
+    reflect_o: Arg,
+    itemsize_o: Arg,
+    ctx_ptr: Arg,
+) raises:
+    var out_addr = _raw_int(out_ptr)
+    var in_addr = _raw_int(in_ptr)
+    var batch = _raw_int(batch_o)
+    var in_h = _raw_int(in_h_o)
+    var in_w = _raw_int(in_w_o)
+    var pad_l = _raw_int(pad_l_o)
+    var pad_r = _raw_int(pad_r_o)
+    var pad_t = _raw_int(pad_t_o)
+    var pad_b = _raw_int(pad_b_o)
+    var reflect = _raw_int(reflect_o)
+    var itemsize = _raw_int(itemsize_o)
+    var ctx = _raw_ctx(ctx_ptr)
+
+    comptime if _dtype_arg_width_on[0, 32]():
+        if itemsize != 4:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint32](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 16]():
+        if itemsize != 2:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint16](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 64]():
+        if itemsize != 8:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint64](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    elif _dtype_arg_width_on[0, 8]():
+        if itemsize != 1:
+            raise Error("Pad2D specialization/itemsize mismatch")
+        _pad2d[DType.uint8](
+            out_addr,
+            in_addr,
+            batch,
+            in_h,
+            in_w,
+            pad_l,
+            pad_r,
+            pad_t,
+            pad_b,
+            reflect,
+            ctx,
+        )
+    else:
+        raise Error("Pad2D: unsupported element size ", itemsize)
 
 
 # ---------------------------------------------------------------------------
@@ -3575,9 +3809,11 @@ def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
     )
 
 
-def _scatter_dim_dispatcher(argv: Argv, argc: Int) raises:
+def _scatter_dim_dispatcher[
+    accumulate: Bool = False
+](argv: Argv, argc: Int) raises:
     var args = argv
-    _scatter_dim_go(
+    _scatter_dim_go[accumulate](
         args[unsafe_offset=0],
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -3587,6 +3823,24 @@ def _scatter_dim_dispatcher(argv: Argv, argc: Int) raises:
         args[unsafe_offset=6],
         args[unsafe_offset=7],
         args[unsafe_offset=8],
+    )
+
+
+def _pad2d_dispatcher(argv: Argv, argc: Int) raises:
+    var args = argv
+    _pad2d_go(
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        args[unsafe_offset=6],
+        args[unsafe_offset=7],
+        args[unsafe_offset=8],
+        args[unsafe_offset=9],
+        args[unsafe_offset=10],
+        args[unsafe_offset=11],
     )
 
 
@@ -3630,55 +3884,60 @@ def _cast_spec_into_go(a_o: Arg, out_dtype_o: Arg, out_o: Arg) raises:
             _ = tmp^
 
 
-def _copy_batched_cast_dispatcher(argv: Argv, argc: Int) raises:
-    if argc != 2:
-        raise Error("CopyBatchedCast expects metadata and context")
-    comptime if _has_sm_9x():
-        var metadata = argv[unsafe_offset=0]
-        var count = _raw_tuple_len(metadata)
-        if count % 3 != 0:
-            raise Error(
-                "CopyBatchedCast metadata must contain pointer/size triples"
-            )
-        var srcs = List[Int]()
-        var dsts = List[Int]()
-        var sizes = List[Int]()
-        for i in range(count // 3):
-            srcs.append(_raw_tuple_int(metadata, i * 3))
-            dsts.append(_raw_tuple_int(metadata, i * 3 + 1))
-            sizes.append(_raw_tuple_int(metadata, i * 3 + 2))
-        copy_batched_cast(srcs, dsts, sizes, _raw_ctx(argv[unsafe_offset=1]))
-    else:
-        raise Error("CopyBatchedCast requires Hopper")
+# Every dtype the batched rectangle copy converts between (`_foreach_copy_`,
+# `cat.out`, `split_with_sizes_copy`); the op side mirrors it in
+# `tmb/ops/foreach.mojo`'s `_batch_copy_dtype`.
+comptime COPY_BATCH_DTYPES = [
+    DType.float64,
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.int64,
+    DType.int32,
+    DType.int16,
+    DType.int8,
+    DType.uint64,
+    DType.uint32,
+    DType.uint16,
+    DType.uint8,
+    DType.bool,
+]
 
 
-def _copy_batched_rows_dispatcher(argv: Argv, argc: Int) raises:
+def _copy_batched_dispatcher(argv: Argv, argc: Int) raises:
     if argc != 2:
-        raise Error("CopyBatchedRows expects metadata and context")
-    comptime if _has_sm_9x():
-        var metadata = argv[unsafe_offset=0]
-        var count = _raw_tuple_len(metadata)
-        if count % 5 != 0:
-            raise Error(
-                "CopyBatchedRows expects source/destination/rows/columns/pitch"
-                " records"
-            )
-        var srcs = List[Int]()
-        var dsts = List[Int]()
-        var rows = List[Int]()
-        var cols = List[Int]()
-        var pitches = List[Int]()
-        for i in range(count // 5):
-            srcs.append(_raw_tuple_int(metadata, i * 5))
-            dsts.append(_raw_tuple_int(metadata, i * 5 + 1))
-            rows.append(_raw_tuple_int(metadata, i * 5 + 2))
-            cols.append(_raw_tuple_int(metadata, i * 5 + 3))
-            pitches.append(_raw_tuple_int(metadata, i * 5 + 4))
-        copy_batched_rows(
-            srcs, dsts, rows, cols, pitches, _raw_ctx(argv[unsafe_offset=1])
+        raise Error("CopyBatched expects metadata and context")
+    var metadata = argv[unsafe_offset=0]
+    var count = _raw_tuple_len(metadata)
+    if count % 6 != 0:
+        raise Error(
+            "CopyBatched expects source/destination/rows/columns/source"
+            " pitch/destination pitch records"
         )
-    else:
-        raise Error("CopyBatchedRows requires Hopper")
+    var n = count // 6
+    var srcs = List[Int](capacity=n)
+    var dsts = List[Int](capacity=n)
+    var rows = List[Int](capacity=n)
+    var cols = List[Int](capacity=n)
+    var src_pitches = List[Int](capacity=n)
+    var dst_pitches = List[Int](capacity=n)
+    for i in range(n):
+        srcs.append(_raw_tuple_int(metadata, i * 6))
+        dsts.append(_raw_tuple_int(metadata, i * 6 + 1))
+        rows.append(_raw_tuple_int(metadata, i * 6 + 2))
+        cols.append(_raw_tuple_int(metadata, i * 6 + 3))
+        src_pitches.append(_raw_tuple_int(metadata, i * 6 + 4))
+        dst_pitches.append(_raw_tuple_int(metadata, i * 6 + 5))
+    var ctx = _raw_ctx(argv[unsafe_offset=1])
+    comptime for src in COPY_BATCH_DTYPES:
+        comptime if _dtype_arg_on[0, src]():
+            comptime for dst in COPY_BATCH_DTYPES:
+                comptime if _dtype_out_on[0, dst]():
+                    copy_batched[src, dst](
+                        srcs, dsts, rows, cols, src_pitches, dst_pitches, ctx
+                    )
+                    return
+    raise Error("CopyBatched: dtype pair not compiled into this module")
 
 
 # ---------------------------------------------------------------------------
@@ -3692,11 +3951,8 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     Slots are described in op_utils (`Arg`); errors come back as (rc=1, message).
     """
     try:
-        comptime if _op_on["CopyBatchedCast"]():
-            _copy_batched_cast_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["CopyBatchedRows"]():
-            _copy_batched_rows_dispatcher(argv, argc)
+        comptime if _op_on["CopyBatched"]():
+            _copy_batched_dispatcher(argv, argc)
             return 0
         comptime if _op_on["CastSpec"]():
             _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
@@ -3706,9 +3962,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["NarrowCopyDst"]():
             _narrow_copy_dst_dispatcher(argv, argc)
-            return 0
-        comptime if _op_on["CatCast"]():
-            _cat_cast_dispatcher(argv, argc)
             return 0
         comptime if _op_on["CatN"]():
             _cat_n_dispatcher(argv, argc)
@@ -3736,6 +3989,15 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["ScatterDim"]():
             _scatter_dim_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["GatherDim"]():
+            _gather_dim_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["ScatterAddDim"]():
+            _scatter_dim_dispatcher[accumulate=True](argv, argc)
+            return 0
+        comptime if _op_on["Pad2D"]():
+            _pad2d_dispatcher(argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

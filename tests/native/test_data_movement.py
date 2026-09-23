@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.native.conftest import ran
+from tests.native.test_matmul import assert_ran
 from torch_mojo_backend import aten_functions, get_accelerators
 
 # tests/native/conftest.py registers devices at fixture setup. Registration
@@ -337,14 +339,23 @@ def _check_split_copy_bits(
     dtype: torch.dtype = torch.bfloat16,
 ):
     count = rows * sum(sizes)
+    bits_dtype = _BITS_DTYPES[dtype.itemsize]
     bits = (torch.arange(count + source_offset + 7, dtype=torch.int64) * 7919 + 13).to(
-        torch.int16
+        bits_dtype
     )
+    if dtype == torch.bool:
+        bits = bits % 2
     host = bits.view(dtype)
     source_base = host.to(device)
     source = source_base[source_offset : source_offset + count].view(rows, sum(sizes))
+    guard_value = True if dtype == torch.bool else -9
     guards = [
-        torch.full((rows * n + destination_offset + 7,), -9, dtype=dtype, device=device)
+        torch.full(
+            (rows * n + destination_offset + 7,),
+            guard_value,
+            dtype=dtype,
+            device=device,
+        )
         for n in sizes
     ]
     outputs = [
@@ -364,26 +375,40 @@ def _check_split_copy_bits(
         outputs, expected, guards, sizes, versions, strict=True
     ):
         torch.testing.assert_close(
-            actual.cpu().view(torch.int16),
-            want.contiguous().view(torch.int16),
+            actual.cpu().view(bits_dtype),
+            want.contiguous().view(bits_dtype),
             rtol=0,
             atol=0,
         )
         observed = guard.cpu()
-        assert bool((observed[:destination_offset] == -9).all())
-        assert bool((observed[destination_offset + rows * n :] == -9).all())
+        assert bool((observed[:destination_offset] == guard_value).all())
+        assert bool((observed[destination_offset + rows * n :] == guard_value).all())
         assert actual._version == version + 1
-    torch.testing.assert_close(
-        source_base.cpu().view(torch.int16), bits, rtol=0, atol=0
-    )
+    torch.testing.assert_close(source_base.cpu().view(bits_dtype), bits, rtol=0, atol=0)
 
 
-# The kernel moves bits through uint16, so every 2-byte dtype is the same work.
-# One small-kernel case (rows <= 8, cols <= the tile) and one that straddles the
-# tile and exercises the 16-byte vector path.
-@pytest.mark.parametrize("dtype", [torch.float16, torch.int16])
+_BITS_DTYPES = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+# A same-dtype copy moves bits, one kernel build per element width; bool also
+# checks its uint8 storage. Short rows under one tile, and rows that straddle
+# it with more rectangles than one launch holds.
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        torch.int16,
+        torch.float32,
+        torch.int32,
+        torch.float64,
+        torch.int64,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
 @pytest.mark.parametrize("rows,sizes", [(3, [17] * 80), (2, [2049, 1, 0, 4096])])
-def test_split_copy_row_other_16_bit_dtypes(
+def test_split_copy_row_other_dtypes(
     mojo_gpu: str, dtype: torch.dtype, rows: int, sizes: list[int]
 ):
     _check_split_copy_bits(mojo_gpu, rows, sizes, 3, 5, dtype)
@@ -1333,6 +1358,95 @@ def test_triu_every_dtype(mojo_gpu):
 
 
 # ---------------------------------------------------------------------------
+# reflection_pad2d / replication_pad2d
+# ---------------------------------------------------------------------------
+
+_PAD2D_MODES = {
+    "reflect": "aten::reflection_pad2d",
+    "replicate": "aten::replication_pad2d",
+}
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.uint8]
+)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7), (1, 2, 37, 53)])
+@pytest.mark.parametrize(
+    "padding", [(1, 2, 0, 3), (0, 0, 0, 0), (5, 1, 2, 5), (1, 1, 1, 1)]
+)
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d(mojo_device, mode, padding, shape, dtype):
+    x = _fill(shape, dtype)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), padding, mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, padding, mode=mode), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d_largest_padding(mojo_device, mode):
+    """Reflect's edge case: padding == dim - 1 (the largest allowed); for
+    replicate, padding far past the input size (no upper bound)."""
+    x = _fill((2, 3, 4, 5), torch.float32)
+    padding = (4, 4, 3, 3) if mode == "reflect" else (9, 7, 11, 6)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), padding, mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, padding, mode=mode)
+    )
+
+
+@pytest.mark.parametrize("mode", _PAD2D_MODES)
+def test_pad2d_strided_input(mojo_device, mode):
+    x = _fill((2, 3, 9, 8), torch.float32).transpose(-1, -2)
+    with ran(_PAD2D_MODES[mode]):
+        out = torch.nn.functional.pad(x.to(mojo_device), (2, 3, 1, 4), mode=mode)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, (2, 3, 1, 4), mode=mode)
+    )
+
+
+def test_pad2d_direct_aten_call(mojo_device):
+    x = _fill((2, 5, 6), torch.bfloat16)
+    dev = x.to(mojo_device)
+    with ran("aten::reflection_pad2d"):
+        out = torch.ops.aten.reflection_pad2d(dev, [2, 1, 3, 0])
+    torch.testing.assert_close(
+        out.cpu(), torch.ops.aten.reflection_pad2d(x, [2, 1, 3, 0])
+    )
+    with ran("aten::replication_pad2d"):
+        out = torch.ops.aten.replication_pad2d(dev, [0, 4, 1, 2])
+    torch.testing.assert_close(
+        out.cpu(), torch.ops.aten.replication_pad2d(x, [0, 4, 1, 2])
+    )
+
+
+def test_pad2d_empty_batch(mojo_device):
+    x = torch.empty(0, 3, 4, 5)
+    out = torch.nn.functional.pad(x.to(mojo_device), (1, 2, 3, 1), mode="replicate")
+    assert out.shape == (0, 3, 8, 8)
+
+
+@pytest.mark.parametrize("pad", [(1, 2, 0, 3), (-1, 2, 0, -2, 0, 0)])
+def test_constant_pad_nd(mojo_device, pad):
+    """No native kernel: ATen's CompositeExplicitAutograd constant_pad_nd
+    decomposes into ops the device has (empty, fill_, slice, copy_)."""
+    x = _fill((2, 3, 4, 5), torch.float32)
+    out = torch.nn.functional.pad(x.to(mojo_device), pad, mode="constant", value=2.5)
+    torch.testing.assert_close(
+        out.cpu(), torch.nn.functional.pad(x, pad, mode="constant", value=2.5)
+    )
+
+
+def test_reflection_pad2d_rejects_padding_ge_input_dim(mojo_device):
+    """Like CPU: a reflected index needs a pivot strictly inside the dim."""
+    x = torch.randn(2, 3, 4, 4, device=mojo_device)
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
+
+
+# ---------------------------------------------------------------------------
 # select_scatter
 # ---------------------------------------------------------------------------
 
@@ -1473,6 +1587,371 @@ def test_scatter_rejects_rank_beyond_4(mojo_gpu):
     index = torch.zeros(2, 2, 2, 2, 2, dtype=torch.int64).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         a.scatter(0, index, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# gather / index_select / scatter_add / index_add (GatherDim, GatherRows,
+# ScatterAddDim) and index_put(accumulate=True)
+# ---------------------------------------------------------------------------
+
+_GATHER_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.bool]
+# Exactly representable sums: a bf16 scatter_add of small integers is exact,
+# so any collision-order difference cannot show up as rounding.
+_ADD_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float64,
+    torch.int32,
+    torch.int64,
+]
+
+
+def _small_ints(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    numel = 1
+    for extent in shape:
+        numel *= extent
+    return (torch.arange(numel, dtype=torch.int64) % 7 - 3).reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("dtype", _GATHER_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((37, 53), 0), ((37, 53), 1), ((37, 53), -1), ((5, 7, 9), 1), ((3, 5, 4, 7), -2)],
+)
+def test_gather(mojo_gpu, shape, dim, dtype, idx_dtype):
+    x = _fill(shape, dtype)
+    # Smaller than self on every dim, not only the indexed one: the output is
+    # shaped like the index, so a kernel walking self's shape is caught.
+    index_shape = tuple(
+        max(1, s - 2) if d != dim % len(shape) else 11 for d, s in enumerate(shape)
+    )
+    index = torch.randint(0, shape[dim], index_shape, dtype=idx_dtype)
+    with assert_ran("aten::gather"):
+        dev = torch.gather(x.to(mojo_gpu), dim, index.to(mojo_gpu))
+    assert dev.shape == index.shape
+    torch.testing.assert_close(dev.cpu(), torch.gather(x, dim, index), rtol=0, atol=0)
+
+
+def test_gather_strided_operands_and_out(mojo_gpu):
+    x = torch.randn(41, 29)
+    index = torch.randint(0, 41, (13, 29))
+    expected = torch.gather(x.t(), 1, index.t())
+    xs, idx = x.to(mojo_gpu).t(), index.to(mojo_gpu).t()
+    with assert_ran("aten::gather"):
+        dev = torch.gather(xs, 1, idx)
+    torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+    # A strided out= of the right shape is written where it lives.
+    base = torch.zeros(13, 29, device=mojo_gpu)
+    out = base.t()
+    with assert_ran("aten::gather.out"):
+        returned = torch.gather(xs, 1, idx, out=out)
+    assert returned.data_ptr() == base.data_ptr()
+    torch.testing.assert_close(base.t().cpu(), expected, rtol=0, atol=0)
+    # A wrongly-shaped one is resized.
+    resized = torch.empty(0, device=mojo_gpu)
+    torch.gather(xs, 1, idx, out=resized)
+    torch.testing.assert_close(resized.cpu(), expected, rtol=0, atol=0)
+
+
+def test_gather_empty_index(mojo_gpu):
+    x = torch.randn(5, 6)
+    index = torch.empty(0, 6, dtype=torch.int64)
+    dev = torch.gather(x.to(mojo_gpu), 0, index.to(mojo_gpu))
+    assert dev.shape == (0, 6)
+
+
+def test_gather_rejects_an_index_bigger_than_self(mojo_gpu):
+    x = torch.randn(4, 5, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Size does not match"):
+        torch.gather(x, 0, torch.zeros(2, 9, dtype=torch.int64, device=mojo_gpu))
+
+
+def test_gather_backward(mojo_gpu):
+    """gather's backward is scatter_add: autograd through both natively."""
+    x = torch.randn(9, 13)
+    index = torch.randint(0, 13, (9, 20))
+    xd = x.to(mojo_gpu).requires_grad_()
+    with assert_ran("aten::gather", "aten::scatter_add_"):
+        torch.gather(xd, 1, index.to(mojo_gpu)).sum().backward()
+    xc = x.clone().requires_grad_()
+    torch.gather(xc, 1, index).sum().backward()
+    assert xd.grad is not None
+    torch.testing.assert_close(xd.grad.cpu(), xc.grad)
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("dtype", _GATHER_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [
+        ((37, 53), 0),
+        ((37, 53), 1),
+        ((37, 53), -1),
+        ((5, 7, 9), 1),
+        ((2, 3, 5, 4, 3), 2),
+    ],
+)
+def test_index_select(mojo_gpu, shape, dim, dtype, idx_dtype):
+    x = _fill(shape, dtype)
+    # Duplicated, out of order and not the indexed extent's length.
+    index = torch.randint(0, shape[dim], (19,), dtype=idx_dtype)
+    with assert_ran("aten::index_select"):
+        dev = torch.index_select(x.to(mojo_gpu), dim, index.to(mojo_gpu))
+    torch.testing.assert_close(
+        dev.cpu(), torch.index_select(x, dim, index), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_index_select_strided_input_and_index(mojo_gpu, dim):
+    x = torch.randn(9, 11, 7).permute(2, 0, 1)
+    index = torch.randint(0, x.shape[dim], (26,))[::2]
+    expected = torch.index_select(x, dim, index)
+    with assert_ran("aten::index_select"):
+        dev = torch.index_select(x.to(mojo_gpu), dim, index.to(mojo_gpu))
+    torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+
+def test_index_select_out_zero_d_and_empty_index(mojo_gpu):
+    x = torch.randn(6, 5)
+    xd = x.to(mojo_gpu)
+    zero_d = torch.tensor(3)
+    torch.testing.assert_close(
+        torch.index_select(xd, 1, zero_d.to(mojo_gpu)).cpu(),
+        torch.index_select(x, 1, zero_d),
+    )
+    empty = torch.empty(0, dtype=torch.int64)
+    assert torch.index_select(xd, 0, empty.to(mojo_gpu)).shape == (0, 5)
+    out = torch.empty(0, device=mojo_gpu)
+    index = torch.tensor([5, 0, 5])
+    with assert_ran("aten::index_select.out"):
+        torch.index_select(xd, 0, index.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.index_select(x, 0, index))
+
+
+def test_index_select_backward(mojo_gpu):
+    """index_select's backward is index_add_ with duplicated indices."""
+    x = torch.randn(8, 5)
+    index = torch.tensor([7, 0, 7, 3, 7])
+    xd = x.to(mojo_gpu).requires_grad_()
+    with assert_ran("aten::index_select", "aten::index_add_"):
+        torch.index_select(xd, 0, index.to(mojo_gpu)).sum().backward()
+    xc = x.clone().requires_grad_()
+    torch.index_select(xc, 0, index).sum().backward()
+    assert xd.grad is not None
+    torch.testing.assert_close(xd.grad.cpu(), xc.grad)
+
+
+@pytest.mark.parametrize("dtype", _ADD_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((37, 53), 0), ((37, 53), 1), ((37, 53), -1), ((5, 7, 9), 1), ((3, 5, 4, 7), -3)],
+)
+def test_scatter_add(mojo_gpu, shape, dim, dtype):
+    """Every target collides many times: a plain scatter would fail."""
+    x = _small_ints(shape, dtype)
+    index_shape = tuple(max(1, s - 1) for s in shape)
+    index = torch.randint(0, min(3, shape[dim]), index_shape)
+    src = _small_ints(shape, dtype).flip(0)
+    expected = x.scatter_add(dim, index, src)
+    with assert_ran("aten::scatter_add"):
+        dev = x.to(mojo_gpu).scatter_add(dim, index.to(mojo_gpu), src.to(mojo_gpu))
+    torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+
+def test_scatter_add_inplace_out_and_empty(mojo_gpu):
+    x = _small_ints((6, 9), torch.float32)
+    index = torch.randint(0, 9, (6, 9))
+    src = _small_ints((6, 9), torch.float32) * 2
+    expected = x.scatter_add(1, index, src)
+    ours = x.to(mojo_gpu)
+    pointer = ours.data_ptr()
+    with assert_ran("aten::scatter_add_"):
+        ours.scatter_add_(1, index.to(mojo_gpu), src.to(mojo_gpu))
+    assert ours.data_ptr() == pointer
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+    out = torch.full((9, 6), 5.0, device=mojo_gpu).t()
+    with assert_ran("aten::scatter_add.out"):
+        torch.scatter_add(
+            x.to(mojo_gpu), 1, index.to(mojo_gpu), src.to(mojo_gpu), out=out
+        )
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    empty = torch.empty(0, 9, dtype=torch.int64, device=mojo_gpu)
+    torch.testing.assert_close(
+        x.to(mojo_gpu).scatter_add(0, empty, src.to(mojo_gpu)).cpu(), x
+    )
+
+
+def test_scatter_add_rejects_bad_indices(mojo_gpu):
+    """Like CPU torch: an out-of-range index raises, and so does an int32
+    index (scatter_add requires int64)."""
+    a = torch.zeros(4, 5, device=mojo_gpu)
+    src = torch.ones(2, 5, device=mojo_gpu)
+    for bad in (4, -1):
+        index = torch.zeros(2, 5, dtype=torch.int64, device=mojo_gpu)
+        index[1, 3] = bad
+        with pytest.raises(RuntimeError, match="index out of range"):
+            a.scatter_add(0, index, src)
+    with pytest.raises(RuntimeError, match="int64"):
+        a.scatter_add(0, torch.zeros(2, 5, dtype=torch.int32, device=mojo_gpu), src)
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("dtype", _ADD_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"), [((37, 53), 0), ((37, 53), -1), ((5, 7, 9), 1), ((3, 5, 4, 7), 2)]
+)
+def test_index_add(mojo_gpu, shape, dim, dtype, idx_dtype):
+    x = _small_ints(shape, dtype)
+    index = torch.randint(0, shape[dim], (23,), dtype=idx_dtype)
+    index[:4] = index[4]  # duplicates accumulate
+    source_shape = list(shape)
+    source_shape[dim] = 23
+    source = _small_ints(tuple(source_shape), dtype)
+    expected = x.index_add(dim, index, source)
+    with assert_ran("aten::index_add"):
+        dev = x.to(mojo_gpu).index_add(dim, index.to(mojo_gpu), source.to(mojo_gpu))
+    torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+
+
+def test_index_add_alpha_inplace_out_and_errors(mojo_gpu):
+    x = _small_ints((7, 6), torch.float32)
+    index = torch.tensor([5, 0, 5])
+    source = _small_ints((7, 3), torch.float32)
+    expected = x.index_add(1, index, source, alpha=2)
+    ours = x.to(mojo_gpu)
+    with assert_ran("aten::index_add_"):
+        ours.index_add_(1, index.to(mojo_gpu), source.to(mojo_gpu), alpha=2)
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+    out = torch.empty(0, device=mojo_gpu)
+    with assert_ran("aten::index_add.out"):
+        torch.index_add(
+            x.to(mojo_gpu), 1, index.to(mojo_gpu), source.to(mojo_gpu), out=out
+        )
+    torch.testing.assert_close(out.cpu(), x.index_add(1, index, source), rtol=0, atol=0)
+    empty = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    torch.testing.assert_close(
+        x.to(mojo_gpu).index_add(1, empty, torch.empty(7, 0, device=mojo_gpu)).cpu(), x
+    )
+    with pytest.raises(RuntimeError, match="index out of range"):
+        x.to(mojo_gpu).index_add(
+            1, torch.tensor([5, 5, 6], device=mojo_gpu), source.to(mojo_gpu)
+        )
+
+
+def test_zero_d_operands(mojo_gpu):
+    """A 0-d operand counts as shape (1,), as in ATen's ensure_nonempty_dim."""
+    x = torch.tensor(2.5)
+    xd = x.to(mojo_gpu)
+    zero = torch.tensor(0)
+    one = torch.tensor([0])
+    cases = [
+        lambda t, i0, i1: torch.gather(t, 0, i0),
+        lambda t, i0, i1: torch.gather(t, 0, i1),
+        lambda t, i0, i1: torch.index_select(t, 0, i1),
+        lambda t, i0, i1: t.scatter_add(0, i0, t * 2),
+        lambda t, i0, i1: t.index_add(0, i1, t * 3),
+    ]
+    for case in cases:
+        expected = case(x, zero, one)
+        actual = case(xd, zero.to(mojo_gpu), one.to(mojo_gpu))
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual.cpu(), expected)
+
+
+def test_scatter_add_and_index_add_bool(mojo_gpu):
+    """A bool sum saturates at True (CPU torch's `+` on bool)."""
+    x = torch.tensor([[True, False, False], [False, False, True]])
+    src = torch.tensor([[False, True, False], [True, False, False]])
+    index = torch.tensor([[0, 0, 1], [1, 1, 1]])
+    torch.testing.assert_close(
+        x.to(mojo_gpu).scatter_add(0, index.to(mojo_gpu), src.to(mojo_gpu)).cpu(),
+        x.scatter_add(0, index, src),
+    )
+    idx1 = torch.tensor([2, 2])
+    torch.testing.assert_close(
+        x.to(mojo_gpu).index_add(1, idx1.to(mojo_gpu), src[:, :2].to(mojo_gpu)).cpu(),
+        x.index_add(1, idx1, src[:, :2]),
+    )
+
+
+def test_gather_and_scatter_rank_mismatch_errors(mojo_gpu):
+    """Like CPU torch: a rank mismatch is a RuntimeError, not a decline."""
+    a = torch.zeros(3, 5, 3, device=mojo_gpu)
+    index = torch.zeros(2, 2, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="same number of dimensions"):
+        torch.gather(a, 0, index)
+    with pytest.raises(RuntimeError, match="same number of dimensions"):
+        a.scatter_add(0, index, torch.zeros(2, 5, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_index_put_accumulate(mojo_gpu, axis, dtype, idx_dtype):
+    data = _small_ints((5, 7, 9), dtype)
+    indices = torch.tensor([4, 0, 2, 4, 4, 0], dtype=idx_dtype)
+    value_shape = [5, 7, 9]
+    value_shape[axis] = indices.numel()
+    values = _small_ints(tuple(value_shape), dtype)
+    # The aten op takes `None` for the leading, unindexed axes.
+    index_put_ = torch.ops.aten.index_put_
+    expected = index_put_(data.clone(), [None] * axis + [indices], values, True)
+    ours = data.to(mojo_gpu)
+    with assert_ran("aten::_index_put_impl_"):
+        index_put_(
+            ours, [None] * axis + [indices.to(mojo_gpu)], values.to(mojo_gpu), True
+        )
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_index_put_bool_mask_scalar(mojo_gpu, dtype):
+    """`x[mask] = scalar` goes to masked_fill_, as ATen's own
+    `_index_put_impl_` does (canDispatchToMaskedFill)."""
+    x = _small_ints((7, 9), dtype)
+    expected = x.clone()
+    expected[x > 0] = -5
+    ours = x.to(mojo_gpu)
+    with assert_ran("aten::_index_put_impl_", "aten::masked_fill_.Tensor"):
+        ours[ours > 0] = -5
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+    # A one-element value tensor on the CPU is read on the host.
+    expected[expected < 0] = 2
+    with assert_ran("aten::masked_fill_.Scalar"):
+        ours[ours < 0] = torch.tensor([2], dtype=dtype)
+    torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
+
+
+def test_index_put_bool_row_mask_on_a_square_tensor(mojo_gpu):
+    """A mask over the LEADING dim only: broadcasting is right-aligned, so an
+    unpadded (4,) mask on a (4, 4) tensor would fill columns instead."""
+    x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    keep = torch.tensor([True, False, False, True])
+    expected = x.clone()
+    expected[keep] = 0.0
+    ours = x.to(mojo_gpu)
+    ours[keep.to(mojo_gpu)] = 0.0
+    torch.testing.assert_close(ours.cpu(), expected)
+
+
+def test_index_put_accumulate_broadcast_and_empty(mojo_gpu):
+    data = torch.zeros(6, 4)
+    indices = torch.tensor([5, 5, 1, 5])
+    expected = data.clone().index_put_((indices,), torch.tensor(1.5), accumulate=True)
+    ours = data.to(mojo_gpu)
+    ours.index_put_(
+        (indices.to(mojo_gpu),), torch.tensor(1.5).to(mojo_gpu), accumulate=True
+    )
+    torch.testing.assert_close(ours.cpu(), expected)
+    ours.index_put_(
+        (torch.empty(0, dtype=torch.int64, device=mojo_gpu),),
+        torch.empty(0, 4, device=mojo_gpu),
+        accumulate=True,
+    )
+    torch.testing.assert_close(ours.cpu(), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -1754,6 +2233,104 @@ def test_cat_cast_rejects_before_writing(mojo_gpu, kind):
     with pytest.raises((RuntimeError, NotImplementedError)):
         torch.cat(parts, 1, out=out)
     assert torch.all(out.cpu() == 17)
+
+
+_CAT_OUT_DTYPES = [
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+# Every pair c10::canCast allows into or out of float32 and bfloat16, the
+# same-dtype copy of each width, and integer widening/narrowing and bool.
+_CAT_OUT_PAIRS = sorted(
+    {
+        (a, b)
+        for a in _CAT_OUT_DTYPES
+        for b in _CAT_OUT_DTYPES
+        if (a == b or {a, b} & {torch.float32, torch.bfloat16})
+        and not (a.is_floating_point and not b.is_floating_point)
+        and not (b == torch.bool and a != torch.bool)
+    }
+    | {
+        (torch.int64, torch.int8),
+        (torch.uint8, torch.int32),
+        (torch.bool, torch.int64),
+    },
+    key=str,
+)
+
+
+def _cat_out_values(n: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
+    index = torch.arange(n, dtype=torch.int64) * 7919 + 13 + seed
+    if dtype == torch.bool:
+        return index % 3 == 1
+    if dtype.is_floating_point:
+        return ((index % 20001 - 10000).double() / 97).to(dtype)
+    return (index % 251 - 125).to(dtype)
+
+
+@pytest.mark.parametrize(("src_dtype", "dst_dtype"), _CAT_OUT_PAIRS, ids=str)
+@pytest.mark.parametrize(
+    "dim,widths,offsets",
+    [
+        (1, [0, 1, 7, 17, 2049, 8193], (0, 0)),
+        (1, [5, 1031, 3], (1, 3)),
+        (0, [4, 1], (3, 1)),
+    ],
+)
+def test_cat_out_batched_dtypes(mojo_gpu, src_dtype, dst_dtype, dim, widths, offsets):
+    """One batched rectangle copy per call: rows of every input straight into
+    the (possibly converting) contiguous output, at aligned and odd offsets."""
+    rows = 3
+    source_offset, destination_offset = offsets
+    hosts, sources = [], []
+    for index, width in enumerate(widths):
+        shape = (rows, width, 2) if dim == 1 else (width, rows, 2)
+        numel = rows * width * 2
+        host = _cat_out_values(numel + source_offset, src_dtype, index)
+        hosts.append(host[source_offset:].view(shape))
+        sources.append(host.to(mojo_gpu)[source_offset:].view(shape))
+    expected = torch.cat(hosts, dim).to(dst_dtype)
+    backing = torch.zeros(
+        expected.numel() + destination_offset + 4, dtype=dst_dtype, device=mojo_gpu
+    )
+    out = backing[destination_offset:][: expected.numel()].view(expected.shape)
+    version, pointer = out._version, out.data_ptr()
+    assert torch.cat(sources, dim, out=out) is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    assert out._version == version + 1 and out.data_ptr() == pointer
+    guard = backing.cpu()
+    assert not guard[:destination_offset].any()
+    assert not guard[destination_offset + expected.numel() :].any()
+
+
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.int64),
+        (torch.bfloat16, torch.uint8),
+        (torch.int32, torch.bool),
+    ],
+    ids=str,
+)
+def test_cat_out_rejects_what_torch_cannot_cast(mojo_gpu, src_dtype, dst_dtype):
+    parts = [torch.ones(2, 3, dtype=src_dtype), torch.ones(2, 5, dtype=src_dtype)]
+    with pytest.raises(TypeError, match="can't be cast to the desired output type"):
+        torch.cat(parts, 1, out=torch.empty(2, 8, dtype=dst_dtype))
+    before = torch.full((2, 8), 3, dtype=dst_dtype)
+    out = before.to(mojo_gpu)
+    with pytest.raises(
+        (TypeError, RuntimeError), match="can't be cast to the desired output type"
+    ):
+        torch.cat([x.to(mojo_gpu) for x in parts], 1, out=out)
+    torch.testing.assert_close(out.cpu(), before, rtol=0, atol=0)
 
 
 def test_cat_out_keeps_a_matching_out_where_it_is(mojo_gpu):
@@ -2142,16 +2719,11 @@ def test_index_put_noncontiguous(mojo_gpu: str):
         torch.testing.assert_close(ours.cpu(), expected)
 
 
-@pytest.mark.parametrize("case", ["int32", "negative", "out_of_bounds", "accumulate"])
+@pytest.mark.parametrize("case", ["negative", "out_of_bounds"])
 def test_index_put_declined_inputs(mojo_gpu: str, case: str):
-    indices = torch.tensor(
-        [-1] if case == "negative" else [9] if case == "out_of_bounds" else [1],
-        dtype=torch.int32 if case == "int32" else torch.int64,
-    )
+    indices = torch.tensor([-1] if case == "negative" else [9])
     data = torch.zeros(3, 4).to(mojo_gpu)
     values = torch.ones(1, 4).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
-        data.index_put_(
-            (indices.to(mojo_gpu),), values, accumulate=case == "accumulate"
-        )
+        data.index_put_((indices.to(mojo_gpu),), values)
     torch.testing.assert_close(data.cpu(), torch.zeros(3, 4))
