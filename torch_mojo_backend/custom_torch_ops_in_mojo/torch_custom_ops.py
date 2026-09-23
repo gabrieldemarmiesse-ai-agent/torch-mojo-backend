@@ -63,7 +63,7 @@ def make_torch_op_from_mojo(
     signed_op = cast(_SignedTorchOp, mojo_custom_op_with_signature)
     signed_op.__signature__ = mojo_custom_op.torch_signature
 
-    torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels.append(
+    torch_mojo_backend.torch_compile_backend.compiler.extra_kernel_paths.append(
         path_to_kernels
     )
     torch_mojo_backend.MAPPING_TORCH_ATEN_TO_MOJO[
