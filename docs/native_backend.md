@@ -942,7 +942,7 @@ tests/conftest.py).
 
 `enable_cuda_fallback()` (or `cuda_fallback()` for one block) installs the
 same conversion as a `PrivateUse1` dispatcher fallback, so every op with a
-CUDA kernel and no Mojo op runs this way — `index_select`, `sort`, `topk`,
+CUDA kernel and no Mojo op runs this way — `take`, `sort`, `topk`,
 … forward and backward. Two ops it cannot reach, both because the fallback
 only fires where *no* kernel is registered:
 

@@ -6137,6 +6137,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "_index_put_impl_": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S65536_acc": {
+                  "layouts": {
+                    "contig": 0.925
+                  }
+                },
+                "R_357x789_S119_acc": {
+                  "layouts": {
+                    "contig": 0.267
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S65536_acc": {
+                  "layouts": {
+                    "contig": 0.856
+                  }
+                },
+                "R_357x789_S119_acc": {
+                  "layouts": {
+                    "contig": 0.22
+                  }
+                }
+              }
+            }
+          }
+        },
         "_log_softmax": {
           "dtypes": {
             "bf16": {
@@ -7900,6 +7932,16 @@ document.addEventListener("DOMContentLoaded", boot);
                     "contig": 24.351
                   }
                 },
+                "N4xC80xL3000_K384k3s1": {
+                  "layouts": {
+                    "contig": 6.564
+                  }
+                },
+                "N8xC256xL357_K512k5s2": {
+                  "layouts": {
+                    "contig": 9.623
+                  }
+                },
                 "N8xC3x224x224_K64k7s2": {
                   "layouts": {
                     "contig": 4.701
@@ -7912,6 +7954,16 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N32xC64x56x56_K64k3s1": {
                   "layouts": {
                     "contig": 12.456
+                  }
+                },
+                "N4xC80xL3000_K384k3s1": {
+                  "layouts": {
+                    "contig": 5.23
+                  }
+                },
+                "N8xC256xL357_K512k5s2": {
+                  "layouts": {
+                    "contig": 5.312
                   }
                 },
                 "N8xC3x224x224_K64k7s2": {
@@ -8299,6 +8351,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "gather": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.755
+                  }
+                },
+                "R_357x789_D0": {
+                  "layouts": {
+                    "contig": 1.252
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.144
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.249
+                  }
+                },
+                "R_357x789_D0": {
+                  "layouts": {
+                    "contig": 1.236
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.074
+                  }
+                }
+              }
+            }
+          }
+        },
         "ge": {
           "dtypes": {
             "f32": {
@@ -8441,6 +8535,90 @@ document.addEventListener("DOMContentLoaded", boot);
                 "R_262144x64_I1048576": {
                   "layouts": {
                     "contig": 0.522
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index_add": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 1.507
+                  }
+                },
+                "R_357x789_S119_D1": {
+                  "layouts": {
+                    "contig": 1.48
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 2.35
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 1.533
+                  }
+                },
+                "R_357x789_S119_D1": {
+                  "layouts": {
+                    "contig": 1.103
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 1.044
+                  }
+                }
+              }
+            }
+          }
+        },
+        "index_select": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 0.541
+                  }
+                },
+                "R_357x789_S119_D1": {
+                  "layouts": {
+                    "contig": 0.651
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 4.411
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_S1048576_D0": {
+                  "layouts": {
+                    "contig": 0.559
+                  }
+                },
+                "R_357x789_S119_D1": {
+                  "layouts": {
+                    "contig": 0.64
+                  }
+                },
+                "R_4096x4096_S8192_D1": {
+                  "layouts": {
+                    "contig": 2.965
                   }
                 }
               }
@@ -10295,6 +10473,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "reflection_pad2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S_16x3x357x789": {
+                  "layouts": {
+                    "contig": 2.497
+                  }
+                },
+                "S_32x128x32x32": {
+                  "layouts": {
+                    "contig": 3.356
+                  }
+                },
+                "S_8x64x64x64": {
+                  "layouts": {
+                    "contig": 3.087
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S_16x3x357x789": {
+                  "layouts": {
+                    "contig": 2.527
+                  }
+                },
+                "S_32x128x32x32": {
+                  "layouts": {
+                    "contig": 3.341
+                  }
+                },
+                "S_8x64x64x64": {
+                  "layouts": {
+                    "contig": 3.089
+                  }
+                }
+              }
+            }
+          }
+        },
         "relu": {
           "dtypes": {
             "bf16": {
@@ -10483,6 +10703,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "replication_pad2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "S_16x3x357x789": {
+                  "layouts": {
+                    "contig": 2.118
+                  }
+                },
+                "S_32x128x32x32": {
+                  "layouts": {
+                    "contig": 2.404
+                  }
+                },
+                "S_8x64x64x64": {
+                  "layouts": {
+                    "contig": 2.355
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "S_16x3x357x789": {
+                  "layouts": {
+                    "contig": 2.15
+                  }
+                },
+                "S_32x128x32x32": {
+                  "layouts": {
+                    "contig": 2.463
+                  }
+                },
+                "S_8x64x64x64": {
+                  "layouts": {
+                    "contig": 2.347
+                  }
+                }
+              }
+            }
+          }
+        },
         "rsqrt": {
           "dtypes": {
             "bf16": {
@@ -10524,6 +10786,16 @@ document.addEventListener("DOMContentLoaded", boot);
                     "contig": 0.832
                   }
                 },
+                "B1H32KV8S4096D128": {
+                  "layouts": {
+                    "contig": 1.077
+                  }
+                },
+                "B1H8KV1S4096D128": {
+                  "layouts": {
+                    "contig": 0.818
+                  }
+                },
                 "B8H12S1024D64": {
                   "layouts": {
                     "contig": 0.912
@@ -10536,6 +10808,16 @@ document.addEventListener("DOMContentLoaded", boot);
                 "B1H16S4096D128": {
                   "layouts": {
                     "contig": 0.835
+                  }
+                },
+                "B1H32KV8S4096D128": {
+                  "layouts": {
+                    "contig": 1.074
+                  }
+                },
+                "B1H8KV1S4096D128": {
+                  "layouts": {
+                    "contig": 0.823
                   }
                 },
                 "B8H12S1024D64": {
@@ -10605,6 +10887,48 @@ document.addEventListener("DOMContentLoaded", boot);
                 "R_262144x64_S65536": {
                   "layouts": {
                     "contig": 1.183
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scatter_add": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 2.277
+                  }
+                },
+                "R_357x789_D0": {
+                  "layouts": {
+                    "contig": 1.47
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.234
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "R_262144x64_D1": {
+                  "layouts": {
+                    "contig": 1.552
+                  }
+                },
+                "R_357x789_D0": {
+                  "layouts": {
+                    "contig": 1.156
+                  }
+                },
+                "R_4096x4096_D0": {
+                  "layouts": {
+                    "contig": 1.051
                   }
                 }
               }
@@ -11159,6 +11483,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N8xC64x56x56_x2": {
                   "layouts": {
                     "contig": 0.938
+                  }
+                }
+              }
+            }
+          }
+        },
+        "upsample_nearest2d": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 3.789
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 4.457
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N2xC3x256x256_x2": {
+                  "layouts": {
+                    "contig": 3.79
+                  }
+                },
+                "N8xC64x56x56_x2": {
+                  "layouts": {
+                    "contig": 4.002
                   }
                 }
               }

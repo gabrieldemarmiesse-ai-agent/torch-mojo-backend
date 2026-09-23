@@ -64,6 +64,19 @@ REPEAT_SHAPES: dict[str, tuple[int, int, tuple[int, int]]] = {
 TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216
 
+# (N, C, H, W). Two round shapes plus one awkward one (357x789, from the
+# repo-wide convention of covering an unaligned regime) -- all comfortably
+# above PAD2D_PADDING's largest side (5), so reflect's "pad < input
+# dimension" validation never trips.
+PAD2D_SHAPES: dict[str, tuple[int, int, int, int]] = {
+    "S_8x64x64x64": (8, 64, 64, 64),
+    "S_32x128x32x32": (32, 128, 32, 32),
+    "S_16x3x357x789": (16, 3, 357, 789),
+}
+# Asymmetric on every side (left, right, top, bottom) -- the normal case for
+# F.pad's 4-tuple, not just the symmetric special case.
+PAD2D_PADDING = (3, 5, 2, 4)
+
 COVERS: dict[str, str] = {
     "aten::split_with_sizes_copy.out": "test_split_copy_rows",
     "aten::_copy_from": "test_copy_row_strided (same-device strided copies; contiguous/device moves are memcpy)",
@@ -78,6 +91,8 @@ COVERS: dict[str, str] = {
     ),
     "aten::_to_copy": "test_to_copy_cast (dtype-cast regime only)",
     "aten::_index_put_impl_": "test_index_put",
+    "aten::reflection_pad2d": "test_reflection_pad2d",
+    "aten::replication_pad2d": "test_replication_pad2d",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -412,4 +427,38 @@ def test_index_put(
         lambda: d_ref.index_put_((i_ref,), v_ref),
         lambda: d_our.index_put_((i_our,), v_our),
         flops=float(values.numel()),
+    )
+
+
+def _pad2d_out_numel(shape: tuple[int, int, int, int]) -> float:
+    n, c, h, w = shape
+    pad_l, pad_r, pad_t, pad_b = PAD2D_PADDING
+    return float(n * c * (h + pad_t + pad_b) * (w + pad_l + pad_r))
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD2D_SHAPES)
+def test_reflection_pad2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = PAD2D_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.nn.functional.pad(x_ref, PAD2D_PADDING, mode="reflect"),
+        lambda: torch.nn.functional.pad(x_our, PAD2D_PADDING, mode="reflect"),
+        flops=_pad2d_out_numel(shape),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", PAD2D_SHAPES)
+def test_replication_pad2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = PAD2D_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.nn.functional.pad(x_ref, PAD2D_PADDING, mode="replicate"),
+        lambda: torch.nn.functional.pad(x_our, PAD2D_PADDING, mode="replicate"),
+        flops=_pad2d_out_numel(shape),
     )

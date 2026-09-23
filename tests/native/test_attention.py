@@ -340,6 +340,119 @@ def test_efficient_attention_declines_bias(mojo_gpu, counting):
 
 
 # --------------------------------------------------------------------------
+# Grouped-query attention (enable_gqa=True)
+# --------------------------------------------------------------------------
+
+
+def _gqa_qkv(
+    device: str,
+    dtype: torch.dtype,
+    q_heads: int,
+    kv_heads: int,
+    q_len: int,
+    kv_len: int,
+    head_dim: int = 64,
+) -> tuple[torch.Tensor, ...]:
+    """Like `_qkv`, with K/V carrying `kv_heads` heads instead of Q's."""
+    gen = torch.Generator().manual_seed(3)
+    shapes = (
+        (2, q_heads, q_len, head_dim),
+        (2, kv_heads, kv_len, head_dim),
+        (2, kv_heads, kv_len, head_dim),
+    )
+    ref = [torch.randn(s, generator=gen).to(dtype).float() for s in shapes]
+    return (*ref, *(t.to(dtype).to(device) for t in ref))
+
+
+_GQA_HEADS = [(8, 2), (8, 1), (4, 4)]
+_GQA_IDS = ["gqa8to2", "mqa8to1", "equal4"]
+
+
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("q_heads,kv_heads", _GQA_HEADS, ids=_GQA_IDS)
+def test_sdpa_enable_gqa_inference(
+    mojo_gpu, counting, dtype, q_heads, kv_heads, is_causal
+):
+    """An odd seqlen (257) so FA4 takes it through its BHSD tail route."""
+    qr, kr, vr, q, k, v = _gqa_qkv(mojo_gpu, dtype, q_heads, kv_heads, 257, 257)
+    with torch.no_grad():
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, enable_gqa=True
+        )
+    if kv_heads != q_heads:
+        assert _counted("_scaled_dot_product_efficient_attention") == 1
+    assert _counted("clone") == 0  # no ATen repeat_interleave
+    expected = F.scaled_dot_product_attention(
+        qr, kr, vr, is_causal=is_causal, enable_gqa=True
+    )
+    torch.testing.assert_close(
+        out.cpu().float(), expected, atol=_tol(dtype), rtol=_tol(dtype)
+    )
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(8, 2), (8, 1)], ids=_GQA_IDS[:2])
+def test_sdpa_enable_gqa_decode_step(mojo_gpu, counting, q_heads, kv_heads):
+    qr, kr, vr, q, k, v = _gqa_qkv(mojo_gpu, torch.float32, q_heads, kv_heads, 1, 130)
+    with torch.no_grad():
+        out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    assert _counted("_scaled_dot_product_efficient_attention") == 1
+    torch.testing.assert_close(
+        out.cpu(),
+        F.scaled_dot_product_attention(qr, kr, vr, enable_gqa=True),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def test_efficient_attention_repeats_strided_gqa_kv(mojo_gpu, counting):
+    """K/V handed over as (B, S, H, D) storage viewed (B, H, S, D): the
+    head repeat reads them through their own strides."""
+    gen = torch.Generator().manual_seed(5)
+    q_ref = torch.randn(1, 6, 40, 32, generator=gen)
+    kv_ref = torch.randn(1, 40, 2, 2, 32, generator=gen)
+    kv = kv_ref.to(mojo_gpu)
+    k, v = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
+    assert not k.is_contiguous()
+    out = aten._scaled_dot_product_efficient_attention(
+        q_ref.to(mojo_gpu), k, v, None, False, 0.0, True
+    )[0]
+    expected = F.scaled_dot_product_attention(
+        q_ref,
+        kv_ref[:, :, 0].transpose(1, 2),
+        kv_ref[:, :, 1].transpose(1, 2),
+        is_causal=True,
+        enable_gqa=True,
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+def test_sdpa_enable_gqa_trains_through_math(mojo_gpu):
+    """Under autograd GQA stays on ATen's math decomposition, whose
+    repeat_interleave backward folds each query group's gradient back onto
+    its KV head."""
+    qr, kr, vr, q, k, v = _gqa_qkv(mojo_gpu, torch.float32, 4, 2, 24, 24, 16)
+    for t in (qr, kr, vr, q, k, v):
+        t.requires_grad_()
+    F.scaled_dot_product_attention(
+        q, k, v, is_causal=True, enable_gqa=True
+    ).sum().backward()
+    F.scaled_dot_product_attention(
+        qr, kr, vr, is_causal=True, enable_gqa=True
+    ).sum().backward()
+    for got, want in ((q, qr), (k, kr), (v, vr)):
+        assert got.grad is not None and want.grad is not None
+        assert got.grad.shape == want.grad.shape
+        torch.testing.assert_close(got.grad.cpu(), want.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_sdpa_enable_gqa_indivisible_heads_raise(mojo_gpu):
+    _, _, _, q, k, v = _gqa_qkv(mojo_gpu, torch.float32, 6, 4, 8, 8, 16)
+    with torch.no_grad(), pytest.raises(RuntimeError, match="divide"):
+        F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+# --------------------------------------------------------------------------
 # _fused_sdp_choice
 # --------------------------------------------------------------------------
 
@@ -374,6 +487,23 @@ def test_fused_sdp_choice_math_for_masked_and_dropout(mojo_gpu, counting):
     mask = torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16, device=mojo_gpu)
     assert aten._fused_sdp_choice(q, k, v, mask, 0.0, False) == MATH
     assert aten._fused_sdp_choice(q, k, v, None, 0.25, True) == MATH
+
+
+def test_fused_sdp_choice_gqa(mojo_gpu, counting):
+    """Unequal heads: the efficient op for inference, math under autograd
+    or when the heads do not divide. Equal heads ignore enable_gqa."""
+    _, _, _, q, k, v = _gqa_qkv(mojo_gpu, torch.bfloat16, 8, 2, 128, 128)
+    assert aten._fused_sdp_choice(q, k, v, None, 0.0, True, enable_gqa=True) == (
+        EFFICIENT
+    )
+    q.requires_grad_()
+    assert aten._fused_sdp_choice(q, k, v, None, 0.0, True, enable_gqa=True) == MATH
+    _, _, _, q, k, v = _gqa_qkv(mojo_gpu, torch.bfloat16, 6, 4, 128, 128)
+    assert aten._fused_sdp_choice(q, k, v, None, 0.0, True, enable_gqa=True) == MATH
+    _, _, _, q, k, v = _qkv(mojo_gpu, torch.bfloat16, 1, 2, 128, 128, 64)
+    assert aten._fused_sdp_choice(
+        q, k, v, None, 0.0, True, enable_gqa=True
+    ) == aten._fused_sdp_choice(q, k, v, None, 0.0, True)
 
 
 def test_public_sdpa_takes_the_supported_route_and_trains(mojo_gpu: str):
