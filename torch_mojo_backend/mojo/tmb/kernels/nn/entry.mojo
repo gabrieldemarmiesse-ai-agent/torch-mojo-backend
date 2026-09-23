@@ -464,7 +464,6 @@ def _attn_decode[
                     ]
                 ](
                     ctx,
-                    String(t"attn_decode_apple_short_{dtype}"),
                     bh,
                     1,
                     1,
@@ -489,7 +488,6 @@ def _attn_decode[
                 return
         _enqueue_cached[_attn_decode_kernel[dtype]](
             ctx,
-            String(t"attn_decode_{dtype}"),
             bh,
             1,
             1,

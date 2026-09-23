@@ -373,7 +373,6 @@ def _softmax_rows_apple[
     if aligned and cols % V == 0 and cols <= WARP_SIZE * _APPLE_SM_MAX_VPT * V:
         _enqueue_cached[_softmax_rows_warp_kernel[dtype, V]](
             ctx,
-            String(t"softmax_rows_warp_{dtype}_{V}"),
             warp_grid,
             1,
             1,
@@ -389,7 +388,6 @@ def _softmax_rows_apple[
     elif cols <= WARP_SIZE * _APPLE_SM_MAX_VPT:
         _enqueue_cached[_softmax_rows_warp_kernel[dtype, 1]](
             ctx,
-            String(t"softmax_rows_warp_{dtype}_1"),
             warp_grid,
             1,
             1,
@@ -408,7 +406,6 @@ def _softmax_rows_apple[
             if aligned:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 1024, True]](
                     ctx,
-                    String(t"softmax_rows_block_{dtype}_1024_v"),
                     block_grid,
                     1,
                     1,
@@ -424,7 +421,6 @@ def _softmax_rows_apple[
             else:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 1024, False]](
                     ctx,
-                    String(t"softmax_rows_block_{dtype}_1024_s"),
                     block_grid,
                     1,
                     1,
@@ -441,7 +437,6 @@ def _softmax_rows_apple[
             if aligned:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 256, True]](
                     ctx,
-                    String(t"softmax_rows_block_{dtype}_256_v"),
                     block_grid,
                     1,
                     1,
@@ -457,7 +452,6 @@ def _softmax_rows_apple[
             else:
                 _enqueue_cached[_softmax_rows_block_kernel[dtype, 256, False]](
                     ctx,
-                    String(t"softmax_rows_block_{dtype}_256_s"),
                     block_grid,
                     1,
                     1,
@@ -675,7 +669,6 @@ def enqueue_softmax_rows_dropout_f32(
         )
         _enqueue_cached[_softmax_rows_dropout_warp_kernel](
             ctx,
-            String("softmax_rows_dropout_warp_f32"),
             warp_grid,
             1,
             1,
@@ -847,7 +840,6 @@ def _enqueue_softmax_warp[
 ) raises:
     _enqueue_cached[_softmax_warp_kernel[dtype, causal, VEC]](
         ctx,
-        String(t"softmax_rows_warp_{dtype}_c{causal}_v{VEC}"),
         min(ceildiv(rows, _SM_WARPS_PER_BLOCK), _SM_MAX_GRID),
         1,
         1,
