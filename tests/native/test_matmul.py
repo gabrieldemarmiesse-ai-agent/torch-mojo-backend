@@ -1205,6 +1205,67 @@ def test_conv2d_depthwise(mojo_device):
     )
 
 
+# conv1d is the rank-3 aten::convolution: the 2-D im2col + GEMM path with a
+# unit H axis. Odd lengths and channel counts on purpose.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "in_c,out_c,length,k,stride,padding,dilation,groups,bias",
+    [
+        (3, 8, 17, 3, 1, 0, 1, 1, True),
+        (8, 8, 17, 3, 2, 1, 1, 1, True),
+        (8, 12, 25, 3, 1, 2, 2, 1, False),
+        (8, 12, 25, 3, 1, 1, 1, 2, True),
+        (6, 6, 19, 5, 2, 2, 1, 6, True),  # depthwise
+        (80, 16, 357, 3, 1, 1, 1, 1, True),
+        (5, 7, 13, 1, 1, 0, 1, 1, True),  # 1x1: no im2col
+        (4, 6, 11, 4, 3, 3, 2, 1, False),
+    ],
+)
+def test_conv1d(
+    mojo_device, dtype, in_c, out_c, length, k, stride, padding, dilation, groups, bias
+):
+    x = torch.randn(2, in_c, length)
+    w = torch.randn(out_c, in_c // groups, k)
+    b = torch.randn(out_c) if bias else None
+    args = (stride, padding, dilation, groups)
+    with assert_ran("aten::convolution"):
+        got = torch.nn.functional.conv1d(
+            x.to(dtype).to(mojo_device),
+            w.to(dtype).to(mojo_device),
+            None if b is None else b.to(dtype).to(mojo_device),
+            *args,
+        )
+    ref = torch.nn.functional.conv1d(
+        x.to(dtype).double(),
+        w.to(dtype).double(),
+        None if b is None else b.to(dtype).double(),
+        *args,
+    )
+    assert got.shape == ref.shape and got.dtype == dtype
+    tol = 1e-4 if dtype == torch.float32 else 3e-2
+    torch.testing.assert_close(got.cpu().double(), ref, atol=tol, rtol=tol)
+
+
+def test_conv1d_non_contiguous_input_and_module(mojo_device):
+    """A transposed (N, L, C) view goes through the contiguous copy, and
+    nn.Conv1d reaches the same op."""
+    conv = torch.nn.Conv1d(6, 10, 3, padding=1)
+    x = torch.randn(3, 23, 6).transpose(1, 2)
+    with torch.no_grad():
+        ref = conv(x)
+        conv = conv.to(mojo_device)
+        with assert_ran("aten::convolution"):
+            got = conv(x.to(mojo_device))
+    torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-3)
+
+
+def test_conv1d_transposed_declines(mojo_device):
+    x = torch.randn(1, 3, 8).to(mojo_device)
+    w = torch.randn(3, 2, 3).to(mojo_device)
+    with pytest.raises(NotImplementedError):
+        torch.nn.functional.conv_transpose1d(x, w)
+
+
 def test_conv_transposed_declines(mojo_device):
     """The transposed forward has no kernel here: it must raise, not produce
     a plain convolution."""

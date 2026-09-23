@@ -21,6 +21,12 @@ CONV_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
     "N32xC64x56x56_K64k3s1": (32, 64, 56, 56, 64, 3, 1, 1),
     "N8xC3x224x224_K64k7s2": (8, 3, 224, 224, 64, 7, 2, 3),
 }
+# (N, C_in, L, C_out, kernel, stride, padding). conv1d is the rank-3
+# aten::convolution; one awkward length on purpose.
+CONV1D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
+    "N4xC80xL3000_K384k3s1": (4, 80, 3000, 384, 3, 1, 1),
+    "N8xC256xL357_K512k5s2": (8, 256, 357, 512, 5, 2, 2),
+}
 # (N, C, H, W, output)
 ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {
     "N32xC512x28x28_o7": (32, 512, 28, 28, 7),
@@ -38,7 +44,7 @@ UPSAMPLE_SHAPES: dict[str, tuple[int, int, int, int]] = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::convolution": "test_conv2d",
+    "aten::convolution": "test_conv2d, test_conv1d (rank 3)",
     "aten::_adaptive_avg_pool2d": "test_adaptive_avg_pool2d",
     "aten::avg_pool2d": "test_avg_pool2d",
     "aten::max_pool2d_with_indices": (
@@ -69,6 +75,26 @@ def test_conv2d(
     bench.run(
         lambda: F.conv2d(x_ref, w_ref, b_ref, stride, pad),
         lambda: F.conv2d(x_our, w_our, b_our, stride, pad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV1D_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv1d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, length, c_out, k, stride, pad = CONV1D_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, length, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(torch.randn(c_out, c_in, k, dtype=dtype) * 0.1, hw, mojo_device)
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    l_out = (length + 2 * pad - k) // stride + 1
+    flops = 2.0 * n * c_out * l_out * c_in * k
+    bench.run(
+        lambda: F.conv1d(x_ref, w_ref, b_ref, stride, pad),
+        lambda: F.conv1d(x_our, w_our, b_our, stride, pad),
         flops=flops,
     )
 

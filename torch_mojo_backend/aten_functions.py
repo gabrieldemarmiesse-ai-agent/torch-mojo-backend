@@ -1838,11 +1838,8 @@ def aten_convolution(
     input_rank = len(input.shape)
 
     if input_rank == 3:
-        if dilation[0] != 1:
-            raise NotImplementedError(
-                "Non-unit dilation is not supported for conv1d yet."
-            )
-
+        # The length becomes a unit-W 2-D conv's H axis, so the one
+        # stride/padding/dilation apply to H and W stays at 1/0/1.
         stride_2d = (stride[0], 1)
         dilation_2d = (dilation[0], 1)
         padding_2d = (padding[0], padding[0], 0, 0)

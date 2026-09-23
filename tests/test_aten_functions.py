@@ -1424,6 +1424,8 @@ def test_aten_bitwise_xor_broadcasting(conf: Conf):
     check_outputs(fn, conf, [x, y])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("mode", ["public", "aten"])
 @pytest.mark.parametrize(
     "in_c,out_c,length,k,stride,padding,dilation,groups",
     [
@@ -1437,6 +1439,7 @@ def test_aten_bitwise_xor_broadcasting(conf: Conf):
 def test_aten_conv1d(
     conf: Conf,
     call_checker: CallChecker,
+    mode: str,
     in_c: int,
     out_c: int,
     length: int,
@@ -1446,14 +1449,17 @@ def test_aten_conv1d(
     dilation: int,
     groups: int,
 ):
-    """aten::convolution with a rank-3 (conv1d) input.
-
-    Same overload as conv2d; mojo eager reuses the rank-4 im2col+GEMM path by
-    inserting a synthetic size-1 H axis (see `fast_aten_convolution`).
+    """aten::convolution with a rank-3 (conv1d) input under torch.compile:
+    the op reaches the graph (it is not decomposed), so `aten_convolution`'s
+    rank-3 branch runs. The mojo device's route is in tests/native/test_matmul.py.
     """
     call_checker.register(aten_functions.aten_convolution)
 
     def fn(x, w, b):
+        if mode == "aten":
+            return aten.convolution(
+                x, w, b, [stride], [padding], [dilation], False, [0], groups
+            )
         return torch.nn.functional.conv1d(
             x, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups
         )
@@ -1464,6 +1470,7 @@ def test_aten_conv1d(
     check_outputs(fn, conf, [x, w, b], atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_conv1d_no_bias(conf: Conf, call_checker: CallChecker):
     call_checker.register(aten_functions.aten_convolution)
 
@@ -1475,6 +1482,7 @@ def test_aten_conv1d_no_bias(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [x, w], atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_aten_conv1d_dtypes(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
     call_checker.register(aten_functions.aten_convolution)
