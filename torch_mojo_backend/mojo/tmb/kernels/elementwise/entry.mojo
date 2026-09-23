@@ -77,6 +77,7 @@ from tmb.kernels.common.variant_gates import (
 )
 from tmb.graph.math_utils import ieee_sqrt
 from std.sys.info import _has_sm_9x
+from std.utils.numerics import inf
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +751,15 @@ def _unary_bool[
 comptime SOP_ADD = 0
 comptime SOP_MUL = 1
 comptime SOP_POW = 2
+# Rounding divisions by a scalar, for bf16/fp16 tensors: ATen's CPU
+# div_floor_kernel / div_trunc_kernel take a separate path when the divisor
+# is a scalar (`iter.is_scalar(2)`) and the dtype is a reduced float, and
+# divide in float32 by the scalar's ORIGINAL value (`original_scalar_value
+# <opmath_t>`, a Python number never rounded to bf16). That is this family's
+# float32 body exactly; the logic family's broadcast route would round the
+# scalar to the tensor's dtype first, and trunc there divides in bf16.
+comptime SOP_FLOORDIV = 3
+comptime SOP_TRUNCDIV = 4
 
 
 @__name("scalar_mul_contig_f32_v4_peel")
@@ -835,6 +845,32 @@ def _scalar_elementwise[
             comptime if op_code == SOP_MUL:
                 out_ptr.unsafe_store[width=width, alignment=al](
                     i, (a * s).cast[dtype]()
+                )
+            comptime if op_code == SOP_FLOORDIV:
+                # The float32 `//` of logic's BOP_FLOORDIV narrow-float
+                # route, with its one fixup: a finite nonzero numerator over
+                # an opposite-sign divisor floors to -1 even when the float32
+                # quotient underflows (or the divisor is infinite) to -0.
+                var q = a // s
+                var zero = SIMD[DType.float32, width](0)
+                var big = SIMD[DType.float32, width](inf[DType.float32]())
+                var negative_zero = (
+                    q.eq(zero)
+                    & a.ne(zero)
+                    & abs(a).lt(big)
+                    & s.ne(zero)
+                    & abs(s).le(big)
+                    & (a.lt(zero) ^ s.lt(zero))
+                )
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i,
+                    negative_zero.select(
+                        SIMD[DType.float32, width](-1), q
+                    ).cast[dtype](),
+                )
+            comptime if op_code == SOP_TRUNCDIV:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (a / s).__trunc__().cast[dtype]()
                 )
             comptime if op_code == SOP_POW:
                 # float32 through float64, as in logic' BOP_POW (the
@@ -1505,6 +1541,16 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["PowScalarSpec"]():
             _spec_dispatcher3[
                 _scalar_spec_into_go[SOP_POW], "a float-scalar spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["FloorDivScalarSpec"]():
+            _spec_dispatcher3[
+                _scalar_spec_into_go[SOP_FLOORDIV], "a float-scalar spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["TruncDivScalarSpec"]():
+            _spec_dispatcher3[
+                _scalar_spec_into_go[SOP_TRUNCDIV], "a float-scalar spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["AddScalarInplace"]():

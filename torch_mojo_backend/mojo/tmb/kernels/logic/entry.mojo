@@ -96,6 +96,9 @@ comptime BOP_REMAINDER = 9
 comptime BOP_FLOORDIV = 10
 comptime BOP_POW = 11
 comptime BOP_TRUNCDIV = 12
+# BOP_TRUNCDIV of a bf16/fp16 tensor by a ONE-ELEMENT tensor, divided in
+# float32 (see there).
+comptime BOP_TRUNCDIV_OPMATH = 13
 
 comptime COP_EQ = 0
 comptime COP_NE = 1
@@ -159,6 +162,8 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "pow"
         comptime if op_code == BOP_TRUNCDIV:
             return "trunc_divide"
+        comptime if op_code == BOP_TRUNCDIV_OPMATH:
+            return "trunc_divide_opmath"
     return "binop"
 
 
@@ -395,16 +400,16 @@ def _bin_vec_op[
                 # (`div_trunc_kernel` in aten/src/ATen/native/cpu/
                 # BinaryOpsKernel.cpp) computes `std::trunc(a / b)` at the
                 # operand's OWN precision for the general tensor/tensor case
-                # -- only its separate is-scalar fast path upcasts to
-                # opmath_t, and that fast path is not reachable from here
-                # (a Python scalar operand already arrives pre-rounded into
-                # a same-dtype broadcast tensor, see `_scalar_embed`). So
-                # matching torch means reproducing its rounding here too:
-                # verified directly against torch.div(..., rounding_mode=
-                # "trunc") on real bf16 tensors that -6.3125 / -1.0546875
-                # (true quotient ~5.985) rounds to 6.0 in bf16 *before*
-                # truncation, same as torch -- not the fp32-computed 5.0
-                # BOP_FLOORDIV's comment calls "correct".
+                # -- only its separate is-scalar path (`iter.is_scalar(2)`)
+                # upcasts to opmath_t, and the ops layer sends that case
+                # elsewhere: a Python scalar to elementwise's
+                # TruncDivScalarSpec, a one-element tensor to
+                # BOP_TRUNCDIV_OPMATH below. So matching torch means
+                # reproducing its rounding here too: verified directly
+                # against torch.div(..., rounding_mode="trunc") on real bf16
+                # tensors that -6.3125 / -1.0546875 (true quotient ~5.985)
+                # rounds to 6.0 in bf16 *before* truncation, same as torch
+                # -- not the fp32-computed 5.0 of the scalar path.
                 return (a / b).__trunc__().cast[out_dtype]()
             else:
                 # Correct Mojo's floor division (`//`, already zero-safe --
@@ -414,12 +419,35 @@ def _bin_vec_op[
                 # from zero than trunc; `r` here has floor's sign
                 # convention (the divisor's sign, or zero) so `r != 0` is
                 # exactly the "inexact" test.
+                #
+                # b == 0: `a // b` is Mojo's zero-guarded 0, the same value
+                # BOP_FLOORDIV (and ATen's own `div_floor_integer`) gives;
+                # masking the fixup off keeps trunc on that 0 instead of
+                # turning it into 1 for a negative numerator. A device
+                # kernel cannot raise the way CPU torch does; the ops layer
+                # raises for a host-scalar zero divisor, which is free.
                 var q = a // b
                 var r = a - q * b
                 var zero = SIMD[dtype, width](0)
                 var opposite_signs = a.lt(zero) ^ b.lt(zero)
-                var needs_adjust = opposite_signs & r.ne(zero)
+                var needs_adjust = opposite_signs & r.ne(zero) & b.ne(zero)
                 return needs_adjust.select(q + 1, q).cast[out_dtype]()
+        comptime if op_code == BOP_TRUNCDIV_OPMATH:
+            # ATen's CPU div_trunc_kernel for a reduced-float operand over a
+            # scalar-shaped divisor (`iter.is_scalar(2)`, which a
+            # one-element tensor is): `std::trunc(float(a) / float(b))`,
+            # one rounding to bf16/fp16 at the end instead of BOP_TRUNCDIV's
+            # rounding of the quotient before the trunc.
+            comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+                return (
+                    (a.cast[DType.float32]() / b.cast[DType.float32]())
+                    .__trunc__()
+                    .cast[out_dtype]()
+                )
+            else:
+                return _bin_vec_op[
+                    dtype, out_dtype, BOP_TRUNCDIV, is_cmp, width
+                ](a, b)
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher); accumulate halves in
             # float32 to match torch's numerics. float32 goes through
@@ -1801,6 +1829,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["TruncDivSpec"]():
             _spec_dispatcher3[
                 _binary_spec_into_go[BOP_TRUNCDIV, False],
+                "a binary spec op",
+            ](argv, argc)
+            return 0
+        comptime if _op_on["TruncDivOpmathSpec"]():
+            _spec_dispatcher3[
+                _binary_spec_into_go[BOP_TRUNCDIV_OPMATH, False],
                 "a binary spec op",
             ](argv, argc)
             return 0
