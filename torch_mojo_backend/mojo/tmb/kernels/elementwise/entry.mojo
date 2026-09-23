@@ -22,14 +22,12 @@
 # ===----------------------------------------------------------------------=== #
 
 from tmb.graph.unary_math import elementwise_predicate, elementwise_unary
-from tmb.graph.math_utils import ieee_sqrt
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
 from std.sys.info import (
-    _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,

@@ -65,8 +65,8 @@ TRI_SHAPES: dict[str, tuple[int, int]] = {"S_8192x8192": (8192, 8192)}
 ARANGE_N = 16777216
 
 COVERS: dict[str, str] = {
-    "aten::_copy_from": "test_copy_row_strided (same-device strided copies; contiguous/device moves are memcpy)",
     "aten::split_with_sizes_copy.out": "test_split_copy_rows",
+    "aten::_copy_from": "test_copy_row_strided (same-device strided copies; contiguous/device moves are memcpy)",
     "aten::cat": "test_cat",
     "aten::stack": "test_stack",
     "aten::repeat": "test_repeat",
