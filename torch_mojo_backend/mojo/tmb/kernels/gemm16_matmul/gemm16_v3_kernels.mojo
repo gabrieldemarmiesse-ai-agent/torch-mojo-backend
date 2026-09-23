@@ -2060,3 +2060,74 @@ def enqueue_gemm16_bmm(
         transpose_b,
         ctx,
     )
+
+
+# ---------------------------------------------------------------------------
+# Raw-address entry points. The two functions above take typed pointers over
+# `_V3_DT`, a define-resolved alias (`gemm16_dtype.mojo`) that a precompiled
+# caller cannot spell consistently: `mojo precompile` leaves the alias
+# unfolded, and the parser then refuses a `Pointer[Scalar[_GEMM16_DT], ...]`
+# built in another module as a different type. A MAX custom op whose body is
+# one of these kernels therefore hands over integer addresses, and the
+# pointers are built here, where the alias is the callee's own.
+# ---------------------------------------------------------------------------
+
+
+def enqueue_gemm16_gemm_addr(
+    output: Int,
+    a: Int,
+    b: Int,
+    bias: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    enqueue_gemm16_gemm(
+        _V3_PTR(unsafe_from_address=output),
+        _V3_PTR(unsafe_from_address=a),
+        _V3_PTR(unsafe_from_address=b),
+        _V3_PTR(unsafe_from_address=bias),
+        m,
+        n,
+        k,
+        transpose_a,
+        transpose_b,
+        has_bias,
+        ctx,
+    )
+
+
+def enqueue_gemm16_bmm_addr(
+    output: Int,
+    a: Int,
+    b: Int,
+    batch_count: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    output_batch_stride: Int,
+    a_batch_stride: Int,
+    b_batch_stride: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    ctx: DeviceContext,
+) raises:
+    enqueue_gemm16_bmm(
+        _V3_PTR(unsafe_from_address=output),
+        _V3_PTR(unsafe_from_address=a),
+        _V3_PTR(unsafe_from_address=b),
+        batch_count,
+        m,
+        n,
+        k,
+        output_batch_stride,
+        a_batch_stride,
+        b_batch_stride,
+        transpose_a,
+        transpose_b,
+        ctx,
+    )
