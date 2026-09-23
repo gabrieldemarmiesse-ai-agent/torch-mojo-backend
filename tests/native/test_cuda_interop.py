@@ -242,29 +242,29 @@ def test_call_cuda_needs_a_mojo_tensor():
 
 
 def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
-    """`aten::index_select` has no mojo kernel: without the fallback it
-    raises, with it the CUDA kernel runs on the mojo tensors."""
+    """`aten::take` has no mojo kernel: without the fallback it raises, with
+    it the CUDA kernel runs on the mojo tensors."""
     x = torch.randn(8, 5, device=gpu)
     idx = torch.tensor([0, 3, 3, 7], device=gpu)
     with pytest.raises(NotImplementedError):
-        torch.index_select(x, 0, idx)
+        torch.take(x, idx)
     with cuda_interop.cuda_fallback():
-        out = torch.index_select(x, 0, idx)
+        out = torch.take(x, idx)
     assert out.device.type == "mojo"
-    torch.testing.assert_close(out.cpu(), torch.index_select(x.cpu(), 0, idx.cpu()))
+    torch.testing.assert_close(out.cpu(), torch.take(x.cpu(), idx.cpu()))
 
 
 def test_fallback_carries_autograd(gpu):
-    """`index_select` has no mojo kernel in either direction: forward and
-    backward (`index_add`) both go through CUDA, on an autograd graph that
-    never leaves mojo tensors."""
+    """`take` has no mojo kernel in either direction: forward and backward
+    (`put_`) both go through CUDA, on an autograd graph that never leaves
+    mojo tensors."""
     torch.manual_seed(0)
     x = torch.randn(8, 5, device=gpu, requires_grad=True)
     idx = torch.tensor([0, 3, 3, 7], device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.index_select(x, 0, idx).sum().backward()
+        torch.take(x, idx).sum().backward()
     xc = x.detach().cpu().requires_grad_()
-    torch.index_select(xc, 0, idx.cpu()).sum().backward()
+    torch.take(xc, idx.cpu()).sum().backward()
     assert x.grad is not None and xc.grad is not None
     torch.testing.assert_close(x.grad.cpu(), xc.grad)
 
@@ -311,9 +311,9 @@ def test_the_fallback_goes_away_with_its_block(gpu):
     x = torch.randn(8, 5, device=gpu)
     idx = torch.tensor([0, 3], device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.index_select(x, 0, idx)
+        torch.take(x, idx)
     with pytest.raises(NotImplementedError):
-        torch.index_select(x, 0, idx)
+        torch.take(x, idx)
 
 
 def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
@@ -331,7 +331,7 @@ def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
         "gc.collect()\n"
         "x = torch.randn(8, 5, device='mojo:0', requires_grad=True)\n"
         "idx = torch.tensor([0, 3], device='mojo:0')\n"
-        "torch.index_select(x, 0, idx).sum().backward()\n"
+        "torch.take(x, idx).sum().backward()\n"
         "w = torch.randn(4, 3, 3, 3, device='mojo:0', requires_grad=True)\n"
         "a = torch.randn(2, 3, 16, 16, device='mojo:0', requires_grad=True)\n"
         "torch.nn.functional.conv2d(a, w, padding=1).sum().backward()\n"

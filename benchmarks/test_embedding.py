@@ -39,34 +39,31 @@ SELECT_SCATTER_SHAPES: dict[str, tuple[int, int, int]] = {
 # dim-indexed family, not just a parameter: indexing the inner dim keeps every
 # thread's read inside one row (and, for scatter_add, concentrates the atomics
 # on `cols` slots per row), while indexing the outer dim spreads both across
-# the whole allocation.  No awkward-length shape here, unlike the rest of this
-# suite: these kernels move ONE element per thread with no vector path at all,
-# so a length that is not a multiple of a vector width is not a distinct
-# regime for them -- it is the only regime they have.
+# the whole allocation.  The awkward 357x789 case keeps a non-round extent in
+# the suite.
 DIM_INDEX_SHAPES: dict[str, tuple[int, int, int]] = {
     "R_262144x64_D1": (262144, 64, 1),
     "R_4096x4096_D0": (4096, 4096, 0),
+    "R_357x789_D0": (357, 789, 0),
 }
-# (rows, row_width, scattered_rows, accumulate).  `accumulate` is a REGIME of
-# index_put -- plain scattered stores vs atomic adds, two different kernels --
-# so it is folded into the shape token rather than parametrized separately: a
-# baseline key is (op, dtype, shape, layout) and nothing else, so two nodes
-# sharing a shape token would overwrite each other's entry and the suite would
-# flap between them on every run.
-PUT_SHAPES: dict[str, tuple[int, int, int, bool]] = {
-    "R_262144x64_S65536_set": (262144, 64, 65536, False),
-    "R_262144x64_S65536_acc": (262144, 64, 65536, True),
+# (rows, row_width, scattered_rows) of index_put(accumulate=True), the atomic
+# regime of `_index_put_impl_` (the plain-store one is test_data_movement's
+# test_index_put). `_acc` in the token keeps its baseline key apart from those.
+PUT_ACC_SHAPES: dict[str, tuple[int, int, int]] = {
+    "R_262144x64_S65536_acc": (262144, 64, 65536),
+    "R_357x789_S119_acc": (357, 789, 119),
 }
 # (rows, cols, selected, dim).  dim 0 is the row-gather fast path (the
-# GatherRows kernel index.Tensor already uses); dim 1 is the general strided
-# kernel, where each selected element is `rows` separate short reads.
+# GatherRows kernel index.Tensor already uses); dim 1 is GatherDim over the
+# folded (outer, selected, inner) view, where each selected element is `rows`
+# separate short reads.
 SELECT_SHAPES: dict[str, tuple[int, int, int, int]] = {
     "R_262144x64_S1048576_D0": (262144, 64, 1048576, 0),
     "R_4096x4096_S8192_D1": (4096, 4096, 8192, 1),
+    "R_357x789_S119_D1": (357, 789, 119, 1),
 }
 
 COVERS: dict[str, str] = {
-    "aten::_index_put_impl_": "test_index_put",
     "aten::embedding": "test_embedding",
     "aten::embedding_dense_backward": "test_embedding_backward",
     "aten::gather": "test_gather",
@@ -81,8 +78,8 @@ COVERS: dict[str, str] = {
 
 _SAME_KERNEL_OUT = (
     "out= overload of a benchmarked functional op: the same single kernel "
-    "launch, writing a caller-supplied destination instead of an allocated "
-    "one (no extra copy, unlike the _register_out wrappers)"
+    "launch, writing a caller-supplied destination (through its own strides) "
+    "instead of an allocated one"
 )
 _SAME_KERNEL_INPLACE = (
     "in-place overload of a benchmarked functional op: the same single kernel "
@@ -200,7 +197,7 @@ def test_scatter_value(
 @pytest.mark.parametrize("shape_id", DIM_INDEX_SHAPES)
 def test_gather(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, cols, dim = DIM_INDEX_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(rows, cols, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -219,7 +216,7 @@ def test_gather(
 @pytest.mark.parametrize("shape_id", SELECT_SHAPES)
 def test_index_select(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, cols, selected, dim = SELECT_SHAPES[shape_id]
     x_ref, x_our = both(
         torch.randn(rows, cols, dtype=DTYPES[dtype_id]), hw, mojo_device
@@ -238,7 +235,7 @@ def test_index_select(
 @pytest.mark.parametrize("shape_id", DIM_INDEX_SHAPES)
 def test_scatter_add(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     """Indices are drawn uniformly over the indexed extent, so collisions are
     the norm — for D1 (64 columns, 262144 rows) every row's 64 writes land in
     64 slots. Both legs accumulate with atomics, so the ratio is a comparison
@@ -261,7 +258,7 @@ def test_scatter_add(
 @pytest.mark.parametrize("shape_id", SELECT_SHAPES)
 def test_index_add(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     """index_add is index_select's mirror image (and its backward): the same
     broadcast index, the same geometry, writes instead of reads."""
     rows, cols, selected, dim = SELECT_SHAPES[shape_id]
@@ -280,19 +277,19 @@ def test_index_add(
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
-@pytest.mark.parametrize("shape_id", PUT_SHAPES)
+@pytest.mark.parametrize("shape_id", PUT_ACC_SHAPES)
 @pytest.mark.bench_op("_index_put_impl_")
-def test_index_put(
+def test_index_put_accumulate(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
-    rows, width, scattered, accumulate = PUT_SHAPES[shape_id]
+):
+    rows, width, scattered = PUT_ACC_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(rows, width, dtype=dtype), hw, mojo_device)
     v_ref, v_our = both(torch.randn(scattered, width, dtype=dtype), hw, mojo_device)
     idx_ref, idx_our = both(torch.randint(0, rows, (scattered,)), hw, mojo_device)
     bench.run(
-        lambda: torch.index_put(x_ref, [idx_ref], v_ref, accumulate),
-        lambda: torch.index_put(x_our, [idx_our], v_our, accumulate),
+        lambda: torch.index_put(x_ref, [idx_ref], v_ref, True),
+        lambda: torch.index_put(x_our, [idx_our], v_our, True),
         flops=float(scattered * width),
     )
 

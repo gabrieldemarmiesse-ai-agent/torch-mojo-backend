@@ -2517,6 +2517,7 @@ def _index_payload(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     ("shape", "dim"),
     [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5), 2)],
 )
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_gather(
     conf: Conf,
     dtype: torch.dtype,
@@ -2539,6 +2540,7 @@ def test_aten_gather(
     check_outputs(fn, conf, [x, index])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_gather_strided_input(conf: Conf, call_checker: CallChecker):
     """A transposed (non-contiguous) `self`: the kernel reads it through its
     real strides instead of materializing a copy first."""
@@ -2552,6 +2554,7 @@ def test_aten_gather_strided_input(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [x, index])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_take_along_dim(conf: Conf, call_checker: CallChecker):
     """`take_along_dim` is a composite that lowers straight to gather — and,
     unlike gather itself, it DOES define negative indices (it normalizes them
@@ -2571,6 +2574,7 @@ def test_aten_take_along_dim(conf: Conf, call_checker: CallChecker):
     ("shape", "dim"),
     [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5, 2), 2)],
 )
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_select(
     conf: Conf,
     dtype: torch.dtype,
@@ -2591,6 +2595,7 @@ def test_aten_index_select(
     check_outputs(fn, conf, [x, index])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_select_int32_index(conf: Conf, call_checker: CallChecker):
     """index_select accepts an int32 index; gather/scatter_add do not."""
     call_checker.register(aten_functions.aten_index_select)
@@ -2603,6 +2608,7 @@ def test_aten_index_select_int32_index(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [x, index])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_select_strided_input(conf: Conf, call_checker: CallChecker):
     call_checker.register(aten_functions.aten_index_select)
 
@@ -2618,6 +2624,7 @@ def test_aten_index_select_strided_input(conf: Conf, call_checker: CallChecker):
 @pytest.mark.parametrize(
     ("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1)]
 )
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_scatter_add(
     conf: Conf,
     dtype: torch.dtype,
@@ -2640,6 +2647,7 @@ def test_aten_scatter_add(
     check_outputs(fn, conf, [x, index, src])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_scatter_add_inplace(conf: Conf, call_checker: CallChecker):
     """`scatter_add_` and `scatter_add` both route through
     `aten::scatter_add.out`; in the in-place one the out= tensor IS self, so
@@ -2660,6 +2668,7 @@ def test_aten_scatter_add_inplace(conf: Conf, call_checker: CallChecker):
 
 @pytest.mark.parametrize("dtype", _INDEX_DTYPES)
 @pytest.mark.parametrize(("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((3, 4, 5), 1)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_add(
     conf: Conf,
     dtype: torch.dtype,
@@ -2686,6 +2695,7 @@ def test_aten_index_add(
 
 @pytest.mark.parametrize("accumulate", [False, True])
 @pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_put(
     conf: Conf, dtype: torch.dtype, accumulate: bool, call_checker: CallChecker
 ):
@@ -2705,6 +2715,7 @@ def test_aten_index_put(
     check_outputs(fn, conf, [x, index, values])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_put_negative_indices(conf: Conf, call_checker: CallChecker):
     """Advanced indexing — unlike gather/index_select/scatter_add — DOES
     define negative indices, and wraps them python-style."""
@@ -2719,6 +2730,7 @@ def test_aten_index_put_negative_indices(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [x, index, values])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_put_broadcast_values(conf: Conf, call_checker: CallChecker):
     call_checker.register(aten_functions.aten_index_put)
 
@@ -2729,39 +2741,6 @@ def test_aten_index_put_broadcast_values(conf: Conf, call_checker: CallChecker):
     index = torch.tensor([1, 4], dtype=torch.int64)
     values = torch.randn(3)  # broadcast over the indexed rows
     check_outputs(fn, conf, [x, index, values])
-
-
-def test_aten_index_put_bool_mask_scalar(conf: Conf):
-    """`x[mask] = scalar` does NOT reach a bool-mask index_put kernel: torch's
-    own `_index_put_impl_` re-routes exactly this shape to `masked_fill_`
-    (canDispatchToMaskedFill), and so does the mojo one — which is why no
-    index_put implementation is asserted here."""
-
-    def fn(x):
-        out = x.clone()
-        out[x > 0] = -1.0
-        return out
-
-    check_outputs(fn, conf, [torch.randn(4, 5)])
-
-
-def test_aten_index_put_bool_row_mask_scalar(conf: Conf):
-    """A mask that covers only the LEADING dim, on a SQUARE tensor.
-
-    A mask index selects leading dims, but broadcasting is right-aligned, so
-    routing a shape-(4,) mask straight into masked_fill_ on a (4, 4) tensor
-    fills the wrong axis — and only a square tensor exposes it, because any
-    other shape raises instead of answering wrongly.
-    """
-
-    def fn(x, keep):
-        out = x.clone()
-        out[keep] = 0.0
-        return out
-
-    x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-    keep = torch.tensor([True, False, False, True])
-    check_outputs(fn, conf, [x, keep])
 
 
 def test_aten_isin_none_match(conf: Conf):

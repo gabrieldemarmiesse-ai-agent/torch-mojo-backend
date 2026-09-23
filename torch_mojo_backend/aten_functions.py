@@ -2272,7 +2272,7 @@ def aten_full_like(
 
 
 # gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor
-@map_to(aten.gather)
+@map_to(aten.gather.default)
 def aten_gather(
     input: MaxTensor, dim: int, index: MaxTensor, sparse_grad: bool = False
 ) -> MaxTensor:
@@ -2306,9 +2306,10 @@ def _dim_coords(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
             coords.append(index)
             continue
         iota = F.arange(0, index.shape[axis], 1, dtype=index.dtype, device=index.device)
-        axis_shape = [StaticDim(1)] * rank
-        axis_shape[axis] = index.shape[axis]
-        coords.append(F.broadcast_to(F.reshape(iota, axis_shape), index.shape))
+        axis_shape = [
+            index.shape[a] if a == axis else StaticDim(1) for a in range(rank)
+        ]
+        coords.append(_broadcast_to(F.reshape(iota, axis_shape), index.shape))
     return F.stack(coords, axis=-1)
 
 
@@ -2478,7 +2479,7 @@ def broadcast_shape(
 
 
 # index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor
-@map_to(aten.index_add)
+@map_to(aten.index_add.default)
 def aten_index_add(
     input: MaxTensor, dim: int, index: MaxTensor, source: MaxTensor, alpha: Scalar = 1
 ) -> MaxTensor:
@@ -2491,14 +2492,16 @@ def aten_index_add(
     """
     if alpha != 1:
         source = source * alpha
-    axis_shape = [StaticDim(1)] * len(source.shape)
-    axis_shape[dim % len(source.shape)] = index.shape[0]
-    index = F.broadcast_to(F.reshape(index, axis_shape), source.shape)
+    rank = len(source.shape)
+    axis_shape = [
+        index.shape[0] if a == dim % rank else StaticDim(1) for a in range(rank)
+    ]
+    index = _broadcast_to(F.reshape(index, axis_shape), source.shape)
     return aten_scatter_add(input, dim, index, source)
 
 
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
-@map_to(aten.index_put)
+@map_to(aten.index_put.default)
 def aten_index_put(
     input: MaxTensor,
     indices: list[MaxTensor | None],
@@ -2508,8 +2511,7 @@ def aten_index_put(
     """``out = input.clone(); out[indices] = values`` (``+=`` when
     ``accumulate``) — the write mirror of ``aten_index``.
 
-    Only a single index tensor on axis 0 is served, the same regime the eager
-    fast path covers; anything else (a boolean mask, several index tensors, an
+    Only a single index tensor on axis 0 is served; anything else (a boolean mask, several index tensors, an
     index on a later axis) raises rather than silently computing the wrong
     thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
     ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
@@ -2533,13 +2535,13 @@ def aten_index_put(
         )
     # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
     # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
-    updates = F.broadcast_to(values, [index.shape[0]] + list(input.shape[1:]))
+    updates = _broadcast_to(values, [index.shape[0], *input.shape[1:]])
     scatter = F.scatter_nd_add if accumulate else F.scatter_nd
     return scatter(input, updates, F.unsqueeze(index, -1))
 
 
 # index_select(Tensor self, int dim, Tensor index) -> Tensor
-@map_to(aten.index_select)
+@map_to(aten.index_select.default)
 def aten_index_select(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
     """``F.gather`` is exactly index_select: numpy.take semantics, with the
     indexed axis replaced by the (1-D) index's shape."""
@@ -3441,7 +3443,7 @@ def aten_scatter_value(
 
 
 # scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
-@map_to(aten.scatter_add)
+@map_to(aten.scatter_add.default)
 def aten_scatter_add(
     input: MaxTensor, dim: int, index: MaxTensor, src: MaxTensor
 ) -> MaxTensor:
