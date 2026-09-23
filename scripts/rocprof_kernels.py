@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-kernel GPU profiling for any command, ROCm's answer to ``ncu``.
 
-Wraps ``rocprofv3`` and reads its SQLite result database with the standard
+Wraps ``rocprofv3`` and reads its SQLite or kernel-trace CSV results with the standard
 library only, so it runs under any interpreter and needs no extra packages.
 It works identically on a standalone Mojo benchmark binary and on a PyTorch
 script, which makes Mojo-versus-ROCm kernel comparisons directly comparable.
@@ -43,6 +43,7 @@ Run ``rocprofv3 --list-avail`` for the full list.
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import shutil
 import sqlite3
@@ -75,9 +76,9 @@ class KernelStats:
     durations_ns: list[float] = field(default_factory=list)
     grid: tuple[int, int, int] = (0, 0, 0)
     block: tuple[int, int, int] = (0, 0, 0)
-    vgpr: int = 0
-    accum_vgpr: int = 0
-    sgpr: int = 0
+    vgpr: int | None = None
+    accum_vgpr: int | None = None
+    sgpr: int | None = None
     lds: int = 0
     scratch: int = 0
     counters: dict[str, float] = field(default_factory=dict)
@@ -104,6 +105,39 @@ def run_rocprofv3(
 
 def result_databases(output_dir: Path) -> list[Path]:
     return sorted(output_dir.rglob("*_results.db"))
+
+
+def load_kernel_csv(path: Path, name_filter: str | None) -> dict[str, KernelStats]:
+    """Read rocprofv3's CSV trace, whose timestamps are integer nanoseconds.
+
+    ROCm 6.4 emits this format by default. It contains launch geometry and
+    segment sizes, but no register counts or hardware counters. Leave those
+    unavailable rather than reporting invented zero-register kernels.
+    """
+    stats = dict[str, KernelStats]()
+    with path.open(newline="") as stream:
+        for row in csv.DictReader(stream):
+            name = row["Kernel_Name"]
+            if name_filter and name_filter not in name:
+                continue
+            entry = stats.setdefault(name, KernelStats(name=name))
+            # Subtract as integers: absolute timestamps can exceed 2**53.
+            entry.durations_ns.append(
+                int(row["End_Timestamp"]) - int(row["Start_Timestamp"])
+            )
+            entry.grid = (
+                int(row["Grid_Size_X"]),
+                int(row["Grid_Size_Y"]),
+                int(row["Grid_Size_Z"]),
+            )
+            entry.block = (
+                int(row["Workgroup_Size_X"]),
+                int(row["Workgroup_Size_Y"]),
+                int(row["Workgroup_Size_Z"]),
+            )
+            entry.lds = int(row["Group_Segment_Size"])
+            entry.scratch = int(row["Private_Segment_Size"])
+    return stats
 
 
 def load_kernels(database: Path, name_filter: str | None) -> dict[str, KernelStats]:
@@ -142,9 +176,27 @@ def load_kernels(database: Path, name_filter: str | None) -> dict[str, KernelSta
     return stats
 
 
+def load_results(output_dir: Path, name_filter: str | None) -> dict[str, KernelStats]:
+    """Prefer databases when both exports exist, so dispatches count once."""
+    databases = result_databases(output_dir)
+    files = databases or sorted(output_dir.rglob("*_kernel_trace.csv"))
+    if not files:
+        raise SystemExit(f"rocprofv3 produced no kernel results in {output_dir}")
+    merged = dict[str, KernelStats]()
+    loader = load_kernels if databases else load_kernel_csv
+    for path in files:
+        for name, entry in loader(path, name_filter).items():
+            if name in merged:
+                merged[name].durations_ns.extend(entry.durations_ns)
+                merged[name].counters.update(entry.counters)
+            else:
+                merged[name] = entry
+    return merged
+
+
 def shorten(name: str, width: int) -> str:
     """Keep kernel names readable: drop C++ template noise, then truncate."""
-    cleaned = name.split("(")[0]
+    cleaned = name.replace("(anonymous namespace)", "anonymous").split("(")[0]
     cleaned = cleaned.replace("void ", "").replace("at::native::", "")
     if len(cleaned) <= width:
         return cleaned
@@ -186,8 +238,10 @@ def render(stats: dict[str, KernelStats], top: int, name_width: int) -> str:
                 f"{min(durations) / 1e3:.2f}",
                 "x".join(str(value) for value in entry.grid),
                 "x".join(str(value) for value in entry.block),
-                str(entry.vgpr + entry.accum_vgpr),
-                str(entry.sgpr),
+                str(entry.vgpr + entry.accum_vgpr)
+                if entry.vgpr is not None and entry.accum_vgpr is not None
+                else "n/a",
+                str(entry.sgpr) if entry.sgpr is not None else "n/a",
                 str(entry.lds),
                 str(entry.scratch),
             ]
@@ -225,6 +279,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--name-width", type=int, default=64)
     parser.add_argument(
+        "--read",
+        type=Path,
+        help="summarize an existing output directory without rerunning",
+    )
+    parser.add_argument(
         "--keep",
         type=Path,
         default=None,
@@ -239,24 +298,19 @@ def main():
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
-    if not command:
+    if args.read is not None and (
+        command or args.keep or args.pmc or args.kernel_trace
+    ):
+        raise SystemExit("--read cannot be combined with a command or capture options")
+    if not command and args.read is None:
         raise SystemExit("usage: rocprof_kernels.py [options] -- <command> [args...]")
 
     with tempfile.TemporaryDirectory() as temporary:
-        output_dir = args.keep if args.keep is not None else Path(temporary)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        run_rocprofv3(command, output_dir, args.pmc, args.kernel_trace)
-        databases = result_databases(output_dir)
-        if not databases:
-            raise SystemExit(f"rocprofv3 produced no result database in {output_dir}")
-        merged: dict[str, KernelStats] = {}
-        for database in databases:
-            for name, entry in load_kernels(database, args.filter).items():
-                if name in merged:
-                    merged[name].durations_ns.extend(entry.durations_ns)
-                    merged[name].counters.update(entry.counters)
-                else:
-                    merged[name] = entry
+        output_dir = args.read or args.keep or Path(temporary)
+        if args.read is None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            run_rocprofv3(command, output_dir, args.pmc, args.kernel_trace)
+        merged = load_results(output_dir, args.filter)
         if not merged:
             raise SystemExit(
                 "no kernels matched"

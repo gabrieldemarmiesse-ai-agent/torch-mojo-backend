@@ -42,7 +42,7 @@ _PROBE = Path(__file__).resolve().parent / "fa4_selfload_ptx_probe.mojo"
 _D128_GUARD_PROBE = (
     Path(__file__).resolve().parent / "fa4_selfload_d128_guard_probe.mojo"
 )
-_FA4_DIR = _REPO_ROOT / "torch_mojo_backend" / "eager_flash_attention"
+_MOJO_ROOT = _REPO_ROOT / "torch_mojo_backend" / "mojo"
 _BUILD_DIR = Path(__file__).resolve().parent / "__mojocache__" / "fa4_selfload_ptx"
 _D128_GUARD_BUILD_DIR = (
     Path(__file__).resolve().parent / "__mojocache__" / "fa4_selfload_d128_guard"
@@ -70,7 +70,7 @@ def _build_probe_ptx(out_dir: Path) -> str:
         "build",
         str(_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "--emit",
         "asm",
         "--target-accelerator",
@@ -186,7 +186,7 @@ def test_selfload_rejects_d128_at_compile_time():
         "build",
         str(_D128_GUARD_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "--emit",
         "asm",
         "--target-accelerator",

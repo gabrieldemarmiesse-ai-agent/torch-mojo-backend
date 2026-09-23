@@ -38,7 +38,7 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
 from torch_mojo_backend.flags import verbose_enabled
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
 # F.functional's stub returns Callable[..., Any], incompatible with the
@@ -59,16 +59,14 @@ _reduce_argmin = F.functional(max_ops.argmin)
 # F.transfer_to is eager-only (reads Tensor.real); re-wrap the graph op so it
 # also works on graph TensorValues in the torch.compile backend.
 _transfer_to = F.functional(max_ops.transfer_to)
-# F.where asserts its result is an eager Tensor; F.broadcast_to/split/sigmoid/
-# gelu are typed `Tensor`-only even though their `_impl`s already forward to
-# the dual-path graph op. Re-wrap all five the same way, both to restore
+# F.where asserts its result is an eager Tensor; F.broadcast_to/split are
+# typed `Tensor`-only even though their `_impl`s already forward to
+# the dual-path graph op. Re-wrap all three the same way, both to restore
 # graph-mode support and to get a stable, precise-enough Callable[..., Any]
 # signature instead of each thin wrapper's narrower stub.
 _broadcast_to = F.functional(max_ops.broadcast_to)
 _where = F.functional(max_ops.where)
 _split = F.functional(max_ops.split)
-_sigmoid = F.functional(max_ops.sigmoid)
-_gelu = F.functional(max_ops.gelu)
 
 
 def _scalar_constant(
@@ -104,20 +102,14 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
 
 def torch_device_to_max_device(x: torch.device) -> DeviceRef:
     if x.type == "mojo":
-        # For mojo, use ordered accelerators (GPU first, CPU last)
-        # index None or 0 = first accelerator (first GPU or CPU if no GPU)
-        # higher indices = additional GPUs, with CPU at the highest index
+        # index None or 0 = first accelerator; higher indices = additional GPUs.
         index = x.index if x.index is not None else 0
 
-        accelerators = get_ordered_accelerators()
+        accelerators = get_accelerators()
         if index >= len(accelerators):
             raise ValueError(f"Invalid mojo index {index}")
 
-        device = accelerators[index]
-        if device.label == "cpu":
-            return DeviceRef.CPU()
-        else:
-            return DeviceRef.GPU(device.id)  # Use the actual GPU ID
+        return DeviceRef.GPU(accelerators[index].id)  # Use the actual GPU ID
     else:
         return max_device_ref(x)
 
@@ -1095,77 +1087,39 @@ def aten__to_copy(
 # abs(Tensor self) -> Tensor
 @map_to(aten.abs)
 def aten_abs(x: MaxTensor) -> MaxTensor:
-    return F.abs(x)
+    return custom_mojo_ops.elementwise(x, "abs")
+
+
+def _acos_float64_gpu(x: MaxTensor) -> MaxTensor:
+    """Retain the graph polynomial where Mojo's float64 acos cannot lower.
+
+    MAX 26.5 lowers Mojo float64 acos to llvm.acos, which has no NVPTX
+    libcall. These are the previous graph implementation's Remez coefficients.
+    Floating dtypes up to float32 use the shared Mojo registration instead.
+    """
+    magnitude = F.abs(x)
+    small = magnitude < 0.5
+    square = _where(small, x * x, (1.0 - magnitude) * 0.5)
+    d = _where(small, magnitude, F.sqrt(square))
+    poly = 0.4197454825e-1
+    poly = poly * square + 0.2424046025e-1
+    poly = poly * square + 0.4547423869e-1
+    poly = poly * square + 0.7495029271e-1
+    poly = poly * square + 0.1666677296
+    correction = poly * square * d
+    positive = _where(small, math.pi * 0.5 - (d + correction), 2.0 * (d + correction))
+    # Outside [-1, 1], sqrt(square) already yields NaN rather than clamping.
+    return _where(x < 0.0, math.pi - positive, positive)
 
 
 # acos(Tensor self) -> Tensor
 @map_to(aten.acos)
 def aten_acos(x: MaxTensor) -> MaxTensor:
-    """Computes the arccosine (inverse cosine) of the input tensor.
-
-    Returns values in the range [0, π] for inputs in [-1, 1].
-    Uses polynomial approximation based on the Mojo stdlib implementation.
-
-    Args:
-        x: Input tensor with values in [-1, 1]
-
-    Returns:
-        Arccosine of the input in radians [0, π]
-    """
-    # Create constants as tensors for use in _where()
-    zero = F.constant(0.0, dtype=x.dtype, device=x.device)
-    one = F.constant(1.0, dtype=x.dtype, device=x.device)
-    neg_one = F.constant(-1.0, dtype=x.dtype, device=x.device)
-
-    # Clamp input to valid domain [-1, 1]
-    x_clamped = F.max(F.min(x, 1.0), -1.0)
-    x_abs = F.abs(x_clamped)
-
-    # Domain split at 0.5
-    small_domain = x_abs < 0.5
-
-    # Compute x_squared and d based on domain
-    # Small domain: x_squared = x², d = |x|
-    # Large domain: x_squared = (1 - |x|) / 2, d = sqrt(x_squared)
-    x_squared_small = x_clamped * x_clamped
-    x_squared_large = (1.0 - x_abs) * 0.5
-    x_squared = _where(small_domain, x_squared_small, x_squared_large)
-
-    d_small = x_abs
-    d_large = F.sqrt(x_squared_large)
-    d = _where(small_domain, d_small, d_large)
-
-    # Handle special case |x| = 1 (d should be 0)
-    is_one = x_abs >= 1.0
-    d = _where(is_one, zero, d)
-
-    # Polynomial evaluation using Horner's method
-    # Coefficients from Mojo stdlib (Remez approximation)
-    poly = 0.4197454825e-1
-    poly = poly * x_squared + 0.2424046025e-1
-    poly = poly * x_squared + 0.4547423869e-1
-    poly = poly * x_squared + 0.7495029271e-1
-    poly = poly * x_squared + 0.1666677296
-    poly = poly * x_squared * d
-
-    # Small domain: π/2 - (d + poly) with sign preservation
-    # copysign(d, x) is implemented as d * sign(x)
-    is_negative = x_clamped < 0.0
-    sign_x = _where(is_negative, neg_one, one)
-    d_signed = d * sign_x
-    poly_signed = poly * sign_x
-    result_small = (math.pi * 0.5) - (d_signed + poly_signed)
-
-    # Large domain: 2 * (d + poly)
-    result_large = 2.0 * (d + poly)
-
-    # For large domain with negative x: π - result
-    result_large = _where(is_negative, math.pi - result_large, result_large)
-
-    # Select based on domain
-    result = _where(small_domain, result_small, result_large)
-
-    return result
+    if x.dtype.is_integral() or x.dtype == DType.bool:
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if x.dtype == DType.float64 and x.type.device.is_gpu():
+        return _acos_float64_gpu(x)
+    return custom_mojo_ops.elementwise(x, "acos")
 
 
 # acosh(Tensor self) -> Tensor
@@ -1511,8 +1465,7 @@ def aten_argmin(
 # asinh(Tensor self) -> Tensor
 @map_to(aten.asinh)
 def aten_asinh(x: MaxTensor) -> MaxTensor:
-    """Computes inverse hyperbolic sine using asinh(x) = log(x + sqrt(x² + 1))"""
-    return F.log(x + F.sqrt(x * x + 1))
+    return custom_mojo_ops.elementwise(x, "asinh")
 
 
 # atan(Tensor self) -> Tensor
@@ -1523,7 +1476,7 @@ def aten_asinh(x: MaxTensor) -> MaxTensor:
 # atanh(Tensor self) -> Tensor
 @map_to(aten.atanh)
 def aten_atanh(x: MaxTensor) -> MaxTensor:
-    return F.atanh(x)
+    return custom_mojo_ops.elementwise(x, "atanh")
 
 
 # avg_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, bool ceil_mode=False, bool count_include_pad=True) -> Tensor
@@ -1714,16 +1667,7 @@ def aten_cat(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
 # ceil(Tensor self) -> Tensor
 @map_to(aten.ceil)
 def aten_ceil(input: MaxTensor) -> MaxTensor:
-    """
-    Ceiling of the input tensor, element-wise.
-
-    For floating-point inputs: Uses MAX's native ceil op.
-    For integer inputs: Returns it (no mathematical change needed, following PyTorch behavior).
-    """
-    if input.type.dtype.is_integral():
-        return input
-    else:
-        return F.ceil(input)
+    return custom_mojo_ops.elementwise(input, "ceil")
 
 
 # clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
@@ -1761,13 +1705,9 @@ def aten_clone(
 
 
 # col2im(Tensor self, SymInt[2] output_size, int[2] kernel_size, int[2] dilation, int[2] padding, int[2] stride) -> Tensor
-# constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
-@map_to(aten.constant_pad_nd)
-def aten_constant_pad_nd(
-    input: MaxTensor, pad: list[int | Dim], value: Scalar = 0
-) -> MaxTensor:
-    # max_ops.pad wants concrete ints; a symbolic (non-static) pad amount
-    # can't be resolved at graph-build time.
+def _static_pad_ints(pad: list[SymIntType]) -> list[int]:
+    """A torch pad list as concrete ints: max_ops.pad wants them, and a
+    symbolic (non-static) pad amount can't be resolved at graph-build time."""
     pad_ints: list[int] = []
     for p in pad:
         if isinstance(p, int):
@@ -1775,19 +1715,50 @@ def aten_constant_pad_nd(
         else:
             assert isinstance(p, StaticDim), f"expected a static pad amount, got {p!r}"
             pad_ints.append(p.dim)
-    if any(p < 0 for p in pad_ints):
-        raise NotImplementedError(
-            "constant_pad_nd with negative padding (cropping) is not supported yet"
-        )
-    # torch's pad list covers the trailing len(pad)//2 dims, LAST dim first:
-    # [last_before, last_after, second_to_last_before, ...]. MAX wants all
-    # dims in forward order: [before_dim0, after_dim0, before_dim1, ...].
-    rank = len(input.shape)
+    return pad_ints
+
+
+def _torch_pad_to_max_paddings(rank: int, pad: list[int]) -> list[int]:
+    """Torch's pad list to MAX's `ops.pad` paddings list.
+
+    Torch's pad list covers the trailing `len(pad) // 2` dims, LAST dim
+    first: `[last_before, last_after, second_to_last_before, ...]`. MAX
+    wants every dim, in forward order: `[before_dim0, after_dim0,
+    before_dim1, after_dim1, ...]`. Shared by constant_pad_nd,
+    reflection_pad2d and replication_pad2d.
+    """
     paddings = [0] * (2 * rank)
-    for i in range(len(pad_ints) // 2):
+    for i in range(len(pad) // 2):
         dim = rank - 1 - i
-        paddings[2 * dim] = pad_ints[2 * i]
-        paddings[2 * dim + 1] = pad_ints[2 * i + 1]
+        paddings[2 * dim] = pad[2 * i]
+        paddings[2 * dim + 1] = pad[2 * i + 1]
+    return paddings
+
+
+# constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
+@map_to(aten.constant_pad_nd)
+def aten_constant_pad_nd(
+    input: MaxTensor, pad: list[int | Dim], value: Scalar = 0
+) -> MaxTensor:
+    pad_ints = _static_pad_ints(pad)
+    rank = len(input.shape)
+    if any(p < 0 for p in pad_ints):
+        # A negative entry crops rather than pads. Mirrors ATen's own
+        # constant_pad_nd (PadNd.cpp): narrow the input away from the
+        # negative amount first, then pad only what remains non-negative --
+        # MAX's ops.pad rejects negative paddings outright.
+        slices = [slice(None)] * rank
+        for i in range(len(pad_ints) // 2):
+            dim = rank - 1 - i
+            before, after = pad_ints[2 * i], pad_ints[2 * i + 1]
+            if before < 0:
+                slices[dim] = slice(-before, slices[dim].stop)
+                pad_ints[2 * i] = 0
+            if after < 0:
+                slices[dim] = slice(slices[dim].start, after)
+                pad_ints[2 * i + 1] = 0
+        input = input[*slices]
+    paddings = _torch_pad_to_max_paddings(rank, pad_ints)
     return max_ops.pad(input, paddings, mode="constant", value=value)
 
 
@@ -1894,11 +1865,8 @@ def aten_convolution(
     input_rank = len(input.shape)
 
     if input_rank == 3:
-        if dilation[0] != 1:
-            raise NotImplementedError(
-                "Non-unit dilation is not supported for conv1d yet."
-            )
-
+        # The length becomes a unit-W 2-D conv's H axis, so the one
+        # stride/padding/dilation apply to H and W stays at 1/0/1.
         stride_2d = (stride[0], 1)
         dilation_2d = (dilation[0], 1)
         padding_2d = (padding[0], padding[0], 0, 0)
@@ -1993,14 +1961,13 @@ def aten_copy(
 # cos(Tensor self) -> Tensor
 @map_to(aten.cos)
 def aten_cos(x: MaxTensor) -> MaxTensor:
-    return F.cos(x)
+    return custom_mojo_ops.elementwise(x, "cos")
 
 
 # cosh(Tensor self) -> Tensor
 @map_to(aten.cosh)
 def aten_cosh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic cosine using cosh(x) = (exp(x) + exp(-x)) / 2"""
-    return (F.exp(x) + F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "cosh")
 
 
 # cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor
@@ -2191,13 +2158,13 @@ def aten_eq(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # erf(Tensor self) -> Tensor
 @map_to(aten.erf)
 def aten_erf(input: MaxTensor) -> MaxTensor:
-    return F.erf(input)
+    return custom_mojo_ops.elementwise(input, "erf")
 
 
 # exp(Tensor self) -> Tensor
 @map_to(aten.exp)
 def aten_exp(input: MaxTensor) -> MaxTensor:
-    return F.exp(input)
+    return custom_mojo_ops.elementwise(input, "exp")
 
 
 # expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)
@@ -2265,11 +2232,7 @@ def aten_fill__scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
 # floor(Tensor self) -> Tensor
 @map_to(aten.floor)
 def aten_floor(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the floor of the elements of input,
-    the largest integer less than or equal to each element.
-    """
-    return F.floor(input)
+    return custom_mojo_ops.elementwise(input, "floor")
 
 
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2333,6 +2296,45 @@ def aten_full_like(
 
 
 # gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor
+@map_to(aten.gather.default)
+def aten_gather(
+    input: MaxTensor, dim: int, index: MaxTensor, sparse_grad: bool = False
+) -> MaxTensor:
+    """``out[i][j][k] = input[i][index[i][j][k]][k]`` for ``dim=1``, etc.
+
+    ``F.gather`` is numpy.take — it selects whole slices along one axis — NOT
+    torch.gather, so the full coordinate of every output element is built and
+    fed to ``gather_nd``. ``sparse_grad`` only picks the layout of the
+    gradient, which autograd builds separately, so the forward ignores it
+    exactly as ATen's does.
+    """
+    return F.gather_nd(input, _dim_coords(input, dim, index), batch_dims=0)
+
+
+def _dim_coords(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """The ``index.shape + [rank]`` coordinate tensor of a torch-style
+    gather/scatter along ``dim``.
+
+    Every axis contributes its own coordinate — an iota broadcast along that
+    axis — except ``dim``, which contributes ``index``. This is the bridge
+    between torch's elementwise gather/scatter index convention and MAX's
+    ``gather_nd``/``scatter_nd`` coordinate-vector convention, and is shared
+    by ``aten_gather`` and ``aten_scatter_add``: their index semantics are
+    identical, only the direction of the copy differs.
+    """
+    rank = len(input.shape)
+    dim = dim % rank
+    coords = []
+    for axis in range(rank):
+        if axis == dim:
+            coords.append(index)
+            continue
+        iota = F.arange(0, index.shape[axis], 1, dtype=index.dtype, device=index.device)
+        axis_shape = [
+            index.shape[a] if a == axis else StaticDim(1) for a in range(rank)
+        ]
+        coords.append(_broadcast_to(F.reshape(iota, axis_shape), index.shape))
+    return F.stack(coords, axis=-1)
 
 
 # ge.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2347,7 +2349,11 @@ def aten_ge(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
 def aten_gelu(
     input: MaxTensor, approximate: Literal["tanh", "none"] = "none"
 ) -> MaxTensor:
-    return _gelu(input, approximate=approximate)
+    if approximate not in ("none", "tanh"):
+        raise ValueError("approximate must be none or tanh")
+    return custom_mojo_ops.elementwise(
+        input, "gelu_tanh" if approximate == "tanh" else "gelu_none"
+    )
 
 
 # gelu_backward(Tensor grad_output, Tensor self, *, str approximate='none') -> Tensor
@@ -2496,8 +2502,76 @@ def broadcast_shape(
     return out
 
 
+# index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor
+@map_to(aten.index_add.default)
+def aten_index_add(
+    input: MaxTensor, dim: int, index: MaxTensor, source: MaxTensor, alpha: Scalar = 1
+) -> MaxTensor:
+    """``out = input.clone(); out.index_add_(dim, index, source)``.
+
+    index_add IS scatter_add with a 1-D index broadcast across every other
+    axis, so it broadcasts the index to `source`'s shape and reuses
+    `aten_scatter_add` rather than repeating the coordinate construction.
+    It is also what autograd calls for index_select's backward.
+    """
+    if alpha != 1:
+        source = source * alpha
+    rank = len(source.shape)
+    axis_shape = [
+        index.shape[0] if a == dim % rank else StaticDim(1) for a in range(rank)
+    ]
+    index = _broadcast_to(F.reshape(index, axis_shape), source.shape)
+    return aten_scatter_add(input, dim, index, source)
+
+
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
+@map_to(aten.index_put.default)
+def aten_index_put(
+    input: MaxTensor,
+    indices: list[MaxTensor | None],
+    values: MaxTensor,
+    accumulate: bool = False,
+) -> MaxTensor:
+    """``out = input.clone(); out[indices] = values`` (``+=`` when
+    ``accumulate``) — the write mirror of ``aten_index``.
+
+    Only a single index tensor on axis 0 is served; anything else (a boolean mask, several index tensors, an
+    index on a later axis) raises rather than silently computing the wrong
+    thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
+    ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
+    would insert a silent host round trip per call.
+    """
+    non_none = [(axis, idx) for axis, idx in enumerate(indices) if idx is not None]
+    if len(non_none) != 1 or non_none[0][0] != 0:
+        raise NotImplementedError(
+            "aten.index_put only supports a single index tensor on dim 0, got "
+            f"{[idx is not None for idx in indices]}"
+        )
+    index = non_none[0][1]
+    if index.dtype == DType.bool:
+        raise NotImplementedError(
+            "aten.index_put with a boolean mask is not supported yet (the "
+            "number of written elements is data dependent)"
+        )
+    if len(index.shape) != 1:
+        raise NotImplementedError(
+            f"aten.index_put needs a 1-D index tensor, got rank {len(index.shape)}"
+        )
+    # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
+    # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
+    updates = _broadcast_to(values, [index.shape[0], *input.shape[1:]])
+    scatter = F.scatter_nd_add if accumulate else F.scatter_nd
+    return scatter(input, updates, F.unsqueeze(index, -1))
+
+
 # index_select(Tensor self, int dim, Tensor index) -> Tensor
+@map_to(aten.index_select.default)
+def aten_index_select(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """``F.gather`` is exactly index_select: numpy.take semantics, with the
+    indexed axis replaced by the (1-D) index's shape."""
+    return F.gather(input, index, axis=dim)
+
+
 # isinf(Tensor self) -> Tensor
 
 
@@ -2584,10 +2658,7 @@ def aten_isin(
 # isnan(Tensor self) -> Tensor
 @map_to(aten.isnan)
 def aten_isnan(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with boolean elements representing if each element is NaN or not.
-    """
-    return F.is_nan(input)
+    return custom_mojo_ops.elementwise(input, "isnan")
 
 
 # le.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2675,10 +2746,7 @@ def aten_lift_fresh_copy(input: MaxTensor) -> MaxTensor:
 # log(Tensor self) -> Tensor
 @map_to(aten.log)
 def aten_log(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of the elements of input.
-    """
-    return F.log(input)
+    return custom_mojo_ops.elementwise(input, "log")
 
 
 # log10(Tensor self) -> Tensor
@@ -2687,14 +2755,13 @@ def aten_log(input: MaxTensor) -> MaxTensor:
 # log1p(Tensor self) -> Tensor
 @map_to(aten.log1p)
 def aten_log1p(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of (1 + input).
-    This function is more numerically stable than log(1 + input) for small values of input.
-    """
-    return F.log1p(input)
+    return custom_mojo_ops.elementwise(input, "log1p")
 
 
-# log2(Tensor self) -> Tensor
+# aten::log2(Tensor self) -> Tensor
+@map_to(aten.log2)
+def aten_log2(input: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(input, "log2")
 
 
 # logical_and(Tensor self, Tensor other) -> Tensor
@@ -2722,14 +2789,7 @@ def aten_logical_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 # logical_not(Tensor self) -> Tensor
 @map_to(aten.logical_not)
 def aten_logical_not(input: MaxTensor) -> MaxTensor:
-    """
-    PyTorch's logical_not treats any non-zero value as True and returns the logical negation.
-    MAX's logical_not requires boolean input, so we need to convert first.
-    """
-    # Convert input to boolean (non-zero -> True, zero -> False)
-    input_bool = F.not_equal(input, 0)
-    # Apply logical not
-    return F.logical_not(input_bool)
+    return custom_mojo_ops.elementwise(input, "logical_not")
 
 
 # logical_or(Tensor self, Tensor other) -> Tensor
@@ -3209,7 +3269,7 @@ def aten_ne(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # neg(Tensor self) -> Tensor
 @map_to(aten.neg)
 def aten_neg(x: MaxTensor) -> MaxTensor:
-    return operator.neg(x)
+    return custom_mojo_ops.elementwise(x, "neg")
 
 
 # nonzero(Tensor self) -> Tensor
@@ -3260,19 +3320,26 @@ def aten_pow(x: Scalar | MaxTensor, y: Scalar | MaxTensor) -> MaxTensor:
 # reciprocal(Tensor self) -> Tensor
 @map_to(aten.reciprocal)
 def aten_reciprocal(tensor: MaxTensor) -> MaxTensor:
-    return 1.0 / tensor
+    return custom_mojo_ops.elementwise(tensor, "reciprocal")
 
 
 # reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
 # reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.reflection_pad2d.default)
+def aten_reflection_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    # ATen's "padding < input dim" check already ran in the meta kernel
+    # during fake-tensor propagation, before this graph is built.
+    paddings = _torch_pad_to_max_paddings(len(input.shape), _static_pad_ints(padding))
+    return max_ops.pad(input, paddings, mode="reflect")
+
+
 # reflection_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 
 # relu(Tensor self) -> Tensor
 @map_to(aten.relu)
 def aten_relu(tensor: MaxTensor) -> MaxTensor:
-    # inplace has no meaning in max since it's graph-based
-    return F.relu(tensor)
+    return custom_mojo_ops.elementwise(tensor, "relu")
 
 
 # remainder.Scalar(Tensor self, Scalar other) -> Tensor
@@ -3299,6 +3366,12 @@ def aten_repeat(input: MaxTensor, repeats: list[SymIntType]) -> MaxTensor:
 
 
 # replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.replication_pad2d.default)
+def aten_replication_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    paddings = _torch_pad_to_max_paddings(len(input.shape), _static_pad_ints(padding))
+    return max_ops.pad(input, paddings, mode="edge")
+
+
 # replication_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 
@@ -3317,7 +3390,7 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 # rsqrt(Tensor self) -> Tensor
 @map_to(aten.rsqrt)
 def aten_rsqrt(x: MaxTensor) -> MaxTensor:
-    return F.rsqrt(x)
+    return custom_mojo_ops.elementwise(x, "rsqrt")
 
 
 # scalar_tensor(Scalar s, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -3356,37 +3429,6 @@ def aten_scaled_dot_product_attention(
         neg_inf = F.constant(float("-inf"), dtype=query.dtype, device=query.device)
         zero = F.constant(0.0, dtype=query.dtype, device=query.device)
         attn_mask = _where(attn_mask, zero, neg_inf)
-
-    query_device = query.device
-    is_gpu = (
-        not query_device.is_cpu()
-        if isinstance(query_device, DeviceRef)
-        else query_device.label != "cpu"
-    )
-
-    if (
-        is_gpu
-        and attn_mask is not None
-        and dropout_p == 0.0
-        and not is_causal
-        and scale in (None, 0.125)
-        and not enable_gqa
-        and query.dtype == key.dtype == value.dtype == attn_mask.dtype == DType.float32
-        and len(query.shape)
-        == len(key.shape)
-        == len(value.shape)
-        == len(attn_mask.shape)
-        == 4
-        and query.shape[2] == 1
-        and query.shape[3] == 64
-        and query.shape[0] == key.shape[0] == value.shape[0]
-        and query.shape[1] == key.shape[1] == value.shape[1]
-        and key.shape == value.shape
-        and attn_mask.shape[-1] == key.shape[2]
-        and attn_mask.shape[0] in (1, query.shape[0])
-        and attn_mask.shape[1] == attn_mask.shape[2] == 1
-    ):
-        return custom_mojo_ops.gpt2_decode_attention(query, key, value, attn_mask)
 
     output, _ = aten__scaled_dot_product_attention_math(
         query,
@@ -3439,6 +3481,25 @@ def aten_scatter_value(
 
 
 # scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
+@map_to(aten.scatter_add.default)
+def aten_scatter_add(
+    input: MaxTensor, dim: int, index: MaxTensor, src: MaxTensor
+) -> MaxTensor:
+    """``out = input.clone(); out[i][index[i][j][k]][k] += src[i][j][k]`` for
+    ``dim=1``, etc. — the accumulating twin of ``aten_scatter_src``, and the
+    backward of ``aten_gather``.
+
+    Deliberately NOT `F.scatter_add`, whose semantics match but which has no
+    GPU kernel: its wrapper transfers input/updates/indices to the host and
+    the result back on every call. The `_nd` form keeps the GPU kernel in the
+    loop, at the cost of materializing the coordinate tensor `_dim_coords`
+    builds (shared with `aten_gather`).
+    """
+    coords = _dim_coords(input, dim, index)
+    rank = len(input.shape)
+    return F.scatter_nd_add(input, F.reshape(src, [-1]), F.reshape(coords, [-1, rank]))
+
+
 # scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
 
 
@@ -3535,48 +3596,43 @@ def aten_select_scatter(
 # sigmoid(Tensor self) -> Tensor
 @map_to(aten.sigmoid)
 def aten_sigmoid(input: MaxTensor) -> MaxTensor:
-    return _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "sigmoid")
 
 
 # sign(Tensor self) -> Tensor
 @map_to(aten.sign)
 def aten_sign(x: MaxTensor) -> MaxTensor:
-    # sign(x) = (x > 0) + (x < 0) * (-1)
-    # This returns 1.0 for positive, -1.0 for negative, 0.0 for zero
-    positive = F.cast(x > 0, dtype=x.dtype)
-    negative = F.cast(x < 0, dtype=x.dtype)
-    return positive + negative * (-1)
+    return custom_mojo_ops.elementwise(x, "sign")
 
 
 # silu(Tensor self) -> Tensor
 @map_to(aten.silu)
 def aten_silu(input: MaxTensor) -> MaxTensor:
-    return input * _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "silu")
 
 
 # sin(Tensor self) -> Tensor
 @map_to(aten.sin)
 def aten_sin(x: MaxTensor) -> MaxTensor:
-    return F.sin(x)
+    return custom_mojo_ops.elementwise(x, "sin")
 
 
 # tan(Tensor self) -> Tensor
 @map_to(aten.tan)
 def aten_tan(x: MaxTensor) -> MaxTensor:
-    return F.sin(x) / F.cos(x)
+    return custom_mojo_ops.elementwise(x, "tan")
 
 
 # tanh(Tensor self) -> Tensor
 @map_to(aten.tanh)
 def aten_tanh(x: MaxTensor) -> MaxTensor:
-    return F.tanh(x)
+    return custom_mojo_ops.elementwise(x, "tanh")
 
 
 # sinh(Tensor self) -> Tensor
 @map_to(aten.sinh)
 def aten_sinh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic sine using sin(x) = (exp(x) - exp(-x)) / 2"""
-    return (F.exp(x) - F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "sinh")
 
 
 # slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
@@ -3616,7 +3672,7 @@ def aten_split_with_sizes(
 # sqrt(Tensor self) -> Tensor
 @map_to(aten.sqrt)
 def aten_sqrt(x: MaxTensor) -> MaxTensor:
-    return F.sqrt(x)
+    return custom_mojo_ops.elementwise(x, "sqrt")
 
 
 # squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)
