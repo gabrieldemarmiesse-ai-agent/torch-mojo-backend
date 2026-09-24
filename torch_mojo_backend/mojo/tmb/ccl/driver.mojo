@@ -28,6 +28,9 @@ comptime FN_PCI_BUS_ID = (
     "hipDeviceGetPCIBusId" if AMD else "cuDeviceGetPCIBusId"
 )
 comptime FN_STREAM_QUERY = "hipStreamQuery" if AMD else "cuStreamQuery"
+comptime FN_DEVICE_ATTRIBUTE = (
+    "hipDeviceGetAttribute" if AMD else "cuDeviceGetAttribute"
+)
 comptime FN_HOST_ALLOC = "hipHostMalloc" if AMD else "cuMemHostAlloc"
 comptime FN_HOST_FREE = "hipHostFree" if AMD else "cuMemFreeHost"
 comptime FN_HOST_DEVPTR = (
@@ -130,41 +133,43 @@ def current_device_ordinal(lib: OwnedDLHandle) raises -> Int:
     return Int(dev)
 
 
-# hipDeviceAttributeDirectManagedMemAccessFromHost. 13 in every ROCm from 5.7
-# to 7.2: hip_runtime_api.h keeps a retired entry as `hipDeviceAttributeUnused<n>`
-# rather than deleting it, so the CUDA-compatible block never renumbers.
-comptime HIP_ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST: Int32 = 13
+def device_attribute(lib: OwnedDLHandle, attr: Int, ordinal: Int) raises -> Int:
+    """`cuDeviceGetAttribute` / `hipDeviceGetAttribute`, or a negative driver
+    rc; raises only if the symbol is missing. Every caller treats "could not
+    ask" as "not supported"."""
+    var v: Int32 = -1
+    var rc = lib.get_function[Int32](FN_DEVICE_ATTRIBUTE)(
+        Pointer(to=v), Int32(attr), Int32(ordinal)
+    )
+    if rc != 0:
+        return -Int(rc)
+    return Int(v)
+
+
+# CU_DEVICE_ATTRIBUTE_ / hipDeviceAttributeDirectManagedMemAccessFromHost.
+# HIP's is 13 in every ROCm from 5.7 to 7.2: hip_runtime_api.h keeps a retired
+# entry as `hipDeviceAttributeUnused<n>`, so that block never renumbers.
+comptime ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST = 13 if AMD else 101
 
 
 def direct_managed_mem_access(lib: OwnedDLHandle, ordinal: Int) -> Bool:
-    """Whether the host accesses this GPU's managed memory directly: 1 on an
-    APU (MI300A), 0 on a discrete GPU (MI300X). RCCL 2.22.3 asks exactly
-    this before forcing its 24-channel multi-node rule
-    (`src/init.cc:1339-1346`). AMD only. False elsewhere, and false (with
-    one line saying so) if the driver will not answer, which keeps the GPU
-    on the discrete caps. Rank-local: `ncclCommInitRank` ANDs every rank's
-    answer, so one failed query moves the whole communicator."""
-    comptime if AMD:
-        var v: Int32 = 0
-        var rc: Int32 = -1
-        try:
-            rc = lib.get_function[Int32]("hipDeviceGetAttribute")(
-                Pointer(to=v),
-                HIP_ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST,
-                Int32(ordinal),
-            )
-        except e:
-            print("mojoccl: hipDeviceGetAttribute unavailable:", e)
-        if rc == 0:
+    """Whether the host accesses this GPU's managed memory directly: an APU
+    (MI300A), not a discrete GPU (MI300X). RCCL's test for its multi-node
+    grid (`_node_grids`). False, with one line saying so, if the driver will
+    not answer, which keeps the discrete-GPU grids."""
+    try:
+        var v = device_attribute(
+            lib, ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST, ordinal
+        )
+        if v >= 0:
             return v != 0
         print(
-            (
-                "mojoccl: hipDeviceGetAttribute(DirectManagedMemAccessFromHost)"
-                " failed, rc="
-            ),
-            rc,
+            "mojoccl: DirectManagedMemAccessFromHost query failed, rc=",
+            -v,
             "; using the discrete-GPU collective grids",
         )
+    except e:
+        print("mojoccl:", FN_DEVICE_ATTRIBUTE, "unavailable:", e)
     return False
 
 

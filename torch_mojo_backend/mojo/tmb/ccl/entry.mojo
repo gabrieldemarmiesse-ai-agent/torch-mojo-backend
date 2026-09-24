@@ -1477,7 +1477,7 @@ def _bootstrap(
     if device_sms <= 0:
         device_sms = sm_count(lib, ordinal)
     var apu = False
-    comptime if _GFX942:
+    comptime if _GFX942:  # RCCL's multi-node APU rule is gfx942's
         apu = direct_managed_mem_access(lib, ordinal)
     # A positive multiple of 4096 (the kernels' own precondition,
     # RESULTS.md section 9) is what keeps every per-chunk offset the
