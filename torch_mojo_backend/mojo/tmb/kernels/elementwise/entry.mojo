@@ -75,9 +75,9 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.graph.div_math import floor_div, trunc_div
 from tmb.graph.math_utils import ieee_sqrt
 from std.sys.info import _has_sm_9x
-from std.utils.numerics import inf
 
 
 # ---------------------------------------------------------------------------
@@ -847,30 +847,12 @@ def _scalar_elementwise[
                     i, (a * s).cast[dtype]()
                 )
             comptime if op_code == SOP_FLOORDIV:
-                # The float32 `//` of logic's BOP_FLOORDIV narrow-float
-                # route, with its one fixup: a finite nonzero numerator over
-                # an opposite-sign divisor floors to -1 even when the float32
-                # quotient underflows (or the divisor is infinite) to -0.
-                var q = a // s
-                var zero = SIMD[DType.float32, width](0)
-                var big = SIMD[DType.float32, width](inf[DType.float32]())
-                var negative_zero = (
-                    q.eq(zero)
-                    & a.ne(zero)
-                    & abs(a).lt(big)
-                    & s.ne(zero)
-                    & abs(s).le(big)
-                    & (a.lt(zero) ^ s.lt(zero))
-                )
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i,
-                    negative_zero.select(
-                        SIMD[DType.float32, width](-1), q
-                    ).cast[dtype](),
+                    i, floor_div(a, s).cast[dtype]()
                 )
             comptime if op_code == SOP_TRUNCDIV:
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, (a / s).__trunc__().cast[dtype]()
+                    i, trunc_div(a, s).cast[dtype]()
                 )
             comptime if op_code == SOP_POW:
                 # float32 through float64, as in logic' BOP_POW (the

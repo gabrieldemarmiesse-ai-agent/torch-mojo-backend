@@ -21,13 +21,10 @@ def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
     )
 
 
-def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
-    """
-    Custom Mojo kernel for bitwise_and operation.
-    """
-
+def _same_type_binary(name: str, input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """An ElementwiseBinaryOp over two operands of one dtype and shape."""
     return F.custom(
-        name="bitwise_and",
+        name=name,
         device=input.device,
         values=[input, other],
         out_types=[
@@ -35,6 +32,13 @@ def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         ],
         custom_extensions=compiler.kernel_extension_paths(),
     )[0]
+
+
+def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """
+    Custom Mojo kernel for bitwise_and operation.
+    """
+    return _same_type_binary("bitwise_and", input, other)
 
 
 def bitwise_and_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -64,16 +68,7 @@ def bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_or operation.
     """
-
-    return F.custom(
-        name="bitwise_or",
-        device=input.device,
-        values=[input, other],
-        out_types=[
-            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
-        ],
-        custom_extensions=compiler.kernel_extension_paths(),
-    )[0]
+    return _same_type_binary("bitwise_or", input, other)
 
 
 def bitwise_or_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -87,16 +82,7 @@ def bitwise_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_xor operation.
     """
-
-    return F.custom(
-        name="bitwise_xor",
-        device=input.device,
-        values=[input, other],
-        out_types=[
-            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
-        ],
-        custom_extensions=compiler.kernel_extension_paths(),
-    )[0]
+    return _same_type_binary("bitwise_xor", input, other)
 
 
 def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -104,6 +90,15 @@ def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
     Custom Mojo kernel for bitwise_xor_scalar operation.
     """
     return bitwise_xor(input, _scalar_to_tensor(input, other))
+
+
+def div(
+    input: MaxTensor, other: MaxTensor, kind: Literal["true", "floor", "trunc"]
+) -> MaxTensor:
+    """torch.div's three modes (`tmb/graph/div_math.mojo`). The operands share
+    a dtype and a shape: promotion, broadcasting and any float32 widening
+    happen before the call."""
+    return _same_type_binary(f"div_{kind}", input, other)
 
 
 def elementwise(

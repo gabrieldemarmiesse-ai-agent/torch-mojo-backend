@@ -70,8 +70,6 @@ _transfer_to = F.functional(max_ops.transfer_to)
 _broadcast_to = F.functional(max_ops.broadcast_to)
 _where = F.functional(max_ops.where)
 _split = F.functional(max_ops.split)
-# F.floor_div asserts an eager result too.
-_floor_div = F.functional(max_ops.floor_div)
 
 
 def _scalar_constant(
@@ -2434,82 +2432,61 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 def aten_div(
     input: MaxTensor, other: MaxTensor | Scalar, *, rounding_mode: str | None = None
 ) -> MaxTensor:
-    if rounding_mode is None:
-        return operator.truediv(input, other)
-    if rounding_mode not in ("floor", "trunc"):
-        raise ValueError(f"Unsupported rounding_mode: {rounding_mode}")
-    return _rounding_div(input, other, floor=rounding_mode == "floor")
+    """div.Tensor / div.Scalar and their rounding modes, on the Mojo kernels
+    of `tmb/graph/division.mojo`, with the mojo device's semantics
+    (`_b_div` / `_b_rounding_div` in `tmb/ops/binary.mojo`).
 
-
-def _rounding_div(
-    input: MaxTensor, other: MaxTensor | Scalar, *, floor: bool
-) -> MaxTensor:
-    """div.Tensor_mode's floor / trunc, after ATen's CPU div_floor_kernel and
-    div_trunc_kernel.
-
-    Integer operands stay integral (MAX's `/` would promote them to
-    float64): floor is MAX's integer floor_div, trunc corrects it toward zero
-    when the signs differ and the division is inexact. A zero Python-number
-    divisor raises like CPU torch; a zero tensor element gives 0 in both
-    modes, as on the mojo device, since a graph cannot raise.
-
-    bf16/fp16 divide in float32 where ATen does: floor always (each step of
-    `div_floor_floating` promotes), trunc over a scalar-shaped divisor
+    Operands are promoted like ATen; true division then lands on the default
+    float dtype when that is integral, and integer floor/trunc stay integral.
+    A zero Python-number divisor of an integer raises like CPU torch; a zero
+    tensor element gives 0 in both rounding modes, since a graph cannot
+    raise. bf16/fp16 divide in float32 where ATen does: floor always (the
+    kernel widens itself) and trunc over a scalar-shaped divisor
     (`iter.is_scalar(2)`: a Python number at its own value, or a one-element
-    tensor). Trunc over a real tensor divides at native precision, rounding
-    the quotient before the trunc, as ATen does.
+    tensor); widening here keeps a Python number from rounding to bf16.
     """
-    assert not isinstance(other, Dim), "div's rounding modes take no symbolic Dim"
-    lhs_probe = torch.empty(
-        (0,) * len(input.shape), dtype=max_dtype_to_torch(input.dtype), device="meta"
-    )
-    rhs_probe = (
-        torch.empty(
-            (0,) * len(other.shape),
-            dtype=max_dtype_to_torch(other.dtype),
-            device="meta",
+    if rounding_mode not in (None, "floor", "trunc"):
+        raise ValueError(f"Unsupported rounding_mode: {rounding_mode}")
+    assert not isinstance(other, Dim), "div takes no symbolic Dim divisor"
+    other_is_tensor = isinstance(other, TensorValue | MaxEagerTensor)
+
+    def probe(x: MaxTensor) -> torch.Tensor:
+        # Rank matters: a 0-d tensor promotes like a number.
+        return torch.empty(
+            (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
         )
-        if isinstance(other, TensorValue | MaxEagerTensor)
-        else other
+
+    result_torch = torch.result_type(
+        probe(input), probe(other) if other_is_tensor else other
     )
-    result = torch_dtype_to_max(torch.result_type(lhs_probe, rhs_probe))
-    lhs = input if input.dtype == result else F.cast(input, result)
-    rhs = (
-        other
-        if not isinstance(other, TensorValue | MaxEagerTensor) or other.dtype == result
-        else F.cast(other, result)
+    if rounding_mode is None and not result_torch.is_floating_point:
+        result_torch = torch.get_default_dtype()
+    result = torch_dtype_to_max(result_torch)
+    if not result.is_float() and not other_is_tensor and other == 0:
+        raise RuntimeError("ZeroDivisionError")
+
+    compute = result
+    if result in (DType.bfloat16, DType.float16) and (
+        (rounding_mode == "floor" and not other_is_tensor)
+        or (
+            rounding_mode == "trunc"
+            and (
+                not other_is_tensor
+                or all(isinstance(d, StaticDim) and int(d) == 1 for d in other.shape)
+            )
+        )
+    ):
+        compute = DType.float32
+    lhs = input if input.dtype == compute else F.cast(input, compute)
+    if not other_is_tensor:
+        rhs = F.constant(other, dtype=compute, device=input.device)
+    else:
+        rhs = other if other.dtype == compute else F.cast(other, compute)
+    shape = find_broadcast_shape(lhs.shape, rhs.shape)
+    quotient = custom_mojo_ops.div(
+        _broadcast_to(lhs, shape), _broadcast_to(rhs, shape), rounding_mode or "true"
     )
-    if not result.is_float():
-        if not isinstance(rhs, TensorValue | MaxEagerTensor):
-            if rhs == 0:
-                raise RuntimeError("ZeroDivisionError")
-            quotient = _floor_div(lhs, rhs)
-            if floor:
-                return quotient
-            inexact = (lhs - quotient * rhs) != 0
-            opposite = lhs > 0 if rhs < 0 else lhs < 0
-            return _where(inexact & opposite, quotient + 1, quotient)
-        # An integer division by zero traps (SIGFPE) in a CPU graph: divide
-        # by 1 there and give 0, the mojo device's value.
-        zero = rhs == 0
-        one = F.constant(1, dtype=result, device=rhs.device)
-        nil = F.constant(0, dtype=result, device=rhs.device)
-        quotient = _where(zero, nil, _floor_div(lhs, _where(zero, one, rhs)))
-        if floor:
-            return quotient
-        inexact = ((lhs - quotient * rhs) != 0) & F.logical_not(zero)
-        opposite = (lhs < 0) != (rhs < 0)
-        return _where(inexact & opposite, quotient + 1, quotient)
-    narrow = result in (DType.bfloat16, DType.float16)
-    scalar_shaped = not isinstance(other, TensorValue | MaxEagerTensor) or all(
-        isinstance(d, StaticDim) and int(d) == 1 for d in other.shape
-    )
-    if narrow and (floor or scalar_shaped):
-        lhs = F.cast(lhs, DType.float32)
-        if isinstance(rhs, TensorValue | MaxEagerTensor):
-            rhs = F.cast(rhs, DType.float32)
-    rounded = F.floor(lhs / rhs) if floor else F.trunc(lhs / rhs)
-    return rounded if rounded.dtype == result else F.cast(rounded, result)
+    return quotient if compute == result else F.cast(quotient, result)
 
 
 # elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor

@@ -2254,6 +2254,43 @@ def test_aten_div_rounding_mode_int_compiled(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("rounding_mode", [None, "floor", "trunc"])
+@pytest.mark.parametrize(
+    ("lhs_dtype", "rhs_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float32),
+        (torch.bfloat16, torch.float16),
+        (torch.int32, torch.int64),
+        (torch.int64, torch.float32),
+    ],
+)
+def test_aten_div_promotes_and_broadcasts_compiled(
+    conf: Conf,
+    call_checker: CallChecker,
+    rounding_mode: str | None,
+    lhs_dtype: torch.dtype,
+    rhs_dtype: torch.dtype,
+):
+    """Promotion (true division of integers lands on the default float),
+    broadcasting against a row and a 0-d tensor, and a Python divisor."""
+    call_checker.register(aten_functions.aten_div)
+    x = (torch.arange(-12, 12).reshape(4, 6) * 7 % 23 - 11).to(lhs_dtype)
+    row = torch.tensor([3, -2, 5, -7, 4, 9]).to(rhs_dtype)
+    zero_d = torch.tensor(-3).to(rhs_dtype)
+
+    def fn(x, row, zero_d):
+        return (
+            torch.div(x, row, rounding_mode=rounding_mode),
+            torch.div(x, zero_d, rounding_mode=rounding_mode),
+            torch.div(x, 2.5, rounding_mode=rounding_mode),
+            torch.div(x, -4, rounding_mode=rounding_mode),
+        )
+
+    check_outputs(fn, conf, [x, row, zero_d])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
 @pytest.mark.parametrize("divisor", ["number", "one_element", "tensor"])
 def test_aten_div_rounding_mode_bf16_compiled(
