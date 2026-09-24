@@ -29,7 +29,7 @@
 #
 # Build (never under the GPU lock):
 #   <mojo> build tests/fa4_selfload_soak_probe.mojo \
-#       -I torch_mojo_backend/eager_flash_attention -o <out>
+#       -I torch_mojo_backend/mojo -o <out>
 # Run (real GPU; no flock needed for a correctness probe -- see
 # AGENTS.md, the lock is for benchmark timing precision only):
 #   REPS=8 ./<out>
@@ -40,8 +40,8 @@ from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext
 from std.memory.unsafe_pointer import pointer_to_int
 
-from fa4_fwd_launch import launch_fwd_fa4
-from fa4_fwd_selfload_launch import launch_fwd_fa4_selfload
+from tmb.kernels.fa4.fwd_launch import launch_fwd_fa4
+from tmb.kernels.fa4.fwd_selfload_launch import launch_fwd_fa4_selfload
 
 comptime D: Int = 64
 comptime BURST: Int = 4

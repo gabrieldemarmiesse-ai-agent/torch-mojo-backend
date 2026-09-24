@@ -26,16 +26,16 @@ struct Grayscale:
             ) -> SIMD[DType.float32, simd_width]:
                 return img_in.load[simd_width](idx).cast[DType.float32]()
 
-            row = Int(idx[0].value())
-            col = Int(idx[1].value())
+            var row = Int(idx[0].value())
+            var col = Int(idx[1].value())
 
             # Load RGB values
-            r = load(IndexList[3](row, col, 0))
-            g = load(IndexList[3](row, col, 1))
-            b = load(IndexList[3](row, col, 2))
+            var r = load(IndexList[3](row, col, 0))
+            var g = load(IndexList[3](row, col, 1))
+            var b = load(IndexList[3](row, col, 2))
 
             # Apply standard grayscale conversion formula
-            gray = 0.21 * r + 0.71 * g + 0.07 * b
+            var gray = 0.21 * r + 0.71 * g + 0.07 * b
             return min(gray, 255)
 
         foreach[color_to_grayscale, target=target, simd_width=1](img_out, ctx)

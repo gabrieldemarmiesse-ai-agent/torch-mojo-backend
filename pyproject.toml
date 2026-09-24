@@ -12,14 +12,13 @@ requires-python = ">=3.11"
 dependencies = [
     "mojo==1.0",
     "max==26.5",
+    "platformdirs",
     "tabulate",
-    "torch>=2.10",
-    # NCCL for the mojo-device distributed backend (torch_mojo_backend/distributed).
-    # The cu12 build: libnccl.so.2 statically links cudart and dlopens libcuda
-    # itself, so it runs on any CUDA-12-capable driver (>= r525) regardless of
-    # which CUDA version torch was built for.
-    "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
+    "torch>=2.7",
 ]
+
+[project.scripts]
+torch-mojo-backend = "torch_mojo_backend.cli:main"
 
 [project.urls]
 "Source" = "https://github.com/gabrieldemarmiesse/torch-mojo-backend"
@@ -28,12 +27,40 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["torch_mojo_backend"]
+# The prebuilt native libraries (scripts/build_prebuilt.py) are ignored by
+# git, and hatchling skips VCS-ignored files unless they are named here. The
+# wheel stays py3-none-any: these are data files ctypes loads at run time, not
+# extension modules, and one wheel carrying every platform's pair is simpler
+# than a wheel per platform -- a file that does not match the machine is never
+# opened (see docs/native_backend.md, "Prebuilt libraries and the wheel").
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
+
+[tool.hatch.build.targets.sdist]
+# Plain `uv build` builds the wheel from the sdist, so the same list has to be
+# here or the libraries silently vanish from the wheel. A checkout without
+# prebuilt libraries (every clone) matches nothing and ships as before.
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
 
 [tool.ruff]
 target-version = "py311"
 # Untracked scratch clone of unrelated third-party repos (dicp/dipu), not
 # part of this project.
 extend-exclude = ["deeplink"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
+    "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
+    "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
+]
 
 [tool.ruff.lint]
 # extend-select keeps ruff's default rule set (E4, E7, E9, F) enabled.
@@ -69,22 +96,22 @@ ban-relative-imports = "all"
 # conda env doesn't look like a normal Python install. `uv run ty check`
 # already sidesteps this, but pin it so a bare `ty check` also works.
 python = ".venv"
+# These suites expose sibling modules through their runtime sys.path setup.
+extra-paths = ["benchmarks", "conformance"]
+
+[tool.ty.analysis]
+# Triton and NCCL wheels are unavailable on macOS. Allow their absence while
+# retaining their type information when installed (e.g. on Linux CI).
+allowed-unresolved-imports = ["triton.**", "nvidia.nccl"]
 
 [tool.ty.rules]
-# Every occurrence (verified by hand, none blanket-assumed) is one of two
-# deliberate polymorphic-override points that nominal override-checking
-# cannot express: (1) MojoExtension's abstract methods are `*args/**kwargs`
-# placeholders precisely so each concrete descriptor (MojoFileExtension,
-# aten_fast.py's per-op extensions, ...) can declare its own independent
-# call ABI -- callers always go through the concrete subclass, never a
-# MojoExtension-typed reference, so this is runtime-duck-typed dispatch, not
-# a substitutability hole; (2) TorchMojoTensor's __torch_dispatch__,
-# __torch_function__, __repr__, __reduce_ex__ and the autograd Functions'
-# backward() are torch's own documented tensor-subclass/autograd extension
-# points, where every real subclass (including torch's own FakeTensor,
-# LoggingTensor, ...) intentionally uses its own signature. `ty check`
-# exits non-zero on warnings too (no `--exit-zero-on-warning` in CI), so
-# this must be "ignore", not "warn", to keep `ty check` green.
+# One deliberate polymorphic-override point that nominal override-checking
+# cannot express: MojoProcessGroup._get_backend returns itself rather than a
+# c10d Backend, because torch looks a group's backend up that way for
+# batch_isend_irecv and _coalescing_manager and the mojo group IS its own
+# backend (see docs/native_backend.md, "Distributed"). `ty check` exits
+# non-zero on warnings too (no `--exit-zero-on-warning` in CI), so this must
+# be "ignore", not "warn", to keep `ty check` green.
 invalid-method-override = "ignore"
 # Bare `dict`/`list`/`Callable` is an unchecked hole: require the arguments.
 missing-type-argument = "error"
@@ -105,8 +132,8 @@ python-preference = "only-managed"
 override-dependencies = [
     # torch's PyPI wheel pins nvidia-nccl-cu13, which needs an r580+ driver and
     # installs to the same site-packages path (nvidia/nccl/) as the
-    # nvidia-nccl-cu12 wheel our distributed backend drives directly. Exclude
-    # it; the cu12 wheel satisfies torch's optional libnccl preload too.
+    # nvidia-nccl-cu12 wheel in our development dependencies. Exclude it;
+    # the cu12 wheel satisfies torch's optional libnccl preload too.
     "nvidia-nccl-cu13; sys_platform == 'never'",
 ]
 
@@ -116,6 +143,13 @@ skip-magic-trailing-comma = true
 
 [dependency-groups]
 dev = [
+    # NCCL for NVIDIA distributed tests; users install it separately when
+    # needed, or use an existing system library.
+    "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
+    # Tested ptxas for NVIDIA kernel development. Runtime installs discover
+    # a compatible assembler on the machine and explain how to install one
+    # when none fits; nvcc is not a runtime dependency.
+    "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
     # Bump the version of mojo/max here.  These come from PyPI like everything
     # else: mojo 1.0 is a stable release, so there is no nightly index and no
     # prerelease opt-in to keep in sync with them.
@@ -134,6 +168,7 @@ dev = [
     # OpInfo database the conformance/ suite runs -- cannot be imported at all.
     "expecttest>=0.2.1",
     "pillow>=11.3.0",
+    "torchvision==0.26.*",
     "pytest>=8.4.1",
     "pytest-forked>=1.6.0",
     "pytest-split>=0.10.0",

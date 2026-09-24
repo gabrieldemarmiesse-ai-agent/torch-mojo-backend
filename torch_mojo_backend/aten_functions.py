@@ -19,12 +19,15 @@ import max.graph.type as max_type
 import torch
 from max.dtype import DType
 from max.experimental import functional as F
-from max.experimental.random import gaussian as max_gaussian
+from max.experimental.random import (
+    gaussian as max_gaussian,
+    uniform_like as _uniform_like,
+)
 from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
 from max.graph import Dim, StaticDim, TensorValue
-from max.graph.type import DeviceRef
+from max.graph.type import DeviceKind, DeviceRef
 from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu
 from torch._decomp import core_aten_decompositions
@@ -37,8 +40,8 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
-from torch_mojo_backend.flags import verbose_enabled
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import get_ordered_accelerators
+from torch_mojo_backend.flags import compile_native_kernels_enabled, verbose_enabled
+from torch_mojo_backend.torch_compile_backend.utils import get_accelerators
 from torch_mojo_backend.types import CountedCallable, MaxTensor, Scalar, SymIntType
 
 # F.functional's stub returns Callable[..., Any], incompatible with the
@@ -59,16 +62,14 @@ _reduce_argmin = F.functional(max_ops.argmin)
 # F.transfer_to is eager-only (reads Tensor.real); re-wrap the graph op so it
 # also works on graph TensorValues in the torch.compile backend.
 _transfer_to = F.functional(max_ops.transfer_to)
-# F.where asserts its result is an eager Tensor; F.broadcast_to/split/sigmoid/
-# gelu are typed `Tensor`-only even though their `_impl`s already forward to
-# the dual-path graph op. Re-wrap all five the same way, both to restore
+# F.where asserts its result is an eager Tensor; F.broadcast_to/split are
+# typed `Tensor`-only even though their `_impl`s already forward to
+# the dual-path graph op. Re-wrap all three the same way, both to restore
 # graph-mode support and to get a stable, precise-enough Callable[..., Any]
 # signature instead of each thin wrapper's narrower stub.
 _broadcast_to = F.functional(max_ops.broadcast_to)
 _where = F.functional(max_ops.where)
 _split = F.functional(max_ops.split)
-_sigmoid = F.functional(max_ops.sigmoid)
-_gelu = F.functional(max_ops.gelu)
 
 
 def _scalar_constant(
@@ -104,20 +105,14 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
 
 def torch_device_to_max_device(x: torch.device) -> DeviceRef:
     if x.type == "mojo":
-        # For mojo, use ordered accelerators (GPU first, CPU last)
-        # index None or 0 = first accelerator (first GPU or CPU if no GPU)
-        # higher indices = additional GPUs, with CPU at the highest index
+        # index None or 0 = first accelerator; higher indices = additional GPUs.
         index = x.index if x.index is not None else 0
 
-        accelerators = get_ordered_accelerators()
+        accelerators = get_accelerators()
         if index >= len(accelerators):
             raise ValueError(f"Invalid mojo index {index}")
 
-        device = accelerators[index]
-        if device.label == "cpu":
-            return DeviceRef.CPU()
-        else:
-            return DeviceRef.GPU(device.id)  # Use the actual GPU ID
+        return DeviceRef.GPU(accelerators[index].id)  # Use the actual GPU ID
     else:
         return max_device_ref(x)
 
@@ -137,6 +132,115 @@ def _only_first_output_used() -> bool:
         return False
     return all(
         user.target is operator.getitem and user.args[1] == 0 for user in node.users
+    )
+
+
+# The compiler's fx-node -> MAX-value resolver (`TensorsBook.convert_to_max`),
+# set next to CURRENT_FX_NODE. Lets a mapping read a *different* MAX value for
+# one of its arguments than the one it was handed: `_transposed_source` looks
+# through an `aten.t` node so a Linear's `input @ weight.T` reaches the native
+# GEMM as the stored weight plus a transpose flag.
+CURRENT_ARG_RESOLVER: contextvars.ContextVar[
+    Callable[[torch.fx.Node], object] | None
+] = contextvars.ContextVar("CURRENT_ARG_RESOLVER", default=None)
+
+
+def _transposed_source(arg_index: int, rank: int) -> MaxTensor | None:
+    """The MAX value whose transpose of the two trailing dims is the current
+    node's `arg_index`-th argument, when that argument is such a transpose
+    (`aten.t`, `transpose` of the last two dims, the matching `permute`) of a
+    rank-`rank` tensor; else None.
+
+    MAX materializes a transposed producer before an opaque custom op, so a
+    GEMM handed `W.T` would copy the weight on every call; handed `W` and
+    `transpose_b=True` it reads the stored matrix, as the eager kernel does.
+    """
+    node = CURRENT_FX_NODE.get()
+    resolve = CURRENT_ARG_RESOLVER.get()
+    if node is None or resolve is None or arg_index >= len(node.args):
+        return None
+    arg = node.args[arg_index]
+    if not isinstance(arg, torch.fx.Node) or arg.op != "call_function":
+        return None
+    if arg.target is aten.t.default:
+        if rank != 2:
+            return None
+    elif arg.target is aten.transpose.int:
+        if len(arg.args) < 3:
+            return None
+        d0, d1 = arg.args[1], arg.args[2]
+        if not (isinstance(d0, int) and isinstance(d1, int)):
+            return None
+        if {d0 % rank, d1 % rank} != {rank - 2, rank - 1}:
+            return None
+    elif arg.target is aten.permute.default:
+        perm = arg.args[1] if len(arg.args) > 1 else None
+        if not isinstance(perm, list | tuple):
+            return None
+        if list(perm) != [*range(rank - 2), rank - 1, rank - 2]:
+            return None
+    else:
+        return None
+    source_node = arg.args[0]
+    if not isinstance(source_node, torch.fx.Node):
+        return None
+    source = resolve(source_node)
+    if not isinstance(source, TensorValue | MaxEagerTensor):
+        return None
+    if len(source.shape) != rank:
+        return None
+    return source
+
+
+# --- The eager kernels in the graph (custom_mojo_ops.native_*) --------------
+#
+# For the ops below, torch.compile calls the same Mojo kernels the mojo device
+# runs in eager mode (tmb/graph/gemm.mojo and nn.mojo) rather than MAX's own:
+# one set of kernels, one set of numerics, in both modes. They are accelerator
+# routes, so every operand has to sit on one GPU; anything else keeps the MAX
+# composition.
+
+_NATIVE_FLOAT_DTYPES = (DType.float32, DType.float16, DType.bfloat16)
+
+
+def _device_key(device: DeviceRef | max_driver.Device) -> tuple[str, int]:
+    """(kind, index) of a graph DeviceRef or an eager driver Device."""
+    if isinstance(device, DeviceRef):
+        return (str(device.device_type), device.id)
+    return (device.label, device.id)
+
+
+def _native_kernel_operands(*tensors: MaxTensor) -> bool:
+    """Whether these operands go to the eager kernels: the switch is on and
+    they share one accelerator. Dtypes are the caller's to check."""
+    if not compile_native_kernels_enabled() or not tensors:
+        return False
+    keys = {_device_key(t.device) for t in tensors}
+    if len(keys) != 1:
+        return False
+    return next(iter(keys))[0] == str(DeviceKind.GPU)
+
+
+def _tf32_allowed() -> bool:
+    """The numerics decision behind the TF32 GEMM bridge, taken the way
+    tmb/ops/matmul.mojo's `_tf32_enabled` takes it for eager mode: any setting
+    but torch's default "highest" allows it."""
+    return torch.get_float32_matmul_precision() != "highest"
+
+
+def _native_matmul(
+    a: MaxTensor, b: MaxTensor, bias: MaxTensor | None, *, mat2_arg_index: int
+) -> MaxTensor:
+    """`a @ b [+ bias]` on the eager GEMM ladder, reading a `b` the torch
+    program transposed (argument `mat2_arg_index` of the current node) as
+    the stored matrix plus a transpose flag."""
+    source = _transposed_source(mat2_arg_index, 2)
+    if source is not None and source.dtype == b.dtype:
+        return custom_mojo_ops.native_gemm(
+            a, source, bias, transpose_b=True, tf32=_tf32_allowed()
+        )
+    return custom_mojo_ops.native_gemm(
+        a, b, bias, transpose_b=False, tf32=_tf32_allowed()
     )
 
 
@@ -311,6 +415,167 @@ def _scale_operand(
         return aten_mul(other, alpha)
     assert not isinstance(alpha, Dim)  # a number times a Dim was never supported
     return other * alpha
+
+
+def _select_sorted_k(
+    input: MaxTensor, k: int, axis: int, largest: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """MAX's k-selection: the k largest (or smallest) values, already ordered.
+
+    Shared by sort (k = the whole axis) and topk. MAX only selects along the
+    innermost axis on GPU, so any other axis is transposed to last and the
+    two results transposed back.
+    """
+    rank = len(input.shape)
+    if k == 0:
+        # top_k/bottom_k reject k=0; an empty slice of the input already has
+        # the right shape, dtype and device.
+        slices = [slice(None)] * rank
+        slices[axis] = slice(0, 0)
+        empty = input[*slices]
+        return empty, F.cast(empty, DType.int64)
+    last = rank - 1
+    operand = input if axis == last else F.transpose(input, axis, last)
+    if largest:
+        values, indices = max_ops.top_k(operand, k=k, axis=last)
+    else:
+        values, indices = max_ops.bottom_k(operand, k=k, axis=last)
+    if axis == last:
+        return values, indices
+    return F.transpose(values, axis, last), F.transpose(indices, axis, last)
+
+
+def _reduction_dim_and_size(
+    op_label: str, input: MaxTensor, dim: int
+) -> tuple[int, int]:
+    """`(axis, size)` for a kthvalue/median.dim-style reduction: `dim`
+    normalized non-negative, and its statically known length -- raising like
+    ATen's own for an out-of-range `dim` or an empty reduction axis."""
+    rank = len(input.shape)
+    ndim = rank or 1
+    if not -ndim <= dim < ndim:
+        raise IndexError(
+            "Dimension out of range (expected to be in range of "
+            f"[{-ndim}, {ndim - 1}], but got {dim})"
+        )
+    axis = dim % ndim
+    size = input.shape[axis] if rank else 1
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            f"{op_label} needs a statically known size along the reduced "
+            f"axis, but axis {axis} has symbolic dim {size}"
+        )
+    size = int(size)
+    if size == 0:
+        raise IndexError(
+            f"{op_label}(): Expected reduction dim {axis} to have non-zero size."
+        )
+    return axis, size
+
+
+def _kth_smallest(
+    input: MaxTensor, k: int, axis: int, keepdim: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """`(value, index)` of the k-th smallest (1-indexed) along `axis`.
+
+    Ties break by the kernel's own stable order (ascending original index),
+    which need not be ATen's own (unspecified) tie index -- the same
+    accepted disagreement already documented for sort/topk: the VALUE always
+    matches, the INDEX is *a* valid occurrence of it.
+    """
+    values_k, indices_k = _select_sorted_k(input, k, axis, False)
+    value = aten_slice(values_k, axis, k - 1, k)
+    index = aten_slice(indices_k, axis, k - 1, k)
+    if not keepdim:
+        value = F.squeeze(value, axis=axis)
+        index = F.squeeze(index, axis=axis)
+    return value, index
+
+
+def _nan_last_order(
+    input: MaxTensor, axis: int, size: int
+) -> tuple[MaxTensor, MaxTensor]:
+    """`(values, indices)` of the whole of `axis` in ascending order with
+    every NaN after every number, ties (NaNs included) in index order.
+
+    Two stable passes, since a NaN has no value to sort by: the numbers by
+    value (NaN keyed +inf), then that order by is-NaN, which moves the NaNs
+    behind a real +inf without reordering anything else."""
+    is_nan = F.cast(F.is_nan(input), DType.int32)
+    key = _where(is_nan > 0, aten_full_like(input, float("inf")), input)
+    _, by_value = _select_sorted_k(key, size, axis, False)
+    nan_in_order = aten_gather(is_nan, axis, by_value)
+    _, by_nan = _select_sorted_k(nan_in_order, size, axis, False)
+    indices = aten_gather(by_value, axis, by_nan)
+    return aten_gather(input, axis, indices), indices
+
+
+def _median_along(
+    input: MaxTensor, dim: int, keepdim: bool, ignore_nan: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """median.dim / nanmedian.dim: the lower of the two middle values.
+
+    median propagates NaN the way CPU torch does -- a row holding any NaN
+    returns (nan, index of its FIRST NaN) -- and nanmedian takes the lower
+    middle of the row's numbers only (nan, index 0 for an all-NaN row).
+    Number ties resolve to the lowest index, as CPU's comparator does.
+    """
+    axis, size = _reduction_dim_and_size("median", input, dim)
+    zero_d = len(input.shape) == 0
+    if zero_d:
+        input = F.unsqueeze(input, axis=0)
+    if not input.dtype.is_float():
+        value, index = _kth_smallest(input, (size + 1) // 2, axis, True)
+    else:
+        values, indices = _nan_last_order(input, axis, size)
+        num_nan = _reduce_sum(F.cast(F.is_nan(input), DType.int64), axis=axis)
+        if ignore_nan:
+            # (size - num_nan - 1) / 2 truncated toward zero, as in C++.
+            numbers = F.max(size - 1 - num_nan, aten_full_like(num_nan, 0))
+            # `//` promotes to float64 in MAX; the halves are exact there.
+            position = F.cast(numbers // 2, DType.int64)
+        else:
+            middle = aten_full_like(num_nan, (size - 1) // 2)
+            position = _where(num_nan > 0, size - num_nan, middle)
+        value = aten_gather(values, axis, position)
+        index = aten_gather(indices, axis, position)
+    if zero_d or not keepdim:
+        value = F.squeeze(value, axis=axis)
+        index = F.squeeze(index, axis=axis)
+    return value, index
+
+
+def _median_all(input: MaxTensor, ignore_nan: bool) -> MaxTensor:
+    """median() / nanmedian(): the flattened tensor's lower middle, NaN for
+    an empty one (as ATen returns)."""
+    numel = 1
+    for d in input.shape:
+        if not isinstance(d, StaticDim):
+            raise NotImplementedError("median() needs a statically known shape")
+        numel *= int(d)
+    if numel == 0:
+        return F.constant(float("nan"), dtype=input.dtype, device=input.device)
+    value, _ = _median_along(F.reshape(input, [numel]), 0, False, ignore_nan)
+    return value
+
+
+def _sort_impl(
+    input: MaxTensor, dim: int, descending: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """sort.default and sort.stable: a k-selection of the whole axis."""
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "sorting a 0-d tensor is not supported by the MAX graph backend"
+        )
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            "sort needs a statically known size along the sorted axis, but "
+            f"axis {axis} has symbolic dim {size}"
+        )
+    return _select_sorted_k(input, int(size), axis, descending)
 
 
 _SEARCHSORTED_DTYPES = (
@@ -597,6 +862,39 @@ def aten__adaptive_avg_pool2d_backward(
 # _log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
 # _native_batch_norm_legit(Tensor input, Tensor? weight, Tensor? bias, Tensor(a!) running_mean, Tensor(b!) running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
 # _native_batch_norm_legit.no_stats(Tensor input, Tensor? weight, Tensor? bias, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
+# _native_batch_norm_legit_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)
+@map_to(aten._native_batch_norm_legit_functional)
+def aten__native_batch_norm_legit_functional(
+    input: MaxTensor,
+    weight: MaxTensor | None,
+    bias: MaxTensor | None,
+    running_mean: MaxTensor,
+    running_var: MaxTensor,
+    training: bool,
+    momentum: float,
+    eps: float,
+) -> tuple[MaxTensor, MaxTensor, MaxTensor, MaxTensor, MaxTensor]:
+    """The functionalized training BatchNorm AOTAutograd puts in a forward
+    graph: `native_batch_norm` plus the running statistics it would have
+    updated in place, returned instead (ATen's `batch_norm_update_stats`:
+    the variance is the unbiased one, `var * M / (M - 1)` with `M = numel / C`).
+    """
+    output, save_mean, save_invstd = aten_native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+    if not training:
+        return output, save_mean, save_invstd, running_mean, running_var
+    num_channels = int(input.shape[1])
+    reduced = math.prod(int(d) for d in input.shape) // num_channels
+    mean, var = _batch_norm_batch_stats(input)
+    unbiased = F.reshape(var, [num_channels]) * (reduced / max(reduced - 1, 1))
+    new_mean = (
+        running_mean * (1 - momentum) + F.reshape(mean, [num_channels]) * momentum
+    )
+    new_var = running_var * (1 - momentum) + unbiased * momentum
+    return output, save_mean, save_invstd, new_mean, new_var
+
+
 # _native_batch_norm_legit_no_training(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor)
 @map_to(aten._native_batch_norm_legit_no_training)
 def aten__native_batch_norm_legit_no_training(
@@ -607,7 +905,7 @@ def aten__native_batch_norm_legit_no_training(
     running_var: MaxTensor,
     momentum: float,
     eps: float,
-) -> tuple[MaxTensor, NotImplementedError, NotImplementedError]:
+) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
     """
     Implements batch normalization for inference (no training).
 
@@ -621,8 +919,9 @@ def aten__native_batch_norm_legit_no_training(
         eps: Small value for numerical stability
 
     Returns:
-        Tuple of (normalized_output, save_mean, save_var)
-        where save_mean and save_var are empty tensors in no-training mode
+        Tuple of (normalized_output, save_mean, save_var), where save_mean
+        and save_var are the empty (0,) tensors PyTorch's meta kernel
+        promises for the no-training overload
     """
     # Get input dimensions
     input_shape = input.shape
@@ -649,19 +948,13 @@ def aten__native_batch_norm_legit_no_training(
         bias_reshaped = F.reshape(bias, broadcast_shape)
         normalized = normalized + bias_reshaped
 
-    # It's not sure we'll ever support returning those, notably because of
-    # https://github.com/pytorch/pytorch/issues/85960
-    return (
-        normalized,
-        NotImplementedError(
-            "We don't support returning the saved mean "
-            "in aten._native_batch_norm_legit_no_training yet"
-        ),
-        NotImplementedError(
-            "We don't support returning the saved variance "
-            "in aten._native_batch_norm_legit_no_training yet"
-        ),
-    )
+    # PyTorch's meta kernel gives both saved statistics shape (0,) here (that
+    # is the inconsistency pytorch/pytorch#85960 is about), and the eval
+    # backward reads the RUNNING buffers rather than these, so empty tensors
+    # are the whole contract -- returning NotImplementedError placeholders
+    # instead only made a training graph fail to compile as soon as anything
+    # kept the node's second or third output alive.
+    return (normalized, running_mean[0:0], running_var[0:0])
 
 
 # _pdist_forward(Tensor self, float p=2) -> Tensor
@@ -936,6 +1229,19 @@ def aten_softmax(
     if dim < 0:
         dim = len(input.shape) + dim
 
+    if (
+        len(input.shape) >= 1
+        and dim == len(input.shape) - 1
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and not (isinstance(input.shape[-1], StaticDim) and int(input.shape[-1]) == 0)
+        and _native_kernel_operands(input)
+    ):
+        # The eager `SoftmaxSpec` kernel over rows of the trailing dim (any
+        # other dim keeps the composition below; the eager op transposes).
+        cols = input.shape[-1]
+        rows = custom_mojo_ops.native_softmax_rows(F.reshape(input, [-1, cols]))
+        return F.reshape(rows, input.shape)
+
     # Manual implementation
     # Compute max along the specified axis for numerical stability, keeping dimensions
     x_max = aten_amax(input, dim=[dim], keepdim=True)
@@ -1095,77 +1401,39 @@ def aten__to_copy(
 # abs(Tensor self) -> Tensor
 @map_to(aten.abs)
 def aten_abs(x: MaxTensor) -> MaxTensor:
-    return F.abs(x)
+    return custom_mojo_ops.elementwise(x, "abs")
+
+
+def _acos_float64_gpu(x: MaxTensor) -> MaxTensor:
+    """Retain the graph polynomial where Mojo's float64 acos cannot lower.
+
+    MAX 26.5 lowers Mojo float64 acos to llvm.acos, which has no NVPTX
+    libcall. These are the previous graph implementation's Remez coefficients.
+    Floating dtypes up to float32 use the shared Mojo registration instead.
+    """
+    magnitude = F.abs(x)
+    small = magnitude < 0.5
+    square = _where(small, x * x, (1.0 - magnitude) * 0.5)
+    d = _where(small, magnitude, F.sqrt(square))
+    poly = 0.4197454825e-1
+    poly = poly * square + 0.2424046025e-1
+    poly = poly * square + 0.4547423869e-1
+    poly = poly * square + 0.7495029271e-1
+    poly = poly * square + 0.1666677296
+    correction = poly * square * d
+    positive = _where(small, math.pi * 0.5 - (d + correction), 2.0 * (d + correction))
+    # Outside [-1, 1], sqrt(square) already yields NaN rather than clamping.
+    return _where(x < 0.0, math.pi - positive, positive)
 
 
 # acos(Tensor self) -> Tensor
 @map_to(aten.acos)
 def aten_acos(x: MaxTensor) -> MaxTensor:
-    """Computes the arccosine (inverse cosine) of the input tensor.
-
-    Returns values in the range [0, π] for inputs in [-1, 1].
-    Uses polynomial approximation based on the Mojo stdlib implementation.
-
-    Args:
-        x: Input tensor with values in [-1, 1]
-
-    Returns:
-        Arccosine of the input in radians [0, π]
-    """
-    # Create constants as tensors for use in _where()
-    zero = F.constant(0.0, dtype=x.dtype, device=x.device)
-    one = F.constant(1.0, dtype=x.dtype, device=x.device)
-    neg_one = F.constant(-1.0, dtype=x.dtype, device=x.device)
-
-    # Clamp input to valid domain [-1, 1]
-    x_clamped = F.max(F.min(x, 1.0), -1.0)
-    x_abs = F.abs(x_clamped)
-
-    # Domain split at 0.5
-    small_domain = x_abs < 0.5
-
-    # Compute x_squared and d based on domain
-    # Small domain: x_squared = x², d = |x|
-    # Large domain: x_squared = (1 - |x|) / 2, d = sqrt(x_squared)
-    x_squared_small = x_clamped * x_clamped
-    x_squared_large = (1.0 - x_abs) * 0.5
-    x_squared = _where(small_domain, x_squared_small, x_squared_large)
-
-    d_small = x_abs
-    d_large = F.sqrt(x_squared_large)
-    d = _where(small_domain, d_small, d_large)
-
-    # Handle special case |x| = 1 (d should be 0)
-    is_one = x_abs >= 1.0
-    d = _where(is_one, zero, d)
-
-    # Polynomial evaluation using Horner's method
-    # Coefficients from Mojo stdlib (Remez approximation)
-    poly = 0.4197454825e-1
-    poly = poly * x_squared + 0.2424046025e-1
-    poly = poly * x_squared + 0.4547423869e-1
-    poly = poly * x_squared + 0.7495029271e-1
-    poly = poly * x_squared + 0.1666677296
-    poly = poly * x_squared * d
-
-    # Small domain: π/2 - (d + poly) with sign preservation
-    # copysign(d, x) is implemented as d * sign(x)
-    is_negative = x_clamped < 0.0
-    sign_x = _where(is_negative, neg_one, one)
-    d_signed = d * sign_x
-    poly_signed = poly * sign_x
-    result_small = (math.pi * 0.5) - (d_signed + poly_signed)
-
-    # Large domain: 2 * (d + poly)
-    result_large = 2.0 * (d + poly)
-
-    # For large domain with negative x: π - result
-    result_large = _where(is_negative, math.pi - result_large, result_large)
-
-    # Select based on domain
-    result = _where(small_domain, result_small, result_large)
-
-    return result
+    if x.dtype.is_integral() or x.dtype == DType.bool:
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if x.dtype == DType.float64 and x.type.device.is_gpu():
+        return _acos_float64_gpu(x)
+    return custom_mojo_ops.elementwise(x, "acos")
 
 
 # acosh(Tensor self) -> Tensor
@@ -1224,6 +1492,24 @@ def aten_addmm(
     alpha: Scalar = 1.0,
 ) -> MaxTensor:
     # addmm computes: beta * input + alpha * mat1 @ mat2
+    if (
+        alpha == 1.0
+        and beta == 1.0
+        and len(mat1.shape) == 2
+        and len(mat2.shape) == 2
+        and mat1.dtype == mat2.dtype
+        and mat1.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(input, mat1, mat2)
+    ):
+        # tmb/ops/matmul.mojo's `_bias_fits`: one row of n in the operands' dtype
+        # is fused into the GEMM; any other broadcastable `self` is added after.
+        fused = (
+            len(input.shape) == 1
+            and input.shape[0] == mat2.shape[1]
+            and input.dtype == mat1.dtype
+        )
+        result = _native_matmul(mat1, mat2, input if fused else None, mat2_arg_index=2)
+        return result if fused else operator.add(input, result)
     matmul_result = operator.matmul(mat1, mat2)
 
     # Apply scaling factors
@@ -1511,8 +1797,7 @@ def aten_argmin(
 # asinh(Tensor self) -> Tensor
 @map_to(aten.asinh)
 def aten_asinh(x: MaxTensor) -> MaxTensor:
-    """Computes inverse hyperbolic sine using asinh(x) = log(x + sqrt(x² + 1))"""
-    return F.log(x + F.sqrt(x * x + 1))
+    return custom_mojo_ops.elementwise(x, "asinh")
 
 
 # atan(Tensor self) -> Tensor
@@ -1523,7 +1808,7 @@ def aten_asinh(x: MaxTensor) -> MaxTensor:
 # atanh(Tensor self) -> Tensor
 @map_to(aten.atanh)
 def aten_atanh(x: MaxTensor) -> MaxTensor:
-    return F.atanh(x)
+    return custom_mojo_ops.elementwise(x, "atanh")
 
 
 # avg_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=0, bool ceil_mode=False, bool count_include_pad=True) -> Tensor
@@ -1666,6 +1951,21 @@ def aten_bmm(input: MaxTensor, mat2: MaxTensor) -> MaxTensor:
     Returns:
         3D tensor of shape [batch_size, n, p]
     """
+    if (
+        len(input.shape) == 3
+        and len(mat2.shape) == 3
+        and input.dtype == mat2.dtype
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(input, mat2)
+    ):
+        source = _transposed_source(1, 3)
+        if source is not None and source.dtype == mat2.dtype:
+            return custom_mojo_ops.native_bmm(
+                input, source, transpose_b=True, tf32=_tf32_allowed()
+            )
+        return custom_mojo_ops.native_bmm(
+            input, mat2, transpose_b=False, tf32=_tf32_allowed()
+        )
     # MAX's matmul handles batch dimensions automatically through broadcasting
     return F.matmul(input, mat2)
 
@@ -1714,16 +2014,7 @@ def aten_cat(tensors: list[MaxTensor], dim: int = 0) -> MaxTensor:
 # ceil(Tensor self) -> Tensor
 @map_to(aten.ceil)
 def aten_ceil(input: MaxTensor) -> MaxTensor:
-    """
-    Ceiling of the input tensor, element-wise.
-
-    For floating-point inputs: Uses MAX's native ceil op.
-    For integer inputs: Returns it (no mathematical change needed, following PyTorch behavior).
-    """
-    if input.type.dtype.is_integral():
-        return input
-    else:
-        return F.ceil(input)
+    return custom_mojo_ops.elementwise(input, "ceil")
 
 
 # clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor
@@ -1761,13 +2052,9 @@ def aten_clone(
 
 
 # col2im(Tensor self, SymInt[2] output_size, int[2] kernel_size, int[2] dilation, int[2] padding, int[2] stride) -> Tensor
-# constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
-@map_to(aten.constant_pad_nd)
-def aten_constant_pad_nd(
-    input: MaxTensor, pad: list[int | Dim], value: Scalar = 0
-) -> MaxTensor:
-    # max_ops.pad wants concrete ints; a symbolic (non-static) pad amount
-    # can't be resolved at graph-build time.
+def _static_pad_ints(pad: list[SymIntType]) -> list[int]:
+    """A torch pad list as concrete ints: max_ops.pad wants them, and a
+    symbolic (non-static) pad amount can't be resolved at graph-build time."""
     pad_ints: list[int] = []
     for p in pad:
         if isinstance(p, int):
@@ -1775,19 +2062,50 @@ def aten_constant_pad_nd(
         else:
             assert isinstance(p, StaticDim), f"expected a static pad amount, got {p!r}"
             pad_ints.append(p.dim)
-    if any(p < 0 for p in pad_ints):
-        raise NotImplementedError(
-            "constant_pad_nd with negative padding (cropping) is not supported yet"
-        )
-    # torch's pad list covers the trailing len(pad)//2 dims, LAST dim first:
-    # [last_before, last_after, second_to_last_before, ...]. MAX wants all
-    # dims in forward order: [before_dim0, after_dim0, before_dim1, ...].
-    rank = len(input.shape)
+    return pad_ints
+
+
+def _torch_pad_to_max_paddings(rank: int, pad: list[int]) -> list[int]:
+    """Torch's pad list to MAX's `ops.pad` paddings list.
+
+    Torch's pad list covers the trailing `len(pad) // 2` dims, LAST dim
+    first: `[last_before, last_after, second_to_last_before, ...]`. MAX
+    wants every dim, in forward order: `[before_dim0, after_dim0,
+    before_dim1, after_dim1, ...]`. Shared by constant_pad_nd,
+    reflection_pad2d and replication_pad2d.
+    """
     paddings = [0] * (2 * rank)
-    for i in range(len(pad_ints) // 2):
+    for i in range(len(pad) // 2):
         dim = rank - 1 - i
-        paddings[2 * dim] = pad_ints[2 * i]
-        paddings[2 * dim + 1] = pad_ints[2 * i + 1]
+        paddings[2 * dim] = pad[2 * i]
+        paddings[2 * dim + 1] = pad[2 * i + 1]
+    return paddings
+
+
+# constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor
+@map_to(aten.constant_pad_nd)
+def aten_constant_pad_nd(
+    input: MaxTensor, pad: list[int | Dim], value: Scalar = 0
+) -> MaxTensor:
+    pad_ints = _static_pad_ints(pad)
+    rank = len(input.shape)
+    if any(p < 0 for p in pad_ints):
+        # A negative entry crops rather than pads. Mirrors ATen's own
+        # constant_pad_nd (PadNd.cpp): narrow the input away from the
+        # negative amount first, then pad only what remains non-negative --
+        # MAX's ops.pad rejects negative paddings outright.
+        slices = [slice(None)] * rank
+        for i in range(len(pad_ints) // 2):
+            dim = rank - 1 - i
+            before, after = pad_ints[2 * i], pad_ints[2 * i + 1]
+            if before < 0:
+                slices[dim] = slice(-before, slices[dim].stop)
+                pad_ints[2 * i] = 0
+            if after < 0:
+                slices[dim] = slice(slices[dim].start, after)
+                pad_ints[2 * i + 1] = 0
+        input = input[*slices]
+    paddings = _torch_pad_to_max_paddings(rank, pad_ints)
     return max_ops.pad(input, paddings, mode="constant", value=value)
 
 
@@ -1894,11 +2212,8 @@ def aten_convolution(
     input_rank = len(input.shape)
 
     if input_rank == 3:
-        if dilation[0] != 1:
-            raise NotImplementedError(
-                "Non-unit dilation is not supported for conv1d yet."
-            )
-
+        # The length becomes a unit-W 2-D conv's H axis, so the one
+        # stride/padding/dilation apply to H and W stays at 1/0/1.
         stride_2d = (stride[0], 1)
         dilation_2d = (dilation[0], 1)
         padding_2d = (padding[0], padding[0], 0, 0)
@@ -1982,6 +2297,237 @@ def aten_convolution(
 
 
 # convolution_backward(Tensor grad_output, Tensor input, Tensor weight, SymInt[]? bias_sizes, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, SymInt[] output_padding, SymInt groups, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+#
+# MAX has no convolution-gradient op of any kind, and its one adjacent
+# primitive, `conv2d_transpose`, is cuDNN-only on GPU (the kernel aborts the
+# process with "symbol not found: cudnnCreate" on an accelerator that has no
+# cuDNN), so neither gradient may be expressed with it. Both are therefore
+# composed here from ops that run everywhere:
+#
+#   grad_input  = fold(weight^T @ grad_output_columns) -- `F.fold` IS col2im,
+#                 the exact adjoint of the im2col a convolution lowers to.
+#   grad_weight = a convolution with the operand ROLES swapped: the input's
+#                 channels become the batch, the batch becomes the reduction,
+#                 and grad_output becomes the filter, with stride and
+#                 dilation exchanged.
+#   grad_bias   = grad_output summed over batch and space.
+#
+# `transposed=True` is not implemented (input and grad_output swap roles
+# again); it raises rather than silently returning the non-transposed answer.
+
+
+def _conv2d_backward_input(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+) -> MaxTensor:
+    """col2im of (weight^T x grad_output), i.e. the data gradient.
+
+    `F.fold`'s own `padding` argument does NOT match torch's fold (measured:
+    it agrees for padding 0 and diverges for every nonzero padding), so the
+    padded case is expressed the way it is defined instead -- fold into the
+    PADDED image extent with zero padding, then crop the border back off.
+    That is the identity `fold(x, H, pad=p) == fold(x, H + 2p, pad=0)[p:-p]`,
+    and it keeps this path on the one fold configuration that is verified
+    against torch.
+    """
+    kh, kw = int(weight.shape[2]), int(weight.shape[3])
+    ph, pw = padding
+    batch = grad_output.shape[0]
+    columns = grad_output.shape[2] * grad_output.shape[3]
+    grad_cols = F.reshape(grad_output, (batch, grad_output.shape[1], columns))
+    padded_size = (input.shape[2] + 2 * ph, input.shape[3] + 2 * pw)
+
+    if groups == 1:
+        weight_groups, grad_groups = [weight], [grad_cols]
+    else:
+        out_channels = int(weight.shape[0])
+        if out_channels % groups != 0:
+            raise ValueError(
+                f"Weight dim 0 ({out_channels}) must be divisible by groups ({groups})."
+            )
+        weight_groups = _split(weight, [out_channels // groups] * groups, axis=0)
+        grad_groups = _split(grad_cols, [out_channels // groups] * groups, axis=1)
+
+    parts = []
+    for weight_group, grad_group in zip(weight_groups, grad_groups):
+        # (out_c/groups, C/groups * KH * KW) -> transposed, so the matmul
+        # reduces over the output channels exactly as the forward reduces
+        # over the patch rows.
+        weight_matrix = F.reshape(
+            weight_group, (weight_group.shape[0], weight_group.shape[1] * kh * kw)
+        )
+        columns_grad = F.matmul(F.transpose(weight_matrix, 0, 1), grad_group)
+        parts.append(
+            F.fold(
+                columns_grad,
+                output_size=padded_size,
+                kernel_size=(kh, kw),
+                stride=stride,
+                dilation=dilation,
+                padding=0,
+            )
+        )
+    padded = parts[0] if len(parts) == 1 else F.concat(parts, axis=1)
+    slices = [
+        slice(None),
+        slice(None),
+        slice(ph, -ph) if ph else slice(None),
+        slice(pw, -pw) if pw else slice(None),
+    ]
+    return padded[*slices]
+
+
+def _conv2d_backward_weight(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+) -> MaxTensor:
+    """The weight gradient as a convolution with the roles permuted.
+
+    `grad_weight[k, c, r, s] = sum_{n, oh, ow} grad_output[n, k, oh, ow] *
+    input[n, c, r*dh - ph + oh*sh, s*dw - pw + ow*sw]` is itself a
+    convolution: over an "input" whose batch is the channel axis `c` and
+    whose channels are the batch `n`, with grad_output as the filter (its
+    `oh, ow` are the filter taps), the forward's DILATION as the stride and
+    its STRIDE as the dilation. The result is bigger than the filter
+    whenever the forward truncated, so it is cropped to the kernel extent.
+    """
+    kh, kw = int(weight.shape[2]), int(weight.shape[3])
+    ph, pw = padding
+    # (N, C, H, W) -> NHWC with C as the batch and N as the channels.
+    input_nhwc = F.permute(input, [1, 2, 3, 0])
+    # (N, K, OH, OW) -> RSCF = (tap_h, tap_w, in_channels=N, out_channels=K).
+    grad_rscf = F.permute(grad_output, [2, 3, 0, 1])
+
+    if groups == 1:
+        pairs = [(input_nhwc, grad_rscf)]
+    else:
+        in_channels = int(input.shape[1])
+        out_channels = int(grad_output.shape[1])
+        if in_channels % groups != 0 or out_channels % groups != 0:
+            raise ValueError(
+                f"Input channels ({in_channels}) and output channels "
+                f"({out_channels}) must both be divisible by groups ({groups})."
+            )
+        pairs = list(
+            zip(
+                _split(input_nhwc, [in_channels // groups] * groups, axis=0),
+                _split(grad_rscf, [out_channels // groups] * groups, axis=3),
+            )
+        )
+
+    parts = []
+    for input_group, grad_group in pairs:
+        correlated = F.conv2d(
+            input_group,
+            grad_group,
+            bias=None,
+            stride=dilation,
+            dilation=stride,
+            padding=(ph, ph, pw, pw),
+            groups=1,
+            input_layout=max_type.ConvInputLayout.NHWC,
+            filter_layout=max_type.FilterLayout.RSCF,
+        )
+        # (C/groups, R', S', out_c/groups) -> (out_c/groups, C/groups, KH, KW)
+        parts.append(F.permute(correlated[:, :kh, :kw, :], [3, 0, 1, 2]))
+    return parts[0] if len(parts) == 1 else F.concat(parts, axis=0)
+
+
+@map_to(aten.convolution_backward)
+def aten_convolution_backward(
+    grad_output: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor,
+    bias_sizes: list[SymIntType] | None,
+    stride: list[SymIntType],
+    padding: list[SymIntType],
+    dilation: list[SymIntType],
+    transposed: bool,
+    output_padding: list[SymIntType],
+    groups: SymIntType,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    mask = tuple(output_mask)
+    if len(mask) != 3 or any(not isinstance(requested, bool) for requested in mask):
+        raise ValueError("convolution_backward output_mask must contain three booleans")
+    if transposed:
+        raise NotImplementedError(
+            "convolution_backward is not implemented for transposed convolutions "
+            "(the backward of a conv_transpose forward, where input and "
+            "grad_output swap roles)."
+        )
+    groups = int(groups)
+    input_rank = len(input.shape)
+
+    if input_rank == 3:
+        # conv1d: a synthetic size-1 H axis makes every operand look like
+        # conv2d's, the single stride/padding/dilation maps onto the W axis,
+        # and the two spatial gradients get the dummy axis squeezed back out.
+        grad_input, grad_weight, grad_bias = aten_convolution_backward(
+            F.unsqueeze(grad_output, axis=2),
+            F.unsqueeze(input, axis=2),
+            F.unsqueeze(weight, axis=2),
+            bias_sizes,
+            [1, stride[0]],
+            [0, padding[0]],
+            [1, dilation[0]],
+            transposed,
+            [0, output_padding[0] if output_padding else 0],
+            groups,
+            output_mask,
+        )
+        if grad_input is not None:
+            grad_input = F.squeeze(grad_input, axis=2)
+        if grad_weight is not None:
+            grad_weight = F.squeeze(grad_weight, axis=2)
+        return grad_input, grad_weight, grad_bias
+
+    if input_rank != 4:
+        raise ValueError(
+            f"Unsupported input rank for convolution_backward: {input_rank}. "
+            "Expected 3 (1D) or 4 (2D)."
+        )
+
+    stride_2d, padding_2d, dilation_2d, _ = _normalize_2d_params(
+        stride, padding, dilation, output_padding
+    )
+    if padding_2d[0] != padding_2d[1] or padding_2d[2] != padding_2d[3]:
+        raise NotImplementedError(
+            "convolution_backward does not support asymmetric padding."
+        )
+    pad_hw = (int(padding_2d[0]), int(padding_2d[2]))
+    stride_hw = (int(stride_2d[0]), int(stride_2d[1]))
+    dilation_hw = (int(dilation_2d[0]), int(dilation_2d[1]))
+
+    grad_input = None
+    if mask[0]:
+        grad_input = _conv2d_backward_input(
+            grad_output, input, weight, stride_hw, pad_hw, dilation_hw, groups
+        )
+    grad_weight = None
+    if mask[1]:
+        grad_weight = _conv2d_backward_weight(
+            grad_output, input, weight, stride_hw, pad_hw, dilation_hw, groups
+        )
+    grad_bias = None
+    if mask[2]:
+        # ATen computes this straight from grad_output whenever the backend
+        # did not, so `bias_sizes` -- which only records that the forward HAD
+        # a bias, something mask[2] already says -- is not consulted.
+        grad_bias = aten_sum(grad_output, dim=[0, 2, 3])
+    return grad_input, grad_weight, grad_bias
+
+
 # copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor
 @map_to(aten.copy)
 def aten_copy(
@@ -1993,14 +2539,13 @@ def aten_copy(
 # cos(Tensor self) -> Tensor
 @map_to(aten.cos)
 def aten_cos(x: MaxTensor) -> MaxTensor:
-    return F.cos(x)
+    return custom_mojo_ops.elementwise(x, "cos")
 
 
 # cosh(Tensor self) -> Tensor
 @map_to(aten.cosh)
 def aten_cosh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic cosine using cosh(x) = (exp(x) + exp(-x)) / 2"""
-    return (F.exp(x) + F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "cosh")
 
 
 # cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor
@@ -2068,6 +2613,18 @@ def aten_embedding(
     sparse: bool = False,
 ) -> MaxTensor:
     # For some reason with aten, input and weight are inverted.
+    table, indices = input, weight
+    if (
+        not scale_grad_by_freq
+        and len(table.shape) == 2
+        and table.dtype in _NATIVE_FLOAT_DTYPES
+        and indices.dtype in (DType.int32, DType.int64)
+        and _native_kernel_operands(table, indices)
+    ):
+        # The eager `Gather0` kernel over the flattened indices. padding_idx
+        # only shapes the backward; the forward reads that row like any other.
+        rows = custom_mojo_ops.native_embedding(table, F.reshape(indices, [-1]))
+        return F.reshape(rows, [*indices.shape, table.shape[1]])
     return torch_embedding_equivalent(
         weight,
         input,
@@ -2191,13 +2748,13 @@ def aten_eq(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # erf(Tensor self) -> Tensor
 @map_to(aten.erf)
 def aten_erf(input: MaxTensor) -> MaxTensor:
-    return F.erf(input)
+    return custom_mojo_ops.elementwise(input, "erf")
 
 
 # exp(Tensor self) -> Tensor
 @map_to(aten.exp)
 def aten_exp(input: MaxTensor) -> MaxTensor:
-    return F.exp(input)
+    return custom_mojo_ops.elementwise(input, "exp")
 
 
 # expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)
@@ -2265,11 +2822,7 @@ def aten_fill__scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
 # floor(Tensor self) -> Tensor
 @map_to(aten.floor)
 def aten_floor(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the floor of the elements of input,
-    the largest integer less than or equal to each element.
-    """
-    return F.floor(input)
+    return custom_mojo_ops.elementwise(input, "floor")
 
 
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2333,6 +2886,45 @@ def aten_full_like(
 
 
 # gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor
+@map_to(aten.gather.default)
+def aten_gather(
+    input: MaxTensor, dim: int, index: MaxTensor, sparse_grad: bool = False
+) -> MaxTensor:
+    """``out[i][j][k] = input[i][index[i][j][k]][k]`` for ``dim=1``, etc.
+
+    ``F.gather`` is numpy.take — it selects whole slices along one axis — NOT
+    torch.gather, so the full coordinate of every output element is built and
+    fed to ``gather_nd``. ``sparse_grad`` only picks the layout of the
+    gradient, which autograd builds separately, so the forward ignores it
+    exactly as ATen's does.
+    """
+    return F.gather_nd(input, _dim_coords(input, dim, index), batch_dims=0)
+
+
+def _dim_coords(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """The ``index.shape + [rank]`` coordinate tensor of a torch-style
+    gather/scatter along ``dim``.
+
+    Every axis contributes its own coordinate — an iota broadcast along that
+    axis — except ``dim``, which contributes ``index``. This is the bridge
+    between torch's elementwise gather/scatter index convention and MAX's
+    ``gather_nd``/``scatter_nd`` coordinate-vector convention, and is shared
+    by ``aten_gather`` and ``aten_scatter_add``: their index semantics are
+    identical, only the direction of the copy differs.
+    """
+    rank = len(input.shape)
+    dim = dim % rank
+    coords = []
+    for axis in range(rank):
+        if axis == dim:
+            coords.append(index)
+            continue
+        iota = F.arange(0, index.shape[axis], 1, dtype=index.dtype, device=index.device)
+        axis_shape = [
+            index.shape[a] if a == axis else StaticDim(1) for a in range(rank)
+        ]
+        coords.append(_broadcast_to(F.reshape(iota, axis_shape), index.shape))
+    return F.stack(coords, axis=-1)
 
 
 # ge.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2347,7 +2939,11 @@ def aten_ge(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
 def aten_gelu(
     input: MaxTensor, approximate: Literal["tanh", "none"] = "none"
 ) -> MaxTensor:
-    return _gelu(input, approximate=approximate)
+    if approximate not in ("none", "tanh"):
+        raise ValueError("approximate must be none or tanh")
+    return custom_mojo_ops.elementwise(
+        input, "gelu_tanh" if approximate == "tanh" else "gelu_none"
+    )
 
 
 # gelu_backward(Tensor grad_output, Tensor self, *, str approximate='none') -> Tensor
@@ -2496,8 +3092,76 @@ def broadcast_shape(
     return out
 
 
+# index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor
+@map_to(aten.index_add.default)
+def aten_index_add(
+    input: MaxTensor, dim: int, index: MaxTensor, source: MaxTensor, alpha: Scalar = 1
+) -> MaxTensor:
+    """``out = input.clone(); out.index_add_(dim, index, source)``.
+
+    index_add IS scatter_add with a 1-D index broadcast across every other
+    axis, so it broadcasts the index to `source`'s shape and reuses
+    `aten_scatter_add` rather than repeating the coordinate construction.
+    It is also what autograd calls for index_select's backward.
+    """
+    if alpha != 1:
+        source = source * alpha
+    rank = len(source.shape)
+    axis_shape = [
+        index.shape[0] if a == dim % rank else StaticDim(1) for a in range(rank)
+    ]
+    index = _broadcast_to(F.reshape(index, axis_shape), source.shape)
+    return aten_scatter_add(input, dim, index, source)
+
+
 # index_put(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor
+@map_to(aten.index_put.default)
+def aten_index_put(
+    input: MaxTensor,
+    indices: list[MaxTensor | None],
+    values: MaxTensor,
+    accumulate: bool = False,
+) -> MaxTensor:
+    """``out = input.clone(); out[indices] = values`` (``+=`` when
+    ``accumulate``) — the write mirror of ``aten_index``.
+
+    Only a single index tensor on axis 0 is served; anything else (a boolean mask, several index tensors, an
+    index on a later axis) raises rather than silently computing the wrong
+    thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
+    ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
+    would insert a silent host round trip per call.
+    """
+    non_none = [(axis, idx) for axis, idx in enumerate(indices) if idx is not None]
+    if len(non_none) != 1 or non_none[0][0] != 0:
+        raise NotImplementedError(
+            "aten.index_put only supports a single index tensor on dim 0, got "
+            f"{[idx is not None for idx in indices]}"
+        )
+    index = non_none[0][1]
+    if index.dtype == DType.bool:
+        raise NotImplementedError(
+            "aten.index_put with a boolean mask is not supported yet (the "
+            "number of written elements is data dependent)"
+        )
+    if len(index.shape) != 1:
+        raise NotImplementedError(
+            f"aten.index_put needs a 1-D index tensor, got rank {len(index.shape)}"
+        )
+    # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
+    # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
+    updates = _broadcast_to(values, [index.shape[0], *input.shape[1:]])
+    scatter = F.scatter_nd_add if accumulate else F.scatter_nd
+    return scatter(input, updates, F.unsqueeze(index, -1))
+
+
 # index_select(Tensor self, int dim, Tensor index) -> Tensor
+@map_to(aten.index_select.default)
+def aten_index_select(input: MaxTensor, dim: int, index: MaxTensor) -> MaxTensor:
+    """``F.gather`` is exactly index_select: numpy.take semantics, with the
+    indexed axis replaced by the (1-D) index's shape."""
+    return F.gather(input, index, axis=dim)
+
+
 # isinf(Tensor self) -> Tensor
 
 
@@ -2584,10 +3248,22 @@ def aten_isin(
 # isnan(Tensor self) -> Tensor
 @map_to(aten.isnan)
 def aten_isnan(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with boolean elements representing if each element is NaN or not.
-    """
-    return F.is_nan(input)
+    return custom_mojo_ops.elementwise(input, "isnan")
+
+
+# kthvalue(Tensor self, SymInt k, int dim=-1, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.kthvalue.default)
+def aten_kthvalue(
+    self: MaxTensor, k: int, dim: int = -1, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    axis, size = _reduction_dim_and_size("kthvalue", self, dim)
+    if not isinstance(k, int):
+        raise NotImplementedError(f"kthvalue needs a statically known k, but got {k!r}")
+    if not 1 <= k <= size:
+        raise RuntimeError(
+            f"kthvalue(): selected number k out of range for dimension {axis}"
+        )
+    return _kth_smallest(self, k, axis, keepdim)
 
 
 # le.Scalar(Tensor self, Scalar other) -> Tensor
@@ -2675,10 +3351,7 @@ def aten_lift_fresh_copy(input: MaxTensor) -> MaxTensor:
 # log(Tensor self) -> Tensor
 @map_to(aten.log)
 def aten_log(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of the elements of input.
-    """
-    return F.log(input)
+    return custom_mojo_ops.elementwise(input, "log")
 
 
 # log10(Tensor self) -> Tensor
@@ -2687,14 +3360,13 @@ def aten_log(input: MaxTensor) -> MaxTensor:
 # log1p(Tensor self) -> Tensor
 @map_to(aten.log1p)
 def aten_log1p(input: MaxTensor) -> MaxTensor:
-    """
-    Returns a new tensor with the natural logarithm of (1 + input).
-    This function is more numerically stable than log(1 + input) for small values of input.
-    """
-    return F.log1p(input)
+    return custom_mojo_ops.elementwise(input, "log1p")
 
 
-# log2(Tensor self) -> Tensor
+# aten::log2(Tensor self) -> Tensor
+@map_to(aten.log2)
+def aten_log2(input: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(input, "log2")
 
 
 # logical_and(Tensor self, Tensor other) -> Tensor
@@ -2722,14 +3394,7 @@ def aten_logical_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 # logical_not(Tensor self) -> Tensor
 @map_to(aten.logical_not)
 def aten_logical_not(input: MaxTensor) -> MaxTensor:
-    """
-    PyTorch's logical_not treats any non-zero value as True and returns the logical negation.
-    MAX's logical_not requires boolean input, so we need to convert first.
-    """
-    # Convert input to boolean (non-zero -> True, zero -> False)
-    input_bool = F.not_equal(input, 0)
-    # Apply logical not
-    return F.logical_not(input_bool)
+    return custom_mojo_ops.elementwise(input, "logical_not")
 
 
 # logical_or(Tensor self, Tensor other) -> Tensor
@@ -2896,6 +3561,20 @@ def aten_mean_out(
     return aten_mean(input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 
+# median(Tensor self) -> Tensor
+@map_to(aten.median.default)
+def aten_median(self: MaxTensor) -> MaxTensor:
+    return _median_all(self, ignore_nan=False)
+
+
+# median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.median.dim)
+def aten_median_dim(
+    self: MaxTensor, dim: int, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _median_along(self, dim, keepdim, ignore_nan=False)
+
+
 # min.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
 @map_to(aten.min)
 def aten_min(
@@ -2924,6 +3603,14 @@ def aten_minimum(x: MaxTensor, y: MaxTensor) -> MaxTensor:
 # mm(Tensor self, Tensor mat2) -> Tensor
 @map_to(aten.mm)
 def aten_mm(x: MaxTensor, y: MaxTensor) -> MaxTensor:
+    if (
+        len(x.shape) == 2
+        and len(y.shape) == 2
+        and x.dtype == y.dtype
+        and x.dtype in _NATIVE_FLOAT_DTYPES
+        and _native_kernel_operands(x, y)
+    ):
+        return _native_matmul(x, y, None, mat2_arg_index=1)
     return operator.matmul(x, y)
 
 
@@ -2942,6 +3629,113 @@ def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
         # MAX's mul doesn't lower for bool; torch defines it as logical AND.
         return F.logical_and(promoted_input, other)
     return promoted_input * other
+
+
+# multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor
+@map_to(aten.multinomial.default)
+def aten_multinomial(
+    self: MaxTensor,
+    num_samples: int,
+    replacement: bool = False,
+    *,
+    generator: torch.Generator | None = None,
+) -> MaxTensor:
+    """Gumbel-max sampling: `argmax(log p + G)` with G ~ Gumbel(0, 1) is one
+    draw from p, and the top `num_samples` of one perturbed row are a draw
+    without replacement. A zero-probability category scores -inf, so it is
+    never drawn while a positive one is left.
+
+    The uniforms come from MAX's own generator, seeded per execution from
+    torch's default generator (`GRAPH_SEEDED_OPS`, compiler.py), so
+    `torch.manual_seed` makes a compiled draw reproducible -- but not equal
+    to an eager one: the streams differ. The graph cannot raise on a bad
+    distribution (negative / non-finite entries, a zero row): that would
+    need a host readback, which the eager device does and a graph cannot.
+    """
+    if generator is not None:
+        raise NotImplementedError(
+            "aten::multinomial does not support the generator argument in the "
+            "MAX graph backend"
+        )
+    rank = len(self.shape)
+    if rank not in (1, 2):
+        raise RuntimeError("prob_dist must be 1 or 2 dim")
+    if not self.dtype.is_float():
+        raise RuntimeError(
+            "multinomial only supports floating-point dtypes for input, got: "
+            f"{self.dtype}"
+        )
+    if not isinstance(num_samples, int):
+        raise NotImplementedError(
+            f"multinomial needs a statically known num_samples, got {num_samples!r}"
+        )
+    if num_samples <= 0:
+        raise RuntimeError("cannot sample n_sample <= 0 samples")
+    n_categories = self.shape[-1]
+    if not isinstance(n_categories, StaticDim):
+        raise NotImplementedError(
+            "multinomial needs a statically known number of categories"
+        )
+    if not replacement and num_samples > int(n_categories):
+        raise RuntimeError(
+            "cannot sample n_sample > prob_dist.size(-1) samples without replacement"
+        )
+    probs = F.cast(self, DType.float32)
+    neg_inf = aten_full_like(probs, float("-inf"))
+    log_p = _where(probs > 0, aten_log(probs), neg_inf)
+    draws_shape = list(probs.shape)
+    if replacement and num_samples > 1:
+        # One independent perturbed copy of the row per sample.
+        log_p = F.unsqueeze(log_p, axis=-2)
+        draws_shape.insert(-1, num_samples)
+    like = max_type.TensorType(DType.float32, draws_shape, device=probs.device)
+    if isinstance(probs, TensorValue):
+        uniform = max_ops.random.uniform(like, range=(0.0, 1.0))
+    else:
+        uniform = _uniform_like(like, range=(0.0, 1.0))
+    # u == 0 would make the noise -inf for every category of a row alike;
+    # the clamp keeps it finite without moving any other draw.
+    uniform = F.max(uniform, aten_full_like(uniform, 1e-30))
+    scores = log_p - aten_log(-aten_log(uniform))
+    if not replacement and num_samples > 1:
+        _, indices = _select_sorted_k(scores, num_samples, rank - 1, True)
+        return indices
+    if num_samples == 1:
+        return aten_argmax(scores, dim=-1, keepdim=True)
+    return aten_argmax(scores, dim=-1, keepdim=False)
+
+
+# The ops whose graph needs a per-execution seed (compiler.py adds a uint64
+# graph input for it, drawn from torch's default generator at every call).
+GRAPH_SEEDED_OPS = frozenset({aten.multinomial.default})
+
+
+def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
+    """Per-channel batch mean and biased variance, reduced over every dim but
+    1 and kept broadcastable against `input` ((1, C, 1, ...))."""
+    reduce_axes = [i for i in range(len(input.shape)) if i != 1]
+    mean = input
+    for axis in reduce_axes:
+        mean = _reduce_mean(mean, axis=axis)
+    centered = input - mean
+    var = centered * centered
+    for axis in reduce_axes:
+        var = _reduce_mean(var, axis=axis)
+    return mean, var
+
+
+# nanmedian(Tensor self) -> Tensor
+@map_to(aten.nanmedian.default)
+def aten_nanmedian(self: MaxTensor) -> MaxTensor:
+    return _median_all(self, ignore_nan=True)
+
+
+# nanmedian.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.nanmedian.dim)
+def aten_nanmedian_dim(
+    self: MaxTensor, dim: int, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _median_along(self, dim, keepdim, ignore_nan=True)
 
 
 # native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
@@ -2987,16 +3781,8 @@ def aten_native_batch_norm(
     broadcast_shape[1] = num_channels
 
     if training:
-        # Reduce over every dimension except the channel dimension, keeping dims
-        # so the statistics broadcast back over the input.
-        reduce_axes = [i for i in range(len(input_shape)) if i != 1]
-        mean = input
-        for axis in reduce_axes:
-            mean = _reduce_mean(mean, axis=axis)
+        mean, var = _batch_norm_batch_stats(input)
         centered = input - mean
-        var = centered * centered
-        for axis in reduce_axes:
-            var = _reduce_mean(var, axis=axis)
         invstd = 1.0 / F.sqrt(var + eps)
         normalized = centered * invstd
         # PyTorch returns the per-channel batch mean and inverse-std (shape (C,)).
@@ -3026,6 +3812,85 @@ def aten_native_batch_norm(
     return (normalized, save_mean, save_invstd)
 
 
+# native_batch_norm_backward(Tensor grad_out, Tensor input, Tensor? weight, Tensor? running_mean, Tensor? running_var, Tensor? save_mean, Tensor? save_invstd, bool train, float eps, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+@map_to(aten.native_batch_norm_backward)
+def aten_native_batch_norm_backward(
+    grad_out: MaxTensor,
+    input: MaxTensor,
+    weight: MaxTensor | None,
+    running_mean: MaxTensor | None,
+    running_var: MaxTensor | None,
+    save_mean: MaxTensor | None,
+    save_invstd: MaxTensor | None,
+    train: bool,
+    eps: float,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    """Gradients of `aten.native_batch_norm`, per channel.
+
+    Follows `batch_norm_backward_cpu_template`
+    (aten/src/ATen/native/Normalization.cpp) with `M = numel / C`:
+
+        dbeta[c]  = sum_{n,s} dy          dgamma[c] = sum_{n,s} dy * xhat
+        dx        = (dy - dbeta/M - xhat * dgamma/M) * invstd * gamma   (train)
+        dx        = dy * invstd * gamma                                 (eval)
+
+    Training reads the statistics the forward saved; evaluation recomputes
+    them from the running buffers, which is why an `.eval()` BatchNorm still
+    produces gradients rather than the zeros an "inference needs no backward"
+    reading would give.
+
+    Returns `None` for the outputs `output_mask` turns off, the way
+    `aten_native_layer_norm` returns `None` for statistics nothing reads.
+    """
+    mask = tuple(output_mask)
+    input_shape = input.shape
+    rank = len(input_shape)
+    num_channels = int(input_shape[1])
+    broadcast_shape = [1] * rank
+    broadcast_shape[1] = num_channels
+    reduce_axes = [axis for axis in range(rank) if axis != 1]
+    reduced = math.prod(int(input_shape[axis]) for axis in reduce_axes)
+
+    if train:
+        if save_mean is None or save_invstd is None:
+            raise ValueError(
+                "save_mean and save_invstd are required when train=True in "
+                "aten.native_batch_norm_backward"
+            )
+        mean = F.reshape(save_mean, broadcast_shape)
+        invstd = F.reshape(save_invstd, broadcast_shape)
+    else:
+        if running_mean is None or running_var is None:
+            raise ValueError(
+                "running_mean and running_var are required when train=False "
+                "in aten.native_batch_norm_backward"
+            )
+        mean = F.reshape(running_mean, broadcast_shape)
+        invstd = 1.0 / F.sqrt(F.reshape(running_var, broadcast_shape) + eps)
+
+    normalized = (input - mean) * invstd
+    # dx needs both affine gradients while training, whatever the mask says.
+    sum_grad = aten_sum(grad_out, dim=reduce_axes, keepdim=True)
+    dot_grad = aten_sum(grad_out * normalized, dim=reduce_axes, keepdim=True)
+
+    grad_input = None
+    if mask[0]:
+        scale = invstd
+        if weight is not None:
+            scale = scale * F.reshape(weight, broadcast_shape)
+        if train:
+            projected = (
+                grad_out - sum_grad / reduced - normalized * (dot_grad / reduced)
+            )
+        else:
+            projected = grad_out
+        grad_input = projected * scale
+    grad_weight = F.reshape(dot_grad, [num_channels]) if mask[1] else None
+    grad_bias = F.reshape(sum_grad, [num_channels]) if mask[2] else None
+    return grad_input, grad_weight, grad_bias
+
+
 # native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)
 
 
@@ -3040,10 +3905,11 @@ def aten_native_group_norm(
     HxW: SymIntType,
     group: int,
     eps: float,
-) -> tuple[MaxTensor, NotImplementedError, NotImplementedError]:
+) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
     """
     This is the low-level operation that F.group_norm gets compiled to.
-    Returns (normalized_output, mean, rstd) tuple but we only return the first element for simplicity.
+    Returns (normalized_output, mean, rstd); the two statistics are per
+    (sample, group) and are what `aten.native_group_norm_backward` consumes.
     """
     # Reshape input from [N*C, HxW] back to [N, C, H, W] format
     # First, calculate H and W from HxW
@@ -3061,15 +3927,19 @@ def aten_native_group_norm(
     # Use the regular group_norm implementation
     result = torch_group_norm_equivalent(input_reshaped, group, weight, bias, eps)
 
-    # Return just the normalized output (native_group_norm returns a tuple)
+    # The statistics are per (sample, group) and are what
+    # `aten.native_group_norm_backward` consumes, so a training graph is dead
+    # without them; they used to be NotImplementedError placeholders, which
+    # made every grad-requiring group norm fail to compile.
+    grouped = F.reshape(input, [int(N), group, (int(C) // group) * HW])
+    group_mean = aten_mean(grouped, dim=[2], keepdim=True)
+    group_centered = grouped - group_mean
+    group_var = aten_mean(group_centered * group_centered, dim=[2], keepdim=True)
+    group_rstd = 1 / F.sqrt(group_var + eps)
     return (
         result,
-        NotImplementedError(
-            "The implementation of aten.native_group_norm doesn't support returning mean yet."
-        ),
-        NotImplementedError(
-            "The implementation of aten.native_group_norm doesn't support returning rstd yet."
-        ),
+        F.reshape(group_mean, [int(N), group]),
+        F.reshape(group_rstd, [int(N), group]),
     )
 
 
@@ -3128,6 +3998,77 @@ def torch_group_norm_equivalent(
 
 
 # native_group_norm_backward(Tensor grad_out, Tensor input, Tensor mean, Tensor rstd, Tensor? weight, SymInt N, SymInt C, SymInt HxW, int group, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+@map_to(aten.native_group_norm_backward)
+def aten_native_group_norm_backward(
+    grad_out: MaxTensor,
+    input: MaxTensor,
+    mean: MaxTensor,
+    rstd: MaxTensor,
+    weight: MaxTensor | None,
+    N: SymIntType,
+    C: SymIntType,
+    HxW: SymIntType,
+    group: int,
+    output_mask: list[bool],
+) -> tuple[MaxTensor | None, MaxTensor | None, MaxTensor | None]:
+    """Gradients of `aten.native_group_norm`.
+
+    Group norm normalizes the trailing `(C / group) * HxW` elements of the
+    `(N, group, K)` view, so its grad-input is the layer-norm formula on that
+    view once the per-channel gamma is folded into grad_out:
+
+        dx = rstd * (q - mean_k(q) - xhat * mean_k(q * xhat)),  q = dy * gamma
+
+    The affine gradients reduce over a different axis set -- the batch and the
+    spatial extent, per channel -- and go through the per-(sample, channel)
+    partial sums ATen's own kernel uses:
+
+        dgamma[c] = sum_n rstd[n, g] * (S2[n, c] - mean[n, g] * S1[n, c])
+        dbeta[c]  = sum_n S1[n, c]
+        S1[n, c]  = sum_hw dy        S2[n, c] = sum_hw dy * x
+    """
+    mask = tuple(output_mask)
+    samples = int(N)
+    channels = int(C)
+    spatial = int(HxW)
+    channels_per_group = channels // group
+    inner = channels_per_group * spatial
+
+    planes = [samples, channels, spatial]
+    grad_planes = F.reshape(grad_out, planes)
+    input_planes = F.reshape(input, planes)
+    mean_groups = F.reshape(mean, [samples, group, 1])
+    rstd_groups = F.reshape(rstd, [samples, group, 1])
+
+    grad_weight = None
+    grad_bias = None
+    if mask[1] or mask[2]:
+        partial_grad = aten_sum(grad_planes, dim=[2])
+        if mask[2]:
+            grad_bias = aten_sum(partial_grad, dim=[0])
+        if mask[1]:
+            partial_dot = aten_sum(grad_planes * input_planes, dim=[2])
+            per_group = [samples, group, channels_per_group]
+            sums = F.reshape(partial_grad, per_group)
+            dots = F.reshape(partial_dot, per_group)
+            centered = (dots - mean_groups * sums) * rstd_groups
+            grad_weight = F.reshape(aten_sum(centered, dim=[0]), [channels])
+
+    grad_input = None
+    if mask[0]:
+        scaled = grad_planes
+        if weight is not None:
+            scaled = scaled * F.reshape(weight, [1, channels, 1])
+        groups = [samples, group, inner]
+        scaled = F.reshape(scaled, groups)
+        normalized = (F.reshape(input_planes, groups) - mean_groups) * rstd_groups
+        mean_scaled = aten_sum(scaled, dim=[2], keepdim=True) / inner
+        mean_dot = aten_sum(scaled * normalized, dim=[2], keepdim=True) / inner
+        grad_input = F.reshape(
+            (scaled - mean_scaled - normalized * mean_dot) * rstd_groups,
+            list(input.shape),
+        )
+    return grad_input, grad_weight, grad_bias
 
 
 # native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)
@@ -3139,6 +4080,33 @@ def aten_native_layer_norm(
     bias: MaxTensor | None,
     eps: float,
 ) -> tuple[MaxTensor, MaxTensor | None, MaxTensor | None]:
+    k = len(normalized_shape)
+    if (
+        weight is not None
+        and bias is not None
+        and 1 <= k <= len(input.shape)
+        and input.dtype == weight.dtype == bias.dtype
+        and input.dtype in _NATIVE_FLOAT_DTYPES
+        and all(isinstance(d, StaticDim) for d in input.shape[-k:])
+        and _native_kernel_operands(input, weight, bias)
+    ):
+        # The eager `LayerNormForward` kernel over rows of the normalized
+        # dims, returning the float32 statistics ATen's accelerator kernel
+        # returns (so a backward graph can consume them too).
+        cols = math.prod(int(d) for d in input.shape[-k:])
+        if cols > 0:
+            out, mean, rstd = custom_mojo_ops.native_layer_norm(
+                F.reshape(input, [-1, cols]),
+                F.reshape(weight, [cols]),
+                F.reshape(bias, [cols]),
+                eps,
+            )
+            stats_shape = [*input.shape[:-k], *([1] * k)]
+            return (
+                F.reshape(out, input.shape),
+                F.reshape(mean, stats_shape),
+                F.reshape(rstd, stats_shape),
+            )
     # Fused MAX kernel for the common last-dim case. The two aten_mean
     # reductions below lower to a generic reduction kernel that costs
     # ~150us per launch on GPU (7.5ms/step on gpt2 decode, 73% of GPU
@@ -3209,7 +4177,7 @@ def aten_ne(x: MaxTensor, y: MaxTensor | Scalar) -> MaxTensor:
 # neg(Tensor self) -> Tensor
 @map_to(aten.neg)
 def aten_neg(x: MaxTensor) -> MaxTensor:
-    return operator.neg(x)
+    return custom_mojo_ops.elementwise(x, "neg")
 
 
 # nonzero(Tensor self) -> Tensor
@@ -3260,19 +4228,26 @@ def aten_pow(x: Scalar | MaxTensor, y: Scalar | MaxTensor) -> MaxTensor:
 # reciprocal(Tensor self) -> Tensor
 @map_to(aten.reciprocal)
 def aten_reciprocal(tensor: MaxTensor) -> MaxTensor:
-    return 1.0 / tensor
+    return custom_mojo_ops.elementwise(tensor, "reciprocal")
 
 
 # reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
 # reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.reflection_pad2d.default)
+def aten_reflection_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    # ATen's "padding < input dim" check already ran in the meta kernel
+    # during fake-tensor propagation, before this graph is built.
+    paddings = _torch_pad_to_max_paddings(len(input.shape), _static_pad_ints(padding))
+    return max_ops.pad(input, paddings, mode="reflect")
+
+
 # reflection_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 
 # relu(Tensor self) -> Tensor
 @map_to(aten.relu)
 def aten_relu(tensor: MaxTensor) -> MaxTensor:
-    # inplace has no meaning in max since it's graph-based
-    return F.relu(tensor)
+    return custom_mojo_ops.elementwise(tensor, "relu")
 
 
 # remainder.Scalar(Tensor self, Scalar other) -> Tensor
@@ -3299,6 +4274,12 @@ def aten_repeat(input: MaxTensor, repeats: list[SymIntType]) -> MaxTensor:
 
 
 # replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+@map_to(aten.replication_pad2d.default)
+def aten_replication_pad2d(input: MaxTensor, padding: list[SymIntType]) -> MaxTensor:
+    paddings = _torch_pad_to_max_paddings(len(input.shape), _static_pad_ints(padding))
+    return max_ops.pad(input, paddings, mode="edge")
+
+
 # replication_pad3d(Tensor self, SymInt[6] padding) -> Tensor
 
 
@@ -3317,7 +4298,7 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 # rsqrt(Tensor self) -> Tensor
 @map_to(aten.rsqrt)
 def aten_rsqrt(x: MaxTensor) -> MaxTensor:
-    return F.rsqrt(x)
+    return custom_mojo_ops.elementwise(x, "rsqrt")
 
 
 # scalar_tensor(Scalar s, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -3356,37 +4337,6 @@ def aten_scaled_dot_product_attention(
         neg_inf = F.constant(float("-inf"), dtype=query.dtype, device=query.device)
         zero = F.constant(0.0, dtype=query.dtype, device=query.device)
         attn_mask = _where(attn_mask, zero, neg_inf)
-
-    query_device = query.device
-    is_gpu = (
-        not query_device.is_cpu()
-        if isinstance(query_device, DeviceRef)
-        else query_device.label != "cpu"
-    )
-
-    if (
-        is_gpu
-        and attn_mask is not None
-        and dropout_p == 0.0
-        and not is_causal
-        and scale in (None, 0.125)
-        and not enable_gqa
-        and query.dtype == key.dtype == value.dtype == attn_mask.dtype == DType.float32
-        and len(query.shape)
-        == len(key.shape)
-        == len(value.shape)
-        == len(attn_mask.shape)
-        == 4
-        and query.shape[2] == 1
-        and query.shape[3] == 64
-        and query.shape[0] == key.shape[0] == value.shape[0]
-        and query.shape[1] == key.shape[1] == value.shape[1]
-        and key.shape == value.shape
-        and attn_mask.shape[-1] == key.shape[2]
-        and attn_mask.shape[0] in (1, query.shape[0])
-        and attn_mask.shape[1] == attn_mask.shape[2] == 1
-    ):
-        return custom_mojo_ops.gpt2_decode_attention(query, key, value, attn_mask)
 
     output, _ = aten__scaled_dot_product_attention_math(
         query,
@@ -3439,6 +4389,25 @@ def aten_scatter_value(
 
 
 # scatter_add(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
+@map_to(aten.scatter_add.default)
+def aten_scatter_add(
+    input: MaxTensor, dim: int, index: MaxTensor, src: MaxTensor
+) -> MaxTensor:
+    """``out = input.clone(); out[i][index[i][j][k]][k] += src[i][j][k]`` for
+    ``dim=1``, etc. — the accumulating twin of ``aten_scatter_src``, and the
+    backward of ``aten_gather``.
+
+    Deliberately NOT `F.scatter_add`, whose semantics match but which has no
+    GPU kernel: its wrapper transfers input/updates/indices to the host and
+    the result back on every call. The `_nd` form keeps the GPU kernel in the
+    loop, at the cost of materializing the coordinate tensor `_dim_coords`
+    builds (shared with `aten_gather`).
+    """
+    coords = _dim_coords(input, dim, index)
+    rank = len(input.shape)
+    return F.scatter_nd_add(input, F.reshape(src, [-1]), F.reshape(coords, [-1, rank]))
+
+
 # scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor
 
 
@@ -3535,48 +4504,43 @@ def aten_select_scatter(
 # sigmoid(Tensor self) -> Tensor
 @map_to(aten.sigmoid)
 def aten_sigmoid(input: MaxTensor) -> MaxTensor:
-    return _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "sigmoid")
 
 
 # sign(Tensor self) -> Tensor
 @map_to(aten.sign)
 def aten_sign(x: MaxTensor) -> MaxTensor:
-    # sign(x) = (x > 0) + (x < 0) * (-1)
-    # This returns 1.0 for positive, -1.0 for negative, 0.0 for zero
-    positive = F.cast(x > 0, dtype=x.dtype)
-    negative = F.cast(x < 0, dtype=x.dtype)
-    return positive + negative * (-1)
+    return custom_mojo_ops.elementwise(x, "sign")
 
 
 # silu(Tensor self) -> Tensor
 @map_to(aten.silu)
 def aten_silu(input: MaxTensor) -> MaxTensor:
-    return input * _sigmoid(input)
+    return custom_mojo_ops.elementwise(input, "silu")
 
 
 # sin(Tensor self) -> Tensor
 @map_to(aten.sin)
 def aten_sin(x: MaxTensor) -> MaxTensor:
-    return F.sin(x)
+    return custom_mojo_ops.elementwise(x, "sin")
 
 
 # tan(Tensor self) -> Tensor
 @map_to(aten.tan)
 def aten_tan(x: MaxTensor) -> MaxTensor:
-    return F.sin(x) / F.cos(x)
+    return custom_mojo_ops.elementwise(x, "tan")
 
 
 # tanh(Tensor self) -> Tensor
 @map_to(aten.tanh)
 def aten_tanh(x: MaxTensor) -> MaxTensor:
-    return F.tanh(x)
+    return custom_mojo_ops.elementwise(x, "tanh")
 
 
 # sinh(Tensor self) -> Tensor
 @map_to(aten.sinh)
 def aten_sinh(x: MaxTensor) -> MaxTensor:
-    """Computes hyperbolic sine using sin(x) = (exp(x) - exp(-x)) / 2"""
-    return (F.exp(x) - F.exp(-x)) / 2
+    return custom_mojo_ops.elementwise(x, "sinh")
 
 
 # slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor(a)
@@ -3596,7 +4560,26 @@ def aten_slice(
 
 
 # slice_scatter(Tensor self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
+
+
 # sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort.default)
+def aten_sort(
+    input: MaxTensor, dim: int = -1, descending: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _sort_impl(input, dim, descending)
+
+
+# sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort.stable)
+def aten_sort_stable(
+    input: MaxTensor, *, stable: bool | None, dim: int = -1, descending: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    # `stable` needs no branch: MAX's top_k/bottom_k document their output as
+    # sorted *stably*, which is the stronger of the two guarantees ATen asks
+    # for, so it is a correct answer to `stable=True` and to `stable=None`.
+    del stable
+    return _sort_impl(input, dim, descending)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
@@ -3616,7 +4599,7 @@ def aten_split_with_sizes(
 # sqrt(Tensor self) -> Tensor
 @map_to(aten.sqrt)
 def aten_sqrt(x: MaxTensor) -> MaxTensor:
-    return F.sqrt(x)
+    return custom_mojo_ops.elementwise(x, "sqrt")
 
 
 # squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)
@@ -3696,7 +4679,30 @@ def aten_sum(
 # sym_stride.int(Tensor self, int dim) -> SymInt
 # tan(Tensor self) -> Tensor
 # tanh(Tensor self) -> Tensor
+
+
 # topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
+@map_to(aten.topk.default)
+def aten_topk(
+    input: MaxTensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
+) -> tuple[MaxTensor, MaxTensor]:
+    # `sorted=False` only permits an arbitrary order among the k results;
+    # returning them sorted, which is all MAX offers, answers both settings.
+    del sorted
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "topk of a 0-d tensor is not supported by the MAX graph backend"
+        )
+    if not isinstance(k, int):
+        raise NotImplementedError(f"topk needs a statically known k, but got {k!r}")
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if isinstance(size, StaticDim) and not 0 <= k <= int(size):
+        raise RuntimeError("selected index k out of range")
+    return _select_sorted_k(input, k, axis, largest)
+
+
 # trunc(Tensor self) -> Tensor
 
 

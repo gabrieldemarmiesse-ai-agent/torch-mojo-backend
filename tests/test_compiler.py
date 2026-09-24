@@ -1,6 +1,5 @@
 import io
 from pathlib import Path
-from typing import TypedDict
 from unittest.mock import patch
 
 import numpy as np
@@ -17,38 +16,13 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend
 import torch_mojo_backend.torch_compile_backend.compiler
-from tests.conftest import require_cuda_autograd
+from tests.conftest import matmul_tolerance, require_cuda_autograd
 from torch_mojo_backend import (
     MAPPING_TORCH_ATEN_TO_MOJO,
     make_torch_op_from_mojo,
     mojo_backend,
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
-
-
-# MAX lowers an fp32 matmul to TF32 tensor cores on NVIDIA GPUs while torch
-# eager defaults to full fp32, so a graph containing a matmul cannot be
-# compared against eager at assert_close's fp32 defaults on GPU
-# (`test_compile_matmul` in test_compile_mojo_device.py makes the same
-# allowance). Verified exactly: for `x @ w + b` on cuda the backend's output
-# is bit-identical to torch's own `allow_tf32=True` result.
-#
-# The numbers below are the measured tf32-vs-fp32 envelope for these shapes
-# over 2000 random draws: max absolute gap 4.8e-3 for one matmul and 1.5e-2
-# for the chained pair in `test_get_attr_multiple_parameters`. The relative
-# gap is unbounded (outputs cancel to near zero), which is why atol carries
-# the tolerance. atol=2e-2 is ~1.3x the measured worst case and still ~50x
-# below the O(1) error an actually wrong matmul produces on N(0, 1) data.
-# CPU keeps assert_close's exact fp32 defaults.
-class _Tolerance(TypedDict, total=False):
-    rtol: float
-    atol: float
-
-
-def matmul_tolerance(device: str) -> _Tolerance:
-    if device == "cpu":
-        return {}
-    return {"rtol": 1e-2, "atol": 2e-2}
 
 
 def test_basic_training(device: str):
@@ -654,8 +628,9 @@ def test_sdpa_with_attention_mask(device: str):
     check_functions_are_equivalent(fn, device, [q, k, v, mask], rtol=1e-2, atol=1e-3)
 
 
-def test_sdpa_decode_gpt2_mask(device: str):
-    """GPT-2 decode shape exercises the fused Mojo graph custom op on GPU."""
+def test_sdpa_decode_additive_mask(device: str):
+    """Single-query (decode) attention with an additive mask and an explicit
+    scale."""
 
     def fn(q, k, v, mask):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=0.125)

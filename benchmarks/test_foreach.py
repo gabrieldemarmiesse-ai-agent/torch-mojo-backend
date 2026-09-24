@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from bench_lib.cases import DTYPES, both_list, unit_interval
+from bench_lib.cases import DTYPES, both, both_list, unit_interval
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
@@ -25,10 +25,9 @@ LISTS: dict[str, list[tuple[int, ...]]] = {
 }
 
 COVERS: dict[str, str] = {
+    "aten::_foreach_copy_": "test_foreach_copy_cast",
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
-    "aten::_foreach_addcdiv_.ScalarList": "test_foreach_addcdiv_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
-    "aten::_foreach_div_.ScalarList": "test_foreach_div_",
     "aten::_foreach_lerp_.Scalar": "test_foreach_lerp_",
     "aten::_foreach_mul_.Scalar": "test_foreach_mul_scalar",
     "aten::_foreach_mul_.Tensor": "test_foreach_mul_tensor",
@@ -41,6 +40,104 @@ COVERS: dict[str, str] = {
 }
 
 SKIPPED: dict[str, str] = {}
+
+
+COPY_LISTS = {
+    "L_mixed_15370400": [
+        800,
+        800,
+        3840000,
+        2400,
+        1280000,
+        800,
+        800,
+        800,
+        5120000,
+        3200,
+        5120000,
+        800,
+    ],
+    "L_12x800": [800] * 12,
+    "L_awkward_357x789": [357 * 789, 7 * 1025, 1025, 17, 1],
+    "L_1x1048576": [1048576],
+    "L_65x513": [513] * 65,
+    "L_empty_mixed": [0, 17, 0, 1025],
+}
+
+
+# (source, destination) of each batched-copy dtype id: the mixed-precision
+# cast both ways, and a same-dtype copy of each width class.
+COPY_DTYPES: dict[str, tuple[torch.dtype, torch.dtype]] = {
+    "f32_to_bf16": (torch.float32, torch.bfloat16),
+    "bf16_to_f32": (torch.bfloat16, torch.float32),
+    "bf16": (torch.bfloat16, torch.bfloat16),
+    "f32": (torch.float32, torch.float32),
+}
+
+
+# Element offsets (source, destination) into each allocation: "contig" puts
+# the two at different vector phases, "aligned" starts both on one.
+COPY_OFFSETS: dict[str, tuple[int, int]] = {"contig": (3, 5), "aligned": (0, 0)}
+
+
+@pytest.mark.bench_op("_foreach_copy_")
+@pytest.mark.parametrize("dtype_id", COPY_DTYPES)
+@pytest.mark.parametrize("layout", COPY_OFFSETS)
+@pytest.mark.parametrize("shape_id", COPY_LISTS)
+def test_foreach_copy_cast(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """Separate allocations, so same-dtype lists take the batched kernel rather
+    than the adjacent-views DMA."""
+    sizes = COPY_LISTS[shape_id]
+    src_dtype, dst_dtype = COPY_DTYPES[dtype_id]
+    src_offset, dst_offset = COPY_OFFSETS[layout]
+    src_ref, src_our = both_list(
+        [torch.randn(n + 8).to(src_dtype) for n in sizes], hw, mojo_device
+    )
+    dst_ref, dst_our = both_list(
+        [torch.empty(n + 12, dtype=dst_dtype) for n in sizes], hw, mojo_device
+    )
+    src_ref = [t[src_offset:][:n] for t, n in zip(src_ref, sizes, strict=True)]
+    src_our = [t[src_offset:][:n] for t, n in zip(src_our, sizes, strict=True)]
+    dst_ref = [t[dst_offset:][:n] for t, n in zip(dst_ref, sizes, strict=True)]
+    dst_our = [t[dst_offset:][:n] for t, n in zip(dst_our, sizes, strict=True)]
+    bench.run(
+        lambda: torch._foreach_copy_(dst_ref, src_ref),
+        lambda: torch._foreach_copy_(dst_our, src_our),
+        flops=float(sum(sizes)),
+    )
+
+
+@pytest.mark.bench_op("_foreach_copy_")
+@pytest.mark.parametrize("dtype_id", ("bf16",))
+@pytest.mark.parametrize("layout", ("adjacent_views",))
+@pytest.mark.parametrize("shape_id", COPY_LISTS)
+def test_foreach_copy_adjacent_views(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """Pure DMA routes skip if the device timer records only kernels."""
+    sizes = COPY_LISTS[shape_id]
+    source = unit_interval((sum(sizes) + 8,), DTYPES[dtype_id])
+    src_ref, src_our = both(source, hw, mojo_device)
+    dst_ref, dst_our = both(torch.empty_like(source), hw, mojo_device)
+    srcs_ref, srcs_our = src_ref[3:-5].split(sizes), src_our[3:-5].split(sizes)
+    dsts_ref, dsts_our = dst_ref[5:-3].split(sizes), dst_our[5:-3].split(sizes)
+    bench.run(
+        lambda: torch._foreach_copy_(dsts_ref, srcs_ref),
+        lambda: torch._foreach_copy_(dsts_our, srcs_our),
+        flops=float(sum(sizes)),
+    )
 
 
 def _lists(

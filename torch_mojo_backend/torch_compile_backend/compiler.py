@@ -1,4 +1,5 @@
 import datetime as dt
+import functools
 import time
 import traceback
 import weakref
@@ -10,6 +11,7 @@ from typing import Any, cast
 
 import max.driver
 import max.graph.value
+import numpy as np
 import torch
 from functorch.compile import make_boxed_func
 from max import engine
@@ -18,19 +20,18 @@ from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
+from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
+    CURRENT_ARG_RESOLVER,
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
+    GRAPH_SEEDED_OPS,
     MAPPING_TORCH_ATEN_TO_MOJO,
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
-from torch_mojo_backend.mojo_device import comm_fence
-from torch_mojo_backend.mojo_device.torch_mojo_tensor import (
-    TorchMojoTensor,
-    _row_major_strides,
-    find_equivalent_max_device,
-)
+from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
+from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -51,14 +52,24 @@ class GlobalMaxObjects:
 
 _global_max_objects: GlobalMaxObjects | None = None
 
-paths_to_mojo_kernels = [Path(__file__).parent.parent / "mojo_kernels"]
+# Custom-op packages user code registered on top of this repository's own
+# (`make_torch_op_from_mojo`): Mojo source directories or `.mojoc` files.
+extra_kernel_paths: list[Path] = []
+
+
+def kernel_extension_paths() -> list[Path]:
+    """Every custom-op package the graph backend loads: this repository's own
+    (`tmb/graph`, precompiled once per source closure), then whatever user
+    code registered. Passed as `custom_extensions` by every `F.custom` call
+    and loaded into the session's kernel library."""
+    return [native.build_graph_package(), *extra_kernel_paths]
 
 
 def global_max_objects() -> GlobalMaxObjects:
     global _global_max_objects
     if _global_max_objects is None:
         kernel_library = KernelLibrary()
-        kernel_library.load_paths(paths_to_mojo_kernels)
+        kernel_library.load_paths(kernel_extension_paths())
         session = engine.InferenceSession(devices=list(get_accelerators()))
         debug.set_print_options(session)
 
@@ -188,17 +199,26 @@ class _GraphFactory:
         self.expression_to_node_name: dict[str, str] = {}
         self.replace_inputs = replace_inputs
         self.force_device = force_device
+        # Whether the graph takes one trailing uint64 seed input (a random op
+        # of GRAPH_SEEDED_OPS is in it; set by create_graph).
+        self.takes_seed = False
 
     def initialize_graph(self):
         if self.graph is not None:
             raise RuntimeError("Graph has already been initialized.")
 
+        if self.takes_seed:
+            self.graph_inputs.append(max_ops.random.SeedType(DeviceRef.CPU()))
         self.graph = Graph(
             "torch_mojo_backend",
             input_types=self.graph_inputs,
             kernel_library=global_max_objects().kernel_library,
         ).__enter__()
         self._graph_open = True
+        if self.takes_seed:
+            # A constant seed would make every execution draw the same
+            # numbers; the caller feeds a fresh one per call (graph_seed()).
+            max_ops.random.set_seed(self.graph.inputs[-1].tensor)
         # Let's fill the tensor book
         for tensor_name, idx in self.names_to_input_idx.items():
             self.tensor_book[tensor_name] = self.graph.inputs[idx]
@@ -300,9 +320,11 @@ class _GraphFactory:
         try:
             mapping_func = MAPPING_TORCH_ATEN_TO_MOJO[key]
             token = CURRENT_FX_NODE.set(node)
+            resolver_token = CURRENT_ARG_RESOLVER.set(self.tensor_book.convert_to_max)
             try:
                 func_output = mapping_func(*func_args, **func_kwargs)
             finally:
+                CURRENT_ARG_RESOLVER.reset(resolver_token)
                 CURRENT_FX_NODE.reset(token)
         except Exception as e:
             raise MojoCompilerError(
@@ -396,6 +418,10 @@ class _GraphFactory:
         self, graph: torch.fx.Graph
     ) -> tuple[Graph, list[tuple[OutputBlueprintKind, int | None]]]:
         output_blueprint = None
+        self.takes_seed = any(
+            node.op == "call_function" and node.target in GRAPH_SEEDED_OPS
+            for node in graph.nodes
+        )
         try:
             for node_idx, node in enumerate(graph.nodes):
                 if node.op == "placeholder":
@@ -449,23 +475,63 @@ def _graph_uses_mojo_device(
     return False
 
 
-def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
-    """Zero-copy wrap of a MAX output buffer as an eager mojo tensor.
+@functools.cache
+def _mojo_accelerators() -> tuple[max.driver.Device, ...]:
+    """The concrete MAX devices backing each `mojo:<index>`, in the same
+    order the native backend's `device.mojo` assigns them -- see
+    `get_accelerators()`."""
+    return tuple(get_accelerators())
 
-    The buffer itself becomes the wrapper's ownership token (`_holder`):
-    MAX buffers release their device memory when the last Python reference
-    drops, exactly like the eager TensorHolder.
+
+def _max_device_for_mojo(device: torch.device) -> max.driver.Device:
+    """The concrete `max.driver.Device` a `mojo:<index>` torch device maps to."""
+    accelerators = _mojo_accelerators()
+    index = device.index if device.index is not None else 0
+    if index >= len(accelerators):
+        raise ValueError(f"Invalid mojo device index {index}")
+    return accelerators[index]
+
+
+def _mojo_index_for_max_device(device: max.driver.Device) -> int:
+    """The inverse of `_max_device_for_mojo`: which `mojo:<index>` a MAX
+    device (as reported by a MAX output buffer) corresponds to."""
+    for index, accelerator in enumerate(_mojo_accelerators()):
+        if accelerator.label == device.label and accelerator.id == device.id:
+            return index
+    raise ValueError(f"MAX device {device} has no corresponding mojo index")
+
+
+def _max_device_for_cuda(device: torch.device) -> max.driver.Device:
+    """The concrete MAX accelerator a real (non-mojo) `cuda`/`hip` torch
+    device maps to: the GPUs among `_mojo_accelerators()`, in order."""
+    gpu_accelerators = [a for a in _mojo_accelerators() if a.label == "gpu"]
+    index = device.index if device.index is not None else 0
+    if index >= len(gpu_accelerators):
+        raise RuntimeError(f"GPU index {index} not available in MAX")
+    return gpu_accelerators[index]
+
+
+def _mojo_tensor_from_buffer(buffer: max.driver.Buffer) -> torch.Tensor:
+    """Zero-copy wrap of a MAX output buffer as a `mojo`-device tensor.
+
+    The graph runs on MAX's own stream, not a mojo one, and is still running
+    when `execute` returns: `__dlpack__(stream=...)` makes the mojo stream
+    wait for it. Metal lacks external streams, so synchronize that handoff.
+    MAX tags the capsule with the vendor device code (a `cuda`
+    tensor on import); retagging it kDLExtDev imports it as PrivateUse1.
     """
-    shape = tuple(buffer.shape)
-    return TorchMojoTensor._make(
-        buffer,
-        buffer._data_ptr(),
-        shape,
-        _row_major_strides(shape),
-        0,
-        buffer.dtype,
-        buffer.device,
-        contiguous=True,
+    index = _mojo_index_for_max_device(buffer.device)
+    if device_module.get_device_properties(index).api == "metal":
+        # MAX does not import/export external Metal streams. Complete graph
+        # work before the native queue can consume its output allocation.
+        buffer.device.synchronize()
+        capsule = buffer.__dlpack__()
+    else:
+        stream = torch.accelerator.current_stream(torch.device("mojo", index))
+        handle = device_module.stream_native_handle(stream) or None
+        capsule = buffer.__dlpack__(stream=handle)
+    return torch.from_dlpack(
+        mojo_dlpack.retag_capsule(capsule, mojo_dlpack.KDL_EXT_DEV, index)
     )
 
 
@@ -492,7 +558,9 @@ class BaseMaxCompiler:
             gather_stats_on_graph(gm)
             gm.graph.print_tabular()
 
-        graph, self.output_blueprint = _GraphFactory().create_graph(gm.graph)
+        factory = _GraphFactory()
+        graph, self.output_blueprint = factory.create_graph(gm.graph)
+        self.takes_seed = factory.takes_seed
         if verbose_enabled():
             print(graph)
         if profiling_enabled():
@@ -528,13 +596,11 @@ class BaseMaxCompiler:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
-        if comm_fence.PENDING:
-            # The graph reads its inputs' device memory straight from MAX, so
-            # the per-op hook in register.py never sees them; fence here.
-            comm_fence.fence_pending_args(args, {})
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
+        if self.takes_seed:
+            input_tensors.append(graph_seed())
         outputs = self.model.execute(*input_tensors)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
@@ -567,6 +633,14 @@ class BaseMaxCompiler:
         return result
 
 
+def graph_seed() -> max.driver.Buffer:
+    """A fresh seed for one execution of a graph with random ops, drawn from
+    torch's default CPU generator so `torch.manual_seed` makes compiled
+    sampling reproducible."""
+    seed = torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64)
+    return max.driver.Buffer.from_numpy(seed.numpy().view(np.uint64))
+
+
 # Cross-call Buffer cache. Graph inputs are dominated by parameters, which
 # are the SAME tensor objects on every call of a compiled graph; converting
 # each of them through DLPack every call costs ~10-20us per tensor. Cache
@@ -582,13 +656,6 @@ def _evict_buffer(tensor_id: int, /):
     _buffer_cache.pop(tensor_id, None)
 
 
-def _data_ptr_of(t: torch.Tensor) -> int:
-    ptr = getattr(t, "_ptr", None)  # TorchMojoTensor
-    if ptr is not None:
-        return ptr
-    return t.data_ptr()
-
-
 def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     if not t.is_contiguous():
         # A MAX Buffer is dense row-major, and the graph input type only
@@ -602,11 +669,11 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
     entry = _buffer_cache.get(key)
     if entry is not None:
         buffer, ptr, _finalizer = entry
-        if ptr == _data_ptr_of(t):
+        if ptr == t.data_ptr():
             return buffer
     buffer = fast_from_dlpack(t.detach())
     finalizer = weakref.finalize(t, _evict_buffer, key)
-    _buffer_cache[key] = (buffer, _data_ptr_of(t), finalizer)
+    _buffer_cache[key] = (buffer, t.data_ptr(), finalizer)
     return buffer
 
 
@@ -651,12 +718,26 @@ dummy_backend = aot_autograd(fw_compiler=dummy_compiler)
 # - Generally users shouldn't be putting this marshalling into their
 #   inner loop. Gains are much more substantial for larger graphs
 #   which can take advantage of MAX's automatic kernel fusion.
+class _MetalDLPackInput:
+    """Expose a synchronized PrivateUse1 allocation using Metal's device tag."""
+
+    def __init__(self, tensor: torch.Tensor, device_id: int):
+        self.tensor = tensor
+        self.device_id = device_id
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return (8, self.device_id)
+
+    def __dlpack__(self, stream: int | None = None) -> object:
+        return mojo_dlpack.retag_capsule(self.tensor.__dlpack__(), 8, self.device_id)
+
+
 def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
     if t.device.type == "cuda":
         stream = torch.cuda.current_stream(t.device).cuda_stream
         # _from_dlpack wants a concrete driver Device, not the graph-building
         # DeviceRef torch_device_to_max_device returns.
-        device = find_equivalent_max_device(t.device)
+        device = _max_device_for_cuda(t.device)
         data = t.__dlpack__()
         try:
             return max.driver.Buffer._from_dlpack(data, device, stream)
@@ -664,4 +745,35 @@ def fast_from_dlpack(t: torch.Tensor) -> max.driver.Buffer:
             # This approach fails when passing the tensor across threads.
             # Fall back to letting torch slowly sync streams.
             return max.driver.Buffer.from_dlpack(t)
+    if t.device.type == "mojo":
+        # `Tensor.__dlpack_device__` (torch/_tensor.py) checks the device
+        # type string literal "privateuse1", not the *renamed* backend name
+        # ("mojo") -- a real torch gap for a renamed PrivateUse1 backend, so
+        # it (and the 1-arg `Buffer.from_dlpack`, which calls it first) raise
+        # "Unknown device type mojo for Dlpack". `Tensor.__dlpack__()` itself
+        # is unaffected (its C++ implementation keys off the DeviceType enum,
+        # not the name), so build the capsule through it directly and hand
+        # MAX the device/stream explicitly, exactly like the CUDA branch
+        # above. No fallback: unlike CUDA, `Buffer.from_dlpack(t)` would hit
+        # the very same broken device query.
+        device = _max_device_for_mojo(t.device)
+        if device.label == "cpu":
+            # The explicit-device/stream `_from_dlpack` overload below is
+            # GPU-only (it raises "unsupported device type in dlpack
+            # implementation" for a CPU `device`), and the MAX-CPU mojo
+            # device's memory is already host RAM, so there is nothing to
+            # gain from a cleverer path: hand MAX a real torch CPU tensor
+            # (a plain host-to-host copy, not the zero-copy exchange the
+            # GPU case below gets).
+            return max.driver.Buffer.from_dlpack(t.cpu())
+        if device_module.get_device_properties(t.device).api == "metal":
+            device_module.synchronize(t.device)
+            return max.driver.Buffer.from_dlpack(_MetalDLPackInput(t, device.id))
+        # the vendor handle of the current mojo stream (torch.Stream's own
+        # native_handle exists only from torch 2.11)
+        stream = device_module.stream_native_handle(
+            torch.accelerator.current_stream(t.device)
+        )
+        data = t.__dlpack__()
+        return max.driver.Buffer._from_dlpack(data, device, stream)
     return max.driver.Buffer.from_dlpack(t)
