@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import max.driver
 import max.graph.value
+import numpy as np
 import torch
 from functorch.compile import make_boxed_func
 from max import engine
@@ -23,6 +24,7 @@ from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
     CURRENT_FX_NODE,
     DECOMPOSITION_TABLE,
+    GRAPH_SEEDED_OPS,
     MAPPING_TORCH_ATEN_TO_MOJO,
     torch_device_to_max_device,
 )
@@ -196,17 +198,26 @@ class _GraphFactory:
         self.expression_to_node_name: dict[str, str] = {}
         self.replace_inputs = replace_inputs
         self.force_device = force_device
+        # Whether the graph takes one trailing uint64 seed input (a random op
+        # of GRAPH_SEEDED_OPS is in it; set by create_graph).
+        self.takes_seed = False
 
     def initialize_graph(self):
         if self.graph is not None:
             raise RuntimeError("Graph has already been initialized.")
 
+        if self.takes_seed:
+            self.graph_inputs.append(max_ops.random.SeedType(DeviceRef.CPU()))
         self.graph = Graph(
             "torch_mojo_backend",
             input_types=self.graph_inputs,
             kernel_library=global_max_objects().kernel_library,
         ).__enter__()
         self._graph_open = True
+        if self.takes_seed:
+            # A constant seed would make every execution draw the same
+            # numbers; the caller feeds a fresh one per call (graph_seed()).
+            max_ops.random.set_seed(self.graph.inputs[-1].tensor)
         # Let's fill the tensor book
         for tensor_name, idx in self.names_to_input_idx.items():
             self.tensor_book[tensor_name] = self.graph.inputs[idx]
@@ -404,6 +415,10 @@ class _GraphFactory:
         self, graph: torch.fx.Graph
     ) -> tuple[Graph, list[tuple[OutputBlueprintKind, int | None]]]:
         output_blueprint = None
+        self.takes_seed = any(
+            node.op == "call_function" and node.target in GRAPH_SEEDED_OPS
+            for node in graph.nodes
+        )
         try:
             for node_idx, node in enumerate(graph.nodes):
                 if node.op == "placeholder":
@@ -540,7 +555,9 @@ class BaseMaxCompiler:
             gather_stats_on_graph(gm)
             gm.graph.print_tabular()
 
-        graph, self.output_blueprint = _GraphFactory().create_graph(gm.graph)
+        factory = _GraphFactory()
+        graph, self.output_blueprint = factory.create_graph(gm.graph)
+        self.takes_seed = factory.takes_seed
         if verbose_enabled():
             print(graph)
         if profiling_enabled():
@@ -579,6 +596,8 @@ class BaseMaxCompiler:
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
+        if self.takes_seed:
+            input_tensors.append(graph_seed())
         outputs = self.model.execute(*input_tensors)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
@@ -609,6 +628,14 @@ class BaseMaxCompiler:
             )
             print(f"Running the Max graph in {inference_duration}")
         return result
+
+
+def graph_seed() -> max.driver.Buffer:
+    """A fresh seed for one execution of a graph with random ops, drawn from
+    torch's default CPU generator so `torch.manual_seed` makes compiled
+    sampling reproducible."""
+    seed = torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64)
+    return max.driver.Buffer.from_numpy(seed.numpy().view(np.uint64))
 
 
 # Cross-call Buffer cache. Graph inputs are dominated by parameters, which

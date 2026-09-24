@@ -82,7 +82,8 @@ COVERS: dict[str, str] = {
     "aten::sort.stable": "test_sort",
     "aten::nonzero": "test_nonzero",
     "aten::multinomial": "test_multinomial",
-    "aten::multinomial.out": "test_multinomial (same kernel, out= overload)",
+    "aten::median.dim": "test_median",
+    "aten::kthvalue": "test_kthvalue",
 }
 
 _SAME_KERNEL_OUT = (
@@ -92,6 +93,20 @@ _SAME_KERNEL_OUT = (
 SKIPPED: dict[str, str] = {
     "aten::topk.values": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,
+    "aten::multinomial.out": _SAME_KERNEL_OUT,
+    "aten::median.dim_values": _SAME_KERNEL_OUT,
+    "aten::kthvalue.values": _SAME_KERNEL_OUT,
+    "aten::nanmedian.dim_values": _SAME_KERNEL_OUT,
+    "aten::nanmedian.dim": (
+        "median.dim's launches (the full sort, then one read per row) with the "
+        "NaN-skipping select mode: the same binary search median.dim already "
+        "runs on every float row"
+    ),
+    "aten::median": (
+        "median.dim's kernels over the flattened tensor as one row: the same "
+        "full-sort route test_median and test_sort measure"
+    ),
+    "aten::nanmedian": "aten::median's route with nanmedian.dim's select mode",
 }
 
 
@@ -371,10 +386,16 @@ def test_sort(
     )
 
 
-# The HF `generate()` regime this op exists for: batch 1, a GPT-2-sized
-# vocabulary, one sample with replacement -- one draw per decode step.
+# The HF `generate()` regime this op exists for is the first: batch 1, a
+# GPT-2-sized vocabulary, one sample -- one draw per decode step (ATen's
+# fast path: exponential_, div, argmax). _NOREP takes the same path with
+# topk for the argmax; _REP with more than one sample is the inverse-CDF
+# kernel of its own.
 MULTINOMIAL_SHAPES: dict[str, tuple[tuple[int, ...], int, bool]] = {
-    "V_1x50304_N1": ((1, 50304), 1, True)
+    "V_1x50304_N1": ((1, 50304), 1, True),
+    "V_8x50304_N4_NOREP": ((8, 50304), 4, False),
+    "V_8x50304_N64_REP": ((8, 50304), 64, True),
+    "A_357x789_N3_REP": ((357, 789), 3, True),
 }
 
 
@@ -388,11 +409,56 @@ def test_multinomial(
     # draw from independent RNG streams, so the sampled INDICES are never
     # compared here -- only how long each backend takes to produce them.
     # Correctness (determinism, distribution, ATen edge semantics) is
-    # covered in tests/native/test_random.py.
+    # covered in tests/native/test_factories.py.
     shape, num_samples, replacement = MULTINOMIAL_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
         lambda: torch.multinomial(x_ref, num_samples, replacement=replacement),
         lambda: torch.multinomial(x_our, num_samples, replacement=replacement),
+        flops=float(x_ref.numel()),
+    )
+
+
+# One order statistic per row, read off the sort kernel: median's rows are
+# sorted whole (V_: a vocabulary row, several tiles; S_: one tile per row),
+# kthvalue's small k takes the topk tournament and its middle k the full sort.
+MEDIAN_SHAPES: dict[str, tuple[int, ...]] = {
+    "V_8x50304": (8, 50304),
+    "S_4096x4096": (4096, 4096),
+    "A_357x789": (357, 789),
+}
+KTHVALUE_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
+    "V_8x50304_K50": ((8, 50304), 50),
+    "V_8x50304_K25152": ((8, 50304), 25152),
+    "A_357x789_K32": ((357, 789), 32),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", MEDIAN_SHAPES)
+@pytest.mark.bench_op("median.dim")
+def test_median(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = MEDIAN_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.median(x_ref, dim=-1),
+        lambda: torch.median(x_our, dim=-1),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", KTHVALUE_SHAPES)
+@pytest.mark.bench_op("kthvalue")
+def test_kthvalue(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, k = KTHVALUE_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.kthvalue(x_ref, k, dim=-1),
+        lambda: torch.kthvalue(x_our, k, dim=-1),
         flops=float(x_ref.numel()),
     )

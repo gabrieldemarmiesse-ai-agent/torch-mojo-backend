@@ -23,6 +23,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
+from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -41,6 +42,7 @@ from tmb.backend.abi import (
     dtype_itemsize,
     dtype_name,
     max_dtype,
+    new_scalar,
     new_tensor,
     own,
     release,
@@ -60,10 +62,13 @@ from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_overlap,
     cast_into,
     cast_to,
     check_out,
+    contiguous,
     copy_strided_into,
+    fill_value,
     resize_out,
 )
 from tmb.backend.registry import Site, impl
@@ -1369,10 +1374,16 @@ def _sort_rows_into(
     descending: Bool,
     values: T,
     indices: T,
+    select_mode: Int = -1,
+    select_pos: Int = 0,
 ) raises:
     """Run the kernel over `rows` contiguous rows of `n` elements of `src`,
     writing the first `out_k` of each sorted row into the contiguous
-    `values` / `indices`."""
+    `values` / `indices` -- or, with a `select_mode` (the sort family's
+    `SELECT_*`, ascending only), the one element that mode reads from each
+    row of `out_k` sorted elements into `values` / `indices` of `rows`."""
+    var select = select_mode >= 0
+    var per_row = 1 if select else out_k
     var tile = SORT_TILE_64 if dtype_itemsize(kdt) == 8 else SORT_TILE_32
     var tiles = (n + tile - 1) // tile
     var n_pow2 = 1
@@ -1402,10 +1413,10 @@ def _sort_rows_into(
     var r0 = 0
     while r0 < rows:
         var r = min(chunk, rows - r0)
-        var call = KernelCall("sort", "Sort")
+        var call = KernelCall("sort", "SortSelect" if select else "Sort")
         call.arg_dtype(0, kdt)
-        call.int(values.ptr + r0 * out_k * values.itemsize)
-        call.int(indices.ptr + r0 * out_k * 8)
+        call.int(values.ptr + r0 * per_row * values.itemsize)
+        call.int(indices.ptr + r0 * per_row * 8)
         call.int(src.ptr + r0 * n * src.itemsize)
         call.int(keys.t.ptr)
         call.int(scratch.t.ptr)
@@ -1414,7 +1425,11 @@ def _sort_rows_into(
         call.int(out_k)
         call.int(pad)
         call.int(route)
-        call.int(1 if descending else 0)
+        if select:
+            call.int(select_pos)
+            call.int(select_mode)
+        else:
+            call.int(1 if descending else 0)
         call.int(dtype_code(kdt))
         call.int(cp)
         call.run()
@@ -1605,6 +1620,324 @@ def op_sort_values_stable(
     )
 
 
+# ---------------------------------------------------------------------------
+# kthvalue / median / nanmedian: one order statistic per row, read off the
+# sort kernel's total (key, index) order by its `SortSelect` op -- the same
+# routes as sort/topk (kthvalue takes the topk tournament when k is small),
+# then one element per row instead of the gather. That order is also what
+# makes the answers ATen's: a tie resolves to the LOWEST index of the tied
+# value (CPU's `nth_element` comparator for median), every NaN sorts after
+# every number, and `median` returns the lower middle and propagates NaN as
+# the row's first NaN (value and index), as CPU torch does.
+# ---------------------------------------------------------------------------
+
+# Mirrored from SELECT_* in tmb/kernels/sort/entry.mojo.
+comptime SELECT_KTH = 0
+comptime SELECT_MEDIAN = 1
+comptime SELECT_NANMEDIAN = 2
+
+
+def _order_stat_dtype(a: T, what: StaticString) raises -> DType:
+    """ATen dispatches these over ALL_TYPES + half/bfloat16: bool raises the
+    dispatcher's own error, everything else rides the sort specializations."""
+    if a.dtype == DType.bool:
+        raise Error('"', what, "\" not implemented for 'Bool'")
+    return _sort_kernel_dtype(a, what)
+
+
+def _order_stat_shape(
+    a: T, dim: Int, keepdim: Bool
+) -> Tuple[IndexList[MAX_RANK], Int]:
+    """The (shape, rank) of a one-per-row result along `dim`."""
+    if a.rank == 0:
+        return (a.shape, 0)
+    if keepdim:
+        return (_selected_shape(a, dim, 1), a.rank)
+    var shape = IndexList[MAX_RANK](1)
+    var rank = a.rank - 1
+    var w = 0
+    for d in range(a.rank):
+        if d != dim:
+            shape[MAX_RANK - rank + w] = a.dim(d)
+            w += 1
+    return (shape, rank)
+
+
+def _order_stat_rows_into(
+    src: T,
+    kdt: DType,
+    rows: Int,
+    n: Int,
+    k: Int,
+    mode: Int,
+    values: T,
+    indices: T,
+) raises:
+    """The k-th smallest (1-based; median's lower middle is k = (n+1)//2) of
+    each of the `rows` contiguous rows of `src`. Only kthvalue can stop at a
+    top-k tournament; the median modes need the whole row sorted, and on a
+    non-float dtype (no NaN) they are that plain k-th smallest."""
+    var m = mode if kdt.is_floating_point() else SELECT_KTH
+    var topk = mode == SELECT_KTH
+    _sort_rows_into(
+        src,
+        kdt,
+        rows,
+        n,
+        k if topk else n,
+        topk,
+        False,
+        values,
+        indices,
+        m,
+        k - 1,
+    )
+
+
+def _order_stat_into(
+    a: T,
+    what: StaticString,
+    dim: Int,
+    k: Int,
+    mode: Int,
+    values: T,
+    indices: T,
+) raises:
+    """Along the normalized `dim` of `a`, into the fresh contiguous `values`
+    / `indices` of the result shape (whose element order is the row order of
+    `a` with `dim` moved last, whether or not `dim` was kept)."""
+    var kdt = _order_stat_dtype(a, what)
+    var n = a.dim(dim) if a.rank > 0 else 1
+    if n > SORT_MAX_ROW:
+        unsupported(String(what) + " of a row longer than 2**31 - 1")
+    if values.numel == 0:
+        return
+    var rows = a.numel // n
+    var last = a.rank <= 1 or dim == a.rank - 1
+    var src = _borrow(a)
+    if a.rank > 0 and not (last and a.contig):
+        var dims = List[Int]()
+        dims.append(dim)
+        src.replace(_permuted_contiguous(a, dims), True)
+    _order_stat_rows_into(src.t, kdt, rows, n, k, mode, values, indices)
+    _ = src^  # alive past the launches
+
+
+def _order_stat_dim(a: T, dim_in: Int) raises -> Int:
+    """`maybe_wrap_dim` plus ATen's `zero_numel_check_dims`."""
+    var dim = _sort_dim(a, dim_in)
+    if a.rank > 0 and a.dim(dim) == 0:
+        raise Error(
+            "median(): Expected reduction dim ",
+            dim,
+            " to have non-zero size.",
+        )
+    return dim
+
+
+def _order_stat(
+    a: T, what: StaticString, dim: Int, keepdim: Bool, k: Int, mode: Int
+) raises -> Tuple[Owned, Owned]:
+    _require_mojo(a)
+    var sr = _order_stat_shape(a, dim, keepdim)
+    var values = own(new_tensor(sr[0], sr[1], a.stype, a.device))
+    var indices = own(new_tensor(sr[0], sr[1], ST_INT64, a.device))
+    _order_stat_into(a, what, dim, k, mode, values.t, indices.t)
+    return (values^, indices^)
+
+
+def _order_stat_out(
+    a: T,
+    what: StaticString,
+    dim: Int,
+    keepdim: Bool,
+    k: Int,
+    mode: Int,
+    var out_v: T,
+    var out_i: T,
+    rets: Values,
+) raises:
+    """The `values=`/`indices=` overloads, as `_select_out` does them."""
+    _require_mojo(a)
+    check_out(out_v, a)
+    if out_i.stype != ST_INT64:
+        raise Error(
+            "Expected out tensor to have dtype long int, but got ",
+            dtype_name(out_i.stype),
+            " instead",
+        )
+    _one_device(a, out_v)
+    _one_device(a, out_i)
+    var sr = _order_stat_shape(a, dim, keepdim)
+    var numel = _shape_numel(sr[0], sr[1])
+    if not _shape_matches(out_v, sr[0], sr[1]):
+        resize_out(out_v, sr[0], sr[1])
+    if not _shape_matches(out_i, sr[0], sr[1]):
+        resize_out(out_i, sr[0], sr[1])
+    if _out_ready(out_v, a, a.stype, numel) and _out_ready(
+        out_i, a, ST_INT64, numel
+    ):
+        _order_stat_into(a, what, dim, k, mode, out_v, out_i)
+    else:
+        var pair = _order_stat(a, what, dim, keepdim, k, mode)
+        copy_strided_into(out_v, pair[0].t)
+        copy_strided_into(out_i, pair[1].t)
+        _ = pair^  # alive past the launches
+    ret_ref(rets, 0, out_v)
+    ret_ref(rets, 1, out_i)
+
+
+def _kth_k(a: T, dim: Int, k: Int) raises -> Int:
+    var size = a.dim(dim) if a.rank > 0 else 1
+    if a.rank > 0 and size == 0:
+        raise Error(
+            "kthvalue(): Expected reduction dim ",
+            dim,
+            " to have non-zero size.",
+        )
+    if k < 1 or k > size:
+        raise Error(
+            "kthvalue(): selected number k out of range for dimension ", dim
+        )
+    return k
+
+
+def _median_k(a: T, dim: Int) -> Int:
+    var size = a.dim(dim) if a.rank > 0 else 1
+    return (size + 1) // 2
+
+
+# aten::kthvalue(Tensor self, SymInt k, int dim=-1, bool keepdim=False)
+#   -> (Tensor values, Tensor indices)
+def op_kthvalue(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = _sort_dim(a, v_int_or(args[unsafe_offset=2], -1))
+    var k = _kth_k(a, dim, v_int(args[unsafe_offset=1]))
+    var keepdim = v_bool_or(args[unsafe_offset=3], False)
+    var pair = _order_stat(a, "kthvalue_cpu", dim, keepdim, k, SELECT_KTH)
+    ret_owned(rets, 0, pair[0])
+    ret_owned(rets, 1, pair[1])
+
+
+# aten::kthvalue.values(Tensor self, SymInt k, int dim=-1, bool keepdim=False,
+#   *, Tensor(a!) values, Tensor(b!) indices)
+#   -> (Tensor(a!) values, Tensor(b!) indices)
+def op_kthvalue_values(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = _sort_dim(a, v_int_or(args[unsafe_offset=2], -1))
+    var k = _kth_k(a, dim, v_int(args[unsafe_offset=1]))
+    assert_no_overlap(v_tensor(args[unsafe_offset=4]), a)
+    _order_stat_out(
+        a,
+        "kthvalue_cpu",
+        dim,
+        v_bool_or(args[unsafe_offset=3], False),
+        k,
+        SELECT_KTH,
+        v_tensor(args[unsafe_offset=4]),
+        v_tensor(args[unsafe_offset=5]),
+        rets,
+    )
+
+
+def _median_dim(
+    args: Values, rets: Values, mode: Int, what: StaticString
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = _order_stat_dim(a, v_int(args[unsafe_offset=1]))
+    var keepdim = v_bool_or(args[unsafe_offset=2], False)
+    var pair = _order_stat(a, what, dim, keepdim, _median_k(a, dim), mode)
+    ret_owned(rets, 0, pair[0])
+    ret_owned(rets, 1, pair[1])
+
+
+def _median_dim_values(
+    args: Values, rets: Values, mode: Int, what: StaticString
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = _order_stat_dim(a, v_int(args[unsafe_offset=1]))
+    _order_stat_out(
+        a,
+        what,
+        dim,
+        v_bool_or(args[unsafe_offset=2], False),
+        _median_k(a, dim),
+        mode,
+        v_tensor(args[unsafe_offset=3]),
+        v_tensor(args[unsafe_offset=4]),
+        rets,
+    )
+
+
+def _median_all(args: Values, rets: Values, mode: Int) raises:
+    """median() / nanmedian(): the whole tensor as one row, a 0-d value (NaN
+    for an empty float tensor, as ATen returns)."""
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    var kdt = _order_stat_dtype(a, "median_cpu")
+    var value = own(new_scalar(a.stype, a.device))
+    if a.numel == 0:
+        if not kdt.is_floating_point():
+            unsupported("median of an empty integer tensor")
+        fill_value(value.t, nan[DType.float64]())
+        ret_owned(rets, 0, value)
+        return
+    if a.numel > SORT_MAX_ROW:
+        unsupported("median of more than 2**31 - 1 elements")
+    var index = own(new_scalar(ST_INT64, a.device))
+    var src = Operand(contiguous(a), not a.contig)
+    _order_stat_rows_into(
+        src.t, kdt, 1, a.numel, (a.numel + 1) // 2, mode, value.t, index.t
+    )
+    _ = src^  # alive past the launches
+    _ = index^
+    ret_owned(rets, 0, value)
+
+
+# aten::median.dim(Tensor self, int dim, bool keepdim=False)
+#   -> (Tensor values, Tensor indices)
+def op_median_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _median_dim(args, rets, SELECT_MEDIAN, "median_out")
+
+
+# aten::median.dim_values(Tensor self, int dim, bool keepdim=False, *,
+#   Tensor(a!) values, Tensor(b!) indices)
+#   -> (Tensor(a!) values, Tensor(b!) indices)
+def op_median_dim_values(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _median_dim_values(args, rets, SELECT_MEDIAN, "median_out")
+
+
+# aten::median(Tensor self) -> Tensor
+def op_median(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _median_all(args, rets, SELECT_MEDIAN)
+
+
+# aten::nanmedian.dim(Tensor self, int dim, bool keepdim=False)
+#   -> (Tensor values, Tensor indices)
+def op_nanmedian_dim(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _median_dim(args, rets, SELECT_NANMEDIAN, "median_out")
+
+
+# aten::nanmedian.dim_values(Tensor self, int dim, bool keepdim=False, *,
+#   Tensor(a!) values, Tensor(b!) indices)
+#   -> (Tensor(a!) values, Tensor(b!) indices)
+def op_nanmedian_dim_values(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _median_dim_values(args, rets, SELECT_NANMEDIAN, "median_out")
+
+
+# aten::nanmedian(Tensor self) -> Tensor
+def op_nanmedian(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _median_all(args, rets, SELECT_NANMEDIAN)
+
+
 def register_reductions(site: Site) raises:
     impl[op_all, "all"](site)
     impl[op_all_dim, "all.dim"](site)
@@ -1618,15 +1951,23 @@ def register_reductions(site: Site) raises:
     impl[op_argmax, "argmax"](site)
     impl[op_argmin, "argmin"](site)
     impl[op_cumsum, "cumsum"](site)
+    impl[op_kthvalue, "kthvalue"](site)
+    impl[op_kthvalue_values, "kthvalue.values"](site)
     impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
     impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
     impl[op_max, "max"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
     impl[op_mean_out, "mean.out"](site)
+    impl[op_median, "median"](site)
+    impl[op_median_dim, "median.dim"](site)
+    impl[op_median_dim_values, "median.dim_values"](site)
     impl[op_min, "min"](site)
     impl[op_min_dim, "min.dim"](site)
     impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_nanmedian, "nanmedian"](site)
+    impl[op_nanmedian_dim, "nanmedian.dim"](site)
+    impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
     impl[op_sort_stable, "sort.stable"](site)
     impl[op_sort_values_stable, "sort.values_stable"](site)
     impl[op_sum_dim_intlist, "sum.dim_IntList"](site)

@@ -19,7 +19,10 @@ import max.graph.type as max_type
 import torch
 from max.dtype import DType
 from max.experimental import functional as F
-from max.experimental.random import gaussian as max_gaussian
+from max.experimental.random import (
+    gaussian as max_gaussian,
+    uniform_like as _uniform_like,
+)
 from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
@@ -378,6 +381,73 @@ def _kth_smallest(
         value = F.squeeze(value, axis=axis)
         index = F.squeeze(index, axis=axis)
     return value, index
+
+
+def _nan_last_order(
+    input: MaxTensor, axis: int, size: int
+) -> tuple[MaxTensor, MaxTensor]:
+    """`(values, indices)` of the whole of `axis` in ascending order with
+    every NaN after every number, ties (NaNs included) in index order.
+
+    Two stable passes, since a NaN has no value to sort by: the numbers by
+    value (NaN keyed +inf), then that order by is-NaN, which moves the NaNs
+    behind a real +inf without reordering anything else."""
+    is_nan = F.cast(F.is_nan(input), DType.int32)
+    key = _where(is_nan > 0, aten_full_like(input, float("inf")), input)
+    _, by_value = _select_sorted_k(key, size, axis, False)
+    nan_in_order = aten_gather(is_nan, axis, by_value)
+    _, by_nan = _select_sorted_k(nan_in_order, size, axis, False)
+    indices = aten_gather(by_value, axis, by_nan)
+    return aten_gather(input, axis, indices), indices
+
+
+def _median_along(
+    input: MaxTensor, dim: int, keepdim: bool, ignore_nan: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """median.dim / nanmedian.dim: the lower of the two middle values.
+
+    median propagates NaN the way CPU torch does -- a row holding any NaN
+    returns (nan, index of its FIRST NaN) -- and nanmedian takes the lower
+    middle of the row's numbers only (nan, index 0 for an all-NaN row).
+    Number ties resolve to the lowest index, as CPU's comparator does.
+    """
+    axis, size = _reduction_dim_and_size("median", input, dim)
+    zero_d = len(input.shape) == 0
+    if zero_d:
+        input = F.unsqueeze(input, axis=0)
+    if not input.dtype.is_float():
+        value, index = _kth_smallest(input, (size + 1) // 2, axis, True)
+    else:
+        values, indices = _nan_last_order(input, axis, size)
+        num_nan = _reduce_sum(F.cast(F.is_nan(input), DType.int64), axis=axis)
+        if ignore_nan:
+            # (size - num_nan - 1) / 2 truncated toward zero, as in C++.
+            numbers = F.max(size - 1 - num_nan, aten_full_like(num_nan, 0))
+            # `//` promotes to float64 in MAX; the halves are exact there.
+            position = F.cast(numbers // 2, DType.int64)
+        else:
+            middle = aten_full_like(num_nan, (size - 1) // 2)
+            position = _where(num_nan > 0, size - num_nan, middle)
+        value = aten_gather(values, axis, position)
+        index = aten_gather(indices, axis, position)
+    if zero_d or not keepdim:
+        value = F.squeeze(value, axis=axis)
+        index = F.squeeze(index, axis=axis)
+    return value, index
+
+
+def _median_all(input: MaxTensor, ignore_nan: bool) -> MaxTensor:
+    """median() / nanmedian(): the flattened tensor's lower middle, NaN for
+    an empty one (as ATen returns)."""
+    numel = 1
+    for d in input.shape:
+        if not isinstance(d, StaticDim):
+            raise NotImplementedError("median() needs a statically known shape")
+        numel *= int(d)
+    if numel == 0:
+        return F.constant(float("nan"), dtype=input.dtype, device=input.device)
+    value, _ = _median_along(F.reshape(input, [numel]), 0, False, ignore_nan)
+    return value
 
 
 def _sort_impl(
@@ -3014,9 +3084,8 @@ def aten_isnan(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "isnan")
 
 
-# aten::kthvalue(Tensor self, SymInt k, int dim=-1, bool keepdim=False) -> (Tensor values, Tensor indices)
-# aten::kthvalue.values(Tensor self, SymInt k, int dim=-1, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
-@map_to(aten.kthvalue)
+# kthvalue(Tensor self, SymInt k, int dim=-1, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.kthvalue.default)
 def aten_kthvalue(
     self: MaxTensor, k: int, dim: int = -1, keepdim: bool = False
 ) -> tuple[MaxTensor, MaxTensor]:
@@ -3273,47 +3342,6 @@ def aten_maximum(x: MaxTensor, y: MaxTensor) -> MaxTensor:
     return F.max(x, y)
 
 
-# aten::median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
-# aten::median.dim_values(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) values, Tensor(b!) indices) -> (Tensor(a!) values, Tensor(b!) indices)
-@map_to(aten.median)
-def aten_median_dim(
-    self: MaxTensor, dim: int, keepdim: bool = False
-) -> tuple[MaxTensor, MaxTensor]:
-    """The lower of the two middle values (ATen's median.dim, not a mean).
-
-    One real ATen quirk beyond order statistics: if the row has ANY NaN, the
-    whole result becomes (nan, index of the FIRST NaN) rather than whatever
-    the order-statistic position would naively land on -- verified against
-    CPU torch.median, including a row with a single NaN far from the median
-    position. `_select_sorted_k(..., largest=False)` already returns
-    (value, index) together, so `bottom_k(key, 1)` on an (isnan ? -1 : 0) key
-    finds the first NaN's index directly (ties broken by the kernel's own
-    stable order, ascending original index) and its value (-1 vs 0) says
-    whether one was present at all -- the same composition as the mojo eager
-    device's `fast_aten_median_dim`, no new kernel either side.
-    """
-    axis, size = _reduction_dim_and_size("median", self, dim)
-    k = (size + 1) // 2
-    value, index = _kth_smallest(self, k, axis, True)
-
-    if self.dtype.is_float():
-        key = -F.cast(F.is_nan(self), dtype=DType.int32)
-        min_key, first_nan_index = _select_sorted_k(key, 1, axis, False)
-        has_nan = min_key < 0
-        # `F.where`'s scalar-branch coercion takes ITS dtype from `cond`
-        # (bool here), not from the other branch, so a bare `float("nan")`
-        # scalar fails to embed -- fill a same-dtype-as-`value` constant
-        # first instead.
-        nan_fill = aten_full_like(value, float("nan"))
-        value = _where(has_nan, nan_fill, value)
-        index = _where(has_nan, first_nan_index, index)
-
-    if not keepdim:
-        value = F.squeeze(value, axis=axis)
-        index = F.squeeze(index, axis=axis)
-    return value, index
-
-
 # mean(Tensor self, *, ScalarType? dtype=None) -> Tensor
 # mean.dim(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
 @map_to(aten.mean)
@@ -3366,6 +3394,20 @@ def aten_mean_out(
     return aten_mean(input, dim=dim, keepdim=keepdim, dtype=dtype)
 
 
+# median(Tensor self) -> Tensor
+@map_to(aten.median.default)
+def aten_median(self: MaxTensor) -> MaxTensor:
+    return _median_all(self, ignore_nan=False)
+
+
+# median.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.median.dim)
+def aten_median_dim(
+    self: MaxTensor, dim: int, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _median_along(self, dim, keepdim, ignore_nan=False)
+
+
 # min.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
 @map_to(aten.min)
 def aten_min(
@@ -3414,34 +3456,83 @@ def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
     return promoted_input * other
 
 
-# aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor
-@map_to(aten.multinomial)
+# multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor
+@map_to(aten.multinomial.default)
 def aten_multinomial(
     self: MaxTensor,
     num_samples: int,
     replacement: bool = False,
     *,
-    generator: object = None,
+    generator: torch.Generator | None = None,
 ) -> MaxTensor:
-    # Declined here the same way aten::rand/randn/randperm still are
-    # (unregistered, further up this file): a graph-mode draw would come
-    # from MAX's own internal random state, which does not tie into torch's
-    # per-device Philox generator the way the mojo eager device's does
-    # (torch_mojo_backend/mojo_device/aten_ops/rng.py -- see
-    # `fast_aten_multinomial`), so `torch.manual_seed` could not reproduce
-    # it. Sample outside the compiled region instead, on a mojo-device
-    # tensor -- which is what HF `generate()` already does; the logits
-    # computation is what benefits from torch.compile, not the sampling
-    # step.
-    del num_samples, replacement, generator
-    raise NotImplementedError(
-        "aten::multinomial is not supported by the MAX graph backend: its "
-        "internal RNG state does not tie into torch's per-device generator, "
-        "so torch.manual_seed could not reproduce a graph-mode draw the way "
-        "it reproduces the mojo eager device's aten::multinomial. Run "
-        "sampling eagerly on a mojo-device tensor instead (outside the "
-        "torch.compile'd region), which is what HF generate() already does."
-    )
+    """Gumbel-max sampling: `argmax(log p + G)` with G ~ Gumbel(0, 1) is one
+    draw from p, and the top `num_samples` of one perturbed row are a draw
+    without replacement. A zero-probability category scores -inf, so it is
+    never drawn while a positive one is left.
+
+    The uniforms come from MAX's own generator, seeded per execution from
+    torch's default generator (`GRAPH_SEEDED_OPS`, compiler.py), so
+    `torch.manual_seed` makes a compiled draw reproducible -- but not equal
+    to an eager one: the streams differ. The graph cannot raise on a bad
+    distribution (negative / non-finite entries, a zero row): that would
+    need a host readback, which the eager device does and a graph cannot.
+    """
+    if generator is not None:
+        raise NotImplementedError(
+            "aten::multinomial does not support the generator argument in the "
+            "MAX graph backend"
+        )
+    rank = len(self.shape)
+    if rank not in (1, 2):
+        raise RuntimeError("prob_dist must be 1 or 2 dim")
+    if not self.dtype.is_float():
+        raise RuntimeError(
+            "multinomial only supports floating-point dtypes for input, got: "
+            f"{self.dtype}"
+        )
+    if not isinstance(num_samples, int):
+        raise NotImplementedError(
+            f"multinomial needs a statically known num_samples, got {num_samples!r}"
+        )
+    if num_samples <= 0:
+        raise RuntimeError("cannot sample n_sample <= 0 samples")
+    n_categories = self.shape[-1]
+    if not isinstance(n_categories, StaticDim):
+        raise NotImplementedError(
+            "multinomial needs a statically known number of categories"
+        )
+    if not replacement and num_samples > int(n_categories):
+        raise RuntimeError(
+            "cannot sample n_sample > prob_dist.size(-1) samples without replacement"
+        )
+    probs = F.cast(self, DType.float32)
+    neg_inf = aten_full_like(probs, float("-inf"))
+    log_p = _where(probs > 0, aten_log(probs), neg_inf)
+    draws_shape = list(probs.shape)
+    if replacement and num_samples > 1:
+        # One independent perturbed copy of the row per sample.
+        log_p = F.unsqueeze(log_p, axis=-2)
+        draws_shape.insert(-1, num_samples)
+    like = max_type.TensorType(DType.float32, draws_shape, device=probs.device)
+    if isinstance(probs, TensorValue):
+        uniform = max_ops.random.uniform(like, range=(0.0, 1.0))
+    else:
+        uniform = _uniform_like(like, range=(0.0, 1.0))
+    # u == 0 would make the noise -inf for every category of a row alike;
+    # the clamp keeps it finite without moving any other draw.
+    uniform = F.max(uniform, aten_full_like(uniform, 1e-30))
+    scores = log_p - aten_log(-aten_log(uniform))
+    if not replacement and num_samples > 1:
+        _, indices = _select_sorted_k(scores, num_samples, rank - 1, True)
+        return indices
+    if num_samples == 1:
+        return aten_argmax(scores, dim=-1, keepdim=True)
+    return aten_argmax(scores, dim=-1, keepdim=False)
+
+
+# The ops whose graph needs a per-execution seed (compiler.py adds a uint64
+# graph input for it, drawn from torch's default generator at every call).
+GRAPH_SEEDED_OPS = frozenset({aten.multinomial.default})
 
 
 def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
@@ -3456,6 +3547,20 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
     for axis in reduce_axes:
         var = _reduce_mean(var, axis=axis)
     return mean, var
+
+
+# nanmedian(Tensor self) -> Tensor
+@map_to(aten.nanmedian.default)
+def aten_nanmedian(self: MaxTensor) -> MaxTensor:
+    return _median_all(self, ignore_nan=True)
+
+
+# nanmedian.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)
+@map_to(aten.nanmedian.dim)
+def aten_nanmedian_dim(
+    self: MaxTensor, dim: int, keepdim: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _median_along(self, dim, keepdim, ignore_nan=True)
 
 
 # native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)

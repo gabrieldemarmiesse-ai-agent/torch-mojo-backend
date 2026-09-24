@@ -24,6 +24,14 @@
 #
 # Every size is a runtime argument; the only compile-time numbers are the
 # tile (a shared-memory budget) and the block width.
+#
+# `SortSelect` runs the same ascending routes and then, instead of gathering
+# the first k, reads ONE position per row (`_select_kernel`): kthvalue's
+# k-th smallest, median's lower middle, nanmedian's lower middle of the
+# non-NaN prefix.  The total order is also what makes those answers ATen's:
+# ties resolve to the lowest index of the tied value (CPU's
+# `nth_element` comparator), and every NaN sorts last, lowest index first,
+# so the first NaN of a row is one binary search over the sorted keys away.
 # ===----------------------------------------------------------------------=== #
 
 from std.bit import next_power_of_two
@@ -52,6 +60,7 @@ from tmb.kernels.common.op_utils import (
     _raw_dtype_int,
     _raw_int,
     _spec_dispatcher13,
+    _spec_dispatcher14,
 )
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
@@ -432,12 +441,68 @@ def _gather_kernel[
         i += stride
 
 
-@always_inline
-def _sort_gpu[
-    dtype: DType, KT: DType, descending: Bool
+# What `_select_kernel` reads from each sorted row.
+comptime SELECT_KTH = 0  # the given position
+comptime SELECT_MEDIAN = 1  # the given position, or the first NaN if any
+comptime SELECT_NANMEDIAN = 2  # the lower middle of the non-NaN prefix
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GS_THREADS))
+)
+@__name(t"segsort_select_{dtype}_m{mode}_t{GS_THREADS}")
+def _select_kernel[
+    dtype: DType, KT: DType, mode: Int
 ](
     out_vals: Pointer[Scalar[dtype], MutAnyOrigin],
     out_idx: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_vals: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    keys: Pointer[Scalar[KT], ImmutAnyOrigin],
+    sorted_idx: Pointer[Scalar[DType.int32], ImmutAnyOrigin],
+    rows_arg: Int64,
+    n_arg: Int64,
+    pad_arg: Int64,
+    pos_arg: Int64,
+):
+    """One (value, int64 index) per ascending-sorted row.
+
+    Only a float row can hold the all-ones key below `n` (`_float_key` gives
+    it to NaN alone; the padding lanes sit at `n` and after), so the NaN
+    modes are compiled for float dtypes only and the others read `pos`.
+    """
+    var rows = Int(rows_arg)
+    var n = Int(n_arg)
+    var pad = Int(pad_arg)
+    var pos = Int(pos_arg)
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while row < rows:
+        var base = row * pad
+        var p = pos
+        comptime if mode != SELECT_KTH and dtype.is_floating_point():
+            var lo = 0
+            var hi = n
+            while lo < hi:
+                var mid = (lo + hi) >> 1
+                if keys[unsafe_offset=base + mid].eq(~Scalar[KT](0))[0]:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            comptime if mode == SELECT_MEDIAN:
+                if lo < n:
+                    p = lo
+            else:
+                p = (lo - 1) >> 1 if lo > 0 else 0
+        var src = Int(sorted_idx[unsafe_offset=base + p])
+        out_vals[unsafe_offset=row] = in_vals[unsafe_offset=row * n + src]
+        out_idx[unsafe_offset=row] = Int64(src)
+        row += stride
+
+
+@always_inline
+def _sort_pairs_gpu[
+    dtype: DType, KT: DType, descending: Bool
+](
     in_vals: Pointer[Scalar[dtype], ImmutAnyOrigin],
     keys: Pointer[Scalar[KT], MutAnyOrigin],
     scratch: Pointer[Scalar[DType.int32], MutAnyOrigin],
@@ -448,6 +513,8 @@ def _sort_gpu[
     route: Int,
     ctx: DeviceContext,
 ) raises:
+    """Leave each row's first `out_k` sorted (key, index) pairs at the start
+    of its `pad`-wide slice of `keys` / `scratch`."""
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
@@ -573,6 +640,27 @@ def _sort_gpu[
         else:
             raise Error("unknown sort route " + String(route))
 
+
+@always_inline
+def _sort_gpu[
+    dtype: DType, KT: DType, descending: Bool
+](
+    out_vals: Pointer[Scalar[dtype], MutAnyOrigin],
+    out_idx: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    in_vals: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    keys: Pointer[Scalar[KT], MutAnyOrigin],
+    scratch: Pointer[Scalar[DType.int32], MutAnyOrigin],
+    rows: Int,
+    n: Int,
+    out_k: Int,
+    pad: Int,
+    route: Int,
+    ctx: DeviceContext,
+) raises:
+    _sort_pairs_gpu[dtype, KT, descending](
+        in_vals, keys, scratch, rows, n, out_k, pad, route, ctx
+    )
+    comptime if has_accelerator():
         _enqueue_cached[_gather_kernel[dtype]](
             ctx,
             _gs_blocks(out_k),
@@ -582,7 +670,7 @@ def _sort_gpu[
             out_vals,
             out_idx,
             in_vals,
-            immutable_scratch,
+            scratch.as_imm(),
             Int64(n),
             Int64(pad),
             Int64(out_k),
@@ -642,6 +730,100 @@ def _dispatch_sort[
         )
 
 
+@always_inline
+def _dispatch_select[
+    dtype: DType
+](
+    out_vals_addr: Int,
+    out_idx_addr: Int,
+    in_addr: Int,
+    keys_addr: Int,
+    scratch_addr: Int,
+    rows: Int,
+    n: Int,
+    out_k: Int,
+    pad: Int,
+    route: Int,
+    pos: Int,
+    mode: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime KT = _KEY_DTYPE[dtype]
+    var out_vals = _make_ptr[dtype](out_vals_addr).as_unsafe_any_origin()
+    var out_idx = _make_ptr[DType.int64](out_idx_addr).as_unsafe_any_origin()
+    var in_vals = _make_ptr[dtype](in_addr).as_unsafe_any_origin().as_imm()
+    var keys = _make_ptr[KT](keys_addr).as_unsafe_any_origin()
+    var scratch = _make_ptr[DType.int32](scratch_addr).as_unsafe_any_origin()
+    _sort_pairs_gpu[dtype, KT, False](
+        in_vals, keys, scratch, rows, n, out_k, pad, route, ctx
+    )
+    comptime if has_accelerator():
+        comptime for m in range(3):
+            if mode == m:
+                _enqueue_cached[_select_kernel[dtype, KT, m]](
+                    ctx,
+                    _gs_blocks(rows),
+                    1,
+                    1,
+                    GS_THREADS,
+                    out_vals,
+                    out_idx,
+                    in_vals,
+                    keys.as_imm(),
+                    scratch.as_imm(),
+                    Int64(rows),
+                    Int64(n),
+                    Int64(pad),
+                    Int64(pos),
+                )
+
+
+def _select_go(
+    out_vals_obj: Arg,
+    out_idx_obj: Arg,
+    in_obj: Arg,
+    keys_obj: Arg,
+    scratch_obj: Arg,
+    rows_obj: Arg,
+    n_obj: Arg,
+    out_k_obj: Arg,
+    pad_obj: Arg,
+    route_obj: Arg,
+    pos_obj: Arg,
+    mode_obj: Arg,
+    dtype_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var mode = _raw_int(mode_obj)
+    if mode < 0 or mode > SELECT_NANMEDIAN:
+        raise Error("unknown sort select mode " + String(mode))
+    var handled = False
+    comptime for dt in SORT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _dispatch_select[dt](
+                    _raw_int(out_vals_obj),
+                    _raw_int(out_idx_obj),
+                    _raw_int(in_obj),
+                    _raw_int(keys_obj),
+                    _raw_int(scratch_obj),
+                    _raw_int(rows_obj),
+                    _raw_int(n_obj),
+                    _raw_int(out_k_obj),
+                    _raw_int(pad_obj),
+                    _raw_int(route_obj),
+                    _raw_int(pos_obj),
+                    mode,
+                    _raw_ctx(ctx_obj),
+                )
+                handled = True
+    if not handled:
+        raise Error(
+            "unsupported dtype specialization for sort select: " + String(dtype)
+        )
+
+
 def _sort_go(
     out_vals_obj: Arg,
     out_idx_obj: Arg,
@@ -691,6 +873,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
         comptime if _op_on["Sort"]():
             _spec_dispatcher13[_sort_go, "Sort"](argv, argc)
+            return 0
+        comptime if _op_on["SortSelect"]():
+            _spec_dispatcher14[_select_go, "SortSelect"](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
