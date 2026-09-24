@@ -1295,7 +1295,12 @@ small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
 the user output. AVG's 1/world is applied by the reduce-scatter to each input
 (NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
-in a half dtype. Broadcast uses the same RDMA path: the root's node fans
+in a half dtype. On gfx942 the node-local reduce of that split schedule runs
+on RCCL's 24 multi-node MI300A channels (`RS_NODES_BLOCKS_MI300A`) instead
+of the allreduce's 128/912: the collective is network-bound (15.4 MB/rank
+fp32 950 vs 951 µs at 128 vs 24 blocks, 2 × 4 MI300A, job 5447705), and the
+freed CUs go to the backward's GEMMs -- GPT-2 XL FSDP2 ABBA legs 22.0k/22.8k
+-> 23.2k/23.2k tokens/s. Broadcast uses the same RDMA path: the root's node fans
 out to its counterparts, then each node broadcasts locally. All-gather
 first gathers local contributions into a node block, then each rank sends
 only its own contribution to the same local rank on each remote node.

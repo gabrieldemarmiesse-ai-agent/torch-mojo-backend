@@ -4,6 +4,7 @@ from std.collections import InlineArray
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from max.gpu.host import DeviceContext, DeviceStream
 from std.sys import size_of
+from std.sys.info import _accelerator_arch
 from std.utils import StaticTuple
 from tmb.ccl.netutil import MAX_NODES
 from tmb.ccl.collectives_kernels import (
@@ -29,6 +30,22 @@ from tmb.ccl.collectives_kernels import (
     _check_common,
     _region_ptrs,
 )
+
+
+comptime _MI300A = (
+    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
+)
+comptime RS_NODES_BLOCKS_MI300A = 24
+"""gfx942 grid of the node-local reduce of a multi-node reduce-scatter, in
+place of the allreduce caps (128, or 912 past `_AR_BIG_BYTES`): RCCL 2.22.3's
+24 channels on multi-node MI300A (rccl `src/init.cc:1339-1346`), as for the
+all-gather's gathers (`AG_NODE_BLOCKS`). The reduce runs beside the
+backward's GEMMs and the collective is network-bound, so fewer CUs cost it
+nothing in isolation and free the rest for the compute stream. Measured on
+2x4 MI300A, Adastra job 5447705: fp32 AVG 123 MB -> 15.4 MB/rank 950 vs
+951 us, 328 MB -> 41 MB 2140 vs 2145 us (128 vs 24 blocks); GPT-2 XL FSDP2
+ABBA legs, tok/s, 128 -> 24 blocks: 22.0k/22.8k -> 23.2k/23.2k (with the
+flush endpoint and split all-gather: 22.9k -> 23.7k; mojo+RCCL 23.3k)."""
 
 
 @__llvm_metadata(
@@ -318,6 +335,8 @@ def reduce_scatter_nodes[
         _AR_BIG_BLOCKS if world * node_count * count * esize
         >= _AR_BIG_BYTES else _AR_MAX_BLOCKS
     )
+    comptime if _MI300A:
+        cap_blocks = RS_NODES_BLOCKS_MI300A
     var blocks = min(cap_blocks, max(1, (count // W + 1 + BLOCK - 1) // BLOCK))
     if world == 8:
         _launch_rs_nodes[dtype, W, 8](
