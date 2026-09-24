@@ -3689,8 +3689,9 @@ def _dense_mfma_route[
     var xcds = max(1, cus // 38)
     var ktiles = ceildiv(k, 32)
     # Whether K can be split at all: a slab has to be a whole number of k tiles,
-    # and the reduction reads the workspace 16 bytes at a time.
-    var splittable = k % 32 == 0 and c_addr % 8 == 0
+    # and the reduction reads the workspace 16 bytes at a time (so every plane
+    # has to start 16-byte aligned).
+    var splittable = k % 32 == 0 and c_addr % 8 == 0 and m * n % 4 == 0
     comptime if FUSE_BIAS:
         # The bias epilogue reads and writes four columns at a time.
         splittable = splittable and n % 8 == 0 and bias_addr % 8 == 0
@@ -7086,6 +7087,27 @@ def _matmul_spec_operands_launch(
         ):
             _nt_bias_mfma_route(c_addr, a.ptr, b.ptr, bias_addr, m, n, k, ctx)
             return
+        # mm(dY, W.t()) with W stored `(n, k)`: B is the transpose view of a
+        # dense k-major buffer, which is the NT core's own operand layout.
+        # Reading it in place saves materializing B^T (a read and a write of
+        # B) and then running the mixed-layout NN core on it.  Measured on
+        # MI300A (gfx942), job 5448054, see `_dense_mfma_route`.  Declines keep
+        # the copy below.
+        if (
+            ctx.api() != "cpu"
+            and not has_bias
+            and batch == 1
+            and a.contig
+            and a.dtype == DType.bfloat16
+            and transpose_b == 0
+            and b.rank == 2
+            and b.strides[MAX_RANK - 2] == 1
+            and b.strides[MAX_RANK - 1] == k
+        ):
+            if _dense_mfma_route[DType.bfloat16, True, True](
+                c_addr, a.ptr, b.ptr, m, n, k, ctx
+            ):
+                return
     if a.contig and b.contig:
         _matmul_spec_launch(
             a.dtype,
