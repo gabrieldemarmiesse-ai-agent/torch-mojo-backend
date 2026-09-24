@@ -331,24 +331,38 @@ def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
 
 
-comptime AG_NODE_BLOCKS = 432 if _MI300A else 96
+comptime AG_NODE_BLOCKS = 24 if _MI300A else 96
 """Grid cap of the node-local gathers of a multi-node all-gather, in place
-of the single-node copy cap (432; gfx942 keeps it). On H100 the gathers
-run under the forward's and backward's GEMMs, so the cap is fitted end to
-end, not on the isolated
-collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
-reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
-96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
-62.4k. Isolated, 64 blocks still beat NCCL (block bf16 0.92x, root fp32
-0.94x). NCCL's 16 CTAs are not the answer for a pull: 16 blocks x 16
-vectors in flight measures the same isolated time as 96 x 4 on the XL sizes
-(block 360 vs 348 us, root 1031 vs 1027) yet 63.1-64.8k tok/s end to end
-against 66.1-69.1k -- a latency-bound pull under the compute stream's HBM
-traffic loses far more from 6x fewer CTAs than the GEMMs gain from the
-freed SMs, and the compute stream waits on this gather."""
-comptime AG_NODE_UNROLL = 4
-"""16-byte vectors in flight per thread in those gathers; 8 measured
-66.1k tok/s against 67.3-67.6k at 96 blocks."""
+of the single-node copy cap (432).
+
+gfx942: RCCL 2.22.3's multi-node MI300A geometry, 24 channels of one
+256-thread CTA each (rccl `src/init.cc:1339-1346` sets 6 channels per ring
+x 4 rings when the device has direct managed-memory access from the host
+and there is more than one node; `src/device/device.h:74` 256 threads).
+Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16, ABBA
+legs, tok/s: 432 blocks 20.9k/20.7k, 96 22.0k/21.8k, 24 23.0k/22.8k,
+mojo+RCCL 23.1k/22.1k. Isolated (streamed device us per call, block bf16
+7.68 MB / root fp32 41.0 MB per rank): 432 -> 742/3034, 96 -> 599/2669,
+24 -> 650/2686; fewer blocks means fewer per-wave release fences and
+barrier arrivals, and fewer CUs taken from the compute stream.
+
+H100: the gathers run under the forward's and backward's GEMMs, so the
+cap is fitted end to end, not on the isolated collective: GPT-2 XL FSDP2 on
+2x8 H100, mojo+mojoccl tok/s at 32 reduce-scatter CTAs (CUDA+NCCL 70.2k):
+32 -> 66.5k, 64 -> 66.5-67.0k, 96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432
+with 128 reduce-scatter CTAs 62.4k. Isolated, 64 blocks still beat NCCL
+(block bf16 0.92x, root fp32 0.94x). NCCL's 16 CTAs are not the answer for
+a pull: 16 blocks x 16 vectors in flight measures the same isolated time as
+96 x 4 on the XL sizes (block 360 vs 348 us, root 1031 vs 1027) yet
+63.1-64.8k tok/s end to end against 66.1-69.1k -- a latency-bound pull
+under the compute stream's HBM traffic loses far more from 6x fewer CTAs
+than the GEMMs gain from the freed SMs, and the compute stream waits on
+this gather. (gfx942 pushes, so its gathers are not latency-bound loads.)"""
+comptime AG_NODE_UNROLL = 2 if _MI300A else 4
+"""16-byte vectors in flight per thread in those gathers. gfx942: RCCL's
+unroll for gfx94 parts with more than 80 CUs (rccl `src/init.cc:101-105`,
+NCCL_UNROLL_2; the generic kernel it launches there is the unroll-2 one).
+H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory

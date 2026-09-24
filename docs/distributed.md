@@ -1324,7 +1324,21 @@ do not change. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
 streamed device time per call, ABBA; RCCL 2.22.3 through the same process
 group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
 41.0 MB/rank 4238 → 3038 µs (RCCL 3214), fp32 357×789+3 233 → 226 µs
-(RCCL 286). Messages at least
+(RCCL 286).
+
+The gfx942 gathers of that schedule then take RCCL's multi-node MI300A
+geometry instead of the single-node copy cap: 24 CTAs of 256 threads,
+two 16-byte vectors in flight per thread (`AG_NODE_BLOCKS`,
+`AG_NODE_UNROLL`; RCCL 2.22.3 forces 24 channels on multi-node MI300A and
+unroll 2 on gfx94 parts with more than 80 CUs). Fewer blocks are faster
+even in isolation (one release fence per wave and one barrier arrival per
+block fewer): block 742 → 650 µs, root 3034 → 2686 µs, 357×789+3 225 →
+174 µs. End to end (GPT-2 XL FSDP2 on those 8 ranks, ABBA legs,
+tokens/s) 432 blocks 20.9k/20.7k, 96 blocks 22.0k/21.8k, 24 blocks
+23.0k/22.8k, mojo+RCCL 23.1k/22.1k. The remaining isolated all-gather time
+is the network: 7.68 MB per NIC at about 16 GB/s, against RCCL's 13.4 MB
+per NIC at 21 GB/s; splitting each exchange into RCCL-sized 512 KiB
+writes did not change it (664 vs 653 µs). Messages at least
 `PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
 chunks unless region capacity requires more. This threshold was measured on
 2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
