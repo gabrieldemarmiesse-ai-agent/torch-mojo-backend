@@ -110,6 +110,7 @@ from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
     FLOAT_DTYPES,
+    GS_THREADS,
     MAX_RANK,
     TensorSpec,
     _copy_strided,
@@ -2176,6 +2177,7 @@ def _nt_mfma_body[
     WBODY: Bool = False,
     FUSE_BIAS: Bool = False,
     SCALAR_LOAD: Bool = False,
+    BULK_K: Bool = False,
 ](
     c: Pointer[Scalar[otype], MutAnyOrigin],
     a: Pointer[Scalar[dtype], ImmutAnyOrigin],
@@ -2486,6 +2488,9 @@ def _nt_mfma_body[
                                         unsafe_offset=p * pass_step + e
                                     ]
                         else:
+                            # Only element alignment is promised (the default),
+                            # which is what lets `BULK_K` read rows whose
+                            # stride K is odd.
                             v = a_ptr.unsafe_load[width=NT_VEC](p * pass_step)
                     areg.unsafe_store(p * NT_VEC, v)
             else:
@@ -2792,7 +2797,9 @@ def _nt_mfma_body[
         # 27 output tiles want eleven slabs to cover 304 CUs, and 11 divides
         # neither 1536 nor anything near it.  The dispatch guarantees the short
         # slab is non-empty, and even whenever `WBODY` needs it to be.
-        var n_kt = ceildiv(k, BK)
+        # `BULK_K` runs only the whole k tiles and leaves the `k % BK` tail to
+        # the caller's reduction; `k` itself stays the row stride.
+        var n_kt = k // BK if BULK_K else ceildiv(k, BK)
         comptime if SPLITK:
             var kt_per = k_per // BK
             n_kt = min(kt_per, n_kt - slab * kt_per)
@@ -3184,6 +3191,7 @@ def _nt_mfma_gemm[
     NOMASK: Bool = False,
     FUSE_BIAS: Bool = False,
     SCALAR_LOAD: Bool = False,
+    BULK_K: Bool = False,
 ](
     c_addr: Int,
     a_addr: Int,
@@ -3212,8 +3220,21 @@ def _nt_mfma_gemm[
     that count does not divide K; the caller must have used the same helper, so
     that the plane count it reduces is the plane count the grid writes.
     """
+    comptime assert not BULK_K or (
+        dtype == DType.bfloat16
+        and otype == DType.float32
+        and A_KMAJOR
+        and not B_KMAJOR
+        and SPLITK
+        and not PAIR
+        and not WBODY
+        and not FUSE_BIAS
+        and not SCALAR_LOAD
+        and NOMASK
+        and BK == 32
+    ), "bulk-K requires the unmasked bf16 NN split-K schedule"
     comptime THREADS = (BM // WM) * (BN // WN) * 64
-    var ktiles = ceildiv(k, BK)
+    var ktiles = k // BK if BULK_K else ceildiv(k, BK)
     var kt_per = _nt_slab_tiles(ktiles, parts) if SPLITK else ktiles
     var k_per = kt_per * BK
     # k tiles the LAST slab runs.  The two-tile body needs an even count in every
@@ -3259,38 +3280,66 @@ def _nt_mfma_gemm[
                 Int64(xcds),
             )
         else:
-            ctx.enqueue_function[
-                _nt_mfma_kernel[
-                    dtype,
-                    BM,
-                    BN,
-                    BK,
-                    WM,
-                    WN,
-                    STAGES,
-                    SWIZZLE,
-                    MASKED,
-                    MASKED,
-                    A_KMAJOR,
-                    B_KMAJOR,
-                    SPLITK,
-                    otype,
-                    PAIR,
-                    FILL_AT,
-                    BODY2,
-                ]
-            ](
-                _make_ptr[otype](c_addr),
-                _make_ptr[dtype](a_addr).as_imm(),
-                _make_ptr[dtype](b_addr).as_imm(),
-                Int64(m),
-                Int64(n),
-                Int64(k),
-                Int64(k_per),
-                Int64(xcds),
-                grid_dim=grid,
-                block_dim=(THREADS,),
-            )
+            comptime if BULK_K:
+                _enqueue_cached[
+                    _nn_bulk_mfma_kernel[
+                        BM,
+                        BN,
+                        BK,
+                        WM,
+                        WN,
+                        STAGES,
+                        SWIZZLE,
+                        FILL_AT,
+                    ]
+                ](
+                    ctx,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    THREADS,
+                    _make_ptr[otype](c_addr),
+                    _make_ptr[dtype](a_addr).as_imm(),
+                    _make_ptr[dtype](b_addr).as_imm(),
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    Int64(k_per),
+                    Int64(xcds),
+                )
+            else:
+                ctx.enqueue_function[
+                    _nt_mfma_kernel[
+                        dtype,
+                        BM,
+                        BN,
+                        BK,
+                        WM,
+                        WN,
+                        STAGES,
+                        SWIZZLE,
+                        MASKED,
+                        MASKED,
+                        A_KMAJOR,
+                        B_KMAJOR,
+                        SPLITK,
+                        otype,
+                        PAIR,
+                        FILL_AT,
+                        BODY2,
+                    ]
+                ](
+                    _make_ptr[otype](c_addr),
+                    _make_ptr[dtype](a_addr).as_imm(),
+                    _make_ptr[dtype](b_addr).as_imm(),
+                    Int64(m),
+                    Int64(n),
+                    Int64(k),
+                    Int64(k_per),
+                    Int64(xcds),
+                    grid_dim=grid,
+                    block_dim=(THREADS,),
+                )
 
     if not SCALAR_LOAD and (NOMASK or (m >= BM and n >= BN and k % BK == 0)):
         # The wide-k body needs an EVEN number of k tiles in every slab, which
@@ -3824,6 +3873,230 @@ def _st2(row_stride: Int, col_stride: Int) -> IndexList[MAX_RANK]:
     return out
 
 
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32((BM // WM) * (BN // WN) * 64)
+    ),
+)
+@__name(t"nn_mfma_bulk_bfloat16_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}")
+def _nn_bulk_mfma_kernel[
+    BM: Int,
+    BN: Int,
+    BK: Int,
+    WM: Int,
+    WN: Int,
+    STAGES: Int,
+    SWIZZLE: Bool,
+    FILL_AT: Int,
+](
+    c: Pointer[Scalar[DType.float32], MutAnyOrigin],
+    a: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    b: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    m: Int64,
+    n: Int64,
+    k: Int64,
+    k_per: Int64,
+    xcds: Int64,
+):
+    _nt_mfma_body[
+        DType.bfloat16,
+        BM,
+        BN,
+        BK,
+        WM,
+        WN,
+        STAGES,
+        SWIZZLE,
+        False,
+        False,
+        True,
+        False,
+        True,
+        DType.float32,
+        False,
+        FILL_AT,
+        False,
+        False,
+        False,
+        True,
+    ](c, a, b, m, n, k, k_per, xcds, a)
+
+
+@__name(t"nn_splitk_epilogue_bfloat16_tail{TAIL}_bias{BIAS}")
+def _nn_splitk_epilogue_kernel[
+    TAIL: Bool, BIAS: Bool
+](
+    c: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    workspace: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
+    a: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    b: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    bias: Pointer[Scalar[DType.bfloat16], ImmutAnyOrigin],
+    total_arg: Int64,
+    n_arg: Int64,
+    k_arg: Int64,
+    k_bulk_arg: Int64,
+    parts_arg: Int64,
+):
+    """`c = sum of the split-K planes [+ A[:, k_bulk:] @ B[k_bulk:, :]] [+ bias]`.
+
+    The NN split-K reduction with the epilogue terms the planes cannot hold:
+    `TAIL` adds the `k - k_bulk < BK` contraction terms a `BULK_K` launch left
+    out, straight from the operands; `BIAS` adds the row-broadcast bias.  Both
+    in FP32, so C is rounded to BF16 exactly once.  Four outputs per thread:
+    `n % 8 == 0` keeps each vector inside one row and every plane 16-byte
+    aligned.
+    """
+    var total = Int(total_arg)
+    var n = Int(n_arg)
+    var k = Int(k_arg)
+    var k_bulk = Int(k_bulk_arg)
+    var parts = Int(parts_arg)
+    var index = Int(block_idx.x) * GS_THREADS + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * GS_THREADS
+    while index < total // 4:
+        var offset = index * 4
+        var acc = SIMD[DType.float32, 4](0)
+        for part in range(parts):
+            acc += workspace.unsafe_load[width=4, alignment=16](
+                part * total + offset
+            )
+        var col = offset % n
+        comptime if TAIL:
+            var row = offset // n
+            for kk in range(k_bulk, k):
+                var av = a[unsafe_offset=row * k + kk].cast[DType.float32]()
+                var bv = b.unsafe_load[width=4, alignment=8](kk * n + col).cast[
+                    DType.float32
+                ]()
+                acc = SIMD[DType.float32, 4](av).fma(bv, acc)
+        comptime if BIAS:
+            acc += bias.unsafe_load[width=4, alignment=8](col).cast[
+                DType.float32
+            ]()
+        c.unsafe_store[width=4, alignment=8](offset, acc.cast[DType.bfloat16]())
+        index += stride
+
+
+@always_inline
+def _nn_splitk_epilogue[
+    TAIL: Bool, BIAS: Bool
+](
+    c: Int,
+    workspace: Int,
+    a: Int,
+    b: Int,
+    bias: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    k_bulk: Int,
+    parts: Int,
+    ctx: DeviceContext,
+) raises:
+    _enqueue_cached[_nn_splitk_epilogue_kernel[TAIL, BIAS]](
+        ctx,
+        _gs_blocks(m * n // 4),
+        1,
+        1,
+        GS_THREADS,
+        _make_ptr[DType.bfloat16](c),
+        _make_ptr[DType.float32](workspace).as_imm(),
+        _make_ptr[DType.bfloat16](a).as_imm(),
+        _make_ptr[DType.bfloat16](b).as_imm(),
+        _make_ptr[DType.bfloat16](bias).as_imm(),
+        Int64(m * n),
+        Int64(n),
+        Int64(k),
+        Int64(k_bulk),
+        Int64(parts),
+    )
+
+
+@always_inline
+def _nn_mfma_partial_k_route(
+    c: Int,
+    a: Int,
+    b: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """Dense bf16 NN GEMM whose K is not a whole number of k tiles.
+
+    Every other MFMA route needs `k % 32 == 0` (and 16-byte rows), so an odd
+    leading dimension -- the input gradient of a projection onto an odd
+    vocabulary, `dX = dY(m, V) @ W(V, n)` -- fell to the scalar tiled kernel at
+    about 13 TFLOP/s.  Here the unmasked NN split-K core runs the `k // 32`
+    whole tiles with A's row stride left at the true K (its loads promise
+    element alignment only), and the reduction adds the `k % 32` leftover terms
+    from the operands before the single rounding.  The plan is the one the
+    aligned NN route picks, from the same `_nt_best_parts` search on the whole
+    tile count, so it declines exactly where that route would.
+
+    Measured on MI300A (gfx942), job 5448054, device time: (1024, 1600, 50257)
+    12.2 ms on the scalar kernel -> 0.52 ms (hipBLASLt 0.59 ms).
+    """
+    comptime BM = 256
+    comptime BN = 256
+    comptime BK = 32
+    # The reduction's four-wide B loads and C stores need 8-byte alignment.
+    if k % BK == 0 or n % 8 != 0 or b % 8 != 0 or c % 8 != 0:
+        return False
+    var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var ktiles = k // BK
+    var parts = _nt_best_parts(BM, BN, m, n, 2, ktiles, cus, True, 2)
+    if parts == 0:
+        return False
+    var workspace = ctx.enqueue_create_buffer[DType.float32](parts * m * n)
+    _nt_mfma_gemm[
+        DType.bfloat16,
+        BM,
+        BN,
+        BK,
+        64,
+        64,
+        2,
+        True,
+        True,
+        False,
+        True,
+        DType.float32,
+        False,
+        NT_MID_FILL,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ](
+        Int(workspace.unsafe_ptr()),
+        a,
+        b,
+        m,
+        n,
+        k,
+        parts,
+        max(1, cus // 38),
+        ctx,
+    )
+    _nn_splitk_epilogue[True, False](
+        c,
+        Int(workspace.unsafe_ptr()),
+        a,
+        b,
+        0,
+        m,
+        n,
+        k,
+        ktiles * BK,
+        parts,
+        ctx,
+    )
+    _ = workspace^
+    return True
+
+
 @always_inline
 def _amd_dynamic_mfma_dispatch[
     dtype: DType, transpose_b: Bool, fuse_bias: Bool = False
@@ -3840,6 +4113,12 @@ def _amd_dynamic_mfma_dispatch[
     ctx: DeviceContext,
 ) raises -> Bool:
     comptime if _accelerator_arch() == "amdgpu:gfx942":
+        comptime if dtype == DType.bfloat16 and not transpose_b and not fuse_bias:
+            if batch == 1 and a_bstride != 0:
+                if _nn_mfma_partial_k_route(
+                    c_addr, a_addr, b_addr, m, n, k, ctx
+                ):
+                    return True
         comptime if dtype == DType.bfloat16 and transpose_b and fuse_bias:
             if batch == 1 and a_bstride != 0:
                 _nt_bias_mfma_route(
