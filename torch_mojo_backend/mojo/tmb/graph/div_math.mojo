@@ -20,10 +20,13 @@ def floor_div[
 
     Floats divide in at least float32: a bf16/fp16 quotient would round onto
     the wrong side of an integer before the floor (5.985 -> 6.0). ATen floors
-    a finite nonzero numerator over an opposite-sign divisor to -1 even when
-    the quotient underflows to -0 or the divisor is infinite, where `//`
-    gives -0; the operands' bits decide it, so a backend that flushes
-    subnormals (Metal, the CPU `elementwise` lowering) still gets -1.
+    a nonzero numerator over an opposite-sign divisor to -1 even when the
+    quotient underflows to -0 or the divisor is infinite, where `//` gives
+    -0. A zero quotient already rules out a zero or NaN divisor. The
+    numerator's bits decide nonzero, so a backend that flushes subnormals
+    (Metal, the CPU `elementwise` lowering) still gets -1; its redundant
+    finite test keeps LLVM from folding the pair into a float compare, which
+    flushes too (float32 1e-38 // -1e10 gave 0 on a CPU graph without it).
     Integers take Mojo's `//`, which gives 0 for a zero divisor.
     """
     comptime if dtype.is_floating_point():
@@ -37,13 +40,10 @@ def floor_div[
         var abits = bitcast[bits, width](aw)
         var bbits = bitcast[bits, width](bw)
         var amag = abits & ~sign
-        var bmag = bbits & ~sign
         var negative_zero = (
             q.eq(0)
             & amag.ne(0)
             & amag.lt(inf_bits)
-            & bmag.ne(0)
-            & bmag.le(inf_bits)
             & ((abits ^ bbits) & sign).ne(0)
         )
         return negative_zero.select(SIMD[wide, width](-1), q).cast[dtype]()

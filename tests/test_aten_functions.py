@@ -2320,6 +2320,34 @@ def test_aten_div_rounding_mode_bf16_compiled(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize(
+    ("dtype", "tiny", "huge"),
+    [
+        (torch.bfloat16, 2.0**-126, 4.71875),
+        (torch.float32, 1e-38, 1e10),
+        (torch.float64, 1e-300, 1e100),
+    ],
+)
+def test_aten_div_floor_quotient_underflow_compiled(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, tiny: float, huge: float
+):
+    """A finite nonzero numerator over an opposite-sign divisor floors to -1
+    in every float dtype, even when the quotient underflows to -0."""
+    call_checker.register(aten_functions.aten_div)
+    x = torch.tensor([tiny, -tiny, tiny, 0.0, 1.0, -1.0], dtype=dtype)
+    y = torch.tensor(
+        [-huge, huge, huge, -huge, -float("inf"), float("inf")], dtype=dtype
+    )
+
+    def fn(x, y):
+        return torch.div(x, y, rounding_mode="floor"), torch.div(
+            x, -huge, rounding_mode="floor"
+        )
+
+    check_outputs(fn, conf, [x, y], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
 def test_aten_div_rounding_mode_int_by_zero_compiled(
     conf: Conf, call_checker: CallChecker, rounding_mode: str

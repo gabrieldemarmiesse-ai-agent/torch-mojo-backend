@@ -33,7 +33,7 @@ from max.algorithm import elementwise
 
 from std.utils import IndexList
 
-from tmb.graph.div_math import trunc_div
+from tmb.graph.div_math import floor_div, trunc_div
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -249,7 +249,6 @@ def _bin_vec_op[
     op_code: Int,
     is_cmp: Bool,
     width: Int,
-    cpu_floordiv_f64: Bool = False,
 ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
     """The op itself on one SIMD group: `dtype x dtype -> out_dtype`.
 
@@ -267,13 +266,6 @@ def _bin_vec_op[
     they still instantiate, so every branch must compile -- hence the
     trailing pass-through return.
 
-    `cpu_floordiv_f64` only affects BOP_FLOORDIV's bf16/fp16 widening (see
-    there); every other op ignores it. It defaults False so the four GPU
-    device-kernel call sites (`_bin_bcast_kernel`, `_bin_flat_vec_kernel`,
-    `_bin_rowvec_kernel`) are untouched byte-for-byte -- float64 is not a
-    legal GPU op here (Apple's Metal backend has no float64 at all, see the
-    `has_apple_gpu_accelerator()` guard in `_binary_bcast`). Only the one
-    CPU `elementwise` call site in `_binary_bcast` passes True.
     """
     comptime if is_cmp:
         # `<` and friends are Scalar-only in mojo 1.0; the elementwise forms
@@ -329,66 +321,7 @@ def _bin_vec_op[
             # fp32 fmod and explains why.
             return custom_remainder(a, b).cast[out_dtype]()
         comptime if op_code == BOP_FLOORDIV:
-            # `//` = floor(a / b), matching torch.floor_divide for both
-            # float and integer dtypes. bf16/fp16 need the division itself
-            # done wider than their own 8/11-bit mantissa, or the quotient
-            # can round onto the wrong side of an integer boundary before
-            # the floor -- e.g. a true quotient of 5.985 rounds to 6.0 in
-            # bf16, giving floor_divide = 6 instead of 5. torch's
-            # floor_divide algorithm (`div_floor_floating` in
-            # c10/util/generic_math.h) is more involved than a plain
-            # divide-then-floor, but empirically (verified directly against
-            # torch.floor_divide on real bf16/fp16 tensors, including this
-            # exact boundary case) computing it at fp32 and narrowing once at
-            # the end reproduces its bf16/fp16 output.
-            #
-            # One body serves every kernel in this family now, so this lives
-            # in one place; before the vectorization refactor the same fix had
-            # to be written twice, in the scalar body and its SIMD twin.
-            #
-            # CPU-only wrinkle: `elementwise[..., simd_width=1]`'s compiled
-            # CPU lowering flushes subnormal fp32 results to zero (verified
-            # with a bare `mojo run` scalar repro, which does NOT flush --
-            # so this is specific to the CPU `elementwise` codegen, not
-            # Mojo's Float32 arithmetic in general). A bf16 numerator near
-            # DType.float32's min normal (~1.1755e-38) divided by an O(1)
-            # denominator lands the true fp32 quotient in fp32's subnormal
-            # range; flushed to zero, floor(0) = 0 instead of the correct
-            # -1. fp64's subnormal threshold is ~2.2e-308 -- nowhere near
-            # reachable from bf16/fp16 operands -- so widening the CPU path
-            # to fp64 sidesteps the flush entirely without chasing whatever
-            # sets the CPU codegen's FTZ mode. GPU device kernels stay on
-            # fp32 unconditionally: fp64 is not just slower there, it is
-            # outright unsupported on Apple's Metal backend, so this same
-            # widen-to-fp64 fix cannot apply to a GPU kernel at all.
-            # Metal flushes a negative subnormal quotient to zero. Inspect
-            # the input bits to retain its sign and distinguish it from a
-            # genuine zero numerator or an infinite divisor, without fp64.
-            comptime if dtype == DType.float16 or dtype == DType.bfloat16:
-                comptime wide = DType.float64 if cpu_floordiv_f64 else DType.float32
-                var quotient = (a.cast[wide]() // b.cast[wide]()).cast[
-                    DType.float32
-                ]()
-                var abits = bitcast[DType.uint16, width](a)
-                var bbits = bitcast[DType.uint16, width](b)
-                comptime infinity = 0x7C00 if dtype == DType.float16 else 0x7F80
-                var amag = abits & 0x7FFF
-                var bmag = bbits & 0x7FFF
-                # ATen's div_floor_floating also returns -1 for finite,
-                # nonzero operands divided by an opposite-sign infinity.
-                var negative_zero = (
-                    quotient.eq(0)
-                    & amag.ne(0)
-                    & amag.lt(SIMD[DType.uint16, width](infinity))
-                    & bmag.ne(0)
-                    & bmag.le(SIMD[DType.uint16, width](infinity))
-                    & ((abits ^ bbits) & 0x8000).ne(0)
-                )
-                return negative_zero.select(
-                    SIMD[DType.float32, width](-1), quotient
-                ).cast[out_dtype]()
-            else:
-                return (a // b).cast[out_dtype]()
+            return floor_div(a, b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV:
             # Native precision for floats: the ops layer sends ATen's
             # float32 scalar-divisor path to TruncDivScalarSpec and

@@ -1292,6 +1292,28 @@ def test_floor_divide_subnormal_quotient_underflow(mojo_device):
     torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "tiny", "huge"),
+    [(torch.float32, 1e-38, 1e10), (torch.float64, 1e-300, 1e100)],
+)
+def test_floor_divide_wide_float_quotient_underflow(mojo_device, dtype, tiny, huge):
+    """ATen floors a finite nonzero numerator over an opposite-sign divisor to
+    -1 in every float dtype, even when the quotient underflows to -0."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    a_cpu = torch.tensor([tiny, -tiny, tiny, 0.0, 1.0, -1.0], dtype=dtype)
+    b_cpu = torch.tensor(
+        [-huge, huge, huge, -huge, -float("inf"), float("inf")], dtype=dtype
+    )
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    expected = torch.floor_divide(a_cpu, b_cpu)
+    assert expected.tolist() == [-1.0, -1.0, 0.0, -0.0, -1.0, -1.0]
+    torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
+    torch.testing.assert_close(
+        torch.floor_divide(a, -huge).cpu(), torch.floor_divide(a_cpu, -huge)
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_div_trunc_mode_keeps_the_narrow_quotient(mojo_device, dtype):
     """The same operands as floor_divide above, with rounding_mode="trunc":
