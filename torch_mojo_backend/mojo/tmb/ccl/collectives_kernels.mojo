@@ -193,9 +193,9 @@ comptime _POLL_ORDER = Ordering.RELAXED if _RELAXED_POLL else Ordering.ACQUIRE
 def poll_pause():
     """RCCL 2.22.3's gfx942 waitPeer sleep (prims_simple.h); no other target."""
     comptime if _RELAXED_POLL:
-        llvm_intrinsic[
-            "llvm.amdgcn.s.sleep", NoneType, has_side_effect=True
-        ](Int32(1))
+        llvm_intrinsic["llvm.amdgcn.s.sleep", NoneType, has_side_effect=True](
+            Int32(1)
+        )
 
 
 @always_inline
@@ -786,9 +786,7 @@ def _sync(
             bid * MAX_WORLD + peer
         )
         var spins = 0
-        while (
-            Atomic[DType.uint64].load[ordering=_POLL_ORDER](mine) < target
-        ):
+        while Atomic[DType.uint64].load[ordering=_POLL_ORDER](mine) < target:
             poll_pause()
             spins += 1
             if spins >= _SPIN_CHECK:
@@ -2528,19 +2526,23 @@ def _allgather_body[
     seq: UInt64,
 ):
     """Local stage + peer gather -- already the unicast minimum: `nbytes` of
-    local copy and `(world-1)*nbytes` of peer reads per GPU.
+    local copy and `(world-1)*nbytes` of cross-link traffic per GPU (peer
+    reads on NVIDIA, peer writes on AMD -- see the branch below).
 
     Rank r's contribution lands at `out_ptr + r*stride_b`; `stride_b` is the
     output layout's true per-rank size, which differs from `nbytes` when the
     caller splits one rank's contribution across several calls.
 
-    `seq != 0` (mapped, NVIDIA): the staged contribution is also this
-    chunk's RDMA payload, and the last block to finish staging stores `seq`
-    into the proxy mailbox `mb_req`, so the NIC reads it while the peer pulls
-    run instead of after them. The arrival RMWs are release, the last one
-    acquire-release, so every block's stage stores are ordered before that
-    mailbox store; the counter is reset by the last arriver and the next
-    launch on this arena is stream-ordered behind this kernel.
+    `seq != 0` (mapped): the staged contribution is also this chunk's RDMA
+    payload, and the last block to finish staging stores `seq` into the
+    proxy mailbox `mb_req`, so the NIC reads it while the local peer copies
+    run instead of after them. Every arrival RMW is acquire-release, so the
+    last arriver's mailbox store is ordered after every block's stage
+    stores; the counter is reset by the last arriver and the next launch on
+    this arena is stream-ordered behind this kernel. On NVIDIA the stage is
+    the slot the peers pull from; on AMD, where the peers push into compact
+    slots of this region, it is a separate slot after them (the host puts
+    the RDMA source there too, `_allgather_multinode_mapped`).
     """
     var t0 = device_now_ns()
     var world = Int(world_i)
@@ -2559,19 +2561,59 @@ def _allgather_body[
         # the staging is `(world-1) * nbytes` -- which is why
         # `allgather_max_bytes` chunks smaller here than on NVIDIA.
         var slot = (n + 15) // 16 * 16
-        if not _sync(
-            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-        ):
-            return
-        _copy_bytes[U](
-            out_ptr.unsafe_offset(
-                _allgather_rank[MAPPED](rank_at, rank) * out_stride
-            ),
-            in_ptr,
-            n,
-            tid,
-            stride,
+        # The single-block rank gate guarantees that every peer has
+        # completed the previous stream work before any of these writes.
+        comptime if not GATED:
+            if not _sync(
+                regions,
+                world,
+                rank,
+                ERR_ALLGATHER_SYNC,
+                flag_base,
+                t0,
+                timeout_ns,
+            ):
+                return
+        var own_output = out_ptr.unsafe_offset(
+            _allgather_rank[MAPPED](rank_at, rank) * out_stride
         )
+        comptime if MAPPED:
+            if seq != 0:
+                # The NIC source follows the compacted peer slots, which
+                # peers may overwrite concurrently. Host geometry reserves
+                # world * align16(n) bytes for these disjoint areas.
+                _copy_bytes2[U](
+                    regions[rank].unsafe_offset(stage_off + (world - 1) * slot),
+                    own_output,
+                    in_ptr,
+                    n,
+                    tid,
+                    stride,
+                )
+                # Like _sync, flush every wave before the block rendezvous;
+                # s_barrier alone does not drain AMD vector-memory stores.
+                fence[ordering=Ordering.RELEASE]()
+                barrier()
+                if thread_idx.x == 0:
+                    var arrive = (
+                        regions[rank]
+                        .unsafe_offset(_AG_ARRIVE_OFFSET)
+                        .unsafe_bitcast[UInt64]()
+                    )
+                    var was = Atomic[DType.uint64].fetch_add[
+                        ordering=Ordering.ACQUIRE_RELEASE
+                    ](arrive, UInt64(1))
+                    if Int(was) == Int(grid_dim.x) - 1:
+                        Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                            arrive, UInt64(0)
+                        )
+                        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                            mb_req, seq
+                        )
+            else:
+                _copy_bytes[U](own_output, in_ptr, n, tid, stride)
+        else:
+            _copy_bytes[U](own_output, in_ptr, n, tid, stride)
         for i in range(1, world):
             var p = rank + _peer_step(i, world)
             if p >= world:
@@ -3865,7 +3907,12 @@ def allgather_mapped[
         return
     if nbytes_per_rank < 0:
         raise Error("collectives: nbytes_per_rank must be >= 0")
-    if nbytes_per_rank > allgather_max_bytes(cap_bytes, world):
+    var max_bytes = allgather_max_bytes(cap_bytes, world)
+    comptime if _AMD:
+        if seq != 0:
+            # Compact peer slots plus a disjoint NIC source slot.
+            max_bytes = min(max_bytes, (2 * cap_bytes // world) // 16 * 16)
+    if nbytes_per_rank > max_bytes:
         raise Error("collectives: allgather message exceeds cap_bytes")
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:

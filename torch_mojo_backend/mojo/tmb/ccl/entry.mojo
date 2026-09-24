@@ -331,10 +331,11 @@ def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
 
 
-comptime AG_NODE_BLOCKS = 96
+comptime AG_NODE_BLOCKS = 432 if _MI300A else 96
 """Grid cap of the node-local gathers of a multi-node all-gather, in place
-of the single-node copy cap (432). The gathers run under the forward's and
-backward's GEMMs, so the cap is fitted end to end, not on the isolated
+of the single-node copy cap (432; gfx942 keeps it). On H100 the gathers
+run under the forward's and backward's GEMMs, so the cap is fitted end to
+end, not on the isolated
 collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
 reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
 96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
@@ -3085,9 +3086,14 @@ def _allgather_locked(
 
 
 def allgather_mapped_max_bytes(
-    arena_cap: Int, inbox_group: Int, npeers: Int
+    arena_cap: Int, inbox_group: Int, npeers: Int, local_world: Int = 1
 ) -> Int:
-    return min(arena_cap, inbox_group // npeers) // 16 * 16
+    var stage_cap = arena_cap
+    comptime if _MI300A:
+        # Compact peer-push slots and one disjoint NIC source, all inside
+        # the existing 2*arena_cap allocation. No extra region reservation.
+        stage_cap = min(stage_cap, 2 * arena_cap // local_world)
+    return min(stage_cap, inbox_group // npeers) // 16 * 16
 
 
 def _allgather_node_mapped(
@@ -3173,7 +3179,7 @@ def _allgather_multinode_mapped(
         return
     var npeers = ib_npeers(state.ib)
     var max_bytes = allgather_mapped_max_bytes(
-        state.arena_cap, _inbox_group_bytes(state), npeers
+        state.arena_cap, _inbox_group_bytes(state), npeers, state.local_world
     )
     var plan = allgather_mapped_pipeline_plan(
         per_rank_bytes,
@@ -3181,8 +3187,10 @@ def _allgather_multinode_mapped(
         state.narenas,
         state.nslots,
         # Measured on 2x8 H100: overlap large gathers, retain the passing
-        # single-chunk route below this node-scaled threshold.
-        PIPE_SPLIT_UNIT * state.local_world,
+        # single-chunk route below this node-scaled threshold. gfx942 splits
+        # only where region capacity requires it (the H100 threshold is not
+        # carried over unmeasured).
+        per_rank_bytes + 1 if _MI300A else PIPE_SPLIT_UNIT * state.local_world,
     )
     var chunk_bytes = plan[0]
     var nchunks = plan[1]
@@ -3198,9 +3206,17 @@ def _allgather_multinode_mapped(
             var seq = ib_next_seq(state.ib)
             var slot_bytes = _align_up(count, 16)
             var inbox_base = _inbox_base(state, seq)
+            var send_stage = (
+                state.owned_base + arena * state.arena_stride + signal_bytes()
+            )
+            comptime if _MI300A:
+                # AMD peers push into this region's compact slots
+                # [0, (lw-1)*slot); the RDMA source is the slot after them
+                # (`_allgather_body`), so local pushes cannot overwrite it.
+                send_stage += (state.local_world - 1) * slot_bytes
             ib_prepare_request(
                 state.ib,
-                state.owned_base + arena * state.arena_stride + signal_bytes(),
+                send_stage,
                 count,
                 inbox_base,
                 slot_bytes,
@@ -3279,7 +3295,7 @@ def _allgather_multinode(
     per_rank_bytes: Int,
 ) raises:
     """Exchange one contribution per NIC, disseminate on the receiving node."""
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if has_nvidia_gpu_accelerator() or _MI300A:
         _allgather_multinode_mapped(
             state, stream, raw_stream, sendbuff, recvbuff, per_rank_bytes
         )

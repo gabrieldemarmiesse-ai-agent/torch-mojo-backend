@@ -180,9 +180,7 @@ def _proxy_wait_kernel(
         var page = Int(status)
         var t0 = device_now_ns()
         var spins = 0
-        while (
-            Atomic[DType.uint64].load[ordering=_POLL_ORDER](mailbox) < seq
-        ):
+        while Atomic[DType.uint64].load[ordering=_POLL_ORDER](mailbox) < seq:
             poll_pause()
             spins += 1
             if spins >= _ABORT_CHECK:

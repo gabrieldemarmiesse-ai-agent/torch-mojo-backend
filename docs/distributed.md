@@ -1301,12 +1301,30 @@ first gathers local contributions into a node block, then each rank sends
 only its own contribution to the same local rank on each remote node.
 After the exchange, node-local all-gathers disseminate the received
 contributions, and placement follows the bootstrap global-rank table.
-On NVIDIA each local all-gather writes directly into the mapped global
-output slots, and its local staging supplies the RDMA send. Other targets
-place the local block while the network transfer runs. Staging is reused
-only after send completion. NVIDIA all-gather pipelines two chunks through
-separate existing arenas, overlapping a network exchange with the next local
-gather and the earlier remote gather. Messages at least
+On NVIDIA and gfx942 each local all-gather writes directly into the mapped
+global output slots, and its local staging supplies the RDMA send. Other
+targets place the local block while the network transfer runs. Staging is
+reused only after send completion. NVIDIA and gfx942 all-gathers pipeline
+two chunks through separate existing arenas, overlapping a network exchange
+with the next local gather and the earlier remote gather.
+
+On gfx942 the local peers push into compact slots of each other's regions
+(see "AMD MI300A" above), so the RDMA source cannot be the slot the peers
+write: each rank stages its contribution into a separate slot after the
+`local_world-1` peer slots, together with its own output slice, releases
+it (every wave's system release fence, then the per-arena acq_rel arrival
+counter), and the last block to arrive release-stores the exchange into
+the proxy mailbox. The NIC therefore starts while the xGMI pushes still
+run, and the two node-block placement kernels and the separate proxy
+request of the older AMD schedule are gone (four launches per chunk instead
+of six on two nodes). The staging bound becomes `local_world *
+align16(chunk) <= 2 * arena_cap` next to the inbox bound; at 4 ranks/node
+and the 64 MiB region the inbox (6,709,248 B) still binds, so chunk counts
+do not change. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
+streamed device time per call, ABBA; RCCL 2.22.3 through the same process
+group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
+41.0 MB/rank 4238 → 3038 µs (RCCL 3214), fp32 357×789+3 233 → 226 µs
+(RCCL 286). Messages at least
 `PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
 chunks unless region capacity requires more. This threshold was measured on
 2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
