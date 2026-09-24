@@ -11,7 +11,8 @@ from std.sys import size_of
 
 from tmb.ccl.collectives_kernels import (
     MAX_WORLD,
-    _GFX942,
+    _AMD,
+    allgather_nic_stage_off,
     shard_range,
     signal_bytes,
 )
@@ -162,7 +163,7 @@ def main() raises:
                     "mapped gather local-world chunk",
                     bad,
                 )
-                comptime if _GFX942:
+                comptime if _AMD:
                     _check(
                         lw * mapped_cap <= 2 * arena_cap,
                         "mapped gather peer slots plus NIC source fit",
@@ -243,9 +244,11 @@ def main() raises:
                                 "gather pipeline tail capacity",
                                 bad,
                             )
-                            comptime if _GFX942:
+                            comptime if _AMD:
                                 var slot = _align_up(size, 16)
-                                var nic_begin = (lw - 1) * slot
+                                var nic_begin = allgather_nic_stage_off(
+                                    lw, size
+                                )
                                 _check(
                                     nic_begin + slot <= 2 * arena_cap,
                                     "gather NIC source tail bound",

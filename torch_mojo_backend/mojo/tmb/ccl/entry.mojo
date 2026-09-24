@@ -141,6 +141,7 @@ from tmb.ccl.collectives_kernels import (
     allgather,
     allgather_max_bytes,
     allgather_mapped,
+    allgather_nic_stage_off,
     allgather_finish,
     allreduce,
     broadcast,
@@ -3159,12 +3160,14 @@ def _allgather_locked(
 def allgather_mapped_max_bytes(
     arena_cap: Int, inbox_group: Int, npeers: Int, local_world: Int
 ) -> Int:
-    var stage_cap = arena_cap
-    comptime if _GFX942:
-        # Compact peer-push slots and one disjoint NIC source, all inside
-        # the existing 2*arena_cap allocation. No extra region reservation.
-        stage_cap = min(stage_cap, 2 * arena_cap // local_world)
-    return min(stage_cap, inbox_group // npeers) // 16 * 16
+    return (
+        min(
+            allgather_max_bytes(arena_cap, local_world, nic_stage=True),
+            inbox_group // npeers,
+        )
+        // 16
+        * 16
+    )
 
 
 def _allgather_node_mapped(
@@ -3280,13 +3283,11 @@ def _allgather_multinode_mapped(
             var slot_bytes = _align_up(count, 16)
             var inbox_base = _inbox_base(state, seq)
             var send_stage = (
-                state.owned_base + arena * state.arena_stride + signal_bytes()
+                state.owned_base
+                + arena * state.arena_stride
+                + signal_bytes()
+                + allgather_nic_stage_off(state.local_world, count)
             )
-            comptime if _GFX942:
-                # AMD peers push into this region's compact slots
-                # [0, (lw-1)*slot); the RDMA source is the slot after them
-                # (`_allgather_body`), so local pushes cannot overwrite it.
-                send_stage += (state.local_world - 1) * slot_bytes
             ib_prepare_request(
                 state.ib,
                 send_stage,

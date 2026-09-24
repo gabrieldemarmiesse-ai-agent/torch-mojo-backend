@@ -2564,8 +2564,8 @@ def _allgather_body[
     stores; the counter is reset by the last arriver and the next launch on
     this arena is stream-ordered behind this kernel. On NVIDIA the stage is
     the slot the peers pull from; on AMD, where the peers push into compact
-    slots of this region, it is a separate slot after them (the host puts
-    the RDMA source there too, `_allgather_multinode_mapped`).
+    slots of this region, it is a separate slot after them
+    (`allgather_nic_stage_off`).
     """
     var t0 = device_now_ns()
     var world = Int(world_i)
@@ -2602,11 +2602,10 @@ def _allgather_body[
         )
         comptime if MAPPED:
             if seq != 0:
-                # The NIC source follows the compacted peer slots, which
-                # peers may overwrite concurrently. Host geometry reserves
-                # world * align16(n) bytes for these disjoint areas.
                 _copy_bytes2[U](
-                    regions[rank].unsafe_offset(stage_off + (world - 1) * slot),
+                    regions[rank].unsafe_offset(
+                        stage_off + allgather_nic_stage_off(world, n)
+                    ),
                     own_output,
                     in_ptr,
                     n,
@@ -3832,19 +3831,36 @@ def broadcast(
     )
 
 
-def allgather_max_bytes(cap_bytes: Int, world: Int) -> Int:
+def allgather_max_bytes(
+    cap_bytes: Int, world: Int, nic_stage: Bool = False
+) -> Int:
     """Largest per-rank contribution one `allgather` call may carry.
 
     NVIDIA stages one message-sized buffer per rank in its own region and
     reads the peers', so `cap_bytes` is the bound and this is the identity.
     AMD pushes instead, which needs `world-1` message-sized slots inside the
-    `2*cap_bytes` arena; the caller chunks to that.
+    `2*cap_bytes` arena; the caller chunks to that. `nic_stage`: the call
+    also stages a multi-node exchange's RDMA source, one more slot on AMD
+    (`allgather_nic_stage_off`).
     """
     comptime if _AMD:
-        if world <= 2:
+        var slots = world if nic_stage else world - 1
+        if slots <= 1:
             return cap_bytes
-        return min(cap_bytes, (2 * cap_bytes // (world - 1)) // 16 * 16)
+        return min(cap_bytes, (2 * cap_bytes // slots) // 16 * 16)
     return cap_bytes
+
+
+@always_inline
+def allgather_nic_stage_off(world: Int, nbytes: Int) -> Int:
+    """Offset of a mapped all-gather's RDMA source from its stage. NVIDIA: 0,
+    the stage the peers pull from. AMD: past the `world-1` compact slots the
+    peers push into, which they may be writing while the NIC reads. The
+    kernel stages it and the host posts the read from it, so both use this.
+    """
+    comptime if _AMD:
+        return (world - 1) * _align_up(nbytes, 16)
+    return 0
 
 
 def allgather(
@@ -3930,12 +3946,9 @@ def allgather_mapped[
         return
     if nbytes_per_rank < 0:
         raise Error("collectives: nbytes_per_rank must be >= 0")
-    var max_bytes = allgather_max_bytes(cap_bytes, world)
-    comptime if _AMD:
-        if seq != 0:
-            # Compact peer slots plus a disjoint NIC source slot.
-            max_bytes = min(max_bytes, (2 * cap_bytes // world) // 16 * 16)
-    if nbytes_per_rank > max_bytes:
+    if nbytes_per_rank > allgather_max_bytes(
+        cap_bytes, world, nic_stage=seq != 0
+    ):
         raise Error("collectives: allgather message exceeds cap_bytes")
     var stride = stride_bytes if stride_bytes >= 0 else nbytes_per_rank
     if stride < nbytes_per_rank:
