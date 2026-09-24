@@ -162,6 +162,79 @@ def test_mm_float32_tensor_core_regime(mojo_device, shape):
     torch.testing.assert_close(got_bias, a @ b + bias, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize(
+    "shape,layout,bias,offsets",
+    [
+        ((1024, 1600, 50257), "NN", False, (0, 0)),
+        ((257, 520, 4095), "NN", False, (1, 1)),
+        ((193, 264, 8193), "NN", False, (1, 1)),
+        ((1009, 1592, 8193), "NN", False, (1, 4)),
+        ((1009, 1592, 8223), "NN", False, (3, 0)),
+        ((1024, 1600, 6400), "NT", False, (0, 0)),
+        ((1600, 1600, 1024), "TN", False, (0, 0)),
+        ((1600, 4800, 1024), "TN", False, (0, 0)),
+        ((2047, 1600, 1024), "TN", False, (0, 0)),
+        ((1009, 1592, 1024), "TN", False, (0, 0)),
+        ((1009, 1617, 1599), "NN", True, (1, 1)),
+        ((1024, 1600, 1600), "NN", True, (0, 0)),
+        ((1009, 1032, 1600), "NN", True, (0, 0)),
+        ((520, 776, 3200), "NN", True, (0, 0)),
+        ((1024, 1600, 1600), "NN", True, (1, 0)),
+    ],
+)
+def test_bf16_gemm_leading_dimensions(mojo_gpu, shape, layout, bias, offsets):
+    """Odd strides, offset pointers, K tails, and matrix-core tile boundaries.
+
+    Covers the gfx942 routes for an odd K (whole k tiles on the MFMA core,
+    the tail in the reduction), the fused-bias NN routes (unsplit 128x128,
+    split-K with the bias in the reduction, a misaligned operand), NT read in
+    place, TN on 256x256, 128x128 and 64x256 tiles including odd leading
+    dimensions (m = 2047, 1009) read without a copy, and ragged extents whose
+    edge tiles are shifted back.  Sample an
+    fp64 CPU product so the large contraction stays inexpensive, at the
+    boundaries of the 32- to 256-element tiles and the last row/column;
+    sentinels and input comparisons catch unintended writes.
+    """
+    m, n, k = shape
+    generator = torch.Generator().manual_seed(731)
+
+    def operand(rows, cols, transposed, offset):
+        physical = (cols, rows) if transposed else (rows, cols)
+        data = torch.randn(physical, generator=generator).to(torch.bfloat16)
+        storage = torch.cat(
+            [torch.full((offset,), 11, dtype=torch.bfloat16), data.reshape(-1)]
+        )
+        device_storage = storage.to(mojo_gpu)
+        view = device_storage[offset:].view(physical)
+        return (
+            (data.t() if transposed else data),
+            (view.t() if transposed else view),
+            storage,
+            device_storage,
+        )
+
+    a, da, a_storage, da_storage = operand(m, k, layout[0] == "T", offsets[0])
+    b, db, b_storage, db_storage = operand(k, n, layout[1] == "T", offsets[1])
+    bias_cpu = torch.randn(n, generator=generator).to(torch.bfloat16)
+    with assert_ran("aten::addmm" if bias else "aten::mm"):
+        result = (
+            torch.addmm(bias_cpu.to(mojo_gpu), da, db) if bias else torch.mm(da, db)
+        )
+    edges = {0, 1, 31, 32, 63, 64, 127, 128, 255, 256}
+    rows = sorted({r for r in edges if r < m} | {m // 2, m - 1})
+    cols = sorted({c for c in edges if c < n} | {n // 2, n - 1})
+    expected = a[rows].double() @ b[:, cols].double()
+    if bias:
+        expected += bias_cpu[cols].double()
+    actual = result.cpu()[rows][:, cols]
+    torch.testing.assert_close(
+        actual, expected.to(torch.bfloat16), atol=0.03125, rtol=0.0078125
+    )
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(da_storage.cpu(), a_storage, atol=0, rtol=0)
+    torch.testing.assert_close(db_storage.cpu(), b_storage, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_mm_degenerate_dims(mojo_device, dtype):
     # n == 1 used to segfault the CPU library-matmul route (gemv special case
