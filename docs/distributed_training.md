@@ -364,6 +364,8 @@ over Slingshot).
 
 Limitations:
 
+- Across nodes on AMD, only MI300A has run them: multi-node Mojo collectives
+  on other AMD GPUs are untested.
 - `all_reduce`, `broadcast`, `all_gather`, `reduce_scatter`, `barrier` and
   the object collectives work. `reduce`, point-to-point, `all_to_all`,
   `gather` and `scatter` raise. See the [Collectives](#collectives) table.
