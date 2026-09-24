@@ -189,7 +189,7 @@ def main() raises:
                         mapped_cap,
                         narenas,
                         INBOX_SLOTS,
-                        count + 1 if _MI300A else PIPE_SPLIT_UNIT * lw,
+                        PIPE_SPLIT_UNIT * lw,
                     )
                     var chunk = plan[0]
                     var nchunks = plan[1]

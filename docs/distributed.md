@@ -1319,8 +1319,7 @@ run, and the two node-block placement kernels and the separate proxy
 request of the older AMD schedule are gone (four launches per chunk instead
 of six on two nodes). The staging bound becomes `local_world *
 align16(chunk) <= 2 * arena_cap` next to the inbox bound; at 4 ranks/node
-and the 64 MiB region the inbox (6,709,248 B) still binds, so chunk counts
-do not change. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
+and the 64 MiB region the inbox (6,709,248 B) still binds. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
 streamed device time per call, ABBA; RCCL 2.22.3 through the same process
 group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
 41.0 MB/rank 4238 → 3038 µs (RCCL 3214), fp32 357×789+3 233 → 226 µs
@@ -1341,7 +1340,9 @@ per NIC at 21 GB/s; splitting each exchange into RCCL-sized 512 KiB
 writes did not change it (664 vs 653 µs). Messages at least
 `PIPE_SPLIT_UNIT * local_world` bytes per rank are split into two balanced
 chunks unless region capacity requires more. This threshold was measured on
-2×8 H100 and leaves smaller single-chunk gathers unchanged. Inbox credits
+2×8 H100 and leaves smaller single-chunk gathers unchanged; on 2 × 4 MI300A
+the two halves (RCCL's two slices per chunk) took the XL bf16 block from 601
+to 541 µs once the flush read had its own endpoint (below). Inbox credits
 follow each chunk's remote consumers; the source arena is reused only after
 its send and consumers complete. Broadcast and the other-target all-gather
 schedule remain unpipelined. Single-node

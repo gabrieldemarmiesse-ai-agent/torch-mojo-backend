@@ -3201,10 +3201,12 @@ def _allgather_multinode_mapped(
         state.narenas,
         state.nslots,
         # Measured on 2x8 H100: overlap large gathers, retain the passing
-        # single-chunk route below this node-scaled threshold. gfx942 splits
-        # only where region capacity requires it (the H100 threshold is not
-        # carried over unmeasured).
-        per_rank_bytes + 1 if _MI300A else PIPE_SPLIT_UNIT * state.local_world,
+        # single-chunk route below this node-scaled threshold. Also measured
+        # on 2x4 MI300A (job 5447705), where two balanced halves are RCCL's
+        # two slices per chunk (all_gather.h): XL bf16 7.68 MB/rank 601 ->
+        # 541 us once the flush read stopped serialising the exchanges
+        # (`fab_post_flush`); the 41 MB root stays capacity-bound.
+        PIPE_SPLIT_UNIT * state.local_world,
     )
     var chunk_bytes = plan[0]
     var nchunks = plan[1]
