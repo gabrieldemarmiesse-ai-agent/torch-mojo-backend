@@ -522,7 +522,15 @@ def run_stress(failures: list[str]):
         ) // 2
         if op == dist.ReduceOp.AVG:
             expected /= world
-        ok_reduce_scatter = ok_reduce_scatter and bool((out.cpu() == expected).all())
+        # AVG scales each contribution before summing (PreMulSum): exact only
+        # when 1/world is, i.e. for a power-of-two world.
+        exact = op == dist.ReduceOp.SUM or world & (world - 1) == 0
+        got = out.cpu()
+        ok_reduce_scatter = ok_reduce_scatter and (
+            bool((got == expected).all())
+            if exact
+            else torch.allclose(got, expected, rtol=1e-6, atol=1e-6)
+        )
     _check(failures, "stress.allreduce", ok_allreduce)
     _check(failures, "stress.allreduce_tiny_int64", ok_tiny_int64)
     _check(failures, "stress.broadcast", ok_broadcast)
