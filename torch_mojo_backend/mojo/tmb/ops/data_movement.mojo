@@ -4,6 +4,7 @@ clone / _to_copy / cat / stack / repeat / tril / triu / reflection_pad2d /
 replication_pad2d / select_scatter / scatter.src / scatter.value /
 scatter_add / gather / index_select / index_add / index.Tensor /
 _index_put_impl_ / nonzero / masked_select(.out) / set_.source_Tensor /
+set_.source_Storage(_storage_offset) /
 empty_permuted -- ported from eager_kernels/aten_fast.py's
 fast_aten_cat/stack/repeat/tril/triu/select_scatter/scatter_src/
 scatter_value/index/nonzero/clone, mojo_device/aten_ops/inplace.py's
@@ -35,6 +36,7 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     IntList,
     Owned,
+    StorageArg,
     dtype_name,
     T,
     Value,
@@ -75,6 +77,7 @@ from tmb.backend.abi import (
     v_memory_format_or,
     v_opt_tensor_list_present,
     v_tensor,
+    v_storage,
     v_tensor_list,
     view_strided,
 )
@@ -3055,6 +3058,115 @@ def op_set_source_tensor(
     ret_ref(rets, 0, self_t)
 
 
+def _set_storage(
+    self_t: T,
+    source: StorageArg,
+    offset: Int,
+    shape: IndexList[MAX_RANK],
+    strides: IndexList[MAX_RANK],
+    rank: Int,
+    what: String,
+) raises:
+    """ATen's `set_storage_cpu_`: `checkSetStorage`, then point self at the
+    storage and lay it out, growing the storage when the view reaches past
+    its end (`resize_impl_` with resize_storage)."""
+    if not self_t.on_mojo() or source.device != self_t.device:
+        raise Error(
+            what,
+            ": expected a storage on ",
+            device_str(self_t),
+            ", the tensor's device",
+        )
+    if offset < 0:
+        raise Error(what, ": Tensor: invalid storage offset ", offset)
+    var needed = 0
+    var numel = 1
+    for i in range(rank):
+        var extent = shape[MAX_RANK - rank + i]
+        if extent < 0:
+            raise Error(what, ": negative size ", extent)
+        numel *= extent
+        needed += (extent - 1) * strides[MAX_RANK - rank + i]
+    check(
+        external_call["tmb_tensor_set_storage_object", Int32](
+            self_t.h, source.addr
+        ),
+        "tmb_tensor_set_storage_object",
+    )
+    var nbytes = (offset + needed + 1) * self_t.itemsize if numel > 0 else 0
+    if nbytes > source.nbytes:
+        check(
+            external_call["tmb_storage_resize", Int32](self_t.h, Int64(nbytes)),
+            "tmb_storage_resize",
+        )
+    set_sizes_strides(self_t, shape, strides, rank, offset)
+
+
+# aten::set_.source_Storage(Tensor(a!) self, Storage source) -> Tensor(a!)
+def op_set_source_storage(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """The whole storage as a 1-D tensor of self's dtype (what
+    `UntypedStorage.copy_` builds on both sides of a device copy, so
+    `torch.save` and `torch.load(map_location=...)` go through here)."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var source = v_storage(args[unsafe_offset=1])
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = source.nbytes // self_t.itemsize
+    _set_storage(
+        self_t,
+        source,
+        0,
+        shape,
+        contiguous_strides(shape, 1),
+        1,
+        "set_.source_Storage",
+    )
+    ret_ref(rets, 0, self_t)
+
+
+# aten::set_.source_Storage_storage_offset(Tensor(a!) self, Storage source,
+#   SymInt storage_offset, SymInt[] size, SymInt[] stride=[]) -> Tensor(a!)
+def op_set_source_storage_offset(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """`torch._utils._rebuild_tensor`: how a loaded tensor is laid over its
+    storage."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var source = v_storage(args[unsafe_offset=1])
+    var offset = v_int(args[unsafe_offset=2])
+    var sizes = IntList(args[unsafe_offset=3])
+    var stride_list = IntList(args[unsafe_offset=4])
+    var rank = len(sizes)
+    if rank > MAX_RANK:
+        unsupported("set_: rank above the mojo device limit")
+    if len(stride_list) != 0 and len(stride_list) != rank:
+        raise Error(
+            "set_: mismatch in length of strides and shape (",
+            len(stride_list),
+            " vs ",
+            rank,
+            ")",
+        )
+    var shape = IndexList[MAX_RANK](1)
+    for i in range(rank):
+        shape[MAX_RANK - rank + i] = sizes[i]
+    var strides = contiguous_strides(shape, rank)
+    if len(stride_list) == rank:
+        for i in range(rank):
+            strides[MAX_RANK - rank + i] = stride_list[i]
+    _set_storage(
+        self_t,
+        source,
+        offset,
+        shape,
+        strides,
+        rank,
+        "set_.source_Storage_storage_offset",
+    )
+    ret_ref(rets, 0, self_t)
+
+
 # aten::empty_permuted(SymInt[] size, int[] physical_layout, *, ScalarType?
 #   dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None)
 #   -> Tensor
@@ -3144,4 +3256,8 @@ def register_data_movement(site: Site) raises:
     impl[op_masked_select, "masked_select"](site)
     impl[op_masked_select_out, "masked_select.out"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
+    impl[op_set_source_storage, "set_.source_Storage"](site)
+    impl[op_set_source_storage_offset, "set_.source_Storage_storage_offset"](
+        site
+    )
     impl[op_empty_permuted, "empty_permuted"](site)
