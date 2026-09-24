@@ -210,6 +210,17 @@ def poll_acquire():
     every failed poll while independent compute is using L2. Every polling
     thread fences, including an already-satisfied flag, before the block
     barrier passes the acquire to the payload-reading threads.
+
+    Call it where the wave has reconverged, never inside the branch that
+    polls. `_sync` used to call it at the end of its `thread_idx.x < world`
+    branch, right after the spin loop. The loop leaves EXEC holding the
+    lanes still waiting, which is 0 on success, and LLVM's
+    SILowerControlFlow, which treats the fence as not reading EXEC, dropped
+    the loop's EXEC restore in front of it: the gfx942 assembly issued
+    `buffer_inv sc0 sc1` with EXEC = 0 on every success path. That is sound
+    only if CDNA3 ignores EXEC for a cache invalidate, which nothing here
+    verifies. After the branch closes, the fence runs under each wave's full
+    mask: one invalidate per wave per barrier, still none inside the spin.
     """
     comptime if _RELAXED_POLL:
         fence[ordering=Ordering.ACQUIRE]()
@@ -822,7 +833,10 @@ def _sync(
                     )
                     failed[unsafe_offset=0] = 1
                     break
-        poll_acquire()
+    # Outside the `thread_idx.x < world` branch on purpose: every wave issues
+    # it under its full EXEC mask. See `poll_acquire` for why nesting it in
+    # the polling branch left the invalidate with EXEC = 0.
+    poll_acquire()
     barrier()
     return failed[unsafe_offset=0] == 0
 

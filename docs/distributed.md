@@ -1044,7 +1044,15 @@ The matching [MAX 26.5 stdlib](https://github.com/modular/modular/blob/b4497b7ce
 maps relaxed to LLVM monotonic; Atomic and fence default to system scope.
 
 Each barrier polling thread acquires its own peer's publication before the
-final block barrier passes visibility to all consumers. The existing
+final block barrier passes visibility to all consumers. The fence sits
+after the polling branch (`thread_idx.x < world`) has closed, so every wave
+of the block issues it under its full EXEC mask: one invalidate per wave
+per barrier. It first sat at the end of that branch, and there the gfx942
+assembly issued it with EXEC = 0 on every successful exit. The divergent
+poll loop leaves EXEC holding the lanes still waiting, and LLVM's
+SILowerControlFlow, which treats a fence as not reading EXEC, dropped the
+loop's EXEC restore in front of it. That spelling is sound only if CDNA3
+ignores EXEC for `buffer_inv`, which nothing here verifies. The existing
 monotonic-generation and arena-reuse protocol still justifies `flag >=
 target`. The proxy wait has one polling thread; the next inbox consumer is
 behind its kernel on the same stream. The host publishes successful
@@ -1057,9 +1065,16 @@ The [LLVM gfx942 memory-model table](https://llvm.org/docs/AMDGPUUsage.html#memo
 specifies a system monotonic load with `sc0 sc1`, then a paired acquire
 fence that waits for the atomic and invalidates the cache. Emitted gfx942
 assembly confirms `global_load ... sc0 sc1` and `s_sleep 1` in the hot loop,
-and `s_waitcnt` followed by `buffer_inv sc0 sc1` at successful exit. There
-is no unconditional cache invalidate on each failed flag poll. System scope
-is retained for both peer-GPU and CPU publications.
+and `s_waitcnt` followed by `buffer_inv sc0 sc1` at successful exit. In
+every gfx942 CCL kernel, each barrier acquire now follows the polling
+branch's `s_or_b64 exec, exec, ...` restore and directly precedes
+`s_barrier`: 309 of 309, against 0 of 305 before the move, where each one
+opened a branch-target block entered with the narrowed mask. The proxy
+wait needs no move. Its single lane polls a uniform address, so the loop
+branches on VCC without narrowing EXEC, and its `buffer_inv` runs with
+EXEC = lane 0. There is no unconditional cache invalidate on each failed
+flag poll. System scope is retained for both peer-GPU and CPU
+publications.
 
 The backoff constant comes from **RCCL 2.22.3**, ROCm tag `rocm-6.4.1`,
 commit `e72b592201d626f16a03a7ba22502130a2846036`:
