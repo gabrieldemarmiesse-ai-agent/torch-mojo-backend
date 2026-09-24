@@ -2223,6 +2223,155 @@ def test_aten_div_rounding_mode_floor_trunc_disagree(
     check_outputs(fn, conf, [x, y])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("divisor", ["tensor", "number"])
+def test_aten_div_rounding_mode_int_compiled(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    rounding_mode: str,
+    divisor: str,
+):
+    """Integer floor/trunc division stays integral under torch.compile (MAX's
+    `/` promotes integers to float64)."""
+    call_checker.register(aten_functions.aten_div)
+    x = torch.tensor([7, -7, 7, -7, 8, -8, 6, -6, 0], dtype=dtype)
+    if divisor == "number":
+
+        def fn(x):
+            return torch.div(x, -3, rounding_mode=rounding_mode)
+
+        check_outputs(fn, conf, [x])
+        return
+
+    def fn2(x, y):
+        return torch.div(x, y, rounding_mode=rounding_mode)
+
+    y = torch.tensor([2, 2, -2, -2, 3, 3, -3, -3, 5], dtype=dtype)
+    check_outputs(fn2, conf, [x, y])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("rounding_mode", [None, "floor", "trunc"])
+@pytest.mark.parametrize(
+    ("lhs_dtype", "rhs_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float32),
+        (torch.bfloat16, torch.float16),
+        (torch.int32, torch.int64),
+        (torch.int64, torch.float32),
+    ],
+)
+def test_aten_div_promotes_and_broadcasts_compiled(
+    conf: Conf,
+    call_checker: CallChecker,
+    rounding_mode: str | None,
+    lhs_dtype: torch.dtype,
+    rhs_dtype: torch.dtype,
+):
+    """Promotion (true division of integers lands on the default float),
+    broadcasting against a row and a 0-d tensor, and a Python divisor."""
+    call_checker.register(aten_functions.aten_div)
+    x = (torch.arange(-12, 12).reshape(4, 6) * 7 % 23 - 11).to(lhs_dtype)
+    row = torch.tensor([3, -2, 5, -7, 4, 9]).to(rhs_dtype)
+    zero_d = torch.tensor(-3).to(rhs_dtype)
+
+    def fn(x, row, zero_d):
+        return (
+            torch.div(x, row, rounding_mode=rounding_mode),
+            torch.div(x, zero_d, rounding_mode=rounding_mode),
+            torch.div(x, 2.5, rounding_mode=rounding_mode),
+            torch.div(x, -4, rounding_mode=rounding_mode),
+        )
+
+    check_outputs(fn, conf, [x, row, zero_d])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+@pytest.mark.parametrize("divisor", ["number", "one_element", "tensor"])
+def test_aten_div_rounding_mode_bf16_compiled(
+    conf: Conf, call_checker: CallChecker, rounding_mode: str, divisor: str
+):
+    """bf16 divides in float32 where ATen does: floor always, trunc over a
+    scalar-shaped divisor (a Python number at its own value, or a
+    one-element tensor); trunc over a real tensor at native precision."""
+    call_checker.register(aten_functions.aten_div)
+    x = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5], dtype=torch.bfloat16)
+    if divisor == "number":
+
+        def fn(x):
+            return torch.div(x, -1.0547, rounding_mode=rounding_mode), torch.div(
+                x, 1.0001, rounding_mode=rounding_mode
+            )
+
+        check_outputs(fn, conf, [x], rtol=0, atol=0)
+        return
+
+    def fn2(x, y):
+        return torch.div(x, y, rounding_mode=rounding_mode)
+
+    shape = (1,) if divisor == "one_element" else (5,)
+    y = torch.full(shape, -1.0547, dtype=torch.bfloat16)
+    check_outputs(fn2, conf, [x, y], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize(
+    ("dtype", "tiny", "huge"),
+    [
+        (torch.bfloat16, 2.0**-126, 4.71875),
+        (torch.float32, 1e-38, 1e10),
+        (torch.float64, 1e-300, 1e100),
+    ],
+)
+def test_aten_div_floor_quotient_underflow_compiled(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, tiny: float, huge: float
+):
+    """A finite nonzero numerator over an opposite-sign divisor floors to -1
+    in every float dtype, even when the quotient underflows to -0."""
+    call_checker.register(aten_functions.aten_div)
+    x = torch.tensor([tiny, -tiny, tiny, 0.0, 1.0, -1.0], dtype=dtype)
+    y = torch.tensor(
+        [-huge, huge, huge, -huge, -float("inf"), float("inf")], dtype=dtype
+    )
+
+    def fn(x, y):
+        return torch.div(x, y, rounding_mode="floor"), torch.div(
+            x, -huge, rounding_mode="floor"
+        )
+
+    check_outputs(fn, conf, [x, y], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+def test_aten_div_rounding_mode_int_by_zero_compiled(
+    conf: Conf, call_checker: CallChecker, rounding_mode: str
+):
+    """CPU torch raises for an integer quotient by zero. A graph cannot raise
+    on data, so a zero tensor element gives 0, the mojo device's value, in
+    both modes (a CPU graph would otherwise trap); a zero Python number is
+    known while tracing and raises."""
+    call_checker.register(aten_functions.aten_div)
+    x = torch.tensor([1, -1, -7], dtype=torch.int64)
+    y = torch.tensor([0, 0, 2], dtype=torch.int64)
+    compiled = torch.compile(
+        lambda x, y: torch.div(x, y, rounding_mode=rounding_mode), backend=mojo_backend
+    )
+    out = compiled(x, y)
+    assert out.dtype == torch.int64
+    assert out.tolist() == [0, 0, -4 if rounding_mode == "floor" else -3]
+    compiled_zero = torch.compile(
+        lambda x: torch.div(x, 0, rounding_mode=rounding_mode), backend=mojo_backend
+    )
+    with pytest.raises(BackendCompilerFailed, match="ZeroDivisionError"):
+        compiled_zero(x)
+
+
 def _convolution_backward_tolerance(device: str) -> Tolerance:
     """How far a composed conv backward may sit from stock torch's.
 

@@ -1,12 +1,12 @@
 # Mojo kernel-family extensions
 
 > This describes the **native backend**'s on-demand kernel builds
-> (`torch_mojo_backend/mojo/tmb/backend/loader.mojo`). See `docs/native_backend.md`
+> (`torch_mojo_backend/mojo/tmb/backend/loader.mojo`). See `agents_docs/native_backend.md`
 > for the full architecture. The Python-level design this file used to
 > describe (`eager_kernels/__init__.py`'s `MojoExtensionLoader`,
 > `MojoExtension` descriptors, one Python-callable `call` per `.so`) was the
 > old eager-mode path; that code is deleted, and its historical measurements
-> live in `docs/fast_eager_design.md` (marked superseded there too).
+> live in `agents_docs/fast_eager_design.md` (marked superseded there too).
 
 ## Compiled at first call
 
@@ -27,7 +27,7 @@ no-warnings check: a warning in any Mojo source fails the tests that build it.
 
 This mirrors the old Python loader's behavior (same "one `.so` per exact
 specialization, built inline at first use" design, same rationale — see
-"Compile granularity" in `docs/fast_eager_design.md`), just driven from Mojo:
+"Compile granularity" in `agents_docs/fast_eager_design.md`), just driven from Mojo:
 the caller is now `tmb/ops/*.mojo`, not a Python `aten_fast.py`
 composition function.
 
@@ -97,13 +97,13 @@ The two backend shims (the C++ shim and the Mojo `tmb/backend/entry.mojo` itself
 cached the same way, one level up, in `native/__init__.py`
 (`libtmb_shim.hash-*.so`, `libtmb_backend.hash-*.so`) -- or copied there
 from the ones the wheel ships prebuilt, which is the same cache entry by
-another route; see `docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
+another route; see `agents_docs/native_backend.md`. `tests/native/test_loader.py` exercises this cache
 end to end through public behavior (env-var relocation, a second process
 reusing a build, a missing/corrupt `.so`).
 
 The ptxas 48 KiB static-shared-memory cap and the dynamic-shared-memory
 workaround for kernels that need more (unchanged from the old design) are
-documented in `docs/fast_eager_design.md`'s "Milestone 3" section and at
+documented in `agents_docs/fast_eager_design.md`'s "Milestone 3" section and at
 each affected kernel's `shared_mem_bytes` call site.
 
 ## Argv ABI
@@ -173,3 +173,93 @@ Pre-commit checks that the checked-in registrations are current.
 GPU float64 `acos` retains its graph implementation because the pinned Mojo
 compiler cannot lower a float64 GPU `acos` call. Other supported routes use
 the shared SIMD implementation.
+
+
+## The eager kernels in the graph backend (`tmb/graph/`)
+
+`torch.compile(backend=mojo_backend)` builds one MAX graph per compiled
+function, and MAX would run Modular's kernels for every op in it -- while the
+same model in eager mode on the `mojo` device runs this repository's
+(`tmb/ops/*.mojo`, usually the faster ones on an H100). For the ops
+GPT-2 inference spends its time in, the graph backend now calls the eager
+kernels too:
+
+| aten op | `aten_functions` route | custom op | eager kernel |
+|---|---|---|---|
+| `addmm`, `mm` | `_native_matmul` | `native_gemm`, `native_gemm_bias` | `_mm_route` / `_addmm_route` ladder: gemm16 (bf16, H100), TF32 (f32, H100, precision != "highest"), SIMT / gemv, fused bias |
+| `bmm` | `aten_bmm` | `native_bmm` | `_bmm_route` |
+| `_softmax` (trailing dim) | `aten_softmax` | `native_softmax_rows` | `SoftmaxSpec` (`_softmax_rows`) |
+| `native_layer_norm` (weight and bias given) | `aten_native_layer_norm` | `native_layer_norm` | `LayerNormForward` (`enqueue_norm_rows`), float32 mean / rstd |
+| `embedding` | `aten_embedding` | `native_embedding` | `Gather0` (`_gather0`) |
+
+`gelu` already ran the shared `tmb/graph/unary_math.mojo` in both modes
+(through MAX's fusible `ElementwiseUnaryOp` registration); the elementwise
+glue (`add`, `mul`, `eq`, `masked_fill`, `clone`) and the view ops stay MAX's,
+which fuses them into their neighbors. The routes take only operands that
+share one accelerator, in float32 / float16 / bfloat16; anything else, and
+`TORCH_MOJO_BACKEND_COMPILE_NATIVE_KERNELS=0`, keeps the MAX composition.
+
+**How a graph op reaches an eager kernel.** `tmb/graph/gemm.mojo` and
+`tmb/graph/nn.mojo` are ordinary MAX custom ops (`@compiler.register`, an `execute` taking
+`InputTensor` / `OutputTensor` and the `DeviceContext`) whose bodies call the
+kernels' comptime-dtype entry points -- `_gemm_transb_dispatch[dt]`,
+`_matmul_bias_launch[dt]`, `_softmax_rows[dt]`, `enqueue_norm_rows[dt, ...]`,
+`_gather0[dt, idx]` -- never the `_spec_*` / runtime-dtype dispatchers: those
+read the `-D` defines of a kernel-family build (`variant_gates.mojo`) and gate
+everything OFF in a build that has none, which a MAX-compiled package is.
+`aten_functions.py` calls the ops through `custom_mojo_ops.native_*`
+(`F.custom(name=...)`, parameters for `transpose_b` / `tf32` / `eps`).
+
+One import rule: a graph that uses several of these ops compiles their
+modules into one unit, and every family entry (`tmb/kernels/<family>/
+entry.mojo`) carries an `@export tmb_call` -- two of them in one unit is
+"invalid re-export of tmb_call". So an op imports its kernel from a module
+WITHOUT the export: the softmax and gather kernels moved out of the nn entry
+into `tmb/kernels/nn/softmax_rows_kernels.mojo` and
+`tmb/kernels/nn/gather_kernels.mojo` for exactly this, and
+`tmb/kernels/matmul/entry.mojo` is the one entry imported directly (its GEMM
+dispatch is the module). A new op that needs a kernel from another entry
+moves the kernel out first.
+
+Two build facts make this work, in `native/__init__.py` (with
+`compiler.kernel_extension_paths()`) and `_mojo_import_path.py`:
+
+* `build_graph_package()` precompiles `tmb/graph/` -- these ops and the
+  fusible elementwise registrations, one package -- into
+  `<cache>/graph.hash-<key>/graph.mojoc`, keyed by the whole import closure
+  (every kernel source it reaches) and the toolchain, with the one `-I`
+  (`torch_mojo_backend/mojo`). A precompiled package is not elaborated, so the
+  build takes seconds and the file stays small; MAX compiles the op bodies for
+  the device when it compiles a graph that uses them. The file stem is the
+  package name MAX imports, so it must stay a Mojo identifier (the key is on
+  the directory). `compiler.kernel_extension_paths()` lists it -- with
+  whatever `make_torch_op_from_mojo` registered -- as the `custom_extensions`
+  of every `F.custom` call. Precompiling it here also retires the per-call
+  source precompile MAX did for the directory (the hack `tests/conftest.py`
+  carried for modular/modular#5495).
+* That compile resolves `from tmb.kernels.matmul.entry import ...` along the
+  Mojo import path, `MODULAR_MOJO_MAX_IMPORT_PATH` (comma-separated), which by
+  default names only MAX's `lib/mojo` and which *replaces* that default when
+  set. `_mojo_import_path.py` therefore puts the default back and appends the
+  Mojo source root, at package import, before `max` reads the variable. The
+  root holds Mojo sources only, under the one package `tmb`, so nothing on it
+  can shadow a toolchain module -- the variable's entries outrank `-I` in
+  every `mojo` the package runs.
+
+**Transposed operands.** MAX materializes a transposed producer before an
+opaque custom op (the op always sees row-major strides), so the GEMM handed
+`weight.T` would copy every Linear's weight on every call. `_native_matmul`
+looks through the `aten.t` / `transpose` / `permute` node feeding `mat2`
+(`_transposed_source`, using the fx node and the compiler's tensor book) and
+passes the stored weight plus `transpose_b=True`, which the eager kernels read
+for free. A `bmm` whose operand is a direct `transpose(1, 2)` gets the same
+treatment; the `view(expand(transpose(...)))` chains torch's `matmul`
+decomposition produces are materialized, as they are in eager mode.
+
+**Numerics.** float32 GEMMs follow `torch.get_float32_matmul_precision()`
+exactly as eager mode does: "highest" (torch's default) runs the fp32 SIMT
+kernels, anything else the TF32 bridge on an H100. MAX's own matmul runs TF32
+for fp32 unconditionally, so switching to the native routes at the default
+precision trades tensor-core speed on large prefill shapes for torch's default
+numerics; decode-size shapes (m <= 32) are where the eager kernels were tuned
+to beat cuBLAS.

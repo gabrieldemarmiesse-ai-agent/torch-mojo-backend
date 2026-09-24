@@ -13,9 +13,11 @@ always `from tmb.<pkg>.<module> import name`: absolute, and naming a module
   native.mojo_import_closure) resolve exactly that grammar; an import they
   cannot resolve is a file whose edits would not invalidate a build.
 
-The one exception is `tmb/graph`, the MAX custom-op package: MAX precompiles
-that directory on its own with no `-I`, so inside it siblings are imported
-relatively (`from .unary_math import ...`) and nothing else may be.
+`tmb/graph`, the MAX custom-op package, may also import a sibling relatively
+(`from .unary_math import ...`): it was once precompiled by MAX itself with no
+`-I`, and its own modules still read that way. `native.build_graph_package()`
+now precompiles it with the one `-I` like every other build, so its ops may
+import the kernel tree, `from tmb.kernels.<family>.<module> import ...`.
 """
 
 import re
@@ -79,10 +81,6 @@ def test_imports_are_absolute_tmb_modules(path: Path):
         assert head == "tmb", (
             f"{where} is a bare import: with one -I root every in-repo import "
             "is absolute, `from tmb.<pkg>.<module> import ...`"
-        )
-        assert not in_graph, (
-            f"{where}: tmb/graph is precompiled by MAX without -I, so it can "
-            "only import its own siblings, relatively"
         )
         target = ROOT / (mod.replace(".", "/") + ".mojo")
         assert target.is_file(), (

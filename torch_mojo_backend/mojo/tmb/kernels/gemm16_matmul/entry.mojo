@@ -6,9 +6,9 @@
 # pointer/layout ABI and enqueues on the caller's DeviceContext. It performs no
 # allocation, host read, or synchronization.
 #
-# The family serves bfloat16 AND float16 from one source: `_GEMM16_DT`
-# (gemm16_dtype.mojo) resolves the operand dtype from the DTYPE_ARG_0 define,
-# so the loader's existing per-dtype specialization is the whole mechanism and
+# The family serves bfloat16, float16 and -- for the NT layout, as TF32 --
+# float32 from one source: `_GEMM16_DT` (gemm16_dtype.mojo) resolves the
+# operand dtype from the DTYPE_ARG_0 define, so the loader's existing per-dtype specialization is the whole mechanism and
 # nothing dtype-dependent travels at runtime. The module, its files and its OP
 # names still spell `bf16` for one reason worth writing down: the entry
 # module's stem is how scripts/compare_kernel_asm.py pairs kernels across two

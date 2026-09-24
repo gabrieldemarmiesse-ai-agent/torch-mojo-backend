@@ -15,7 +15,7 @@
 #            setup (ROCM_PATH, LD_LIBRARY_PATH with /opt/cray/pe/gcc-libs
 #            and /opt/rocm/lib) and TORCH_MOJO_BACKEND_CACHE_DIR on scratch.
 #   REPO     checkout to test (default: this script's checkout). Run it from
-#            /lus/scratch, never /lus/work (docs/distributed.md).
+#            /lus/scratch, never /lus/work (agents_docs/distributed.md).
 #   NNODES   nodes of the multi-node pass (default 2); NPROC ranks per node
 #            (default 4). LOGDIR (default $REPO/logs/worker_suites).
 #   PASSES   "multi single" (default), or one of them.

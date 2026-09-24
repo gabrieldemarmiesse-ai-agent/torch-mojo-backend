@@ -123,7 +123,7 @@ lines** — `nvls_kernels.mojo` and `vmm.mojo`, dispatched above 48 MiB, taking
 168 MiB from 990 to 790 us and 512 MiB from 2988 to 2226. Nothing in this file
 changed: the six exported names below are untouched and the unicast kernels
 still carry everything below the crossover. See the "NVLS" subsection of
-docs/distributed.md.
+agents_docs/distributed.md.
 
 Consequences for GPT-2 DDP: buckets 0-11 (9 and 27 MiB) are faster than NCCL and
 overlapped with backward anyway; the exposed 168 MiB tail bucket costs
@@ -452,7 +452,7 @@ shard in stage_out. Checked exhaustively over every dtype width, world and cap.
 
 The ABI layer now runs several such pairs CONCURRENTLY, to overlap the
 inter-node hop with the intra-node halves of other chunks (see the
-"Multi-node" subsection of `docs/distributed.md`). It needs nothing from this
+"Multi-node" subsection of `agents_docs/distributed.md`). It needs nothing from this
 file to do it: each in-flight chunk is handed a different arena -- a shifted
 region base and a smaller `cap_bytes`, carved so the arenas are disjoint --
 so every rule above applies per arena, unchanged, and point 3 is what orders
@@ -839,7 +839,7 @@ exits nonzero for reasons that have nothing to do with these kernels: without
 `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM` four ranks reserving ~124 GB each
 are OOM-killed on this APU, and with it the process segfaults in HIP's atexit
 handler unless the script ends in `os._exit(0)` — both already in
-`docs/distributed.md`.
+`agents_docs/distributed.md`.
 
 **A flake that cost the large messages 6%.** During the work the barrier's
 acquire was cheapened: spin on a *relaxed* load (still `sc0 sc1`, so it cannot
@@ -890,7 +890,7 @@ the per-iteration invalidate evicts the L2 of the compute kernels running
 beside the collective, and the relaxed spin took the profiled communication
 busy time from 209.5 to 188.5 ms per step and the compute kernel sum from
 249 to 235 ms. End to end the gain was about 1%, inside the leg noise.
-`docs/distributed.md` ("gfx942 waits acquire payloads once") has the
+`agents_docs/distributed.md` ("gfx942 waits acquire payloads once") has the
 ordering argument: a relaxed load that reads the release store, followed by
 an acquire fence, is the atomic-to-fence rule of the C++ and LLVM memory
 models. That is a proof, not the symmetry argument of 2026-09-09.

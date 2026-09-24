@@ -678,6 +678,219 @@ def test_gemm16_addmm_residue64_sites(mojo_h100, site, n, k):
     assert _rel_err(got, ref) < _bf16_bound(k)
 
 
+# --- TF32 NT on Hopper WGMMA (gemm16's float32 build) -------------------------
+#
+# Under a TF32 matmul precision an fp32 NT GEMM (A (m, k) row-major, B stored
+# (n, k)) runs gemm16's warp-specialized WGMMA kernels compiled for a 4-byte
+# operand; every other fp32 GEMM keeps the SM80-class tf32_matmul family.
+#
+# The oracle is EXACT: operands are multiples of 1/32 in [-1, 1), exact in
+# TF32's 10 mantissa bits, so every product is a multiple of 1/1024 and every
+# k-deep sum here stays inside fp32's exact range. Any mantissa loss, lost
+# k-step or dropped tile is a nonzero error, not a tolerance call.
+#
+# Which route ran is read off the numerics: WGMMA reads the top 19 bits of an
+# fp32 operand (it truncates to TF32), the SM80-class kernel rounds to nearest
+# even, and strict fp32 does neither. 1 + 3 * 2**-12 is 0.75 of a TF32 ulp
+# above 1, so it comes back as 1.0, 1 + 2**-10 and itself respectively.
+# -------------------------------------------------------------------------------
+
+_TF32_PROBE = 1.0 + 3 * 2.0**-12
+_ROUTE_WGMMA = 1.0
+_ROUTE_SM80 = 1.0 + 2.0**-10
+_ROUTE_STRICT = _TF32_PROBE
+
+TF32_WGMMA_SHAPES = {
+    "aligned_256x512x256": (256, 512, 256),
+    # ragged m, ragged (even) n, k not a multiple of BK = 32: the three
+    # relaxations over the 16-bit routes' tile-multiple gate, at once
+    "ragged_357x790x336": (357, 790, 336),
+    "awkward_357x790x1020": (357, 790, 1020),
+    # deep K, few output tiles: the split-K workspace + reduce route
+    "deep_k_256x256x8192": (256, 256, 8192),
+    # k = 4, the smallest the TMA rule admits: one partial k-tile, zero-filled
+    "min_k_128x256x4": (128, 256, 4),
+}
+
+# Declined by the host gate: k * 4 not a multiple of 16 bytes (no TMA
+# descriptor can describe it) or an odd n (the pair store would misalign).
+TF32_DECLINED_SHAPES = {
+    "awkward_357x789x1023": (357, 789, 1023),
+    "unaligned_k_357x790x333": (357, 790, 333),
+    "odd_n_128x257x256": (128, 257, 256),
+}
+
+
+@contextlib.contextmanager
+def _matmul_precision(precision: str):
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def _tf32_exact(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """Multiples of 1/32 in [-1, 1): exact in TF32, so the reference is."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(-31, 32, shape, generator=g).float() / 32.0
+
+
+def _nt_exact(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    a = _tf32_exact((m, k), m * 7 + k)
+    b = _tf32_exact((n, k), n * 11 + k)
+    return a, b
+
+
+def _exact_ref(a: torch.Tensor, b_nk: torch.Tensor, bias=None) -> torch.Tensor:
+    out = a.double() @ b_nk.double().t()
+    if bias is not None:
+        out = out + bias.double()
+    return out.float()
+
+
+@pytest.mark.parametrize("shape_id", sorted(TF32_WGMMA_SHAPES))
+def test_tf32_wgmma_nt_mm_is_bit_exact(mojo_h100, shape_id):
+    m, n, k = TF32_WGMMA_SHAPES[shape_id]
+    a, b = _nt_exact(m, n, k)
+    with _matmul_precision("high"), assert_ran("aten::mm"):
+        got = (a.to(mojo_h100) @ b.to(mojo_h100).t()).cpu()
+    torch.testing.assert_close(got, _exact_ref(a, b), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape_id", sorted(TF32_WGMMA_SHAPES))
+@pytest.mark.parametrize("op", ["linear", "addmm", "linear_3d"])
+def test_tf32_wgmma_nt_bias_is_bit_exact(mojo_h100, shape_id, op):
+    """linear / addmm with a bias: the WGMMA product plus a separate bias add,
+    exact on exact operands. linear_3d is a batched (rank-3) input, which the
+    route flattens into one (batch * m, k) matrix without a copy."""
+    m, n, k = TF32_WGMMA_SHAPES[shape_id]
+    a, w = _nt_exact(m, n, k)
+    bias = _tf32_exact((n,), n)
+    ref = _exact_ref(a, w, bias)
+    da, dw, db = a.to(mojo_h100), w.to(mojo_h100), bias.to(mojo_h100)
+    with _matmul_precision("high"):
+        if op == "linear":
+            got = torch.nn.functional.linear(da, dw, db)
+        elif op == "addmm":
+            got = torch.addmm(db, da, dw.t())
+        else:
+            if m % 2:
+                pytest.skip("an odd m has no two-batch split")
+            got = torch.nn.functional.linear(da.view(2, m // 2, k), dw, db)
+            ref = ref.view(2, m // 2, n)
+    torch.testing.assert_close(got.cpu(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape_id", sorted(TF32_DECLINED_SHAPES))
+def test_tf32_declined_nt_shapes_stay_exact(mojo_h100, shape_id):
+    m, n, k = TF32_DECLINED_SHAPES[shape_id]
+    a, b = _nt_exact(m, n, k)
+    bias = _tf32_exact((n,), n)
+    with _matmul_precision("high"):
+        got = (a.to(mojo_h100) @ b.to(mojo_h100).t()).cpu()
+        got_bias = torch.nn.functional.linear(
+            a.to(mojo_h100), b.to(mojo_h100), bias.to(mojo_h100)
+        ).cpu()
+    torch.testing.assert_close(got, _exact_ref(a, b), atol=0, rtol=0)
+    torch.testing.assert_close(got_bias, _exact_ref(a, b, bias), atol=0, rtol=0)
+
+
+def _probe_nt(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A (m, k) whose column 0 is the probe and B (n, k) of ones in column 0:
+    every output element is the probe as the route rounded it."""
+    a = torch.zeros(m, k)
+    a[:, 0] = _TF32_PROBE
+    b = torch.zeros(n, k)
+    b[:, 0] = 1.0
+    return a, b
+
+
+def _probe_value(out: torch.Tensor) -> float:
+    flat = out.cpu().reshape(-1)
+    assert torch.all(flat == flat[0]), "the route did not treat rows alike"
+    return float(flat[0])
+
+
+def _misaligned(t: torch.Tensor, device: str) -> torch.Tensor:
+    """The same matrix at a 4-byte offset into its storage: not 16B-aligned,
+    so no TMA descriptor may be built over it."""
+    flat = torch.zeros(t.numel() + 1)
+    flat[1:] = t.reshape(-1)
+    view = flat.to(device)[1:].view(t.shape)
+    assert view.data_ptr() % 16 != 0
+    return view
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("mm_nt", _ROUTE_WGMMA),
+        ("mm_nt_ragged", _ROUTE_WGMMA),
+        ("linear", _ROUTE_WGMMA),
+        ("linear_bias", _ROUTE_WGMMA),
+        ("linear_3d", _ROUTE_WGMMA),
+        ("addmm_nt", _ROUTE_WGMMA),
+        ("mm_nt_k_not_4", _ROUTE_SM80),
+        ("mm_nt_odd_n", _ROUTE_SM80),
+        ("mm_nt_misaligned_a", _ROUTE_SM80),
+        ("mm_nt_misaligned_b", _ROUTE_SM80),
+        ("mm_nn", _ROUTE_SM80),
+        ("mm_tn", _ROUTE_SM80),
+        ("bmm_nt", _ROUTE_SM80),
+    ],
+)
+def test_tf32_route_selection(mojo_h100, case, expected):
+    """Which kernel family served each fp32 GEMM under precision "high"."""
+    m, n, k = (357, 790, 1020) if case == "mm_nt_ragged" else (256, 512, 256)
+    if case == "mm_nt_k_not_4":
+        k = 255
+    if case == "mm_nt_odd_n":
+        n = 511
+    a, b = _probe_nt(m, n, k)
+    d = mojo_h100
+    with _matmul_precision("high"):
+        if case.startswith("mm_nt") and "misaligned" not in case:
+            out = a.to(d) @ b.to(d).t()
+        elif case == "mm_nt_misaligned_a":
+            out = _misaligned(a, d) @ b.to(d).t()
+        elif case == "mm_nt_misaligned_b":
+            out = a.to(d) @ _misaligned(b, d).t()
+        elif case == "linear":
+            out = torch.nn.functional.linear(a.to(d), b.to(d))
+        elif case == "linear_bias":
+            out = torch.nn.functional.linear(a.to(d), b.to(d), torch.zeros(n).to(d))
+        elif case == "linear_3d":
+            out = torch.nn.functional.linear(a.to(d).view(2, m // 2, k), b.to(d))
+        elif case == "addmm_nt":
+            out = torch.addmm(torch.zeros(n).to(d), a.to(d), b.to(d).t())
+        elif case == "mm_nn":
+            out = a.to(d) @ b.t().contiguous().to(d)
+        elif case == "mm_tn":
+            out = a.t().contiguous().to(d).t() @ b.t().contiguous().to(d)
+        else:
+            out = torch.bmm(a.to(d).expand(2, m, k), b.to(d).expand(2, n, k).mT)
+    assert _probe_value(out) == expected
+
+
+@pytest.mark.parametrize("op", ["mm", "linear", "addmm"])
+def test_tf32_wgmma_not_used_at_highest_precision(mojo_h100, op):
+    """ "highest" (torch's default) is the user asking for real fp32: an NT
+    GEMM the WGMMA route would take must not drop a single mantissa bit."""
+    m, n, k = 256, 512, 256
+    a, b = _probe_nt(m, n, k)
+    d = mojo_h100
+    assert torch.get_float32_matmul_precision() == "highest"
+    if op == "mm":
+        out = a.to(d) @ b.to(d).t()
+    elif op == "linear":
+        out = torch.nn.functional.linear(a.to(d), b.to(d), torch.zeros(n).to(d))
+    else:
+        out = torch.addmm(torch.zeros(n).to(d), a.to(d), b.to(d).t())
+    assert _probe_value(out) == _ROUTE_STRICT
+
+
 # --- the NT+bias 192x192 rolling kernel (GPT-2 XL forward linear sites) ------
 #
 # gemm16_candidate_dispatch.mojo's try_enqueue_candidate_nt_bias now tries the

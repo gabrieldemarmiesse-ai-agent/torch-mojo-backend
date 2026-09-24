@@ -233,7 +233,7 @@ on this shared fabric, so compare interleaved series only.
 ## Design notes
 
 The process group is split the way the rest of the native backend is
-(`docs/native_backend.md`): a thin Python adapter
+(`agents_docs/native_backend.md`): a thin Python adapter
 (`torch_mojo_backend/distributed/process_group.py`, `MojoProcessGroup`) over
 a Mojo core (`torch_mojo_backend/mojo/tmb/backend/pg.mojo`, `PG`) that owns the
 communicators and does the actual library calls.
@@ -331,7 +331,7 @@ communicators and does the actual library calls.
   `MODULAR_NVPTX_COMPILER_PATH` itself, to the assembler on the node that
   suits both the driver and the GPU — the `nvidia-cuda-nvcc-cu12` wheel's
   CUDA 12.8 one wherever it fits (`torch_mojo_backend/_ptxas.py`,
-  docs/native_backend.md "Which ptxas assembles the kernels").
+  agents_docs/native_backend.md "Which ptxas assembles the kernels").
   `torch-mojo-backend ptxas` prints the choice; export the variable yourself
   only to use another ptxas.
 - `NCCL_DEBUG=WARN` (or `INFO` during bring-up) is the first knob for
@@ -599,8 +599,8 @@ same lock/atomic-rename machinery), and `nccl.py`'s `library_path()` resolves
 to it instead of `libnccl.so.2`/`librccl.so.1` when `TORCH_MOJO_BACKEND_CCL=mojo`
 — `pg.mojo` dlopens whichever path comes back, so neither it nor
 `process_group.py` special-cases mojoccl; NCCL/RCCL stays the default. Design
-and measurements: `docs/mojo_collectives_feasibility.md` (study) and
-`docs/mojo_collectives_kernel_results.md` (kernels).
+and measurements: `agents_docs/mojo_collectives_feasibility.md` (study) and
+`agents_docs/mojo_collectives_kernel_results.md` (kernels).
 
 Scope, deliberately narrow — it is an experiment showing Mojo can write
 NCCL-class collectives, not a general library:
@@ -1119,7 +1119,7 @@ Earlier experiments that removed the all-thread producer writeback, or
 moved it after the barrier into only the publishing threads, failed small
 collectives. Those results still apply: `hipIpcOpenMemHandle` does not
 preserve the allocation's uncached memory type. See
-`docs/mojo_collectives_kernel_results.md` §3 and §7. The historical two-rank,
+`agents_docs/mojo_collectives_kernel_results.md` §3 and §7. The historical two-rank,
 one-element int64 flake later failed to reproduce in an A/B check: 0/20 on
 each tree. That did not establish the original cause. The separate AMD
 clock-overflow problem was fixed by `device_now_ns` (see "Multi-node").
@@ -2167,7 +2167,7 @@ weight:
    cause was the `cuMemCreate` prop, not the kind of memory: `nvidia_peermem`
    refuses (EFAULT) a chunk created without `allocFlags.gpuDirectRDMACapable`,
    which NCCL sets and `vmm.mojo` now sets too, after which all 12 HCAs
-   register it (`docs/mojo_collectives_nvls_results.md` §4). There is still
+   register it (`agents_docs/mojo_collectives_nvls_results.md` §4). There is still
    no dmabuf fallback (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0 on every
    device).
 3. So, on the first reason alone, a multi-node communicator would pay

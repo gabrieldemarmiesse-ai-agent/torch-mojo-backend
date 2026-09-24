@@ -634,6 +634,99 @@ def test_floor_divide(mojo_device):
     torch.testing.assert_close(out_scalar.cpu(), a_cpu // 3)
 
 
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "divisor", ["number", "one_element", "zero_dim", "cpu_zero_dim"]
+)
+def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divisor):
+    """ATen divides a bf16/fp16 tensor by a scalar-shaped divisor in float32
+    (`iter.is_scalar(2)`): -6.3125 / -1.0547 is 5.985, which rounds to 6.0 in
+    bf16 before a native-precision trunc but truncates to 5 in float32. And
+    a Python number keeps its own value: 3 / 1.0001 floors to 2, while
+    1.0001 rounded to bf16 is 1.0 and gives 3."""
+    a_cpu = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5, -1e-3], dtype=dtype)
+    a = a_cpu.to(mojo_device)
+    for value in (-1.0547, 1.0001, -2.5):
+        if divisor == "number":
+            b_cpu, b = value, value
+        else:
+            b_cpu = torch.tensor(value if divisor != "one_element" else [value])
+            b_cpu = b_cpu.to(dtype)
+            b = b_cpu if divisor == "cpu_zero_dim" else b_cpu.to(mojo_device)
+        with native_ran("aten::div.Tensor_mode"):
+            out = torch.div(a, b, rounding_mode=mode)
+        assert out.dtype == dtype
+        torch.testing.assert_close(
+            out.cpu(), torch.div(a_cpu, b_cpu, rounding_mode=mode), rtol=0, atol=0
+        )
+
+
+def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
+    """A multi-element divisor is ATen's general trunc loop: the quotient is
+    rounded to bf16 before the trunc (6.0 here, not the scalar path's 5)."""
+    a_cpu = torch.tensor([-6.3125, -6.3125], dtype=torch.bfloat16)
+    b_cpu = torch.tensor([-1.0547, -1.0547], dtype=torch.bfloat16)
+    expected = torch.div(a_cpu, b_cpu, rounding_mode="trunc")
+    assert expected.tolist() == [6.0, 6.0]
+    out = torch.div(a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode="trunc")
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_floor_divide_narrow_float_scalar(mojo_device):
+    a_cpu = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
+    with native_ran("aten::floor_divide", "aten::floor_divide.Scalar"):
+        out = a_cpu.to(mojo_device) // 1.0001
+    torch.testing.assert_close(out.cpu(), a_cpu // 1.0001, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.uint8])
+def test_div_int_by_zero_host_scalar_raises(mojo_device, dtype):
+    """CPU torch raises for an integer quotient by zero. A host-scalar zero is
+    known without touching the device, so the mojo device raises too."""
+    a = torch.tensor([1, 5, 0], dtype=dtype).to(mojo_device)
+    for mode in ("floor", "trunc"):
+        with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+            torch.div(a, 0, rounding_mode=mode)
+    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+        a // 0
+    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+        torch.floor_divide(a, torch.tensor(0))
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_div_int_by_zero_tensor_gives_zero(mojo_device, dtype):
+    """A zero element of a DEVICE divisor cannot raise without a sync; floor
+    and trunc both give 0 for it (ATen's `div_floor_integer` value), and
+    trunc's sign fixup no longer turns that into 1 for a negative
+    numerator."""
+    a = torch.tensor([1, -1, -7, 7], dtype=dtype).to(mojo_device)
+    b = torch.tensor([0, 0, 2, -2], dtype=dtype).to(mojo_device)
+    for mode, rest in (("floor", [-4, -4]), ("trunc", [-3, -3])):
+        with native_ran("aten::div.Tensor_mode"):
+            out = torch.div(a, b, rounding_mode=mode)
+        assert out.cpu().tolist() == [0, 0, *rest]
+
+
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+@pytest.mark.parametrize("out_dtype", [torch.float64, torch.int16, torch.int8])
+def test_div_out_mode_cast_outside_cast_dtypes(mojo_device, mode, out_dtype):
+    """div.out_mode accepts any `out` dtype torch's can_cast allows, not only
+    the device cast kernel's dtypes: int32 into float64 / int16 / int8."""
+    if out_dtype == torch.float64:
+        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    a_cpu = torch.tensor([7, -7, 9], dtype=torch.int32)
+    b_cpu = torch.tensor([2, 2, -4], dtype=torch.int32)
+    expected = torch.empty(3, dtype=out_dtype)
+    torch.div(a_cpu, b_cpu, rounding_mode=mode, out=expected)
+    dest = torch.empty(3, dtype=out_dtype, device=mojo_device)
+    with native_ran("aten::div.out_mode"):
+        torch.div(
+            a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode=mode, out=dest
+        )
+    torch.testing.assert_close(dest.cpu(), expected)
+
+
 def test_remainder(mojo_device, call_checker):
     call_checker.register(aten_functions.aten_remainder)
     a_cpu, a = _both((8,), torch.float32, mojo_device)
@@ -1197,6 +1290,28 @@ def test_floor_divide_subnormal_quotient_underflow(mojo_device):
     expected = torch.floor_divide(a_cpu, b_cpu)
     assert expected[0].item() == -1.0, expected  # the CPU reference itself
     torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tiny", "huge"),
+    [(torch.float32, 1e-38, 1e10), (torch.float64, 1e-300, 1e100)],
+)
+def test_floor_divide_wide_float_quotient_underflow(mojo_device, dtype, tiny, huge):
+    """ATen floors a finite nonzero numerator over an opposite-sign divisor to
+    -1 in every float dtype, even when the quotient underflows to -0."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    a_cpu = torch.tensor([tiny, -tiny, tiny, 0.0, 1.0, -1.0], dtype=dtype)
+    b_cpu = torch.tensor(
+        [-huge, huge, huge, -huge, -float("inf"), float("inf")], dtype=dtype
+    )
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    expected = torch.floor_divide(a_cpu, b_cpu)
+    assert expected.tolist() == [-1.0, -1.0, 0.0, -0.0, -1.0, -1.0]
+    torch.testing.assert_close(torch.floor_divide(a, b).cpu(), expected)
+    torch.testing.assert_close(
+        torch.floor_divide(a, -huge).cpu(), torch.floor_divide(a_cpu, -huge)
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

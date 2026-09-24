@@ -176,7 +176,7 @@ def exit_past_vmm_teardown(device: str):
     """Skip C exit handlers under MAX's VMM allocator (see nanogpt_ddp.py).
 
     MAX's on-demand (VMM) device allocator is what makes an APU such as the
-    MI300A usable with one rank per GPU (docs/distributed.md), but with MAX
+    MI300A usable with one rank per GPU (agents_docs/distributed.md), but with MAX
     26.5 + ROCm 6.4.3 the HSA runtime segfaults in its atexit teardown of the
     VMM mappings, after Python has finished. Everything above has completed.
     """

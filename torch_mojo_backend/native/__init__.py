@@ -913,8 +913,9 @@ _GRAPH_SRC = _MOJO_ROOT / "tmb" / "graph"
 def mojo_import_roots() -> list[Path]:
     """The import roots every Mojo build of this package resolves `tmb.`
     against -- one, the Mojo source root. `loader.mojo`'s `mojo build` lines
-    and `build_backend` pass it as `-I`, and so does the graph package's
-    precompile below."""
+    and `build_backend` pass it as `-I`; `_mojo_import_path` hands it to MAX's
+    in-process graph compiler, which has no `-I`, so that a custom op whose
+    body is an eager kernel can import it."""
     return [_MOJO_ROOT]
 
 
@@ -965,8 +966,11 @@ def build_graph_package() -> Path:
     again at every `F.custom` call (modular/modular#5495) and names it after a
     hash. A precompiled package is not elaborated, so the build takes seconds
     and the file stays small: MAX compiles the op bodies for the device when it
-    compiles a graph that uses them. The key is the whole import closure of the
-    package's modules, so an edit to anything they reach rebuilds it.
+    compiles a graph that uses them -- and it keeps its `from tmb.kernels...`
+    lines by name, which MAX resolves along the import path `_mojo_import_path`
+    sets. That is what lets an op's body BE an eager kernel. The key is the
+    whole import closure of the package's modules, kernels included, so an edit
+    to a kernel rebuilds the package too.
 
     Cached for the process: every `F.custom` call asks for the path, hashing
     the sources each time would cost milliseconds per op, and MAX loads a

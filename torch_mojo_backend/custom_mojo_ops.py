@@ -1,3 +1,4 @@
+import struct
 from typing import Literal
 
 import torch
@@ -21,13 +22,10 @@ def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
     )
 
 
-def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
-    """
-    Custom Mojo kernel for bitwise_and operation.
-    """
-
+def _same_type_binary(name: str, input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """An ElementwiseBinaryOp over two operands of one dtype and shape."""
     return F.custom(
-        name="bitwise_and",
+        name=name,
         device=input.device,
         values=[input, other],
         out_types=[
@@ -35,6 +33,13 @@ def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         ],
         custom_extensions=compiler.kernel_extension_paths(),
     )[0]
+
+
+def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
+    """
+    Custom Mojo kernel for bitwise_and operation.
+    """
+    return _same_type_binary("bitwise_and", input, other)
 
 
 def bitwise_and_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -64,16 +69,7 @@ def bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_or operation.
     """
-
-    return F.custom(
-        name="bitwise_or",
-        device=input.device,
-        values=[input, other],
-        out_types=[
-            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
-        ],
-        custom_extensions=compiler.kernel_extension_paths(),
-    )[0]
+    return _same_type_binary("bitwise_or", input, other)
 
 
 def bitwise_or_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -87,16 +83,7 @@ def bitwise_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
     """
     Custom Mojo kernel for bitwise_xor operation.
     """
-
-    return F.custom(
-        name="bitwise_xor",
-        device=input.device,
-        values=[input, other],
-        out_types=[
-            TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
-        ],
-        custom_extensions=compiler.kernel_extension_paths(),
-    )[0]
+    return _same_type_binary("bitwise_xor", input, other)
 
 
 def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
@@ -104,6 +91,15 @@ def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
     Custom Mojo kernel for bitwise_xor_scalar operation.
     """
     return bitwise_xor(input, _scalar_to_tensor(input, other))
+
+
+def div(
+    input: MaxTensor, other: MaxTensor, kind: Literal["true", "floor", "trunc"]
+) -> MaxTensor:
+    """torch.div's three modes (`tmb/graph/div_math.mojo`). The operands share
+    a dtype and a shape: promotion, broadcasting and any float32 widening
+    happen before the call."""
+    return _same_type_binary(f"div_{kind}", input, other)
 
 
 def elementwise(
@@ -187,5 +183,112 @@ def gelu_backward(
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
+
+
+# --- The eager kernels as graph custom ops (tmb/graph/gemm.mojo, nn.mojo) ----
+#
+# `torch.compile(backend=mojo_backend)` would otherwise run MAX's own matmul /
+# softmax / layer-norm / embedding kernels where the same model in eager mode
+# runs this repository's. These wrappers call the eager routes through the
+# `@compiler.register` structs of `tmb/graph/`, so both modes run one
+# set of kernels with one set of numerics. Every operand is a dense row-major
+# 2-D (or 3-D, for bmm) tensor: the aten_functions callers flatten leading
+# dimensions and see through transposes; MAX materializes anything else.
+
+
+def native_gemm(
+    a: MaxTensor, b: MaxTensor, bias: MaxTensor | None, *, transpose_b: bool, tf32: bool
+) -> MaxTensor:
+    """`a @ op(b) [+ bias]` through the eager GEMM ladder (tmb/ops/matmul.mojo's
+    `_mm_route` / `_addmm_route`): `a` is (m, k); `b` is (k, n), or (n, k)
+    with `transpose_b` -- the stored weight of a Linear, read as `W.T` for
+    free; `bias` is one row of n. `tf32` is torch's
+    `get_float32_matmul_precision() != "highest"`, the only knob that picks
+    the TF32 tensor-core bridge for float32 on an H100."""
+    n = b.shape[0] if transpose_b else b.shape[1]
+    out_type = TensorType(dtype=a.dtype, shape=[a.shape[0], n], device=a.device)
+    return F.custom(
+        name="native_gemm" if bias is None else "native_gemm_bias",
+        device=a.device,
+        values=[a, b] if bias is None else [a, b, bias],
+        out_types=[out_type],
+        parameters={"transpose_b": transpose_b, "tf32": tf32},
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
+
+
+def native_bmm(
+    a: MaxTensor, b: MaxTensor, *, transpose_b: bool, tf32: bool
+) -> MaxTensor:
+    """`a[i] @ op(b[i])` over a dense batch (tmb/ops/matmul.mojo's `_bmm_route`):
+    `a` is (batch, m, k); `b` is (batch, k, n), or (batch, n, k) with
+    `transpose_b`."""
+    n = b.shape[1] if transpose_b else b.shape[2]
+    out_type = TensorType(
+        dtype=a.dtype, shape=[a.shape[0], a.shape[1], n], device=a.device
+    )
+    return F.custom(
+        name="native_bmm",
+        device=a.device,
+        values=[a, b],
+        out_types=[out_type],
+        parameters={"transpose_b": transpose_b, "tf32": tf32},
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
+
+
+def native_softmax_rows(x: MaxTensor) -> MaxTensor:
+    """Softmax over the trailing dim of a (rows, cols) operand: the eager
+    `SoftmaxSpec` kernel (tmb/kernels/nn's `_softmax_rows`)."""
+    return F.custom(
+        name="native_softmax_rows",
+        device=x.device,
+        values=[x],
+        out_types=[TensorType(dtype=x.dtype, shape=x.shape, device=x.device)],
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
+
+
+def native_layer_norm(
+    x: MaxTensor, weight: MaxTensor, bias: MaxTensor, eps: float
+) -> tuple[MaxTensor, MaxTensor, MaxTensor]:
+    """Layer norm over the trailing dim of a (rows, cols) operand with a
+    (cols,) weight and bias: the eager `LayerNormForward` kernel. Returns
+    `(out, mean, rstd)`, the two statistics float32 of shape (rows,), as
+    ATen's accelerator kernel does whatever the input dtype."""
+    rows = x.shape[0]
+    stats = TensorType(dtype=DType.float32, shape=[rows], device=x.device)
+    out, mean, rstd = F.custom(
+        name="native_layer_norm",
+        device=x.device,
+        values=[x, weight, bias],
+        out_types=[
+            TensorType(dtype=x.dtype, shape=x.shape, device=x.device),
+            stats,
+            stats,
+        ],
+        # ATen's `float eps` travels as the bit pattern of its float64: a
+        # custom-op parameter is a bool, an int, a str or a dtype.
+        parameters={"eps_bits": struct.unpack("<q", struct.pack("<d", eps))[0]},
+        custom_extensions=compiler.kernel_extension_paths(),
+    )
+    return out, mean, rstd
+
+
+def native_embedding(weight: MaxTensor, indices: MaxTensor) -> MaxTensor:
+    """One row of the (num_rows, row_len) table per index of a flat int32 /
+    int64 `indices`: the eager `Gather0` kernel (tmb/kernels/nn's `_gather0`)."""
+    out_type = TensorType(
+        dtype=weight.dtype,
+        shape=[indices.shape[0], weight.shape[1]],
+        device=weight.device,
+    )
+    return F.custom(
+        name="native_embedding",
+        device=weight.device,
+        values=[weight, indices],
+        out_types=[out_type],
         custom_extensions=compiler.kernel_extension_paths(),
     )[0]
