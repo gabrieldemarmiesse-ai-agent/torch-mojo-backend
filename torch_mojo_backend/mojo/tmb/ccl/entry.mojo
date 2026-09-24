@@ -201,7 +201,6 @@ from tmb.ccl.internode_kernels import (
     copy_bytes,
     inbox_add,
     inbox_sum_out,
-    place_blocks,
 )
 from tmb.ccl.reduce_scatter.fused import (
     RS_FUSED_BIG_BLOCKS,
@@ -3151,9 +3150,7 @@ def _allgather_locked(
             )
             done += chunk
         return NCCL_SUCCESS
-    _allgather_multinode(
-        state, s, stream, Int(sendbuff), Int(recvbuff), per_rank_bytes
-    )
+    _allgather_multinode(state, s, Int(sendbuff), Int(recvbuff), per_rank_bytes)
     return NCCL_SUCCESS
 
 
@@ -3241,13 +3238,16 @@ def allgather_mapped_pipeline_plan(
     return Tuple(chunk, nchunks, min(2, min(narenas, min(nslots - 1, nchunks))))
 
 
-def _allgather_multinode_mapped(
+def _allgather_multinode(
     mut state: CommState,
     stream: DeviceStream,
     sendbuff: Int,
     recvbuff: Int,
     per_rank_bytes: Int,
 ) raises:
+    """Exchange one contribution per NIC, disseminate on the receiving node.
+    The node-local gathers write straight into the mapped output slots and
+    stage the RDMA source; chunks pipeline through two arenas."""
     if per_rank_bytes == 0:
         return
     var npeers = ib_npeers(state.ib)
@@ -3354,145 +3354,6 @@ def _allgather_multinode_mapped(
                 )
                 slot += 1
             ib_note_consumed(state.ib, seq)
-
-
-def _allgather_multinode(
-    mut state: CommState,
-    stream: DeviceStream,
-    raw_stream: Int64,
-    sendbuff: Int,
-    recvbuff: Int,
-    per_rank_bytes: Int,
-) raises:
-    """Exchange one contribution per NIC, disseminate on the receiving node."""
-    comptime if has_nvidia_gpu_accelerator() or _GFX942:
-        _allgather_multinode_mapped(
-            state, stream, sendbuff, recvbuff, per_rank_bytes
-        )
-        return
-    var lw = state.local_world
-    var npeers = ib_npeers(state.ib)
-    var block_stage = state.owned_base + _net_stage_off(state)
-    var max_bytes = (
-        min(
-            _net_stage_bytes(state) // lw,
-            min(
-                allgather_max_bytes(state.arena_cap, lw),
-                _inbox_group_bytes(state) // npeers,
-            ),
-        )
-        // 16
-        * 16
-    )
-    if max_bytes < 16:
-        raise Error("mojoccl: allgather staging cannot hold one vector")
-    var done = 0
-    var chunk_index = 0
-    var nchunks = (per_rank_bytes + max_bytes - 1) // max_bytes
-    while done < per_rank_bytes:
-        var chunk = min(max_bytes, per_rank_bytes - done)
-        state.generation += 1
-        allgather(
-            state.ctx,
-            stream,
-            state.local_rank,
-            lw,
-            _arena_regions(state, 0),
-            sendbuff + done,
-            block_stage,
-            chunk,
-            state.arena_cap,
-            state.generation,
-            stride_bytes=chunk,
-        )
-        var seq = ib_next_seq(state.ib)
-        var slot_bytes = _align_up(chunk, 16)
-        var inbox_base = _inbox_base(state, seq)
-        if npeers * slot_bytes > _inbox_group_bytes(state):
-            raise Error("mojoccl: allgather inbox does not fit")
-        ib_enqueue_request(
-            state.ib,
-            state.driver,
-            state.ctx,
-            stream,
-            Int(raw_stream),
-            block_stage + state.local_rank * chunk,
-            chunk,
-            inbox_base,
-            slot_bytes,
-            True,
-            npeers,
-            state.owned_base + inbox_base,
-            seq,
-            OP_ALLGATHER,
-            chunk_index,
-            nchunks,
-            chunk,
-        )
-        _place_node_block(
-            state,
-            stream,
-            recvbuff,
-            block_stage,
-            state.my_node,
-            chunk,
-            done,
-            per_rank_bytes,
-        )
-        # Completion includes sends: staging is now safe to overwrite.
-        ib_enqueue_wait(state.ib, state.ctx, stream, seq)
-        var slot = 0
-        for node in range(state.nnodes):
-            if node == state.my_node:
-                continue
-            state.generation += 1
-            allgather(
-                state.ctx,
-                stream,
-                state.local_rank,
-                lw,
-                _arena_regions(state, 0),
-                state.owned_base + inbox_base + slot * slot_bytes,
-                block_stage,
-                chunk,
-                state.arena_cap,
-                state.generation,
-                stride_bytes=chunk,
-            )
-            _place_node_block(
-                state,
-                stream,
-                recvbuff,
-                block_stage,
-                node,
-                chunk,
-                done,
-                per_rank_bytes,
-            )
-            slot += 1
-        ib_note_consumed(state.ib, seq)
-        done += chunk
-        chunk_index += 1
-
-
-def _place_node_block(
-    mut state: CommState,
-    stream: DeviceStream,
-    recvbuff: Int,
-    src: Int,
-    node: Int,
-    chunk: Int,
-    done: Int,
-    per_rank_bytes: Int,
-) raises:
-    var offs = StaticTuple[Int64, MAX_WORLD](fill=0)
-    for l in range(state.local_world):
-        offs[l] = Int64(
-            state.rank_at[node * state.local_world + l] * per_rank_bytes + done
-        )
-    place_blocks(
-        state.ctx, stream, recvbuff, src, offs, chunk, state.local_world
-    )
 
 
 # ---------------------------------------------------------------------------

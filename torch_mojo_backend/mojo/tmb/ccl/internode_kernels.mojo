@@ -233,38 +233,6 @@ def _copy_kernel(
     )
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BLOCK))
-)
-@__name("ccl_internode_place_blocks")
-def _place_blocks_kernel(
-    dst: Pointer[UInt8, MutAnyOrigin],
-    src: Pointer[UInt8, MutAnyOrigin],
-    dst_offsets: StaticTuple[Int64, MAX_WORLD],
-    block_bytes: Int64,
-    nblocks_i: Int32,
-):
-    """Scatter one node's allgather block into the output by global rank.
-
-    A node's block holds its `local_world` contributions in local-rank order;
-    the output wants them at their global ranks, which torchrun's numbering
-    makes contiguous but which this library reads out of the bootstrap table
-    instead of assuming. One launch per node beats `local_world` launches of
-    a few bytes each.
-    """
-    var nb = Int(block_bytes)
-    var tid = Int(global_idx.x)
-    var stride = Int(grid_dim.x) * BLOCK
-    for l in range(Int(nblocks_i)):
-        _copy_bytes[_UNROLL](
-            dst.unsafe_offset(Int(dst_offsets[l])),
-            src.unsafe_offset(l * nb),
-            nb,
-            tid,
-            stride,
-        )
-
-
 # ===-------------------------------------------------------------------=== #
 # Launchers
 # ===-------------------------------------------------------------------=== #
@@ -381,30 +349,6 @@ def copy_bytes(
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=dst),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src),
         Int64(nbytes),
-    )
-
-
-def place_blocks(
-    ctx: DeviceContext,
-    stream: DeviceStream,
-    dst: Int,
-    src: Int,
-    dst_offsets: StaticTuple[Int64, MAX_WORLD],
-    block_bytes: Int,
-    nblocks: Int,
-) raises:
-    if block_bytes <= 0 or nblocks <= 0:
-        return
-    _enqueue_cached[_place_blocks_kernel](
-        ctx,
-        stream,
-        "ib_place",
-        _blocks_for(block_bytes),
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=dst),
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src),
-        dst_offsets,
-        Int64(block_bytes),
-        Int32(nblocks),
     )
 
 

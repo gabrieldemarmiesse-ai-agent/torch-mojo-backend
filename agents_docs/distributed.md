@@ -1295,28 +1295,31 @@ the reduce-scatter is network-bound (15.4 MB/rank fp32 950 vs 951 µs at 128
 vs 24 blocks, 2 × 4 MI300A, job 5447705), and the freed CUs go to the
 backward's GEMMs -- GPT-2 XL FSDP2 ABBA legs 22.0k/22.8k -> 23.2k/23.2k
 tokens/s. Broadcast uses the same RDMA path: the root's node fans
-out to its counterparts, then each node broadcasts locally. All-gather
-first gathers local contributions into a node block, then each rank sends
-only its own contribution to the same local rank on each remote node.
+out to its counterparts, then each node broadcasts locally. In an
+all-gather each rank sends only its own contribution to the same local
+rank on each remote node.
 After the exchange, node-local all-gathers disseminate the received
 contributions, and placement follows the bootstrap global-rank table.
-On NVIDIA and gfx942 each local all-gather writes directly into the mapped
-global output slots, and its local staging supplies the RDMA send. Other
-targets place the local block while the network transfer runs. Staging is
-reused only after send completion. NVIDIA and gfx942 all-gathers pipeline
-two chunks through separate existing arenas, overlapping a network exchange
+Each local all-gather writes directly into the mapped global output slots,
+and its local staging supplies the RDMA send. Staging is reused only after
+send completion. All-gathers pipeline two chunks through separate existing
+arenas, overlapping a network exchange
 with the next local gather and the earlier remote gather.
 
-On gfx942 the local peers push into compact slots of each other's regions
+On AMD the local peers push into compact slots of each other's regions
 (see "AMD MI300A" above), so the RDMA source cannot be the slot the peers
 write: each rank stages its contribution into a separate slot after the
-`local_world-1` peer slots, together with its own output slice, releases
+`local_world-1` peer slots (`allgather_nic_stage_off`), together with its own output slice, releases
 it (every wave's system release fence, then the per-arena acq_rel arrival
 counter), and the last block to arrive release-stores the exchange into
 the proxy mailbox. The NIC therefore starts while the xGMI pushes still
 run, and the two node-block placement kernels and the separate proxy
 request of the older AMD schedule are gone (four launches per chunk instead
-of six on two nodes). The staging bound becomes `local_world *
+of six on two nodes); that older schedule is deleted, so every AMD target
+takes this one. Multi-node MojoCCL on AMD GPUs other than MI300A is
+untested: they get the same push kernel and NIC slot, the single-node copy
+cap for the gathers (`_node_grids`) and unroll 4, none of it measured or
+run there. The staging bound becomes `local_world *
 align16(chunk) <= 2 * arena_cap` next to the inbox bound; at 4 ranks/node
 and the 64 MiB region the inbox (6,709,248 B) still binds. Measured on 2 × 4 MI300A (Adastra job 5447705, 8 ranks,
 streamed device time per call, ABBA; RCCL 2.22.3 through the same process
@@ -1354,8 +1357,7 @@ chunks unless region capacity requires more. This threshold was measured on
 the two halves (RCCL's two slices per chunk) took the XL bf16 block from 601
 to 541 µs once the flush read had its own endpoint (below). Inbox credits
 follow each chunk's remote consumers; the source arena is reused only after
-its send and consumers complete. Broadcast and the other-target all-gather
-schedule remain unpipelined. Single-node
+its send and consumers complete. Broadcast remains unpipelined. Single-node
 communicators keep the fused intra-node path and never touch IB.
 
 Measured at 16 ranks (2x8 H100 SXM, InfiniBand, job 258050) through the
