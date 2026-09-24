@@ -26,6 +26,8 @@
 # locks are taken; eager kernel specializations compile at first use, so warm
 # TORCH_MOJO_BACKEND_CACHE_DIR first or they compile under the locks.
 # Prints one PASS/FAIL line per suite; each suite's full output is in LOGDIR.
+# Every requested suite runs; the exit status is nonzero if any of them failed
+# (a worker assertion, a crash or a timeout), so sbatch and callers see it.
 set -uo pipefail
 J=${SLURM_JOB_ID:-${J:?set J=<jobid> or run under sbatch}}
 REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -69,8 +71,10 @@ suite() {  # $1 = pass, $2 = nnodes, $3 = name, rest = worker script + args
     echo "PASS $pass $name"
   else
     echo "FAIL $pass $name ($log)"
+    FAILED+=("$pass/$name")
   fi
 }
+FAILED=()
 
 for pass in $PASSES; do
   nn=$NNODES; [ "$pass" = single ] && nn=1
@@ -92,5 +96,13 @@ for pass in $PASSES; do
       tests/multinode/small_region_probe.py
     SUITE_ENV="MOJOCCL_IB_TIMEOUT_S=3" suite "$pass" "$nn" deadline \
       tests/multinode/deadline_probe.py
+    # Past the fused work ring's capacity: the split wait kernel's deadline.
+    SUITE_ENV="MOJOCCL_REGION_MB=1 MOJOCCL_IB_TIMEOUT_S=3" suite "$pass" "$nn" \
+      deadline_split tests/multinode/deadline_probe.py --size-mib 129
   fi
 done
+if [ ${#FAILED[@]} -gt 0 ]; then
+  echo "=== ${#FAILED[@]} suite(s) failed: ${FAILED[*]} ==="
+  exit 1
+fi
+echo "=== all suites passed ==="

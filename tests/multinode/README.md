@@ -225,10 +225,12 @@ partition, mojoccl only, with the multi-node probes added. It runs every
 `abort`) and every `fsdp_worker` mode (`reduce_scatter`,
 `fsdp_collectives_stress`, `parity`) first on `NNODES` (default 2) nodes x 4
 APUs, adding `ring_pressure.py` (N=1500), `small_region_probe.py`
-(`MOJOCCL_REGION_MB=1`) and `deadline_probe.py` (`MOJOCCL_IB_TIMEOUT_S=3`),
-then all the worker modes again on one node. It prints one PASS/FAIL line per
-suite and keeps each suite's output under `LOGDIR`. Run it as a batch script
-or from a login node against an existing allocation:
+(`MOJOCCL_REGION_MB=1`) and `deadline_probe.py` (`MOJOCCL_IB_TIMEOUT_S=3`,
+once fused and once with `MOJOCCL_REGION_MB=1 --size-mib 129` for the split
+wait kernel), then all the worker modes again on one node. It prints one
+PASS/FAIL line per suite, keeps each suite's output under `LOGDIR`, and exits
+nonzero when any suite failed. Run it as a batch script or from a login node
+against an existing allocation:
 
 ```bash
 J=<jobid> ENV_SH=$SCRATCHDIR/env.sh REPO=$SCRATCHDIR/checkout \
