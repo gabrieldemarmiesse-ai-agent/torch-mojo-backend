@@ -42,7 +42,10 @@ must be routed to the existing v3 dispatcher by the caller
 The operand dtype is bfloat16 or float16, chosen at compile time by
 `_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
 here is a function of the 2-byte operand width, not of the exponent
-layout, so one source serves both.
+layout, so one source serves both.  The persistent kernels here are
+16-bit-only (their epilogues assume a 2-byte operand) and the float32 ladder
+never selects them; `_v4_mma_tile` alone IS width-generic, because the
+float32 NT split-K route in gemm16_tn_v4_kernels.mojo shares it.
 """
 
 from std.gpu import (
@@ -93,7 +96,13 @@ from layout.tensor_core_async import (
 from layout.tma_async import SharedMemBarrier, TMATensorTile
 
 from tmb.kernels.gemm16_matmul.gemm16_kernels import _pick_regime
-from tmb.kernels.gemm16_matmul.gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from tmb.kernels.gemm16_matmul.gemm16_dtype import (
+    _GEMM16_BK,
+    _GEMM16_DT,
+    _GEMM16_TAG,
+    _GEMM16_W,
+    _GEMM16_WGMMA_K,
+)
 
 from tmb.kernels.common.op_utils import _enqueue_cached
 
@@ -115,7 +124,7 @@ from tmb.kernels.gemm16_matmul.gemm16_sched_pool import (
 comptime _V4_DT = _GEMM16_DT
 comptime _V4_F32 = DType.float32
 comptime _V4_PTR = Pointer[Scalar[_V4_DT], MutAnyOrigin]
-comptime _V4_BK = 64
+comptime _V4_BK = _GEMM16_BK
 # Macro-rows per rasterization group: consecutive work indices cover
 # _V4_GROUP macro rows before advancing one BN column, keeping the in-flight
 # A slab and the current B column resident in L2.
@@ -256,10 +265,14 @@ def _v4_mma_tile[
     comptime a_stride01 = a_canonical_layout[0].stride[1].value()
     comptime a_stride11 = a_canonical_layout[1].stride[1].value()
     comptime b_stride11 = b_canonical_layout[1].stride[1].value()
-    comptime a_m_stride = a_stride01 * (64 // a_shape00) * 2
-    comptime a_k_stride = a_stride11 * 2 * 2
-    comptime b_k_stride = b_stride11 * 2 * 2
-    comptime NUM_K_MMAS = _V4_BK // 16
+    # Only the TRAILING factor of each stride is the operand width. The
+    # leading 2 of a_k_stride/b_k_stride is modular's own core-matrix factor
+    # (layout/tensor_core_async.mojo, `TensorCoreAsync.wgmma`): scaling it by
+    # the width too would mis-address every k-step past the first.
+    comptime a_m_stride = a_stride01 * (64 // a_shape00) * _GEMM16_W
+    comptime a_k_stride = a_stride11 * 2 * _GEMM16_W
+    comptime b_k_stride = b_stride11 * 2 * _GEMM16_W
+    comptime NUM_K_MMAS = _V4_BK // _GEMM16_WGMMA_K
     var a_desc = _wgmma_descriptor[a_canonical_layout, not COL_A, _V4_SWIZZLE](
         a_smem
     )
@@ -275,7 +288,7 @@ def _v4_mma_tile[
         var c_out = wgmma_async[
             64,
             BN,
-            16,
+            _GEMM16_WGMMA_K,
             a_type=_V4_DT,
             b_type=_V4_DT,
             layout_a="col" if COL_A else "row",

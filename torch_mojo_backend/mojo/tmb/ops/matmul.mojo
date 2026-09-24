@@ -4,7 +4,8 @@ the convolution forward and backward.
 The route cascade is the old fast path's (aten_fast.py), unchanged:
 
     gemm16 (bf16/f16 tensor cores, CUDA sm_90a)
-      -> tf32 (fp32 tensor cores, CUDA sm_90a, opt-in)
+      -> tf32 (fp32 tensor cores, CUDA sm_90a, opt-in: the NT layout runs
+         gemm16's WGMMA kernels at float32, the rest the SM80-class family)
       -> the generic matmul spec kernels (MatmulSpec / MatmulBiasSpec /
          BmmSpec), which own every other target, dtype and layout.
 
@@ -202,6 +203,8 @@ def _gemm16_available() raises -> Bool:
             "gemm16_rolling_kernels.mojo",
             "gemm16_nt_bias_kernels.mojo",
             "gemm16_sched_pool.mojo",
+            # The float32 (TF32) ladder falls back to this kernel in-family.
+            "../tf32_matmul/tf32_gemm_kernels.mojo",
         ],
     )
 
@@ -639,6 +642,83 @@ def _try_gemm16_mm(
     )
 
 
+def _tf32_wgmma_nt(a: Mat, b: Mat, transpose_b: Bool) raises -> Bool:
+    """Whether a bias-free fp32 GEMM (TF32 already allowed) should go to
+    gemm16's float32 build, whose NT routes are Hopper WGMMA + TMA kernels,
+    rather than to the SM80-class tf32_matmul family.
+
+    Only the physical NT pair -- A (m, k) row-major, B stored (n, k) -- was
+    ported to a 4-byte operand. The rest is the TMA/epilogue hardware rule:
+    both row pitches k * 4 bytes a multiple of 16 (k % 4 == 0), an even n for
+    the epilogue's two-element stores, and 16-byte-aligned bases (an offset
+    view's need not be). m is free, and so is k % BK: TMA zero-fills a
+    partial trailing tile. Everything the gemm16 ladder still declines on
+    the device (the output pointer, grid limits) runs the same SM80-class
+    kernel inside that family, so this gate may be a guess, never a trap.
+    """
+    var m = a.rows
+    var k = a.cols
+    var n = b.rows if transpose_b else b.cols
+    var rhs_k = b.cols if transpose_b else b.rows
+    return (
+        a.t == 0
+        and (b.t ^ (1 if transpose_b else 0)) == 1
+        and m > 0
+        and n > 0
+        and k > 0
+        and rhs_k == k
+        and k % 4 == 0
+        and n % 2 == 0
+        and a.ptr % 16 == 0
+        and b.ptr % 16 == 0
+        and _gemm16_available()
+    )
+
+
+def _tf32_bridge(
+    a: T,
+    am: Mat,
+    bm: Mat,
+    transpose_b: Bool,
+    bias: Optional[T],
+    out_dims: List[Int],
+) raises -> Optional[T]:
+    """One TF32 GEMM: the WGMMA NT route when `_tf32_wgmma_nt` takes it (with
+    a bias added afterwards: those kernels have no bias epilogue), the
+    SM80-class family otherwise."""
+    if _tf32_wgmma_nt(am, bm, transpose_b):
+        var mm_out = _gemm_bridge(
+            GEMM16_FAMILY,
+            "Gemm16",
+            am,
+            bm,
+            transpose_b,
+            None,
+            a.dtype,
+            a.stype,
+            a.device,
+            out_dims,
+        )
+        if not bias:
+            return mm_out^
+        if mm_out:
+            var biased = _add_bias(mm_out.value().copy(), bias.value())
+            if biased:
+                return biased^
+    return _gemm_bridge(
+        "tf32_matmul",
+        "Tf32GemmF32",
+        am,
+        bm,
+        transpose_b,
+        bias,
+        a.dtype,
+        a.stype,
+        a.device,
+        out_dims,
+    )
+
+
 def _try_tf32_mm(
     a: T, b: T, bias: Optional[T], transpose_b: Bool, out_dims: List[Int]
 ) raises -> Optional[T]:
@@ -648,18 +728,7 @@ def _try_tf32_mm(
     var bm = _dense_2d(b)
     if not am or not bm:
         return None
-    return _gemm_bridge(
-        "tf32_matmul",
-        "Tf32GemmF32",
-        am.value(),
-        bm.value(),
-        transpose_b,
-        bias,
-        a.dtype,
-        a.stype,
-        a.device,
-        out_dims,
-    )
+    return _tf32_bridge(a, am.value(), bm.value(), transpose_b, bias, out_dims)
 
 
 def _try_gemm16_bmm(a: T, b: T, transpose_b: Bool) raises -> Optional[T]:
@@ -783,15 +852,9 @@ def _try_gemm16_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
             dims,
         )
         if mm_out:
-            var plain = own(mm_out.value().copy())
-            if _try_bias_inplace(plain.t, bias.value()):
-                return plain.take()
-            var biased = _try_add(plain.t, bias.value())
+            var biased = _add_bias(mm_out.value().copy(), bias.value())
             if biased:
-                return biased.value().copy()
-            # The add declined this bias: drop the unbiased product and fall
-            # through to the fused kernel rather than return a biasless one.
-            _ = plain^
+                return biased^
     # Either the shape can never reach a fast route regardless of bias, or the
     # fast add declined for this bias: the bias-fused kernel is at worst
     # identical, and never drops the bias silently.
@@ -819,18 +882,7 @@ def _try_tf32_linear(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
         return None
     var dims = _leading_dims(a)
     dims.append(w.dim(0))
-    return _gemm_bridge(
-        "tf32_matmul",
-        "Tf32GemmF32",
-        am.value(),
-        wm.value(),
-        True,
-        bias,
-        a.dtype,
-        a.stype,
-        a.device,
-        dims,
-    )
+    return _tf32_bridge(a, am.value(), wm.value(), True, bias, dims)
 
 
 # --- the generic spec kernels -------------------------------------------------
@@ -1001,6 +1053,19 @@ def _try_bias_inplace(dst: T, bias: T) raises -> Bool:
         raise e^
     _ = ctx
     return True
+
+
+def _add_bias(var product: T, bias: T) raises -> Optional[T]:
+    """`product + bias` for a GEMM whose route has no bias epilogue: in place
+    into the fresh product when it can be, else through aten::add. None when
+    both decline -- the unbiased product is dropped, and the caller falls
+    through to a bias-fused route rather than return a biasless result."""
+    var plain = own(product^)
+    if _try_bias_inplace(plain.t, bias):
+        return plain.take()
+    var biased = _try_add(plain.t, bias)
+    _ = plain^
+    return biased^
 
 
 # --- neighbouring ops reached through the dispatcher --------------------------
@@ -1205,15 +1270,9 @@ def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
     if am and bm and _alignment_favors_split(am.value(), bm.value(), False):
         var mm_out = _try_gemm16_mm(mat1, mat2, None, False, List[Int]())
         if mm_out:
-            var plain = own(mm_out.value().copy())
-            if _try_bias_inplace(plain.t, bias):
-                return plain.take()
-            var biased = _try_add(plain.t, bias)
+            var biased = _add_bias(mm_out.value().copy(), bias)
             if biased:
-                return biased.value().copy()
-            # The add declined this bias: drop the unbiased product and fall
-            # through to the fused kernel rather than return a biasless one.
-            _ = plain^
+                return biased^
     var g = _try_gemm16_mm(mat1, mat2, opt_bias, False, List[Int]())
     if g:
         return g.value().copy()
