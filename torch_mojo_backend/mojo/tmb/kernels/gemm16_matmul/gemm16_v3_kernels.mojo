@@ -1,4 +1,4 @@
-"""Dynamically routed H100 16-bit tensor-core GEMM kernels.
+"""Dynamically routed H100 tensor-core GEMM kernels (16-bit and TF32).
 
 The accepted-v2 implementation remains the fallback for every regime not
 handled by the optimized NN, NT, and TN routes in this module.
@@ -6,7 +6,11 @@ handled by the optimized NN, NT, and TN routes in this module.
 The operand dtype is bfloat16 or float16, chosen at compile time by
 `_GEMM16_DT` (gemm16_dtype.mojo); every tile size and pipeline constant
 here is a function of the 2-byte operand width, not of the exponent
-layout, so one source serves both.
+layout, so one source serves both.  float32 operands -- which WGMMA
+computes as TF32 -- reach only the NT routes (`_enqueue_gemm16_gemm_tf32`),
+so only the NT 128x256 kernel's constants are width-derived; the NN/TN
+kernels here stay 16-bit and are never instantiated in a float32 build
+(Mojo instantiates only what is called).
 """
 
 from max.gpu.sync import barrier
@@ -65,7 +69,15 @@ from tmb.kernels.gemm16_matmul.gemm16_tn_v4_kernels import (
     try_enqueue_gemm16_gemm_tn_v4,
     try_enqueue_gemm16_gemm_tt_v4,
 )
-from tmb.kernels.gemm16_matmul.gemm16_dtype import _GEMM16_DT, _GEMM16_TAG
+from tmb.kernels.tf32_matmul.tf32_gemm_kernels import enqueue_tf32_gemm_f32
+from tmb.kernels.gemm16_matmul.gemm16_dtype import (
+    _GEMM16_BK,
+    _GEMM16_DT,
+    _GEMM16_TAG,
+    _GEMM16_TF32,
+    _GEMM16_W,
+    _GEMM16_WGMMA_K,
+)
 
 
 comptime _V3_DT = _GEMM16_DT
@@ -139,11 +151,11 @@ comptime _V3_NN_SMALL_B_PIPE_LAYOUT = Layout.row_major(
 )
 comptime _V3_NT_BM = 128
 comptime _V3_NT_BN = 256
-comptime _V3_NT_BK = 64
+comptime _V3_NT_BK = _GEMM16_BK
 comptime _V3_NT_STAGES = 3
 comptime _V3_NT_THREADS = 384
 comptime _V3_NT_CONSUMERS = 2
-comptime _V3_NT_WGMMA_SHAPE = Index(64, 256, 16)
+comptime _V3_NT_WGMMA_SHAPE = Index(64, 256, _GEMM16_WGMMA_K)
 comptime _V3_NT_A_LAYOUT = tile_layout_k_major[
     _V3_DT, _V3_NT_BM, _V3_NT_BK, _V3_SWIZZLE
 ]()
@@ -779,7 +791,8 @@ def _v3_nt_ws_m128n256_tma_s3(
         # comment.
         comptime assert (
             _v4_ws_smem_bytes[_V3_NT_STAGES, _V3_NT_BM, _V3_NT_BN]()
-            == (B_PIPE_OFFSET + _V3_NT_STAGES * _V3_NT_BN * _V3_NT_BK) * 2
+            == (B_PIPE_OFFSET + _V3_NT_STAGES * _V3_NT_BN * _V3_NT_BK)
+            * _GEMM16_W
         ), "v3 NT 128x256 smem carve and launch size disagree"
         var full_barriers = stack_allocation[
             _V3_NT_STAGES,
@@ -816,7 +829,15 @@ def _v3_nt_ws_m128n256_tma_s3(
         var m0 = (group * 8 + rem % rows_in_group) * _V3_NT_BM
         var n0 = (rem // rows_in_group) * _V3_NT_BN
         var num_tiles = k // _V3_NT_BK
-        comptime TMA_BYTES = (_V3_NT_BM + _V3_NT_BN) * _V3_NT_BK * 2
+        comptime if _GEMM16_TF32:
+            # The 16-bit ladder admits this route only at k % BK == 0, so the
+            # exact division above is its whole K range.  The tf32 ladder
+            # admits any k whose ROW PITCH is TMA-legal ((k * 4) % 16 == 0),
+            # which leaves a partial trailing k-tile: TMA zero-fills a box
+            # that runs past the global extent, and zeros add nothing to a
+            # dot product, so one extra tile is exactly right.
+            num_tiles = (k + _V3_NT_BK - 1) // _V3_NT_BK
+        comptime TMA_BYTES = (_V3_NT_BM + _V3_NT_BN) * _V3_NT_BK * _GEMM16_W
 
         if warp_group_idx > 0 and warp_group_thread_idx == 0:
             comptime for stage in range(_V3_NT_STAGES):
@@ -929,7 +950,7 @@ def _v3_nt_ws_m128n256_tma_s3(
                     accum.ptr[unsafe_offset=e + 1].cast[_V3_DT](),
                 )
                 if m0 + row < m and n0 + col + 1 < n:
-                    output.unsafe_store[alignment=4](
+                    output.unsafe_store[alignment=2 * _GEMM16_W](
                         (m0 + row) * n + n0 + col, pair
                     )
 
@@ -1668,7 +1689,164 @@ def _try_enqueue_gemm16_tn_route(
     return False
 
 
+# ============================================================================
+# float32 (TF32) NT route: the 128x256 warp-specialized WGMMA kernel above at
+# the 4-byte tile.  Its admission gate is NOT the 16-bit NT route's
+# tile-multiple gate but the two hardware constraints, which are looser:
+#
+#   * TMA requires every global stride to be a multiple of 16 BYTES.  A is
+#     (m, k) row-major and B is (n, k) row-major, so both row pitches are
+#     k * width: k % 4 at float32.  NOT k % BK: a partial trailing k-tile is
+#     fine because TMA zero-fills a box past the global extent (the ceil-div
+#     `num_tiles` in the kernel).  A violation fails descriptor creation, so
+#     it has to be a gate rather than a hope.
+#   * the epilogue stores a 2-element pair per lane at a row start of
+#     row * n * width bytes, so n must be EVEN.  m is unconstrained: the
+#     epilogue's bounds check clips a partial edge tile.
+# ============================================================================
+def _try_enqueue_gemm16_nt_v3_tf32(
+    output: _V3_PTR,
+    a: _V3_PTR,
+    b: _V3_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    ctx: DeviceContext,
+) raises -> Bool:
+    comptime if not _has_sm_9x():
+        return False
+    if ctx.api() != "cuda":
+        return False
+    # _has_sm_9x() is a comptime FAMILY check; the DeviceContext can still be
+    # bound to a non-Hopper device, and this kernel is WGMMA+TMA-only.
+    var cc_major = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MAJOR)
+    var cc_minor = ctx.get_attribute(DeviceAttribute.COMPUTE_CAPABILITY_MINOR)
+    if cc_major != 9 or cc_minor != 0:
+        return False
+    if (
+        m < 1
+        or n < 1
+        or k < 1
+        or (k * _GEMM16_W) % 16 != 0
+        or n % 2 != 0
+        or Int(output) % 16 != 0
+        or Int(a) % 16 != 0
+        or Int(b) % 16 != 0
+        or m > 2_147_483_647
+        or n > 2_147_483_647
+        or k > 2_147_483_647
+        or k > 9_223_372_036_854_775_807 // m
+        or k > 9_223_372_036_854_775_807 // n
+        or n > 9_223_372_036_854_775_807 // m
+    ):
+        return False
+    var blocks_m = (m + _V3_NT_BM - 1) // _V3_NT_BM
+    var blocks_n = (n + _V3_NT_BN - 1) // _V3_NT_BN
+    var max_grid_x = ctx.get_attribute(DeviceAttribute.MAX_GRID_DIM_X)
+    if max_grid_x <= 0 or blocks_m > max_grid_x // blocks_n:
+        return False
+    _v3_enqueue_nt_ws_m128n256_tma_s3(
+        output, a, b, m, n, k, blocks_m * blocks_n, ctx
+    )
+    return True
+
+
+# ============================================================================
+# The float32 (TF32) route ladder.
+#
+# Deliberately much shorter than the 16-bit one: only the NT split-K kernel
+# and the NT 128x256 WGMMA kernel above were measured at float32 (H100 PCIe
+# at 1395 MHz, 0.85-1.13x stock PyTorch on the benchmark's NT shapes).  Two
+# of the routes NOT reachable here are structurally 16-bit: the persistent
+# NT/NN v4 kernels stage C through `st.matrix` / a 128B swizzle whose
+# 64-element row is one swizzle row only at a 2-byte operand.
+#
+# Everything this ladder declines -- another layout, a bias, a shape or
+# pointer the WGMMA gates refuse -- runs the SM80-class `mma.m16n8k8` kernel
+# of tf32_matmul, exactly what the host would have launched without this
+# route.  So the host gate (tmb/ops/matmul.mojo, `_tf32_wgmma_nt`) only has
+# to be a good guess, never an exact mirror.
+# ============================================================================
+def _enqueue_gemm16_gemm_tf32(
+    output: _V3_PTR,
+    a: _V3_PTR,
+    b: _V3_PTR,
+    bias: _V3_PTR,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    if not transpose_a and transpose_b and not has_bias:
+        if try_enqueue_gemm16_gemm_splitk_rm_v4[True](
+            output, a, b, m, n, k, ctx
+        ):
+            return
+        if _try_enqueue_gemm16_nt_v3_tf32(output, a, b, m, n, k, ctx):
+            return
+    comptime F32_PTR = Pointer[Scalar[DType.float32], MutAnyOrigin]
+    enqueue_tf32_gemm_f32(
+        F32_PTR(unsafe_from_address=Int(output)),
+        F32_PTR(unsafe_from_address=Int(a)),
+        F32_PTR(unsafe_from_address=Int(b)),
+        F32_PTR(unsafe_from_address=Int(bias)),
+        m,
+        n,
+        k,
+        transpose_a,
+        transpose_b,
+        has_bias,
+        ctx,
+    )
+
+
 def enqueue_gemm16_gemm(
+    output: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    bias: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises:
+    comptime if _GEMM16_TF32:
+        _enqueue_gemm16_gemm_tf32(
+            output,
+            a,
+            b,
+            bias,
+            m,
+            n,
+            k,
+            transpose_a,
+            transpose_b,
+            has_bias,
+            ctx,
+        )
+    else:
+        _enqueue_gemm16_gemm_16bit(
+            output,
+            a,
+            b,
+            bias,
+            m,
+            n,
+            k,
+            transpose_a,
+            transpose_b,
+            has_bias,
+            ctx,
+        )
+
+
+def _enqueue_gemm16_gemm_16bit(
     output: Pointer[Scalar[_V3_DT], MutAnyOrigin],
     a: Pointer[Scalar[_V3_DT], MutAnyOrigin],
     b: Pointer[Scalar[_V3_DT], MutAnyOrigin],
@@ -1951,6 +2129,49 @@ def enqueue_gemm16_gemm(
 
 
 def enqueue_gemm16_bmm(
+    output: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    a: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    b: Pointer[Scalar[_V3_DT], MutAnyOrigin],
+    batch_count: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    output_batch_stride: Int,
+    a_batch_stride: Int,
+    b_batch_stride: Int,
+    transpose_a: Bool,
+    transpose_b: Bool,
+    ctx: DeviceContext,
+) raises:
+    # No float32 (TF32) BMM here: the batched routes below have not been
+    # widened or measured at a 4-byte operand, and a float32 BMM keeps the
+    # tf32_matmul family on the host (tmb/ops/matmul.mojo), so this raise is
+    # unreachable from the eager path and exists only so a float32
+    # specialization of this module compiles and says why.
+    comptime if _GEMM16_TF32:
+        raise Error(
+            "gemm16 carries no float32 (tf32) BMM route; float32 batched"
+            " matmuls use the tf32_matmul family."
+        )
+    else:
+        _enqueue_gemm16_bmm_16bit(
+            output,
+            a,
+            b,
+            batch_count,
+            m,
+            n,
+            k,
+            output_batch_stride,
+            a_batch_stride,
+            b_batch_stride,
+            transpose_a,
+            transpose_b,
+            ctx,
+        )
+
+
+def _enqueue_gemm16_bmm_16bit(
     output: Pointer[Scalar[_V3_DT], MutAnyOrigin],
     a: Pointer[Scalar[_V3_DT], MutAnyOrigin],
     b: Pointer[Scalar[_V3_DT], MutAnyOrigin],
