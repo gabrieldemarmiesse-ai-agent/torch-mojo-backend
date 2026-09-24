@@ -198,10 +198,19 @@ def check_fsdp_collectives_stress():
     and last generation of each case are checked in full, every element of
     both outputs, so every chunk boundary of the transport's split is
     covered without this test having to know the split. Each case then runs
-    an in-place all-gather, FSDP2's own layout. Values and SUM/AVG
-    references are exact for 2, 4 and 8 ranks.
+    an in-place all-gather, FSDP2's own layout. Values and SUM references
+    are exact at any world size, AVG ones for a power-of-two world (see
+    `avg_rtol`).
     """
     rank, world = dist.get_rank(), dist.get_world_size()
+    # AVG scales each contribution by fp32(1/world) before summing (NCCL's
+    # PreMulSum) while the reference divides the exact sum: identical only
+    # when 1/world is exact, i.e. for a power-of-two world (as in
+    # ddp_worker's stress).  Otherwise allow the fp32 rounding of `world`
+    # scaled terms (well under 1e-4 at these magnitudes), far below the
+    # >= 1/world by which one stale or wrong-shard contribution moves a value.
+    exact_avg = world & (world - 1) == 0
+    avg_rtol, avg_atol = (0.0, 0.0) if exact_avg else (1e-5, 1e-4)
     rounds = 12
     full_generations = (1, rounds)
     cases = (
@@ -269,10 +278,12 @@ def check_fsdp_collectives_stress():
                 expected_full = (pattern + rank + generation) * world + world * (
                     world - 1
                 ) // 2
+                rtol = atol = 0.0
                 if op == dist.ReduceOp.AVG:
                     expected_full /= world
+                    rtol, atol = avg_rtol, avg_atol
                 torch.testing.assert_close(
-                    rs_output.cpu(), expected_full, rtol=0, atol=0
+                    rs_output.cpu(), expected_full, rtol=rtol, atol=atol
                 )
             rs_sample = rs_output.index_select(0, device_indices)
             pending.append((generation, op, ag_sample, rs_sample))
@@ -285,10 +296,14 @@ def check_fsdp_collectives_stress():
                 expected_rs = (pattern[indices] + rank + step) * world + world * (
                     world - 1
                 ) // 2
+                rtol = atol = 0.0
                 if reduction == dist.ReduceOp.AVG:
                     expected_rs /= world
+                    rtol, atol = avg_rtol, avg_atol
                 torch.testing.assert_close(gathered.cpu(), expected_ag, rtol=0, atol=0)
-                torch.testing.assert_close(scattered.cpu(), expected_rs, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    scattered.cpu(), expected_rs, rtol=rtol, atol=atol
+                )
             pending.clear()
         # Source preservation is independent of output correctness.
         torch.testing.assert_close(
