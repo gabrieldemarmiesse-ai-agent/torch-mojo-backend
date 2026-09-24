@@ -162,11 +162,6 @@ def test_indexless_mojo_device_uses_and_restores_current_device():
     assert device_module.current_device() == original_index
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="op not ported yet: aten::abs.out (torch's tensor-repr formatter "
-    "needs it, along with isfinite/masked_select, to choose a print style)",
-)
 def test_tensor_properties(mojo_device):
     """A native mojo tensor is a plain torch.Tensor: shape/dtype/device and
     the standard torch repr all just work, with no custom wrapper needed."""

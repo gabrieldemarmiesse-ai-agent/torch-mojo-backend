@@ -573,14 +573,13 @@ def test_an_unregistered_op_raises_out_of_the_dispatcher(mojo_gpu):
     eager path had to preflight from the FORWARD because a Python exception
     raised inside its autograd engine could kill the interpreter; the native
     backend has no such hazard and those three now have composed kernels
-    (tests/native/test_composed.py). `masked_select` stands in as an op the
-    backend genuinely does not implement -- the point is the failure mode,
-    not which op it is.
+    (tests/native/test_composed.py). `histc` stands in as an op the backend
+    genuinely does not implement -- the point is the failure mode, not which
+    op it is.
     """
     x = torch.rand(4).to(mojo_gpu)
-    mask = (x > 0.5).to(mojo_gpu)
     with pytest.raises((NotImplementedError, RuntimeError)):
-        torch.masked_select(x, mask)
+        torch.histc(x, bins=4)
 
 
 def test_isnan(mojo_gpu):
