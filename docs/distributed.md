@@ -1762,6 +1762,20 @@ serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
 floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
 floor and mojoccl at 1.8x.
 
+**On gfx942 the flush read has its own endpoint.** Queued behind the data
+writes, the flush of exchange e waited for exchange e+1's payload, which the
+progress thread had already posted: e retired one exchange late, so the
+pipelined all-gather's remote gathers of chunk e could not overlap the
+network transfer of chunk e+1. A second endpoint on the same domain (same
+NIC and PCIe function, so its read still orders behind that NIC's earlier
+writes; same CQ and AV) issues only the flush -- the role of the verbs
+path's self-connected QP and NCCL's gpuFlush QP; RCCL on AMD flushes every
+512 KiB step (`net.cc`, `paths.cc` `ncclTopoNeedFlush`), so its flush never
+waits behind megabytes. The flush itself stays. Measured on 2 x 4 MI300A
+(job 5447705, streamed device time per call): XL bf16 block all-gather
+654 -> 601 us, fp32 root 2682 -> 2365 us; reduce-scatter unchanged (its
+exchanges are back to back on the wire either way).
+
 **`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
 memory.** Several ranks of one node fail `ncclCommInitRank` with
 `fi_enable failed, rc=-12`, the identical batch passes on other nodes or

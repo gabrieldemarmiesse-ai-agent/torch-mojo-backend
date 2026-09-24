@@ -61,6 +61,7 @@
 from std.ffi import OwnedDLHandle
 from std.os import getenv
 from std.sys import size_of
+from std.sys.info import _accelerator_arch
 from std.time import perf_counter_ns, sleep
 
 from tmb.ccl.env_vars import (
@@ -304,6 +305,15 @@ comptime CTX_SEQ_MASK = (1 << 40) - 1
 
 comptime EP_NAME_MAX = 80  # what `IB_BLOB_BYTES` leaves for an endpoint name
 comptime FLUSH_PAD_BYTES = 4096
+comptime _FLUSH_EP = (
+    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
+)
+"""gfx942: the flush read gets an endpoint of its own (`FabricNet.flush_ep`).
+On the data endpoint it sits in the transmit command queue behind whatever
+was posted since -- the next exchange's multi-megabyte write -- so exchange
+e retired only when e+1's payload had gone out. That is why the verbs path
+keeps its flush on a separate self-connected QP (NCCL's gpuFlush QP).
+Measured on 2x4 MI300A, Adastra job 5447705: see `fab_post_flush`."""
 comptime RECV_BUF_BYTES = 64
 # Completion-queue depth. Far above what can be outstanding (flow control
 # caps it at `nslots` exchanges, each worth two transmit completions and two
@@ -585,9 +595,10 @@ comptime EAGAIN_SPINS = 1_000_000
 struct FabricNet(Movable):
     """Everything the libfabric transport owns, per communicator.
 
-    One RDM endpoint, one completion queue for both directions, one address
-    vector holding this rank's own address (for the flush read) and one
-    entry per remote node. Two memory regions: the communicator's device
+    One RDM endpoint (two on gfx942: the second only issues the flush
+    read, `_FLUSH_EP`), one completion queue for both directions, one
+    address vector holding this rank's own address (for the flush read) and
+    one entry per remote node. Two memory regions: the communicator's device
     region, and a host scratch area holding the flush landing pad and the
     receive buffers.
     """
@@ -614,6 +625,9 @@ struct FabricNet(Movable):
     var my_name: Int  # EP_NAME_MAX scratch holding fi_getname's answer
     var virt_addr: Bool  # FI_MR_VIRT_ADDR: remote addresses are VAs, not offsets
     var need_endpoint_mr: Bool
+    var flush_ep: Int  # gfx942 only (`_FLUSH_EP`); else the flush uses `ep`
+    var flush_mr: Int  # its landing pad's MR under FI_MR_ENDPOINT, or 0
+    var flush_desc: Int
     var hmem_iface: Int
     var recv_depth: Int
     var self_addr: UInt64
@@ -660,6 +674,9 @@ struct FabricNet(Movable):
         self.my_name = Int(alloc_bytes(EP_NAME_MAX))
         self.virt_addr = False
         self.need_endpoint_mr = False
+        self.flush_ep = 0
+        self.flush_mr = 0
+        self.flush_desc = 0
         self.hmem_iface = FI_HMEM_SYSTEM
         self.recv_depth = 0
         self.self_addr = FI_ADDR_UNSPEC
@@ -908,10 +925,16 @@ def _check(f: FabricNet, rc: Int, what: String) raises:
 
 
 def _reg_mr(
-    mut f: FabricNet, addr: Int, nbytes: Int, iface: Int, out_key: P8
+    mut f: FabricNet,
+    addr: Int,
+    nbytes: Int,
+    iface: Int,
+    out_key: P8,
+    ep: Int = 0,
 ) raises -> Int:
-    """One `fi_mr_regattr`, bound to the endpoint and enabled if the
-    provider asked for FI_MR_ENDPOINT. Returns the fid_mr, or 0."""
+    """One `fi_mr_regattr`, bound to the endpoint (`ep`, default the data
+    endpoint) and enabled if the provider asked for FI_MR_ENDPOINT. Returns
+    the fid_mr, or 0."""
     var attr = alloc_bytes(SZ_FI_MR_ATTR)
     var iov = alloc_bytes(SZ_IOVEC)
     st64(iov, IOV_BASE, addr)
@@ -936,7 +959,7 @@ def _reg_mr(
         # FI_MR_ENDPOINT: the key is only valid once the MR is attached to
         # the endpoint that will serve it, and reading it before
         # `fi_mr_enable` gives FI_KEY_NOTAVAIL.
-        _check(f, Int(fi_bind(mr, f.ep, 0)), "fi_mr_bind")
+        _check(f, Int(fi_bind(mr, ep if ep != 0 else f.ep, 0)), "fi_mr_bind")
         _check(f, Int(fi_enable(mr)), "fi_mr_enable")
     stu64(out_key, 0, fi_mr_key(mr))
     return mr
@@ -1079,6 +1102,25 @@ def _fab_setup_once(
         )
         _check(st, Int(fi_bind(st.ep, st.av, 0)), "fi_ep_bind(av)")
         _check(st, Int(fi_enable(st.ep)), "fi_enable")
+        comptime if _FLUSH_EP:
+            # Same domain (so the same NIC and PCIe function, which is what
+            # makes its read a flush of that NIC's earlier writes), same CQ
+            # and AV; it only ever issues the flush read.
+            _check(
+                st,
+                Int(fi_endpoint(st.domain, st.info, o)),
+                "fi_endpoint(flush)",
+            )
+            st.flush_ep = ld64(o, 0)
+            _check(
+                st,
+                Int(fi_bind(st.flush_ep, st.cq, FI_SEND | FI_RECV)),
+                "fi_ep_bind(flush cq)",
+            )
+            _check(
+                st, Int(fi_bind(st.flush_ep, st.av, 0)), "fi_ep_bind(flush av)"
+            )
+            _check(st, Int(fi_enable(st.flush_ep)), "fi_enable(flush)")
 
         # ---- this endpoint's address -----------------------------------
         st64(P8(unsafe_from_address=st.lenbuf), 0, EP_NAME_MAX)
@@ -1118,6 +1160,21 @@ def _fab_setup_once(
             _check(st, hmr, "fi_mr_regattr of the host scratch")
         st.host_mr = hmr
         st.host_desc = fi_mr_desc(st.host_mr)
+        st.flush_desc = st.host_desc
+        if st.flush_ep != 0 and st.need_endpoint_mr:
+            # The landing pad, registered again for the flush endpoint.
+            var fmr = _reg_mr(
+                st,
+                st.host,
+                FLUSH_PAD_BYTES,
+                FI_HMEM_SYSTEM,
+                keybuf,
+                st.flush_ep,
+            )
+            if fmr <= 0:
+                _check(st, fmr, "fi_mr_regattr of the flush landing pad")
+            st.flush_mr = fmr
+            st.flush_desc = fi_mr_desc(st.flush_mr)
 
         # ---- the communicator's region ---------------------------------
         # Ask the provider which accelerator interface can register this
@@ -1525,13 +1582,22 @@ def fab_post_flush(
     it, and on an MI300A "device memory" is host-attached HBM anyway, so the
     read stays: it costs about a microsecond and it is the difference
     between an argument and a guarantee. The flush is always enabled.
+
+    On gfx942 it is posted on its own endpoint (`_FLUSH_EP`). On the data
+    endpoint it queued behind the next exchange's write, already in the
+    command queue, so exchange e retired only once e+1's payload had been
+    sent: measured on 2x4 MI300A (Adastra job 5447705, streamed device
+    time per call), an XL bf16 all-gather split into two 3.84 MB exchanges
+    saw its first exchange retire at ~423 us instead of ~225 us. With the
+    separate endpoint the 7.68 MB/rank all-gather went 654 -> 601 us, and
+    the 41 MB/rank one 2682 -> 2365 us.
     """
     for _ in range(EAGAIN_SPINS):
         var rc = fi_read(
-            f.ep,
+            f.flush_ep if f.flush_ep != 0 else f.ep,
             f.host,
             nbytes,
-            f.host_desc,
+            f.flush_desc,
             f.self_addr,
             UInt64(remote_off if not f.virt_addr else f.region + remote_off),
             f.mr_key,
@@ -1603,8 +1669,12 @@ def fab_teardown(mut f: FabricNet):
     own failure path, where only some of it exists."""
     _ = fi_close(f.mr)
     f.mr = 0
+    _ = fi_close(f.flush_mr)
+    f.flush_mr = 0
     _ = fi_close(f.host_mr)
     f.host_mr = 0
+    _ = fi_close(f.flush_ep)
+    f.flush_ep = 0
     _ = fi_close(f.ep)
     f.ep = 0
     _ = fi_close(f.cq)
