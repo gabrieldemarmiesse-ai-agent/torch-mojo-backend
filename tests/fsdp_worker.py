@@ -133,12 +133,132 @@ def check_reduce_scatter():
     print(f"rank={rank} reduce-scatter correctness OK", flush=True)
 
 
+def _stress_indices(count: int) -> torch.Tensor:
+    """Sample the whole shard, its ends, and both sides of regular boundaries."""
+    if count <= 4096:
+        return torch.arange(count)
+    spread = torch.arange(1024) * count // 1024
+    boundaries = torch.arange(16_384, count, 16_384)
+    return torch.unique(
+        torch.cat(
+            (
+                spread,
+                torch.arange(16),
+                torch.arange(count - 16, count),
+                boundaries - 1,
+                boundaries,
+                boundaries + 1,
+            )
+        ).clamp_max(count - 1)
+    )
+
+
+def check_fsdp_collectives_stress():
+    """Reuse changing AG/RS payloads across generations and network inbox slots.
+
+    Full FSDP2-sized transfers run on the device; only deterministic samples
+    reach the CPU. Four generations are queued before checking, so validation
+    does not synchronize each individual collective. Small cases check every
+    element. Values and SUM/AVG references are exact for 2, 4 and 8 ranks.
+    """
+    rank, world = dist.get_rank(), dist.get_world_size()
+    rounds = 12
+    cases = (
+        (1, torch.float32),
+        (13, torch.bfloat16),
+        (357 * 789 + 3, torch.float32),
+        (3_840_000, torch.bfloat16),  # XL block: 7.68 MB AG / 15.36 MB RS out.
+        (10_254_200, torch.float32),  # XL root: 41.02 MB per rank.
+    )
+    for count, dtype in cases:
+        offset = 1 if count < 3_840_000 else 8
+        indices = _stress_indices(count)
+        gather_indices = torch.cat([indices + peer * count for peer in range(world)])
+        device_indices = indices.to("mojo")
+        device_gather_indices = gather_indices.to("mojo")
+        pattern = (torch.arange(count, dtype=torch.int32) % 17 - 8).float()
+        # Small/awkward cases are misaligned; large cases keep FSDP2's 16-byte
+        # alignment. Destination-dependent RS input catches wrong-shard reads.
+        ag_source_storage = torch.full(
+            (count + offset + 1,), -123, dtype=dtype, device="mojo"
+        )
+        ag_source = ag_source_storage[offset:-1]
+        ag_source.copy_((pattern + rank).to(dtype))
+        rs_source_storage = torch.full(
+            (world * count + offset + 1,), -123.0, device="mojo"
+        )
+        rs_source = rs_source_storage[offset:-1]
+        rs_source.copy_(
+            (pattern[None, :] + torch.arange(world)[:, None] + rank).reshape(-1)
+        )
+        ag_storage = torch.full(
+            (world * count + offset + 1,), -123, dtype=dtype, device="mojo"
+        )
+        rs_storage = torch.full((count + offset + 1,), -123.0, device="mojo")
+        ag_output, rs_output = ag_storage[offset:-1], rs_storage[offset:-1]
+        pending = []
+        for generation in range(1, rounds + 1):
+            ag_source.add_(1)
+            ag_output.fill_(-123)
+            dist.all_gather_into_tensor(ag_output, ag_source, async_op=True).wait()
+            ag_sample = ag_output.index_select(0, device_gather_indices)
+            rs_source.add_(1)
+            rs_output.fill_(-123)
+            op = dist.ReduceOp.SUM if generation % 2 else dist.ReduceOp.AVG
+            dist.reduce_scatter_tensor(
+                rs_output, rs_source, op=op, async_op=True
+            ).wait()
+            rs_sample = rs_output.index_select(0, device_indices)
+            pending.append((generation, op, ag_sample, rs_sample))
+            if len(pending) < 4:
+                continue
+            for step, reduction, gathered, scattered in pending:
+                expected_ag = torch.cat(
+                    [pattern[indices] + peer + step for peer in range(world)]
+                ).to(dtype)
+                expected_rs = (pattern[indices] + rank + step) * world + world * (
+                    world - 1
+                ) // 2
+                if reduction == dist.ReduceOp.AVG:
+                    expected_rs /= world
+                torch.testing.assert_close(gathered.cpu(), expected_ag, rtol=0, atol=0)
+                torch.testing.assert_close(scattered.cpu(), expected_rs, rtol=0, atol=0)
+            pending.clear()
+        # Source preservation is independent of output correctness.
+        torch.testing.assert_close(
+            ag_source.index_select(0, device_indices).cpu(),
+            (pattern[indices] + rank + rounds).to(dtype),
+            rtol=0,
+            atol=0,
+        )
+        expected_source = torch.cat(
+            [pattern[indices] + peer + rank + rounds for peer in range(world)]
+        )
+        torch.testing.assert_close(
+            rs_source.index_select(0, device_gather_indices).cpu(),
+            expected_source,
+            rtol=0,
+            atol=0,
+        )
+        for storage in (ag_source_storage, rs_source_storage, ag_storage, rs_storage):
+            assert storage[offset - 1].cpu().item() == storage[-1].cpu().item() == -123
+        print(
+            f"rank={rank} FSDP collectives stress count={count} dtype={dtype} "
+            f"generations={rounds} OK",
+            flush=True,
+        )
+
+
 def main():
     register_mojo_devices()
     dist.init_process_group("mojo", timeout=datetime.timedelta(minutes=5))
     rank, world = dist.get_rank(), dist.get_world_size()
     if len(sys.argv) > 1 and sys.argv[1] == "reduce_scatter":
         check_reduce_scatter()
+        dist.destroy_process_group()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "fsdp_collectives_stress":
+        check_fsdp_collectives_stress()
         dist.destroy_process_group()
         return
     torch.manual_seed(123)
