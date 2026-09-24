@@ -3778,9 +3778,16 @@ def _dense_mfma_route[
         if one <= best:
             s_parts = 1
             best = one
-        var split = _nt_best_parts(
-            128, 128, m, n, size_of[dtype](), ktiles, cus, splittable, 2
-        )
+        # Not split when both operands are native (TN): that layout runs the
+        # 128x128 tile well below the model's rate (34.0 us unsplit at
+        # (1600, 1600, 1024) against 30.2 for NT), and a split of it measured
+        # 11% slower than the 128x384 plan it would replace at
+        # (768, 768, 12288), 42.1 against 33.9 unsplit at (1600, 1600, 1024).
+        var split = 0
+        comptime if A_KMAJOR or B_KMAJOR:
+            split = _nt_best_parts(
+                128, 128, m, n, size_of[dtype](), ktiles, cus, splittable, 2
+            )
         if (
             split != 0
             and _nt_plan_cost(
