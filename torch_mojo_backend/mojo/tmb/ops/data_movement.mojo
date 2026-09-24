@@ -3,14 +3,15 @@
 clone / _to_copy / cat / stack / repeat / tril / triu / reflection_pad2d /
 replication_pad2d / select_scatter / scatter.src / scatter.value /
 scatter_add / gather / index_select / index_add / index.Tensor /
-_index_put_impl_ / nonzero / set_.source_Tensor /
+_index_put_impl_ / nonzero / masked_select(.out) / set_.source_Tensor /
 empty_permuted -- ported from eager_kernels/aten_fast.py's
 fast_aten_cat/stack/repeat/tril/triu/select_scatter/scatter_src/
 scatter_value/index/nonzero/clone, mojo_device/aten_ops/inplace.py's
 set_.source_Tensor, factories.py's empty_permuted and transfer.py's
 _to_copy. Kernel families: data_movement (CatN, NarrowCopyDst, TileCopy,
 RepeatTiled, TriangularCopy, Pad2D, GatherRows, GatherDim, ScatterDim,
-ScatterAddDim, IndexPutRows, PermuteCopy, CastSpec).
+ScatterAddDim, IndexPutRows, PermuteCopy, CastSpec, MaskedSelectCount,
+MaskedSelectCompact).
 
 `nonzero` and the boolean-mask branch of `index.Tensor` are data-dependent
 (the output shape depends on tensor CONTENTS, not just metadata) and have no
@@ -90,6 +91,7 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    broadcast_shape,
     is_cast_dtype,
     cast_into,
     device_str,
@@ -2904,6 +2906,126 @@ def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+# ---------------------------------------------------------------------------
+# masked_select: data-dependent like nonzero, but compacted on the device.
+# data_movement MaskedSelectCount writes one mask count per tile, the host
+# scans those (one int64 per tile crosses each way, never the data) into
+# exclusive offsets and the total that sizes the output, and
+# MaskedSelectCompact writes each tile's selected elements from its offset.
+# ---------------------------------------------------------------------------
+
+# Elements per tile: MS_TILE in tmb/kernels/data_movement/masked_select.mojo,
+# which checks the tile count it is handed against its own.
+comptime _MASKED_SELECT_TILE = 1024
+
+
+def _broadcast_dense(
+    t: T, shape: IndexList[MAX_RANK], rank: Int
+) raises -> Owned:
+    """`t` expanded to `shape` and made contiguous: `t` itself (not owned)
+    when it already is both, else a fresh copy."""
+    var same = t.rank == rank
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            same = False
+    if same:
+        return own_if_new(contiguous(t), t)
+    var strides = t.strides
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            strides[i] = 0
+    var view = own(view_strided(t, shape, strides, rank, t.offset))
+    var dense = own(new_tensor(shape, rank, t.stype, t.device))
+    copy_strided_into(dense.t, view.t)
+    return dense^
+
+
+def _masked_select(a: T, mask: T) raises -> Owned:
+    if mask.dtype != DType.bool:
+        raise Error(
+            "masked_select: expected BoolTensor for mask, got ",
+            _scalar_type_name(mask.dtype),
+        )
+    if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
+        unsupported("masked_select: self and mask must be on the same mojo GPU")
+    if a.itemsize > 8:
+        unsupported("masked_select: dtype " + _scalar_type_name(a.dtype))
+    var rank = max(a.rank, mask.rank)
+    var shape = broadcast_shape(a, mask)
+    var src = _broadcast_dense(a, shape, rank)
+    var flags = _broadcast_dense(mask, shape, rank)
+    var n = src.t.numel
+    var out_shape = IndexList[MAX_RANK](1)
+    if n == 0:
+        out_shape[MAX_RANK - 1] = 0
+        return own(new_tensor(out_shape, 1, a.stype, a.device))
+    var tiles = (n + _MASKED_SELECT_TILE - 1) // _MASKED_SELECT_TILE
+    var tile_shape = IndexList[MAX_RANK](1)
+    tile_shape[MAX_RANK - 1] = tiles
+    var offsets = own(new_tensor(tile_shape, 1, ST_INT64, a.device))
+    var ctx = ctx_for(a.device)
+    var count = KernelCall("data_movement", "MaskedSelectCount")
+    count.int(flags.t.ptr)
+    count.int(offsets.t.ptr)
+    count.int(n)
+    count.int(tiles)
+    count.int(ctx_ptr(ctx))
+    count.run()
+    var host = own(cpu_empty(tile_shape, 1, ST_INT64))
+    copy_to_host(ctx, offsets.t.ptr, host.t.ptr, tiles * 8)
+    var per_tile = Pointer[Int64, MutUntrackedOrigin](
+        unsafe_from_address=host.t.ptr
+    )
+    var total = 0
+    for i in range(tiles):
+        var c = Int(per_tile[unsafe_offset=i])
+        per_tile[unsafe_offset=i] = Int64(total)
+        total += c
+    out_shape[MAX_RANK - 1] = total
+    var out = own(new_tensor(out_shape, 1, a.stype, a.device))
+    if total > 0:
+        copy_from_host(a.device, ctx, offsets.t.ptr, host.t.ptr, tiles * 8)
+        var compact = KernelCall("data_movement", "MaskedSelectCompact")
+        compact.int(src.t.ptr)
+        compact.int(flags.t.ptr)
+        compact.int(offsets.t.ptr)
+        compact.int(out.t.ptr)
+        compact.int(n)
+        compact.int(tiles)
+        compact.int(a.itemsize)
+        compact.int(ctx_ptr(ctx))
+        compact.run()
+    _ = ctx
+    _ = src^
+    _ = flags^
+    _ = offsets^
+    _ = host^
+    return out^
+
+
+# aten::masked_select(Tensor self, Tensor mask) -> Tensor
+def op_masked_select(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var out = _masked_select(
+        v_tensor(args[unsafe_offset=0]), v_tensor(args[unsafe_offset=1])
+    )
+    ret_owned(rets, 0, out)
+
+
+# aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)
+def op_masked_select_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var mask = v_tensor(args[unsafe_offset=1])
+    var out = v_tensor(args[unsafe_offset=2])
+    var result = _masked_select(a, mask)
+    _out_target(out, result.t.shape, 1, a, "masked_select")
+    copy_strided_into(out, result.t)
+    ret_ref(rets, 0, out)
+
+
 # aten::set_.source_Tensor(Tensor(a!) self, Tensor source) -> Tensor(a!)
 def op_set_source_tensor(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -3019,5 +3141,7 @@ def register_data_movement(site: Site) raises:
     impl[op_index_tensor, "index.Tensor"](site)
     impl[op_index_put_impl_, "_index_put_impl_"](site)
     impl[op_nonzero, "nonzero"](site)
+    impl[op_masked_select, "masked_select"](site)
+    impl[op_masked_select_out, "masked_select.out"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_empty_permuted, "empty_permuted"](site)

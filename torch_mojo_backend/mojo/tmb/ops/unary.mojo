@@ -672,7 +672,7 @@ def op_tanh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # ---------------------------------------------------------------------------
 # ceil / floor: identity (as a fresh copy, functional semantics) on integer
-# dtypes, the float-only spec kernel otherwise — matches
+# dtypes, the float spec kernel (float64 included) otherwise — matches
 # aten_fast._int_unary_identity.
 # ---------------------------------------------------------------------------
 
@@ -687,10 +687,21 @@ def _int_identity(t: T) raises -> T:
     return out^
 
 
+def _require_float_or_f64(op: String, t: T) raises:
+    """ceil / floor also take float64 (torch's tensor printer ceils float64
+    values), except on Apple GPUs, which have none."""
+    if t.dtype == DType.float64:
+        if dev(t.device)[].api == "metal":
+            unsupported(op + ": float64 is unavailable on Apple GPUs")
+        return
+    _require_float(op, t.dtype)
+
+
 def _ceil_or_floor(op: String, t: T) raises -> T:
     if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         return _int_identity(t)
-    return _float_unary(op, t)
+    _require_float_or_f64(op, t)
+    return _unary("elementwise", op, t, t.dtype)
 
 
 def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
@@ -708,7 +719,8 @@ def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
             resize_out(dst, t.shape, t.rank)
         copy_strided_into(dst, t)
         return
-    _float_unary_out(op, t, dst)
+    _require_float_or_f64(op, t)
+    _unary_out("elementwise", op, t, dst, t.dtype)
 
 
 # aten::ceil(Tensor self) -> Tensor

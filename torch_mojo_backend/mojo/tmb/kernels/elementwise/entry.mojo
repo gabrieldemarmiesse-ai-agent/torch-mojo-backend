@@ -496,6 +496,10 @@ def _unary_elementwise[
         or op_code == UOP_NEG
         or op_code == UOP_SIGN
     )
+    # float64 ceil / floor take the scalar kernel, like float64 log2.
+    comptime f64_rounding = dtype == DType.float64 and (
+        op_code == UOP_CEIL or op_code == UOP_FLOOR
+    )
     comptime if not is_direct and not dtype.is_floating_point():
         # Transcendentals / ceil / floor / gelu require a float dtype; the
         # Python side already gates on this, so this only ever fires as a
@@ -503,7 +507,9 @@ def _unary_elementwise[
         raise Error("this unary op requires a floating point dtype")
     else:
         comptime if has_accelerator():
-            comptime if dtype != DType.float64 or op_code == UOP_LOG2:
+            comptime if (
+                dtype != DType.float64 or op_code == UOP_LOG2 or f64_rounding
+            ):
                 # Public elementwise owns launch geometry on every GPU.
                 # SIMD-4 needs BOTH pointers aligned; offset views retain the
                 # existing scalar/vector fallback and its cached launch.
@@ -611,7 +617,9 @@ def _unary_elementwise[
                 ](Int(out_ptr), Int(in_ptr), size, ctx):
                     return
             comptime if (
-                op_code == UOP_LOG2 or (is_direct and dtype == DType.float64)
+                op_code == UOP_LOG2
+                or f64_rounding
+                or (is_direct and dtype == DType.float64)
             ) and not has_apple_gpu_accelerator():
                 # Preserve log2's upstream scalar fallback, including
                 # float64; the existing unary ops keep their 4-wide route.
@@ -1140,7 +1148,9 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
         or op_code == UOP_SIGN
     )
     var supported = False
-    comptime if op_code == UOP_LOG2:
+    comptime if (
+        op_code == UOP_LOG2 or op_code == UOP_CEIL or op_code == UOP_FLOOR
+    ):
         supported = _dtype_supported[
             [DType.float16, DType.bfloat16, DType.float32, DType.float64]
         ](a.dtype)
