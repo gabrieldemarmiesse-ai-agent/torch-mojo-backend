@@ -14,6 +14,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
@@ -2220,6 +2221,193 @@ def test_aten_div_rounding_mode_floor_trunc_disagree(
     x = torch.tensor([-7, 7], dtype=torch.int64)
     y = torch.tensor([2, -2], dtype=torch.int64)
     check_outputs(fn, conf, [x, y])
+
+
+def _convolution_backward_tolerance(device: str) -> Tolerance:
+    """How far a composed conv backward may sit from stock torch's.
+
+    On CPU the arithmetic is plain fp32 on both sides, but the reductions are
+    reassociated -- this backend folds a matmul and runs a role-swapped
+    convolution where torch runs its own im2col GEMMs -- and reassociation
+    alone moves the last bits: measured at most 2.3e-5 absolute and 9.8e-5
+    relative over these cases. On an accelerator MAX reduces through TF32,
+    four orders looser again, which is what `matmul_tolerance` exists for.
+    """
+    return matmul_tolerance(device) or {"rtol": 1e-4, "atol": 1e-4}
+
+
+# (n, c, h, w, out_c, k, stride, padding, dilation, groups)
+_CONVOLUTION_BACKWARD_CASES = {
+    "k3s1p1": (2, 6, 9, 9, 8, 3, 1, 1, 1, 1),
+    "stride2": (2, 6, 11, 11, 8, 3, 2, 1, 1, 1),
+    "unpadded": (2, 4, 10, 12, 6, 3, 1, 0, 1, 1),
+    "dilation2": (2, 4, 13, 13, 6, 3, 1, 2, 2, 1),
+    "groups2": (2, 8, 9, 9, 12, 3, 1, 1, 1, 2),
+    "depthwise": (2, 6, 9, 9, 6, 3, 1, 1, 1, 6),
+    "pointwise_1x1": (2, 5, 7, 7, 4, 1, 1, 0, 1, 1),
+    # The forward truncates here ((11 + 2 - 3) // 2 + 1 == 5 loses a column),
+    # so the data gradient's last input row/column has no tap at all.
+    "truncating_stride2": (1, 4, 11, 9, 6, 3, 2, 1, 1, 1),
+}
+
+
+def _convolution_backward_inputs(case: str) -> list[torch.Tensor]:
+    n, c, h, w, out_c, k, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+    out_h = (h + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    out_w = (w + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    torch.manual_seed(0)
+    return [
+        torch.randn(n, out_c, out_h, out_w),
+        torch.randn(n, c, h, w),
+        torch.randn(out_c, c // groups, k, k) * 0.2,
+    ]
+
+
+def _convolution_backward_call(case: str):
+    _, _, _, _, out_c, _, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [out_c],
+            [stride, stride],
+            [padding, padding],
+            [dilation, dilation],
+            False,
+            [0, 0],
+            groups,
+            [True, True, True],
+        )
+
+    return fn
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward(case: str, conf: Conf, call_checker: CallChecker):
+    """AOTAutograd keeps `convolution_backward.default` as a backward graph
+    node (it is not in DECOMPOSITION_TABLE), so the compile backend maps it."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    check_outputs(
+        _convolution_backward_call(case),
+        conf,
+        _convolution_backward_inputs(case),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+def test_aten_convolution_backward_compiled(case: str, device: str):
+    """The compile backend's own composition of the three gradients.
+
+    `conf` only exercises the mojo eager device, so the MAX-graph path in
+    `aten_functions.py` -- `F.fold` for the data gradient, a role-swapped
+    `F.conv2d` for the weight gradient -- needs its own compiled comparison
+    against stock torch on the same device.
+    """
+    check_functions_are_equivalent(
+        _convolution_backward_call(case),
+        device,
+        _convolution_backward_inputs(case),
+        **_convolution_backward_tolerance(device),
+    )
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+        [True, True, False],
+        [False, True, True],
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: list[bool]
+):
+    """Only the requested gradients are computed, and they do not change
+    because the others were skipped."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+
+    def fn(grad_output, x, weight):
+        outputs = aten.convolution_backward(
+            grad_output, x, weight, [8], [1, 1], [1, 1], [1, 1], False, [0, 0], 1, mask
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    check_outputs(
+        fn, conf, _convolution_backward_inputs("k3s1p1"), atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("stride,padding,dilation", [(1, 0, 1), (2, 1, 1), (1, 2, 2)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_1d(
+    conf: Conf, call_checker: CallChecker, stride: int, padding: int, dilation: int
+):
+    """conv1d's backward, through the same rank-4 path behind a size-1 H
+    axis."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    torch.manual_seed(0)
+    length = (17 + 2 * padding - (dilation * 2 + 1)) // stride + 1
+    inputs = [
+        torch.randn(2, 8, length),
+        torch.randn(2, 6, 17),
+        torch.randn(8, 6, 3) * 0.2,
+    ]
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [8],
+            [stride],
+            [padding],
+            [dilation],
+            False,
+            [0],
+            1,
+            [True, True, True],
+        )
+
+    check_outputs(fn, conf, inputs, atol=1e-4, rtol=1e-4)
+
+
+def test_aten_convolution_trains_end_to_end_compiled(device: str):
+    """The gradient the autograd engine actually asks for: a compiled conv
+    whose input, weight and bias all require grad."""
+    require_cuda_autograd(device)
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 10, 10)
+    weight = torch.randn(6, 3, 3, 3) * 0.2
+    bias = torch.randn(6) * 0.1
+    upstream = torch.randn(2, 6, 10, 10)
+
+    def fn(x, weight, bias, upstream):
+        x = x.detach().requires_grad_()
+        weight = weight.detach().requires_grad_()
+        bias = bias.detach().requires_grad_()
+        out = torch.nn.functional.conv2d(x, weight, bias, 1, 1)
+        out.backward(upstream)
+        return x.grad, weight.grad, bias.grad
+
+    check_functions_are_equivalent(
+        fn,
+        device,
+        [x, weight, bias, upstream],
+        **_convolution_backward_tolerance(device),
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
