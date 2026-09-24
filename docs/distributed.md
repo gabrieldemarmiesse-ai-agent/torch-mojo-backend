@@ -137,8 +137,8 @@ currently requires fp32 gradients. GPT-2 also passed five steps in this
 configuration (loss 11.028791 → 6.922672), as did GPT-2 XL
 (11.165338 → 4.369543). These
 are training smoke tests, not performance measurements or pretrained-model
-quality results. Runtime behavior on AMD and multi-node FSDP2 remains
-unvalidated; the MojoCCL addition also cross-compiles for gfx942.
+quality results. Multi-node FSDP2 on AMD is measured below ("GPT-2 XL
+FSDP2 on two MI300A nodes").
 
 The two-rank regression worker (`tests/fsdp_worker.py`) compares full
 gradients and AdamW updates against CPU PyTorch on uneven layer shapes,
@@ -172,6 +172,35 @@ This measures that explicit training configuration, without `torch.compile`
 or an optimizer tuning search.
 See [the two-H100 GPT-2 XL comparison](gpt2_fsdp2_throughput.md) for measured
 CUDA, Mojo + NCCL, and Mojo + MojoCCL throughput.
+
+### GPT-2 XL FSDP2 on two MI300A nodes
+
+Measured on 2026-09-24 on Adastra (job 5447705, a1029 + a1070): 2 nodes x 4
+MI300A (gfx942), Slingshot through libfabric cxi, 8 ranks, the demo's timed
+mode with `--model gpt2-xl --dtype bfloat16 --sequence-length 1024
+--batch-size 1 --benchmark --warmup 5 --steps 10 --windows 3`. Stock is torch
+2.9.1+rocm6.4 with its RCCL and the site's `aws-ofi-rccl` plugin (`--device
+cuda`); the mojo stacks use torch 2.11.0+cpu,
+`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_VMM=1` (without it four ranks per node
+are OOM-killed) and either the system RCCL 2.22.3 or MojoCCL, with no
+`MOJOCCL_*` variables. Every rank is NUMA-bound (`tests/multinode/rank_bind.py`).
+Five interleaved rounds (ABC CBA ABC CBA ABC); median of the 15 windows per
+stack:
+
+| Stack | Tokens/s | vs stock | Window range |
+|---|---:|---:|---:|
+| Stock torch ROCm + RCCL | 25,365 | 100% | 23,622-26,026 |
+| Torch Mojo + RCCL | 26,770 | 105.5% | 25,392-27,107 |
+| Torch Mojo + MojoCCL | 26,420 | 104.2% | 24,062-26,908 |
+
+Before the gfx942 GEMM and MojoCCL work that produced these numbers the same
+configuration measured 25.6k / 23.5k / 19.7k tokens/s: the mojo device's bf16
+GEMMs at 1024 rows (96 ms/step of kernels against hipBLASLt's 49, including a
+12 ms scalar fallback for the odd K = 50257 of the tied head's input
+gradient) and MojoCCL's unpipelined multi-node all-gather, 432-block gathers
+and L2-invalidating completion polls, which also slowed the GEMMs running
+beside them. Each window is 10 steps of ~0.3 s; a leg is noisy to about +-3%
+on this shared fabric, so compare interleaved series only.
 
 ## What works, what to avoid
 
