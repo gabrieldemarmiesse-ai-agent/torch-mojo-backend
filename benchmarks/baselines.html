@@ -10193,6 +10193,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "native_batch_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 1.222
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 4.453
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 0.875
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 3.817
+                  }
+                }
+              }
+            }
+          }
+        },
         "native_dropout": {
           "dtypes": {
             "f32": {
@@ -10255,6 +10287,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N8xC256xH14xW14_G32": {
                   "layouts": {
                     "contig": 0.466
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_group_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 3.372
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 3.133
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.931
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 2.846
                   }
                 }
               }

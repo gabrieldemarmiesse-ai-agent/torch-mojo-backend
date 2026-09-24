@@ -71,7 +71,7 @@ different kind of item.
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
 | [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
 | [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
-| [N2](#n2) | BatchNorm training and GroupNorm backward are absent in eager | Normalization | High for vision training (blocks it) | Medium | — |
+| [N2](#n2) | BatchNorm / GroupNorm backward are composed from existing kernels, not fused (0.9-4.5x stock) | Normalization | Medium for vision training | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
 | [Q3](#q3) | Graph `max_pool2d_with_indices` returns the values as the indices | Graph | Correctness bug | Low | — |
 | [P2](#p2) | ~~Strict-FIFO call queue: one cold variant blocks every warm launch behind it~~ **OBSOLETE**: the call queue was removed (2026-09-08) | Compile pipeline | — | — | — |
@@ -577,39 +577,31 @@ different kind of item.
   cast to bf16.
 
 ### N2
-**BatchNorm and GroupNorm BACKWARD are absent in eager (the BatchNorm training
-forward now exists)**
+**BatchNorm and GroupNorm BACKWARD are composed from existing kernels, not fused**
 
-* **What.** `aten::native_batch_norm_backward` and
-  `aten::native_group_norm_backward` are not registered at all — the file has
-  exactly one `_register_missing`, for `aten::_adaptive_avg_pool2d_backward`.
-* **Current implementation.** The BatchNorm TRAINING FORWARD landed with the
-  shared-moments normalization work: `_fast_batch_norm_training` in
-  `aten_fast.py` over
-  `normalization_forward_ops/batch_norm_kernels.mojo`, which reduces
-  `{0, 2, 3}` in place through `op_utils._moments_scan_contig` and produces
-  `save_mean` / `save_invstd` plus the ATen running-statistic update
-  (measured 0.19-0.85x stock CUDA). Because its backward does not exist,
-  `mojo_device_native_batch_norm` refuses a training call whose inputs require
-  grad IN THE FORWARD — a raise from inside the autograd engine aborts the
-  process on this backend rather than raising. GroupNorm likewise has a fused
-  forward and no backward, and `mojo_device_native_group_norm` now refuses a
-  grad-requiring call in the forward for the same reason — with no `training`
-  flag to key on, that means every such call.
-* **Why it is not optimal.** ResNet / VGG / DenseNet *training* on the mojo
-  device is still blocked — now by the missing backward rather than the
-  missing forward; the `demo_scripts/` vision examples are inference-only for
-  this reason.
-* **What the optimized version looks like.** The two backwards, written like
-  the existing layer-norm pair (`normalization_backward_dx.mojo` +
-  `normalization_backward_params.mojo`), which already solve the identical
-  "per-channel parameter reduction across a large outer extent" problem; the
-  batch-norm one can walk the NCHW geometry exactly as its forward does.
-  Removing the forward preflight is part of that change.
-* **Expected win.** N/A (coverage). Unblocks vision training.
-* **How to measure it.** `tests/test_aten_functions.py` for correctness; a
-  resnet-18 training-step benchmark modelled on `bench_nanogpt_train.py` for
-  speed — none exists today, see [Not audited](#not-audited).
+* **What.** `op_native_batch_norm_backward` and
+  `op_native_group_norm_backward` in `tmb/ops/composed.mojo`; benchmarked by
+  `benchmarks/test_norm.py::test_batch_norm_backward` and
+  `::test_group_norm_backward`.
+* **Current implementation.** Both run on the `[N, C, HxW]` view. Every
+  per-channel broadcast `(x - a[c]) * b[c]` is one pass of the eval-mode
+  batch-norm elementwise kernel (`_channel_affine`), every per-channel sum a
+  spatial then a batch `aten::sum`. The group-norm grad_input is the
+  LayerNorm-backward dx kernel on the `[N * group, K]` view, with gamma folded
+  into grad_out first.
+* **Why it is not optimal.** Measured on H100 PCIe
+  (`benchmarks/baselines.html`): batch norm 0.9-1.2x stock on
+  `N32xC64xH112xW112` but 3.8-4.5x on `N8xC256xH28xW28`, group norm 1.9-3.4x.
+  Stock is one or two fused passes; ours is ~10 launches, several over
+  input-sized temporaries, and the `[N, C] -> [C]` batch sums are
+  single-block reductions.
+* **What the optimized version looks like.** One per-channel backward in
+  `normalization_backward/`, walking the NCHW geometry the way
+  `batch_norm_kernels.mojo` does for the forward (the `{0, 2, 3}` moments
+  scan) to produce both sums, then one elementwise pass for dx.
+* **Expected win.** ~3-4x on the small shapes.
+* **How to measure it.** `benchmarks/test_norm.py -k backward`;
+  `tests/native/test_composed.py -k norm` for correctness.
 
 ### N3
 **`_TARGET_BLOCKS = 1280` in the LayerNorm-backward parameter reduction is an unlabelled fitted constant**
