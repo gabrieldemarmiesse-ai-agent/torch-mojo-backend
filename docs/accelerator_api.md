@@ -381,30 +381,35 @@ device times there.
 
 ## Saving and loading
 
-!!! warning "Save CPU copies"
-    `torch.save` of an accelerator tensor, and `torch.load` with
-    `map_location` set to the accelerator, currently fail with
-    `NotImplementedError`, because a storage op PyTorch uses for them is not
-    implemented yet. Move tensors to the CPU to save them, and load on the
-    CPU:
+`torch.save` and `torch.load` work on accelerator tensors. A saved tensor
+records its device, so by default it loads back onto the accelerator, and
+`map_location` sends it anywhere else:
 
-    ```python
-    import torch
-    import torch_mojo_backend
+```python
+import torch
+import torch_mojo_backend
 
-    torch_mojo_backend.register_mojo_devices()
-    device = torch.accelerator.current_accelerator()
+torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
 
-    model = torch.nn.Linear(4, 2).to(device)
+model = torch.nn.Linear(4, 2).to(device)
+torch.save(model.state_dict(), "ckpt.pt")
 
-    # Save: copy the tensors to the CPU first.
-    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, "ckpt.pt")
+restored = torch.nn.Linear(4, 2).to(device)
+restored.load_state_dict(torch.load("ckpt.pt", map_location=device))
+print(restored.weight.device)                              # mojo:0
 
-    # Load: read on the CPU; load_state_dict copies into the device parameters.
-    restored = torch.nn.Linear(4, 2).to(device)
-    restored.load_state_dict(torch.load("ckpt.pt", map_location="cpu"))
-    print(restored.weight.device)            # mojo:0
-    ```
+cpu_state = torch.load("ckpt.pt", map_location="cpu")      # CPU tensors
+```
+
+Views keep sharing their storage through a save and load. `torch.load`
+also takes `mmap=True`, and `map_location` a mapping such as
+`{"cpu": device}`.
+A checkpoint saved from the accelerator can only be loaded without
+`map_location` in a process that has called `register_mojo_devices()`, so
+pass `map_location="cpu"` to read it anywhere else, or save CPU copies
+(`{k: v.cpu() for k, v in model.state_dict().items()}`) when the file must
+load without the backend.
 
 ## Processes and `fork`
 

@@ -2846,11 +2846,6 @@ def test_mojo_adamw_step_matches_cpu(mojo_gpu_available, foreach):
     assert mojo_state["step"].item() == cpu_state["step"].item() == 2
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="op not ported yet: aten::set_.source_Storage (torch.load's "
-    "tensor rebuild path needs it before map_location moves the value to cpu)",
-)
 def test_mojo_checkpoint_resumes_through_portable_cpu_state(mojo_gpu_available):
     """The nanoGPT resume path loads CPU state, then moves it normally."""
     if not mojo_gpu_available:
