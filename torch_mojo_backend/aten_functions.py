@@ -2587,17 +2587,61 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 def aten_div(
     input: MaxTensor, other: MaxTensor | Scalar, *, rounding_mode: str | None = None
 ) -> MaxTensor:
-    # Handle torch.div with different rounding modes
-    if rounding_mode is None:
-        return operator.truediv(input, other)
-    elif rounding_mode == "floor":
-        return operator.floordiv(input, other)
-    elif rounding_mode == "trunc":
-        # Truncation towards zero (not implemented in operator, need custom logic)
-        result = operator.truediv(input, other)
-        return F.trunc(result)
-    else:
+    """div.Tensor / div.Scalar and their rounding modes, on the Mojo kernels
+    of `tmb/graph/division.mojo`, with the mojo device's semantics
+    (`_b_div` / `_b_rounding_div` in `tmb/ops/binary.mojo`).
+
+    Operands are promoted like ATen; true division then lands on the default
+    float dtype when that is integral, and integer floor/trunc stay integral.
+    A zero Python-number divisor of an integer raises like CPU torch; a zero
+    tensor element gives 0 in both rounding modes, since a graph cannot
+    raise. bf16/fp16 divide in float32 where ATen does: floor always (the
+    kernel widens itself) and trunc over a scalar-shaped divisor
+    (`iter.is_scalar(2)`: a Python number at its own value, or a one-element
+    tensor); widening here keeps a Python number from rounding to bf16.
+    """
+    if rounding_mode not in (None, "floor", "trunc"):
         raise ValueError(f"Unsupported rounding_mode: {rounding_mode}")
+    assert not isinstance(other, Dim), "div takes no symbolic Dim divisor"
+    other_is_tensor = isinstance(other, TensorValue | MaxEagerTensor)
+
+    def probe(x: MaxTensor) -> torch.Tensor:
+        # Rank matters: a 0-d tensor promotes like a number.
+        return torch.empty(
+            (0,) * len(x.shape), dtype=max_dtype_to_torch(x.dtype), device="meta"
+        )
+
+    result_torch = torch.result_type(
+        probe(input), probe(other) if other_is_tensor else other
+    )
+    if rounding_mode is None and not result_torch.is_floating_point:
+        result_torch = torch.get_default_dtype()
+    result = torch_dtype_to_max(result_torch)
+    if not result.is_float() and not other_is_tensor and other == 0:
+        raise RuntimeError("ZeroDivisionError")
+
+    compute = result
+    if result in (DType.bfloat16, DType.float16) and (
+        (rounding_mode == "floor" and not other_is_tensor)
+        or (
+            rounding_mode == "trunc"
+            and (
+                not other_is_tensor
+                or all(isinstance(d, StaticDim) and int(d) == 1 for d in other.shape)
+            )
+        )
+    ):
+        compute = DType.float32
+    lhs = input if input.dtype == compute else F.cast(input, compute)
+    if not other_is_tensor:
+        rhs = F.constant(other, dtype=compute, device=input.device)
+    else:
+        rhs = other if other.dtype == compute else F.cast(other, compute)
+    shape = find_broadcast_shape(lhs.shape, rhs.shape)
+    quotient = custom_mojo_ops.div(
+        _broadcast_to(lhs, shape), _broadcast_to(rhs, shape), rounding_mode or "true"
+    )
+    return quotient if compute == result else F.cast(quotient, result)
 
 
 # elu(Tensor self, Scalar alpha=1, Scalar scale=1, Scalar input_scale=1) -> Tensor

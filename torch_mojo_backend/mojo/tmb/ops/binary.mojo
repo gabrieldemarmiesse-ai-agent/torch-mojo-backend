@@ -68,6 +68,7 @@ from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import cast_to, contiguous, copy_strided_into, resize_out
+from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
 from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
 
@@ -1074,7 +1075,10 @@ def _b_store_out(rets: Values, dest: T, var res: Res) raises:
     if dst.stype == held.t.stype:
         _b_copy_into(dst, held.t)
     else:
-        var casted = own(cast_to(held.t, dst.stype))
+        # cast_for_copy, not cast_to: `_b_can_cast` admits every pair torch's
+        # own out= does (int32 into a float64 `out`), CastSpec only its
+        # CAST_DTYPES; the rest round-trip through the host like `copy_`.
+        var casted = own(cast_for_copy(held.t, dst.stype))
         _b_copy_into(dst, casted.t)
         _ = casted^  # alive past the launch
     _ = held^
@@ -1496,6 +1500,51 @@ def _b_true_div_dtype(a_stype: Int32, rhs: Side) raises -> Int32:
     return common
 
 
+def _b_rounding_div(
+    floor: Bool, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    """Floor or trunc division: div.Tensor_mode and floor_divide.
+
+    Two rules of ATen's CPU div_floor_kernel / div_trunc_kernel that the
+    logic broadcast route alone would miss:
+
+    - An integer quotient by zero raises ZeroDivisionError. A zero HOST
+      scalar is known here for free, so it raises like CPU torch; a device
+      divisor cannot without a sync, and the kernel gives 0 for it (floor
+      and trunc alike, as ATen's `div_floor_integer` does).
+    - A bf16/fp16 tensor over a scalar-shaped divisor (`iter.is_scalar(2)`)
+      divides in float32 by the divisor's own value. A Python scalar goes to
+      the elementwise float-scalar family, which never rounds it to bf16 --
+      the broadcast route would embed it in a bf16 tensor first. A
+      one-element tensor divisor already is a bf16 value, and floor's
+      general route already divides in float32; trunc takes
+      TruncDivOpmathSpec, the float32 twin of its native-precision kernel.
+    """
+    if lhs.is_t and not rhs.is_t:
+        var a = lhs.t.value().copy()
+        var s = rhs.s.value().copy()
+        if not _b_is_floating(a.stype) and s.is_int and s.i == 0:
+            raise Error("ZeroDivisionError")
+        if a.stype == ST_BFLOAT16 or a.stype == ST_FLOAT16:
+            var op: StaticString = "TruncDivScalarSpec"
+            if floor:
+                op = "FloorDivScalarSpec"
+            var src = _b_ready(a, a.stype, True)
+            var out = own(new_like(src.t))
+            _b_scalar_spec(op, src.t, s.f, out.t)
+            _ = src
+            return Res(out.take(), True)
+    if floor:
+        return _b_binary("FloorDivSpec", lhs, rhs, Int32(-1), dst)
+    if lhs.is_t and rhs.is_t:
+        var a = lhs.t.value().copy()
+        var b = rhs.t.value().copy()
+        var common = _b_promote(a.stype, b.stype)
+        if b.numel == 1 and (common == ST_BFLOAT16 or common == ST_FLOAT16):
+            return _b_binary("TruncDivOpmathSpec", lhs, rhs, Int32(-1), dst)
+    return _b_binary("TruncDivSpec", lhs, rhs, Int32(-1), dst)
+
+
 def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     """The `fast_aten_div` cascade, rounding modes included.
 
@@ -1505,10 +1554,8 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     """
     if not v_is_none(mode):
         var name = v_string(mode)
-        if name == "floor":
-            return _b_binary("FloorDivSpec", lhs, rhs, Int32(-1), dst)
-        if name == "trunc":
-            return _b_binary("TruncDivSpec", lhs, rhs, Int32(-1), dst)
+        if name == "floor" or name == "trunc":
+            return _b_rounding_div(name == "floor", lhs, rhs, dst)
         unsupported("div rounding_mode " + name)
     if not lhs.is_t:
         unsupported("div with a scalar numerator")
@@ -1734,7 +1781,15 @@ def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_floor_divide(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _b_simple("FloorDivSpec", args, rets)
+    _b_ret(
+        rets,
+        _b_rounding_div(
+            True,
+            _b_side(args[unsafe_offset=0]),
+            _b_side(args[unsafe_offset=1]),
+            None,
+        ),
+    )
 
 
 # aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor
