@@ -1395,7 +1395,9 @@ RCCL applies its 24-channel rule only to an APU, which it detects as
 The discrete gfx942 parts, MI300X and MI325X, are the same ISA, so every
 `comptime` gfx942 choice reaches them too. The two 24-block grids therefore
 use RCCL's own test at run time instead (`CommState.apu`, queried once at
-init): a discrete gfx942 keeps the single-node copy cap for the gathers and
+init, and ANDed over the ranks in the bootstrap so that a query failing on
+one rank puts every rank on the same grids): a discrete gfx942 keeps the
+single-node copy cap for the gathers and
 the allreduce caps for the node reduce, as before, and nothing in this
 section was measured on one. Unroll 2 needs no such test: RCCL's
 unroll-2 rule covers MI300X too. The remaining isolated all-gather time

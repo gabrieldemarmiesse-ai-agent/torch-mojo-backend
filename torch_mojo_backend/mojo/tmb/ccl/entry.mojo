@@ -377,8 +377,8 @@ H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
 
 def _ag_node_blocks(state: CommState) -> Int:
     """`AG_NODE_BLOCKS`, with RCCL's APU test: a discrete gfx942 keeps the
-    single-node copy cap. Every rank of a node takes the same answer: the
-    ranks of a node run identical GPUs (checked at init)."""
+    single-node copy cap. Every rank of the communicator takes the same
+    answer: `apu` is the AND of all ranks' queries (bootstrap round 2)."""
     comptime if _GFX942:
         if not state.apu:
             return _COPY_MAX_BLOCKS
@@ -595,6 +595,9 @@ struct CommState(Movable):
     # `src/init.cc:1339-1346`). It selects RCCL's 24-channel multi-node
     # grids (`_ag_node_blocks`, `RS_NODES_BLOCKS_MI300A`); a discrete gfx942
     # (MI300X, MI325X) keeps the caps it had before. Always False elsewhere.
+    # The same on every rank: the AND of every rank's query, taken in
+    # bootstrap round 2, since ranks on different grids would block-match
+    # different slices of a collective.
     var apu: Bool
     # Whether multi-node allreduces go through the one-launch fused kernel.
     # Requires the progress thread. A message exceeding the fused work-ring
@@ -1680,7 +1683,7 @@ def _bootstrap(
         # a per-rank `NVLS_MIN_BYTES` sends one rank into the multicast
         # counter barrier and another into the flag barrier, which is a hang.
         # Checking three integers here turns both into a message.
-        comptime CFG_BYTES = 88
+        comptime CFG_BYTES = 96
         comptime BLOB2 = HANDLE_BYTES + IB_BLOB_BYTES + CFG_BYTES
         var b2 = unsafe_alloc[UInt8](BLOB2)
         for i in range(BLOB2):
@@ -1720,8 +1723,16 @@ def _bootstrap(
         cfg[unsafe_offset=8] = Int64(FUSED_THREADS)
         cfg[unsafe_offset=9] = Int64(fused_resident)
         cfg[unsafe_offset=10] = Int64(device_sms)
+        # RCCL's APU test, which picks the 24-block multi-node grids
+        # (`CommState.apu`). The query is rank-local and a rank whose driver
+        # call fails answers "discrete" alone, while ranks on different grids
+        # block-match different slices of a collective. So, like the NVLS
+        # column of round 1, every rank ANDs the column: one "discrete"
+        # answer puts the whole communicator on the discrete-GPU grids.
+        cfg[unsafe_offset=11] = Int64(1 if apu else 0)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
+        var not_apu_rank = -1
         for r in range(nranks):
             var rcfg = Pointer[Int64, MutAnyOrigin](
                 unsafe_from_address=Int(t2)
@@ -1729,6 +1740,8 @@ def _bootstrap(
                 + HANDLE_BYTES
                 + IB_BLOB_BYTES
             )
+            if rcfg[unsafe_offset=11] == 0 and not_apu_rank < 0:
+                not_apu_rank = r
             if (
                 rcfg[unsafe_offset=0] != cfg[unsafe_offset=0]
                 or rcfg[unsafe_offset=1] != cfg[unsafe_offset=1]
@@ -1799,6 +1812,18 @@ def _bootstrap(
                     + String(device_sms)
                     + "; the ranks of a node must run identical GPUs"
                 )
+        if apu and not_apu_rank >= 0:
+            apu = False
+            print(
+                "mojoccl: rank",
+                rank,
+                "is on an APU but rank",
+                not_apu_rank,
+                (
+                    "reported a discrete GPU (or could not query it); every"
+                    " rank uses the discrete-GPU collective grids"
+                ),
+            )
 
         # Same-node peers only: an IPC handle from another host is meaningless.
         regions[topo.my_local_rank] = base

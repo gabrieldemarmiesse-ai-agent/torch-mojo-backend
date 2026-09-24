@@ -142,7 +142,8 @@ def direct_managed_mem_access(lib: OwnedDLHandle, ordinal: Int) -> Bool:
     this before forcing its 24-channel multi-node rule
     (`src/init.cc:1339-1346`). AMD only. False elsewhere, and false (with
     one line saying so) if the driver will not answer, which keeps the GPU
-    on the discrete caps."""
+    on the discrete caps. Rank-local: `ncclCommInitRank` ANDs every rank's
+    answer, so one failed query moves the whole communicator."""
     comptime if AMD:
         var v: Int32 = 0
         var rc: Int32 = -1
