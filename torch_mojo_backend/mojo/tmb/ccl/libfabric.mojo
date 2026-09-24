@@ -74,6 +74,7 @@ from tmb.ccl.netutil import (
     alloc_bytes,
     as_fn,
     c_string,
+    free_bytes,
     ld32,
     ld64,
     ldu32,
@@ -966,11 +967,9 @@ def _reg_mr(
     st32(attr, MRA_IFACE, Int32(iface))
     var out = alloc_bytes(8)
     var rc = fi_mr_regattr(f.domain, attr, 0, out)
-    if rc != 0:
-        stu64(out_key, 0, 0)
-        return Int(rc)  # negative: a libfabric error, not a fid_mr
     var mr = ld64(out, 0)
-    if f.need_endpoint_mr:
+    free_bytes(out)
+    if rc == 0 and f.need_endpoint_mr:
         # FI_MR_ENDPOINT: the key is only valid once the MR is attached to
         # the endpoint that will serve it, and reading it before
         # `fi_mr_enable` gives FI_KEY_NOTAVAIL.
@@ -981,7 +980,16 @@ def _reg_mr(
             _check(f, Int(fi_enable(mr)), "fi_mr_enable")
         except e:
             _ = fi_close(mr)
+            free_bytes(iov)
+            free_bytes(attr)
             raise e
+    # Scratch of this call only: the provider copies the attributes, and the
+    # bind and enable above ran with them still live.
+    free_bytes(iov)
+    free_bytes(attr)
+    if rc != 0:
+        stu64(out_key, 0, 0)
+        return Int(rc)  # negative: a libfabric error, not a fid_mr
     stu64(out_key, 0, fi_mr_key(mr))
     return mr
 
@@ -1011,8 +1019,11 @@ def _flush_ep_open(mut st: FabricNet) raises:
     if rx != 0:
         stu64(P8(unsafe_from_address=rx), RXA_CAPS, 0)
     var o = alloc_bytes(8)
-    _check(st, Int(fi_endpoint(st.domain, fi, o)), "fi_endpoint(flush)")
-    st.flush_ep = ld64(o, 0)
+    var rc = Int(fi_endpoint(st.domain, fi, o))
+    var ep = ld64(o, 0)
+    free_bytes(o)
+    _check(st, rc, "fi_endpoint(flush)")
+    st.flush_ep = ep
     _check(
         st,
         Int(fi_bind(st.flush_ep, st.cq, FI_TRANSMIT)),
@@ -1024,19 +1035,23 @@ def _flush_ep_open(mut st: FabricNet) raises:
         # The landing pad, registered again for the flush endpoint. Local
         # access only: it is the destination of this endpoint's own read.
         var keybuf = alloc_bytes(8)
-        var fmr = _reg_mr(
-            st,
-            st.host,
-            FLUSH_PAD_BYTES,
-            FI_HMEM_SYSTEM,
-            keybuf,
-            st.flush_ep,
-            FI_READ,
-        )
-        if fmr <= 0:
-            _check(st, fmr, "fi_mr_regattr of the flush landing pad")
-        st.flush_mr = fmr
-        st.flush_desc = fi_mr_desc(st.flush_mr)
+        try:
+            var fmr = _reg_mr(
+                st,
+                st.host,
+                FLUSH_PAD_BYTES,
+                FI_HMEM_SYSTEM,
+                keybuf,
+                st.flush_ep,
+                FI_READ,
+            )
+            if fmr <= 0:
+                _check(st, fmr, "fi_mr_regattr of the flush landing pad")
+            st.flush_mr = fmr
+            st.flush_desc = fi_mr_desc(st.flush_mr)
+        finally:
+            # Never sent: the pad is only this endpoint's own read target.
+            free_bytes(keybuf)
 
 
 def _flush_ep_close(mut f: FabricNet):
