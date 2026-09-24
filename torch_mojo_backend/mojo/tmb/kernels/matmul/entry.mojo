@@ -3875,6 +3875,41 @@ def _dense_mfma_route[
         _ = ws^
 
     if s_parts != 0:
+        comptime if not A_KMAJOR and not B_KMAJOR:
+            # Both operands native (TN): when the unsplit 128x128 grid leaves at
+            # most one workgroup per CU, the 64x256 tile of the same area with
+            # eight 32x64 waves instead of four 64x64 ones hides the native
+            # loads better.  Measured on MI300A (gfx942), job 5448054, device
+            # time: (1600, 1600, 1024) 34.0 -> 29.7 us, (1280, 2560, 768)
+            # 29.6 -> 27.4, (2048, 1536, 1536) 53.4 -> 47.7, (1536, 2304, 2048)
+            # 73.3 -> 75.3.  With a k-major operand it loses (NT and NN+bias
+            # (1024, 1600, 1600): 33.9 / 51.9 against 30.2 / 40.8), so only the
+            # native layout takes it.
+            if (
+                s_parts == 1
+                and n >= 256
+                and k % 32 == 0
+                and ceildiv(m, 128) * ceildiv(n, 128) <= cus
+            ):
+                _nt_mfma_gemm[
+                    dtype,
+                    64,
+                    256,
+                    32,
+                    32,
+                    64,
+                    2,
+                    True,
+                    A_KMAJOR,
+                    B_KMAJOR,
+                    False,
+                    dtype,
+                    PAIR_FILL,
+                    FILL,
+                    BODY2,
+                    True,  # the tile fits (m >= 128, n >= 256) and BK divides k
+                ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
+                return True
         _launch[128, 128](s_parts)
         return True
     # The mixed layout never selects the second tile, so it does not instantiate
