@@ -12,10 +12,13 @@ requires-python = ">=3.11"
 dependencies = [
     "mojo==1.0",
     "max==26.5",
+    "platformdirs",
     "tabulate",
-    "torch>=2.10",
-    "beartype>=0.17.0",
+    "torch>=2.7",
 ]
+
+[project.scripts]
+torch-mojo-backend = "torch_mojo_backend.cli:main"
 
 [project.urls]
 "Source" = "https://github.com/gabrieldemarmiesse/torch-mojo-backend"
@@ -24,25 +27,129 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["torch_mojo_backend"]
+# The prebuilt native libraries (scripts/build_prebuilt.py) are ignored by
+# git, and hatchling skips VCS-ignored files unless they are named here. The
+# wheel stays py3-none-any: these are data files ctypes loads at run time, not
+# extension modules, and one wheel carrying every platform's pair is simpler
+# than a wheel per platform -- a file that does not match the machine is never
+# opened (see docs/native_backend.md, "Prebuilt libraries and the wheel").
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
+
+[tool.hatch.build.targets.sdist]
+# Plain `uv build` builds the wheel from the sdist, so the same list has to be
+# here or the libraries silently vanish from the wheel. A checkout without
+# prebuilt libraries (every clone) matches nothing and ships as before.
+artifacts = [
+    "torch_mojo_backend/native/prebuilt/*.so",
+    "torch_mojo_backend/native/prebuilt/*.dylib",
+    "torch_mojo_backend/native/prebuilt/manifest.json",
+]
 
 [tool.ruff]
 target-version = "py311"
+# Untracked scratch clone of unrelated third-party repos (dicp/dipu), not
+# part of this project.
+extend-exclude = ["deeplink"]
 
-[tool.ruff.lint]
-select = [
-    "F",  # pyflakes (includes unused imports)
-    "UP", # pyupgrade
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
+    "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
+    "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
 ]
 
+[tool.ruff.lint]
+# extend-select keeps ruff's default rule set (E4, E7, E9, F) enabled.
+extend-select = [
+    "UP",  # pyupgrade
+    "ANN", # flake8-annotations: every function needs type hints (ty then checks them)
+    "TID252", # relative imports (banned below)
+    "PLC0415", # imports at the top of the file (lazy ones need a noqa saying why)
+]
+
+[tool.ruff.lint.isort]
+# Keep `from m import (A as A, B as B)` re-exports as one statement.
+combine-as-imports = true
+
+[tool.ruff.lint.flake8-annotations]
+suppress-none-returning = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.per-file-ignores]
+# ty infers unannotated params/returns as Unknown and never flags their misuse,
+# so ANN is what actually forces a hint to exist; tests/ predates that (~5k
+# gaps, mostly pytest fixture params) and current_bench/ is ad hoc GPU
+# profiling scratch, not shipped code -- both excluded, same as in [tool.ty].
+"tests/**" = ["ANN"]
+"current_bench/**" = ["ANN"]
+
+[tool.ty.environment]
+# Pins the venv explicitly: on boxes with an active conda env, ty's
+# site-packages discovery prefers CONDA_PREFIX over sys.prefix and fails
+# outright ("Failed to discover the site-packages directory") when that
+# conda env doesn't look like a normal Python install. `uv run ty check`
+# already sidesteps this, but pin it so a bare `ty check` also works.
+python = ".venv"
+# These suites expose sibling modules through their runtime sys.path setup.
+extra-paths = ["benchmarks", "conformance"]
+
+[tool.ty.analysis]
+# Triton and NCCL wheels are unavailable on macOS. Allow their absence while
+# retaining their type information when installed (e.g. on Linux CI).
+allowed-unresolved-imports = ["triton.**", "nvidia.nccl"]
+
+[tool.ty.rules]
+# One deliberate polymorphic-override point that nominal override-checking
+# cannot express: MojoProcessGroup._get_backend returns itself rather than a
+# c10d Backend, because torch looks a group's backend up that way for
+# batch_isend_irecv and _coalescing_manager and the mojo group IS its own
+# backend (see docs/native_backend.md, "Distributed"). `ty check` exits
+# non-zero on warnings too (no `--exit-zero-on-warning` in CI), so this must
+# be "ignore", not "warn", to keep `ty check` green.
+invalid-method-override = "ignore"
+# Bare `dict`/`list`/`Callable` is an unchecked hole: require the arguments.
+missing-type-argument = "error"
+
+[tool.ty.src]
+exclude = [
+    # Untracked scratch clone of unrelated third-party repos (dicp/dipu), not
+    # part of this project.
+    "deeplink/",
+    # Ad hoc GPU profiling/comparison scratch from past kernel-optimization
+    # engagements, not shipped code; not held to the same typing bar as
+    # benchmarks/ or demo_scripts/.
+    "current_bench/",
+]
 
 [tool.uv]
 python-preference = "only-managed"
+override-dependencies = [
+    # torch's PyPI wheel pins nvidia-nccl-cu13, which needs an r580+ driver and
+    # installs to the same site-packages path (nvidia/nccl/) as the
+    # nvidia-nccl-cu12 wheel in our development dependencies. Exclude it;
+    # the cu12 wheel satisfies torch's optional libnccl preload too.
+    "nvidia-nccl-cu13; sys_platform == 'never'",
+]
 
 [tool.ruff.format]
+line-ending = "lf"
 skip-magic-trailing-comma = true
 
 [dependency-groups]
 dev = [
+    # NCCL for NVIDIA distributed tests; users install it separately when
+    # needed, or use an existing system library.
+    "nvidia-nccl-cu12>=2.27; platform_system == 'Linux'",
+    # Tested ptxas for NVIDIA kernel development. Runtime installs discover
+    # a compatible assembler on the machine and explain how to install one
+    # when none fits; nvcc is not a runtime dependency.
+    "nvidia-cuda-nvcc-cu12==12.8.*; platform_system == 'Linux'",
     # Bump the version of mojo/max here.  These come from PyPI like everything
     # else: mojo 1.0 is a stable release, so there is no nightly index and no
     # prerelease opt-in to keep in sync with them.
@@ -61,6 +168,7 @@ dev = [
     # OpInfo database the conformance/ suite runs -- cannot be imported at all.
     "expecttest>=0.2.1",
     "pillow>=11.3.0",
+    "torchvision==0.26.*",
     "pytest>=8.4.1",
     "pytest-forked>=1.6.0",
     "pytest-split>=0.10.0",
@@ -76,4 +184,5 @@ dev = [
     "pytest-random-order>=1.2.0",
     "setuptools>=80.9.0",
     "pydantic>=2.9",
+    "ty>=0.0.77",
 ]

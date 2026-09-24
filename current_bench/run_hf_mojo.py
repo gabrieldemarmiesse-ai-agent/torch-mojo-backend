@@ -12,6 +12,13 @@ import sys
 import traceback
 
 import torch
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageClassification,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 
 from torch_mojo_backend import register_mojo_devices
 
@@ -52,8 +59,6 @@ def _compare(model, inputs, extract):
 
 
 def run_bert():
-    from transformers import AutoModel, AutoTokenizer
-
     name = "bert-base-uncased"
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModel.from_pretrained(name)
@@ -62,8 +67,6 @@ def run_bert():
 
 
 def run_gpt2():
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     name = "gpt2"
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(name)
@@ -72,8 +75,6 @@ def run_gpt2():
 
 
 def run_distilbert():
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
     name = "distilbert-base-uncased-finetuned-sst-2-english"
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModelForSequenceClassification.from_pretrained(name)
@@ -82,8 +83,6 @@ def run_distilbert():
 
 
 def run_vit():
-    from transformers import AutoModelForImageClassification
-
     name = "google/vit-base-patch16-224"
     model = AutoModelForImageClassification.from_pretrained(name)
     inputs = {"pixel_values": torch.randn(1, 3, 224, 224)}
@@ -91,8 +90,6 @@ def run_vit():
 
 
 def run_resnet():
-    from transformers import AutoModelForImageClassification
-
     name = "microsoft/resnet-18"
     model = AutoModelForImageClassification.from_pretrained(name)
     inputs = {"pixel_values": torch.randn(1, 3, 224, 224)}

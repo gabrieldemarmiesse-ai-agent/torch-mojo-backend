@@ -33,6 +33,27 @@ LASTDIM_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
     "S_4096x4096_d0": ((4096, 4096), 0),
     "S_4096x4096_d1": ((4096, 4096), 1),
 }
+# Selection along the last dim. k and the direction are folded into the shape
+# token, per the design rule above that any extra axis an op needs goes into
+# the shape id. V_ rows are a GPT-2 vocabulary -- the regime HF generate()
+# actually runs, one row per sequence with k either a sampling cutoff or a
+# beam width -- and A_ is the awkward-shape control. k also selects the launch
+# route: K50 fits the tournament (one pass over the row), K2048 does not and
+# falls back to the full sort, which is why both are measured. The _min /
+# _desc tokens only pick the other comptime direction of the same kernels;
+# one of each is enough to notice if that stops being true.
+TOPK_SHAPES: dict[str, tuple[tuple[int, ...], int, bool]] = {
+    "V_1x50304_K50": ((1, 50304), 50, True),
+    "V_8x50304_K2048": ((8, 50304), 2048, True),
+    "V_8x50304_K2048_min": ((8, 50304), 2048, False),
+    "A_357x789_K32": ((357, 789), 32, True),
+}
+SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
+    "V_8x50304": ((8, 50304), False),
+    "V_8x50304_desc": ((8, 50304), True),
+    "S_4096x4096": ((4096, 4096), False),
+    "A_357x789": ((357, 789), False),
+}
 
 COVERS: dict[str, str] = {
     "aten::sum.dim_IntList": "test_sum",
@@ -52,15 +73,24 @@ COVERS: dict[str, str] = {
     "aten::any.dims": "test_any (same fast impl as .dim)",
     "aten::min.dim": "test_min_dim",
     "aten::var.correction": "test_var",
+    "aten::linalg_vector_norm": "test_vector_norm",
     "aten::linalg_vector_norm.out": (
-        "test_vector_norm (the .out form is the only registered entry; "
-        "torch.linalg.vector_norm reaches it)"
+        "test_vector_norm (same kernel, out-variant plumbing)"
     ),
     "aten::cumsum": "test_cumsum",
+    "aten::topk": "test_topk",
+    "aten::sort.stable": "test_sort",
     "aten::nonzero": "test_nonzero",
 }
 
-SKIPPED: dict[str, str] = {}
+_SAME_KERNEL_OUT = (
+    "out= overload of a benchmarked functional op: the same kernel launches, "
+    "written straight into (or copied into) the caller's tensors"
+)
+SKIPPED: dict[str, str] = {
+    "aten::topk.values": _SAME_KERNEL_OUT,
+    "aten::sort.values_stable": _SAME_KERNEL_OUT,
+}
 
 
 def _dim_case(
@@ -76,7 +106,7 @@ def _dim_case(
 @pytest.mark.bench_op("sum.dim_IntList")
 def test_sum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     d = 0 if dim is None else dim
     bench.run(
@@ -90,7 +120,7 @@ def test_sum(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     if dim is None:
         bench.run(
@@ -110,7 +140,7 @@ def test_mean(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_max(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -123,7 +153,7 @@ def test_max(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_min(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -136,7 +166,7 @@ def test_min(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_amax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -150,7 +180,7 @@ def test_amax(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_amin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -164,7 +194,7 @@ def test_amin(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_argmax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.argmax(x_ref, dim=dim),
@@ -177,7 +207,7 @@ def test_argmax(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_argmin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     bench.run(
         lambda: torch.argmin(x_ref, dim=dim),
@@ -190,7 +220,7 @@ def test_argmin(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_all(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.999, hw, mojo_device)
     if dim is None:
@@ -211,7 +241,7 @@ def test_all(
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_any(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.001, hw, mojo_device)
     if dim is None:
@@ -233,7 +263,7 @@ def test_any(
 @pytest.mark.bench_op("min.dim")
 def test_min_dim(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -248,7 +278,7 @@ def test_min_dim(
 @pytest.mark.bench_op("var.correction")
 def test_var(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
     if dim is None:
         bench.run(
@@ -269,7 +299,7 @@ def test_var(
 @pytest.mark.bench_op("linalg_vector_norm")
 def test_vector_norm(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     x_ref, x_our = both(
         unit_interval(FULL_SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
     )
@@ -284,7 +314,7 @@ def test_vector_norm(
 @pytest.mark.parametrize("shape_id", LASTDIM_SHAPES)
 def test_cumsum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -298,12 +328,42 @@ def test_cumsum(
 @pytest.mark.parametrize("shape_id", FULL_SHAPES)
 def test_nonzero(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     # Fixed 50% density under the seeded fixture: the output size, and so
     # the kernel work, is identical on both legs and across runs.
     x_ref, x_our = both(torch.rand(FULL_SHAPES[shape_id]) < 0.5, hw, mojo_device)
     bench.run(
         lambda: torch.nonzero(x_ref),
         lambda: torch.nonzero(x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", TOPK_SHAPES)
+@pytest.mark.bench_op("topk")
+def test_topk(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, k, largest = TOPK_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.topk(x_ref, k, dim=-1, largest=largest),
+        lambda: torch.topk(x_our, k, dim=-1, largest=largest),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SORT_SHAPES)
+@pytest.mark.bench_op("sort.stable")
+def test_sort(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, descending = SORT_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.sort(x_ref, dim=-1, descending=descending, stable=True),
+        lambda: torch.sort(x_our, dim=-1, descending=descending, stable=True),
         flops=float(x_ref.numel()),
     )

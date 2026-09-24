@@ -69,7 +69,7 @@ COVERS: dict[str, str] = (
     | {
         f"aten::{name}{variant}": "test_compare"
         for name in COMPARE_OPS
-        for variant in ("", ".Scalar", ".Tensor")
+        for variant in (".Scalar", ".Tensor")
     }
     | {
         f"aten::{name}.{variant}": "test_bitwise"
@@ -82,7 +82,6 @@ COVERS: dict[str, str] = (
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
         "aten::floor_divide": "test_floor_divide[Tensor]",
         "aten::floor_divide.Scalar": "test_floor_divide[Scalar]",
-        "aten::floordiv": "test_floor_divide (same fast impl, alias entry)",
         "aten::div.Tensor_mode": "test_div_trunc_mode (rounding_mode='trunc'; "
         "the 'floor' sub-case shares FloorDivSpec with test_floor_divide above)",
         "aten::remainder.Tensor": "test_remainder[Tensor]",
@@ -91,9 +90,17 @@ COVERS: dict[str, str] = (
             "test_remainder (same kernel, scalar lhs plumbing)"
         ),
         "aten::lerp.Scalar": "test_lerp",
+        # In-place and aliased out= share the same native launch helper and
+        # device code. Keep the recorded out= keys for these device-time cases.
+        "aten::lerp.Scalar_out": "test_lerp_inplace",
+        "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
         "aten::addcdiv": "test_addcdiv",
+        "aten::addcdiv.out": "test_addcdiv_inplace",
+        "aten::addcdiv_": "test_addcdiv_inplace",
         "aten::addcmul": "test_addcmul",
+        "aten::addcmul.out": "test_addcmul_inplace",
+        "aten::addcmul_": "test_addcmul_inplace",
         "aten::where.self": "test_where",
         "aten::masked_fill.Scalar": "test_masked_fill[Scalar]",
         "aten::masked_fill.Tensor": "test_masked_fill[Tensor]",
@@ -129,7 +136,7 @@ def _pair(
 @pytest.mark.bench_op("bucketize.Tensor")
 def test_bucketize(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     value_shape, boundary_size = BUCKETIZE_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     values_ref, values_our = both(
@@ -150,7 +157,7 @@ def test_bucketize(
 @pytest.mark.bench_op("searchsorted.Tensor")
 def test_searchsorted(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     rows, values_per_row, boundary_size = SEARCHSORTED_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     boundaries = (
@@ -180,7 +187,7 @@ def test_arith(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = ARITH_OPS[op_name]
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, layout, hw, mojo_device)
     bench.run(
@@ -198,7 +205,7 @@ def test_minmax(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = MINMAX_OPS[op_name]
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     bench.run(
@@ -218,7 +225,7 @@ def test_compare(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = COMPARE_OPS[op_name]
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     if layout == "Scalar":
@@ -245,7 +252,7 @@ def test_bitwise(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = BITWISE_OPS[op_name]
     shape = SHAPES[shape_id]
     a_ref, a_our = both(
@@ -276,7 +283,7 @@ def test_logical(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     fn = LOGICAL_OPS[op_name]
     shape = SHAPES[shape_id]
     a_ref, a_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
@@ -297,7 +304,7 @@ def test_pow(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     if layout == "Scalar":
         bench.run(
@@ -323,7 +330,7 @@ def test_floor_divide(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     if layout == "Scalar":
         bench.run(
@@ -349,7 +356,7 @@ def test_div_trunc_mode(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     """`torch.div(..., rounding_mode="trunc")` -- aten::div.Tensor_mode /
     div.Scalar_mode, a separate kernel (TruncDivSpec) from floor_divide's
     FloorDivSpec above despite the shared `div.Tensor_mode` overload for the
@@ -387,7 +394,7 @@ def test_remainder(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     if layout == "Scalar":
         bench.run(
@@ -408,7 +415,7 @@ def test_remainder(
 @pytest.mark.bench_op("lerp.Scalar")
 def test_lerp(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
     bench.run(
         lambda: torch.lerp(a_ref, b_ref, 0.3),
@@ -421,7 +428,7 @@ def test_lerp(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_clamp(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -435,7 +442,7 @@ def test_clamp(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_addcdiv(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     a_ref, a_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -452,7 +459,7 @@ def test_addcdiv(
 @pytest.mark.parametrize("shape_id", SHAPES)
 def test_addcmul(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     a_ref, a_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -465,12 +472,132 @@ def test_addcmul(
     )
 
 
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("lerp.Scalar_out")
+def test_lerp_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.lerp_(b_ref, 0.1),
+        lambda: a_our.lerp_(b_our, 0.1),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("addcmul.out")
+def test_addcmul_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.addcmul_(b_ref, b_ref, value=1e-5),
+        lambda: a_our.addcmul_(b_our, b_our, value=1e-5),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("addcdiv.out")
+def test_addcdiv_inplace(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    b_ref, b_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1, hw, mojo_device)
+    bench.run(
+        lambda: a_ref.addcdiv_(b_ref, b_ref, value=1e-5),
+        lambda: a_our.addcdiv_(b_our, b_our, value=1e-5),
+        flops=3.0 * a_ref.numel(),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("host_scalar",))
+@pytest.mark.bench_op("div.Tensor")
+def test_div_host_scalar(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    a_ref, a_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.div(a_ref, 0.03162277660168379),
+        lambda: torch.div(a_our, 0.03162277660168379),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16", "f16"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("inplace_device_scalar",))
+@pytest.mark.bench_op("mul.Tensor")
+def test_mul_inplace_device_scalar(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    dtype = DTYPES[dtype_id]
+    a_ref, a_our = both(unit_interval(SHAPES[shape_id], dtype), hw, mojo_device)
+    scalar_ref, scalar_our = both(torch.tensor(1.0, dtype=dtype), hw, mojo_device)
+    bench.run(
+        lambda: a_ref.mul_(scalar_ref),
+        lambda: a_our.mul_(scalar_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("layout", ("host_scalar_offset1",))
+@pytest.mark.bench_op("mul.Tensor")
+def test_mul_host_scalar_offset(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    size = torch.Size(SHAPES[shape_id]).numel()
+    src_ref, src_our = both(
+        unit_interval((size + 4,), DTYPES[dtype_id]), hw, mojo_device
+    )
+    dst_ref, dst_our = both(
+        torch.empty(size + 4, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    src_ref, src_our = src_ref[1 : size + 1], src_our[1 : size + 1]
+    dst_ref, dst_our = dst_ref[1 : size + 1], dst_our[1 : size + 1]
+    bench.run(
+        lambda: torch.mul(src_ref, 0.375, out=dst_ref),
+        lambda: torch.mul(src_our, 0.375, out=dst_our),
+        flops=float(size),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("where.self")
 def test_where(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     mask_ref, mask_our = both(torch.rand(shape) < 0.5, hw, mojo_device)
@@ -493,7 +620,7 @@ def test_masked_fill(
     bench: Bench,
     hw: Hardware,
     mojo_device: torch.device,
-) -> None:
+):
     shape = SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     a_ref, a_our = both(unit_interval(shape, dtype), hw, mojo_device)
@@ -518,7 +645,7 @@ def test_masked_fill(
 @pytest.mark.bench_op("isin.Tensor_Tensor")
 def test_isin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape = SHAPES[shape_id]
     elements = torch.randint(0, 4096, shape, dtype=DTYPES[dtype_id])
     tests = torch.randint(0, 4096, (512,), dtype=DTYPES[dtype_id])

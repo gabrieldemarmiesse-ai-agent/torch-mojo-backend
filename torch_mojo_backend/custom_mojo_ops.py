@@ -1,29 +1,24 @@
-from max.experimental import functional as F
-from max.graph import TensorType
+from typing import Literal
 
-import torch_mojo_backend
+import torch
+from max.dtype import DType
+from max.experimental import functional as F
+from max.experimental.torch.torch import torch_dtype_to_max
+from max.graph import Dim, TensorType
+
+from torch_mojo_backend.torch_compile_backend import compiler
 from torch_mojo_backend.types import MaxTensor, Scalar
 
 
 def _scalar_to_tensor(input: MaxTensor, other: Scalar) -> MaxTensor:
+    # `Scalar` also covers a symbolic Dim for ops that legitimately take one;
+    # the bitwise ops that call this never do (ATen's Scalar there is a
+    # genuine number), and F.constant only accepts a real number.
+    if isinstance(other, Dim):
+        raise TypeError(f"bitwise scalar ops expect a number, got a Dim: {other!r}")
     return F.broadcast_to(
         F.constant(other, dtype=input.dtype, device=input.device), input.shape
     )
-
-
-def gpt2_decode_attention(
-    query: MaxTensor, key: MaxTensor, value: MaxTensor, mask: MaxTensor
-) -> MaxTensor:
-    """Pure-Mojo single-query attention for contiguous BHSD graph tensors."""
-    return F.custom(
-        name="gpt2_decode_attention",
-        device=query.device,
-        values=[query, key, value, mask],
-        out_types=[
-            TensorType(dtype=query.dtype, shape=query.shape, device=query.device)
-        ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
-    )[0]
 
 
 def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
@@ -38,7 +33,7 @@ def bitwise_and(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -61,7 +56,7 @@ def bitwise_not(input: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -77,7 +72,7 @@ def bitwise_or(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -100,7 +95,7 @@ def bitwise_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]
 
 
@@ -109,6 +104,73 @@ def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
     Custom Mojo kernel for bitwise_xor_scalar operation.
     """
     return bitwise_xor(input, _scalar_to_tensor(input, other))
+
+
+def elementwise(
+    input: MaxTensor,
+    kind: Literal[
+        "abs",
+        "acos",
+        "asinh",
+        "atanh",
+        "ceil",
+        "cos",
+        "cosh",
+        "erf",
+        "exp",
+        "floor",
+        "gelu_none",
+        "gelu_tanh",
+        "isnan",
+        "logical_not",
+        "log",
+        "log1p",
+        "log2",
+        "neg",
+        "reciprocal",
+        "relu",
+        "rsqrt",
+        "sigmoid",
+        "sign",
+        "silu",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+    ],
+) -> MaxTensor:
+    """Call shared unary math through MAX's fusible Mojo registrations."""
+    if (
+        kind
+        not in {
+            "abs",
+            "ceil",
+            "floor",
+            "gelu_none",
+            "gelu_tanh",
+            "isnan",
+            "logical_not",
+            "neg",
+            "relu",
+            "sign",
+            "silu",
+        }
+        and not input.dtype.is_float()
+    ):
+        # ATen unary_float_op promotes integer and bool inputs to the default
+        # floating dtype, whereas ElementwiseUnaryOp preserves its input dtype.
+        input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    output_dtype = DType.bool if kind in {"isnan", "logical_not"} else input.dtype
+    return F.custom(
+        name=f"elementwise_{kind}",
+        device=input.device,
+        values=[input],
+        out_types=[
+            TensorType(dtype=output_dtype, shape=input.shape, device=input.device)
+        ],
+        custom_extensions=compiler.kernel_extension_paths(),
+    )[0]
 
 
 def gelu_backward(
@@ -125,5 +187,5 @@ def gelu_backward(
         out_types=[
             TensorType(dtype=input.dtype, shape=input.shape, device=input.device)
         ],
-        custom_extensions=torch_mojo_backend.torch_compile_backend.compiler.paths_to_mojo_kernels,
+        custom_extensions=compiler.kernel_extension_paths(),
     )[0]

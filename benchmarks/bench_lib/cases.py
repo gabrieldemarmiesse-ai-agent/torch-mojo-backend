@@ -13,6 +13,8 @@ own aten op token in baselines.html.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 import torch
 
@@ -54,7 +56,7 @@ def unit_interval(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return (torch.rand(shape, dtype=torch.float32) * 0.9 + 0.05).to(dtype)
 
 
-def op_params(ops: dict[str, object]) -> list[object]:
+def op_params(ops: Mapping[str, object]) -> list[object]:
     """One pytest.param per op, marked with bench_op so the baseline tree
     stores the case under the aten op token rather than the test name."""
     return [

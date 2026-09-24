@@ -23,9 +23,11 @@ import pytest
 from scripts.compare_kernel_asm import build_env, mojo_cli
 from torch_mojo_backend import get_accelerators
 
+pytestmark = pytest.mark.gpu
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROBE = Path(__file__).resolve().parent / "fa4_selfload_soak_probe.mojo"
-_FA4_DIR = _REPO_ROOT / "torch_mojo_backend" / "eager_flash_attention"
+_MOJO_ROOT = _REPO_ROOT / "torch_mojo_backend" / "mojo"
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +51,7 @@ def selfload_soak_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "build",
         str(_PROBE),
         "-I",
-        str(_FA4_DIR),
+        str(_MOJO_ROOT),
         "-o",
         str(out_path),
     ]
@@ -68,7 +70,7 @@ def selfload_soak_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out_path
 
 
-def test_selfload_soak_no_race(selfload_soak_binary: Path) -> None:
+def test_selfload_soak_no_race(selfload_soak_binary: Path):
     """64 back-to-back self-load launches per shape must be bitwise
     deterministic and match the phase-2b kernel within tolerance."""
     result = subprocess.run(
