@@ -1053,85 +1053,42 @@ HBM rate (1434 GB/s measured, against 1453 for a normal buffer). The
 all-gather and the broadcast's gather half became pushes for the same reason.
 
 **gfx942 waits acquire payloads once after observing completion.** The
-intra-node barrier and inter-node proxy wait use a relaxed system atomic
-load, `s_sleep(1)` after an unsuccessful poll, and a system acquire fence
-on exit. An acquire load on gfx942 includes `buffer_inv sc0 sc1`; repeatedly
-executing it while communication waits also invalidates caches used by
-compute on other streams. Infrequent abort/status loads remain acquire.
-Every producer thread still executes its system release fence before the
-block barrier, and flag publication remains a system release store.
+intra-node barrier and the inter-node proxy wait poll with a relaxed system
+atomic load, `s_sleep(1)` after a failed poll (RCCL 2.22.3's gfx942
+[`waitPeer`](https://github.com/ROCm/rccl/blob/e72b592201d626f16a03a7ba22502130a2846036/src/device/prims_simple.h#L92-L128)),
+and one system acquire fence on exit (`poll_acquire`). An acquire load on
+gfx942 includes `buffer_inv sc0 sc1`, and issuing it on every failed poll
+also invalidates the L2 of the compute running on other streams. Abort and
+status loads stay acquire; every producer still executes its system release
+fence before the block barrier, and flag publication is still a system
+release store (the release side cannot be weakened: `hipIpcOpenMemHandle`
+does not carry the uncached memory type, kernel_results §3 and §7).
 
-This is the atomic-operation-to-fence synchronization rule. Let W be the
-payload writes, S their release publication, L a relaxed atomic load that
-observes S, F the following acquire fence, and R the consuming reads. W
-precedes S, L is sequenced before F, S synchronizes with F because L reads
-S, and F precedes R. Therefore W happens-before R. The fence also runs
-when the first load already satisfies the wait. See
-[C++ atomics.fences paragraph 4](https://eel.is/c++draft/atomics.fences#4)
-and [LLVM fence semantics](https://llvm.org/docs/LangRef.html#fence-instruction).
-The matching [MAX 26.5 stdlib](https://github.com/modular/modular/blob/b4497b7ce9ba96331c72c637ad41b44bab374f33/mojo/stdlib/std/atomic/atomic.mojo)
-maps relaxed to LLVM monotonic; Atomic and fence default to system scope.
+This is the atomic-to-fence rule
+([C++ atomics.fences p4](https://eel.is/c++draft/atomics.fences#4),
+[LLVM fence](https://llvm.org/docs/LangRef.html#fence-instruction)): a
+relaxed load L that reads the release store S, sequenced before the acquire
+fence F, makes S synchronize with F, so the payload writes before S happen
+before the reads after F. The fence runs even when the first poll succeeds.
+MAX 26.5 maps relaxed to LLVM monotonic, and Atomic and fence default to
+system scope. The fence sits after the polling branch has closed, so every
+wave issues it under its full EXEC mask; inside the branch the gfx942
+assembly issued it with EXEC = 0 (kernel_results §7 has that history). The
+proxy wait's single lane polls a uniform address, so its loop never narrows
+EXEC. The host publishes completion only after the receive arrivals, the
+sends and the NIC flush; a transport error may release the mailbox without
+data, with the communicator fault latched, as before.
 
-Each barrier polling thread acquires its own peer's publication before the
-final block barrier passes visibility to all consumers. The fence sits
-after the polling branch (`thread_idx.x < world`) has closed, so every wave
-of the block issues it under its full EXEC mask: one invalidate per wave
-per barrier. It first sat at the end of that branch, and there the gfx942
-assembly issued it with EXEC = 0 on every successful exit. The divergent
-poll loop leaves EXEC holding the lanes still waiting, and LLVM's
-SILowerControlFlow, which treats a fence as not reading EXEC, dropped the
-loop's EXEC restore in front of it. That spelling is sound only if CDNA3
-ignores EXEC for `buffer_inv`, which nothing here verifies. The existing
-monotonic-generation and arena-reuse protocol still justifies `flag >=
-target`. The proxy wait has one polling thread; the next inbox consumer is
-behind its kernel on the same stream. The host publishes successful
-completion only after receive arrivals, outgoing sends, and the NIC flush;
-the CPU release does not replace that flush. On transport error the mailbox
-may instead be released to unblock the GPU, while the communicator fault
-remains latched. Abort/deadline handling and its polling cadence are unchanged.
-
-The [LLVM gfx942 memory-model table](https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942)
-specifies a system monotonic load with `sc0 sc1`, then a paired acquire
-fence that waits for the atomic and invalidates the cache. Emitted gfx942
-assembly confirms `global_load ... sc0 sc1` and `s_sleep 1` in the hot loop,
-and `s_waitcnt` followed by `buffer_inv sc0 sc1` at successful exit. In
-every gfx942 CCL kernel, each barrier acquire now follows the polling
-branch's `s_or_b64 exec, exec, ...` restore and directly precedes
-`s_barrier`: 309 of 309, against 0 of 305 before the move, where each one
-opened a branch-target block entered with the narrowed mask. The proxy
-wait needs no move. Its single lane polls a uniform address, so the loop
-branches on VCC without narrowing EXEC, and its `buffer_inv` runs with
-EXEC = lane 0. There is no unconditional cache invalidate on each failed
-flag poll. System scope is retained for both peer-GPU and CPU
-publications. With the fence moved, the 2 × 4 and 1 × 4 worker suites
-passed, 20 of 20 (Adastra job 5447705). The DDP `stress` mode includes a
-one-element int64 allreduce in each of its 40 generations.
-
-The backoff constant comes from **RCCL 2.22.3**, ROCm tag `rocm-6.4.1`,
-commit `e72b592201d626f16a03a7ba22502130a2846036`:
-[`loadStepValue` and `waitPeer`](https://github.com/ROCm/rccl/blob/e72b592201d626f16a03a7ba22502130a2846036/src/device/prims_simple.h#L92-L128)
-use relaxed gfx942 polling and `s_sleep(1)`. RCCL's payload reads have their
-own volatile/coherent protocol. MojoCCL retains its final acquire fence and
-all producer releases; it does not copy a relaxed poll without the required
-payload ordering.
-
-Earlier experiments that removed the all-thread producer writeback, or
-moved it after the barrier into only the publishing threads, failed small
-collectives. Those results still apply: `hipIpcOpenMemHandle` does not
-preserve the allocation's uncached memory type. See
-`agents_docs/mojo_collectives_kernel_results.md` §3 and §7. The historical two-rank,
-one-element int64 flake later failed to reproduce in an A/B check: 0/20 on
-each tree. That did not establish the original cause. The separate AMD
-clock-overflow problem was fixed by `device_now_ns` (see "Multi-node").
-
-Only `_accelerator_arch()` equal to `gfx942` or `amdgpu:gfx942` takes this
-polling route. Other targets retain their acquire loads without a new sleep
-or fence. The sm_90a comparison against the upstream baseline found **173
-identical CCL kernels, zero changed**; there is no host dispatch change.
-The earlier AMD push direction and grid caps retain their own gates.
+Assembly ([LLVM gfx942 memory model](https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942)):
+`global_load ... sc0 sc1` and `s_sleep 1` in the hot loop, `s_waitcnt` and
+`buffer_inv sc0 sc1` at the exit; every barrier acquire of the CCL entry
+follows the branch's `s_or_b64 exec` restore and directly precedes
+`s_barrier` (309 of 309). Only gfx942 takes this route; every other target
+keeps its acquire loads, and the sm_90a CCL kernels are unchanged (173 of
+173).
 
 Measured on **2 × 4 MI300A, Adastra job 5447705**, GPT-2 XL FSDP2,
-bf16 parameters, fp32 reduction, sequence 1024, batch 1/rank, code defaults:
+bf16 parameters, fp32 reduction, sequence 1024, batch 1/rank:
 
 | Measurement | Previous polling | Acquire once | Mojo + RCCL |
 |---|---:|---:|---:|
@@ -1142,30 +1099,14 @@ bf16 parameters, fp32 reduction, sequence 1024, batch 1/rank, code defaults:
 | Root AG, streamed device µs | 4285.4 | 4256.9 | 3228.4 |
 | Block RS AVG, streamed device µs | 954.0 | 951.3 | 1235.0 |
 
-The isolated timings use 30 queued calls, three bursts and eight ranks;
-the previous-polling leg is a single reference, while the acquire-once and
-RCCL columns summarize interleaved ABBA legs. Profiles compare the final
-three steps and are diagnostic single runs. Event spans include queue gaps;
-the trace kernel sums distinguish actual compute time from those gaps.
-
-An unchanged-tree/acquire-once ABBA gave 19.963k/19.489k/20.657k/19.791k
-tokens/s: about 1% gain in the paired medians, with larger run-to-run
-variation. A separate acquire-once/RCCL ABBA gave
-20.488k/23.435k/23.541k/20.371k. Thus this polling change reduces device
-work and cache interference but does not close the end-to-end gap by itself.
-The runs used five warmup steps and three ten-step windows; each reported
-leg is its median window. Logs are `ccl_p1_poll_abba_*` and
-`ccl_p1_e2e_*` in that job's workspace; traces are `prof/ccl_p1_fsdp`.
-
-All five warmup losses match RCCL to six decimals. At steps 15/25/35,
-MojoCCL gives 7.060111/4.112370/1.766074 versus RCCL's
-7.057992/4.119257/1.757732. These exactly reproduce each implementation's
-pre-change trajectory; the later small divergence predates this change.
-Correctness passed at four and eight ranks: dtype/offset/in-place/overflow
-and cross-stream reduce-scatter, mixed collective stress, changing XL-sized
-AG/RS generations, tiny int64 allreduce, DDP and FSDP parity including a
-checkpoint round trip. Two-node ring pressure, small regions, and both
-regular and split timeout paths also passed.
+Isolated timings: 30 queued calls, three bursts, eight ranks, ABBA legs
+(the previous-polling column is one reference leg); profiles are single
+diagnostic runs over three steps. End to end the change was about 1% in
+paired medians (19.96k/19.49k/20.66k/19.79k tokens/s, unchanged/acquire-once
+ABBA), inside the leg noise: it cuts device work and cache interference but
+does not close the gap to RCCL alone. Losses reproduced each
+implementation's pre-change trajectory, and the 2 × 4 and 1 × 4 worker
+suites passed.
 
 ### NVLS: the large sizes go through the switch
 
@@ -1397,16 +1338,12 @@ grid, though: 96 blocks measured 599 / 2669 µs. 24 wins end to end
 they hold is one the GEMMs do not get. Unroll 2 was measured only together
 with the 24-block grid.
 
-RCCL applies its 24-channel rule only to an APU, which it detects as
-`hipDeviceAttributeDirectManagedMemAccessFromHost` (`init.cc:1339-1346`).
-The discrete gfx942 parts, MI300X and MI325X, are the same ISA, so every
-`comptime` gfx942 choice reaches them too. The two 24-block grids therefore
-use RCCL's own test at run time instead (`_node_grids`, queried once at
-init, and ANDed over the ranks in the bootstrap so that a query failing on
-one rank puts every rank on the same grids): a discrete gfx942 keeps the
-single-node copy cap for the gathers and
-the allreduce caps for the node reduce, as before, and nothing in this
-section was measured on one. Unroll 2 needs no such test: RCCL's
+RCCL applies its 24-channel rule only to an APU
+(`hipDeviceAttributeDirectManagedMemAccessFromHost`, `init.cc:1339-1346`),
+and the discrete gfx942 parts (MI300X, MI325X) are the same ISA, so the
+24-block grids take RCCL's test at run time (`_node_grids`, ANDed over the
+ranks at init): a discrete gfx942 keeps the single-node copy cap for the
+gathers and the allreduce caps for the node reduce, unmeasured. Unroll 2 needs no such test: RCCL's
 unroll-2 rule covers MI300X too. The remaining isolated all-gather time
 is the network: 7.68 MB per NIC at about 16 GB/s, against RCCL's 13.4 MB
 per NIC at 21 GB/s; splitting each exchange into RCCL-sized 512 KiB

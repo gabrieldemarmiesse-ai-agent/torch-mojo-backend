@@ -682,8 +682,8 @@ measured 243 microseconds at 128 blocks and 465 at 1024 with that spelling.
 given up; the barrier shipped on 2026-09-09 was the one that was there before
 this work.** The two release-side ones stay given up. The acquire-side one,
 a relaxed spin with one acquire fence after it, was re-adopted on gfx942 on
-2026-09-24 (commit 2d67247) with its fence later moved out of the polling
-branch (commit 466a448). Section 7 has why, and what the evidence does and
+2026-09-24 (PR #545), its fence moved out of the polling branch after
+review. Section 7 has why, and what the evidence does and
 does not show. The spellings are recorded because the pattern was the same
 every time and it was the lesson of the engagement: each looked provably
 equivalent, and each broke only the *small* collectives, where a payload is
@@ -696,7 +696,7 @@ a cache on its own.
 | release writeback moved after the barrier, into the `world` publishing threads | correct | correct | **fails** |
 | relaxed spin + one acquire fence after the wait (2026-09-09) | correct | correct | **2 failures in 13 runs** |
 | release fence in every thread, acquire load per iteration (shipped 2026-09-09; still every non-gfx942 target) | correct | correct | 0 failures in 12 runs |
-| gfx942 since 2d67247/466a448: relaxed spin + `s_sleep(1)`, one acquire fence per wave after the polling branch | correct | correct | 0 failures; no directed repeat (section 7) |
+| gfx942 since PR #545: relaxed spin + `s_sleep(1)`, one acquire fence per wave after the polling branch | correct | correct | 0 failures; no directed repeat (section 7) |
 
 RCCL's `skip_fence` (`rccl:src/include/rccl_common.h:262-273`, on for cudaArch
 940 when the buffers are uncached) is sound for RCCL and not for us: our region
@@ -883,7 +883,7 @@ redesign did not bring the flake in; it says nothing about the relaxed spin,
 which neither tree had.
 
 **Update, 2026-09-24: the relaxed spin is back on gfx942, fence moved.**
-Commit 2d67247 re-adopted it for gfx942 only (every other target keeps the
+PR #545 re-adopted it for gfx942 only (every other target keeps the
 acquire load), with RCCL 2.22.3's `s_sleep(1)` between failed polls. The
 reason was a workload, not this benchmark: on 2 × 4 MI300A (GPT-2 XL FSDP2)
 the per-iteration invalidate evicts the L2 of the compute kernels running
@@ -896,7 +896,7 @@ an acquire fence, is the atomic-to-fence rule of the C++ and LLVM memory
 models. That is a proof, not the symmetry argument of 2026-09-09.
 
 A later code review then found why the symmetry argument was worse than
-unproven. In 2d67247 the fence sat at the end of the `thread_idx.x < world`
+unproven. In its first spelling the fence sat at the end of the `thread_idx.x < world`
 branch, right after the divergent spin loop. The loop leaves EXEC holding
 the lanes still waiting, which is 0 once every flag is seen, and LLVM's
 SILowerControlFlow, which treats a fence as not reading EXEC, dropped the
@@ -907,20 +907,20 @@ hardware ignores EXEC for a cache invalidate, and nothing verified that for
 CDNA3. If the 2026-09-09 spelling had its fence in the same place (its
 assembly was not kept), a success path with no acquire at all is a
 plausible cause of the 2/13, and would also explain why only one-element
-payloads failed. That is unverified. Commit 466a448 moved the fence after
+payloads failed. That is unverified. The review fix moved the fence after
 the branch closes. Every wave now issues it under its full mask, one
 invalidate per wave per barrier and still none in the spin. The gfx942
 assembly of the CCL entry shows all 309 barrier acquires after the EXEC
-restore and directly before `s_barrier`, against 0 of 305 in the 2d67247
-dump.
+restore and directly before `s_barrier`, against 0 of 305 in the first
+spelling's dump.
 
 What the correctness evidence shows, then:
 
 * **For the old spelling:** 2 failures in 13 runs of the 2-rank
   one-element allreduce.
-* **For 2d67247's in-branch fence** (EXEC = 0): no failure in any
+* **For the first spelling's in-branch fence** (EXEC = 0): no failure in any
   validation round of the 2 × 4 and 1 × 4 suites, one per commit. Since
-  commit 1ce5707 the DDP `stress` mode runs one-element int64 allreduces in
+  the same PR the DDP `stress` mode runs one-element int64 allreduces in
   every generation, with changing data and an exact integer reference.
   None of this was a directed repeat of the 2-rank loop, so it bounds the
   rate only loosely. It does not show the in-branch fence was sound.

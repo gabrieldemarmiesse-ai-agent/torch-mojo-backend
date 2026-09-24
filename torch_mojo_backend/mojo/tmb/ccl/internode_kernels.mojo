@@ -36,11 +36,10 @@ comptime _ABORT_CHECK = 256
 across PCIe, so probing every iteration would double the wait kernel's traffic
 for no gain: 256 iterations is well under a millisecond."""
 
-# gfx942 waits use the atomic-to-fence acquire in collectives_kernels:
-# the progress thread flushes the NIC writes before release-storing MB_DONE;
-# the relaxed system load that observes it precedes one system acquire fence.
-# Preserve error handling: a transport error can release MB_DONE without data,
-# just as with the old acquire load. The communicator's fault stays latched.
+# gfx942 polls MB_DONE relaxed and acquires once (`poll_acquire`); the
+# progress thread flushes the NIC writes before release-storing it. A
+# transport error can release it without data, as before; the fault stays
+# latched.
 
 
 @__llvm_metadata(

@@ -229,15 +229,14 @@ def check_fsdp_collectives_stress():
     for count, dtype in cases:
         # Small/awkward cases get misaligned bases; the large ones keep
         # FSDP2's 16-byte-aligned bases, so their misalignment (if any) is the
-        # per-rank stride alone.
+        # per-rank stride alone. Destination-dependent RS input catches
+        # wrong-shard reads.
         offset = 1 if count < 1_000_000 else 8
         indices = _stress_indices(count)
         gather_indices = torch.cat([indices + peer * count for peer in range(world)])
         device_indices = indices.to("mojo")
         device_gather_indices = gather_indices.to("mojo")
         pattern = (torch.arange(count, dtype=torch.int32) % 17 - 8).float()
-        # Small/awkward cases are misaligned; large cases keep FSDP2's 16-byte
-        # alignment. Destination-dependent RS input catches wrong-shard reads.
         ag_source_storage = torch.full(
             (count + offset + 1,), -123, dtype=dtype, device="mojo"
         )

@@ -355,7 +355,7 @@ unroll for gfx94 parts with more than 80 CUs (rccl `src/init.cc:101-105`,
 NCCL_UNROLL_2; the generic kernel it launches there is the unroll-2 one).
 That rule covers MI300A and MI300X alike; a gfx942 part with 80 CUs or
 fewer would get RCCL's unroll 4 and gets 2 here, unmeasured. Unroll 2 was
-only measured together with the 24-block grid (b589468), never on its own.
+only measured together with the 24-block grid, never on its own.
 H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
 
 
@@ -3244,7 +3244,6 @@ def allgather_mapped_pipeline_plan(
 def _allgather_multinode_mapped(
     mut state: CommState,
     stream: DeviceStream,
-    raw_stream: Int64,
     sendbuff: Int,
     recvbuff: Int,
     per_rank_bytes: Int,
@@ -3261,11 +3260,8 @@ def _allgather_multinode_mapped(
         state.narenas,
         state.nslots,
         # Measured on 2x8 H100: overlap large gathers, retain the passing
-        # single-chunk route below this node-scaled threshold. Also measured
-        # on 2x4 MI300A (job 5447705), where two balanced halves are RCCL's
-        # two slices per chunk (all_gather.h): XL bf16 7.68 MB/rank 601 ->
-        # 541 us once the flush read stopped serialising the exchanges
-        # (`fab_post_flush`); the 41 MB root stays capacity-bound.
+        # single-chunk route below this node-scaled threshold. 2x4 MI300A:
+        # agents_docs/distributed.md.
         PIPE_SPLIT_UNIT * state.local_world,
     )
     var chunk_bytes = plan[0]
@@ -3371,7 +3367,7 @@ def _allgather_multinode(
     """Exchange one contribution per NIC, disseminate on the receiving node."""
     comptime if has_nvidia_gpu_accelerator() or _GFX942:
         _allgather_multinode_mapped(
-            state, stream, raw_stream, sendbuff, recvbuff, per_rank_bytes
+            state, stream, sendbuff, recvbuff, per_rank_bytes
         )
         return
     var lw = state.local_world

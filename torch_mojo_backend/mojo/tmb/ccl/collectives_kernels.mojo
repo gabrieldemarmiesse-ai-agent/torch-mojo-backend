@@ -192,16 +192,15 @@ architecture. gfx942 covers the MI300A APU and the discrete MI300X and
 MI325X alike. The multi-node grid rule RCCL applies only to the APU is
 chosen at run time (`_node_grids` in entry.mojo), not here."""
 
-comptime _RELAXED_POLL = _GFX942
-# Measured on MI300A, job 5447705: FSDP2 comm busy 209.5 -> 188.5 ms/step.
-# End-to-end improvement alone was small/noisy; see agents_docs/distributed.md.
-comptime _POLL_ORDER = Ordering.RELAXED if _RELAXED_POLL else Ordering.ACQUIRE
+# gfx942 polls relaxed and acquires once (`poll_acquire`). MI300A, job
+# 5447705: FSDP2 comm busy 209.5 -> 188.5 ms/step (agents_docs/distributed.md).
+comptime _POLL_ORDER = Ordering.RELAXED if _GFX942 else Ordering.ACQUIRE
 
 
 @always_inline
 def poll_pause():
     """RCCL 2.22.3's gfx942 waitPeer sleep (prims_simple.h); no other target."""
-    comptime if _RELAXED_POLL:
+    comptime if _GFX942:
         llvm_intrinsic["llvm.amdgcn.s.sleep", NoneType, has_side_effect=True](
             Int32(1)
         )
@@ -221,17 +220,11 @@ def poll_acquire():
     barrier passes the acquire to the payload-reading threads.
 
     Call it where the wave has reconverged, never inside the branch that
-    polls. `_sync` used to call it at the end of its `thread_idx.x < world`
-    branch, right after the spin loop. The loop leaves EXEC holding the
-    lanes still waiting, which is 0 on success, and LLVM's
-    SILowerControlFlow, which treats the fence as not reading EXEC, dropped
-    the loop's EXEC restore in front of it: the gfx942 assembly issued
-    `buffer_inv sc0 sc1` with EXEC = 0 on every success path. That is sound
-    only if CDNA3 ignores EXEC for a cache invalidate, which nothing here
-    verifies. After the branch closes, the fence runs under each wave's full
-    mask: one invalidate per wave per barrier, still none inside the spin.
+    polls: there the spin loop's exit leaves EXEC = 0 and the gfx942
+    invalidate ran with no lanes (agents_docs/mojo_collectives_kernel_results.md
+    section 7).
     """
-    comptime if _RELAXED_POLL:
+    comptime if _GFX942:
         fence[ordering=Ordering.ACQUIRE]()
 
 
@@ -792,10 +785,8 @@ def _sync(
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x) if row < 0 else row
-        # Keep both producer release operations above/below: unlike polling,
-        # weakening those loses small payloads through the IPC mapping.
-        # gfx942 uses atomic-to-fence acquisition (poll_acquire), preserving
-        # the same system scope and the final cross-wave block rendezvous.
+        # Only the acquire side is relaxed on gfx942 (`poll_acquire`); both
+        # releases stay, for the small-payload reason above.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
                 bid * MAX_WORLD + rank
@@ -842,10 +833,7 @@ def _sync(
                     )
                     failed[unsafe_offset=0] = 1
                     break
-    # Outside the `thread_idx.x < world` branch on purpose: every wave issues
-    # it under its full EXEC mask. See `poll_acquire` for why nesting it in
-    # the polling branch left the invalidate with EXEC = 0.
-    poll_acquire()
+    poll_acquire()  # outside the polling branch on purpose
     barrier()
     return failed[unsafe_offset=0] == 0
 
@@ -2600,40 +2588,40 @@ def _allgather_body[
         var own_output = out_ptr.unsafe_offset(
             _allgather_rank[MAPPED](rank_at, rank) * out_stride
         )
+        var nic = False
         comptime if MAPPED:
-            if seq != 0:
-                _copy_bytes2[U](
-                    regions[rank].unsafe_offset(
-                        stage_off + allgather_nic_stage_off(world, n)
-                    ),
-                    own_output,
-                    in_ptr,
-                    n,
-                    tid,
-                    stride,
+            nic = seq != 0
+        if nic:
+            _copy_bytes2[U](
+                regions[rank].unsafe_offset(
+                    stage_off + allgather_nic_stage_off(world, n)
+                ),
+                own_output,
+                in_ptr,
+                n,
+                tid,
+                stride,
+            )
+            # Like _sync, flush every wave before the block rendezvous;
+            # s_barrier alone does not drain AMD vector-memory stores.
+            fence[ordering=Ordering.RELEASE]()
+            barrier()
+            if thread_idx.x == 0:
+                var arrive = (
+                    regions[rank]
+                    .unsafe_offset(_AG_ARRIVE_OFFSET)
+                    .unsafe_bitcast[UInt64]()
                 )
-                # Like _sync, flush every wave before the block rendezvous;
-                # s_barrier alone does not drain AMD vector-memory stores.
-                fence[ordering=Ordering.RELEASE]()
-                barrier()
-                if thread_idx.x == 0:
-                    var arrive = (
-                        regions[rank]
-                        .unsafe_offset(_AG_ARRIVE_OFFSET)
-                        .unsafe_bitcast[UInt64]()
+                var was = Atomic[DType.uint64].fetch_add[
+                    ordering=Ordering.ACQUIRE_RELEASE
+                ](arrive, UInt64(1))
+                if Int(was) == Int(grid_dim.x) - 1:
+                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                        arrive, UInt64(0)
                     )
-                    var was = Atomic[DType.uint64].fetch_add[
-                        ordering=Ordering.ACQUIRE_RELEASE
-                    ](arrive, UInt64(1))
-                    if Int(was) == Int(grid_dim.x) - 1:
-                        Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
-                            arrive, UInt64(0)
-                        )
-                        Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                            mb_req, seq
-                        )
-            else:
-                _copy_bytes[U](own_output, in_ptr, n, tid, stride)
+                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
+                        mb_req, seq
+                    )
         else:
             _copy_bytes[U](own_output, in_ptr, n, tid, stride)
         for i in range(1, world):
