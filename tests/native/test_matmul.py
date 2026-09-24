@@ -175,6 +175,12 @@ def test_mm_float32_tensor_core_regime(mojo_device, shape):
         ((1600, 4800, 1024), "TN", False, (0, 0)),
         ((2047, 1600, 1024), "TN", False, (0, 0)),
         ((1009, 1592, 1024), "TN", False, (0, 0)),
+        ((1009, 1592, 1024), "TN", False, (1, 3)),
+        ((1600, 4800, 33), "TN", False, (0, 0)),
+        ((1600, 4800, 1025), "TN", False, (0, 0)),
+        ((1600, 4800, 40), "TN", False, (0, 0)),
+        ((1600, 4800, 40), "NT", False, (0, 0)),
+        ((1600, 4800, 40), "NN", False, (0, 0)),
         ((1009, 1617, 1599), "NN", True, (1, 1)),
         ((1024, 1600, 1600), "NN", True, (0, 0)),
         ((1009, 1032, 1600), "NN", True, (0, 0)),
@@ -233,6 +239,46 @@ def test_bf16_gemm_leading_dimensions(mojo_gpu, shape, layout, bias, offsets):
     assert result.dtype == torch.bfloat16
     torch.testing.assert_close(da_storage.cpu(), a_storage, atol=0, rtol=0)
     torch.testing.assert_close(db_storage.cpu(), b_storage, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "shape,layout",
+    [
+        ((1600, 4800, 33), "TN"),
+        ((1600, 4800, 1), "TN"),
+        ((1600, 4800, 17), "TN"),
+        ((1600, 4800, 1025), "TN"),
+        ((1600, 4800, 40), "TN"),
+        ((4096, 4096, 33), "TN"),
+        ((1600, 4800, 33), "NN"),
+        ((1600, 4800, 1025), "NN"),
+        ((1600, 4800, 40), "NN"),
+        ((1600, 4800, 33), "NT"),
+        ((1600, 4800, 40), "NT"),
+    ],
+)
+def test_bf16_gemm_k_tail_only(mojo_gpu, shape, layout):
+    """Only the LAST k term is nonzero, so the exact product is all ones.
+
+    A kernel that drops the K tail returns zeros: on gfx942 the masked TN
+    tile loads k in pairs, and guarding a pair as a unit threw away row
+    K - 1 whenever an odd K ends inside one (1, 17, 33, 1025 here; 40 is the
+    even tail).  (1600, 4800) fills half of a 228-CU MI300A with 256x256
+    tiles and (4096, 4096) all of it, so both reach the unsplit masked
+    plan; the NN and NT rows cover the neighbouring routes' tails.
+    """
+    m, n, k = shape
+    a = torch.zeros(m, k, dtype=torch.bfloat16)
+    a[:, -1] = 1
+    b = torch.zeros(k, n, dtype=torch.bfloat16)
+    b[-1] = 1
+    da = a.t().contiguous().to(mojo_gpu).t() if layout[0] == "T" else a.to(mojo_gpu)
+    db = b.t().contiguous().to(mojo_gpu).t() if layout[1] == "T" else b.to(mojo_gpu)
+    with assert_ran("aten::mm"):
+        result = torch.mm(da, db).cpu()
+    assert result.dtype == torch.bfloat16
+    wrong = (result != 1).sum().item()
+    assert wrong == 0, f"{wrong} of {m * n} outputs differ from 1"
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])

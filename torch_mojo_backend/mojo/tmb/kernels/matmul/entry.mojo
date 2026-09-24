@@ -2506,23 +2506,30 @@ def _nt_mfma_body[
                         # inside the extent or wholly outside it: one guard, no
                         # per-element tail.  A tail written as predicated scalar
                         # loads costs 144 bytes of scratch per thread and
-                        # measures 3.2x slower.
+                        # measures 3.2x slower.  Along k the guard is on this
+                        # vector's own row; a pair's second row has its own
+                        # below, because an odd K ends inside a pair.
                         live = (
                             live
                             and m0 + axc < m
-                            and k0
-                            + kt * BK
-                            + NROWS * (akr + p * LRA)
-                            + NROWS
-                            - 1
-                            < k
+                            and k0 + kt * BK + NROWS * (akr + p * LRA) < k
                         )
                     var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
                         v0 = a_ptr.unsafe_load[width=NT_HVEC](p * a_pass)
                     comptime if PAIR:
+                        # Guarding the pair as a unit dropped row K - 1 of an
+                        # odd K (all zeros for a K = 33 whose only nonzero
+                        # term is its last).
+                        var live1 = live
+                        comptime if MASK_LOAD:
+                            live1 = (
+                                live
+                                and k0 + kt * BK + NROWS * (akr + p * LRA) + 1
+                                < k
+                            )
                         var v1 = SIMD[dtype, NT_HVEC](0)
-                        if live:
+                        if live1:
                             v1 = a_ptr.unsafe_load[width=NT_HVEC](
                                 p * a_pass + m
                             )
@@ -2558,19 +2565,22 @@ def _nt_mfma_body[
                         live = (
                             live
                             and n0 + bxc < n
-                            and k0
-                            + kt * BK
-                            + NROWS * (bkr + p * LRB)
-                            + NROWS
-                            - 1
-                            < k
+                            and k0 + kt * BK + NROWS * (bkr + p * LRB) < k
                         )
                     var v0 = SIMD[dtype, NT_HVEC](0)
                     if live:
                         v0 = b_ptr.unsafe_load[width=NT_HVEC](p * b_pass)
                     comptime if PAIR:
+                        # Each row of the pair on its own, as for A.
+                        var live1 = live
+                        comptime if MASK_LOAD:
+                            live1 = (
+                                live
+                                and k0 + kt * BK + NROWS * (bkr + p * LRB) + 1
+                                < k
+                            )
                         var v1 = SIMD[dtype, NT_HVEC](0)
-                        if live:
+                        if live1:
                             v1 = b_ptr.unsafe_load[width=NT_HVEC](
                                 p * b_pass + n
                             )
