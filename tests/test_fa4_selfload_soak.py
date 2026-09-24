@@ -65,7 +65,7 @@ _PROD_REPS = int(os.environ.get("FA4_SELFLOAD_SOAK_REPS", "12"))
 _DEVICE_EVENT_TYPES = ("DeviceType.CUDA", "DeviceType.PrivateUse1")
 
 
-def _require_sm90a() -> None:
+def _require_sm90a():
     accelerators = list(get_accelerators())
     if (
         not accelerators
@@ -138,9 +138,7 @@ def _device_kernel_names(run: Callable[[], object]) -> set[str]:
 
 
 @pytest.mark.parametrize("shape", _PROD_SHAPES, ids=lambda s: "B{}H{}S{}D64".format(*s))
-def test_selfload_bhsd_production_soak(
-    shape: tuple[int, int, int], mojo_gpu: str
-) -> None:
+def test_selfload_bhsd_production_soak(shape: tuple[int, int, int], mojo_gpu: str):
     """The reachable-in-production path: contiguous BHSD SDPA, soaked.
 
     Every launch is checked bitwise against the first one (this kernel is

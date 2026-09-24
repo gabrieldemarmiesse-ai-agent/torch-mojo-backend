@@ -217,9 +217,7 @@ def _line_numbers(pattern: re.Pattern[str], text: str) -> list[int]:
     return [i for i, line in enumerate(text.splitlines()) if pattern.search(line)]
 
 
-def _assert_every_event_follows_a_wait(
-    events: list[tuple[int, str]], event_label: str
-) -> None:
+def _assert_every_event_follows_a_wait(events: list[tuple[int, str]], event_label: str):
     """Walk (position, kind) events in position order: every 'event_label'
     kind must have a 'wait' kind since the previous 'event_label' (or since
     the start of the region, for the first one). `position` is a PTX line
@@ -276,7 +274,7 @@ def test_selfload_refills_follow_their_wait_group(selfload_ptx: str):
     _assert_every_event_follows_a_wait(expect_events, "mbarrier.arrive.expect_tx")
 
 
-def test_selfload_refills_follow_their_wait_group_sass(selfload_sass: str) -> None:
+def test_selfload_refills_follow_their_wait_group_sass(selfload_sass: str):
     """Same ordering, one compiler further down: in ptxas-scheduled SASS.
 
     The PTX test above constrains LLVM only. ptxas re-schedules that PTX
@@ -304,7 +302,7 @@ def test_selfload_refills_follow_their_wait_group_sass(selfload_sass: str) -> No
     _assert_every_event_follows_a_wait(events, "UTMALDG refill")
 
 
-def test_selfload_rejects_d128_at_compile_time() -> None:
+def test_selfload_rejects_d128_at_compile_time():
     """Scope enforcement, not just documentation: instantiating the
     self-loading kernel at head_dim=128 must fail the BUILD (ported from
     agent A2's review artifact, d128_guard_v7.mojo)."""
