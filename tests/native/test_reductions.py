@@ -13,6 +13,7 @@ import math
 import pytest
 import torch
 
+from tests.native.conftest import ran
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -944,6 +945,26 @@ _EXPECTED_OVERLOADS = [
         ),
     ),
     ("aten::cumsum", lambda d: torch.cumsum(torch.randn(4, 5).to(d), dim=1)),
+    ("aten::topk", lambda d: torch.topk(torch.randn(4, 5).to(d), 2)),
+    (
+        "aten::topk.values",
+        lambda d: torch.topk(
+            torch.randn(4, 5).to(d),
+            2,
+            out=(torch.empty(0, device=d), torch.empty(0, dtype=torch.int64, device=d)),
+        ),
+    ),
+    ("aten::sort.stable", lambda d: torch.sort(torch.randn(4, 5).to(d))),
+    ("aten::sort.stable", lambda d: torch.argsort(torch.randn(4, 5).to(d))),
+    ("aten::sort.stable", lambda d: torch.msort(torch.randn(4, 5).to(d))),
+    (
+        "aten::sort.values_stable",
+        lambda d: torch.sort(
+            torch.randn(4, 5).to(d),
+            stable=True,
+            out=(torch.empty(0, device=d), torch.empty(0, dtype=torch.int64, device=d)),
+        ),
+    ),
 ]
 
 
@@ -1034,3 +1055,273 @@ def test_var_constant_slice_is_exactly_zero(mojo_gpu, shape, dim, value, dtype):
     result = torch.var(x.to(mojo_gpu), correction=1, **kwargs).cpu()
     assert bool((result == 0).all()), result
     assert not bool(result.signbit().any())
+
+
+# ---------------------------------------------------------------------------
+# sort / topk. The kernel orders (key, original index) pairs, so its result is
+# always the STABLE one: every reference below is CPU's `stable=True` sort,
+# which it must reproduce exactly, ties included. topk's tie order is
+# unspecified in ATen, so its values are compared with `torch.topk` and its
+# indices with the stable sort's prefix, plus a check that they point at the
+# returned values. The kernel picks one of three launch routes from the row
+# length and k (one tile / tournament / full multi-tile sort), so the sizes
+# straddle the route boundaries: the tile is 4096 elements for 32-bit keys
+# and 2048 for 64-bit ones.
+# ---------------------------------------------------------------------------
+
+_SORT_ROUTE_SIZES = (1, 2, 33, 255, 2049, 4095, 4096, 4097, 8193, 12000, 50257)
+_SORT_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float64,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+]
+
+
+def _same(actual: torch.Tensor, expected: torch.Tensor):
+    """Bit-exact equality with NaN equal to NaN (`torch.equal` has no
+    equal_nan, and a NaN still has to land in the right place)."""
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+
+
+def _sort_probe(rows: int, columns: int, seed: int = 7) -> torch.Tensor:
+    """Values with deliberate ties, both zeros, and NaNs in longer rows."""
+    host = torch.randn(rows, columns, generator=torch.Generator().manual_seed(seed))
+    if columns >= 16:
+        host[:, ::7] = 0.0
+        host[:, ::11] = -0.0
+        host[:, ::13] = 1.5
+        host[:, 3] = float("nan")
+        host[:, 5] = -float("nan")
+    return host
+
+
+def _dtype_probe(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Heavily tied values exactly representable in every dtype."""
+    host = torch.arange(math.prod(shape), dtype=torch.int64).reshape(shape)
+    host = (host * 37 + 11) % 97
+    if dtype is torch.bool:
+        return host % 3 == 0
+    if dtype is torch.uint8:
+        return host.to(dtype)
+    return (host - 48).to(dtype)
+
+
+def _check_topk(x: torch.Tensor, device: str, k: int, dim: int, largest: bool):
+    with ran("aten::topk"):
+        actual = torch.topk(x.to(device), k, dim=dim, largest=largest)
+    expected = torch.topk(x, k, dim=dim, largest=largest)
+    _same(actual.values, expected.values)
+    indices = actual.indices.cpu()
+    assert indices.dtype == torch.int64
+    _same(torch.gather(x, dim, indices), expected.values)
+    stable = torch.sort(x, dim=dim, descending=largest, stable=True)
+    _same(indices, stable.indices.narrow(dim, 0, k))
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("columns", _SORT_ROUTE_SIZES)
+def test_sort_matches_stable_cpu_on_every_route(mojo_gpu, columns, descending):
+    host = _sort_probe(3, columns)
+    expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+    with ran("aten::sort.stable"):
+        actual = torch.sort(host.to(mojo_gpu), dim=-1, descending=descending)
+    _same(actual.values, expected.values)
+    _same(actual.indices, expected.indices)
+
+
+@pytest.mark.parametrize(
+    ("columns", "k"),
+    [
+        # k = 1, in between, the whole row; for the long rows, k small enough
+        # for the tournament route, then the first k that no longer fits and
+        # falls back to the full sort, then the whole row.
+        (1, 1),
+        (33, 1),
+        (33, 5),
+        (33, 33),
+        (4095, 17),
+        (4096, 4096),
+        (8193, 4096),
+        (50257, 1),
+        (50257, 50),
+        (50257, 315),
+        (50257, 316),
+        (50257, 2048),
+    ],
+)
+@pytest.mark.parametrize("largest", [True, False])
+def test_topk_matches_cpu_across_the_routes(mojo_gpu, columns, k, largest):
+    _check_topk(_sort_probe(2, columns, seed=11), mojo_gpu, k, -1, largest)
+
+
+@pytest.mark.parametrize("dtype", _SORT_DTYPES)
+@pytest.mark.parametrize("columns", [37, 6001])
+def test_sort_every_dtype(mojo_gpu, dtype, columns):
+    """Every kernel dtype, on a one-tile and a multi-tile row. The 64-bit
+    dtypes matter most: their key is twice as wide, which halves the tile and
+    so moves every route boundary."""
+    host = _dtype_probe((3, columns), dtype)
+    for descending in (False, True):
+        expected = torch.sort(host, dim=-1, descending=descending, stable=True)
+        with ran("aten::sort.stable"):
+            actual = torch.sort(host.to(mojo_gpu), dim=-1, descending=descending)
+        assert actual.values.dtype == dtype
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+
+
+@pytest.mark.parametrize("dtype", [d for d in _SORT_DTYPES if d is not torch.bool])
+@pytest.mark.parametrize("k", [1, 9, 257])
+def test_topk_every_dtype(mojo_gpu, dtype, k):
+    host = _dtype_probe((3, 257), dtype)
+    for largest in (True, False):
+        _check_topk(host, mojo_gpu, k, -1, largest)
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2, -1, -2, -3])
+def test_sort_and_topk_every_dim(mojo_gpu, dim):
+    """A dim other than the last is moved to last, sorted, and moved back."""
+    host = _sort_probe(5, 7 * 9, seed=3).reshape(5, 7, 9)
+    device = host.to(mojo_gpu)
+    for descending in (False, True):
+        expected = torch.sort(host, dim=dim, descending=descending, stable=True)
+        actual = torch.sort(device, dim=dim, descending=descending, stable=True)
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+    for k in (1, 3, host.shape[dim]):
+        _check_topk(host, mojo_gpu, k, dim, True)
+        _check_topk(host, mojo_gpu, k, dim, False)
+
+
+def test_sort_and_topk_non_contiguous_input(mojo_gpu):
+    host = _sort_probe(9, 40, seed=5)
+    device = host.to(mojo_gpu)
+    for view, ref in ((device.t(), host.t()), (device[:, 1::3], host[:, 1::3])):
+        expected = torch.sort(ref, dim=-1, stable=True)
+        actual = torch.sort(view, dim=-1)
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+        _check_topk(ref.contiguous(), mojo_gpu, 4, -1, True)
+        with ran("aten::topk"):
+            got = torch.topk(view, 4, dim=-1)
+        _same(got.values, torch.topk(ref, 4, dim=-1).values)
+
+
+def test_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu):
+    """A negative NaN's bits sit below -inf and -0.0's below +0.0, but ATen
+    orders every NaN above every number and treats the two zeros as equal."""
+    nan = float("nan")
+    inf = float("inf")
+    host = torch.tensor([[0.0, -0.0, nan, -nan, inf, -inf, 1.0, -1.0, nan, 0.0]])
+    for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.float64):
+        x = host.to(dtype)
+        for descending in (False, True):
+            expected = torch.sort(x, dim=-1, descending=descending, stable=True)
+            actual = torch.sort(x.to(mojo_gpu), dim=-1, descending=descending)
+            _same(actual.values, expected.values)
+            _same(actual.indices, expected.indices)
+        for k in (1, 3, 10):
+            for largest in (True, False):
+                got = torch.topk(x.to(mojo_gpu), k, largest=largest)
+                _same(got.values, torch.topk(x, k, largest=largest).values)
+
+
+def test_sort_and_topk_many_rows(mojo_gpu):
+    """More rows than one launch's grid.y (65535): the op runs row chunks."""
+    host = _sort_probe(70001, 3, seed=9)
+    expected = torch.sort(host, dim=-1, stable=True)
+    actual = torch.sort(host.to(mojo_gpu), dim=-1)
+    _same(actual.values, expected.values)
+    _same(actual.indices, expected.indices)
+    _check_topk(host, mojo_gpu, 2, -1, True)
+
+
+def test_sort_and_topk_empty_and_scalar(mojo_gpu):
+    for host in (torch.empty(2, 0), torch.empty(0, 5), torch.tensor(4.5)):
+        expected = torch.sort(host, dim=-1)
+        actual = torch.sort(host.to(mojo_gpu), dim=-1)
+        assert actual.values.shape == expected.values.shape
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+    for host, k in (
+        (torch.empty(2, 0), 0),
+        (torch.randn(3, 4), 0),
+        (torch.tensor(4.5), 1),
+    ):
+        expected = torch.topk(host, k, dim=-1)
+        actual = torch.topk(host.to(mojo_gpu), k, dim=-1)
+        assert actual.values.shape == expected.values.shape
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+
+
+def test_sort_and_topk_out_variants(mojo_gpu):
+    host = _sort_probe(3, 37)
+    x = host.to(mojo_gpu)
+    # Empty outs (resized) and a transposed out (not contiguous: computed,
+    # then copied into it).
+    for values, indices in (
+        (
+            torch.empty(0, device=mojo_gpu),
+            torch.empty(0, dtype=torch.int64, device=mojo_gpu),
+        ),
+        (
+            torch.empty(5, 3, device=mojo_gpu).t(),
+            torch.empty(5, 3, dtype=torch.int64, device=mojo_gpu).t(),
+        ),
+    ):
+        with ran("aten::topk.values"):
+            got = torch.topk(x, 5, out=(values, indices))
+        assert got[0] is values and got[1] is indices
+        expected = torch.topk(host, 5)
+        _same(values, expected.values)
+        _same(indices, torch.sort(host, descending=True, stable=True).indices[:, :5])
+    values = torch.empty(0, device=mojo_gpu)
+    indices = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    with ran("aten::sort.values_stable"):
+        got = torch.sort(x, dim=-1, stable=True, out=(values, indices))
+    assert got[0] is values and got[1] is indices
+    expected = torch.sort(host, dim=-1, stable=True)
+    _same(values, expected.values)
+    _same(indices, expected.indices)
+
+
+def test_sort_and_topk_errors(mojo_gpu):
+    x = torch.randn(3, 6).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        torch.topk(x, 7)
+    with pytest.raises(RuntimeError, match="selected index k out of range"):
+        torch.topk(x, -1)
+    with pytest.raises((IndexError, RuntimeError), match="Dimension out of range"):
+        torch.topk(x, 2, dim=2)
+    with pytest.raises((IndexError, RuntimeError), match="Dimension out of range"):
+        torch.sort(x, dim=-3)
+    with pytest.raises(RuntimeError, match="dtype"):
+        torch.sort(
+            x, out=(torch.empty(0, device=mojo_gpu), torch.empty(0, device=mojo_gpu))
+        )
+
+
+def test_sort_and_topk_backward(mojo_gpu):
+    """Both backwards are a scatter of the gradient over the returned
+    indices, through ops the device already has."""
+    host = _dtype_probe((4, 9), torch.float32) + torch.arange(9) * 0.01
+    x = host.to(mojo_gpu).requires_grad_(True)
+    reference = host.clone().requires_grad_(True)
+
+    def loss(t: torch.Tensor) -> torch.Tensor:
+        top = torch.topk(t, 3, dim=-1).values
+        low = torch.sort(t, dim=0).values[:2]
+        return (top * 2).sum() + (low * 3).sum()
+
+    loss(x).backward()
+    loss(reference).backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad.cpu(), reference.grad)

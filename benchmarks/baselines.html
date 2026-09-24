@@ -11177,6 +11177,58 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "sort.stable": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 3.044
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 4.7
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 3.67
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 3.629
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 2.035
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 3.056
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 2.455
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 2.439
+                  }
+                }
+              }
+            }
+          }
+        },
         "split_with_sizes_copy.out": {
           "dtypes": {
             "bf16": {
@@ -11439,6 +11491,58 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 1.129
+                  }
+                }
+              }
+            }
+          }
+        },
+        "topk": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.466
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 2.051
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 3.954
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 3.866
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.277
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 1.376
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 2.707
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 2.69
                   }
                 }
               }

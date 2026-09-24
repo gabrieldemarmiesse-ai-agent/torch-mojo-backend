@@ -4061,6 +4061,96 @@ def test_aten_searchsorted_compile_backend_declines_unchecked_sorter():
         torch.compile(fn, backend=mojo_backend)(boundaries, values, out_of_range_sorter)
 
 
+# ---------------------------------------------------------------------------
+# topk / sort (compile backend; the mojo device's native kernels are tested in
+# tests/native/test_reductions.py). Tie-free values except where the test is
+# about ties: ATen leaves the index of a tie unspecified for topk and for a
+# non-stable sort.
+# ---------------------------------------------------------------------------
+
+
+def _distinct(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor whose values are all distinct, exactly representable in
+    `dtype`, and not in sorted order."""
+    numel = math.prod(shape)
+    values = torch.arange(numel, dtype=torch.int64)
+    values = (values * 37 + 11) % numel  # a fixed tie-free permutation
+    return (values - numel // 2).reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("largest", [True, False])
+@pytest.mark.parametrize("k", [1, 5, 33])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_topk(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, k: int, largest: bool
+):
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x):
+        return torch.topk(x, k, dim=-1, largest=largest)
+
+    check_outputs(fn, conf, [_distinct((4, 33), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dim", [0, 1, -2])
+def test_aten_topk_non_last_dim(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x):
+        return aten.topk(x, 2, dim, False, False)
+
+    check_outputs(fn, conf, [_distinct((5, 4, 3), torch.float32)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("dim", [-1, 0, -2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_aten_sort(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    dim: int,
+    descending: bool,
+):
+    """torch.sort and argsort reach the graph as sort.default."""
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x):
+        values, indices = torch.sort(x, dim=dim, descending=descending)
+        return values, indices, torch.argsort(x, dim=dim, descending=descending)
+
+    check_outputs(fn, conf, [_distinct((5, 4, 7), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("descending", [False, True])
+def test_aten_sort_stable_with_ties(
+    conf: Conf, call_checker: CallChecker, descending: bool
+):
+    """`stable=True` reaches the graph as sort.stable and pins the index order
+    of equal values."""
+    call_checker.register(aten_functions.aten_sort_stable)
+
+    def fn(x):
+        return torch.sort(x, dim=-1, descending=descending, stable=True)
+
+    x = torch.tensor([[3.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]]).repeat(3, 5)
+    check_outputs(fn, conf, [x])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_msort(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x):
+        return torch.msort(x)
+
+    check_outputs(fn, conf, [_distinct((6, 5), torch.float32)])
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_scatter_src_basic_2d(conf: Conf, dtype: torch.dtype):
     """Test aten.scatter.src basic functionality with 2D tensors"""

@@ -91,6 +91,8 @@ SKIPPED: dict[str, str] = {
     "aten::index_add.out": _SAME_KERNEL_OUT,
     "aten::index_add_": _SAME_KERNEL_INPLACE,
     "aten::index_select.out": _SAME_KERNEL_OUT,
+    "aten::scatter.src_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.src": _SAME_KERNEL_INPLACE,
     "aten::scatter_add.out": _SAME_KERNEL_OUT,
     "aten::scatter_add_": _SAME_KERNEL_INPLACE,
 }
