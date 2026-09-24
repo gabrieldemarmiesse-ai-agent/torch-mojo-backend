@@ -1,5 +1,5 @@
 """ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
-any/all, var, the L2 vector norm and cumsum).
+any/all, var, the L2 vector norm, cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -26,6 +26,7 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     ST_BOOL,
+    ST_INT32,
     ST_INT64,
     TAG_INT,
     TAG_INT_LIST,
@@ -36,6 +37,9 @@ from tmb.backend.abi import (
     T,
     Value,
     Values,
+    dtype_code,
+    dtype_itemsize,
+    dtype_name,
     max_dtype,
     new_tensor,
     own,
@@ -48,13 +52,20 @@ from tmb.backend.abi import (
     v_f64,
     v_f64_or,
     v_int,
+    v_int_or,
     v_scalar_is_bool,
     v_tensor,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import cast_into, cast_to, copy_strided_into, resize_out
+from tmb.ops.common import (
+    cast_into,
+    cast_to,
+    check_out,
+    copy_strided_into,
+    resize_out,
+)
 from tmb.backend.registry import Site, impl
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
@@ -1251,6 +1262,349 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ = src^
 
 
+# ---------------------------------------------------------------------------
+# sort / topk: one segmented (key, index) sort behind both ops
+# (tmb/kernels/sort/entry.mojo).
+#
+# The kernel orders (order-preserving unsigned key, original index) pairs, so
+# the order is total: ties resolve by index, which makes every result the
+# STABLE one. `sort(stable=True)` therefore costs nothing extra, and `topk` is
+# the same primitive run as a tournament. That is stronger than ATen asks
+# for: `sort(stable=False)` and `topk` leave the order of equal elements
+# unspecified, and CPU ATen may pick a different one.
+# ---------------------------------------------------------------------------
+
+# Elements one block sorts in shared memory, mirrored from `_TILE` in
+# tmb/kernels/sort/entry.mojo: the op picks the launch route and sizes the
+# workspace, so the two have to agree.
+comptime SORT_TILE_32 = 4096
+comptime SORT_TILE_64 = 2048
+# grid.y carries the row, and CUDA/Metal cap that dimension at 65535; more
+# rows run as several launches over row chunks.
+comptime SORT_MAX_GRID_ROWS = 65535
+# The index rides through the kernel as int32 (halving shared-memory traffic
+# against int64), so a longer row cannot be addressed.
+comptime SORT_MAX_ROW = 2147483647
+
+
+def _sort_kernel_dtype(a: T, op: StaticString) raises -> DType:
+    """The kernel specialization for `a`'s dtype: bool rides uint8 (its ties
+    are broken by index, so the stable answer is well defined); the unsigned
+    16/32/64-bit dtypes and float64 on Apple GPUs are declined."""
+    var dt = a.dtype
+    if dt == DType.bool:
+        return DType.uint8
+    if (
+        dt == DType.float32
+        or dt == DType.bfloat16
+        or dt == DType.float16
+        or dt == DType.int64
+        or dt == DType.int32
+        or dt == DType.int16
+        or dt == DType.int8
+        or dt == DType.uint8
+    ):
+        return dt
+    if dt == DType.float64:
+        if dev(a.device)[].api == "metal":
+            unsupported(String(op) + ": float64 is unavailable on Apple GPUs")
+        return dt
+    unsupported(String(op) + " of dtype " + String(dt))
+    return dt
+
+
+def _sort_dim(a: T, dim: Int) raises -> Int:
+    """ATen's `maybe_wrap_dim` for sort/topk: a 0-d tensor has one dim."""
+    var ndim = max(a.rank, 1)
+    if dim < -ndim or dim >= ndim:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -ndim,
+            ", ",
+            ndim - 1,
+            "], but got ",
+            dim,
+            ")",
+        )
+    return dim + ndim if dim < 0 else dim
+
+
+def _selected_shape(a: T, dim: Int, k: Int) -> IndexList[MAX_RANK]:
+    """`a`'s shape with `dim` replaced by `k` (a 0-d tensor stays 0-d)."""
+    var shape = a.shape
+    if a.rank > 0:
+        shape[MAX_RANK - a.rank + dim] = k
+    return shape
+
+
+def _dim_last_view(t: T, dim: Int) -> T:
+    """`t` read with `dim` moved to the end, the other dims in order: the
+    same storage, only shape/strides rewritten (see `_permuted_contiguous`).
+    """
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - t.rank
+    var w = 0
+    for d in range(t.rank):
+        if d != dim:
+            shape[pad + w] = t.dim(d)
+            strides[pad + w] = t.stride(d)
+            w += 1
+    shape[MAX_RANK - 1] = t.dim(dim)
+    strides[MAX_RANK - 1] = t.stride(dim)
+    var view = t.copy()
+    view.shape = shape
+    view.strides = strides
+    view.contig = False
+    return view^
+
+
+def _sort_rows_into(
+    src: T,
+    kdt: DType,
+    rows: Int,
+    n: Int,
+    out_k: Int,
+    topk: Bool,
+    descending: Bool,
+    values: T,
+    indices: T,
+) raises:
+    """Run the kernel over `rows` contiguous rows of `n` elements of `src`,
+    writing the first `out_k` of each sorted row into the contiguous
+    `values` / `indices`."""
+    var tile = SORT_TILE_64 if dtype_itemsize(kdt) == 8 else SORT_TILE_32
+    var tiles = (n + tile - 1) // tile
+    var n_pow2 = 1
+    while n_pow2 < n:
+        n_pow2 <<= 1
+    var route: Int
+    var pad: Int
+    if n_pow2 <= tile:
+        route = 0
+        pad = n_pow2
+    elif topk and tiles * out_k <= tile:
+        route = 1
+        pad = tiles * out_k
+    else:
+        route = 2
+        pad = n_pow2
+    var chunk = min(rows, SORT_MAX_GRID_ROWS)
+    var ws = IndexList[MAX_RANK](1)
+    ws[MAX_RANK - 1] = chunk * pad
+    # Only the key's byte width matters (the kernel reinterprets the buffer
+    # as unsigned); int32/int64 are those widths.
+    var key_stype = ST_INT64 if dtype_itemsize(kdt) == 8 else ST_INT32
+    var keys = own(new_tensor(ws, 1, key_stype, src.device))
+    var scratch = own(new_tensor(ws, 1, ST_INT32, src.device))
+    var ctx = ctx_for(src.device)
+    var cp = ctx_ptr(ctx)
+    var r0 = 0
+    while r0 < rows:
+        var r = min(chunk, rows - r0)
+        var call = KernelCall("sort", "Sort")
+        call.arg_dtype(0, kdt)
+        call.int(values.ptr + r0 * out_k * values.itemsize)
+        call.int(indices.ptr + r0 * out_k * 8)
+        call.int(src.ptr + r0 * n * src.itemsize)
+        call.int(keys.t.ptr)
+        call.int(scratch.t.ptr)
+        call.int(r)
+        call.int(n)
+        call.int(out_k)
+        call.int(pad)
+        call.int(route)
+        call.int(1 if descending else 0)
+        call.int(dtype_code(kdt))
+        call.int(cp)
+        call.run()
+        r0 += r
+    _ = ctx
+    _ = keys^  # alive past the launches
+    _ = scratch^
+
+
+def _select_into(
+    a: T,
+    op: StaticString,
+    dim_in: Int,
+    k: Int,
+    topk: Bool,
+    descending: Bool,
+    values: T,
+    indices: T,
+) raises:
+    """sort (`topk` False, `k` the whole dim) or topk along `dim_in` of `a`,
+    into the fresh contiguous `values` / `indices` of the result's shape."""
+    var kdt = _sort_kernel_dtype(a, op)
+    var dim = _sort_dim(a, dim_in)
+    var n = a.dim(dim) if a.rank > 0 else 1
+    if n > SORT_MAX_ROW:
+        unsupported(String(op) + " of a row longer than 2**31 - 1")
+    if values.numel == 0:
+        return
+    var rows = a.numel // n
+    var last = a.rank <= 1 or dim == a.rank - 1
+    var dims = List[Int]()
+    dims.append(dim)
+    var src = _borrow(a)
+    if a.rank > 0 and not (last and a.contig):
+        src.replace(_permuted_contiguous(a, dims), True)
+    if last:
+        _sort_rows_into(
+            src.t, kdt, rows, n, k, topk, descending, values, indices
+        )
+        _ = src^
+        return
+    var moved = src.t.shape
+    moved[MAX_RANK - 1] = k
+    var tv = own(new_tensor(moved, a.rank, a.stype, a.device))
+    var ti = own(new_tensor(moved, a.rank, ST_INT64, a.device))
+    _sort_rows_into(src.t, kdt, rows, n, k, topk, descending, tv.t, ti.t)
+    _ = src^  # alive past the launch
+    copy_strided_into(_dim_last_view(values, dim), tv.t)
+    copy_strided_into(_dim_last_view(indices, dim), ti.t)
+    _ = tv^
+    _ = ti^
+
+
+def _select(
+    a: T, op: StaticString, dim_in: Int, k: Int, topk: Bool, descending: Bool
+) raises -> Tuple[Owned, Owned]:
+    _require_mojo(a)
+    var dim = _sort_dim(a, dim_in)
+    var shape = _selected_shape(a, dim, k)
+    var values = own(new_tensor(shape, a.rank, a.stype, a.device))
+    var indices = own(new_tensor(shape, a.rank, ST_INT64, a.device))
+    _select_into(a, op, dim, k, topk, descending, values.t, indices.t)
+    return (values^, indices^)
+
+
+def _select_out(
+    a: T,
+    op: StaticString,
+    dim_in: Int,
+    k: Int,
+    topk: Bool,
+    descending: Bool,
+    var out_v: T,
+    var out_i: T,
+    rets: Values,
+) raises:
+    """The `out=` overloads: check, resize, then compute straight into the
+    caller's tensors when they are contiguous, else compute and copy."""
+    _require_mojo(a)
+    check_out(out_v, a)
+    if out_i.stype != ST_INT64:
+        raise Error(
+            "Expected out tensor to have dtype long int, but got ",
+            dtype_name(out_i.stype),
+            " instead",
+        )
+    _one_device(a, out_v)
+    _one_device(a, out_i)
+    var dim = _sort_dim(a, dim_in)
+    var shape = _selected_shape(a, dim, k)
+    var numel = _shape_numel(shape, a.rank)
+    if not _shape_matches(out_v, shape, a.rank):
+        resize_out(out_v, shape, a.rank)
+    if not _shape_matches(out_i, shape, a.rank):
+        resize_out(out_i, shape, a.rank)
+    if _out_ready(out_v, a, a.stype, numel) and _out_ready(
+        out_i, a, ST_INT64, numel
+    ):
+        _select_into(a, op, dim, k, topk, descending, out_v, out_i)
+    else:
+        var pair = _select(a, op, dim, k, topk, descending)
+        copy_strided_into(out_v, pair[0].t)
+        copy_strided_into(out_i, pair[1].t)
+        _ = pair^  # alive past the launches
+    ret_ref(rets, 0, out_v)
+    ret_ref(rets, 1, out_i)
+
+
+def _topk_k(a: T, dim_in: Int, k: Int) raises -> Int:
+    var dim = _sort_dim(a, dim_in)
+    var size = a.dim(dim) if a.rank > 0 else 1
+    if k < 0 or k > size:
+        raise Error("selected index k out of range")
+    return k
+
+
+def _sort_size(a: T, dim_in: Int) raises -> Int:
+    var dim = _sort_dim(a, dim_in)
+    return a.dim(dim) if a.rank > 0 else 1
+
+
+# aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
+#   bool sorted=True) -> (Tensor values, Tensor indices)
+# `sorted=False` only permits any order among the k results; the sorted
+# order is one of them.
+def op_topk(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int_or(args[unsafe_offset=2], -1)
+    var k = _topk_k(a, dim, v_int(args[unsafe_offset=1]))
+    var largest = v_bool_or(args[unsafe_offset=3], True)
+    var pair = _select(a, "topk", dim, k, True, largest)
+    ret_owned(rets, 0, pair[0])
+    ret_owned(rets, 1, pair[1])
+
+
+# aten::topk.values(Tensor self, SymInt k, int dim=-1, bool largest=True,
+#   bool sorted=True, *, Tensor(a!) values, Tensor(b!) indices)
+#   -> (Tensor(a!) values, Tensor(b!) indices)
+def op_topk_values(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int_or(args[unsafe_offset=2], -1)
+    var k = _topk_k(a, dim, v_int(args[unsafe_offset=1]))
+    var largest = v_bool_or(args[unsafe_offset=3], True)
+    _select_out(
+        a,
+        "topk",
+        dim,
+        k,
+        True,
+        largest,
+        v_tensor(args[unsafe_offset=5]),
+        v_tensor(args[unsafe_offset=6]),
+        rets,
+    )
+
+
+# aten::sort.stable(Tensor self, *, bool? stable, int dim=-1,
+#   bool descending=False) -> (Tensor values, Tensor indices)
+# Every result is the stable one, so `stable` needs no branch.
+def op_sort_stable(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int_or(args[unsafe_offset=2], -1)
+    var descending = v_bool_or(args[unsafe_offset=3], False)
+    var pair = _select(a, "sort", dim, _sort_size(a, dim), False, descending)
+    ret_owned(rets, 0, pair[0])
+    ret_owned(rets, 1, pair[1])
+
+
+# aten::sort.values_stable(Tensor self, *, bool? stable, int dim=-1,
+#   bool descending=False, Tensor(a!) values, Tensor(b!) indices)
+#   -> (Tensor(a!) values, Tensor(b!) indices)
+def op_sort_values_stable(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim = v_int_or(args[unsafe_offset=2], -1)
+    var descending = v_bool_or(args[unsafe_offset=3], False)
+    _select_out(
+        a,
+        "sort",
+        dim,
+        _sort_size(a, dim),
+        False,
+        descending,
+        v_tensor(args[unsafe_offset=4]),
+        v_tensor(args[unsafe_offset=5]),
+        rets,
+    )
+
+
 def register_reductions(site: Site) raises:
     impl[op_all, "all"](site)
     impl[op_all_dim, "all.dim"](site)
@@ -1273,5 +1627,9 @@ def register_reductions(site: Site) raises:
     impl[op_min, "min"](site)
     impl[op_min_dim, "min.dim"](site)
     impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_sort_stable, "sort.stable"](site)
+    impl[op_sort_values_stable, "sort.values_stable"](site)
     impl[op_sum_dim_intlist, "sum.dim_IntList"](site)
+    impl[op_topk, "topk"](site)
+    impl[op_topk_values, "topk.values"](site)
     impl[op_var_correction, "var.correction"](site)

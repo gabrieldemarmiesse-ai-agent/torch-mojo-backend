@@ -333,6 +333,25 @@ def _select_sorted_k(
     return F.transpose(values, axis, last), F.transpose(indices, axis, last)
 
 
+def _sort_impl(
+    input: MaxTensor, dim: int, descending: bool
+) -> tuple[MaxTensor, MaxTensor]:
+    """sort.default and sort.stable: a k-selection of the whole axis."""
+    rank = len(input.shape)
+    if rank == 0:
+        raise NotImplementedError(
+            "sorting a 0-d tensor is not supported by the MAX graph backend"
+        )
+    axis = dim + rank if dim < 0 else dim
+    size = input.shape[axis]
+    if not isinstance(size, StaticDim):
+        raise NotImplementedError(
+            "sort needs a statically known size along the sorted axis, but "
+            f"axis {axis} has symbolic dim {size}"
+        )
+    return _select_sorted_k(input, int(size), axis, descending)
+
+
 _SEARCHSORTED_DTYPES = (
     DType.float32,
     DType.bfloat16,
@@ -3871,33 +3890,24 @@ def aten_slice(
 # slice_scatter(Tensor self, Tensor src, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor
 
 
-# aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
-# aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
-@map_to(aten.sort)
+# sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort.default)
 def aten_sort(
-    input: MaxTensor,
-    dim: int = -1,
-    descending: bool = False,
-    *,
-    stable: bool | None = None,
+    input: MaxTensor, dim: int = -1, descending: bool = False
+) -> tuple[MaxTensor, MaxTensor]:
+    return _sort_impl(input, dim, descending)
+
+
+# sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)
+@map_to(aten.sort.stable)
+def aten_sort_stable(
+    input: MaxTensor, *, stable: bool | None, dim: int = -1, descending: bool = False
 ) -> tuple[MaxTensor, MaxTensor]:
     # `stable` needs no branch: MAX's top_k/bottom_k document their output as
     # sorted *stably*, which is the stronger of the two guarantees ATen asks
     # for, so it is a correct answer to `stable=True` and to `stable=None`.
     del stable
-    rank = len(input.shape)
-    if rank == 0:
-        raise NotImplementedError(
-            "sorting a 0-d tensor is not supported by the MAX graph backend"
-        )
-    axis = dim + rank if dim < 0 else dim
-    size = input.shape[axis]
-    if not isinstance(size, StaticDim):
-        raise NotImplementedError(
-            "sort needs a statically known size along the sorted axis, but "
-            f"axis {axis} has symbolic dim {size}"
-        )
-    return _select_sorted_k(input, int(size), axis, descending)
+    return _sort_impl(input, dim, descending)
 
 
 # split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]
@@ -3997,11 +4007,10 @@ def aten_sum(
 # sym_stride.int(Tensor self, int dim) -> SymInt
 # tan(Tensor self) -> Tensor
 # tanh(Tensor self) -> Tensor
-# trunc(Tensor self) -> Tensor
 
 
-# aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
-@map_to(aten.topk)
+# topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)
+@map_to(aten.topk.default)
 def aten_topk(
     input: MaxTensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
 ) -> tuple[MaxTensor, MaxTensor]:
@@ -4020,6 +4029,9 @@ def aten_topk(
     if isinstance(size, StaticDim) and not 0 <= k <= int(size):
         raise RuntimeError("selected index k out of range")
     return _select_sorted_k(input, k, axis, largest)
+
+
+# trunc(Tensor self) -> Tensor
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)

@@ -1517,6 +1517,26 @@ def test_scatter_src(mojo_device, dim, call_checker):
     torch.testing.assert_close(dev.cpu(), expected)
 
 
+def test_scatter_src_in_place_and_out(mojo_device):
+    """`scatter_.src` (what the backward of topk/sort/min.dim calls on a zeros
+    tensor) and `scatter.src_out`, into a strided self/out too."""
+    a = _fill((5, 4), torch.float32).t()
+    index = torch.stack([torch.randperm(5)[:3] for _ in range(4)], dim=0)
+    src = _fill((4, 3), torch.float32) + 100
+    expected = a.clone().scatter_(1, index, src)
+    dev = a.to(mojo_device)
+    with ran("aten::scatter_.src"):
+        got = dev.scatter_(1, index.to(mojo_device), src.to(mojo_device))
+    assert got is dev
+    torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
+    out = torch.empty(0, device=mojo_device)
+    with ran("aten::scatter.src_out"):
+        torch.scatter(
+            a.to(mojo_device), 1, index.to(mojo_device), src.to(mojo_device), out=out
+        )
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
 def test_scatter_value(mojo_device, call_checker):
     call_checker.register(aten_functions.aten_scatter_value)
     a = _fill((4, 5), torch.float32)

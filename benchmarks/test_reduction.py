@@ -40,8 +40,8 @@ LASTDIM_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
 # beam width -- and A_ is the awkward-shape control. k also selects the launch
 # route: K50 fits the tournament (one pass over the row), K2048 does not and
 # falls back to the full sort, which is why both are measured. The _min /
-# _desc tokens only flip a compile-time flag in the same kernel; one of each
-# is enough to notice if that stops being true.
+# _desc tokens only pick the other comptime direction of the same kernels;
+# one of each is enough to notice if that stops being true.
 TOPK_SHAPES: dict[str, tuple[tuple[int, ...], int, bool]] = {
     "V_1x50304_K50": ((1, 50304), 50, True),
     "V_8x50304_K2048": ((8, 50304), 2048, True),
@@ -78,19 +78,19 @@ COVERS: dict[str, str] = {
         "test_vector_norm (same kernel, out-variant plumbing)"
     ),
     "aten::cumsum": "test_cumsum",
-    "aten::topk.values": "test_topk",
-    "aten::topk": (
-        "test_topk (torch.topk dispatches the .values overload; the "
-        "functional one is the same kernel plus one less copy)"
-    ),
-    "aten::sort.values_stable": "test_sort",
-    "aten::sort": "test_sort (same kernel, plain overload)",
-    "aten::sort.stable": "test_sort (same kernel, stable= is free here)",
-    "aten::sort.values": "test_sort (same kernel, non-stable out= overload)",
+    "aten::topk": "test_topk",
+    "aten::sort.stable": "test_sort",
     "aten::nonzero": "test_nonzero",
 }
 
-SKIPPED: dict[str, str] = {}
+_SAME_KERNEL_OUT = (
+    "out= overload of a benchmarked functional op: the same kernel launches, "
+    "written straight into (or copied into) the caller's tensors"
+)
+SKIPPED: dict[str, str] = {
+    "aten::topk.values": _SAME_KERNEL_OUT,
+    "aten::sort.values_stable": _SAME_KERNEL_OUT,
+}
 
 
 def _dim_case(
@@ -341,10 +341,10 @@ def test_nonzero(
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", TOPK_SHAPES)
-@pytest.mark.bench_op("topk.values")
+@pytest.mark.bench_op("topk")
 def test_topk(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, k, largest = TOPK_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
@@ -356,10 +356,10 @@ def test_topk(
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SORT_SHAPES)
-@pytest.mark.bench_op("sort.values_stable")
+@pytest.mark.bench_op("sort.stable")
 def test_sort(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     shape, descending = SORT_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
     bench.run(
