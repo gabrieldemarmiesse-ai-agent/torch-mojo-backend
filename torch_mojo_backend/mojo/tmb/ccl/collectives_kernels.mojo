@@ -181,9 +181,18 @@ comptime _AMD = has_amd_gpu_accelerator()
 is behind it, so the NVIDIA path is exactly what it was before the MI300A work
 (see the "Link direction" note in the module header)."""
 
-comptime _RELAXED_POLL = (
+comptime _GFX942 = (
     _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
 )
+"""Whether this build targets gfx942, the one spelling of it in the CCL.
+
+The host pass uses the bare --target-accelerator name, while device
+compilation can use the target-qualified spelling; both are the same
+architecture. gfx942 covers the MI300A APU and the discrete MI300X and
+MI325X alike. The multi-node grid rule RCCL applies only to the APU is
+chosen at run time (`CommState.apu` in entry.mojo), not here."""
+
+comptime _RELAXED_POLL = _GFX942
 # Measured on MI300A, job 5447705: FSDP2 comm busy 209.5 -> 188.5 ms/step.
 # End-to-end improvement alone was small/noisy; see docs/distributed.md.
 comptime _POLL_ORDER = Ordering.RELAXED if _RELAXED_POLL else Ordering.ACQUIRE

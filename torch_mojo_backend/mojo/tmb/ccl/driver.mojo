@@ -130,6 +130,43 @@ def current_device_ordinal(lib: OwnedDLHandle) raises -> Int:
     return Int(dev)
 
 
+# hipDeviceAttributeDirectManagedMemAccessFromHost. 13 in every ROCm from 5.7
+# to 7.2: hip_runtime_api.h keeps a retired entry as `hipDeviceAttributeUnused<n>`
+# rather than deleting it, so the CUDA-compatible block never renumbers.
+comptime HIP_ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST: Int32 = 13
+
+
+def direct_managed_mem_access(lib: OwnedDLHandle, ordinal: Int) -> Bool:
+    """Whether the host accesses this GPU's managed memory directly: 1 on an
+    APU (MI300A), 0 on a discrete GPU (MI300X). RCCL 2.22.3 asks exactly
+    this before forcing its 24-channel multi-node rule
+    (`src/init.cc:1339-1346`). AMD only. False elsewhere, and false (with
+    one line saying so) if the driver will not answer, which keeps the GPU
+    on the discrete caps."""
+    comptime if AMD:
+        var v: Int32 = 0
+        var rc: Int32 = -1
+        try:
+            rc = lib.get_function[Int32]("hipDeviceGetAttribute")(
+                Pointer(to=v),
+                HIP_ATTR_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST,
+                Int32(ordinal),
+            )
+        except e:
+            print("mojoccl: hipDeviceGetAttribute unavailable:", e)
+        if rc == 0:
+            return v != 0
+        print(
+            (
+                "mojoccl: hipDeviceGetAttribute(DirectManagedMemAccessFromHost)"
+                " failed, rc="
+            ),
+            rc,
+            "; using the discrete-GPU collective grids",
+        )
+    return False
+
+
 def alloc_region(lib: OwnedDLHandle, nbytes: Int) raises -> Int:
     """cuMemAlloc_v2 / hipExtMallocWithFlags(hipDeviceMallocUncached, size).
 

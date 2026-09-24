@@ -92,6 +92,7 @@ from tmb.ccl.driver import (
     alloc_region,
     close_handle,
     current_device_ordinal,
+    direct_managed_mem_access,
     free_host,
     free_region,
     get_handle,
@@ -134,6 +135,8 @@ from tmb.ccl.collectives_kernels import (
     STATUS_FAULT_WORD,
     STATUS_HOST_FAULT_WORD,
     STATUS_PAGE_BYTES,
+    _COPY_MAX_BLOCKS,
+    _GFX942,
     _shard_per,
     allgather,
     allgather_max_bytes,
@@ -183,7 +186,6 @@ from tmb.ccl.internode import (
     ib_teardown,
 )
 from tmb.ccl.internode_fused import (
-    _MI300A,
     FUSED_THREADS,
     check_fused_call,
     fused_big_block_cap,
@@ -331,20 +333,25 @@ def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
 
 
-comptime AG_NODE_BLOCKS = 24 if _MI300A else 96
+comptime AG_NODE_BLOCKS = 24 if _GFX942 else 96
 """Grid cap of the node-local gathers of a multi-node all-gather, in place
-of the single-node copy cap (432).
+of the single-node copy cap (432). Read it through `_ag_node_blocks`.
 
-gfx942: RCCL 2.22.3's multi-node MI300A geometry, 24 channels of one
-256-thread CTA each (rccl `src/init.cc:1339-1346` sets 6 channels per ring
-x 4 rings when the device has direct managed-memory access from the host
-and there is more than one node; `src/device/device.h:74` 256 threads).
-Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16, ABBA
-legs, tok/s: 432 blocks 20.9k/20.7k, 96 22.0k/21.8k, 24 23.0k/22.8k,
+gfx942 APU (MI300A): RCCL 2.22.3's multi-node MI300A geometry, 24 channels
+of one 256-thread CTA each (rccl `src/init.cc:1339-1346` sets 6 channels per
+ring x 4 rings when the device has direct managed-memory access from the
+host and there is more than one node; `src/device/device.h:74` 256
+threads). Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16,
+ABBA legs, tok/s: 432 blocks 20.9k/20.7k, 96 22.0k/21.8k, 24 23.0k/22.8k,
 mojo+RCCL 23.1k/22.1k. Isolated (streamed device us per call, block bf16
 7.68 MB / root fp32 41.0 MB per rank): 432 -> 742/3034, 96 -> 599/2669,
-24 -> 650/2686; fewer blocks means fewer per-wave release fences and
-barrier arrivals, and fewer CUs taken from the compute stream.
+24 -> 650/2686. So 96 blocks is the faster isolated collective and 24 wins
+only end to end, where the gathers run beside the compute stream and every
+CU they hold is one the GEMMs lose.
+
+A discrete gfx942 (MI300X, MI325X) does not take RCCL's rule, so it does
+not take this one either (`CommState.apu`, RCCL's own test): it keeps the
+single-node copy cap it had before, and nothing here was measured on one.
 
 H100: the gathers run under the forward's and backward's GEMMs, so the
 cap is fitted end to end, not on the isolated collective: GPT-2 XL FSDP2 on
@@ -358,18 +365,31 @@ a pull: 16 blocks x 16 vectors in flight measures the same isolated time as
 under the compute stream's HBM traffic loses far more from 6x fewer CTAs
 than the GEMMs gain from the freed SMs, and the compute stream waits on
 this gather. (gfx942 pushes, so its gathers are not latency-bound loads.)"""
-comptime AG_NODE_UNROLL = 2 if _MI300A else 4
+comptime AG_NODE_UNROLL = 2 if _GFX942 else 4
 """16-byte vectors in flight per thread in those gathers. gfx942: RCCL's
 unroll for gfx94 parts with more than 80 CUs (rccl `src/init.cc:101-105`,
 NCCL_UNROLL_2; the generic kernel it launches there is the unroll-2 one).
+That rule covers MI300A and MI300X alike; a gfx942 part with 80 CUs or
+fewer would get RCCL's unroll 4 and gets 2 here, unmeasured. Unroll 2 was
+only measured together with the 24-block grid (b589468), never on its own.
 H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
+
+
+def _ag_node_blocks(state: CommState) -> Int:
+    """`AG_NODE_BLOCKS`, with RCCL's APU test: a discrete gfx942 keeps the
+    single-node copy cap. Every rank of a node takes the same answer: the
+    ranks of a node run identical GPUs (checked at init)."""
+    comptime if _GFX942:
+        if not state.apu:
+            return _COPY_MAX_BLOCKS
+    return AG_NODE_BLOCKS
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
 # reservation conflict (Adastra 124M measurements in docs/distributed.md),
 # and the GPT-2 XL five-round series at 0.9873x stock used it, job 5417296,
 # 2026-09-15. NVIDIA retains its H100 staging fit of 256 MiB.
-comptime DEFAULT_REGION_MB = 64 if _MI300A else 256
+comptime DEFAULT_REGION_MB = 64 if _GFX942 else 256
 comptime DEFAULT_BOOTSTRAP_TIMEOUT_S: Float64 = 120.0
 
 comptime DEFAULT_SOCKET_DIR = "/tmp"
@@ -570,6 +590,12 @@ struct CommState(Movable):
     var fused_resident: Int
     # `PIPE_SPLIT_UNIT`; checked equal on every rank at init.
     var split_unit: Int
+    # gfx942 only: this GPU is an APU (MI300A), by RCCL 2.22.3's own test,
+    # `hipDeviceAttributeDirectManagedMemAccessFromHost` (rccl
+    # `src/init.cc:1339-1346`). It selects RCCL's 24-channel multi-node
+    # grids (`_ag_node_blocks`, `RS_NODES_BLOCKS_MI300A`); a discrete gfx942
+    # (MI300X, MI325X) keeps the caps it had before. Always False elsewhere.
+    var apu: Bool
     # Whether multi-node allreduces go through the one-launch fused kernel.
     # Requires the progress thread. A message exceeding the fused work-ring
     # capacity still takes the split schedule at launch time.
@@ -613,6 +639,7 @@ struct CommState(Movable):
         fused_big_bytes: Int,
         fused_resident: Int,
         split_unit: Int,
+        apu: Bool,
         fused: Bool,
         abort_host: Int,
         abort_dev: Int,
@@ -658,6 +685,7 @@ struct CommState(Movable):
         self.fused_big_bytes = fused_big_bytes
         self.fused_resident = fused_resident
         self.split_unit = split_unit
+        self.apu = apu
         self.fused = fused
         # Barriers the NVLS kernel has completed on this region. Its flag is a
         # single UInt64 counter that every GPU adds 1 to per barrier, so the
@@ -1446,6 +1474,9 @@ def _bootstrap(
         device_sms = 0
     if device_sms <= 0:
         device_sms = sm_count(lib, ordinal)
+    var apu = False
+    comptime if _GFX942:
+        apu = direct_managed_mem_access(lib, ordinal)
     # A positive multiple of 4096 (the kernels' own precondition,
     # RESULTS.md section 9) is what keeps every per-chunk offset the
     # collectives form 16-byte aligned for every supported dtype.
@@ -1851,6 +1882,7 @@ def _bootstrap(
         fused_big_bytes=fused_big,
         fused_resident=fused_resident,
         split_unit=split_unit,
+        apu=apu,
         fused=fused,
         abort_host=abort_host,
         abort_dev=abort_dev,
@@ -3100,10 +3132,10 @@ def _allgather_locked(
 
 
 def allgather_mapped_max_bytes(
-    arena_cap: Int, inbox_group: Int, npeers: Int, local_world: Int = 1
+    arena_cap: Int, inbox_group: Int, npeers: Int, local_world: Int
 ) -> Int:
     var stage_cap = arena_cap
-    comptime if _MI300A:
+    comptime if _GFX942:
         # Compact peer-push slots and one disjoint NIC source, all inside
         # the existing 2*arena_cap allocation. No extra region reservation.
         stage_cap = min(stage_cap, 2 * arena_cap // local_world)
@@ -3141,7 +3173,7 @@ def _allgather_node_mapped(
             state.generation,
             stride,
             ranks,
-            AG_NODE_BLOCKS,
+            _ag_node_blocks(state),
             mb_req,
             seq,
         )
@@ -3159,7 +3191,7 @@ def _allgather_node_mapped(
         state.generation,
         stride,
         ranks,
-        AG_NODE_BLOCKS,
+        _ag_node_blocks(state),
         mb_req,
         seq,
     )
@@ -3225,7 +3257,7 @@ def _allgather_multinode_mapped(
             var send_stage = (
                 state.owned_base + arena * state.arena_stride + signal_bytes()
             )
-            comptime if _MI300A:
+            comptime if _GFX942:
                 # AMD peers push into this region's compact slots
                 # [0, (lw-1)*slot); the RDMA source is the slot after them
                 # (`_allgather_body`), so local pushes cannot overwrite it.
@@ -3311,7 +3343,7 @@ def _allgather_multinode(
     per_rank_bytes: Int,
 ) raises:
     """Exchange one contribution per NIC, disseminate on the receiving node."""
-    comptime if has_nvidia_gpu_accelerator() or _MI300A:
+    comptime if has_nvidia_gpu_accelerator() or _GFX942:
         _allgather_multinode_mapped(
             state, stream, raw_stream, sendbuff, recvbuff, per_rank_bytes
         )
@@ -3944,6 +3976,7 @@ def _do_reduce_scatter_nodes[
                 count,
                 rank_ids,
                 state.nnodes,
+                state.apu,
             )
             var seq = ib_next_seq(state.ib)
             var inbox_base = _inbox_base(state, seq)

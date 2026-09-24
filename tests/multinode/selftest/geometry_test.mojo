@@ -9,9 +9,13 @@
 # of the shipped code and not of a copy of it.
 from std.sys import size_of
 
-from tmb.ccl.collectives_kernels import MAX_WORLD, shard_range, signal_bytes
+from tmb.ccl.collectives_kernels import (
+    MAX_WORLD,
+    _GFX942,
+    shard_range,
+    signal_bytes,
+)
 from tmb.ccl.internode import CREDIT_AREA_BYTES, CREDIT_SLOT_BYTES, MAX_NODES
-from tmb.ccl.internode_fused import _MI300A
 from tmb.ccl.reduce_scatter.fused import reduce_scatter_fused_plan
 from tmb.ccl.reduce_scatter.multinode import (
     reduce_scatter_nodes_max_count,
@@ -126,7 +130,10 @@ def main() raises:
                 bad,
             )
             var npeers = nnodes - 1
-            var ag_bytes = allgather_mapped_max_bytes(arena_cap, group, npeers)
+            # local_world 1 (no NIC-source slot); every local_world is below.
+            var ag_bytes = allgather_mapped_max_bytes(
+                arena_cap, group, npeers, 1
+            )
             _check(
                 ag_bytes > 0 and ag_bytes % 16 == 0, "mapped gather chunk", bad
             )
@@ -155,7 +162,7 @@ def main() raises:
                     "mapped gather local-world chunk",
                     bad,
                 )
-                comptime if _MI300A:
+                comptime if _GFX942:
                     _check(
                         lw * mapped_cap <= 2 * arena_cap,
                         "mapped gather peer slots plus NIC source fit",
@@ -178,6 +185,10 @@ def main() raises:
                 # 2x4 MI300A GPT-2 XL FSDP2: one bf16 block shard, the fp32 root shard.
                 ag_counts.append(7_680_000)
                 ag_counts.append(41_016_800)
+                # bf16 1,280,003 elements: above the split threshold at lw=4
+                # and not a multiple of 16 bytes (chunks of 1,280,016 and
+                # 1,279,990 B; fsdp_worker's stress runs it on hardware).
+                ag_counts.append(2_560_006)
                 ag_counts.append(mapped_cap - 1)
                 ag_counts.append(mapped_cap)
                 ag_counts.append(mapped_cap + 1)
@@ -232,7 +243,7 @@ def main() raises:
                                 "gather pipeline tail capacity",
                                 bad,
                             )
-                            comptime if _MI300A:
+                            comptime if _GFX942:
                                 var slot = _align_up(size, 16)
                                 var nic_begin = (lw - 1) * slot
                                 _check(
