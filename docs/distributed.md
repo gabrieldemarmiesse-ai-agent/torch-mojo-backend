@@ -1074,7 +1074,9 @@ wait needs no move. Its single lane polls a uniform address, so the loop
 branches on VCC without narrowing EXEC, and its `buffer_inv` runs with
 EXEC = lane 0. There is no unconditional cache invalidate on each failed
 flag poll. System scope is retained for both peer-GPU and CPU
-publications.
+publications. With the fence moved, the 2 × 4 and 1 × 4 worker suites
+passed, 20 of 20 (Adastra job 5447705). The DDP `stress` mode includes a
+one-element int64 allreduce in each of its 40 generations.
 
 The backoff constant comes from **RCCL 2.22.3**, ROCm tag `rocm-6.4.1`,
 commit `e72b592201d626f16a03a7ba22502130a2846036`:
@@ -1310,9 +1312,9 @@ small kernel sums the N−1 inbox shards into the shard; the intra-node
 all-gather (`allgather_finish`) then pulls the globally reduced shards into
 the user output. AVG's 1/world is applied by the reduce-scatter to each input
 (NCCL's PreMulSum), so no node partial or inbox sum is ever an unscaled total
-in a half dtype. On gfx942 the node-local reduce of that split schedule runs
+in a half dtype. On MI300A the node-local reduce of that split schedule runs
 on RCCL's 24 multi-node MI300A channels (`RS_NODES_BLOCKS_MI300A`) instead
-of the allreduce's 128/912: the collective is network-bound (15.4 MB/rank
+of the allreduce's 128/912 (a discrete gfx942 keeps 128/912, see below): the collective is network-bound (15.4 MB/rank
 fp32 950 vs 951 µs at 128 vs 24 blocks, 2 × 4 MI300A, job 5447705), and the
 freed CUs go to the backward's GEMMs -- GPT-2 XL FSDP2 ABBA legs 22.0k/22.8k
 -> 23.2k/23.2k tokens/s. Broadcast uses the same RDMA path: the root's node fans
@@ -1345,16 +1347,29 @@ group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
 41.0 MB/rank 4238 → 3038 µs (RCCL 3214), fp32 357×789+3 233 → 226 µs
 (RCCL 286).
 
-The gfx942 gathers of that schedule then take RCCL's multi-node MI300A
+The MI300A gathers of that schedule then take RCCL's multi-node MI300A
 geometry instead of the single-node copy cap: 24 CTAs of 256 threads,
 two 16-byte vectors in flight per thread (`AG_NODE_BLOCKS`,
 `AG_NODE_UNROLL`; RCCL 2.22.3 forces 24 channels on multi-node MI300A and
-unroll 2 on gfx94 parts with more than 80 CUs). Fewer blocks are faster
-even in isolation (one release fence per wave and one barrier arrival per
-block fewer): block 742 → 650 µs, root 3034 → 2686 µs, 357×789+3 225 →
-174 µs. End to end (GPT-2 XL FSDP2 on those 8 ranks, ABBA legs,
-tokens/s) 432 blocks 20.9k/20.7k, 96 blocks 22.0k/21.8k, 24 blocks
-23.0k/22.8k, mojo+RCCL 23.1k/22.1k. The remaining isolated all-gather time
+unroll 2 on gfx94 parts with more than 80 CUs). Against the 432-block copy
+cap, 24 blocks is faster in isolation too: block 742 → 650 µs, root
+3034 → 2686 µs, 357×789+3 225 → 174 µs. It is not the fastest isolated
+grid, though: 96 blocks measured 599 / 2669 µs. 24 wins end to end
+(GPT-2 XL FSDP2 on those 8 ranks, ABBA legs, tokens/s): 432 blocks
+20.9k/20.7k, 96 blocks 22.0k/21.8k, 24 blocks 23.0k/22.8k, mojo+RCCL
+23.1k/22.1k. There the gathers run beside the compute stream, and every CU
+they hold is one the GEMMs do not get. Unroll 2 was measured only together
+with the 24-block grid.
+
+RCCL applies its 24-channel rule only to an APU, which it detects as
+`hipDeviceAttributeDirectManagedMemAccessFromHost` (`init.cc:1339-1346`).
+The discrete gfx942 parts, MI300X and MI325X, are the same ISA, so every
+`comptime` gfx942 choice reaches them too. The two 24-block grids therefore
+use RCCL's own test at run time instead (`CommState.apu`, queried once at
+init): a discrete gfx942 keeps the single-node copy cap for the gathers and
+the allreduce caps for the node reduce, as before, and nothing in this
+section was measured on one. Unroll 2 needs no such test: RCCL's
+unroll-2 rule covers MI300X too. The remaining isolated all-gather time
 is the network: 7.68 MB per NIC at about 16 GB/s, against RCCL's 13.4 MB
 per NIC at 21 GB/s; splitting each exchange into RCCL-sized 512 KiB
 writes did not change it (664 vs 653 µs). Messages at least
@@ -1796,6 +1811,20 @@ waits behind megabytes. The flush itself stays. Measured on 2 x 4 MI300A
 (job 5447705, streamed device time per call): XL bf16 block all-gather
 654 -> 601 us, fp32 root 2682 -> 2365 us; reduce-scatter unchanged (its
 exchanges are back to back on the wire either way).
+
+The second endpoint is an optimization, so it may never fail a
+communicator. It is opened from an `fi_dupinfo` copy of the data endpoint's
+info with the capabilities cut to `FI_RMA | FI_READ` and none on the receive
+side. It binds the CQ for transmit completions only, and its landing pad's
+MR (under FI_MR_ENDPOINT) has local read access only. It is still a second
+cxi address context, though, and that is the allocation `_check` documents
+failing with -FI_ENOMEM under node memory pressure. So any failure while it
+comes up (endpoint, bindings, enable, MR) closes what was created, prints
+one line (`mojoccl: flush endpoint unavailable, flushing on the data
+endpoint`) and leaves the flush on the data endpoint, where it is correct and
+only later. It is not retried: the 30 s ENOMEM retry covers only the
+resources the communicator needs. Under `MOJOCCL_IB_TRACE=1` the closing
+`mojoccl net:` line says which endpoint flushed (`flush_ep=own|data`).
 
 **`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
 memory.** Several ranks of one node fail `ncclCommInitRank` with
