@@ -26,11 +26,16 @@ from tmb.backend.abi import (
     ST_BOOL,
     ST_FLOAT32,
     ST_FLOAT64,
+    ST_INT32,
+    ST_INT64,
     T,
     Value,
     Values,
+    bool_arg,
+    cpu_empty,
     dtype_code,
     call_op,
+    int_arg,
     contiguous_strides,
     new_like,
     new_scalar,
@@ -50,7 +55,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
+from tmb.backend.device import copy_d2d, copy_to_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _device_attr_cached
 from tmb.ops.common import (
@@ -61,6 +66,7 @@ from tmb.ops.common import (
     philox_reserve,
     resize_out,
 )
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 comptime INT32_MAX = 2147483647
@@ -1187,6 +1193,229 @@ def op_native_dropout_backward(
     ret_owned(rets, 0, grad_input)
 
 
+# ---------------------------------------------------------------------------
+# aten::multinomial -- ATen's own algorithm (Distributions.cpp,
+# multinomial_out), on the device Philox stream:
+#
+# * without replacement, or one sample: `argmax(p / q)` / `topk(p / q, n)`
+#   with q ~ Exp(1) drawn by the registered exponential_ into a tensor of the
+#   input's shape and dtype. Every piece is the native op of the same name,
+#   so a seeded draw is the one stock CUDA makes from the same seed (its
+#   exponential_ is bit-exact, `div` is IEEE and argmax takes the first
+#   maximum). A zero-probability category scores exactly 0 and a positive one
+#   scores > 0, so it is drawn only once every positive one is taken -- which
+#   only `replacement=False` with more samples than positive entries asks.
+# * with replacement and n_sample > 1: the inverse-CDF sampler of
+#   tmb/kernels/random/multinomial_kernels.mojo, one Philox word per sample.
+#
+# Both validate the distribution first with one read of it and a 4-byte
+# readback, raising ATen's messages synchronously (CPU's behaviour; CUDA's
+# `_assert_async` aborts the context instead).
+# ---------------------------------------------------------------------------
+
+# Mirrored from MN_BAD_* in tmb/kernels/random/multinomial_kernels.mojo.
+comptime MN_BAD_NEGATIVE = 1
+comptime MN_BAD_NONFINITE = 2
+comptime MN_BAD_SUM = 4
+comptime FLOAT32_MAX_CONSECUTIVE_INT = 16777216
+
+
+def _multinomial_check(p: T, rows: Int, n: Int, fast_path: Bool) raises:
+    var ctx = ctx_for(p.device)
+    var flag = own(new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, p.device))
+    fill_value(flag.t, 0.0)
+    var call = KernelCall("random", "MultinomialCheck")
+    call.arg_dtype(0, p.dtype)
+    call.int(flag.t.ptr)
+    call.int(p.ptr)
+    call.int(rows)
+    call.int(n)
+    call.int(dtype_code(p.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    var host = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr, host.t.ptr, 4)
+    var code = Int(
+        Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)[]
+    )
+    _ = host^
+    _ = flag^
+    _ = ctx
+    if code == 0:
+        return
+    if fast_path:
+        if code & (MN_BAD_NEGATIVE | MN_BAD_NONFINITE):
+            raise Error(
+                "probability tensor contains either `inf`, `nan` or element < 0"
+            )
+        raise Error(
+            "invalid multinomial distribution (sum of probabilities <= 0)"
+        )
+    if code & MN_BAD_NEGATIVE:
+        raise Error(
+            "invalid multinomial distribution (encountering probability entry"
+            " < 0)"
+        )
+    if code & MN_BAD_NONFINITE:
+        raise Error(
+            "invalid multinomial distribution (encountering probability entry"
+            " = infinity or NaN)"
+        )
+    raise Error("invalid multinomial distribution (sum of probabilities <= 0)")
+
+
+def _multinomial(
+    p_in: T, n_sample: Int, replacement: Bool, generator: Int
+) raises -> T:
+    """The int64 result, an owned handle."""
+    if p_in.rank < 1 or p_in.rank > 2:
+        raise Error("prob_dist must be 1 or 2 dim")
+    if not _is_floating(p_in.dtype):
+        raise Error(
+            "multinomial only supports floating-point dtypes for input, got: ",
+            _scalar_type_name(p_in.dtype),
+        )
+    if n_sample <= 0:
+        raise Error("cannot sample n_sample <= 0 samples")
+    var n = p_in.dim(p_in.rank - 1)
+    if not replacement and n_sample > n:
+        raise Error(
+            "cannot sample n_sample > prob_dist.size(-1) samples without"
+            " replacement"
+        )
+    if n > FLOAT32_MAX_CONSECUTIVE_INT:
+        raise Error("number of categories cannot exceed 2^24")
+    _check_device_dtype(p_in, "multinomial", True)
+    var rows = p_in.dim(0) if p_in.rank == 2 else 1
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n_sample
+    if p_in.rank == 2:
+        shape[MAX_RANK - 2] = rows
+    if rows == 0:
+        return new_tensor(shape, p_in.rank, ST_INT64, p_in.device)
+    if n == 0:
+        # ATen's aminmax / CPU sampler reject an empty row before drawing.
+        raise Error(
+            "invalid multinomial distribution (sum of probabilities <= 0)"
+        )
+    var p = own_if_new(contiguous(p_in), p_in)
+    var fast_path = not replacement or n_sample == 1
+    _multinomial_check(p.t, rows, n, fast_path)
+    if fast_path:
+        var q = own(new_like(p.t))
+        _draw(q.t, "Exponential", 1.0, 0.0, 0, 0, generator)
+        var score_r = call_op(
+            "aten::div", "Tensor", [_tensor_value(p.t), _tensor_value(q.t)], 1
+        )
+        var score = own(score_r.take_tensor(0))
+        _ = q^
+        # The argmax kernel has no float64 specialization; topk(1) is the
+        # same answer (first maximum) in the same (rows, 1) shape.
+        if n_sample == 1 and p.t.dtype != DType.float64:
+            var r = call_op(
+                "aten::argmax",
+                "",
+                [_tensor_value(score.t), int_arg(-1), bool_arg(True)],
+                1,
+            )
+            _ = score^
+            _ = p^
+            return r.take_tensor(0)
+        var r = call_op(
+            "aten::topk",
+            "",
+            [
+                _tensor_value(score.t),
+                int_arg(n_sample),
+                int_arg(-1),
+                bool_arg(True),
+                bool_arg(True),
+            ],
+            2,
+        )
+        _ = score^
+        _ = p^
+        return r.take_tensor(1)
+    var out = own(new_tensor(shape, p_in.rank, ST_INT64, p_in.device))
+    var ws = IndexList[MAX_RANK](1)
+    ws[MAX_RANK - 1] = rows * n
+    var cdf = own(
+        new_tensor(
+            ws,
+            1,
+            ST_FLOAT64 if p.t.dtype == DType.float64 else ST_FLOAT32,
+            p_in.device,
+        )
+    )
+    var words = rows * n_sample
+    var seed_offset = philox_reserve(
+        generator, p_in.device, ((words + 3) // 4) * 4
+    )
+    var ctx = ctx_for(p_in.device)
+    var call = KernelCall("random", "MultinomialDraw")
+    call.arg_dtype(0, p.t.dtype)
+    call.int(out.t.ptr)
+    call.int(cdf.t.ptr)
+    call.int(p.t.ptr)
+    call.int(rows)
+    call.int(n)
+    call.int(n_sample)
+    call.int(Int(seed_offset[0] & 0xFFFFFFFF))
+    call.int(Int((seed_offset[0] >> 32) & 0xFFFFFFFF))
+    call.int(Int(seed_offset[1] & 0xFFFFFFFF))
+    call.int(Int((seed_offset[1] >> 32) & 0xFFFFFFFF))
+    call.int(dtype_code(p.t.dtype))
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = cdf^  # alive past the launch
+    _ = p^
+    return out.take()
+
+
+# aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *,
+#   Generator? generator=None) -> Tensor
+def op_multinomial(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var result = own(
+        _multinomial(
+            v_tensor(args[unsafe_offset=0]),
+            v_int(args[unsafe_offset=1]),
+            v_bool_or(args[unsafe_offset=2], False),
+            v_generator(args[unsafe_offset=3]),
+        )
+    )
+    ret_owned(rets, 0, result)
+
+
+# aten::multinomial.out(Tensor self, SymInt num_samples, bool replacement=False,
+#   *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)
+def op_multinomial_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var p = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=4])
+    if out.device != p.device:
+        raise Error("multinomial arguments must have the same device")
+    if out.stype != ST_INT64:
+        raise Error(
+            "multinomial expects Long tensor out, got: ",
+            _scalar_type_name(out.dtype),
+        )
+    var result = own(
+        _multinomial(
+            p,
+            v_int(args[unsafe_offset=1]),
+            v_bool_or(args[unsafe_offset=2], False),
+            v_generator(args[unsafe_offset=3]),
+        )
+    )
+    if not (out.rank == result.t.rank and out.shape == result.t.shape):
+        resize_out(out, result.t.shape, result.t.rank)
+    copy_strided_into(out, result.t)
+    _ = result^  # alive past the copy
+    ret_ref(rets, 0, out)
+
+
 def register_random(site: Site) raises:
     impl[op_uniform_, "uniform_"](site)
     impl[op_normal_, "normal_"](site)
@@ -1207,3 +1436,5 @@ def register_random(site: Site) raises:
     impl[op_random_, "random_"](site)
     impl[op_native_dropout, "native_dropout"](site)
     impl[op_native_dropout_backward, "native_dropout_backward"](site)
+    impl[op_multinomial, "multinomial"](site)
+    impl[op_multinomial_out, "multinomial.out"](site)

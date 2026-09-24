@@ -1,11 +1,13 @@
 """Native backend: factories group (arange.start_out, uniform_, normal_,
-native_dropout, native_dropout_backward), plus a correctness smoke test of
+native_dropout, native_dropout_backward, multinomial), plus a correctness smoke test of
 the composite-decomposed factories this group deliberately does not
 register (see ops_factories.mojo's module docstring and the final report).
 
 Public torch API only, per the porting brief: no `aten_fast`,
 `TorchMojoTensor`, or `_ctx_ptr` internals.
 """
+
+import re
 
 import pytest
 import torch
@@ -637,3 +639,160 @@ def test_native_dropout_half_precision_round_trips_through_float32(mojo_gpu, dty
     assert x.grad is not None
     assert x.grad.dtype == dtype
     torch.testing.assert_close(x.grad.cpu().float(), 2 * kept.float(), atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# multinomial. A draw is random, so it is validated statistically -- fixed
+# seeds, a chi-square bound far from the edge (p < 1e-6 for a correct
+# sampler) -- plus what no draw may ever do: repeat without replacement,
+# leave the range, or pick a zero-probability category while a positive one
+# is left. ATen's fast path (no replacement, or one sample) is also
+# bit-for-bit stock CUDA's for the same seed, checked when CUDA is present.
+# ---------------------------------------------------------------------------
+
+_MULTINOMIAL_PROBS = torch.tensor([0.0, 0.1, 0.2, 0.0, 0.3, 0.4, 0.0])
+_MULTINOMIAL_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.float64]
+
+
+def _chi2(samples: torch.Tensor, probs: torch.Tensor) -> float:
+    counts = torch.bincount(samples.reshape(-1).cpu(), minlength=probs.numel())
+    counts = counts.double()
+    expected = probs.double() / probs.double().sum() * counts.sum()
+    assert (counts[expected == 0] == 0).all(), counts
+    support = expected > 0
+    return float((((counts - expected) ** 2)[support] / expected[support]).sum())
+
+
+def _multinomial(probs: torch.Tensor, n: int, replacement: bool, **kwargs):
+    ran = _op_count_delta("aten::multinomial")
+    out = torch.multinomial(probs, n, replacement, **kwargs)
+    assert ran()
+    assert out.dtype == torch.int64 and out.device == probs.device
+    return out
+
+
+@pytest.mark.parametrize("dtype", _MULTINOMIAL_DTYPES)
+@pytest.mark.parametrize(
+    ("n", "replacement", "rows"),
+    [(1, False, 20000), (1, True, 20000), (3, False, 20000), (50, True, 400)],
+)
+def test_multinomial_frequencies(mojo_gpu, dtype, n, replacement, rows):
+    """Every first draw follows p (for top-k Gumbel sampling the first pick
+    is the argmax, a draw from p), and with replacement every draw does."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "float64 is unavailable on Apple GPUs")
+    torch.manual_seed(1234)
+    probs = _MULTINOMIAL_PROBS.to(dtype)
+    out = _multinomial(probs.expand(rows, -1).contiguous().to(mojo_gpu), n, replacement)
+    assert out.shape == (rows, n)
+    drawn = out if replacement else out[:, 0]
+    assert _chi2(drawn, probs.float()) < 35  # 3 degrees of freedom
+
+
+def test_multinomial_one_long_row_with_replacement(mojo_gpu):
+    """The inverse-CDF sampler over a vocabulary-sized row whose CDF spans
+    many per-thread chunks, with runs of zeros across chunk boundaries."""
+    torch.manual_seed(7)
+    probs = torch.rand(50257)
+    probs[1000:1500] = 0.0
+    probs[::97] = 0.0
+    out = _multinomial(probs.to(mojo_gpu), 200000, True).cpu()
+    assert out.shape == (200000,)
+    assert (probs[out] > 0).all()
+    # Coarse bins of ~50 categories keep the chi-square meaningful.
+    bins = torch.arange(50257) // 50
+    counts = torch.bincount(bins[out], minlength=int(bins[-1]) + 1).double()
+    expected = torch.zeros_like(counts).index_add_(0, bins, probs.double())
+    expected = expected / expected.sum() * out.numel()
+    support = expected > 0
+    dof = int(support.sum()) - 1
+    chi2 = float((((counts - expected) ** 2)[support] / expected[support]).sum())
+    assert chi2 < dof + 8 * dof**0.5, (chi2, dof)
+
+
+def test_multinomial_without_replacement_never_repeats(mojo_gpu):
+    torch.manual_seed(3)
+    probs = torch.rand(64, 37).to(mojo_gpu)
+    out = _multinomial(probs, 37, False).cpu()
+    assert torch.equal(out.sort(dim=1).values, torch.arange(37).expand(64, -1))
+    positives = torch.tensor([[0.0, 2.0, 0.0, 1.0, 3.0]] * 500).to(mojo_gpu)
+    out = _multinomial(positives, 3, False).cpu()
+    assert set(out.reshape(-1).tolist()) == {1, 3, 4}
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_multinomial_is_reproducible(mojo_gpu, replacement):
+    probs = torch.rand(5, 11).to(mojo_gpu)
+    n = 4
+    torch.manual_seed(99)
+    first = _multinomial(probs, n, replacement).cpu()
+    second = _multinomial(probs, n, replacement).cpu()
+    torch.manual_seed(99)
+    assert torch.equal(_multinomial(probs, n, replacement).cpu(), first)
+    assert not torch.equal(first, second)
+    g = torch.Generator(device=mojo_gpu)
+    g.manual_seed(5)
+    a = _multinomial(probs, n, replacement, generator=g).cpu()
+    g.manual_seed(5)
+    assert torch.equal(_multinomial(probs, n, replacement, generator=g).cpu(), a)
+
+
+@pytest.mark.parametrize(("n", "replacement"), [(1, False), (1, True), (6, False)])
+def test_multinomial_fast_path_matches_stock_cuda(mojo_gpu, n, replacement):
+    """ATen's fast path composes exponential_, div and argmax/topk, all of
+    them CUDA's bits here, so a seeded draw is stock CUDA's own."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device to compare against")
+    skip_if_metal(mojo_gpu, "CUDA bit-parity is only claimed on NVIDIA GPUs")
+    probs = torch.rand(6, 50304, generator=torch.Generator().manual_seed(0))
+    torch.manual_seed(11)
+    ours = _multinomial(probs.to(mojo_gpu), n, replacement).cpu()
+    torch.manual_seed(11)
+    theirs = torch.multinomial(probs.cuda(), n, replacement).cpu()
+    assert torch.equal(ours, theirs)
+
+
+def test_multinomial_shapes_layouts_and_out(mojo_gpu):
+    torch.manual_seed(0)
+    one_d = _multinomial(torch.rand(9).to(mojo_gpu), 4, True)
+    assert one_d.shape == (4,)
+    strided = torch.rand(9, 5).to(mojo_gpu).t()  # rows of stride 5
+    out = _multinomial(strided, 2, False).cpu()
+    assert out.shape == (5, 2) and out.max() < 9
+    assert _multinomial(torch.rand(0, 5).to(mojo_gpu), 3, True).shape == (0, 3)
+    dest = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    ran = _op_count_delta("aten::multinomial.out")
+    torch.multinomial(torch.rand(2, 5).to(mojo_gpu), 3, out=dest)
+    assert ran()
+    assert dest.shape == (2, 3) and dest.cpu().max() < 5
+
+
+@pytest.mark.parametrize(
+    "probs",
+    [[0.1, -0.1, 0.2], [0.1, float("nan"), 0.2], [0.1, float("inf"), 0.2], [0.0, 0.0]],
+    ids=["negative", "nan", "inf", "zero_sum"],
+)
+@pytest.mark.parametrize(("n", "replacement"), [(1, False), (2, True)])
+def test_multinomial_rejects_invalid_distributions_like_cpu(
+    mojo_gpu, probs, n, replacement
+):
+    """The same message as CPU torch, raised synchronously (both of ATen's
+    paths, whose messages differ)."""
+    host = torch.tensor(probs)
+    with pytest.raises(RuntimeError) as cpu_error:
+        torch.multinomial(host, n, replacement)
+    message = str(cpu_error.value).splitlines()[0]
+    with pytest.raises(RuntimeError, match=re.escape(message)):
+        torch.multinomial(host.to(mojo_gpu), n, replacement)
+
+
+def test_multinomial_argument_errors(mojo_gpu):
+    probs = torch.rand(2, 3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="without replacement"):
+        torch.multinomial(probs, 4)
+    with pytest.raises(RuntimeError, match="n_sample <= 0"):
+        torch.multinomial(probs, 0, True)
+    with pytest.raises(RuntimeError, match="1 or 2 dim"):
+        torch.multinomial(torch.rand(2, 2, 2).to(mojo_gpu), 1)
+    with pytest.raises(RuntimeError, match="floating-point dtypes"):
+        torch.multinomial(torch.ones(3, dtype=torch.int64).to(mojo_gpu), 1)

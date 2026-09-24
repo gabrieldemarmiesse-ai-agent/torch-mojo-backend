@@ -4339,6 +4339,199 @@ def test_aten_msort(conf: Conf, call_checker: CallChecker):
     check_outputs(fn, conf, [_distinct((6, 5), torch.float32)])
 
 
+# ---------------------------------------------------------------------------
+# kthvalue / median / nanmedian (compile backend; the mojo device's native
+# kernels are tested in tests/native/test_reductions.py). Inputs are tie-free
+# unless the test is about ties: kthvalue's tie index is unspecified in ATen,
+# while median's is the lowest index (CPU's comparator), which the graph's
+# stable sort reproduces.
+# ---------------------------------------------------------------------------
+
+
+def _check_nan_outputs(fn: Callable[..., Sequence[torch.Tensor]], x: torch.Tensor):
+    """`check_outputs` for results that hold NaN (equal where both are NaN):
+    compiled on CPU against eager CPU, values and indices."""
+    expected = fn(x)
+    actual = torch.compile(fn, backend=mojo_backend)(x)
+    for want, got in zip(expected, actual, strict=True):
+        assert want.dtype == got.dtype and want.shape == got.shape
+        torch.testing.assert_close(got, want, equal_nan=True, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize(
+    ("k", "dim", "keepdim"), [(1, -1, False), (3, 0, True), (5, 1, False)]
+)
+def test_aten_kthvalue(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    k: int,
+    dim: int,
+    keepdim: bool,
+):
+    call_checker.register(aten_functions.aten_kthvalue)
+
+    def fn(x):
+        return torch.kthvalue(x, k, dim, keepdim)
+
+    check_outputs(fn, conf, [_distinct((5, 7), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_kthvalue_out_of_range(conf: Conf):
+    fn = torch.compile(lambda x: torch.kthvalue(x, 6, 1), backend=mojo_backend)
+    with pytest.raises((RuntimeError, BackendCompilerFailed), match="k out of range"):
+        fn(_distinct((3, 5), torch.float32))
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize("size", [6, 7])
+@pytest.mark.parametrize(("dim", "keepdim"), [(-1, False), (0, True), (-3, False)])
+def test_aten_median_dim(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    size: int,
+    dim: int,
+    keepdim: bool,
+):
+    """The lower of the two middle values, on odd and even lengths."""
+    call_checker.register(aten_functions.aten_median_dim)
+
+    def fn(x):
+        return torch.median(x, dim, keepdim)
+
+    check_outputs(fn, conf, [_distinct((size, 3, size), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_median_dim_ties_and_nan(conf: Conf, call_checker: CallChecker):
+    """Ties give the lowest index of the median value; a row with any NaN
+    gives (nan, index of its first NaN), even behind a real +inf."""
+    call_checker.register(aten_functions.aten_median_dim)
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [2.0, 1.0, 2.0, 3.0, 2.0, 1.0],
+            [1.0, 5.0, nan, 0.0, nan, 2.0],
+            [inf, 1.0, 0.0, nan, -inf, 3.0],
+            [-0.0, 0.0, 0.0, -0.0, 1.0, -1.0],
+        ]
+    )
+
+    def fn(x):
+        return torch.median(x, 1)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_nanmedian_dim(conf: Conf, call_checker: CallChecker):
+    """The lower middle of each row's numbers, NaNs ignored."""
+    call_checker.register(aten_functions.aten_nanmedian_dim)
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [2.0, 1.0, 7.0, 3.0, 4.0, 1.5],
+            [1.0, 5.0, nan, 0.0, nan, 2.0],
+            [nan, inf, 0.0, nan, -inf, 3.0],
+            [nan, nan, nan, 9.0, nan, nan],
+        ]
+    )
+
+    def fn(x):
+        return torch.nanmedian(x, -1, True)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("with_nan", [False, True])
+def test_aten_median_and_nanmedian_all(
+    conf: Conf, call_checker: CallChecker, with_nan: bool
+):
+    call_checker.register(aten_functions.aten_median)
+    call_checker.register(aten_functions.aten_nanmedian)
+    x = _distinct((4, 5), torch.float32)
+    if with_nan:
+        x[1, 2] = float("nan")
+
+    def fn(x):
+        return torch.median(x), torch.nanmedian(x)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("shape", "num_samples", "replacement"),
+    [((7,), 1, False), ((3, 7), 4, False), ((3, 7), 1, True), ((2, 7), 5, True)],
+)
+def test_aten_multinomial_shape_and_support(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    num_samples: int,
+    replacement: bool,
+):
+    """A draw is random, so it is checked for what is not: shape, dtype,
+    range, no repeats without replacement, and zero-probability categories
+    never drawn while positive ones are left."""
+    call_checker.register(aten_functions.aten_multinomial)
+    probs = torch.tensor([0.0, 0.1, 0.2, 0.0, 0.3, 0.4, 0.0], dtype=dtype)
+    probs = probs.expand(shape).contiguous()
+
+    def fn(p):
+        return torch.multinomial(p, num_samples, replacement)
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    for _ in range(3):
+        out = compiled(probs)
+        assert out.dtype == torch.int64
+        assert out.shape == fn(probs).shape
+        assert torch.isin(out, torch.tensor([1, 2, 4, 5])).all(), out
+        if not replacement:
+            rows = out.reshape(-1, num_samples)
+            assert all(len(set(r.tolist())) == num_samples for r in rows)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("replacement", [False, True])
+def test_aten_multinomial_frequencies_and_seeding(
+    conf: Conf, call_checker: CallChecker, replacement: bool
+):
+    """One compiled draw of many samples follows the distribution (a
+    generous chi-square bound), every call draws afresh, and
+    `torch.manual_seed` makes the draws reproducible."""
+    call_checker.register(aten_functions.aten_multinomial)
+    probs = torch.tensor([0.1, 0.0, 0.2, 0.3, 0.4])
+    rows, samples = 4000, 1
+
+    def fn(p):
+        return torch.multinomial(p, 1 if replacement else 2, replacement)
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    batch = probs.expand(rows, -1).contiguous()
+    torch.manual_seed(0)
+    first = compiled(batch)
+    second = compiled(batch)
+    torch.manual_seed(0)
+    again = compiled(batch)
+    assert torch.equal(first, again)
+    assert not torch.equal(first, second)
+    counts = torch.bincount(first[:, 0], minlength=5).double()
+    assert counts[1] == 0
+    expected = probs.double() * rows * samples
+    support = expected > 0
+    chi2 = (((counts - expected) ** 2)[support] / expected[support]).sum()
+    assert chi2 < 30, (counts, expected)  # 3 d.o.f.: p < 1e-5 when correct
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_scatter_src_basic_2d(conf: Conf, dtype: torch.dtype):
     """Test aten.scatter.src basic functionality with 2D tensors"""

@@ -896,6 +896,12 @@ def _bools() -> torch.Tensor:
     return torch.randint(0, 2, (4, 5), dtype=torch.bool)
 
 
+def _value_index_out(device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty(0, device=device), torch.empty(
+        0, dtype=torch.int64, device=device
+    )
+
+
 _EXPECTED_OVERLOADS = [
     ("aten::sum.dim_IntList", lambda d: torch.randn(4, 5).to(d).sum(dim=1)),
     ("aten::mean", lambda d: torch.randn(4, 5).to(d).mean()),
@@ -964,6 +970,23 @@ _EXPECTED_OVERLOADS = [
             stable=True,
             out=(torch.empty(0, device=d), torch.empty(0, dtype=torch.int64, device=d)),
         ),
+    ),
+    ("aten::kthvalue", lambda d: torch.kthvalue(torch.randn(4, 5).to(d), 2)),
+    (
+        "aten::kthvalue.values",
+        lambda d: torch.kthvalue(torch.randn(4, 5).to(d), 2, out=_value_index_out(d)),
+    ),
+    ("aten::median", lambda d: torch.median(torch.randn(4, 5).to(d))),
+    ("aten::median.dim", lambda d: torch.median(torch.randn(4, 5).to(d), 1)),
+    (
+        "aten::median.dim_values",
+        lambda d: torch.median(torch.randn(4, 5).to(d), 1, out=_value_index_out(d)),
+    ),
+    ("aten::nanmedian", lambda d: torch.nanmedian(torch.randn(4, 5).to(d))),
+    ("aten::nanmedian.dim", lambda d: torch.nanmedian(torch.randn(4, 5).to(d), 1)),
+    (
+        "aten::nanmedian.dim_values",
+        lambda d: torch.nanmedian(torch.randn(4, 5).to(d), 1, out=_value_index_out(d)),
     ),
 ]
 
@@ -1325,3 +1348,205 @@ def test_sort_and_topk_backward(mojo_gpu):
     loss(reference).backward()
     assert x.grad is not None
     torch.testing.assert_close(x.grad.cpu(), reference.grad)
+
+
+# ---------------------------------------------------------------------------
+# kthvalue / median / nanmedian: one element per row of the same sorted
+# (key, index) order. median's tie index is the lowest one (CPU's comparator),
+# so its indices are compared exactly; kthvalue's is unspecified in ATen, so
+# its indices are checked to point at the returned value. NaN sorts after
+# every number: median returns a row's first NaN, nanmedian the lower middle
+# of its numbers. The row lengths cross the sort routes as above, and the k
+# of kthvalue crosses the topk tournament's boundary.
+# ---------------------------------------------------------------------------
+
+_ORDER_STAT_DTYPES = [
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float64,
+    torch.int64,
+    torch.int32,
+    torch.uint8,
+]
+
+
+def _check_points_at(x: torch.Tensor, dim: int, keepdim: bool, result):
+    """The returned indices hold the returned values (NaN equal to NaN)."""
+    indices = result.indices.cpu()
+    assert indices.dtype == torch.int64
+    values = result.values.cpu()
+    if x.dim() == 0:
+        assert indices.item() == 0
+        _same(values, x)
+        return
+    if not keepdim:
+        indices, values = indices.unsqueeze(dim), values.unsqueeze(dim)
+    _same(torch.gather(x, dim, indices), values)
+
+
+def _check_kthvalue(x: torch.Tensor, device: str, k: int, dim: int, keepdim: bool):
+    with ran("aten::kthvalue", "aten::kthvalue.values"):
+        actual = torch.kthvalue(x.to(device), k, dim, keepdim)
+    expected = torch.kthvalue(x, k, dim, keepdim)
+    _same(actual.values, expected.values)
+    _check_points_at(x, dim, keepdim, actual)
+
+
+def _check_median(x: torch.Tensor, device: str, dim: int, keepdim: bool):
+    with ran("aten::median.dim", "aten::median.dim_values"):
+        actual = torch.median(x.to(device), dim, keepdim)
+    expected = torch.median(x, dim, keepdim)
+    _same(actual.values, expected.values)
+    _same(actual.indices, expected.indices)
+
+
+@pytest.mark.parametrize("columns", _SORT_ROUTE_SIZES)
+def test_median_matches_cpu_on_every_route(mojo_gpu, columns):
+    """Ties, both zeros and NaN rows (every probe of 16+ columns has NaNs):
+    values AND indices exactly CPU's, whatever the route."""
+    host = _sort_probe(3, columns)
+    _check_median(host, mojo_gpu, -1, False)
+    clean = torch.randn(3, columns, generator=torch.Generator().manual_seed(5))
+    clean[:, ::3] = 0.25  # ties at the median
+    _check_median(clean, mojo_gpu, 1, True)
+
+
+@pytest.mark.parametrize(
+    ("columns", "k"),
+    [
+        (1, 1),
+        (33, 1),
+        (33, 17),
+        (33, 33),
+        (4095, 17),
+        (4097, 2049),
+        (8193, 8193),
+        (50257, 50),
+        (50257, 316),
+        (50257, 25129),
+    ],
+)
+def test_kthvalue_matches_cpu_across_the_routes(mojo_gpu, columns, k):
+    host = torch.randn(2, columns, generator=torch.Generator().manual_seed(9))
+    _check_kthvalue(host, mojo_gpu, k, -1, False)
+
+
+@pytest.mark.parametrize("dtype", _ORDER_STAT_DTYPES)
+@pytest.mark.parametrize("columns", [37, 38, 6001])
+def test_median_and_kthvalue_every_dtype(mojo_gpu, dtype, columns):
+    """Heavily tied values: median's lowest-index tie rule is exact, and
+    kthvalue's value is, with an index pointing at it."""
+    host = _dtype_probe((3, columns), dtype)
+    _check_median(host, mojo_gpu, -1, False)
+    for k in (1, columns // 3, columns):
+        _check_kthvalue(host, mojo_gpu, k, -1, False)
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2, -1, -2, -3])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_median_and_kthvalue_every_dim(mojo_gpu, dim, keepdim):
+    """Odd and even lengths along a dim that is not last are moved to last;
+    the result keeps the other dims' order."""
+    host = torch.randn(5, 7, 6, generator=torch.Generator().manual_seed(4))
+    _check_median(host, mojo_gpu, dim, keepdim)
+    for k in (1, 3, host.shape[dim]):
+        _check_kthvalue(host, mojo_gpu, k, dim, keepdim)
+
+
+def test_median_and_kthvalue_non_contiguous_input(mojo_gpu):
+    host = torch.randn(9, 7, generator=torch.Generator().manual_seed(2))
+    device = host.to(mojo_gpu)
+    _same(torch.median(device.t(), 1).values, torch.median(host.t(), 1).values)
+    _same(
+        torch.median(device[:, ::2], 1).indices, torch.median(host[:, ::2], 1).indices
+    )
+    _same(
+        torch.kthvalue(device.t(), 4, 1).values, torch.kthvalue(host.t(), 4, 1).values
+    )
+
+
+def test_median_nan_rules_match_cpu(mojo_gpu):
+    """median: a row with any NaN is (nan, first NaN), even behind +inf.
+    nanmedian: the lower middle of the numbers (an all-NaN row is NaN).
+    kthvalue: NaN is the largest value."""
+    nan, inf = float("nan"), float("inf")
+    host = torch.tensor(
+        [
+            [2.0, 1.0, 2.0, 3.0, 2.0, 1.0],
+            [1.0, 5.0, nan, 0.0, nan, 2.0],
+            [inf, 1.0, 0.0, nan, -inf, 3.0],
+            [nan, nan, nan, 9.0, nan, nan],
+            [nan, nan, nan, nan, nan, nan],
+        ]
+    )
+    device = host.to(mojo_gpu)
+    _check_median(host, mojo_gpu, 1, False)
+    with ran("aten::nanmedian.dim", "aten::nanmedian.dim_values"):
+        actual = torch.nanmedian(device, 1)
+    expected = torch.nanmedian(host, 1)
+    _same(actual.values, expected.values)
+    # ATen leaves the index of an all-NaN row unspecified.
+    _same(actual.indices[:4], expected.indices[:4])
+    for k in (1, 3, 6):
+        _check_kthvalue(host, mojo_gpu, k, 1, False)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_median_and_nanmedian_of_the_whole_tensor(mojo_gpu, dtype):
+    host = _dtype_probe((7, 9), dtype)
+    with ran("aten::median"):
+        _same(torch.median(host.to(mojo_gpu)), torch.median(host))
+    with ran("aten::nanmedian"):
+        _same(torch.nanmedian(host.to(mojo_gpu)), torch.nanmedian(host))
+    if dtype.is_floating_point:
+        host[2, 3] = float("nan")
+        _same(torch.median(host.to(mojo_gpu)), torch.median(host))
+        _same(torch.nanmedian(host.to(mojo_gpu)), torch.nanmedian(host))
+        empty = torch.empty(0, dtype=dtype)
+        _same(torch.median(empty.to(mojo_gpu)), torch.median(empty))
+
+
+def test_median_and_kthvalue_scalar_and_single_column(mojo_gpu):
+    for host in (torch.tensor(3.5), torch.randn(4, 1)):
+        dim = 0 if host.dim() == 0 else 1
+        for keepdim in (False, True):
+            _check_median(host, mojo_gpu, dim, keepdim)
+            _check_kthvalue(host, mojo_gpu, 1, dim, keepdim)
+
+
+def test_median_and_kthvalue_out_variants(mojo_gpu):
+    host = torch.randn(4, 7, generator=torch.Generator().manual_seed(8))
+    device = host.to(mojo_gpu)
+    for fn, overload in (
+        (lambda t, out: torch.median(t, 1, out=out), "aten::median.dim_values"),
+        (lambda t, out: torch.nanmedian(t, 1, out=out), "aten::nanmedian.dim_values"),
+        (lambda t, out: torch.kthvalue(t, 3, 1, out=out), "aten::kthvalue.values"),
+    ):
+        # A wrong-sized out is resized; a strided one is written through.
+        values = torch.empty(0, device=mojo_gpu)
+        indices = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+        with ran(overload):
+            fn(device, (values, indices))
+        expected = fn(host, (torch.empty(0), torch.empty(0, dtype=torch.int64)))
+        _same(values, expected[0])
+        _same(indices, expected[1])
+        values = torch.zeros(4, 2, device=mojo_gpu)[:, 0]
+        indices = torch.zeros(4, 2, dtype=torch.int64, device=mojo_gpu)[:, 1]
+        fn(device, (values, indices))
+        _same(values, expected[0])
+        _same(indices, expected[1])
+
+
+def test_median_and_kthvalue_errors(mojo_gpu):
+    device = torch.randn(3, 4).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="k out of range"):
+        torch.kthvalue(device, 5, 1)
+    with pytest.raises(RuntimeError, match="k out of range"):
+        torch.kthvalue(device, 0, 1)
+    with pytest.raises((IndexError, RuntimeError), match="out of range"):
+        torch.median(device, 2)
+    with pytest.raises((IndexError, RuntimeError), match="non-zero size"):
+        torch.median(torch.empty(2, 0).to(mojo_gpu), 1)
+    with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
+        torch.median(torch.tensor([True, False]).to(mojo_gpu), 0)

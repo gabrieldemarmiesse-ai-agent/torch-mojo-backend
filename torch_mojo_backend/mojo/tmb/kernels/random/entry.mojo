@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
 # C entry of the on-device random generators (kernels: distribution_kernels.mojo,
-# curand_philox.mojo). Slots are unpacked here and nothing is read from the
+# multinomial_kernels.mojo, curand_philox.mojo). Slots are unpacked here and nothing is read from the
 # host or synchronized: the generator state was reserved before the call.
 # ===----------------------------------------------------------------------=== #
 
@@ -22,6 +22,10 @@ from tmb.kernels.random.distribution_kernels import (
     enqueue_bernoulli_tensor,
     enqueue_distribution,
 )
+from tmb.kernels.random.multinomial_kernels import (
+    enqueue_multinomial_check,
+    enqueue_multinomial_draw,
+)
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -31,6 +35,8 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher6,
+    _spec_dispatcher12,
     _spec_dispatcher15,
     _spec_dispatcher16,
 )
@@ -60,6 +66,13 @@ comptime ALL_DTYPES = [
     DType.bool,
 ]
 comptime PROB_DTYPES = [DType.float32, DType.float64]
+# aten::multinomial's input dtypes (ATen's floating dispatch).
+comptime MULTINOMIAL_DTYPES = [
+    DType.float32,
+    DType.bfloat16,
+    DType.float16,
+    DType.float64,
+]
 
 
 @always_inline
@@ -266,6 +279,66 @@ def _bernoulli_tensor_go(
         )
 
 
+def _multinomial_check_go(
+    flag_obj: Arg,
+    probs_obj: Arg,
+    rows_obj: Arg,
+    n_obj: Arg,
+    dtype_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var handled = False
+    comptime for dt in MULTINOMIAL_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                enqueue_multinomial_check[dt](
+                    _raw_ctx(ctx_obj),
+                    _raw_int(flag_obj),
+                    _raw_int(probs_obj),
+                    _raw_int(rows_obj),
+                    _raw_int(n_obj),
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for multinomial: ", dtype)
+
+
+def _multinomial_draw_go(
+    dst_obj: Arg,
+    cdf_obj: Arg,
+    probs_obj: Arg,
+    rows_obj: Arg,
+    n_obj: Arg,
+    n_sample_obj: Arg,
+    seed_lo_obj: Arg,
+    seed_hi_obj: Arg,
+    offset_lo_obj: Arg,
+    offset_hi_obj: Arg,
+    dtype_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    var dtype = _raw_dtype_int(dtype_obj)
+    var handled = False
+    comptime for dt in MULTINOMIAL_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                enqueue_multinomial_draw[dt](
+                    _raw_ctx(ctx_obj),
+                    _raw_int(dst_obj),
+                    _raw_int(cdf_obj),
+                    _raw_int(probs_obj),
+                    _raw_int(rows_obj),
+                    _raw_int(n_obj),
+                    _raw_int(n_sample_obj),
+                    _join_u64(_raw_int(seed_lo_obj), _raw_int(seed_hi_obj)),
+                    _join_u64(_raw_int(offset_lo_obj), _raw_int(offset_hi_obj)),
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for multinomial: ", dtype)
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -321,6 +394,16 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["BernoulliTensor"]():
             _spec_dispatcher15[_bernoulli_tensor_go, "BernoulliTensor"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["MultinomialCheck"]():
+            _spec_dispatcher6[_multinomial_check_go, "MultinomialCheck"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["MultinomialDraw"]():
+            _spec_dispatcher12[_multinomial_draw_go, "MultinomialDraw"](
                 argv, argc
             )
             return 0

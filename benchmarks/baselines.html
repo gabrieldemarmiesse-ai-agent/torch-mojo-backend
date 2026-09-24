@@ -8743,6 +8743,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "kthvalue": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 2.026
+                  }
+                },
+                "V_8x50304_K25152": {
+                  "layouts": {
+                    "contig": 1.496
+                  }
+                },
+                "V_8x50304_K50": {
+                  "layouts": {
+                    "contig": 0.533
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.858
+                  }
+                },
+                "V_8x50304_K25152": {
+                  "layouts": {
+                    "contig": 0.889
+                  }
+                },
+                "V_8x50304_K50": {
+                  "layouts": {
+                    "contig": 0.36
+                  }
+                }
+              }
+            }
+          }
+        },
         "le": {
           "dtypes": {
             "f32": {
@@ -9661,6 +9703,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "median.dim": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 2.126
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 3.389
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 1.518
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.723
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 2.521
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 0.91
+                  }
+                }
+              }
+            }
+          }
+        },
         "min": {
           "dtypes": {
             "bf16": {
@@ -10223,6 +10307,58 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 1.019
+                  }
+                }
+              }
+            }
+          }
+        },
+        "multinomial": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_N3_REP": {
+                  "layouts": {
+                    "contig": 0.338
+                  }
+                },
+                "V_1x50304_N1": {
+                  "layouts": {
+                    "contig": 0.437
+                  }
+                },
+                "V_8x50304_N4_NOREP": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "V_8x50304_N64_REP": {
+                  "layouts": {
+                    "contig": 0.919
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_N3_REP": {
+                  "layouts": {
+                    "contig": 0.357
+                  }
+                },
+                "V_1x50304_N1": {
+                  "layouts": {
+                    "contig": 0.451
+                  }
+                },
+                "V_8x50304_N4_NOREP": {
+                  "layouts": {
+                    "contig": 0.837
+                  }
+                },
+                "V_8x50304_N64_REP": {
+                  "layouts": {
+                    "contig": 0.927
                   }
                 }
               }
