@@ -166,6 +166,7 @@ from std.sys import (
     size_of,
 )
 from std.sys import llvm_intrinsic
+from std.sys.info import _accelerator_arch
 from std.time import global_perf_counter_ns
 from std.utils import StaticTuple
 
@@ -179,6 +180,40 @@ comptime _AMD = has_amd_gpu_accelerator()
 """Whether this build targets AMD.  Every behavioural difference in this file
 is behind it, so the NVIDIA path is exactly what it was before the MI300A work
 (see the "Link direction" note in the module header)."""
+
+comptime _RELAXED_POLL = (
+    _accelerator_arch() == "gfx942" or _accelerator_arch() == "amdgpu:gfx942"
+)
+# Measured on MI300A, job 5447705: FSDP2 comm busy 209.5 -> 188.5 ms/step.
+# End-to-end improvement alone was small/noisy; see docs/distributed.md.
+comptime _POLL_ORDER = Ordering.RELAXED if _RELAXED_POLL else Ordering.ACQUIRE
+
+
+@always_inline
+def poll_pause():
+    """RCCL 2.22.3's gfx942 waitPeer sleep (prims_simple.h); no other target."""
+    comptime if _RELAXED_POLL:
+        llvm_intrinsic[
+            "llvm.amdgcn.s.sleep", NoneType, has_side_effect=True
+        ](Int32(1))
+
+
+@always_inline
+def poll_acquire():
+    """Acquire the release observed by a successful relaxed flag poll.
+
+    The system-scope atomic read is sequenced before this system acquire
+    fence, so the release it reads synchronizes with the fence (the standard
+    atomic-to-fence rule). LLVM lowers gfx942's monotonic system load to
+    `global_load ... sc0 sc1`, and this fence to waitcnt + buffer_inv sc0 sc1.
+    The invalidate happens once, before consuming payload, instead of on
+    every failed poll while independent compute is using L2. Every polling
+    thread fences, including an already-satisfied flag, before the block
+    barrier passes the acquire to the payload-reading threads.
+    """
+    comptime if _RELAXED_POLL:
+        fence[ordering=Ordering.ACQUIRE]()
+
 
 comptime MAX_WORLD = 8
 """Largest world size a single region can address (one flag column per rank)."""
@@ -737,20 +772,10 @@ def _sync(
     if Int(thread_idx.x) < world:
         var peer = Int(thread_idx.x)
         var bid = Int(block_idx.x) if row < 0 else row
-        # The acquire stays an acquire *load*, per iteration. Spinning on a
-        # relaxed load (still `sc0 sc1`, so it cannot read a stale flag) and
-        # invalidating once after the wait looks exactly as strong, is worth
-        # a lot -- it is the difference between 243 us and 465 us at 27 MiB
-        # when the grid is 1024 blocks, because `buffer_inv sc0 sc1` throws
-        # the payload out of L2 for every block still working -- and was
-        # measured to leave a one-element allreduce at 2 ranks failing 2 runs
-        # in 13, against 0 in 12 with this spelling. Neither sample proves
-        # anything on its own (Fisher p ~ 0.5), but there is no argument for
-        # why the cheap version is sound on this hardware, and two cheaper
-        # release spellings already turned out unsound here in exactly this
-        # way -- small payloads only. So: correctness, and the large messages
-        # pay for it. See docs/mojo_collectives_kernel_results.md section 7
-        # for the experiment that would settle it.
+        # Keep both producer release operations above/below: unlike polling,
+        # weakening those loses small payloads through the IPC mapping.
+        # gfx942 uses atomic-to-fence acquisition (poll_acquire), preserving
+        # the same system scope and the final cross-wave block rendezvous.
         Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
             _flags(regions[peer].unsafe_offset(arena_off)).unsafe_offset(
                 bid * MAX_WORLD + rank
@@ -762,8 +787,9 @@ def _sync(
         )
         var spins = 0
         while (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mine) < target
+            Atomic[DType.uint64].load[ordering=_POLL_ORDER](mine) < target
         ):
+            poll_pause()
             spins += 1
             if spins >= _SPIN_CHECK:
                 spins = 0
@@ -798,6 +824,7 @@ def _sync(
                     )
                     failed[unsafe_offset=0] = 1
                     break
+        poll_acquire()
     barrier()
     return failed[unsafe_offset=0] == 0
 

@@ -19,10 +19,13 @@ from tmb.ccl.collectives_kernels import (
     ERR_PROXY_WAIT,
     FAULT_NO_PEER,
     MAX_WORLD,
+    _POLL_ORDER,
     _copy_bytes,
     _enqueue_cached,
     abort_raised,
     latch_arena_error,
+    poll_acquire,
+    poll_pause,
     publish_fault,
 )
 
@@ -33,30 +36,11 @@ comptime _ABORT_CHECK = 256
 across PCIe, so probing every iteration would double the wait kernel's traffic
 for no gain: 256 iterations is well under a millisecond."""
 
-# REVERTED: polling the mailbox with a relaxed load and one acquire fence at
-# the end.
-#
-# The measurement that motivated it is real. On gfx942 an acquire load at
-# system scope lowers to `global_load ... sc0 sc1` followed by `buffer_inv sc0
-# sc1`, a whole L1 AND L2 invalidate, and this kernel spins for as long as an
-# exchange takes -- so every other kernel resident on the GPU loses its L2,
-# millions of times a second. The relaxed spelling removed every invalidate
-# from the loop (verified in the assembly: 0 in the loop, 1 for the fence
-# after it) and left the sm_90a PTX byte-identical.
-#
-# It is reverted anyway, for the reason the same change was reverted in
-# `collectives_kernels.mojo`'s barrier (see that file's history): there is no
-# argument for why the cheap version is sound on this hardware, only a
-# symmetry that looks right -- the spin load still carries `sc0 sc1`, so it
-# cannot read a stale flag, and the payload ordering is provided once by the
-# fence. A one-element allreduce at 2 ranks flaked 2 runs in 13 with the
-# barrier's version and 0 in 12 without. And the benefit here was never
-# measured on a workload: nanoGPT's throughput was identical with and without
-# it, because what actually cost 26x was MAX's VMM allocator, not this.
-#
-# Unmeasured benefit plus an unexplained multi-node stall in the same
-# neighbourhood is not a trade worth making. If it comes back it should come
-# back with a soundness argument and a workload that shows the win.
+# gfx942 waits use the atomic-to-fence acquire in collectives_kernels:
+# the progress thread flushes the NIC writes before release-storing MB_DONE;
+# the relaxed system load that observes it precedes one system acquire fence.
+# Preserve error handling: a transport error can release MB_DONE without data,
+# just as with the old acquire load. The communicator's fault stays latched.
 
 
 @__llvm_metadata(
@@ -197,8 +181,9 @@ def _proxy_wait_kernel(
         var t0 = device_now_ns()
         var spins = 0
         while (
-            Atomic[DType.uint64].load[ordering=Ordering.ACQUIRE](mailbox) < seq
+            Atomic[DType.uint64].load[ordering=_POLL_ORDER](mailbox) < seq
         ):
+            poll_pause()
             spins += 1
             if spins >= _ABORT_CHECK:
                 spins = 0
@@ -227,6 +212,8 @@ def _proxy_wait_kernel(
                         Int(error_word),
                     )
                 return
+
+        poll_acquire()
 
 
 @__llvm_metadata(
