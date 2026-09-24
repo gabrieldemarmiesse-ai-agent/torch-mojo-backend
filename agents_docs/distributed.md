@@ -1773,7 +1773,7 @@ serialise the pipeline. What is left is 1.33x over RCCL against a 5.2 ms wire
 floor (14 chunks x 9.36 MB shard / 25 GB/s), where RCCL sits at 1.36x the
 floor and mojoccl at 1.8x.
 
-**On gfx942 the flush read has its own endpoint.** Queued behind the data
+**The flush read has its own endpoint.** Queued behind the data
 writes, the flush of exchange e waited for exchange e+1's payload, which the
 progress thread had already posted: e retired one exchange late, so the
 pipelined all-gather's remote gathers of chunk e could not overlap the
@@ -1787,19 +1787,19 @@ waits behind megabytes. The flush itself stays. Measured on 2 x 4 MI300A
 654 -> 601 us, fp32 root 2682 -> 2365 us; reduce-scatter unchanged (its
 exchanges are back to back on the wire either way).
 
-The second endpoint is an optimization, so it may never fail a
-communicator. It is opened from an `fi_dupinfo` copy of the data endpoint's
-info with the capabilities cut to `FI_RMA | FI_READ` and none on the receive
-side. It binds the CQ for transmit completions only, and its landing pad's
-MR (under FI_MR_ENDPOINT) has local read access only. It is still a second
-cxi address context, though, and that is the allocation `_check` documents
-failing with -FI_ENOMEM under node memory pressure. So any failure while it
-comes up (endpoint, bindings, enable, MR) closes what was created, prints
-one line (`mojoccl: flush endpoint unavailable, flushing on the data
-endpoint`) and leaves the flush on the data endpoint, where it is correct and
-only later. It is not retried: the 30 s ENOMEM retry covers only the
-resources the communicator needs. Under `MOJOCCL_IB_TRACE=1` the closing
-`mojoccl net:` line says which endpoint flushed (`flush_ep=own|data`).
+The second endpoint is an optimization and never fails a communicator:
+it asks for the least the read needs (an `fi_dupinfo` copy of the data
+endpoint's info cut to `FI_RMA | FI_READ`, transmit-only CQ binding, a
+local-read landing pad), and any failure while it comes up -- it is a second
+cxi address context, the allocation `_check` documents failing with
+-FI_ENOMEM under node memory pressure -- closes what was created, prints
+`mojoccl: flush endpoint unavailable, flushing on the data endpoint` and
+flushes on the data endpoint, correct and only later. It is not retried.
+`MOJOCCL_IB_TRACE=1`'s closing `mojoccl net:` line says which endpoint
+flushed (`flush_ep=own|data`). It is opened on every GPU: the serialisation
+is a property of a libfabric endpoint's transmit queue, not of the GPU. Only
+MI300A was measured; NVIDIA on libfabric (Slingshot GH200, EFA) is not
+(H100 here uses verbs, whose flush QP was always separate).
 
 **`fi_enable` returning `-FI_ENOMEM`: the node is out of contiguous kernel
 memory.** Several ranks of one node fail `ncclCommInitRank` with

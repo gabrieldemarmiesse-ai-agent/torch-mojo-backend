@@ -63,7 +63,6 @@ from std.os import getenv
 from std.sys import size_of
 from std.time import perf_counter_ns, sleep
 
-from tmb.ccl.collectives_kernels import _GFX942
 from tmb.ccl.env_vars import (
     MOJOCCL_FABRIC_DOMAIN,
     MOJOCCL_FABRIC_PROVIDER,
@@ -307,18 +306,6 @@ comptime CTX_SEQ_MASK = (1 << 40) - 1
 
 comptime EP_NAME_MAX = 80  # what `IB_BLOB_BYTES` leaves for an endpoint name
 comptime FLUSH_PAD_BYTES = 4096
-comptime _FLUSH_EP = _GFX942
-"""gfx942: the flush read gets an endpoint of its own (`FabricNet.flush_ep`).
-On the data endpoint it sits in the transmit command queue behind whatever
-was posted since -- the next exchange's multi-megabyte write -- so exchange
-e retired only when e+1's payload had gone out. That is why the verbs path
-keeps its flush on a separate self-connected QP (NCCL's gpuFlush QP).
-Measured on 2x4 MI300A, Adastra job 5447705: see `fab_post_flush`.
-
-It is an optimization, never a requirement: `_flush_ep_open` asks for the
-least the read needs (`FLUSH_EP_CAPS`, a transmit-only CQ binding, a
-local-only landing pad), and if any step of it fails the communicator
-flushes on the data endpoint instead, as it did before."""
 comptime FLUSH_EP_CAPS: UInt64 = FI_RMA | FI_READ
 """All the flush endpoint does is initiate one RMA read. No FI_MSG, no
 receive and no remote access: it never receives, and the read's target is
@@ -609,8 +596,8 @@ comptime EAGAIN_SPINS = 1_000_000
 struct FabricNet(Movable):
     """Everything the libfabric transport owns, per communicator.
 
-    One RDM endpoint (two on gfx942 when the second comes up: it only
-    issues the flush read, `_FLUSH_EP`), one completion queue for both
+    One RDM endpoint (two when the second comes up: it only issues the
+    flush read, `_flush_ep_open`), one completion queue for both
     directions, one
     address vector holding this rank's own address (for the flush read) and
     one entry per remote node. Two memory regions: the communicator's device
@@ -640,7 +627,7 @@ struct FabricNet(Movable):
     var my_name: Int  # EP_NAME_MAX scratch holding fi_getname's answer
     var virt_addr: Bool  # FI_MR_VIRT_ADDR: remote addresses are VAs, not offsets
     var need_endpoint_mr: Bool
-    var flush_ep: Int  # gfx942 only (`_FLUSH_EP`); else the flush uses `ep`
+    var flush_ep: Int  # 0 if `_flush_ep_open` failed: the flush uses `ep`
     var flush_mr: Int  # its landing pad's MR under FI_MR_ENDPOINT, or 0
     var flush_desc: Int
     var flush_info: Int  # `fi_dupinfo` copy flush_ep was opened from, or 0
@@ -995,9 +982,15 @@ def _reg_mr(
 
 
 def _flush_ep_open(mut st: FabricNet) raises:
-    """Bring up the flush endpoint (`_FLUSH_EP`) and, under FI_MR_ENDPOINT,
-    its landing pad's MR. On an error the caller runs `_flush_ep_close`,
-    which undoes whatever part of this ran.
+    """Bring up the flush endpoint and, under FI_MR_ENDPOINT, its landing
+    pad's MR. On an error the caller runs `_flush_ep_close`, which undoes
+    whatever part of this ran, and the flush stays on the data endpoint.
+
+    On the data endpoint the flush read sits in the transmit queue behind
+    whatever was posted since -- the next exchange's multi-megabyte write --
+    so exchange e retires only once e+1's payload has gone out. The verbs
+    path keeps its flush on a separate QP for the same reason (NCCL's
+    gpuFlush QP). An optimization, never a requirement.
 
     Same domain (so the same NIC and PCIe function, which is what makes its
     read a flush of that NIC's earlier writes), same CQ and AV as the data
@@ -1249,22 +1242,21 @@ def _fab_setup_once(
         st.host_mr = hmr
         st.host_desc = fi_mr_desc(st.host_mr)
         st.flush_desc = st.host_desc
-        comptime if _FLUSH_EP:
-            try:
-                _flush_ep_open(st)
-            except e:
-                # Never fatal: the data endpoint flushes correctly, only
-                # later (see `_FLUSH_EP`). A second endpoint is a second
-                # cxi address context, and the node memory pressure `_check`
-                # describes can deny it after the first one succeeded.
-                _flush_ep_close(st)
-                print(
-                    (
-                        "mojoccl: flush endpoint unavailable, flushing on the"
-                        " data endpoint --"
-                    ),
-                    e,
-                )
+        try:
+            _flush_ep_open(st)
+        except e:
+            # Never fatal: the data endpoint flushes correctly, only later.
+            # A second endpoint is a second cxi address context, and the
+            # node memory pressure `_check` describes can deny it after the
+            # first one succeeded.
+            _flush_ep_close(st)
+            print(
+                (
+                    "mojoccl: flush endpoint unavailable, flushing on the"
+                    " data endpoint --"
+                ),
+                e,
+            )
 
         # ---- the communicator's region ---------------------------------
         # Ask the provider which accelerator interface can register this
@@ -1673,14 +1665,8 @@ def fab_post_flush(
     read stays: it costs about a microsecond and it is the difference
     between an argument and a guarantee. The flush is always enabled.
 
-    On gfx942 it is posted on its own endpoint (`_FLUSH_EP`). On the data
-    endpoint it queued behind the next exchange's write, already in the
-    command queue, so exchange e retired only once e+1's payload had been
-    sent: measured on 2x4 MI300A (Adastra job 5447705, streamed device
-    time per call), an XL bf16 all-gather split into two 3.84 MB exchanges
-    saw its first exchange retire at ~423 us instead of ~225 us. With the
-    separate endpoint the 7.68 MB/rank all-gather went 654 -> 601 us, and
-    the 41 MB/rank one 2682 -> 2365 us.
+    It goes on its own endpoint when one came up (`_flush_ep_open`;
+    measured in agents_docs/distributed.md).
     """
     for _ in range(EAGAIN_SPINS):
         var rc = fi_read(
