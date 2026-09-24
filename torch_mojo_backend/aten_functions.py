@@ -2078,8 +2078,8 @@ def _conv2d_backward_input(
             raise ValueError(
                 f"Weight dim 0 ({out_channels}) must be divisible by groups ({groups})."
             )
-        weight_groups = F.split(weight, [out_channels // groups] * groups, axis=0)
-        grad_groups = F.split(grad_cols, [out_channels // groups] * groups, axis=1)
+        weight_groups = _split(weight, [out_channels // groups] * groups, axis=0)
+        grad_groups = _split(grad_cols, [out_channels // groups] * groups, axis=1)
 
     parts = []
     for weight_group, grad_group in zip(weight_groups, grad_groups):
@@ -2148,8 +2148,8 @@ def _conv2d_backward_weight(
             )
         pairs = list(
             zip(
-                F.split(input_nhwc, [in_channels // groups] * groups, axis=0),
-                F.split(grad_rscf, [out_channels // groups] * groups, axis=3),
+                _split(input_nhwc, [in_channels // groups] * groups, axis=0),
+                _split(grad_rscf, [out_channels // groups] * groups, axis=3),
             )
         )
 
@@ -2226,26 +2226,26 @@ def aten_convolution_backward(
             "Expected 3 (1D) or 4 (2D)."
         )
 
-    stride, padding, dilation, _ = _normalize_2d_params(
+    stride_2d, padding_2d, dilation_2d, _ = _normalize_2d_params(
         stride, padding, dilation, output_padding
     )
-    if padding[0] != padding[1] or padding[2] != padding[3]:
+    if padding_2d[0] != padding_2d[1] or padding_2d[2] != padding_2d[3]:
         raise NotImplementedError(
             "convolution_backward does not support asymmetric padding."
         )
-    padding = (int(padding[0]), int(padding[2]))
-    stride = (int(stride[0]), int(stride[1]))
-    dilation = (int(dilation[0]), int(dilation[1]))
+    pad_hw = (int(padding_2d[0]), int(padding_2d[2]))
+    stride_hw = (int(stride_2d[0]), int(stride_2d[1]))
+    dilation_hw = (int(dilation_2d[0]), int(dilation_2d[1]))
 
     grad_input = None
     if mask[0]:
         grad_input = _conv2d_backward_input(
-            grad_output, input, weight, stride, padding, dilation, groups
+            grad_output, input, weight, stride_hw, pad_hw, dilation_hw, groups
         )
     grad_weight = None
     if mask[1]:
         grad_weight = _conv2d_backward_weight(
-            grad_output, input, weight, stride, padding, dilation, groups
+            grad_output, input, weight, stride_hw, pad_hw, dilation_hw, groups
         )
     grad_bias = None
     if mask[2]:

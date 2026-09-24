@@ -14,6 +14,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
@@ -23,8 +24,6 @@ from torch_mojo_backend.testing import (
     check_functions_are_equivalent,
     check_outputs,
 )
-
-from .conftest import matmul_tolerance, require_cuda_autograd
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -2224,7 +2223,7 @@ def test_aten_div_rounding_mode_floor_trunc_disagree(
     check_outputs(fn, conf, [x, y])
 
 
-def _convolution_backward_tolerance(device: str) -> dict[str, float]:
+def _convolution_backward_tolerance(device: str) -> Tolerance:
     """How far a composed conv backward may sit from stock torch's.
 
     On CPU the arithmetic is plain fp32 on both sides, but the reductions are
@@ -2290,7 +2289,10 @@ def _convolution_backward_call(case: str):
 
 
 @pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
 def test_aten_convolution_backward(case: str, conf: Conf, call_checker: CallChecker):
+    """AOTAutograd keeps `convolution_backward.default` as a backward graph
+    node (it is not in DECOMPOSITION_TABLE), so the compile backend maps it."""
     call_checker.register(aten_functions.aten_convolution_backward)
     check_outputs(
         _convolution_backward_call(case),
@@ -2318,43 +2320,44 @@ def test_aten_convolution_backward_compiled(case: str, device: str):
     )
 
 
-def test_aten_convolution_backward_output_mask_compiled(device: str):
-    """Each gradient in isolation: a masked-off slot must not be computed,
-    and the ones that are must not change because the others were skipped."""
-    grad_output, x, weight = _convolution_backward_inputs("k3s1p1")
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+        [True, True, False],
+        [False, True, True],
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: list[bool]
+):
+    """Only the requested gradients are computed, and they do not change
+    because the others were skipped."""
+    call_checker.register(aten_functions.aten_convolution_backward)
 
-    for slot in range(3):
-        mask = [index == slot for index in range(3)]
-
-        def fn(grad_output, x, weight, mask=mask, slot=slot):
-            return aten.convolution_backward(
-                grad_output,
-                x,
-                weight,
-                [8],
-                [1, 1],
-                [1, 1],
-                [1, 1],
-                False,
-                [0, 0],
-                1,
-                mask,
-            )[slot]
-
-        check_functions_are_equivalent(
-            fn,
-            device,
-            [grad_output, x, weight],
-            **_convolution_backward_tolerance(device),
+    def fn(grad_output, x, weight):
+        outputs = aten.convolution_backward(
+            grad_output, x, weight, [8], [1, 1], [1, 1], [1, 1], False, [0, 0], 1, mask
         )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    check_outputs(
+        fn, conf, _convolution_backward_inputs("k3s1p1"), atol=1e-4, rtol=1e-4
+    )
 
 
 @pytest.mark.parametrize("stride,padding,dilation", [(1, 0, 1), (2, 1, 1), (1, 2, 2)])
-def test_aten_convolution_backward_1d_compiled(
-    device: str, stride: int, padding: int, dilation: int
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_1d(
+    conf: Conf, call_checker: CallChecker, stride: int, padding: int, dilation: int
 ):
     """conv1d's backward, through the same rank-4 path behind a size-1 H
     axis."""
+    call_checker.register(aten_functions.aten_convolution_backward)
     torch.manual_seed(0)
     length = (17 + 2 * padding - (dilation * 2 + 1)) // stride + 1
     inputs = [
@@ -2378,9 +2381,7 @@ def test_aten_convolution_backward_1d_compiled(
             [True, True, True],
         )
 
-    check_functions_are_equivalent(
-        fn, device, inputs, **_convolution_backward_tolerance(device)
-    )
+    check_outputs(fn, conf, inputs, atol=1e-4, rtol=1e-4)
 
 
 def test_aten_convolution_trains_end_to_end_compiled(device: str):

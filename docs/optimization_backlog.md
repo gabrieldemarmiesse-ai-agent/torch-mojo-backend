@@ -70,7 +70,7 @@ different kind of item.
 | [A5](#a5) | `attn_mask` is a hard decline in eager SDPA | Attention | High for HF models | Medium | — |
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
 | [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
-| [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
+| [C3](#c3) | conv backward is materialized im2col/col2im + GEMM, not implicit GEMM; no conv3d/transposed in eager | Conv | High for vision *training* | High | — |
 | [N2](#n2) | BatchNorm / GroupNorm backward are composed from existing kernels, not fused (0.9-4.5x stock) | Normalization | Medium for vision training | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
 | [Q3](#q3) | Graph `max_pool2d_with_indices` returns the values as the indices | Graph | Correctness bug | Low | — |
@@ -945,27 +945,26 @@ temporary** — **DONE** (`NormSpec`)
   (depthwise-heavy) model, and `TORCH_MOJO_BACKEND_TRACE=1` to count launches.
 
 ### C3
-**Convolution is 2-D and forward-only in eager**
+**Convolution backward rides the materialized im2col route; no conv3d / transposed**
 
-* **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
-  and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
-* **Current implementation.** conv1d (rank-3 input), conv3d and transposed
-  convolutions all return `NOT_HANDLED` → raise. There is no eager conv
-  backward, so `mojo_device_convolution` refuses any conv whose operands
-  require grad in the FORWARD (see [N2](#n2) for why it cannot wait for the
-  backward node). A conv weight normally requires grad, so that is every conv
-  in a training model; inference under `torch.no_grad()` is unaffected.
-* **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
-  `(N, C, 1, L)` with a `(1, kw)` kernel. The missing backward blocks all vision
-  training together with [N2](#n2) and [C4](#c4).
-* **What the optimized version looks like.** conv1d by reshape into the existing
-  2-D path; `convolution_backward` as dgrad (col2im of a GEMM) plus wgrad (a
-  transposed-A GEMM against the im2col matrix) — the same `TRANSPOSE_A`
-  capability [G2](#g2) asks for.
-* **Expected win.** N/A (coverage).
-* **How to measure it.** `tests/test_aten_functions.py`; then a resnet-18
-  training step.
+* **What.** `op_convolution_backward` in `tmb/ops/matmul.mojo`. conv1d and
+  conv2d forward and backward are native; conv3d and transposed convolutions
+  decline (`_conv_geometry`).
+* **Current implementation.** grad_output is copied once to (K, N*OH*OW)
+  (skipped at N == 1), the input is im2col'ed patch-major, so grad_weight is
+  one `_linear_route` GEMM per group with the batch folded into K and
+  grad_input one `_mm_route` GEMM per group followed by `Col2im` (a gather,
+  deterministic, fp32 accumulation). grad_bias is a row sum of the permuted
+  grad_output. Grouped convolutions copy each group's GEMM result into place.
+* **Why it is not optimal.** Both spatial gradients write and re-read a full
+  column buffer (C*KH*KW x N*OH*OW), and depthwise runs one tiny GEMM per
+  group. `benchmarks/test_vision.py::test_conv2d_backward` has the ratios.
+* **What the optimized version looks like.** Implicit-GEMM dgrad / wgrad
+  (the columns never materialized), a grouped/batched GEMM launch for
+  depthwise, and conv3d / transposed by the same patch kernels.
+* **Expected win.** Several x on the spatial gradients (column traffic
+  dominates the materialized route).
+* **How to measure it.** `uv run pytest benchmarks/test_vision.py -k backward`.
 
 ### C4
 **Pooling has no `ceil_mode` and no backward**

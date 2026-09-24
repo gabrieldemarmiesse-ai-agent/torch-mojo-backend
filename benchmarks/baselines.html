@@ -7975,6 +7975,74 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "convolution_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 3.149,
+                    "dgrad": 5.002,
+                    "wgrad": 6.826
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 6.063,
+                    "dgrad": 15.411,
+                    "wgrad": 32.244
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 6.285,
+                    "dgrad": 8.723,
+                    "wgrad": 10.171
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 6.087,
+                    "dgrad": 2.477,
+                    "wgrad": 23.827
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 3.126,
+                    "dgrad": 5.091,
+                    "wgrad": 6.631
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 6.237,
+                    "dgrad": 11.974,
+                    "wgrad": 13.196
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 6.202,
+                    "dgrad": 5.907,
+                    "wgrad": 7.143
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 6.229,
+                    "dgrad": 3.779,
+                    "wgrad": 7.644
+                  }
+                }
+              }
+            }
+          }
+        },
         "cos": {
           "dtypes": {
             "bf16": {

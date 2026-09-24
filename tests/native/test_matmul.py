@@ -1,5 +1,6 @@
 """End-to-end checks of the matmul group on the native backend: mm, bmm,
-addmm, linear, linear_backward, addr and the convolution forward.
+addmm, linear, linear_backward, addr and the convolution forward and
+backward.
 
 Public torch API only — every assertion compares the mojo device against the
 same computation on CPU, and `assert_ran` proves the native op is what
@@ -7,6 +8,7 @@ produced it (rather than a decomposition into something else).
 """
 
 import contextlib
+import copy
 import os
 import pathlib
 import re
@@ -1273,6 +1275,209 @@ def test_conv_transposed_declines(mojo_device):
     w = torch.randn(3, 2, 3, 3).to(mojo_device)
     with pytest.raises(NotImplementedError):
         torch.nn.functional.conv_transpose2d(x, w)
+
+
+# --- convolution_backward -----------------------------------------------------
+
+# (n, c, spatial, out_c, kernel, stride, padding, dilation, groups): odd and
+# rectangular extents, every stride/padding/dilation regime, grouped and
+# depthwise, batch 1 (where grad_output needs no permuting copy) and the 1x1
+# stride-1 case (where im2col and col2im are the identity).
+_CONV_BWD_CASES = {
+    "k3s1p1": (2, 6, (9, 11), 8, (3, 3), 1, 1, 1, 1),
+    "stride2": (2, 6, (11, 11), 8, (3, 3), 2, 1, 1, 1),
+    "unpadded": (3, 4, (10, 13), 6, (3, 3), 1, 0, 1, 1),
+    "dilation2": (2, 4, (13, 13), 6, (3, 3), 1, 2, 2, 1),
+    "groups2": (2, 8, (9, 9), 12, (3, 3), 1, 1, 1, 2),
+    "depthwise": (2, 6, (9, 9), 6, (3, 3), 1, 1, 1, 6),
+    "pointwise": (2, 5, (7, 7), 4, (1, 1), 1, 0, 1, 1),
+    "pointwise_n1": (1, 5, (7, 9), 4, (1, 1), 1, 0, 1, 1),
+    "pointwise_grouped_n1": (1, 4, (6, 6), 8, (1, 1), 1, 0, 1, 2),
+    # (11 + 2 - 3) // 2 + 1 == 5 drops a row: the last input row has no tap.
+    "truncating_n1": (1, 4, (11, 9), 6, (3, 3), 2, 1, 1, 1),
+    "rect_per_axis": (2, 3, (12, 10), 5, (5, 3), (2, 1), (2, 1), (1, 2), 1),
+    "grouped_n1": (1, 6, (8, 8), 6, (3, 3), 1, 1, 1, 3),
+    "1d": (2, 3, (17,), 8, (3,), 1, 0, 1, 1),
+    "1d_stride2_groups2": (2, 8, (25,), 12, (3,), 2, 1, 1, 2),
+    "1d_depthwise": (2, 6, (19,), 6, (5,), 2, 2, 1, 6),
+    "1d_pointwise_n1": (1, 5, (13,), 7, (1,), 1, 0, 1, 1),
+    "1d_dilated": (3, 4, (11,), 6, (4,), 3, 3, 2, 1),
+}
+
+
+def _conv_bwd_args(case: str) -> tuple[list[torch.Tensor], list[object]]:
+    n, c, spatial, out_c, kernel, stride, padding, dilation, groups = _CONV_BWD_CASES[
+        case
+    ]
+    rank = len(spatial)
+
+    def per_axis(v):
+        return list(v) if isinstance(v, tuple) else [v] * rank
+
+    stride, padding, dilation = per_axis(stride), per_axis(padding), per_axis(dilation)
+    out = [
+        (spatial[i] + 2 * padding[i] - dilation[i] * (kernel[i] - 1) - 1) // stride[i]
+        + 1
+        for i in range(rank)
+    ]
+    gen = torch.Generator().manual_seed(0)
+    tensors = [
+        torch.randn(n, out_c, *out, generator=gen),
+        torch.randn(n, c, *spatial, generator=gen),
+        torch.randn(out_c, c // groups, *kernel, generator=gen),
+    ]
+    rest = [[out_c], stride, padding, dilation, False, [0] * rank, groups]
+    return tensors, rest
+
+
+def _conv_bwd_bound(dtype: torch.dtype, k: int) -> float:
+    """Per-element error allowance relative to |go| (x) |x| (x) |w|, the
+    same backward over absolute values.
+
+    fp32 is an fp32 accumulation of `k` terms: ~sqrt(k) half-ulps, x8 for
+    margin. A 16-bit dtype also rounds the output once, and the data
+    gradient's intermediate columns once before col2im sums them: two
+    half-ulps of the 16-bit format, x2 for margin.
+    """
+    acc = 8 * torch.finfo(torch.float32).eps * k**0.5
+    if dtype == torch.float32:
+        return acc
+    return acc + 2 * torch.finfo(dtype).eps
+
+
+def _check_conv_bwd(case: str, dtype: torch.dtype, mask: list[bool], device: str):
+    tensors, rest = _conv_bwd_args(case)
+    tensors = [t.to(dtype) for t in tensors]
+    with assert_ran("aten::convolution_backward"):
+        got = torch.ops.aten.convolution_backward(
+            *[t.to(device) for t in tensors], *rest, mask
+        )
+    ref = torch.ops.aten.convolution_backward(
+        *[t.double() for t in tensors], *rest, [True, True, True]
+    )
+    mag = torch.ops.aten.convolution_backward(
+        *[t.double().abs() for t in tensors], *rest, [True, True, True]
+    )
+    grad_output, x, weight = tensors
+    groups = _CONV_BWD_CASES[case][-1]
+    k_in = weight.shape[0] // groups * weight[0, 0].numel()
+    k_param = grad_output.numel() // grad_output.shape[1]
+    for slot, wanted in enumerate(mask):
+        if not wanted:
+            assert got[slot] is None
+            continue
+        assert got[slot].dtype == dtype
+        assert got[slot].shape == ref[slot].shape
+        bound = mag[slot] * _conv_bwd_bound(dtype, k_in if slot == 0 else k_param)
+        err = (got[slot].cpu().double() - ref[slot]).abs()
+        assert (err <= bound + 1e-30).all(), (
+            f"slot {slot}: worst error {err.max().item()} at bound "
+            f"{bound.flatten()[err.argmax()].item()}"
+        )
+
+
+@pytest.mark.parametrize("case", _CONV_BWD_CASES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_convolution_backward(mojo_device, case, dtype):
+    _check_conv_bwd(case, dtype, [True, True, True], mojo_device)
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+        [True, True, False],
+        [True, False, True],
+        [False, True, True],
+        [False, False, False],
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("case", ["stride2", "groups2", "pointwise_n1", "1d"])
+def test_convolution_backward_output_mask(mojo_device, case, mask):
+    """Masked-off slots come back undefined (None), and the requested ones do
+    not depend on which others were skipped."""
+    _check_conv_bwd(case, torch.float32, mask, mojo_device)
+
+
+def test_convolution_backward_float16(mojo_device):
+    _check_conv_bwd("rect_per_axis", torch.float16, [True, True, True], mojo_device)
+
+
+def test_convolution_backward_strided_operands(mojo_device):
+    """A channels-last grad_output, a transposed-view input and a
+    channels-last weight all go through the same gradients."""
+    tensors, rest = _conv_bwd_args("stride2")
+    grad_output, x, weight = tensors
+    ref = torch.ops.aten.convolution_backward(
+        grad_output.double(), x.double(), weight.double(), *rest, [True] * 3
+    )
+    go_m = grad_output.to(mojo_device).to(memory_format=torch.channels_last)
+    x_m = x.transpose(2, 3).contiguous().to(mojo_device).transpose(2, 3)
+    w_m = weight.to(mojo_device).to(memory_format=torch.channels_last)
+    assert not go_m.is_contiguous() and not x_m.is_contiguous()
+    with assert_ran("aten::convolution_backward"):
+        got = torch.ops.aten.convolution_backward(go_m, x_m, w_m, *rest, [True] * 3)
+    for g, r in zip(got, ref, strict=True):
+        torch.testing.assert_close(g.cpu().double(), r, atol=1e-4, rtol=1e-4)
+
+
+def test_convolution_backward_transposed_declines(mojo_device):
+    x = torch.randn(1, 3, 8, 8).to(mojo_device)
+    w = torch.randn(3, 2, 3, 3).to(mojo_device)
+    go = torch.randn(1, 2, 10, 10).to(mojo_device)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.convolution_backward(
+            go, x, w, [2], [1, 1], [0, 0], [1, 1], True, [0, 0], 1, [True] * 3
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: torch.nn.Conv2d(5, 7, 3, stride=2, padding=1),
+        lambda: torch.nn.Conv2d(6, 6, 3, padding=1, groups=6, bias=False),
+        lambda: torch.nn.Conv2d(4, 8, (3, 5), padding=(1, 2), dilation=(1, 2)),
+        lambda: torch.nn.Conv1d(5, 7, 5, stride=2, padding=2),
+        lambda: torch.nn.Conv1d(6, 9, 3, groups=3),
+    ],
+    ids=[
+        "conv2d_s2",
+        "conv2d_depthwise",
+        "conv2d_rect_dilated",
+        "conv1d_s2",
+        "conv1d_g3",
+    ],
+)
+def test_conv_module_trains(mojo_device, make, bias, dtype):
+    """nn.Conv forward then .backward(): every parameter's .grad and the
+    input's match CPU, and the backward is the native op."""
+    torch.manual_seed(0)
+    conv = make()
+    if not bias:
+        conv.bias = None
+    spatial = (13, 11) if isinstance(conv, torch.nn.Conv2d) else (23,)
+    x = torch.randn(3, conv.in_channels, *spatial)
+
+    def run(module, device, dt):
+        module = module.to(device=device, dtype=dt)
+        xi = x.to(device=device, dtype=dt).requires_grad_()
+        out = module(xi)
+        out.backward(torch.ones_like(out) * 0.5)
+        return [xi.grad] + [p.grad for p in module.parameters()]
+
+    ref = run(copy.deepcopy(conv), "cpu", torch.float64)
+    with assert_ran("aten::convolution", "aten::convolution_backward"):
+        got = run(conv, mojo_device, dtype)
+    tol = 1e-4 if dtype == torch.float32 else 5e-2
+    assert len(got) == len(ref)
+    for g, r in zip(got, ref, strict=True):
+        assert g is not None and g.dtype == dtype
+        torch.testing.assert_close(g.cpu().double(), r, atol=tol, rtol=tol)
 
 
 # --- torch.matmul decomposes onto the registered ops --------------------------

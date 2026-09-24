@@ -49,7 +49,8 @@ some other way, and it is a promise, not a fix.
 `call_cuda(fn, *args)` is the two together: convert, call, convert back, all
 under the stream. `enable_cuda_fallback()` is the same conversion installed as
 a dispatcher fallback, so an op with a CUDA kernel and no Mojo op runs this
-way -- with the two exceptions `_convolution_backward_overrideable` describes.
+way. It fires only where no kernel is registered at all, so an op the native
+backend registers and then declines at run time still raises.
 
 Gradients do not cross an alias (DLPack carries no autograd history), so
 `call_cuda` is a leaf: wrap a package's forward and backward entry points in
@@ -441,58 +442,8 @@ def _cuda_fallback(
         return _to_mojo(out, originals)
 
 
-def _convolution_backward_overrideable(
-    grad_output: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    stride: list[int],
-    padding: list[int],
-    dilation: list[int],
-    transposed: bool,
-    output_padding: list[int],
-    groups: int,
-    output_mask: list[bool],
-) -> tuple[torch.Tensor | None, ...]:
-    """`aten::convolution_backward` never reaches the fallback.
-
-    It is CompositeExplicitAutograd and branches on the backend itself,
-    sending anything that is not CPU / CUDA / MKLDNN to this stub -- which
-    has a CompositeExplicitAutograd kernel of its own that only raises "use
-    TORCH_LIBRARY_IMPL to override this function". A fallback fires where
-    *no* kernel is registered, so it never sees either name. Registering the
-    stub by hand is that TORCH_LIBRARY_IMPL, and it is what makes a
-    convolution trainable on the mojo device while `convolution_backward`
-    has no Mojo op.
-    """
-    bias_sizes = [weight.shape[1] * groups if transposed else weight.shape[0]]
-    with on_mojo_stream(_gpu_index(input.device)):
-        grads = torch.ops.aten.convolution_backward(
-            as_cuda(grad_output),
-            as_cuda(input),
-            as_cuda(weight),
-            bias_sizes,
-            stride,
-            padding,
-            dilation,
-            transposed,
-            output_padding,
-            groups,
-            output_mask,
-        )
-        return tuple(None if g is None else as_mojo(g) for g in grads)
-
-
-# Ops that need a registration of their own rather than the fallback, because
-# ATen already put a kernel at the mojo key for them (see the docstring above).
-_EXPLICIT_ROUTES = {
-    "aten::convolution_backward_overrideable": _convolution_backward_overrideable
-}
-
-
-def _install(lib: torch.library.Library, aten: torch.library.Library):
+def _install(lib: torch.library.Library):
     lib.fallback(_cuda_fallback, "PrivateUse1")
-    for name, fn in _EXPLICIT_ROUTES.items():
-        aten.impl(name, fn, "PrivateUse1", allow_override=True)
 
 
 def enable_cuda_fallback():
@@ -503,9 +454,8 @@ def enable_cuda_fallback():
     if not is_available():
         raise RuntimeError("the CUDA fallback needs a CUDA build of torch")
     lib = torch.library.Library("_", "IMPL")  # noqa: TOR901 -- a process-lifetime registration, by design
-    aten = torch.library.Library("aten", "IMPL")  # noqa: TOR901 -- idem
-    _install(lib, aten)
-    _fallback_libs.extend((lib, aten))
+    _install(lib)
+    _fallback_libs.append(lib)
 
 
 @contextlib.contextmanager
@@ -519,11 +469,8 @@ def cuda_fallback() -> Iterator[None]:
     """
     if not is_available():
         raise RuntimeError("the CUDA fallback needs a CUDA build of torch")
-    with (
-        torch.library._scoped_library("_", "IMPL") as lib,
-        torch.library._scoped_library("aten", "IMPL") as aten,
-    ):
-        _install(lib, aten)
+    with torch.library._scoped_library("_", "IMPL") as lib:
+        _install(lib)
         yield
 
 
