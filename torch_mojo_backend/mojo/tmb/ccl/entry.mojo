@@ -135,6 +135,7 @@ from tmb.ccl.collectives_kernels import (
     STATUS_FAULT_WORD,
     STATUS_HOST_FAULT_WORD,
     STATUS_PAGE_BYTES,
+    _AMD,
     _COPY_MAX_BLOCKS,
     _GFX942,
     _shard_per,
@@ -334,38 +335,20 @@ def _pipe_split_unit() -> Int:
     return PIPE_SPLIT_UNIT
 
 
-comptime AG_NODE_BLOCKS = 24 if _GFX942 else 96
+comptime AG_NODE_BLOCKS = 96
 """Grid cap of the node-local gathers of a multi-node all-gather, in place
-of the single-node copy cap (432). Read it through `_ag_node_blocks`.
-
-gfx942 APU (MI300A): RCCL 2.22.3's multi-node MI300A geometry, 24 channels
-of one 256-thread CTA each (rccl `src/init.cc:1339-1346` sets 6 channels per
-ring x 4 rings when the device has direct managed-memory access from the
-host and there is more than one node; `src/device/device.h:74` 256
-threads). Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16,
-ABBA legs, tok/s: 432 blocks 20.9k/20.7k, 96 22.0k/21.8k, 24 23.0k/22.8k,
-mojo+RCCL 23.1k/22.1k. Isolated (streamed device us per call, block bf16
-7.68 MB / root fp32 41.0 MB per rank): 432 -> 742/3034, 96 -> 599/2669,
-24 -> 650/2686. So 96 blocks is the faster isolated collective and 24 wins
-only end to end, where the gathers run beside the compute stream and every
-CU they hold is one the GEMMs lose.
-
-A discrete gfx942 (MI300X, MI325X) does not take RCCL's rule, so it does
-not take this one either (`CommState.apu`, RCCL's own test): it keeps the
-single-node copy cap it had before, and nothing here was measured on one.
-
-H100: the gathers run under the forward's and backward's GEMMs, so the
-cap is fitted end to end, not on the isolated collective: GPT-2 XL FSDP2 on
-2x8 H100, mojo+mojoccl tok/s at 32 reduce-scatter CTAs (CUDA+NCCL 70.2k):
-32 -> 66.5k, 64 -> 66.5-67.0k, 96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432
-with 128 reduce-scatter CTAs 62.4k. Isolated, 64 blocks still beat NCCL
-(block bf16 0.92x, root fp32 0.94x). NCCL's 16 CTAs are not the answer for
-a pull: 16 blocks x 16 vectors in flight measures the same isolated time as
-96 x 4 on the XL sizes (block 360 vs 348 us, root 1031 vs 1027) yet
-63.1-64.8k tok/s end to end against 66.1-69.1k -- a latency-bound pull
-under the compute stream's HBM traffic loses far more from 6x fewer CTAs
-than the GEMMs gain from the freed SMs, and the compute stream waits on
-this gather. (gfx942 pushes, so its gathers are not latency-bound loads.)"""
+of the single-node copy cap (432). The gathers run under the forward's and
+backward's GEMMs, so the cap is fitted end to end, not on the isolated
+collective: GPT-2 XL FSDP2 on 2x8 H100, mojo+mojoccl tok/s at 32
+reduce-scatter CTAs (CUDA+NCCL 70.2k): 32 -> 66.5k, 64 -> 66.5-67.0k,
+96 -> 67.3-67.6k, 128 -> 65.3-66.7k; 432 with 128 reduce-scatter CTAs
+62.4k. Isolated, 64 blocks still beat NCCL (block bf16 0.92x, root fp32
+0.94x). NCCL's 16 CTAs are not the answer for a pull: 16 blocks x 16
+vectors in flight measures the same isolated time as 96 x 4 on the XL sizes
+(block 360 vs 348 us, root 1031 vs 1027) yet 63.1-64.8k tok/s end to end
+against 66.1-69.1k -- a latency-bound pull under the compute stream's HBM
+traffic loses far more from 6x fewer CTAs than the GEMMs gain from the
+freed SMs, and the compute stream waits on this gather."""
 comptime AG_NODE_UNROLL = 2 if _GFX942 else 4
 """16-byte vectors in flight per thread in those gathers. gfx942: RCCL's
 unroll for gfx94 parts with more than 80 CUs (rccl `src/init.cc:101-105`,
@@ -376,14 +359,32 @@ only measured together with the 24-block grid (b589468), never on its own.
 H100: 8 measured 66.1k tok/s against 67.3-67.6k at 96 blocks."""
 
 
-def _ag_node_blocks(state: CommState) -> Int:
-    """`AG_NODE_BLOCKS`, with RCCL's APU test: a discrete gfx942 keeps the
-    single-node copy cap. Every rank of the communicator takes the same
-    answer: `apu` is the AND of all ranks' queries (bootstrap round 2)."""
-    comptime if _GFX942:
-        if not state.apu:
-            return _COPY_MAX_BLOCKS
-    return AG_NODE_BLOCKS
+comptime RCCL_APU_NODE_CTAS = 24
+"""Grid of a multi-node collective's node-local kernels on an APU (MI300A):
+the all-gather's gathers and the reduce-scatter's node reduce. RCCL 2.22.3
+forces 24 channels (4 rings x 6, one 256-thread CTA each) on a gfx942 whose
+host accesses its managed memory directly (an APU) when there is more than
+one node (rccl `src/init.cc:1339-1346`, `src/device/device.h:74`).
+Measured on 2x4 MI300A, Adastra job 5447705, GPT-2 XL FSDP2 bf16, ABBA legs,
+tok/s: gathers at 432/96/24 blocks 20.9k/22.0k/23.0k (mojo+RCCL 23.1k), node
+reduce at 128 -> 24 blocks 22.0k -> 23.2k. In isolation 96 blocks is the
+faster gather (XL bf16 block 599 vs 650 us) and the reduce is network-bound
+(950 vs 951 us), so 24 wins end to end only: every CU a collective holds
+beside the compute stream is one the GEMMs lose. A discrete gfx942 (MI300X,
+MI325X) fails RCCL's test and keeps its caps; nothing was measured on one."""
+
+
+def _node_grids(apu: Bool) -> Tuple[Int, Int]:
+    """Grid caps of a multi-node all-gather's gathers and reduce-scatter's
+    node reduce (0: the allreduce caps), chosen once at init. `apu`: RCCL's
+    test, ANDed over the ranks in bootstrap round 2, since ranks on
+    different grids would block-match different slices of a collective.
+    Only gfx942 asks the question, as RCCL does."""
+    if apu:
+        return (RCCL_APU_NODE_CTAS, RCCL_APU_NODE_CTAS)
+    comptime if _AMD:
+        return (_COPY_MAX_BLOCKS, 0)  # the single-node copy cap
+    return (AG_NODE_BLOCKS, 0)
 
 
 # MI300A: 64 MiB supports four ranks/node without the large shared-memory
@@ -591,15 +592,10 @@ struct CommState(Movable):
     var fused_resident: Int
     # `PIPE_SPLIT_UNIT`; checked equal on every rank at init.
     var split_unit: Int
-    # gfx942 only: this GPU is an APU (MI300A), by RCCL 2.22.3's own test,
-    # `hipDeviceAttributeDirectManagedMemAccessFromHost` (rccl
-    # `src/init.cc:1339-1346`). It selects RCCL's 24-channel multi-node
-    # grids (`_ag_node_blocks`, `RS_NODES_BLOCKS_MI300A`); a discrete gfx942
-    # (MI300X, MI325X) keeps the caps it had before. Always False elsewhere.
-    # The same on every rank: the AND of every rank's query, taken in
-    # bootstrap round 2, since ranks on different grids would block-match
-    # different slices of a collective.
-    var apu: Bool
+    # Grid caps of a multi-node all-gather's gathers and reduce-scatter's
+    # node reduce (`_node_grids`), the same on every rank.
+    var ag_node_blocks: Int
+    var rs_node_blocks: Int
     # Whether multi-node allreduces go through the one-launch fused kernel.
     # Requires the progress thread. A message exceeding the fused work-ring
     # capacity still takes the split schedule at launch time.
@@ -643,7 +639,8 @@ struct CommState(Movable):
         fused_big_bytes: Int,
         fused_resident: Int,
         split_unit: Int,
-        apu: Bool,
+        ag_node_blocks: Int,
+        rs_node_blocks: Int,
         fused: Bool,
         abort_host: Int,
         abort_dev: Int,
@@ -689,7 +686,8 @@ struct CommState(Movable):
         self.fused_big_bytes = fused_big_bytes
         self.fused_resident = fused_resident
         self.split_unit = split_unit
-        self.apu = apu
+        self.ag_node_blocks = ag_node_blocks
+        self.rs_node_blocks = rs_node_blocks
         self.fused = fused
         # Barriers the NVLS kernel has completed on this region. Its flag is a
         # single UInt64 counter that every GPU adds 1 to per barrier, so the
@@ -1724,12 +1722,12 @@ def _bootstrap(
         cfg[unsafe_offset=8] = Int64(FUSED_THREADS)
         cfg[unsafe_offset=9] = Int64(fused_resident)
         cfg[unsafe_offset=10] = Int64(device_sms)
-        # RCCL's APU test, which picks the 24-block multi-node grids
-        # (`CommState.apu`). The query is rank-local and a rank whose driver
-        # call fails answers "discrete" alone, while ranks on different grids
-        # block-match different slices of a collective. So, like the NVLS
-        # column of round 1, every rank ANDs the column: one "discrete"
-        # answer puts the whole communicator on the discrete-GPU grids.
+        # RCCL's APU test, which picks the multi-node grids (`_node_grids`).
+        # The query is rank-local and a rank whose driver call fails answers
+        # "discrete" alone, while ranks on different grids block-match
+        # different slices of a collective. So, like the NVLS column of round
+        # 1, every rank ANDs the column: one "discrete" answer puts the whole
+        # communicator on the discrete-GPU grids.
         cfg[unsafe_offset=11] = Int64(1 if apu else 0)
         var t2 = unsafe_alloc[UInt8](BLOB2 * nranks)
         bootstrap_allgather(conn, _any(b2), BLOB2, _any(t2), timeout_s)
@@ -1878,6 +1876,7 @@ def _bootstrap(
     for i in range(len(topo.rank_at)):
         rank_at.append(topo.rank_at[i])
     var nvls_grid = nvls_blocks(device_sms)
+    var node_grids = _node_grids(apu)
     var state = CommState(
         rank=rank,
         world=nranks,
@@ -1908,7 +1907,8 @@ def _bootstrap(
         fused_big_bytes=fused_big,
         fused_resident=fused_resident,
         split_unit=split_unit,
-        apu=apu,
+        ag_node_blocks=node_grids[0],
+        rs_node_blocks=node_grids[1],
         fused=fused,
         abort_host=abort_host,
         abort_dev=abort_dev,
@@ -3201,7 +3201,7 @@ def _allgather_node_mapped(
             state.generation,
             stride,
             ranks,
-            _ag_node_blocks(state),
+            state.ag_node_blocks,
             mb_req,
             seq,
         )
@@ -3219,7 +3219,7 @@ def _allgather_node_mapped(
         state.generation,
         stride,
         ranks,
-        _ag_node_blocks(state),
+        state.ag_node_blocks,
         mb_req,
         seq,
     )
@@ -4002,7 +4002,7 @@ def _do_reduce_scatter_nodes[
                 count,
                 rank_ids,
                 state.nnodes,
-                state.apu,
+                state.rs_node_blocks,
             )
             var seq = ib_next_seq(state.ib)
             var inbox_base = _inbox_base(state, seq)

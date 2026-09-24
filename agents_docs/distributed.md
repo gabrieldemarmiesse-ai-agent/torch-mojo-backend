@@ -1348,7 +1348,7 @@ one aligned partial per node, each rank RDMA-writes every remote node's
 partial to its counterpart there, and `inbox_sum_out` adds the received
 partials to the local one in the caller's output. On
 MI300A that node-local reduce runs on RCCL's 24 multi-node MI300A channels
-(`RS_NODES_BLOCKS_MI300A`) instead of the allreduce's 128/912 (a discrete
+(`RCCL_APU_NODE_CTAS`) instead of the allreduce's 128/912 (a discrete
 gfx942 keeps 128/912, see below; the split allreduce keeps them everywhere):
 the reduce-scatter is network-bound (15.4 MB/rank fp32 950 vs 951 µs at 128
 vs 24 blocks, 2 × 4 MI300A, job 5447705), and the freed CUs go to the
@@ -1385,7 +1385,7 @@ group): XL block bf16 7.68 MB/rank 887 → 737 µs (RCCL 638), fp32 root
 
 The MI300A gathers of that schedule then take RCCL's multi-node MI300A
 geometry instead of the single-node copy cap: 24 CTAs of 256 threads,
-two 16-byte vectors in flight per thread (`AG_NODE_BLOCKS`,
+two 16-byte vectors in flight per thread (`RCCL_APU_NODE_CTAS`,
 `AG_NODE_UNROLL`; RCCL 2.22.3 forces 24 channels on multi-node MI300A and
 unroll 2 on gfx94 parts with more than 80 CUs). Against the 432-block copy
 cap, 24 blocks is faster in isolation too: block 742 → 650 µs, root
@@ -1401,7 +1401,7 @@ RCCL applies its 24-channel rule only to an APU, which it detects as
 `hipDeviceAttributeDirectManagedMemAccessFromHost` (`init.cc:1339-1346`).
 The discrete gfx942 parts, MI300X and MI325X, are the same ISA, so every
 `comptime` gfx942 choice reaches them too. The two 24-block grids therefore
-use RCCL's own test at run time instead (`CommState.apu`, queried once at
+use RCCL's own test at run time instead (`_node_grids`, queried once at
 init, and ANDed over the ranks in the bootstrap so that a query failing on
 one rank puts every rank on the same grids): a discrete gfx942 keeps the
 single-node copy cap for the gathers and
