@@ -2106,7 +2106,7 @@ def _nt_mfma_kernel[
     ),
 )
 @__name(
-    t"nt_mfma_bias_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_f{FILL_AT}_body{WBODY}_scalar{SCALAR_LOAD}"
+    t"nt_mfma_bias_{dtype}_{BM}x{BN}x{BK}_w{WM}x{WN}_s{STAGES}_z{SWIZZLE}_l{MASK_LOAD}_t{MASK_STORE}_f{FILL_AT}_body{WBODY}_scalar{SCALAR_LOAD}_b{B_KMAJOR}_pair{PAIR}"
 )
 def _nt_bias_mfma_kernel[
     dtype: DType,
@@ -2122,6 +2122,8 @@ def _nt_bias_mfma_kernel[
     FILL_AT: Int,
     WBODY: Bool,
     SCALAR_LOAD: Bool,
+    B_KMAJOR: Bool = True,
+    PAIR: Bool = False,
 ](
     c: Pointer[Scalar[dtype], MutAnyOrigin],
     a: Pointer[Scalar[dtype], ImmutAnyOrigin],
@@ -2145,10 +2147,10 @@ def _nt_bias_mfma_kernel[
         MASK_LOAD,
         MASK_STORE,
         True,
-        True,
+        B_KMAJOR,
         False,
         dtype,
-        False,
+        PAIR,
         FILL_AT,
         WBODY,
         True,
@@ -2943,9 +2945,10 @@ def _nt_mfma_body[
         # read fenced on both sides, which keeps the invariant that matters
         # (no read of an MFMA destination adjacent to a branch) at a sixteenth
         # of the peak register cost.
+        # The bias is indexed by output column only, so B's layout is free.
         comptime assert not FUSE_BIAS or (
-            not SPLITK and otype == dtype and A_KMAJOR and B_KMAJOR
-        ), "bias belongs in the final unsplit k-major epilogue"
+            not SPLITK and otype == dtype and A_KMAJOR
+        ), "bias belongs in the final unsplit epilogue of a k-major A"
         comptime OUT_ALL = size_of[otype]() <= size_of[dtype]()
         _nt_sched_fence()
         var out = stack_allocation[(MT * NTL if OUT_ALL else 1) * 16, otype]()
@@ -3233,6 +3236,12 @@ def _nt_mfma_gemm[
         and NOMASK
         and BK == 32
     ), "bulk-K requires the unmasked bf16 NN split-K schedule"
+    comptime assert not FUSE_BIAS or (
+        A_KMAJOR and not SPLITK and otype == dtype
+    ), "the fused bias is an unsplit epilogue of a k-major A"
+    comptime assert not SCALAR_LOAD or (
+        A_KMAJOR and B_KMAJOR
+    ), "per-element tail loads exist for k-major operands only"
     comptime THREADS = (BM // WM) * (BN // WN) * 64
     var ktiles = k // BK if BULK_K else ceildiv(k, BK)
     var kt_per = _nt_slab_tiles(ktiles, parts) if SPLITK else ktiles
@@ -3262,6 +3271,8 @@ def _nt_mfma_gemm[
                     FILL_AT,
                     BODY2,
                     SCALAR_LOAD,
+                    B_KMAJOR,
+                    PAIR,
                 ]
             ](
                 ctx,
@@ -3558,7 +3569,7 @@ def _nt_mfma_route[
 
 @always_inline
 def _dense_mfma_route[
-    dtype: DType, A_KMAJOR: Bool, B_KMAJOR: Bool
+    dtype: DType, A_KMAJOR: Bool, B_KMAJOR: Bool, FUSE_BIAS: Bool = False
 ](
     c_addr: Int,
     a_addr: Int,
@@ -3567,6 +3578,7 @@ def _dense_mfma_route[
     n: Int,
     k: Int,
     ctx: DeviceContext,
+    bias_addr: Int = 0,
 ) raises -> Bool:
     """The same MFMA core for any combination of dense operand layouts.
 
@@ -3586,7 +3598,13 @@ def _dense_mfma_route[
     does not cover the device leaves CUs idle for the whole k loop.  Two macro
     tiles and every slab count are searched together by `_nt_plan_cost`, and when
     no plan is left the route declines and the caller keeps its own.
+
+    `FUSE_BIAS` (NN only) adds a row bias to the FP32 accumulator before the one
+    rounding: in the unsplit epilogue, or in the split-K reduction.
     """
+    comptime assert not FUSE_BIAS or (
+        A_KMAJOR and not B_KMAJOR and dtype == DType.bfloat16
+    ), "the split-K bias epilogue is the bf16 NN reduction"
     # Whether the native operand's LDS tile holds k PAIRS.  Pairing turns a
     # fragment into two `ds_read_b32` whose dwords ARE the operand register
     # pair -- half the LDS read cycles of the one-element-per-row layout, which
@@ -3596,7 +3614,9 @@ def _dense_mfma_route[
     # the same bytes and the same 64-byte request count.  With BOTH operands
     # native it is worth 40% and is never in doubt; with ONE it is measured, and
     # it splits on the regime -- see the journal.
-    comptime if A_KMAJOR and not B_KMAJOR and size_of[dtype]() == 2:
+    comptime if A_KMAJOR and not B_KMAJOR and size_of[
+        dtype
+    ]() == 2 and not FUSE_BIAS:
         # The MIXED layout is the one the two-tile body loses on, and a k-major B
         # is one transpose away.  Measured one shape per process, this route
         # against `_nt_mfma_route` on the same extents:
@@ -3664,6 +3684,9 @@ def _dense_mfma_route[
     # Whether K can be split at all: a slab has to be a whole number of k tiles,
     # and the reduction reads the workspace 16 bytes at a time.
     var splittable = k % 32 == 0 and c_addr % 8 == 0
+    comptime if FUSE_BIAS:
+        # The bias epilogue reads and writes four columns at a time.
+        splittable = splittable and n % 8 == 0 and bias_addr % 8 == 0
     # Plan search: for each candidate macro tile, every slab count up to
     # `NT_MAX_PARTS`, ranked by `_nt_plan_cost` on grid fill, wave quantization
     # and traffic.  Which plan wins is a property of the runtime shape, not of
@@ -3709,9 +3732,9 @@ def _dense_mfma_route[
 
     @always_inline
     @parameter
-    def _launch[BM: Int, BN: Int, SPLIT_ONLY: Bool = False]() raises:
+    def _launch[BM: Int, BN: Int, SPLIT_ONLY: Bool = False](parts: Int) raises:
         comptime if not SPLIT_ONLY:
-            if b_parts == 1:
+            if parts == 1:
                 _nt_mfma_gemm[
                     dtype,
                     BM,
@@ -3728,9 +3751,11 @@ def _dense_mfma_route[
                     PAIR_FILL,
                     FILL,
                     BODY2,
-                ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx)
+                    False,
+                    FUSE_BIAS,
+                ](c_addr, a_addr, b_addr, m, n, k, 1, xcds, ctx, bias_addr)
                 return
-        var ws = ctx.enqueue_create_buffer[DType.float32](b_parts * m * n)
+        var ws = ctx.enqueue_create_buffer[DType.float32](parts * m * n)
         _nt_mfma_gemm[
             dtype,
             BM,
@@ -3755,34 +3780,49 @@ def _dense_mfma_route[
             m,
             n,
             k,
-            b_parts,
+            parts,
             xcds,
             ctx,
         )
-        comptime VEC = 16 // size_of[DType.float32]()
-        _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
-            ctx,
-            _gs_blocks(m * n // VEC),
-            1,
-            1,
-            256,
-            _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
-            ws.unsafe_ptr().as_unsafe_any_origin().as_imm(),
-            Int64(m * n),
-            Int64(b_parts),
-            Int64(m * n // VEC),
-        )
+        comptime if FUSE_BIAS:
+            _nn_splitk_epilogue[False, True](
+                c_addr,
+                Int(ws.unsafe_ptr()),
+                a_addr,
+                b_addr,
+                bias_addr,
+                m,
+                n,
+                k,
+                k,
+                parts,
+                ctx,
+            )
+        else:
+            comptime VEC = 16 // size_of[DType.float32]()
+            _enqueue_cached[_splitk_reduce_kernel[dtype, VEC]](
+                ctx,
+                _gs_blocks(m * n // VEC),
+                1,
+                1,
+                256,
+                _make_ptr[dtype](c_addr).as_unsafe_any_origin(),
+                ws.unsafe_ptr().as_unsafe_any_origin().as_imm(),
+                Int64(m * n),
+                Int64(parts),
+                Int64(m * n // VEC),
+            )
         _ = ws^
 
     # The mixed layout never selects the second tile, so it does not instantiate
     # it either.
     comptime if BODY2:
         if b_wide:
-            _launch[128, 384, True]()
+            _launch[128, 384, True](b_parts)
         else:
-            _launch[256, 256]()
+            _launch[256, 256](b_parts)
     else:
-        _launch[256, 256]()
+        _launch[256, 256](b_parts)
     return True
 
 
@@ -4117,6 +4157,16 @@ def _amd_dynamic_mfma_dispatch[
             if batch == 1 and a_bstride != 0:
                 if _nn_mfma_partial_k_route(
                     c_addr, a_addr, b_addr, m, n, k, ctx
+                ):
+                    return True
+        comptime if dtype == DType.bfloat16 and not transpose_b and fuse_bias:
+            # addmm(bias, x, W) with W stored `(k, n)`: the NN route below with
+            # the bias added before its one rounding, where MAX's multistage
+            # kernel plus its N-edge kernel ran 1.4-4.3x behind hipBLASLt on
+            # the 1024-row forward GEMMs of a GPT-2 XL block.
+            if batch == 1 and a_bstride != 0 and k % 32 == 0:
+                if _dense_mfma_route[dtype, True, False, True](
+                    c_addr, a_addr, b_addr, m, n, k, ctx, bias_addr
                 ):
                     return True
         comptime if dtype == DType.bfloat16 and transpose_b and fuse_bias:
