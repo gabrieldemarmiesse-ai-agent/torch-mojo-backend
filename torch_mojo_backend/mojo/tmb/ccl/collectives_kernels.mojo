@@ -2519,6 +2519,33 @@ def _allgather_rank[
 
 
 @always_inline
+def _ag_release_to_nic(
+    region: Pointer[UInt8, MutAnyOrigin],
+    mb_req: Pointer[UInt64, MutAnyOrigin],
+    seq: UInt64,
+):
+    """The last block to finish staging releases RDMA exchange `seq` to the
+    proxy (acq_rel arrivals, release mailbox store: `_allgather_body`)."""
+    comptime if _AMD:
+        # Like _sync, flush every wave before the block rendezvous;
+        # s_barrier alone does not drain AMD vector-memory stores.
+        fence[ordering=Ordering.RELEASE]()
+    barrier()
+    if thread_idx.x == 0:
+        var arrive = region.unsafe_offset(_AG_ARRIVE_OFFSET).unsafe_bitcast[
+            UInt64
+        ]()
+        var was = Atomic[DType.uint64].fetch_add[
+            ordering=Ordering.ACQUIRE_RELEASE
+        ](arrive, UInt64(1))
+        if Int(was) == Int(grid_dim.x) - 1:
+            Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
+                arrive, UInt64(0)
+            )
+            Atomic[DType.uint64].store[ordering=Ordering.RELEASE](mb_req, seq)
+
+
+@always_inline
 def _allgather_body[
     U: Int, MAPPED: Bool, GATED: Bool
 ](
@@ -2564,6 +2591,14 @@ def _allgather_body[
     var out_stride = Int(stride_b)
     var stage_off = Int(stage_off_b)
 
+    # A GATED caller ran `rank_gate` ahead of the grid instead: every peer
+    # finished its previous stream work, which the AMD pushes rely on too.
+    comptime if not GATED:
+        if not _sync(
+            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
+        ):
+            return
+
     comptime if _AMD:
         # Push instead of pull (module header, "Link direction"): my
         # contribution goes into every peer's slot for me and straight into my
@@ -2572,19 +2607,6 @@ def _allgather_body[
         # the staging is `(world-1) * nbytes` -- which is why
         # `allgather_max_bytes` chunks smaller here than on NVIDIA.
         var slot = (n + 15) // 16 * 16
-        # The single-block rank gate guarantees that every peer has
-        # completed the previous stream work before any of these writes.
-        comptime if not GATED:
-            if not _sync(
-                regions,
-                world,
-                rank,
-                ERR_ALLGATHER_SYNC,
-                flag_base,
-                t0,
-                timeout_ns,
-            ):
-                return
         var own_output = out_ptr.unsafe_offset(
             _allgather_rank[MAPPED](rank_at, rank) * out_stride
         )
@@ -2602,26 +2624,7 @@ def _allgather_body[
                 tid,
                 stride,
             )
-            # Like _sync, flush every wave before the block rendezvous;
-            # s_barrier alone does not drain AMD vector-memory stores.
-            fence[ordering=Ordering.RELEASE]()
-            barrier()
-            if thread_idx.x == 0:
-                var arrive = (
-                    regions[rank]
-                    .unsafe_offset(_AG_ARRIVE_OFFSET)
-                    .unsafe_bitcast[UInt64]()
-                )
-                var was = Atomic[DType.uint64].fetch_add[
-                    ordering=Ordering.ACQUIRE_RELEASE
-                ](arrive, UInt64(1))
-                if Int(was) == Int(grid_dim.x) - 1:
-                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
-                        arrive, UInt64(0)
-                    )
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        mb_req, seq
-                    )
+            _ag_release_to_nic(regions[rank], mb_req, seq)
         else:
             _copy_bytes[U](own_output, in_ptr, n, tid, stride)
         for i in range(1, world):
@@ -2664,13 +2667,6 @@ def _allgather_body[
             )
         return
 
-    # A GATED caller ran `_gate_kernel` ahead of the grid instead.
-    comptime if not GATED:
-        if not _sync(
-            regions, world, rank, ERR_ALLGATHER_SYNC, flag_base, t0, timeout_ns
-        ):
-            return
-
     # One read of my contribution, two stores: my region (what the peers
     # read) and my own slice of the output.
     _copy_bytes2[U](
@@ -2685,23 +2681,7 @@ def _allgather_body[
     )
     comptime if MAPPED:
         if seq != 0:
-            barrier()
-            if thread_idx.x == 0:
-                var arrive = (
-                    regions[rank]
-                    .unsafe_offset(_AG_ARRIVE_OFFSET)
-                    .unsafe_bitcast[UInt64]()
-                )
-                var was = Atomic[DType.uint64].fetch_add[
-                    ordering=Ordering.ACQUIRE_RELEASE
-                ](arrive, UInt64(1))
-                if Int(was) == Int(grid_dim.x) - 1:
-                    Atomic[DType.uint64].store[ordering=Ordering.RELAXED](
-                        arrive, UInt64(0)
-                    )
-                    Atomic[DType.uint64].store[ordering=Ordering.RELEASE](
-                        mb_req, seq
-                    )
+            _ag_release_to_nic(regions[rank], mb_req, seq)
 
     if not _sync(
         regions, world, rank, ERR_ALLGATHER_SYNC, flag_base + 1, t0, timeout_ns
