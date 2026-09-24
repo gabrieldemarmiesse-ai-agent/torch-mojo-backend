@@ -533,10 +533,20 @@ def op_log2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ = source^
 
 
+def _reciprocal_check(t: T) raises:
+    """Floats and float64: GradScaler takes its inverse scale in float64."""
+    if t.dtype == DType.float64:
+        if dev(t.device)[].api == "metal":
+            unsupported("reciprocal float64 is unavailable on Apple GPUs")
+    else:
+        _require_float("ReciprocalSpec", t.dtype)
+
+
 # aten::reciprocal(Tensor self) -> Tensor
 def op_reciprocal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("ReciprocalSpec", t))
+    _reciprocal_check(t)
+    var out = own(_unary("elementwise", "ReciprocalSpec", t, t.dtype))
     ret_owned(rets, 0, out)
 
 
@@ -546,7 +556,8 @@ def op_reciprocal_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("ReciprocalSpec", t, dst)
+    _reciprocal_check(t)
+    _unary_out("elementwise", "ReciprocalSpec", t, dst, t.dtype)
     ret_ref(rets, 0, dst)
 
 
