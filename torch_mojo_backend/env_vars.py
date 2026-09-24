@@ -48,6 +48,12 @@ OWN_ENV_VARS: dict[str, str] = {
         "(libmojoccl.so) instead of vendor NCCL/RCCL. Anything else, or "
         "unset, keeps the vendor library."
     ),
+    "TORCH_MOJO_BACKEND_COMPILE_NATIVE_KERNELS": (
+        "`0` makes the torch.compile backend compose MAX's own matmul / "
+        "softmax / layer-norm / embedding ops instead of calling this "
+        "repository's eager kernels through `tmb/graph`. On by "
+        "default; the switch exists to compare the two and as an escape hatch."
+    ),
     "TORCH_MOJO_BACKEND_DEBUG_GRAPH": (
         "`1` dumps the FX graph the torch.compile backend received."
     ),
@@ -204,6 +210,13 @@ FOREIGN_ENV_VARS: dict[str, str] = {
     "MODULAR_HOME": (
         "The Mojo compiler's module cache. Defaulted to node-local scratch so "
         "concurrent compilers on an NFS $HOME cannot evict each other."
+    ),
+    "MODULAR_MOJO_MAX_IMPORT_PATH": (
+        "The comma-separated import path the Mojo toolchain -- MAX's in-process "
+        "graph compiler included -- resolves `from X import` along. Extended at "
+        "package import with the Mojo source root (`_mojo_import_path.py`) so the "
+        "torch.compile backend's custom ops can call the eager kernels; a value "
+        "you set is extended, never replaced."
     ),
     "CUDA_HOME": "A CUDA toolkit root, searched for a ptxas to assemble with.",
     "CUDA_PATH": "Older spelling of CUDA_HOME, searched the same way.",
