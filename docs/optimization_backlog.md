@@ -14,6 +14,14 @@ PCIe (`sm_90a`), PyTorch 2.11.0+cu130.
 files were being edited concurrently while this was written. Every citation also
 names the symbol; if a line does not match, grep the name.
 
+**The host side moved to Mojo.** Every `aten_fast.py`, `mojo_device_aten_ops.py`
+and `TorchMojoTensor` citation below points into the Python eager path, which
+has since been deleted: the host logic it describes now lives in
+`native/mojo/ops_*.mojo` (see `docs/native_backend.md`). The *kernels* and the
+gates in `eager_kernels/<family>/` are the same sources, so every finding about
+a kernel, a dtype gate or a route still applies; translate the entry point by
+grepping the route's name or its `KernelCall("<family>", "<Op>")`.
+
 **Honesty rules used here** (AGENTS.md "no silent caps" spirit):
 
 * Every number is labelled with where it came from. Numbers taken from
@@ -62,12 +70,12 @@ different kind of item.
 | [A5](#a5) | `attn_mask` is a hard decline in eager SDPA | Attention | High for HF models | Medium | — |
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
 | [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
-| [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
-| [N2](#n2) | BatchNorm training and GroupNorm backward are absent in eager | Normalization | High for vision training (blocks it) | Medium | — |
+| [C3](#c3) | conv backward is materialized im2col/col2im + GEMM, not implicit GEMM; no conv3d/transposed in eager | Conv | High for vision *training* | High | — |
+| [N2](#n2) | BatchNorm / GroupNorm backward are composed from existing kernels, not fused (0.9-4.5x stock) | Normalization | Medium for vision training | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
 | [Q3](#q3) | Graph `max_pool2d_with_indices` returns the values as the indices | Graph | Correctness bug | Low | — |
-| [P2](#p2) | Strict-FIFO call queue: one cold variant blocks every warm launch behind it | Compile pipeline | Cold-start only | Medium | — |
-| [P3](#p3) | Ops whose Mojo gates are not mirrored in Python drain the queue on every call | Compile pipeline | Low–Medium | Low per op | — |
+| [P2](#p2) | ~~Strict-FIFO call queue: one cold variant blocks every warm launch behind it~~ **OBSOLETE**: the call queue was removed (2026-09-08) | Compile pipeline | — | — | — |
+| [P3](#p3) | ~~Ops whose Mojo gates are not mirrored in Python drain the queue on every call~~ **OBSOLETE**: the call queue was removed (2026-09-08) | Compile pipeline | — | — | — |
 | [D4](#d4) | `nonzero` round-trips through the host | Data movement | Low (rare op, but a full drain) | Medium | — |
 | [E4](#e4) | GELU forward has ~0.3 ms/step of ALU above its memory bound (gfx942-measured) | Elementwise | Low | Medium | — |
 | [G9](#g9) | The last 5.3% of every gfx942 GEMM is a tile-count / CU-count residue; only Stream-K reaches it | GEMM | ~0.45 ms/step on gfx942 (modelled) | High | — |
@@ -308,7 +316,7 @@ different kind of item.
   a slice or a permuted view out of the tensor-core path.
 * **What the optimized version looks like.** `alpha`/`beta` as *runtime* scalars
   in the existing bias epilogue — they do not select different code, so per
-  `docs/kernel_call_queue.md` they must be runtime data, not defines. For rank>2,
+  `docs/mojo_extensions.md` they must be runtime data, not defines. For rank>2,
   flatten the leading dims whenever the trailing two are dense, which is strictly
   weaker than full contiguity.
 * **Expected win.** **UNMEASURED.** Coverage-shaped: zero for workloads that
@@ -433,7 +441,12 @@ different kind of item.
   which is what AGENTS.md rule 4 asks for — not hardcoded shapes.
 * **Expected win.** head_dim=128: measured, see `benchmarks/baselines.html`
   (`B1H16S4096D128`). GQA / ragged-seqlen: **UNMEASURED**, bounded above by
-  the [A1](#a1) ratio for the shapes they would newly claim.
+  the [A1](#a1) ratio for the shapes they would newly claim. Update: GQA
+  inference now reaches FA4 through a materialized K/V repeat (one batched
+  rectangle copy per tensor, `_gqa_expand` in `tmb/ops/attention.mojo`):
+  1.08 at `B1H32KV8S4096D128`, 0.82 at `B1H8KV1S4096D128` (bf16, H100).
+  The in-kernel KV-head index would save those two copies (~24 us each at
+  the first shape); GQA under autograd still takes the math decomposition.
 * **How to measure it.** `tests/test_fa4_host_wiring.py` and
   `tests/test_eager_kernels.py` (`test_fa4_*[...-d128]`) cover the gate
   itself; for timing, `benchmarks/test_attention.py -k D128` and a
@@ -564,39 +577,31 @@ different kind of item.
   cast to bf16.
 
 ### N2
-**BatchNorm and GroupNorm BACKWARD are absent in eager (the BatchNorm training
-forward now exists)**
+**BatchNorm and GroupNorm BACKWARD are composed from existing kernels, not fused**
 
-* **What.** `aten::native_batch_norm_backward` and
-  `aten::native_group_norm_backward` are not registered at all — the file has
-  exactly one `_register_missing`, for `aten::_adaptive_avg_pool2d_backward`.
-* **Current implementation.** The BatchNorm TRAINING FORWARD landed with the
-  shared-moments normalization work: `_fast_batch_norm_training` in
-  `aten_fast.py` over
-  `normalization_forward_ops/batch_norm_kernels.mojo`, which reduces
-  `{0, 2, 3}` in place through `op_utils._moments_scan_contig` and produces
-  `save_mean` / `save_invstd` plus the ATen running-statistic update
-  (measured 0.19-0.85x stock CUDA). Because its backward does not exist,
-  `mojo_device_native_batch_norm` refuses a training call whose inputs require
-  grad IN THE FORWARD — a raise from inside the autograd engine aborts the
-  process on this backend rather than raising. GroupNorm likewise has a fused
-  forward and no backward, and `mojo_device_native_group_norm` now refuses a
-  grad-requiring call in the forward for the same reason — with no `training`
-  flag to key on, that means every such call.
-* **Why it is not optimal.** ResNet / VGG / DenseNet *training* on the mojo
-  device is still blocked — now by the missing backward rather than the
-  missing forward; the `demo_scripts/` vision examples are inference-only for
-  this reason.
-* **What the optimized version looks like.** The two backwards, written like
-  the existing layer-norm pair (`normalization_backward_dx.mojo` +
-  `normalization_backward_params.mojo`), which already solve the identical
-  "per-channel parameter reduction across a large outer extent" problem; the
-  batch-norm one can walk the NCHW geometry exactly as its forward does.
-  Removing the forward preflight is part of that change.
-* **Expected win.** N/A (coverage). Unblocks vision training.
-* **How to measure it.** `tests/test_aten_functions.py` for correctness; a
-  resnet-18 training-step benchmark modelled on `bench_nanogpt_train.py` for
-  speed — none exists today, see [Not audited](#not-audited).
+* **What.** `op_native_batch_norm_backward` and
+  `op_native_group_norm_backward` in `tmb/ops/composed.mojo`; benchmarked by
+  `benchmarks/test_norm.py::test_batch_norm_backward` and
+  `::test_group_norm_backward`.
+* **Current implementation.** Both run on the `[N, C, HxW]` view. Every
+  per-channel broadcast `(x - a[c]) * b[c]` is one pass of the eval-mode
+  batch-norm elementwise kernel (`_channel_affine`), every per-channel sum a
+  spatial then a batch `aten::sum`. The group-norm grad_input is the
+  LayerNorm-backward dx kernel on the `[N * group, K]` view, with gamma folded
+  into grad_out first.
+* **Why it is not optimal.** Measured on H100 PCIe
+  (`benchmarks/baselines.html`): batch norm 0.9-1.2x stock on
+  `N32xC64xH112xW112` but 3.8-4.5x on `N8xC256xH28xW28`, group norm 1.9-3.4x.
+  Stock is one or two fused passes; ours is ~10 launches, several over
+  input-sized temporaries, and the `[N, C] -> [C]` batch sums are
+  single-block reductions.
+* **What the optimized version looks like.** One per-channel backward in
+  `normalization_backward/`, walking the NCHW geometry the way
+  `batch_norm_kernels.mojo` does for the forward (the `{0, 2, 3}` moments
+  scan) to produce both sums, then one elementwise pass for dx.
+* **Expected win.** ~3-4x on the small shapes.
+* **How to measure it.** `benchmarks/test_norm.py -k backward`;
+  `tests/native/test_composed.py -k norm` for correctness.
 
 ### N3
 **`_TARGET_BLOCKS = 1280` in the LayerNorm-backward parameter reduction is an unlabelled fitted constant**
@@ -807,8 +812,7 @@ temporary** — **DONE** (`NormSpec`)
 * **What.** `fast_aten_nonzero`, `aten_fast.py:4009` —
   `t._to_cpu_tensor().nonzero()` then `TorchMojoTensor._from_cpu(...)` (`:4015`).
 * **Current implementation.** Full device→host copy, CPU `nonzero`, full
-  host→device copy. Because the payload is read from Python this also drains the
-  entire call queue (`docs/kernel_call_queue.md`, "Host reads drain").
+  host→device copy.
 * **Why it is not optimal.** The output *shape* is data-dependent, so one
   synchronization is unavoidable — but only one, on a single integer. Today the
   whole tensor crosses the bus twice.
@@ -816,9 +820,8 @@ temporary** — **DONE** (`NormSpec`)
   4-byte D2H of the count → allocate → device-side compaction (prefix sum +
   scatter). One sync on a scalar instead of two full transfers.
 * **Expected win.** **UNMEASURED**, and `nonzero` is rare in the benchmarked
-  workloads. The queue drain may matter more than the copy.
-* **How to measure it.** A microbenchmark on a large boolean mask; watch the
-  drain with `TORCH_MOJO_BACKEND_TRACE=1`.
+  workloads.
+* **How to measure it.** A microbenchmark on a large boolean mask.
 
 ### D5
 **`aten::index` handles only a single index tensor on dimension 0**
@@ -834,6 +837,16 @@ temporary** — **DONE** (`NormSpec`)
   broadcast index shape and per-dim index pointers as runtime data (rank ≤ 8,
   the descriptor style `CopyStrided` already uses), plus the boolean-mask case
   routed through `nonzero` + gather.
+* **Still open, but narrower than when this was written.** `aten::gather`,
+  `index_select`, `scatter_add` and `index_add` now run natively on `GatherDim`
+  (reads) and `ScatterAddDim` (ScatterDim with an atomic add) beside
+  `GatherRows`, `_index_put_impl_` takes `accumulate=True` and int32 indices,
+  and `x[mask] = scalar` reaches `masked_fill_`. What is left of D5 is
+  `aten::index` with several index tensors or one on a non-zero axis,
+  `index_put` with several index tensors, and a boolean mask whose write is not
+  a scalar fill. Both new kernels decode a rank-4 coordinate with 64-bit
+  div/mod per element and trail stock by 2-4x where the indexed dim is the
+  inner one (`benchmarks/test_embedding.py`, `*_D1` shapes).
 * **Expected win.** N/A (coverage).
 * **How to measure it.** `tests/test_aten_functions.py` with parametrized index
   patterns.
@@ -932,27 +945,26 @@ temporary** — **DONE** (`NormSpec`)
   (depthwise-heavy) model, and `TORCH_MOJO_BACKEND_TRACE=1` to count launches.
 
 ### C3
-**Convolution is 2-D and forward-only in eager**
+**Convolution backward rides the materialized im2col route; no conv3d / transposed**
 
-* **What.** `fast_aten_convolution`, `aten_fast.py:7438` (`and not transposed`)
-  and `:7442` (`len(a._shape) == 4`). `aten::convolution_backward` is not
-  registered in `mojo_device_aten_ops.py` (`aten::convolution` is).
-* **Current implementation.** conv1d (rank-3 input), conv3d and transposed
-  convolutions all return `NOT_HANDLED` → raise. There is no eager conv
-  backward, so `mojo_device_convolution` refuses any conv whose operands
-  require grad in the FORWARD (see [N2](#n2) for why it cannot wait for the
-  backward node). A conv weight normally requires grad, so that is every conv
-  in a training model; inference under `torch.no_grad()` is unaffected.
-* **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
-  `(N, C, 1, L)` with a `(1, kw)` kernel. The missing backward blocks all vision
-  training together with [N2](#n2) and [C4](#c4).
-* **What the optimized version looks like.** conv1d by reshape into the existing
-  2-D path; `convolution_backward` as dgrad (col2im of a GEMM) plus wgrad (a
-  transposed-A GEMM against the im2col matrix) — the same `TRANSPOSE_A`
-  capability [G2](#g2) asks for.
-* **Expected win.** N/A (coverage).
-* **How to measure it.** `tests/test_aten_functions.py`; then a resnet-18
-  training step.
+* **What.** `op_convolution_backward` in `tmb/ops/matmul.mojo`. conv1d and
+  conv2d forward and backward are native; conv3d and transposed convolutions
+  decline (`_conv_geometry`).
+* **Current implementation.** grad_output is copied once to (K, N*OH*OW)
+  (skipped at N == 1), the input is im2col'ed patch-major, so grad_weight is
+  one `_linear_route` GEMM per group with the batch folded into K and
+  grad_input one `_mm_route` GEMM per group followed by `Col2im` (a gather,
+  deterministic, fp32 accumulation). grad_bias is a row sum of the permuted
+  grad_output. Grouped convolutions copy each group's GEMM result into place.
+* **Why it is not optimal.** Both spatial gradients write and re-read a full
+  column buffer (C*KH*KW x N*OH*OW), and depthwise runs one tiny GEMM per
+  group. `benchmarks/test_vision.py::test_conv2d_backward` has the ratios.
+* **What the optimized version looks like.** Implicit-GEMM dgrad / wgrad
+  (the columns never materialized), a grouped/batched GEMM launch for
+  depthwise, and conv3d / transposed by the same patch kernels.
+* **Expected win.** Several x on the spatial gradients (column traffic
+  dominates the materialized route).
+* **How to measure it.** `uv run pytest benchmarks/test_vision.py -k backward`.
 
 ### C4
 **Pooling has no `ceil_mode` and no backward**
@@ -1202,10 +1214,11 @@ descriptor-batched body for the whole family)
   *"The warm path is currently a regression, not a win. Steady-state training
   step with everything cached: 101 ms on this branch vs 60 ms on main."* The cost
   lives in `eager_kernels/__init__.py` (source-path resolution, define
-  normalization) and `eager_kernels/call_queue.py` (queue handling).
+  normalization) and, at the time, the kernel-call queue (removed
+  2026-09-08).
 * **Current implementation.** Every kernel call resolves its source path,
   normalizes and canonically orders its defines, hashes them, looks up the module
-  cache, prepares a queue item and enqueues it — per launch, warm or not.
+  cache and calls it — per launch, warm or not.
 * **Why it is not optimal.** A 68% steady-state regression on the primary
   training benchmark, self-declared in the design doc. Cold start went
   56.3 s → 11.6 s, which is the trade being made, but the warm path is what runs
@@ -1221,56 +1234,20 @@ descriptor-batched body for the whole family)
   the measured *size of the regression*, not a measurement of any proposed fix.
 * **How to measure it.** `uv run --no-sync python bench_nanogpt_train.py --device
   mojo` with a warm `__mojocache__`, against the same command on `main`.
-  `TORCH_MOJO_BACKEND_KERNEL_QUEUE=0` isolates the queue's share from the
-  loader's.
 
 ### P2
 **Strict FIFO: one cold variant blocks every warm launch behind it**
 
-* **What.** `docs/kernel_call_queue.md`, "Queue ordering" rule 1;
-  `eager_kernels/call_queue.py`.
-* **Current implementation.** `pump()` launches the longest *ready prefix*. A
-  queued item whose extension is still compiling stalls everything enqueued after
-  it, warm or not.
-* **Why it is not optimal.** During cold start — and after any new shape/dtype
-  combination appears mid-run — the device idles behind a compile even when the
-  next twenty launches are ready and independent.
-* **What the optimized version looks like.** Dependency-aware release: an item
-  may launch ahead of a blocked predecessor when their keep-alive sets are
-  disjoint. The queue already retains every input and output per item (rule 3),
-  so the buffer sets needed for the check are in hand. This carries real
-  correctness risk — the FIFO rule exists because a consumer must not observe a
-  buffer before its producer launches — so the aliasing check must be exact, not
-  heuristic.
-* **Expected win.** Cold start only; **UNMEASURED**. Steady state is unaffected
-  because everything is warm.
-* **How to measure it.** `bench_nanogpt_train.py` with `__mojocache__` wiped,
-  first-step timing; `TORCH_MOJO_BACKEND_TRACE=1` prints build start/finish
-  timestamps to line up against launches.
+> **Obsolete 2026-09-08.** The kernel-call queue was removed: kernels build
+> inline at their first call and every launch is synchronous, so there is no
+> FIFO to release ahead of a blocked predecessor.
 
 ### P3
 **Ops whose Mojo-side gates are not mirrored in Python drain the queue on every call**
 
-* **What.** `_try_spec_unary`, `aten_fast.py:1763` — the
-  `ok = False  # e.g. CumsumSpec: constraints not mirrored, stay sync` branch at
-  `:1784` and the `force_sync=True` at `:1793`. Same shape in `_try_spec_reduce`
-  (`:1800`, `force_sync=True` at `:1830`) and `_try_spec_matmul` (via
-  `_submit_spec_matmul`, `:1975`). `mojo_device_aten_ops.py` comments name
-  Cumsum, BatchNorm and AttnDecode as keeping the legacy sync form.
-* **Current implementation.** `force_sync=True` calls `_call_queue.drain()` — a
-  full pipeline flush — then executes inline.
-* **Why it is not optimal.** A drain is not just "this op is synchronous"; it
-  stalls every *other* pending launch too. `AttnDecodeSpec` in particular is on
-  the hot decode path and runs once per layer per token.
-* **What the optimized version looks like.** Mirror each op's Mojo-side
-  eligibility in Python — the design calls this "Python eligibility stays
-  conservatively exact per family" — so it can take the Into form. The three
-  named ops need one predicate each.
-* **Expected win.** **UNMEASURED.** Proportional to how much work is pending when
-  the drain happens.
-* **How to measure it.** `bench_gpt2_kernels.py` (decode shapes) and
-  `bench_gpt2_batch.py`; `tests/test_call_queue.py` already asserts which ops
-  queue and which drain, so the change is directly testable.
+> **Obsolete 2026-09-08.** Same removal as P2: with no queue there is no
+> drain, and every spec route asks the Mojo side directly and falls back on a
+> refusal.
 
 ### P4
 **Cold start is 11.6 s for the first nanoGPT step, and `__mojocache__` cannot be shipped**
@@ -1283,7 +1260,8 @@ descriptor-batched body for the whole family)
 > steps of transients stay live at once — observed 71.5 GB across 3,244
 > blocks at batch 12 before a 36 MB `memAlloc` failed and the process
 > aborted. Real training loops survive because their eval/logging reads
-> drain the queue. **Fixed 2026-08-03**: the queue now meters each item's
+> drain the queue. **Fixed 2026-08-03** (and moot since 2026-09-08, when
+> the queue was removed): the queue now meters each item's
 > retained device bytes and the enqueue that crosses the budget
 > (`TORCH_MOJO_BACKEND_QUEUE_BUDGET_MB`, default 8192; 0 disables) drains
 > first, waiting builds out. The same cold read-free loop now completes
@@ -1293,8 +1271,8 @@ descriptor-batched body for the whole family)
 
 * **What.** `docs/fast_eager_design.md`, "Measured (H100 PCIe, 24-core host)":
   11.6 s first step with the build pool, 56.3 s without.
-* **Current implementation.** One `.so` per exact specialization, built on demand
-  on a background pool sized by `_pool_size()` (RAM / 5 GiB, cores / 3, cap 16).
+* **Current implementation.** One `.so` per exact specialization, built inline
+  at its first call (the background pool was removed 2026-09-08).
   Caches are per-machine: `mojo build` defaults to `-march=native` and detects the
   GPU arch, so a prebuilt `.so` can SIGILL elsewhere.
 * **Why it is not optimal.** 11.6 s is the honest cost of the design and already
@@ -1505,7 +1483,7 @@ Stated explicitly so nobody reads this document as complete.
   other ~200 op implementations were not.
 * **Op *coverage* was inventoried only where it intersected performance.** No
   full "which ATen ops raise on the mojo device" list was produced. Holes noted
-  in passing: `topk`, `sort`, `gather`, `index_select`, `scatter_add`, `div` with
+  in passing: `topk`, `sort`, `div` with
   `rounding_mode` (`aten_fast.py:2498`), `softmax` with `dtype=`
   (`aten_fast.py:7714`), `conv1d`/`conv3d`/transposed conv, `ceil_mode` pooling,
   and the vision-training backwards.

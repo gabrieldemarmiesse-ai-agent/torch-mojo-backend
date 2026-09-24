@@ -1,9 +1,11 @@
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import pytest
 import torch
 import torch.nn.functional
+from max.experimental import functional as F
+from max.experimental.tensor import Tensor as MaxEagerTensor
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
 
@@ -12,12 +14,13 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
+from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
-from torch_mojo_backend.eager_kernels import aten_fast
-from torch_mojo_backend.mojo_device.mojo_device_aten_ops import EAGER_CALL_COUNTERS
 from torch_mojo_backend.testing import (
     CallChecker,
     Conf,
+    _xfail_if_unsupported,
     check_functions_are_equivalent,
     check_outputs,
 )
@@ -54,6 +57,31 @@ def test_scaled_dot_product_flash_attention_basic(
 
     # TensorFloat-32 tensor cores are used by default, lowering precision
     check_outputs(fn, conf, [q, k, v], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("kv_heads", [2, 1], ids=["gqa", "mqa"])
+def test_scaled_dot_product_attention_enable_gqa(
+    conf: Conf, call_checker: CallChecker, kv_heads: int, is_causal: bool
+):
+    """enable_gqa=True under torch.compile: K/V carry fewer heads than Q.
+
+    On CPU float32 AOT decomposes SDPA (GQA or not) into the math graph --
+    unsqueeze/expand/clone for the head repeat, then bmm + softmax + bmm --
+    so the graph ops are what reaches the backend.
+    """
+    call_checker.register(aten_functions.aten_bmm, aten_functions.aten__softmax)
+
+    def fn(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, enable_gqa=True
+        )
+
+    q = torch.randn(2, 8, 9, 16)
+    k = torch.randn(2, kv_heads, 9, 16)
+    v = torch.randn(2, kv_heads, 9, 16)
+    check_outputs(fn, conf, [q, k, v], atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -376,9 +404,7 @@ def test_native_batch_norm_legit_no_training_2d_input(device: str):
 
 def test_aten_native_batch_norm_inference(conf: Conf, call_checker: CallChecker):
     """Test aten.native_batch_norm in inference mode (training=False)."""
-    call_checker.register(
-        aten_functions.aten_native_batch_norm, aten_fast.fast_aten_native_batch_norm
-    )
+    call_checker.register(aten_functions.aten_native_batch_norm)
 
     def fn(input_tensor, weight, bias, running_mean, running_var):
         return aten.native_batch_norm(
@@ -419,9 +445,7 @@ def test_aten_native_layer_norm_basic(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm returns (output, mean, rstd)"""
-    call_checker.register(
-        aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
-    )
+    call_checker.register(aten_functions.aten_native_layer_norm)
 
     def fn(x, weight, bias):
         out, mean, rstd = aten.native_layer_norm(x, [10], weight, bias, 1e-5)
@@ -464,9 +488,7 @@ def test_aten_native_layer_norm_different_eps(
     conf: Conf, eps: float, call_checker: CallChecker
 ):
     """Test aten.native_layer_norm with different epsilon values"""
-    call_checker.register(
-        aten_functions.aten_native_layer_norm, aten_fast.fast_aten_native_layer_norm
-    )
+    call_checker.register(aten_functions.aten_native_layer_norm)
 
     def fn(x, weight, bias):
         out, mean, rstd = aten.native_layer_norm(x, [10], weight, bias, eps)
@@ -667,6 +689,491 @@ def test_aten_acos_single_element(conf: Conf):
 
     x = torch.tensor([0.5], dtype=torch.float32)
     check_outputs(fn, conf, [x])
+
+
+SHARED_ELEMENTWISE_KINDS = (
+    "abs",
+    "ceil",
+    "erf",
+    "exp",
+    "floor",
+    "log",
+    "rsqrt",
+    "sign",
+    "silu",
+    "tan",
+)
+
+
+# TODO: Make this a normal parametrized test once
+# https://github.com/modular/modular/issues/7167 is fixed
+def run_shared_elementwise_kinds(
+    kinds: Sequence[str], x: torch.Tensor, mode: str
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+    """Run every kind in ONE MAX graph and return (kind, actual, expected).
+
+    Loading a MAX graph costs over a second even on a warm cache, so a test
+    per kind pays that once per kind; one graph per test pays it once.
+    """
+    operators = []
+    implementations = []
+    checkers = []
+    for kind in kinds:
+        aten_kind = "gelu" if kind.startswith("gelu_") else kind
+        kwargs = (
+            {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
+        )
+        operators.append((getattr(aten, aten_kind).default, kwargs))
+        implementations.append(getattr(aten_functions, f"aten_{aten_kind}"))
+        checker = CallChecker()
+        checker.register(implementations[-1])
+        checkers.append(checker)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(op(x, **kwargs) for op, kwargs in operators)
+
+    if mode == "compile":
+        actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+    else:
+        with F.lazy():
+            max_x = MaxEagerTensor.from_dlpack(x)
+            lazy_outputs = [
+                implementation(max_x, **kwargs)
+                for implementation, (_, kwargs) in zip(implementations, operators)
+            ]
+        actual = tuple(torch.from_dlpack(output) for output in lazy_outputs)
+    for checker in checkers:
+        checker.check_was_called()
+    return list(zip(kinds, actual, fn(x)))
+
+
+def kind_message(kind: str) -> Callable[[str], str]:
+    return lambda message: f"{kind}: {message}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise(dtype: torch.dtype, mode: str, device: str):
+    """Both MAX value types use the shared math, including domains and SIMD tails."""
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -3,
+            -0.75,
+            -0.0,
+            0.0,
+            0.25,
+            1,
+            3,
+            float("inf"),
+            float("nan"),
+            0.5,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        SHARED_ELEMENTWISE_KINDS, x, mode
+    ):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
+        # assert_close equates signed zeros; preserve the signs explicitly as well.
+        zeros = (expected == 0) & (actual == 0)
+        assert torch.equal(
+            torch.signbit(actual[zeros]), torch.signbit(expected[zeros])
+        ), kind
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (357, 17)])
+def test_aten_shared_elementwise_compile_shapes(shape: tuple[int, ...], device: str):
+    x = torch.linspace(0.25, 1.25, math.prod(shape), device=device).reshape(shape)
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        SHARED_ELEMENTWISE_KINDS, x, "compile"
+    ):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_integer(mode: str):
+    kinds = ["abs", "ceil", "floor", "sign", "erf", "exp", "log", "rsqrt", "tan"]
+    x = torch.tensor([-3, -1, 0, 1, 3], dtype=torch.int64)
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
+
+
+def test_aten_shared_elementwise_bool():
+    kinds = ["erf", "exp", "log", "rsqrt", "tan", "sign"]
+    x = torch.tensor([False, True])
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, "compile"):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+
+
+def test_aten_shared_elementwise_default_dtype():
+    kinds = ["erf", "exp", "log", "rsqrt", "tan"]
+    x = torch.tensor([1, 2, 3], dtype=torch.int32)
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        results = run_shared_elementwise_kinds(kinds, x, "compile")
+    finally:
+        torch.set_default_dtype(original)
+    for kind, actual, expected in results:
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+
+
+def test_aten_shared_elementwise_dynamic_strides(
+    device: str, call_checker: CallChecker
+):
+    call_checker.register(aten_functions.aten_silu)
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return aten.silu(x.t())
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True, dynamic=True)
+    for rows, cols in [(7, 13), (11, 19)]:
+        x = torch.linspace(-2, 2, rows * cols * 2, device=device).reshape(
+            rows, cols * 2
+        )[:, 1::2]
+        torch.testing.assert_close(compiled(x), fn(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_remaining(dtype: torch.dtype, mode: str, device: str):
+    kinds = [
+        "acos",
+        "asinh",
+        "atanh",
+        "cos",
+        "cosh",
+        "log1p",
+        "log2",
+        "neg",
+        "reciprocal",
+        "relu",
+        "sigmoid",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tanh",
+        "gelu_none",
+        "gelu_tanh",
+    ]
+    x = torch.linspace(0.125, 0.875, 23, dtype=dtype, device=device)
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_predicate(dtype: torch.dtype, mode: str, device: str):
+    values = [0.0, 1.0, -1.0, 0.0, 2.0]
+    if dtype.is_floating_point:
+        values += [float("nan"), float("inf"), -float("inf"), -0.0]
+    x = torch.tensor(values, dtype=dtype, device=device)
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        ["isnan", "logical_not"], x, mode
+    ):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_activation_edges(
+    dtype: torch.dtype, mode: str, device: str
+):
+    x = torch.tensor(
+        [-float("inf"), -2.0, -0.0, 0.0, 2.0, float("inf"), float("nan")],
+        dtype=dtype,
+        device=device,
+    )
+    for kind, actual, expected in run_shared_elementwise_kinds(
+        ["relu", "asinh"], x, mode
+    ):
+        torch.testing.assert_close(
+            actual, expected, equal_nan=True, msg=kind_message(kind)
+        )
+        zeros = expected == 0
+        # PyTorch CUDA relu returns +0 for -0, while CPU preserves -0. The shared
+        # expression preserves the CPU convention on every device.
+        expected_signs = torch.signbit(getattr(aten, kind).default(x.cpu())).to(device)
+        assert torch.equal(torch.signbit(actual[zeros]), expected_signs[zeros]), kind
+
+
+@pytest.mark.parametrize(
+    "kinds, dtype", [(["ceil", "floor"], torch.int64), (["sign"], torch.bool)]
+)
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+def test_aten_shared_elementwise_identity_allocation(
+    kinds: list[str], dtype: torch.dtype, mode: str
+):
+    x = torch.tensor([0, 1, 2], dtype=dtype)
+    for kind, actual, expected in run_shared_elementwise_kinds(kinds, x, mode):
+        torch.testing.assert_close(actual, expected, msg=kind_message(kind))
+        assert actual.data_ptr() != x.data_ptr(), kind
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_aten_shared_elementwise_batch(dtype: torch.dtype, device: str):
+    """Compile every specialization together to amortize GPU graph setup."""
+    kinds = (
+        "abs",
+        "acos",
+        "asinh",
+        "atanh",
+        "ceil",
+        "cos",
+        "cosh",
+        "erf",
+        "exp",
+        "floor",
+        "gelu_none",
+        "gelu_tanh",
+        "isnan",
+        "log",
+        "log1p",
+        "log2",
+        "logical_not",
+        "neg",
+        "reciprocal",
+        "relu",
+        "rsqrt",
+        "sigmoid",
+        "sign",
+        "silu",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+    )
+    operators = []
+    checkers = []
+    for kind in kinds:
+        aten_kind = "gelu" if kind.startswith("gelu_") else kind
+        kwargs = (
+            {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
+        )
+        operators.append((getattr(aten, aten_kind).default, kwargs))
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{aten_kind}"))
+        checkers.append(checker)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(op(x, **kwargs) for op, kwargs in operators)
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True, dynamic=True)
+    for shape in [(17,), (357, 789)]:
+        # CUDA's fp16 linspace overflows its index arithmetic beyond 65504.
+        # Construct finite input in fp32 before rounding to the tested dtype.
+        x = (
+            torch.linspace(
+                0.05, 0.95, math.prod(shape), dtype=torch.float32, device=device
+            )
+            .to(dtype)
+            .reshape(shape)
+        )
+        assert torch.isfinite(x).all()
+        actual = compiled(x)
+        for kind, result, expected in zip(kinds, actual, fn(x)):
+            torch.testing.assert_close(
+                result, expected, msg=lambda message: f"{kind}, {shape}: {message}"
+            )
+    for checker in checkers:
+        checker.check_was_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "target,kinds",
+    [
+        pytest.param(
+            "cuda",
+            (
+                "acos",
+                "asinh",
+                "atanh",
+                "ceil",
+                "cos",
+                "cosh",
+                "erf",
+                "exp",
+                "floor",
+                "log",
+                "log1p",
+                "log2",
+                "reciprocal",
+                "rsqrt",
+                "sigmoid",
+                "silu",
+                "sin",
+                "sinh",
+                "sqrt",
+                "tan",
+                "tanh",
+                "gelu_none",
+                "gelu_tanh",
+            ),
+            id="gpu",
+            marks=pytest.mark.cuda,
+        ),
+        pytest.param("cpu", ("exp", "tanh", "cosh"), id="cpu"),
+    ],
+)
+def test_aten_shared_elementwise_special_batch(
+    dtype: torch.dtype, target: str, kinds: tuple[str, ...], cuda_available: bool
+):
+    """GPU fast math preserves edge semantics without removing CPU NaN fixes."""
+    if target == "cuda" and not cuda_available:
+        pytest.skip("CUDA not available")
+    operators = []
+    checkers = []
+    for kind in kinds:
+        aten_kind = "gelu" if kind.startswith("gelu_") else kind
+        kwargs = (
+            {"approximate": kind.removeprefix("gelu_")} if aten_kind == "gelu" else {}
+        )
+        operators.append((getattr(aten, aten_kind).default, kwargs))
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{aten_kind}"))
+        checkers.append(checker)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(op(x, **kwargs) for op, kwargs in operators)
+
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -2,
+            -1,
+            -0.5,
+            -0.0,
+            0.0,
+            0.125,
+            0.5,
+            1,
+            2,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=dtype,
+        device=target,
+    )
+    actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x)
+    # Use the same device for the reference: CUDA and CPU differ at +Inf GELU.
+    for kind, result, expected in zip(kinds, actual, fn(x), strict=True):
+        torch.testing.assert_close(
+            result, expected, equal_nan=True, msg=lambda message: f"{kind}: {message}"
+        )
+    for checker in checkers:
+        checker.check_was_called()
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.cuda
+def test_aten_shared_elementwise_log1p_near_zero(
+    mode: str, dtype: torch.dtype, cuda_available: bool
+):
+    if not cuda_available:
+        pytest.skip("CUDA not available")
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_log1p)
+    cpu = log1p_edge_input(dtype)
+    x = cpu.to("cuda")
+    if mode == "compile":
+        actual = torch.compile(
+            aten.log1p.default, backend=mojo_backend, fullgraph=True
+        )(x)
+    else:
+        actual = torch.from_dlpack(
+            aten_functions.aten_log1p(MaxEagerTensor.from_dlpack(x))
+        )
+    expected = torch.log1p(cpu.double()).to(dtype)
+    actual_cpu = actual.cpu()
+    torch.testing.assert_close(
+        actual_cpu, expected, rtol=log1p_rtol(dtype), atol=0, equal_nan=True
+    )
+    zeros = cpu == 0
+    torch.testing.assert_close(
+        torch.signbit(actual_cpu[zeros]), torch.signbit(cpu[zeros])
+    )
+    call_checker.check_was_called()
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.cuda
+def test_aten_shared_elementwise_acos_float64_gpu(mode: str, cuda_available: bool):
+    if not cuda_available:
+        pytest.skip("CUDA not available")
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_acos)
+    x = torch.tensor(
+        [
+            -float("inf"),
+            -1.5,
+            -1,
+            -0.999,
+            -0.5,
+            -0.0,
+            0.0,
+            0.5,
+            0.999,
+            1,
+            1.5,
+            float("inf"),
+            float("nan"),
+        ],
+        dtype=torch.float64,
+        device="cuda",
+    )
+    if mode == "compile":
+        actual = torch.compile(aten.acos.default, backend=mojo_backend, fullgraph=True)(
+            x
+        )
+    else:
+        actual = torch.from_dlpack(
+            aten_functions.aten_acos(MaxEagerTensor.from_dlpack(x))
+        )
+    torch.testing.assert_close(actual, torch.acos(x), equal_nan=True)
+    call_checker.check_was_called()
+
+
+@pytest.mark.parametrize("mode", ["compile", "max_eager"])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64])
+@pytest.mark.cuda
+def test_aten_shared_elementwise_acos_gpu_integer_default_float64(
+    mode: str, dtype: torch.dtype, cuda_available: bool
+):
+    if not cuda_available:
+        pytest.skip("CUDA not available")
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_acos)
+    x = torch.tensor(
+        [False, True] if dtype == torch.bool else [-1, 0, 1, 2],
+        dtype=dtype,
+        device="cuda",
+    )
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        if mode == "compile":
+            actual = torch.compile(
+                aten.acos.default, backend=mojo_backend, fullgraph=True
+            )(x)
+        else:
+            actual = torch.from_dlpack(
+                aten_functions.aten_acos(MaxEagerTensor.from_dlpack(x))
+            )
+        torch.testing.assert_close(actual, torch.acos(x), equal_nan=True)
+    finally:
+        torch.set_default_dtype(original)
+    call_checker.check_was_called()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -941,6 +1448,78 @@ def test_aten_bitwise_xor_broadcasting(conf: Conf):
     y = torch.randint(0, 10, (4, 5), dtype=torch.int32)
 
     check_outputs(fn, conf, [x, y])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("mode", ["public", "aten"])
+@pytest.mark.parametrize(
+    "in_c,out_c,length,k,stride,padding,dilation,groups",
+    [
+        (3, 8, 17, 3, 1, 0, 1, 1),  # basic, awkward/non-round length
+        (8, 8, 17, 3, 2, 1, 1, 1),  # stride
+        (8, 12, 25, 3, 1, 2, 2, 1),  # dilation
+        (8, 12, 25, 3, 1, 1, 1, 2),  # groups
+        (80, 16, 40, 3, 1, 1, 1, 1),  # Whisper-shaped channel counts
+    ],
+)
+def test_aten_conv1d(
+    conf: Conf,
+    call_checker: CallChecker,
+    mode: str,
+    in_c: int,
+    out_c: int,
+    length: int,
+    k: int,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+):
+    """aten::convolution with a rank-3 (conv1d) input under torch.compile:
+    the op reaches the graph (it is not decomposed), so `aten_convolution`'s
+    rank-3 branch runs. The mojo device's route is in tests/native/test_matmul.py.
+    """
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        if mode == "aten":
+            return aten.convolution(
+                x, w, b, [stride], [padding], [dilation], False, [0], groups
+            )
+        return torch.nn.functional.conv1d(
+            x, w, b, stride=stride, padding=padding, dilation=dilation, groups=groups
+        )
+
+    x = torch.randn(2, in_c, length)
+    w = torch.randn(out_c, in_c // groups, k)
+    b = torch.randn(out_c)
+    check_outputs(fn, conf, [x, w, b], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_conv1d_no_bias(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w):
+        return torch.nn.functional.conv1d(x, w, padding=1)
+
+    x = torch.randn(2, 4, 13)
+    w = torch.randn(6, 4, 3)
+    check_outputs(fn, conf, [x, w], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_aten_conv1d_dtypes(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_convolution)
+
+    def fn(x, w, b):
+        return torch.nn.functional.conv1d(x, w, b, stride=2, padding=1)
+
+    x = torch.randn(2, 8, 21, dtype=dtype)
+    w = torch.randn(12, 8, 3, dtype=dtype)
+    b = torch.randn(12, dtype=dtype)
+    check_outputs(fn, conf, [x, w, b], atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -1644,6 +2223,193 @@ def test_aten_div_rounding_mode_floor_trunc_disagree(
     check_outputs(fn, conf, [x, y])
 
 
+def _convolution_backward_tolerance(device: str) -> Tolerance:
+    """How far a composed conv backward may sit from stock torch's.
+
+    On CPU the arithmetic is plain fp32 on both sides, but the reductions are
+    reassociated -- this backend folds a matmul and runs a role-swapped
+    convolution where torch runs its own im2col GEMMs -- and reassociation
+    alone moves the last bits: measured at most 2.3e-5 absolute and 9.8e-5
+    relative over these cases. On an accelerator MAX reduces through TF32,
+    four orders looser again, which is what `matmul_tolerance` exists for.
+    """
+    return matmul_tolerance(device) or {"rtol": 1e-4, "atol": 1e-4}
+
+
+# (n, c, h, w, out_c, k, stride, padding, dilation, groups)
+_CONVOLUTION_BACKWARD_CASES = {
+    "k3s1p1": (2, 6, 9, 9, 8, 3, 1, 1, 1, 1),
+    "stride2": (2, 6, 11, 11, 8, 3, 2, 1, 1, 1),
+    "unpadded": (2, 4, 10, 12, 6, 3, 1, 0, 1, 1),
+    "dilation2": (2, 4, 13, 13, 6, 3, 1, 2, 2, 1),
+    "groups2": (2, 8, 9, 9, 12, 3, 1, 1, 1, 2),
+    "depthwise": (2, 6, 9, 9, 6, 3, 1, 1, 1, 6),
+    "pointwise_1x1": (2, 5, 7, 7, 4, 1, 1, 0, 1, 1),
+    # The forward truncates here ((11 + 2 - 3) // 2 + 1 == 5 loses a column),
+    # so the data gradient's last input row/column has no tap at all.
+    "truncating_stride2": (1, 4, 11, 9, 6, 3, 2, 1, 1, 1),
+}
+
+
+def _convolution_backward_inputs(case: str) -> list[torch.Tensor]:
+    n, c, h, w, out_c, k, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+    out_h = (h + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    out_w = (w + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    torch.manual_seed(0)
+    return [
+        torch.randn(n, out_c, out_h, out_w),
+        torch.randn(n, c, h, w),
+        torch.randn(out_c, c // groups, k, k) * 0.2,
+    ]
+
+
+def _convolution_backward_call(case: str):
+    _, _, _, _, out_c, _, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [out_c],
+            [stride, stride],
+            [padding, padding],
+            [dilation, dilation],
+            False,
+            [0, 0],
+            groups,
+            [True, True, True],
+        )
+
+    return fn
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward(case: str, conf: Conf, call_checker: CallChecker):
+    """AOTAutograd keeps `convolution_backward.default` as a backward graph
+    node (it is not in DECOMPOSITION_TABLE), so the compile backend maps it."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    check_outputs(
+        _convolution_backward_call(case),
+        conf,
+        _convolution_backward_inputs(case),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+def test_aten_convolution_backward_compiled(case: str, device: str):
+    """The compile backend's own composition of the three gradients.
+
+    `conf` only exercises the mojo eager device, so the MAX-graph path in
+    `aten_functions.py` -- `F.fold` for the data gradient, a role-swapped
+    `F.conv2d` for the weight gradient -- needs its own compiled comparison
+    against stock torch on the same device.
+    """
+    check_functions_are_equivalent(
+        _convolution_backward_call(case),
+        device,
+        _convolution_backward_inputs(case),
+        **_convolution_backward_tolerance(device),
+    )
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+        [True, True, False],
+        [False, True, True],
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: list[bool]
+):
+    """Only the requested gradients are computed, and they do not change
+    because the others were skipped."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+
+    def fn(grad_output, x, weight):
+        outputs = aten.convolution_backward(
+            grad_output, x, weight, [8], [1, 1], [1, 1], [1, 1], False, [0, 0], 1, mask
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    check_outputs(
+        fn, conf, _convolution_backward_inputs("k3s1p1"), atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("stride,padding,dilation", [(1, 0, 1), (2, 1, 1), (1, 2, 2)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_1d(
+    conf: Conf, call_checker: CallChecker, stride: int, padding: int, dilation: int
+):
+    """conv1d's backward, through the same rank-4 path behind a size-1 H
+    axis."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    torch.manual_seed(0)
+    length = (17 + 2 * padding - (dilation * 2 + 1)) // stride + 1
+    inputs = [
+        torch.randn(2, 8, length),
+        torch.randn(2, 6, 17),
+        torch.randn(8, 6, 3) * 0.2,
+    ]
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [8],
+            [stride],
+            [padding],
+            [dilation],
+            False,
+            [0],
+            1,
+            [True, True, True],
+        )
+
+    check_outputs(fn, conf, inputs, atol=1e-4, rtol=1e-4)
+
+
+def test_aten_convolution_trains_end_to_end_compiled(device: str):
+    """The gradient the autograd engine actually asks for: a compiled conv
+    whose input, weight and bias all require grad."""
+    require_cuda_autograd(device)
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 10, 10)
+    weight = torch.randn(6, 3, 3, 3) * 0.2
+    bias = torch.randn(6) * 0.1
+    upstream = torch.randn(2, 6, 10, 10)
+
+    def fn(x, weight, bias, upstream):
+        x = x.detach().requires_grad_()
+        weight = weight.detach().requires_grad_()
+        bias = bias.detach().requires_grad_()
+        out = torch.nn.functional.conv2d(x, weight, bias, 1, 1)
+        out.backward(upstream)
+        return x.grad, weight.grad, bias.grad
+
+    check_functions_are_equivalent(
+        fn,
+        device,
+        [x, weight, bias, upstream],
+        **_convolution_backward_tolerance(device),
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_aten_gelu_backward_basic(conf: Conf, dtype: torch.dtype, approximate: str):
@@ -1844,7 +2610,7 @@ def test_aten_addr_basic(conf: Conf, dtype: torch.dtype, call_checker: CallCheck
     and ..._bfloat16. beta/alpha values below match the failing OpInfo
     sample exactly.
     """
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.6, alpha=0.2)
@@ -1861,7 +2627,7 @@ def test_aten_addr_default_beta_alpha(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
     """aten.addr with default beta=alpha=1 (self + outer(vec1, vec2))."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2)
@@ -1876,7 +2642,7 @@ def test_aten_addr_default_beta_alpha(
 def test_aten_addr_beta_zero(conf: Conf, call_checker: CallChecker):
     """beta=0 must ignore `self` entirely, including nan/inf in it (matches
     ATen's own addr contract, see aten/src/ATen/native/LinearAlgebra.cpp)."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.0, alpha=1.5)
@@ -1893,7 +2659,7 @@ def test_aten_addr_self_broadcast(conf: Conf, call_checker: CallChecker):
     shape (here: 0-d): the fast path's own right-alignment handles this
     directly (see `fast_aten_addr`), so this still goes through the fused
     kernel, not the composite fallback -- verified via call_checker."""
-    call_checker.register(EAGER_CALL_COUNTERS["aten::addr"])
+    call_checker.register("aten::addr")
 
     def fn(self, vec1, vec2):
         return aten.addr(self, vec1, vec2, beta=0.5, alpha=2.0)
@@ -2009,6 +2775,259 @@ def test_aten_isin_all_match(conf: Conf):
     check_outputs(fn, conf, [elements, test_elements])
 
 
+# ---------------------------------------------------------------------------
+# The dim-indexed family: gather / index_select / scatter_add / index_add /
+# index_put.  All of them are the same two kernels over an index space
+# described by strides (GatherDim reads, ScatterDim[+add] writes), so the
+# axes worth parametrizing are the ones that change that description: the
+# rank, WHICH dim is indexed (0 has a dedicated row fast path, the last is
+# the contiguous-inner regime, a negative dim exercises normalization), the
+# payload dtype, and whether the operands are contiguous.
+# ---------------------------------------------------------------------------
+
+_INDEX_DTYPES = [torch.float32, torch.bfloat16, torch.int64]
+
+
+def _index_payload(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor of `dtype` holding exactly representable values: bfloat16 has
+    8 mantissa bits, so a scatter_add of random floats would fail on rounding
+    rather than on anything this family of ops does."""
+    numel = math.prod(shape)
+    values = torch.arange(numel, dtype=torch.int64) % 17 - 8
+    return values.reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5), 2)],
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_gather(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return aten.gather(x, dim, index)
+
+    x = _index_payload(shape, dtype)
+    # `index.size(d) <= self.size(d)` is legal for gather on EVERY dim, not
+    # only the indexed one, and the output is shaped like the INDEX — so a
+    # kernel that walked `self`'s shape, or took the output's strides from
+    # `self`, is wrong here while an equal-shaped index would hide it.
+    index_shape = [3 if d == dim else max(1, s - 1) for d, s in enumerate(shape)]
+    index = torch.randint(0, shape[dim], index_shape, dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_gather_strided_input(conf: Conf, call_checker: CallChecker):
+    """A transposed (non-contiguous) `self`: the kernel reads it through its
+    real strides instead of materializing a copy first."""
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return aten.gather(x.transpose(0, 1), 1, index)
+
+    x = torch.randn(7, 5)
+    index = torch.randint(0, 7, (5, 7), dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_take_along_dim(conf: Conf, call_checker: CallChecker):
+    """`take_along_dim` is a composite that lowers straight to gather — and,
+    unlike gather itself, it DOES define negative indices (it normalizes them
+    with `remainder` before calling gather)."""
+    call_checker.register(aten_functions.aten_gather)
+
+    def fn(x, index):
+        return torch.take_along_dim(x, index, dim=1)
+
+    x = torch.randn(4, 6)
+    index = torch.tensor([[0, -1, 2], [-2, 1, 0], [3, 3, -6], [5, 0, 1]])
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1), ((2, 3, 4, 5, 2), 2)],
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_select(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x, dim, index)
+
+    x = _index_payload(shape, dtype)
+    # Duplicated and out-of-order indices, and a length that differs from the
+    # indexed extent (index_select is the one op in the family whose output is
+    # shaped like neither input).
+    index = torch.tensor([2, 0, 2, 1, 0, 1, 2], dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_select_int32_index(conf: Conf, call_checker: CallChecker):
+    """index_select accepts an int32 index; gather/scatter_add do not."""
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x, 0, index)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([4, 0, 2], dtype=torch.int32)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_select_strided_input(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_select)
+
+    def fn(x, index):
+        return aten.index_select(x.transpose(0, 1), 1, index)
+
+    x = torch.randn(6, 4)
+    index = torch.tensor([5, 5, 1, 0], dtype=torch.int64)
+    check_outputs(fn, conf, [x, index])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((6, 5), -1), ((3, 4, 5), 1)]
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_scatter_add(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    """Every index here is duplicated many times over: the whole point of
+    scatter_add is that colliding writes SUM instead of clobbering, and a test
+    with unique indices would pass against a plain scatter."""
+    call_checker.register(aten_functions.aten_scatter_add)
+
+    def fn(x, index, src):
+        return aten.scatter_add(x, dim, index, src)
+
+    x = _index_payload(shape, dtype)
+    index = torch.zeros(shape, dtype=torch.int64)
+    index.narrow(dim % len(shape), 1, shape[dim] - 1).fill_(1)
+    src = _index_payload(shape, dtype)
+    check_outputs(fn, conf, [x, index, src])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_scatter_add_inplace(conf: Conf, call_checker: CallChecker):
+    """`scatter_add_` and `scatter_add` both route through
+    `aten::scatter_add.out`; in the in-place one the out= tensor IS self, so
+    the "start from a copy of self" step must be a no-op rather than a copy of
+    an already-scattered buffer."""
+    call_checker.register(aten_functions.aten_scatter_add)
+
+    def fn(x, index, src):
+        out = x.clone()
+        out.scatter_add_(1, index, src)
+        return out
+
+    x = _index_payload((4, 6), torch.float32)
+    index = torch.randint(0, 6, (4, 6), dtype=torch.int64)
+    src = _index_payload((4, 6), torch.float32)
+    check_outputs(fn, conf, [x, index, src])
+
+
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize(("shape", "dim"), [((6, 5), 0), ((6, 5), 1), ((3, 4, 5), 1)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_add(
+    conf: Conf,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    dim: int,
+    call_checker: CallChecker,
+):
+    """index_add is scatter_add with a broadcast index, and it is also what
+    autograd calls for index_select's backward — an unimplemented backward on
+    this device aborts the process instead of raising, so it stops being
+    optional the moment index_select exists."""
+    call_checker.register(aten_functions.aten_index_add)
+
+    def fn(x, index, source):
+        return aten.index_add(x, dim, index, source)
+
+    x = _index_payload(shape, dtype)
+    index = torch.tensor([0, 0, 1, 0], dtype=torch.int64)
+    source_shape = list(shape)
+    source_shape[dim] = 4
+    source = _index_payload(tuple(source_shape), dtype)
+    check_outputs(fn, conf, [x, index, source])
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("dtype", _INDEX_DTYPES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_put(
+    conf: Conf, dtype: torch.dtype, accumulate: bool, call_checker: CallChecker
+):
+    """`x[idx] = v` / `x[idx] += v`. With `accumulate=False` the indices are
+    unique on purpose: torch leaves the winner of colliding writes undefined
+    on an accelerator, so a duplicate there would be testing nothing."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    x = _index_payload((6, 4), dtype)
+    index = torch.tensor(
+        [3, 0, 3, 1] if accumulate else [3, 0, 5, 1], dtype=torch.int64
+    )
+    values = _index_payload((4, 4), dtype)
+    check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_put_negative_indices(conf: Conf, call_checker: CallChecker):
+    """Advanced indexing — unlike gather/index_select/scatter_add — DOES
+    define negative indices, and wraps them python-style."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([-1, -5, 2], dtype=torch.int64)
+    values = torch.randn(3, 3)
+    check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_put_broadcast_values(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    x = torch.randn(5, 3)
+    index = torch.tensor([1, 4], dtype=torch.int64)
+    values = torch.randn(3)  # broadcast over the indexed rows
+    check_outputs(fn, conf, [x, index, values])
+
+
 def test_aten_isin_none_match(conf: Conf):
     """Test aten.isin when no elements are in test_elements"""
 
@@ -2061,6 +3080,111 @@ def test_aten_isin_3d_tensor(conf: Conf):
 
     # Expected: [[[False, True], [False, True]], [[False, True], [False, True]]]
     check_outputs(fn, conf, [elements, test_elements])
+
+
+# ---------------------------------------------------------------------------
+# constant_pad_nd / reflection_pad2d / replication_pad2d (compile backend; the
+# mojo device's native kernels are tested in tests/native/test_data_movement.py)
+# ---------------------------------------------------------------------------
+
+_PAD_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Asymmetric on every side -- F.pad's normal 4-tuple usage.
+_PAD_ASYM = (1, 2, 0, 3)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+def test_aten_constant_pad_nd_compile(
+    conf: Conf, dtype: torch.dtype, call_checker: CallChecker
+):
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="constant", value=2.5)
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_constant_pad_nd_compile_negative_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Negative entries crop first, then the rest pads (ATen's algorithm;
+    MAX's ops.pad rejects negative paddings). One dim purely cropped, one
+    cropped on one side and padded on the other, one untouched."""
+    call_checker.register(aten_functions.aten_constant_pad_nd)
+
+    def fn(x):
+        return torch.nn.functional.pad(
+            x, (-1, 2, 0, -2, 0, 0), mode="constant", value=1.5
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 4, 5)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_reflection_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_reflection_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.reflection_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="reflect")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", _PAD_DTYPES)
+@pytest.mark.parametrize("shape", [(3, 6, 7), (2, 3, 6, 7)])
+@pytest.mark.parametrize("mode", ["public", "aten"])
+def test_aten_replication_pad2d(
+    conf: Conf,
+    mode: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    call_checker: CallChecker,
+):
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        if mode == "aten":
+            return aten.replication_pad2d(x, list(_PAD_ASYM))
+        return torch.nn.functional.pad(x, _PAD_ASYM, mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(shape, dtype=dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_replication_pad2d_compile_large_padding(
+    conf: Conf, call_checker: CallChecker
+):
+    """Replication padding has no upper bound relative to the input size."""
+    call_checker.register(aten_functions.aten_replication_pad2d)
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (5, 5, 5, 5), mode="replicate")
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 3, 3)])
+
+
+def test_aten_reflection_pad2d_compile_rejects_padding_ge_input_dim():
+    """The meta kernel raises during fake-tensor propagation, as CPU does."""
+
+    def fn(x):
+        return torch.nn.functional.pad(x, (4, 0, 0, 0), mode="reflect")
+
+    with pytest.raises(RuntimeError, match="Padding size should be less than"):
+        torch.compile(fn, backend=mojo_backend)(torch.randn(2, 3, 4, 4))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -2204,6 +3328,324 @@ def test_aten_select_scatter_scalar_src(conf: Conf):
     src = torch.tensor(5.0, dtype=torch.float32)
 
     check_outputs(fn, conf, [self, src])
+
+
+# ---------------------------------------------------------------------------
+# Group / batch norm backward through the torch.compile backend.
+#
+# AOTAutograd keeps both backwards as graph nodes (neither is in
+# DECOMPOSITION_TABLE), so `aten_functions` maps them; the eager mojo ops are
+# tested in tests/native/test_composed.py.
+#
+# Tolerance: every gradient here is a float32 reduction over at most a few
+# hundred elements, so the accumulation error is around sqrt(k) * eps ~ 3e-6
+# relative; both sides sum in different orders (ATen's group-norm reference
+# even carries an rstd**3 term), and the inputs are standard normal so rstd is
+# O(1) and does not amplify. 2e-5 is therefore ~5x the noise floor of a
+# correct implementation, while a wrong formula (a mismatched axis, a missing
+# term) moves these outputs by O(1) rather than by ulps.
+# ---------------------------------------------------------------------------
+
+_NORM_BACKWARD_TOLERANCE = 2e-5
+
+# (N, C, HxW, group). Covers group == 1 (layer norm over the whole sample),
+# group == C (instance norm), a group count that is neither, and shapes whose
+# channel and spatial extents are odd / not powers of two.
+_GROUP_NORM_BACKWARD_SHAPES = [
+    (2, 6, 12, 3),
+    (3, 8, 5, 1),
+    (2, 4, 7, 4),
+    (1, 9, 13, 3),
+    (2, 10, 33, 5),
+]
+
+_NORM_BACKWARD_MASKS = [
+    (True, True, True),
+    (True, False, False),
+    (False, True, True),
+    (False, True, False),
+    (False, False, True),
+    (True, True, False),
+    (True, False, True),
+]
+
+
+@pytest.mark.parametrize(("N", "C", "HxW", "group"), _GROUP_NORM_BACKWARD_SHAPES)
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_group_norm_backward(
+    conf: Conf,
+    call_checker: CallChecker,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    affine: bool,
+):
+    """`aten.native_group_norm_backward` against the CPU reference."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+
+    def fn(grad_out, x, weight):
+        weight = weight if affine else None
+        _, mean, rstd = aten.native_group_norm(x, weight, None, N, C, HxW, group, 1e-5)
+        # ATen's own CPU kernel cannot produce the affine gradients when there
+        # is no gamma (it reads an undefined tensor's device), and autograd
+        # never asks it to, so only grad_input is requested in that case.
+        mask = [True, True, True] if affine else [True, False, False]
+        outputs = aten.native_group_norm_backward(
+            grad_out, x, mean, rstd, weight, N, C, HxW, group, mask
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(0)
+    x = torch.randn(N, C, HxW)
+    grad_out = torch.randn(N, C, HxW)
+    weight = torch.randn(C)
+    check_outputs(
+        fn,
+        conf,
+        [grad_out, x, weight],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_group_norm_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: tuple[bool, bool, bool]
+):
+    """Only the requested gradients come back."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+    N, C, HxW, group = 2, 6, 10, 3
+
+    def fn(grad_out, x, weight):
+        _, mean, rstd = aten.native_group_norm(x, weight, None, N, C, HxW, group, 1e-5)
+        outputs = aten.native_group_norm_backward(
+            grad_out, x, mean, rstd, weight, N, C, HxW, group, list(mask)
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(1)
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(N, C, HxW), torch.randn(N, C, HxW), torch.randn(C)],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_group_norm_autograd_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled `F.group_norm` training step: the backward graph holds
+    `native_group_norm_backward`, fed by the forward's mean / rstd (which used
+    to be NotImplementedError placeholders, so this failed to compile)."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+
+    def fn(x, weight, bias):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True) if affine else None
+        beta = bias.detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.group_norm(leaf, 3, gamma, beta)
+        (output * output).sum().backward()
+        if not affine:
+            return (leaf.grad,)
+        assert gamma is not None
+        assert beta is not None
+        return leaf.grad, gamma.grad, beta.grad
+
+    torch.manual_seed(2)
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(2, 6, 5, 5), torch.randn(6), torch.randn(6)],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+def _batch_norm_saved_stats(x: torch.Tensor, eps: float):
+    """The per-channel statistics `aten::native_batch_norm` saves, from x."""
+    channels = x.shape[1]
+    planes = x.reshape(x.shape[0], channels, math.prod(x.shape[2:]))
+    mean = torch.mean(planes, dim=[0, 2])
+    centered = planes - mean.reshape(1, channels, 1)
+    variance = torch.mean(centered * centered, dim=[0, 2])
+    return mean, torch.rsqrt(variance + eps)
+
+
+@pytest.mark.parametrize("shape", [(4, 3, 5, 5), (2, 7, 3), (6, 5), (3, 4, 2, 2, 2)])
+@pytest.mark.parametrize("train", [True, False])
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_batch_norm_backward(
+    conf: Conf,
+    call_checker: CallChecker,
+    shape: tuple[int, ...],
+    train: bool,
+    affine: bool,
+):
+    """`aten.native_batch_norm_backward` in both modes, against the CPU reference.
+
+    Evaluation is not a no-op here: it reads the running buffers rather than
+    the saved statistics, so an `.eval()` BatchNorm still has a real gradient.
+    """
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(grad_out, x, weight, running_mean, running_var):
+        weight = weight if affine else None
+        if train:
+            save_mean, save_invstd = _batch_norm_saved_stats(x, 1e-5)
+        else:
+            # ATen returns empty saved statistics for the inference forward;
+            # the backward reads the running buffers instead.
+            save_mean = running_mean
+            save_invstd = torch.rsqrt(running_var + 1e-5)
+        return aten.native_batch_norm_backward(
+            grad_out,
+            x,
+            weight,
+            running_mean,
+            running_var,
+            save_mean,
+            save_invstd,
+            train,
+            1e-5,
+            [True, True, True],
+        )
+
+    torch.manual_seed(3)
+    channels = shape[1]
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(shape),
+            torch.randn(shape),
+            torch.randn(channels),
+            torch.zeros(channels),
+            torch.rand(channels) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
+@pytest.mark.parametrize("train", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_batch_norm_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, train: bool, mask: tuple[bool, bool, bool]
+):
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(grad_out, x, weight, running_mean, running_var):
+        save_mean, save_invstd = _batch_norm_saved_stats(x, 1e-5)
+        outputs = aten.native_batch_norm_backward(
+            grad_out,
+            x,
+            weight,
+            running_mean,
+            running_var,
+            save_mean,
+            save_invstd,
+            train,
+            1e-5,
+            list(mask),
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(4)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(3, 5, 4, 4),
+            torch.randn(3, 5, 4, 4),
+            torch.randn(5),
+            torch.zeros(5),
+            torch.rand(5) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_training_step_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled training-mode BatchNorm step. AOTAutograd's forward holds
+    `_native_batch_norm_legit_functional` (the running-stat update returned
+    rather than done in place) and its backward `native_batch_norm_backward`;
+    the updated running buffers are compared too."""
+    # The forward mapping has no fallback: the compile fails without it.
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(x, weight, bias, running_mean, running_var):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True) if affine else None
+        beta = bias.detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=True
+        )
+        (output * output).sum().backward()
+        if gamma is None or beta is None:
+            return leaf.grad, running_mean, running_var
+        return leaf.grad, gamma.grad, beta.grad, running_mean, running_var
+
+    torch.manual_seed(6)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(3, 5, 4, 3),
+            torch.randn(5),
+            torch.randn(5),
+            torch.randn(5),
+            torch.rand(5) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_eval_autograd_compiled(conf: Conf, call_checker: CallChecker):
+    """A compiled `.eval()` BatchNorm backward: the forward is
+    `_native_batch_norm_legit_no_training`, whose two saved-statistic outputs
+    used to be NotImplementedError placeholders that broke the joint graph."""
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(x, weight, bias, running_mean, running_var):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True)
+        beta = bias.detach().requires_grad_(True)
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=False
+        )
+        (output * output).sum().backward()
+        return leaf.grad, gamma.grad, beta.grad
+
+    torch.manual_seed(5)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(2, 4, 3, 3),
+            torch.randn(4),
+            torch.randn(4),
+            torch.randn(4),
+            torch.rand(4) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
 
 
 @pytest.mark.parametrize("repeats", [1, 2, 3, 5])
@@ -2687,12 +4129,15 @@ def test_aten_searchsorted_and_bucketize_errors(
             values,
             sorter=torch.tensor([0, 1, 2], dtype=torch.int32).to(mojo_device),
         )
-    with pytest.raises(RuntimeError, match="sorter index out of range"):
-        aten.searchsorted.Tensor(
-            boundaries,
-            values,
-            sorter=torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device),
-        )
+    # An out-of-range sorter index is not validated (that would need a
+    # device-to-host sync on every call): the native backend clamps it in
+    # the kernel instead of raising, so this must merely not crash.
+    out_of_range_sorter = torch.tensor([0, 1, 3], dtype=torch.int64).to(mojo_device)
+    unspecified = aten.searchsorted.Tensor(
+        boundaries, values, sorter=out_of_range_sorter
+    )
+    assert unspecified.shape == values.shape
+    assert unspecified.dtype == torch.int64
     with pytest.raises(RuntimeError, match="should have same device type"):
         aten.searchsorted.Tensor(boundaries, torch.tensor([0.0, 4.0]))
     with pytest.raises(
@@ -2701,8 +4146,39 @@ def test_aten_searchsorted_and_bucketize_errors(
         aten.searchsorted.Tensor(
             boundaries, values, sorter=torch.tensor([0, 1, 2], dtype=torch.int64)
         )
+    with pytest.raises(
+        RuntimeError, match="boundary and sorter must have the same size"
+    ):
+        aten.searchsorted.Tensor(
+            boundaries,
+            values,
+            sorter=torch.tensor([0, 1], dtype=torch.int64).to(mojo_device),
+        )
     with pytest.raises(RuntimeError, match="boundaries tensor must be 1 dimension"):
         aten.bucketize.Tensor(values, boundaries.unsqueeze(0))
+
+
+def test_aten_searchsorted_sorter_noncontiguous(
+    mojo_device: str, call_checker: CallChecker
+):
+    register_mojo_devices()
+    call_checker.register(aten_functions.aten_searchsorted)
+
+    boundaries = torch.tensor([30.0, 10.0, 20.0])
+    values = torch.tensor([5.0, 10.0, 25.0, 35.0])
+    # Every other entry of a padded buffer: a genuine non-contiguous sorter
+    # (stride 2) holding the same permutation as test_aten_searchsorted_sorter.
+    sorter_padded = torch.tensor([1, -1, 2, -1, 0, -1], dtype=torch.int64)
+    sorter = sorter_padded.as_strided((3,), (2,), 0)
+    assert not sorter.is_contiguous()
+    expected = torch.searchsorted(boundaries, values, sorter=sorter)
+
+    sorter_d = sorter_padded.to(mojo_device).as_strided((3,), (2,), 0)
+    assert not sorter_d.is_contiguous()
+    actual = aten.searchsorted.Tensor(
+        boundaries.to(mojo_device), values.to(mojo_device), sorter=sorter_d
+    )
+    torch.testing.assert_close(actual.cpu(), expected)
 
 
 def test_aten_searchsorted_and_bucketize_compile_backend(call_checker: CallChecker):
@@ -2774,10 +4250,10 @@ def test_aten_searchsorted_compile_backend_declines_unchecked_sorter():
 
 
 # ---------------------------------------------------------------------------
-# topk / sort.  Every case below uses tie-free values on purpose: ATen leaves
-# the index of a tie unspecified (CPU, CUDA and this backend are each free to
-# pick a different one), so only `sort(stable=True)` -- which pins the order --
-# is tested against ties.
+# topk / sort (compile backend; the mojo device's native kernels are tested in
+# tests/native/test_reductions.py). Tie-free values except where the test is
+# about ties: ATen leaves the index of a tie unspecified for topk and for a
+# non-stable sort.
 # ---------------------------------------------------------------------------
 
 
@@ -2790,488 +4266,77 @@ def _distinct(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return (values - numel // 2).reshape(shape).to(dtype)
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("largest", [True, False])
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
-)
-def test_aten_topk_last_dim(
-    mojo_device: str, call_checker: CallChecker, dtype: torch.dtype, largest: bool
-) -> None:
-    register_mojo_devices()
+@pytest.mark.parametrize("k", [1, 5, 33])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_topk(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, k: int, largest: bool
+):
     call_checker.register(aten_functions.aten_topk)
 
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.topk(x, 3, -1, largest, True)
+    def fn(x):
+        return torch.topk(x, k, dim=-1, largest=largest)
 
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 33), dtype)])
+    check_outputs(fn, conf, [_distinct((4, 33), dtype)])
 
 
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("dim", [0, 1, -2])
-def test_aten_topk_non_last_dim(
-    mojo_device: str, call_checker: CallChecker, dim: int
-) -> None:
-    register_mojo_devices()
+def test_aten_topk_non_last_dim(conf: Conf, call_checker: CallChecker, dim: int):
     call_checker.register(aten_functions.aten_topk)
 
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.topk(x, 2, dim, True, True)
+    def fn(x):
+        return aten.topk(x, 2, dim, False, False)
 
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
-
-
-@pytest.mark.parametrize("k", [0, 1, 7])
-def test_aten_topk_k_edges(mojo_device: str, call_checker: CallChecker, k: int) -> None:
-    """k=0 (empty result), k=1, and k == the whole row (a full sort)."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_topk)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.topk(x, k, -1, True, True)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, 7), torch.float32)])
+    check_outputs(fn, conf, [_distinct((5, 4, 3), torch.float32)])
 
 
-def test_aten_topk_large_row_small_k(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    """The LLM-sampling regime: k tiny, the row a whole vocabulary."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_topk)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.topk(x, 50, -1, True, True)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((2, 4099), torch.float32)])
-
-
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("descending", [False, True])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float32,
-        torch.bfloat16,
-        torch.float16,
-        torch.int64,
-        torch.int32,
-        torch.bool,
-    ],
-)
-def test_aten_sort_last_dim(
-    mojo_device: str, call_checker: CallChecker, dtype: torch.dtype, descending: bool
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.sort.stable(x, stable=True, dim=-1, descending=descending)
-
-    if dtype is torch.bool:
-        # Booleans are all ties; only a stable sort has a defined answer, and
-        # `stable=True` above is what makes CPU and this backend agree.
-        x = (torch.arange(4 * 33) % 3 == 0).reshape(4, 33)
-    else:
-        x = _distinct((4, 33), dtype)
-    check_outputs(fn, Conf(mojo_device, False), [x])
-
-
-@pytest.mark.parametrize("dim", [0, 1, -2])
-def test_aten_sort_non_last_dim(
-    mojo_device: str, call_checker: CallChecker, dim: int
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.sort.stable(x, stable=True, dim=dim, descending=False)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
-
-
-@pytest.mark.parametrize("descending", [False, True])
-def test_aten_sort_stable_with_ties(
-    mojo_device: str, call_checker: CallChecker, descending: bool
-) -> None:
-    """`stable=True` pins the index order of equal values; check it holds."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.sort.stable(x, stable=True, dim=-1, descending=descending)
-
-    x = torch.tensor([[3.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]]).repeat(3, 5)
-    check_outputs(fn, Conf(mojo_device, False), [x])
-
-
-def test_aten_sort_large_row(mojo_device: str, call_checker: CallChecker) -> None:
-    """The top-p sampling regime: one full-vocabulary descending sort."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.sort.stable(x, stable=True, dim=-1, descending=True)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((2, 4099), torch.float32)])
-
-
-def test_aten_sort_empty_and_singleton(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-
-    def fn(
-        empty: torch.Tensor, scalar: torch.Tensor, single: torch.Tensor
-    ) -> tuple[torch.Tensor, ...]:
-        empty_values, empty_indices = aten.sort.stable(empty, stable=True, dim=-1)
-        scalar_values, scalar_indices = aten.topk(scalar, 1, 0, True, True)
-        single_values, single_indices = aten.sort.stable(single, stable=True, dim=0)
-        return (
-            empty_values,
-            empty_indices,
-            scalar_values,
-            scalar_indices,
-            single_values,
-            single_indices,
-        )
-
-    check_outputs(
-        fn,
-        Conf(mojo_device, False),
-        [torch.empty(2, 0), torch.tensor(4.5), torch.tensor([7.0])],
-    )
-
-
-def test_aten_argsort_and_msort_reach_sort(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    """Both decompose onto aten::sort, so registering sort covers them."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            torch.argsort(x, dim=-1),
-            torch.argsort(x, dim=-1, descending=True),
-            torch.msort(x),
-        )
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 9), torch.float32)])
-
-
-def test_aten_topk_and_sort_non_contiguous_input(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    """A transposed (and a sliced) view must be materialized, not misread."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        transposed = x.t()
-        sliced = x[:, 1::2]
-        top_values, top_indices = aten.topk(transposed, 2, -1, True, True)
-        sorted_values, sorted_indices = aten.sort.stable(sliced, stable=True, dim=-1)
-        return (top_values, top_indices, sorted_values, sorted_indices)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((6, 8), torch.float32)])
-
-
-def test_aten_topk_and_sort_out_variants(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-    x = _distinct((3, 6), torch.float32).to(mojo_device)
-
-    values = torch.empty(0, dtype=torch.float32, device=mojo_device)
-    indices = torch.empty(0, dtype=torch.int64, device=mojo_device)
-    got = aten.topk.values(x, 2, -1, True, True, values=values, indices=indices)
-    assert got[0] is values and got[1] is indices
-    expected = torch.topk(x.cpu(), 2, dim=-1)
-    torch.testing.assert_close(values.cpu(), expected.values)
-    torch.testing.assert_close(indices.cpu(), expected.indices)
-
-    values = torch.empty(0, dtype=torch.float32, device=mojo_device)
-    indices = torch.empty(0, dtype=torch.int64, device=mojo_device)
-    got = aten.sort.values_stable(
-        x, stable=True, dim=-1, descending=False, values=values, indices=indices
-    )
-    assert got[0] is values and got[1] is indices
-    expected = torch.sort(x.cpu(), dim=-1, stable=True)
-    torch.testing.assert_close(values.cpu(), expected.values)
-    torch.testing.assert_close(indices.cpu(), expected.indices)
-
-
-def test_aten_topk_and_sort_errors(mojo_device: str, call_checker: CallChecker) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-    x = _distinct((3, 6), torch.float32).to(mojo_device)
-
-    with pytest.raises(RuntimeError, match="selected index k out of range"):
-        aten.topk(x, 7, -1, True, True)
-    with pytest.raises(IndexError, match="Dimension out of range"):
-        aten.topk(x, 2, 5, True, True)
-    with pytest.raises(IndexError, match="Dimension out of range"):
-        aten.sort.stable(x, stable=True, dim=5)
-
-
-def test_aten_topk_and_sort_backward(call_checker: CallChecker) -> None:
-    """Both backwards are a scatter of the gradient over the returned indices.
-
-    Pinned to mojo device 0 rather than the `mojo_device` fixture: the
-    generated backward rebuilds the gradient buffer from the C++ side with
-    `at::zeros(sizes, grad.options())`, and a mojo tensor's C++ TensorImpl
-    carries the phantom device index 0 whatever device it really lives on, so
-    on any other index that allocation lands on the wrong device. That is a
-    backend-wide property (`aten::min.dim` backward hits it identically), not
-    something sort or topk can fix.
-    """
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-    x = _distinct((4, 9), torch.float32).to("mojo:0").requires_grad_(True)
-    reference = x.detach().cpu().clone().requires_grad_(True)
-
-    def loss(t: torch.Tensor) -> torch.Tensor:
-        top = torch.topk(t, 3, dim=-1).values
-        low = torch.sort(t, dim=-1).values[..., :2]
-        return (top * 2).sum() + (low * 3).sum()
-
-    loss(x).backward()
-    loss(reference).backward()
-    assert x.grad is not None
-    torch.testing.assert_close(x.grad.cpu(), reference.grad)
-
-
-def test_aten_topk_and_sort_compile_backend(call_checker: CallChecker) -> None:
-    call_checker.register(aten_functions.aten_sort, aten_functions.aten_topk)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        top_values, top_indices = aten.topk(x, 3, -1, True, True)
-        low_values, low_indices = aten.topk(x, 2, -1, False, True)
-        sorted_values, sorted_indices = aten.sort.stable(
-            x, stable=True, dim=-1, descending=False
-        )
-        descending_values, _ = aten.sort.stable(x, stable=True, dim=0, descending=True)
-        return (
-            top_values,
-            top_indices,
-            low_values,
-            low_indices,
-            sorted_values,
-            sorted_indices,
-            descending_values,
-        )
-
-    check_outputs(fn, Conf("cpu", True), [_distinct((4, 9), torch.float32)])
-
-
-# ---------------------------------------------------------------------------
-# median.dim / kthvalue.  Both are a k-th order statistic along one dim, so
-# both reuse #416's sort/topk kernel (the k smallest values, ascending, kept
-# to the last one) rather than a new kernel. Ties are only guaranteed to
-# match ATen's VALUE, not necessarily its (unspecified, introselect-derived)
-# tie index -- the same accepted disagreement class already documented for
-# sort/topk itself -- so every case below except the dedicated NaN ones uses
-# tie-free values.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("keepdim", [False, True])
-@pytest.mark.parametrize("dim", [0, 1, -1])
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
-)
-def test_aten_median_dim(
-    mojo_device: str,
+@pytest.mark.parametrize("dim", [-1, 0, -2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_aten_sort(
+    conf: Conf,
     call_checker: CallChecker,
     dtype: torch.dtype,
     dim: int,
-    keepdim: bool,
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_median_dim)
+    descending: bool,
+):
+    """torch.sort and argsort reach the graph as sort.default."""
+    call_checker.register(aten_functions.aten_sort)
 
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.median.dim(x, dim, keepdim)
+    def fn(x):
+        values, indices = torch.sort(x, dim=dim, descending=descending)
+        return values, indices, torch.argsort(x, dim=dim, descending=descending)
 
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((4, 5), dtype)])
-
-
-@pytest.mark.parametrize("size", [1, 2, 5, 8])
-def test_aten_median_dim_odd_and_even_sizes(
-    mojo_device: str, call_checker: CallChecker, size: int
-) -> None:
-    """The lower-of-two-middle rule only shows up at even sizes; size 1 is
-    the degenerate single-element case."""
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_median_dim)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.median.dim(x, -1, False)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, size), torch.float32)])
+    check_outputs(fn, conf, [_distinct((5, 4, 7), dtype)])
 
 
-def test_aten_median_dim_propagates_nan(mojo_device: str) -> None:
-    """ATen's real median.dim quirk: ANY NaN in the row forces the whole
-    result to (nan, index of the FIRST nan) -- not merely whatever value the
-    order-statistic position would naively land on. Compared manually
-    (`equal_nan=True`) since `check_outputs` doesn't expose that."""
-    register_mojo_devices()
-    x = torch.tensor([[5.0, float("nan"), 1.0, 2.0], [1.0, 2.0, 3.0, 4.0]])
-    expected = torch.median(x, dim=1)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("descending", [False, True])
+def test_aten_sort_stable_with_ties(
+    conf: Conf, call_checker: CallChecker, descending: bool
+):
+    """`stable=True` reaches the graph as sort.stable and pins the index order
+    of equal values."""
+    call_checker.register(aten_functions.aten_sort_stable)
 
-    eager = torch.median(x.to(mojo_device), dim=1)
-    torch.testing.assert_close(eager.values.cpu(), expected.values, equal_nan=True)
-    assert torch.equal(eager.indices.cpu(), expected.indices)
+    def fn(x):
+        return torch.sort(x, dim=-1, descending=descending, stable=True)
 
-    def fn(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.median.dim(t, 1, False)
-
-    compiled = torch.compile(fn, backend=mojo_backend)(x.to(mojo_device))
-    torch.testing.assert_close(compiled[0].cpu(), expected.values, equal_nan=True)
-    assert torch.equal(compiled[1].cpu(), expected.indices)
+    x = torch.tensor([[3.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]]).repeat(3, 5)
+    check_outputs(fn, conf, [x])
 
 
-def test_aten_median_dim_errors(mojo_device: str) -> None:
-    register_mojo_devices()
-    x = torch.randn(3, 4).to(mojo_device)
-    with pytest.raises(IndexError, match="Dimension out of range"):
-        torch.median(x, dim=5)
-    with pytest.raises(IndexError, match="non-zero size"):
-        torch.median(torch.randn(3, 0).to(mojo_device), dim=1)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_msort(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_sort)
 
+    def fn(x):
+        return torch.msort(x)
 
-@pytest.mark.parametrize("keepdim", [False, True])
-@pytest.mark.parametrize("k", [1, 2, 5])
-@pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32]
-)
-def test_aten_kthvalue(
-    mojo_device: str,
-    call_checker: CallChecker,
-    dtype: torch.dtype,
-    k: int,
-    keepdim: bool,
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_kthvalue)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.kthvalue(x, k, -1, keepdim)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((3, 5), dtype)])
-
-
-def test_aten_kthvalue_non_last_dim(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_functions.aten_kthvalue)
-
-    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return aten.kthvalue(x, 2, 0, False)
-
-    check_outputs(fn, Conf(mojo_device, False), [_distinct((5, 4, 3), torch.float32)])
-
-
-def test_aten_kthvalue_with_nan_matches_stable_sort_order(mojo_device: str) -> None:
-    """kthvalue has no median-style NaN special case: a NaN just sorts as
-    the largest value, like everywhere else in this kernel family, so it
-    matches ATen's own kthvalue exactly here (verified against CPU torch,
-    including the index -- there is no tie to break with a single NaN)."""
-    register_mojo_devices()
-    x = torch.tensor([1.0, float("nan"), 3.0])
-    expected = torch.kthvalue(x, 3, dim=0)
-    got = torch.kthvalue(x.to(mojo_device), 3, dim=0)
-    torch.testing.assert_close(got.values.cpu(), expected.values, equal_nan=True)
-    assert torch.equal(got.indices.cpu(), expected.indices)
-
-
-def test_aten_kthvalue_errors(mojo_device: str) -> None:
-    register_mojo_devices()
-    x = torch.randn(3, 4).to(mojo_device)
-    with pytest.raises(RuntimeError, match="selected number k out of range"):
-        torch.kthvalue(x, 5, dim=1)
-    with pytest.raises(IndexError, match="Dimension out of range"):
-        torch.kthvalue(x, 1, dim=5)
-    with pytest.raises(IndexError, match="non-zero size"):
-        torch.kthvalue(torch.randn(3, 0).to(mojo_device), 1, dim=1)
-
-
-def test_aten_median_and_kthvalue_compile_backend(call_checker: CallChecker) -> None:
-    call_checker.register(aten_functions.aten_median_dim, aten_functions.aten_kthvalue)
-
-    def fn(
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        median_values, median_indices = aten.median.dim(x, 1, False)
-        kth_values, kth_indices = aten.kthvalue(x, 2, 1, False)
-        return median_values, median_indices, kth_values, kth_indices
-
-    check_outputs(fn, Conf("cpu", True), [_distinct((4, 7), torch.float32)])
-
-
-# ---------------------------------------------------------------------------
-# multinomial.  A sampler, not a pure function: its distribution and
-# determinism are exercised in test_eager_kernels.py (which already has the
-# Philox / manual_seed conventions this needs); here we cover dispatch
-# (CallChecker), the compile backend's deliberate decline, and the ATen-
-# worded validation errors that don't need randomness to trigger.
-# ---------------------------------------------------------------------------
-
-
-def test_aten_multinomial_dispatches_to_fast_eager(
-    mojo_device: str, call_checker: CallChecker
-) -> None:
-    register_mojo_devices()
-    call_checker.register(aten_fast.fast_aten_multinomial)
-    torch.mojo.manual_seed_all(20260819)  # ty: ignore[unresolved-attribute]
-
-    weights = torch.tensor([0.1, 0.2, 0.3, 0.4], device=mojo_device)
-    out = torch.multinomial(weights, 5, replacement=True)
-    assert out.dtype == torch.int64
-    assert out.shape == (5,)
-    assert out.device.type == "mojo"
-
-
-def test_aten_multinomial_compile_backend_declines() -> None:
-    def fn(weights: torch.Tensor) -> torch.Tensor:
-        return torch.multinomial(weights, 1)
-
-    weights = torch.tensor([0.1, 0.2, 0.3], device="mojo")
-    with pytest.raises(BackendCompilerFailed, match="multinomial"):
-        torch.compile(fn, backend=mojo_backend)(weights)
-
-
-def test_aten_multinomial_validation_errors(mojo_device: str) -> None:
-    register_mojo_devices()
-
-    with pytest.raises(RuntimeError, match="prob_dist must be 1 or 2 dim"):
-        torch.multinomial(torch.rand(2, 3, 4, device=mojo_device), 1)
-
-    with pytest.raises(RuntimeError, match=r"cannot sample n_sample <= 0"):
-        torch.multinomial(torch.tensor([1.0, 2.0], device=mojo_device), 0)
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"cannot sample n_sample > prob_dist.size\(-1\) samples without replacement",
-    ):
-        torch.multinomial(
-            torch.tensor([1.0, 1.0], device=mojo_device), 3, replacement=False
-        )
-
-    with pytest.raises(
-        RuntimeError, match=r"invalid multinomial distribution \(sum of probabilities"
-    ):
-        torch.multinomial(torch.tensor([0.0, 0.0], device=mojo_device), 1)
-
-    with pytest.raises(RuntimeError, match="inf.*nan.*element < 0"):
-        torch.multinomial(torch.tensor([1.0, -1.0], device=mojo_device), 1)
-
-    with pytest.raises(NotImplementedError, match="generator"):
-        torch.multinomial(
-            torch.tensor([1.0, 1.0], device=mojo_device), 1, generator=torch.Generator()
-        )
+    check_outputs(fn, conf, [_distinct((6, 5), torch.float32)])
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -3847,6 +4912,23 @@ def test_aten_triu_dynamic_batch_dimension(conf: Conf):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(), (3, 7)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_log2(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, shape: tuple[int, ...]
+):
+    call_checker.register(aten_functions.aten_log2)
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return aten.log2(x)
+
+    data = torch.full(shape, 8, dtype=dtype)
+    check_outputs(fn, conf, [data])
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 
@@ -4391,6 +5473,36 @@ def test_aten_linear_backward_degenerate_features(
         torch.testing.assert_close(got.cpu(), want)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("size", "scale_factor"),
+    [
+        pytest.param(None, 2.0, id="2x"),
+        pytest.param((20, 20), None, id="8_to_20"),
+        pytest.param(None, 1.5, id="scale_1.5"),
+        pytest.param((4, 3), None, id="down"),
+    ],
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_upsample_nearest2d_compiles(
+    conf: Conf,
+    dtype: torch.dtype,
+    size: tuple[int, int] | None,
+    scale_factor: float | None,
+):
+    """torch.compile traces nearest upsampling through torch's own Python
+    decomposition (an `index` gather), which runs under compile for both
+    `upsample_nearest2d` overloads, so no graph op of that name exists to map.
+    The eager mojo op is tested in tests/native/test_nn.py."""
+
+    def fn(x):
+        return torch.nn.functional.interpolate(
+            x, size=size, scale_factor=scale_factor, mode="nearest"
+        )
+
+    check_outputs(fn, conf, [torch.randn(2, 3, 8, 8, dtype=dtype)], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_aten_var_no_dim(conf: Conf, dtype: torch.dtype, call_checker: CallChecker):
     """Test aten.var over all dimensions (default correction=1)"""
@@ -4482,9 +5594,7 @@ def test_fill_scalar_basic(
     call_checker: CallChecker,
 ):
     """Test basic fill.Scalar functionality with different dtypes, shapes, and values"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4506,9 +5616,7 @@ def test_fill_scalar_integer_dtypes(
     call_checker: CallChecker,
 ):
     """Test fill.Scalar functionality with integer dtypes"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4522,9 +5630,7 @@ def test_fill_scalar_integer_dtypes(
 @pytest.mark.parametrize("value", [-5, 100])
 def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallChecker):
     """Test fill.Scalar with integer values"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return aten.fill.Scalar(x, value)
@@ -4537,9 +5643,7 @@ def test_fill_scalar_integer_values(conf: Conf, value: int, call_checker: CallCh
 
 def test_fill_scalar_single_element(conf: Conf, call_checker: CallChecker):
     """Test fill.Scalar with single element tensor"""
-    call_checker.register(
-        aten_functions.aten_fill_scalar, aten_fast.fast_aten_fill_scalar
-    )
+    call_checker.register(aten_functions.aten_fill_scalar)
 
     def fn(x):
         return torch.ops.aten.fill.Scalar(x, 7.5)
@@ -4564,9 +5668,7 @@ def test_fill_scalar_zero_dim(conf: Conf):
 
 def test_fill__scalar_inplace(conf: Conf, call_checker: CallChecker):
     """Test fill_.Scalar fills tensor in-place"""
-    call_checker.register(
-        aten_functions.aten_fill__scalar, aten_fast.fast_aten_fill__scalar
-    )
+    call_checker.register(aten_functions.aten_fill__scalar)
 
     def fn(x):
         aten.fill_(x, 3.5)
@@ -4672,7 +5774,9 @@ def test_aten__log_softmax_backward_data_scalar_nonfinite(
     grad_output = torch.tensor(grad_value, device=conf.device)
     output = torch.tensor(0.0, device=conf.device)
 
-    actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
+    # no MAX-CPU-device route in the native backend: declines there
+    with _xfail_if_unsupported(conf.device):
+        actual = aten._log_softmax_backward_data(grad_output, output, -1, torch.float32)
 
     assert torch.isnan(actual.cpu())
 
@@ -4688,9 +5792,10 @@ def test_aten__log_softmax_backward_data_half_to_float(
         torch.float16
     )
 
-    actual = aten._log_softmax_backward_data(
-        grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
-    )
+    with _xfail_if_unsupported(conf.device):  # no MAX-CPU-device route
+        actual = aten._log_softmax_backward_data(
+            grad_output.to(conf.device), output.to(conf.device), -1, torch.float16
+        )
 
     assert actual.dtype == torch.float16
     torch.testing.assert_close(
@@ -4769,9 +5874,7 @@ def test_aten_erf_basic(conf: Conf, dtype: torch.dtype):
 
 
 def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
-    call_checker.register(
-        aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
-    )
+    call_checker.register(aten_functions.aten__unsafe_view)
 
     def fn(x):
         return aten._unsafe_view(x, [2, 6])
@@ -4784,9 +5887,7 @@ def test_aten__unsafe_view(conf: Conf, call_checker: CallChecker):
 def test_aten__unsafe_view_dtypes(
     conf: Conf, dtype: torch.dtype, call_checker: CallChecker
 ):
-    call_checker.register(
-        aten_functions.aten__unsafe_view, aten_fast.fast_aten__unsafe_view
-    )
+    call_checker.register(aten_functions.aten__unsafe_view)
 
     def fn(x):
         return aten._unsafe_view(x, [4, -1])
