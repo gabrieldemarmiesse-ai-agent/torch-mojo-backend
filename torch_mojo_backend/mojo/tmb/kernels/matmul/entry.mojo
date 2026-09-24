@@ -3134,17 +3134,20 @@ def _nt_best_parts(
     kernel needs its edge-masked instantiation, which spills and measures 2.2-3.2x
     slower, so the caller is better off declining to the routes tuned for small
     grids.  `parts == 1` is likewise only offered when this tile's own output grid
-    covers the device -- an unsplit wave that leaves CUs idle is exactly what
-    those other routes beat by 19-49% (change 24) -- and when the caller allows
-    it: `min_parts` is how a tile that is only instantiated in its split form
-    says so.
+    covers at least half the device -- an unsplit wave that leaves most CUs idle
+    is exactly what those other routes beat by 19-49% (change 24, grids of 12-16%
+    of the CUs), while from half the device up the model ranks it against the
+    split plans: measured on MI300A (gfx942), job 5448054, TN (1600, 4800, 1024)
+    runs 133 unsplit tiles on 228 CUs in 76.6 us, against 99.6 for the 128x128
+    tile and more for any split -- and when the caller allows it: `min_parts` is
+    how a tile that is only instantiated in its split form says so.
     """
     if m < bm or n < bn:
         return 0
     var best = 0
     var chosen = 0
     var tiles = ceildiv(m, bm) * ceildiv(n, bn)
-    var lo = max(min_parts, 1 if tiles >= cus else 2)
+    var lo = max(min_parts, 1 if 2 * tiles >= cus else 2)
     var hi = NT_MAX_PARTS if splittable else 1
     # Splitting K is what covers the device when the output grid cannot, but it
     # cannot conjure WORK: below a few k tiles per CU the whole GEMM is prologue
@@ -3666,7 +3669,11 @@ def _dense_mfma_route[
     # positions) with one of each.  So the mixed-layout NN keeps the one-tile
     # body and its own refill position.
     comptime BODY2 = A_KMAJOR == B_KMAJOR
-    comptime FILL = NT_BODY2_FILL_NATIVE if BODY2 else NT_MID_FILL
+    comptime FILL = (
+        (
+            NT_BODY2_FILL if A_KMAJOR else NT_BODY2_FILL_NATIVE
+        ) if BODY2 else NT_MID_FILL
+    )
     # Each operand's 16-byte rows run along its own contiguous axis, so it is
     # that axis's length that has to keep every tile row aligned.
     var alen = k if A_KMAJOR else m
@@ -3693,9 +3700,9 @@ def _dense_mfma_route[
     # this workload.  A tile is only a candidate when it fits inside the output,
     # because the edge-masked instantiation it would otherwise need spills and
     # measures 2.2-3.2x slower (see `_nt_mfma_gemm`).  `parts == 1` is only offered
-    # when the tile's own grid covers the device: a single unsplit workgroup wave
-    # that leaves CUs idle is what the routes below this one are for, and measured
-    # 19-49% better there.
+    # when the tile's own grid covers at least half the device (`_nt_best_parts`):
+    # a single unsplit workgroup wave that leaves most CUs idle is what the routes
+    # below this one are for, and measured 19-49% better there.
     var sq_parts = _nt_best_parts(
         256, 256, m, n, size_of[dtype](), ktiles, cus, splittable, 1
     )
@@ -3729,6 +3736,50 @@ def _dense_mfma_route[
     var b_parts = wide_parts if b_wide else sq_parts
     if b_parts == 0:
         return False
+    # A third tile, 128x128, for the shapes whose best big-tile plan has to
+    # split K: a grid four times finer, so fewer slabs -- or none -- fill the
+    # device, with less workspace to write and reduce.  Offered unsplit and at
+    # its own best slab count, ranked by the same model, and only ever in place
+    # of a split plan: where 256x256 runs unsplit its operand reuse wins
+    # (measured below), and the set of shapes the route accepts is unchanged.
+    # Measured on MI300A (gfx942), job 5448054, device time, one plan per
+    # process, against the plan this replaced:
+    #   NN+bias (1024, 1600, 1600)  128 p2  37.8 us   128 p1 40.8, 256 p5 48
+    #   NN+bias (1024, 4800, 1600)  128 p1  80.5      256 p3 102.7
+    #   NN+bias (1024, 1600, 6400)  128 p2 113.2      256 p8 121.7
+    #   NT      (1024, 1600, 4800)  128 p2  77.7      128x384 p5 91.4
+    #   NT      (1024, 1600, 6400)  128 p2 102.3      256 p8 110.9
+    #   TN      (1600, 1600, 1024)  128 p1  33.9      256 p4 56.4
+    # and TN (1600, 4800, 1024) 256 unsplit 76.6 against 128 unsplit 99.6.
+    var s_parts = 0
+    if b_parts > 1 and m >= 128 and n >= 128:
+        var best = _nt_plan_cost(
+            128 if b_wide else 256,
+            384 if b_wide else 256,
+            m,
+            n,
+            size_of[dtype](),
+            ktiles,
+            b_parts,
+            cus,
+        )
+        var one = _nt_plan_cost(
+            128, 128, m, n, size_of[dtype](), ktiles, 1, cus
+        )
+        if one <= best:
+            s_parts = 1
+            best = one
+        var split = _nt_best_parts(
+            128, 128, m, n, size_of[dtype](), ktiles, cus, splittable, 2
+        )
+        if (
+            split != 0
+            and _nt_plan_cost(
+                128, 128, m, n, size_of[dtype](), ktiles, split, cus
+            )
+            < best
+        ):
+            s_parts = split
 
     @always_inline
     @parameter
@@ -3814,6 +3865,9 @@ def _dense_mfma_route[
             )
         _ = ws^
 
+    if s_parts != 0:
+        _launch[128, 128](s_parts)
+        return True
     # The mixed layout never selects the second tile, so it does not instantiate
     # it either.
     comptime if BODY2:

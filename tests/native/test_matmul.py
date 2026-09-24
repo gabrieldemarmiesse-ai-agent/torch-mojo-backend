@@ -172,6 +172,7 @@ def test_mm_float32_tensor_core_regime(mojo_device, shape):
         ((1009, 1592, 8223), "NN", False, (3, 0)),
         ((1024, 1600, 6400), "NT", False, (0, 0)),
         ((1600, 1600, 1024), "TN", False, (0, 0)),
+        ((1600, 4800, 1024), "TN", False, (0, 0)),
         ((1009, 1617, 1599), "NN", True, (1, 1)),
         ((1024, 1600, 1600), "NN", True, (0, 0)),
         ((1009, 1032, 1600), "NN", True, (0, 0)),
@@ -184,8 +185,9 @@ def test_bf16_gemm_leading_dimensions(mojo_gpu, shape, layout, bias, offsets):
 
     Covers the gfx942 routes for an odd K (whole k tiles on the MFMA core,
     the tail in the reduction), the fused-bias NN routes (unsplit 128x128,
-    split-K with the bias in the reduction, a misaligned operand), NT, TN, and
-    ragged extents whose edge tiles are shifted back.  Sample an
+    split-K with the bias in the reduction, a misaligned operand), NT, TN on
+    256x256 and 128x128 tiles, and ragged extents whose edge tiles are
+    shifted back.  Sample an
     fp64 CPU product so the large contraction stays inexpensive, at the
     boundaries of the 32- to 256-element tiles and the last row/column;
     sentinels and input comparisons catch unintended writes.
