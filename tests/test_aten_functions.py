@@ -14,7 +14,6 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
-from tests.conftest import require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
@@ -3144,7 +3143,11 @@ def test_aten_select_scatter_scalar_src(conf: Conf):
 
 
 # ---------------------------------------------------------------------------
-# Group / batch norm backward.
+# Group / batch norm backward through the torch.compile backend.
+#
+# AOTAutograd keeps both backwards as graph nodes (neither is in
+# DECOMPOSITION_TABLE), so `aten_functions` maps them; the eager mojo ops are
+# tested in tests/native/test_composed.py.
 #
 # Tolerance: every gradient here is a float32 reduction over at most a few
 # hundred elements, so the accumulation error is around sqrt(k) * eps ~ 3e-6
@@ -3168,9 +3171,20 @@ _GROUP_NORM_BACKWARD_SHAPES = [
     (2, 10, 33, 5),
 ]
 
+_NORM_BACKWARD_MASKS = [
+    (True, True, True),
+    (True, False, False),
+    (False, True, True),
+    (False, True, False),
+    (False, False, True),
+    (True, True, False),
+    (True, False, True),
+]
+
 
 @pytest.mark.parametrize(("N", "C", "HxW", "group"), _GROUP_NORM_BACKWARD_SHAPES)
 @pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
 def test_aten_native_group_norm_backward(
     conf: Conf,
     call_checker: CallChecker,
@@ -3208,13 +3222,12 @@ def test_aten_native_group_norm_backward(
     )
 
 
-@pytest.mark.parametrize(
-    "mask", [(True, False, False), (False, True, False), (False, False, True)]
-)
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
 def test_aten_native_group_norm_backward_output_mask(
     conf: Conf, call_checker: CallChecker, mask: tuple[bool, bool, bool]
 ):
-    """Only the requested gradients come back; the rest are None."""
+    """Only the requested gradients come back."""
     call_checker.register(aten_functions.aten_native_group_norm_backward)
     N, C, HxW, group = 2, 6, 10, 3
 
@@ -3223,7 +3236,6 @@ def test_aten_native_group_norm_backward_output_mask(
         outputs = aten.native_group_norm_backward(
             grad_out, x, mean, rstd, weight, N, C, HxW, group, list(mask)
         )
-        assert [out is not None for out in outputs] == list(mask)
         return tuple(out for out, wanted in zip(outputs, mask) if wanted)
 
     torch.manual_seed(1)
@@ -3237,12 +3249,13 @@ def test_aten_native_group_norm_backward_output_mask(
 
 
 @pytest.mark.parametrize("affine", [True, False])
-def test_group_norm_autograd(conf: Conf, call_checker: CallChecker, affine: bool):
-    """`F.group_norm` trains: the recorded backward node actually runs.
-
-    This used to be refused from the forward, because reaching an unimplemented
-    backward node aborts the process on this backend rather than raising.
-    """
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_group_norm_autograd_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled `F.group_norm` training step: the backward graph holds
+    `native_group_norm_backward`, fed by the forward's mean / rstd (which used
+    to be NotImplementedError placeholders, so this failed to compile)."""
     call_checker.register(aten_functions.aten_native_group_norm_backward)
 
     def fn(x, weight, bias):
@@ -3268,13 +3281,7 @@ def test_group_norm_autograd(conf: Conf, call_checker: CallChecker, affine: bool
 
 
 def _batch_norm_saved_stats(x: torch.Tensor, eps: float):
-    """The per-channel statistics `aten::native_batch_norm` saves, from x alone.
-
-    Written out with mean/sub/mul rather than by calling the forward, so the
-    backward can be tested on a device whose forward covers inference only.
-    Everything happens on the (N, C, spatial) view: a rank-5 broadcast has no
-    kernel on the mojo CPU device, and that gap belongs to `sub`, not here.
-    """
+    """The per-channel statistics `aten::native_batch_norm` saves, from x."""
     channels = x.shape[1]
     planes = x.reshape(x.shape[0], channels, math.prod(x.shape[2:]))
     mean = torch.mean(planes, dim=[0, 2])
@@ -3286,6 +3293,7 @@ def _batch_norm_saved_stats(x: torch.Tensor, eps: float):
 @pytest.mark.parametrize("shape", [(4, 3, 5, 5), (2, 7, 3), (6, 5), (3, 4, 2, 2, 2)])
 @pytest.mark.parametrize("train", [True, False])
 @pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
 def test_aten_native_batch_norm_backward(
     conf: Conf,
     call_checker: CallChecker,
@@ -3339,44 +3347,17 @@ def test_aten_native_batch_norm_backward(
     )
 
 
-@pytest.mark.parametrize("affine", [True, False])
-def test_aten_native_group_norm_backward_compiled(
-    device: str, call_checker: CallChecker, affine: bool
-):
-    """The torch.compile backend serves the group-norm backward too."""
-    call_checker.register(aten_functions.aten_native_group_norm_backward)
-    N, C, HxW, group = 2, 6, 12, 3
-
-    def fn(grad_out, x, weight):
-        weight = weight if affine else None
-        _, mean, rstd = aten.native_group_norm(x, weight, None, N, C, HxW, group, 1e-5)
-        mask = [True, True, True] if affine else [True, False, False]
-        outputs = aten.native_group_norm_backward(
-            grad_out, x, mean, rstd, weight, N, C, HxW, group, mask
-        )
-        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
-
-    torch.manual_seed(5)
-    check_functions_are_equivalent(
-        fn,
-        device,
-        [torch.randn(N, C, HxW), torch.randn(N, C, HxW), torch.randn(C)],
-        rtol=_NORM_BACKWARD_TOLERANCE,
-        atol=_NORM_BACKWARD_TOLERANCE,
-    )
-
-
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
 @pytest.mark.parametrize("train", [True, False])
-def test_aten_native_batch_norm_backward_compiled(
-    device: str, call_checker: CallChecker, train: bool
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_batch_norm_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, train: bool, mask: tuple[bool, bool, bool]
 ):
-    """The torch.compile backend serves the batch-norm backward too."""
     call_checker.register(aten_functions.aten_native_batch_norm_backward)
 
     def fn(grad_out, x, weight, running_mean, running_var):
-        save_mean = running_mean
-        save_invstd = torch.rsqrt(running_var + 1e-5)
-        return aten.native_batch_norm_backward(
+        save_mean, save_invstd = _batch_norm_saved_stats(x, 1e-5)
+        outputs = aten.native_batch_norm_backward(
             grad_out,
             x,
             weight,
@@ -3386,47 +3367,94 @@ def test_aten_native_batch_norm_backward_compiled(
             save_invstd,
             train,
             1e-5,
-            [True, True, True],
+            list(mask),
         )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
 
-    torch.manual_seed(6)
-    check_functions_are_equivalent(
+    torch.manual_seed(4)
+    check_outputs(
         fn,
-        device,
+        conf,
         [
-            torch.randn(2, 4, 3, 3),
-            torch.randn(2, 4, 3, 3),
-            torch.randn(4),
-            torch.zeros(4),
-            torch.rand(4) + 0.5,
+            torch.randn(3, 5, 4, 4),
+            torch.randn(3, 5, 4, 4),
+            torch.randn(5),
+            torch.zeros(5),
+            torch.rand(5) + 0.5,
         ],
         rtol=_NORM_BACKWARD_TOLERANCE,
         atol=_NORM_BACKWARD_TOLERANCE,
     )
 
 
-def test_group_norm_autograd_compiled(device: str):
-    """A compiled `F.group_norm` training step.
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_training_step_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled training-mode BatchNorm step. AOTAutograd's forward holds
+    `_native_batch_norm_legit_functional` (the running-stat update returned
+    rather than done in place) and its backward `native_batch_norm_backward`;
+    the updated running buffers are compared too."""
+    # The forward mapping has no fallback: the compile fails without it.
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
 
-    The forward's mean/rstd used to be NotImplementedError placeholders, which
-    made every grad-requiring group norm fail to compile: the decomposed
-    backward needs them.
-    """
-    require_cuda_autograd(device)
+    def fn(x, weight, bias, running_mean, running_var):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True) if affine else None
+        beta = bias.detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=True
+        )
+        (output * output).sum().backward()
+        if gamma is None or beta is None:
+            return leaf.grad, running_mean, running_var
+        return leaf.grad, gamma.grad, beta.grad, running_mean, running_var
 
-    def fn(x, weight, bias):
+    torch.manual_seed(6)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(3, 5, 4, 3),
+            torch.randn(5),
+            torch.randn(5),
+            torch.randn(5),
+            torch.rand(5) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_eval_autograd_compiled(conf: Conf, call_checker: CallChecker):
+    """A compiled `.eval()` BatchNorm backward: the forward is
+    `_native_batch_norm_legit_no_training`, whose two saved-statistic outputs
+    used to be NotImplementedError placeholders that broke the joint graph."""
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(x, weight, bias, running_mean, running_var):
         leaf = x.detach().requires_grad_(True)
         gamma = weight.detach().requires_grad_(True)
         beta = bias.detach().requires_grad_(True)
-        output = torch.nn.functional.group_norm(leaf, 3, gamma, beta)
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=False
+        )
         (output * output).sum().backward()
         return leaf.grad, gamma.grad, beta.grad
 
-    torch.manual_seed(7)
-    check_functions_are_equivalent(
+    torch.manual_seed(5)
+    check_outputs(
         fn,
-        device,
-        [torch.randn(2, 6, 4, 4), torch.randn(6), torch.randn(6)],
+        conf,
+        [
+            torch.randn(2, 4, 3, 3),
+            torch.randn(4),
+            torch.randn(4),
+            torch.randn(4),
+            torch.rand(4) + 0.5,
+        ],
         rtol=_NORM_BACKWARD_TOLERANCE,
         atol=_NORM_BACKWARD_TOLERANCE,
     )

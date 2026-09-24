@@ -589,6 +589,39 @@ def aten__adaptive_avg_pool2d_backward(
 # _log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
 # _native_batch_norm_legit(Tensor input, Tensor? weight, Tensor? bias, Tensor(a!) running_mean, Tensor(b!) running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
 # _native_batch_norm_legit.no_stats(Tensor input, Tensor? weight, Tensor? bias, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
+# _native_batch_norm_legit_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)
+@map_to(aten._native_batch_norm_legit_functional)
+def aten__native_batch_norm_legit_functional(
+    input: MaxTensor,
+    weight: MaxTensor | None,
+    bias: MaxTensor | None,
+    running_mean: MaxTensor,
+    running_var: MaxTensor,
+    training: bool,
+    momentum: float,
+    eps: float,
+) -> tuple[MaxTensor, MaxTensor, MaxTensor, MaxTensor, MaxTensor]:
+    """The functionalized training BatchNorm AOTAutograd puts in a forward
+    graph: `native_batch_norm` plus the running statistics it would have
+    updated in place, returned instead (ATen's `batch_norm_update_stats`:
+    the variance is the unbiased one, `var * M / (M - 1)` with `M = numel / C`).
+    """
+    output, save_mean, save_invstd = aten_native_batch_norm(
+        input, weight, bias, running_mean, running_var, training, momentum, eps
+    )
+    if not training:
+        return output, save_mean, save_invstd, running_mean, running_var
+    num_channels = int(input.shape[1])
+    reduced = math.prod(int(d) for d in input.shape) // num_channels
+    mean, var = _batch_norm_batch_stats(input)
+    unbiased = F.reshape(var, [num_channels]) * (reduced / max(reduced - 1, 1))
+    new_mean = (
+        running_mean * (1 - momentum) + F.reshape(mean, [num_channels]) * momentum
+    )
+    new_var = running_var * (1 - momentum) + unbiased * momentum
+    return output, save_mean, save_invstd, new_mean, new_var
+
+
 # _native_batch_norm_legit_no_training(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor)
 @map_to(aten._native_batch_norm_legit_no_training)
 def aten__native_batch_norm_legit_no_training(
@@ -2999,6 +3032,20 @@ def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
     return promoted_input * other
 
 
+def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
+    """Per-channel batch mean and biased variance, reduced over every dim but
+    1 and kept broadcastable against `input` ((1, C, 1, ...))."""
+    reduce_axes = [i for i in range(len(input.shape)) if i != 1]
+    mean = input
+    for axis in reduce_axes:
+        mean = _reduce_mean(mean, axis=axis)
+    centered = input - mean
+    var = centered * centered
+    for axis in reduce_axes:
+        var = _reduce_mean(var, axis=axis)
+    return mean, var
+
+
 # native_batch_norm(Tensor input, Tensor? weight, Tensor? bias, Tensor? running_mean, Tensor? running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor)
 @map_to(aten.native_batch_norm)
 def aten_native_batch_norm(
@@ -3042,16 +3089,8 @@ def aten_native_batch_norm(
     broadcast_shape[1] = num_channels
 
     if training:
-        # Reduce over every dimension except the channel dimension, keeping dims
-        # so the statistics broadcast back over the input.
-        reduce_axes = [i for i in range(len(input_shape)) if i != 1]
-        mean = input
-        for axis in reduce_axes:
-            mean = _reduce_mean(mean, axis=axis)
+        mean, var = _batch_norm_batch_stats(input)
         centered = input - mean
-        var = centered * centered
-        for axis in reduce_axes:
-            var = _reduce_mean(var, axis=axis)
         invstd = 1.0 / F.sqrt(var + eps)
         normalized = centered * invstd
         # PyTorch returns the per-channel batch mean and inverse-std (shape (C,)).

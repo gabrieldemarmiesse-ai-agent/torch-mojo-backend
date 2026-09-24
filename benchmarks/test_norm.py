@@ -127,7 +127,7 @@ def test_batch_norm(
 @pytest.mark.bench_op("native_batch_norm_backward")
 def test_batch_norm_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     # ATen's backward checks that every per-channel buffer shares ONE dtype
     # (`check_mixed_data_type`), so the half-precision case is the layout AMP
     # actually produces: a half input with float32 affine and running stats.
@@ -201,7 +201,7 @@ def test_group_norm(
 @pytest.mark.bench_op("native_group_norm_backward")
 def test_group_norm_backward(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
-) -> None:
+):
     n, c, h, w, groups = GN_SHAPES[shape_id]
     dtype = DTYPES[dtype_id]
     x_ref, x_our = both(torch.randn(n, c, h, w, dtype=dtype), hw, mojo_device)

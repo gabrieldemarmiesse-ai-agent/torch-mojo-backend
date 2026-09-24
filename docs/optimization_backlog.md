@@ -71,7 +71,7 @@ different kind of item.
 | [D5](#d5) | `aten::index` only handles a single index tensor on dim 0 | Data movement | Medium | Medium | — |
 | [R2](#r2) | ~~`linalg_vector_norm` is composed: 3 launches + an input-sized temporary~~ **DONE**: `NormSpec` / `NormL2Op`, one pass | Reductions | Low | Low | — |
 | [C3](#c3) | conv is 2-D forward only; no `convolution_backward`, no conv1d/3d/transposed in eager | Conv | High for vision *training* (blocks it) | High | — |
-| [N2](#n2) | BatchNorm and GroupNorm backward are composed from generic kernels, not fused (2.6-11.8x stock) | Normalization | Medium for vision training | Medium | — |
+| [N2](#n2) | BatchNorm / GroupNorm backward are composed from existing kernels, not fused (0.9-4.5x stock) | Normalization | Medium for vision training | Medium | — |
 | [Q1](#q1) | Graph backend hand-decomposes softmax / log_softmax instead of using MAX's fused ops | Graph | Low–Medium | **Low** | verify MAX does not already re-fuse |
 | [Q3](#q3) | Graph `max_pool2d_with_indices` returns the values as the indices | Graph | Correctness bug | Low | — |
 | [P2](#p2) | ~~Strict-FIFO call queue: one cold variant blocks every warm launch behind it~~ **OBSOLETE**: the call queue was removed (2026-09-08) | Compile pipeline | — | — | — |
@@ -577,45 +577,31 @@ different kind of item.
   cast to bf16.
 
 ### N2
-**BatchNorm and GroupNorm BACKWARD are composed from generic kernels, not fused**
+**BatchNorm and GroupNorm BACKWARD are composed from existing kernels, not fused**
 
-* **What.** `fast_aten_native_batch_norm_backward` and
-  `fast_aten_native_group_norm_backward` in `aten_fast.py`, registered in
-  `mojo_device_aten_ops.py`; benchmarked by
+* **What.** `op_native_batch_norm_backward` and
+  `op_native_group_norm_backward` in `tmb/ops/composed.mojo`; benchmarked by
   `benchmarks/test_norm.py::test_batch_norm_backward` and
   `::test_group_norm_backward`.
-* **Current implementation.** Both ops exist and are correct, but only the
-  group-norm grad-input reaches a fused kernel: group norm IS layer norm over
-  the trailing `(C / group) * HxW` elements of the `(N * group, K)` view, so
-  that half calls `fast_aten_native_layer_norm_backward` on that view with the
-  per-channel gamma folded into grad_out first. Everything else -- both affine
-  gradients of both ops, and the whole batch-norm grad-input -- is a chain of
-  ordinary reduce and broadcast-binary launches, because those reductions run
-  over the batch and the spatial extent PER CHANNEL, the complement of the
-  per-sample axes every LayerNorm kernel reduces.
-* **Why it is not optimal.** Measured on H100 (recorded in
-  `benchmarks/baselines.html`): group norm 2.7-4.2x stock, batch norm 2.6x on
-  the large shape and **11.8x** on `N8xC256xH28xW28`. A profile of that worst
-  case says the whole gap is the broadcast-strided binary kernel: five of them
-  per call at ~24 us each on a 6.4 MB tensor (0.5 TB/s) against 3.2 us for the
-  same traffic through the flat vectorized form (~4 TB/s, L2-resident). The
-  reductions and the flat binaries together are under 25 us.
-* **What the optimized version looks like.** One fused per-channel backward in
-  `normalization_backward_ops/`, walking the NCHW geometry the way
-  `batch_norm_kernels.mojo` already does for the forward (a `{0, 2, 3}`
-  reduction in place through `op_utils._moments_scan_contig`) and writing dx in
-  the same pass. That is a new reduction schedule, not a re-parameterization of
-  the LayerNorm pair, which is why it was deliberately left out of the change
-  that added these ops. A cheaper intermediate step -- worth measuring first --
-  is making the broadcast-strided binary kernel vectorize when the broadcast
-  operand is a per-channel vector, which would lift every composed op here at
-  once.
-* **Expected win.** Up to ~10x on the small batch-norm shape, ~3x on the rest.
-  Vision training already runs on the mojo device without it.
+* **Current implementation.** Both run on the `[N, C, HxW]` view. Every
+  per-channel broadcast `(x - a[c]) * b[c]` is one pass of the eval-mode
+  batch-norm elementwise kernel (`_channel_affine`), every per-channel sum a
+  spatial then a batch `aten::sum`. The group-norm grad_input is the
+  LayerNorm-backward dx kernel on the `[N * group, K]` view, with gamma folded
+  into grad_out first.
+* **Why it is not optimal.** Measured on H100 PCIe
+  (`benchmarks/baselines.html`): batch norm 0.9-1.2x stock on
+  `N32xC64xH112xW112` but 3.8-4.5x on `N8xC256xH28xW28`, group norm 1.9-3.4x.
+  Stock is one or two fused passes; ours is ~10 launches, several over
+  input-sized temporaries, and the `[N, C] -> [C]` batch sums are
+  single-block reductions.
+* **What the optimized version looks like.** One per-channel backward in
+  `normalization_backward/`, walking the NCHW geometry the way
+  `batch_norm_kernels.mojo` does for the forward (the `{0, 2, 3}` moments
+  scan) to produce both sums, then one elementwise pass for dx.
+* **Expected win.** ~3-4x on the small shapes.
 * **How to measure it.** `benchmarks/test_norm.py -k backward`;
-  `tests/test_eager_kernels.py -k "norm_backward"` for correctness. A resnet-18
-  training-step benchmark modelled on `bench_nanogpt_train.py` would show the
-  end-to-end effect -- none exists today, see [Not audited](#not-audited).
+  `tests/native/test_composed.py -k norm` for correctness.
 
 ### N3
 **`_TARGET_BLOCKS = 1280` in the LayerNorm-backward parameter reduction is an unlabelled fitted constant**
@@ -967,12 +953,12 @@ temporary** — **DONE** (`NormSpec`)
 * **Current implementation.** conv1d (rank-3 input), conv3d and transposed
   convolutions all return `NOT_HANDLED` → raise. There is no eager conv
   backward, so `mojo_device_convolution` refuses any conv whose operands
-  require grad in the FORWARD (`mojo_device/aten_ops/autograd_preflight.py`
-  explains why the refusal cannot wait for the backward node). A conv weight normally requires grad, so that is every conv
+  require grad in the FORWARD (see [N2](#n2) for why it cannot wait for the
+  backward node). A conv weight normally requires grad, so that is every conv
   in a training model; inference under `torch.no_grad()` is unaffected.
 * **Why it is not optimal.** conv1d is a reshape away — `(N, C, L)` →
   `(N, C, 1, L)` with a `(1, kw)` kernel. The missing backward blocks all vision
-  training together with [C4](#c4).
+  training together with [N2](#n2) and [C4](#c4).
 * **What the optimized version looks like.** conv1d by reshape into the existing
   2-D path; `convolution_backward` as dgrad (col2im of a GEMM) plus wgrad (a
   transposed-A GEMM against the im2col matrix) — the same `TRANSPOSE_A`
@@ -992,7 +978,7 @@ temporary** — **DONE** (`NormSpec`)
   (`mojo_device_aten_ops.py`).
 * **Current implementation.** Forward-only, floor-mode-only, rank-4-only. All
   three pooling forwards refuse a grad-requiring call in the FORWARD (see
-  `mojo_device/aten_ops/autograd_preflight.py`); `_register_missing` on the backward was not enough, because that
+  [N2](#n2)); `_register_missing` on the backward was not enough, because that
   raise still happens inside the autograd node and aborts the process.
 * **Why it is not optimal.** `ceil_mode=True` appears in common torchvision
   configurations; the missing backwards are the third blocker for vision
@@ -1501,12 +1487,11 @@ Stated explicitly so nobody reads this document as complete.
   in passing: `topk`, `sort`, `div` with
   `rounding_mode` (`aten_fast.py:2498`), `softmax` with `dtype=`
   (`aten_fast.py:7714`), `conv1d`/`conv3d`/transposed conv, `ceil_mode` pooling,
-  and the conv/pooling training backwards.
+  and the vision-training backwards.
 * **No benchmark exists in this repo for convolution or for vision training.**
   The `bench_*.py` family covers GEMM, GPT-2 decode and nanoGPT training only.
-  Items [C1](#c1)–[C4](#c4) therefore have no end-to-end measurement harness at
-  all; building one is a prerequisite for working on them. [N2](#n2) now has
-  per-op numbers in `benchmarks/test_norm.py`, but no training-step benchmark.
+  Items [C1](#c1)–[C4](#c4) and [N2](#n2) therefore have no measurement harness
+  at all; building one is a prerequisite for working on them.
 * **Numerical accuracy was out of scope.** This document is about speed and
   coverage; the one correctness item included ([Q3](#q3)) is here because it is
   masked by xfails rather than tracked.
