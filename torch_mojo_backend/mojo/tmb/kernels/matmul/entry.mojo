@@ -3678,12 +3678,20 @@ def _dense_mfma_route[
     # that axis's length that has to keep every tile row aligned.
     var alen = k if A_KMAJOR else m
     var blen = k if B_KMAJOR else n
-    if (
-        alen % NT_VEC != 0
-        or blen % NT_VEC != 0
-        or a_addr % 16 != 0
-        or b_addr % 16 != 0
-    ):
+    var aligned = (
+        alen % NT_VEC == 0
+        and blen % NT_VEC == 0
+        and a_addr % 16 == 0
+        and b_addr % 16 == 0
+    )
+    # Without 16-byte rows only the unmasked kernel is correct: the masked one
+    # guards whole vectors, while the unmasked one shifts its edge tiles back
+    # inside the extents, so every load stays in bounds at any alignment (the
+    # loads promise element alignment only).  Every plan below is unmasked once
+    # BK divides K -- each tile it considers fits the output -- so an odd
+    # leading dimension, the weight gradient of a projection onto an odd
+    # vocabulary, is read in place instead of transposed into a copy first.
+    if not aligned and k % 32 != 0:
         return False
     var cus = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
     var xcds = max(1, cus // 38)
