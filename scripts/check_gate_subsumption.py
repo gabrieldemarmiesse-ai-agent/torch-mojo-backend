@@ -1,6 +1,6 @@
 """Report Mojo dispatch gates that can never be reached.
 
-The host dispatchers in ``eager_kernels`` are long ``if`` ladders: each branch
+The host dispatchers in ``mojo/tmb/kernels`` are long ``if`` ladders: each branch
 tests a shape/alignment predicate, launches a kernel and returns, so a later
 branch only runs when every earlier one declined. A branch whose predicate is
 identical to an earlier sibling's is therefore dead, along with every kernel it

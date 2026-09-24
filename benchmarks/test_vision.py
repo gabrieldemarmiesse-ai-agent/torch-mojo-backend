@@ -3,8 +3,8 @@
 Driven through the public functional entry points (F.conv2d,
 F.max_pool2d, F.interpolate, ...), which reach the registered aten ops:
 convolution, max_pool2d_with_indices (max_pool2d is composite over it),
-_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d.  Shape tokens
-fold the kernel/stride/output configuration in.
+_adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d, upsample_nearest2d.
+Shape tokens fold the kernel/stride/output configuration in.
 """
 
 from __future__ import annotations
@@ -20,6 +20,12 @@ from bench_lib.hw import Hardware
 CONV_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
     "N32xC64x56x56_K64k3s1": (32, 64, 56, 56, 64, 3, 1, 1),
     "N8xC3x224x224_K64k7s2": (8, 3, 224, 224, 64, 7, 2, 3),
+}
+# (N, C_in, L, C_out, kernel, stride, padding). conv1d is the rank-3
+# aten::convolution; one awkward length on purpose.
+CONV1D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
+    "N4xC80xL3000_K384k3s1": (4, 80, 3000, 384, 3, 1, 1),
+    "N8xC256xL357_K512k5s2": (8, 256, 357, 512, 5, 2, 2),
 }
 # (N, C, H, W, output)
 ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {
@@ -38,13 +44,14 @@ UPSAMPLE_SHAPES: dict[str, tuple[int, int, int, int]] = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::convolution": "test_conv2d",
+    "aten::convolution": "test_conv2d, test_conv1d (rank 3)",
     "aten::_adaptive_avg_pool2d": "test_adaptive_avg_pool2d",
     "aten::avg_pool2d": "test_avg_pool2d",
     "aten::max_pool2d_with_indices": (
         "test_max_pool2d (F.max_pool2d is composite over it)"
     ),
     "aten::upsample_bilinear2d": "test_upsample_bilinear2d",
+    "aten::upsample_nearest2d": "test_upsample_nearest2d",
 }
 
 SKIPPED: dict[str, str] = {}
@@ -69,6 +76,26 @@ def test_conv2d(
     bench.run(
         lambda: F.conv2d(x_ref, w_ref, b_ref, stride, pad),
         lambda: F.conv2d(x_our, w_our, b_our, stride, pad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV1D_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv1d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, length, c_out, k, stride, pad = CONV1D_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, length, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(torch.randn(c_out, c_in, k, dtype=dtype) * 0.1, hw, mojo_device)
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    l_out = (length + 2 * pad - k) // stride + 1
+    flops = 2.0 * n * c_out * l_out * c_in * k
+    bench.run(
+        lambda: F.conv1d(x_ref, w_ref, b_ref, stride, pad),
+        lambda: F.conv1d(x_our, w_our, b_our, stride, pad),
         flops=flops,
     )
 
@@ -142,4 +169,23 @@ def test_upsample_bilinear2d(
             x_our, scale_factor=2, mode="bilinear", align_corners=False
         ),
         flops=float(x_ref.numel()) * 4.0,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", UPSAMPLE_SHAPES)
+@pytest.mark.bench_op("upsample_nearest2d")
+def test_upsample_nearest2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w = UPSAMPLE_SHAPES[shape_id]
+    x_ref, x_our = both(
+        torch.randn(n, c, h, w, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: F.interpolate(x_ref, scale_factor=2, mode="nearest"),
+        lambda: F.interpolate(x_our, scale_factor=2, mode="nearest"),
+        # No interpolation weights (unlike bilinear): a pure index gather, so
+        # there is no meaningful FLOP count -- element throughput instead.
+        flops=float(x_ref.numel()),
     )

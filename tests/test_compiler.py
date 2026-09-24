@@ -654,8 +654,9 @@ def test_sdpa_with_attention_mask(device: str):
     check_functions_are_equivalent(fn, device, [q, k, v, mask], rtol=1e-2, atol=1e-3)
 
 
-def test_sdpa_decode_gpt2_mask(device: str):
-    """GPT-2 decode shape exercises the fused Mojo graph custom op on GPU."""
+def test_sdpa_decode_additive_mask(device: str):
+    """Single-query (decode) attention with an additive mask and an explicit
+    scale."""
 
     def fn(q, k, v, mask):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=0.125)

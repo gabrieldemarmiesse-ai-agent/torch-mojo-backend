@@ -13,7 +13,7 @@ dimensions. Example:
 from std.builtin.sort import sort
 from std.collections import List, Optional
 from std.gpu import block_idx, grid_dim, thread_idx
-from std.gpu.host import DeviceContext, FuncAttribute
+from max.gpu.host import DeviceContext, FuncAttribute
 from std.math import ceildiv
 from std.time import perf_counter_ns
 from std.sys import get_defined_bool, get_defined_int
@@ -41,7 +41,7 @@ comptime THREADS = (BM // WM) * (BN // WN) * WARP_K * 64
 
 @__name("bench_mfma_fill_bf16")
 def _fill_bf16(
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    ptr: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     count: Int,
     value: Scalar[DType.bfloat16],
 ):
@@ -49,17 +49,17 @@ def _fill_bf16(
     var stride = Int(grid_dim.x) * 256 * 4
     while i < count:
         if i + 4 <= count:
-            ptr.store[width=4](i, SIMD[DType.bfloat16, 4](value))
+            ptr.unsafe_store[width=4](i, SIMD[DType.bfloat16, 4](value))
         else:
             for lane in range(4):
                 if i + lane < count:
-                    ptr[i + lane] = value
+                    ptr[unsafe_offset=i + lane] = value
         i += stride
 
 
 @always_inline
 def _enqueue_fill(
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    ptr: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     count: Int,
     value: Scalar[DType.bfloat16],
     ctx: DeviceContext,
@@ -120,24 +120,22 @@ def main() raises:
         var b = TileTensor[mut=False](b_buf, row_major(Coord(k, n)))
         var c = TileTensor[mut=True](c_buf, row_major(Coord(m, n)))
         var c_ptr = c_buf.unsafe_ptr().as_unsafe_any_origin()
-        var bias_ptr = (
-            bias_buf.unsafe_ptr().as_unsafe_any_origin().as_immutable()
-        )
+        var bias_ptr = bias_buf.unsafe_ptr().as_unsafe_any_origin().as_imm()
 
         @always_inline
         @parameter
         @__copy_capture(c_ptr, bias_ptr, n)
         def _bias_store[
-            value_dtype: DType, width: SIMDSize, *, alignment: Int = 1
+            value_dtype: DType, width: SIMDLength, *, alignment: Int = 1
         ](coords: IndexList[2], value: SIMD[value_dtype, width]):
             var row = Int(coords[0])
             var col = Int(coords[1])
             var off = row * n + col
             var result = (
                 value.cast[DType.float32]()
-                + bias_ptr.load[width=width](col).cast[DType.float32]()
+                + bias_ptr.unsafe_load[width=width](col).cast[DType.float32]()
             )
-            c_ptr.store[width=width, alignment=4](
+            c_ptr.unsafe_store[width=width, alignment=4](
                 off, result.cast[DType.bfloat16]()
             )
 
