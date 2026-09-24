@@ -14,6 +14,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 # see `torch/ops/__init__.py` or `torch/ops.py`.
 from torch.ops import aten  # ty: ignore[unresolved-import]
 
+from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.testing import (
@@ -2306,6 +2307,193 @@ def test_aten_div_rounding_mode_int_by_zero_compiled(
         compiled_zero(x)
 
 
+def _convolution_backward_tolerance(device: str) -> Tolerance:
+    """How far a composed conv backward may sit from stock torch's.
+
+    On CPU the arithmetic is plain fp32 on both sides, but the reductions are
+    reassociated -- this backend folds a matmul and runs a role-swapped
+    convolution where torch runs its own im2col GEMMs -- and reassociation
+    alone moves the last bits: measured at most 2.3e-5 absolute and 9.8e-5
+    relative over these cases. On an accelerator MAX reduces through TF32,
+    four orders looser again, which is what `matmul_tolerance` exists for.
+    """
+    return matmul_tolerance(device) or {"rtol": 1e-4, "atol": 1e-4}
+
+
+# (n, c, h, w, out_c, k, stride, padding, dilation, groups)
+_CONVOLUTION_BACKWARD_CASES = {
+    "k3s1p1": (2, 6, 9, 9, 8, 3, 1, 1, 1, 1),
+    "stride2": (2, 6, 11, 11, 8, 3, 2, 1, 1, 1),
+    "unpadded": (2, 4, 10, 12, 6, 3, 1, 0, 1, 1),
+    "dilation2": (2, 4, 13, 13, 6, 3, 1, 2, 2, 1),
+    "groups2": (2, 8, 9, 9, 12, 3, 1, 1, 1, 2),
+    "depthwise": (2, 6, 9, 9, 6, 3, 1, 1, 1, 6),
+    "pointwise_1x1": (2, 5, 7, 7, 4, 1, 1, 0, 1, 1),
+    # The forward truncates here ((11 + 2 - 3) // 2 + 1 == 5 loses a column),
+    # so the data gradient's last input row/column has no tap at all.
+    "truncating_stride2": (1, 4, 11, 9, 6, 3, 2, 1, 1, 1),
+}
+
+
+def _convolution_backward_inputs(case: str) -> list[torch.Tensor]:
+    n, c, h, w, out_c, k, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+    out_h = (h + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    out_w = (w + 2 * padding - (dilation * (k - 1) + 1)) // stride + 1
+    torch.manual_seed(0)
+    return [
+        torch.randn(n, out_c, out_h, out_w),
+        torch.randn(n, c, h, w),
+        torch.randn(out_c, c // groups, k, k) * 0.2,
+    ]
+
+
+def _convolution_backward_call(case: str):
+    _, _, _, _, out_c, _, stride, padding, dilation, groups = (
+        _CONVOLUTION_BACKWARD_CASES[case]
+    )
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [out_c],
+            [stride, stride],
+            [padding, padding],
+            [dilation, dilation],
+            False,
+            [0, 0],
+            groups,
+            [True, True, True],
+        )
+
+    return fn
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward(case: str, conf: Conf, call_checker: CallChecker):
+    """AOTAutograd keeps `convolution_backward.default` as a backward graph
+    node (it is not in DECOMPOSITION_TABLE), so the compile backend maps it."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    check_outputs(
+        _convolution_backward_call(case),
+        conf,
+        _convolution_backward_inputs(case),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parametrize("case", _CONVOLUTION_BACKWARD_CASES)
+def test_aten_convolution_backward_compiled(case: str, device: str):
+    """The compile backend's own composition of the three gradients.
+
+    `conf` only exercises the mojo eager device, so the MAX-graph path in
+    `aten_functions.py` -- `F.fold` for the data gradient, a role-swapped
+    `F.conv2d` for the weight gradient -- needs its own compiled comparison
+    against stock torch on the same device.
+    """
+    check_functions_are_equivalent(
+        _convolution_backward_call(case),
+        device,
+        _convolution_backward_inputs(case),
+        **_convolution_backward_tolerance(device),
+    )
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [True, False, False],
+        [False, True, False],
+        [False, False, True],
+        [True, True, False],
+        [False, True, True],
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: list[bool]
+):
+    """Only the requested gradients are computed, and they do not change
+    because the others were skipped."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+
+    def fn(grad_output, x, weight):
+        outputs = aten.convolution_backward(
+            grad_output, x, weight, [8], [1, 1], [1, 1], [1, 1], False, [0, 0], 1, mask
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    check_outputs(
+        fn, conf, _convolution_backward_inputs("k3s1p1"), atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.parametrize("stride,padding,dilation", [(1, 0, 1), (2, 1, 1), (1, 2, 2)])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_convolution_backward_1d(
+    conf: Conf, call_checker: CallChecker, stride: int, padding: int, dilation: int
+):
+    """conv1d's backward, through the same rank-4 path behind a size-1 H
+    axis."""
+    call_checker.register(aten_functions.aten_convolution_backward)
+    torch.manual_seed(0)
+    length = (17 + 2 * padding - (dilation * 2 + 1)) // stride + 1
+    inputs = [
+        torch.randn(2, 8, length),
+        torch.randn(2, 6, 17),
+        torch.randn(8, 6, 3) * 0.2,
+    ]
+
+    def fn(grad_output, x, weight):
+        return aten.convolution_backward(
+            grad_output,
+            x,
+            weight,
+            [8],
+            [stride],
+            [padding],
+            [dilation],
+            False,
+            [0],
+            1,
+            [True, True, True],
+        )
+
+    check_outputs(fn, conf, inputs, atol=1e-4, rtol=1e-4)
+
+
+def test_aten_convolution_trains_end_to_end_compiled(device: str):
+    """The gradient the autograd engine actually asks for: a compiled conv
+    whose input, weight and bias all require grad."""
+    require_cuda_autograd(device)
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 10, 10)
+    weight = torch.randn(6, 3, 3, 3) * 0.2
+    bias = torch.randn(6) * 0.1
+    upstream = torch.randn(2, 6, 10, 10)
+
+    def fn(x, weight, bias, upstream):
+        x = x.detach().requires_grad_()
+        weight = weight.detach().requires_grad_()
+        bias = bias.detach().requires_grad_()
+        out = torch.nn.functional.conv2d(x, weight, bias, 1, 1)
+        out.backward(upstream)
+        return x.grad, weight.grad, bias.grad
+
+    check_functions_are_equivalent(
+        fn,
+        device,
+        [x, weight, bias, upstream],
+        **_convolution_backward_tolerance(device),
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_aten_gelu_backward_basic(conf: Conf, dtype: torch.dtype, approximate: str):
@@ -3226,6 +3414,324 @@ def test_aten_select_scatter_scalar_src(conf: Conf):
     check_outputs(fn, conf, [self, src])
 
 
+# ---------------------------------------------------------------------------
+# Group / batch norm backward through the torch.compile backend.
+#
+# AOTAutograd keeps both backwards as graph nodes (neither is in
+# DECOMPOSITION_TABLE), so `aten_functions` maps them; the eager mojo ops are
+# tested in tests/native/test_composed.py.
+#
+# Tolerance: every gradient here is a float32 reduction over at most a few
+# hundred elements, so the accumulation error is around sqrt(k) * eps ~ 3e-6
+# relative; both sides sum in different orders (ATen's group-norm reference
+# even carries an rstd**3 term), and the inputs are standard normal so rstd is
+# O(1) and does not amplify. 2e-5 is therefore ~5x the noise floor of a
+# correct implementation, while a wrong formula (a mismatched axis, a missing
+# term) moves these outputs by O(1) rather than by ulps.
+# ---------------------------------------------------------------------------
+
+_NORM_BACKWARD_TOLERANCE = 2e-5
+
+# (N, C, HxW, group). Covers group == 1 (layer norm over the whole sample),
+# group == C (instance norm), a group count that is neither, and shapes whose
+# channel and spatial extents are odd / not powers of two.
+_GROUP_NORM_BACKWARD_SHAPES = [
+    (2, 6, 12, 3),
+    (3, 8, 5, 1),
+    (2, 4, 7, 4),
+    (1, 9, 13, 3),
+    (2, 10, 33, 5),
+]
+
+_NORM_BACKWARD_MASKS = [
+    (True, True, True),
+    (True, False, False),
+    (False, True, True),
+    (False, True, False),
+    (False, False, True),
+    (True, True, False),
+    (True, False, True),
+]
+
+
+@pytest.mark.parametrize(("N", "C", "HxW", "group"), _GROUP_NORM_BACKWARD_SHAPES)
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_group_norm_backward(
+    conf: Conf,
+    call_checker: CallChecker,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    affine: bool,
+):
+    """`aten.native_group_norm_backward` against the CPU reference."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+
+    def fn(grad_out, x, weight):
+        weight = weight if affine else None
+        _, mean, rstd = aten.native_group_norm(x, weight, None, N, C, HxW, group, 1e-5)
+        # ATen's own CPU kernel cannot produce the affine gradients when there
+        # is no gamma (it reads an undefined tensor's device), and autograd
+        # never asks it to, so only grad_input is requested in that case.
+        mask = [True, True, True] if affine else [True, False, False]
+        outputs = aten.native_group_norm_backward(
+            grad_out, x, mean, rstd, weight, N, C, HxW, group, mask
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(0)
+    x = torch.randn(N, C, HxW)
+    grad_out = torch.randn(N, C, HxW)
+    weight = torch.randn(C)
+    check_outputs(
+        fn,
+        conf,
+        [grad_out, x, weight],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_group_norm_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, mask: tuple[bool, bool, bool]
+):
+    """Only the requested gradients come back."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+    N, C, HxW, group = 2, 6, 10, 3
+
+    def fn(grad_out, x, weight):
+        _, mean, rstd = aten.native_group_norm(x, weight, None, N, C, HxW, group, 1e-5)
+        outputs = aten.native_group_norm_backward(
+            grad_out, x, mean, rstd, weight, N, C, HxW, group, list(mask)
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(1)
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(N, C, HxW), torch.randn(N, C, HxW), torch.randn(C)],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_group_norm_autograd_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled `F.group_norm` training step: the backward graph holds
+    `native_group_norm_backward`, fed by the forward's mean / rstd (which used
+    to be NotImplementedError placeholders, so this failed to compile)."""
+    call_checker.register(aten_functions.aten_native_group_norm_backward)
+
+    def fn(x, weight, bias):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True) if affine else None
+        beta = bias.detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.group_norm(leaf, 3, gamma, beta)
+        (output * output).sum().backward()
+        if not affine:
+            return (leaf.grad,)
+        assert gamma is not None
+        assert beta is not None
+        return leaf.grad, gamma.grad, beta.grad
+
+    torch.manual_seed(2)
+    check_outputs(
+        fn,
+        conf,
+        [torch.randn(2, 6, 5, 5), torch.randn(6), torch.randn(6)],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+def _batch_norm_saved_stats(x: torch.Tensor, eps: float):
+    """The per-channel statistics `aten::native_batch_norm` saves, from x."""
+    channels = x.shape[1]
+    planes = x.reshape(x.shape[0], channels, math.prod(x.shape[2:]))
+    mean = torch.mean(planes, dim=[0, 2])
+    centered = planes - mean.reshape(1, channels, 1)
+    variance = torch.mean(centered * centered, dim=[0, 2])
+    return mean, torch.rsqrt(variance + eps)
+
+
+@pytest.mark.parametrize("shape", [(4, 3, 5, 5), (2, 7, 3), (6, 5), (3, 4, 2, 2, 2)])
+@pytest.mark.parametrize("train", [True, False])
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_batch_norm_backward(
+    conf: Conf,
+    call_checker: CallChecker,
+    shape: tuple[int, ...],
+    train: bool,
+    affine: bool,
+):
+    """`aten.native_batch_norm_backward` in both modes, against the CPU reference.
+
+    Evaluation is not a no-op here: it reads the running buffers rather than
+    the saved statistics, so an `.eval()` BatchNorm still has a real gradient.
+    """
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(grad_out, x, weight, running_mean, running_var):
+        weight = weight if affine else None
+        if train:
+            save_mean, save_invstd = _batch_norm_saved_stats(x, 1e-5)
+        else:
+            # ATen returns empty saved statistics for the inference forward;
+            # the backward reads the running buffers instead.
+            save_mean = running_mean
+            save_invstd = torch.rsqrt(running_var + 1e-5)
+        return aten.native_batch_norm_backward(
+            grad_out,
+            x,
+            weight,
+            running_mean,
+            running_var,
+            save_mean,
+            save_invstd,
+            train,
+            1e-5,
+            [True, True, True],
+        )
+
+    torch.manual_seed(3)
+    channels = shape[1]
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(shape),
+            torch.randn(shape),
+            torch.randn(channels),
+            torch.zeros(channels),
+            torch.rand(channels) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("mask", _NORM_BACKWARD_MASKS, ids=str)
+@pytest.mark.parametrize("train", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_aten_native_batch_norm_backward_output_mask(
+    conf: Conf, call_checker: CallChecker, train: bool, mask: tuple[bool, bool, bool]
+):
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(grad_out, x, weight, running_mean, running_var):
+        save_mean, save_invstd = _batch_norm_saved_stats(x, 1e-5)
+        outputs = aten.native_batch_norm_backward(
+            grad_out,
+            x,
+            weight,
+            running_mean,
+            running_var,
+            save_mean,
+            save_invstd,
+            train,
+            1e-5,
+            list(mask),
+        )
+        return tuple(out for out, wanted in zip(outputs, mask) if wanted)
+
+    torch.manual_seed(4)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(3, 5, 4, 4),
+            torch.randn(3, 5, 4, 4),
+            torch.randn(5),
+            torch.zeros(5),
+            torch.rand(5) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_training_step_compiled(
+    conf: Conf, call_checker: CallChecker, affine: bool
+):
+    """A compiled training-mode BatchNorm step. AOTAutograd's forward holds
+    `_native_batch_norm_legit_functional` (the running-stat update returned
+    rather than done in place) and its backward `native_batch_norm_backward`;
+    the updated running buffers are compared too."""
+    # The forward mapping has no fallback: the compile fails without it.
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(x, weight, bias, running_mean, running_var):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True) if affine else None
+        beta = bias.detach().requires_grad_(True) if affine else None
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=True
+        )
+        (output * output).sum().backward()
+        if gamma is None or beta is None:
+            return leaf.grad, running_mean, running_var
+        return leaf.grad, gamma.grad, beta.grad, running_mean, running_var
+
+    torch.manual_seed(6)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(3, 5, 4, 3),
+            torch.randn(5),
+            torch.randn(5),
+            torch.randn(5),
+            torch.rand(5) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True, ids=str)
+def test_batch_norm_eval_autograd_compiled(conf: Conf, call_checker: CallChecker):
+    """A compiled `.eval()` BatchNorm backward: the forward is
+    `_native_batch_norm_legit_no_training`, whose two saved-statistic outputs
+    used to be NotImplementedError placeholders that broke the joint graph."""
+    call_checker.register(aten_functions.aten_native_batch_norm_backward)
+
+    def fn(x, weight, bias, running_mean, running_var):
+        leaf = x.detach().requires_grad_(True)
+        gamma = weight.detach().requires_grad_(True)
+        beta = bias.detach().requires_grad_(True)
+        output = torch.nn.functional.batch_norm(
+            leaf, running_mean, running_var, gamma, beta, training=False
+        )
+        (output * output).sum().backward()
+        return leaf.grad, gamma.grad, beta.grad
+
+    torch.manual_seed(5)
+    check_outputs(
+        fn,
+        conf,
+        [
+            torch.randn(2, 4, 3, 3),
+            torch.randn(4),
+            torch.randn(4),
+            torch.randn(4),
+            torch.rand(4) + 0.5,
+        ],
+        rtol=_NORM_BACKWARD_TOLERANCE,
+        atol=_NORM_BACKWARD_TOLERANCE,
+    )
+
+
 @pytest.mark.parametrize("repeats", [1, 2, 3, 5])
 @pytest.mark.parametrize("dim", [0, 1, -1])
 def test_aten_repeat_interleave_basic(device: str, repeats: int, dim: int):
@@ -3825,6 +4331,289 @@ def test_aten_searchsorted_compile_backend_declines_unchecked_sorter():
         BackendCompilerFailed, match="sorter bounds cannot be validated"
     ):
         torch.compile(fn, backend=mojo_backend)(boundaries, values, out_of_range_sorter)
+
+
+# ---------------------------------------------------------------------------
+# topk / sort (compile backend; the mojo device's native kernels are tested in
+# tests/native/test_reductions.py). Tie-free values except where the test is
+# about ties: ATen leaves the index of a tie unspecified for topk and for a
+# non-stable sort.
+# ---------------------------------------------------------------------------
+
+
+def _distinct(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor whose values are all distinct, exactly representable in
+    `dtype`, and not in sorted order."""
+    numel = math.prod(shape)
+    values = torch.arange(numel, dtype=torch.int64)
+    values = (values * 37 + 11) % numel  # a fixed tie-free permutation
+    return (values - numel // 2).reshape(shape).to(dtype)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("largest", [True, False])
+@pytest.mark.parametrize("k", [1, 5, 33])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_topk(
+    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, k: int, largest: bool
+):
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x):
+        return torch.topk(x, k, dim=-1, largest=largest)
+
+    check_outputs(fn, conf, [_distinct((4, 33), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dim", [0, 1, -2])
+def test_aten_topk_non_last_dim(conf: Conf, call_checker: CallChecker, dim: int):
+    call_checker.register(aten_functions.aten_topk)
+
+    def fn(x):
+        return aten.topk(x, 2, dim, False, False)
+
+    check_outputs(fn, conf, [_distinct((5, 4, 3), torch.float32)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("dim", [-1, 0, -2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_aten_sort(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    dim: int,
+    descending: bool,
+):
+    """torch.sort and argsort reach the graph as sort.default."""
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x):
+        values, indices = torch.sort(x, dim=dim, descending=descending)
+        return values, indices, torch.argsort(x, dim=dim, descending=descending)
+
+    check_outputs(fn, conf, [_distinct((5, 4, 7), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("descending", [False, True])
+def test_aten_sort_stable_with_ties(
+    conf: Conf, call_checker: CallChecker, descending: bool
+):
+    """`stable=True` reaches the graph as sort.stable and pins the index order
+    of equal values."""
+    call_checker.register(aten_functions.aten_sort_stable)
+
+    def fn(x):
+        return torch.sort(x, dim=-1, descending=descending, stable=True)
+
+    x = torch.tensor([[3.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]]).repeat(3, 5)
+    check_outputs(fn, conf, [x])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_msort(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_sort)
+
+    def fn(x):
+        return torch.msort(x)
+
+    check_outputs(fn, conf, [_distinct((6, 5), torch.float32)])
+
+
+# ---------------------------------------------------------------------------
+# kthvalue / median / nanmedian (compile backend; the mojo device's native
+# kernels are tested in tests/native/test_reductions.py). Inputs are tie-free
+# unless the test is about ties: kthvalue's tie index is unspecified in ATen,
+# while median's is the lowest index (CPU's comparator), which the graph's
+# stable sort reproduces.
+# ---------------------------------------------------------------------------
+
+
+def _check_nan_outputs(fn: Callable[..., Sequence[torch.Tensor]], x: torch.Tensor):
+    """`check_outputs` for results that hold NaN (equal where both are NaN):
+    compiled on CPU against eager CPU, values and indices."""
+    expected = fn(x)
+    actual = torch.compile(fn, backend=mojo_backend)(x)
+    for want, got in zip(expected, actual, strict=True):
+        assert want.dtype == got.dtype and want.shape == got.shape
+        torch.testing.assert_close(got, want, equal_nan=True, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize(
+    ("k", "dim", "keepdim"), [(1, -1, False), (3, 0, True), (5, 1, False)]
+)
+def test_aten_kthvalue(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    k: int,
+    dim: int,
+    keepdim: bool,
+):
+    call_checker.register(aten_functions.aten_kthvalue)
+
+    def fn(x):
+        return torch.kthvalue(x, k, dim, keepdim)
+
+    check_outputs(fn, conf, [_distinct((5, 7), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_kthvalue_out_of_range(conf: Conf):
+    fn = torch.compile(lambda x: torch.kthvalue(x, 6, 1), backend=mojo_backend)
+    with pytest.raises((RuntimeError, BackendCompilerFailed), match="k out of range"):
+        fn(_distinct((3, 5), torch.float32))
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize("size", [6, 7])
+@pytest.mark.parametrize(("dim", "keepdim"), [(-1, False), (0, True), (-3, False)])
+def test_aten_median_dim(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    size: int,
+    dim: int,
+    keepdim: bool,
+):
+    """The lower of the two middle values, on odd and even lengths."""
+    call_checker.register(aten_functions.aten_median_dim)
+
+    def fn(x):
+        return torch.median(x, dim, keepdim)
+
+    check_outputs(fn, conf, [_distinct((size, 3, size), dtype)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_median_dim_ties_and_nan(conf: Conf, call_checker: CallChecker):
+    """Ties give the lowest index of the median value; a row with any NaN
+    gives (nan, index of its first NaN), even behind a real +inf."""
+    call_checker.register(aten_functions.aten_median_dim)
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [2.0, 1.0, 2.0, 3.0, 2.0, 1.0],
+            [1.0, 5.0, nan, 0.0, nan, 2.0],
+            [inf, 1.0, 0.0, nan, -inf, 3.0],
+            [-0.0, 0.0, 0.0, -0.0, 1.0, -1.0],
+        ]
+    )
+
+    def fn(x):
+        return torch.median(x, 1)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_nanmedian_dim(conf: Conf, call_checker: CallChecker):
+    """The lower middle of each row's numbers, NaNs ignored."""
+    call_checker.register(aten_functions.aten_nanmedian_dim)
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [2.0, 1.0, 7.0, 3.0, 4.0, 1.5],
+            [1.0, 5.0, nan, 0.0, nan, 2.0],
+            [nan, inf, 0.0, nan, -inf, 3.0],
+            [nan, nan, nan, 9.0, nan, nan],
+        ]
+    )
+
+    def fn(x):
+        return torch.nanmedian(x, -1, True)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("with_nan", [False, True])
+def test_aten_median_and_nanmedian_all(
+    conf: Conf, call_checker: CallChecker, with_nan: bool
+):
+    call_checker.register(aten_functions.aten_median)
+    call_checker.register(aten_functions.aten_nanmedian)
+    x = _distinct((4, 5), torch.float32)
+    if with_nan:
+        x[1, 2] = float("nan")
+
+    def fn(x):
+        return torch.median(x), torch.nanmedian(x)
+
+    _check_nan_outputs(fn, x)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("shape", "num_samples", "replacement"),
+    [((7,), 1, False), ((3, 7), 4, False), ((3, 7), 1, True), ((2, 7), 5, True)],
+)
+def test_aten_multinomial_shape_and_support(
+    conf: Conf,
+    call_checker: CallChecker,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    num_samples: int,
+    replacement: bool,
+):
+    """A draw is random, so it is checked for what is not: shape, dtype,
+    range, no repeats without replacement, and zero-probability categories
+    never drawn while positive ones are left."""
+    call_checker.register(aten_functions.aten_multinomial)
+    probs = torch.tensor([0.0, 0.1, 0.2, 0.0, 0.3, 0.4, 0.0], dtype=dtype)
+    probs = probs.expand(shape).contiguous()
+
+    def fn(p):
+        return torch.multinomial(p, num_samples, replacement)
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    for _ in range(3):
+        out = compiled(probs)
+        assert out.dtype == torch.int64
+        assert out.shape == fn(probs).shape
+        assert torch.isin(out, torch.tensor([1, 2, 4, 5])).all(), out
+        if not replacement:
+            rows = out.reshape(-1, num_samples)
+            assert all(len(set(r.tolist())) == num_samples for r in rows)
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("replacement", [False, True])
+def test_aten_multinomial_frequencies_and_seeding(
+    conf: Conf, call_checker: CallChecker, replacement: bool
+):
+    """One compiled draw of many samples follows the distribution (a
+    generous chi-square bound), every call draws afresh, and
+    `torch.manual_seed` makes the draws reproducible."""
+    call_checker.register(aten_functions.aten_multinomial)
+    probs = torch.tensor([0.1, 0.0, 0.2, 0.3, 0.4])
+    rows, samples = 4000, 1
+
+    def fn(p):
+        return torch.multinomial(p, 1 if replacement else 2, replacement)
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    batch = probs.expand(rows, -1).contiguous()
+    torch.manual_seed(0)
+    first = compiled(batch)
+    second = compiled(batch)
+    torch.manual_seed(0)
+    again = compiled(batch)
+    assert torch.equal(first, again)
+    assert not torch.equal(first, second)
+    counts = torch.bincount(first[:, 0], minlength=5).double()
+    assert counts[1] == 0
+    expected = probs.double() * rows * samples
+    support = expected > 0
+    chi2 = (((counts - expected) ** 2)[support] / expected[support]).sum()
+    assert chi2 < 30, (counts, expected)  # 3 d.o.f.: p < 1e-5 when correct
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

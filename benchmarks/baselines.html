@@ -7975,6 +7975,74 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "convolution_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 3.149,
+                    "dgrad": 5.002,
+                    "wgrad": 6.826
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 6.063,
+                    "dgrad": 15.411,
+                    "wgrad": 32.244
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 6.285,
+                    "dgrad": 8.723,
+                    "wgrad": 10.171
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 6.087,
+                    "dgrad": 2.477,
+                    "wgrad": 23.827
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC512x7x7_K512k3s1": {
+                  "layouts": {
+                    "bgrad": 3.126,
+                    "dgrad": 5.091,
+                    "wgrad": 6.631
+                  }
+                },
+                "N32xC64x56x56_K64k3s1": {
+                  "layouts": {
+                    "bgrad": 6.237,
+                    "dgrad": 11.974,
+                    "wgrad": 13.196
+                  }
+                },
+                "N7xC48x39x53_K80k3s1": {
+                  "layouts": {
+                    "bgrad": 6.202,
+                    "dgrad": 5.907,
+                    "wgrad": 7.143
+                  }
+                },
+                "N8xC3x224x224_K64k7s2": {
+                  "layouts": {
+                    "bgrad": 6.229,
+                    "dgrad": 3.779,
+                    "wgrad": 7.644
+                  }
+                }
+              }
+            }
+          }
+        },
         "cos": {
           "dtypes": {
             "bf16": {
@@ -8669,6 +8737,48 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 1.007
+                  }
+                }
+              }
+            }
+          }
+        },
+        "kthvalue": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 2.026
+                  }
+                },
+                "V_8x50304_K25152": {
+                  "layouts": {
+                    "contig": 1.496
+                  }
+                },
+                "V_8x50304_K50": {
+                  "layouts": {
+                    "contig": 0.533
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.858
+                  }
+                },
+                "V_8x50304_K25152": {
+                  "layouts": {
+                    "contig": 0.889
+                  }
+                },
+                "V_8x50304_K50": {
+                  "layouts": {
+                    "contig": 0.36
                   }
                 }
               }
@@ -9593,6 +9703,48 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "median.dim": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 2.126
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 3.389
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 1.518
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.723
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 2.521
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 0.91
+                  }
+                }
+              }
+            }
+          }
+        },
         "min": {
           "dtypes": {
             "bf16": {
@@ -10161,6 +10313,58 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "multinomial": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_N3_REP": {
+                  "layouts": {
+                    "contig": 0.338
+                  }
+                },
+                "V_1x50304_N1": {
+                  "layouts": {
+                    "contig": 0.437
+                  }
+                },
+                "V_8x50304_N4_NOREP": {
+                  "layouts": {
+                    "contig": 1.001
+                  }
+                },
+                "V_8x50304_N64_REP": {
+                  "layouts": {
+                    "contig": 0.919
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_N3_REP": {
+                  "layouts": {
+                    "contig": 0.357
+                  }
+                },
+                "V_1x50304_N1": {
+                  "layouts": {
+                    "contig": 0.451
+                  }
+                },
+                "V_8x50304_N4_NOREP": {
+                  "layouts": {
+                    "contig": 0.837
+                  }
+                },
+                "V_8x50304_N64_REP": {
+                  "layouts": {
+                    "contig": 0.927
+                  }
+                }
+              }
+            }
+          }
+        },
         "native_batch_norm": {
           "dtypes": {
             "bf16": {
@@ -10187,6 +10391,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N8xC256xH28xW28": {
                   "layouts": {
                     "contig": 0.851
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_batch_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 1.222
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 4.453
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH112xW112": {
+                  "layouts": {
+                    "contig": 0.875
+                  }
+                },
+                "N8xC256xH28xW28": {
+                  "layouts": {
+                    "contig": 3.817
                   }
                 }
               }
@@ -10255,6 +10491,38 @@ document.addEventListener("DOMContentLoaded", boot);
                 "N8xC256xH14xW14_G32": {
                   "layouts": {
                     "contig": 0.466
+                  }
+                }
+              }
+            }
+          }
+        },
+        "native_group_norm_backward": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 3.372
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 3.133
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "N32xC64xH56xW56_G32": {
+                  "layouts": {
+                    "contig": 1.931
+                  }
+                },
+                "N8xC256xH14xW14_G32": {
+                  "layouts": {
+                    "contig": 2.846
                   }
                 }
               }
@@ -11113,6 +11381,58 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "sort.stable": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 3.044
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 4.7
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 3.67
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 3.629
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 2.035
+                  }
+                },
+                "S_4096x4096": {
+                  "layouts": {
+                    "contig": 3.056
+                  }
+                },
+                "V_8x50304": {
+                  "layouts": {
+                    "contig": 2.455
+                  }
+                },
+                "V_8x50304_desc": {
+                  "layouts": {
+                    "contig": 2.439
+                  }
+                }
+              }
+            }
+          }
+        },
         "split_with_sizes_copy.out": {
           "dtypes": {
             "bf16": {
@@ -11375,6 +11695,58 @@ document.addEventListener("DOMContentLoaded", boot);
                 "C_16777216": {
                   "layouts": {
                     "contig": 1.129
+                  }
+                }
+              }
+            }
+          }
+        },
+        "topk": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.466
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 2.051
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 3.954
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 3.866
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789_K32": {
+                  "layouts": {
+                    "contig": 1.277
+                  }
+                },
+                "V_1x50304_K50": {
+                  "layouts": {
+                    "contig": 1.376
+                  }
+                },
+                "V_8x50304_K2048": {
+                  "layouts": {
+                    "contig": 2.707
+                  }
+                },
+                "V_8x50304_K2048_min": {
+                  "layouts": {
+                    "contig": 2.69
                   }
                 }
               }

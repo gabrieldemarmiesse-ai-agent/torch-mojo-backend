@@ -237,10 +237,6 @@ SKIPPED_OPS: dict[str, str] = {
         "shares _log_softmax_backward_data's reduce-and-scale shape, but it "
         "has no benchmark node of its own yet"
     ),
-    "aten::native_batch_norm_backward": (
-        "newly registered; test_batch_norm covers the forward, and the "
-        "backward has no benchmark node of its own yet"
-    ),
     "aten::addr": (
         "newly added fast kernel (see fix-addr-fp16-bf16-precision) fixes "
         "fp16/bf16 rounding-order drift vs CPU; it has no prior native "

@@ -1865,6 +1865,40 @@ def op_scatter_src(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+# aten::scatter_.src(Tensor(a!) self, int dim, Tensor index, Tensor src)
+#   -> Tensor(a!)
+# What `value_selecting_reduction_backward` (the backward of topk, sort,
+# min.dim, max.dim, ...) calls on a zeros tensor.
+def op_scatter_src_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = v_tensor(args[unsafe_offset=3])
+    var dim = _scatter_validate(
+        a, v_int(args[unsafe_offset=1]), index, src.copy(), False
+    )
+    _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
+    ret_ref(rets, 0, a)
+
+
+# aten::scatter.src_out(Tensor self, int dim, Tensor index, Tensor src, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_scatter_src_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = v_tensor(args[unsafe_offset=3])
+    var out = v_tensor(args[unsafe_offset=4])
+    var dim = _scatter_validate(
+        a, v_int(args[unsafe_offset=1]), index, src.copy(), False
+    )
+    _copy_self_into_out(out, a, "scatter")
+    _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
+    ret_ref(rets, 0, out)
+
+
 # aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor
 def op_scatter_value(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -2969,6 +3003,8 @@ def register_data_movement(site: Site) raises:
     impl[op_replication_pad2d, "replication_pad2d"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
+    impl[op_scatter_src_, "scatter_.src"](site)
+    impl[op_scatter_src_out, "scatter.src_out"](site)
     impl[op_scatter_value, "scatter.value"](site)
     impl[op_scatter_add, "scatter_add"](site)
     impl[op_scatter_add_, "scatter_add_"](site)

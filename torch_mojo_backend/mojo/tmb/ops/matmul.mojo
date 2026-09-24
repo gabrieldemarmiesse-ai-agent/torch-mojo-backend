@@ -1,5 +1,5 @@
 """ATen ops: matmul group — mm, bmm, addmm, linear, linear_backward, addr and
-the convolution forward.
+the convolution forward and backward.
 
 The route cascade is the old fast path's (aten_fast.py), unchanged:
 
@@ -22,6 +22,7 @@ from max.gpu.host import DeviceAttribute
 
 from tmb.backend.abi import (
     IntList,
+    Owned,
     T,
     TAG_BOOL_LIST,
     TAG_NONE,
@@ -34,6 +35,7 @@ from tmb.backend.abi import (
     dtype_code,
     new_tensor,
     own,
+    own_if_new,
     release,
     ret_owned,
     ret_ref,
@@ -1342,25 +1344,29 @@ def _bool_list(v: Value) raises -> List[Bool]:
     return out^
 
 
-def _sum_rows(a: T) raises -> T:
-    """`a.sum(dim=0)` for a contiguous (rows, cols) matrix.
-
-    reduction reads a leading reduce interval where it lies (outer 1,
-    reduce rows, inner cols), so this needs no transposed materialization.
-    """
-    var out = own(_new([a.dim(1)], a.stype, a.device))
+def _sum_dims(a: T, dims: List[Int], out_len: Int) raises -> T:
+    """`a.sum(dims)` of a contiguous matrix into a fresh 1-D tensor of the
+    one dim left: `[0]` (a leading reduce interval) or `[1]` (trailing), both
+    of which the reduction kernels read in place."""
+    var out = own(_new([out_len], a.stype, a.device))
     var ctx = ctx_for(a.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("reduction", "SumSpec")
     call.arg_dtype(0, a.dtype)
     call.out_dtype(a.dtype)
     call.spec(a.spec(cp))
-    call.tuple([0])
+    call.tuple(dims)
     call.int(0)
     call.spec(out.t.spec(cp))
     call.run()
     _ = ctx
     return out.take()
+
+
+def _sum_rows(a: T) raises -> T:
+    """`a.sum(dim=0)` for a contiguous (rows, cols) matrix (outer 1, reduce
+    rows, inner cols: no transposed materialization)."""
+    return _sum_dims(a, [0], a.dim(1))
 
 
 def _transpose_2d(t: T) raises -> T:
@@ -1632,20 +1638,100 @@ def _pair(xs: IntList) raises -> List[Int]:
     return out^
 
 
-def _conv_forward(
+@fieldwise_init
+struct ConvGeom(Copyable, ImplicitlyCopyable, Movable):
+    """The geometry of one non-transposed convolution, as the 2-D path sees
+    it: a rank-3 (conv1d) operand has in_h = kh = out_h = 1 and stride 1,
+    padding 0, dilation 1 on that unit H axis."""
+
+    var conv1d: Bool
+    var n: Int
+    var c: Int
+    var in_h: Int
+    var in_w: Int
+    var out_c: Int
+    var c_per_group: Int
+    var groups: Int
+    var kh: Int
+    var kw: Int
+    var sh: Int
+    var sw: Int
+    var ph: Int
+    var pw: Int
+    var dh: Int
+    var dw: Int
+    var out_h: Int
+    var out_w: Int
+
+    def cols(self) -> Int:
+        """Output pixels per sample: the im2col matrix's column count."""
+        return self.out_h * self.out_w
+
+    def ckk(self) -> Int:
+        """Patch rows over every group: C * KH * KW."""
+        return self.c * self.kh * self.kw
+
+    def crs_g(self) -> Int:
+        """Patch rows of one group (the weight's row length)."""
+        return self.c_per_group * self.kh * self.kw
+
+    def oc_g(self) -> Int:
+        return self.out_c // self.groups
+
+    def one_by_one(self) -> Bool:
+        """A 1x1 stride-1 unpadded conv: the NCHW input already is the
+        (C, H*W) patch matrix of each sample."""
+        return (
+            self.kh == 1
+            and self.kw == 1
+            and self.sh == 1
+            and self.sw == 1
+            and self.ph == 0
+            and self.pw == 0
+            and self.dh == 1
+            and self.dw == 1
+        )
+
+    def output_shape(self) -> List[Int]:
+        var out = List[Int]()
+        out.append(self.n)
+        out.append(self.out_c)
+        if not self.conv1d:
+            out.append(self.out_h)
+        out.append(self.out_w)
+        return out^
+
+    def patch_params(self) -> List[Int]:
+        """The conv family's im2col / col2im params tuple."""
+        return [
+            self.in_h,
+            self.in_w,
+            self.out_h,
+            self.out_w,
+            self.kh,
+            self.kw,
+            self.sh,
+            self.sw,
+            self.ph,
+            self.pw,
+            self.dh,
+            self.dw,
+            self.c,
+            self.n,
+        ]
+
+
+def _conv_geometry(
     input: T,
     weight: T,
-    bias: Optional[T],
     stride: IntList,
     padding: IntList,
     dilation: IntList,
     transposed: Bool,
     groups: Int,
-) raises -> Optional[T]:
-    """Batched im2col + the pure-Mojo GEMM, with torch's (K, C, R, S) weight
-    used as-is and an NCHW output — no layout permutes, no cuDNN. Grouped
-    convolutions slice the channel-major im2col rows and the weights per group
-    with element offsets."""
+) raises -> Optional[ConvGeom]:
+    """What the im2col + GEMM path supports, or None: a non-transposed rank-3
+    or rank-4 float convolution of non-empty operands on one device."""
     if transposed or groups < 1:
         return None
     if input.stype != weight.stype or not _is_float(input.dtype):
@@ -1695,58 +1781,99 @@ def _conv_forward(
         return None
     if out_c % groups != 0:
         return None
+    return ConvGeom(
+        conv1d,
+        n,
+        c,
+        in_h,
+        in_w,
+        out_c,
+        c_per_group,
+        groups,
+        kh,
+        kw,
+        sh,
+        sw,
+        ph,
+        pw,
+        dh,
+        dw,
+        out_h,
+        out_w,
+    )
+
+
+def _conv_patches(
+    op: StaticString,
+    dst_ptr: Int,
+    src_ptr: Int,
+    g: ConvGeom,
+    dtype: DType,
+    cp: Int,
+) raises:
+    """One conv-family patch kernel: Im2col / Im2colPatchMajor (image ->
+    columns) or Col2im (patch-major columns -> image)."""
+    var call = KernelCall("conv", String(op))
+    call.arg_dtype(0, dtype)
+    call.out_dtype(dtype)
+    call.int(dst_ptr)
+    call.int(src_ptr)
+    call.tuple(g.patch_params())
+    call.int(dtype_code(dtype))
+    call.int(cp)
+    call.run()
+
+
+def _conv_forward(
+    input: T,
+    weight: T,
+    bias: Optional[T],
+    stride: IntList,
+    padding: IntList,
+    dilation: IntList,
+    transposed: Bool,
+    groups: Int,
+) raises -> Optional[T]:
+    """Batched im2col + the pure-Mojo GEMM, with torch's (K, C, R, S) weight
+    used as-is and an NCHW output — no layout permutes, no cuDNN. Grouped
+    convolutions slice the channel-major im2col rows and the weights per group
+    with element offsets."""
+    var geom = _conv_geometry(
+        input, weight, stride, padding, dilation, transposed, groups
+    )
+    if not geom:
+        return None
+    var g = geom.value()
     if bias:
         if (
             bias.value().stype != input.stype
             or bias.value().rank != 1
-            or bias.value().dim(0) != out_c
+            or bias.value().dim(0) != g.out_c
             or bias.value().device != input.device
         ):
             return None
 
+    var n = g.n
+    var c = g.c
+    var out_c = g.out_c
+    var c_per_group = g.c_per_group
     var a = Tmp(input)
     var w = Tmp(weight)
     var device = input.device
     var ctx = ctx_for(device)
     var cp = ctx_ptr(ctx)
-    var cols = out_h * out_w
-    var ckk = c * kh * kw
+    var cols = g.cols()
+    var ckk = g.ckk()
     var col = own(_new([0], input.stype, device))
     var col_ptr = a.t.ptr
-    var one_by_one = (
-        kh == 1
-        and kw == 1
-        and sh == 1
-        and sw == 1
-        and ph == 0
-        and pw == 0
-        and dh == 1
-        and dw == 1
-    )
-    if not one_by_one:
+    if not g.one_by_one():
         # Anything but a 1x1 stride-1 conv builds the patch matrix; for that
         # one case the NCHW input already is the col matrix.
         col = own(_new([n, ckk, cols], input.stype, device))
-        var im = KernelCall("conv", "Im2col")
-        im.arg_dtype(0, input.dtype)
-        im.out_dtype(input.dtype)
-        im.int(col.t.ptr)
-        im.int(a.t.ptr)
-        im.tuple(
-            [in_h, in_w, out_h, out_w, kh, kw, sh, sw, ph, pw, dh, dw, c, n]
-        )
-        im.int(dtype_code(input.dtype))
-        im.int(cp)
-        im.run()
+        _conv_patches("Im2col", col.t.ptr, a.t.ptr, g, input.dtype, cp)
         col_ptr = col.t.ptr
 
-    var out_shape = List[Int]()
-    out_shape.append(n)
-    out_shape.append(out_c)
-    if not conv1d:
-        out_shape.append(out_h)
-    out_shape.append(out_w)
-    var out = own(_new(out_shape, input.stype, device))
+    var out = own(_new(g.output_shape(), input.stype, device))
     if groups == 1:
         var mm = KernelCall("matmul", "Bmm")
         mm.arg_dtype(0, weight.dtype)
@@ -1767,10 +1894,11 @@ def _conv_forward(
     else:
         # Channel-major im2col rows make each group a contiguous
         # (crs_g, cols) slice; one offset GEMM per (sample, group).
-        var crs_g = c_per_group * kh * kw
-        var oc_g = out_c // groups
+        var crs_g = g.crs_g()
+        var oc_g = g.oc_g()
+        var kk = g.kh * g.kw
         for s in range(n):
-            for g in range(groups):
+            for gi in range(groups):
                 var mm = KernelCall("matmul", "Matmul")
                 mm.arg_dtype(0, weight.dtype)
                 mm.arg_dtype(1, input.dtype)
@@ -1785,9 +1913,9 @@ def _conv_forward(
                         cols,
                         crs_g,
                         0,
-                        (s * out_c + g * oc_g) * cols,
-                        g * oc_g * crs_g,
-                        (s * c + g * c_per_group) * kh * kw * cols,
+                        (s * out_c + gi * oc_g) * cols,
+                        gi * oc_g * crs_g,
+                        (s * c + gi * c_per_group) * kk * cols,
                     ]
                 )
                 mm.int(dtype_code(input.dtype))
@@ -1835,6 +1963,242 @@ def op_convolution(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_tensor(rets, 0, out.value())
 
 
+# --- aten::convolution_backward -----------------------------------------------
+#
+# The backward folds the batch into the GEMMs' shared dimension. With the
+# columns laid out patch-major -- (C*KH*KW, N*OH*OW), one row per filter tap
+# holding every sample's output pixels -- and grad_output as (K, N*OH*OW):
+#
+#   grad_weight = grad_out @ col^T          (a linear: K x C*KH*KW)
+#   grad_input  = col2im(weight^T @ grad_out)
+#   grad_bias   = grad_out summed over batch and space
+#
+# so each gradient is ONE GEMM per group through the ordinary ladders
+# (`_linear_route` / `_mm_route`: gemm16, tf32, then the spec kernels), with
+# no per-sample partials to reduce afterwards. The only data movement beyond
+# the forward's is one permuting copy of grad_output (skipped when N == 1)
+# and col2im, im2col's adjoint.
+
+
+def _grad_output_patch_major(grad: T, g: ConvGeom) raises -> Owned:
+    """grad_output as a contiguous (K, N, OH*OW) buffer: its sample axis moved
+    inside the channel axis, so it reads as the (K, N*OH*OW) GEMM operand.
+    For N == 1 that already is NCHW's layout, and a contiguous grad_output is
+    used where it lies."""
+    if g.n == 1:
+        return own_if_new(contiguous(grad), grad)
+    var out = own(_new([g.out_c, g.n, g.cols()], grad.stype, grad.device))
+    # A (N, K, [OH,] OW) view of that buffer, strided so the copy lands each
+    # element at its patch-major place, whatever grad_output's own layout.
+    var dims = g.output_shape()
+    var shape = _index_list(dims)
+    var strides = IndexList[MAX_RANK](0)
+    var pad = MAX_RANK - len(dims)
+    strides[pad] = g.cols()
+    strides[pad + 1] = g.n * g.cols()
+    if not g.conv1d:
+        strides[pad + 2] = g.out_w
+    strides[MAX_RANK - 1] = 1
+    var permuted = own(
+        view_strided(out.t, shape, strides, len(dims), out.t.offset)
+    )
+    copy_strided_into(permuted.t, grad)
+    _ = permuted^
+    return out^
+
+
+def _rows(t: T, first: Int, count: Int, width: Int) raises -> T:
+    """Rows [first, first + count) of a contiguous (*, width) buffer, as a
+    (count, width) view (an owned handle)."""
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    shape[MAX_RANK - 2] = count
+    shape[MAX_RANK - 1] = width
+    strides[MAX_RANK - 2] = width
+    strides[MAX_RANK - 1] = 1
+    return view_strided(t, shape, strides, 2, t.offset + first * width)
+
+
+def _store_rows(dst: T, first: Int, var block: T) raises:
+    """Copy a fresh (count, width) GEMM result into rows [first, ...) of the
+    contiguous `dst`, then release it."""
+    var held = own(block^)
+    var slot = own(_rows(dst, first, held.t.dim(0), held.t.dim(1)))
+    copy_strided_into(slot.t, held.t)
+    _ = slot^
+    _ = held^
+
+
+def _conv_grad_weight(
+    input: T, go: T, g: ConvGeom, cp: Int, weight_shape: List[Int]
+) raises -> T:
+    """grad_out (K, N*cols) @ col (C*KH*KW, N*cols)^T, one GEMM per group."""
+    var rows = g.n * g.cols()
+    var x = Tmp(input)
+    var cols_t: Owned
+    if g.n == 1 and g.one_by_one():
+        # One sample of a 1x1 stride-1 conv: NCHW is the (C, H*W) matrix.
+        cols_t = own(_view(x.t, [g.ckk(), rows]))
+    else:
+        cols_t = own(_new([g.ckk(), rows], input.stype, input.device))
+        _conv_patches(
+            "Im2colPatchMajor", cols_t.t.ptr, x.t.ptr, g, input.dtype, cp
+        )
+    var oc_g = g.oc_g()
+    var crs_g = g.crs_g()
+    var out = own(_empty_result(input.stype, input.device))
+    if g.groups > 1:
+        out = own(_new(weight_shape, input.stype, input.device))
+    for gi in range(g.groups):
+        var a = own(_rows(go, gi * oc_g, oc_g, rows))
+        var b = own(_rows(cols_t.t, gi * crs_g, crs_g, rows))
+        var dw = _linear_route(a.t, b.t, None)
+        if not dw:
+            unsupported("aten::convolution_backward: no GEMM route for wgrad")
+        if g.groups == 1:
+            var flat = own(dw.value().copy())
+            out = own(_view(flat.t, weight_shape))
+            _ = flat^
+        else:
+            _store_rows(out.t, gi * oc_g, dw.value().copy())
+        _ = a^
+        _ = b^
+    _ = cols_t^
+    _ = x^
+    return out.take()
+
+
+def _conv_grad_input(
+    weight: T, go: T, g: ConvGeom, cp: Int, input_shape: List[Int]
+) raises -> T:
+    """col2im(weight^T (C*KH*KW, K) @ grad_out (K, N*cols)), one GEMM per
+    group into the patch-major column buffer."""
+    var rows = g.n * g.cols()
+    var w = Tmp(weight)
+    var oc_g = g.oc_g()
+    var crs_g = g.crs_g()
+    var dcol = own(_new([0], weight.stype, weight.device))
+    if g.groups > 1:
+        dcol = own(_new([g.ckk(), rows], weight.stype, weight.device))
+    for gi in range(g.groups):
+        # weight^T of group gi: its (oc_g, crs_g) rows read transposed.
+        var wt_shape = IndexList[MAX_RANK](1)
+        var wt_strides = IndexList[MAX_RANK](0)
+        wt_shape[MAX_RANK - 2] = crs_g
+        wt_shape[MAX_RANK - 1] = oc_g
+        wt_strides[MAX_RANK - 2] = 1
+        wt_strides[MAX_RANK - 1] = crs_g
+        var wt = own(
+            view_strided(
+                w.t, wt_shape, wt_strides, 2, w.t.offset + gi * oc_g * crs_g
+            )
+        )
+        var b = own(_rows(go, gi * oc_g, oc_g, rows))
+        var part = _mm_route(wt.t, b.t)
+        if not part:
+            unsupported("aten::convolution_backward: no GEMM route for dgrad")
+        if g.groups == 1:
+            dcol = own(part.value().copy())
+        else:
+            _store_rows(dcol.t, gi * crs_g, part.value().copy())
+        _ = wt^
+        _ = b^
+    _ = w^
+    if g.n == 1 and g.one_by_one():
+        # col2im is the identity: (C, H*W) columns already are NCHW.
+        var dx = own(_view(dcol.t, input_shape))
+        _ = dcol^
+        return dx.take()
+    var dx = own(_new(input_shape, weight.stype, weight.device))
+    _conv_patches("Col2im", dx.t.ptr, dcol.t.ptr, g, weight.dtype, cp)
+    _ = dcol^
+    return dx.take()
+
+
+# aten::convolution_backward(Tensor grad_output, Tensor input, Tensor weight,
+#   SymInt[]? bias_sizes, SymInt[] stride, SymInt[] padding, SymInt[] dilation,
+#   bool transposed, SymInt[] output_padding, SymInt groups,
+#   bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+def op_convolution_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var grad = v_tensor(args[unsafe_offset=0])
+    var input = v_tensor(args[unsafe_offset=1])
+    var weight = v_tensor(args[unsafe_offset=2])
+    var mask = _bool_list(args[unsafe_offset=10])
+    # The forward's own gate: whatever `aten::convolution` ran here (a
+    # non-transposed rank-3/4 float conv) has a backward, and a transposed
+    # conv never gets this far because its forward declines too.
+    var geom = _conv_geometry(
+        input,
+        weight,
+        IntList(args[unsafe_offset=4]),
+        IntList(args[unsafe_offset=5]),
+        IntList(args[unsafe_offset=6]),
+        v_bool(args[unsafe_offset=7]),
+        v_int(args[unsafe_offset=9]),
+    )
+    if len(mask) != 3 or not geom:
+        unsupported("aten::convolution_backward with these operands")
+    if not mask[0] and not mask[1] and not mask[2]:
+        for i in range(3):
+            _ret_undefined(rets, i)
+        return
+    var g = geom.value()
+    var expected = g.output_shape()
+    if (
+        grad.stype != input.stype
+        or grad.device != input.device
+        or not grad.on_mojo()
+        or grad.rank != len(expected)
+    ):
+        unsupported("aten::convolution_backward: grad_output does not match")
+    for i in range(grad.rank):
+        if grad.dim(i) != expected[i]:
+            unsupported(
+                "aten::convolution_backward: grad_output has the wrong shape"
+            )
+    if g.out_c == 0:
+        unsupported("aten::convolution_backward with no output channels")
+
+    var ctx = ctx_for(input.device)
+    var cp = ctx_ptr(ctx)
+    # All three gradients read grad_output as (K, N*cols); the bias gradient
+    # is then a trailing-axis sum the reduction kernels take in place.
+    var go3 = _grad_output_patch_major(grad, g)
+    var go = own(_view(go3.t, [g.out_c, g.n * g.cols()]))
+    _ = go3^  # `go` holds its own reference to the storage
+
+    var grad_input = own(_empty_result(input.stype, input.device))
+    if mask[0]:
+        grad_input = own(
+            _conv_grad_input(weight, go.t, g, cp, input.logical_shape())
+        )
+    var grad_weight = own(_empty_result(input.stype, input.device))
+    if mask[1]:
+        grad_weight = own(
+            _conv_grad_weight(input, go.t, g, cp, weight.logical_shape())
+        )
+    var grad_bias = own(_empty_result(input.stype, input.device))
+    if mask[2]:
+        grad_bias = own(_sum_dims(go.t, [1], g.out_c))
+    _ = go^
+    _ = ctx
+
+    if mask[0]:
+        ret_owned(rets, 0, grad_input)
+    else:
+        _ret_undefined(rets, 0)
+    if mask[1]:
+        ret_owned(rets, 1, grad_weight)
+    else:
+        _ret_undefined(rets, 1)
+    if mask[2]:
+        ret_owned(rets, 2, grad_bias)
+    else:
+        _ret_undefined(rets, 2)
+
+
 def register_matmul(site: Site) raises:
     impl[op_addmm, "addmm"](site)
     impl[op_addmm_out, "addmm.out"](site)
@@ -1842,6 +2206,7 @@ def register_matmul(site: Site) raises:
     impl[op_bmm, "bmm"](site)
     impl[op_bmm_out, "bmm.out"](site)
     impl[op_convolution, "convolution"](site)
+    impl[op_convolution_backward, "convolution_backward"](site)
     impl[op_linear, "linear"](site)
     impl[op_linear_backward, "linear_backward"](site)
     impl[op_mm, "mm"](site)

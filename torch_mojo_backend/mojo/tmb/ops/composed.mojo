@@ -1,9 +1,10 @@
 """Ops composed from registered ops through the dispatcher (`call_op`), with
 fused routes for supported regimes: backward formulas ATen ships as per-backend
-kernels (threshold / sigmoid / tanh / batch norm / softmax backward), the
-signed-infinity tests, and out= overloads of ops whose functional form
-exists. Contiguous FP32 tanh backward has a fused Hopper route; other regimes
-retain the composed implementation without changing the registration."""
+kernels (threshold / sigmoid / tanh / batch norm / group norm / softmax
+backward), the signed-infinity tests, and out= overloads of ops whose
+functional form exists. Contiguous FP32 tanh backward has a fused Hopper
+route; other regimes retain the composed implementation without changing the
+registration."""
 from std.utils import IndexList
 
 from tmb.backend.abi import (
@@ -13,6 +14,7 @@ from tmb.backend.abi import (
     T,
     TAG_BOOL,
     TAG_BOOL_LIST,
+    TAG_DOUBLE,
     TAG_INT_LIST,
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
@@ -536,32 +538,20 @@ def op_where_self_out(
 #   grad_input   = invstd * w * (grad_out - grad_bias/N - xhat * grad_weight/N)
 #                = invstd * w * grad_out                      (evaluation)
 #
-# with w = weight or 1. Half / bfloat16 inputs run the whole formula in
-# float32 (ATen's opmath_t) and cast back; the two affine gradients come out
-# in the weight's dtype, like `at::empty_like(weight)` in the CUDA kernel.
+# with w = weight or 1, all of it on the `[N, C, HxW]` view. Every
+# per-channel broadcast is `(x - a[c]) * b[c]`, which is one pass of the
+# eval-mode batch norm kernel (`_channel_affine`); every per-channel sum is a
+# spatial then a batch reduction (`_channel_sum`). Half / bfloat16 inputs run
+# the whole formula in float32 (ATen's opmath_t) and cast back; the two
+# affine gradients come out in the weight's dtype, like
+# `at::empty_like(weight)` in the CUDA kernel.
 # ---------------------------------------------------------------------------
-
-
-def _channel_view(vec: Owned, rank: Int) raises -> Owned:
-    """A rank-`rank` `[1, C, 1, ...]` view of a per-channel vector, which is
-    what lines it up with dim 1 of the input for the broadcast binary
-    kernels. Zero-copy, so a non-contiguous vector needs no materializing:
-    only the C axis carries a real stride."""
-    if vec.t.rank != 1:
-        unsupported(
-            "native_batch_norm_backward: a per-channel parameter must be 1-D"
-        )
-    var shape = IndexList[MAX_RANK](1)
-    var strides = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - rank + 1] = vec.t.dim(0)
-    strides[MAX_RANK - rank + 1] = vec.t.stride(0)
-    return own(view_strided(vec.t, shape, strides, rank, vec.t.offset))
 
 
 def _planes_view(t: T) raises -> Owned:
     """`t` as a contiguous rank-3 `[N, C, HxW]` tensor, the shape ATen itself
-    reduces batch norm to. Only used above rank 4, where the broadcast binary
-    kernels stop; the copy is free for an already contiguous input."""
+    reduces batch norm to (batch norm only ever looks at dim 1). The copy is
+    free for an already contiguous input."""
     var c = _dense(_hold(t))
     var inner = 1
     for i in range(2, c.t.rank):
@@ -573,23 +563,59 @@ def _planes_view(t: T) raises -> Owned:
     return _view_as(c, shape, 3)
 
 
-def _bn_operand(t: T, rank: Int) raises -> Owned:
-    """The operand the formula runs on: `t` itself up to rank 4, its
-    `[N, C, HxW]` view above -- batch norm only ever looks at dim 1, and the
-    broadcast binary kernels stop at rank 4."""
-    if rank <= 4:
-        return _hold(t)
-    return _planes_view(t)
-
-
 def _shaped_like(gi: Owned, out_like: T) raises -> Owned:
-    """`gi` in the dtype and shape of `out_like`. The shape only ever differs
-    when rank > 4 sent the formula through the `[N, C, HxW]` view."""
+    """`gi` (an `[N, C, HxW]` result) in the dtype and shape of `out_like`."""
     var res = _cast(gi, out_like.stype)
     if res.t.rank == out_like.rank:
         return res^
     var dense = _dense(res)
     return _view_as(dense, out_like.shape, out_like.rank)
+
+
+def _filled_channels(c: Int, value: Float64, device: Int) raises -> Owned:
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = c
+    var t = own(new_tensor(shape, 1, ST_FLOAT32, device))
+    fill_value(t.t, value)
+    return t^
+
+
+def _channel_sum(x: Owned) raises -> Owned:
+    """Per-channel sum of an `[N, C, HxW]` operand, as `[C]`: the spatial axis
+    first, then the batch axis. Each is a plain reduction shape, where one sum
+    over both axes has to reorder the whole tensor first."""
+    var spatial = List[Int64](capacity=1)
+    spatial.append(2)
+    var batch = List[Int64](capacity=1)
+    batch.append(0)
+    var partial = _sum_dims(x, spatial, False)
+    return _sum_dims(partial, batch, False)
+
+
+def _channel_affine(
+    x: Owned, shift: Owned, scale: Owned, zeros: Owned, ones: Owned
+) raises -> Owned:
+    """`(x - shift[c]) * scale[c]` over dim 1 of a float32 `[N, C, HxW]`
+    operand, in one elementwise pass: that is eval-mode batch norm with unit
+    variance, zero bias and `eps = 0` (`1 / sqrt(1 + 0)` is exactly 1), whose
+    kernel loads the per-channel coefficients once per plane instead of
+    through a broadcast-strided binary. Every vector is a contiguous float32
+    `[C]`."""
+    var rets = call_op(
+        "aten::_native_batch_norm_legit_no_training",
+        "",
+        [
+            _tensor_value(x.t),
+            _tensor_value(scale.t),
+            _tensor_value(zeros.t),
+            _tensor_value(shift.t),
+            _tensor_value(ones.t),
+            Value(TAG_DOUBLE, 0, f64_bits(0.0), 0),
+            Value(TAG_DOUBLE, 0, f64_bits(0.0), 0),
+        ],
+        3,
+    )
+    return own(rets.take_tensor(0))
 
 
 def _bn_scale(args: Values, invstd: Owned, cst: Int32) raises -> Owned:
@@ -598,40 +624,7 @@ def _bn_scale(args: Values, invstd: Owned, cst: Int32) raises -> Owned:
     if v_is_none(args[unsafe_offset=2]):
         return _hold(invstd.t)
     var w = _as_dtype(v_tensor(args[unsafe_offset=2]), cst)
-    return _mul(invstd, w)
-
-
-def _bn_grad_input(
-    args: Values,
-    gc: Owned,
-    xhat: Owned,
-    grad_bias: Owned,
-    grad_weight: Owned,
-    invstd: Owned,
-    out_like: T,
-    train: Bool,
-    wanted: Bool,
-    n: Int,
-    cst: Int32,
-) raises -> Owned:
-    """grad_input, in the input's dtype and shape (`out_like`'s)."""
-    if not wanted:
-        return _empty_result(out_like.stype, out_like.device)
-    var rank = gc.t.rank
-    var factor = _bn_scale(args, invstd, cst)
-    var factor_b = _channel_view(factor, rank)
-    if not train:
-        var scaled = _mul(gc, factor_b)
-        return _shaped_like(scaled, out_like)
-    var gb = _div_scalar(grad_bias, Float64(n))
-    var gb_b = _channel_view(gb, rank)
-    var gw = _div_scalar(grad_weight, Float64(n))
-    var gw_b = _channel_view(gw, rank)
-    var debiased = _sub(gc, gb_b)
-    var projected = _mul(xhat, gw_b)
-    var inner = _sub(debiased, projected)
-    var gi = _mul(inner, factor_b)
-    return _shaped_like(gi, out_like)
+    return _dense(_mul(invstd, w))
 
 
 def _bn_affine_grad(v: Owned, stype: Int32, wanted: Bool) raises -> Owned:
@@ -653,55 +646,69 @@ def _bn_backward(
     pst: Int32,
     mask: List[Bool],
 ) raises:
-    """The formula itself, over operands already reduced to a rank the
-    broadcast binary kernels handle. `mean` and `invstd` are per-channel
-    vectors in the compute dtype `cst`; the affine gradients come back in
-    `pst`, grad_input in `out_like`'s dtype and shape."""
-    var rank = a.t.rank
-    var n = a.t.numel // a.t.dim(1)
-    var dims = List[Int64](capacity=rank - 1)
-    dims.append(0)
-    for i in range(2, rank):
-        dims.append(Int64(i))
+    """The formula itself, over `[N, C, HxW]` operands already in the compute
+    dtype `cst` (float32). `mean` and `invstd` are contiguous `[C]` vectors in
+    `cst`; the affine gradients come back in `pst`, grad_input in
+    `out_like`'s dtype and shape. Only what the mask needs is computed: an
+    evaluation grad_input or a bias-only call never forms `xhat`."""
+    var c = a.t.dim(1)
+    var n = a.t.numel // c
+    var device = a.t.device
+    var zeros = _filled_channels(c, 0.0, device)
+    var ones = _filled_channels(c, 1.0, device)
+    var need_bias = mask[2] or (mask[0] and train)
+    var need_weight = mask[1] or (mask[0] and train)
+    var grad_bias = _empty_result(cst, device)
+    if need_bias:
+        grad_bias = _channel_sum(grad)
+    var xhat = _empty_result(cst, device)
+    var grad_weight = _empty_result(cst, device)
+    if need_weight:
+        xhat = _channel_affine(a, mean, invstd, zeros, ones)
+        var gxhat = _mul(grad, xhat)
+        grad_weight = _channel_sum(gxhat)
 
-    var gc = _cast(grad, cst)
-    var ac = _cast(a, cst)
-    var mean_b = _channel_view(mean, rank)
-    var invstd_b = _channel_view(invstd, rank)
-    var centered = _sub(ac, mean_b)
-    var xhat = _mul(centered, invstd_b)
-    var grad_bias = _sum_dims(gc, dims, False)
-    var gxhat = _mul(gc, xhat)
-    var grad_weight = _sum_dims(gxhat, dims, False)
-
-    var gi = _bn_grad_input(
-        args,
-        gc,
-        xhat,
-        grad_bias,
-        grad_weight,
-        invstd,
-        out_like,
-        train,
-        mask[0],
-        n,
-        cst,
-    )
-    var gw = _bn_affine_grad(grad_weight, pst, mask[1])
-    var gb = _bn_affine_grad(grad_bias, pst, mask[2])
     # an output autograd did not ask for is an undefined Tensor (None record)
     if mask[0]:
-        ret_owned(rets, 0, gi)
+        var factor = _bn_scale(args, invstd, cst)
+        if train:
+            # invstd * w * (grad - grad_bias/N - xhat * grad_weight/N)
+            var gb_n = _div_scalar(grad_bias, Float64(n))
+            var debiased = _channel_affine(grad, gb_n, factor, zeros, ones)
+            var gw_n = _div_scalar(grad_weight, Float64(n))
+            var coef = _mul(gw_n, factor)
+            var projected = _channel_affine(xhat, zeros, coef, zeros, ones)
+            var gi = _sub(debiased, projected)
+            var shaped = _shaped_like(gi, out_like)
+            ret_owned(rets, 0, shaped)
+        else:
+            var gi = _channel_affine(grad, zeros, factor, zeros, ones)
+            var shaped = _shaped_like(gi, out_like)
+            ret_owned(rets, 0, shaped)
     else:
         rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
     if mask[1]:
+        var gw = _bn_affine_grad(grad_weight, pst, True)
         ret_owned(rets, 1, gw)
     else:
         rets[unsafe_offset=1] = Value(TAG_NONE, 0, 0, 0)
     if mask[2]:
+        var gb = _bn_affine_grad(grad_bias, pst, True)
         ret_owned(rets, 2, gb)
     else:
         rets[unsafe_offset=2] = Value(TAG_NONE, 0, 0, 0)
+
+
+def _bn_channel_vec(v: Value, c: Int, cst: Int32) raises -> Owned:
+    """A per-channel argument as the contiguous `[C]` vector in `cst` that
+    `_channel_affine` reads."""
+    var t = v_tensor(v)
+    if t.rank != 1 or t.dim(0) != c:
+        unsupported(
+            "native_batch_norm_backward: a per-channel parameter must be 1-D"
+            " of size C"
+        )
+    return _dense(_as_dtype(t, cst))
 
 
 def _bn_stats_then_backward(
@@ -716,14 +723,15 @@ def _bn_stats_then_backward(
     pst: Int32,
     mask: List[Bool],
 ) raises:
+    var c = a.t.dim(1)
     if train:
         if v_is_none(args[unsafe_offset=5]) or v_is_none(args[unsafe_offset=6]):
             unsupported(
                 "training native_batch_norm_backward needs both saved"
                 " statistics"
             )
-        var mean = _as_dtype(v_tensor(args[unsafe_offset=5]), cst)
-        var invstd = _as_dtype(v_tensor(args[unsafe_offset=6]), cst)
+        var mean = _bn_channel_vec(args[unsafe_offset=5], c, cst)
+        var invstd = _bn_channel_vec(args[unsafe_offset=6], c, cst)
         _bn_backward(
             args, rets, grad, a, out_like, mean, invstd, True, cst, pst, mask
         )
@@ -733,8 +741,8 @@ def _bn_stats_then_backward(
             "evaluation native_batch_norm_backward needs both running"
             " statistics"
         )
-    var mean = _as_dtype(v_tensor(args[unsafe_offset=3]), cst)
-    var var_t = _as_dtype(v_tensor(args[unsafe_offset=4]), cst)
+    var mean = _bn_channel_vec(args[unsafe_offset=3], c, cst)
+    var var_t = _bn_channel_vec(args[unsafe_offset=4], c, cst)
     var shifted = _add_scalar(var_t, eps)
     var invstd = _rsqrt(shifted)
     _bn_backward(
@@ -773,7 +781,11 @@ def op_native_batch_norm_backward(
             "native_batch_norm_backward: every operand must be on one mojo"
             " device"
         )
-    if not a.dtype.is_floating_point():
+    if (
+        a.dtype != DType.float32
+        and a.dtype != DType.bfloat16
+        and a.dtype != DType.float16
+    ):
         unsupported("native_batch_norm_backward of dtype " + String(a.dtype))
     if a.rank < 2:
         unsupported("native_batch_norm_backward needs a tensor of rank >= 2")
@@ -782,9 +794,7 @@ def op_native_batch_norm_backward(
             "native_batch_norm_backward: grad_out and input must share a shape"
         )
     # ATen's opmath_t: the whole formula runs in float32 for a half input.
-    var cst = a.stype
-    if a.dtype == DType.float16 or a.dtype == DType.bfloat16:
-        cst = ST_FLOAT32
+    var cst = ST_FLOAT32
     var pst = cst
     if not v_is_none(args[unsafe_offset=2]):
         pst = v_tensor(args[unsafe_offset=2]).stype
@@ -800,11 +810,227 @@ def op_native_batch_norm_backward(
         ret_owned(rets, 1, gw)
         ret_owned(rets, 2, gb)
         return
-    var grad_w = _bn_operand(grad, a.rank)
-    var a_w = _bn_operand(a, a.rank)
+    if not v_is_none(args[unsafe_offset=2]):
+        var w = v_tensor(args[unsafe_offset=2])
+        if w.rank != 1 or w.dim(0) != a.dim(1):
+            unsupported("native_batch_norm_backward: weight must be 1-D of C")
+    var grad_w = _cast(_planes_view(grad), cst)
+    var a_w = _cast(_planes_view(a), cst)
     _bn_stats_then_backward(
         args, rets, grad_w, a_w, a, train, eps, cst, pst, mask
     )
+
+
+# ---------------------------------------------------------------------------
+# native_group_norm_backward
+#
+# Group norm normalizes the trailing K = (C / group) * HxW elements of the
+# [N, group, K] view, so its grad_input is the layer-norm formula on that view
+# once the per-channel gamma is folded into grad_out:
+#
+#   q  = grad_out * w                                  (w = weight or 1)
+#   dx = rstd * (q - mean_K(q) - xhat * mean_K(q * xhat))
+#
+# which is exactly what the LayerNorm backward dx kernel computes over
+# rows = N * group, cols = K. The affine gradients reduce over the batch and
+# the spatial extent per channel instead, through the per-(sample, channel)
+# partial sums ATen's own kernel uses (group_norm_kernel.cu):
+#
+#   S1[n, c]  = sum_hw grad_out        S2[n, c] = sum_hw grad_out * input
+#   dgamma[c] = sum_n rstd[n, g] * (S2[n, c] - mean[n, g] * S1[n, c])
+#   dbeta[c]  = sum_n S1[n, c]
+#
+# Half / bfloat16 run all of it in float32 (ATen's opmath_t) and cast back.
+# ---------------------------------------------------------------------------
+
+
+def _gn_planes(t: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Owned:
+    """`t` in float32, contiguous, viewed as `shape`."""
+    var f = _as_dtype(t, ST_FLOAT32)
+    var d = _dense(f)
+    return _view_as(d, shape, rank)
+
+
+def _gn_dims3(a: Int, b: Int, c: Int) -> IndexList[MAX_RANK]:
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 3] = a
+    shape[MAX_RANK - 2] = b
+    shape[MAX_RANK - 1] = c
+    return shape
+
+
+def _gn_vector(n: Int) -> IndexList[MAX_RANK]:
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n
+    return shape
+
+
+def _gn_grad_input(
+    args: Values,
+    gc: Owned,
+    ac: Owned,
+    mean: Owned,
+    rstd: Owned,
+    out_like: T,
+    rows: Int,
+    cols: Int,
+) raises -> Owned:
+    """grad_input through the LayerNorm backward dx kernel on the
+    [N * group, K] view, in the input's dtype and shape."""
+    var q = _hold(gc.t)
+    if not v_is_none(args[unsafe_offset=4]):
+        var c = gc.t.dim(1)
+        var w = _dense(_as_dtype(v_tensor(args[unsafe_offset=4]), ST_FLOAT32))
+        var zeros = _filled_channels(c, 0.0, gc.t.device)
+        var ones = _filled_channels(c, 1.0, gc.t.device)
+        q = _dense(_channel_affine(gc, zeros, w, zeros, ones))
+    var gi = own(
+        new_tensor(out_like.shape, out_like.rank, ST_FLOAT32, out_like.device)
+    )
+    var ctx = ctx_for(out_like.device)
+    var call = KernelCall("normalization_backward", "LayerNormBackwardF32")
+    call.arg_dtype(0, DType.float32)
+    call.arg_dtype(1, DType.float32)
+    call.arg_dtype(2, DType.float32)
+    call.arg_dtype(3, DType.float32)
+    call.arg_dtype(4, DType.float32)
+    call.out_dtype_i(0, DType.float32)
+    call.out_dtype_i(1, DType.float32)
+    call.out_dtype_i(2, DType.float32)
+    call.flag("OUTPUT_MASK", 1)
+    call.int(gi.t.ptr)
+    call.int(0)
+    call.int(0)
+    call.int(q.t.ptr)
+    call.int(ac.t.ptr)
+    call.int(mean.t.ptr)
+    call.int(rstd.t.ptr)
+    call.int(0)
+    call.int(rows)
+    call.int(cols)
+    call.int(1)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = q.t.ptr
+    _ = ac.t.ptr
+    _ = mean.t.ptr
+    _ = rstd.t.ptr
+    _ = ctx
+    return _as_dtype(gi.t, out_like.stype)
+
+
+# aten::native_group_norm_backward(Tensor grad_out, Tensor input, Tensor mean,
+#   Tensor rstd, Tensor? weight, SymInt N, SymInt C, SymInt HxW, int group,
+#   bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+def op_native_group_norm_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var grad = v_tensor(args[unsafe_offset=0])
+    var a = v_tensor(args[unsafe_offset=1])
+    var mean_t = v_tensor(args[unsafe_offset=2])
+    var rstd_t = v_tensor(args[unsafe_offset=3])
+    var has_w = not v_is_none(args[unsafe_offset=4])
+    var n = v_int(args[unsafe_offset=5])
+    var c = v_int(args[unsafe_offset=6])
+    var hxw = v_int(args[unsafe_offset=7])
+    var group = v_int(args[unsafe_offset=8])
+    var mask = _bool_list(args[unsafe_offset=9])
+    if len(mask) != 3:
+        raise Error(
+            "native_group_norm_backward: output_mask must have 3 entries"
+        )
+    if (
+        not a.on_mojo()
+        or grad.device != a.device
+        or mean_t.device != a.device
+        or rstd_t.device != a.device
+    ):
+        unsupported(
+            "native_group_norm_backward: every operand must be on one mojo"
+            " device"
+        )
+    if (
+        a.dtype != DType.float32
+        and a.dtype != DType.bfloat16
+        and a.dtype != DType.float16
+    ):
+        unsupported("native_group_norm_backward of dtype " + String(a.dtype))
+    if not grad.same_shape(a) or grad.stype != a.stype:
+        unsupported(
+            "native_group_norm_backward: grad_out and input must share a"
+            " shape and dtype"
+        )
+    if (
+        group <= 0
+        or c <= 0
+        or c % group != 0
+        or a.numel != n * c * hxw
+        or mean_t.numel != n * group
+        or rstd_t.numel != n * group
+    ):
+        unsupported("native_group_norm_backward: bad group geometry")
+    var pst = a.stype
+    if has_w:
+        var w = v_tensor(args[unsafe_offset=4])
+        if w.device != a.device or w.rank != 1 or w.dim(0) != c:
+            unsupported("native_group_norm_backward: unsupported weight")
+        pst = w.stype
+    if a.numel == 0:
+        # Nothing to reduce: both affine gradients are zero over an empty
+        # extent (ATen fills them with zeros too) and grad_input is empty.
+        var gi = own(new_like(a))
+        var gw = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[1])
+        var gb = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[2])
+        ret_owned(rets, 0, gi)
+        ret_owned(rets, 1, gw)
+        ret_owned(rets, 2, gb)
+        return
+    var cpg = c // group
+    var planes = _gn_dims3(n, c, hxw)
+    var gc = _gn_planes(grad, planes, 3)
+    var ac = _gn_planes(a, planes, 3)
+    var stats = _gn_dims3(n, group, 1)
+    var mean = _gn_planes(mean_t, stats, 3)
+    var rstd = _gn_planes(rstd_t, stats, 3)
+
+    # an output autograd did not ask for is an undefined Tensor (None record)
+    if mask[0]:
+        var gi = _gn_grad_input(
+            args, gc, ac, mean, rstd, a, n * group, cpg * hxw
+        )
+        ret_owned(rets, 0, gi)
+    else:
+        rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
+    if not mask[1] and not mask[2]:
+        rets[unsafe_offset=1] = Value(TAG_NONE, 0, 0, 0)
+        rets[unsafe_offset=2] = Value(TAG_NONE, 0, 0, 0)
+        return
+    var spatial = List[Int64](capacity=1)
+    spatial.append(2)
+    var batch = List[Int64](capacity=1)
+    batch.append(0)
+    var per_group = _gn_dims3(n, group, cpg)
+    var s1 = _sum_dims(gc, spatial, False)
+    if mask[1]:
+        var gx = _mul(gc, ac)
+        var s2 = _dense(_sum_dims(gx, spatial, False))
+        var s1g = _view_as(_dense(s1), per_group, 3)
+        var s2g = _view_as(s2, per_group, 3)
+        var shifted = _mul(s1g, mean)
+        var centered = _sub(s2g, shifted)
+        var scaled = _mul(centered, rstd)
+        var total = _dense(_sum_dims(scaled, batch, False))
+        var flat = _view_as(total, _gn_vector(c), 1)
+        var gw = _cast(flat, pst)
+        ret_owned(rets, 1, gw)
+    else:
+        rets[unsafe_offset=1] = Value(TAG_NONE, 0, 0, 0)
+    if mask[2]:
+        var bias_sum = _sum_dims(s1, batch, False)
+        var gb = _cast(bias_sum, pst)
+        ret_owned(rets, 2, gb)
+    else:
+        rets[unsafe_offset=2] = Value(TAG_NONE, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -873,4 +1099,5 @@ def register_composed(site: Site) raises:
     impl[op_isposinf_out, "isposinf.out"](site)
     impl[op_where_self_out, "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
+    impl[op_native_group_norm_backward, "native_group_norm_backward"](site)
     impl[op_softmax_backward_data, "_softmax_backward_data"](site)

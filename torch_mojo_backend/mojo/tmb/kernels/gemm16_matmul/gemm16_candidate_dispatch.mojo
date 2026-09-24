@@ -355,3 +355,30 @@ def try_enqueue_candidate_tn(
             ](output, a, b, m, n, k, sms, ctx)
         return False
     return False
+
+
+def try_enqueue_candidate_nt_bias_addr(
+    output: Int,
+    a: Int,
+    b: Int,
+    bias: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    has_bias: Bool,
+    ctx: DeviceContext,
+) raises -> Bool:
+    """`try_enqueue_candidate_nt_bias` over raw addresses, for a precompiled
+    caller that cannot spell `PTR` (see gemm16_v3_kernels.mojo's
+    `enqueue_gemm16_gemm_addr`)."""
+    return try_enqueue_candidate_nt_bias(
+        PTR(unsafe_from_address=output),
+        PTR(unsafe_from_address=a),
+        PTR(unsafe_from_address=b),
+        PTR(unsafe_from_address=bias),
+        m,
+        n,
+        k,
+        has_bias,
+        ctx,
+    )

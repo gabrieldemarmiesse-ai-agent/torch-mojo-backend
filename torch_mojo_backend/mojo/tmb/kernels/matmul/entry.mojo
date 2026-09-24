@@ -4776,6 +4776,48 @@ def _gemv_enqueue[
 
 
 @always_inline
+def _gemv_launch[
+    dt: DType
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_b: Int,
+    ctx: DeviceContext,
+) raises:
+    """The m == 1 route for one dtype. `_gemv_dtype_dispatch` below picks
+    the dtype at run time behind the build's DTYPE_ARG_0 gate; a MAX custom
+    op calls this directly with the dtype as a parameter, because a
+    MAX-compiled package carries no -D defines."""
+    # The pinned MAX AMD GEVM launch grid divides N by 16 even
+    # though a gfx942 wavefront emits 64 columns.  That launches 4x
+    # too many blocks and writes beyond the output.  Keep every
+    # dtype off that unsafe path on MI300X; the existing GEMM path
+    # is correct for m == 1 and also avoids bf16's unsupported fdot2.
+    comptime if _accelerator_arch() == "amdgpu:gfx942":
+        _gemm_transb_dispatch[dt](
+            c_addr,
+            a_addr,
+            b_addr,
+            1,
+            m,
+            n,
+            k,
+            m * k,
+            transpose_b,
+            ctx,
+        )
+    else:
+        if transpose_b != 0:
+            _gemv_enqueue[dt, True](c_addr, a_addr, b_addr, m, n, k, ctx)
+        else:
+            _gemv_enqueue[dt, False](c_addr, a_addr, b_addr, m, n, k, ctx)
+
+
+@always_inline
 def _gemv_dtype_dispatch(
     dtype: DType,
     c_addr: Int,
@@ -4791,33 +4833,9 @@ def _gemv_dtype_dispatch(
     comptime for dt in FLOAT_DTYPES:
         comptime if _dtype_arg_on[0, dt]():
             if dtype == dt:
-                # The pinned MAX AMD GEVM launch grid divides N by 16 even
-                # though a gfx942 wavefront emits 64 columns.  That launches 4x
-                # too many blocks and writes beyond the output.  Keep every
-                # dtype off that unsafe path on MI300X; the existing GEMM path
-                # is correct for m == 1 and also avoids bf16's unsupported fdot2.
-                comptime if _accelerator_arch() == "amdgpu:gfx942":
-                    _gemm_transb_dispatch[dt](
-                        c_addr,
-                        a_addr,
-                        b_addr,
-                        1,
-                        m,
-                        n,
-                        k,
-                        m * k,
-                        transpose_b,
-                        ctx,
-                    )
-                else:
-                    if transpose_b != 0:
-                        _gemv_enqueue[dt, True](
-                            c_addr, a_addr, b_addr, m, n, k, ctx
-                        )
-                    else:
-                        _gemv_enqueue[dt, False](
-                            c_addr, a_addr, b_addr, m, n, k, ctx
-                        )
+                _gemv_launch[dt](
+                    c_addr, a_addr, b_addr, m, n, k, transpose_b, ctx
+                )
                 handled = True
     if not handled:
         raise Error("unsupported dtype for gemv: " + String(dtype))
@@ -6283,25 +6301,49 @@ def _matmul_bias_run(
 ) raises:
     """The MatmulBiasSpec tier ladder: m==1 gemv+bias / f32 fused-epilogue /
     GEMM+bias."""
+    var handled = False
+    comptime for dt in FLOAT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype == dt:
+                _matmul_bias_launch[dt](
+                    c_addr, a_addr, b_addr, bias_addr, m, n, k, transpose_b, ctx
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for fast matmul: " + String(dtype))
+
+
+def _matmul_bias_launch[
+    dt: DType
+](
+    c_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    bias_addr: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+    transpose_b: Int,
+    ctx: DeviceContext,
+) raises:
+    """The accelerator half of `_matmul_bias_run` for one dtype (same
+    arrangement as `_gemv_launch`: the graph backend calls this directly)."""
     # Keep the bias in fp32 even for decode and irregular/offset NT inputs.
     # This branch is absent on other architectures and for all other dtypes.
     comptime if _accelerator_arch() == "amdgpu:gfx942":
-        if dtype == DType.bfloat16 and transpose_b != 0:
-            _nt_bias_mfma_route(c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx)
-            return
+        comptime if dt == DType.bfloat16:
+            if transpose_b != 0:
+                _nt_bias_mfma_route(
+                    c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
+                )
+                return
 
     # Single-token (m == 1) decode: gemv_gpu + row-broadcast bias. gemv beats
     # our smallm split-K path on every decode shape; the bias add is the same
-    # cheap epilogue either way. No unsupported-dtype raise needed here:
-    # _gemv_dtype_dispatch already raised for anything outside FLOAT_DTYPES.
+    # cheap epilogue either way.
     if m == 1:
-        _gemv_dtype_dispatch(
-            dtype, c_addr, a_addr, b_addr, m, n, k, transpose_b, ctx
-        )
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if dtype == dt:
-                    _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
+        _gemv_launch[dt](c_addr, a_addr, b_addr, m, n, k, transpose_b, ctx)
+        _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
         return
 
     # Apple: skinny-M float32 projections take the vendored cached
@@ -6310,54 +6352,41 @@ def _matmul_bias_run(
     # is absent from CUDA/ROCm builds, which retain the existing pure-Mojo
     # SIMT dispatch and tuning constants exactly.
     comptime if has_apple_gpu_accelerator():
-        if (
-            dtype == DType.float32
-            and transpose_b == 0
-            and m > SMALLM_MR
-            and m <= 32
-            and k % MMA8_DIM == 0
-        ):
-            _apple8_enqueue[True](
-                c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
-            )
-            return
-        # Fat tiles: the simdgroup-matrix GEMM plus a separate row-broadcast
-        # bias pass still beats the NVIDIA-tuned fused-bias pipe3 tile here.
-        if dtype == DType.float32 and m > 32 and n >= 16:
-            if transpose_b != 0:
-                _gemm_enqueue[DType.float32, True](
-                    c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
+        comptime if dt == DType.float32:
+            if (
+                transpose_b == 0
+                and m > SMALLM_MR
+                and m <= 32
+                and k % MMA8_DIM == 0
+            ):
+                _apple8_enqueue[True](
+                    c_addr, a_addr, b_addr, bias_addr, m, n, k, ctx
                 )
-            else:
-                _gemm_enqueue[DType.float32, False](
-                    c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
-                )
-            _bias_add_row[DType.float32](c_addr, bias_addr, m * n, n, ctx)
-            return
+                return
+            # Fat tiles: the simdgroup-matrix GEMM plus a separate
+            # row-broadcast bias pass still beats the NVIDIA-tuned fused-bias
+            # pipe3 tile here.
+            if m > 32 and n >= 16:
+                if transpose_b != 0:
+                    _gemm_enqueue[DType.float32, True](
+                        c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
+                    )
+                else:
+                    _gemm_enqueue[DType.float32, False](
+                        c_addr, a_addr, b_addr, 1, m, n, k, m * k, ctx
+                    )
+                _bias_add_row[DType.float32](c_addr, bias_addr, m * n, n, ctx)
+                return
 
     # Large-M gfx942 workloads use the dynamic pure-Mojo MFMA kernels and
     # fold the row-broadcast bias into the store epilogue. This check
     # precedes the portable SIMT fused-bias route below.
     comptime if _accelerator_arch() == "amdgpu:gfx942":
-        if dtype == DType.float32:
-            var used_mfma = _amd_dynamic_mfma_dispatch[
-                DType.float32, True, True
-            ](
+        comptime if dt == DType.float32 or dt == DType.bfloat16:
+            var used_mfma = _amd_dynamic_mfma_dispatch[dt, True, True](
                 c_addr, a_addr, b_addr, 1, m, n, k, m * k, bias_addr, ctx
             ) if transpose_b != 0 else _amd_dynamic_mfma_dispatch[
-                DType.float32, False, True
-            ](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, bias_addr, ctx
-            )
-            if used_mfma:
-                return
-        if dtype == DType.bfloat16:
-            var used_mfma = _amd_dynamic_mfma_dispatch[
-                DType.bfloat16, True, True
-            ](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, bias_addr, ctx
-            ) if transpose_b != 0 else _amd_dynamic_mfma_dispatch[
-                DType.bfloat16, False, True
+                dt, False, True
             ](
                 c_addr, a_addr, b_addr, 1, m, n, k, m * k, bias_addr, ctx
             )
@@ -6366,47 +6395,46 @@ def _matmul_bias_run(
 
     # Fused-epilogue path: the float32 pipe3 tile kernels add the bias in
     # the GEMM epilogue, saving a full extra read+write of C per call.
-    if (
-        dtype == DType.float32
-        and transpose_b == 0
-        and m > SMALLM_MR
-        and k % 4 == 0
-        and n % 4 == 0
-    ):
-        if m <= 32:
-            _tune_enqueue[
-                32, 64, 16, 4, 4, False, True, PIPE3_STAGES, -1, True
-            ](c_addr, a_addr, b_addr, 1, m, n, k, m * k, 96, ctx, bias_addr)
-        else:
-            _tune_enqueue[64, 64, 16, 4, 4, False, True, PIPE3_STAGES, 4, True](
-                c_addr, a_addr, b_addr, 1, m, n, k, m * k, 192, ctx, bias_addr
-            )
-        return
+    comptime if dt == DType.float32:
+        if transpose_b == 0 and m > SMALLM_MR and k % 4 == 0 and n % 4 == 0:
+            if m <= 32:
+                _tune_enqueue[
+                    32, 64, 16, 4, 4, False, True, PIPE3_STAGES, -1, True
+                ](
+                    c_addr,
+                    a_addr,
+                    b_addr,
+                    1,
+                    m,
+                    n,
+                    k,
+                    m * k,
+                    96,
+                    ctx,
+                    bias_addr,
+                )
+            else:
+                _tune_enqueue[
+                    64, 64, 16, 4, 4, False, True, PIPE3_STAGES, 4, True
+                ](
+                    c_addr,
+                    a_addr,
+                    b_addr,
+                    1,
+                    m,
+                    n,
+                    k,
+                    m * k,
+                    192,
+                    ctx,
+                    bias_addr,
+                )
+            return
 
-    _gemm_dtype_dispatch(
-        dtype,
-        c_addr,
-        a_addr,
-        b_addr,
-        1,
-        m,
-        n,
-        k,
-        m * k,
-        transpose_b,
-        0,
-        0,
-        0,
-        ctx,
+    _gemm_transb_dispatch[dt](
+        c_addr, a_addr, b_addr, 1, m, n, k, m * k, transpose_b, ctx
     )
-    var handled = False
-    comptime for dt in FLOAT_DTYPES:
-        comptime if _dtype_arg_on[0, dt]():
-            if dtype == dt:
-                _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
-                handled = True
-    if not handled:
-        raise Error("unsupported dtype for fast bias add: " + String(dtype))
+    _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
 
 
 # METH_FASTCALL wrappers for the hot dispatchers (raw CPython unpack; the

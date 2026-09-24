@@ -269,15 +269,21 @@ def test_fallback_carries_autograd(gpu):
     torch.testing.assert_close(x.grad.cpu(), xc.grad)
 
 
-def test_conv2d_trains_through_the_explicit_route(gpu):
-    """conv2d's forward is `aten::convolution` (a mojo op); its backward is
-    not, and ATen routes it to `convolution_backward_overrideable`, which the
-    fallback cannot see -- `_EXPLICIT_ROUTES` registers that one by hand."""
+def test_conv2d_trains_natively_under_the_fallback(gpu):
+    """conv2d's forward and backward are both mojo ops, so the fallback
+    diverts neither of them."""
     torch.manual_seed(0)
     x = torch.randn(2, 3, 16, 16, device=gpu, requires_grad=True)
     w = torch.randn(4, 3, 3, 3, device=gpu, requires_grad=True)
     with cuda_interop.cuda_fallback():
+        before = dict(cuda_interop.fallback_counts())
         torch.nn.functional.conv2d(x, w, padding=1).sum().backward()
+        diverted = {
+            op
+            for op, count in cuda_interop.fallback_counts().items()
+            if count > before.get(op, 0) and "convolution" in op
+        }
+    assert not diverted
     xc = x.detach().cpu().requires_grad_()
     wc = w.detach().cpu().requires_grad_()
     torch.nn.functional.conv2d(xc, wc, padding=1).sum().backward()

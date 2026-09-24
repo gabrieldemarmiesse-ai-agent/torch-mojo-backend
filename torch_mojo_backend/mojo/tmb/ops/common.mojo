@@ -105,6 +105,35 @@ def device_str(t: T) -> String:
     return String("device type ") + String(t.device_type)
 
 
+def _repeats_elements(t: T) -> Bool:
+    for i in range(t.rank):
+        if t.stride(i) <= 0 and t.dim(i) > 1:
+            return True
+    return False
+
+
+def assert_no_overlap(written: T, other: T) raises:
+    """`at::assert_no_overlap`: an `out=` tensor sharing any memory with an
+    input -- the identical view included -- raises before anything is
+    written. A view that repeats elements is what ATen's check calls
+    `TooHard` and lets through, and so does this one."""
+    if written.numel == 0 or other.numel == 0:
+        return
+    var storage = written.storage_ptr()
+    if storage == 0 or storage != other.storage_ptr():
+        return
+    if _repeats_elements(written) or _repeats_elements(other):
+        return
+    var a_end = written.ptr + written.numel * written.itemsize
+    var b_end = other.ptr + other.numel * other.itemsize
+    if written.ptr < b_end and other.ptr < a_end:
+        raise Error(
+            "unsupported operation: some elements of the input tensor and the"
+            " written-to tensor refer to a single memory location. Please"
+            " clone() the tensor before performing the operation."
+        )
+
+
 def check_out(dest: T, like: T) raises:
     """The dtype and device half of torch's generated `resize_out`
     (torchgen/dest/register_dispatch_key.py, `gen_resize_out_helper`).
