@@ -1269,12 +1269,12 @@ def op_flash_attention_for_cpu(
     `_for_cpu_backward`, wrapped the same way below)."""
     if not v_is_none(args[unsafe_offset=5]):
         unsupported("flash attention with an explicit attn_mask")
-    var fargs = InlineArray[Value, 7](fill=Value(TAG_NONE, 0, 0, 0))
+    var fargs = Array[Value, 7](fill=Value(TAG_NONE, 0, 0, 0))
     for i in range(5):
         fargs[i] = args[unsafe_offset=i].copy()
     fargs[5] = Value(TAG_BOOL, 0, 0, 0)  # return_debug_mask
     fargs[6] = args[unsafe_offset=6].copy()
-    var frets = InlineArray[Value, 9](fill=Value(TAG_NONE, 0, 0, 0))
+    var frets = Array[Value, 9](fill=Value(TAG_NONE, 0, 0, 0))
     op_flash_attention(
         Values(unsafe_from_address=Int(fargs.unsafe_ptr())),
         7,
@@ -1300,7 +1300,7 @@ def op_flash_attention_for_cpu_backward(
     if not v_is_none(args[unsafe_offset=8]):
         unsupported("flash attention backward with an explicit attn_mask")
     # the CUDA layout: cum_seq_q/k, max_q/k and the philox pair are never read
-    var fargs = InlineArray[Value, 15](fill=Value(TAG_NONE, 0, 0, 0))
+    var fargs = Array[Value, 15](fill=Value(TAG_NONE, 0, 0, 0))
     for i in range(6):
         fargs[i] = args[unsafe_offset=i].copy()
     fargs[8] = Value(TAG_INT, 0, 0, 0)

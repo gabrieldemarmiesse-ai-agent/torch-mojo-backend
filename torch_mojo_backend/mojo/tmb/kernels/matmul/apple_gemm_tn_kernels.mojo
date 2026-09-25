@@ -198,7 +198,7 @@ def _apple8_tn_kernel[
     var col_base = Int(block_idx.x) * BN + (sg % SGC) * SG_N
     var interior = (row_base + SG_M <= m) and (col_base + SG_N <= n)
 
-    var accum = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, TN_FRAG8](0)
     )
 
@@ -208,9 +208,9 @@ def _apple8_tn_kernel[
     @parameter
     def _slab_guarded(
         kk: Int,
-        mut acc: InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
     ):
-        var afrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M](
+        var afrag = Array[SIMD[DType.float32, TN_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
@@ -222,7 +222,7 @@ def _apple8_tn_kernel[
                         # A is (K, M): logical row = stored column.
                         af[s] = a_ptr[unsafe_offset=(kk + fcol + s) * m + grow]
             afrag[mi] = af
-        var bfrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N](
+        var bfrag = Array[SIMD[DType.float32, TN_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
@@ -246,8 +246,8 @@ def _apple8_tn_kernel[
     @parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M]:
-        var afrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M](
+    ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_M]:
+        var afrag = Array[SIMD[DType.float32, TN_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
@@ -262,8 +262,8 @@ def _apple8_tn_kernel[
     @parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N]:
-        var bfrag = InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N](
+    ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_N]:
+        var bfrag = Array[SIMD[DType.float32, TN_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
@@ -275,9 +275,9 @@ def _apple8_tn_kernel[
     @always_inline
     @parameter
     def _mma_block(
-        afrag: InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M],
-        bfrag: InlineArray[SIMD[DType.float32, TN_FRAG8], NT_N],
-        mut acc: InlineArray[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
+        afrag: Array[SIMD[DType.float32, TN_FRAG8], NT_M],
+        bfrag: Array[SIMD[DType.float32, TN_FRAG8], NT_N],
+        mut acc: Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
     ):
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):

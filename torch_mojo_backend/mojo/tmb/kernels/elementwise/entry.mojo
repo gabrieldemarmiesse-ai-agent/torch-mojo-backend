@@ -21,7 +21,10 @@
 # key, so one compiled variant serves every shape with zero recompilation.
 # ===----------------------------------------------------------------------=== #
 
-from tmb.graph.unary_math import elementwise_predicate, elementwise_unary
+from tmb.kernels.common.unary_math import (
+    elementwise_predicate,
+    elementwise_unary,
+)
 
 from std.os import abort
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
@@ -75,8 +78,8 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
-from tmb.graph.div_math import floor_div, trunc_div
-from tmb.graph.math_utils import ieee_sqrt
+from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.math_utils import ieee_sqrt
 from std.sys.info import _has_sm_9x
 
 

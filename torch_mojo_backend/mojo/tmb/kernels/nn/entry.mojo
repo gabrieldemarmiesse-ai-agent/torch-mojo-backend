@@ -74,7 +74,6 @@ from tmb.kernels.nn.softmax_rows_kernels import (
 )
 from layout import TileTensor, row_major
 from tmb.kernels.random.dropout_kernels import _philox4x32_10
-from nn.softmax import softmax
 
 
 from tmb.kernels.common.op_utils import (

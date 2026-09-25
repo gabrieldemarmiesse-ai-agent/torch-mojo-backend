@@ -9,7 +9,7 @@ allocation. The kernel is specialized on the (source, destination) dtype
 pair; bool travels as its uint8 storage. Tiles measured on H100.
 """
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from std.sys import size_of
@@ -122,11 +122,7 @@ def _head[S: DType, D: DType, V: Int](rect: CopyRect) -> Int:
 @__name(t"copy_batched_rect_{src}_{dst}_v{V}")
 def _copy_rect_kernel[
     src: DType, dst: DType, V: Int
-](
-    rects: InlineArray[CopyRect, COPY_BATCH_CAP],
-    count_arg: Int64,
-    tiles_arg: Int64,
-):
+](rects: Array[CopyRect, COPY_BATCH_CAP], count_arg: Int64, tiles_arg: Int64):
     """`V`-wide accesses after each row's `head` scalar elements, one tile
     of one row per block iteration. One width per kernel, and no loop over
     rows inside a tile: either measured at twice the registers and half the
@@ -179,7 +175,7 @@ def _copy_rect_kernel[
 @__name(t"copy_batched_rect_{src}_{dst}_small")
 def _copy_rect_small_kernel[
     src: DType, dst: DType
-](rects: InlineArray[CopyRect, COPY_BATCH_CAP]):
+](rects: Array[CopyRect, COPY_BATCH_CAP]):
     """One block per rectangle row, scalar: for launches whose rows all fit
     in one tile, where the tile lookup and vector route measured slower."""
     comptime S = storage_dtype[src]()
@@ -205,11 +201,7 @@ def _copy_rect_small_kernel[
 @__name(t"copy_batched_rect_{src}_{dst}_narrow")
 def _copy_rect_narrow_kernel[
     src: DType, dst: DType
-](
-    rects: InlineArray[CopyRect, COPY_BATCH_CAP],
-    count_arg: Int64,
-    tiles_arg: Int64,
-):
+](rects: Array[CopyRect, COPY_BATCH_CAP], count_arg: Int64, tiles_arg: Int64):
     """Scalar copies over each rectangle's rows x cols as one run, for many
     rows narrower than a block: a tile per row would idle nearly every
     thread (65536 rows of 1-2 elements measured 100x slower that way)."""
@@ -255,7 +247,7 @@ def copy_batched[
     comptime VEC = _vec[src, dst]()
     var index = 0
     while index < len(cols):
-        var rects = InlineArray[CopyRect, COPY_BATCH_CAP](
+        var rects = Array[CopyRect, COPY_BATCH_CAP](
             fill=CopyRect(0, 0, 0, 0, 0, 0)
         )
         var count = 0

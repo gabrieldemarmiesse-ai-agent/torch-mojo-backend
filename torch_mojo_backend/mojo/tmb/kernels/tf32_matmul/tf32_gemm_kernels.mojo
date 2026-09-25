@@ -305,9 +305,7 @@ def _tile_body[
             # consumers must drain before new copies land in stage 0.
             barrier()
 
-            var acc = InlineArray[SIMD[DType.float32, 4], MT * NT](
-                uninitialized=True
-            )
+            var acc = Array[SIMD[DType.float32, 4], MT * NT](uninitialized=True)
             comptime for i in range(MT * NT):
                 acc[i] = SIMD[DType.float32, 4](0.0)
 
@@ -329,7 +327,7 @@ def _tile_body[
                 var sa_ptr = smem.unsafe_offset((kt % STAGES) * STAGE_WORDS)
                 var sb_ptr = sa_ptr.unsafe_offset(SA)
                 comptime for ks in range(_BK // 8):
-                    var a_frag = InlineArray[SIMD[DType.float32, 4], MT](
+                    var a_frag = Array[SIMD[DType.float32, 4], MT](
                         uninitialized=True
                     )
                     comptime for mt in range(MT):
@@ -365,7 +363,7 @@ def _tile_body[
                                     ]
                                 ),
                             )
-                    var b_frag = InlineArray[SIMD[DType.float32, 2], NT](
+                    var b_frag = Array[SIMD[DType.float32, 2], NT](
                         uninitialized=True
                     )
                     comptime for nt in range(NT):

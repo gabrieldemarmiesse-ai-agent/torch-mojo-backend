@@ -47,7 +47,7 @@ here is a function of the 2-byte operand width, not of the exponent
 layout, so one source serves both.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from max.gpu.sync import barrier
 from std.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.compute.mma import mma
@@ -83,7 +83,7 @@ def _g2r_kc[
     kdim: Int32,
     tid: Int32,
     fast: Int32,
-    mut regs: InlineArray[SIMD[_DT, 8], CH],
+    mut regs: Array[SIMD[_DT, 8], CH],
 ):
     # K-contiguous operand: element (r, kk) lives at src[r * kdim + kk].
     # Quad q takes row (4q % 64) + q // 16 so the paired quads of one shared
@@ -140,7 +140,7 @@ def _g2r_mc[
     kdim: Int32,
     tid: Int32,
     fast: Int32,
-    mut regs: InlineArray[SIMD[_DT, 8], CH],
+    mut regs: Array[SIMD[_DT, 8], CH],
 ):
     # Row-contiguous operand: element (r, kk) lives at src[kk * rows + r].
     #
@@ -301,9 +301,9 @@ def _mma_tile_impl[
         2 * STAGE_B, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
 
-    var acc = InlineArray[SIMD[_F32, 4], 2 * NT](fill=SIMD[_F32, 4]())
-    var va = InlineArray[SIMD[_DT, 8], ACH](fill=SIMD[_DT, 8]())
-    var vb = InlineArray[SIMD[_DT, 8], BCH](fill=SIMD[_DT, 8]())
+    var acc = Array[SIMD[_F32, 4], 2 * NT](fill=SIMD[_F32, 4]())
+    var va = Array[SIMD[_DT, 8], ACH](fill=SIMD[_DT, 8]())
+    var vb = Array[SIMD[_DT, 8], BCH](fill=SIMD[_DT, 8]())
 
     # QKMAJ: in the guarded small-tile regime, m/n-contiguous operands use
     # the quad load mapping (see _g2r_mc) plus k-major staging with one 16B
@@ -417,7 +417,7 @@ def _mma_tile_impl[
 
         comptime for ks in range(2):
             var kb = Int32(ks * 16) + 2 * tg
-            var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
+            var afr = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
             comptime for mt in range(2):
                 var row = wm + Int32(mt * 16) + g
@@ -791,12 +791,8 @@ def _gemm_splitk_reduce[
         Int(block_idx.y) * (GSTRIDE * _SPLITK_RED_GROUPS)
         + Int(thread_idx.x) * 4
     )
-    var acc = InlineArray[SIMD[_F32, 4], _SPLITK_RED_GROUPS](
-        fill=SIMD[_F32, 4]()
-    )
-    var acc_b = InlineArray[SIMD[_F32, 4], _SPLITK_RED_GROUPS](
-        fill=SIMD[_F32, 4]()
-    )
+    var acc = Array[SIMD[_F32, 4], _SPLITK_RED_GROUPS](fill=SIMD[_F32, 4]())
+    var acc_b = Array[SIMD[_F32, 4], _SPLITK_RED_GROUPS](fill=SIMD[_F32, 4]())
 
     comptime for gr in range(_SPLITK_RED_GROUPS):
         acc[gr] = ws.unsafe_load[width=4, alignment=16](
@@ -943,7 +939,7 @@ def _g2r_kc_wide(
     kdim: Int,
     tid: Int,
     fast: Int,
-    mut regs: InlineArray[SIMD[_DT, 8], 2],
+    mut regs: Array[SIMD[_DT, 8], 2],
 ):
     # Full-width copy of the accepted-v1 K-contiguous staging: element
     # (r, kk) lives at src[r * kdim + kk]. Every coordinate and flat offset
@@ -981,7 +977,7 @@ def _g2r_mc_wide(
     kdim: Int,
     tid: Int,
     fast: Int,
-    mut regs: InlineArray[SIMD[_DT, 8], 2],
+    mut regs: Array[SIMD[_DT, 8], 2],
 ):
     # Full-width copy of the accepted-v1 row-contiguous staging: element
     # (r, kk) lives at src[kk * rows + r].
@@ -1074,9 +1070,9 @@ def _mma_tile_wide[
         2 * _STAGE_B, _DT, alignment=16, address_space=AddressSpace.SHARED
     ]()
 
-    var acc = InlineArray[SIMD[_F32, 4], 16](fill=SIMD[_F32, 4]())
-    var va = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
-    var vb = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
+    var acc = Array[SIMD[_F32, 4], 16](fill=SIMD[_F32, 4]())
+    var va = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
+    var vb = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
     @parameter
     @always_inline
@@ -1143,7 +1139,7 @@ def _mma_tile_wide[
 
         comptime for ks in range(2):
             var kb = ks * 16 + 2 * tg
-            var afr = InlineArray[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
+            var afr = Array[SIMD[_DT, 8], 2](fill=SIMD[_DT, 8]())
 
             comptime for mt in range(2):
                 var row = wm + mt * 16 + g

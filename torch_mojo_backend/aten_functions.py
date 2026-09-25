@@ -19,10 +19,7 @@ import max.graph.type as max_type
 import torch
 from max.dtype import DType
 from max.experimental import functional as F
-from max.experimental.random import (
-    gaussian as max_gaussian,
-    uniform_like as _uniform_like,
-)
+from max.experimental.random import gaussian as max_gaussian
 from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch import max_dtype_to_torch
 from max.experimental.torch.torch import max_device_ref, torch_dtype_to_max
@@ -59,6 +56,8 @@ _reduce_max = F.functional(max_ops.reduction.max)
 _reduce_min = F.functional(max_ops.reduction.min)
 _reduce_argmax = F.functional(max_ops.argmax)
 _reduce_argmin = F.functional(max_ops.argmin)
+# max.experimental.random made its `uniform_like` private (26.6); it is this.
+_uniform_like = F.functional(max_ops.random.uniform)
 # F.transfer_to is eager-only (reads Tensor.real); re-wrap the graph op so it
 # also works on graph TensorValues in the torch.compile backend.
 _transfer_to = F.functional(max_ops.transfer_to)

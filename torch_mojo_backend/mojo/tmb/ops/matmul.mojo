@@ -1074,11 +1074,11 @@ def _add_bias(var product: T, bias: T) raises -> Optional[T]:
 def _try_add(a: T, b: T) raises -> Optional[T]:
     """`a + b` through aten::add.Tensor — the same broadcasting elementwise
     add every other caller of that op gets. None when it declines."""
-    var args = InlineArray[Value, 3](fill=Value(TAG_NONE, 0, 0, 0))
+    var args = Array[Value, 3](fill=Value(TAG_NONE, 0, 0, 0))
     args[0] = Value(TAG_TENSOR, 0, Int64(a.h), 0)
     args[1] = Value(TAG_TENSOR, 0, Int64(b.h), 0)
     args[2] = Value(TAG_SCALAR_INT, 0, 1, 0)
-    var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
+    var rets = Array[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
     try:
         call_op_raw(
             "aten::add",
@@ -1103,10 +1103,10 @@ def _call_1(
     op: StaticString, overload: StaticString, a: Value, b: Value
 ) raises -> T:
     """A two-argument aten op through the dispatcher, one Tensor result."""
-    var args = InlineArray[Value, 2](fill=Value(TAG_NONE, 0, 0, 0))
+    var args = Array[Value, 2](fill=Value(TAG_NONE, 0, 0, 0))
     args[0] = a.copy()
     args[1] = b.copy()
-    var rets = InlineArray[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
+    var rets = Array[Value, 1](fill=Value(TAG_NONE, 0, 0, 0))
     call_op_raw(
         String(op),
         String(overload),

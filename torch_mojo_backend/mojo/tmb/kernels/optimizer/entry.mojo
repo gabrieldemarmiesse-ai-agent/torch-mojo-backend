@@ -6,7 +6,7 @@ per by-value launch and enqueues on the tensors' existing DeviceContext. It does
 no allocation, host read, synchronization, or vendor-library call.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.math import ceildiv
 from std.os import abort
 
@@ -118,9 +118,7 @@ def _fused_adamw_go(
     var record_count = value_count // _ADAMW_RECORD_FIELDS
     while record < record_count:
         # The complete array is encoded by value, so initialize unused slots.
-        var descs = InlineArray[AdamWDesc, ADAMW_DESC_CAP](
-            fill=empty_adamw_desc()
-        )
+        var descs = Array[AdamWDesc, ADAMW_DESC_CAP](fill=empty_adamw_desc())
         var desc_count = 0
         var total_chunks = 0
         while record < record_count and desc_count < ADAMW_DESC_CAP:
@@ -200,7 +198,7 @@ def _foreach_l2_norm_go(
     var partial_offset = 0
     var record = 0
     while record < record_count:
-        var descs = InlineArray[ForeachDesc, FOREACH_DESC_CAP](
+        var descs = Array[ForeachDesc, FOREACH_DESC_CAP](
             fill=empty_foreach_desc()
         )
         var desc_count = 0
@@ -336,10 +334,10 @@ def _foreach_ew_go[
 
     var record = 0
     while record < record_count:
-        var descs = InlineArray[ForeachEwDesc, FEW_DESC_CAP](
+        var descs = Array[ForeachEwDesc, FEW_DESC_CAP](
             fill=empty_foreach_ew_desc()
         )
-        var scalars = InlineArray[Float32, FEW_DESC_CAP](fill=0.0)
+        var scalars = Array[Float32, FEW_DESC_CAP](fill=0.0)
         var desc_count = 0
         var total_chunks = 0
         while record < record_count and desc_count < FEW_DESC_CAP:
@@ -403,7 +401,7 @@ def _foreach_gather_scalars_go(
 
     var record = 0
     while record < record_count:
-        var in_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
+        var in_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
         var base = record
         var slot = 0
         while record < record_count and slot < FOREACH_EW_SLOTS:

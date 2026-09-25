@@ -14,10 +14,11 @@ always `from tmb.<pkg>.<module> import name`: absolute, and naming a module
   cannot resolve is a file whose edits would not invalidate a build.
 
 `tmb/graph`, the MAX custom-op package, may also import a sibling relatively
-(`from .unary_math import ...`): it was once precompiled by MAX itself with no
+(`from .elementwise import ...`): it was once precompiled by MAX itself with no
 `-I`, and its own modules still read that way. `native.build_graph_package()`
 now precompiles it with the one `-I` like every other build, so its ops may
-import the kernel tree, `from tmb.kernels.<family>.<module> import ...`.
+import the kernel tree, `from tmb.kernels.<family>.<module> import ...`, and
+for the same reason nothing may import `tmb.graph.*` back (see the test).
 """
 
 import re
@@ -78,6 +79,12 @@ def test_imports_are_absolute_tmb_modules(path: Path):
         head = mod.split(".")[0]
         if head in TOOLCHAIN:
             continue
+        assert not mod.startswith("tmb.graph"), (
+            f"{where}: nothing imports tmb.graph.*. The package is precompiled "
+            "on its own and imports the kernel tree, so this reaches it a "
+            "second time, as `tmb.graph` beside `graph`, which Mojo 1.1 "
+            "rejects; shared code lives in tmb/kernels/common"
+        )
         assert head == "tmb", (
             f"{where} is a bare import: with one -I root every in-repo import "
             "is absolute, `from tmb.<pkg>.<module> import ...`"

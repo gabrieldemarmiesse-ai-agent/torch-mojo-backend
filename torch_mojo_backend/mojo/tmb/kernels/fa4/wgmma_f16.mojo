@@ -234,7 +234,7 @@ def wgmma_rs_f16_m64n128[
     )
     var out = SIMD[DType.float32, 64]()
     comptime for i in range(64):
-        out[i] = r[i]
+        out[i] = rebind[Float32](r[i])
     return out
 
 
@@ -359,5 +359,5 @@ def wgmma_rs_f16_m64n64[
     )
     var out = SIMD[DType.float32, 32]()
     comptime for i in range(32):
-        out[i] = r[i]
+        out[i] = rebind[Float32](r[i])
     return out

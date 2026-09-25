@@ -506,8 +506,8 @@ def _table_accum(
     if col < embedding_dim:
         var row = Int(block_idx.y) * rows_per_block + ty
         while row + (_TABLE_UNROLL - 1) * _TABLE_ROWG < row_end:
-            var t = InlineArray[Int, _TABLE_UNROLL](uninitialized=True)
-            var v = InlineArray[Float32, _TABLE_UNROLL](uninitialized=True)
+            var t = Array[Int, _TABLE_UNROLL](uninitialized=True)
+            var v = Array[Float32, _TABLE_UNROLL](uninitialized=True)
             comptime for u in range(_TABLE_UNROLL):
                 t[u] = Int(indices[unsafe_offset=row + u * _TABLE_ROWG])
             comptime for u in range(_TABLE_UNROLL):

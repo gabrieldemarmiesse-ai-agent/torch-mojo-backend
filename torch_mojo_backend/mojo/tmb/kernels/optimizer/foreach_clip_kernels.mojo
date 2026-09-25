@@ -7,7 +7,7 @@ follows a norm is not here: it is `aten::_foreach_mul_.Tensor`, one member of
 the elementwise family `foreach_batched_kernels` serves.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
@@ -46,7 +46,7 @@ def _ptr(addr: Int) -> Pointer[Scalar[DType.float32], MutUntrackedOrigin]:
 
 @always_inline
 def _chunk_bounds(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count: Int,
     chunk: Int,
 ) -> Tuple[ForeachDesc, Int, Int]:
@@ -63,7 +63,7 @@ def _chunk_bounds(
 
 @__name("foreach_l2_norm_f32_chunk_partials_v1")
 def _norm_chunk_partials(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count_arg: Int64,
     partials_addr_arg: Int64,
 ):
@@ -100,7 +100,7 @@ def _norm_chunk_partials(
 
 @__name("foreach_l2_norm_f32_finalize_v1")
 def _norm_finalize(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count_arg: Int64,
     partials_addr_arg: Int64,
 ):
@@ -216,7 +216,7 @@ def _norm_finalize_batched_apple(
 
 
 def _enqueue_norm_partials_cached(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count: Int,
     total_chunks: Int,
     partials_addr: Int,
@@ -253,7 +253,7 @@ def _enqueue_norm_partials_cached(
 
 
 def _enqueue_norm_finalize_cached(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count: Int,
     partials_addr: Int,
     ctx: DeviceContext,
@@ -289,7 +289,7 @@ def _enqueue_norm_finalize_cached(
 
 
 def enqueue_foreach_l2_norm_f32(
-    descs: InlineArray[ForeachDesc, FOREACH_DESC_CAP],
+    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count: Int,
     total_chunks: Int,
     partials_addr: Int,
@@ -303,10 +303,10 @@ def enqueue_foreach_l2_norm_f32(
             var group_first_chunk = 0
             if desc_index != 0:
                 group_first_chunk = descs[desc_index - 1].chunk_end
-            var in_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var out_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var chunk_ends = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var numels = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
+            var in_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var out_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var chunk_ends = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var numels = Array[Int, FOREACH_EW_SLOTS](fill=0)
             var slot = 0
             while desc_index < desc_count and slot < FOREACH_EW_SLOTS:
                 var desc = descs[desc_index]

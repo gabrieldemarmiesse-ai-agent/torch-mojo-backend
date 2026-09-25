@@ -249,7 +249,7 @@ def _norm_rows_cached_kernel[
         var has_head = ragged and head_col < head
         var has_tail = ragged and tail_col < cols
 
-        var x = InlineArray[SIMD[dtype, V], vecs](fill=SIMD[dtype, V](0))
+        var x = Array[SIMD[dtype, V], vecs](fill=SIMD[dtype, V](0))
         var xh = Float32(0)
         var xt = Float32(0)
         var acc = SIMD[DType.float32, V](0)
@@ -605,7 +605,7 @@ def _ln_fwd_warp_rows[
         # The whole row stays in registers between the two reductions and
         # the store pass; `chunks` is comptime so the array indexes are
         # static.
-        var x = InlineArray[SIMD[dtype, V], chunks](fill=SIMD[dtype, V](0))
+        var x = Array[SIMD[dtype, V], chunks](fill=SIMD[dtype, V](0))
         var acc = SIMD[DType.float32, V](0.0)
         comptime for u in range(chunks):
             var c = lane + u * WARP_SIZE

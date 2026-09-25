@@ -229,7 +229,7 @@ def _gemm_tiled_kernel[
     var tm0 = (tid // (BN // TN)) * TM
 
     comptime acc_dtype = DType.float64 if dtype == DType.float64 else DType.float32
-    var acc = InlineArray[SIMD[acc_dtype, TN], TM](fill=SIMD[acc_dtype, TN](0))
+    var acc = Array[SIMD[acc_dtype, TN], TM](fill=SIMD[acc_dtype, TN](0))
 
     for kt in range(k_start, k_end, BK):
         # Cooperative loads, zero-padded on every edge.
@@ -377,9 +377,9 @@ def _gemm_pipe_kernel[
     var tn0 = (tid % (BN // TN)) * TN
     var tm0 = (tid // (BN // TN)) * TM
 
-    var acc = InlineArray[SIMD[F32, TN], TM](fill=SIMD[F32, TN](0))
-    var a_regs = InlineArray[SIMD[F32, VEC_A], NA](uninitialized=True)
-    var b_regs = InlineArray[SIMD[F32, VEC_B], NB](uninitialized=True)
+    var acc = Array[SIMD[F32, TN], TM](fill=SIMD[F32, TN](0))
+    var a_regs = Array[SIMD[F32, VEC_A], NA](uninitialized=True)
+    var b_regs = Array[SIMD[F32, VEC_B], NB](uninitialized=True)
 
     var nslabs = ceildiv(k_end - k_start, BK)
 
@@ -388,7 +388,7 @@ def _gemm_pipe_kernel[
     @always_inline
     @parameter
     @__copy_capture(a_ptr, bm, k_end)
-    def _load_a_regs(kt: Int, mut regs: InlineArray[SIMD[F32, VEC_A], NA]):
+    def _load_a_regs(kt: Int, mut regs: Array[SIMD[F32, VEC_A], NA]):
         # Guarded (row, k) loads, zero-padded past m / k_end.
         comptime for t in range(NA):
             var ci = t * THREADS + tid
@@ -408,7 +408,7 @@ def _gemm_pipe_kernel[
     @always_inline
     @parameter
     @__copy_capture(a_smem, tid)
-    def _store_a_smem(buf: Int, regs: InlineArray[SIMD[F32, VEC_A], NA]):
+    def _store_a_smem(buf: Int, regs: Array[SIMD[F32, VEC_A], NA]):
         var base = a_smem.unsafe_offset(buf * BK * BM)
         comptime for t in range(NA):
             var ci = t * THREADS + tid
@@ -446,7 +446,7 @@ def _gemm_pipe_kernel[
     @always_inline
     @parameter
     @__copy_capture(b_ptr, bn, n, k, k_end)
-    def _load_b_regs(kt: Int, mut regs: InlineArray[SIMD[F32, VEC_B], NB]):
+    def _load_b_regs(kt: Int, mut regs: Array[SIMD[F32, VEC_B], NB]):
         # transpose_b: B is (n, k) row-major; chunks along k like A.
         comptime for t in range(NB):
             var ci = t * THREADS + tid
@@ -466,7 +466,7 @@ def _gemm_pipe_kernel[
     @always_inline
     @parameter
     @__copy_capture(b_smem, tid)
-    def _store_b_smem(buf: Int, regs: InlineArray[SIMD[F32, VEC_B], NB]):
+    def _store_b_smem(buf: Int, regs: Array[SIMD[F32, VEC_B], NB]):
         var base = b_smem.unsafe_offset(buf * BK * BN)
         comptime for t in range(NB):
             var ci = t * THREADS + tid
@@ -662,7 +662,7 @@ def _gemm_pipe3_kernel[
     var tn0 = (tid % (BN // TN)) * TN
     var tm0 = (tid // (BN // TN)) * TM
 
-    var acc = InlineArray[SIMD[F32, TN], TM](fill=SIMD[F32, TN](0))
+    var acc = Array[SIMD[F32, TN], TM](fill=SIMD[F32, TN](0))
 
     var nslabs = ceildiv(k_end - k_start, BK)
     if nslabs == 0:
@@ -887,7 +887,7 @@ def _gemm_smallm_kernel[
     var a_ptr = a_base.unsafe_offset(bz * a_bstride)
     var b_ptr = b_base.unsafe_offset(bz * k * n)
 
-    var acc = InlineArray[Scalar[DType.float32], SMALLM_MR](
+    var acc = Array[Scalar[DType.float32], SMALLM_MR](
         fill=Scalar[DType.float32](0)
     )
 
@@ -905,7 +905,7 @@ def _gemm_smallm_kernel[
             return b_ptr[unsafe_offset=kk * n + col].cast[DType.float32]()
 
     for kt in range(k_start, k4, KU):
-        var bv = InlineArray[Scalar[DType.float32], KU](uninitialized=True)
+        var bv = Array[Scalar[DType.float32], KU](uninitialized=True)
         comptime for u in range(KU):
             bv[u] = _load_b(kt + u)
         comptime for u in range(KU):
@@ -5349,15 +5349,13 @@ def _apple8_gemm_kernel[
     var ks0 = Int(block_idx.z) * chunk
     var ks1 = min(slabs, ks0 + chunk)
 
-    var accum = InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, FRAG8](0)
     )
 
     for ks in range(ks0, ks1):
         var kk = ks * MMA8_DIM
-        var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
-            uninitialized=True
-        )
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
             var grow = row_base + mi * MMA8_DIM + frow
             if interior or grow < m:
@@ -5366,9 +5364,7 @@ def _apple8_gemm_kernel[
                 ).unsafe_load[width=FRAG8]()
             else:
                 afrag[mi] = SIMD[DType.float32, FRAG8](0)
-        var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
-            uninitialized=True
-        )
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
             comptime if TRANSPOSE_B:
                 var bf = SIMD[DType.float32, FRAG8](0)
@@ -5612,7 +5608,7 @@ def _apple8_fat_kernel[
     comptime if CAUSAL == 2:
         k_end = max(k_start, min(k_end, row_base + SG_M))
 
-    var accum = InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, FRAG8](0)
     )
 
@@ -5621,11 +5617,9 @@ def _apple8_fat_kernel[
     @always_inline
     @parameter
     def _slab_guarded(
-        kk: Int, mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N]
+        kk: Int, mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N]
     ):
-        var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
-            uninitialized=True
-        )
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
             var grow = row_base + mi * MMA8_DIM + frow
             var af = SIMD[DType.float32, FRAG8](0)
@@ -5642,9 +5636,7 @@ def _apple8_fat_kernel[
                                 unsafe_offset=grow * k + kk + fcol + s
                             ]
             afrag[mi] = af
-        var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
-            uninitialized=True
-        )
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
             var bf = SIMD[DType.float32, FRAG8](0)
             comptime if TRANSPOSE_B:
@@ -5672,10 +5664,8 @@ def _apple8_fat_kernel[
     @parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_M]:
-        var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_M]:
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
             comptime if TRANSPOSE_A:
                 # A (K, M): the fragment's two slots differ by one stored
@@ -5695,10 +5685,8 @@ def _apple8_fat_kernel[
     @parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, FRAG8], NT_N]:
-        var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_N]:
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
             comptime if TRANSPOSE_B:
                 # B is (N, K): the fragment's two slots differ in n-row.
@@ -5716,9 +5704,9 @@ def _apple8_fat_kernel[
     @always_inline
     @parameter
     def _mma_block(
-        afrag: InlineArray[SIMD[DType.float32, FRAG8], NT_M],
-        bfrag: InlineArray[SIMD[DType.float32, FRAG8], NT_N],
-        mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N],
+        afrag: Array[SIMD[DType.float32, FRAG8], NT_M],
+        bfrag: Array[SIMD[DType.float32, FRAG8], NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
@@ -6021,7 +6009,7 @@ def _apple8_smem_kernel[
     var sgm = (sg // 2) * SG_M
     var sgn = (sg % 2) * SG_N
 
-    var accum = InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, FRAG8](0)
     )
 
@@ -6030,8 +6018,8 @@ def _apple8_smem_kernel[
     @parameter
     def _fill_regs(
         kt: Int,
-        mut a_regs: InlineArray[SIMD[DType.float32, 4], AV],
-        mut b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+        mut a_regs: Array[SIMD[DType.float32, 4], AV],
+        mut b_regs: Array[SIMD[DType.float32, 4], BV],
     ):
         comptime for q in range(AV):
             var fid = q * THREADS + tid
@@ -6111,8 +6099,8 @@ def _apple8_smem_kernel[
     @parameter
     def _store_smem(
         buf: Int,
-        a_regs: InlineArray[SIMD[DType.float32, 4], AV],
-        b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+        a_regs: Array[SIMD[DType.float32, 4], AV],
+        b_regs: Array[SIMD[DType.float32, 4], BV],
     ):
         var a_dst = a_smem.unsafe_offset(buf * BLOCK_M * LDA)
         var b_dst = b_smem.unsafe_offset(buf * BK * LDB)
@@ -6144,7 +6132,7 @@ def _apple8_smem_kernel[
     @parameter
     def _compute(
         buf: Int,
-        mut acc: InlineArray[SIMD[DType.float32, FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
         var a_src = a_smem.unsafe_offset(
             buf * BLOCK_M * LDA + (sgm + frow) * LDA + fcol
@@ -6153,14 +6141,14 @@ def _apple8_smem_kernel[
             buf * BK * LDB + frow * LDB + sgn + fcol
         )
         comptime for kc in range(BK // MMA8_DIM):
-            var afrag = InlineArray[SIMD[DType.float32, FRAG8], NT_M](
+            var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](
                 uninitialized=True
             )
             comptime for mi in range(NT_M):
                 afrag[mi] = (
                     a_src.unsafe_offset(mi * MMA8_DIM * LDA + kc * MMA8_DIM)
                 ).unsafe_load[width=FRAG8]()
-            var bfrag = InlineArray[SIMD[DType.float32, FRAG8], NT_N](
+            var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](
                 uninitialized=True
             )
             comptime for ni in range(NT_N):
@@ -6174,8 +6162,8 @@ def _apple8_smem_kernel[
                     )
 
     var stages = ceildiv(k_end - k_start, BK)
-    var a_regs = InlineArray[SIMD[DType.float32, 4], AV](uninitialized=True)
-    var b_regs = InlineArray[SIMD[DType.float32, 4], BV](uninitialized=True)
+    var a_regs = Array[SIMD[DType.float32, 4], AV](uninitialized=True)
+    var b_regs = Array[SIMD[DType.float32, 4], BV](uninitialized=True)
     if stages > 0:
         _fill_regs(k_start, a_regs, b_regs)
     for t in range(stages):

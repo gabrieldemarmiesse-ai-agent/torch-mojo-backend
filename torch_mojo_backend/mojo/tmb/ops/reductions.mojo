@@ -252,7 +252,7 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
             for d in range(rank):
                 dims.append(d)
         return dims^
-    var seen = InlineArray[Bool, MAX_RANK](fill=False)
+    var seen = Array[Bool, MAX_RANK](fill=False)
     for i in range(len(given)):
         var d = _norm_dim(given[i], rank)
         if seen[d]:
@@ -273,7 +273,7 @@ def _reduced_shape(
 ):
     """The reduction's torch output shape, leading-padded: keepdim leaves a 1
     at every reduced position, otherwise the kept dims pack together."""
-    var is_red = InlineArray[Bool, MAX_RANK](fill=False)
+    var is_red = Array[Bool, MAX_RANK](fill=False)
     for d in dims:
         is_red[d] = True
     shape = IndexList[MAX_RANK](1)
@@ -346,7 +346,7 @@ def _permuted_contiguous(t: T, dims: List[Int]) raises -> T:
     rewriting those fields of a `T` copy is the whole permutation — no torch
     view object, no second allocation.
     """
-    var is_red = InlineArray[Bool, MAX_RANK](fill=False)
+    var is_red = Array[Bool, MAX_RANK](fill=False)
     for d in dims:
         is_red[d] = True
     var shape = IndexList[MAX_RANK](1)
@@ -784,7 +784,7 @@ def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
     (`errors_on_empty_axis`). Declining on the host gives the caller the
     actionable NotImplementedError the old fast path gave, rather than the
     kernel's own message. A reduction with no OUTPUTS is an error for nobody."""
-    var is_red = InlineArray[Bool, MAX_RANK](fill=False)
+    var is_red = Array[Bool, MAX_RANK](fill=False)
     var extent = 1
     for d in dims:
         is_red[d] = True

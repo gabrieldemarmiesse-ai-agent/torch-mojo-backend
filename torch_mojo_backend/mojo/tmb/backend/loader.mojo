@@ -405,7 +405,7 @@ def invoke_family(entry: Int, argv: Argv, argc: Int) raises:
     on a path that runs ~10k times per training step cost more than every
     error message ever read from it.
     """
-    var err = InlineArray[UInt8, ERR_CAP](uninitialized=True)
+    var err = Array[UInt8, ERR_CAP](uninitialized=True)
     err[0] = 0
     var f = Pointer(to=entry).unsafe_bitcast[FamilyFn]()[]
     var rc = f(
