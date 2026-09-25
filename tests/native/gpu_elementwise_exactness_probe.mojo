@@ -8,8 +8,7 @@ element written (no sentinel left), and no guard element touched. The body
 loads with the `alignment` the launcher claims, so a wrong alignment claim
 faults. Covers ranks 1-3, empty, tails, and both closure forms.
 
-Build and run locked (needs a real NVIDIA GPU): see
-test_gpu_elementwise_launcher.py, which takes /tmp/gpu_lock_0.lock.
+Needs a real NVIDIA GPU; built and run by test_gpu_elementwise_launcher.py.
 """
 from std.memory import bitcast
 from std.sys import size_of

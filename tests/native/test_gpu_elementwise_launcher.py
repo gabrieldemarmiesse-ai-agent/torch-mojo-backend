@@ -108,8 +108,6 @@ def test_gpu_elementwise_matches_max_bit_exact(exactness_binary: Path):
     """Every (dtype, simd_width, shape, closure form) the launcher supports
     must be bit-identical to MAX's own `elementwise` -- this is what makes
     the import swap in every eager call site behavior-preserving."""
-    # No flock here: the caller holds /tmp/gpu_lock_0.lock around pytest
-    # (AGENTS.md), and taking it again from inside the run deadlocks.
     result = subprocess.run(
         [str(exactness_binary)],
         cwd=str(_REPO_ROOT),
