@@ -167,11 +167,6 @@ to overlap copies with compute.
     with accelerator tensors, and copying between the two raises
     `NotImplementedError`. Take every device from `torch.accelerator`.
 
-!!! note "Printing tensors"
-    `print(t)` works on accelerator tensors of every dtype and gives the
-    same output as on the CPU, plus the `device=` suffix. To format the
-    values, PyTorch reads them back to the host, so `print` waits for the
-    work queued on the tensor's stream, just as `.item()` does.
 
 ## Selecting a GPU
 
