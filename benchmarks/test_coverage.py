@@ -153,6 +153,7 @@ SKIPPED_OPS: dict[str, str] = {
     # -- out-variant plumbing --------------------------------------------
     "aten::abs.out": _OUT,
     "aten::acos.out": _OUT,
+    "aten::acosh.out": _OUT,
     "aten::add.out": _OUT,
     "aten::addmm.out": _OUT,
     "aten::any.out": _OUT,

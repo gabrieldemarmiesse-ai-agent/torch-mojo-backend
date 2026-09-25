@@ -649,6 +649,29 @@ def test_aten_acos_special_values(conf: Conf, dtype: torch.dtype):
     check_outputs(fn, conf, [x])
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_acosh(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_acosh)
+
+    def fn(x):
+        return aten.acosh(x)
+
+    x = torch.tensor([[1.0, 1.25, 1.5], [2.0, 3.0, 10.0]]).to(dtype)
+    check_outputs(fn, conf, [x])
+
+
+def test_aten_acosh_special_values(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_acosh)
+
+    def fn(x):
+        return aten.acosh(x)
+
+    # Zero at one, +inf at +inf, log(2x) for large x. check_outputs compares
+    # without equal_nan, so the NaN cases live in the special batch below.
+    x = torch.tensor([1.0, 1.0001, 1e10, 1e30, float("inf")])
+    check_outputs(fn, conf, [x])
+
+
 def test_aten_acos_2d_tensor(conf: Conf):
     """Test aten.acos with 2D tensor"""
 
@@ -996,6 +1019,7 @@ def test_aten_shared_elementwise_batch(dtype: torch.dtype, device: str):
             "cuda",
             (
                 "acos",
+                "acosh",
                 "asinh",
                 "atanh",
                 "ceil",

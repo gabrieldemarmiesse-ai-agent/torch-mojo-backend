@@ -285,10 +285,11 @@ def _bin_go[
 #   * every other opcode is float-only (shared `unary_math._float_unary`): half-precision
 #     inputs are promoted to float32, computed, and cast back — matching
 #     torch's numerics and keeping the polynomial math accurate.
-# Two of the ops deserve a note: `tan` and `asinh` cannot call the std.math
-# primitive of the same name, because those lower to libm (`_call_libm`) which
-# `comptime assert`s CPU-only and would refuse to compile for the GPU target.
-# `asinh` is composed from log/sqrt in shared math; `tan` routes through
+# Three of the ops deserve a note: `tan`, `acosh` and `asinh` cannot call the
+# std.math primitive of the same name, because those lower to libm
+# (`_call_libm`) which `comptime assert`s CPU-only and would refuse to compile
+# for the GPU target. `acosh` and `asinh` are composed from log/sqrt in shared
+# math; `tan` routes through
 # the shared `custom_tan`, which selects math per target and dtype.
 # ---------------------------------------------------------------------------
 
@@ -319,6 +320,7 @@ comptime UOP_TAN = 23
 comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
+comptime UOP_ACOSH = 27
 
 
 @always_inline
@@ -393,6 +395,8 @@ def _unary_apply[
         return elementwise_unary["floor"](a)
     elif op_code == UOP_ACOS:
         return elementwise_unary["acos"](a)
+    elif op_code == UOP_ACOSH:
+        return elementwise_unary["acosh"](a)
     elif op_code == UOP_ASINH:
         return elementwise_unary["asinh"](a)
     elif op_code == UOP_ATANH:
@@ -1432,6 +1436,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher2[_unary_spec_into_go[UOP_ACOS], "a unary spec op"](
                 argv, argc
             )
+            return 0
+        comptime if _op_on["AcoshSpec"]():
+            _spec_dispatcher2[
+                _unary_spec_into_go[UOP_ACOSH], "a unary spec op"
+            ](argv, argc)
             return 0
         comptime if _op_on["AsinhSpec"]():
             _spec_dispatcher2[

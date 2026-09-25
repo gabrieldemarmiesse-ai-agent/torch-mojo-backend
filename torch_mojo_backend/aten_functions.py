@@ -1436,6 +1436,13 @@ def aten_acos(x: MaxTensor) -> MaxTensor:
 
 
 # acosh(Tensor self) -> Tensor
+@map_to(aten.acosh)
+def aten_acosh(x: MaxTensor) -> MaxTensor:
+    if x.dtype.is_integral() or x.dtype == DType.bool:
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    return custom_mojo_ops.elementwise(x, "acosh")
+
+
 # adaptive_avg_pool1d(Tensor self, int[1] output_size) -> Tensor
 
 

@@ -15,12 +15,77 @@ from std.math import (
     log2,
     sin,
     sinh,
+    sqrt,
     tanh,
 )
 from std.memory import bitcast
 from std.sys.info import is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import isnan, max_or_inf, nan
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
+
+
+@always_inline
+def _log1p_nonneg[
+    dtype: DType, width: SIMDLength
+](t: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """log1p for finite t >= 0 (special values are the caller's to select).
+
+    float32 is CUDA's log1pf (libdevice): 1 + t = 2^i (1 + m) by exponent
+    arithmetic on the bits, m in about [-1/4, 1/2], then a degree-9
+    polynomial -- no division and no hardware lg2 approximation, whose
+    absolute error near one the compensated log1p kind has to repair.
+    """
+    comptime if dtype == DType.float32:
+        var x = rebind[SIMD[DType.float32, width]](t)
+        var e = (bitcast[DType.int32](x + 1) - 0x3F400000) & -8388608
+        var m = bitcast[DType.float32](bitcast[DType.int32](x) - e)
+        var s = bitcast[DType.float32](0x40800000 - e)
+        m += SIMD[DType.float32, width](0.25).fma(s, -1)
+        var i = e.cast[DType.float32]() * 1.1920928955078125e-7
+        var p = SIMD[DType.float32, width](-0.04534861445426941)
+        p = p.fma(m, 0.10546888411045074)
+        p = p.fma(m, -0.13229703903198242)
+        p = p.fma(m, 0.14491446316242218)
+        p = p.fma(m, -0.16641564667224884)
+        p = p.fma(m, 0.199888676404953)
+        p = p.fma(m, -0.2500019669532776)
+        p = p.fma(m, 0.33333510160446167)
+        p = p.fma(m, -0.5)
+        var r = (p * m).fma(m, m)
+        return rebind[SIMD[dtype, width]](i.fma(0.6931471824645996, r))
+    else:
+        return log1p(t)
+
+
+@always_inline
+def _acosh[
+    dtype: DType, width: SIMDLength, //, exact_sqrt: Bool
+](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """acosh as CUDA's acoshf computes it (libdevice __nv_acoshf, what stock
+    torch runs): log1p(d + sqrt(d (x + 1))) with d = x - 1, exact near one.
+
+    Past d = 2^23 acosh(x) = log(2x) = log1p(d) + ln 2 instead, where
+    d (x + 1) would overflow float32. `exact_sqrt=False` takes the hardware
+    approximation (~2^-22 relative on NVIDIA), for float16/bfloat16 inputs
+    whose result is rounded to 11 or 8 bits anyway: the correctly rounded
+    root cost ~10 instructions per element. std.math.acosh is libm/CPU-only.
+    """
+    var d = a - 1
+    var large = ~(d.ge(0) & d.le(8388608.0))
+    var prod = a.fma(d, d)
+    comptime if exact_sqrt:
+        prod = ieee_sqrt(prod)
+    else:
+        prod = sqrt(prod)
+    var res = _log1p_nonneg(large.select(d, d + prod)) + large.select(
+        SIMD[dtype, width](0.69314718055994530942), 0
+    )
+    # One mask for every special value: NaN below one and for NaN, +inf
+    # at +inf; only finite x >= 1 keeps the computed value.
+    var ge1 = a.ge(1)
+    return (ge1 & a.lt(max_or_inf[dtype]())).select(
+        res, ge1.select(a, SIMD[dtype, width](nan[dtype]()))
+    )
 
 
 @always_inline
@@ -38,6 +103,7 @@ def _float_unary[
         or kind == "ceil"
         or kind == "floor"
         or kind == "acos"
+        or kind == "acosh"
         or kind == "asinh"
         or kind == "atanh"
         or kind == "cos"
@@ -80,6 +146,8 @@ def _float_unary[
             res = (abs(a).gt(1) | isnan(a)).select(
                 SIMD[dtype, width](nan[dtype]()), res
             )
+    comptime if kind == "acosh":
+        res = _acosh[exact_sqrt=True](a)
     comptime if kind == "asinh":
         # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
         res = log(a + ieee_sqrt(a * a + 1))
@@ -188,6 +256,10 @@ def elementwise_unary[
             return x.gt(0).cast[dtype]() - x.lt(0).cast[dtype]()
     elif (kind == "ceil" or kind == "floor") and dtype.is_integral():
         return x
+    elif kind == "acosh" and (
+        dtype == DType.float16 or dtype == DType.bfloat16
+    ):
+        return _acosh[exact_sqrt=False](x.cast[DType.float32]()).cast[dtype]()
     elif dtype == DType.float16 or dtype == DType.bfloat16:
         # Compute once in float32 and round only the final result.
         return _float_unary[kind](x.cast[DType.float32]()).cast[dtype]()
