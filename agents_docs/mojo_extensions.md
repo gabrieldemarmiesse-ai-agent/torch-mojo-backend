@@ -213,6 +213,22 @@ everything OFF in a build that has none, which a MAX-compiled package is.
 `aten_functions.py` calls the ops through `custom_mojo_ops.native_*`
 (`F.custom(name=...)`, parameters for `transpose_b` / `tf32` / `eps`).
 
+**The NVIDIA `gpu_elementwise` launcher stays out of this path.** Several of
+the shared eager kernels above launch through `elementwise[...]`
+(`_bias_add_row` in `tmb/kernels/matmul/entry.mojo`; `_gather0` and other
+`op_utils._parallel_for` callers; the softmax-rows and batch/layer-norm
+kernels), which every eager call site imports from
+`tmb/kernels/common/gpu_elementwise.mojo` instead of `max.algorithm`
+directly (`tests/test_kernel_source_rules.py` enforces that nothing else
+does). That module's fast NVIDIA launcher only activates when
+`-D TMB_EAGER_ELEMENTWISE=1` is among the build's defines, which
+`tmb/backend/loader.mojo`'s `entry()` appends to every eager kernel-family
+build and `build_graph_package()`'s `mojo precompile` below never does (it
+passes no `-D` at all, and MAX's in-process graph compiler that later
+elaborates a custom op's body for a device sets none either). So the same
+Mojo source reaches MAX's own `elementwise` when called from a graph and the
+faster launcher when called eagerly, with no per-call-site branching.
+
 One import rule: a graph that uses several of these ops compiles their
 modules into one unit, and every family entry (`tmb/kernels/<family>/
 entry.mojo`) carries an `@export tmb_call` -- two of them in one unit is

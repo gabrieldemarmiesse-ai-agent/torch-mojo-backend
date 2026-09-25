@@ -46,7 +46,9 @@ from std.sys.info import (
 from std.utils.coord import Coord as StdCoord
 from std.utils.static_tuple import StaticTuple
 
-from max.algorithm import elementwise, parallelize
+from max.algorithm import parallelize
+
+from tmb.kernels.common.gpu_elementwise import elementwise
 
 from layout import Coord, TileTensor, row_major
 from layout.tensor_core import get_mma_shape

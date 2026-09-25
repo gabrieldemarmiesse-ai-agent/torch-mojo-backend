@@ -335,7 +335,10 @@ def variant_defines(
     gates: Gates, op: str | None, dtype: str | None, extra: tuple[tuple[str, str], ...]
 ) -> tuple[tuple[str, str], ...]:
     """The `-D` set that turns one operation of one module on."""
-    defines: dict[str, str] = {}
+    # tmb/backend/loader.mojo passes this to every eager family build: it
+    # selects tmb/kernels/common/gpu_elementwise.mojo's own launcher over
+    # MAX's, so the assembly compared is the assembly the device runs.
+    defines: dict[str, str] = {"TMB_EAGER_ELEMENTWISE": "1"}
     if op is not None:
         defines["OP"] = op
     if dtype is not None:
