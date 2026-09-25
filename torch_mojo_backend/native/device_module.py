@@ -198,12 +198,21 @@ class MojoDeviceProperties:
     max_grid_dim_x: int | None
 
 
+def _gfx_version(arch: str) -> tuple[int | None, int | None]:
+    """HIP's `hipDeviceProp_t` (major, minor): the gfx ISA version, whose last
+    two hex digits are minor and stepping ("gfx90a" -> 9, 0; "gfx1100" -> 11, 0)."""
+    digits = arch.split(":")[0].removeprefix("gfx")
+    if len(digits) < 3 or not digits[:-2].isdigit():
+        return None, None
+    return int(digits[:-2]), int(digits[-2], 16)
+
+
 def get_device_properties(
     device: int | str | torch.device | None = None,
 ) -> MojoDeviceProperties:
     """Properties cached per device in Mojo."""
     idx = _index(device)
-    values = (ctypes.c_int64 * 15)()
+    values = (ctypes.c_int64 * 16)()  # tmb.h TMB_DEVICE_PROPS_SLOTS
     text = ctypes.create_string_buffer(4096)
     fn = native.shim().tmb_device_properties
     fn.argtypes = [
@@ -223,10 +232,13 @@ def get_device_properties(
     def value(slot: int) -> int | None:
         return values[slot] if values[slot] >= 0 else None
 
+    major, minor = value(0), value(1)
+    if api == "hip":
+        major, minor = _gfx_version(arch)
     return MojoDeviceProperties(
         name=name,
-        major=value(0),
-        minor=value(1),
+        major=major,
+        minor=minor,
         total_memory=value(2),
         multi_processor_count=value(3),
         max_threads_per_multi_processor=value(4),
@@ -254,7 +266,7 @@ def get_device_name(device: int | str | torch.device | None = None) -> str:
 def get_device_capability(
     device: int | str | torch.device | None = None,
 ) -> tuple[int | None, int | None]:
-    """CUDA (major, minor); unknown components are None on other APIs."""
+    """torch.cuda's (major, minor) on CUDA and ROCm; (None, None) on Metal."""
     props = get_device_properties(device)
     return props.major, props.minor
 

@@ -449,8 +449,6 @@ Keep device work out of the dataset and in the main process.
 
 ## Not supported
 
-- `torch.accelerator.get_device_capability()` raises
-  `RuntimeError: Backend doesn't support getting device capabilities.`
 - `torch.amp.GradScaler` on Apple GPUs, see [Mixed precision](#mixed-precision).
 - CUDA graphs (`torch.cuda.graph`, `CUDAGraph`, `make_graphed_callables`) have
   no equivalent.
