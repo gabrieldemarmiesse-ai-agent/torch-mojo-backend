@@ -57,9 +57,10 @@ def run_one[
             out_ptr.unsafe_store[width=width, alignment=ba](flat, a * 3 + 1)
 
     comptime if unified:
-        def ubody[width: Int, alignment: Int = 1](idx: Coord) {
-            var out_ptr, var in_ptr, var strides
-        }:
+
+        def ubody[
+            width: Int, alignment: Int = 1
+        ](idx: Coord) {var out_ptr, var in_ptr, var strides}:
             var flat = 0
             comptime for k in range(rank):
                 flat += Int(idx[k].value()) * strides[k]
@@ -129,14 +130,28 @@ def check[
         var m = bitcast[U](hm.unsafe_ptr()[unsafe_offset=i])
         var c = bitcast[U](hc.unsafe_ptr()[unsafe_offset=i])
         var inside = i >= GUARD and i < GUARD + n
-        if m != c or (inside and c == Scalar[U](SENT)) or (
-            not inside and c != Scalar[U](SENT)
+        if (
+            m != c
+            or (inside and c == Scalar[U](SENT))
+            or (not inside and c != Scalar[U](SENT))
         ):
             if bad < 3:
                 print(
-                    "  MISMATCH", String(dtype), "rank", rank, "w", simd_width,
-                    "unified" if unified else "capturing", "shape", shape,
-                    "flat", i - GUARD, "max", m, "cand", c,
+                    "  MISMATCH",
+                    String(dtype),
+                    "rank",
+                    rank,
+                    "w",
+                    simd_width,
+                    "unified" if unified else "capturing",
+                    "shape",
+                    shape,
+                    "flat",
+                    i - GUARD,
+                    "max",
+                    m,
+                    "cand",
+                    c,
                 )
             bad += 1
     return bad
@@ -145,23 +160,87 @@ def check[
 def sweep[dtype: DType, simd_width: Int](ctx: DeviceContext) raises -> Int:
     var bad = 0
     var sizes: List[Int] = [
-        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 127, 128, 129,
-        255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049,
-        4095, 4096, 4097, 8191, 8192, 8193, 16383, 16385, 65536, 65537,
-        131071, 131073, 357 * 789, 1048576 + 3, 3000009, 16777216 + 5,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        15,
+        16,
+        17,
+        31,
+        33,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        1023,
+        1024,
+        1025,
+        2047,
+        2048,
+        2049,
+        4095,
+        4096,
+        4097,
+        8191,
+        8192,
+        8193,
+        16383,
+        16385,
+        65536,
+        65537,
+        131071,
+        131073,
+        357 * 789,
+        1048576 + 3,
+        3000009,
+        16777216 + 5,
         # Around the candidate's regime thresholds (tiny = 1 or 2 waves of
         # 114 * 2048 threads, big = 2**20 vectors) for widths 1..16.
-        233472, 233473, 466944, 466945, 933888, 933889, 933891, 1867776,
-        1867777, 1867783, 3735552, 3735569, 1048575, 1048576, 2097151,
-        2097152, 2097153, 4194303, 4194304, 4194305, 8388607, 8388608,
+        233472,
+        233473,
+        466944,
+        466945,
+        933888,
+        933889,
+        933891,
+        1867776,
+        1867777,
+        1867783,
+        3735552,
+        3735569,
+        1048575,
+        1048576,
+        2097151,
+        2097152,
+        2097153,
+        4194303,
+        4194304,
+        4194305,
+        8388607,
+        8388608,
         8388615,
     ]
     for n in sizes:
         bad += check[dtype, 1, simd_width, False](ctx, IndexList[1](n))
     bad += check[dtype, 1, simd_width, True](ctx, IndexList[1](357 * 789))
     var shapes2: List[IndexList[2]] = [
-        IndexList[2](0, 5), IndexList[2](1, 1), IndexList[2](7, 13),
-        IndexList[2](3, 1024), IndexList[2](1000, 17), IndexList[2](357, 789),
+        IndexList[2](0, 5),
+        IndexList[2](1, 1),
+        IndexList[2](7, 13),
+        IndexList[2](3, 1024),
+        IndexList[2](1000, 17),
+        IndexList[2](357, 789),
         IndexList[2](4096, 3),
     ]
     for s in shapes2:
