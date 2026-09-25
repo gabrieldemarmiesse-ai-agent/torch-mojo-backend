@@ -108,6 +108,7 @@ comptime COP_GT = 4
 comptime COP_GE = 5
 comptime COP_LAND = 6
 comptime COP_LXOR = 7
+comptime COP_LOR = 8
 
 
 @always_inline
@@ -135,6 +136,8 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "logical_and"
         comptime if op_code == COP_LXOR:
             return "logical_xor"
+        comptime if op_code == COP_LOR:
+            return "logical_or"
     else:
         comptime if op_code == BOP_ADD:
             return "add"
@@ -242,6 +245,28 @@ def _add_f32_bf16_contig(
 
 
 @always_inline
+def _nonzero[
+    dtype: DType, width: Int
+](a: SIMD[dtype, width]) -> SIMD[DType.bool, width]:
+    """`a != 0` as torch's logical ops read it: NaN is nonzero.
+
+    Floats test their magnitude bits instead of comparing: the GPU build's
+    fast-math flags let LLVM assume no NaN and fold `NaN != 0` to False,
+    which made `logical_or(nan, 0)` False.
+    """
+    comptime if dtype.is_floating_point():
+        comptime bits = DType.uint64 if size_of[dtype]() == 8 else (
+            DType.uint32 if size_of[dtype]() == 4 else DType.uint16
+        )
+        comptime magnitude = ~(
+            Scalar[bits](1) << Scalar[bits](size_of[dtype]() * 8 - 1)
+        )
+        return (bitcast[bits, width](a) & magnitude).ne(0)
+    else:
+        return a.ne(SIMD[dtype, width](0))
+
+
+@always_inline
 def _bin_vec_op[
     dtype: DType,
     out_dtype: DType,
@@ -281,13 +306,17 @@ def _bin_vec_op[
             return a.gt(b).cast[out_dtype]()
         comptime if op_code == COP_GE:
             return a.ge(b).cast[out_dtype]()
-        comptime if op_code == COP_LAND or op_code == COP_LXOR:
+        comptime if (
+            op_code == COP_LAND or op_code == COP_LXOR or op_code == COP_LOR
+        ):
             # Logical ops test each operand for nonzero-ness, then combine.
             # Output is bool regardless of the (arbitrary) input dtype.
-            var la = a.ne(SIMD[dtype, width](0))
-            var lb = b.ne(SIMD[dtype, width](0))
+            var la = _nonzero(a)
+            var lb = _nonzero(b)
             comptime if op_code == COP_LAND:
                 return (la & lb).cast[out_dtype]()
+            elif op_code == COP_LOR:
+                return (la | lb).cast[out_dtype]()
             else:
                 return (la ^ lb).cast[out_dtype]()
     else:
@@ -1779,6 +1808,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["LogicalXorSpec"]():
             _spec_dispatcher3[
                 _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["LogicalOrSpec"]():
+            _spec_dispatcher3[
+                _binary_spec_into_go[COP_LOR, True], "a binary spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["BitwiseNot"]():

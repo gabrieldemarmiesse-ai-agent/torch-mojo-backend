@@ -61,7 +61,11 @@ BITWISE_OPS = {
     "bitwise_or": torch.bitwise_or,
     "bitwise_xor": torch.bitwise_xor,
 }
-LOGICAL_OPS = {"logical_and": torch.logical_and, "logical_xor": torch.logical_xor}
+LOGICAL_OPS = {
+    "logical_and": torch.logical_and,
+    "logical_or": torch.logical_or,
+    "logical_xor": torch.logical_xor,
+}
 
 COVERS: dict[str, str] = (
     {f"aten::{name}": "test_arith" for name in ARITH_OPS}
@@ -116,7 +120,43 @@ COVERS: dict[str, str] = (
     }
 )
 
-SKIPPED: dict[str, str] = {}
+_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl "
+    "(computed straight into `out` when it has the result's dtype, shape and "
+    "a dense layout, else computed then copied into it)"
+)
+_CLAMP_SCALAR = "the ClampScalar kernel test_clamp measures, one bound disabled"
+_MAXMIN_BOUND = (
+    "ATen's clamp_{min,max}_Tensor_out is maximum_stub / minimum_stub: the "
+    "MaximumSpec / MinimumSpec kernels test_minmax measures"
+)
+
+SKIPPED: dict[str, str] = {
+    "aten::bitwise_and.Scalar_out": _OUT,
+    "aten::bitwise_and.Tensor_out": _OUT,
+    "aten::bitwise_or.Scalar_out": _OUT,
+    "aten::bitwise_or.Tensor_out": _OUT,
+    "aten::bitwise_xor.Scalar_out": _OUT,
+    "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::clamp.out": _OUT,
+    "aten::clamp_max": _CLAMP_SCALAR,
+    "aten::clamp_max.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_max.Tensor_out": _OUT,
+    "aten::clamp_max.out": _OUT,
+    "aten::clamp_min": _CLAMP_SCALAR,
+    "aten::clamp_min.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_min.Tensor_out": _OUT,
+    "aten::clamp_min.out": _OUT,
+    "aten::logical_and.out": _OUT,
+    "aten::logical_or.out": _OUT,
+    "aten::logical_xor.out": _OUT,
+    "aten::maximum.out": _OUT,
+    "aten::minimum.out": _OUT,
+    "aten::pow.Tensor_Scalar_out": _OUT,
+    "aten::pow.Tensor_Tensor_out": _OUT,
+    "aten::remainder.Scalar_out": _OUT,
+    "aten::remainder.Tensor_out": _OUT,
+}
 
 
 def _pair(
