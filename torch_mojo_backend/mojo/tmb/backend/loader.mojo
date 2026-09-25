@@ -67,8 +67,8 @@ def _local_dir(prefix: String) raises -> String:
 
 def _compiler_env() raises -> String:
     """Environment every `mojo build` subprocess runs with; an explicit value
-    wins. Why MODULAR_HOME must be node-local: native/__init__.py's
-    `compiler_env`, the same thing on the Python side."""
+    wins. Why MODULAR_HOME and MODULAR_CACHE_DIR must be node-local:
+    native/__init__.py's `compiler_env`, the same thing on the Python side."""
     # PYTHONEXECUTABLE/PYTHONHOME: the MAX runtime exports the interpreter it
     # found on PATH into this process's environment (invisible to os.environ,
     # inherited by children); with a venv that is not on PATH, the `mojo`
@@ -77,6 +77,8 @@ def _compiler_env() raises -> String:
     return (
         'unset PYTHONEXECUTABLE PYTHONHOME; MODULAR_HOME="${MODULAR_HOME:-'
         + _local_dir("modular-home-")
+        + '}" MODULAR_CACHE_DIR="${MODULAR_CACHE_DIR:-'
+        + _local_dir("modular-cache-")
         + '}"'
     )
 
@@ -234,8 +236,8 @@ struct Loader(Movable):
             + String(perf_counter_ns())
             + ".so"
         )
-        # MODULAR_HOME: the compiler's own cache goes to local scratch too
-        # (native/__init__.py compiler_env explains why)
+        # MODULAR_HOME, MODULAR_CACHE_DIR: the compiler's own caches go to
+        # local scratch too (native/__init__.py compiler_env explains why)
         var cmd = (
             _compiler_env()
             + " '"
@@ -276,9 +278,7 @@ struct Loader(Movable):
             rc = Int(atol(String(String(output[byte = marker + 9 :]).strip())))
         if rc != 0:
             if exists(tmp):
-                _ = external_call["unlink", Int32](
-                    tmp.as_c_string_slice().unsafe_ptr()
-                )
+                _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
             var defs = String()
             for d in defines:
                 defs += " -D " + d
@@ -309,14 +309,12 @@ struct Loader(Movable):
         if exists(
             out_path
         ):  # another process installed the same build first: use theirs
-            _ = external_call["unlink", Int32](
-                tmp.as_c_string_slice().unsafe_ptr()
-            )
+            _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
         else:
             var dst = String(out_path)
             var r = external_call["rename", Int32](
-                tmp.as_c_string_slice().unsafe_ptr(),
-                dst.as_c_string_slice().unsafe_ptr(),
+                tmp.as_c_string_span().ptr(),
+                dst.as_c_string_span().ptr(),
             )
             if r != 0 and not exists(out_path):
                 raise Error("could not install ", out_path)
@@ -347,7 +345,7 @@ struct Loader(Movable):
             makedirs(self.cache_dir, exist_ok=True)
         var lock_path = self.cache_dir + "/." + key + ".lock"
         var fd = external_call["creat", Int32](
-            lock_path.as_c_string_slice().unsafe_ptr(), Int32(0o644)
+            lock_path.as_c_string_span().ptr(), Int32(0o644)
         )
         if fd >= 0:
             _ = external_call["flock", Int32](
