@@ -187,7 +187,7 @@ def test_unary_launcher_offset_out(
 
 @pytest.mark.parametrize(
     "op_name,dtype",
-    [("log2", torch.float64)]
+    [("log2", torch.float64), ("reciprocal", torch.float64)]
     + [
         (name, dtype)
         for name in ("abs", "neg", "sign", "ceil", "floor")
@@ -208,6 +208,19 @@ def test_unary_launcher_other_dtypes(
     expected = getattr(torch, op_name)(cpu[offset : offset + 257])
     actual = getattr(torch, op_name)(x)
     torch.testing.assert_close(actual.cpu(), expected)
+
+
+def test_reciprocal_float64_out_and_inplace(mojo_gpu: str):
+    """GradScaler.unscale_ takes its inverse scale as
+    `scale.double().reciprocal().float()`."""
+    skip_if_metal(mojo_gpu, "Metal does not support float64")
+    cpu = torch.tensor([65536.0, 3.0, -0.1, 0.0, float("inf")], dtype=torch.float64)
+    expected = torch.reciprocal(cpu)
+    x = cpu.to(mojo_gpu)
+    out = torch.empty_like(x)
+    torch.reciprocal(x, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    torch.testing.assert_close(x.reciprocal_().cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

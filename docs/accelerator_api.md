@@ -262,11 +262,43 @@ print(logits.dtype, loss.dtype, model.weight.grad.dtype)
 
 Without a `dtype`, autocast uses `torch.float16`, the same default as CUDA.
 
-!!! warning "No `GradScaler` yet"
-    `torch.amp.GradScaler(device.type)` does not work on this backend: ops it
-    relies on are not implemented yet, and `scaler.step()` raises
-    `NotImplementedError`. Train with `dtype=torch.bfloat16`, which has the
-    range of `float32` and needs no loss scaling.
+With `torch.float16`, scale the loss with `torch.amp.GradScaler`, exactly
+as on CUDA:
+
+```python
+import torch
+import torch_mojo_backend
+
+torch_mojo_backend.register_mojo_devices()
+device = torch.accelerator.current_accelerator()
+
+model = torch.nn.Linear(16, 4).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), fused=True)
+scaler = torch.amp.GradScaler(device.type)
+x = torch.randn(8, 16, device=device)
+target = torch.randint(0, 4, (8,), device=device)
+
+for _ in range(3):
+    with torch.autocast(device.type, dtype=torch.float16):
+        loss = torch.nn.functional.cross_entropy(model(x), target)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)  # optional: to clip or inspect gradients
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+print(scaler.get_scale())  # 65536.0
+```
+
+The inf/NaN check, the unscaling and the scale update all run on the GPU,
+so `unscale_()` and `update()` do not synchronize with the host, and a fused
+optimizer (`fused=True`) skips the whole step on the GPU when the gradients
+overflowed. `bfloat16` has the range of `float32` and needs no scaler.
+
+!!! warning "No `GradScaler` on Apple GPUs"
+    `GradScaler.unscale_()` computes the inverse scale in `float64`, which
+    Apple GPUs do not have, so on those use `dtype=torch.bfloat16` without a
+    scaler.
 
 `torch.set_float32_matmul_precision("high")` (or `"medium"`) lets float32
 matmuls use TF32 tensor cores where the backend has a TF32 kernel, which is
@@ -424,7 +456,7 @@ Keep device work out of the dataset and in the main process.
 
 - `torch.accelerator.get_device_capability()` raises
   `RuntimeError: Backend doesn't support getting device capabilities.`
-- `torch.amp.GradScaler`, see [Mixed precision](#mixed-precision).
+- `torch.amp.GradScaler` on Apple GPUs, see [Mixed precision](#mixed-precision).
 - CUDA graphs (`torch.cuda.graph`, `CUDAGraph`, `make_graphed_callables`) have
   no equivalent.
 
