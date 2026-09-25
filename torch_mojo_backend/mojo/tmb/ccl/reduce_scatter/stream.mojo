@@ -41,7 +41,7 @@
 # the exchange, which every block does for itself on the pinned mailbox.
 
 from std.atomic import Atomic, Ordering, fence
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -219,7 +219,7 @@ def _poison(region: Pointer[UInt8, MutAnyOrigin], tag: UInt64):
 
 @always_inline
 def _publish(
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     table: Int,
     world: Int,
     rank: Int,
@@ -243,7 +243,7 @@ def _publish(
 
 @always_inline
 def _await(
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     table: Int,
     world: Int,
     rank: Int,
@@ -416,7 +416,7 @@ def _arrive(
 def _push_piece[
     NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Float32, MutAnyOrigin],
     e0: Int,
     n: Int,
@@ -426,7 +426,7 @@ def _push_piece[
     push_off: Int,
     slot_stride: Int,
     in_stride: Int,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     vec: Bool,
 ):
     """Elements `[e0, e0+n)` of my contribution to every destination shard."""
@@ -497,7 +497,7 @@ def _reduce_piece[
     slot_stride: Int,
     out_stride_e: Int,
     in_stride: Int,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     scale: Float32,
     vec: Bool,
 ):
@@ -572,7 +572,7 @@ def _sum_out(
     var v = t
     while v < vc:
         # Four rows per iteration so 4 * (1 + npeers) loads are in flight.
-        var acc = InlineArray[SIMD[DType.float32, 4], 4](uninitialized=True)
+        var acc = Array[SIMD[DType.float32, 4], 4](uninitialized=True)
         comptime for u in range(4):
             if v + u * RS_STREAM_THREADS < vc:
                 acc[u] = partial.unsafe_load[width=4, alignment=16](
@@ -617,7 +617,7 @@ def _sum_out(
 def _stream_rs_kernel[
     NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Float32, MutAnyOrigin],
     out_ptr: Pointer[Float32, MutAnyOrigin],
     mb_req: Pointer[UInt64, MutAnyOrigin],
@@ -637,7 +637,7 @@ def _stream_rs_kernel[
     flag_base: UInt64,
     scale: Float32,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     vector_ok: Int32,
 ):
     var world = NW if NW > 0 else Int(world_i)
@@ -937,7 +937,7 @@ def _launch[
     ctx: DeviceContext,
     stream: DeviceStream,
     blocks: Int,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     mailbox: StaticTuple[Int, 3],
@@ -955,7 +955,7 @@ def _launch[
     generation: Int,
     scale: Float32,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
 ) raises:
     _enqueue_cached_dim[_stream_rs_kernel[NW]](
         ctx,
@@ -1018,7 +1018,7 @@ def reduce_scatter_stream(
     piece_vecs: Int,
     pieces: Int,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
 ) raises:
     if count <= 0:
         return

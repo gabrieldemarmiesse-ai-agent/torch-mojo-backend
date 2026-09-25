@@ -33,7 +33,7 @@ from max.algorithm import elementwise
 
 from std.utils import IndexList
 
-from tmb.graph.div_math import floor_div, trunc_div
+from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,

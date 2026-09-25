@@ -6,7 +6,7 @@
 # pointer that `device._device_context_ptr()` hands us on the Python side.
 # ===----------------------------------------------------------------------=== #
 
-from tmb.graph.math_utils import custom_tan, ieee_sqrt
+from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 
 from max.algorithm import elementwise
 from std.builtin.device_passable import DevicePassable

@@ -1,6 +1,6 @@
 # Node-local partials for hierarchical reduce-scatter.
 # Compacted push slots precede the node outputs in the 2*cap staging arena.
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import MAX_THREADS_PER_BLOCK_METADATA, global_idx, grid_dim
 from max.gpu.host import DeviceContext, DeviceStream
 from std.sys import size_of
@@ -38,7 +38,7 @@ from tmb.ccl.collectives_kernels import (
 def _rs_nodes_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     count: Int64,
@@ -51,7 +51,7 @@ def _rs_nodes_kernel[
     scale: Float32,
     timeout_ns: UInt64,
     vector_ok: Int32,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int32,
 ):
     _ = _rs_nodes_body[dtype, W, U, NW, BLOCK, False](
@@ -78,7 +78,7 @@ def _rs_nodes_kernel[
 def _rs_nodes_body[
     dtype: DType, W: Int, U: Int, NW: Int, THREADS: Int, GATED: Bool
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     count: Int64,
@@ -91,7 +91,7 @@ def _rs_nodes_body[
     scale: Float32,
     timeout_ns: UInt64,
     vector_ok: Int32,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int32,
     arena_off: Int,
 ) -> Bool:
@@ -221,11 +221,11 @@ def _rs_nodes_body[
 
 def reduce_scatter_rank_ids(
     rank_at: List[Int],
-) raises -> InlineArray[Int32, MAX_WORLD * MAX_NODES]:
+) raises -> Array[Int32, MAX_WORLD * MAX_NODES]:
     # Dynamic writes to large StaticTuple silently vanished in Mojo 1.0.
     if len(rank_at) > MAX_WORLD * MAX_NODES:
         raise Error("collectives: hierarchical rank map exceeds capacity")
-    var ids = InlineArray[Int32, MAX_WORLD * MAX_NODES](fill=0)
+    var ids = Array[Int32, MAX_WORLD * MAX_NODES](fill=0)
     for i in range(len(rank_at)):
         ids[i] = Int32(rank_at[i])
     return ids^
@@ -243,7 +243,7 @@ def _launch_rs_nodes[
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     count: Int,
@@ -254,7 +254,7 @@ def _launch_rs_nodes[
     vec: Bool,
     scale: Float32,
     generation: Int,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int,
 ) raises:
     _enqueue_cached[_rs_nodes_kernel[dtype, W, _UNROLL, NW]](
@@ -295,7 +295,7 @@ def reduce_scatter_nodes[
     scale: Float32,
     generation: Int,
     in_stride: Int,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     node_count: Int,
     max_blocks: Int,
 ) raises:

@@ -42,9 +42,10 @@ comptime THREADS = (BM // WM) * (BN // WN) * WARP_K * 64
 @__name("bench_mfma_fill_bf16")
 def _fill_bf16(
     ptr: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    count: Int,
+    count_arg: Int64,
     value: Scalar[DType.bfloat16],
 ):
+    var count = Int(count_arg)
     var i = (Int(block_idx.x) * 256 + Int(thread_idx.x)) * 4
     var stride = Int(grid_dim.x) * 256 * 4
     while i < count:
@@ -66,7 +67,7 @@ def _enqueue_fill(
 ) raises:
     ctx.enqueue_function[_fill_bf16](
         ptr,
-        count,
+        Int64(count),
         value,
         grid_dim=(max(1, min(ceildiv(count, 1024), 512)),),
         block_dim=(256,),

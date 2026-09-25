@@ -289,7 +289,7 @@ def _cumsum_chunk_finish_kernel[
     `block.prefix_sum` (over the `threads` per-thread local totals) is
     needed to place every thread's run, regardless of `tiles`. Without the
     launch-bounds metadata below, a large `tiles` on a large `threads` block
-    (`InlineArray[Scalar[acc], tiles]` fully live across the
+    (`Array[Scalar[acc], tiles]` fully live across the
     `block.prefix_sum` call) can ask the register allocator for more than
     the hardware has and crash at launch (CUDA LAUNCH_OUT_OF_RESOURCES,
     measured at threads=1024/tiles=32) instead of just running slower --
@@ -307,7 +307,7 @@ def _cumsum_chunk_finish_kernel[
     var tid = Int(thread_idx.x)
     var local_base = chunk_start + tid * tiles
 
-    var local_scan = InlineArray[Scalar[acc], tiles](uninitialized=True)
+    var local_scan = Array[Scalar[acc], tiles](uninitialized=True)
     var running = Scalar[acc](0)
 
     comptime for k in range(tiles):

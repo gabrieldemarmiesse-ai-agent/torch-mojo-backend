@@ -552,7 +552,7 @@ struct T(Copyable, Movable):
     var device_type: Int  # torch DeviceType (DEVICE_TYPE_PRIVATEUSE1, DEVICE_TYPE_CPU, ...)
 
     def __init__(out self, h: Int) raises:
-        var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
+        var info = Array[Int64, TENSOR_INFO_SLOTS](fill=0)
         external_call["tmb_tensor_info", NoneType](h, info.unsafe_ptr())
         self = T(h, Int(info.unsafe_ptr()))
         _ = info^  # read through its address above, so alive until here
@@ -945,14 +945,14 @@ def new_strided(
     # T rejects unsupported ScalarTypes. Validate before creating its owned
     # C++ handle, otherwise a failed T(h) strands that handle and its storage.
     _ = max_dtype(stype)
-    var sizes = InlineArray[Int64, MAX_RANK](fill=0)
-    var strd = InlineArray[Int64, MAX_RANK](fill=0)
+    var sizes = Array[Int64, MAX_RANK](fill=0)
+    var strd = Array[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
     for i in range(rank):
         sizes[i] = Int64(shape[pad + i])
         strd[i] = Int64(strides[pad + i])
     var h: Int = 0
-    var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
+    var info = Array[Int64, TENSOR_INFO_SLOTS](fill=0)
     check(
         external_call["tmb_empty_strided", Int32](
             Int64(rank),
@@ -999,14 +999,14 @@ def view_strided(
     offset: Int,
 ) raises -> T:
     """A zero-copy view over base's storage (an owned handle to return)."""
-    var sizes = InlineArray[Int64, MAX_RANK](fill=0)
-    var strd = InlineArray[Int64, MAX_RANK](fill=0)
+    var sizes = Array[Int64, MAX_RANK](fill=0)
+    var strd = Array[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
     for i in range(rank):
         sizes[i] = Int64(shape[pad + i])
         strd[i] = Int64(strides[pad + i])
     var h: Int = 0
-    var info = InlineArray[Int64, TENSOR_INFO_SLOTS](fill=0)
+    var info = Array[Int64, TENSOR_INFO_SLOTS](fill=0)
     check(
         external_call["tmb_as_strided", Int32](
             base.h,
@@ -1031,8 +1031,8 @@ def set_sizes_strides(
     rank: Int,
     offset: Int,
 ) raises:
-    var sizes = InlineArray[Int64, MAX_RANK](fill=0)
-    var strd = InlineArray[Int64, MAX_RANK](fill=0)
+    var sizes = Array[Int64, MAX_RANK](fill=0)
+    var strd = Array[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
     for i in range(rank):
         sizes[i] = Int64(shape[pad + i])
@@ -1099,7 +1099,7 @@ def release(h: Int):
 def cpu_empty(
     shape: IndexList[MAX_RANK], rank: Int, stype: Int32, pinned_device: Int = -1
 ) raises -> T:
-    var sizes = InlineArray[Int64, MAX_RANK](fill=0)
+    var sizes = Array[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank
     for i in range(rank):
         sizes[i] = Int64(shape[pad + i])

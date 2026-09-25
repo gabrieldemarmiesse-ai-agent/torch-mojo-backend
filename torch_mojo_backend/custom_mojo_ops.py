@@ -96,9 +96,9 @@ def bitwise_xor_scalar(input: MaxTensor, other: Scalar) -> MaxTensor:
 def div(
     input: MaxTensor, other: MaxTensor, kind: Literal["true", "floor", "trunc"]
 ) -> MaxTensor:
-    """torch.div's three modes (`tmb/graph/div_math.mojo`). The operands share
-    a dtype and a shape: promotion, broadcasting and any float32 widening
-    happen before the call."""
+    """torch.div's three modes (`tmb/kernels/common/div_math.mojo`). The
+    operands share a dtype and a shape: promotion, broadcasting and any float32
+    widening happen before the call."""
     return _same_type_binary(f"div_{kind}", input, other)
 
 

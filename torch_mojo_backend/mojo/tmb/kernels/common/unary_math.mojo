@@ -20,7 +20,7 @@ from std.math import (
 from std.memory import bitcast
 from std.sys.info import is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import isnan, max_or_inf, nan
-from .math_utils import custom_tan, ieee_sqrt
+from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 
 
 @always_inline

@@ -232,7 +232,7 @@ def _apple8_nn_smem_kernel[
     var sgm = (sg // SGC) * SG_M
     var sgn = (sg % SGC) * SG_N
 
-    var accum = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, NN_FRAG8](0)
     )
 
@@ -241,8 +241,8 @@ def _apple8_nn_smem_kernel[
     @parameter
     def _fill_regs(
         kt: Int,
-        mut a_regs: InlineArray[SIMD[DType.float32, 4], AV],
-        mut b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+        mut a_regs: Array[SIMD[DType.float32, 4], AV],
+        mut b_regs: Array[SIMD[DType.float32, 4], BV],
     ):
         comptime for q in range(AV):
             var fid = q * THREADS + tid
@@ -284,8 +284,8 @@ def _apple8_nn_smem_kernel[
     @parameter
     def _store_smem(
         buf: Int,
-        a_regs: InlineArray[SIMD[DType.float32, 4], AV],
-        b_regs: InlineArray[SIMD[DType.float32, 4], BV],
+        a_regs: Array[SIMD[DType.float32, 4], AV],
+        b_regs: Array[SIMD[DType.float32, 4], BV],
     ):
         var a_dst = a_smem.unsafe_offset(buf * BM * LDA)
         var b_dst = b_smem.unsafe_offset(buf * BK * LDB)
@@ -305,7 +305,7 @@ def _apple8_nn_smem_kernel[
     @parameter
     def _compute(
         buf: Int,
-        mut acc: InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
     ):
         var a_src = a_smem.unsafe_offset(
             buf * BM * LDA + (sgm + frow) * LDA + fcol
@@ -314,7 +314,7 @@ def _apple8_nn_smem_kernel[
             buf * BK * LDB + frow * LDB + sgn + fcol
         )
         comptime for kc in range(BK // NN_MMA8_DIM):
-            var afrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M](
+            var afrag = Array[SIMD[DType.float32, NN_FRAG8], NT_M](
                 uninitialized=True
             )
             comptime for mi in range(NT_M):
@@ -323,7 +323,7 @@ def _apple8_nn_smem_kernel[
                         mi * NN_MMA8_DIM * LDA + kc * NN_MMA8_DIM
                     )
                 ).unsafe_load[width=NN_FRAG8]()
-            var bfrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_N](
+            var bfrag = Array[SIMD[DType.float32, NN_FRAG8], NT_N](
                 uninitialized=True
             )
             comptime for ni in range(NT_N):
@@ -339,8 +339,8 @@ def _apple8_nn_smem_kernel[
                     )
 
     var stages = ceildiv(k_end - k_start, BK)
-    var a_regs = InlineArray[SIMD[DType.float32, 4], AV](uninitialized=True)
-    var b_regs = InlineArray[SIMD[DType.float32, 4], BV](uninitialized=True)
+    var a_regs = Array[SIMD[DType.float32, 4], AV](uninitialized=True)
+    var b_regs = Array[SIMD[DType.float32, 4], BV](uninitialized=True)
     if stages > 0:
         _fill_regs(k_start, a_regs, b_regs)
     comptime if DOUBLE:
@@ -554,7 +554,7 @@ def _apple8_nn_direct_kernel[
     var col_base = bx * BN + (sg % SGC) * SG_N
     var interior = (row_base + SG_M <= m) and (col_base + SG_N <= n)
 
-    var accum = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N](
+    var accum = Array[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N](
         fill=SIMD[DType.float32, NN_FRAG8](0)
     )
 
@@ -564,9 +564,9 @@ def _apple8_nn_direct_kernel[
     @parameter
     def _slab_guarded(
         kk: Int,
-        mut acc: InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
     ):
-        var afrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M](
+        var afrag = Array[SIMD[DType.float32, NN_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
@@ -577,7 +577,7 @@ def _apple8_nn_direct_kernel[
                     if kk + fcol + s < k_end:
                         af[s] = a_ptr[unsafe_offset=grow * k + kk + fcol + s]
             afrag[mi] = af
-        var bfrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_N](
+        var bfrag = Array[SIMD[DType.float32, NN_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
@@ -600,8 +600,8 @@ def _apple8_nn_direct_kernel[
     @parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M]:
-        var afrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M](
+    ) -> Array[SIMD[DType.float32, NN_FRAG8], NT_M]:
+        var afrag = Array[SIMD[DType.float32, NN_FRAG8], NT_M](
             uninitialized=True
         )
         comptime for mi in range(NT_M):
@@ -614,8 +614,8 @@ def _apple8_nn_direct_kernel[
     @parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[DType.float32, NN_FRAG8], NT_N]:
-        var bfrag = InlineArray[SIMD[DType.float32, NN_FRAG8], NT_N](
+    ) -> Array[SIMD[DType.float32, NN_FRAG8], NT_N]:
+        var bfrag = Array[SIMD[DType.float32, NN_FRAG8], NT_N](
             uninitialized=True
         )
         comptime for ni in range(NT_N):
@@ -627,9 +627,9 @@ def _apple8_nn_direct_kernel[
     @always_inline
     @parameter
     def _mma_block(
-        afrag: InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M],
-        bfrag: InlineArray[SIMD[DType.float32, NN_FRAG8], NT_N],
-        mut acc: InlineArray[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
+        afrag: Array[SIMD[DType.float32, NN_FRAG8], NT_M],
+        bfrag: Array[SIMD[DType.float32, NN_FRAG8], NT_N],
+        mut acc: Array[SIMD[DType.float32, NN_FRAG8], NT_M * NT_N],
     ):
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):

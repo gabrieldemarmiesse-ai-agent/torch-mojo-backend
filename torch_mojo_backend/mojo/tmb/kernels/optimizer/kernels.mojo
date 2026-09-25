@@ -6,7 +6,7 @@ and the block resolves that chunk to its runtime tensor descriptor. Tensor
 sizes and addresses are runtime data and never compilation keys.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.ffi import _get_global_or_null, external_call
 from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
@@ -76,7 +76,7 @@ def _adamw_update[
 
 @__name("fused_adamw_f32_dynamic_multitensor")
 def _fused_adamw_f32(
-    descs: InlineArray[AdamWDesc, ADAMW_DESC_CAP],
+    descs: Array[AdamWDesc, ADAMW_DESC_CAP],
     desc_count_arg: Int64,
     lr_scalar: Float32,
     lr_ptr_addr_arg: Int64,
@@ -344,7 +344,7 @@ def _fused_adamw_f32_tensor_apple(
 
 
 def enqueue_fused_adamw_f32(
-    descs: InlineArray[AdamWDesc, ADAMW_DESC_CAP],
+    descs: Array[AdamWDesc, ADAMW_DESC_CAP],
     desc_count: Int,
     total_chunks: Int,
     lr_scalar: Float32,

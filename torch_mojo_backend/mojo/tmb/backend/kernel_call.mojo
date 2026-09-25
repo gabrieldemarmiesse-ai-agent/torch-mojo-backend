@@ -91,14 +91,14 @@ struct Name(Copyable, Movable):
 
     # 64-bit words, so the hash below can read them eight bytes at a time;
     # a byte array would not be aligned for that.
-    var words: InlineArray[UInt64, NAME_WORDS]  # NUL-terminated bytes
+    var words: Array[UInt64, NAME_WORDS]  # NUL-terminated bytes
     var hash: UInt64
     var whole: Bool  # False if the name did not fit; `run()` reports it
 
     def __init__(out self, s: StringSlice):
         var b = s.as_bytes()
         var n = min(len(b), NAME_CAP - 1)
-        self.words = InlineArray[UInt64, NAME_WORDS](uninitialized=True)
+        self.words = Array[UInt64, NAME_WORDS](uninitialized=True)
         # `used` covers the NUL at index n; zeroing first makes the padding
         # after it deterministic, which the word-wise hash relies on.
         var used = n // 8 + 1
@@ -155,14 +155,14 @@ struct Defines(Movable):
     """
 
     var op: Name
-    var items: InlineArray[Define, MAX_DEFINES]
+    var items: Array[Define, MAX_DEFINES]
     var count: Int
     var key: UInt64
     var bad: StaticString
 
     def __init__(out self, op: StringSlice):
         self.op = Name(op)
-        self.items = InlineArray[Define, MAX_DEFINES](uninitialized=True)
+        self.items = Array[Define, MAX_DEFINES](uninitialized=True)
         self.count = 0
         self.key = self.op.hash
         self.bad = "" if self.op.whole else "OP name too long"
@@ -257,30 +257,30 @@ struct KernelCall(Movable):
 
     var family: Name
     var defines: Defines
-    var specs: InlineArray[TensorSpec, MAX_CALL_SPECS]
+    var specs: Array[TensorSpec, MAX_CALL_SPECS]
     var nspecs: Int
-    var pool: InlineArray[Int, TUPLE_POOL_WORDS]
+    var pool: Array[Int, TUPLE_POOL_WORDS]
     var npool: Int
     # Tuples too long for `pool`, end to end. One arena rather than a list per
     # tuple: the slots are resolved in `run()`, so a reallocation here moves
     # nothing a slot has recorded.
     var spill: List[Int]
-    var slots: InlineArray[Int, MAX_CALL_SLOTS]
+    var slots: Array[Int, MAX_CALL_SLOTS]
     var nslots: Int
-    var fixups: InlineArray[Int, MAX_CALL_SLOTS]  # (slot << 2) | FIX_*
+    var fixups: Array[Int, MAX_CALL_SLOTS]  # (slot << 2) | FIX_*
     var nfix: Int
 
     def __init__(out self, family: StringSlice, op: StringSlice):
         self.family = Name(family)
         self.defines = Defines(op)
-        self.specs = InlineArray[TensorSpec, MAX_CALL_SPECS](uninitialized=True)
+        self.specs = Array[TensorSpec, MAX_CALL_SPECS](uninitialized=True)
         self.nspecs = 0
-        self.pool = InlineArray[Int, TUPLE_POOL_WORDS](uninitialized=True)
+        self.pool = Array[Int, TUPLE_POOL_WORDS](uninitialized=True)
         self.npool = 0
         self.spill = List[Int]()
-        self.slots = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+        self.slots = Array[Int, MAX_CALL_SLOTS](uninitialized=True)
         self.nslots = 0
-        self.fixups = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+        self.fixups = Array[Int, MAX_CALL_SLOTS](uninitialized=True)
         self.nfix = 0
         if not self.family.whole:
             self.defines.bad = "family name too long"
@@ -351,7 +351,7 @@ struct KernelCall(Movable):
             self.spill.append(v)
         self._reloc_slot(at, FIX_SPILL)
 
-    def _resolve(self, mut argv: InlineArray[Int, MAX_CALL_SLOTS]):
+    def _resolve(self, mut argv: Array[Int, MAX_CALL_SLOTS]):
         """The slots as the kernel reads them: every relocatable one becomes
         an address inside `self` here, so a call that was moved after it was
         built still hands over live storage."""
@@ -378,7 +378,7 @@ struct KernelCall(Movable):
         else:
             entry = l[].entry(self.family.text(), self.defines.sorted())
             l[].fast[self.defines.key] = entry
-        var argv = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+        var argv = Array[Int, MAX_CALL_SLOTS](uninitialized=True)
         self._resolve(argv)
         invoke_family(
             entry,

@@ -1,6 +1,9 @@
 from extensibility import ElementwiseUnaryMixedOp
 
-from .unary_math import elementwise_predicate, elementwise_unary
+from tmb.kernels.common.unary_math import (
+    elementwise_predicate,
+    elementwise_unary,
+)
 
 
 struct ElementwiseOp[kind: StaticString](ElementwiseUnaryMixedOp):

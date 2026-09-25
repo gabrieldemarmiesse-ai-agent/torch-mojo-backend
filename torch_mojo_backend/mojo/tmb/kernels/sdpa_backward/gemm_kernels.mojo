@@ -132,18 +132,14 @@ def _sdpa_ta_gemm_kernel[
     comptime if CAUSAL:
         k_start = min(k, row_base)
 
-    var accum = InlineArray[SIMD[F32, FRAG8], _NT_M * _NT_N](
-        fill=SIMD[F32, FRAG8](0)
-    )
+    var accum = Array[SIMD[F32, FRAG8], _NT_M * _NT_N](fill=SIMD[F32, FRAG8](0))
 
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
     # tail. Interior full slabs never come through here.
     @always_inline
     @parameter
-    def _slab_guarded(
-        kk: Int, mut acc: InlineArray[SIMD[F32, FRAG8], _NT_M * _NT_N]
-    ):
-        var afrag = InlineArray[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
+    def _slab_guarded(kk: Int, mut acc: Array[SIMD[F32, FRAG8], _NT_M * _NT_N]):
+        var afrag = Array[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
         comptime for mi in range(_NT_M):
             # Logical A row = stored A column index.
             var grow = row_base + mi * MMA8_DIM + frow
@@ -163,7 +159,7 @@ def _sdpa_ta_gemm_kernel[
                             )
                         af[s] = av
             afrag[mi] = af
-        var bfrag = InlineArray[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
+        var bfrag = Array[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
         comptime for ni in range(_NT_N):
             var bf = SIMD[F32, FRAG8](0)
             if kk + frow < k:
@@ -186,8 +182,8 @@ def _sdpa_ta_gemm_kernel[
     def _load_a_fast(
         ap0: Pointer[Scalar[F32], ImmutAnyOrigin],
         mp0: Pointer[Scalar[DType.bool], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[F32, FRAG8], _NT_M]:
-        var afrag = InlineArray[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
+    ) -> Array[SIMD[F32, FRAG8], _NT_M]:
+        var afrag = Array[SIMD[F32, FRAG8], _NT_M](uninitialized=True)
         comptime for mi in range(_NT_M):
             var p = ap0.unsafe_offset(mi * MMA8_DIM)
             var af = SIMD[F32, FRAG8](0)
@@ -206,8 +202,8 @@ def _sdpa_ta_gemm_kernel[
     @parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[F32], ImmutAnyOrigin],
-    ) -> InlineArray[SIMD[F32, FRAG8], _NT_N]:
-        var bfrag = InlineArray[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
+    ) -> Array[SIMD[F32, FRAG8], _NT_N]:
+        var bfrag = Array[SIMD[F32, FRAG8], _NT_N](uninitialized=True)
         comptime for ni in range(_NT_N):
             bfrag[ni] = (bp0.unsafe_offset(ni * MMA8_DIM)).unsafe_load[
                 width=FRAG8
@@ -217,9 +213,9 @@ def _sdpa_ta_gemm_kernel[
     @always_inline
     @parameter
     def _mma_block(
-        afrag: InlineArray[SIMD[F32, FRAG8], _NT_M],
-        bfrag: InlineArray[SIMD[F32, FRAG8], _NT_N],
-        mut acc: InlineArray[SIMD[F32, FRAG8], _NT_M * _NT_N],
+        afrag: Array[SIMD[F32, FRAG8], _NT_M],
+        bfrag: Array[SIMD[F32, FRAG8], _NT_N],
+        mut acc: Array[SIMD[F32, FRAG8], _NT_M * _NT_N],
     ):
         comptime for mi in range(_NT_M):
             comptime for ni in range(_NT_N):

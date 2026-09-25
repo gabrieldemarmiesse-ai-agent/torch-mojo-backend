@@ -123,14 +123,16 @@ building the call, exactly as the old Python descriptor's
 
 ## Shared unary operations
 
-`tmb/graph/unary_math.mojo` owns the SIMD expressions used by both native
-unary kernels and `torch.compile`. Half inputs are evaluated in float32 and
-rounded once on output. `tmb/graph/math_utils.mojo` holds the existing accurate square
-root and tangent helpers; `op_utils` re-exports them for other native kernels.
-They live in the graph package because MAX precompiles that directory on its
-own, without any `-I`, so it can only import its own siblings; the kernels
-import them as `from tmb.graph.unary_math import ...`. Edits to either
-shared module invalidate the native build cache.
+`tmb/kernels/common/unary_math.mojo` owns the SIMD expressions used by both
+native unary kernels and `torch.compile`. Half inputs are evaluated in float32
+and rounded once on output. `tmb/kernels/common/math_utils.mojo` holds the
+existing accurate square root and tangent helpers; `op_utils` re-exports them
+for other native kernels, and `div_math.mojo` beside them holds torch.div's
+three modes. They sit outside `tmb/graph` although the graph ops use them:
+the graph package imports the kernel tree, so a kernel module importing
+`tmb.graph.*` would reach the package twice while it is precompiled, as
+`graph` and as `tmb.graph`, which Mojo 1.1 rejects. Edits to any of them
+invalidate the native build cache.
 
 Native contiguous unary operations delegate aligned GPU work to Modular's
 public `max.algorithm.elementwise`, on NVIDIA, AMD, and Apple. The general
@@ -192,7 +194,7 @@ kernels too:
 | `native_layer_norm` (weight and bias given) | `aten_native_layer_norm` | `native_layer_norm` | `LayerNormForward` (`enqueue_norm_rows`), float32 mean / rstd |
 | `embedding` | `aten_embedding` | `native_embedding` | `Gather0` (`_gather0`) |
 
-`gelu` already ran the shared `tmb/graph/unary_math.mojo` in both modes
+`gelu` already ran the shared `tmb/kernels/common/unary_math.mojo` in both modes
 (through MAX's fusible `ElementwiseUnaryOp` registration); the elementwise
 glue (`add`, `mul`, `eq`, `masked_fill`, `clone`) and the view ops stay MAX's,
 which fuses them into their neighbors. The routes take only operands that

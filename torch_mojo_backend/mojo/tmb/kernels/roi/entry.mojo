@@ -32,7 +32,7 @@ from tmb.kernels.common.variant_gates import (
 )
 
 # Vector kernel arguments lack Metal buffer metadata; use an aggregate.
-comptime DivisorArgs = InlineArray[UInt32, 4]
+comptime DivisorArgs = Array[UInt32, 4]
 
 comptime BLOCK = 256
 # Measured on H100: 32 forward blocks/SM, 8 scatter blocks/SM.
@@ -251,7 +251,7 @@ def _pool_geometry[
         )
         comptime for field in range(5):
             geometry[unsafe_offset=Int(index) * 5 + field] = Int64(
-                bounds[field]
+                rebind[Int](bounds[field])
             )
         index += Int32(grid_dim.x) * BLOCK
 

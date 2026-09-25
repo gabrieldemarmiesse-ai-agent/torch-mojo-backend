@@ -201,7 +201,7 @@ def _tn_core_kernel[
     var am0 = wr * WM + tr * TM
     var bn0 = wc * WN + tc * 4
 
-    var acc = InlineArray[SIMD[F32, 4], TM * QN](fill=SIMD[F32, 4](0))
+    var acc = Array[SIMD[F32, 4], TM * QN](fill=SIMD[F32, 4](0))
 
     var nslabs = ceildiv(k_end - k_start, BK)
     if nslabs == 0:
@@ -311,7 +311,7 @@ def _tn_core_kernel[
         var a_base_s = a_smem.unsafe_offset(aoff)
         var b_base_s = b_smem.unsafe_offset(boff)
         var a_cur = a_base_s.unsafe_load[width=TM, alignment=16](am0)
-        var b_cur = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
+        var b_cur = Array[SIMD[F32, 4], QN](uninitialized=True)
         comptime for q in range(QN):
             b_cur[q] = b_base_s.unsafe_load[width=4, alignment=16](
                 bn0 + q * (LC * 4)
@@ -320,7 +320,7 @@ def _tn_core_kernel[
             var a_nxt = a_base_s.unsafe_load[width=TM, alignment=16](
                 (kk + 1) * BM + am0
             )
-            var b_nxt = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
+            var b_nxt = Array[SIMD[F32, 4], QN](uninitialized=True)
             comptime for q in range(QN):
                 b_nxt[q] = b_base_s.unsafe_load[width=4, alignment=16](
                     (kk + 1) * BN + bn0 + q * (LC * 4)
@@ -519,7 +519,7 @@ def _tn_split_kernel[
     var am0 = wr * WM + tr * TM
     var bn0 = wc * WN + tc * 4
 
-    var acc = InlineArray[SIMD[F32, 4], TM * QN](fill=SIMD[F32, 4](0))
+    var acc = Array[SIMD[F32, 4], TM * QN](fill=SIMD[F32, 4](0))
 
     # Block-internal split-K: group 0 takes slabs [0, nsl0), group 1 takes
     # [nsl0, ns). Group 0 gets the extra slab and is the finisher.
@@ -607,7 +607,7 @@ def _tn_split_kernel[
         var a_base_s = a_smem.unsafe_offset(aoff)
         var b_base_s = b_smem.unsafe_offset(boff)
         var a_cur = a_base_s.unsafe_load[width=TM, alignment=16](am0)
-        var b_cur = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
+        var b_cur = Array[SIMD[F32, 4], QN](uninitialized=True)
         comptime for q in range(QN):
             b_cur[q] = b_base_s.unsafe_load[width=4, alignment=16](
                 bn0 + q * (LC * 4)
@@ -616,7 +616,7 @@ def _tn_split_kernel[
             var a_nxt = a_base_s.unsafe_load[width=TM, alignment=16](
                 (kk + 1) * BM + am0
             )
-            var b_nxt = InlineArray[SIMD[F32, 4], QN](uninitialized=True)
+            var b_nxt = Array[SIMD[F32, 4], QN](uninitialized=True)
             comptime for q in range(QN):
                 b_nxt[q] = b_base_s.unsafe_load[width=4, alignment=16](
                     (kk + 1) * BN + bn0 + q * (LC * 4)

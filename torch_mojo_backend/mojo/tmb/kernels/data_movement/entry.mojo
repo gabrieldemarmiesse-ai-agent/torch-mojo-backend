@@ -17,7 +17,7 @@
 from std.atomic import Atomic, Ordering
 from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
@@ -680,7 +680,7 @@ struct CatSeg(DevicePassable, ImplicitlyCopyable, TrivialRegisterPassable):
 
 @always_inline
 def _cat_owner(
-    segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, tile: Int
+    segs: Array[CatSeg, CAT_CAP], nseg: Int, tile: Int
 ) -> Tuple[Int, Int]:
     """(input owning `tile`, first tile of that input): the smallest index
     whose exclusive tile prefix sum is past `tile`."""
@@ -741,7 +741,7 @@ def _cat_batched_kernel[
     dtype: DType, width: Int
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
-    segs: InlineArray[CatSeg, CAT_CAP],
+    segs: Array[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
     outer_arg: Int64,
@@ -817,7 +817,7 @@ def _cat_slots_kernel[
     p5: Pointer[Scalar[dtype], ImmutAnyOrigin],
     p6: Pointer[Scalar[dtype], ImmutAnyOrigin],
     p7: Pointer[Scalar[dtype], ImmutAnyOrigin],
-    segs: InlineArray[CatSeg, CAT_CAP],
+    segs: Array[CatSeg, CAT_CAP],
     nseg_arg: Int64,
     tiles_arg: Int64,
     outer_arg: Int64,
@@ -851,7 +851,7 @@ def _cat_slots_kernel[
 @always_inline
 def _cat_slot_ptr[
     dtype: DType
-](segs: InlineArray[CatSeg, CAT_CAP], nseg: Int, index: Int) -> Pointer[
+](segs: Array[CatSeg, CAT_CAP], nseg: Int, index: Int) -> Pointer[
     Scalar[dtype], ImmutAnyOrigin
 ]:
     """A translatable pointer for every pointer argument: padding slots
@@ -880,7 +880,7 @@ def _cat_launch_width[
     var dst_off = 0
     var index = 0
     while index < n:
-        var segs = InlineArray[CatSeg, CAT_CAP](fill=CatSeg(0, 0, 0, 0))
+        var segs = Array[CatSeg, CAT_CAP](fill=CatSeg(0, 0, 0, 0))
         var tiles = 0
         var nseg = 0
         while index < n and nseg < CAT_CAP:

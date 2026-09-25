@@ -142,7 +142,7 @@
 
 from std.atomic import Atomic, Ordering, fence
 from std.builtin.device_passable import DevicePassable
-from std.collections import InlineArray
+from std.collections import Array
 from std.ffi import _get_global_or_null, external_call
 from std.os import getenv
 from std.gpu import (
@@ -680,7 +680,7 @@ def publish_fault(
 
 @always_inline
 def _record_deadline(
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     rank: Int,
     code: Int,
     target: UInt64,
@@ -715,7 +715,7 @@ def _record_deadline(
 
 @always_inline
 def _sync(
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     world: Int,
     rank: Int,
     code: Int,
@@ -1063,7 +1063,7 @@ def _copy_vec[
     var v = tid
     var lim = nvec - (U - 1) * stride
     while v < lim:
-        var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+        var tmp = Array[SIMD[dtype, W], U](uninitialized=True)
         comptime for u in range(U):
             tmp[u] = src.unsafe_load[width=W, alignment=16](
                 (v + u * stride) * W
@@ -1077,7 +1077,7 @@ def _copy_vec[
     # before the first store, as the main loop does, rather than one round
     # trip per vector. Same vector -> thread mapping either way.
     if v < nvec:
-        var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+        var tmp = Array[SIMD[dtype, W], U](uninitialized=True)
         comptime for u in range(U):
             if v + u * stride < nvec:
                 tmp[u] = src.unsafe_load[width=W, alignment=16](
@@ -1170,7 +1170,7 @@ def _copy_bytes2[
         var v = tid
         var lim = nvec - (U - 1) * stride
         while v < lim:
-            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            var tmp = Array[SIMD[DType.uint8, 16], U](uninitialized=True)
             comptime for u in range(U):
                 tmp[u] = src.unsafe_load[width=16, alignment=16](
                     (v + u * stride) * 16
@@ -1184,7 +1184,7 @@ def _copy_bytes2[
                 )
             v += U * stride
         if v < nvec:
-            var tmp = InlineArray[SIMD[DType.uint8, 16], U](uninitialized=True)
+            var tmp = Array[SIMD[DType.uint8, 16], U](uninitialized=True)
             comptime for u in range(U):
                 if v + u * stride < nvec:
                     tmp[u] = src.unsafe_load[width=16, alignment=16](
@@ -1290,7 +1290,7 @@ def _copy_span_scaled[
             var v = tid
             var lim = vc - (U - 1) * stride
             while v < lim:
-                var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+                var tmp = Array[SIMD[dtype, W], U](uninitialized=True)
                 comptime for u in range(U):
                     tmp[u] = src.unsafe_load[width=W, alignment=16](
                         (v + u * stride) * W
@@ -1302,7 +1302,7 @@ def _copy_span_scaled[
                     )
                 v += U * stride
             if v < vc:
-                var tmp = InlineArray[SIMD[dtype, W], U](uninitialized=True)
+                var tmp = Array[SIMD[dtype, W], U](uninitialized=True)
                 comptime for u in range(U):
                     if v + u * stride < vc:
                         tmp[u] = src.unsafe_load[width=W, alignment=16](
@@ -1466,7 +1466,7 @@ def shard_range(
 def _ar_twoshot_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     numel: Int64,
@@ -1553,7 +1553,7 @@ def _ar_twoshot_kernel[
     # index is a runtime value, which is why the reduce's own source pointers
     # are still formed by arithmetic.  `NW == 0` (world 3, 5, 6, 7) has no
     # comptime bound and falls back to a second pass over the shard.
-    var gout = InlineArray[Pointer[Scalar[dtype], MutAnyOrigin], MAX_WORLD](
+    var gout = Array[Pointer[Scalar[dtype], MutAnyOrigin], MAX_WORLD](
         uninitialized=True
     )
     comptime if _AMD and NW > 0:
@@ -1697,7 +1697,7 @@ def _ar_twoshot_kernel[
 def _ar_oneshot_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     numel: Int64,
@@ -1858,7 +1858,7 @@ def _ar_oneshot_kernel[
 def _rs_stage_body[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     arena_off: Int,
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     n: Int,
@@ -2017,7 +2017,7 @@ def _rs_stage_body[
 def _rs_stage_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     numel: Int64,
     per_e: Int64,
@@ -2054,7 +2054,7 @@ def _rs_stage_kernel[
 def _ag_finish_body[
     dtype: DType, W: Int, U: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     arena_off: Int,
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     n: Int,
@@ -2117,7 +2117,7 @@ def _ag_finish_body[
 def _ag_finish_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     numel: Int64,
     per_e: Int64,
@@ -2230,7 +2230,7 @@ def _rs_one[
 def _rs_kernel[
     dtype: DType, W: Int, U: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     count: Int64,
@@ -2369,7 +2369,7 @@ def _rs_kernel[
 def _bcast_kernel[
     U: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     send: Pointer[UInt8, MutAnyOrigin],
     recv: Pointer[UInt8, MutAnyOrigin],
     nbytes: Int64,
@@ -2512,7 +2512,7 @@ def _bcast_kernel[
 @always_inline
 def _allgather_rank[
     MAPPED: Bool
-](rank_at: InlineArray[Int32, MAX_WORLD], rank: Int) -> Int:
+](rank_at: Array[Int32, MAX_WORLD], rank: Int) -> Int:
     comptime if MAPPED:
         return Int(rank_at[rank])
     return rank
@@ -2549,7 +2549,7 @@ def _ag_release_to_nic(
 def _allgather_body[
     U: Int, MAPPED: Bool, GATED: Bool
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
     out_ptr: Pointer[UInt8, MutAnyOrigin],
     nbytes: Int64,
@@ -2559,7 +2559,7 @@ def _allgather_body[
     rank_i: Int32,
     flag_base: UInt64,
     timeout_ns: UInt64,
-    rank_at: InlineArray[Int32, MAX_WORLD],
+    rank_at: Array[Int32, MAX_WORLD],
     mb_req: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
 ):
@@ -2710,7 +2710,7 @@ def _allgather_body[
 def _allgather_kernel[
     U: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
     out_ptr: Pointer[UInt8, MutAnyOrigin],
     nbytes: Int64,
@@ -2732,7 +2732,7 @@ def _allgather_kernel[
         rank_i,
         flag_base,
         timeout_ns,
-        InlineArray[Int32, MAX_WORLD](fill=0),
+        Array[Int32, MAX_WORLD](fill=0),
         regions[0].unsafe_bitcast[UInt64](),
         UInt64(0),
     )
@@ -2745,7 +2745,7 @@ def _allgather_kernel[
 def _allgather_mapped_kernel[
     U: Int, GATED: Bool
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[UInt8, MutAnyOrigin],
     out_ptr: Pointer[UInt8, MutAnyOrigin],
     nbytes: Int64,
@@ -2755,7 +2755,7 @@ def _allgather_mapped_kernel[
     rank_i: Int32,
     flag_base: UInt64,
     timeout_ns: UInt64,
-    rank_at: InlineArray[Int32, MAX_WORLD],
+    rank_at: Array[Int32, MAX_WORLD],
     mb_req: Pointer[UInt64, MutAnyOrigin],
     seq: UInt64,
 ):
@@ -2788,7 +2788,7 @@ grids may reach MAX_BLOCKS, never gate."""
 )
 @__name("ccl_rank_gate")
 def _gate_kernel(
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     world_i: Int32,
     rank_i: Int32,
     code: Int32,
@@ -2994,12 +2994,10 @@ def _enqueue_cached_dim[
 @always_inline
 def _region_ptrs(
     regions: StaticTuple[Int, MAX_WORLD], rank: Int, world: Int
-) -> InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD]:
+) -> Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD]:
     """Peer region bases as mapped in this process. Unused slots are filled
     with my own region so no kernel can ever hold a null pointer."""
-    var out = InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD](
-        uninitialized=True
-    )
+    var out = Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD](uninitialized=True)
     for r in range(MAX_WORLD):
         var addr = regions[r] if r < world else regions[rank]
         out[r] = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
@@ -3073,7 +3071,7 @@ def _launch_allreduce[
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     numel: Int,
@@ -3316,7 +3314,7 @@ def _launch_rs_stage[
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     numel: Int,
     per: Int,
@@ -3352,7 +3350,7 @@ def _launch_ag_finish[
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     out_ptr: Int,
     numel: Int,
     per: Int,
@@ -3598,7 +3596,7 @@ def _launch_rs[
 ](
     ctx: DeviceContext,
     stream: DeviceStream,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     count: Int,
@@ -3928,7 +3926,7 @@ def allgather_mapped[
         max_blocks,
         max(1, (nbytes_per_rank // 16 + BLOCK - 1) // BLOCK),
     )
-    var ranks = InlineArray[Int32, MAX_WORLD](fill=0)
+    var ranks = Array[Int32, MAX_WORLD](fill=0)
     for i in range(world):
         ranks[i] = rank_at[i]
     _enqueue_cached[_allgather_mapped_kernel[U, GATED]](

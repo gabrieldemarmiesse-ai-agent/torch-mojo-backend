@@ -554,7 +554,7 @@ def op_local_scalar_dense(
         raise Error(
             "a Tensor with ", t.numel, " elements cannot be converted to Scalar"
         )
-    var buf = InlineArray[UInt8, 16](fill=0)
+    var buf = Array[UInt8, 16](fill=0)
     read_bytes_sync(ctx_for(t.device), t.ptr, Int(buf.unsafe_ptr()), t.itemsize)
     var p = buf.unsafe_ptr()
     if t.dtype == DType.bool:

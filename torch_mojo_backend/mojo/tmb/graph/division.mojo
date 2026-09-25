@@ -1,7 +1,7 @@
 import extensibility as compiler
 from extensibility import ElementwiseBinaryOp
 
-from .div_math import floor_div, trunc_div, true_div
+from tmb.kernels.common.div_math import floor_div, trunc_div, true_div
 
 
 @compiler.register("div_true")

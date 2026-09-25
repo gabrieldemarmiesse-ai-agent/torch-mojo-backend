@@ -25,7 +25,7 @@
 #     is enqueued" and rely on stream order).
 
 from std.atomic import Atomic, Ordering
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -279,7 +279,7 @@ def _await_exchange(
 def _fused_ar_kernel[
     dtype: DType, W: Int, NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     mb_req: Pointer[UInt64, MutAnyOrigin],
@@ -468,7 +468,7 @@ def _launch_fused[
     ctx: DeviceContext,
     stream: DeviceStream,
     blocks: Int,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     mailbox: StaticTuple[Int, 3],

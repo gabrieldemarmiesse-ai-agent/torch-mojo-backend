@@ -595,9 +595,11 @@ Believe them before rediscovering them at GPU-hour prices.
   `from tmb.kernels.roi.entry import bilinear`. No bare names, no relative
   imports (the compiler rejects them in the file passed to `mojo build`,
   and every `entry.mojo` is such a file) — except inside `tmb/graph`, the
-  MAX custom-op package, which MAX precompiles without any `-I`, so it may
-  only import its own siblings, relatively. `tests/test_mojo_imports.py`
-  enforces all of this. Never name a module after its directory: the
+  MAX custom-op package, whose modules may also import a sibling
+  relatively. Nothing may import `tmb.graph.*`: the package is
+  precompiled on its own and imports the kernel tree, so reaching back into
+  it would reach it twice, as `graph` and as `tmb.graph`, which Mojo 1.1
+  rejects; code both sides share lives in `tmb/kernels/common`. `tests/test_mojo_imports.py` enforces all of this. Never name a module after its directory: the
   package shadows the file, which is why every built library is
   `entry.mojo`.
 - Cache/source registration for new `.mojo` files: the extension loader

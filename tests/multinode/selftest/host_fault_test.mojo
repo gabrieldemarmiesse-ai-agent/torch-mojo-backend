@@ -9,7 +9,7 @@ from tmb.ccl.collectives_kernels import (
 
 
 def main() raises:
-    var storage = InlineArray[UInt64, 16](uninitialized=True)
+    var storage = Array[UInt64, 16](uninitialized=True)
     var page = Pointer(to=storage).unsafe_bitcast[UInt64]()
     for device_first in range(2):
         for i in range(16):

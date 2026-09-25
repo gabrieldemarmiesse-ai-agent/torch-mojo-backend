@@ -44,16 +44,21 @@ from max.gpu.host import DeviceContext
 from std.gpu import thread_idx
 
 
-def fill_kernel(p: UnsafePointer[Float32, MutAnyOrigin]):
-    p[thread_idx.x] = Float32(thread_idx.x)
+def fill_kernel(p: Pointer[Float32, MutAnyOrigin]):
+    p[unsafe_offset=Int(thread_idx.x)] = Float32(thread_idx.x)
 
 
 @export
-def run_fill(n: Int) raises:
-    var ctx = DeviceContext()
-    var buf = ctx.enqueue_create_buffer[DType.float32](n)
-    ctx.enqueue_function[fill_kernel](buf.unsafe_ptr(), grid_dim=1, block_dim=n)
-    ctx.synchronize()
+def run_fill(n: Int) abi("C"):
+    try:
+        var ctx = DeviceContext()
+        var buf = ctx.enqueue_create_buffer[DType.float32](n)
+        ctx.enqueue_function[fill_kernel](
+            buf.unsafe_ptr(), grid_dim=1, block_dim=n
+        )
+        ctx.synchronize()
+    except:
+        pass
 """
 
 

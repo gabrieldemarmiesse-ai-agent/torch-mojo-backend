@@ -26,8 +26,8 @@ def _spec(ptr: Int) -> TensorSpec:
     )
 
 
-def _resolved(call: KernelCall) -> InlineArray[Int, MAX_CALL_SLOTS]:
-    var argv = InlineArray[Int, MAX_CALL_SLOTS](uninitialized=True)
+def _resolved(call: KernelCall) -> Array[Int, MAX_CALL_SLOTS]:
+    var argv = Array[Int, MAX_CALL_SLOTS](uninitialized=True)
     call._resolve(argv)
     return argv^
 

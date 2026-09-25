@@ -266,7 +266,7 @@ def _log_softmax_bwd_reg_kernel[
         var nvec = (cols - head) // VEC
         var tail_start = head + nvec * VEC
 
-        var cache = InlineArray[SIMD[dtype, VEC], slots](uninitialized=True)
+        var cache = Array[SIMD[dtype, VEC], slots](uninitialized=True)
         var vsum = SIMD[DType.float32, VEC](0)
         var ssum = Float32(0)
         if tid < head:

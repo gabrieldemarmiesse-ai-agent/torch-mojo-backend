@@ -1,6 +1,6 @@
 """Every build's cache key is the hash of the entry's import closure, so an
-edit to shared code (the SIMD math in tmb/graph that both the graph backend
-and the eager kernels use, the op_utils every family imports) must
+edit to shared code (the SIMD math in tmb/kernels/common that both the graph
+backend and the eager kernels use, the op_utils every family imports) must
 invalidate the kernel builds AND the backend library that reach it.
 
 The two walkers -- `Loader._closure` in tmb/backend/loader.mojo for the
@@ -24,24 +24,22 @@ REAL_ROOT = PACKAGE / "mojo"
 
 def _fake_root(tmp_path: Path) -> tuple[Path, Path, Path]:
     """A miniature of the real layout: a family entry importing op_utils,
-    which imports the graph package's math, which imports a sibling
-    relatively (the one place relative imports remain)."""
+    which imports the shared math, which imports a sibling relatively (the
+    grammar tmb/graph's modules still use, so the walkers must follow it)."""
     root = tmp_path / "mojo"
     (root / "tmb/kernels/example").mkdir(parents=True)
     (root / "tmb/kernels/common").mkdir()
-    (root / "tmb/graph").mkdir()
     (root / "tmb/backend").mkdir()
     (root / "tmb/kernels/example/entry.mojo").write_text(
         "from tmb.kernels.common.op_utils import Argv\n"
         "from std.ffi import external_call\n"
     )
     (root / "tmb/kernels/common/op_utils.mojo").write_text(
-        "from tmb.graph.unary_math import elementwise_unary\n"
+        "from tmb.kernels.common.unary_math import elementwise_unary\n"
     )
-    (root / "tmb/graph/__init__.mojo").write_text("")
-    unary = root / "tmb/graph/unary_math.mojo"
+    unary = root / "tmb/kernels/common/unary_math.mojo"
     unary.write_text("from .math_utils import ieee_sqrt\n# first implementation\n")
-    math = root / "tmb/graph/math_utils.mojo"
+    math = root / "tmb/kernels/common/math_utils.mojo"
     math.write_text("# original math\n")
     (root / "tmb/backend/entry.mojo").write_text(
         "from tmb.kernels.common.op_utils import Argv\n"
@@ -56,9 +54,9 @@ def test_python_walker_follows_absolute_and_relative_imports(
     monkeypatch.setattr(native, "_MOJO_ROOT", root)
     closure = native.mojo_import_closure(root / "tmb/kernels/example/entry.mojo")
     assert [p.relative_to(root).as_posix() for p in closure] == [
-        "tmb/graph/math_utils.mojo",
-        "tmb/graph/unary_math.mojo",
+        "tmb/kernels/common/math_utils.mojo",
         "tmb/kernels/common/op_utils.mojo",
+        "tmb/kernels/common/unary_math.mojo",
         "tmb/kernels/example/entry.mojo",
     ]
 
@@ -163,4 +161,6 @@ def test_both_walkers_agree_on_the_real_tree(cache_probe: Path, tmp_path: Path):
         from_python = sorted(str(p) for p in native.mojo_import_closure(entry))
         assert from_mojo == from_python, family
         assert any(p.endswith("tmb/kernels/common/op_utils.mojo") for p in from_python)
-        assert any(p.endswith("tmb/graph/math_utils.mojo") for p in from_python)
+        assert any(
+            p.endswith("tmb/kernels/common/math_utils.mojo") for p in from_python
+        )

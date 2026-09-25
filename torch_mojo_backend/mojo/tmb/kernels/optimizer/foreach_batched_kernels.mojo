@@ -40,7 +40,7 @@ everywhere else.
 """
 
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, min
@@ -373,8 +373,8 @@ def _few_element[
 def _foreach_ew_kernel[
     dtype: DType, op: Int
 ](
-    descs: InlineArray[ForeachEwDesc, FEW_DESC_CAP],
-    scalars: InlineArray[Float32, FEW_DESC_CAP],
+    descs: Array[ForeachEwDesc, FEW_DESC_CAP],
+    scalars: Array[Float32, FEW_DESC_CAP],
     desc_count_arg: Int64,
     chunk_elements_arg: Int64,
     scalar_addr_arg: Int64,
@@ -520,9 +520,7 @@ def foreach_ew_chunk_elements(total_elements: Int, ctx: DeviceContext) -> Int:
 
 
 @always_inline
-def _few_backfill(
-    mut addrs: InlineArray[Int, FOREACH_EW_SLOTS], slot_count: Int
-):
+def _few_backfill(mut addrs: Array[Int, FOREACH_EW_SLOTS], slot_count: Int):
     """Give empty/padding slots a valid dummy address (never dereferenced:
     those slots own zero chunks). Metal still requires every pointer-typed
     argument to translate to a real buffer."""
@@ -539,8 +537,8 @@ def _few_backfill(
 def _foreach_ew_enqueue_apple[
     dtype: DType, op: Int
 ](
-    descs: InlineArray[ForeachEwDesc, FEW_DESC_CAP],
-    scalars: InlineArray[Float32, FEW_DESC_CAP],
+    descs: Array[ForeachEwDesc, FEW_DESC_CAP],
+    scalars: Array[Float32, FEW_DESC_CAP],
     desc_count: Int,
     scalar_addr: Int,
     weight: Float32,
@@ -559,12 +557,12 @@ def _foreach_ew_enqueue_apple[
             var group_first_chunk = 0
             if desc_index != 0:
                 group_first_chunk = descs[desc_index - 1].chunk_end
-            var first_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var second_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var third_addrs = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var chunk_ends = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var numels = InlineArray[Int, FOREACH_EW_SLOTS](fill=0)
-            var group_scalars = InlineArray[Float32, FOREACH_EW_SLOTS](fill=0.0)
+            var first_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var second_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var third_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var chunk_ends = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var numels = Array[Int, FOREACH_EW_SLOTS](fill=0)
+            var group_scalars = Array[Float32, FOREACH_EW_SLOTS](fill=0.0)
             var slot = 0
             while desc_index < desc_count and slot < FOREACH_EW_SLOTS:
                 var desc = descs[desc_index]
@@ -680,8 +678,8 @@ def _foreach_ew_enqueue_apple[
 def foreach_ew_enqueue[
     dtype: DType, op: Int
 ](
-    descs: InlineArray[ForeachEwDesc, FEW_DESC_CAP],
-    scalars: InlineArray[Float32, FEW_DESC_CAP],
+    descs: Array[ForeachEwDesc, FEW_DESC_CAP],
+    scalars: Array[Float32, FEW_DESC_CAP],
     desc_count: Int,
     total_chunks: Int,
     chunk_elements: Int,

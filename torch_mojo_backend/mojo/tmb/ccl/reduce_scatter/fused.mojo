@@ -1,6 +1,6 @@
 # Hierarchical fp32 reduce-scatter, including every pipelined chunk, in one launch.
 from std.atomic import Atomic, Ordering
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import (
     MAX_THREADS_PER_BLOCK_METADATA,
     block_idx,
@@ -88,7 +88,7 @@ def _sum_out(
     var v = tid
     while v < vc:
         # Four rows per iteration so 4 * (1 + npeers) loads are in flight.
-        var acc = InlineArray[SIMD[DType.float32, 4], 4](uninitialized=True)
+        var acc = Array[SIMD[DType.float32, 4], 4](uninitialized=True)
         comptime for u in range(4):
             if v + u * stride < vc:
                 acc[u] = partial.unsafe_load[width=4, alignment=16](
@@ -126,7 +126,7 @@ def _sum_out(
 def _fused_rs_kernel[
     NW: Int
 ](
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Pointer[Float32, MutAnyOrigin],
     out_ptr: Pointer[Float32, MutAnyOrigin],
     mb_req: Pointer[UInt64, MutAnyOrigin],
@@ -144,7 +144,7 @@ def _fused_rs_kernel[
     flag_base: UInt64,
     scale: Float32,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
     vector_ok: Int32,
 ):
     var world = NW if NW > 0 else Int(world_i)
@@ -336,7 +336,7 @@ def _launch[
     ctx: DeviceContext,
     stream: DeviceStream,
     blocks: Int,
-    regions: InlineArray[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
+    regions: Array[Pointer[UInt8, MutAnyOrigin], MAX_WORLD],
     in_ptr: Int,
     out_ptr: Int,
     mailbox: StaticTuple[Int, 3],
@@ -352,7 +352,7 @@ def _launch[
     generation: Int,
     scale: Float32,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
 ) raises:
     _enqueue_cached_dim[_fused_rs_kernel[NW]](
         ctx,
@@ -411,7 +411,7 @@ def reduce_scatter_fused(
     scale: Float32,
     blocks: Int,
     timeout_ns: UInt64,
-    rank_ids: InlineArray[Int32, MAX_WORLD * MAX_NODES],
+    rank_ids: Array[Int32, MAX_WORLD * MAX_NODES],
 ) raises:
     if count <= 0:
         return

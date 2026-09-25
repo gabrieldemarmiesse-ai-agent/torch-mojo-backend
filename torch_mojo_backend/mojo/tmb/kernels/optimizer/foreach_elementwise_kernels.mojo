@@ -22,7 +22,7 @@ back to (`elementwise`/`logic`), keeping the batched path
 bit-compatible with the sequential per-tensor decomposition.
 """
 
-from std.collections import InlineArray
+from std.collections import Array
 from std.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import min
@@ -49,10 +49,10 @@ comptime _ImmutPtr = Pointer[Scalar[DType.float32], ImmutAnyOrigin]
 
 # Per-slot chunk offsets and lengths as they cross the launch ABI. `Int` is
 # not device-passable (its width differs between host and device, and Metal's
-# device `Int` is not the host's), and an `InlineArray` encodes element-wise,
+# device `Int` is not the host's), and an `Array` encodes element-wise,
 # so the array element type has to be fixed-width too. Kernels convert back
 # to `Int` at the use site and all index math stays in `Int`.
-comptime _SlotInts = InlineArray[Int64, FOREACH_EW_SLOTS]
+comptime _SlotInts = Array[Int64, FOREACH_EW_SLOTS]
 
 
 @always_inline
@@ -63,7 +63,7 @@ def _addr_ptr(addr: Int) -> _MutPtr:
 
 
 @always_inline
-def _slot_ints(values: InlineArray[Int, FOREACH_EW_SLOTS]) -> _SlotInts:
+def _slot_ints(values: Array[Int, FOREACH_EW_SLOTS]) -> _SlotInts:
     """Widen a host-side per-slot `Int` array to the launch ABI type."""
     var widened = _SlotInts(fill=Int64(0))
     for slot in range(FOREACH_EW_SLOTS):
@@ -108,7 +108,7 @@ def _slot_begin(chunk_ends: _SlotInts, chunk: Int) -> Tuple[Int, Int]:
 
 # Metal constraint (verified like the descriptor case in
 # foreach_clip_kernels.mojo): copying pointer-typed kernel *arguments* into an
-# InlineArray and indexing it dynamically miscompiles — stores through the
+# Array and indexing it dynamically miscompiles — stores through the
 # selected pointer are silently dropped. A branch chain over the original
 # arguments keeps every access on the translated argument values.
 
@@ -186,7 +186,7 @@ def _foreach_scalar_kernel[
     p7: _MutPtr,
     chunk_ends: _SlotInts,
     numels: _SlotInts,
-    scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
+    scalars: Array[Float32, FOREACH_EW_SLOTS],
 ):
     """In-place x = x (op) scalar[slot], one scalar per slot.
 
@@ -400,7 +400,7 @@ def _foreach_addc_kernel[
     c7: _ImmutPtr,
     chunk_ends: _SlotInts,
     numels: _SlotInts,
-    scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
+    scalars: Array[Float32, FOREACH_EW_SLOTS],
 ):
     """In-place self = self + value[slot] * (t1 * t2) or (t1 / t2).
 
@@ -510,7 +510,7 @@ def _gather_scalars_kernel(
 
 def enqueue_foreach_gather_scalars_f32(
     out_addr: Int,
-    in_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
+    in_addrs: Array[Int, FOREACH_EW_SLOTS],
     base: Int,
     count: Int,
     ctx: DeviceContext,
@@ -541,10 +541,10 @@ def enqueue_foreach_gather_scalars_f32(
 def enqueue_foreach_scalar_f32[
     op_code: Int
 ](
-    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
-    scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
+    addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
+    scalars: Array[Float32, FOREACH_EW_SLOTS],
     total_chunks: Int,
     ctx: DeviceContext,
 ) raises:
@@ -572,9 +572,9 @@ def enqueue_foreach_scalar_f32[
 
 
 def enqueue_foreach_mul_tensor_f32(
-    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
     scalar_addr: Int,
     total_chunks: Int,
     ctx: DeviceContext,
@@ -603,9 +603,9 @@ def enqueue_foreach_mul_tensor_f32(
 
 
 def enqueue_foreach_nonfinite_unscale_f32(
-    addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
     inv_scale_addr: Int,
     found_inf_addr: Int,
     total_chunks: Int,
@@ -636,10 +636,10 @@ def enqueue_foreach_nonfinite_unscale_f32(
 
 
 def enqueue_foreach_lerp_f32(
-    self_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    end_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    self_addrs: Array[Int, FOREACH_EW_SLOTS],
+    end_addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
     weight: Float32,
     one_minus_weight: Float32,
     low_branch: Int,
@@ -682,12 +682,12 @@ def enqueue_foreach_lerp_f32(
 def enqueue_foreach_addc_f32[
     op_code: Int
 ](
-    self_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    first_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    second_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
-    scalars: InlineArray[Float32, FOREACH_EW_SLOTS],
+    self_addrs: Array[Int, FOREACH_EW_SLOTS],
+    first_addrs: Array[Int, FOREACH_EW_SLOTS],
+    second_addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
+    scalars: Array[Float32, FOREACH_EW_SLOTS],
     total_chunks: Int,
     ctx: DeviceContext,
 ) raises:
@@ -731,10 +731,10 @@ def enqueue_foreach_addc_f32[
 
 
 def enqueue_foreach_sqrt_f32(
-    in_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    out_addrs: InlineArray[Int, FOREACH_EW_SLOTS],
-    chunk_ends: InlineArray[Int, FOREACH_EW_SLOTS],
-    numels: InlineArray[Int, FOREACH_EW_SLOTS],
+    in_addrs: Array[Int, FOREACH_EW_SLOTS],
+    out_addrs: Array[Int, FOREACH_EW_SLOTS],
+    chunk_ends: Array[Int, FOREACH_EW_SLOTS],
+    numels: Array[Int, FOREACH_EW_SLOTS],
     total_chunks: Int,
     ctx: DeviceContext,
 ) raises:
