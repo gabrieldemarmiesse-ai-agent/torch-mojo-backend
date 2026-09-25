@@ -167,11 +167,6 @@ to overlap copies with compute.
     with accelerator tensors, and copying between the two raises
     `NotImplementedError`. Take every device from `torch.accelerator`.
 
-!!! warning "Printing floating-point tensors"
-    `print(t)` on a floating-point accelerator tensor currently raises
-    `NotImplementedError`: PyTorch's tensor formatter calls `masked_select`,
-    which the backend does not implement yet. Print `t.cpu()` instead.
-    Integer and boolean tensors print directly.
 
 ## Selecting a GPU
 

@@ -1140,7 +1140,12 @@ def _unary_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
         or op_code == UOP_SIGN
     )
     var supported = False
-    comptime if op_code == UOP_LOG2 or op_code == UOP_RECIPROCAL:
+    comptime if (
+        op_code == UOP_LOG2
+        or op_code == UOP_RECIPROCAL
+        or op_code == UOP_CEIL
+        or op_code == UOP_FLOOR
+    ):
         supported = _dtype_supported[
             [DType.float16, DType.bfloat16, DType.float32, DType.float64]
         ](a.dtype)
