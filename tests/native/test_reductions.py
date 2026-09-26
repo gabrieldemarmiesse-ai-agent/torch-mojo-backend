@@ -383,6 +383,51 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(37, 41), (357, 789), (128,)])
+def test_max_unary_out(mojo_device, shape, dtype):
+    """`max.unary_out`: the full-reduction `out=` overload (`aten::max`
+    itself has no `out=` form; torch routes `torch.max(x, out=t)` here)."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    xd = x.to(mojo_device)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    returned = torch.max(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+def test_max_unary_out_noncontiguous_and_wrongly_shaped_out(mojo_device):
+    x = torch.randn(6, 11)
+    xd = x.to(mojo_device)[:, ::2]
+    assert not xd.is_contiguous()
+    out = torch.empty(4, 4, device=mojo_device)  # wrong shape: resized to ()
+    torch.max(xd, out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), torch.max(x[:, ::2]))
+
+
+def test_max_unary_out_propagates_nan(mojo_device):
+    x = torch.tensor([1.0, float("nan"), -7.0])
+    out = torch.empty((), device=mojo_device)
+    torch.max(x.to(mojo_device), out=out)
+    assert out.cpu().isnan().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
+    """Stock CUDA errors on this too (an internal assert in Reduce.cuh,
+    verified on an H100), just not cleanly; declining is the closest match."""
+    x = torch.empty((0, 5), dtype=dtype)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    with pytest.raises(RuntimeError):
+        torch.max(x.to(mojo_device), out=out)
+
+
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
 def test_extrema_float64(mojo_gpu, shape):
     """amax/amin and full max/min select exactly in float64 (the warp fold

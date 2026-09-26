@@ -857,6 +857,37 @@ def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
 
 
+# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_max_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_extremum_dtype(a, "MaxSpec")
+    if a.rank == 0:
+        unsupported("max()/min() of a rank-0 tensor")
+    var dims = _trailing_dims(a.rank, a.rank)
+    # Stock CUDA does not special-case this: `max_unary_out`'s TensorIterator
+    # over zero elements trips an internal assert in Reduce.cuh (verified on
+    # an H100). Declining cleanly here matches "errors on empty" without
+    # reproducing that assert.
+    _refuse_empty_extremum("MaxSpec", a, dims)
+    _scalar_reduction_out(
+        "nn",
+        "MaxSpec",
+        "aten::max.unary_out",
+        "safe_cast",
+        a,
+        dims,
+        False,
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 # ---------------------------------------------------------------------------
 # min.dim (values + indices)
 # ---------------------------------------------------------------------------
@@ -1965,6 +1996,7 @@ def register_reductions(site: Site) raises:
     impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
     impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
     impl[op_max, "max"](site)
+    impl[op_max_unary_out, "max.unary_out"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
     impl[op_mean_out, "mean.out"](site)
