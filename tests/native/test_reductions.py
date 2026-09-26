@@ -319,9 +319,14 @@ def test_nansum_dtype_promotion(mojo_gpu):
         assert got.dtype == torch.int64 == i.nansum(dim=1).dtype
         torch.testing.assert_close(got.cpu(), i.nansum(dim=1))
 
-    y = torch.tensor([[1.7, float("nan"), 3.7, 0.2]])
+    # dtype= casts the input BEFORE the reduction: summing two 40000s in
+    # float16 overflows to inf, but casting to float32 first (as torch does)
+    # sums them to exactly 80000.
+    y = torch.tensor([[40000.0, 40000.0]], dtype=torch.float16)
     ours = torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.float32)
-    torch.testing.assert_close(ours.cpu(), torch.nansum(y, dim=1, dtype=torch.float32))
+    expected = torch.nansum(y, dim=1, dtype=torch.float32)
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(ours.cpu(), expected)
 
     # An explicit dtype=int32 is declined, same as sum's own dtype= gate.
     with pytest.raises(NotImplementedError):
@@ -345,7 +350,9 @@ def test_nansum_out_variant_and_noncontiguous(mojo_gpu):
     assert tuple(out.shape) == tuple(expected.shape)
     torch.testing.assert_close(out.cpu(), expected)
 
-    # Non-contiguous input: the strided-axis path.
+    # Non-contiguous input: not an adjacent-ascending interval, so this takes
+    # the permute + materialize path (`_middle_direct_ok` requires
+    # contiguity), not the strided-axis kernel.
     y = torch.randn(5, 7)
     y[1, 2] = float("nan")
     yt = y.t()
