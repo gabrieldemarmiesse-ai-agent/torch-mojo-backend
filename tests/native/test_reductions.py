@@ -82,6 +82,12 @@ def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
     fn = _REDUCE_OPS[op]
     if op in ("all", "any"):
         x = torch.rand(shape) < 0.5
+    elif op == "prod":
+        # Values near 1: a product over millions of elements from the [0.05,
+        # 0.95) range used below underflows to 0 on BOTH legs (device and the
+        # fp64 reference), which would pass trivially without checking that
+        # the split/merge path actually combines partial products correctly.
+        x = 1.0 + (torch.rand(shape) - 0.5) * 0.002
     else:
         x = torch.rand(shape) * 0.9 + 0.05
     ours = fn(x.to(mojo_gpu), dim=dim).cpu()
@@ -91,7 +97,14 @@ def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
         # fp64 reference on the same values: this measures the reduction
         # order, not the input dtype.
         expected = fn(x.double(), dim=dim)
-        torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
+        if op == "prod":
+            # Unlike a sum, a product compounds one float32 rounding error
+            # PER MULTIPLY: the relative error random-walks as
+            # sqrt(reduce extent) * eps32, ~1e-4 at the million-element end
+            # of these shapes -- looser than the other ops' shared tolerance.
+            torch.testing.assert_close(ours.double(), expected, atol=1e-5, rtol=3e-3)
+        else:
+            torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
 
 
 @pytest.mark.parametrize("op", list(_REDUCE_OPS))
