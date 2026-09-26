@@ -606,6 +606,26 @@ def op_hypot_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_math("hypot", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
+# aten::igamma(Tensor self, Tensor other) -> Tensor
+def op_igamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_math("igamma", P_FLOAT, False, 2, args, rets, -1)
+
+
+# aten::igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_igamma_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_math("igamma", P_FLOAT, False, 2, args, rets, 2)
+
+
+# aten::igammac(Tensor self, Tensor other) -> Tensor
+def op_igammac(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_math("igammac", P_FLOAT, False, 2, args, rets, -1)
+
+
+# aten::igammac.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_math("igammac", P_FLOAT, False, 2, args, rets, 2)
+
+
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
 def op_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, -1)
@@ -1841,6 +1861,10 @@ def register_pointwise(site: Site) raises:
     impl[op_heaviside_out, "heaviside.out"](site)
     impl[op_hypot, "hypot"](site)
     impl[op_hypot_out, "hypot.out"](site)
+    impl[op_igamma, "igamma"](site)
+    impl[op_igamma_out, "igamma.out"](site)
+    impl[op_igammac, "igammac"](site)
+    impl[op_igammac_out, "igammac.out"](site)
     impl[op_lcm, "lcm"](site)
     impl[op_lcm_out, "lcm.out"](site)
     impl[op_leaky_relu, "leaky_relu"](site)

@@ -230,6 +230,8 @@ def pointwise_binary(
         "hermite_polynomial_h",
         "hermite_polynomial_he",
         "hypot",
+        "igamma",
+        "igammac",
         "laguerre_polynomial_l",
         "lcm",
         "legendre_polynomial_p",

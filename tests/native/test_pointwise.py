@@ -649,3 +649,35 @@ def test_clamp_tensor_mixed_dtypes(mojo_gpu):
     )
     xb = x.bfloat16()
     _close(torch.clamp(xb.to(mojo_gpu), lo.to(mojo_gpu)), torch.clamp(xb, lo))
+
+
+@pytest.mark.parametrize("dtype", FLOATS)
+@pytest.mark.parametrize(
+    "name,fn", (("igamma", torch.igamma), ("igammac", torch.igammac))
+)
+def test_igamma(mojo_gpu, name, fn, dtype):
+    """Every regime of calc_igamma / calc_igammac: the boundaries (a or x at
+    0, inf, NaN, negative), the series and the continued fraction on either
+    side of x = a, and the uniform asymptotic expansion for large a ~ x."""
+    grid = [0.0, 1e-3, 0.3, 0.5, 0.75, 1.0, 1.05, 1.2, 2.5, 7.0, 19.0]
+    grid += [21.0, 24.0, 30.0, 150.0, 199.0, 210.0, 1000.0, 1040.0]
+    edges = [float("inf"), float("nan"), -1.0]
+    values = torch.tensor(grid + edges)
+    a = values[:, None].expand(-1, len(values)).to(dtype)
+    x = values[None, :].expand(len(values), -1).to(dtype)
+    expected = fn(a, x)
+    with ran(f"aten::{name}"):
+        actual = fn(a.to(mojo_gpu), x.to(mojo_gpu))
+    _close(actual, expected, **_tol(dtype, 8))
+    # Broadcast against a 0-d tensor, a strided out= and the in-place method.
+    x_row = x[3].contiguous()
+    scalar = torch.tensor(2.5, dtype=dtype)
+    _close(
+        fn(x_row.to(mojo_gpu), scalar.to(mojo_gpu)), fn(x_row, scalar), **_tol(dtype, 8)
+    )
+    out = torch.zeros(len(values), 2 * len(values), dtype=dtype).to(mojo_gpu)
+    fn(a.to(mojo_gpu), x.to(mojo_gpu), out=out[:, ::2])
+    _close(out[:, ::2], expected, **_tol(dtype, 8))
+    inplace = a.contiguous().to(mojo_gpu)
+    getattr(inplace, name + "_")(x.to(mojo_gpu))
+    _close(inplace, expected, **_tol(dtype, 8))

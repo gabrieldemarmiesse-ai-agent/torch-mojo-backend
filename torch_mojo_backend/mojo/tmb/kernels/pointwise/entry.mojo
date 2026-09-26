@@ -107,6 +107,8 @@ comptime KINDS_2 = [
     "hermite_polynomial_h",
     "hermite_polynomial_he",
     "hypot",
+    "igamma",
+    "igammac",
     "ipow",
     "laguerre_polynomial_l",
     "lcm",

@@ -1252,6 +1252,38 @@ def test_aten_special_unary_compiled_batch(dtype: torch.dtype, device: str):
         checker.check_was_called()
 
 
+@pytest.mark.parametrize("name", ["igamma", "igammac"])
+def test_aten_igamma(conf: Conf, call_checker: CallChecker, name: str):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    op = getattr(aten, name)
+
+    def fn(a, x):
+        return op(a, x)
+
+    a = torch.tensor([0.5, 1.0, 2.5, 30.0, 150.0, 3.0])
+    x = torch.tensor([0.25, 1.5, 2.5, 29.0, 160.0, 0.0])
+    check_outputs(fn, conf, [a, x])
+
+
+def test_aten_igamma_compiled(device: str):
+    checkers = []
+    for name in ("igamma", "igammac"):
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{name}"))
+        checkers.append(checker)
+
+    def fn(a: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return aten.igamma(a, x), aten.igammac(a, x), aten.igamma(a, x[:1])
+
+    a = torch.linspace(0.1, 40.0, 64, device=device)
+    x = torch.linspace(35.0, 0.05, 64, device=device)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for result, expected in zip(compiled(a, x), fn(a, x), strict=True):
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+    for checker in checkers:
+        checker.check_was_called()
+
+
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.cuda

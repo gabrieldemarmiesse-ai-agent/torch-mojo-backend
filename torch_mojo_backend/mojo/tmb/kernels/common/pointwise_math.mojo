@@ -39,6 +39,7 @@ from tmb.kernels.common.libdevice_port import (
 )
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_narrow_float_exact_scalar
+from tmb.kernels.common.special_math import igamma_f, igammac_f
 
 
 @always_inline
@@ -944,6 +945,18 @@ def _wide[
         r = a.eq(0).select(zero, r)
         r = isnan(a).select(a, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
+    elif kind == "igamma" or kind == "igammac":
+        # IGammaKernel.cu calc_igamma / calc_igammac, float accscalar_t
+        # (special_math.mojo; stock torch has no float64 route to match here).
+        var r = SIMD[w, n]()
+        comptime for i in range(n):
+            var ai = a[i].cast[DType.float32]()
+            var xi = b[i].cast[DType.float32]()
+            comptime if kind == "igamma":
+                r[i] = igamma_f(ai, xi).cast[w]()
+            else:
+                r[i] = igammac_f(ai, xi).cast[w]()
+        return r
     elif kind == "zeta":
         var r = SIMD[w, n]()
         comptime for i in range(n):

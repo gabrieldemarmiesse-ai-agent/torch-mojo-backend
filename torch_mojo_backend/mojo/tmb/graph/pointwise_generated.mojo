@@ -176,6 +176,30 @@ struct PointwiseHypot(ElementwiseBinaryOp):
         )
 
 
+@extensibility.register("pointwise_igamma")
+struct PointwiseIgamma(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["igamma", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
+@extensibility.register("pointwise_igammac")
+struct PointwiseIgammac(ElementwiseBinaryOp):
+    @staticmethod
+    def elementwise[
+        dtype: DType,
+        width: SIMDLength,
+    ](lhs: SIMD[dtype, width], rhs: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return pointwise["igammac", dtype, dtype, width](
+            lhs, rhs, SIMD[dtype, width](0), SIMD[param_dtype[dtype](), 4](0)
+        )
+
+
 @extensibility.register("pointwise_laguerre_polynomial_l")
 struct PointwiseLaguerrePolynomialL(ElementwiseBinaryOp):
     @staticmethod

@@ -261,6 +261,8 @@ def _pointwise_binary(
         "hermite_polynomial_h",
         "hermite_polynomial_he",
         "hypot",
+        "igamma",
+        "igammac",
         "laguerre_polynomial_l",
         "lcm",
         "legendre_polynomial_p",
@@ -3279,6 +3281,20 @@ def aten_hypot(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTenso
 @map_to(aten.i0)
 def aten_i0(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "i0")
+
+
+# igamma(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igamma)
+def aten_igamma(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized lower incomplete gamma function P(a, x)."""
+    return _pointwise_binary(input, other, "igamma", promote_float=True)
+
+
+# igammac(Tensor self, Tensor other) -> Tensor
+@map_to(aten.igammac)
+def aten_igammac(input: MaxTensor | Scalar, other: MaxTensor | Scalar) -> MaxTensor:
+    """The regularized upper incomplete gamma function Q(a, x)."""
+    return _pointwise_binary(input, other, "igammac", promote_float=True)
 
 
 # index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
