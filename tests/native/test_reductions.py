@@ -493,6 +493,28 @@ def test_max_unary_out_propagates_nan(mojo_device):
     assert out.cpu().isnan().item()
 
 
+def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, max_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.max(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
 def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
     """Stock CUDA errors on this too (an internal assert in Reduce.cuh,

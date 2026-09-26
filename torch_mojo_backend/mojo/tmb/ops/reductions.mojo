@@ -961,7 +961,11 @@ def op_max_unary_out(
         "nn",
         "MaxSpec",
         "aten::max.unary_out",
-        "safe_cast",
+        # `make_reduction`'s TensorIterator requires the output dtype to
+        # equal the input's exactly (verified on real CUDA: an int64 input
+        # with a float32 out raises "provided dtype must match dtype of
+        # result"), unlike the ordinary `canCast` policy other out= ops use.
+        "exact",
         a,
         dims,
         False,
