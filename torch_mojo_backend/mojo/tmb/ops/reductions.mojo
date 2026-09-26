@@ -832,6 +832,32 @@ def op_amin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _amax_amin("AminSpec", args, rets)
 
 
+# aten::amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_extremum_dtype(a, "AmaxSpec")
+    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
+    if len(dims) == 0:
+        unsupported("amax with no reduce dim (a rank-0 operand)")
+    _refuse_empty_extremum("AmaxSpec", a, dims)
+    _scalar_reduction_out(
+        "reduction",
+        "AmaxSpec",
+        "aten::amax.out",
+        "exact",  # torch's amax meta: out dtype must equal input dtype
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 def _full_extremum(
     family: StaticString, op: StaticString, args: Values, rets: Values
 ) raises:
@@ -1952,6 +1978,7 @@ def register_reductions(site: Site) raises:
     impl[op_all_dim, "all.dim"](site)
     impl[op_all_dim, "all.dims"](site)
     impl[op_amax, "amax"](site)
+    impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
     impl[op_any, "any"](site)
     impl[op_any_dim, "any.dim"](site)

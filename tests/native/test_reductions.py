@@ -374,6 +374,49 @@ def test_amax_amin_layouts(mojo_device, shape, dim, keepdim):
         torch.testing.assert_close(ours.cpu(), expected)
 
 
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_amax_out_variant(mojo_gpu, keepdim):
+    x = torch.randn(357, 789)
+    xd = x.to(mojo_gpu)
+    expected = torch.amax(x, dim=1, keepdim=keepdim)
+
+    out = torch.empty(expected.shape, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.amax(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # a wrongly-shaped out is resized (resize_output), by shape not numel.
+    mismatched = torch.empty(0, device=mojo_gpu)
+    torch.amax(xd, dim=1, keepdim=keepdim, out=mismatched)
+    torch.testing.assert_close(mismatched.cpu(), expected)
+
+
+def test_amax_out_into_a_strided_destination(mojo_gpu):
+    """A non-contiguous `out` cannot be written by the kernel directly, so the
+    result is computed into a fresh buffer and copied across."""
+    x = torch.randn(357, 789)
+    storage = torch.zeros(357, 2, device=mojo_gpu)
+    out = storage[:, 0]
+    assert not out.is_contiguous()
+    torch.amax(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), x.amax(dim=1))
+    torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(357))
+
+
+def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
+    """amax's out dtype policy is exact (torch's meta: input/out dtypes must
+    match, no cast), unlike mean.out's safe_cast."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.amax(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(NotImplementedError, match="reduce dim of size 0"):
+        torch.amax(
+            torch.empty(4, 0, device=mojo_gpu),
+            dim=1,
+            out=torch.empty(4, device=mojo_gpu),
+        )
+
+
 def test_max_and_min_full_reduction(mojo_device):
     x = torch.randn(37, 41)
     xd = x.to(mojo_device)
