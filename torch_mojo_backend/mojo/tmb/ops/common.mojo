@@ -149,42 +149,6 @@ def assert_no_overlap(written: T, other: T) raises:
         )
 
 
-def assert_no_partial_overlap(written: T, other: T) raises:
-    """`at::assert_no_partial_overlap`: an `out=` that shares storage with an
-    input WITHOUT being the identical view of it is a read/write race
-    (`torch.neg(x[:-1], out=x[1:])`) -- the identical view is fine, that is
-    how in-place-via-`out=` is meant to work (`torch.abs(x, out=x)`).
-    `assert_no_overlap` above is the stricter sibling for ops (like `cat`)
-    where even the identical view must be rejected; a true 1:1 elementwise
-    op (abs, neg, ...) wants this one instead."""
-    if written.h == other.h or written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if _repeats_elements(written) or _repeats_elements(other):
-        return
-    var a_begin = written.ptr
-    var a_end = a_begin + written.numel * written.itemsize
-    var b_begin = other.ptr
-    var b_end = b_begin + other.numel * other.itemsize
-    if a_begin == b_begin and a_end == b_end:
-        if written.rank == other.rank:
-            var same = True
-            for i in range(written.rank):
-                if written.stride(i) != other.stride(i):
-                    same = False
-            if same:
-                return
-    elif not (a_begin < b_end and b_begin < a_end):
-        return
-    raise Error(
-        "unsupported operation: some elements of the input tensor and the"
-        " written-to tensor refer to a single memory location. Please clone()"
-        " the tensor before performing the operation."
-    )
-
-
 def assert_no_internal_overlap(t: T) raises:
     """`at::assert_no_internal_overlap`: an `out=` tensor may not alias
     itself (e.g. a size-1 storage `.expand()`ed to more than one logical
@@ -451,18 +415,27 @@ def cast_to(t: T, stype: Int32) raises -> T:
     return out.take()
 
 
+def one_device(a: T, b: T) raises:
+    """Both operands of a raw-pointer launch on the same mojo device. A
+    pointer belonging to another device -- or to no mojo device at all --
+    would be dereferenced against the wrong context."""
+    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+        raise Error("expected every operand on the same mojo device")
+
+
 def elementwise_direct(
-    family: StaticString,
-    op: StaticString,
+    family: String,
+    op: String,
     src_c: T,
     mut dst: T,
     out_dtype: DType,
 ) raises:
-    """dst[...] = f(src_c[...]); both operands already contiguous with the
-    same element count. The one-TensorSpec-in/one-out shape every direct
-    unary op (abs, neg, sign, ...) and the vector-norm size-one-reduce fast
-    path (reductions.mojo's `_vector_norm_abs*`, also a true 1:1 elementwise
-    op) share."""
+    """dst[...] = f(src_c[...]); src_c must already be contiguous, dst must
+    already be the right shape/dtype/contiguity. The one-TensorSpec-in/
+    one-out shape every direct unary op (abs, neg, sign, ...) and the
+    vector-norm size-one-reduce fast path (reductions.mojo's
+    `_vector_norm_abs*`, also a true 1:1 elementwise op) share."""
+    one_device(src_c, dst)
     if src_c.numel == 0:
         return
     var ctx = ctx_for(dst.device)

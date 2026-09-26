@@ -64,7 +64,6 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
-    assert_no_partial_overlap,
     cast_into,
     cast_to,
     check_out,
@@ -617,6 +616,23 @@ def _shape_matches(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     return True
 
 
+def _decline_aliasing_out(op_name: StaticString, a: T, dst: T) raises:
+    """`out=` sharing storage with the input is declined outright, before any
+    resize is even considered. Resizing an `out=` that shares `a`'s storage
+    is not one well-defined case: the resize hook can grow the shared
+    allocation, which reallocates the block `a`'s already-cached tensor info
+    points at -- verified on stock CUDA torch that this has no single
+    behavior worth reproducing: `torch.max(x, out=x[x.numel():])` is fine,
+    but `torch.max(x, out=x)` (`resize_output` shrinking `self`'s own
+    metadata out from under the reduction that is about to read it) comes
+    back with a silently WRONG answer on real CUDA, not merely a stale
+    pointer. Shared with the sibling out= overload fixes on other reduce ops
+    (see #565) so both land on the identical check."""
+    var a_storage = a.storage_ptr()
+    if a_storage != 0 and a_storage == dst.storage_ptr():
+        unsupported(String(op_name) + ": out= aliasing the input")
+
+
 def _scalar_reduction_out(
     family: StaticString,
     op: StaticString,
@@ -643,9 +659,11 @@ def _scalar_reduction_out(
     case it must catch) declines an `out=` that repeats elements: several
     logical output positions would alias one physical address, so distinct
     reduction results written there would silently collapse into whichever
-    write lands last.
+    write lands last. `_decline_aliasing_out`, a separate concern, catches
+    `out=` sharing storage with the INPUT.
     """
     _one_device(a, dst)
+    _decline_aliasing_out(op_name, a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
@@ -1319,24 +1337,19 @@ def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
 def _vector_norm_abs_out(
     op_name: StaticString, a: T, dims: List[Int], keepdim: Bool, mut dst: T
 ) raises:
-    """Same dtype policy as `_scalar_reduction_out` (`exact`), plus the
-    overlap checks a true 1:1 elementwise op needs that the reduction
-    accumulator doesn't: `assert_no_internal_overlap` (an `out=` that repeats
-    elements, e.g. `.expand()`ed, would silently collapse distinct results)
-    and `assert_no_partial_overlap` (identical-view `out=` is fine -- that's
-    `abs(x, out=x)` -- anything else sharing storage is a race), checked
-    AFTER the resize since that is what can turn a non-overlapping `out=`
-    into an overlapping one (`resize_out` grows storage in place at the
-    existing offset). Checking overlap before ever computing anything from
-    `a` also means a rejected call never reads through a `dst` that resizing
-    may have just invalidated for anyone else aliasing that storage.
+    """Same policy as `_scalar_reduction_out`: dtype (`exact`), `out=`
+    aliasing the input declined outright before any resize
+    (`_decline_aliasing_out`), and `out=` repeating elements declined too
+    (`assert_no_internal_overlap`, after the resize decision).
 
     The result is always computed into a FRESH tensor first (`_vector_norm_abs`,
-    never a direct launch into `dst`) and then copied in: with the checks
-    above already guaranteeing `dst` doesn't partially alias `a`, this is
-    just the same "copy the result across" tail `_scalar_reduction_out` uses.
+    never a direct launch into `dst`) and then copied in: with
+    `_decline_aliasing_out` already ruling out any shared storage between
+    `dst` and `a`, this is just the same "copy the result across" tail
+    `_scalar_reduction_out` uses.
     """
     _one_device(a, dst)
+    _decline_aliasing_out(op_name, a, dst)
     _check_out_dtype(op_name, "exact", max_dtype(a.stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
@@ -1344,7 +1357,6 @@ def _vector_norm_abs_out(
     if not _shape_matches(dst, shape, rank):
         resize_out(dst, shape, rank)
     assert_no_internal_overlap(dst)
-    assert_no_partial_overlap(dst, a)
     var result = _vector_norm_abs(a, dims, keepdim)
     _copy_result_into(dst, result.t)
     _ = result^

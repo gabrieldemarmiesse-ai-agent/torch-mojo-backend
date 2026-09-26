@@ -900,16 +900,30 @@ def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
     torch.testing.assert_close(got.cpu(), expected)
 
 
-def test_vector_norm_size_one_reduce_out_declines_overlap(mojo_gpu):
-    """The abs() fast path is a true 1:1 elementwise kernel (unlike the
-    accumulator, many-to-few), so an `out=` overlapping the input is a real
-    read/write race, same as `abs.out` -- torch declines it, confirmed on
-    stock CUDA torch (`RuntimeError: ... refer to a single memory location``).
-    """
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input(mojo_gpu):
+    """Any `out=` sharing storage with the input is declined outright, before
+    any resize is even considered -- not just when the current byte ranges
+    overlap. `resize_out` can reallocate a shared allocation to grow `dst`,
+    which would silently move the bytes `a`'s already-cached tensor info
+    still points at (see `_decline_aliasing_out`'s docstring); declining
+    every case uniformly avoids having to reason about which ones happen to
+    be safe. Covers: a genuinely shifted overlap, a same-tensor "in-place via
+    out=" call (`abs(x, out=x)` is fine on real torch, but this backend
+    declines it too rather than special-case it), and a same-storage `out=`
+    that merely reshapes the input (`x.squeeze(1)`, no resize needed and no
+    byte-range overlap either -- still declined, since it still shares
+    storage)."""
     b = torch.arange(6, dtype=torch.float32).to(mojo_gpu)
     inp = b[:-1].view(-1, 1)  # every reduced dim (dim=1) has extent 1
-    with pytest.raises(RuntimeError, match="single memory location"):
+    with pytest.raises(NotImplementedError):
         torch.linalg.vector_norm(inp, dim=1, out=b[1:])
+
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, keepdim=True, out=x)
+
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, out=x.squeeze(1))
 
 
 def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
@@ -922,28 +936,19 @@ def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
         torch.linalg.vector_norm(x, dim=1, out=out)
 
 
-def test_vector_norm_size_one_reduce_out_identical_view_is_fine(mojo_gpu):
-    """`out=` the SAME tensor being reduced (an in-place-via-out pattern, like
-    `abs(x, out=x)`) is not overlap -- confirmed allowed on stock CUDA torch,
-    unlike the genuinely shifted overlap above."""
-    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
-    expected = torch.linalg.vector_norm(x.cpu(), dim=1, keepdim=True)
-    x_ptr = x.data_ptr()
-    returned = torch.linalg.vector_norm(x, dim=1, keepdim=True, out=x)
-    assert returned.data_ptr() == x_ptr
-    torch.testing.assert_close(x.cpu(), expected)
-
-
-def test_vector_norm_size_one_reduce_out_declines_overlap_needing_resize(mojo_gpu):
-    """Overlap that only appears AFTER `out=` is resized (an empty `out=`
-    view into the same storage as the input, at an offset that collides once
-    grown): confirmed this raises on stock CUDA torch too, so the overlap
-    check must run on the POST-resize `out=`, not the empty one the caller
-    passed in."""
-    base = torch.arange(10, dtype=torch.float32).to(mojo_gpu)
-    inp = base[1:].view(-1, 1)  # every reduced dim (dim=1) has extent 1
-    out = base[:0]  # empty view into the SAME storage, offset 0
-    with pytest.raises(RuntimeError, match="single memory location"):
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input_needing_resize(
+    mojo_gpu,
+):
+    """The hazard `_decline_aliasing_out` exists for: a same-storage `out=`
+    that does NOT currently overlap the input's bytes at all, but whose
+    resize (growing it in place) would reallocate the storage `a` also reads
+    through -- caught by the storage-identity check before resize is even
+    attempted, not by comparing byte ranges (which would find no overlap
+    here, before OR after resizing this particular pair of slices)."""
+    base = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
+    inp = base[:3].view(3, 1)  # every reduced dim (dim=1) has extent 1
+    out = base[3:]  # 1 element; the result needs 3 -- same storage as inp
+    with pytest.raises(NotImplementedError):
         torch.linalg.vector_norm(inp, dim=1, out=out)
 
 
