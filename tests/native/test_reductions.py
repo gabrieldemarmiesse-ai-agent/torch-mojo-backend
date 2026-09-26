@@ -756,6 +756,88 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
 
 
 # ---------------------------------------------------------------------------
+# norm (legacy overloads): all route through the same ord-2 path as
+# linalg_vector_norm above, so these tests only need to check the schema
+# plumbing (p=None/2, dim=[]/None/single/multi, dtype=, out=), not the math.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("p", [None, 2, 2.0])
+def test_norm_scalar_defaults_to_p2_over_all_dims(mojo_gpu, p):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x)
+    if p is None:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu))
+    else:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu), p)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dtype(x.to(mojo_gpu), None, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [None, 1, [0, 1], []])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_norm_scalaropt_dim(mojo_gpu, dim, keepdim):
+    """An explicit empty dim list means "reduce every dim", same as dim=None,
+    unlike any.dims/all.dims."""
+    x = torch.randn(4, 5)
+    dim_arg = [] if dim is None else ([dim] if isinstance(dim, int) else dim)
+    expected = torch.linalg.vector_norm(
+        x, dim=(None if dim is None else dim), keepdim=keepdim
+    )
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, dim_arg, keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dim_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=1, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dim_dtype(
+        x.to(mojo_gpu), None, [1], False, dtype=torch.float32
+    )
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_out_resizes_a_wrongly_shaped_out(mojo_gpu):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    out = torch.empty(1, dtype=torch.float32, device=mojo_gpu)  # wrong shape
+    returned = torch.ops.aten.norm.out(x.to(mojo_gpu), 2, [1], False, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == (4,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_norm_dtype_out(mojo_gpu):
+    """float64 is out of scope: `_is_float3` (mean/var/L2-norm) never admits
+    it, same as `linalg_vector_norm`, so this exercises the accumulation-dtype
+    plumbing with float32 instead."""
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=[0, 1], dtype=torch.float32)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    returned = torch.ops.aten.norm.dtype_out(
+        x.to(mojo_gpu), None, [0, 1], False, dtype=torch.float32, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_norm_declines_ord_other_than_2(mojo_gpu):
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.Scalar(x, 1)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.ScalarOpt_dim(x, float("inf"), [1], False)
+
+
+# ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------
 
@@ -968,6 +1050,45 @@ _EXPECTED_OVERLOADS = [
         "aten::linalg_vector_norm.out",
         lambda d: torch.linalg.vector_norm(
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.Scalar",
+        lambda d: torch.ops.aten.norm.Scalar(torch.randn(4, 5).to(d)),
+    ),
+    (
+        "aten::norm.ScalarOpt_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dtype(
+            torch.randn(4, 5).to(d), None, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim(
+            torch.randn(4, 5).to(d), 2, [1], False
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim_dtype(
+            torch.randn(4, 5).to(d), None, [1], False, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.out",
+        lambda d: torch.ops.aten.norm.out(
+            torch.randn(4, 5).to(d), 2, [1], False, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.dtype_out",
+        lambda d: torch.ops.aten.norm.dtype_out(
+            torch.randn(4, 5).to(d),
+            None,
+            [1],
+            False,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float32, device=d),
         ),
     ),
     ("aten::cumsum", lambda d: torch.cumsum(torch.randn(4, 5).to(d), dim=1)),
