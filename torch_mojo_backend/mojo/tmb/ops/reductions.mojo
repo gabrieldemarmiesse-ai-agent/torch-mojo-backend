@@ -959,7 +959,9 @@ def op_min_unary_out(
         "reduction",
         "AminSpec",
         "aten::min.unary_out",
-        "safe_cast",
+        # CUDA's min_all_kernel_impl -> make_reduction requires an exact
+        # dtype match, unlike mean.out/any.out's safe_cast.
+        "exact",
         a,
         dims,
         False,

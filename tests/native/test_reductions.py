@@ -498,18 +498,26 @@ def test_min_unary_out_resizes_a_mismatching_out(mojo_gpu):
     torch.testing.assert_close(returned.cpu(), torch.min(x))
 
 
-def test_min_unary_out_casts_when_allowed_and_refuses_otherwise(mojo_gpu):
+def test_min_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, min_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
     x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
-    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
-    torch.min(x.to(mojo_gpu), out=out)  # int -> float is a safe cast
-    torch.testing.assert_close(out.cpu(), torch.min(x).to(torch.float32))
+    with pytest.raises(RuntimeError):
+        torch.min(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
 
     y = torch.randn(9, 5)
     with pytest.raises(RuntimeError):
-        # float -> integral is never a safe cast.
         torch.min(
             y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
         )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.min(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.min(x))
 
 
 def test_min_unary_out_empty_input_errors(mojo_gpu):
