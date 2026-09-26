@@ -1818,13 +1818,15 @@ def op_pow_tensor_out(
     _b_simple_out("PowSpec", args, rets, 2)
 
 
-def _b_maxmin(
-    op: StaticString, bool_op: StaticString, args: Values, dst: Optional[T]
+def _b_maxmin_res(
+    op: StaticString,
+    bool_op: StaticString,
+    lhs: Side,
+    rhs: Side,
+    dst: Optional[T],
 ) raises -> Res:
     """maximum/minimum. Two bool tensors are torch's `a || b` / `a && b`
     (MaxMinElementwiseKernel.cu), which the logical kernels compute."""
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
     if (
         lhs.is_t
         and rhs.is_t
@@ -1833,6 +1835,18 @@ def _b_maxmin(
     ):
         return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
     return _b_binary(op, lhs, rhs, Int32(-1), dst)
+
+
+def _b_maxmin(
+    op: StaticString, bool_op: StaticString, args: Values, dst: Optional[T]
+) raises -> Res:
+    return _b_maxmin_res(
+        op,
+        bool_op,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        dst,
+    )
 
 
 def _b_maxmin_out(
@@ -2579,9 +2593,6 @@ def register_binary(site: Site) raises:
     impl[op_div_out_mode, "div.out_mode"](site)
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
-    impl[op_lerp_scalar, "lerp.Scalar"](site)
-    impl[op_lerp_scalar_, "lerp_.Scalar"](site)
-    impl[op_lerp_scalar_out, "lerp.Scalar_out"](site)
     impl[op_logical_and, "logical_and"](site)
     impl[op_logical_and_out, "logical_and.out"](site)
     impl[op_logical_or, "logical_or"](site)
@@ -2596,10 +2607,6 @@ def register_binary(site: Site) raises:
     impl[op_mul_, "mul_.Tensor"](site)
     impl[op_mul_, "mul_.Scalar"](site)
     impl[op_mul_out, "mul.out"](site)
-    impl[op_pow_scalar, "pow.Tensor_Scalar"](site)
-    impl[op_pow_scalar_out, "pow.Tensor_Scalar_out"](site)
-    impl[op_pow_tensor, "pow.Tensor_Tensor"](site)
-    impl[op_pow_tensor_out, "pow.Tensor_Tensor_out"](site)
     impl[op_remainder, "remainder.Scalar"](site)
     impl[op_remainder, "remainder.Scalar_Tensor"](site)
     impl[op_remainder, "remainder.Tensor"](site)

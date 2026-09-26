@@ -81,6 +81,76 @@ COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} |
 }
 
 
+# The activations with scalar parameters of tmb/ops/pointwise.mojo, at
+# their default parameters (the scalars travel in slots, so every value
+# runs the same kernel). Operands are unit_interval shifted to (-0.45, 0.45)
+# so both sides of every kink are timed.
+ACTIVATION_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "elu": F.elu,
+    "hardshrink": lambda x: F.hardshrink(x, 0.2),
+    "hardsigmoid": F.hardsigmoid,
+    "hardswish": F.hardswish,
+    "hardtanh": lambda x: F.hardtanh(x, -0.25, 0.25),
+    "leaky_relu": F.leaky_relu,
+    "log_sigmoid_forward": F.logsigmoid,
+    "mish": F.mish,
+    "softplus": F.softplus,
+    "softshrink": lambda x: F.softshrink(x, 0.2),
+    "threshold": lambda x: F.threshold(x, 0.1, -1.0),
+}
+COVERS |= {f"aten::{name}": "test_activation" for name in ACTIVATION_OPS}
+_ACT_OUT = (
+    "out= / in-place plumbing over the activation kernel test_activation "
+    "measures (computed straight into a fitting destination)"
+)
+SKIPPED |= {
+    f"aten::{name}": _ACT_OUT
+    for name in (
+        "elu.out",
+        "hardshrink.out",
+        "hardsigmoid.out",
+        "hardsigmoid_",
+        "hardswish.out",
+        "hardswish_",
+        "hardtanh.out",
+        "hardtanh_",
+        "leaky_relu.out",
+        "leaky_relu_",
+        "log_sigmoid_forward.output",
+        "mish.out",
+        "rrelu_with_noise.out",
+        "rrelu_with_noise_",
+        "softplus.out",
+        "softshrink.out",
+        "threshold.out",
+        "threshold_",
+    )
+} | {
+    "aten::rrelu_with_noise": (
+        "eval mode is the leaky_relu kernel test_activation measures; "
+        "training is uniform_ (test_inplace's test_uniform_) plus two of the "
+        "same pointwise launches"
+    )
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(ACTIVATION_OPS))
+def test_activation(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = ACTIVATION_OPS[op_name]
+    cpu = (unit_interval(SHAPES[shape_id], torch.float32) - 0.5).to(DTYPES[dtype_id])
+    x_ref, x_our = both(cpu, hw, mojo_device)
+    bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
+
+
 @pytest.mark.parametrize("dtype_id", ("f16", "bf16", "f32"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.parametrize("op_name", op_params(UNARY_OPS))

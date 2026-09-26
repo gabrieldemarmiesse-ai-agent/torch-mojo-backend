@@ -26,6 +26,7 @@ from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, pow
 from std.memory import bitcast
+from std.utils.numerics import isnan
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -329,10 +330,15 @@ def _bin_vec_op[
         comptime if op_code == BOP_DIV:
             comptime if dtype.is_floating_point():
                 return (a / b).cast[out_dtype]()
-        comptime if op_code == BOP_MAX:
-            return max(a, b).cast[out_dtype]()
-        comptime if op_code == BOP_MIN:
-            return min(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_MAX or op_code == BOP_MIN:
+            var r = max(a, b) if op_code == BOP_MAX else min(a, b)
+            comptime if dtype.is_floating_point():
+                # MaxMinElementwiseKernel.cu propagates a NaN operand; the
+                # bit-based isnan survives the fast-math flags under which
+                # max/min may drop it.
+                r = isnan(b).select(b, r)
+                r = isnan(a).select(a, r)
+            return r.cast[out_dtype]()
         comptime if op_code == BOP_AND:
             comptime if not dtype.is_floating_point():
                 return (a & b).cast[out_dtype]()
