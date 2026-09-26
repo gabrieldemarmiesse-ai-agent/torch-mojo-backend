@@ -740,37 +740,75 @@ def op_mean_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
-#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
-def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=4])
+def _mean_out(
+    a: T,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    op_name: StaticString,
+    mut dst: T,
+    rets: Values,
+) raises:
     _require_mojo(a)
-    _require_mojo(out)
+    _require_mojo(dst)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
+    var want = _opt_dtype(dtype_v)
     if want >= 0:
         if not _is_float3(max_dtype(want)):
             unsupported("mean with dtype=" + String(max_dtype(want)))
         _promote(src, want)
     if not _is_float3(src.t.dtype):
         unsupported("mean of dtype " + String(src.t.dtype))
-    var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "nn",
         "MeanSpec",
-        "aten::mean.out",
+        op_name,
         "safe_cast",
         src.t,
         dims,
-        v_bool_or(args[unsafe_offset=2], False),
+        keepdim,
         src.t.stype,
-        out,
+        dst,
     )
-    ret_ref(rets, 0, out)
+    ret_ref(rets, 0, dst)
     _ = src^
+
+
+# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
+#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var out = v_tensor(args[unsafe_offset=4])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        v_bool_or(args[unsafe_offset=2], False),
+        args[unsafe_offset=3],
+        "aten::mean.out",
+        out,
+        rets,
+    )
+
+
+# aten::mean.dtype_out(Tensor self, *, ScalarType? dtype=None,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_mean_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    # CompositeExplicitAutograd forwards to mean.out with dim=[] (full
+    # reduce), keepdim=False: aten/src/ATen/native/ReduceOps.cpp mean_dtype_out.
+    var out = v_tensor(args[unsafe_offset=2])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        Value(TAG_NONE, 0, 0, 0),
+        False,
+        args[unsafe_offset=1],
+        "aten::mean.dtype_out",
+        out,
+        rets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1967,6 +2005,7 @@ def register_reductions(site: Site) raises:
     impl[op_max, "max"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
+    impl[op_mean_dtype_out, "mean.dtype_out"](site)
     impl[op_mean_out, "mean.out"](site)
     impl[op_median, "median"](site)
     impl[op_median_dim, "median.dim"](site)

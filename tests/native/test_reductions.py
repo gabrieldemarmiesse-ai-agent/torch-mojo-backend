@@ -342,6 +342,58 @@ def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
     torch.testing.assert_close(transposed.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
+    """`torch.mean(x, out=out)` with no `dim` dispatches to mean.dtype_out
+    (verified against stock torch's own overload resolution), always a full
+    reduce to a 0-d result regardless of input rank."""
+    x = torch.randn(4, 6, 5, dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = x.mean()
+    out = torch.empty((), dtype=dtype, device=mojo_gpu)
+    returned = torch.mean(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-2, atol=2e-2)
+
+
+def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
+    """`dtype=` promotes the input before reducing (only float16/bfloat16/
+    float32 are supported, same as mean()/mean.out/mean.dim)."""
+    x = torch.randn(5, 7, dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.mean(dtype=torch.float32)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.ops.aten.mean.dtype_out(xd, dtype=torch.float32, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-3, atol=2e-3)
+
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.mean.dtype_out(xd, dtype=torch.float64, out=out)
+
+
+def test_mean_dtype_out_resizes_a_mismatching_out(mojo_gpu):
+    """Non-scalar `out` is resized to the full-reduce (0-d) shape."""
+    x = torch.randn(3, 4)
+    out = torch.empty(3, 4, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), x.mean())
+
+
+def test_mean_dtype_out_rejects_integer_input(mojo_gpu):
+    x = torch.randint(0, 10, (3, 4))
+    out = torch.empty((), device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x.to(mojo_gpu), out=out)
+
+
+def test_mean_dtype_out_nan(mojo_gpu):
+    x = torch.randn(4, 6)
+    x[2, 3] = float("nan")
+    out = torch.empty((), device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), x.mean(), equal_nan=True)
+
+
 def test_out_variant_into_a_strided_destination(mojo_gpu):
     """A non-contiguous `out` cannot be written by the kernel directly, so the
     result is computed into a fresh buffer and copied across."""
@@ -931,6 +983,10 @@ _EXPECTED_OVERLOADS = [
         lambda d: torch.mean(
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
         ),
+    ),
+    (
+        "aten::mean.dtype_out",
+        lambda d: torch.mean(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
     ),
     ("aten::amax", lambda d: torch.amax(torch.randn(4, 5).to(d), dim=1)),
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),
