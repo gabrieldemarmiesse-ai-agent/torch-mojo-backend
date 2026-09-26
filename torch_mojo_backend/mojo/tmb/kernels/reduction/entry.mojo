@@ -62,6 +62,7 @@ from tmb.kernels.reduction.reduce_skeleton import (
     CountNonzeroOp,
     MaxOp,
     MinOp,
+    NanSumOp,
     NormL2Op,
     ProdOp,
     SumOp,
@@ -1205,6 +1206,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["SumSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[SumOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["NanSumSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[NanSumOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["AmaxSpec"]():
