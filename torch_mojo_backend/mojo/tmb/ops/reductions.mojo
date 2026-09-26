@@ -932,19 +932,13 @@ def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
     reduction dim to have non-zero size") and so does the accumulator
     (`errors_on_empty_axis`). Declining on the host gives the caller the
     actionable NotImplementedError the old fast path gave, rather than the
-    kernel's own message. A reduction with no OUTPUTS is an error for nobody."""
-    var is_red = Array[Bool, MAX_RANK](fill=False)
+    kernel's own message. Torch refuses this EVEN WHEN THE OUTPUT ITSELF IS
+    EMPTY (e.g. amin(empty(0, 0), dim=1) still raises), so the output count
+    plays no part here."""
     var extent = 1
     for d in dims:
-        is_red[d] = True
         extent *= t.dim(d)
-    if extent != 0:
-        return
-    var outputs = 1
-    for d in range(t.rank):
-        if not is_red[d]:
-            outputs *= t.dim(d)
-    if outputs > 0:
+    if extent == 0:
         unsupported(
             String(op) + " over a reduce dim of size 0 (torch refuses it too)"
         )
@@ -981,23 +975,23 @@ def op_amin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _amax_amin("AminSpec", args, rets)
 
 
-# aten::amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
-#   Tensor(a!) out) -> Tensor(a!)
-def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+def _amax_amin_out(
+    op: StaticString, op_name: StaticString, args: Values, rets: Values
+) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
     _require_mojo(a)
     _require_mojo(out)
-    _check_extremum_dtype(a, "AmaxSpec")
+    _check_extremum_dtype(a, op)
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
     if len(dims) == 0:
-        unsupported("amax with no reduce dim (a rank-0 operand)")
-    _refuse_empty_extremum("AmaxSpec", a, dims)
+        unsupported("amax/amin with no reduce dim (a rank-0 operand)")
+    _refuse_empty_extremum(op, a, dims)
     _scalar_reduction_out(
         "reduction",
-        "AmaxSpec",
-        "aten::amax.out",
-        "exact",  # torch's amax meta: out dtype must equal input dtype
+        op,
+        op_name,
+        "exact",  # torch's amax/amin meta: out dtype must equal input dtype
         a,
         dims,
         v_bool_or(args[unsafe_offset=2], False),
@@ -1005,6 +999,18 @@ def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# aten::amax.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _amax_amin_out("AmaxSpec", "aten::amax.out", args, rets)
+
+
+# aten::amin.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _amax_amin_out("AminSpec", "aten::amin.out", args, rets)
 
 
 def _full_extremum_dims(op: StaticString, a: T) raises -> List[Int]:
@@ -1039,20 +1045,26 @@ def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
 
 
-# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_min_unary_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
+def _full_extremum_out(
+    family: StaticString,
+    op: StaticString,
+    op_name: StaticString,
+    args: Values,
+    rets: Values,
 ) raises:
+    """max.unary_out / min.unary_out: `_full_extremum_dims`'s gate, then an
+    `exact`-dtype `out=` -- stock CUDA's `make_reduction` requires the output
+    dtype to equal the input's exactly (verified on real CUDA: an int64
+    input with a float32 out raises "provided dtype must match dtype of
+    result"), unlike mean.out/any.out's `canCast` policy."""
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=1])
     _require_mojo(out)
-    var dims = _full_extremum_dims("AminSpec", a)
+    var dims = _full_extremum_dims(op, a)
     _scalar_reduction_out(
-        "reduction",
-        "AminSpec",
-        "aten::min.unary_out",
-        # CUDA's min_all_kernel_impl -> make_reduction requires an exact
-        # dtype match, unlike mean.out/any.out's safe_cast.
+        family,
+        op,
+        op_name,
         "exact",
         a,
         dims,
@@ -1061,6 +1073,22 @@ def op_min_unary_out(
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_max_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out("nn", "MaxSpec", "aten::max.unary_out", args, rets)
+
+
+# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_min_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out(
+        "reduction", "AminSpec", "aten::min.unary_out", args, rets
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1284,8 +1312,7 @@ def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out = v_tensor(args[unsafe_offset=1])
     _require_mojo(a)
     _require_mojo(out)
-    if not _is_truthy(a.dtype):
-        unsupported("any of dtype " + String(a.dtype))
+    _check_truthy_dtype("any", a)
     _scalar_reduction_out(
         "reduction",
         "AnySpec",
@@ -1313,6 +1340,26 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+def _check_truthy_dtype(name: StaticString, a: T) raises:
+    if not _is_truthy(a.dtype):
+        unsupported(String(name) + " of dtype " + String(a.dtype))
+
+
+def _truthy_reduce_dims(
+    name: StaticString, a: T, dim_v: Value
+) raises -> List[Int]:
+    """Shared any/all `.out` checks for the overloads that take a dim
+    argument: truthy dtype, non-empty dim list. The full-reduction *_out
+    overloads (any.all_out/all.all_out) use `_check_truthy_dtype` alone --
+    their dims come from reducing a rank-0 input over zero axes, a
+    legitimate no-op, not a user-requested empty dim list to decline."""
+    _check_truthy_dtype(name, a)
+    var dims = _reduce_dims(dim_v, a.rank, False)
+    if len(dims) == 0:
+        unsupported(String(name) + " with an empty dim list")
+    return dims^
+
+
 # aten::any.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
 # aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
@@ -1324,15 +1371,78 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out = v_tensor(args[unsafe_offset=3])
     _require_mojo(a)
     _require_mojo(out)
-    if not _is_truthy(a.dtype):
-        unsupported("any of dtype " + String(a.dtype))
-    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, False)
-    if len(dims) == 0:
-        unsupported("any with an empty dim list")
+    var dims = _truthy_reduce_dims("any", a, args[unsafe_offset=1])
     _scalar_reduction_out(
         "reduction",
         "AnySpec",
         "aten::any.out",
+        "bool_or_uint8",
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.out(Tensor self, int dim, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.out",
+        "bool_or_uint8",
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_all_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_truthy_dtype("all", a)
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.all_out",
+        "bool_or_uint8",
+        a,
+        _reduce_dims(_none_value(), a.rank, False),
+        False,
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_all_dims_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.dims_out",
         "bool_or_uint8",
         a,
         dims,
@@ -2437,11 +2547,15 @@ def op_nanmedian(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_reductions(site: Site) raises:
     impl[op_all, "all"](site)
+    impl[op_all_all_out, "all.all_out"](site)
     impl[op_all_dim, "all.dim"](site)
     impl[op_all_dim, "all.dims"](site)
+    impl[op_all_dims_out, "all.dims_out"](site)
+    impl[op_all_out, "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
+    impl[op_amin_out, "amin.out"](site)
     impl[op_any, "any"](site)
     impl[op_any_all_out, "any.all_out"](site)
     impl[op_any_dim, "any.dim"](site)
@@ -2457,6 +2571,7 @@ def register_reductions(site: Site) raises:
     impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
     impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
     impl[op_max, "max"](site)
+    impl[op_max_unary_out, "max.unary_out"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
     impl[op_mean_dtype_out, "mean.dtype_out"](site)

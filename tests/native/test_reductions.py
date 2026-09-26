@@ -686,6 +686,19 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
     torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(4))
 
 
+def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`out=x.reshape(-1)[x.numel():]` aliases `x`'s storage (a 0-element view
+    that would need to GROW to hold the result): `_scalar_reduction_out`
+    declines any aliasing `out=` outright rather than resizing it, since stock
+    CUDA has no one well-defined answer here (`torch.max(x, out=x)` -- a
+    different alias of the same helper's problem, tested alongside this one --
+    comes back silently WRONG on real CUDA, not merely a stale pointer)."""
+    x = torch.randn(3, 4, device=mojo_gpu)
+    out = x.reshape(-1)[x.numel() :]
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=out)
+
+
 # ---------------------------------------------------------------------------
 # amax / amin / max / min / min.dim
 # ---------------------------------------------------------------------------
@@ -749,6 +762,89 @@ def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
         )
 
 
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize(
+    "shape,dim", [((357, 789), 1), ((4, 5, 6), (0, 2)), ((37,), None)]
+)
+def test_amin_out(mojo_gpu, shape, dim, dtype, keepdim):
+    """amin.out over dtypes/dims/keepdim, including the dim=None full reduce
+    (empty dim list) and a non-contiguous input."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    dim_args = (dim,) if dim is not None else ()
+    expected = torch.amin(x, *dim_args, keepdim=keepdim)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    returned = torch.amin(x.to(mojo_gpu), *dim_args, out=out, keepdim=keepdim)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input, out already correctly shaped
+    if len(shape) >= 2:
+        xt = x.transpose(0, 1)
+        expected_t = torch.amin(xt, *dim_args, keepdim=keepdim)
+        out2 = torch.empty(expected_t.shape, dtype=dtype, device=mojo_gpu)
+        torch.amin(xt.to(mojo_gpu), *dim_args, out=out2, keepdim=keepdim)
+        torch.testing.assert_close(out2.cpu(), expected_t)
+
+
+def test_amin_out_resizes_a_mismatching_out(mojo_gpu):
+    x = torch.randn(2, 3, 4)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.amin(x.to(mojo_gpu), dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), torch.amin(x, dim=2))
+
+
+def test_amin_out_rejects_a_mismatching_dtype(mojo_gpu):
+    """amin's meta func requires out.dtype == self.dtype exactly (no dtype=
+    kwarg exists to cast through)."""
+    x = torch.randn(4, 7)
+    with pytest.raises(RuntimeError):
+        torch.amin(
+            x.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float64, device=mojo_gpu),
+        )
+
+
+def test_amin_out_empty_reduce_dim_raises(mojo_gpu):
+    x = torch.empty(3, 0, 5)
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.amin(x.to(mojo_gpu), dim=1, out=out)
+
+
+def test_amax_amin_empty_reduce_dim_refused_even_with_empty_output(mojo_gpu):
+    """torch refuses a zero-length reduce dim EVEN WHEN the output itself is
+    empty too: amin(empty(0, 0), dim=1) still raises "Expected reduction dim
+    1 to have non-zero size", it does not just return an empty tensor."""
+    x = torch.empty(0, 0)
+    xd = x.to(mojo_gpu)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1, out=torch.empty(0, device=mojo_gpu))
+
+    # sanity pair: reducing the EMPTY dim is refused regardless of which side
+    # it's on ((0, 3) dim=0, (3, 0) dim=1); reducing the NON-EMPTY dim while
+    # the other one happens to be empty is not an error (output is empty too).
+    a = torch.empty(0, 3)
+    b = torch.empty(3, 0)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(a.to(mojo_gpu), dim=0)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(b.to(mojo_gpu), dim=1)
+        torch.testing.assert_close(fn(a.to(mojo_gpu), dim=1).cpu(), fn(a, dim=1))
+        torch.testing.assert_close(fn(b.to(mojo_gpu), dim=0).cpu(), fn(b, dim=0))
+
+
 def test_max_and_min_full_reduction(mojo_device):
     x = torch.randn(37, 41)
     xd = x.to(mojo_device)
@@ -756,6 +852,100 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
     ints = torch.randint(-100, 100, (5, 9), dtype=torch.int64)
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
+
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 3)])
+def test_max_and_min_full_reduction_of_empty_refused(mojo_device, shape):
+    """The extent==0 refusal reused by full max()/min() (every dim is
+    reduced, so any zero dim makes the whole reduce extent 0) must stay
+    unaffected by widening amax/amin's out= refusal to empty outputs too."""
+    x = torch.empty(shape).to(mojo_device)
+    for fn in (torch.max, torch.min):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(x)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(37, 41), (357, 789), (128,)])
+def test_max_unary_out(mojo_device, shape, dtype):
+    """`max.unary_out`: the full-reduction `out=` overload (`aten::max`
+    itself has no `out=` form; torch routes `torch.max(x, out=t)` here)."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    xd = x.to(mojo_device)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    returned = torch.max(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+def test_max_unary_out_noncontiguous_and_wrongly_shaped_out(mojo_device):
+    x = torch.randn(6, 11)
+    xd = x.to(mojo_device)[:, ::2]
+    assert not xd.is_contiguous()
+    out = torch.empty(4, 4, device=mojo_device)  # wrong shape: resized to ()
+    torch.max(xd, out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), torch.max(x[:, ::2]))
+
+
+def test_max_unary_out_propagates_nan(mojo_device):
+    x = torch.tensor([1.0, float("nan"), -7.0])
+    out = torch.empty((), device=mojo_device)
+    torch.max(x.to(mojo_device), out=out)
+    assert out.cpu().isnan().item()
+
+
+def test_max_unary_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`_scalar_reduction_out` refuses any `out=` sharing storage with the
+    input outright, rather than resizing it: stock CUDA has no one
+    well-defined answer to reproduce here. `out=x[x.numel():]` (a 0-element
+    view that would need to GROW) computes the right answer on real CUDA, but
+    `out=x` itself -- same tensor, needing to SHRINK from (6,) to () --
+    silently returns the WRONG value there (`resize_output` mutates `self`'s
+    own metadata before the reduction reads it), so there is no single
+    aliasing behavior worth special-casing; every aliasing `out=` declines."""
+    x = torch.randn(6, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x[x.numel() :])
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x)
+
+
+def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, max_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.max(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
+    """Stock CUDA errors on this too (an internal assert in Reduce.cuh,
+    verified on an H100), just not cleanly; declining is the closest match."""
+    x = torch.empty((0, 5), dtype=dtype)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    with pytest.raises(RuntimeError):
+        torch.max(x.to(mojo_device), out=out)
 
 
 @pytest.mark.parametrize(
@@ -820,10 +1010,14 @@ def test_min_unary_out_requires_an_exact_dtype_match(mojo_gpu):
     torch.testing.assert_close(out.cpu(), torch.min(x))
 
 
-def test_min_unary_out_empty_input_errors(mojo_gpu):
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 3)])
+def test_min_unary_out_empty_input_errors(mojo_gpu, shape):
+    """min.unary_out rides `_full_extremum_dims`, so it inherits the same
+    extent==0 refusal as full max()/min() (a zero-length reduce dim always
+    refuses here, since a full reduction's output is never itself empty)."""
     out = torch.empty((), device=mojo_gpu)
-    with pytest.raises(RuntimeError):
-        torch.min(torch.empty(0, device=mojo_gpu), out=out)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.min(torch.empty(shape, device=mojo_gpu), out=out)
 
 
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
@@ -925,6 +1119,92 @@ def test_any_out_accepts_a_uint8_destination(mojo_gpu):
             dim=1,
             out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
         )
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int32, torch.float32])
+def test_all_out_variants(mojo_gpu, keepdim, dtype):
+    """all.out (int dim), all.dims_out (dim list) and all.all_out (no dim,
+    full reduction) all round-trip through the out= tensor, reusing the
+    same AllOp path as the non-out overloads."""
+    if dtype is torch.bool:
+        x = torch.randint(0, 2, (6, 9), dtype=dtype)
+    else:
+        x = torch.randint(0, 3, (6, 9), dtype=dtype)
+    xd = x.to(mojo_gpu)
+
+    # `out=` fixes the result dtype explicitly (here bool), which the
+    # bool-or-uint8 policy accepts regardless of the input's dtype -- unlike
+    # the no-out overloads, which follow the uint8-input-keeps-uint8 rule.
+    expected = torch.all(x, dim=1, keepdim=keepdim).bool()
+    out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    expected_dims = torch.all(x, dim=(0, 1), keepdim=keepdim).bool()
+    out_dims = torch.empty(expected_dims.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, dim=(0, 1), keepdim=keepdim, out=out_dims)
+    assert returned.data_ptr() == out_dims.data_ptr()
+    torch.testing.assert_close(out_dims.cpu(), expected_dims)
+
+    expected_full = torch.all(x).bool()
+    out_full = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, out=out_full)
+    assert returned.data_ptr() == out_full.data_ptr()
+    torch.testing.assert_close(out_full.cpu(), expected_full)
+
+
+def test_all_out_accepts_a_uint8_destination(mojo_gpu):
+    """all's out dtype policy is bool-or-uint8, mirroring any.out."""
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.all(mask, dim=1)
+    out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)
+    torch.all(mask.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+    with pytest.raises(RuntimeError):
+        torch.all(
+            mask.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
+        )
+
+
+def test_all_out_resizes_and_handles_strided_and_noncontig(mojo_gpu):
+    """all.out follows the same resize/strided-copy rules as mean.out /
+    any.out (`_scalar_reduction_out`), exercised here for all's overloads."""
+    x = torch.randint(0, 2, (2, 3, 4), dtype=torch.bool)
+    xd = x.to(mojo_gpu)
+
+    # Mismatching shape -> resize_output.
+    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    torch.all(xd, dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), x.all(dim=2))
+
+    # Non-contiguous destination -> computed into a fresh buffer and copied.
+    storage = torch.zeros(2, 3, 2, dtype=torch.bool, device=mojo_gpu)
+    strided_out = storage[:, :, 0]
+    assert not strided_out.is_contiguous()
+    torch.all(xd, dim=2, out=strided_out)
+    torch.testing.assert_close(strided_out.cpu(), x.all(dim=2))
+    torch.testing.assert_close(
+        storage[:, :, 1].cpu(), torch.zeros(2, 3, dtype=torch.bool)
+    )
+
+    # Non-contiguous input works too.
+    x_t = x.transpose(0, 1)
+    out_t = torch.empty(x_t.shape[:-1], dtype=torch.bool, device=mojo_gpu)
+    torch.all(x_t.to(mojo_gpu), dim=-1, out=out_t)
+    torch.testing.assert_close(out_t.cpu(), x_t.all(dim=-1))
+
+    # all.dims_out with an empty tensor.
+    empty = torch.empty(0, 3, dtype=torch.bool, device=mojo_gpu)
+    out_empty = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    torch.all(empty, dim=(0, 1), out=out_empty)
+    torch.testing.assert_close(
+        out_empty.cpu(), torch.empty(0, 3, dtype=torch.bool).all(dim=(0, 1))
+    )
 
 
 @pytest.mark.parametrize(
@@ -1727,6 +2007,10 @@ _EXPECTED_OVERLOADS = [
     ("aten::amax", lambda d: torch.amax(torch.randn(4, 5).to(d), dim=1)),
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),
     ("aten::max", lambda d: torch.max(torch.randn(4, 5).to(d))),
+    (
+        "aten::max.unary_out",
+        lambda d: torch.max(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::min", lambda d: torch.min(torch.randn(4, 5).to(d))),
     (
         "aten::min.unary_out",
@@ -1746,6 +2030,24 @@ _EXPECTED_OVERLOADS = [
     ("aten::all", lambda d: torch.all(_bools().to(d))),
     ("aten::all.dim", lambda d: torch.all(_bools().to(d), dim=1)),
     ("aten::all.dims", lambda d: torch.ops.aten.all.dims(_bools().to(d), [0, 1])),
+    (
+        "aten::all.out",
+        lambda d: torch.all(
+            _bools().to(d), dim=1, out=torch.empty(4, dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::all.all_out",
+        lambda d: torch.all(
+            _bools().to(d), out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::all.dims_out",
+        lambda d: torch.all(
+            _bools().to(d), dim=[0, 1], out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
     ("aten::any", lambda d: torch.any(_bools().to(d))),
     ("aten::any.dim", lambda d: torch.any(_bools().to(d), dim=1)),
     ("aten::any.dims", lambda d: torch.ops.aten.any.dims(_bools().to(d), [0, 1])),
