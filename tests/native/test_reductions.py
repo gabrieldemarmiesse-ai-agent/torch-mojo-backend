@@ -343,6 +343,22 @@ def test_sum_out_variant_into_int64_truncates_each_element_first(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected)
 
 
+def test_sum_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """`out`'s dtype is the compute dtype for ANY self, not just a floating
+    one: an int64 self summed into a float32 `out` casts each element to
+    float32 first, same as a float self does (test above). It must NOT
+    accumulate in int64 (self's own dtype) and cast the sum down afterward.
+    Verified on stock CUDA: [16777217, -16777216] (adjacent int64 values that
+    collapse to the same float32) sums to 0.0 in float32, not 1.0 from an
+    int64 sum cast down afterward."""
+    x = torch.tensor([16777217, -16777216], dtype=torch.int64)
+    xd = x.to(mojo_gpu)
+    assert x.sum().item() == 1  # int64 sum-then-cast would give 1.0, not 0.0
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    assert out.item() == 0.0
+
+
 def test_sum_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
     """SumSpec only accumulates in float16/bfloat16/float32/int64
     (`_is_sum_dtype`); bool/uint8 outs, which torch itself accepts for

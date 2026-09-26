@@ -753,23 +753,16 @@ def op_sum_intlist_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
+    # `out` always exists here, so its dtype is the compute dtype for ANY
+    # self (float or int) with no explicit dtype= -- the bool/sub-int64 ->
+    # int64 default (`_sum`, above) only applies when there is no out tensor
+    # to take a dtype from.
     var target = _out_reduce_dtype(
         args[unsafe_offset=3], out, "aten::sum.IntList_out"
     )
-    if (
-        _opt_dtype(args[unsafe_offset=3]) < 0
-        and not src.t.dtype.is_floating_point()
-    ):
-        # No explicit dtype=: torch's bool/sub-int64 -> int64 default
-        # promotion (SumSpec's only integer accumulation dtype) takes
-        # priority over `out`'s own, possibly narrower, integer dtype; the
-        # cast-copy below still rounds the int64 result into it.
-        target = DType.int64
     if not _is_sum_dtype(target):
         unsupported("sum with dtype=" + String(target))
     _promote_for_out_reduction(src, target)
-    if not _is_sum_dtype(src.t.dtype):
-        unsupported("sum of dtype " + String(src.t.dtype))
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
