@@ -1371,9 +1371,9 @@ def test_vector_norm_size_one_reduce_out_declines_aliasing_input(mojo_gpu):
     be safe. Covers: a genuinely shifted overlap, a same-tensor "in-place via
     out=" call (`abs(x, out=x)` is fine on real torch, but this backend
     declines it too rather than special-case it), and a same-storage `out=`
-    that merely reshapes the input (`x.squeeze(1)`, no resize needed and no
-    byte-range overlap either -- still declined, since it still shares
-    storage)."""
+    that merely reshapes the input (`x.squeeze(1)`, covering the exact same
+    bytes as `x` at a different rank -- no resize needed, but still declined,
+    since it still shares storage)."""
     b = torch.arange(6, dtype=torch.float32).to(mojo_gpu)
     inp = b[:-1].view(-1, 1)  # every reduced dim (dim=1) has extent 1
     with pytest.raises(NotImplementedError):
@@ -1433,6 +1433,16 @@ def test_reduction_out_declines_internal_overlap(mojo_gpu):
     out = torch.empty(1, device=mojo_gpu).expand(4)
     with pytest.raises(RuntimeError, match="single memory location"):
         torch.sum(x, dim=1, out=out)
+
+
+def test_reduction_out_internal_overlap_is_fine_when_empty(mojo_gpu):
+    """An EMPTY out= is exempt regardless of its strides: nothing is written,
+    so a degenerate `.expand()` over a zero extent can't collapse anything.
+    Confirmed accepted on stock CUDA torch."""
+    x = torch.randn(0, 3, 1).to(mojo_gpu)
+    out = torch.empty(0, 1, device=mojo_gpu).expand(0, 3)
+    result = torch.sum(x, dim=2, out=out)
+    assert result.shape == (0, 3)
 
 
 # ---------------------------------------------------------------------------

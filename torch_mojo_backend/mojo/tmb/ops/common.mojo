@@ -153,7 +153,17 @@ def assert_no_internal_overlap(t: T) raises:
     """`at::assert_no_internal_overlap`: an `out=` tensor may not alias
     itself (e.g. a size-1 storage `.expand()`ed to more than one logical
     element) -- distinct reduction results written to the same physical
-    address would silently collapse into whichever write lands last."""
+    address would silently collapse into whichever write lands last.
+
+    An EMPTY tensor is exempt regardless of its strides (matches ATen's
+    `is_non_overlapping_and_dense_or_false`, which short-circuits before ever
+    reading strides for a 0-element tensor): nothing is written, so
+    degenerate strides from an `.expand()` over a zero extent -- a normal way
+    to reduce e.g. a (0, 3, 1) tensor over its last dim into `out=
+    torch.empty(0, 1).expand(0, 3)` -- can't actually collapse anything.
+    Confirmed on stock CUDA torch that this exact case is accepted."""
+    if t.numel == 0:
+        return
     if _repeats_elements(t):
         raise Error(
             "unsupported operation: more than one element of the written-to"

@@ -72,6 +72,7 @@ from tmb.ops.common import (
     copy_strided_into,
     elementwise_direct,
     fill_value,
+    one_device,
     resize_out,
 )
 from tmb.backend.registry import Site, impl
@@ -403,19 +404,6 @@ def _ready_operand(
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _reduce_into(
     family: StaticString,
     op: StaticString,
@@ -432,7 +420,7 @@ def _reduce_into(
     reduce-dim tuple, keepdim, the accumulator's extra payload (var's
     correction), output spec.
     """
-    _one_device(a, dst)
+    one_device(a, dst)
     var src = _ready_operand(a, dims, False)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -460,7 +448,7 @@ def _arg_reduce_into(
 ) raises:
     """argmax / argmin: same slots as a scalar reduction, but the in-place
     route has the extra coalescing floor."""
-    _one_device(a, dst)
+    one_device(a, dst)
     var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -482,8 +470,8 @@ def _min_dim_into(
     """min.dim in one call: `_min_dim_spec_into_go` fills both preallocated
     outputs, so values and indices come out of a single pass with torch's
     first-min-wins tie rule and its NaN propagation."""
-    _one_device(a, dst_v)
-    _one_device(a, dst_i)
+    one_device(a, dst_v)
+    one_device(a, dst_i)
     var src = _ready_operand(a, dims, True)
     var ctx = ctx_for(dst_v.device)
     var cp = ctx_ptr(ctx)
@@ -565,7 +553,7 @@ def _copy_result_into(dst: T, src: T) raises:
     """`out[...] = src` with a dtype cast, for any `out` layout. `src` is a
     freshly allocated contiguous result, so the cast kernel's contiguity
     requirement is already met."""
-    _one_device(src, dst)
+    one_device(src, dst)
     if not dst.same_shape(src):
         raise Error(
             "out= tensor of rank ",
@@ -663,7 +651,7 @@ def _scalar_reduction_out(
     write lands last. `_decline_aliasing_out`, a separate concern, catches
     `out=` sharing storage with the INPUT.
     """
-    _one_device(a, dst)
+    one_device(a, dst)
     _decline_aliasing_out(op_name, a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
@@ -1131,8 +1119,8 @@ def op_min_dim_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
     var numel = _shape_numel(shape, rank)
-    _one_device(a, out_v)
-    _one_device(a, out_i)
+    one_device(a, out_v)
+    one_device(a, out_i)
     if not _shape_matches(out_v, shape, rank):
         resize_out(out_v, shape, rank)
     if not _shape_matches(out_i, shape, rank):
@@ -1503,7 +1491,7 @@ def _vector_norm_abs_out(
     `dst` and `a`, this is just the same "copy the result across" tail
     `_scalar_reduction_out` uses.
     """
-    _one_device(a, dst)
+    one_device(a, dst)
     _decline_aliasing_out(op_name, a, dst)
     _check_out_dtype(op_name, "exact", max_dtype(a.stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
@@ -2025,8 +2013,8 @@ def _select_out(
             dtype_name(out_i.stype),
             " instead",
         )
-    _one_device(a, out_v)
-    _one_device(a, out_i)
+    one_device(a, out_v)
+    one_device(a, out_i)
     var dim = _sort_dim(a, dim_in)
     var shape = _selected_shape(a, dim, k)
     var numel = _shape_numel(shape, a.rank)
@@ -2275,8 +2263,8 @@ def _order_stat_out(
             dtype_name(out_i.stype),
             " instead",
         )
-    _one_device(a, out_v)
-    _one_device(a, out_i)
+    one_device(a, out_v)
+    one_device(a, out_i)
     var sr = _order_stat_shape(a, dim, keepdim)
     var numel = _shape_numel(sr[0], sr[1])
     if not _shape_matches(out_v, sr[0], sr[1]):

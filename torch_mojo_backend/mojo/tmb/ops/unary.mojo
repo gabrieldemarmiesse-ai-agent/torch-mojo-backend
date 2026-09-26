@@ -46,6 +46,7 @@ from tmb.ops.common import (
     copy_strided_into,
     elementwise_direct,
     fill_value,
+    one_device,
     resize_out,
 )
 from tmb.backend.registry import Site, impl
@@ -172,19 +173,6 @@ def _no_partial_overlap(written: T, other: T) raises:
     )
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _unary_direct(
     family: String, op: String, src_c: T, mut dst: T, out_dtype: DType
 ) raises:
@@ -218,7 +206,7 @@ def _unary_out(
     a shape it cannot satisfy. A correctly shaped one keeps its own strides
     and storage offset, so `out=base[4:8]` writes where the caller asked.
     """
-    _one_device(t_in, dst)
+    one_device(t_in, dst)
     _no_partial_overlap(dst, t_in)
     if dst.stype != torch_dtype(out_dtype):
         raise Error(
@@ -720,7 +708,7 @@ def _ceil_or_floor(op: String, t: T) raises -> T:
 
 def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
     if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
-        _one_device(t, dst)
+        one_device(t, dst)
         _no_partial_overlap(dst, t)
         if dst.stype != t.stype:
             raise Error(
@@ -917,7 +905,7 @@ def op_logical_not_out(
 
 
 def _bitwise_not_kernel(src: T, dst: T) raises:
-    _one_device(src, dst)
+    one_device(src, dst)
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -956,7 +944,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )
-    _one_device(t_in, dst)
+    one_device(t_in, dst)
     _no_partial_overlap(dst, t_in)
     if dst.stype != t_in.stype:
         raise Error(
