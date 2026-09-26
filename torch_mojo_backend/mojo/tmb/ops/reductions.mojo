@@ -62,12 +62,15 @@ from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     assert_no_overlap,
+    assert_no_partial_overlap,
     cast_into,
     cast_to,
     check_out,
     contiguous,
     copy_strided_into,
+    elementwise_direct,
     fill_value,
     resize_out,
 )
@@ -633,6 +636,14 @@ def _scalar_reduction_out(
     element count alone is not enough: the copy below reads the source
     through the destination's extents, so a (2,3) result poured into a (3,2)
     out would walk off the end of the source.
+
+    `assert_no_internal_overlap` (checked once here for every out= reduction,
+    after the resize decision since a resize that leaves the shape alone --
+    e.g. an already-right-shaped but `.expand()`ed `out=` -- is exactly the
+    case it must catch) declines an `out=` that repeats elements: several
+    logical output positions would alias one physical address, so distinct
+    reduction results written there would silently collapse into whichever
+    write lands last.
     """
     _one_device(a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
@@ -642,6 +653,7 @@ def _scalar_reduction_out(
     var numel = _shape_numel(shape, rank)
     if not _shape_matches(dst, shape, rank):
         resize_out(dst, shape, rank)
+    assert_no_internal_overlap(dst)
     if _out_ready(dst, a, out_stype, numel):
         _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
         return
@@ -1289,30 +1301,16 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     return True
 
 
-def _vector_norm_abs_direct(src_c: T, mut dst: T) raises:
-    """dst[...] = abs(src_c[...]); both operands already contiguous with the
-    same element count (the reduced dims all have extent 1, so squeezing or
-    keeping them doesn't change the flat element order)."""
-    if src_c.numel == 0:
-        return
-    var ctx = ctx_for(dst.device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("elementwise", "AbsSpec")
-    call.arg_dtype(0, src_c.dtype)
-    call.out_dtype(dst.dtype)
-    call.spec(src_c.spec(cp))
-    call.spec(dst.spec(cp))
-    call.run()
-    _ = ctx
-
-
 def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
+    """abs(a), reshaped to the reduced-and-squeezed (or kept-dims) output
+    shape; always a FRESH tensor, so this never reads and writes overlapping
+    memory regardless of what the caller does with the result."""
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
     var src_c = contiguous(a)
     var out = own(new_tensor(shape, rank, a.stype, a.device))
-    _vector_norm_abs_direct(src_c, out.t)
+    elementwise_direct("elementwise", "AbsSpec", src_c, out.t, out.t.dtype)
     if src_c.h != a.h:
         release(src_c.h)
     return out^
@@ -1321,31 +1319,35 @@ def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
 def _vector_norm_abs_out(
     op_name: StaticString, a: T, dims: List[Int], keepdim: Bool, mut dst: T
 ) raises:
-    """Same validation order as `_scalar_reduction_out`: dtype (`exact`, same
-    policy as the accumulator path) and overlap are checked before any resize
-    or launch -- an abs() launch is a true 1:1 elementwise kernel (unlike the
-    accumulator, which reduces many inputs into few outputs), so an
-    overlapping `out=` is a real read/write race, the same hazard
-    `op_abs_out` guards against."""
+    """Same dtype policy as `_scalar_reduction_out` (`exact`), plus the
+    overlap checks a true 1:1 elementwise op needs that the reduction
+    accumulator doesn't: `assert_no_internal_overlap` (an `out=` that repeats
+    elements, e.g. `.expand()`ed, would silently collapse distinct results)
+    and `assert_no_partial_overlap` (identical-view `out=` is fine -- that's
+    `abs(x, out=x)` -- anything else sharing storage is a race), checked
+    AFTER the resize since that is what can turn a non-overlapping `out=`
+    into an overlapping one (`resize_out` grows storage in place at the
+    existing offset). Checking overlap before ever computing anything from
+    `a` also means a rejected call never reads through a `dst` that resizing
+    may have just invalidated for anyone else aliasing that storage.
+
+    The result is always computed into a FRESH tensor first (`_vector_norm_abs`,
+    never a direct launch into `dst`) and then copied in: with the checks
+    above already guaranteeing `dst` doesn't partially alias `a`, this is
+    just the same "copy the result across" tail `_scalar_reduction_out` uses.
+    """
     _one_device(a, dst)
     _check_out_dtype(op_name, "exact", max_dtype(a.stype), dst.dtype)
-    assert_no_overlap(dst, a)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
-    var numel = _shape_numel(shape, rank)
     if not _shape_matches(dst, shape, rank):
         resize_out(dst, shape, rank)
-    var src_c = contiguous(a)
-    if _out_ready(dst, a, a.stype, numel):
-        _vector_norm_abs_direct(src_c, dst)
-    else:
-        var tmp = own(new_tensor(shape, rank, a.stype, a.device))
-        _vector_norm_abs_direct(src_c, tmp.t)
-        _copy_result_into(dst, tmp.t)
-        _ = tmp^  # alive past the launch
-    if src_c.h != a.h:
-        release(src_c.h)
+    assert_no_internal_overlap(dst)
+    assert_no_partial_overlap(dst, a)
+    var result = _vector_norm_abs(a, dims, keepdim)
+    _copy_result_into(dst, result.t)
+    _ = result^
 
 
 def _vector_norm(

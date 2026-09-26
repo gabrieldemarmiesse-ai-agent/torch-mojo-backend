@@ -922,6 +922,53 @@ def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
         torch.linalg.vector_norm(x, dim=1, out=out)
 
 
+def test_vector_norm_size_one_reduce_out_identical_view_is_fine(mojo_gpu):
+    """`out=` the SAME tensor being reduced (an in-place-via-out pattern, like
+    `abs(x, out=x)`) is not overlap -- confirmed allowed on stock CUDA torch,
+    unlike the genuinely shifted overlap above."""
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    expected = torch.linalg.vector_norm(x.cpu(), dim=1, keepdim=True)
+    x_ptr = x.data_ptr()
+    returned = torch.linalg.vector_norm(x, dim=1, keepdim=True, out=x)
+    assert returned.data_ptr() == x_ptr
+    torch.testing.assert_close(x.cpu(), expected)
+
+
+def test_vector_norm_size_one_reduce_out_declines_overlap_needing_resize(mojo_gpu):
+    """Overlap that only appears AFTER `out=` is resized (an empty `out=`
+    view into the same storage as the input, at an offset that collides once
+    grown): confirmed this raises on stock CUDA torch too, so the overlap
+    check must run on the POST-resize `out=`, not the empty one the caller
+    passed in."""
+    base = torch.arange(10, dtype=torch.float32).to(mojo_gpu)
+    inp = base[1:].view(-1, 1)  # every reduced dim (dim=1) has extent 1
+    out = base[:0]  # empty view into the SAME storage, offset 0
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.linalg.vector_norm(inp, dim=1, out=out)
+
+
+def test_vector_norm_size_one_reduce_out_declines_internal_overlap(mojo_gpu):
+    """An `out=` with more than one logical element sharing one physical
+    address (`.expand()`) must be declined, not silently collapse every
+    reduced row into whichever write happens to land last."""
+    x = torch.tensor([[1e20], [2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(3)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
+def test_reduction_out_declines_internal_overlap(mojo_gpu):
+    """Same check, in the general (non size-one-reduce) `_scalar_reduction_out`
+    path every out= reduction shares -- stock CUDA torch actually tolerates
+    this for `sum.out` (every aliased position ends up holding whichever
+    result happened to be written last, which is never what the caller
+    wanted), so this backend is intentionally stricter here."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(4)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.sum(x, dim=1, out=out)
+
+
 # ---------------------------------------------------------------------------
 # norm (legacy overloads): all route through the same ord-2 path as
 # linalg_vector_norm above, so these tests only need to check the schema
