@@ -280,7 +280,7 @@ def test_anyall_nan_is_truthy(mojo_device):
 
 
 def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
-    """`sum()` with no dim decomposes to sum.dim_IntList, and torch's promotion
+    """`sum()` with no dim reduces over every axis, and torch's promotion
     rules (bool / sub-int64 integers -> int64, an explicit dtype= casting the
     input BEFORE the accumulation) are applied on our side too."""
     x = torch.randn(16, 33, generator=torch.Generator().manual_seed(0))
@@ -354,6 +354,38 @@ def test_nansum_out_variant_and_noncontiguous(mojo_gpu):
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
+def test_sum_out_variant(mojo_gpu, keepdim):
+    """out= writes into the caller's tensor, resizes on a shape mismatch, and
+    applies the same int64 promotion as the non-out overload."""
+    x = torch.randn(6, 9)
+    xd = x.to(mojo_gpu)
+    expected = x.sum(dim=1, keepdim=keepdim)
+    out = torch.empty(expected.shape, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.sum(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-6, atol=2e-6)
+
+    i = torch.randint(0, 20, (8, 16), dtype=torch.int32)
+    out_i = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    torch.sum(i.to(mojo_gpu), dim=1, out=out_i)
+    torch.testing.assert_close(out_i.cpu(), i.sum(dim=1))
+
+    resized = torch.empty(0, device=mojo_gpu)
+    torch.sum(xd, dim=1, out=resized)
+    assert tuple(resized.shape) == tuple(x.sum(dim=1).shape)
+    torch.testing.assert_close(resized.cpu(), x.sum(dim=1), rtol=2e-6, atol=2e-6)
+
+
+def test_sum_out_variant_declines_unsafe_cast(mojo_gpu):
+    """`safe_cast`: a float result poured into an integral out is refused,
+    matching sum.IntList_out's structured-kernel dtype check."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    out = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.sum(x, dim=1, out=out)
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
 def test_mean_and_any_out_variants(mojo_gpu, keepdim):
     """out= writes into the caller's tensor and returns it."""
     x = torch.randn(6, 9)
@@ -420,6 +452,49 @@ def test_amax_amin_layouts(mojo_device, shape, dim, keepdim):
         expected = fn(x, dim=dim, keepdim=keepdim)
         assert ours.shape == expected.shape
         torch.testing.assert_close(ours.cpu(), expected)
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_amax_out_variant(mojo_gpu, keepdim):
+    x = torch.randn(357, 789)
+    xd = x.to(mojo_gpu)
+    expected = torch.amax(x, dim=1, keepdim=keepdim)
+
+    out = torch.empty(expected.shape, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.amax(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # a wrongly-shaped out is resized (resize_output), by shape not numel.
+    mismatched = torch.empty(0, device=mojo_gpu)
+    torch.amax(xd, dim=1, keepdim=keepdim, out=mismatched)
+    torch.testing.assert_close(mismatched.cpu(), expected)
+
+
+def test_amax_out_into_a_strided_destination(mojo_gpu):
+    """A non-contiguous `out` cannot be written by the kernel directly, so the
+    result is computed into a fresh buffer and copied across."""
+    x = torch.randn(357, 789)
+    storage = torch.zeros(357, 2, device=mojo_gpu)
+    out = storage[:, 0]
+    assert not out.is_contiguous()
+    torch.amax(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), x.amax(dim=1))
+    torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(357))
+
+
+def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
+    """amax's out dtype policy is exact (torch's meta: input/out dtypes must
+    match, no cast), unlike mean.out's safe_cast."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.amax(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(NotImplementedError, match="reduce dim of size 0"):
+        torch.amax(
+            torch.empty(4, 0, device=mojo_gpu),
+            dim=1,
+            out=torch.empty(4, device=mojo_gpu),
+        )
 
 
 def test_max_and_min_full_reduction(mojo_device):
@@ -971,7 +1046,14 @@ def _value_index_out(device: str) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 _EXPECTED_OVERLOADS = [
+    ("aten::sum", lambda d: torch.randn(4, 5).to(d).sum()),
     ("aten::sum.dim_IntList", lambda d: torch.randn(4, 5).to(d).sum(dim=1)),
+    (
+        "aten::sum.IntList_out",
+        lambda d: torch.sum(
+            torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
+        ),
+    ),
     ("aten::mean", lambda d: torch.randn(4, 5).to(d).mean()),
     ("aten::mean.dim", lambda d: torch.randn(4, 5).to(d).mean(dim=1)),
     (
@@ -1072,14 +1154,14 @@ def test_every_overload_dispatches_natively(mojo_gpu, op_name, call):
     assert native.op_count(op_name) > before, f"{op_name} did not reach the backend"
 
 
-def test_sum_default_overload_decomposes_to_dim_intlist(mojo_gpu):
-    """`aten::sum` is left to ATen's composite, which calls sum.dim_IntList —
-    the old registry did the same, so there is one sum implementation."""
+def test_sum_default_overload_dispatches_natively(mojo_gpu):
+    """`aten::sum` (full reduction) is registered directly now, so it no
+    longer falls through ATen's CompositeExplicitAutograd to
+    sum.dim_IntList."""
     native.op_counting(True)
-    before = native.op_count("aten::sum.dim_IntList")
+    before = native.op_count("aten::sum")
     torch.randn(4, 5).to(mojo_gpu).sum()
-    assert native.op_count("aten::sum.dim_IntList") > before
-    assert native.op_count("aten::sum") == 0
+    assert native.op_count("aten::sum") > before
 
 
 def test_accelerator_count_is_sane(registered):
