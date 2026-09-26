@@ -57,6 +57,7 @@ SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
 
 COVERS: dict[str, str] = {
     "aten::sum.dim_IntList": "test_sum",
+    "aten::nansum": "test_nansum (same kernel as sum, NaN-zeroing map)",
     "aten::mean": "test_mean (full-reduction case)",
     "aten::mean.dim": "test_mean (dim cases)",
     "aten::max": "test_max",
@@ -92,6 +93,7 @@ _SAME_KERNEL_OUT = (
 )
 SKIPPED: dict[str, str] = {
     "aten::topk.values": _SAME_KERNEL_OUT,
+    "aten::nansum.out": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,
     "aten::multinomial.out": _SAME_KERNEL_OUT,
     "aten::median.dim_values": _SAME_KERNEL_OUT,
@@ -129,6 +131,20 @@ def test_sum(
     bench.run(
         lambda: torch.sum(x_ref, dim=d),
         lambda: torch.sum(x_our, dim=d),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_nansum(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
+    d = 0 if dim is None else dim
+    bench.run(
+        lambda: torch.nansum(x_ref, dim=d),
+        lambda: torch.nansum(x_our, dim=d),
         flops=float(x_ref.numel()),
     )
 
