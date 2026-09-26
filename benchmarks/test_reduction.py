@@ -56,7 +56,8 @@ SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::sum.dim_IntList": "test_sum",
+    "aten::sum": "test_sum (full-reduction case)",
+    "aten::sum.dim_IntList": "test_sum (dim cases)",
     "aten::mean": "test_mean (full-reduction case)",
     "aten::mean.dim": "test_mean (dim cases)",
     "aten::max": "test_max",
@@ -91,6 +92,7 @@ _SAME_KERNEL_OUT = (
     "written straight into (or copied into) the caller's tensors"
 )
 SKIPPED: dict[str, str] = {
+    "aten::sum.IntList_out": _SAME_KERNEL_OUT,
     "aten::topk.values": _SAME_KERNEL_OUT,
     "aten::min.unary_out": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,
@@ -126,12 +128,18 @@ def test_sum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    d = 0 if dim is None else dim
-    bench.run(
-        lambda: torch.sum(x_ref, dim=d),
-        lambda: torch.sum(x_our, dim=d),
-        flops=float(x_ref.numel()),
-    )
+    if dim is None:
+        bench.run(
+            lambda: torch.sum(x_ref),
+            lambda: torch.sum(x_our),
+            flops=float(x_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.sum(x_ref, dim=dim),
+            lambda: torch.sum(x_our, dim=dim),
+            flops=float(x_ref.numel()),
+        )
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
