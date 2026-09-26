@@ -47,6 +47,7 @@ def mojo_device(mojo_gpu: str) -> str:
 
 _REDUCE_OPS = {
     "sum": lambda t, **kw: torch.sum(t, **kw),
+    "nansum": lambda t, **kw: torch.nansum(t, **kw),
     "mean": lambda t, **kw: torch.mean(t, **kw),
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
@@ -304,6 +305,94 @@ def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     y = torch.tensor([[1.7, 2.7, 3.7, 0.2]])
     ours = torch.sum(y.to(mojo_gpu), dim=1, dtype=torch.float32)
     torch.testing.assert_close(ours.cpu(), torch.sum(y, dim=1, dtype=torch.float32))
+
+
+def test_nansum_dtype_promotion(mojo_gpu):
+    """Same promotion rules as `sum` (bool/int -> int64, `dtype=` casts before
+    the reduction) -- integral inputs have no NaN to remove, so nansum and sum
+    must agree on them exactly."""
+    for dtype in (torch.bool, torch.uint8, torch.int32):
+        if dtype is torch.bool:
+            i = torch.randint(0, 2, (8, 16), dtype=dtype)
+        else:
+            i = torch.randint(0, 20, (8, 16), dtype=dtype)
+        got = i.to(mojo_gpu).nansum(dim=1)
+        assert got.dtype == torch.int64 == i.nansum(dim=1).dtype
+        torch.testing.assert_close(got.cpu(), i.nansum(dim=1))
+
+    # dtype= casts the input BEFORE the reduction: summing two 40000s in
+    # float16 overflows to inf, but casting to float32 first (as torch does)
+    # sums them to exactly 80000.
+    y = torch.tensor([[40000.0, 40000.0]], dtype=torch.float16)
+    ours = torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.float32)
+    expected = torch.nansum(y, dim=1, dtype=torch.float32)
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(ours.cpu(), expected)
+
+    # An explicit dtype=int32 is declined, same as sum's own dtype= gate.
+    with pytest.raises(NotImplementedError):
+        torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.int32)
+
+    # An explicit integral dtype on a floating input is declined outright:
+    # this backend has no `nan_to_num` kernel to zero the NaN before the cast
+    # would otherwise truncate it to an arbitrary integer.
+    with pytest.raises(NotImplementedError):
+        torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.int64)
+
+
+def test_nansum_out_variant_and_noncontiguous(mojo_gpu):
+    x = torch.tensor([[1.0, float("nan"), 3.0], [float("nan"), float("nan"), 6.0]])
+    xd = x.to(mojo_gpu)
+
+    expected = x.nansum(dim=1)
+    out = torch.empty(0, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.nansum(xd, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == tuple(expected.shape)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # Non-contiguous input: not an adjacent-ascending interval, so this takes
+    # the permute + materialize path (`_middle_direct_ok` requires
+    # contiguity), not the strided-axis kernel.
+    y = torch.randn(5, 7)
+    y[1, 2] = float("nan")
+    yt = y.t()
+    yt_device = y.to(mojo_gpu).t()
+    torch.testing.assert_close(yt_device.nansum(dim=0).cpu(), yt.nansum(dim=0))
+
+
+def test_nansum_out_computes_in_outs_dtype(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
+    sum.IntList_out/mean.out: with no `dtype=`, nansum.out accumulates in
+    `out`'s own dtype, not the input's -- summing two 40000s in float16
+    overflows to inf, but widened to float32 first (what CUDA's own
+    `make_reduction` does for a lower-precision input against a float32 out,
+    `gpu_lowp_to_f32` in ReduceOpsUtils.h; float16->float32 is an exact
+    widening, so casting up front reproduces that fused kernel's result
+    exactly) it is exactly 80000. Not run against actual CUDA tensors here:
+    this box's driver (12.8) is too old for the installed cu130 wheel
+    (`torch.cuda.is_available()` is False even under `srun` on the H100
+    nodes) -- verified instead by reading `ReduceOpsUtils.h`'s
+    `make_reduction` and `ReduceSumProdKernel.cu`'s `nansum_kernel_cuda`."""
+    y = torch.tensor([40000.0, 40000.0], dtype=torch.float16)
+    assert torch.isinf(y.sum())  # accumulating (and rounding) in float16 overflows
+    yd = y.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.nansum(yd, dim=0, out=out)
+    assert out.item() == 80000.0
+
+
+def test_nansum_out_dtype_must_match_out_dtype(mojo_gpu):
+    """An explicit `dtype=` that disagrees with `out`'s dtype raises, rather
+    than silently using either one (same rule as sum.IntList_out/mean.out)."""
+    y = torch.tensor([40000.0, 40000.0], dtype=torch.float16).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.nansum(
+            y,
+            dim=0,
+            dtype=torch.float32,
+            out=torch.empty((), dtype=torch.float16, device=mojo_gpu),
+        )
 
 
 @pytest.mark.parametrize(
