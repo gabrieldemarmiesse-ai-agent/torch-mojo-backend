@@ -382,12 +382,13 @@ def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
 
 
 def test_sum_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
-    """Unlike mean (below), sum has no `is_half_type` precision trick:
-    `TORCH_IMPL_FUNC(sum_out)` builds its TensorIterator from `out`'s own
-    dtype directly, so every element is rounded to it BEFORE accumulating.
-    Verified on stock CUDA: summing [1 + 2**-12, -1] with dtype=float16
-    rounds 1 + 2**-12 down to 1.0 first, giving exactly 0 -- not 2**-12 from
-    summing at full precision and rounding only the final scalar."""
+    """`TORCH_IMPL_FUNC(sum_out)`'s CUDA path (`make_reduction_from_out_ty`)
+    builds its TensorIterator from `out`'s own dtype directly, so every
+    element is rounded to it BEFORE accumulating (`SumOp`'s own float32
+    `acc_dtype` then sums those already-rounded values). Verified on an
+    actual CUDA device: summing [1 + 2**-12, -1] with dtype=float16 rounds
+    1 + 2**-12 down to 1.0 first, giving exactly 0 -- not 2**-12 from summing
+    at full precision and rounding only the final scalar."""
     x = torch.tensor([1.0 + 2**-12, -1.0])
     xd = x.to(mojo_gpu)
     assert (x.sum().half().item(), x.half().sum().item()) == (2**-12, 0.0)
@@ -401,23 +402,25 @@ def test_sum_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
     assert out2.item() == 0.0
 
 
-def test_mean_never_rounds_to_a_half_dtype_mid_reduction(mojo_gpu):
-    """Mean's `is_half_type` trick (ReduceOps.cpp's `mean_out`, CPU path)
-    substitutes float32 for a float16/bfloat16 target before ever reading the
-    input, so it does NOT round elements the way sum does (test above):
-    verified on stock CUDA to give 2**-13 (accumulate at full precision,
-    divide by 2, round only the final scalar), not 0."""
+def test_mean_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
+    """Confirmed on an actual CUDA device (not CPU torch, whose `mean_out`
+    has a CPU-only `is_half_type` trick that avoids this): mean's CUDA path
+    is the exact same `make_reduction_from_out_ty` machinery as sum (above),
+    so it rounds every element to the target dtype BEFORE accumulating too --
+    `torch.mean(torch.tensor([1 + 2**-12, -1], device="cuda"),
+    dtype=torch.float16)` gives 0, not the CPU-only 2**-13. The mojo device
+    mirrors CUDA, not CPU."""
     x = torch.tensor([1.0 + 2**-12, -1.0])
     xd = x.to(mojo_gpu)
-    assert x.mean().half().item() == 2**-13
+    assert (x.mean().half().item(), x.half().mean().item()) == (2**-13, 0.0)
 
     out = torch.empty((), dtype=torch.float16, device=mojo_gpu)
-    torch.mean(xd, dim=0, dtype=torch.float16, out=out)
-    assert out.item() == 2**-13
+    torch.mean(xd, dtype=torch.float16, out=out)  # -> mean.dtype_out
+    assert out.item() == 0.0
 
     out2 = torch.empty((), dtype=torch.float16, device=mojo_gpu)
-    torch.mean(xd, dim=0, out=out2)  # dtype=None: same rule
-    assert out2.item() == 2**-13
+    torch.mean(xd, dim=0, out=out2)  # dtype=None: same rule -> mean.out
+    assert out2.item() == 0.0
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
@@ -483,7 +486,7 @@ def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
     expected = x.mean(dtype=torch.float32)
     assert expected.item() != x.half().mean().float().item()  # the two must differ
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
-    torch.ops.aten.mean.dtype_out(xd, dtype=torch.float32, out=out)
+    torch.mean(xd, dtype=torch.float32, out=out)  # no dim -> mean.dtype_out
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
 
