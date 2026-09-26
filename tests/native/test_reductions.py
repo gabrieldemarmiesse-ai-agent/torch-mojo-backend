@@ -463,22 +463,19 @@ def test_amin_out(mojo_gpu, shape, dim, dtype, keepdim):
         x = torch.randn(shape).to(dtype)
     else:
         x = torch.randint(-100, 100, shape, dtype=dtype)
-    kwargs = {"keepdim": keepdim} if dim is not None else {}
     dim_args = (dim,) if dim is not None else ()
-    expected = torch.amin(x, *dim_args, **kwargs)
+    expected = torch.amin(x, *dim_args, keepdim=keepdim)
     out = torch.empty(0, dtype=dtype, device=mojo_gpu)
-    returned = torch.amin(x.to(mojo_gpu), *dim_args, out=out, **kwargs)
+    returned = torch.amin(x.to(mojo_gpu), *dim_args, out=out, keepdim=keepdim)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), expected)
 
     # non-contiguous input, out already correctly shaped
     if len(shape) >= 2:
         xt = x.transpose(0, 1)
-        expected_t = (
-            torch.amin(xt, *dim_args, **kwargs) if dim is not None else torch.amin(xt)
-        )
+        expected_t = torch.amin(xt, *dim_args, keepdim=keepdim)
         out2 = torch.empty(expected_t.shape, dtype=dtype, device=mojo_gpu)
-        torch.amin(xt.to(mojo_gpu), *dim_args, out=out2, **kwargs)
+        torch.amin(xt.to(mojo_gpu), *dim_args, out=out2, keepdim=keepdim)
         torch.testing.assert_close(out2.cpu(), expected_t)
 
 
@@ -509,6 +506,32 @@ def test_amin_out_empty_reduce_dim_raises(mojo_gpu):
         torch.amin(x.to(mojo_gpu), dim=1, out=out)
 
 
+def test_amax_amin_empty_reduce_dim_refused_even_with_empty_output(mojo_gpu):
+    """torch refuses a zero-length reduce dim EVEN WHEN the output itself is
+    empty too: amin(empty(0, 0), dim=1) still raises "Expected reduction dim
+    1 to have non-zero size", it does not just return an empty tensor."""
+    x = torch.empty(0, 0)
+    xd = x.to(mojo_gpu)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1, out=torch.empty(0, device=mojo_gpu))
+
+    # sanity pair: reducing the EMPTY dim is refused regardless of which side
+    # it's on ((0, 3) dim=0, (3, 0) dim=1); reducing the NON-EMPTY dim while
+    # the other one happens to be empty is not an error (output is empty too).
+    a = torch.empty(0, 3)
+    b = torch.empty(3, 0)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(a.to(mojo_gpu), dim=0)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(b.to(mojo_gpu), dim=1)
+        torch.testing.assert_close(fn(a.to(mojo_gpu), dim=1).cpu(), fn(a, dim=1))
+        torch.testing.assert_close(fn(b.to(mojo_gpu), dim=0).cpu(), fn(b, dim=0))
+
+
 def test_max_and_min_full_reduction(mojo_device):
     x = torch.randn(37, 41)
     xd = x.to(mojo_device)
@@ -516,6 +539,17 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
     ints = torch.randint(-100, 100, (5, 9), dtype=torch.int64)
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
+
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 3)])
+def test_max_and_min_full_reduction_of_empty_refused(mojo_device, shape):
+    """The extent==0 refusal reused by full max()/min() (every dim is
+    reduced, so any zero dim makes the whole reduce extent 0) must stay
+    unaffected by widening amax/amin's out= refusal to empty outputs too."""
+    x = torch.empty(shape).to(mojo_device)
+    for fn in (torch.max, torch.min):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(x)
 
 
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])

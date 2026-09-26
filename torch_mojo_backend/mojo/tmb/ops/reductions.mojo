@@ -840,19 +840,13 @@ def _refuse_empty_extremum(op: StaticString, t: T, dims: List[Int]) raises:
     reduction dim to have non-zero size") and so does the accumulator
     (`errors_on_empty_axis`). Declining on the host gives the caller the
     actionable NotImplementedError the old fast path gave, rather than the
-    kernel's own message. A reduction with no OUTPUTS is an error for nobody."""
-    var is_red = Array[Bool, MAX_RANK](fill=False)
+    kernel's own message. Torch refuses this EVEN WHEN THE OUTPUT ITSELF IS
+    EMPTY (e.g. amin(empty(0, 0), dim=1) still raises), so the output count
+    plays no part here."""
     var extent = 1
     for d in dims:
-        is_red[d] = True
         extent *= t.dim(d)
-    if extent != 0:
-        return
-    var outputs = 1
-    for d in range(t.rank):
-        if not is_red[d]:
-            outputs *= t.dim(d)
-    if outputs > 0:
+    if extent == 0:
         unsupported(
             String(op) + " over a reduce dim of size 0 (torch refuses it too)"
         )
