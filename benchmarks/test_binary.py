@@ -61,7 +61,74 @@ BITWISE_OPS = {
     "bitwise_or": torch.bitwise_or,
     "bitwise_xor": torch.bitwise_xor,
 }
-LOGICAL_OPS = {"logical_and": torch.logical_and, "logical_xor": torch.logical_xor}
+# The pointwise family (tmb/ops/pointwise.mojo): float binary math on
+# operands in unit_interval (inside every domain here: xlogy/xlog1py need
+# y > 0, fmod a nonzero divisor).
+MATH_OPS = {
+    "atan2": torch.atan2,
+    "copysign.Tensor": torch.copysign,
+    "fmax": torch.fmax,
+    "fmin": torch.fmin,
+    "fmod.Tensor": torch.fmod,
+    "heaviside": torch.heaviside,
+    "hypot": torch.hypot,
+    "logaddexp": torch.logaddexp,
+    "logaddexp2": torch.logaddexp2,
+    "nextafter": torch.nextafter,
+    "special_xlog1py": torch.special.xlog1py,
+    "xlogy.Tensor": torch.xlogy,
+}
+INT_MATH_OPS = {
+    "bitwise_left_shift.Tensor": torch.bitwise_left_shift,
+    "bitwise_right_shift.Tensor": torch.bitwise_right_shift,
+    "gcd": torch.gcd,
+    "lcm": torch.lcm,
+}
+# (x, n) polynomials: x in (-1, 1) takes the recurrence below n = 7 and the
+# trigonometric form above; n = 5 and n = 9 time both regimes.
+POLY_OPS = {
+    f"special_{name}": getattr(torch.special, name)
+    for name in (
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
+        "laguerre_polynomial_l",
+        "legendre_polynomial_p",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
+    )
+}
+# Activation backwards: (grad_output, input) of one shape.
+ACT_BACKWARD_OPS = {
+    "elu_backward": lambda g, x: torch.ops.aten.elu_backward(
+        g, 1.0, 1.0, 1.0, False, x
+    ),
+    "hardshrink_backward": lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.5),
+    "hardsigmoid_backward": torch.ops.aten.hardsigmoid_backward,
+    "hardswish_backward": torch.ops.aten.hardswish_backward,
+    "hardtanh_backward": lambda g, x: torch.ops.aten.hardtanh_backward(g, x, -0.5, 0.5),
+    "leaky_relu_backward": lambda g, x: torch.ops.aten.leaky_relu_backward(
+        g, x, 0.01, False
+    ),
+    "log_sigmoid_backward": lambda g, x: torch.ops.aten.log_sigmoid_backward(
+        g, x, torch.empty(0, device=x.device, dtype=x.dtype)
+    ),
+    "logit_backward": torch.ops.aten.logit_backward,
+    "mish_backward": torch.ops.aten.mish_backward,
+    "silu_backward": torch.ops.aten.silu_backward,
+    "softplus_backward": lambda g, x: torch.ops.aten.softplus_backward(g, x, 1.0, 20.0),
+    "softshrink_backward": lambda g, x: torch.ops.aten.softshrink_backward(g, x, 0.5),
+}
+LOGICAL_OPS = {
+    "logical_and": torch.logical_and,
+    "logical_or": torch.logical_or,
+    "logical_xor": torch.logical_xor,
+}
 
 COVERS: dict[str, str] = (
     {f"aten::{name}": "test_arith" for name in ARITH_OPS}
@@ -77,6 +144,10 @@ COVERS: dict[str, str] = (
         for variant in ("Scalar", "Tensor")
     }
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
+    | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
+    | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
+    | {f"aten::{name}": "test_special_polynomial" for name in POLY_OPS}
+    | {f"aten::{name}": "test_activation_backward" for name in ACT_BACKWARD_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -95,6 +166,11 @@ COVERS: dict[str, str] = (
         "aten::lerp.Scalar_out": "test_lerp_inplace",
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
+        "aten::clamp.Tensor": "test_clamp_tensor",
+        "aten::frexp.Tensor": "test_frexp",
+        "aten::lerp.Tensor": "test_lerp_tensor",
+        "aten::pow.Scalar": "test_pow_scalar_base",
+        "aten::special_zeta": "test_zeta",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -116,7 +192,109 @@ COVERS: dict[str, str] = (
     }
 )
 
-SKIPPED: dict[str, str] = {}
+_OUT = (
+    "out-variant plumbing over an already-benchmarked functional impl "
+    "(computed straight into `out` when it has the result's dtype, shape and "
+    "a dense layout, else computed then copied into it)"
+)
+_CLAMP_SCALAR = "the ClampScalar kernel test_clamp measures, one bound disabled"
+_MAXMIN_BOUND = (
+    "ATen's clamp_{min,max}_Tensor_out is maximum_stub / minimum_stub: the "
+    "MaximumSpec / MinimumSpec kernels test_minmax measures"
+)
+
+_SHIFT_ALIAS = (
+    "the lshift/rshift kernels test_int_math measures through "
+    "bitwise_{left,right}_shift.Tensor (the Python operator spelling)"
+)
+_SHIFT_INPLACE = "in-place form of the same lshift/rshift launch, written into self"
+_SCALAR_OPERAND = (
+    "the Tensor overload's kernel with the scalar passed by value in a slot "
+    "(no device operand read); nothing new to time"
+)
+
+SKIPPED: dict[str, str] = {
+    "aten::__ilshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__ilshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__irshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__irshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__lshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__lshift__.Tensor": _SHIFT_ALIAS,
+    "aten::__rshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__rshift__.Tensor": _SHIFT_ALIAS,
+    "aten::atan2.out": _OUT,
+    "aten::bitwise_left_shift.Tensor_out": _OUT,
+    "aten::bitwise_right_shift.Tensor_out": _OUT,
+    "aten::clamp.Tensor_out": _OUT,
+    "aten::copysign.Scalar": _SCALAR_OPERAND,
+    "aten::copysign.Scalar_out": _OUT,
+    "aten::copysign.out": _OUT,
+    "aten::elu_backward.grad_input": _OUT,
+    "aten::fmax.out": _OUT,
+    "aten::fmin.out": _OUT,
+    "aten::fmod.Scalar": _SCALAR_OPERAND,
+    "aten::fmod.Scalar_out": _OUT,
+    "aten::fmod.Tensor_out": _OUT,
+    "aten::frexp.Tensor_out": _OUT,
+    "aten::gcd.out": _OUT,
+    "aten::gelu_backward.grad_input": _OUT,
+    "aten::hardshrink_backward.grad_input": _OUT,
+    "aten::hardsigmoid_backward.grad_input": _OUT,
+    "aten::hardtanh_backward.grad_input": _OUT,
+    "aten::heaviside.out": _OUT,
+    "aten::hypot.out": _OUT,
+    "aten::lcm.out": _OUT,
+    "aten::leaky_relu_backward.grad_input": _OUT,
+    "aten::lerp.Tensor_out": _OUT,
+    "aten::log_sigmoid_backward.grad_input": _OUT,
+    "aten::logaddexp.out": _OUT,
+    "aten::logaddexp2.out": _OUT,
+    "aten::logit_backward.grad_input": _OUT,
+    "aten::nextafter.out": _OUT,
+    "aten::pow.Scalar_out": _OUT,
+    "aten::silu_backward.grad_input": _OUT,
+    "aten::softplus_backward.grad_input": _OUT,
+    "aten::softshrink_backward.grad_input": _OUT,
+    "aten::special_xlog1py.out": _OUT,
+    "aten::special_zeta.out": _OUT,
+    "aten::xlogy.OutTensor": _OUT,
+    "aten::special_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_chebyshev_polynomial_w.out": _OUT,
+    "aten::special_hermite_polynomial_h.out": _OUT,
+    "aten::special_hermite_polynomial_he.out": _OUT,
+    "aten::special_laguerre_polynomial_l.out": _OUT,
+    "aten::special_legendre_polynomial_p.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_t.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_u.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_v.out": _OUT,
+    "aten::special_shifted_chebyshev_polynomial_w.out": _OUT,
+    "aten::bitwise_and.Scalar_out": _OUT,
+    "aten::bitwise_and.Tensor_out": _OUT,
+    "aten::bitwise_or.Scalar_out": _OUT,
+    "aten::bitwise_or.Tensor_out": _OUT,
+    "aten::bitwise_xor.Scalar_out": _OUT,
+    "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::clamp.out": _OUT,
+    "aten::clamp_max": _CLAMP_SCALAR,
+    "aten::clamp_max.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_max.Tensor_out": _OUT,
+    "aten::clamp_max.out": _OUT,
+    "aten::clamp_min": _CLAMP_SCALAR,
+    "aten::clamp_min.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_min.Tensor_out": _OUT,
+    "aten::clamp_min.out": _OUT,
+    "aten::logical_and.out": _OUT,
+    "aten::logical_or.out": _OUT,
+    "aten::logical_xor.out": _OUT,
+    "aten::maximum.out": _OUT,
+    "aten::minimum.out": _OUT,
+    "aten::pow.Tensor_Scalar_out": _OUT,
+    "aten::pow.Tensor_Tensor_out": _OUT,
+    "aten::remainder.Scalar_out": _OUT,
+    "aten::remainder.Tensor_out": _OUT,
+}
 
 
 def _pair(
@@ -655,4 +833,166 @@ def test_isin(
         lambda: torch.isin(e_ref, t_ref),
         lambda: torch.isin(e_our, t_our),
         flops=float(e_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(MATH_OPS))
+def test_binary_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = MATH_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("i32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(INT_MATH_OPS))
+def test_int_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = INT_MATH_OPS[op_name]
+    shape = SHAPES[shape_id]
+    high = 31 if "shift" in op_name else 1 << 20
+    a_ref, a_our = both(
+        torch.randint(1, 1 << 20, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    b_ref, b_our = both(
+        torch.randint(1, high, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", ("A_357x789_n5", "A_357x789_n9"))
+@pytest.mark.parametrize("op_name", op_params(POLY_OPS))
+def test_special_polynomial(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = POLY_OPS[op_name]
+    shape = SHAPES[shape_id.rsplit("_", 1)[0]]
+    degree = float(shape_id.rsplit("_n", 1)[1])
+    x = unit_interval(shape, DTYPES[dtype_id])
+    x_ref, x_our = both(x, hw, mojo_device)
+    n_ref, n_our = both(torch.full(shape, degree), hw, mojo_device)
+    bench.run(
+        lambda: fn(x_ref, n_ref), lambda: fn(x_our, n_our), flops=float(x.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("special_zeta")
+def test_zeta(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]) + 1.5, hw, mojo_device)
+    q_ref, q_our = both(unit_interval(shape, DTYPES[dtype_id]) + 0.5, hw, mojo_device)
+    bench.run(
+        lambda: torch.special.zeta(x_ref, q_ref),
+        lambda: torch.special.zeta(x_our, q_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("lerp.Tensor")
+def test_lerp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    w_ref, w_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.lerp(a_ref, b_ref, w_ref),
+        lambda: torch.lerp(a_our, b_our, w_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("clamp.Tensor")
+def test_clamp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: torch.clamp(a_ref, b_ref - 0.2, b_ref + 0.2),
+        lambda: torch.clamp(a_our, b_our - 0.2, b_our + 0.2),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("pow.Scalar")
+def test_pow_scalar_base(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.pow(2.5, x_ref),
+        lambda: torch.pow(2.5, x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("frexp.Tensor")
+def test_frexp(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(
+        (torch.randn(shape) * 100).to(DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.frexp(x_ref),
+        lambda: torch.frexp(x_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(ACT_BACKWARD_OPS))
+def test_activation_backward(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = ACT_BACKWARD_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
     )

@@ -1462,3 +1462,155 @@ def test_add_above_last_level_cache(mojo_gpu):
     right_cpu = torch.arange(n, dtype=torch.float32) % 733 - 366.0
     out = left_cpu.to(mojo_gpu) + right_cpu.to(mojo_gpu)
     torch.testing.assert_close(out.cpu(), left_cpu + right_cpu, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
+# out= variants of the binary ops, logical_or, bool maximum/minimum and the
+# clamp_min / clamp_max family
+# --------------------------------------------------------------------------
+
+
+_OUT_OPS = [
+    ("logical_and", torch.logical_and, torch.float32),
+    ("logical_or", torch.logical_or, torch.float32),
+    ("logical_xor", torch.logical_xor, torch.float32),
+    ("maximum", torch.maximum, torch.float32),
+    ("minimum", torch.minimum, torch.float32),
+    ("remainder", torch.remainder, torch.float32),
+    ("bitwise_and", torch.bitwise_and, torch.int32),
+    ("bitwise_or", torch.bitwise_or, torch.int64),
+    ("bitwise_xor", torch.bitwise_xor, torch.int32),
+    ("pow", torch.pow, torch.float32),
+]
+
+
+@pytest.mark.parametrize("name,fn,dtype", _OUT_OPS, ids=[o[0] for o in _OUT_OPS])
+@pytest.mark.parametrize("layout", ["same", "broadcast", "strided_out"])
+def test_binary_out_variants(mojo_device, name, fn, dtype, layout):
+    a_cpu, a = _both((4, 6), dtype, mojo_device)
+    b_shape = (6,) if layout == "broadcast" else (4, 6)
+    b_cpu, b = _both(b_shape, dtype, mojo_device)
+    if name == "pow":
+        a_cpu, a = a_cpu.abs() + 0.5, a.abs() + 0.5
+    expected = fn(a_cpu, b_cpu)
+    if layout == "strided_out":
+        out_cpu = torch.empty((6, 4), dtype=expected.dtype)
+        out = out_cpu.to(mojo_device).t()
+    else:
+        out = torch.empty(expected.shape, dtype=expected.dtype, device=mojo_device)
+    with native_ran(
+        f"aten::{name}.out",
+        f"aten::{name}.Tensor_out",
+        f"aten::{name}.Tensor_Tensor_out",
+    ):
+        result = fn(a, b, out=out)
+    assert result is out
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_binary_out_resizes_and_casts(mojo_device):
+    a_cpu, a = _both((3, 5), torch.float32, mojo_device)
+    b_cpu, b = _both((3, 5), torch.float32, mojo_device)
+    out = torch.empty(0, device=mojo_device)
+    torch.maximum(a, b, out=out)
+    torch.testing.assert_close(out.cpu(), torch.maximum(a_cpu, b_cpu))
+    mask = torch.empty((3, 5), dtype=torch.float32, device=mojo_device)
+    torch.logical_or(a > 0, b > 0, out=mask)
+    torch.testing.assert_close(
+        mask.cpu(), torch.logical_or(a_cpu > 0, b_cpu > 0).float()
+    )
+
+
+def test_binary_scalar_out_variants(mojo_device):
+    a_cpu, a = _both((7,), torch.int64, mojo_device)
+    for fn in (torch.bitwise_and, torch.bitwise_or, torch.bitwise_xor):
+        out = torch.empty(7, dtype=torch.int64, device=mojo_device)
+        fn(a, 5, out=out)
+        torch.testing.assert_close(out.cpu(), fn(a_cpu, 5))
+    f_cpu, f = _both((7,), torch.float32, mojo_device)
+    out = torch.empty(7, device=mojo_device)
+    torch.remainder(f, 0.75, out=out)
+    torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
+    out = torch.empty(7, device=mojo_device)
+    torch.pow(f.abs(), 1.5, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(f_cpu.abs(), 1.5))
+
+
+def test_logical_or(mojo_device, call_checker):
+    call_checker.register("aten::logical_or")
+    a_cpu = torch.tensor([0.0, 1.0, 0.0, -2.0, float("nan")])
+    b_cpu = torch.tensor([0, 0, 3, 1, 0], dtype=torch.int64)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(
+        torch.logical_or(a, a).cpu(), torch.logical_or(a_cpu, a_cpu)
+    )
+    torch.testing.assert_close(
+        torch.logical_or(b, b).cpu(), torch.logical_or(b_cpu, b_cpu)
+    )
+    torch.testing.assert_close(
+        torch.logical_or(a, b).cpu(), torch.logical_or(a_cpu, b_cpu)
+    )
+    x, x_cpu = a.clone(), a_cpu.clone()
+    x.logical_or_(a_cpu.flip(0).to(mojo_device))
+    x_cpu.logical_or_(a_cpu.flip(0))
+    torch.testing.assert_close(x.cpu(), x_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fn", [torch.logical_and, torch.logical_or, torch.logical_xor])
+def test_logical_ops_read_nan_as_true(mojo_device, dtype, fn):
+    """NaN is nonzero: fast-math must not fold `NaN != 0` to False."""
+    a_cpu = torch.tensor(
+        [0.0, 1.0, -0.0, -2.0, float("nan"), float("inf")], dtype=dtype
+    )
+    b_cpu = a_cpu.flip(0)
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(fn(a, b).cpu(), fn(a_cpu, b_cpu))
+
+
+def test_maximum_minimum_bool(mojo_device):
+    a_cpu = torch.tensor([True, False, True, False])
+    b_cpu = torch.tensor([True, True, False, False])
+    a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
+    torch.testing.assert_close(torch.maximum(a, b).cpu(), torch.maximum(a_cpu, b_cpu))
+    torch.testing.assert_close(torch.minimum(a, b).cpu(), torch.minimum(a_cpu, b_cpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_clamp_min_max(mojo_device, dtype):
+    a_cpu, a = _both((5, 3), dtype, mojo_device, low=-9, high=9)
+    lo_cpu, lo = _both((3,), dtype, mojo_device, low=-3, high=0)
+    hi_cpu, hi = _both((5, 1), dtype, mojo_device, low=0, high=3)
+    with native_ran("aten::clamp_min"):
+        torch.testing.assert_close(a.clamp_min(0).cpu(), a_cpu.clamp_min(0))
+    with native_ran("aten::clamp_max"):
+        torch.testing.assert_close(a.clamp_max(1).cpu(), a_cpu.clamp_max(1))
+    with native_ran("aten::clamp_min.Tensor"):
+        torch.testing.assert_close(a.clamp_min(lo).cpu(), a_cpu.clamp_min(lo_cpu))
+    with native_ran("aten::clamp_max.Tensor"):
+        torch.testing.assert_close(a.clamp_max(hi).cpu(), a_cpu.clamp_max(hi_cpu))
+    out = torch.empty_like(a)
+    torch.clamp(a, min=-1, max=1, out=out)
+    torch.testing.assert_close(out.cpu(), torch.clamp(a_cpu, min=-1, max=1))
+    x, x_cpu = a.clone(), a_cpu.clone()
+    x.clamp_(min=0)
+    x_cpu.clamp_(min=0)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+    x.clamp_max_(hi)
+    x_cpu.clamp_max_(hi_cpu)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+
+
+def test_clamp_nan_bound_fills_nan(mojo_device):
+    a_cpu, a = _both((6,), torch.float32, mojo_device)
+    nan = float("nan")
+    for lo, hi in ((nan, None), (None, nan), (0.0, nan), (nan, 1.0)):
+        torch.testing.assert_close(
+            torch.clamp(a, lo, hi).cpu(), torch.clamp(a_cpu, lo, hi), equal_nan=True
+        )
+    torch.testing.assert_close(
+        a.clamp_min(nan).cpu(), a_cpu.clamp_min(nan), equal_nan=True
+    )
+    torch.testing.assert_close(
+        a.clamp_max(nan).cpu(), a_cpu.clamp_max(nan), equal_nan=True
+    )

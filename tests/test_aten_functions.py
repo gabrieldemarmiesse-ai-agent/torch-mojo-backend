@@ -5470,6 +5470,151 @@ def test_aten_log2(
     check_outputs(fn, conf, [data])
 
 
+def _compiled_matches_cpu(
+    fn: Callable[..., torch.Tensor],
+    inputs: Sequence[torch.Tensor],
+    *,
+    rtol: float | None = None,
+    atol: float | None = None,
+):
+    """torch.compile(backend=mojo_backend) on CPU tensors against eager CPU:
+    exercises the aten_functions twin, which `check_outputs(conf)` (eager on
+    the mojo device) never reaches."""
+    expected = fn(*inputs)
+    actual = torch.compile(fn, backend=mojo_backend, fullgraph=True)(*inputs)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
+def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dtype):
+    call_checker.register(aten_functions.aten_logical_or)
+
+    def fn(x, y):
+        return aten.logical_or(x, y)
+
+    x = torch.tensor([[1, 0, 2, -1], [0, 0, 1, 1]]).to(dtype)
+    y = torch.tensor([3, 0, 0, 0]).to(dtype)
+    check_outputs(fn, conf, [x, y])
+    _compiled_matches_cpu(fn, [x, y])
+
+
+_POINTWISE_BINARY_TWINS = [
+    ("atan2", aten.atan2, torch.float32, "float"),
+    ("copysign", aten.copysign, torch.float32, "float"),
+    ("fmax", aten.fmax, torch.float32, "float"),
+    ("fmin", aten.fmin, torch.int64, "int"),
+    ("fmod", aten.fmod, torch.float32, "float"),
+    ("gcd", aten.gcd, torch.int64, "int"),
+    ("lcm", aten.lcm, torch.int32, "int"),
+    ("hypot", aten.hypot, torch.float32, "float"),
+    ("nextafter", aten.nextafter, torch.float32, "float"),
+    ("special_zeta", aten.special_zeta, torch.float32, "zeta"),
+    ("bitwise_left_shift", aten.bitwise_left_shift, torch.int64, "shift"),
+    ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
+    ("__lshift__", aten.__lshift__, torch.int64, "shift"),
+    ("__rshift__", aten.__rshift__, torch.int64, "shift"),
+    (
+        "special_chebyshev_polynomial_t",
+        aten.special_chebyshev_polynomial_t,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_hermite_polynomial_h",
+        aten.special_hermite_polynomial_h,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_legendre_polynomial_p",
+        aten.special_legendre_polynomial_p,
+        torch.float32,
+        "poly",
+    ),
+    (
+        "special_laguerre_polynomial_l",
+        aten.special_laguerre_polynomial_l,
+        torch.float32,
+        "poly",
+    ),
+]
+
+
+def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
+    torch.manual_seed(0)
+    if domain == "int":
+        return [
+            torch.randint(-20, 20, (3, 5)).to(dtype),
+            torch.randint(-20, 20, (5,)).to(dtype),
+        ]
+    if domain == "shift":
+        return [
+            torch.randint(-50, 50, (3, 5)).to(dtype),
+            torch.randint(0, 9, (5,)).to(dtype),
+        ]
+    if domain == "zeta":
+        return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
+    if domain == "poly":
+        return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    return [torch.randn(3, 5).to(dtype), torch.randn(5).to(dtype)]
+
+
+@pytest.mark.parametrize(
+    "name,op,dtype,domain",
+    _POINTWISE_BINARY_TWINS,
+    ids=[t[0] for t in _POINTWISE_BINARY_TWINS],
+)
+def test_aten_pointwise_binary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    op: Callable[..., torch.Tensor],
+    dtype: torch.dtype,
+    domain: str,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+
+    def fn(x, y):
+        return op(x, y)
+
+    inputs = _pointwise_operands(domain, dtype)
+    check_outputs(fn, conf, inputs, rtol=2e-5, atol=2e-5)
+    _compiled_matches_cpu(fn, inputs, rtol=2e-5, atol=2e-5)
+
+
+_ACTIVATION_TWINS = [
+    ("elu", lambda x: aten.elu(x, 0.8, 1.2, 0.9)),
+    ("hardtanh", lambda x: aten.hardtanh(x, -0.5, 0.7)),
+    ("leaky_relu", lambda x: aten.leaky_relu(x, 0.1)),
+    (
+        "rrelu_with_noise",
+        lambda x: aten.rrelu_with_noise(x, torch.empty_like(x), 0.1, 0.3),
+    ),
+    ("hardshrink_backward", lambda x: aten.hardshrink_backward(x * 2, x, 0.4)),
+    ("softshrink_backward", lambda x: aten.softshrink_backward(x * 2, x, 0.4)),
+]
+
+
+@pytest.mark.parametrize(
+    "name,fn", _ACTIVATION_TWINS, ids=[t[0] for t in _ACTIVATION_TWINS]
+)
+def test_aten_pointwise_activation(
+    conf: Conf, call_checker: CallChecker, name: str, fn: Callable[..., torch.Tensor]
+):
+    call_checker.register(
+        getattr(aten_functions, f"aten_{name}"),
+        *(
+            [aten_functions.aten_rrelu_with_noise_functional]
+            if name == "rrelu_with_noise"
+            else []
+        ),
+    )
+    torch.manual_seed(0)
+    x = torch.randn(4, 7) * 2
+    check_outputs(fn, conf, [x], rtol=1e-5, atol=1e-5)
+    _compiled_matches_cpu(fn, [x], rtol=1e-5, atol=1e-5)
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 

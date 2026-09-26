@@ -212,6 +212,47 @@ def elementwise(
     )[0]
 
 
+def pointwise_binary(
+    input: MaxTensor,
+    other: MaxTensor,
+    kind: Literal[
+        "atan2",
+        "chebyshev_polynomial_t",
+        "chebyshev_polynomial_u",
+        "chebyshev_polynomial_v",
+        "chebyshev_polynomial_w",
+        "copysign",
+        "fmax",
+        "fmin",
+        "fmod",
+        "gcd",
+        "heaviside",
+        "hermite_polynomial_h",
+        "hermite_polynomial_he",
+        "hypot",
+        "laguerre_polynomial_l",
+        "lcm",
+        "legendre_polynomial_p",
+        "logaddexp",
+        "logaddexp2",
+        "lshift",
+        "nextafter",
+        "rshift",
+        "shifted_chebyshev_polynomial_t",
+        "shifted_chebyshev_polynomial_u",
+        "shifted_chebyshev_polynomial_v",
+        "shifted_chebyshev_polynomial_w",
+        "xlog1py",
+        "xlogy",
+        "zeta",
+    ],
+) -> MaxTensor:
+    """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
+    as a fusible binary custom op. The operands share a dtype and a shape:
+    promotion and broadcasting happen before the call."""
+    return _same_type_binary(f"pointwise_{kind}", input, other)
+
+
 def polygamma(n: int, input: MaxTensor) -> MaxTensor:
     """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s binary
     `polygamma`, n broadcast as a float operand)."""
