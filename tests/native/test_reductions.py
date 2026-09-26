@@ -386,6 +386,23 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
     torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(4))
 
 
+def test_mean_out_into_an_out_that_shares_storage_with_the_input(mojo_gpu):
+    """`out=x[x.numel():]` aliases `x`'s storage and starts with 0 elements,
+    so `_scalar_reduction_out` must GROW it to write the row -- the same
+    aliasing resize `test_max_unary_out_into_an_out_that_shares_storage...`
+    exercises for the full-reduction path, here for the dim-reduction one
+    that shares the same `_scalar_reduction_out` helper."""
+    x = torch.randn(3, 4, device=mojo_gpu)
+    x_before = x.cpu().clone()
+    out = x.reshape(-1)[x.numel() :]
+    returned = torch.mean(x, dim=1, out=out)
+    assert tuple(returned.shape) == (3,)
+    torch.testing.assert_close(
+        returned.cpu(), x_before.mean(dim=1), rtol=2e-6, atol=2e-6
+    )
+    torch.testing.assert_close(x.cpu(), x_before)  # x itself must be intact
+
+
 # ---------------------------------------------------------------------------
 # amax / amin / max / min / min.dim
 # ---------------------------------------------------------------------------
@@ -491,6 +508,21 @@ def test_max_unary_out_propagates_nan(mojo_device):
     out = torch.empty((), device=mojo_device)
     torch.max(x.to(mojo_device), out=out)
     assert out.cpu().isnan().item()
+
+
+def test_max_unary_out_into_an_out_that_shares_storage_with_the_input(mojo_gpu):
+    """`out=x[x.numel():]` aliases `x`'s storage and starts with 0 elements,
+    so `_scalar_reduction_out` must GROW it to write the scalar result --
+    exactly the resize that can reallocate the shared storage's data pointer
+    out from under an already-cached read of `x` (verified this is not an
+    error on stock CUDA torch: `x` itself must come back untouched)."""
+    x = torch.randn(6, device=mojo_gpu)
+    x_before = x.cpu().clone()
+    out = x[x.numel() :]
+    returned = torch.max(x, out=out)
+    assert tuple(returned.shape) == ()
+    torch.testing.assert_close(returned.cpu(), x_before.max())
+    torch.testing.assert_close(x.cpu(), x_before)  # x itself must be intact
 
 
 def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):

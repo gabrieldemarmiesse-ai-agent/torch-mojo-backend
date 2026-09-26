@@ -633,6 +633,14 @@ def _scalar_reduction_out(
     element count alone is not enough: the copy below reads the source
     through the destination's extents, so a (2,3) result poured into a (3,2)
     out would walk off the end of the source.
+
+    A resize that GROWS `dst`'s storage can reallocate bytes `dst` shares
+    with `a` -- `torch.max(x, out=x[x.numel():])` -- since `resize_out`
+    replaces the shared StorageImpl's data pointer under both tensors, but
+    only refreshes `dst`'s own cached `T`. `a`'s `.ptr` was read once, at
+    dispatch entry, before that swap; using it unrefreshed after the resize
+    is exactly the dangling read a live `data_ptr()` in ATen never has, so
+    `a` is re-read from its handle whenever a resize happened.
     """
     _one_device(a, dst)
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
@@ -640,13 +648,15 @@ def _scalar_reduction_out(
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
     var numel = _shape_numel(shape, rank)
+    var src = a.copy()
     if not _shape_matches(dst, shape, rank):
         resize_out(dst, shape, rank)
-    if _out_ready(dst, a, out_stype, numel):
-        _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
+        src = T(a.h)
+    if _out_ready(dst, src, out_stype, numel):
+        _reduce_into(family, op, src, dims.copy(), keepdim, dst, False, 0.0)
         return
-    var tmp = own(new_tensor(shape, rank, out_stype, a.device))
-    _reduce_into(family, op, a, dims.copy(), keepdim, tmp.t, False, 0.0)
+    var tmp = own(new_tensor(shape, rank, out_stype, src.device))
+    _reduce_into(family, op, src, dims.copy(), keepdim, tmp.t, False, 0.0)
     _copy_result_into(dst, tmp.t)
     _ = tmp^  # alive past the launch
 
