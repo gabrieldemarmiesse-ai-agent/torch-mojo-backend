@@ -1,5 +1,5 @@
 """ATen ops: reductions (sum, mean, amax/amin, max/min, the arg-reductions,
-any/all, var, the L2 vector norm, cumsum, and sort/topk).
+any/all, count_nonzero, var, the L2 vector norm, cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -929,17 +929,24 @@ def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, out)
 
 
-def _full_extremum(
-    family: StaticString, op: StaticString, args: Values, rets: Values
-) raises:
-    """max(Tensor) / min(Tensor): the values-only full reduction."""
-    var a = v_tensor(args[unsafe_offset=0])
+def _full_extremum_dims(op: StaticString, a: T) raises -> List[Int]:
+    """Shared gate for max(Tensor)/min(Tensor) and min.unary_out: dtype,
+    rank and empty-reduce-dim checks, then every dim is reduced."""
     _require_mojo(a)
     _check_extremum_dtype(a, op)
     if a.rank == 0:
         unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)
     _refuse_empty_extremum(op, a, dims)
+    return dims^
+
+
+def _full_extremum(
+    family: StaticString, op: StaticString, args: Values, rets: Values
+) raises:
+    """max(Tensor) / min(Tensor): the values-only full reduction."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var dims = _full_extremum_dims(op, a)
     var out = _scalar_reduction(family, op, a, dims, False, a.stype, False, 0.0)
     ret_owned(rets, 0, out)
 
@@ -954,31 +961,26 @@ def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
 
 
-# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_max_unary_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
+def _full_extremum_out(
+    family: StaticString,
+    op: StaticString,
+    op_name: StaticString,
+    args: Values,
+    rets: Values,
 ) raises:
+    """max.unary_out / min.unary_out: `_full_extremum_dims`'s gate, then an
+    `exact`-dtype `out=` -- stock CUDA's `make_reduction` requires the output
+    dtype to equal the input's exactly (verified on real CUDA: an int64
+    input with a float32 out raises "provided dtype must match dtype of
+    result"), unlike mean.out/any.out's `canCast` policy."""
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=1])
-    _require_mojo(a)
     _require_mojo(out)
-    _check_extremum_dtype(a, "MaxSpec")
-    if a.rank == 0:
-        unsupported("max()/min() of a rank-0 tensor")
-    var dims = _trailing_dims(a.rank, a.rank)
-    # Stock CUDA does not special-case this: `max_unary_out`'s TensorIterator
-    # over zero elements trips an internal assert in Reduce.cuh (verified on
-    # an H100). Declining cleanly here matches "errors on empty" without
-    # reproducing that assert.
-    _refuse_empty_extremum("MaxSpec", a, dims)
+    var dims = _full_extremum_dims(op, a)
     _scalar_reduction_out(
-        "nn",
-        "MaxSpec",
-        "aten::max.unary_out",
-        # `make_reduction`'s TensorIterator requires the output dtype to
-        # equal the input's exactly (verified on real CUDA: an int64 input
-        # with a float32 out raises "provided dtype must match dtype of
-        # result"), unlike the ordinary `canCast` policy other out= ops use.
+        family,
+        op,
+        op_name,
         "exact",
         a,
         dims,
@@ -987,6 +989,22 @@ def op_max_unary_out(
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_max_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out("nn", "MaxSpec", "aten::max.unary_out", args, rets)
+
+
+# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_min_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out(
+        "reduction", "AminSpec", "aten::min.unary_out", args, rets
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1222,28 @@ def op_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# aten::any.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    if not _is_truthy(a.dtype):
+        unsupported("any of dtype " + String(a.dtype))
+    _scalar_reduction_out(
+        "reduction",
+        "AnySpec",
+        "aten::any.all_out",
+        "bool_or_uint8",
+        a,
+        _reduce_dims(_none_value(), a.rank, False),
+        False,
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 # aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor
 # aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor
 def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1219,6 +1259,10 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::any.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
+# aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# `_reduce_dims` reads the dim arg's Value tag (plain int for any.out, an
+# optional int list for any.dims_out), so one body serves both overloads.
 def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
@@ -1241,6 +1285,30 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
+# count_nonzero
+# ---------------------------------------------------------------------------
+
+
+# aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+def op_count_nonzero(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    if not _is_truthy(a.dtype):
+        unsupported("count_nonzero of dtype " + String(a.dtype))
+    # An explicit empty dim list reduces every dim (unlike any.dims/all.dims):
+    # `count_nonzero.default(self, dim=None)` redispatches here with `dim=[]`.
+    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
+    if len(dims) == 0:
+        unsupported("count_nonzero with no reduce dim (a rank-0 operand)")
+    var out = _scalar_reduction(
+        "reduction", "CountNonzeroSpec", a, dims, False, ST_INT64, False, 0.0
+    )
+    ret_owned(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -2087,11 +2155,14 @@ def register_reductions(site: Site) raises:
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
     impl[op_any, "any"](site)
+    impl[op_any_all_out, "any.all_out"](site)
     impl[op_any_dim, "any.dim"](site)
     impl[op_any_dim, "any.dims"](site)
+    impl[op_any_out, "any.dims_out"](site)
     impl[op_any_out, "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmin, "argmin"](site)
+    impl[op_count_nonzero, "count_nonzero.dim_IntList"](site)
     impl[op_cumsum, "cumsum"](site)
     impl[op_kthvalue, "kthvalue"](site)
     impl[op_kthvalue_values, "kthvalue.values"](site)
@@ -2108,6 +2179,7 @@ def register_reductions(site: Site) raises:
     impl[op_min, "min"](site)
     impl[op_min_dim, "min.dim"](site)
     impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_min_unary_out, "min.unary_out"](site)
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
