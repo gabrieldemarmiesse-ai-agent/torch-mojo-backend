@@ -24,6 +24,8 @@
 from tmb.kernels.common.unary_math import (
     elementwise_predicate,
     elementwise_unary,
+    elementwise_unary_param,
+    is_rounding,
 )
 
 from std.os import abort
@@ -65,6 +67,7 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_len,
     _spec_dispatcher2,
     _spec_dispatcher3,
+    _spec_dispatcher5,
     _spec_ptr,
 )
 
@@ -321,6 +324,94 @@ comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
 comptime UOP_ACOSH = 27
+# The float-only ops whose math is a scalar port of torch's CUDA routine
+# (`unary_math.is_scalar_special`) or a rounding (`unary_math.is_rounding`):
+# opcode UOP_TABLE_BASE + i computes kind _TABLE_UOP_KINDS[i], and its spec op
+# is _TABLE_UOP_SPECS[i].
+comptime UOP_TABLE_BASE = 28
+comptime _TABLE_UOP_KINDS: List[StaticString] = [
+    "airy_ai",
+    "angle",
+    "asin",
+    "atan",
+    "bessel_j0",
+    "bessel_j1",
+    "bessel_y0",
+    "bessel_y1",
+    "digamma",
+    "entr",
+    "erfc",
+    "erfcx",
+    "erfinv",
+    "exp2",
+    "expm1",
+    "frac",
+    "i0",
+    "i0e",
+    "i1",
+    "i1e",
+    "lgamma",
+    "log10",
+    "log_ndtr",
+    "modified_bessel_i0",
+    "modified_bessel_i1",
+    "modified_bessel_k0",
+    "modified_bessel_k1",
+    "ndtri",
+    "round",
+    "scaled_modified_bessel_k0",
+    "scaled_modified_bessel_k1",
+    "sinc",
+    "spherical_bessel_j0",
+    "trunc",
+]
+comptime _TABLE_UOP_SPECS: List[StaticString] = [
+    "AiryAiSpec",
+    "AngleSpec",
+    "AsinSpec",
+    "AtanSpec",
+    "BesselJ0Spec",
+    "BesselJ1Spec",
+    "BesselY0Spec",
+    "BesselY1Spec",
+    "DigammaSpec",
+    "EntrSpec",
+    "ErfcSpec",
+    "ErfcxSpec",
+    "ErfinvSpec",
+    "Exp2Spec",
+    "Expm1Spec",
+    "FracSpec",
+    "I0Spec",
+    "I0eSpec",
+    "I1Spec",
+    "I1eSpec",
+    "LgammaSpec",
+    "Log10Spec",
+    "LogNdtrSpec",
+    "ModifiedBesselI0Spec",
+    "ModifiedBesselI1Spec",
+    "ModifiedBesselK0Spec",
+    "ModifiedBesselK1Spec",
+    "NdtriSpec",
+    "RoundSpec",
+    "ScaledModifiedBesselK0Spec",
+    "ScaledModifiedBesselK1Spec",
+    "SincSpec",
+    "SphericalBesselJ0Spec",
+    "TruncSpec",
+]
+
+
+@always_inline
+def _table_uop_kind[op_code: Int]() -> StaticString:
+    comptime assert (
+        op_code >= UOP_TABLE_BASE
+        and op_code < UOP_TABLE_BASE + len(_TABLE_UOP_KINDS)
+    ), "not a table opcode"
+    comptime kind = _TABLE_UOP_KINDS[op_code - UOP_TABLE_BASE]
+    return kind
+
 
 # Below this many elements the expensive half-precision bodies
 # (`is_expensive_half` in `_unary_elementwise`) run faster at W4 than at the
@@ -353,13 +444,17 @@ def _unary_float64_on[op_code: Int]() -> Bool:
     only available on CPU targets", "DType.float64 is not supported for cos
     on NVIDIA GPU"; LLVM on AMD: "Cannot select: f64 = fcos").
     """
-    return (
-        _unary_is_direct[op_code]()
-        or op_code == UOP_LOG2
-        or op_code == UOP_RECIPROCAL
-        or op_code == UOP_CEIL
-        or op_code == UOP_FLOOR
-    )
+    comptime if op_code >= UOP_TABLE_BASE:
+        # trunc / round / frac / angle are exact in float64.
+        return is_rounding[_table_uop_kind[op_code]()]()
+    else:
+        return (
+            _unary_is_direct[op_code]()
+            or op_code == UOP_LOG2
+            or op_code == UOP_RECIPROCAL
+            or op_code == UOP_CEIL
+            or op_code == UOP_FLOOR
+        )
 
 
 def _unary_contig_kernel[
@@ -441,6 +536,8 @@ def _unary_apply[
         return elementwise_unary["gelu_tanh"](a)
     elif op_code == UOP_LOG2:
         return elementwise_unary["log2"](a)
+    elif op_code >= UOP_TABLE_BASE:
+        return elementwise_unary[_table_uop_kind[op_code]()](a)
     else:
         comptime assert False, "unknown unary opcode"
 
@@ -703,6 +800,7 @@ def _unary_elementwise[
 
 comptime BUOP_ISNAN = 0
 comptime BUOP_LOGICAL_NOT = 1
+comptime BUOP_SIGNBIT = 2
 
 
 @always_inline
@@ -722,6 +820,8 @@ def _unary_bool_vec[
         # fast-math flags that would fold `a != a` to False; it also returns
         # all-False for integer dtypes.
         return elementwise_predicate["isnan"](a).cast[DType.uint8]()
+    elif op_code == BUOP_SIGNBIT:
+        return elementwise_predicate["signbit"](a).cast[DType.uint8]()
     else:
         return elementwise_predicate["logical_not"](a).cast[DType.uint8]()
 
@@ -953,6 +1053,93 @@ def _scalar_elementwise[
                 )
             else:
                 elementwise[func, simd_width=1, target="gpu"](Coord(size), ctx)
+        else:
+            raise Error("no GPU accelerator available at compile time")
+
+
+# ---------------------------------------------------------------------------
+# Unary ops with runtime scalar arguments (`unary_math.elementwise_unary_param`):
+# kind _PARAM_UOP_KINDS[i] is spec op _PARAM_UOP_SPECS[i], and takes three
+# float64 slots after its input spec. round_decimals and nan_to_num are exact
+# in any float dtype and take float64 too; the others are float-only.
+# ---------------------------------------------------------------------------
+
+comptime _PARAM_UOP_KINDS: List[StaticString] = [
+    "logit",
+    "mvlgamma",
+    "nan_to_num",
+    "polygamma",
+    "round_decimals",
+]
+comptime _PARAM_UOP_SPECS: List[StaticString] = [
+    "LogitSpec",
+    "MvlgammaSpec",
+    "NanToNumSpec",
+    "PolygammaSpec",
+    "RoundDecimalsSpec",
+]
+
+
+@always_inline
+def _param_float64_on[index: Int]() -> Bool:
+    comptime kind = _PARAM_UOP_KINDS[index]
+    return kind == "nan_to_num" or kind == "round_decimals"
+
+
+@always_inline
+def _param_unary_elementwise[
+    dtype: DType, index: Int
+](
+    out_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    in_ptr: Pointer[Scalar[dtype], MutUntrackedOrigin],
+    p0: Float64,
+    p1: Float64,
+    p2: Float64,
+    size: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime kind = _PARAM_UOP_KINDS[index]
+    comptime if not dtype.is_floating_point():
+        raise Error("parameterized unary ops require a floating point dtype")
+    else:
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, in_ptr, p0, p1, p2)
+        def body[width: Int, al: Int](i: Int):
+            out_ptr.unsafe_store[width=width, alignment=al](
+                i,
+                elementwise_unary_param[kind](
+                    in_ptr.unsafe_load[width=width, alignment=al](i), p0, p1, p2
+                ),
+            )
+
+        @always_inline
+        @__parameter
+        def func[width: Int, alignment: Int = 1](idx: Coord):
+            body[width, size_of[dtype]()](Int(idx[0].value()))
+
+        @always_inline
+        @__parameter
+        def func_vec[width: Int, alignment: Int = 1](idx: Coord):
+            body[width, 16](Int(idx[0].value()))
+
+        comptime if has_accelerator():
+            comptime vec = 16 // size_of[dtype]()
+            if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                elementwise[
+                    func_vec,
+                    simd_width=vec,
+                    target="gpu",
+                    _trace_description="modular_param_unary",
+                ](Coord(size), ctx)
+            else:
+                elementwise[
+                    func,
+                    simd_width=1,
+                    target="gpu",
+                    _trace_description="modular_param_unary",
+                ](Coord(size), ctx)
         else:
             raise Error("no GPU accelerator available at compile time")
 
@@ -1292,6 +1479,45 @@ def _scalar_spec_into_go[
                     )
 
 
+def _param_unary_spec_into_go[
+    index: Int
+](a_o: Arg, p0_o: Arg, p1_o: Arg, p2_o: Arg, out_o: Arg) raises:
+    ref a = _spec_ptr(a_o)[]
+    ref out = _spec_ptr(out_o)[]
+    var supported = False
+    comptime if _param_float64_on[index]():
+        supported = _dtype_supported[
+            [DType.float16, DType.bfloat16, DType.float32, DType.float64]
+        ](a.dtype)
+    else:
+        supported = _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype)
+    if not supported:
+        raise Error("mojo parameterized unary: unsupported dtype ", a.dtype)
+    var ctx = a.ctx()
+    _check_into(a, out, a.dtype)
+    var addr = out.ptr
+    if a.numel > 0:
+        if not a.contig:
+            raise Error("mojo parameterized unary: input must be contiguous")
+        comptime for dt in [
+            DType.float16,
+            DType.bfloat16,
+            DType.float32,
+            DType.float64,
+        ]:
+            comptime if _dtype_arg_on[0, dt]():
+                if a.dtype == dt:
+                    _param_unary_elementwise[dt, index](
+                        _make_ptr[dt](addr),
+                        _make_ptr[dt](a.ptr),
+                        _raw_f64(p0_o),
+                        _raw_f64(p1_o),
+                        _raw_f64(p2_o),
+                        a.numel,
+                        ctx,
+                    )
+
+
 def _scalar_inplace_go[op_code: Int](a_o: Arg, scalar_o: Arg) raises:
     """`a op= scalar` for a contiguous float tensor, in place.
 
@@ -1553,6 +1779,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 _unary_spec_into_go[UOP_GELU_TANH], "a unary spec op"
             ](argv, argc)
             return 0
+        comptime for i in range(len(_TABLE_UOP_SPECS)):
+            comptime if _op_on[_TABLE_UOP_SPECS[i]]():
+                _spec_dispatcher2[
+                    _unary_spec_into_go[UOP_TABLE_BASE + i], "a unary spec op"
+                ](argv, argc)
+                return 0
         comptime if _op_on["IsNanSpec"]():
             _spec_dispatcher2[
                 _unary_bool_spec_into_go[BUOP_ISNAN],
@@ -1565,6 +1797,18 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 "a bool-output unary spec op",
             ](argv, argc)
             return 0
+        comptime if _op_on["SignbitSpec"]():
+            _spec_dispatcher2[
+                _unary_bool_spec_into_go[BUOP_SIGNBIT],
+                "a bool-output unary spec op",
+            ](argv, argc)
+            return 0
+        comptime for i in range(len(_PARAM_UOP_SPECS)):
+            comptime if _op_on[_PARAM_UOP_SPECS[i]]():
+                _spec_dispatcher5[
+                    _param_unary_spec_into_go[i], "a parameterized unary op"
+                ](argv, argc)
+                return 0
         comptime if _op_on["AddScalarSpec"]():
             _spec_dispatcher3[
                 _scalar_spec_into_go[SOP_ADD], "a float-scalar spec op"

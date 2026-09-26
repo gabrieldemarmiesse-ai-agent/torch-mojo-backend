@@ -1258,6 +1258,12 @@ def aten_softmax(
     return x_exp / x_sum
 
 
+# angle(Tensor self) -> Tensor
+@map_to(aten.angle)
+def aten_angle(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "angle")
+
+
 # aten._log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor
 @map_to(aten._log_softmax)
 def aten__log_softmax(input: MaxTensor, dim: int, half_to_float: bool) -> MaxTensor:
@@ -1798,6 +1804,9 @@ def aten_argmin(
 
 # as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
 # asin(Tensor self) -> Tensor
+@map_to(aten.asin)
+def aten_asin(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "asin")
 
 
 # asinh(Tensor self) -> Tensor
@@ -1807,6 +1816,11 @@ def aten_asinh(x: MaxTensor) -> MaxTensor:
 
 
 # atan(Tensor self) -> Tensor
+@map_to(aten.atan)
+def aten_atan(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "atan")
+
+
 # atan2(Tensor self, Tensor other) -> Tensor
 # atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 
@@ -2585,6 +2599,12 @@ def aten_detach(input: MaxTensor) -> MaxTensor:
 # diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)
 
 
+# digamma(Tensor self) -> Tensor
+@map_to(aten.digamma)
+def aten_digamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "digamma")
+
+
 # div.Scalar(Tensor self, Scalar other) -> Tensor
 # div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor
 # div.Tensor(Tensor self, Tensor other) -> Tensor
@@ -2801,10 +2821,28 @@ def aten_erf(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "erf")
 
 
+# erfc(Tensor self) -> Tensor
+@map_to(aten.erfc)
+def aten_erfc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfc")
+
+
+# erfinv(Tensor self) -> Tensor
+@map_to(aten.erfinv)
+def aten_erfinv(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfinv")
+
+
 # exp(Tensor self) -> Tensor
 @map_to(aten.exp)
 def aten_exp(input: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(input, "exp")
+
+
+# exp2(Tensor self) -> Tensor
+@map_to(aten.exp2)
+def aten_exp2(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "exp2")
 
 
 # expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)
@@ -2841,6 +2879,11 @@ def aten_expand(
 
 
 # expm1(Tensor self) -> Tensor
+@map_to(aten.expm1)
+def aten_expm1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "expm1")
+
+
 # fill.Scalar(Tensor self, Scalar value) -> Tensor
 @map_to(aten.fill)
 def aten_fill_scalar(input: MaxTensor, value: Scalar) -> MaxTensor:
@@ -2877,6 +2920,12 @@ def aten_floor(input: MaxTensor) -> MaxTensor:
 
 # fmod.Scalar(Tensor self, Scalar other) -> Tensor
 # fmod.Tensor(Tensor self, Tensor other) -> Tensor
+
+
+# frac(Tensor self) -> Tensor
+@map_to(aten.frac)
+def aten_frac(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "frac")
 
 
 # full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor
@@ -3042,6 +3091,12 @@ def aten_gt(x: MaxTensor, y: int | float | MaxTensor) -> MaxTensor:
 
 
 # hardtanh(Tensor self, Scalar min_val=-1, Scalar max_val=1) -> Tensor
+
+
+# i0(Tensor self) -> Tensor
+@map_to(aten.i0)
+def aten_i0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0")
 
 
 # index.Tensor(Tensor self, Tensor?[] indices) -> Tensor
@@ -3324,6 +3379,14 @@ def aten_le(input: MaxTensor, other: Scalar | MaxTensor) -> MaxTensor:
 
 
 # leaky_relu(Tensor self, Scalar negative_slope=0.01) -> Tensor
+
+
+# lgamma(Tensor self) -> Tensor
+@map_to(aten.lgamma)
+def aten_lgamma(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "lgamma")
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(
@@ -3405,6 +3468,9 @@ def aten_log(input: MaxTensor) -> MaxTensor:
 
 
 # log10(Tensor self) -> Tensor
+@map_to(aten.log10)
+def aten_log10(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "log10")
 
 
 # log1p(Tensor self) -> Tensor
@@ -3470,6 +3536,24 @@ def aten_logical_xor(input: MaxTensor, other: MaxTensor) -> MaxTensor:
 
     # Apply logical xor
     return F.logical_xor(input_bool, other_bool)
+
+
+# logit(Tensor self, float? eps=None) -> Tensor
+@map_to(aten.logit)
+def aten_logit(x: MaxTensor, eps: float | None = None) -> MaxTensor:
+    if eps is None:
+        return custom_mojo_ops.elementwise(x, "logit")
+    # logit_kernel_cuda clamps in float (NaN passes through both compares).
+    dtype = x.dtype
+    if not dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+        dtype = x.dtype
+    xf = x if dtype in (DType.float32, DType.float64) else F.cast(x, DType.float32)
+    lo = F.constant(eps, dtype=xf.dtype, device=xf.device)
+    hi = F.constant(1.0 - eps, dtype=xf.dtype, device=xf.device)
+    z = _where(xf < lo, lo, _where(xf > hi, hi, xf))
+    out = custom_mojo_ops.elementwise(z, "logit")
+    return out if out.dtype == dtype else F.cast(out, dtype)
 
 
 # lt.Scalar(Tensor self, Scalar other) -> Tensor
@@ -3772,6 +3856,58 @@ def _batch_norm_batch_stats(input: MaxTensor) -> tuple[MaxTensor, MaxTensor]:
     for axis in reduce_axes:
         var = _reduce_mean(var, axis=axis)
     return mean, var
+
+
+# mvlgamma(Tensor self, int p) -> Tensor
+@map_to(aten.mvlgamma)
+def aten_mvlgamma(x: MaxTensor, p: int) -> MaxTensor:
+    """ATen's composition (UnaryOps.cpp): sum_j lgamma(x + (1 - p)/2 + j/2)
+    + p (p - 1) log(pi) / 4."""
+    if p < 1:
+        raise ValueError("p has to be greater than or equal to 1")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    # The terms in the tensor dtype, their sum accumulated in float (as
+    # ATen's sum reduction does for the half types), the constant added last.
+    acc = DType.float64 if x.dtype == DType.float64 else DType.float32
+    total = None
+    for j in range(p):
+        shift = F.constant((1 - p) / 2 + j / 2, dtype=x.dtype, device=x.device)
+        term = F.cast(custom_mojo_ops.elementwise(x + shift, "lgamma"), acc)
+        total = term if total is None else total + term
+    assert total is not None
+    total = F.cast(F.cast(total, x.dtype), acc)
+    constant = p * (p - 1) * math.log(math.pi) / 4
+    return F.cast(total + F.constant(constant, dtype=acc, device=x.device), x.dtype)
+
+
+# nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
+@map_to(aten.nan_to_num)
+def aten_nan_to_num(
+    x: MaxTensor,
+    nan: float | None = None,
+    posinf: float | None = None,
+    neginf: float | None = None,
+) -> MaxTensor:
+    if not x.dtype.is_float():
+        return x
+    big = {
+        DType.float16: torch.finfo(torch.float16).max,
+        DType.bfloat16: torch.finfo(torch.bfloat16).max,
+        DType.float32: torch.finfo(torch.float32).max,
+    }.get(x.dtype, torch.finfo(torch.float64).max)
+    inf = F.constant(float("inf"), dtype=x.dtype, device=x.device)
+
+    def const(value: float) -> MaxTensor:
+        return F.constant(value, dtype=x.dtype, device=x.device)
+
+    replaced = _where(x == inf, const(big if posinf is None else posinf), x)
+    replaced = _where(x == -inf, const(-big if neginf is None else neginf), replaced)
+    return _where(
+        custom_mojo_ops.elementwise(x, "isnan"),
+        const(0.0 if nan is None else nan),
+        replaced,
+    )
 
 
 # nanmedian(Tensor self) -> Tensor
@@ -4262,6 +4398,20 @@ def aten_permute(x: MaxTensor, dims: list[int]) -> MaxTensor:
     return F.permute(x, dims)
 
 
+# polygamma(int n, Tensor self) -> Tensor
+@map_to(aten.polygamma)
+def aten_polygamma(n: int, x: MaxTensor) -> MaxTensor:
+    if n < 0:
+        raise ValueError("polygamma(n, x) does not support negative n.")
+    if not x.dtype.is_float():
+        x = F.cast(x, dtype=torch_dtype_to_max(torch.get_default_dtype()))
+    if n == 0:
+        return custom_mojo_ops.elementwise(x, "digamma")
+    if n == 1:
+        return custom_mojo_ops.elementwise(x, "trigamma")
+    return custom_mojo_ops.polygamma(n, x)
+
+
 # pow.Scalar(Scalar self, Tensor exponent) -> Tensor
 # pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 # pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
@@ -4343,6 +4493,15 @@ def aten_relu_(tensor: MaxTensor) -> MaxTensor:
 
 # resize_(Tensor(a!) self, SymInt[] size, *, MemoryFormat? memory_format=None) -> Tensor(a!)
 # round(Tensor self) -> Tensor
+@map_to(aten.round)
+def aten_round(x: MaxTensor, decimals: int = 0) -> MaxTensor:
+    if decimals == 0 or not x.dtype.is_float():
+        return custom_mojo_ops.elementwise(x, "round")
+    # round_decimals_kernel_cuda, in the tensor dtype.
+    ten_pow = F.constant(10.0 ** abs(decimals), dtype=x.dtype, device=x.device)
+    if decimals < 0:
+        return custom_mojo_ops.elementwise(x / ten_pow, "round") * ten_pow
+    return custom_mojo_ops.elementwise(x * ten_pow, "round") / ten_pow
 
 
 # rsqrt(Tensor self) -> Tensor
@@ -4551,6 +4710,12 @@ def aten_select_scatter(
     return _where(mask_expanded, src_expanded, input)
 
 
+# sgn(Tensor self) -> Tensor
+@map_to(aten.sgn)
+def aten_sgn(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "sign")
+
+
 # sigmoid(Tensor self) -> Tensor
 @map_to(aten.sigmoid)
 def aten_sigmoid(input: MaxTensor) -> MaxTensor:
@@ -4563,6 +4728,12 @@ def aten_sign(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sign")
 
 
+# signbit(Tensor self) -> Tensor
+@map_to(aten.signbit)
+def aten_signbit(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "signbit")
+
+
 # silu(Tensor self) -> Tensor
 @map_to(aten.silu)
 def aten_silu(input: MaxTensor) -> MaxTensor:
@@ -4573,6 +4744,126 @@ def aten_silu(input: MaxTensor) -> MaxTensor:
 @map_to(aten.sin)
 def aten_sin(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "sin")
+
+
+# sinc(Tensor self) -> Tensor
+@map_to(aten.sinc)
+def aten_sinc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "sinc")
+
+
+# special_airy_ai(Tensor x) -> Tensor
+@map_to(aten.special_airy_ai)
+def aten_special_airy_ai(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "airy_ai")
+
+
+# special_bessel_j0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j0)
+def aten_special_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j0")
+
+
+# special_bessel_j1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_j1)
+def aten_special_bessel_j1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_j1")
+
+
+# special_bessel_y0(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y0)
+def aten_special_bessel_y0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y0")
+
+
+# special_bessel_y1(Tensor self) -> Tensor
+@map_to(aten.special_bessel_y1)
+def aten_special_bessel_y1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "bessel_y1")
+
+
+# special_entr(Tensor self) -> Tensor
+@map_to(aten.special_entr)
+def aten_special_entr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "entr")
+
+
+# special_erfcx(Tensor self) -> Tensor
+@map_to(aten.special_erfcx)
+def aten_special_erfcx(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "erfcx")
+
+
+# special_i0e(Tensor self) -> Tensor
+@map_to(aten.special_i0e)
+def aten_special_i0e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i0e")
+
+
+# special_i1(Tensor self) -> Tensor
+@map_to(aten.special_i1)
+def aten_special_i1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1")
+
+
+# special_i1e(Tensor self) -> Tensor
+@map_to(aten.special_i1e)
+def aten_special_i1e(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "i1e")
+
+
+# special_log_ndtr(Tensor self) -> Tensor
+@map_to(aten.special_log_ndtr)
+def aten_special_log_ndtr(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "log_ndtr")
+
+
+# special_modified_bessel_i0(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_i0)
+def aten_special_modified_bessel_i0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_i0")
+
+
+# special_modified_bessel_i1(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_i1)
+def aten_special_modified_bessel_i1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_i1")
+
+
+# special_modified_bessel_k0(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_k0)
+def aten_special_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_k0")
+
+
+# special_modified_bessel_k1(Tensor self) -> Tensor
+@map_to(aten.special_modified_bessel_k1)
+def aten_special_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "modified_bessel_k1")
+
+
+# special_ndtri(Tensor self) -> Tensor
+@map_to(aten.special_ndtri)
+def aten_special_ndtri(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "ndtri")
+
+
+# special_scaled_modified_bessel_k0(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k0)
+def aten_special_scaled_modified_bessel_k0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k0")
+
+
+# special_scaled_modified_bessel_k1(Tensor x) -> Tensor
+@map_to(aten.special_scaled_modified_bessel_k1)
+def aten_special_scaled_modified_bessel_k1(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "scaled_modified_bessel_k1")
+
+
+# special_spherical_bessel_j0(Tensor x) -> Tensor
+@map_to(aten.special_spherical_bessel_j0)
+def aten_special_spherical_bessel_j0(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "spherical_bessel_j0")
 
 
 # tan(Tensor self) -> Tensor
@@ -4754,6 +5045,9 @@ def aten_topk(
 
 
 # trunc(Tensor self) -> Tensor
+@map_to(aten.trunc)
+def aten_trunc(x: MaxTensor) -> MaxTensor:
+    return custom_mojo_ops.elementwise(x, "trunc")
 
 
 # unsqueeze(Tensor(a) self, int dim) -> Tensor(a)

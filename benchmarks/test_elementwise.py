@@ -33,35 +33,82 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "abs": torch.abs,
     "acos": torch.acos,
     "acosh": torch.acosh,
+    "angle": torch.angle,
+    "asin": torch.asin,
     "asinh": torch.asinh,
+    "atan": torch.atan,
     "atanh": torch.atanh,
     "ceil": torch.ceil,
     "cos": torch.cos,
     "cosh": torch.cosh,
+    "digamma": torch.digamma,
     "erf": torch.erf,
+    "erfc": torch.erfc,
+    "erfinv": torch.erfinv,
     "exp": torch.exp,
+    "exp2": torch.exp2,
+    "expm1": torch.expm1,
     "floor": torch.floor,
+    "frac": torch.frac,
     "gelu": F.gelu,
+    "i0": torch.i0,
     "isnan": torch.isnan,
+    "lgamma": torch.lgamma,
     "log": torch.log,
+    "log10": torch.log10,
     "log1p": torch.log1p,
     "log2": torch.log2,
+    "logit": torch.logit,
+    "mvlgamma": lambda x: torch.mvlgamma(x, 2),
+    "nan_to_num": torch.nan_to_num,
     "neg": torch.neg,
+    "polygamma": lambda x: torch.polygamma(2, x),
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "round": torch.round,
+    "round.decimals": lambda x: torch.round(x, decimals=2),
     "rsqrt": torch.rsqrt,
+    "sgn": torch.sgn,
     "sigmoid": torch.sigmoid,
     "sign": torch.sign,
+    "signbit": torch.signbit,
     "silu": F.silu,
     "sin": torch.sin,
+    "sinc": torch.sinc,
     "sinh": torch.sinh,
+    "special_entr": torch.special.entr,
+    "special_i0e": torch.special.i0e,
+    "special_i1": torch.special.i1,
+    "special_i1e": torch.special.i1e,
     "sqrt": torch.sqrt,
     "tan": torch.tan,
     "tanh": torch.tanh,
+    "trunc": torch.trunc,
 }
 
 # Ops whose domain excludes unit_interval: its operand, shifted by this much.
-DOMAIN_SHIFT: dict[str, float] = {"acosh": 1.0}
+# mvlgamma(x, 2) needs x > 1/2.
+DOMAIN_SHIFT: dict[str, float] = {"acosh": 1.0, "mvlgamma": 1.0}
+
+# Special functions stock torch implements for float32/float64 only
+# (AT_DISPATCH_FLOATING_TYPES): benchmarked in float32 alone.
+FLOAT32_ONLY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "special_airy_ai": torch.special.airy_ai,
+    "special_bessel_j0": torch.special.bessel_j0,
+    "special_bessel_j1": torch.special.bessel_j1,
+    "special_bessel_y0": torch.special.bessel_y0,
+    "special_bessel_y1": torch.special.bessel_y1,
+    "special_erfcx": torch.special.erfcx,
+    "special_log_ndtr": torch.special.log_ndtr,
+    "special_modified_bessel_i0": torch.special.modified_bessel_i0,
+    "special_modified_bessel_i1": torch.special.modified_bessel_i1,
+    "special_modified_bessel_k0": torch.special.modified_bessel_k0,
+    "special_modified_bessel_k1": torch.special.modified_bessel_k1,
+    "special_ndtri": torch.special.ndtri,
+    "special_scaled_modified_bessel_k0": torch.special.scaled_modified_bessel_k0,
+    "special_scaled_modified_bessel_k1": torch.special.scaled_modified_bessel_k1,
+    "special_spherical_bessel_j0": torch.special.spherical_bessel_j0,
+}
 
 
 def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -72,13 +119,22 @@ def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.
 
 # Registered elementwise ops NOT benchmarked here, and why.  Reconciled
 # against the live registration table by test_coverage.py.
-SKIPPED: dict[str, str] = {}
-
-COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {
-    "aten::bitwise_not": "test_bitwise_not",
-    "aten::logical_not": "test_logical_not",
-    "aten::sqrt.out": "test_sqrt_contiguous_out",
+SKIPPED: dict[str, str] = {
+    "aten::round_.decimals": (
+        "in-place form of round.decimals: the same kernel, measured by"
+        " test_unary[round.decimals]"
+    )
 }
+
+COVERS: dict[str, str] = (
+    {f"aten::{name}": "test_unary" for name in UNARY_OPS}
+    | {f"aten::{name}": "test_unary_float32_only" for name in FLOAT32_ONLY_OPS}
+    | {
+        "aten::bitwise_not": "test_bitwise_not",
+        "aten::logical_not": "test_logical_not",
+        "aten::sqrt.out": "test_sqrt_contiguous_out",
+    }
+)
 
 
 @pytest.mark.parametrize("dtype_id", ("f16", "bf16", "f32"))
@@ -127,6 +183,24 @@ def test_unary_unaligned(
         assert value.data_ptr() % (4 * cpu.element_size()) == cpu.element_size()
     torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
     bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(cpu.numel()))
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(FLOAT32_ONLY_OPS))
+def test_unary_float32_only(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = FLOAT32_ONLY_OPS[op_name]
+    cpu = _operand(op_name, SHAPES[shape_id], DTYPES[dtype_id])
+    x_ref, x_our = both(cpu, hw, mojo_device)
+    torch.testing.assert_close(fn(x_our).cpu(), fn(cpu))
+    bench.run(lambda: fn(x_ref), lambda: fn(x_our), flops=float(x_ref.numel()))
 
 
 @pytest.mark.bench_op("gelu")

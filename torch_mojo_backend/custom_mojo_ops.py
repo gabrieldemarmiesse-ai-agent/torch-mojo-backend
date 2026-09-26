@@ -108,33 +108,70 @@ def elementwise(
         "abs",
         "acos",
         "acosh",
+        "airy_ai",
+        "angle",
+        "asin",
         "asinh",
+        "atan",
         "atanh",
+        "bessel_j0",
+        "bessel_j1",
+        "bessel_y0",
+        "bessel_y1",
         "ceil",
         "cos",
         "cosh",
+        "digamma",
+        "entr",
         "erf",
+        "erfc",
+        "erfcx",
+        "erfinv",
         "exp",
+        "exp2",
+        "expm1",
         "floor",
+        "frac",
         "gelu_none",
         "gelu_tanh",
+        "i0",
+        "i0e",
+        "i1",
+        "i1e",
         "isnan",
+        "lgamma",
+        "log10",
+        "log_ndtr",
         "logical_not",
         "log",
         "log1p",
         "log2",
+        "logit",
+        "modified_bessel_i0",
+        "modified_bessel_i1",
+        "modified_bessel_k0",
+        "modified_bessel_k1",
+        "ndtri",
         "neg",
         "reciprocal",
         "relu",
+        "round",
         "rsqrt",
+        "scaled_modified_bessel_k0",
+        "scaled_modified_bessel_k1",
         "sigmoid",
         "sign",
+        "signbit",
         "silu",
         "sin",
+        "sinc",
         "sinh",
+        "spherical_bessel_j0",
         "sqrt",
         "tan",
         "tanh",
+        "trigamma",
+        "trunc",
     ],
 ) -> MaxTensor:
     """Call shared unary math through MAX's fusible Mojo registrations."""
@@ -150,15 +187,20 @@ def elementwise(
             "logical_not",
             "neg",
             "relu",
+            "round",
             "sign",
+            "signbit",
             "silu",
+            "trunc",
         }
         and not input.dtype.is_float()
     ):
         # ATen unary_float_op promotes integer and bool inputs to the default
         # floating dtype, whereas ElementwiseUnaryOp preserves its input dtype.
         input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
-    output_dtype = DType.bool if kind in {"isnan", "logical_not"} else input.dtype
+    output_dtype = (
+        DType.bool if kind in {"isnan", "logical_not", "signbit"} else input.dtype
+    )
     return F.custom(
         name=f"elementwise_{kind}",
         device=input.device,
@@ -168,6 +210,12 @@ def elementwise(
         ],
         custom_extensions=compiler.kernel_extension_paths(),
     )[0]
+
+
+def polygamma(n: int, input: MaxTensor) -> MaxTensor:
+    """polygamma(n, x) for n >= 2 (`tmb/graph/elementwise.mojo`'s binary
+    `polygamma`, n broadcast as a float operand)."""
+    return _same_type_binary("polygamma", _scalar_to_tensor(input, n), input)
 
 
 def gelu_backward(

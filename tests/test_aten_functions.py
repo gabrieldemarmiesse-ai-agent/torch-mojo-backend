@@ -1098,6 +1098,160 @@ def test_aten_shared_elementwise_special_batch(
         checker.check_was_called()
 
 
+# Unary math and special functions: (aten_functions twin, aten call, input).
+_SPECIAL_UNARY_CASES = [
+    ("angle", lambda x: aten.angle(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("asin", lambda x: aten.asin(x), [-1.0, -0.5, 0.0, 0.25, 1.0]),
+    ("atan", lambda x: aten.atan(x), [-50.0, -1.0, 0.0, 0.5, 3.0]),
+    ("digamma", lambda x: aten.digamma(x), [-2.5, -0.5, 0.25, 1.0, 12.0]),
+    ("erfc", lambda x: aten.erfc(x), [-3.0, -0.5, 0.0, 2.0, 9.0]),
+    ("erfinv", lambda x: aten.erfinv(x), [-0.999, -0.5, 0.0, 0.3, 0.9]),
+    ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
+    ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
+    ("frac", lambda x: aten.frac(x), [-2.75, -0.5, 0.0, 1.25, 100.5]),
+    ("i0", lambda x: aten.i0(x), [-10.0, -1.0, 0.0, 3.0, 9.0]),
+    ("lgamma", lambda x: aten.lgamma(x), [-2.5, 0.3, 1.0, 2.5, 40.0]),
+    ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
+    ("logit", lambda x: aten.logit(x, 0.01), [0.0, 0.005, 0.25, 0.5, 0.999]),
+    ("mvlgamma", lambda x: aten.mvlgamma(x, 3), [1.5, 2.0, 3.25, 7.0, 20.0]),
+    ("nan_to_num", lambda x: aten.nan_to_num(x, 0.5), [-1.0, 0.0, 2.0, 1e3, 3.0]),
+    ("polygamma", lambda x: aten.polygamma(3, x), [0.25, 1.0, 2.5, 7.0, 30.0]),
+    ("round", lambda x: aten.round(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
+    ("round", lambda x: aten.round(x, decimals=2), [-2.555, 0.125, 1.005, 3.14159]),
+    ("sgn", lambda x: aten.sgn(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("signbit", lambda x: aten.signbit(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
+    ("special_airy_ai", lambda x: aten.special_airy_ai(x), [-5.0, -1.0, 0.0, 3.0]),
+    ("special_bessel_j0", lambda x: aten.special_bessel_j0(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_j1", lambda x: aten.special_bessel_j1(x), [-7.0, 0.0, 3.0, 9.0]),
+    ("special_bessel_y0", lambda x: aten.special_bessel_y0(x), [0.5, 3.0, 9.0]),
+    ("special_bessel_y1", lambda x: aten.special_bessel_y1(x), [0.5, 3.0, 9.0]),
+    ("special_entr", lambda x: aten.special_entr(x), [-1.0, 0.0, 0.5, 3.0]),
+    ("special_erfcx", lambda x: aten.special_erfcx(x), [-3.0, 0.0, 2.0, 70.0]),
+    ("special_i0e", lambda x: aten.special_i0e(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1", lambda x: aten.special_i1(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_i1e", lambda x: aten.special_i1e(x), [-10.0, 0.0, 3.0, 9.0]),
+    ("special_log_ndtr", lambda x: aten.special_log_ndtr(x), [-20.0, -2.0, 0.0, 3.0]),
+    (
+        "special_modified_bessel_i0",
+        lambda x: aten.special_modified_bessel_i0(x),
+        [-10.0, 0.0, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_i1",
+        lambda x: aten.special_modified_bessel_i1(x),
+        [-10.0, 0.0, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_k0",
+        lambda x: aten.special_modified_bessel_k0(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_modified_bessel_k1",
+        lambda x: aten.special_modified_bessel_k1(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    ("special_ndtri", lambda x: aten.special_ndtri(x), [0.01, 0.2, 0.5, 0.95]),
+    (
+        "special_scaled_modified_bessel_k0",
+        lambda x: aten.special_scaled_modified_bessel_k0(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_scaled_modified_bessel_k1",
+        lambda x: aten.special_scaled_modified_bessel_k1(x),
+        [0.5, 1.5, 3.0, 9.0],
+    ),
+    (
+        "special_spherical_bessel_j0",
+        lambda x: aten.special_spherical_bessel_j0(x),
+        [-7.0, 0.0, 0.25, 9.0],
+    ),
+    ("trunc", lambda x: aten.trunc(x), [-2.5, -0.5, 0.5, 1.5, 2.4]),
+]
+
+
+# Float and double only in stock torch (AT_DISPATCH_FLOATING_TYPES).
+_NO_HALF_KERNEL = {
+    "special_airy_ai",
+    "special_bessel_j0",
+    "special_bessel_j1",
+    "special_bessel_y0",
+    "special_bessel_y1",
+    "special_erfcx",
+    "special_log_ndtr",
+    "special_modified_bessel_i0",
+    "special_modified_bessel_i1",
+    "special_modified_bessel_k0",
+    "special_modified_bessel_k1",
+    "special_ndtri",
+    "special_scaled_modified_bessel_k0",
+    "special_scaled_modified_bessel_k1",
+    "special_spherical_bessel_j0",
+}
+
+
+# logit's bfloat16 reference would be CPU torch's reduced-precision path,
+# which differs from CUDA's (float compute, one rounding; what the device does).
+_SPECIAL_UNARY_PARAMS = [
+    pytest.param(name, fn, values, dtype, id=f"{name}-{i}-{str(dtype)[6:]}")
+    for i, (name, fn, values) in enumerate(_SPECIAL_UNARY_CASES)
+    for dtype in (torch.float32, torch.bfloat16)
+    if dtype == torch.float32 or name not in _NO_HALF_KERNEL | {"logit"}
+]
+
+
+@pytest.mark.parametrize("name,fn,values,dtype", _SPECIAL_UNARY_PARAMS)
+def test_aten_special_unary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    values: list[float],
+    dtype: torch.dtype,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    check_outputs(fn, conf, [torch.tensor(values, dtype=dtype)])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_aten_special_unary_compiled_batch(dtype: torch.dtype, device: str):
+    """The torch.compile twins of every case above, in one graph (the shared
+    elementwise kinds, the polygamma binary op and the compositions), against
+    stock torch on the same device."""
+    checkers = []
+    for name, _, _ in _SPECIAL_UNARY_CASES:
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{name}"))
+        checkers.append(checker)
+    # The graph follows CUDA's reduced-precision arithmetic on every device:
+    # logit in float with one rounding, round.decimals in the tensor dtype.
+    # CPU torch does neither, and stock CUDA has no half angle to compare to.
+    no_half = {"logit", "round"} if device == "cpu" else {"angle"}
+    cases = [
+        case
+        for case in _SPECIAL_UNARY_CASES
+        if dtype == torch.float32 or case[0] not in _NO_HALF_KERNEL | no_half
+    ]
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(case[1](x) for case in cases)
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    x = torch.linspace(0.05, 0.95, 64, dtype=torch.float32, device=device).to(dtype)
+    for case, result, expected in zip(cases, compiled(x), fn(x), strict=True):
+        torch.testing.assert_close(
+            result,
+            expected,
+            equal_nan=True,
+            msg=lambda message, name=case[0]: f"{name}: {message}",
+        )
+    called = [c for c, case in zip(checkers, _SPECIAL_UNARY_CASES) if case in cases]
+    for checker in called:
+        checker.check_was_called()
+
+
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.cuda

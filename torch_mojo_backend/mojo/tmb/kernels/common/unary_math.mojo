@@ -19,9 +19,45 @@ from std.math import (
     tanh,
 )
 from std.memory import bitcast
-from std.sys.info import is_apple_gpu, is_nvidia_gpu
+from std.sys import llvm_intrinsic
+from std.sys.info import bit_width_of, is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import isnan, max_or_inf, nan
+from tmb.kernels.common.cuda_math import (
+    nv_asinf,
+    nv_atanf,
+    nv_erfcf,
+    nv_erfinvf,
+    nv_exp2f,
+    nv_expm1f,
+    nv_lgammaf,
+    nv_log10f,
+)
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
+from tmb.kernels.common.special_math import (
+    airy_ai_f,
+    bessel_j0_f,
+    bessel_j1_f,
+    bessel_y0_f,
+    bessel_y1_f,
+    digamma_f,
+    entr_f,
+    erfcx_f,
+    i0_f,
+    i0e_f,
+    i1_f,
+    i1e_f,
+    log_ndtr_f,
+    logit_f,
+    modified_bessel_i0_f,
+    modified_bessel_i1_f,
+    modified_bessel_k0_f,
+    modified_bessel_k1_f,
+    ndtri_f,
+    polygamma_f,
+    sinc_f,
+    spherical_bessel_j0_f,
+    trigamma_f,
+)
 
 
 @always_inline
@@ -85,6 +121,158 @@ def _acosh[
     var ge1 = a.ge(1)
     return (ge1 & a.lt(max_or_inf[dtype]())).select(
         res, ge1.select(a, SIMD[dtype, width](nan[dtype]()))
+    )
+
+
+@always_inline
+def is_scalar_special[kind: StaticString]() -> Bool:
+    """The kinds computed one float32 lane at a time by a scalar port of the
+    CUDA routine stock torch runs (`cuda_math.mojo`, `special_math.mojo`):
+    branchy Cephes/libdevice code, evaluated in float for float16/bfloat16
+    inputs as the jiterator does. float64 inputs (reachable only from the
+    torch.compile graph; the eager ops decline them) compute in float too.
+    """
+    return (
+        kind == "airy_ai"
+        or kind == "asin"
+        or kind == "atan"
+        or kind == "bessel_j0"
+        or kind == "bessel_j1"
+        or kind == "bessel_y0"
+        or kind == "bessel_y1"
+        or kind == "digamma"
+        or kind == "entr"
+        or kind == "erfc"
+        or kind == "erfcx"
+        or kind == "erfinv"
+        or kind == "exp2"
+        or kind == "expm1"
+        or kind == "i0"
+        or kind == "i0e"
+        or kind == "i1"
+        or kind == "i1e"
+        or kind == "lgamma"
+        or kind == "log10"
+        or kind == "log_ndtr"
+        or kind == "logit"
+        or kind == "modified_bessel_i0"
+        or kind == "modified_bessel_i1"
+        or kind == "modified_bessel_k0"
+        or kind == "modified_bessel_k1"
+        or kind == "ndtri"
+        or kind == "scaled_modified_bessel_k0"
+        or kind == "scaled_modified_bessel_k1"
+        or kind == "sinc"
+        or kind == "spherical_bessel_j0"
+        or kind == "trigamma"
+    )
+
+
+@always_inline
+def _scalar_special[kind: StaticString](a: Float32) -> Float32:
+    comptime if kind == "airy_ai":
+        return airy_ai_f(a)
+    elif kind == "asin":
+        return nv_asinf(a)
+    elif kind == "atan":
+        return nv_atanf(a)
+    elif kind == "bessel_j0":
+        return bessel_j0_f(a)
+    elif kind == "bessel_j1":
+        return bessel_j1_f(a)
+    elif kind == "bessel_y0":
+        return bessel_y0_f(a)
+    elif kind == "bessel_y1":
+        return bessel_y1_f(a)
+    elif kind == "digamma":
+        return digamma_f(a)
+    elif kind == "entr":
+        return entr_f(a)
+    elif kind == "erfc":
+        return nv_erfcf(a)
+    elif kind == "erfcx":
+        return erfcx_f(a)
+    elif kind == "erfinv":
+        return nv_erfinvf(a)
+    elif kind == "exp2":
+        return nv_exp2f(a)
+    elif kind == "expm1":
+        return nv_expm1f(a)
+    elif kind == "i0":
+        return i0_f(a)
+    elif kind == "i0e":
+        return i0e_f(a)
+    elif kind == "i1":
+        return i1_f(a)
+    elif kind == "i1e":
+        return i1e_f(a)
+    elif kind == "lgamma":
+        return nv_lgammaf(a)
+    elif kind == "log10":
+        return nv_log10f(a)
+    elif kind == "log_ndtr":
+        return log_ndtr_f(a)
+    elif kind == "logit":
+        return logit_f(a, Float32(-1.0))
+    elif kind == "modified_bessel_i0":
+        return modified_bessel_i0_f(a)
+    elif kind == "modified_bessel_i1":
+        return modified_bessel_i1_f(a)
+    elif kind == "modified_bessel_k0":
+        return modified_bessel_k0_f(a, scaled=False)
+    elif kind == "modified_bessel_k1":
+        return modified_bessel_k1_f(a, scaled=False)
+    elif kind == "ndtri":
+        return ndtri_f(a)
+    elif kind == "scaled_modified_bessel_k0":
+        return modified_bessel_k0_f(a, scaled=True)
+    elif kind == "scaled_modified_bessel_k1":
+        return modified_bessel_k1_f(a, scaled=True)
+    elif kind == "sinc":
+        return sinc_f(a)
+    elif kind == "spherical_bessel_j0":
+        return spherical_bessel_j0_f(a)
+    elif kind == "trigamma":
+        return trigamma_f(a)
+    else:
+        comptime assert False, "unsupported scalar special kind"
+
+
+@always_inline
+def _rounding[
+    kind: StaticString, dtype: DType, width: SIMDLength
+](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """trunc / round (half to even: ATen's nearbyint) / frac / angle of a
+    real input: exact in any float dtype, so float64 computes natively."""
+    comptime if kind == "trunc":
+        return llvm_intrinsic["llvm.trunc", type_of(a), has_side_effect=False](
+            a
+        )
+    elif kind == "round":
+        return llvm_intrinsic[
+            "llvm.roundeven", type_of(a), has_side_effect=False
+        ](a)
+    elif kind == "frac":
+        # `a - trunc(a)`: exact, and NaN / +-inf -> NaN as in ATen.
+        return a - llvm_intrinsic[
+            "llvm.trunc", type_of(a), has_side_effect=False
+        ](a)
+    else:
+        comptime assert kind == "angle", "unsupported rounding kind"
+        # UnaryComplexKernels.cu `angle_wrapper`: NaN stays, pi below zero.
+        return isnan(a).select(
+            a,
+            a.lt(0).select(
+                SIMD[dtype, width](3.14159265358979323846),
+                SIMD[dtype, width](0),
+            ),
+        )
+
+
+@always_inline
+def is_rounding[kind: StaticString]() -> Bool:
+    return (
+        kind == "trunc" or kind == "round" or kind == "frac" or kind == "angle"
     )
 
 
@@ -254,8 +442,24 @@ def elementwise_unary[
         else:
             # Both comparisons are false for NaN, matching ATen's zero result.
             return x.gt(0).cast[dtype]() - x.lt(0).cast[dtype]()
-    elif (kind == "ceil" or kind == "floor") and dtype.is_integral():
+    elif (
+        kind == "ceil" or kind == "floor" or kind == "trunc" or kind == "round"
+    ) and dtype.is_integral():
         return x
+    elif is_rounding[kind]():
+        comptime assert (
+            dtype.is_floating_point()
+        ), "floating point input required"
+        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+            return _rounding[kind](x.cast[DType.float32]()).cast[dtype]()
+        else:
+            return _rounding[kind](x)
+    elif is_scalar_special[kind]():
+        var xf = x.cast[DType.float32]()
+        var r = SIMD[DType.float32, width]()
+        comptime for i in range(width):
+            r[i] = _scalar_special[kind](xf[i])
+        return r.cast[dtype]()
     elif kind == "acosh" and (
         dtype == DType.float16 or dtype == DType.bfloat16
     ):
@@ -279,5 +483,129 @@ def elementwise_predicate[
         return isnan(x)
     elif kind == "logical_not":
         return x.eq(SIMD[dtype, width](0))
+    elif kind == "signbit":
+        # signbit_kernel_cuda: the sign bit of a float (-0.0 and -NaN too),
+        # `x < 0` for an integer (false for every unsigned value).
+        comptime if dtype.is_floating_point():
+            comptime bits = DType.uint64 if dtype == DType.float64 else (
+                DType.uint32 if dtype == DType.float32 else DType.uint16
+            )
+            comptime top = bit_width_of[dtype]() - 1
+            return (bitcast[bits](x) >> SIMD[bits, width](top)).ne(0)
+        else:
+            return x.lt(0)
     else:
         comptime assert False, "unsupported elementwise predicate"
+
+
+@always_inline
+def _to_dtype_rounded[
+    dtype: DType, width: SIMDLength
+](v: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """Round a float32 intermediate to `dtype` and back: a step the C++
+    kernel performs in scalar_t (c10::Half / c10::BFloat16 arithmetic)."""
+    return v.cast[dtype]().cast[DType.float32]()
+
+
+@always_inline
+def elementwise_unary_param[
+    kind: StaticString, dtype: DType, width: SIMDLength
+](x: SIMD[dtype, width], p0: Float64, p1: Float64, p2: Float64) -> SIMD[
+    dtype, width
+] where dtype.is_floating_point():
+    """The unary ops with runtime scalar arguments (the elementwise family's
+    parameterized route; `p0..p2` as the host sends them):
+
+    * round_decimals: p0 = 10^|decimals| (double), p1 = 1 when decimals < 0.
+      round_decimals_kernel_cuda computes in scalar_t: each step rounds.
+    * logit: p0 = eps, negative for None (logit_kernel_cuda, in float).
+    * polygamma: p0 = n (polygamma_kernel_cuda, in float).
+    * mvlgamma: p0 = p. ATen composes it (UnaryOps.cpp `mvlgamma`):
+      sum_j lgamma(x + (1 - p)/2 + j/2) + p (p - 1) log(pi) / 4, the terms
+      and the sum in the tensor dtype, the sum accumulated in float.
+    * nan_to_num: p0 / p1 / p2 replace NaN / +inf / -inf, each first cast to
+      the tensor dtype (nan_to_num_kernel_cuda).
+    """
+    comptime if kind == "nan_to_num":
+        comptime if dtype == DType.float64:
+            var r_nan = SIMD[dtype, width](p0)
+            var r_pos = SIMD[dtype, width](p1)
+            var r_neg = SIMD[dtype, width](p2)
+            return isnan(x).select(
+                r_nan,
+                x.eq(max_or_inf[dtype]()).select(
+                    r_pos, x.eq(-max_or_inf[dtype]()).select(r_neg, x)
+                ),
+            )
+        else:
+            # static_cast<scalar_t>(double): through float for the halves.
+            var r_nan = SIMD[dtype, width](Float32(p0).cast[dtype]())
+            var r_pos = SIMD[dtype, width](Float32(p1).cast[dtype]())
+            var r_neg = SIMD[dtype, width](Float32(p2).cast[dtype]())
+            return isnan(x).select(
+                r_nan,
+                x.eq(max_or_inf[dtype]()).select(
+                    r_pos, x.eq(-max_or_inf[dtype]()).select(r_neg, x)
+                ),
+            )
+    elif kind == "round_decimals":
+        comptime if dtype == DType.float64:
+            var tp = SIMD[dtype, width](p0)
+            if p1 != 0:
+                return _rounding["round"](x / tp) * tp
+            return _rounding["round"](x * tp) / tp
+        else:
+            var tp = SIMD[DType.float32, width](
+                Float32(p0).cast[dtype]().cast[DType.float32]()
+            )
+            var xf = x.cast[DType.float32]()
+            if p1 != 0:
+                var q = _to_dtype_rounded[dtype](xf / tp)
+                return (_rounding["round"](q) * tp).cast[dtype]()
+            var q = _to_dtype_rounded[dtype](xf * tp)
+            return (_rounding["round"](q) / tp).cast[dtype]()
+    else:
+        var xf = x.cast[DType.float32]()
+        var r = SIMD[DType.float32, width]()
+        comptime if kind == "logit":
+            var eps = Float32(p0)
+            comptime for i in range(width):
+                r[i] = logit_f(xf[i], eps)
+        elif kind == "polygamma":
+            var n = Int(p0)
+            comptime for i in range(width):
+                r[i] = polygamma_f(xf[i], n)
+        else:
+            comptime assert kind == "mvlgamma", "unsupported param kind"
+            var p = Int(p0)
+            var start = Float32(1 - p) * Float32(0.5)
+            comptime for i in range(width):
+                var acc = Float32(0.0)
+                for j in range(p):
+                    var arg = _to_dtype_rounded[dtype](
+                        SIMD[DType.float32, 1](
+                            xf[i] + (start + Float32(j) * Float32(0.5))
+                        )
+                    )
+                    acc += _to_dtype_rounded[dtype](
+                        SIMD[DType.float32, 1](nv_lgammaf(arg[0]))
+                    )[0]
+                # p (p - 1) log(pi) / 4 in double, added in float.
+                var c = Float64(p) * Float64(p - 1) * 1.1447298858494002 / 4
+                r[i] = _to_dtype_rounded[dtype](SIMD[DType.float32, 1](acc))[
+                    0
+                ] + Float32(c)
+        return r.cast[dtype]()
+
+
+@always_inline
+def elementwise_polygamma[
+    dtype: DType, width: SIMDLength
+](n: SIMD[dtype, width], x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """The polygamma function lane by lane, the order n read from a float
+    operand (the torch.compile graph's binary form of the op)."""
+    var xf = x.cast[DType.float32]()
+    var r = SIMD[DType.float32, width]()
+    comptime for i in range(width):
+        r[i] = polygamma_f(xf[i], Int(n[i]))
+    return r.cast[dtype]()
