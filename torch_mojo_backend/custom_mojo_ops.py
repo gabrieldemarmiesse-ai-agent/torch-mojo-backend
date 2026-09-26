@@ -107,6 +107,7 @@ def elementwise(
     kind: Literal[
         "abs",
         "acos",
+        "acosh",
         "asinh",
         "atanh",
         "ceil",

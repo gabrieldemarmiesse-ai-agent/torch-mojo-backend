@@ -388,6 +388,21 @@ def op_acos_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, dst)
 
 
+# aten::acosh(Tensor self) -> Tensor
+def op_acosh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var out = own(_float_unary("AcoshSpec", t))
+    ret_owned(rets, 0, out)
+
+
+# aten::acosh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_acosh_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _float_unary_out("AcoshSpec", t, dst)
+    ret_ref(rets, 0, dst)
+
+
 # aten::asinh(Tensor self) -> Tensor
 def op_asinh(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
@@ -1007,6 +1022,8 @@ def register_unary(site: Site) raises:
     impl[op_abs_out, "abs.out"](site)
     impl[op_acos, "acos"](site)
     impl[op_acos_out, "acos.out"](site)
+    impl[op_acosh, "acosh"](site)
+    impl[op_acosh_out, "acosh.out"](site)
     impl[op_asinh, "asinh"](site)
     impl[op_asinh_out, "asinh.out"](site)
     impl[op_atanh, "atanh"](site)

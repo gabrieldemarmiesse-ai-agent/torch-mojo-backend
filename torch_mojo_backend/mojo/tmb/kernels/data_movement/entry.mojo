@@ -30,10 +30,9 @@ from std.sys.info import (
 )
 from std.utils.coord import Coord
 
-from max.algorithm import elementwise
 from std.utils import IndexList
 
-
+from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,

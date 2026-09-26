@@ -6,9 +6,9 @@
 # pointer that `device._device_context_ptr()` hands us on the Python side.
 # ===----------------------------------------------------------------------=== #
 
+from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 
-from max.algorithm import elementwise
 from std.builtin.device_passable import DevicePassable
 from std.collections import OptionalReg
 from std.collections.string.string_span import get_static_string

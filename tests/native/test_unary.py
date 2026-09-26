@@ -43,6 +43,7 @@ SWEEP_DTYPE = torch.bfloat16
 _UNARY_OPS = [
     ("abs", torch.abs, "signed"),
     ("acos", torch.acos, "unit"),
+    ("acosh", torch.acosh, "above_1"),
     ("asinh", torch.asinh, "signed"),
     ("atanh", torch.atanh, "unit"),
     ("cos", torch.cos, "signed"),
@@ -72,6 +73,9 @@ def _sample(domain: str, shape: tuple[int, ...]) -> torch.Tensor:
         return torch.empty(shape, dtype=torch.float64).uniform_(-0.85, 0.85)
     if domain == "positive":
         return torch.empty(shape, dtype=torch.float64).uniform_(0.15, 4.0)
+    if domain == "above_1":
+        # acosh(x) is real for x >= 1 only.
+        return torch.empty(shape, dtype=torch.float64).uniform_(1.0, 6.0)
     if domain == "above_neg1":
         # log1p(x) = log(1 + x) needs x > -1; stay well clear of the pole.
         return torch.empty(shape, dtype=torch.float64).uniform_(-0.9, 4.0)
@@ -377,6 +381,42 @@ def test_unary_launcher_log1p_near_zero(mojo_gpu: str, dtype: torch.dtype, offse
     )
     zeros = cpu == 0
     torch.testing.assert_close(torch.signbit(actual[zeros]), torch.signbit(cpu[zeros]))
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("offset", (0, 1))
+def test_unary_launcher_acosh_edges(mojo_gpu: str, dtype: torch.dtype, offset: int):
+    """NaN below one and for NaN, exact zero at one, the near-one regime where
+    the naive log(x + sqrt(x^2 - 1)) loses the sqrt term, and the large inputs
+    where x^2 would overflow."""
+    finfo = torch.finfo(dtype)
+    values = [
+        -float("inf"),
+        -2.0,
+        0.0,
+        0.5,
+        1.0 - finfo.eps,
+        1.0,
+        1.0 + finfo.eps,
+        1.0 + 4 * finfo.eps,
+        1.001,
+        1.5,
+        2.0,
+        1e3,
+        2.0**28,
+        finfo.max,
+        float("inf"),
+        float("nan"),
+    ]
+    if dtype != torch.float16:
+        values += [1e20, 1e30]
+    cpu = torch.tensor(values, dtype=dtype)
+    storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
+    _reset_native_counts()
+    actual = torch.acosh(storage[offset:])
+    assert _native_count("acosh") > 0
+    expected = torch.acosh(cpu.double()).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))

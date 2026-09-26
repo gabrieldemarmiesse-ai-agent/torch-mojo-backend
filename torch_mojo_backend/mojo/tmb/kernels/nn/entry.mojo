@@ -47,8 +47,7 @@ from std.utils.index import IndexList
 from std.utils.numerics import min_finite, min_or_neg_inf
 from std.utils.static_tuple import StaticTuple
 
-from max.algorithm import elementwise
-
+from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.reduction.argreduce import _argreduce_spec_into
 from tmb.kernels.nn.cumsum_kernels import (
     CUMSUM_DTYPES,

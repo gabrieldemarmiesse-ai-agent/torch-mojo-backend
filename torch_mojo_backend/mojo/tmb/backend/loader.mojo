@@ -23,6 +23,17 @@ from tmb.kernels.common.op_utils import Argv
 
 comptime CACHE_ABI = "native-v2"
 
+# Appended to every eager kernel family build below (`entry()`), never to the
+# torch.compile graph package (`native.build_graph_package()`'s `mojo
+# precompile` passes no `-D` at all -- see `native/__init__.py`).
+# `tmb.kernels.common.gpu_elementwise.elementwise` reads it with
+# `is_defined["TMB_EAGER_ELEMENTWISE"]()` to take the fast NVIDIA launcher
+# only on this path: several eager kernels it calls (`_bias_add_row` in
+# matmul/entry.mojo, `_gather0`/`op_utils._parallel_for`, ...) are also
+# imported by tmb/graph's custom ops for the torch.compile backend, and that
+# backend must keep MAX's own `elementwise` unchanged.
+comptime _EAGER_ELEMENTWISE_DEFINE = "TMB_EAGER_ELEMENTWISE=1"
+
 # Every Mojo source lives under one root, torch_mojo_backend/mojo, which is
 # the one `-I` of every build, as one top-level package: `from
 # tmb.<pkg>.<module> import ...`. Kernel families are
@@ -360,8 +371,16 @@ struct Loader(Movable):
                 _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
                 _ = external_call["close", Int32](fd)
 
-    def entry(mut self, family: String, defines: List[String]) raises -> Int:
-        """Address of the family's `tmb_call` for this specialization."""
+    def entry(
+        mut self, family: String, var defines: List[String]
+    ) raises -> Int:
+        """Address of the family's `tmb_call` for this specialization.
+
+        Appends `_EAGER_ELEMENTWISE_DEFINE`: every eager build goes through
+        here, so this is the one place that marks the whole family build,
+        rather than plumbing it through each op's `KernelCall`.
+        """
+        defines.append(_EAGER_ELEMENTWISE_DEFINE)
         var key = family + "." + _slug(defines)
         if key in self.families:
             return self.families[key].entry

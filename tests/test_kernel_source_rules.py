@@ -76,3 +76,47 @@ def test_kernel_source_does_not_synchronize(path: Path):
         "DeviceContext its caller hands it (tmb/backend/abi.mojo's `ctx_for`) "
         "and returns; blocking inside an op serializes the caller's stream."
     )
+
+
+# `tmb/kernels/common/gpu_elementwise.mojo` is the one drop-in replacement
+# for MAX's `elementwise` on the NVIDIA eager path (faster launcher, same
+# API, gated on `-D TMB_EAGER_ELEMENTWISE=1` so torch.compile graphs still
+# get MAX's own kernel -- see that module's docstring). Every OTHER source
+# must import `elementwise` through it rather than straight from MAX, or an
+# eager call site quietly stops benefiting from the faster launcher and
+# nobody notices because both compile and both are correct.
+MOJO_ROOT = PACKAGE / "mojo"
+_GPU_ELEMENTWISE_MODULE = (
+    MOJO_ROOT / "tmb" / "kernels" / "common" / "gpu_elementwise.mojo"
+)
+# The import statement, single- or parenthesized-multi-line
+# (`from max.algorithm import (\n    elementwise,\n    ...\n)`); whether
+# `elementwise` is among the named imports is checked separately, over the
+# captured name list, so either form is caught the same way.
+_MAX_ALGORITHM_IMPORT = re.compile(
+    r"from\s+max\.algorithm(?:\.functional)?\s+import\s+(\((?:.|\n)*?\)|[^\n]*)"
+)
+_ELEMENTWISE_NAME = re.compile(r"\belementwise\b")
+
+
+def _mojo_sources() -> list[Path]:
+    paths = sorted(MOJO_ROOT.rglob("*.mojo"))
+    assert paths, f"no Mojo sources found under {MOJO_ROOT}"
+    return paths
+
+
+@pytest.mark.parametrize(
+    "path", _mojo_sources(), ids=lambda p: str(p.relative_to(PACKAGE))
+)
+def test_only_gpu_elementwise_imports_max_algorithm_elementwise(path: Path):
+    if path == _GPU_ELEMENTWISE_MODULE:
+        return
+    code = _code_only(path.read_text())
+    for match in _MAX_ALGORITHM_IMPORT.finditer(code):
+        assert not _ELEMENTWISE_NAME.search(match.group(1)), (
+            f"{path.relative_to(PACKAGE)} imports `elementwise` straight "
+            "from max.algorithm. Every eager call site must import it from "
+            "tmb.kernels.common.gpu_elementwise instead (its NVIDIA/eager-"
+            "build fast path forwards to MAX everywhere else), or that call "
+            "site silently loses the faster launcher."
+        )

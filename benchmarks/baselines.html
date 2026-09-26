@@ -6172,9 +6172,19 @@ document.addEventListener("DOMContentLoaded", boot);
           "dtypes": {
             "bf16": {
               "shapes": {
+                "N1000C256H7W7_K500": {
+                  "layouts": {
+                    "contig": 0.281
+                  }
+                },
+                "N357C789_K119": {
+                  "layouts": {
+                    "contig": 1.218
+                  }
+                },
                 "R_262144x64_S65536_acc": {
                   "layouts": {
-                    "contig": 0.925
+                    "contig": 0.782
                   }
                 },
                 "R_357x789_S119_acc": {
@@ -6186,14 +6196,24 @@ document.addEventListener("DOMContentLoaded", boot);
             },
             "f32": {
               "shapes": {
+                "N1000C256H7W7_K500": {
+                  "layouts": {
+                    "contig": 0.605
+                  }
+                },
+                "N357C789_K119": {
+                  "layouts": {
+                    "contig": 1.233
+                  }
+                },
                 "R_262144x64_S65536_acc": {
                   "layouts": {
-                    "contig": 0.856
+                    "contig": 0.713
                   }
                 },
                 "R_357x789_S119_acc": {
                   "layouts": {
-                    "contig": 0.22
+                    "contig": 0.202
                   }
                 }
               }
@@ -6524,12 +6544,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.425
+                    "contig": 0.981,
+                    "offset_1": 1.538
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.43
+                    "contig": 1.061,
+                    "offset_1": 1.386
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.985,
+                    "offset_1": 1.54
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.07,
+                    "offset_1": 1.389
                   }
                 }
               }
@@ -6538,12 +6576,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.341
+                    "contig": 1.061,
+                    "offset_1": 1.547
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.114
+                    "contig": 1.114,
+                    "offset_1": 1.167
                   }
                 }
               }
@@ -6556,12 +6596,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.296
+                    "contig": 1.034,
+                    "offset_1": 1.409
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.591
+                    "contig": 1.18,
+                    "offset_1": 1.485
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.034,
+                    "offset_1": 1.408
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.155,
+                    "offset_1": 1.485
                   }
                 }
               }
@@ -6570,12 +6628,66 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.247
+                    "contig": 1.086,
+                    "offset_1": 1.386
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.14
+                    "contig": 1.031,
+                    "offset_1": 1.193
+                  }
+                }
+              }
+            }
+          }
+        },
+        "acosh": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.937,
+                    "offset_1": 1.233
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.987,
+                    "offset_1": 1.034
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.929,
+                    "offset_1": 1.224
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.993,
+                    "offset_1": 1.026
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.017,
+                    "offset_1": 1.316
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.027,
+                    "offset_1": 1.462
                   }
                 }
               }
@@ -6656,12 +6768,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 3.771
+                    "contig": 3.336
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "contig": 4.451
+                    "contig": 4.068
                   }
                 }
               }
@@ -6670,12 +6782,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 3.346
+                    "contig": 2.991
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
                     "contig": 2.22
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcdiv.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.251
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.056
                   }
                 }
               }
@@ -6688,12 +6818,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 4.421
+                    "contig": 3.865
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "contig": 4.41
+                    "contig": 3.918
                   }
                 }
               }
@@ -6702,12 +6832,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 3.818
+                    "contig": 3.323
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "contig": 2.238
+                    "contig": 2.023
+                  }
+                }
+              }
+            }
+          }
+        },
+        "addcmul.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.463
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.052
                   }
                 }
               }
@@ -7306,7 +7454,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "N_16777216": {
                   "layouts": {
-                    "contig": 0.264
+                    "contig": 0.185
                   }
                 }
               }
@@ -7374,12 +7522,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.041
+                    "contig": 1.041,
+                    "offset_1": 1.213
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.34
+                    "contig": 0.957,
+                    "offset_1": 1.426
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.992,
+                    "offset_1": 1.22
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.977,
+                    "offset_1": 1.452
                   }
                 }
               }
@@ -7388,12 +7554,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 0.997
+                    "contig": 0.912,
+                    "offset_1": 1.21
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.137
+                    "contig": 1.028,
+                    "offset_1": 1.405
                   }
                 }
               }
@@ -7406,12 +7574,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.177
+                    "contig": 1.177,
+                    "offset_1": 1.447
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.479
+                    "contig": 1.123,
+                    "offset_1": 1.704
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.154,
+                    "offset_1": 1.359
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.106,
+                    "offset_1": 1.511
                   }
                 }
               }
@@ -7420,12 +7606,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.173
+                    "contig": 1.014,
+                    "offset_1": 1.47
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.152
+                    "contig": 1.028,
+                    "offset_1": 1.535
                   }
                 }
               }
@@ -7970,12 +8158,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.381
+                    "contig": 1.03,
+                    "offset_1": 1.578
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.442
+                    "contig": 1.067,
+                    "offset_1": 1.406
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.05,
+                    "offset_1": 1.579
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.066,
+                    "offset_1": 1.404
                   }
                 }
               }
@@ -7984,12 +8190,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.332
+                    "contig": 1.096,
+                    "offset_1": 1.604
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.131
+                    "contig": 1.037,
+                    "offset_1": 1.17
                   }
                 }
               }
@@ -8002,12 +8210,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 2.189
+                    "contig": 1.254
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "contig": 2.166
+                    "contig": 1.418
                   }
                 }
               }
@@ -8016,12 +8224,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 2.193
+                    "contig": 1.229
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "contig": 1.231
+                    "contig": 1.111
                   }
                 }
               }
@@ -8176,12 +8384,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.001
+                    "contig": 0.741,
+                    "offset_1": 1.118
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.419
+                    "contig": 1.046,
+                    "offset_1": 1.067
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.728,
+                    "offset_1": 1.102
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.042,
+                    "offset_1": 1.079
                   }
                 }
               }
@@ -8190,12 +8416,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 0.998
+                    "contig": 0.842,
+                    "offset_1": 1.221
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.124
+                    "contig": 1.031,
+                    "offset_1": 1.171
                   }
                 }
               }
@@ -8208,12 +8436,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.256
+                    "contig": 1.126,
+                    "offset_1": 1.328
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.533
+                    "contig": 1.071,
+                    "offset_1": 1.649
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.171,
+                    "offset_1": 1.338
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.071,
+                    "offset_1": 1.635
                   }
                 }
               }
@@ -8222,12 +8468,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.185
+                    "contig": 1.046,
+                    "offset_1": 1.346
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.143
+                    "contig": 1.038,
+                    "offset_1": 1.378
                   }
                 }
               }
@@ -8289,13 +8537,15 @@ document.addEventListener("DOMContentLoaded", boot);
                 "A_357x789": {
                   "layouts": {
                     "bcast": 2.434,
-                    "contig": 1.0
+                    "contig": 1.0,
+                    "host_scalar": 1.093
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
                     "bcast": 0.902,
-                    "contig": 1.01
+                    "contig": 1.01,
+                    "host_scalar": 1.038
                   }
                 }
               }
@@ -8328,7 +8578,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "V1000xD64_T4096": {
                   "layouts": {
-                    "contig": 0.962
+                    "contig": 0.795
                   }
                 },
                 "V50304xD768_T49152": {
@@ -8342,7 +8592,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "V1000xD64_T4096": {
                   "layouts": {
-                    "contig": 0.972
+                    "contig": 0.8
                   }
                 },
                 "V50304xD768_T49152": {
@@ -8378,7 +8628,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.755,
+                    "Scalar": 1.071,
                     "Tensor": 1.035
                   }
                 },
@@ -8390,7 +8640,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.256,
+                    "Scalar": 1.015,
                     "Tensor": 0.732
                   }
                 }
@@ -8404,12 +8654,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.296
+                    "contig": 1.047,
+                    "offset_1": 1.346
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.552
+                    "contig": 1.051,
+                    "offset_1": 1.179
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.039,
+                    "offset_1": 1.33
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.059,
+                    "offset_1": 1.179
                   }
                 }
               }
@@ -8418,12 +8686,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.201
+                    "contig": 1.015,
+                    "offset_1": 1.283
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.147
+                    "contig": 1.033,
+                    "offset_1": 1.186
                   }
                 }
               }
@@ -8436,12 +8706,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.259
+                    "contig": 0.929,
+                    "offset_1": 1.297
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.446
+                    "contig": 1.069,
+                    "offset_1": 1.355
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.908,
+                    "offset_1": 1.28
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.072,
+                    "offset_1": 1.357
                   }
                 }
               }
@@ -8450,12 +8738,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.271
+                    "contig": 1.046,
+                    "offset_1": 1.418
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.129
+                    "contig": 1.036,
+                    "offset_1": 1.171
                   }
                 }
               }
@@ -8500,12 +8790,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.373
+                    "contig": 1.021,
+                    "offset_1": 1.573
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.445
+                    "contig": 1.071,
+                    "offset_1": 1.402
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.024,
+                    "offset_1": 1.577
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.066,
+                    "offset_1": 1.405
                   }
                 }
               }
@@ -8514,12 +8822,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.326
+                    "contig": 1.075,
+                    "offset_1": 1.603
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.129
+                    "contig": 1.037,
+                    "offset_1": 1.17
                   }
                 }
               }
@@ -8532,13 +8842,13 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 2.456,
+                    "Scalar": 1.025,
                     "Tensor": 0.369
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "Scalar": 3.502,
+                    "Scalar": 1.014,
                     "Tensor": 0.941
                   }
                 }
@@ -8594,7 +8904,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.75,
+                    "Scalar": 1.084,
                     "Tensor": 1.055
                   }
                 },
@@ -8606,7 +8916,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.278,
+                    "Scalar": 1.029,
                     "Tensor": 0.727
                   }
                 }
@@ -8620,12 +8930,54 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.005
+                    "contig": 1.005,
+                    "offset_1": 1.266
+                  }
+                },
+                "A_357x789_tanh": {
+                  "layouts": {
+                    "contig": 0.865,
+                    "offset_1": 1.31
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 0.965
+                    "contig": 0.965,
+                    "offset_1": 1.076
+                  }
+                },
+                "C_16777216_tanh": {
+                  "layouts": {
+                    "contig": 1.06,
+                    "offset_1": 1.195
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.018,
+                    "offset_1": 1.255
+                  }
+                },
+                "A_357x789_tanh": {
+                  "layouts": {
+                    "contig": 0.847,
+                    "offset_1": 1.299
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.034,
+                    "offset_1": 1.078
+                  }
+                },
+                "C_16777216_tanh": {
+                  "layouts": {
+                    "contig": 1.057,
+                    "offset_1": 1.203
                   }
                 }
               }
@@ -8634,12 +8986,26 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.224
+                    "contig": 0.952,
+                    "offset_1": 1.262
+                  }
+                },
+                "A_357x789_tanh": {
+                  "layouts": {
+                    "contig": 0.897,
+                    "offset_1": 1.225
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.153
+                    "contig": 1.03,
+                    "offset_1": 1.188
+                  }
+                },
+                "C_16777216_tanh": {
+                  "layouts": {
+                    "contig": 1.036,
+                    "offset_1": 1.172
                   }
                 }
               }
@@ -8684,7 +9050,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.737,
+                    "Scalar": 1.085,
                     "Tensor": 1.043
                   }
                 },
@@ -8696,7 +9062,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.268,
+                    "Scalar": 1.035,
                     "Tensor": 0.728
                   }
                 }
@@ -8710,7 +9076,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_I4096": {
                   "layouts": {
-                    "contig": 0.976
+                    "contig": 0.832
                   }
                 },
                 "R_262144x64_I1048576": {
@@ -8724,7 +9090,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_I4096": {
                   "layouts": {
-                    "contig": 0.991
+                    "contig": 0.836
                   }
                 },
                 "R_262144x64_I1048576": {
@@ -8752,7 +9118,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "R_4096x4096_S8192_D1": {
                   "layouts": {
-                    "contig": 2.35
+                    "contig": 1.881
                   }
                 }
               }
@@ -8844,12 +9210,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.092
+                    "contig": 1.092,
+                    "offset_1": 1.135
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.006
+                    "contig": 1.006,
+                    "offset_1": 1.487
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.104,
+                    "offset_1": 1.137
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.13,
+                    "offset_1": 1.483
                   }
                 }
               }
@@ -8858,12 +9242,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.035
+                    "contig": 1.035,
+                    "offset_1": 1.162
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.007
+                    "contig": 1.007,
+                    "offset_1": 1.169
                   }
                 }
               }
@@ -8918,7 +9304,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.75,
+                    "Scalar": 1.087,
                     "Tensor": 1.049
                   }
                 },
@@ -8930,7 +9316,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.266,
+                    "Scalar": 1.026,
                     "Tensor": 0.744
                   }
                 }
@@ -8944,12 +9330,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 3.874
+                    "contig": 3.074
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
                     "contig": 2.803
+                  }
+                }
+              }
+            }
+          }
+        },
+        "lerp.Scalar_out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.371
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "contig": 1.054
                   }
                 }
               }
@@ -9604,12 +10008,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.122
+                    "contig": 0.813,
+                    "offset_1": 1.241
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.456
+                    "contig": 1.052,
+                    "offset_1": 1.134
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.816,
+                    "offset_1": 1.25
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.06,
+                    "offset_1": 1.146
                   }
                 }
               }
@@ -9618,12 +10040,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.053
+                    "contig": 0.901,
+                    "offset_1": 1.285
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.13
+                    "contig": 1.035,
+                    "offset_1": 1.254
                   }
                 }
               }
@@ -9636,12 +10060,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.91
+                    "contig": 1.079,
+                    "offset_1": 1.536
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 3.696
+                    "contig": 1.158,
+                    "offset_1": 2.058
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.089,
+                    "offset_1": 1.415
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.128,
+                    "offset_1": 1.817
                   }
                 }
               }
@@ -9650,12 +10092,66 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.941
+                    "contig": 1.144,
+                    "offset_1": 1.457
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.934
+                    "contig": 1.03,
+                    "offset_1": 1.425
+                  }
+                }
+              }
+            }
+          }
+        },
+        "log2": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.78,
+                    "offset_1": 0.987
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.034,
+                    "offset_1": 1.06
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.791,
+                    "offset_1": 0.985
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.047,
+                    "offset_1": 1.053
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.873,
+                    "offset_1": 0.987
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.037,
+                    "offset_1": 1.164
                   }
                 }
               }
@@ -9722,7 +10218,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.723,
+                    "Scalar": 1.084,
                     "Tensor": 1.025
                   }
                 },
@@ -9734,7 +10230,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.268,
+                    "Scalar": 1.023,
                     "Tensor": 0.729
                   }
                 }
@@ -10573,13 +11069,29 @@ document.addEventListener("DOMContentLoaded", boot);
                 "A_357x789": {
                   "layouts": {
                     "bcast": 2.272,
-                    "contig": 1.001
+                    "contig": 1.001,
+                    "inplace_device_scalar": 0.625
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
                     "bcast": 0.591,
-                    "contig": 1.006
+                    "contig": 1.006,
+                    "inplace_device_scalar": 0.412
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.628
+                  }
+                },
+                "C_4096x4096": {
+                  "layouts": {
+                    "inplace_device_scalar": 0.426
                   }
                 }
               }
@@ -10589,13 +11101,63 @@ document.addEventListener("DOMContentLoaded", boot);
                 "A_357x789": {
                   "layouts": {
                     "bcast": 2.48,
-                    "contig": 1.031
+                    "contig": 1.031,
+                    "host_scalar_offset1": 0.959,
+                    "inplace_device_scalar": 0.693
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
                     "bcast": 0.918,
-                    "contig": 1.008
+                    "contig": 1.008,
+                    "host_scalar_offset1": 1.004,
+                    "inplace_device_scalar": 0.93
+                  }
+                }
+              }
+            }
+          }
+        },
+        "mul_.Scalar": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.491
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.054
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.486
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.059
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.065
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.055
                   }
                 }
               }
@@ -10906,7 +11468,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.755,
+                    "Scalar": 1.087,
                     "Tensor": 1.036
                   }
                 },
@@ -10918,7 +11480,7 @@ document.addEventListener("DOMContentLoaded", boot);
                 },
                 "E_2048x2048": {
                   "layouts": {
-                    "Scalar": 1.25,
+                    "Scalar": 1.014,
                     "Tensor": 0.723
                   }
                 }
@@ -10932,12 +11494,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.427
+                    "contig": 0.982,
+                    "offset_1": 1.538
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.432
+                    "contig": 1.071,
+                    "offset_1": 1.385
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.985,
+                    "offset_1": 1.536
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.064,
+                    "offset_1": 1.39
                   }
                 }
               }
@@ -10946,12 +11526,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.345
+                    "contig": 1.021,
+                    "offset_1": 1.547
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.131
+                    "contig": 1.036,
+                    "offset_1": 1.166
                   }
                 }
               }
@@ -10994,19 +11576,51 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "normal_": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.939
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.961
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.925
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.926
+                  }
+                }
+              }
+            }
+          }
+        },
         "pow": {
           "dtypes": {
             "bf16": {
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 1.081,
+                    "Scalar": 0.723,
                     "Tensor": 0.755
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "Scalar": 1.082,
+                    "Scalar": 0.512,
                     "Tensor": 0.65
                   }
                 }
@@ -11036,12 +11650,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.239
+                    "contig": 1.085,
+                    "offset_1": 1.347
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.497
+                    "contig": 1.075,
+                    "offset_1": 1.652
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.08,
+                    "offset_1": 1.341
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.073,
+                    "offset_1": 1.646
                   }
                 }
               }
@@ -11050,12 +11682,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.169
+                    "contig": 0.962,
+                    "offset_1": 1.34
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.141
+                    "contig": 1.032,
+                    "offset_1": 1.268
                   }
                 }
               }
@@ -11068,17 +11702,17 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_16x3x357x789": {
                   "layouts": {
-                    "contig": 2.497
+                    "contig": 1.988
                   }
                 },
                 "S_32x128x32x32": {
                   "layouts": {
-                    "contig": 3.356
+                    "contig": 2.569
                   }
                 },
                 "S_8x64x64x64": {
                   "layouts": {
-                    "contig": 3.087
+                    "contig": 2.35
                   }
                 }
               }
@@ -11087,17 +11721,17 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_16x3x357x789": {
                   "layouts": {
-                    "contig": 2.527
+                    "contig": 2.006
                   }
                 },
                 "S_32x128x32x32": {
                   "layouts": {
-                    "contig": 3.341
+                    "contig": 2.553
                   }
                 },
                 "S_8x64x64x64": {
                   "layouts": {
-                    "contig": 3.089
+                    "contig": 2.356
                   }
                 }
               }
@@ -11110,12 +11744,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.305
+                    "contig": 0.905,
+                    "offset_1": 1.364
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.423
+                    "contig": 1.069,
+                    "offset_1": 1.365
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.916,
+                    "offset_1": 1.372
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.052,
+                    "offset_1": 1.372
                   }
                 }
               }
@@ -11124,12 +11776,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.26
+                    "contig": 1.053,
+                    "offset_1": 1.529
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.124
+                    "contig": 1.124,
+                    "offset_1": 1.17
                   }
                 }
               }
@@ -11142,12 +11796,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.354
+                    "contig": 0.907
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 2.548
+                    "contig": 1.05
                   }
                 }
               }
@@ -11156,7 +11810,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.324
+                    "contig": 0.999
                   }
                 },
                 "C_16777216": {
@@ -11206,13 +11860,13 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "Scalar": 2.902,
+                    "Scalar": 1.252,
                     "Tensor": 0.75
                   }
                 },
                 "C_4096x4096": {
                   "layouts": {
-                    "Scalar": 3.633,
+                    "Scalar": 1.021,
                     "Tensor": 0.999
                   }
                 }
@@ -11298,17 +11952,17 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_16x3x357x789": {
                   "layouts": {
-                    "contig": 2.118
+                    "contig": 1.444
                   }
                 },
                 "S_32x128x32x32": {
                   "layouts": {
-                    "contig": 2.404
+                    "contig": 1.387
                   }
                 },
                 "S_8x64x64x64": {
                   "layouts": {
-                    "contig": 2.355
+                    "contig": 1.433
                   }
                 }
               }
@@ -11317,17 +11971,17 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_16x3x357x789": {
                   "layouts": {
-                    "contig": 2.15
+                    "contig": 1.471
                   }
                 },
                 "S_32x128x32x32": {
                   "layouts": {
-                    "contig": 2.463
+                    "contig": 1.439
                   }
                 },
                 "S_8x64x64x64": {
                   "layouts": {
-                    "contig": 2.347
+                    "contig": 1.435
                   }
                 }
               }
@@ -11340,12 +11994,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.497
+                    "contig": 1.497,
+                    "offset_1": 1.604
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.591
+                    "contig": 1.092,
+                    "offset_1": 1.781
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.483,
+                    "offset_1": 1.623
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.087,
+                    "offset_1": 1.785
                   }
                 }
               }
@@ -11354,12 +12026,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.447
+                    "contig": 1.324,
+                    "offset_1": 1.585
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.154
+                    "contig": 1.034,
+                    "offset_1": 1.293
                   }
                 }
               }
@@ -11424,12 +12098,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_S512": {
                   "layouts": {
-                    "contig": 0.961
+                    "contig": 0.626
                   }
                 },
                 "R_262144x64_S65536": {
                   "layouts": {
-                    "contig": 1.161
+                    "contig": 1.007
                   }
                 }
               }
@@ -11438,12 +12112,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_S512": {
                   "layouts": {
-                    "contig": 0.946
+                    "contig": 0.598
                   }
                 },
                 "R_262144x64_S65536": {
                   "layouts": {
-                    "contig": 1.17
+                    "contig": 1.004
                   }
                 }
               }
@@ -11456,12 +12130,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_S512": {
                   "layouts": {
-                    "contig": 1.217
+                    "contig": 0.741
                   }
                 },
                 "R_262144x64_S65536": {
                   "layouts": {
-                    "contig": 1.202
+                    "contig": 0.994
                   }
                 }
               }
@@ -11470,12 +12144,12 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "R_1000x64_S512": {
                   "layouts": {
-                    "contig": 1.217
+                    "contig": 0.71
                   }
                 },
                 "R_262144x64_S65536": {
                   "layouts": {
-                    "contig": 1.183
+                    "contig": 1.006
                   }
                 }
               }
@@ -11548,12 +12222,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.066
+                    "contig": 0.978,
+                    "offset_1": 1.264
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.513
+                    "contig": 1.061,
+                    "offset_1": 1.529
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.972,
+                    "offset_1": 1.271
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.054,
+                    "offset_1": 1.548
                   }
                 }
               }
@@ -11562,12 +12254,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.103
+                    "contig": 0.972,
+                    "offset_1": 1.275
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.145
+                    "contig": 1.032,
+                    "offset_1": 1.279
                   }
                 }
               }
@@ -11580,12 +12274,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.365
+                    "contig": 0.977,
+                    "offset_1": 1.395
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.455
+                    "contig": 1.073,
+                    "offset_1": 1.378
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.98,
+                    "offset_1": 1.395
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.07,
+                    "offset_1": 1.377
                   }
                 }
               }
@@ -11594,12 +12306,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.319
+                    "contig": 1.031,
+                    "offset_1": 1.433
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.128
+                    "contig": 1.128,
+                    "offset_1": 1.166
                   }
                 }
               }
@@ -11612,12 +12326,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.095
+                    "contig": 1.001,
+                    "offset_1": 1.258
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.502
+                    "contig": 1.057,
+                    "offset_1": 1.538
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.013,
+                    "offset_1": 1.286
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.055,
+                    "offset_1": 1.555
                   }
                 }
               }
@@ -11626,12 +12358,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.137
+                    "contig": 0.975,
+                    "offset_1": 1.349
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.143
+                    "contig": 1.035,
+                    "offset_1": 1.382
                   }
                 }
               }
@@ -11644,12 +12378,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.014
+                    "contig": 0.744,
+                    "offset_1": 1.124
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.421
+                    "contig": 1.042,
+                    "offset_1": 1.088
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.735,
+                    "offset_1": 1.112
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.041,
+                    "offset_1": 1.103
                   }
                 }
               }
@@ -11658,12 +12410,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.01
+                    "contig": 0.826,
+                    "offset_1": 1.234
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.125
+                    "contig": 1.033,
+                    "offset_1": 1.172
                   }
                 }
               }
@@ -11676,12 +12430,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.295
+                    "contig": 1.168,
+                    "offset_1": 1.579
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.695
+                    "contig": 1.312,
+                    "offset_1": 2.177
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.157,
+                    "offset_1": 1.621
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.309,
+                    "offset_1": 2.156
                   }
                 }
               }
@@ -11690,12 +12462,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.238
+                    "contig": 1.238,
+                    "offset_1": 1.623
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.16
+                    "contig": 1.026,
+                    "offset_1": 1.618
                   }
                 }
               }
@@ -11822,12 +12596,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.225
+                    "contig": 1.022,
+                    "offset_1": 1.349
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.48
+                    "contig": 1.075,
+                    "offset_1": 1.617
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.024,
+                    "offset_1": 1.347
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.07,
+                    "offset_1": 1.628
                   }
                 }
               }
@@ -11836,12 +12628,52 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.217
+                    "contig": 1.069,
+                    "offset_1": 1.381
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.137
+                    "contig": 1.037,
+                    "offset_1": 1.265
+                  }
+                }
+              }
+            }
+          }
+        },
+        "sqrt.out": {
+          "dtypes": {
+            "f32": {
+              "shapes": {
+                "awkward_281673": {
+                  "layouts": {
+                    "contig": 1.019
+                  }
+                },
+                "l2_3840000": {
+                  "layouts": {
+                    "contig": 1.183
+                  }
+                },
+                "l2_5120000": {
+                  "layouts": {
+                    "contig": 1.418
+                  }
+                },
+                "offset_281673": {
+                  "layouts": {
+                    "contig": 0.941
+                  }
+                },
+                "small_800": {
+                  "layouts": {
+                    "contig": 0.751
+                  }
+                },
+                "stream_40206400": {
+                  "layouts": {
+                    "contig": 1.011
                   }
                 }
               }
@@ -11916,6 +12748,38 @@ document.addEventListener("DOMContentLoaded", boot);
             }
           }
         },
+        "sub_.Tensor": {
+          "dtypes": {
+            "bf16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.062
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 0.996
+                  }
+                }
+              }
+            },
+            "f32": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 1.071
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.005
+                  }
+                }
+              }
+            }
+          }
+        },
         "sum.dim_IntList": {
           "dtypes": {
             "bf16": {
@@ -11964,12 +12828,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.079
+                    "contig": 0.987,
+                    "offset_1": 1.381
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.504
+                    "contig": 1.112,
+                    "offset_1": 1.802
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.992,
+                    "offset_1": 1.32
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.119,
+                    "offset_1": 1.481
                   }
                 }
               }
@@ -11978,12 +12860,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.039
+                    "contig": 1.039,
+                    "offset_1": 1.369
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.139
+                    "contig": 1.028,
+                    "offset_1": 1.414
                   }
                 }
               }
@@ -11996,12 +12880,30 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.171
+                    "contig": 0.889,
+                    "offset_1": 1.236
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.441
+                    "contig": 1.061,
+                    "offset_1": 1.316
+                  }
+                }
+              }
+            },
+            "f16": {
+              "shapes": {
+                "A_357x789": {
+                  "layouts": {
+                    "contig": 0.883,
+                    "offset_1": 1.241
+                  }
+                },
+                "C_16777216": {
+                  "layouts": {
+                    "contig": 1.063,
+                    "offset_1": 1.305
                   }
                 }
               }
@@ -12010,12 +12912,14 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "A_357x789": {
                   "layouts": {
-                    "contig": 1.168
+                    "contig": 0.934,
+                    "offset_1": 1.343
                   }
                 },
                 "C_16777216": {
                   "layouts": {
-                    "contig": 1.129
+                    "contig": 1.037,
+                    "offset_1": 1.171
                   }
                 }
               }
@@ -12080,7 +12984,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_8192x8192": {
                   "layouts": {
-                    "contig": 2.686
+                    "contig": 2.471
                   }
                 }
               }
@@ -12089,7 +12993,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_8192x8192": {
                   "layouts": {
-                    "contig": 1.911
+                    "contig": 1.752
                   }
                 }
               }
@@ -12102,7 +13006,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_8192x8192": {
                   "layouts": {
-                    "contig": 2.683
+                    "contig": 2.461
                   }
                 }
               }
@@ -12111,7 +13015,7 @@ document.addEventListener("DOMContentLoaded", boot);
               "shapes": {
                 "S_8192x8192": {
                   "layouts": {
-                    "contig": 1.908
+                    "contig": 1.74
                   }
                 }
               }

@@ -29,11 +29,10 @@ from std.memory import bitcast
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
-from max.algorithm import elementwise
-
 from std.utils import IndexList
 
 from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,

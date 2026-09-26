@@ -4,7 +4,8 @@ Every op here is a single memory-bound kernel; two shapes cover the two
 regimes that matter: C_16777216 is a large contiguous vector (bandwidth
 bound) and A_357x789 is small and awkward (launch/tail bound).  Operands
 live in (0.05, 0.95) so one generator serves every op's domain
-(acos/atanh need |x| < 1, log/rsqrt need x > 0).
+(acos/atanh need |x| < 1, log/rsqrt need x > 0), except acosh, which is
+real only from 1 on and reads the same interval shifted to (1.05, 1.95).
 
 The op axis carries a bench_op mark per param, so the baseline tree path
 of node test_unary[abs-C_16777216-bf16] is bf16/abs/C_16777216/contig.
@@ -31,6 +32,7 @@ SHAPES: dict[str, tuple[int, ...]] = {
 UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "abs": torch.abs,
     "acos": torch.acos,
+    "acosh": torch.acosh,
     "asinh": torch.asinh,
     "atanh": torch.atanh,
     "ceil": torch.ceil,
@@ -58,6 +60,16 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "tanh": torch.tanh,
 }
 
+# Ops whose domain excludes unit_interval: its operand, shifted by this much.
+DOMAIN_SHIFT: dict[str, float] = {"acosh": 1.0}
+
+
+def _operand(op_name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    return (unit_interval(shape, torch.float32) + DOMAIN_SHIFT.get(op_name, 0.0)).to(
+        dtype
+    )
+
+
 # Registered elementwise ops NOT benchmarked here, and why.  Reconciled
 # against the live registration table by test_coverage.py.
 SKIPPED: dict[str, str] = {}
@@ -82,7 +94,7 @@ def test_unary(
 ):
     fn = UNARY_OPS[op_name]
     shape = SHAPES[shape_id]
-    cpu = unit_interval(shape, DTYPES[dtype_id])
+    cpu = _operand(op_name, shape, DTYPES[dtype_id])
     x_ref, x_our = both(cpu, hw, mojo_device)
     for value in (x_ref, x_our):
         assert value.data_ptr() % (4 * cpu.element_size()) == 0
@@ -105,7 +117,7 @@ def test_unary_unaligned(
 ):
     fn = UNARY_OPS[op_name]
     shape = SHAPES[shape_id]
-    cpu = unit_interval(shape, DTYPES[dtype_id])
+    cpu = _operand(op_name, shape, DTYPES[dtype_id])
     # Slice after the device copy: copying a CPU view would realign it.
     storage = torch.cat((torch.zeros(1, dtype=cpu.dtype), cpu.flatten()))
     ref_storage, our_storage = both(storage, hw, mojo_device)

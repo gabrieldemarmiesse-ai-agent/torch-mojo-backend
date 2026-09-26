@@ -40,7 +40,7 @@ from std.sys.info import (
 from std.utils.index import IndexList
 from std.utils.coord import Coord
 
-from max.algorithm import elementwise
+from tmb.kernels.common.gpu_elementwise import elementwise
 
 from tmb.kernels.common.op_utils import (
     Arg,
@@ -285,10 +285,11 @@ def _bin_go[
 #   * every other opcode is float-only (shared `unary_math._float_unary`): half-precision
 #     inputs are promoted to float32, computed, and cast back — matching
 #     torch's numerics and keeping the polynomial math accurate.
-# Two of the ops deserve a note: `tan` and `asinh` cannot call the std.math
-# primitive of the same name, because those lower to libm (`_call_libm`) which
-# `comptime assert`s CPU-only and would refuse to compile for the GPU target.
-# `asinh` is composed from log/sqrt in shared math; `tan` routes through
+# Three of the ops deserve a note: `tan`, `acosh` and `asinh` cannot call the
+# std.math primitive of the same name, because those lower to libm
+# (`_call_libm`) which `comptime assert`s CPU-only and would refuse to compile
+# for the GPU target. `acosh` and `asinh` are composed from log/sqrt in shared
+# math; `tan` routes through
 # the shared `custom_tan`, which selects math per target and dtype.
 # ---------------------------------------------------------------------------
 
@@ -319,6 +320,15 @@ comptime UOP_TAN = 23
 comptime UOP_GELU_NONE = 24
 comptime UOP_GELU_TANH = 25
 comptime UOP_LOG2 = 26
+comptime UOP_ACOSH = 27
+
+# Below this many elements the expensive half-precision bodies
+# (`is_expensive_half` in `_unary_elementwise`) run faster at W4 than at the
+# full 16-bytes/sizeof width: per-thread body latency, not block dispatch,
+# limits such launches. Fitted on H100 PCIe (e.g. acosh f16, 281673 elements:
+# 4.1 us at W4, 4.7 us at W8); it sits above 357*789 = 281673, the awkward
+# shape of benchmarks/test_elementwise.py. Unmeasured on other GPUs.
+comptime _NARROW_TRANSCENDENTAL_THRESHOLD = 300000
 
 
 @always_inline
@@ -393,6 +403,8 @@ def _unary_apply[
         return elementwise_unary["floor"](a)
     elif op_code == UOP_ACOS:
         return elementwise_unary["acos"](a)
+    elif op_code == UOP_ACOSH:
+        return elementwise_unary["acosh"](a)
     elif op_code == UOP_ASINH:
         return elementwise_unary["asinh"](a)
     elif op_code == UOP_ATANH:
@@ -554,34 +566,39 @@ def _unary_elementwise[
                         i, _unary_apply[dtype, width, op_code](a)
                     )
 
-                # Measured on H100: these wider public bodies avoid excess
-                # waves for expensive half math and the float32 log1p body.
-                # Keep SIMD4 for 8-byte-aligned half views and other GPUs.
-                comptime wider_nvidia = has_nvidia_gpu_accelerator() and (
-                    (
-                        (dtype == DType.float16 or dtype == DType.bfloat16)
-                        and (
-                            op_code == UOP_ACOS
-                            or op_code == UOP_GELU_NONE
-                            or op_code == UOP_GELU_TANH
-                            or op_code == UOP_LOG2
-                        )
-                    )
-                    or (
-                        (
-                            dtype == DType.float16
-                            or dtype == DType.bfloat16
-                            or dtype == DType.float32
-                        )
-                        and op_code == UOP_LOG1P
-                    )
+                # Width, measured on H100 with gpu_elementwise: 16 bytes /
+                # sizeof(dtype) (W8 f16/bf16, W4 f32) once both pointers are
+                # 16-byte aligned, except the expensive half bodies below,
+                # which take W4 under `_NARROW_TRANSCENDENTAL_THRESHOLD`
+                # elements. 8-byte-aligned half views and every non-NVIDIA
+                # GPU keep W4 (unmeasured there).
+                comptime is_expensive_half = (
+                    dtype == DType.float16 or dtype == DType.bfloat16
+                ) and (
+                    op_code == UOP_ACOS
+                    or op_code == UOP_ACOSH
+                    or op_code == UOP_GELU_NONE
+                    or op_code == UOP_GELU_TANH
+                    or op_code == UOP_LOG2
+                    or op_code == UOP_LOG1P
+                    or op_code == UOP_SINH
+                    or op_code == UOP_TAN
                 )
-                comptime preferred_width = (16 if op_code == UOP_ACOS else 8)
-                comptime if wider_nvidia:
+                comptime if has_nvidia_gpu_accelerator():
+                    comptime full_width = 16 // size_of[dtype]()
                     if (Int(out_ptr) | Int(in_ptr)) % 16 == 0:
+                        comptime if is_expensive_half:
+                            if size < _NARROW_TRANSCENDENTAL_THRESHOLD:
+                                elementwise[
+                                    gpu_func,
+                                    simd_width=4,
+                                    target="gpu",
+                                    _trace_description="modular_unary",
+                                ](Coord(size), ctx)
+                                return
                         elementwise[
                             gpu_func,
-                            simd_width=preferred_width,
+                            simd_width=full_width,
                             target="gpu",
                             _trace_description="modular_unary",
                         ](Coord(size), ctx)
@@ -750,10 +767,18 @@ def _unary_bool[
                 ](i, _unary_bool_vec[dtype, op_code, width](a))
 
             # H100 measurements favor 16 input bytes for half predicates,
-            # and 32 byte-sized inputs per thread for logical_not.
-            comptime preferred_width = 32 if size_of[
-                dtype
-            ]() == 1 else 16 // size_of[dtype]()
+            # and 32 byte-sized inputs per thread for logical_not. float32
+            # takes 8 lanes (32 input bytes), not 4: with the NVIDIA
+            # gpu_elementwise launcher, 8-byte bool stores per thread beat
+            # 4-byte ones by ~5.5% at 16M elements (48.4 vs 51.2 us
+            # streamed; W16 for half measured no better than W8), fitted on
+            # H100 PCIe at 1395 MHz, not measured elsewhere.
+            comptime preferred_width = (
+                32 if size_of[dtype]()
+                == 1 else (
+                    8 if size_of[dtype]() == 4 else 16 // size_of[dtype]()
+                )
+            )
             comptime if has_nvidia_gpu_accelerator() and preferred_width > 4:
                 if (
                     Int(in_ptr) % 16 == 0
@@ -1432,6 +1457,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher2[_unary_spec_into_go[UOP_ACOS], "a unary spec op"](
                 argv, argc
             )
+            return 0
+        comptime if _op_on["AcoshSpec"]():
+            _spec_dispatcher2[
+                _unary_spec_into_go[UOP_ACOSH], "a unary spec op"
+            ](argv, argc)
             return 0
         comptime if _op_on["AsinhSpec"]():
             _spec_dispatcher2[
