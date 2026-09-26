@@ -556,6 +556,22 @@ def test_mean_out_dtype_must_match_out_dtype(mojo_gpu):
         )
 
 
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_mean_out_explicit_dtype_bypasses_the_int_input_check(mojo_gpu, dtype):
+    """Verified on stock CUDA: an int/bool self with an explicit float
+    `dtype=` is valid (self is cast to it before reducing) -- mean only
+    requires self itself to be float/complex when `dtype=` is absent."""
+    x = (
+        torch.randint(0, 10, (4, 5), dtype=dtype)
+        if dtype is not torch.bool
+        else torch.randint(0, 2, (4, 5), dtype=dtype)
+    )
+    expected = x.float().mean(dim=0)
+    out = torch.empty(5, dtype=torch.float32, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), dim=0, dtype=torch.float32, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 def test_mean_dtype_out_nan(mojo_gpu):
     x = torch.randn(4, 6)
     x[2, 3] = float("nan")

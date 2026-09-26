@@ -674,27 +674,11 @@ def _out_reduce_dtype(
 
 
 def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
-    """Cast `src` straight to `target` (the reduction's resolved compute
-    dtype): both mean and sum round every element to `target` BEFORE
-    accumulating, matching `TORCH_IMPL_FUNC(sum_out)`/`mean_out`'s CUDA path
-    (`make_reduction_from_out_ty(self, result, ..., dtype)`), which builds
-    its `TensorIterator` from `target` directly. `SumOp`/`MeanOp`'s own
-    float32 `acc_dtype` (for any floating, non-float64 dtype -- matching
-    CUDA's `acc_type`) then accumulates those already-rounded values; that
-    part needs no help here.
-
-    (`mean_out`'s CPU-only path has a separate `is_half_type` trick that
-    substitutes float32 for a float16/bfloat16 target and never rounds an
-    element mid-reduction -- confirmed on an actual CUDA device that the GPU
-    path does NOT do this: `torch.mean(torch.tensor([1 + 2**-12, -1],
-    device="cuda"), dtype=torch.float16)` gives 0, the same
-    round-then-accumulate answer as sum, not the CPU-only 2**-13. The mojo
-    device mirrors CUDA, not CPU, so no such trick belongs here.)
-
-    Always exact for a widening/identity `target` (fp16/bf16 -> fp32 loses
-    nothing); the deliberate rounding only bites when `target` is narrower
-    than `src`'s current dtype, which is precisely when torch itself rounds
-    too."""
+    """Cast `src` to `target` before reducing: both mean and sum round every
+    element to `target` first (their CUDA kernels build the reduction
+    directly from it), then accumulate in float32 via their own `acc_dtype`
+    -- mirroring CUDA, not CPU torch's separate half-precision-avoiding
+    `mean_out` path."""
     if src.t.dtype != target:
         _promote(src, torch_dtype(target))
 
@@ -867,7 +851,10 @@ def _mean_out(
     _require_mojo(dst)
     var src = _borrow(a)
     var target = _out_reduce_dtype(dtype_v, dst, op_name)
-    if not _is_float3(src.t.dtype):
+    if _opt_dtype(dtype_v) < 0 and not _is_float3(src.t.dtype):
+        # No explicit dtype=: torch requires self itself to be float/complex.
+        # An explicit dtype= bypasses this -- self is cast to it below, so an
+        # int64 self with dtype=torch.float32 is valid.
         unsupported("mean of dtype " + String(src.t.dtype))
     if not _is_float3(target):
         unsupported("mean with dtype=" + String(target))
