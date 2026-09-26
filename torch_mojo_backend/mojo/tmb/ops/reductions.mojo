@@ -1,5 +1,6 @@
 """ATen ops: reductions (sum, nansum, mean, amax/amin, max/min, the
-arg-reductions, any/all, var, the L2 vector norm, cumsum, and sort/topk).
+arg-reductions, any/all, count_nonzero, var, the L2 vector norm, cumsum, and
+sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -48,6 +49,7 @@ from tmb.backend.abi import (
     release,
     ret_owned,
     ret_ref,
+    torch_dtype,
     unsupported,
     v_bool_or,
     v_dtype_or,
@@ -651,6 +653,37 @@ def _scalar_reduction_out(
     _ = tmp^  # alive past the launch
 
 
+def _out_reduce_dtype(
+    dtype_v: Value, dst: T, op_name: StaticString
+) raises -> DType:
+    """The dtype an out= reduction with an optional `dtype=` computes and
+    rounds into: `dtype_v` if given -- which torch requires to equal `dst`'s
+    dtype exactly ("Expected out tensor to have dtype X, but got dtype Y
+    instead", the structured-kernel `set_output` check every `.out`/
+    `.dtype_out` reduction shares) -- otherwise `dst`'s own dtype
+    (ReduceOps.cpp: `ScalarType dtype = result.scalar_type();`, read
+    regardless of the input's own dtype). Callers still validate the
+    resolved dtype is one their op/kernel supports (mean/norm: float only;
+    sum: float or int64) and may override it for a dtype-less integer input
+    (sum's bool/sub-int64 -> int64 default)."""
+    var want = _opt_dtype(dtype_v)
+    if want < 0:
+        return dst.dtype
+    var target = max_dtype(want)
+    _check_out_dtype(op_name, "exact", target, dst.dtype)
+    return target
+
+
+def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
+    """Cast `src` to `target` before reducing: both mean and sum round every
+    element to `target` first (their CUDA kernels build the reduction
+    directly from it), then accumulate in float32 via their own `acc_dtype`
+    -- mirroring CUDA, not CPU torch's separate half-precision-avoiding
+    `mean_out` path."""
+    if src.t.dtype != target:
+        _promote(src, torch_dtype(target))
+
+
 # ---------------------------------------------------------------------------
 # sum
 # ---------------------------------------------------------------------------
@@ -721,14 +754,16 @@ def op_sum_intlist_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        _promote(src, want)
-    elif not src.t.dtype.is_floating_point():
-        # torch promotes bool / sub-int64 integer sums to int64.
-        _promote(src, ST_INT64)
-    if not _is_sum_dtype(src.t.dtype):
-        unsupported("sum of dtype " + String(src.t.dtype))
+    # `out` always exists here, so its dtype is the compute dtype for ANY
+    # self (float or int) with no explicit dtype= -- the bool/sub-int64 ->
+    # int64 default (`_sum`, above) only applies when there is no out tensor
+    # to take a dtype from.
+    var target = _out_reduce_dtype(
+        args[unsafe_offset=3], out, "aten::sum.IntList_out"
+    )
+    if not _is_sum_dtype(target):
+        unsupported("sum with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
@@ -784,6 +819,30 @@ def _nansum_prep(
     return dims^
 
 
+def _nansum_out_target(
+    dtype_v: Value, src_dtype: DType, dst: T, op_name: StaticString
+) raises -> DType:
+    """nansum.out's compute dtype: `_out_reduce_dtype` (`dtype_v` if given,
+    else `dst`'s own -- so dtype=None computes and rounds into the caller's
+    out dtype, not the default's bool/sub-int64 -> int64 rule), gated to
+    `_is_sum_dtype` and declined outright when the ORIGINAL operand is
+    floating and the target is not: torch either `nan_to_num`s this
+    combination explicitly (an explicit integral `dtype=`) or fails at its
+    own dispatch (an integral `out` with no `dtype=`, since its floating
+    nansum kernel has no integral specialization). This backend has no
+    `nan_to_num` kernel, so both are declined rather than risking a silently
+    wrong truncation.
+    """
+    var target = _out_reduce_dtype(dtype_v, dst, op_name)
+    if not _is_sum_dtype(target):
+        unsupported("nansum with dtype=" + String(target))
+    if src_dtype.is_floating_point() and not target.is_floating_point():
+        unsupported(
+            "nansum with dtype=" + String(target) + " from a floating input"
+        )
+    return target
+
+
 # aten::nansum(Tensor self, int[1]? dim=None, bool keepdim=False, *,
 #   ScalarType? dtype=None) -> Tensor
 def op_nansum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -814,7 +873,13 @@ def op_nansum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    var dims = _nansum_prep(src, args[unsafe_offset=3], args[unsafe_offset=1])
+    var target = _nansum_out_target(
+        args[unsafe_offset=3], src.t.dtype, out, "aten::nansum.out"
+    )
+    _promote_for_out_reduction(src, target)
+    var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
+    if len(dims) == 0:
+        unsupported("nansum with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "reduction",
         "NanSumSpec",
@@ -880,37 +945,77 @@ def op_mean_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
-#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
-def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=4])
+def _mean_out(
+    a: T,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    op_name: StaticString,
+    mut dst: T,
+    rets: Values,
+) raises:
     _require_mojo(a)
-    _require_mojo(out)
+    _require_mojo(dst)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        if not _is_float3(max_dtype(want)):
-            unsupported("mean with dtype=" + String(max_dtype(want)))
-        _promote(src, want)
-    if not _is_float3(src.t.dtype):
+    var target = _out_reduce_dtype(dtype_v, dst, op_name)
+    if _opt_dtype(dtype_v) < 0 and not _is_float3(src.t.dtype):
+        # No explicit dtype=: torch requires self itself to be float/complex.
+        # An explicit dtype= bypasses this -- self is cast to it below, so an
+        # int64 self with dtype=torch.float32 is valid.
         unsupported("mean of dtype " + String(src.t.dtype))
-    var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
+    if not _is_float3(target):
+        unsupported("mean with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
+    var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "nn",
         "MeanSpec",
-        "aten::mean.out",
+        op_name,
         "safe_cast",
         src.t,
         dims,
-        v_bool_or(args[unsafe_offset=2], False),
+        keepdim,
         src.t.stype,
-        out,
+        dst,
     )
-    ret_ref(rets, 0, out)
+    ret_ref(rets, 0, dst)
     _ = src^
+
+
+# aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *,
+#   ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var out = v_tensor(args[unsafe_offset=4])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        v_bool_or(args[unsafe_offset=2], False),
+        args[unsafe_offset=3],
+        "aten::mean.out",
+        out,
+        rets,
+    )
+
+
+# aten::mean.dtype_out(Tensor self, *, ScalarType? dtype=None,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_mean_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    # CompositeExplicitAutograd forwards to mean.out with dim=[] (full
+    # reduce), keepdim=False: aten/src/ATen/native/ReduceOps.cpp mean_dtype_out.
+    var out = v_tensor(args[unsafe_offset=2])
+    _mean_out(
+        v_tensor(args[unsafe_offset=0]),
+        Value(TAG_NONE, 0, 0, 0),
+        False,
+        args[unsafe_offset=1],
+        "aten::mean.dtype_out",
+        out,
+        rets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -998,17 +1103,24 @@ def op_amax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, out)
 
 
-def _full_extremum(
-    family: StaticString, op: StaticString, args: Values, rets: Values
-) raises:
-    """max(Tensor) / min(Tensor): the values-only full reduction."""
-    var a = v_tensor(args[unsafe_offset=0])
+def _full_extremum_dims(op: StaticString, a: T) raises -> List[Int]:
+    """Shared gate for max(Tensor)/min(Tensor) and min.unary_out: dtype,
+    rank and empty-reduce-dim checks, then every dim is reduced."""
     _require_mojo(a)
     _check_extremum_dtype(a, op)
     if a.rank == 0:
         unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)
     _refuse_empty_extremum(op, a, dims)
+    return dims^
+
+
+def _full_extremum(
+    family: StaticString, op: StaticString, args: Values, rets: Values
+) raises:
+    """max(Tensor) / min(Tensor): the values-only full reduction."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var dims = _full_extremum_dims(op, a)
     var out = _scalar_reduction(family, op, a, dims, False, a.stype, False, 0.0)
     ret_owned(rets, 0, out)
 
@@ -1021,6 +1133,30 @@ def op_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::min(Tensor self) -> Tensor
 def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
+
+
+# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_min_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(out)
+    var dims = _full_extremum_dims("AminSpec", a)
+    _scalar_reduction_out(
+        "reduction",
+        "AminSpec",
+        "aten::min.unary_out",
+        # CUDA's min_all_kernel_impl -> make_reduction requires an exact
+        # dtype match, unlike mean.out/any.out's safe_cast.
+        "exact",
+        a,
+        dims,
+        False,
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1374,28 @@ def op_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# aten::any.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    if not _is_truthy(a.dtype):
+        unsupported("any of dtype " + String(a.dtype))
+    _scalar_reduction_out(
+        "reduction",
+        "AnySpec",
+        "aten::any.all_out",
+        "bool_or_uint8",
+        a,
+        _reduce_dims(_none_value(), a.rank, False),
+        False,
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 # aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor
 # aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor
 def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1253,6 +1411,10 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::any.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
+# aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# `_reduce_dims` reads the dim arg's Value tag (plain int for any.out, an
+# optional int list for any.dims_out), so one body serves both overloads.
 def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
@@ -1275,6 +1437,30 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# ---------------------------------------------------------------------------
+# count_nonzero
+# ---------------------------------------------------------------------------
+
+
+# aten::count_nonzero.dim_IntList(Tensor self, int[] dim) -> Tensor
+def op_count_nonzero(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    _require_mojo(a)
+    if not _is_truthy(a.dtype):
+        unsupported("count_nonzero of dtype " + String(a.dtype))
+    # An explicit empty dim list reduces every dim (unlike any.dims/all.dims):
+    # `count_nonzero.default(self, dim=None)` redispatches here with `dim=[]`.
+    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
+    if len(dims) == 0:
+        unsupported("count_nonzero with no reduce dim (a rank-0 operand)")
+    var out = _scalar_reduction(
+        "reduction", "CountNonzeroSpec", a, dims, False, ST_INT64, False, 0.0
+    )
+    ret_owned(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -2121,11 +2307,14 @@ def register_reductions(site: Site) raises:
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
     impl[op_any, "any"](site)
+    impl[op_any_all_out, "any.all_out"](site)
     impl[op_any_dim, "any.dim"](site)
     impl[op_any_dim, "any.dims"](site)
+    impl[op_any_out, "any.dims_out"](site)
     impl[op_any_out, "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmin, "argmin"](site)
+    impl[op_count_nonzero, "count_nonzero.dim_IntList"](site)
     impl[op_cumsum, "cumsum"](site)
     impl[op_kthvalue, "kthvalue"](site)
     impl[op_kthvalue_values, "kthvalue.values"](site)
@@ -2134,6 +2323,7 @@ def register_reductions(site: Site) raises:
     impl[op_max, "max"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
+    impl[op_mean_dtype_out, "mean.dtype_out"](site)
     impl[op_mean_out, "mean.out"](site)
     impl[op_median, "median"](site)
     impl[op_median_dim, "median.dim"](site)
@@ -2141,6 +2331,7 @@ def register_reductions(site: Site) raises:
     impl[op_min, "min"](site)
     impl[op_min_dim, "min.dim"](site)
     impl[op_min_dim_min, "min.dim_min"](site)
+    impl[op_min_unary_out, "min.unary_out"](site)
     impl[op_nanmedian, "nanmedian"](site)
     impl[op_nanmedian_dim, "nanmedian.dim"](site)
     impl[op_nanmedian_dim_values, "nanmedian.dim_values"](site)
