@@ -673,19 +673,39 @@ def _out_reduce_dtype(
     return target
 
 
-def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
-    """Cast `src` up to the dtype the reduction should accumulate in for a
-    `target` output dtype: float16/bfloat16 still accumulate in float32 (the
-    `is_half_type` rule ReduceOps.cpp's CPU mean/sum path spells out; the
-    CUDA kernels it mirrors do the same via `acc_type`), everything else
-    accumulates directly in `target`. Always a widening (or identity) cast,
-    so this cannot itself round -- the one rounding into a narrower actual
-    `dst` happens once, in `_scalar_reduction_out`'s own cast-copy."""
-    var acc = target
-    if target == DType.float16 or target == DType.bfloat16:
-        acc = DType.float32
-    if src.t.dtype != acc:
-        _promote(src, torch_dtype(acc))
+def _promote_for_out_reduction(
+    mut src: Operand, target: DType, avoid_half_rounding: Bool
+) raises:
+    """Cast `src` to the dtype the reduction should actually read/accumulate
+    from for a `target` output dtype. Verified against stock CUDA torch:
+    mean and sum round differently here, so this is not one universal rule.
+
+    `avoid_half_rounding=True` (mean/norm): `ReduceOps.cpp`'s `mean_out`
+    (CPU) never rounds an element to float16/bfloat16 mid-reduction -- when
+    `target` is one of those, it substitutes `sum_out_dtype = Float` and
+    sums the ORIGINAL (unrounded) input in float32, rounding only the final
+    scalar once, in `_scalar_reduction_out`'s cast-copy. So `src` is
+    promoted to float32 here instead of `target` (a widening/identity cast,
+    never itself lossy) whenever `target` is float16/bfloat16.
+
+    `avoid_half_rounding=False` (sum): `TORCH_IMPL_FUNC(sum_out)` has no such
+    substitution -- it always builds its `TensorIterator` from `target`
+    directly (`result.scalar_type()`), so every element is read/rounded to
+    `target` (e.g. float16) BEFORE the sum; `SumOp.acc_dtype` (float32 for
+    any floating dtype, matching CUDA's `acc_type`) then accumulates those
+    already-rounded values. So `src` is cast straight to `target` here.
+
+    Confirmed on stock CUDA: summing `[1 + 2**-12, -1]` with dtype=float16
+    gives 0 (round 1+2**-12 to 1.0 first, then 1.0 + -1.0 = 0), while the
+    corresponding mean gives 2**-13, not 0 (accumulate at full precision,
+    divide, and only then round the scalar to float16)."""
+    var cast_to = target
+    if avoid_half_rounding and (
+        target == DType.float16 or target == DType.bfloat16
+    ):
+        cast_to = DType.float32
+    if src.t.dtype != cast_to:
+        _promote(src, torch_dtype(cast_to))
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +792,7 @@ def op_sum_intlist_out(
         target = DType.int64
     if not _is_sum_dtype(target):
         unsupported("sum with dtype=" + String(target))
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, False)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("sum of dtype " + String(src.t.dtype))
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
@@ -860,7 +880,7 @@ def _mean_out(
         unsupported("mean of dtype " + String(src.t.dtype))
     if not _is_float3(target):
         unsupported("mean with dtype=" + String(target))
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, True)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
