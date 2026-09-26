@@ -771,6 +771,46 @@ def test_prod_noncontiguous(mojo_gpu):
     )
 
 
+def test_prod_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
+    sum.IntList_out: with no `dtype=`, prod.int_out accumulates in `out`'s own
+    dtype, not the input's. An int64 self must NOT be multiplied in int64
+    (where 2**32 * 2**32 wraps to 0) and cast down afterward -- each element
+    is cast to `out`'s dtype FIRST. Verified on stock CUDA: [2**32, 2**32] as
+    int64 overflows to 0 in an int64 product, but 2**32 is an exact float32
+    value and so is their product, giving exactly 2**64 in a float32 out."""
+    x = torch.tensor([2**32, 2**32], dtype=torch.int64)
+    assert x.prod().item() == 0  # the int64 product wraps to 0
+    xd = x.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.prod(xd, dim=0, out=out)
+    assert out.item() == 2.0**64
+
+
+def test_prod_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as sum.IntList_out/mean.out: an explicit `dtype=`
+    that disagrees with `out`'s dtype raises, rather than silently using
+    either one."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(RuntimeError):
+        torch.prod(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_prod_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """ProdSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`, shared with sum); an int32 out -- which torch itself
+    accepts for prod.int_out -- is declined rather than silently
+    mishandled."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(NotImplementedError):
+        torch.prod(x, dim=1, out=torch.empty(4, dtype=torch.int32, device=mojo_gpu))
+
+
 # ---------------------------------------------------------------------------
 # amax / amin / max / min / min.dim
 # ---------------------------------------------------------------------------

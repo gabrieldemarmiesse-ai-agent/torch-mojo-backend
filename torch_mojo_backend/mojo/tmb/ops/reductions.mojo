@@ -1590,13 +1590,16 @@ def op_prod_int_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        _promote(src, want)
-    elif not src.t.dtype.is_floating_point():
-        _promote(src, ST_INT64)
-    if not _is_sum_dtype(src.t.dtype):
-        unsupported("prod of dtype " + String(src.t.dtype))
+    # `out` always exists here, so its dtype is the compute dtype for ANY
+    # self with no explicit dtype= -- the bool/sub-int64 -> int64 default
+    # (`op_prod`, above) only applies when there is no out tensor to take a
+    # dtype from.
+    var target = _out_reduce_dtype(
+        args[unsafe_offset=3], out, "aten::prod.int_out"
+    )
+    if not _is_sum_dtype(target):
+        unsupported("prod with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
     var dims = List[Int]()
     dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
     _scalar_reduction_out(
