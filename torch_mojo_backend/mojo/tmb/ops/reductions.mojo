@@ -1266,8 +1266,7 @@ def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out = v_tensor(args[unsafe_offset=1])
     _require_mojo(a)
     _require_mojo(out)
-    if not _is_truthy(a.dtype):
-        unsupported("any of dtype " + String(a.dtype))
+    _check_truthy_dtype("any", a)
     _scalar_reduction_out(
         "reduction",
         "AnySpec",
@@ -1295,6 +1294,26 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+def _check_truthy_dtype(name: StaticString, a: T) raises:
+    if not _is_truthy(a.dtype):
+        unsupported(String(name) + " of dtype " + String(a.dtype))
+
+
+def _truthy_reduce_dims(
+    name: StaticString, a: T, dim_v: Value
+) raises -> List[Int]:
+    """Shared any/all `.out` checks for the overloads that take a dim
+    argument: truthy dtype, non-empty dim list. The full-reduction *_out
+    overloads (any.all_out/all.all_out) use `_check_truthy_dtype` alone --
+    their dims come from reducing a rank-0 input over zero axes, a
+    legitimate no-op, not a user-requested empty dim list to decline."""
+    _check_truthy_dtype(name, a)
+    var dims = _reduce_dims(dim_v, a.rank, False)
+    if len(dims) == 0:
+        unsupported(String(name) + " with an empty dim list")
+    return dims^
+
+
 # aten::any.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
 # aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
@@ -1306,15 +1325,78 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out = v_tensor(args[unsafe_offset=3])
     _require_mojo(a)
     _require_mojo(out)
-    if not _is_truthy(a.dtype):
-        unsupported("any of dtype " + String(a.dtype))
-    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, False)
-    if len(dims) == 0:
-        unsupported("any with an empty dim list")
+    var dims = _truthy_reduce_dims("any", a, args[unsafe_offset=1])
     _scalar_reduction_out(
         "reduction",
         "AnySpec",
         "aten::any.out",
+        "bool_or_uint8",
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.out(Tensor self, int dim, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.out",
+        "bool_or_uint8",
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_all_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=1])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_truthy_dtype("all", a)
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.all_out",
+        "bool_or_uint8",
+        a,
+        _reduce_dims(_none_value(), a.rank, False),
+        False,
+        ST_BOOL,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
+# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_all_dims_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
+    _scalar_reduction_out(
+        "reduction",
+        "AllSpec",
+        "aten::all.dims_out",
         "bool_or_uint8",
         a,
         dims,
@@ -2187,8 +2269,11 @@ def op_nanmedian(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_reductions(site: Site) raises:
     impl[op_all, "all"](site)
+    impl[op_all_all_out, "all.all_out"](site)
     impl[op_all_dim, "all.dim"](site)
     impl[op_all_dim, "all.dims"](site)
+    impl[op_all_dims_out, "all.dims_out"](site)
+    impl[op_all_out, "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
