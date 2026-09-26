@@ -634,8 +634,22 @@ def _scalar_reduction_out(
     element count alone is not enough: the copy below reads the source
     through the destination's extents, so a (2,3) result poured into a (3,2)
     out would walk off the end of the source.
+
+    `out` ALIASING `a`'s storage is declined outright, before any resize is
+    even considered. Resizing an `out` that shares `a`'s storage is not one
+    well-defined case: the C++ resize hook can grow the shared allocation,
+    which reallocates the block `a`'s already-cached tensor info points at
+    (verified on stock CUDA torch: `torch.max(x, out=x[x.numel():])` is fine,
+    but `torch.max(x, out=x)` -- `resize_output` shrinking `self`'s own
+    metadata out from under the reduction that is about to read it -- comes
+    back with a silently WRONG answer on real CUDA, not merely a stale
+    pointer). Since stock CUDA has no single correct behavior here to
+    reproduce, every aliasing `out=` is refused instead of guessing.
     """
     _one_device(a, dst)
+    var a_storage = a.storage_ptr()
+    if a_storage != 0 and a_storage == dst.storage_ptr():
+        unsupported(String(op_name) + ": out= aliasing the input")
     _check_out_dtype(op_name, policy, max_dtype(out_stype), dst.dtype)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
@@ -1027,20 +1041,26 @@ def op_min(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _full_extremum("reduction", "AminSpec", args, rets)
 
 
-# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_min_unary_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
+def _full_extremum_out(
+    family: StaticString,
+    op: StaticString,
+    op_name: StaticString,
+    args: Values,
+    rets: Values,
 ) raises:
+    """max.unary_out / min.unary_out: `_full_extremum_dims`'s gate, then an
+    `exact`-dtype `out=` -- stock CUDA's `make_reduction` requires the output
+    dtype to equal the input's exactly (verified on real CUDA: an int64
+    input with a float32 out raises "provided dtype must match dtype of
+    result"), unlike mean.out/any.out's `canCast` policy."""
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=1])
     _require_mojo(out)
-    var dims = _full_extremum_dims("AminSpec", a)
+    var dims = _full_extremum_dims(op, a)
     _scalar_reduction_out(
-        "reduction",
-        "AminSpec",
-        "aten::min.unary_out",
-        # CUDA's min_all_kernel_impl -> make_reduction requires an exact
-        # dtype match, unlike mean.out/any.out's safe_cast.
+        family,
+        op,
+        op_name,
         "exact",
         a,
         dims,
@@ -1049,6 +1069,22 @@ def op_min_unary_out(
         out,
     )
     ret_ref(rets, 0, out)
+
+
+# aten::max.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_max_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out("nn", "MaxSpec", "aten::max.unary_out", args, rets)
+
+
+# aten::min.unary_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_min_unary_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _full_extremum_out(
+        "reduction", "AminSpec", "aten::min.unary_out", args, rets
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2299,6 +2335,7 @@ def register_reductions(site: Site) raises:
     impl[op_linalg_vector_norm, "linalg_vector_norm"](site)
     impl[op_linalg_vector_norm_out, "linalg_vector_norm.out"](site)
     impl[op_max, "max"](site)
+    impl[op_max_unary_out, "max.unary_out"](site)
     impl[op_mean, "mean"](site)
     impl[op_mean_dim, "mean.dim"](site)
     impl[op_mean_dtype_out, "mean.dtype_out"](site)
