@@ -156,6 +156,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::acosh.out": _OUT,
     "aten::add.out": _OUT,
     "aten::addmm.out": _OUT,
+    "aten::amax.out": _OUT,
     "aten::any.all_out": _OUT,
     "aten::any.dims_out": _OUT,
     "aten::any.out": _OUT,
