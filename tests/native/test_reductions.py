@@ -755,6 +755,57 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shape,dim,keepdim",
+    [
+        ((4099, 1031), 1, False),
+        ((5003, 37), 0, True),
+        ((357, 789), None, False),
+        ((4, 5, 6), [0, 2], False),
+    ],
+)
+def test_vector_norm_ord0_matches_torch(mojo_gpu, shape, dim, keepdim, dtype):
+    """ord=0: count of nonzero elements (a separate compiled spec, NormL0Op)."""
+    x = torch.randint(-2, 3, shape).to(dtype)  # includes exact zeros
+    ours = torch.linalg.vector_norm(
+        x.to(mojo_gpu), ord=0, dim=dim, keepdim=keepdim
+    ).cpu()
+    expected = torch.linalg.vector_norm(x, ord=0, dim=dim, keepdim=keepdim)
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_ord0_nan_counts_as_nonzero(mojo_gpu):
+    """Matches CUDA's `NormZeroOps`: an ordered `== 0` test, so NaN counts."""
+    x = torch.tensor([0.0, 1.0, float("nan"), 0.0, -3.0])
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0).cpu()
+    expected = torch.linalg.vector_norm(x, ord=0)
+    torch.testing.assert_close(ours, expected)
+
+
+def test_vector_norm_ord0_noncontiguous_and_empty(mojo_gpu):
+    contiguous = torch.linspace(-3.0, 4.0, 35).reshape(5, 7)
+    strided = contiguous.t()
+    expected = torch.linalg.vector_norm(strided, ord=0)
+    ours = torch.linalg.vector_norm(contiguous.to(mojo_gpu).t(), ord=0).cpu()
+    torch.testing.assert_close(ours, expected)
+
+    empty = torch.empty((0, 7), dtype=torch.float32).to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(empty, ord=0).cpu(), torch.tensor(0.0), rtol=0, atol=0
+    )
+
+
+def test_vector_norm_ord0_out_resizes(mojo_gpu):
+    """out= starts the wrong shape and must be resized (`resize_output`)."""
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x, ord=0, dim=1)
+    out = torch.empty(1, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 # ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------
