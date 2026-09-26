@@ -1319,8 +1319,17 @@ def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
 
 
 def _vector_norm_abs_out(
-    a: T, dims: List[Int], keepdim: Bool, mut dst: T
+    op_name: StaticString, a: T, dims: List[Int], keepdim: Bool, mut dst: T
 ) raises:
+    """Same validation order as `_scalar_reduction_out`: dtype (`exact`, same
+    policy as the accumulator path) and overlap are checked before any resize
+    or launch -- an abs() launch is a true 1:1 elementwise kernel (unlike the
+    accumulator, which reduces many inputs into few outputs), so an
+    overlapping `out=` is a real read/write race, the same hazard
+    `op_abs_out` guards against."""
+    _one_device(a, dst)
+    _check_out_dtype(op_name, "exact", max_dtype(a.stype), dst.dtype)
+    assert_no_overlap(dst, a)
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
@@ -1385,7 +1394,7 @@ def _vector_norm_out(
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
     if _all_reduced_dims_size_one(src.t, dims):
-        _vector_norm_abs_out(src.t, dims, keepdim, out)
+        _vector_norm_abs_out(op_name, src.t, dims, keepdim, out)
         ret_ref(rets, 0, out)
         _ = src^
         return

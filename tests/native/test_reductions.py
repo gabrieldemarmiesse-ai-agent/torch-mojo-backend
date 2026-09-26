@@ -900,6 +900,28 @@ def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
     torch.testing.assert_close(got.cpu(), expected)
 
 
+def test_vector_norm_size_one_reduce_out_declines_overlap(mojo_gpu):
+    """The abs() fast path is a true 1:1 elementwise kernel (unlike the
+    accumulator, many-to-few), so an `out=` overlapping the input is a real
+    read/write race, same as `abs.out` -- torch declines it, confirmed on
+    stock CUDA torch (`RuntimeError: ... refer to a single memory location``).
+    """
+    b = torch.arange(6, dtype=torch.float32).to(mojo_gpu)
+    inp = b[:-1].view(-1, 1)  # every reduced dim (dim=1) has extent 1
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.linalg.vector_norm(inp, dim=1, out=b[1:])
+
+
+def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
+    """Same `exact` out-dtype policy as the accumulator path (`_check_out_dtype`):
+    confirmed on stock CUDA torch that an integer `out=` for a float result is
+    rejected, not silently cast."""
+    x = torch.tensor([[1e20]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
 # ---------------------------------------------------------------------------
 # norm (legacy overloads): all route through the same ord-2 path as
 # linalg_vector_norm above, so these tests only need to check the schema
