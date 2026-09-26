@@ -830,10 +830,89 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
+def test_vector_norm_declines_non_floating_input(mojo_gpu):
+    """`TORCH_META_FUNC(linalg_vector_norm)` calls `checkFloatingOrComplex` on
+    the INPUT's own dtype unconditionally, before ever looking at `dtype=`:
+    an integer/bool input is rejected even though `dtype=float32` would make
+    the cast well-defined."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            (torch.randn(4, 5) > 0).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+
+
+@pytest.mark.parametrize(
+    "src_dtype,target_dtype",
+    [
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+def test_vector_norm_declines_narrowing_dtype(mojo_gpu, src_dtype, target_dtype):
+    """`check_linalg_norm_dtype`'s `promoteTypes(self_dtype, dtype) == dtype`:
+    among these three floats, only same-dtype or a target of float32 widens;
+    every other pair narrows and torch rejects it."""
+    x = torch.randn(4, 5, dtype=src_dtype)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x.to(mojo_gpu), dim=1, dtype=target_dtype)
+
+
+def test_vector_norm_out_declines_non_floating_input(mojo_gpu):
+    out = torch.empty(4, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, out=out
+        )
+
+
+@pytest.mark.parametrize(
+    "shape,dim,keepdim",
+    [((1,), 0, False), ((1, 1), None, False), ((5, 1), 1, False), ((5, 1), 1, True)],
+)
+def test_vector_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu, shape, dim, keepdim):
+    """torch's `is_reduce_over_1D_vector`: every REDUCED dim has extent 1
+    (a kept dim may be any size), so the reduction is exactly `abs()`, not
+    square-then-sqrt -- squaring 1e20 overflows float32 to inf even though
+    abs(1e20) is exact (`linalg_vector_norm_out` in ATen's LinearAlgebra.cpp)."""
+    x = torch.tensor([1e20, -1e20, 3.0, -1.0, 0.0][: shape[0]], dtype=torch.float32)
+    x = x.reshape(shape)
+    expected = torch.linalg.vector_norm(x, dim=dim, keepdim=keepdim)
+    assert torch.isfinite(
+        expected
+    ).all()  # sanity: the reference itself must not be inf
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), dim=dim, keepdim=keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
+    """Same fix, reached through the legacy `norm.ScalarOpt_dim` overload."""
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, [1], False)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
 # ---------------------------------------------------------------------------
 # norm (legacy overloads): all route through the same ord-2 path as
 # linalg_vector_norm above, so these tests only need to check the schema
 # plumbing (p=None/2, dim=[]/None/single/multi, dtype=, out=), not the math.
+#
+# These call `torch.ops.aten.norm.*` directly rather than the public
+# `torch.norm`/`Tensor.norm`: on a strided PrivateUse1 tensor (ours),
+# `torch/functional.py`'s `norm()` always redirects to
+# `torch.linalg.vector_norm`/`matrix_norm`/`_VF.nuclear_norm` before the
+# dispatcher is ever reached (confirmed with the boxed-kernel counters --
+# `torch.norm(x.to(mojo_gpu), p=2, dim=1)` increments
+# `aten::linalg_vector_norm`, never any `aten::norm.*`), so no public API
+# reaches these overloads on this device.
 # ---------------------------------------------------------------------------
 
 

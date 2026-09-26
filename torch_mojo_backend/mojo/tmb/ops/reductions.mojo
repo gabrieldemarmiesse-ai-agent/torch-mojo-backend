@@ -1228,101 +1228,137 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm (ord=2 only: one pass, the root folded into the finalize)
+# linalg_vector_norm / norm (ord=2 only: one pass, the root folded into the
+# finalize). `norm`'s six legacy overloads are torch's own redispatch onto
+# this op (`impl_func_norm` in ATen's ReduceOps.cpp: p=None -> 2, dim=[] ->
+# every dim), so they share every helper below with `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_operand(ord_v: Value, dtype_v: Value, mut src: Operand) raises:
-    """The `ord` / `dtype=` gates shared by the functional and out= forms:
-    only the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32).
-    A missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
-    `impl_func_norm`."""
+def _vector_norm_operand(
+    op_label: StaticString, ord_v: Value, dtype_v: Value, mut src: Operand
+) raises:
+    """The `ord` / `dtype=` gates shared by every overload of both ops: only
+    the ord-2 one-pass accumulator exists, and `dtype=` selects the
+    accumulation type by casting first (clip_grad_norm_ asks for float32). A
+    missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
+    `impl_func_norm`.
+
+    torch validates the INPUT's own dtype unconditionally
+    (`checkFloatingOrComplex` in `TORCH_META_FUNC(linalg_vector_norm)`)
+    before ever looking at `dtype=`, so an integer/bool input is declined
+    even when `dtype=float32` would make the cast well-defined; and `dtype=`
+    may only WIDEN (`check_linalg_norm_dtype`'s
+    `promoteTypes(self_dtype, dtype) == dtype`), so a float32 input with
+    `dtype=float16` is declined too. Restricted to the three floats this path
+    supports, "widen" means the same dtype or a target of float32.
+    """
     if v_scalar_is_bool(ord_v) or v_f64_or(ord_v, 2.0) != 2.0:
-        unsupported("linalg_vector_norm with ord != 2")
+        unsupported(String(op_label) + " with ord != 2")
+    if not _is_float3(src.t.dtype):
+        unsupported(String(op_label) + " of dtype " + String(src.t.dtype))
     var want = _opt_dtype(dtype_v)
     if want >= 0:
-        if not _is_float3(max_dtype(want)):
+        var target = max_dtype(want)
+        if not _is_float3(target):
+            unsupported(String(op_label) + " with dtype=" + String(target))
+        if target != src.t.dtype and target != DType.float32:
             unsupported(
-                "linalg_vector_norm with dtype=" + String(max_dtype(want))
+                String(op_label)
+                + ": the dtype of the input ("
+                + String(src.t.dtype)
+                + ") can't convert without narrowing to dtype="
+                + String(target)
             )
         _promote(src, want)
-    if not _is_float3(src.t.dtype):
-        unsupported("linalg_vector_norm of dtype " + String(src.t.dtype))
 
 
-# aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
-#   bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
-def op_linalg_vector_norm(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
+def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
+    """torch's `is_reduce_over_1D_vector`: every dim BEING REDUCED has extent
+    1 (a dim that is kept may be any size). Squaring a lone element can
+    overflow a magnitude the un-squared `abs` represents exactly (float32
+    1e20: `(1e20)**2` overflows to inf, `sqrt(inf)` stays inf), so torch
+    special-cases this to `abs()` instead of routing it through the
+    square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
+    LinearAlgebra.cpp. (torch also special-cases `ord == 0` to `ne(0)`
+    there, but ord is always 2 on this path.)
+    """
+    for d in dims:
+        if a.dim(d) != 1:
+            return False
+    return True
+
+
+def _vector_norm_abs_direct(src_c: T, mut dst: T) raises:
+    """dst[...] = abs(src_c[...]); both operands already contiguous with the
+    same element count (the reduced dims all have extent 1, so squeezing or
+    keeping them doesn't change the flat element order)."""
+    if src_c.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("elementwise", "AbsSpec")
+    call.arg_dtype(0, src_c.dtype)
+    call.out_dtype(dst.dtype)
+    call.spec(src_c.spec(cp))
+    call.spec(dst.spec(cp))
+    call.run()
+    _ = ctx
+
+
+def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    _reduced_shape(a, dims, keepdim, shape, rank)
+    var src_c = contiguous(a)
+    var out = own(new_tensor(shape, rank, a.stype, a.device))
+    _vector_norm_abs_direct(src_c, out.t)
+    if src_c.h != a.h:
+        release(src_c.h)
+    return out^
+
+
+def _vector_norm_abs_out(
+    a: T, dims: List[Int], keepdim: Bool, mut dst: T
 ) raises:
-    var a = v_tensor(args[unsafe_offset=0])
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    _reduced_shape(a, dims, keepdim, shape, rank)
+    var numel = _shape_numel(shape, rank)
+    if not _shape_matches(dst, shape, rank):
+        resize_out(dst, shape, rank)
+    var src_c = contiguous(a)
+    if _out_ready(dst, a, a.stype, numel):
+        _vector_norm_abs_direct(src_c, dst)
+    else:
+        var tmp = own(new_tensor(shape, rank, a.stype, a.device))
+        _vector_norm_abs_direct(src_c, tmp.t)
+        _copy_result_into(dst, tmp.t)
+        _ = tmp^  # alive past the launch
+    if src_c.h != a.h:
+        release(src_c.h)
+
+
+def _vector_norm(
+    op_label: StaticString,
+    a: T,
+    ord_v: Value,
+    dim_v: Value,
+    keepdim: Bool,
+    dtype_v: Value,
+    rets: Values,
+) raises:
     _require_mojo(a)
     var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
-    var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
-    if len(dims) == 0:
-        unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
-    var out = _scalar_reduction(
-        "reduction",
-        "NormSpec",
-        src.t,
-        dims,
-        v_bool_or(args[unsafe_offset=3], False),
-        src.t.stype,
-        False,
-        0.0,
-    )
-    ret_owned(rets, 0, out)
-    _ = src^
-
-
-# aten::linalg_vector_norm.out(Tensor self, Scalar ord=2, int[1]? dim=None,
-#   bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
-def op_linalg_vector_norm_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=5])
-    _require_mojo(a)
-    _require_mojo(out)
-    var src = _borrow(a)
-    _vector_norm_operand(args[unsafe_offset=1], args[unsafe_offset=4], src)
-    var dims = _reduce_dims(args[unsafe_offset=2], src.t.rank, True)
-    if len(dims) == 0:
-        unsupported("linalg_vector_norm with no reduce dim (a rank-0 operand)")
-    _scalar_reduction_out(
-        "reduction",
-        "NormSpec",
-        "aten::linalg_vector_norm.out",
-        "exact",
-        src.t,
-        dims,
-        v_bool_or(args[unsafe_offset=3], False),
-        src.t.stype,
-        out,
-    )
-    ret_ref(rets, 0, out)
-    _ = src^
-
-
-# ---------------------------------------------------------------------------
-# norm (legacy overloads): all six redispatch to `linalg_vector_norm_out`
-# with `dim=[]` treated as "reduce every dim" and a missing `p` as 2 (see
-# `impl_func_norm` in ATen's ReduceOps.cpp) -- the same one-pass ord-2 path
-# as `linalg_vector_norm` above, gated the same way.
-# ---------------------------------------------------------------------------
-
-
-def _norm(
-    a: T, p_v: Value, dim_v: Value, keepdim: Bool, dtype_v: Value, rets: Values
-) raises:
-    _require_mojo(a)
-    var src = _borrow(a)
-    _vector_norm_operand(p_v, dtype_v, src)
+    _vector_norm_operand(op_label, ord_v, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
-        unsupported("norm with no reduce dim (a rank-0 operand)")
+        unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
+    if _all_reduced_dims_size_one(src.t, dims):
+        var out = _vector_norm_abs(src.t, dims, keepdim)
+        ret_owned(rets, 0, out)
+        _ = src^
+        return
     var out = _scalar_reduction(
         "reduction", "NormSpec", src.t, dims, keepdim, src.t.stype, False, 0.0
     )
@@ -1330,9 +1366,11 @@ def _norm(
     _ = src^
 
 
-def _norm_out(
+def _vector_norm_out(
+    op_label: StaticString,
+    op_name: StaticString,
     a: T,
-    p_v: Value,
+    ord_v: Value,
     dim_v: Value,
     keepdim: Bool,
     dtype_v: Value,
@@ -1342,14 +1380,19 @@ def _norm_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    _vector_norm_operand(p_v, dtype_v, src)
+    _vector_norm_operand(op_label, ord_v, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
-        unsupported("norm with no reduce dim (a rank-0 operand)")
+        unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
+    if _all_reduced_dims_size_one(src.t, dims):
+        _vector_norm_abs_out(src.t, dims, keepdim, out)
+        ret_ref(rets, 0, out)
+        _ = src^
+        return
     _scalar_reduction_out(
         "reduction",
         "NormSpec",
-        "aten::norm.out",
+        op_name,
         "exact",
         src.t,
         dims,
@@ -1361,9 +1404,53 @@ def _norm_out(
     _ = src^
 
 
+# aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
+#   bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
+def op_linalg_vector_norm(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _vector_norm(
+        "linalg_vector_norm",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        args[unsafe_offset=4],
+        rets,
+    )
+
+
+# aten::linalg_vector_norm.out(Tensor self, Scalar ord=2, int[1]? dim=None,
+#   bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)
+def op_linalg_vector_norm_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var out = v_tensor(args[unsafe_offset=5])
+    _vector_norm_out(
+        "linalg_vector_norm",
+        "aten::linalg_vector_norm.out",
+        v_tensor(args[unsafe_offset=0]),
+        args[unsafe_offset=1],
+        args[unsafe_offset=2],
+        v_bool_or(args[unsafe_offset=3], False),
+        args[unsafe_offset=4],
+        out,
+        rets,
+    )
+
+
+# ---------------------------------------------------------------------------
+# norm (legacy overloads): all six redispatch to `linalg_vector_norm_out`
+# with `dim=[]` treated as "reduce every dim" and a missing `p` as 2 (see
+# `impl_func_norm` in ATen's ReduceOps.cpp) -- the same helpers as
+# `linalg_vector_norm` above, gated the same way.
+# ---------------------------------------------------------------------------
+
+
 # aten::norm.Scalar(Tensor self, Scalar p=2) -> Tensor
 def op_norm_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _norm(
+    _vector_norm(
+        "norm",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         _none_value(),
@@ -1377,7 +1464,8 @@ def op_norm_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_norm_scalaropt_dtype(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _norm(
+    _vector_norm(
+        "norm",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         _none_value(),
@@ -1392,7 +1480,8 @@ def op_norm_scalaropt_dtype(
 def op_norm_scalaropt_dim(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _norm(
+    _vector_norm(
+        "norm",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -1407,7 +1496,8 @@ def op_norm_scalaropt_dim(
 def op_norm_scalaropt_dim_dtype(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _norm(
+    _vector_norm(
+        "norm",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -1421,7 +1511,9 @@ def op_norm_scalaropt_dim_dtype(
 #   Tensor(a!) out) -> Tensor(a!)
 def op_norm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var out = v_tensor(args[unsafe_offset=4])
-    _norm_out(
+    _vector_norm_out(
+        "norm",
+        "aten::norm.out",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         args[unsafe_offset=2],
@@ -1438,7 +1530,9 @@ def op_norm_dtype_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var out = v_tensor(args[unsafe_offset=5])
-    _norm_out(
+    _vector_norm_out(
+        "norm",
+        "aten::norm.dtype_out",
         v_tensor(args[unsafe_offset=0]),
         args[unsafe_offset=1],
         args[unsafe_offset=2],
