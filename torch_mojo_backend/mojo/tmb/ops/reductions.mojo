@@ -48,6 +48,7 @@ from tmb.backend.abi import (
     release,
     ret_owned,
     ret_ref,
+    torch_dtype,
     unsupported,
     v_bool_or,
     v_dtype_or,
@@ -651,6 +652,42 @@ def _scalar_reduction_out(
     _ = tmp^  # alive past the launch
 
 
+def _out_reduce_dtype(
+    dtype_v: Value, dst: T, op_name: StaticString
+) raises -> DType:
+    """The dtype an out= reduction with an optional `dtype=` computes and
+    rounds into: `dtype_v` if given -- which torch requires to equal `dst`'s
+    dtype exactly ("Expected out tensor to have dtype X, but got dtype Y
+    instead", the structured-kernel `set_output` check every `.out`/
+    `.dtype_out` reduction shares) -- otherwise `dst`'s own dtype
+    (ReduceOps.cpp: `ScalarType dtype = result.scalar_type();`, read
+    regardless of the input's own dtype). Callers still validate the
+    resolved dtype is one their op/kernel supports (mean/norm: float only;
+    sum: float or int64) and may override it for a dtype-less integer input
+    (sum's bool/sub-int64 -> int64 default)."""
+    var want = _opt_dtype(dtype_v)
+    if want < 0:
+        return dst.dtype
+    var target = max_dtype(want)
+    _check_out_dtype(op_name, "exact", target, dst.dtype)
+    return target
+
+
+def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
+    """Cast `src` up to the dtype the reduction should accumulate in for a
+    `target` output dtype: float16/bfloat16 still accumulate in float32 (the
+    `is_half_type` rule ReduceOps.cpp's CPU mean/sum path spells out; the
+    CUDA kernels it mirrors do the same via `acc_type`), everything else
+    accumulates directly in `target`. Always a widening (or identity) cast,
+    so this cannot itself round -- the one rounding into a narrower actual
+    `dst` happens once, in `_scalar_reduction_out`'s own cast-copy."""
+    var acc = target
+    if target == DType.float16 or target == DType.bfloat16:
+        acc = DType.float32
+    if src.t.dtype != acc:
+        _promote(src, torch_dtype(acc))
+
+
 # ---------------------------------------------------------------------------
 # sum
 # ---------------------------------------------------------------------------
@@ -721,12 +758,21 @@ def op_sum_intlist_out(
     _require_mojo(a)
     _require_mojo(out)
     var src = _borrow(a)
-    var want = _opt_dtype(args[unsafe_offset=3])
-    if want >= 0:
-        _promote(src, want)
-    elif not src.t.dtype.is_floating_point():
-        # torch promotes bool / sub-int64 integer sums to int64.
-        _promote(src, ST_INT64)
+    var target = _out_reduce_dtype(
+        args[unsafe_offset=3], out, "aten::sum.IntList_out"
+    )
+    if (
+        _opt_dtype(args[unsafe_offset=3]) < 0
+        and not src.t.dtype.is_floating_point()
+    ):
+        # No explicit dtype=: torch's bool/sub-int64 -> int64 default
+        # promotion (SumSpec's only integer accumulation dtype) takes
+        # priority over `out`'s own, possibly narrower, integer dtype; the
+        # cast-copy below still rounds the int64 result into it.
+        target = DType.int64
+    if not _is_sum_dtype(target):
+        unsupported("sum with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("sum of dtype " + String(src.t.dtype))
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
@@ -809,13 +855,12 @@ def _mean_out(
     _require_mojo(a)
     _require_mojo(dst)
     var src = _borrow(a)
-    var want = _opt_dtype(dtype_v)
-    if want >= 0:
-        if not _is_float3(max_dtype(want)):
-            unsupported("mean with dtype=" + String(max_dtype(want)))
-        _promote(src, want)
+    var target = _out_reduce_dtype(dtype_v, dst, op_name)
     if not _is_float3(src.t.dtype):
         unsupported("mean of dtype " + String(src.t.dtype))
+    if not _is_float3(target):
+        unsupported("mean with dtype=" + String(target))
+    _promote_for_out_reduction(src, target)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")

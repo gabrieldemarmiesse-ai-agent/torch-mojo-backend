@@ -328,13 +328,57 @@ def test_sum_out_variant(mojo_gpu, keepdim):
     torch.testing.assert_close(resized.cpu(), x.sum(dim=1), rtol=2e-6, atol=2e-6)
 
 
-def test_sum_out_variant_declines_unsafe_cast(mojo_gpu):
-    """`safe_cast`: a float result poured into an integral out is refused,
-    matching sum.IntList_out's structured-kernel dtype check."""
+def test_sum_out_variant_into_int64_truncates_each_element_first(mojo_gpu):
+    """Verified against stock torch: a float result poured into an int64 out
+    with no `dtype=` is NOT a "sum then cast" -- torch truncates every
+    element to int64 first (`ScalarType dtype = result.scalar_type();`, used
+    as the reduction's own compute dtype), so this differs from
+    `x.sum(dim=1).to(int64)` whenever fractional parts would otherwise
+    accumulate before truncation."""
+    x = torch.tensor([[0.9, 0.9, 0.9]])
+    expected = x.to(torch.int64).sum(dim=1)
+    assert expected.item() != x.sum(dim=1).to(torch.int64).item()  # the two must differ
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    torch.sum(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_sum_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """SumSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`); bool/uint8 outs, which torch itself accepts for
+    sum.out, are declined rather than silently mishandled."""
     x = torch.randn(4, 5).to(mojo_gpu)
-    out = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
-    with pytest.raises(RuntimeError, match="can't be cast"):
-        torch.sum(x, dim=1, out=out)
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.bool, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.uint8, device=mojo_gpu))
+
+
+def test_sum_out_computes_in_outs_dtype(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as mean.out:
+    with no `dtype=`, sum.IntList_out accumulates in `out`'s own dtype, not
+    the input's (values picked so a float16 accumulation would round
+    differently than the float32 one torch actually does)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().sum(dim=0)
+    assert expected.item() != x.sum(dim=0).float().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as mean.out: an explicit `dtype=` that disagrees
+    with `out`'s dtype raises, rather than silently using either one."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.sum(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
@@ -390,16 +434,18 @@ def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
 
 def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
     """`dtype=` promotes the input before reducing (only float16/bfloat16/
-    float32 are supported, same as mean()/mean.out/mean.dim)."""
-    x = torch.randn(5, 7, dtype=torch.float16)
+    float32 are supported, same as mean()/mean.out/mean.dim). These two
+    values are picked so summing them AS float16 (cast-after-reduce, the bug)
+    rounds to a different float16-representable pair than summing them AS
+    float32 (cast-before-reduce, what torch does): a loose tolerance cannot
+    tell the two apart, so this uses an exact comparison."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
     xd = x.to(mojo_gpu)
     expected = x.mean(dtype=torch.float32)
+    assert expected.item() != x.half().mean().float().item()  # the two must differ
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
     torch.ops.aten.mean.dtype_out(xd, dtype=torch.float32, out=out)
-    torch.testing.assert_close(out.cpu(), expected, rtol=2e-3, atol=2e-3)
-
-    with pytest.raises(NotImplementedError):
-        torch.ops.aten.mean.dtype_out(xd, dtype=torch.float64, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
 
 def test_mean_dtype_out_resizes_a_mismatching_out(mojo_gpu):
@@ -416,6 +462,56 @@ def test_mean_dtype_out_rejects_integer_input(mojo_gpu):
     out = torch.empty((), device=mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.mean(x.to(mojo_gpu), out=out)
+
+
+def test_mean_out_computes_in_outs_dtype(mojo_gpu):
+    """With no `dtype=`, torch computes mean.out/mean.dtype_out in `out`'s
+    OWN dtype (`ReduceOps.cpp`: `ScalarType dtype = result.scalar_type();`),
+    not the input's: a float16 input poured into a float32 `out` must match
+    the float32-accumulated answer exactly, not a float16-rounded one poured
+    into fp32 (the values below are picked so the two differ)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().mean()
+    assert expected.item() != x.mean().float().item()  # the two must differ
+
+    out_dtype_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, out=out_dtype_out)  # -> mean.dtype_out
+    torch.testing.assert_close(out_dtype_out.cpu(), expected, rtol=0, atol=0)
+
+    out_dim_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out_dim_out)  # -> mean.out
+    torch.testing.assert_close(out_dim_out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_out_declines_float64_out(mojo_gpu):
+    """No float64 kernel specialization exists; a float64 `out` is declined
+    cleanly instead of reaching the cast kernel with an unsupported pair."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, out=torch.empty((), dtype=torch.float64, device=mojo_gpu))
+
+
+def test_mean_out_dtype_must_match_out_dtype(mojo_gpu):
+    """torch requires an explicit `dtype=` to equal `out`'s dtype exactly and
+    raises otherwise ("Expected out tensor to have dtype X, but got dtype Y
+    instead"); it is not a safe-cast check."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dtype=torch.float32,
+            out=torch.empty((), dtype=torch.float16, device=mojo_gpu),
+        )
 
 
 def test_mean_dtype_out_nan(mojo_gpu):
