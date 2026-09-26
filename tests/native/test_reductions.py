@@ -386,21 +386,17 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
     torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(4))
 
 
-def test_mean_out_into_an_out_that_shares_storage_with_the_input(mojo_gpu):
-    """`out=x[x.numel():]` aliases `x`'s storage and starts with 0 elements,
-    so `_scalar_reduction_out` must GROW it to write the row -- the same
-    aliasing resize `test_max_unary_out_into_an_out_that_shares_storage...`
-    exercises for the full-reduction path, here for the dim-reduction one
-    that shares the same `_scalar_reduction_out` helper."""
+def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`out=x.reshape(-1)[x.numel():]` aliases `x`'s storage (a 0-element view
+    that would need to GROW to hold the result): `_scalar_reduction_out`
+    declines any aliasing `out=` outright rather than resizing it, since stock
+    CUDA has no one well-defined answer here (`torch.max(x, out=x)` -- a
+    different alias of the same helper's problem, tested alongside this one --
+    comes back silently WRONG on real CUDA, not merely a stale pointer)."""
     x = torch.randn(3, 4, device=mojo_gpu)
-    x_before = x.cpu().clone()
     out = x.reshape(-1)[x.numel() :]
-    returned = torch.mean(x, dim=1, out=out)
-    assert tuple(returned.shape) == (3,)
-    torch.testing.assert_close(
-        returned.cpu(), x_before.mean(dim=1), rtol=2e-6, atol=2e-6
-    )
-    torch.testing.assert_close(x.cpu(), x_before)  # x itself must be intact
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=out)
 
 
 # ---------------------------------------------------------------------------
@@ -510,19 +506,20 @@ def test_max_unary_out_propagates_nan(mojo_device):
     assert out.cpu().isnan().item()
 
 
-def test_max_unary_out_into_an_out_that_shares_storage_with_the_input(mojo_gpu):
-    """`out=x[x.numel():]` aliases `x`'s storage and starts with 0 elements,
-    so `_scalar_reduction_out` must GROW it to write the scalar result --
-    exactly the resize that can reallocate the shared storage's data pointer
-    out from under an already-cached read of `x` (verified this is not an
-    error on stock CUDA torch: `x` itself must come back untouched)."""
+def test_max_unary_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`_scalar_reduction_out` refuses any `out=` sharing storage with the
+    input outright, rather than resizing it: stock CUDA has no one
+    well-defined answer to reproduce here. `out=x[x.numel():]` (a 0-element
+    view that would need to GROW) computes the right answer on real CUDA, but
+    `out=x` itself -- same tensor, needing to SHRINK from (6,) to () --
+    silently returns the WRONG value there (`resize_output` mutates `self`'s
+    own metadata before the reduction reads it), so there is no single
+    aliasing behavior worth special-casing; every aliasing `out=` declines."""
     x = torch.randn(6, device=mojo_gpu)
-    x_before = x.cpu().clone()
-    out = x[x.numel() :]
-    returned = torch.max(x, out=out)
-    assert tuple(returned.shape) == ()
-    torch.testing.assert_close(returned.cpu(), x_before.max())
-    torch.testing.assert_close(x.cpu(), x_before)  # x itself must be intact
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x[x.numel() :])
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x)
 
 
 def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):
