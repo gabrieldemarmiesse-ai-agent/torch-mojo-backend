@@ -832,6 +832,32 @@ def op_amin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _amax_amin("AminSpec", args, rets)
 
 
+# aten::amin.out(Tensor self, int[1] dim=[], bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_amin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=3])
+    _require_mojo(a)
+    _require_mojo(out)
+    _check_extremum_dtype(a, "AminSpec")
+    var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
+    if len(dims) == 0:
+        unsupported("amin with no reduce dim (a rank-0 operand)")
+    _refuse_empty_extremum("AminSpec", a, dims)
+    _scalar_reduction_out(
+        "reduction",
+        "AminSpec",
+        "aten::amin.out",
+        "exact",  # amin's meta func requires out.dtype == self.dtype, no dtype= kwarg
+        a,
+        dims,
+        v_bool_or(args[unsafe_offset=2], False),
+        a.stype,
+        out,
+    )
+    ret_ref(rets, 0, out)
+
+
 def _full_extremum(
     family: StaticString, op: StaticString, args: Values, rets: Values
 ) raises:
@@ -1953,6 +1979,7 @@ def register_reductions(site: Site) raises:
     impl[op_all_dim, "all.dims"](site)
     impl[op_amax, "amax"](site)
     impl[op_amin, "amin"](site)
+    impl[op_amin_out, "amin.out"](site)
     impl[op_any, "any"](site)
     impl[op_any_dim, "any.dim"](site)
     impl[op_any_dim, "any.dims"](site)

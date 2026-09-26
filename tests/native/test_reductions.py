@@ -374,6 +374,66 @@ def test_amax_amin_layouts(mojo_device, shape, dim, keepdim):
         torch.testing.assert_close(ours.cpu(), expected)
 
 
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize(
+    "shape,dim", [((357, 789), 1), ((4, 5, 6), (0, 2)), ((37,), None)]
+)
+def test_amin_out(mojo_gpu, shape, dim, dtype, keepdim):
+    """amin.out over dtypes/dims/keepdim, including the dim=None full reduce
+    (empty dim list) and a non-contiguous input."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    kwargs = {"keepdim": keepdim} if dim is not None else {}
+    dim_args = (dim,) if dim is not None else ()
+    expected = torch.amin(x, *dim_args, **kwargs)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    returned = torch.amin(x.to(mojo_gpu), *dim_args, out=out, **kwargs)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input, out already correctly shaped
+    if len(shape) >= 2:
+        xt = x.transpose(0, 1)
+        expected_t = (
+            torch.amin(xt, *dim_args, **kwargs) if dim is not None else torch.amin(xt)
+        )
+        out2 = torch.empty(expected_t.shape, dtype=dtype, device=mojo_gpu)
+        torch.amin(xt.to(mojo_gpu), *dim_args, out=out2, **kwargs)
+        torch.testing.assert_close(out2.cpu(), expected_t)
+
+
+def test_amin_out_resizes_a_mismatching_out(mojo_gpu):
+    x = torch.randn(2, 3, 4)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.amin(x.to(mojo_gpu), dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), torch.amin(x, dim=2))
+
+
+def test_amin_out_rejects_a_mismatching_dtype(mojo_gpu):
+    """amin's meta func requires out.dtype == self.dtype exactly (no dtype=
+    kwarg exists to cast through)."""
+    x = torch.randn(4, 7)
+    with pytest.raises(RuntimeError):
+        torch.amin(
+            x.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float64, device=mojo_gpu),
+        )
+
+
+def test_amin_out_empty_reduce_dim_raises(mojo_gpu):
+    x = torch.empty(3, 0, 5)
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.amin(x.to(mojo_gpu), dim=1, out=out)
+
+
 def test_max_and_min_full_reduction(mojo_device):
     x = torch.randn(37, 41)
     xd = x.to(mojo_device)
