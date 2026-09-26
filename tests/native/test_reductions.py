@@ -858,13 +858,22 @@ def test_vector_norm_ord0_nan_counts_as_nonzero(mojo_gpu):
     torch.testing.assert_close(ours, expected)
 
 
-def test_vector_norm_ord0_noncontiguous_and_empty(mojo_gpu):
-    contiguous = torch.linspace(-3.0, 4.0, 35).reshape(5, 7)
+def test_vector_norm_ord0_noncontiguous(mojo_gpu):
+    """A full reduction is permutation-invariant for a count, so it can't
+    catch a kernel that ignores strides; reduce one axis of a transpose
+    instead -- the wrong grouping would change per-row counts."""
+    contiguous = torch.randint(-2, 3, (5, 7)).float()
     strided = contiguous.t()
-    expected = torch.linalg.vector_norm(strided, ord=0)
-    ours = torch.linalg.vector_norm(contiguous.to(mojo_gpu).t(), ord=0).cpu()
+    assert not strided.is_contiguous()
+    expected = torch.linalg.vector_norm(strided, ord=0, dim=1)
+    # The transpose is taken ON the device (see test_vector_norm_out_and_
+    # strided_input): a strided host tensor cannot cross `_copy_from`.
+    device_strided = contiguous.to(mojo_gpu).t()
+    ours = torch.linalg.vector_norm(device_strided, ord=0, dim=1).cpu()
     torch.testing.assert_close(ours, expected)
 
+
+def test_vector_norm_ord0_empty(mojo_gpu):
     empty = torch.empty((0, 7), dtype=torch.float32).to(mojo_gpu)
     torch.testing.assert_close(
         torch.linalg.vector_norm(empty, ord=0).cpu(), torch.tensor(0.0), rtol=0, atol=0
