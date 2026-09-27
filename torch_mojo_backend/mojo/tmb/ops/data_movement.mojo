@@ -95,7 +95,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     broadcast_shape,
-    is_cast_dtype,
+    is_cast_dtype_on,
     cast_into,
     device_str,
     fill_value,
@@ -460,7 +460,7 @@ def _to_copy_same_device(
     if stype == t.stype:
         return _materialize_as(t, want)
     var dst_dtype = max_dtype(stype)
-    if not (is_cast_dtype(t.dtype) and is_cast_dtype(dst_dtype)):
+    if not (is_cast_dtype_on(t.dtype, t) and is_cast_dtype_on(dst_dtype, t)):
         return _relayout_owned(own(_host_cast(t, stype)), want)
     if (
         not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank)
@@ -658,8 +658,8 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         and dev_type != DEVICE_TYPE_CPU
         and (dev_type == -1 or v_device_index(dev_v) == t.device)
         and strides_equal(want, contig, t.rank)
-        and is_cast_dtype(t.dtype)
-        and is_cast_dtype(max_dtype(stype))
+        and is_cast_dtype_on(t.dtype, t)
+        and is_cast_dtype_on(max_dtype(stype), t)
     ):
         # The hot case of a mixed-precision step: a dense same-device cast
         # whose result is the contiguous layout. `_to_copy_same_device` ends
@@ -720,7 +720,10 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # fallback blocking; GPU casts/relayouts can remain stream-ordered.
         var async_download = non_blocking and (
             stype == t.stype
-            or (is_cast_dtype(t.dtype) and is_cast_dtype(max_dtype(stype)))
+            or (
+                is_cast_dtype_on(t.dtype, t)
+                and is_cast_dtype_on(max_dtype(stype), t)
+            )
         )
         var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
         _ = staged^

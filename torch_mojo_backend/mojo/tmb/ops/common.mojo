@@ -43,7 +43,7 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_int,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, memset_bytes, memset_typed
+from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 
@@ -395,10 +395,11 @@ def _fill_contiguous(t: T, s: FillScalar) raises:
 
 
 def is_cast_dtype(dt: DType) -> Bool:
-    """Mirrors tmb/kernels/data_movement/entry.mojo's `CAST_DTYPES`. float64
-    is in the list on every device; `_cast` itself declines it on Apple GPUs,
-    so a caller that also needs a clean pre-launch decline there must check
-    the device separately (see reductions.mojo's `_decline_metal_float64`)."""
+    """Mirrors tmb/kernels/data_movement/entry.mojo's `CAST_DTYPES`, dtype
+    only: float64 is in the list here even though `_cast` itself declines it
+    on Apple GPUs. A caller choosing between the device cast kernel and a
+    host-round-trip fallback must use `is_cast_dtype_on` instead, or it will
+    route float64 into `_cast` on Metal and hit that raw decline."""
     return (
         dt == DType.float32
         or dt == DType.float16
@@ -409,6 +410,20 @@ def is_cast_dtype(dt: DType) -> Bool:
         or dt == DType.uint8
         or dt == DType.bool
     )
+
+
+def is_cast_dtype_on(dt: DType, t: T) raises -> Bool:
+    """`is_cast_dtype`, narrowed by `t`'s device: false for float64 on an
+    Apple GPU, where the device cast kernel can't run it (`_cast` raises
+    there). Every caller that picks between the device cast kernel and a
+    host round-trip fallback (aten.to/copy_'s hot paths in core.mojo and
+    data_movement.mojo, the bool-mixed promotions below) must check this
+    instead of the bare dtype predicate, so float64 keeps working on Metal
+    through the fallback exactly as it did before float64 joined
+    `CAST_DTYPES`."""
+    if dt == DType.float64 and t.on_mojo() and dev(t.device)[].api == "metal":
+        return False
+    return is_cast_dtype(dt)
 
 
 def cast_into(dst: T, src: T) raises:
@@ -722,12 +737,17 @@ def result_type(a: T, b: T) raises -> Int32:
     return combine_categories(dim, zero)
 
 
-def binary_promotion(a_dtype: DType, b_dtype: DType) raises -> DType:
+def binary_promotion(a: T, b: T) raises -> DType:
     """torch's promotion for a binary pair, restricted to what the
     broadcast-strided spec kernels cover: equal dtypes; bool with any
     castable dtype; int32/int64; float32 with float16/bfloat16; and
     float16<->bfloat16 (widens both sides to float32). Declines
     (`unsupported`) any other pair.
+
+    Takes the tensors, not just their dtypes, so the bool+castable branch
+    can check `is_cast_dtype_on` (float64 declines cleanly on an Apple GPU,
+    where there is no host-fallback route for this promotion the way
+    aten.to/copy_ have one).
 
     A caller casts each operand into the returned dtype with
     `cast_to(operand, torch_dtype(result))`, which already no-ops when an
@@ -736,11 +756,13 @@ def binary_promotion(a_dtype: DType, b_dtype: DType) raises -> DType:
     dtype) triple; there is no separate cast-skipping fast path to expose.
     Ported from `_binary_promotion`.
     """
+    var a_dtype = a.dtype
+    var b_dtype = b.dtype
     if a_dtype == b_dtype:
         return a_dtype
-    if a_dtype == DType.bool and is_cast_dtype(b_dtype):
+    if a_dtype == DType.bool and is_cast_dtype_on(b_dtype, b):
         return b_dtype
-    if b_dtype == DType.bool and is_cast_dtype(a_dtype):
+    if b_dtype == DType.bool and is_cast_dtype_on(a_dtype, a):
         return a_dtype
     if a_dtype == DType.int32 and b_dtype == DType.int64:
         return DType.int64
@@ -776,9 +798,9 @@ def promoted_pair(a: T, b: T) raises -> Tuple[T, T]:
     """
     if a.dtype == b.dtype:
         return (a.copy(), b.copy())
-    if a.dtype == DType.bool and is_cast_dtype(b.dtype):
+    if a.dtype == DType.bool and is_cast_dtype_on(b.dtype, b):
         return (cast_to(a, torch_dtype(b.dtype)), b.copy())
-    if b.dtype == DType.bool and is_cast_dtype(a.dtype):
+    if b.dtype == DType.bool and is_cast_dtype_on(a.dtype, a):
         return (a.copy(), cast_to(b, torch_dtype(a.dtype)))
     if a.dtype == DType.int32 and b.dtype == DType.int64:
         return (cast_to(a, torch_dtype(DType.int64)), b.copy())

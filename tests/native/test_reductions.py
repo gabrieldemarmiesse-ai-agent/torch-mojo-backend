@@ -980,15 +980,17 @@ def test_prod_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
 
 
 def test_prod_out_float64_out(mojo_gpu):
-    """A float64 `out` with no `dtype=` casts every element to double first,
-    the same 2**64-int64-overflow case as the float32 test above but landing
-    exactly since double, unlike float32, is exact well past 2**64."""
+    """A float64 `out` with no `dtype=` casts every element to double, not
+    float32, before multiplying: 2**24+1 is exact in double but rounds in
+    float32, so a float32-then-cast accumulation would give a different
+    (rounded) product than casting straight to double."""
     skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
-    x = torch.tensor([2**32, 2**32], dtype=torch.int64)
-    xd = x.to(mojo_gpu)
+    x = torch.tensor([2**24 + 1, 2**24 + 1], dtype=torch.int64)
+    expected = x.double().prod()
+    assert expected.item() != x.float().prod().double().item()  # must differ
     out = torch.empty((), dtype=torch.float64, device=mojo_gpu)
-    torch.prod(xd, dim=0, out=out)
-    assert out.item() == 2.0**64
+    torch.prod(x.to(mojo_gpu), dim=0, out=out)
+    assert out.item() == expected.item()
 
     x64 = torch.rand(4, 5, dtype=torch.float64) * 0.5 + 0.5
     out2 = torch.empty(4, dtype=torch.float64, device=mojo_gpu)
@@ -2350,7 +2352,7 @@ def test_norm_dtype_out_float64(mojo_gpu):
     # a float64 self needs no dtype= at all, and rejects narrowing back down.
     x64 = torch.randn(4, 5, dtype=torch.float64)
     out2 = torch.empty(4, dtype=torch.float64, device=mojo_gpu)
-    torch.ops.aten.linalg_vector_norm.out(x64.to(mojo_gpu), 2, [1], False, out=out2)
+    torch.linalg.vector_norm(x64.to(mojo_gpu), dim=1, out=out2)
     torch.testing.assert_close(out2.cpu(), torch.linalg.vector_norm(x64, dim=1))
     with pytest.raises(RuntimeError):
         torch.linalg.vector_norm(x64.to(mojo_gpu), dim=1, dtype=torch.float32)

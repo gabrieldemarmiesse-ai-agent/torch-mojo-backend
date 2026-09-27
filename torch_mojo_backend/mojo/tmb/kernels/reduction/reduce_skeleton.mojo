@@ -675,7 +675,10 @@ struct NormL0Op(ReduceOp):
     (NaN == 0 is false) counts as nonzero, same rule as `AnyOp`. Accumulates
     in float, not int, matching CUDA's `acc_t` for this op: the count is a sum
     of 0.0/1.0 finished with a plain cast, never a separate int->float
-    conversion.
+    conversion. Verified on real CUDA that a float64 input accumulates the
+    count in double, not float32: a count just above 2**24 (not exactly
+    representable in float32) comes back exact for a double input and
+    rounded for a float32 one -- `_float_acc[in_dt]()` reproduces that.
     """
 
     comptime name = "norml0"
@@ -684,7 +687,7 @@ struct NormL0Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:

@@ -166,7 +166,7 @@ def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var b = v_tensor(args[unsafe_offset=1])
     if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
         raise Error("expected both operands on the same mojo device")
-    var dtype = binary_promotion(a.dtype, b.dtype)
+    var dtype = binary_promotion(a, b)
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
     var pb = cast_to(b, stype)
@@ -187,7 +187,7 @@ def _compare_functional_out(
     var out_arg = v_tensor(args[unsafe_offset=2])
     if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
         raise Error("expected both operands on the same mojo device")
-    var dtype = binary_promotion(a.dtype, b.dtype)
+    var dtype = binary_promotion(a, b)
     var stype = torch_dtype(dtype)
     var pa = cast_to(a, stype)
     var pb = cast_to(b, stype)

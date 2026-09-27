@@ -1471,9 +1471,9 @@ def test_select_scatter_negative_dim_and_index(mojo_device):
 
 
 def test_select_scatter_casts_src(mojo_gpu):
-    # float16 (not float64): the fast CastSpec kernel's dtype set is what
-    # select_scatter's src-cast uses, matching the old eager path's
-    # `_cast_tensor` (pre-gated on the same set, never a host round trip).
+    # float16: the fast CastSpec kernel's dtype set is what select_scatter's
+    # src-cast uses, matching the old eager path's `_cast_tensor` (pre-gated
+    # on the same set, never a host round trip).
     a = _fill((4, 5), torch.float32)
     src = torch.full((5,), 9.0, dtype=torch.float16)
     expected = a.select_scatter(src, 0, 1)
@@ -2598,6 +2598,7 @@ def test_empty_permuted_rejects_a_bad_layout(mojo_gpu):
 # ---------------------------------------------------------------------------
 
 _CAST_DTYPES = [
+    torch.float64,
     torch.float32,
     torch.float16,
     torch.bfloat16,
@@ -2610,6 +2611,9 @@ _CAST_DTYPES = [
 
 @pytest.mark.parametrize("src_dtype", _CAST_DTYPES)
 def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
+    """Runs on every backend, Apple GPUs included: float64 takes the fast
+    CastSpec kernel on CUDA/ROCm and the host round-trip fallback on Metal
+    (`is_cast_dtype_on`), and both must agree with CPU torch exactly."""
     for dst_dtype in _CAST_DTYPES:
         for numel in (1, 3, 17, 1027, 4099):
             for offset in (0, 1, 2, 3):
