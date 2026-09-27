@@ -33,29 +33,43 @@ UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "abs": torch.abs,
     "acos": torch.acos,
     "acosh": torch.acosh,
+    "angle": torch.angle,
+    "asin": torch.asin,
     "asinh": torch.asinh,
+    "atan": torch.atan,
     "atanh": torch.atanh,
     "ceil": torch.ceil,
     "cos": torch.cos,
     "cosh": torch.cosh,
     "erf": torch.erf,
+    "erfc": torch.erfc,
+    "erfinv": torch.erfinv,
     "exp": torch.exp,
+    "exp2": torch.exp2,
+    "expm1": torch.expm1,
     "floor": torch.floor,
     "gelu": F.gelu,
+    "isfinite": torch.isfinite,
+    "isinf": torch.isinf,
     "isnan": torch.isnan,
     "isneginf": torch.isneginf,
     "isposinf": torch.isposinf,
     "log": torch.log,
+    "log10": torch.log10,
     "log1p": torch.log1p,
     "log2": torch.log2,
+    "nan_to_num": torch.nan_to_num,
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "rsqrt": torch.rsqrt,
+    "sgn": torch.sgn,
     "sigmoid": torch.sigmoid,
     "sign": torch.sign,
+    "signbit": torch.signbit,
     "silu": F.silu,
     "sin": torch.sin,
+    "sinc": torch.sinc,
     "sinh": torch.sinh,
     "sqrt": torch.sqrt,
     "tan": torch.tan,
@@ -79,7 +93,8 @@ _UNARY_OUT = (
     "straight into a fitting destination)"
 )
 SKIPPED: dict[str, str] = {
-    f"aten::{name}": _UNARY_OUT for name in ("isneginf.out", "isposinf.out")
+    f"aten::{name}": _UNARY_OUT
+    for name in ("isinf.out", "isneginf.out", "isposinf.out")
 }
 
 COVERS: dict[str, str] = {f"aten::{name}": "test_unary" for name in UNARY_OPS} | {

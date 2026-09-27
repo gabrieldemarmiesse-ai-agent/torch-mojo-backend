@@ -31,7 +31,11 @@ from tmb.backend.abi import (
     ST_INT8,
     ST_UINT8,
     T,
+    TAG_BOOL,
+    TAG_DOUBLE,
     TAG_NONE,
+    TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     Value,
     bits_f64,
@@ -95,6 +99,7 @@ from tmb.ops.common import (
     known_stype as _pw_known,
     promote_types,
     resize_out,
+    scalar_to_float,
     scalar_to_int,
 )
 from tmb.ops.random import _draw
@@ -599,11 +604,24 @@ def op_lcm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_math("lcm", P_INT, True, 2, args, rets, 2)
 
 
+def _pw_side_stype(side: Side) -> Int32:
+    """The dtype of an operand's tensor: a CPU 0-d tensor read back as a
+    Scalar keeps its own (a wrapped Python number is double / long / bool)."""
+    if side.is_t:
+        return side.t.value().stype
+    if side.zero_st >= 0:
+        return side.zero_st
+    if side.s.value().is_bool:
+        return ST_BOOL
+    return ST_INT64 if side.s.value().is_int else ST_FLOAT64
+
+
 def _pw_same_dtype(name: StaticString, args: Values) raises:
-    """heaviside's meta check: both tensors of one dtype."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
-    if a.is_t and b.is_t and a.t.value().stype != b.t.value().stype:
+    """heaviside's meta check: both tensors of one dtype, a CPU 0-d
+    `values` included."""
+    var a = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var b = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    if a != b:
         raise Error(
             String(name)
             + " is not yet implemented for tensors with different dtypes."
@@ -1155,6 +1173,9 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     var common = _pw_result_type(a, b, _none_side(), 2)
     if not _pw_is_float(common):
         return False
+    # `alpha.to<scalar_t>()`: a finite alpha past the result dtype's range
+    # raises, as ATen's checked conversion does.
+    alpha = scalar_to_float(args[unsafe_offset=2], common)
     var compute = _pw_compute_dtype("rsub_alpha", common, P_FLOAT, True)
     var dest = Optional[T]()
     if out_index >= 0:
@@ -1196,9 +1217,51 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     return True
 
 
+def _pw_is_bool_side(side: Side) -> Bool:
+    if side.is_t:
+        return side.t.value().stype == ST_BOOL
+    return side.s.value().is_bool
+
+
+def _pw_rsub_check(args: Values) raises:
+    """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
+    alpha)): no bool operand, no bool alpha (it would need a bool result,
+    which sub_check already refused), no floating alpha for an integral
+    result."""
+    var a = _pw_is_bool_side(_b_side(args[unsafe_offset=0]))
+    var b = _pw_is_bool_side(_b_side(args[unsafe_offset=1]))
+    if a and b:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if a or b:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+    var alpha = args[unsafe_offset=2].tag
+    if alpha == TAG_SCALAR_BOOL or alpha == TAG_BOOL:
+        raise Error("Boolean alpha only supported for Boolean results.")
+    if alpha == TAG_SCALAR_DOUBLE or alpha == TAG_DOUBLE:
+        var common = _pw_result_type(
+            _b_side(args[unsafe_offset=0]),
+            _b_side(args[unsafe_offset=1]),
+            _none_side(),
+            2,
+        )
+        if not _pw_is_float(common):
+            raise Error(
+                "For integral input tensors, argument alpha must not be a"
+                " floating point number."
+            )
+
+
 # aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 # aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
 def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, -1):
         op_rsub(args, n_args, rets, n_rets)
 
@@ -1208,6 +1271,7 @@ def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_rsub_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, 3):
         op_rsub_out(args, n_args, rets, n_rets)
 
@@ -2697,12 +2761,67 @@ def op_binary_cross_entropy_with_logits_out(
 
 
 def register_pointwise(site: Site) raises:
+    impl[op_ilshift, "__ilshift__.Scalar"](site)
+    impl[op_ilshift, "__ilshift__.Tensor"](site)
+    impl[op_irshift, "__irshift__.Scalar"](site)
+    impl[op_irshift, "__irshift__.Tensor"](site)
+    impl[op_lshift, "__lshift__.Scalar"](site)
+    impl[op_lshift, "__lshift__.Tensor"](site)
+    impl[op_rshift, "__rshift__.Scalar"](site)
+    impl[op_rshift, "__rshift__.Tensor"](site)
+    impl[op_atan2, "atan2"](site)
+    impl[op_atan2_out, "atan2.out"](site)
+    impl[op_lshift, "bitwise_left_shift.Tensor"](site)
+    impl[op_lshift_out, "bitwise_left_shift.Tensor_out"](site)
+    impl[op_rshift, "bitwise_right_shift.Tensor"](site)
+    impl[op_rshift_out, "bitwise_right_shift.Tensor_out"](site)
+    impl[op_clamp_tensor, "clamp.Tensor"](site)
+    impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
+    impl[op_copysign, "copysign.Scalar"](site)
+    impl[op_copysign, "copysign.Tensor"](site)
+    impl[op_copysign_out, "copysign.Scalar_out"](site)
+    impl[op_copysign_out, "copysign.out"](site)
+    impl[op_fmax, "fmax"](site)
+    impl[op_fmax_out, "fmax.out"](site)
+    impl[op_fmin, "fmin"](site)
+    impl[op_fmin_out, "fmin.out"](site)
+    impl[op_fmod, "fmod.Scalar"](site)
+    impl[op_fmod, "fmod.Tensor"](site)
+    impl[op_fmod_out, "fmod.Scalar_out"](site)
+    impl[op_fmod_out, "fmod.Tensor_out"](site)
+    impl[op_gcd, "gcd"](site)
+    impl[op_gcd_out, "gcd.out"](site)
     impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[op_heaviside, "heaviside"](site)
+    impl[op_heaviside_out, "heaviside.out"](site)
+    impl[op_hypot, "hypot"](site)
+    impl[op_hypot_out, "hypot.out"](site)
+    impl[op_lcm, "lcm"](site)
+    impl[op_lcm_out, "lcm.out"](site)
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
+    impl[op_lerp_tensor, "lerp.Tensor"](site)
+    impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
+    impl[op_logaddexp, "logaddexp"](site)
+    impl[op_logaddexp_out, "logaddexp.out"](site)
+    impl[op_logaddexp2, "logaddexp2"](site)
+    impl[op_logaddexp2_out, "logaddexp2.out"](site)
+    impl[op_nextafter, "nextafter"](site)
+    impl[op_nextafter_out, "nextafter.out"](site)
+    impl[op_rsub_any, "rsub.Tensor"](site)
+    impl[op_rsub_any, "rsub.Scalar"](site)
+    impl[op_rsub_out_any, "rsub.Tensor_out"](site)
+    impl[op_rsub_out_any, "rsub.Scalar_out"](site)
+    impl[op_pow_scalar_base, "pow.Scalar"](site)
+    impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
     impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
+    impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
+    impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    _register_special(site)
+    impl[op_xlogy, "xlogy.Tensor"](site)
+    impl[op_xlogy_out, "xlogy.OutTensor"](site)
 
 
 comptime op_special_chebyshev_polynomial_t = op_poly[
@@ -2769,3 +2888,8 @@ comptime op_special_shifted_chebyshev_polynomial_w = op_poly[
 comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
     "shifted_chebyshev_polynomial_w", 2
 ]
+
+
+def _register_special(site: Site) raises:
+    impl[op_special_xlog1py, "special_xlog1py"](site)
+    impl[op_special_xlog1py_out, "special_xlog1py.out"](site)

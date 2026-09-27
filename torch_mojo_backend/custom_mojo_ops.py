@@ -171,19 +171,28 @@ def elementwise(
         "abs",
         "acos",
         "acosh",
+        "angle",
+        "asin",
         "asinh",
+        "atan",
         "atanh",
         "ceil",
         "cos",
         "cosh",
         "erf",
+        "erfc",
+        "erfinv",
         "exp",
+        "exp2",
+        "expm1",
         "floor",
         "gelu_none",
         "gelu_tanh",
+        "isinf",
         "isnan",
         "logical_not",
         "log",
+        "log10",
         "log1p",
         "log2",
         "neg",
@@ -192,8 +201,10 @@ def elementwise(
         "rsqrt",
         "sigmoid",
         "sign",
+        "signbit",
         "silu",
         "sin",
+        "sinc",
         "sinh",
         "sqrt",
         "tan",
@@ -210,11 +221,13 @@ def elementwise(
             "floor",
             "gelu_none",
             "gelu_tanh",
+            "isinf",
             "isnan",
             "logical_not",
             "neg",
             "relu",
             "sign",
+            "signbit",
             "silu",
         }
         and not input.dtype.is_float()
@@ -222,7 +235,11 @@ def elementwise(
         # ATen unary_float_op promotes integer and bool inputs to the default
         # floating dtype, whereas ElementwiseUnaryOp preserves its input dtype.
         input = F.cast(input, dtype=torch_dtype_to_max(torch.get_default_dtype()))
-    output_dtype = DType.bool if kind in {"isnan", "logical_not"} else input.dtype
+    output_dtype = (
+        DType.bool
+        if kind in {"isinf", "isnan", "logical_not", "signbit"}
+        else input.dtype
+    )
     return F.custom(
         name=f"elementwise_{kind}",
         device=input.device,
@@ -232,6 +249,34 @@ def elementwise(
         ],
         custom_extensions=compiler.kernel_extension_paths(),
     )[0]
+
+
+def pointwise_binary(
+    input: MaxTensor,
+    other: MaxTensor,
+    kind: Literal[
+        "atan2",
+        "copysign",
+        "fmax",
+        "fmin",
+        "fmod",
+        "gcd",
+        "heaviside",
+        "hypot",
+        "lcm",
+        "logaddexp",
+        "logaddexp2",
+        "lshift",
+        "nextafter",
+        "rshift",
+        "xlog1py",
+        "xlogy",
+    ],
+) -> MaxTensor:
+    """The mojo device's pointwise math (`tmb/kernels/common/pointwise_math`)
+    as a fusible binary custom op. The operands share a dtype and a shape:
+    promotion and broadcasting happen before the call."""
+    return _same_type_binary(f"pointwise_{kind}", input, other)
 
 
 def gelu_backward(

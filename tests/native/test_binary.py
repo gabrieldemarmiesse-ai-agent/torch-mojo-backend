@@ -1484,6 +1484,7 @@ _OUT_OPS = [
     ("bitwise_and", torch.bitwise_and, torch.int32),
     ("bitwise_or", torch.bitwise_or, torch.int64),
     ("bitwise_xor", torch.bitwise_xor, torch.int32),
+    ("pow", torch.pow, torch.float32),
 ]
 
 
@@ -1538,6 +1539,15 @@ def test_binary_scalar_out_variants(mojo_device):
     with native_ran("aten::remainder.Scalar_out"):
         torch.remainder(f, 0.75, out=out)
     torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
+    out = torch.empty(7, device=mojo_device)
+    with native_ran("aten::pow.Tensor_Scalar_out"):
+        torch.pow(f.abs(), 1.5, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(f_cpu.abs(), 1.5))
+    # The scalar-base overload: pow(Scalar self, Tensor exponent, *, out).
+    out = torch.empty(7, device=mojo_device)
+    with native_ran("aten::pow.Scalar_out"):
+        torch.pow(2.0, f, out=out)
+    torch.testing.assert_close(out.cpu(), torch.pow(2.0, f_cpu))
 
 
 def test_logical_or(mojo_device, call_checker):
@@ -1580,6 +1590,31 @@ def test_maximum_minimum_bool(mojo_device):
     torch.testing.assert_close(torch.minimum(a, b).cpu(), torch.minimum(a_cpu, b_cpu))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_clamp_min_max(mojo_device, dtype):
+    a_cpu, a = _both((5, 3), dtype, mojo_device, low=-9, high=9)
+    lo_cpu, lo = _both((3,), dtype, mojo_device, low=-3, high=0)
+    hi_cpu, hi = _both((5, 1), dtype, mojo_device, low=0, high=3)
+    with native_ran("aten::clamp_min"):
+        torch.testing.assert_close(a.clamp_min(0).cpu(), a_cpu.clamp_min(0))
+    with native_ran("aten::clamp_max"):
+        torch.testing.assert_close(a.clamp_max(1).cpu(), a_cpu.clamp_max(1))
+    with native_ran("aten::clamp_min.Tensor"):
+        torch.testing.assert_close(a.clamp_min(lo).cpu(), a_cpu.clamp_min(lo_cpu))
+    with native_ran("aten::clamp_max.Tensor"):
+        torch.testing.assert_close(a.clamp_max(hi).cpu(), a_cpu.clamp_max(hi_cpu))
+    out = torch.empty_like(a)
+    torch.clamp(a, min=-1, max=1, out=out)
+    torch.testing.assert_close(out.cpu(), torch.clamp(a_cpu, min=-1, max=1))
+    x, x_cpu = a.clone(), a_cpu.clone()
+    x.clamp_(min=0)
+    x_cpu.clamp_(min=0)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+    x.clamp_max_(hi)
+    x_cpu.clamp_max_(hi_cpu)
+    torch.testing.assert_close(x.cpu(), x_cpu)
+
+
 def test_clamp_nan_bound_fills_nan(mojo_device):
     a_cpu, a = _both((6,), torch.float32, mojo_device)
     nan = float("nan")
@@ -1587,6 +1622,253 @@ def test_clamp_nan_bound_fills_nan(mojo_device):
         torch.testing.assert_close(
             torch.clamp(a, lo, hi).cpu(), torch.clamp(a_cpu, lo, hi), equal_nan=True
         )
+    torch.testing.assert_close(
+        a.clamp_min(nan).cpu(), a_cpu.clamp_min(nan), equal_nan=True
+    )
+    torch.testing.assert_close(
+        a.clamp_max(nan).cpu(), a_cpu.clamp_max(nan), equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32])
+def test_clamp_nan_scalar_bound_rules(mojo_device, dtype):
+    """Every Scalar-bound overload with a NaN bound, a NaN in x, and an
+    integral x (promoted to float by the NaN bound), against CPU torch:
+    clamp_min / clamp_max and two-bound clamp fill NaN, one-bound clamp
+    keeps x (torch 2.11)."""
+    nan = float("nan")
+    if dtype.is_floating_point:
+        x_cpu = torch.tensor([1.0, 2.0, nan, -5.0], dtype=dtype)
+    else:
+        x_cpu = torch.tensor([1, 2, -3, 4], dtype=dtype)
+    x = x_cpu.to(mojo_device)
+    cases = [
+        lambda t, **kw: torch.clamp(t, min=nan, **kw),
+        lambda t, **kw: torch.clamp(t, max=nan, **kw),
+        lambda t, **kw: torch.clamp(t, nan, 3.0, **kw),
+        lambda t, **kw: torch.clamp(t, 0.0, nan, **kw),
+        lambda t, **kw: torch.clamp_min(t, nan, **kw),
+        lambda t, **kw: torch.clamp_max(t, nan, **kw),
+        lambda t, **kw: torch.clamp(t, -1.0, 1.5, **kw),
+    ]
+    for fn in cases:
+        expected = fn(x_cpu)
+        actual = fn(x).cpu()
+        assert actual.dtype == expected.dtype
+        torch.testing.assert_close(actual, expected, equal_nan=True)
+        if dtype.is_floating_point:
+            out = torch.empty_like(x)
+            fn(x, out=out)
+            torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_clamp_scalar_bound_overflow(mojo_device, dtype):
+    """A finite Scalar bound past the result dtype's range raises as c10's
+    checked conversion does, even on an empty tensor; inf and NaN bounds
+    are fine, and a NaN fill never converts the other bound."""
+    big = {torch.float16: 70000.0, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
+    x_cpu = torch.tensor([1.0, -2.0, 3.0], dtype=dtype)
+    x = x_cpu.to(mojo_device)
+    raising = [
+        lambda t: torch.clamp_min(t, big),
+        lambda t: torch.clamp_max(t, -big),
+        lambda t: torch.clamp(t, big),
+        lambda t: torch.clamp(t, None, big),
+        lambda t: torch.clamp(t, -big, big),
+        lambda t: torch.clamp_min(t, big, out=torch.empty_like(t)),
+        lambda t: t.clone().clamp_(max=big),
+        lambda t: torch.clamp_min(t[:0], big),
+    ]
+    for fn in raising:
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x_cpu)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            fn(x)
+    inf = float("inf")
+    fine = [
+        lambda t: torch.clamp_min(t, inf),
+        lambda t: torch.clamp_max(t, -inf),
+        lambda t: torch.clamp(t, -inf, inf),
+        lambda t: torch.clamp(t, float("nan"), big),
+    ]
+    for fn in fine:
+        torch.testing.assert_close(fn(x).cpu(), fn(x_cpu), equal_nan=True)
+    if dtype == torch.float32:
+        # An integral tensor with a float bound computes in float32.
+        xi_cpu = torch.tensor([1, 2], dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            torch.clamp(xi_cpu, big)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            torch.clamp(xi_cpu.to(mojo_device), big)
+
+
+# --------------------------------------------------------------------------
+# rsub: other - alpha * self as one sub launch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+def test_rsub(mojo_gpu, dtype):
+    a_cpu, a = _both((4, 5), dtype, mojo_gpu)
+    b_cpu, b = _both((5,), dtype, mojo_gpu)
+    native.op_counting(True)
+    native.op_counts_reset()
+    got = torch.rsub(a, b)
+    assert native.op_counts() == {"aten::rsub.Tensor": 1}
+    torch.testing.assert_close(got.cpu(), torch.rsub(a_cpu, b_cpu))
+    native.op_counts_reset()
+    got = torch.rsub(a, 3)
+    assert native.op_counts() == {"aten::rsub.Scalar": 1}
+    torch.testing.assert_close(got.cpu(), torch.rsub(a_cpu, 3))
+    torch.testing.assert_close(
+        torch.rsub(a, b, alpha=2).cpu(), torch.rsub(a_cpu, b_cpu, alpha=2)
+    )
+    torch.testing.assert_close(
+        torch.rsub(a, 3, alpha=2).cpu(), torch.rsub(a_cpu, 3, alpha=2)
+    )
+    torch.testing.assert_close(
+        torch.rsub(a.t(), b[:, None]).cpu(), torch.rsub(a_cpu.t(), b_cpu[:, None])
+    )
+
+
+def test_rsub_promotion_and_out(mojo_gpu):
+    i_cpu = torch.arange(6)
+    i = i_cpu.to(mojo_gpu)
+    got = torch.rsub(i, 3.5)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), torch.rsub(i_cpu, 3.5))
+    f_cpu = torch.randn(6)
+    out = torch.empty(6, device=mojo_gpu)
+    torch.ops.aten.rsub.Tensor_out(f_cpu.to(mojo_gpu), f_cpu.to(mojo_gpu) * 2, out=out)
+    torch.testing.assert_close(out.cpu(), f_cpu)
+    torch.ops.aten.rsub.Scalar_out(f_cpu.to(mojo_gpu), 1.0, out=out)
+    torch.testing.assert_close(out.cpu(), 1.0 - f_cpu)
+
+
+def test_rsub_checks_and_rank_promotion(mojo_gpu):
+    f = torch.tensor([1.0, 2.0], device=mojo_gpu)
+    # BinaryOps.cpp's sub_check / alpha_check, as stock torch raises them.
+    with pytest.raises(RuntimeError, match="with a bool tensor"):
+        torch.rsub(f, True)
+    with pytest.raises(RuntimeError, match="with a bool tensor"):
+        torch.rsub(f, torch.tensor([True, False], device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Boolean alpha"):
+        torch.rsub(f, f, alpha=True)
+    # A 0-d operand does not outrank a dimensioned one of its category.
+    h_cpu = torch.tensor([1.0, 2.0], dtype=torch.float16)
+    got = torch.rsub(h_cpu.to(mojo_gpu), torch.tensor(3.0, device=mojo_gpu))
+    assert got.dtype == torch.float16
+    torch.testing.assert_close(got.cpu(), torch.rsub(h_cpu, torch.tensor(3.0)))
+    # Scalar_out computes what the functional form computes (float opmath).
+    out = torch.empty(1, dtype=torch.float16, device=mojo_gpu)
+    one = torch.ones(1, dtype=torch.float16, device=mojo_gpu)
+    torch.ops.aten.rsub.Scalar_out(one, 1.0001, out=out)
+    torch.testing.assert_close(out, torch.rsub(one, 1.0001))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "alpha", "ok_alpha"),
+    [
+        (torch.float32, 1e100, 1e6),
+        (torch.float16, 7e4, 6e4),
+        (torch.bfloat16, 1e100, 1e6),
+    ],
+)
+def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
+    """A finite alpha past the result dtype's range raises, as CPU torch's
+    checked `alpha.to<scalar_t>()` does, instead of scaling by inf."""
+    x_cpu = torch.tensor([1.0], dtype=dtype)
+    x = x_cpu.to(mojo_gpu)
+    for other_cpu in (3, x_cpu):
+        other = other_cpu if isinstance(other_cpu, int) else other_cpu.to(mojo_gpu)
+        with pytest.raises(RuntimeError, match="without overflow") as cpu_err:
+            torch.rsub(x_cpu, other_cpu, alpha=alpha)
+        with pytest.raises(RuntimeError, match="without overflow") as err:
+            torch.rsub(x, other, alpha=alpha)
+        assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
+        torch.testing.assert_close(
+            torch.rsub(x, other, alpha=ok_alpha).cpu(),
+            torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
+        )
+
+
+def test_rsub_integral_promotes_before_alpha(mojo_gpu):
+    """ATen promotes both operands before scaling self: int32 self times
+    alpha = 2**30 against an int64 other must not wrap in int32 first."""
+    i32_cpu = torch.tensor([100, -7, 3], dtype=torch.int32)
+    i64_cpu = torch.tensor([0, 5, 2**40], dtype=torch.int64)
+    i32, i64 = i32_cpu.to(mojo_gpu), i64_cpu.to(mojo_gpu)
+    alpha = 2**30
+    expected = torch.rsub(i32_cpu, i64_cpu, alpha=alpha)
+    torch.testing.assert_close(torch.rsub(i32, i64, alpha=alpha).cpu(), expected)
+    out = torch.empty(3, dtype=torch.int64, device=mojo_gpu)
+    torch.ops.aten.rsub.Tensor_out(i32, i64, alpha=alpha, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+    # The same promotion order for sub / add, which rsub shares.
+    torch.testing.assert_close(
+        torch.sub(i64, i32, alpha=alpha).cpu(), torch.sub(i64_cpu, i32_cpu, alpha=alpha)
+    )
+    torch.testing.assert_close(
+        torch.add(i64, i32, alpha=alpha).cpu(), torch.add(i64_cpu, i32_cpu, alpha=alpha)
+    )
+
+
+def test_rsub_float_alpha_integral_result(mojo_gpu):
+    """ATen's alpha_check: a floating alpha is refused for an integral
+    result, in the functional and the out= overloads alike."""
+    i_cpu = torch.tensor([1, 2], dtype=torch.int32)
+    j_cpu = torch.tensor([3, 4], dtype=torch.int64)
+    i, j = i_cpu.to(mojo_gpu), j_cpu.to(mojo_gpu)
+    msg = "argument alpha must not be a floating point number"
+    cases = [
+        lambda a, b: torch.rsub(a, b, alpha=1.0),
+        lambda a, b: torch.rsub(a, 3, alpha=1.0),
+        lambda a, b: torch.ops.aten.rsub.Tensor_out(
+            a, b, alpha=2.0, out=torch.empty_like(b)
+        ),
+        lambda a, b: torch.ops.aten.rsub.Scalar_out(a, 3, 1.0, out=torch.empty_like(a)),
+    ]
+    for fn in cases:
+        with pytest.raises(RuntimeError, match=msg):
+            fn(i_cpu, j_cpu)
+        with pytest.raises(RuntimeError, match=msg):
+            fn(i, j)
+    # A float `other` makes the result floating: the float alpha is fine.
+    torch.testing.assert_close(
+        torch.rsub(i, 3.5, alpha=1.0).cpu(), torch.rsub(i_cpu, 3.5, alpha=1.0)
+    )
+
+
+def test_rsub_autograd(mojo_gpu):
+    a_cpu = torch.randn(3, 4, requires_grad=True)
+    b_cpu = torch.randn(3, 4, requires_grad=True)
+    a = a_cpu.detach().to(mojo_gpu).requires_grad_()
+    b = b_cpu.detach().to(mojo_gpu).requires_grad_()
+    (torch.rsub(a, b, alpha=3) * torch.rsub(a, 2.0)).sum().backward()
+    (torch.rsub(a_cpu, b_cpu, alpha=3) * torch.rsub(a_cpu, 2.0)).sum().backward()
+    assert a.grad is not None and b.grad is not None
+    torch.testing.assert_close(a.grad.cpu(), a_cpu.grad)
+    torch.testing.assert_close(b.grad.cpu(), b_cpu.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_rsub_alpha_is_one_fused_step(mojo_gpu, dtype):
+    """CUDA's sub kernel computes other - alpha * self as one fma in float
+    (a Python-number other stays in float): no rounding of alpha * self to
+    the half dtype first, as the CPU kernel does."""
+    torch.manual_seed(0)
+    x = (torch.randn(257) * 8).to(dtype)
+    o = (torch.randn(257) * 8).to(dtype)
+    got = torch.rsub(x.to(mojo_gpu), o.to(mojo_gpu), alpha=-3.125).cpu()
+    want = (o.double() + 3.125 * x.double()).float().to(dtype)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    got = torch.rsub(x.to(mojo_gpu), 1.7, alpha=0.3).cpu()
+    alpha, other = torch.tensor([0.3, 1.7]).tolist()  # rounded to float
+    want = (other - alpha * x.double()).float().to(dtype)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 # --------------------------------------------------------------------------

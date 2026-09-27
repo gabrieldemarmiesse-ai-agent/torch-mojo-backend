@@ -774,6 +774,90 @@ def kind_message(kind: str) -> Callable[[str], str]:
     return lambda message: f"{kind}: {message}"
 
 
+_NAN = float("nan")
+# case -> (fn(x, t), the twin it must reach)
+_CLAMP_NAN_CASES = {
+    "clamp_one_nan_min": (lambda x, t: torch.clamp(x, min=_NAN), "aten_clamp"),
+    "clamp_one_nan_max": (lambda x, t: torch.clamp(x, max=_NAN), "aten_clamp"),
+    "clamp_nan_and_bound": (lambda x, t: torch.clamp(x, _NAN, 3.0), "aten_clamp"),
+    "clamp_bound_and_nan": (lambda x, t: torch.clamp(x, 0.0, _NAN), "aten_clamp"),
+    "clamp_scalars": (lambda x, t: torch.clamp(x, -1.0, 1.5), "aten_clamp"),
+    "clamp_tensor_min": (lambda x, t: torch.clamp(x, min=t), "aten_clamp"),
+    "clamp_tensors": (lambda x, t: torch.clamp(x, t, t + 1), "aten_clamp"),
+    "clamp_min_nan": (lambda x, t: torch.clamp_min(x, _NAN), "aten_clamp_min"),
+    "clamp_min_tensor": (lambda x, t: torch.clamp_min(x, t), "aten_clamp_min"),
+    "clamp_max_nan": (lambda x, t: torch.clamp_max(x, _NAN), "aten_clamp_max"),
+    "clamp_max_tensor": (lambda x, t: torch.clamp_max(x, t), "aten_clamp_max"),
+}
+
+
+@pytest.mark.parametrize("case", list(_CLAMP_NAN_CASES))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
+def test_aten_clamp_nan_rules(
+    case: str, dtype: torch.dtype, device: str, call_checker: CallChecker
+):
+    """The compiled clamp / clamp_min / clamp_max match CPU torch 2.11 on
+    NaN: clamp_min / clamp_max and two-bound clamp fill a NaN Scalar bound,
+    one-bound clamp keeps x, a NaN in x or in a Tensor bound gives NaN there,
+    and a float bound promotes an integral x."""
+    fn, twin = _CLAMP_NAN_CASES[case]
+    call_checker.register(getattr(aten_functions, twin))
+    if dtype.is_floating_point:
+        x = torch.tensor([1.0, 2.0, _NAN, -5.0, 0.5], dtype=dtype)
+    else:
+        x = torch.tensor([1, 2, -3, 4, 0], dtype=dtype)
+    t = torch.tensor([_NAN, 0.0, 0.0, 0.0, 1.0])
+    expected = fn(x, t)
+    actual = torch.compile(fn, backend=mojo_backend)(x.to(device), t.to(device))
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x, lo, hi: torch.clamp_min(x, lo),
+        lambda x, lo, hi: torch.clamp_max(x, hi),
+        lambda x, lo, hi: torch.clamp(x, lo, hi),
+        lambda x, lo, hi: torch.clamp(x, min=lo),
+    ],
+    ids=["clamp_min", "clamp_max", "clamp", "clamp_min_only"],
+)
+def test_aten_clamp_zero_dim_bound_promotion(fn, device: str):
+    """A 0-d float32 Tensor bound promotes like a number (rank-aware
+    torch.result_type): a float16 [n] input stays float16, the bound
+    rounded to it (1.0001 -> 1)."""
+    x = torch.tensor([0.0, 2.0, -3.0], dtype=torch.float16)
+    lo = torch.tensor(1.0001)
+    hi = torch.tensor(1.9999)
+    expected = fn(x, lo, hi)
+    actual = torch.compile(fn, backend=mojo_backend)(
+        x.to(device), lo.to(device), hi.to(device)
+    )
+    assert actual.dtype == expected.dtype == torch.float16
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bound", ["min", "max"])
+def test_aten_clamp_single_nan_bound_is_a_fresh_tensor(bound: str, device: str):
+    """clamp with one NaN Scalar bound returns x's values in a NEW tensor,
+    as eager does: mutating the result leaves the input alone."""
+
+    def fn(x):
+        if bound == "min":
+            return torch.clamp(x, min=_NAN)
+        return torch.clamp(x, max=_NAN)
+
+    x_cpu = torch.tensor([1.0, 2.0, _NAN])
+    expected = fn(x_cpu)
+    x = x_cpu.to(device)
+    actual = torch.compile(fn, backend=mojo_backend)(x)
+    torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
+    assert actual.data_ptr() != x.data_ptr()
+    actual.add_(10)
+    torch.testing.assert_close(x.cpu(), x_cpu, equal_nan=True)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["compile", "max_eager"])
 def test_aten_shared_elementwise(dtype: torch.dtype, mode: str, device: str):
@@ -5344,6 +5428,217 @@ def test_aten_logical_or(conf: Conf, call_checker: CallChecker, dtype: torch.dty
     _compiled_matches_cpu(fn, [x, y])
 
 
+_POINTWISE_BINARY_TWINS = [
+    ("heaviside", aten.heaviside, torch.float32, "heaviside"),
+    ("atan2", aten.atan2, torch.float32, "float"),
+    ("copysign", aten.copysign, torch.float32, "float"),
+    ("fmax", aten.fmax, torch.float32, "float"),
+    ("fmin", aten.fmin, torch.int64, "int"),
+    ("fmod", aten.fmod, torch.float32, "float"),
+    ("gcd", aten.gcd, torch.int64, "int"),
+    ("lcm", aten.lcm, torch.int32, "int"),
+    ("hypot", aten.hypot, torch.float32, "float"),
+    ("nextafter", aten.nextafter, torch.float32, "float"),
+    ("bitwise_left_shift", aten.bitwise_left_shift, torch.int64, "shift"),
+    ("bitwise_right_shift", aten.bitwise_right_shift, torch.int32, "shift"),
+    ("__lshift__", aten.__lshift__, torch.int64, "shift"),
+    ("__rshift__", aten.__rshift__, torch.int64, "shift"),
+]
+
+
+def _pointwise_operands(domain: str, dtype: torch.dtype) -> list[torch.Tensor]:
+    torch.manual_seed(0)
+    if domain == "int":
+        return [
+            torch.randint(-20, 20, (3, 5)).to(dtype),
+            torch.randint(-20, 20, (5,)).to(dtype),
+        ]
+    if domain == "shift":
+        return [
+            torch.randint(-50, 50, (3, 5)).to(dtype),
+            torch.randint(0, 9, (5,)).to(dtype),
+        ]
+    if domain == "heaviside":
+        return [
+            torch.tensor([[-1.0, 0.0, 2.0, math.nan, 0.0]] * 3).to(dtype),
+            torch.tensor([0.5, 0.25, 7.0, 0.5, math.nan]).to(dtype),
+        ]
+    if domain == "zeta":
+        return [torch.rand(3, 5) * 4 + 1.1, torch.rand(5) + 0.5]
+    if domain == "poly":
+        return [torch.rand(3, 5) * 2 - 1, torch.randint(0, 6, (5,)).float()]
+    return [torch.randn(3, 5).to(dtype), torch.randn(5).to(dtype)]
+
+
+@pytest.mark.parametrize(
+    "name,op,dtype,domain",
+    _POINTWISE_BINARY_TWINS,
+    ids=[t[0] for t in _POINTWISE_BINARY_TWINS],
+)
+def test_aten_pointwise_binary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    op: Callable[..., torch.Tensor],
+    dtype: torch.dtype,
+    domain: str,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+
+    def fn(x, y):
+        return op(x, y)
+
+    inputs = _pointwise_operands(domain, dtype)
+    # nextafter is one ulp: a tolerance would accept the input unchanged.
+    tol = 0.0 if name == "nextafter" else 2e-5
+    if domain != "heaviside":  # check_outputs has no equal_nan for its NaN
+        check_outputs(fn, conf, inputs, rtol=tol, atol=tol)
+    _compiled_matches_cpu(fn, inputs, rtol=tol, atol=tol)
+
+
+def test_aten_rsub(conf: Conf, call_checker: CallChecker):
+    call_checker.register("aten::rsub.Tensor", "aten::rsub.Scalar")
+
+    def fn(a, b):
+        return aten.rsub(a, b, alpha=2), aten.rsub(a, 1.5)
+
+    check_outputs(fn, conf, [torch.randn(3, 4), torch.randn(4)])
+
+
+def test_aten_rsub_integral_promotes_before_alpha(call_checker: CallChecker):
+    """The compiled rsub (sub with swapped operands) and add promote int32
+    to int64 before scaling by alpha = 2**30, as ATen does."""
+    call_checker.register(aten_functions.aten_sub, aten_functions.aten_add)
+
+    def fn(a, b):
+        return (
+            torch.rsub(a, b, alpha=2**30),
+            torch.sub(b, a, alpha=2**30),
+            torch.add(b, a, alpha=2**30),
+        )
+
+    a = torch.tensor([100, -7, 3], dtype=torch.int32)
+    b = torch.tensor([0, 5, 2**40], dtype=torch.int64)
+    _compiled_matches_cpu(fn, [a, b])
+
+
+_INF_EDGES = [0.0, -0.0, 1.5, -2.0, 1e-40, float("inf"), float("-inf"), float("nan")]
+
+
+@pytest.mark.parametrize("name", ["isinf", "isposinf", "isneginf", "isfinite"])
+def test_aten_inf_predicates(conf: Conf, call_checker: CallChecker, name: str):
+    # isinf has an aten_functions twin; the other three are decomposed by
+    # the graph backend, so only the mojo device's own kernel counts.
+    if name == "isinf":
+        call_checker.register(aten_functions.aten_isinf)
+    else:
+        call_checker.register(f"aten::{name}")
+    op = getattr(aten, name)
+
+    def fn(x):
+        return op(x)
+
+    check_outputs(fn, conf, [torch.tensor(_INF_EDGES)])
+
+
+# Unary math and special functions: (aten_functions twin, aten call, input).
+_SPECIAL_UNARY_CASES = [
+    ("angle", lambda x: aten.angle(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("asin", lambda x: aten.asin(x), [-1.0, -0.5, 0.0, 0.25, 1.0]),
+    ("atan", lambda x: aten.atan(x), [-50.0, -1.0, 0.0, 0.5, 3.0]),
+    ("erfc", lambda x: aten.erfc(x), [-3.0, -0.5, 0.0, 2.0, 9.0]),
+    ("erfinv", lambda x: aten.erfinv(x), [-0.999, -0.5, 0.0, 0.3, 0.9]),
+    ("exp2", lambda x: aten.exp2(x), [-100.0, -1.5, 0.0, 3.0, 60.0]),
+    ("expm1", lambda x: aten.expm1(x), [-20.0, -1e-4, 0.0, 1e-3, 5.0]),
+    ("log10", lambda x: aten.log10(x), [1e-3, 0.5, 1.0, 10.0, 1e5]),
+    ("nan_to_num", lambda x: aten.nan_to_num(x, 0.5), [-1.0, 0.0, 2.0, 1e3, 3.0]),
+    ("sgn", lambda x: aten.sgn(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("signbit", lambda x: aten.signbit(x), [-2.0, -0.0, 0.0, 3.0]),
+    ("sinc", lambda x: aten.sinc(x), [-2.5, -0.1, 0.0, 0.5, 7.0]),
+]
+
+
+# Float and double only in stock torch (AT_DISPATCH_FLOATING_TYPES).
+_NO_HALF_KERNEL: set[str] = set()
+
+
+# logit's bfloat16 reference would be CPU torch's reduced-precision path,
+# which differs from CUDA's (float compute, one rounding; what the device does).
+_SPECIAL_UNARY_PARAMS = [
+    pytest.param(name, fn, values, dtype, id=f"{name}-{i}-{str(dtype)[6:]}")
+    for i, (name, fn, values) in enumerate(_SPECIAL_UNARY_CASES)
+    for dtype in (torch.float32, torch.bfloat16)
+    if dtype == torch.float32 or name not in _NO_HALF_KERNEL | {"logit"}
+]
+
+
+@pytest.mark.parametrize("name,fn,values,dtype", _SPECIAL_UNARY_PARAMS)
+def test_aten_special_unary(
+    conf: Conf,
+    call_checker: CallChecker,
+    name: str,
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    values: list[float],
+    dtype: torch.dtype,
+):
+    call_checker.register(getattr(aten_functions, f"aten_{name}"))
+    check_outputs(fn, conf, [torch.tensor(values, dtype=dtype)])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_aten_special_unary_compiled_batch(dtype: torch.dtype, device: str):
+    """The torch.compile twins of every case above, in one graph (the shared
+    elementwise kinds, the polygamma binary op and the compositions), against
+    stock torch on the same device."""
+    checkers = []
+    for name, _, _ in _SPECIAL_UNARY_CASES:
+        checker = CallChecker()
+        checker.register(getattr(aten_functions, f"aten_{name}"))
+        checkers.append(checker)
+    # The graph follows CUDA's reduced-precision arithmetic on every device:
+    # logit in float with one rounding, round.decimals in the tensor dtype.
+    # CPU torch does neither, and stock CUDA has no half angle to compare to.
+    no_half = {"logit", "round"} if device == "cpu" else {"angle"}
+    cases = [
+        case
+        for case in _SPECIAL_UNARY_CASES
+        if dtype == torch.float32 or case[0] not in _NO_HALF_KERNEL | no_half
+    ]
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(case[1](x) for case in cases)
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    x = torch.linspace(0.05, 0.95, 64, dtype=torch.float32, device=device).to(dtype)
+    for case, result, expected in zip(cases, compiled(x), fn(x), strict=True):
+        torch.testing.assert_close(
+            result,
+            expected,
+            equal_nan=True,
+            msg=lambda message, name=case[0]: f"{name}: {message}",
+        )
+    called = [c for c, case in zip(checkers, _SPECIAL_UNARY_CASES) if case in cases]
+    for checker in called:
+        checker.check_was_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.int64, torch.bool])
+def test_aten_nan_to_num_integral_compiled_is_a_copy(dtype: torch.dtype, device: str):
+    """nan_to_num of an integer or bool tensor changes nothing, yet eager
+    torch returns a new tensor: the compiled result must not alias the input
+    either, or writing into it would change the input."""
+    call_checker = CallChecker()
+    call_checker.register(aten_functions.aten_nan_to_num)
+    x = torch.tensor([3, 0, 1, 2], device=device).to(dtype)
+    before = x.clone()
+    got = torch.compile(torch.nan_to_num, backend=mojo_backend, fullgraph=True)(x)
+    call_checker.check_was_called()
+    torch.testing.assert_close(got, torch.nan_to_num(before))
+    assert got.data_ptr() != x.data_ptr()
+    got.zero_()
+    torch.testing.assert_close(x, before)
+
+
 def test_aten_logical_and_bool_tensors(conf: Conf):
     """Test aten.logical_and with boolean tensors"""
 
@@ -5453,6 +5748,25 @@ def test_aten_logical_ops_read_nan_as_true_compiled(op: Callable[..., torch.Tens
     x = torch.tensor([nan, nan, 0.0, 1.0, nan])
     y = torch.tensor([0.0, nan, nan, 0.0, 1.0])
     _compiled_matches_cpu(lambda a, b: op(a, b), [x, y])
+
+
+@pytest.mark.parametrize(
+    "op,values",
+    [
+        (aten.atan, [-math.inf, -1e30, 0.5, math.inf, math.nan]),
+        (aten.exp2, [-math.inf, -150.0, 127.5, 128.0, 200.0, math.inf, math.nan]),
+        (aten.expm1, [-math.inf, -100.0, 88.7, 89.0, 100.0, math.inf, math.nan]),
+        (aten.log10, [0.0, -1.0, 1e-30, 1e30, math.inf, math.nan]),
+    ],
+    ids=["atan", "exp2", "expm1", "log10"],
+)
+def test_aten_elementary_unary_edges_compiled(
+    op: Callable[..., torch.Tensor], values: list[float]
+):
+    """Overflow points, infinities and NaN through the CPU graph, whose
+    exp2 is libm's (the stdlib one clamps to 2^126 and reads NaN as finite).
+    Subnormal inputs are left out: MAX's CPU runtime flushes them to zero."""
+    _compiled_matches_cpu(lambda a: op(a), [torch.tensor(values)])
 
 
 def test_aten_logical_and_negative_values(conf: Conf):

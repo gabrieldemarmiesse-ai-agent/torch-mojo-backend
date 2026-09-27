@@ -46,6 +46,9 @@ ARITH_OPS = {
     "sub.Tensor": torch.sub,
     "mul.Tensor": torch.mul,
     "div.Tensor": torch.div,
+    "rsub.Tensor": torch.rsub,
+    # b is unused: rsub.Scalar embeds the number in the one sub launch.
+    "rsub.Scalar": lambda a, b: torch.rsub(a, 2.0),
 }
 MINMAX_OPS = {"maximum": torch.maximum, "minimum": torch.minimum}
 COMPARE_OPS = {
@@ -60,6 +63,29 @@ BITWISE_OPS = {
     "bitwise_and": torch.bitwise_and,
     "bitwise_or": torch.bitwise_or,
     "bitwise_xor": torch.bitwise_xor,
+}
+# The pointwise family (tmb/ops/pointwise.mojo): float binary math on
+# operands in unit_interval (inside every domain here: xlogy/xlog1py need
+# y > 0, fmod a nonzero divisor).
+MATH_OPS = {
+    "atan2": torch.atan2,
+    "copysign.Tensor": torch.copysign,
+    "fmax": torch.fmax,
+    "fmin": torch.fmin,
+    "fmod.Tensor": torch.fmod,
+    "heaviside": torch.heaviside,
+    "hypot": torch.hypot,
+    "logaddexp": torch.logaddexp,
+    "logaddexp2": torch.logaddexp2,
+    "nextafter": torch.nextafter,
+    "special_xlog1py": torch.special.xlog1py,
+    "xlogy.Tensor": torch.xlogy,
+}
+INT_MATH_OPS = {
+    "bitwise_left_shift.Tensor": torch.bitwise_left_shift,
+    "bitwise_right_shift.Tensor": torch.bitwise_right_shift,
+    "gcd": torch.gcd,
+    "lcm": torch.lcm,
 }
 LOGICAL_OPS = {
     "logical_and": torch.logical_and,
@@ -81,6 +107,8 @@ COVERS: dict[str, str] = (
         for variant in ("Scalar", "Tensor")
     }
     | {f"aten::{name}": "test_logical" for name in LOGICAL_OPS}
+    | {f"aten::{name}": "test_binary_math" for name in MATH_OPS}
+    | {f"aten::{name}": "test_int_math" for name in INT_MATH_OPS}
     | {
         "aten::pow.Tensor_Scalar": "test_pow[Scalar]",
         "aten::pow.Tensor_Tensor": "test_pow[Tensor]",
@@ -99,6 +127,9 @@ COVERS: dict[str, str] = (
         "aten::lerp.Scalar_out": "test_lerp_inplace",
         "aten::lerp_.Scalar": "test_lerp_inplace",
         "aten::clamp": "test_clamp",
+        "aten::clamp.Tensor": "test_clamp_tensor",
+        "aten::lerp.Tensor": "test_lerp_tensor",
+        "aten::pow.Scalar": "test_pow_scalar_base",
         "aten::addcdiv": "test_addcdiv",
         "aten::addcdiv.out": "test_addcdiv_inplace",
         "aten::addcdiv_": "test_addcdiv_inplace",
@@ -125,21 +156,79 @@ _OUT = (
     "(computed straight into `out` when it has the result's dtype, shape and "
     "a dense layout, else computed then copied into it)"
 )
+_CLAMP_SCALAR = "the ClampScalar kernel test_clamp measures, one bound disabled"
+_MAXMIN_BOUND = (
+    "ATen's clamp_{min,max}_Tensor_out is maximum_stub / minimum_stub: the "
+    "MaximumSpec / MinimumSpec kernels test_minmax measures"
+)
+_SCALAR_OPERAND = (
+    "the Tensor overload's kernel with the scalar passed by value in a slot "
+    "(no device operand read); nothing new to time"
+)
+_SHIFT_ALIAS = (
+    "the lshift/rshift kernels test_int_math measures through "
+    "bitwise_{left,right}_shift.Tensor (the Python operator spelling)"
+)
+_SHIFT_INPLACE = "in-place form of the same lshift/rshift launch, written into self"
 
 SKIPPED: dict[str, str] = {
+    "aten::__ilshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__ilshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__irshift__.Scalar": _SHIFT_INPLACE,
+    "aten::__irshift__.Tensor": _SHIFT_INPLACE,
+    "aten::__lshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__lshift__.Tensor": _SHIFT_ALIAS,
+    "aten::__rshift__.Scalar": _SHIFT_ALIAS,
+    "aten::__rshift__.Tensor": _SHIFT_ALIAS,
+    "aten::atan2.out": _OUT,
     "aten::bitwise_and.Scalar_out": _OUT,
     "aten::bitwise_and.Tensor_out": _OUT,
+    "aten::bitwise_left_shift.Tensor_out": _OUT,
     "aten::bitwise_or.Scalar_out": _OUT,
     "aten::bitwise_or.Tensor_out": _OUT,
+    "aten::bitwise_right_shift.Tensor_out": _OUT,
     "aten::bitwise_xor.Scalar_out": _OUT,
     "aten::bitwise_xor.Tensor_out": _OUT,
+    "aten::clamp.Tensor_out": _OUT,
+    "aten::clamp.out": _OUT,
+    "aten::clamp_max": _CLAMP_SCALAR,
+    "aten::clamp_max.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_max.Tensor_out": _OUT,
+    "aten::clamp_max.out": _OUT,
+    "aten::clamp_min": _CLAMP_SCALAR,
+    "aten::clamp_min.Tensor": _MAXMIN_BOUND,
+    "aten::clamp_min.Tensor_out": _OUT,
+    "aten::clamp_min.out": _OUT,
+    "aten::copysign.Scalar": _SCALAR_OPERAND,
+    "aten::copysign.Scalar_out": _OUT,
+    "aten::copysign.out": _OUT,
+    "aten::fmax.out": _OUT,
+    "aten::fmin.out": _OUT,
+    "aten::fmod.Scalar": _SCALAR_OPERAND,
+    "aten::fmod.Scalar_out": _OUT,
+    "aten::fmod.Tensor_out": _OUT,
+    "aten::gcd.out": _OUT,
+    "aten::heaviside.out": _OUT,
+    "aten::hypot.out": _OUT,
+    "aten::lcm.out": _OUT,
+    "aten::lerp.Tensor_out": _OUT,
+    "aten::logaddexp.out": _OUT,
+    "aten::logaddexp2.out": _OUT,
     "aten::logical_and.out": _OUT,
     "aten::logical_or.out": _OUT,
     "aten::logical_xor.out": _OUT,
     "aten::maximum.out": _OUT,
     "aten::minimum.out": _OUT,
+    "aten::nextafter.out": _OUT,
+    "aten::pow.Scalar_out": _OUT,
+    "aten::pow.Tensor_Scalar_out": _OUT,
+    "aten::pow.Tensor_Tensor_out": _OUT,
     "aten::remainder.Scalar_out": _OUT,
     "aten::remainder.Tensor_out": _OUT,
+    "aten::rsub.Scalar_out": _OUT,
+    "aten::rsub.Tensor_out": _OUT,
+    "aten::special_xlog1py.out": _OUT,
+    "aten::xlogy.OutTensor": _OUT,
 }
 
 
@@ -318,6 +407,49 @@ def test_logical(
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(MATH_OPS))
+def test_binary_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = MATH_OPS[op_name]
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("i32",))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.parametrize("op_name", op_params(INT_MATH_OPS))
+def test_int_math(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    fn = INT_MATH_OPS[op_name]
+    shape = SHAPES[shape_id]
+    high = 31 if "shift" in op_name else 1 << 20
+    a_ref, a_our = both(
+        torch.randint(1, 1 << 20, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    b_ref, b_our = both(
+        torch.randint(1, high, shape, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: fn(a_ref, b_ref), lambda: fn(a_our, b_our), flops=float(a_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
 @pytest.mark.parametrize("shape_id", SHAPES)
 @pytest.mark.bench_op("pow")
@@ -459,6 +591,55 @@ def test_clamp(
         lambda: torch.clamp(a_ref, 0.2, 0.8),
         lambda: torch.clamp(a_our, 0.2, 0.8),
         flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("clamp.Tensor")
+def test_clamp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    # The bounds are built once, outside the timed legs: only clamp is measured.
+    lo_ref, hi_ref = b_ref - 0.2, b_ref + 0.2
+    lo_our, hi_our = b_our - 0.2, b_our + 0.2
+    bench.run(
+        lambda: torch.clamp(a_ref, lo_ref, hi_ref),
+        lambda: torch.clamp(a_our, lo_our, hi_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("lerp.Tensor")
+def test_lerp_tensor(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our = _pair(shape_id, dtype_id, "contig", hw, mojo_device)
+    w_ref, w_our = both(
+        unit_interval(SHAPES[shape_id], DTYPES[dtype_id]), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.lerp(a_ref, b_ref, w_ref),
+        lambda: torch.lerp(a_our, b_our, w_our),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("pow.Scalar")
+def test_pow_scalar_base(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape = SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.pow(2.5, x_ref),
+        lambda: torch.pow(2.5, x_our),
+        flops=float(x_ref.numel()),
     )
 
 

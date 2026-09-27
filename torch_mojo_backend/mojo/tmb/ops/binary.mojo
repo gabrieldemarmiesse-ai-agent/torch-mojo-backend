@@ -83,6 +83,7 @@ from tmb.ops.common import (
     fill_value,
     is_int_stype,
     resize_out,
+    scalar_to_float,
     scalar_to_int,
 )
 from tmb.ops.core import cast_for_copy
@@ -1428,10 +1429,25 @@ def _b_add(
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_add_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
+    var scaled = _b_scale_promoted(lhs, rhs.t.value(), alpha, alpha_i)
     var res = _b_add_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
+
+
+def _b_scale_promoted(
+    lhs: Side, rhs: T, alpha: Float64, alpha_i: Optional[Int]
+) raises -> Held:
+    """`rhs * alpha` in the add/sub's result dtype: ATen promotes both
+    operands before its kernel scales `other`, so an int32 operand times
+    alpha = 2**30 against an int64 one must not wrap in int32 first."""
+    var common = _b_promote(lhs.t.value(), rhs) if lhs.is_t else (
+        _b_side_result(rhs, lhs)
+    )
+    if common < 0 or common == rhs.stype:
+        return _b_scale(rhs, alpha, alpha_i)
+    var promoted = _b_cast(rhs, common)
+    return _b_scale(promoted.t, alpha, alpha_i)
 
 
 def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
@@ -1460,7 +1476,7 @@ def _b_sub(
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_sub_routes(lhs, scaled_s^, dst)
-    var scaled = _b_scale(rhs.t.value(), alpha, alpha_i)
+    var scaled = _b_scale_promoted(lhs, rhs.t.value(), alpha, alpha_i)
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
@@ -2426,9 +2442,10 @@ def _b_clamp(
 
 def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
+    # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
+    # an integral one).
     if _b_is_floating(result_stype):
-        return Int(f64_bits(v_f64(v)))
-    # `Scalar::to<scalar_t>()`: exact, and checked against the dtype.
+        return Int(f64_bits(scalar_to_float(v, result_stype)))
     return scalar_to_int(v, result_stype)
 
 
@@ -2872,6 +2889,15 @@ def register_binary(site: Site) raises:
     impl[op_bitwise_xor_out, "bitwise_xor.Tensor_out"](site)
     impl[op_bitwise_xor_out, "bitwise_xor.Scalar_out"](site)
     impl[op_clamp, "clamp"](site)
+    impl[op_clamp_out, "clamp.out"](site)
+    impl[op_clamp_max, "clamp_max"](site)
+    impl[op_clamp_max_out, "clamp_max.out"](site)
+    impl[op_clamp_max_tensor, "clamp_max.Tensor"](site)
+    impl[op_clamp_max_tensor_out, "clamp_max.Tensor_out"](site)
+    impl[op_clamp_min, "clamp_min"](site)
+    impl[op_clamp_min_out, "clamp_min.out"](site)
+    impl[op_clamp_min_tensor, "clamp_min.Tensor"](site)
+    impl[op_clamp_min_tensor_out, "clamp_min.Tensor_out"](site)
     impl[op_div_tensor, "div.Tensor"](site)
     impl[op_div_mode, "div.Tensor_mode"](site)
     impl[op_div_out, "div.out"](site)
