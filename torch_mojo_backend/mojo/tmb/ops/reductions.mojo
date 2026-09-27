@@ -1,6 +1,6 @@
 """ATen ops: reductions (sum, nansum, mean, amax/amin, max/min, the
-arg-reductions, any/all, count_nonzero, var, the L2 vector norm, cumsum, and
-sort/topk).
+arg-reductions, any/all, count_nonzero, var, the vector norm (ord=2,
+ord=-inf), cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -24,7 +24,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
-from std.utils.numerics import nan
+from std.utils.numerics import min_or_neg_inf, nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -1624,40 +1624,42 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm / norm (ord in {0, 2}: one pass each, no separate
-# elementwise map/reduce launch pair). `norm`'s six legacy overloads are
-# torch's own redispatch onto this op (`impl_func_norm` in ATen's
-# ReduceOps.cpp: p=None -> 2, dim=[] -> every dim), so they share every
-# helper below with `linalg_vector_norm`.
+# linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|),
+# ord=-inf (min of |x|) and ord=0 (count of nonzero) share everything but the
+# accumulator; other ords decline. `norm`'s six legacy overloads are torch's
+# own redispatch onto this op (`impl_func_norm` in ATen's ReduceOps.cpp:
+# p=None -> 2, dim=[] -> every dim), so they share every helper below with
+# `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_spec(
-    op_label: StaticString, ord_v: Value
-) raises -> StaticString:
-    """Which compiled reduction spec implements this `ord`; a missing `ord`
-    (legacy `norm`'s `p=None`) means 2, same as torch's `impl_func_norm`.
-
-    One `if` per ord in torch's declared order (2, 1, +inf, -inf, 0), so a
-    sibling ord lands as one more branch here plus one more `NormL*Op` /
-    `_op_on` arm in entry.mojo.
-    """
-    if not v_scalar_is_bool(ord_v):
-        var ord = v_f64_or(ord_v, 2.0)
-        if ord == 2.0:
-            return "NormSpec"
-        if ord == 0.0:
-            return "NormL0Spec"
-    unsupported(String(op_label) + " with ord != 2, 0")
-    return "NormSpec"
+def _vector_norm_spec(ord_v: Value) raises -> StaticString:
+    """The kernel op token for `ord`, shared by every overload of both ops:
+    a missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
+    `impl_func_norm`. One `if` per supported ord, in torch's own
+    enumeration order (2, 1, inf, -inf, 0) -- sibling ops land one branch at
+    a time here; every other ord declines."""
+    if v_scalar_is_bool(ord_v):
+        unsupported("vector_norm with an unsupported ord")
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f == 2.0:
+        return "NormSpec"
+    if ord_f == 1.0:
+        return "NormL1Spec"
+    if ord_f == min_or_neg_inf[DType.float64]():
+        return "NormNegInfSpec"
+    if ord_f == 0.0:
+        return "NormL0Spec"
+    unsupported("vector_norm with an unsupported ord")
+    return ""
 
 
 def _vector_norm_operand(
     op_label: StaticString, dtype_v: Value, mut src: Operand
 ) raises:
-    """The `dtype=` gate shared by every overload of both ops: `dtype=`
-    selects the accumulation type by casting first (clip_grad_norm_ asks for
-    float32).
+    """The `dtype=` gate shared by every ord and every overload of both ops:
+    `dtype=` selects the accumulation type by casting first (clip_grad_norm_
+    asks for float32).
 
     torch validates the INPUT's own dtype unconditionally
     (`checkFloatingOrComplex` in `TORCH_META_FUNC(linalg_vector_norm)`)
@@ -1693,11 +1695,11 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     1e20: `(1e20)**2` overflows to inf, `sqrt(inf)` stays inf), so torch
     special-cases this to `abs()` instead of routing it through the
     square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
-    LinearAlgebra.cpp. torch ALSO special-cases `ord == 0` there to `ne(0)`
-    instead of `abs()` (counting is not magnitude), so callers must skip this
-    shortcut for ord=0: the general reduce path already computes `ne(0)`
-    correctly through `NormL0Op` for a size-one reduction, same as any other
-    size.
+    LinearAlgebra.cpp. That special case fires for every ord != 0 (torch maps
+    `ord == 0` to `ne(0)` there instead, since counting is not magnitude), so
+    it is correct for ord=1, 2 and -inf here; callers must skip it for ord=0,
+    where the general reduce path already computes `ne(0)` correctly through
+    `NormL0Op` for a size-one reduction, same as any other size.
     """
     for d in dims:
         if a.dim(d) != 1:
@@ -1758,7 +1760,7 @@ def _vector_norm(
     rets: Values,
 ) raises:
     _require_mojo(a)
-    var op = _vector_norm_spec(op_label, ord_v)
+    var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
     _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
@@ -1769,6 +1771,10 @@ def _vector_norm(
         ret_owned(rets, 0, out)
         _ = src^
         return
+    if op == "NormNegInfSpec":
+        # -inf has no identity: torch refuses a zero-length reduce dim (an
+        # empty output is still fine -- there is nothing to refuse for it).
+        _refuse_empty_extremum(op_label, src.t, dims)
     var out = _scalar_reduction(
         "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
     )
@@ -1789,7 +1795,7 @@ def _vector_norm_out(
 ) raises:
     _require_mojo(a)
     _require_mojo(out)
-    var op = _vector_norm_spec(op_label, ord_v)
+    var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
     _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
@@ -1800,6 +1806,8 @@ def _vector_norm_out(
         ret_ref(rets, 0, out)
         _ = src^
         return
+    if op == "NormNegInfSpec":
+        _refuse_empty_extremum(op_label, src.t, dims)
     _scalar_reduction_out(
         "reduction",
         op,

@@ -2,14 +2,14 @@
 # One reduction skeleton, parametrized over the ACCUMULATOR.
 #
 # Every scalar-payload reduction this backend implements -- sum, nansum,
-# mean, amax, amin, max, min, the L2 vector norm, any, all and count_nonzero
-# -- is the same three moving parts over the same geometry, and they used to
-# be nine hand-written launches with three different launch policies between
-# them. What actually differs between two of them is four lines of algebra:
-# the accumulator dtype, its identity, how an input element maps into it, how
-# two accumulators combine, and how a finished accumulator becomes an output
-# element. `ReduceOp` is that four-line interface and everything below is
-# written once against it.
+# mean, amax, amin, max, min, the L1/L2/-inf vector norms, any, all and
+# count_nonzero -- is the same three moving parts over the same geometry, and
+# they used to be nine hand-written launches with three different launch
+# policies between them. What actually differs between two of them is four
+# lines of algebra: the accumulator dtype, its identity, how an input element
+# maps into it, how two accumulators combine, and how a finished accumulator
+# becomes an output element. `ReduceOp` is that four-line interface and
+# everything below is written once against it.
 #
 # GEOMETRY. The input is a contiguous buffer viewed as (outer, reduce, inner):
 # element (o, r, i) sits at `(o * reduce + r) * inner + i` and output (o, i) at
@@ -520,6 +520,93 @@ struct NormL2Op(ReduceOp):
         acc: DType, //, out_dt: DType
     ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
         return sqrt(a).cast[out_dt]()
+
+
+struct NormL1Op(ReduceOp):
+    """linalg_vector_norm(ord=1): sum of absolute values, no finalize root."""
+
+    comptime name = "norml1"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return abs(x.cast[acc]())
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
+struct NormNegInfOp(ReduceOp):
+    """linalg_vector_norm(ord=-inf): min of |x|, identity +inf.
+
+    Torch refuses this one on an empty reduce dim (`AbsMinOps`'s identity is
+    only a stand-in for the merge across splits, not a real answer for "no
+    elements": there is no minimum of an empty set), matching amax/amin
+    rather than the L2 norm, whose sum-of-squares identity (0) is a genuine
+    answer.
+    """
+
+    comptime name = "normneginf"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = True
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return _float_acc[in_dt]()
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](max_or_inf[acc]())
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return abs(x.cast[acc]())
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        comptime if dtype.is_floating_point():
+            # Mirrors MinOp.combine: NaN propagates (torch's `min_propagate_nan`).
+            return (b.lt(a) | isnan(b)).select(b, a)
+        else:
+            return min(a, b)
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
 
 
 struct NormL0Op(ReduceOp):
