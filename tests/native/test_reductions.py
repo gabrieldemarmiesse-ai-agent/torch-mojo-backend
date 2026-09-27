@@ -301,7 +301,7 @@ def test_anyall_nan_is_truthy(mojo_device):
 @pytest.mark.parametrize("dim_kw", [{}, {"dim": 1}, {"dim": [0, 1]}])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bool, torch.int32, torch.float32])
 def test_any_all_uint8_input_keeps_uint8_output(mojo_gpu, op, dim_kw, dtype):
-    """torch's uint8 compatibility (native_functions.yaml, Note "[all, any :
+    """torch's uint8 compatibility (ReduceOps.cpp, Note "[all, any :
     uint8 compatibility]"): a uint8 input's any/any.dim/any.dims (and all's)
     result stays uint8; every other truthy dtype still narrows to bool."""
     fn = torch.all if op == "all" else torch.any
@@ -379,9 +379,13 @@ def test_nansum_dtype_promotion(mojo_gpu):
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(ours.cpu(), expected)
 
-    # An explicit dtype=int32 is declined, same as sum's own dtype= gate.
+    # An explicit dtype=int32 is declined (`_is_sum_dtype`, same as sum's own
+    # dtype= gate) regardless of the input -- use an INTEGRAL input here so
+    # this actually exercises that gate, rather than the floating-input ->
+    # integral-dtype rejection below (which would fire first on `y`).
+    i32 = torch.randint(0, 20, (4, 5), dtype=torch.int32)
     with pytest.raises(NotImplementedError):
-        torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.int32)
+        torch.nansum(i32.to(mojo_gpu), dim=1, dtype=torch.int32)
 
     # An explicit integral dtype on a floating input is declined outright:
     # this backend has no `nan_to_num` kernel to zero the NaN before the cast
@@ -494,10 +498,25 @@ def test_count_nonzero_nan_counts_as_nonzero(mojo_device):
 
 
 def test_count_nonzero_noncontiguous_and_empty(mojo_device):
-    x = torch.randn(4, 6)
+    """A deterministic zero/nonzero pattern whose per-row and per-column
+    counts differ, reduced along both axes of a transposed (non-contiguous)
+    view -- random normals are virtually always nonzero, so a stride bug
+    that skips or duplicates elements would not change the count and would
+    go undetected."""
+    x = torch.tensor(
+        [
+            [1.0, 0.0, 3.0, 0.0, 5.0, 0.0],
+            [0.0, 0.0, 0.0, 4.0, 5.0, 6.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
     xd = x.to(mojo_device)
     torch.testing.assert_close(
         torch.count_nonzero(xd.t(), dim=0).cpu(), torch.count_nonzero(x.t(), dim=0)
+    )
+    torch.testing.assert_close(
+        torch.count_nonzero(xd.t(), dim=1).cpu(), torch.count_nonzero(x.t(), dim=1)
     )
     e = torch.empty(0)
     ed = e.to(mojo_device)
@@ -1337,9 +1356,19 @@ def test_min_dim_out_into_a_strided_destination(mojo_gpu):
 
 def test_any_out_accepts_a_uint8_destination(mojo_gpu):
     """`any.out`'s dtype policy is bool-or-uint8, so a uint8 `out` is written
-    through the cast kernel rather than refused."""
-    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    through the cast kernel rather than refused. Deterministic rows (an
+    all-False row included) so both outcomes are exercised, unlike random
+    zero-containing data which is almost always any=True per row."""
+    mask = torch.tensor(
+        [
+            [False, False, False, False, False, False, False],
+            [False, False, True, False, False, False, False],
+            [True, True, True, True, True, True, True],
+            [False, False, False, False, False, False, False],
+        ]
+    )
     expected = torch.any(mask, dim=1)
+    assert expected.tolist() == [False, True, True, False]
     out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)
     torch.any(mask.to(mojo_gpu), dim=1, out=out)
     torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
@@ -1356,39 +1385,67 @@ def test_any_out_accepts_a_uint8_destination(mojo_gpu):
 def test_all_out_variants(mojo_gpu, keepdim, dtype):
     """all.out (int dim), all.dims_out (dim list) and all.all_out (no dim,
     full reduction) all round-trip through the out= tensor, reusing the
-    same AllOp path as the non-out overloads."""
-    if dtype is torch.bool:
-        x = torch.randint(0, 2, (6, 9), dtype=dtype)
-    else:
-        x = torch.randint(0, 3, (6, 9), dtype=dtype)
-    xd = x.to(mojo_gpu)
+    same AllOp path as the non-out overloads. Random zero-containing data
+    almost never has an all-True row, so the rows below are a deterministic
+    mix of all-nonzero, all-zero and one-zero; the full/dims_out cases (one
+    scalar each, so they can't show both outcomes in a single call) are
+    checked against this mixed tensor (a real, non-vacuous False) and a
+    second all-nonzero one (True)."""
+    mixed = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 1, 1, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2, 2],
+            [1, 1, 1, 1, 0, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2, 2],
+        ]
+    ).to(dtype)
+    all_true = torch.full_like(mixed, 1)
+    xd = mixed.to(mojo_gpu)
 
     # `out=` fixes the result dtype explicitly (here bool), which the
     # bool-or-uint8 policy accepts regardless of the input's dtype -- unlike
     # the no-out overloads, which follow the uint8-input-keeps-uint8 rule.
-    expected = torch.all(x, dim=1, keepdim=keepdim).bool()
+    expected = torch.all(mixed, dim=1, keepdim=keepdim).bool()
+    assert expected.reshape(-1).tolist() == [True, False, False, True, False, True]
     out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
     returned = torch.all(xd, dim=1, keepdim=keepdim, out=out)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), expected)
 
-    expected_dims = torch.all(x, dim=(0, 1), keepdim=keepdim).bool()
-    out_dims = torch.empty(expected_dims.shape, dtype=torch.bool, device=mojo_gpu)
-    returned = torch.all(xd, dim=(0, 1), keepdim=keepdim, out=out_dims)
-    assert returned.data_ptr() == out_dims.data_ptr()
-    torch.testing.assert_close(out_dims.cpu(), expected_dims)
+    for src, want in ((mixed, False), (all_true, True)):
+        srcd = src.to(mojo_gpu)
+        expected_dims = torch.all(src, dim=(0, 1), keepdim=keepdim).bool()
+        assert expected_dims.item() == want
+        out_dims = torch.empty(expected_dims.shape, dtype=torch.bool, device=mojo_gpu)
+        returned = torch.all(srcd, dim=(0, 1), keepdim=keepdim, out=out_dims)
+        assert returned.data_ptr() == out_dims.data_ptr()
+        torch.testing.assert_close(out_dims.cpu(), expected_dims)
 
-    expected_full = torch.all(x).bool()
-    out_full = torch.empty((), dtype=torch.bool, device=mojo_gpu)
-    returned = torch.all(xd, out=out_full)
-    assert returned.data_ptr() == out_full.data_ptr()
-    torch.testing.assert_close(out_full.cpu(), expected_full)
+        expected_full = torch.all(src).bool()
+        assert expected_full.item() == want
+        out_full = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+        returned = torch.all(srcd, out=out_full)
+        assert returned.data_ptr() == out_full.data_ptr()
+        torch.testing.assert_close(out_full.cpu(), expected_full)
 
 
 def test_all_out_accepts_a_uint8_destination(mojo_gpu):
-    """all's out dtype policy is bool-or-uint8, mirroring any.out."""
-    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    """all's out dtype policy is bool-or-uint8, mirroring any.out.
+    Deterministic rows (an all-True row included) so both outcomes are
+    exercised, unlike random zero-containing data which is almost always
+    all=False per row."""
+    mask = torch.tensor(
+        [
+            [True, True, True, True, True, True, True],
+            [True, False, True, True, True, True, True],
+            [False, False, False, False, False, False, False],
+            [True, True, True, True, True, True, True],
+        ]
+    )
     expected = torch.all(mask, dim=1)
+    assert expected.tolist() == [True, False, False, True]
     out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)
     torch.all(mask.to(mojo_gpu), dim=1, out=out)
     torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
@@ -1446,12 +1503,19 @@ def test_any_all_out_full_reduction(mojo_gpu, dtype):
     The `out=` dtype is bool here on both sides, so the input-dtype-dependent
     result-dtype rule (`aten::any` w/o `out` keeps a uint8 input as uint8)
     does not come into play; that overload is unrelated to this one.
+
+    Random data with `> 0.3` is True with 99.9997% probability over 30
+    elements, so the "True" and "all-False" cases below are deterministic
+    (one hot element, and an actual non-empty all-zero tensor) rather than
+    relying on chance.
     """
-    x = (torch.randn(5, 6) > 0.3).to(dtype)
+    x = torch.zeros(5, 6, dtype=dtype)
+    x[2, 3] = 1
     xd = x.to(mojo_gpu)
     out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
     expected = torch.empty((), dtype=torch.bool)
     torch.any(x, out=expected)
+    assert expected.item() is True
     returned = torch.any(xd, out=out)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), expected)
@@ -1460,6 +1524,14 @@ def test_any_all_out_full_reduction(mojo_gpu, dtype):
     xt = x.t()
     torch.any(xt, out=expected)
     torch.any(xt.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # A real, non-empty all-zero input (not the vacuous empty-tensor
+    # identity below): the sum-of-truthiness ops must find no True anywhere.
+    zeros_nonempty = torch.zeros(5, 6, dtype=dtype)
+    torch.any(zeros_nonempty, out=expected)
+    assert expected.item() is False
+    torch.any(zeros_nonempty.to(mojo_gpu), out=out)
     torch.testing.assert_close(out.cpu(), expected)
 
     # all-False input, including the empty-tensor case (identity = False)
@@ -1471,8 +1543,10 @@ def test_any_all_out_full_reduction(mojo_gpu, dtype):
 
 def test_any_all_out_uint8_destination_and_resize(mojo_gpu):
     """bool-or-uint8 dtype policy and `resize_output` apply to all_out too."""
-    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    mask = torch.zeros(4, 7, dtype=torch.bool)
+    mask[1, 3] = True
     expected = torch.any(mask)
+    assert expected.item() is True
     out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)  # wrong shape too
     torch.any(mask.to(mojo_gpu), out=out)
     assert tuple(out.shape) == ()
@@ -1495,8 +1569,12 @@ def test_any_all_out_nan_is_truthy(mojo_gpu):
 @pytest.mark.parametrize("dims", [None, [0], [1], [0, 2], [-1, 0]])
 def test_any_dims_out(mojo_gpu, dims, keepdim):
     """`any.dims_out`: optional int[] dim (None = full reduce), like
-    `any.dims` but writing into `out`."""
-    x = torch.randn(3, 4, 5) > 0
+    `any.dims` but writing into `out`. A sparse deterministic hot-cell
+    pattern (6 True cells out of 60) rather than random data, so every dims
+    combination's output mixes True and False instead of "almost always
+    True" (`any` over ~15-20 random booleans per fiber is True >99.99% of
+    the time)."""
+    x = torch.arange(60).reshape(3, 4, 5) % 11 == 0
     xd = x.to(mojo_gpu)
     expected = torch.any(x, dim=dims, keepdim=keepdim)
     out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
@@ -1513,8 +1591,16 @@ def test_any_dims_out(mojo_gpu, dims, keepdim):
 
 
 def test_any_dims_out_uint8_destination_and_resize(mojo_gpu):
-    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    mask = torch.tensor(
+        [
+            [False, False, False, False, False, False, False],
+            [False, True, False, False, False, False, False],
+            [False, False, False, False, False, False, False],
+            [False, False, False, False, False, False, True],
+        ]
+    )
     expected = torch.any(mask, dim=[1])
+    assert expected.tolist() == [False, True, False, True]
     out = torch.empty(0, dtype=torch.uint8, device=mojo_gpu)  # wrong shape
     torch.ops.aten.any.dims_out(mask.to(mojo_gpu), [1], False, out=out)
     assert tuple(out.shape) == expected.shape
@@ -1900,11 +1986,14 @@ def test_vector_norm_l1_out_resizes_and_strided_input(mojo_gpu):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_vector_norm_inf_matches_torch(mojo_gpu, dtype):
-    """ord=+inf: max of |x|, distinct from ord=2's sum of squares."""
+    """ord=+inf: max of |x|, distinct from ord=2's sum of squares. This
+    selects one already-rounded element rather than accumulating, so it is
+    exactly representable -- exact equality catches a selection error (wrong
+    element/index) that a loose tolerance would hide."""
     x = (torch.randn(4099, 37) * 10).to(dtype)
     expected = torch.linalg.vector_norm(x.double(), ord=math.inf, dim=1)
     ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=1).cpu()
-    torch.testing.assert_close(ours.double(), expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(ours.double(), expected, atol=0, rtol=0)
 
 
 def test_vector_norm_inf_with_an_accumulation_dtype(mojo_gpu):
@@ -1983,6 +2072,31 @@ def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
     expected = torch.linalg.vector_norm(x, dim=1)
     got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, [1], False)
     torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_size_one_reduce_out_success(mojo_gpu):
+    """`_vector_norm_abs_out`'s success path (the decline tests below only
+    cover rejection): a wrongly-shaped `out=` is resized, and a
+    non-contiguous `out=` is computed into a fresh buffer and copied across,
+    same as `_scalar_reduction_out`."""
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    xd = x.to(mojo_gpu)
+
+    # Mismatching shape -> resize_out.
+    out = torch.empty(0, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(xd, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == (3,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # Non-contiguous destination -> computed into a fresh buffer and copied.
+    storage = torch.zeros(3, 2, device=mojo_gpu)
+    strided_out = storage[:, 0]
+    assert not strided_out.is_contiguous()
+    torch.linalg.vector_norm(xd, dim=1, out=strided_out)
+    torch.testing.assert_close(strided_out.cpu(), expected)
+    torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(3))
 
 
 def test_vector_norm_size_one_reduce_out_declines_aliasing_input(mojo_gpu):
@@ -2225,10 +2339,13 @@ def test_norm_declines_unsupported_ord(mojo_gpu):
     [((4099, 1031), 1), ((5003, 37), 1), ((1031, 4099), 0), ((1 << 20,), 0)],
 )
 def test_vector_norm_neginf_matches_torch(mojo_gpu, shape, dim, dtype):
+    """ord=-inf selects the min |x|, an already-rounded, exactly
+    representable element (not an accumulation), so exact equality is the
+    right bar -- a loose tolerance would hide a selection error."""
     x = (torch.rand(shape) * 0.9 + 0.05).to(dtype)
     ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=float("-inf"), dim=dim).cpu()
     expected = torch.linalg.vector_norm(x.double(), ord=float("-inf"), dim=dim)
-    torch.testing.assert_close(ours.double(), expected, atol=0, rtol=1e-2)
+    torch.testing.assert_close(ours.double(), expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("keepdim", [True, False])

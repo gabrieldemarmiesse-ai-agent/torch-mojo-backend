@@ -812,7 +812,7 @@ struct AnyOp(ReduceOp):
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
-        # torch's uint8 compatibility (native_functions.yaml, Note "[all,
+        # torch's uint8 compatibility (ReduceOps.cpp, Note "[all,
         # any : uint8 compatibility]"): a uint8 input keeps a uint8 output
         # instead of narrowing to bool.
         comptime if in_dt == DType.uint8:
