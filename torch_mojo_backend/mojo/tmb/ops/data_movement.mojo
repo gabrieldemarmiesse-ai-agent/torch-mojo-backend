@@ -718,11 +718,25 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # destination whose lifetime can be tracked on the source's device.
         # A host cast already required a completed readback. Keep that entire
         # fallback blocking; GPU casts/relayouts can remain stream-ordered.
+        #
+        # float64 is excluded here even though it is now `is_cast_dtype_on`
+        # (the on-device cast in `_to_copy_same_device` above already used
+        # it): `tests/test_mojo_device.py::
+        # test_to_cpu_host_conversion_is_deliberately_blocking` -- and,
+        # presumably, real callers relying on the same historical guarantee
+        # -- depends on a float64 `.to("cpu", ...)` staying synchronous even
+        # under `non_blocking=True`, the one dtype this backend has always
+        # forced blocking downloads for. Widening `is_cast_dtype_on` for the
+        # on-device cast was correct; widening THIS decision along with it
+        # was not -- verified as a real regression on an H100 (passes on
+        # main, fails here) before this exclusion was added back.
         var async_download = non_blocking and (
             stype == t.stype
             or (
                 is_cast_dtype_on(t.dtype, t)
                 and is_cast_dtype_on(max_dtype(stype), t)
+                and t.dtype != DType.float64
+                and max_dtype(stype) != DType.float64
             )
         )
         var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
