@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     ST_BOOL,
     ST_INT32,
     ST_INT64,
+    ST_UINT8,
     TAG_INT,
     TAG_INT_LIST,
     TAG_NONE,
@@ -678,11 +679,11 @@ def _out_reduce_dtype(
     dtype exactly ("Expected out tensor to have dtype X, but got dtype Y
     instead", the structured-kernel `set_output` check every `.out`/
     `.dtype_out` reduction shares) -- otherwise `dst`'s own dtype
-    (ReduceOps.cpp: `ScalarType dtype = result.scalar_type();`, read
-    regardless of the input's own dtype). Callers still validate the
-    resolved dtype is one their op/kernel supports (mean/norm: float only;
-    sum: float or int64) and may override it for a dtype-less integer input
-    (sum's bool/sub-int64 -> int64 default)."""
+    (ReduceOps.cpp: `ScalarType dtype = result.scalar_type();`), which is
+    authoritative regardless of the input's own dtype: unlike the no-`out=`
+    path, an integer input never overrides it with the bool/sub-int64 ->
+    int64 default. Callers still validate the resolved dtype is one their
+    op/kernel supports (mean/norm: float only; sum: float or int64)."""
     var want = _opt_dtype(dtype_v)
     if want < 0:
         return dst.dtype
@@ -807,8 +808,8 @@ def op_sum_intlist_out(
 def _nansum_prep(
     mut src: Operand, dtype_v: Value, dim_v: Value
 ) raises -> List[Int]:
-    """Shared prep for both nansum overloads: dtype promotion, the dtype gate,
-    and the reduce-dim list.
+    """Prep for `nansum` (the no-`out=` overload): dtype promotion, the dtype
+    gate, and the reduce-dim list.
 
     Mirrors `sum`'s own promotion (`_promote` / `_is_sum_dtype`) exactly for
     integral/bool inputs -- they carry no NaN, so nansum and sum must agree on
@@ -1373,9 +1374,16 @@ def _any_all(
     if len(dims) == 0:
         unsupported("any/all with an empty dim list")
     var out = _scalar_reduction(
-        "reduction", spec, a, dims, keepdim, ST_BOOL, False, 0.0
+        "reduction", spec, a, dims, keepdim, _any_all_out_stype(a), False, 0.0
     )
     ret_owned(rets, 0, out)
+
+
+def _any_all_out_stype(a: T) -> Int32:
+    """The dtype AnyOp/AllOp's kernel actually writes: torch's uint8
+    compatibility keeps a uint8 input's dtype instead of narrowing to bool
+    (native_functions.yaml, Note "[all, any : uint8 compatibility]")."""
+    return ST_UINT8 if a.dtype == DType.uint8 else ST_BOOL
 
 
 def _none_value() -> Value:
@@ -1434,7 +1442,7 @@ def op_any_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         a,
         _reduce_dims(_none_value(), a.rank, False),
         False,
-        ST_BOOL,
+        _any_all_out_stype(a),
         out,
     )
     ret_ref(rets, 0, out)
@@ -1493,7 +1501,7 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         a,
         dims,
         v_bool_or(args[unsafe_offset=2], False),
-        ST_BOOL,
+        _any_all_out_stype(a),
         out,
     )
     ret_ref(rets, 0, out)
@@ -1515,7 +1523,7 @@ def op_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         a,
         dims,
         v_bool_or(args[unsafe_offset=2], False),
-        ST_BOOL,
+        _any_all_out_stype(a),
         out,
     )
     ret_ref(rets, 0, out)
@@ -1536,7 +1544,7 @@ def op_all_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         a,
         _reduce_dims(_none_value(), a.rank, False),
         False,
-        ST_BOOL,
+        _any_all_out_stype(a),
         out,
     )
     ret_ref(rets, 0, out)
@@ -1560,7 +1568,7 @@ def op_all_dims_out(
         a,
         dims,
         v_bool_or(args[unsafe_offset=2], False),
-        ST_BOOL,
+        _any_all_out_stype(a),
         out,
     )
     ret_ref(rets, 0, out)

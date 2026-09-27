@@ -812,7 +812,13 @@ struct AnyOp(ReduceOp):
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
-        return DType.bool
+        # torch's uint8 compatibility (native_functions.yaml, Note "[all,
+        # any : uint8 compatibility]"): a uint8 input keeps a uint8 output
+        # instead of narrowing to bool.
+        comptime if in_dt == DType.uint8:
+            return DType.uint8
+        else:
+            return DType.bool
 
     @staticmethod
     def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
@@ -854,7 +860,11 @@ struct AllOp(ReduceOp):
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
-        return DType.bool
+        # Same uint8 compatibility rule as AnyOp.
+        comptime if in_dt == DType.uint8:
+            return DType.uint8
+        else:
+            return DType.bool
 
     @staticmethod
     def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
@@ -882,9 +892,10 @@ struct AllOp(ReduceOp):
 struct CountNonzeroOp(ReduceOp):
     """count_nonzero: sum of AnyOp/AllOp's nonzero test, int64 output.
 
-    NaN counts as nonzero (the same ordered-`!=`-to-true map). The
-    accumulator is int64 rather than any/all's int32 lane trick because the
-    output here IS the count, not a truthiness flag, and needs the range.
+    NaN counts as nonzero (the same negated-ordered-equality map, `not (x ==
+    0)`, as AnyOp/AllOp). The accumulator is int64 rather than any/all's
+    int32 lane trick because the output here IS the count, not a truthiness
+    flag, and needs the range.
     """
 
     comptime name = "count_nonzero"
@@ -1479,14 +1490,15 @@ def _rowred_spec_into_go[
 ](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg,) raises:
     """TensorSpec entry for one scalar reduction (agents_docs/tensor_spec_design.md).
 
-    Python parses the dim spec and owns dtype promotion and output allocation;
-    this side derives the (outer, reduce, inner) geometry, validates the
-    preallocated output and launches. A reduce interval that is adjacent and
-    ascending over a contiguous operand is read WHERE IT LIES, whatever its
-    position -- the strided-axis kernel is what lets a `dim=0` reduction skip
-    the transposed full-tensor copy Python would otherwise materialize.
-    Anything else raises a real NotImplementedError into Python ("take the
-    classic permute+materialize path").
+    The caller (`_reduce_into` in ops/reductions.mojo) owns dtype promotion
+    and output allocation, and already pre-materializes any operand this
+    kernel cannot read directly (`_ready_operand`) into a trailing-dim
+    contiguous copy; this side derives the (outer, reduce, inner) geometry,
+    validates the preallocated output and launches. A reduce interval that is
+    adjacent and ascending over a contiguous operand is read WHERE IT LIES,
+    whatever its position -- the strided-axis kernel is what lets a `dim=0`
+    reduction skip that transposed materialization. A geometry the caller
+    failed to normalize into this shape raises directly.
     """
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
@@ -1497,8 +1509,9 @@ def _rowred_spec_into_go[
     var reduce_n = 0
     var inner = 0
     if not _adjacent_reduce_geom(a, rdims_t, outer, reduce_n, inner):
-        # Non-adjacent or strided: Python permuted and materialized before the
-        # call, so this only has to reproduce the rejection message.
+        # Non-adjacent or strided: the caller already permuted and
+        # materialized before this call, so this only reproduces the
+        # rejection message if that invariant is somehow violated.
         var rows = 0
         var cols = 0
         var out_rank = 0
@@ -1510,8 +1523,8 @@ def _rowred_spec_into_go[
     var outputs = outer * inner
     comptime if Op.errors_on_empty_axis:
         # torch refuses this one EVEN when the output itself is empty
-        # (e.g. amin(empty(0, 0), dim=1)); raising hands it back to Python,
-        # which declines and lets torch raise its own message.
+        # (e.g. amin(empty(0, 0), dim=1)); raise directly rather than
+        # falling through to the reduce kernel with reduce_n == 0.
         if reduce_n == 0:
             raise Error("mojo spec reduce: empty reduce dim")
     var ctx = a.ctx()
