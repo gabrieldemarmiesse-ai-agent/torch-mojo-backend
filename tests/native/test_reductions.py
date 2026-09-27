@@ -47,12 +47,15 @@ def mojo_device(mojo_gpu: str) -> str:
 
 _REDUCE_OPS = {
     "sum": lambda t, **kw: torch.sum(t, **kw),
+    "nansum": lambda t, **kw: torch.nansum(t, **kw),
     "mean": lambda t, **kw: torch.mean(t, **kw),
+    "prod": lambda t, **kw: torch.prod(t, **kw),
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
+    "count_nonzero": lambda t, **kw: torch.count_nonzero(t, **kw),
 }
 
 
@@ -79,18 +82,31 @@ _REDUCE_OPS = {
 )
 def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
     fn = _REDUCE_OPS[op]
-    if op in ("all", "any"):
+    if op in ("all", "any", "count_nonzero"):
         x = torch.rand(shape) < 0.5
+    elif op == "prod":
+        # Values near 1: a product over millions of elements from the [0.05,
+        # 0.95) range used below underflows to 0 on BOTH legs (device and the
+        # fp64 reference), which would pass trivially without checking that
+        # the split/merge path actually combines partial products correctly.
+        x = 1.0 + (torch.rand(shape) - 0.5) * 0.002
     else:
         x = torch.rand(shape) * 0.9 + 0.05
     ours = fn(x.to(mojo_gpu), dim=dim).cpu()
-    if op in ("all", "any"):
+    if op in ("all", "any", "count_nonzero"):
         torch.testing.assert_close(ours, fn(x, dim=dim))
     else:
         # fp64 reference on the same values: this measures the reduction
         # order, not the input dtype.
         expected = fn(x.double(), dim=dim)
-        torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
+        if op == "prod":
+            # Unlike a sum, a product compounds one float32 rounding error
+            # PER MULTIPLY: the relative error random-walks as
+            # sqrt(reduce extent) * eps32, ~1e-4 at the million-element end
+            # of these shapes -- looser than the other ops' shared tolerance.
+            torch.testing.assert_close(ours.double(), expected, atol=1e-5, rtol=3e-3)
+        else:
+            torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
 
 
 @pytest.mark.parametrize("op", list(_REDUCE_OPS))
@@ -305,6 +321,171 @@ def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     torch.testing.assert_close(ours.cpu(), torch.sum(y, dim=1, dtype=torch.float32))
 
 
+def test_nansum_dtype_promotion(mojo_gpu):
+    """Same promotion rules as `sum` (bool/int -> int64, `dtype=` casts before
+    the reduction) -- integral inputs have no NaN to remove, so nansum and sum
+    must agree on them exactly."""
+    for dtype in (torch.bool, torch.uint8, torch.int32):
+        if dtype is torch.bool:
+            i = torch.randint(0, 2, (8, 16), dtype=dtype)
+        else:
+            i = torch.randint(0, 20, (8, 16), dtype=dtype)
+        got = i.to(mojo_gpu).nansum(dim=1)
+        assert got.dtype == torch.int64 == i.nansum(dim=1).dtype
+        torch.testing.assert_close(got.cpu(), i.nansum(dim=1))
+
+    # dtype= casts the input BEFORE the reduction: summing two 40000s in
+    # float16 overflows to inf, but casting to float32 first (as torch does)
+    # sums them to exactly 80000.
+    y = torch.tensor([[40000.0, 40000.0]], dtype=torch.float16)
+    ours = torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.float32)
+    expected = torch.nansum(y, dim=1, dtype=torch.float32)
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(ours.cpu(), expected)
+
+    # An explicit dtype=int32 is declined, same as sum's own dtype= gate.
+    with pytest.raises(NotImplementedError):
+        torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.int32)
+
+    # An explicit integral dtype on a floating input is declined outright:
+    # this backend has no `nan_to_num` kernel to zero the NaN before the cast
+    # would otherwise truncate it to an arbitrary integer.
+    with pytest.raises(NotImplementedError):
+        torch.nansum(y.to(mojo_gpu), dim=1, dtype=torch.int64)
+
+
+def test_nansum_out_variant_and_noncontiguous(mojo_gpu):
+    x = torch.tensor([[1.0, float("nan"), 3.0], [float("nan"), float("nan"), 6.0]])
+    xd = x.to(mojo_gpu)
+
+    expected = x.nansum(dim=1)
+    out = torch.empty(0, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.nansum(xd, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == tuple(expected.shape)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # Non-contiguous input: not an adjacent-ascending interval, so this takes
+    # the permute + materialize path (`_middle_direct_ok` requires
+    # contiguity), not the strided-axis kernel.
+    y = torch.randn(5, 7)
+    y[1, 2] = float("nan")
+    yt = y.t()
+    yt_device = y.to(mojo_gpu).t()
+    torch.testing.assert_close(yt_device.nansum(dim=0).cpu(), yt.nansum(dim=0))
+
+
+def test_nansum_out_computes_in_outs_dtype(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
+    sum.IntList_out/mean.out: with no `dtype=`, nansum.out accumulates in
+    `out`'s own dtype, not the input's -- summing two 40000s in float16
+    overflows to inf, but widened to float32 first (what CUDA's own
+    `make_reduction` does for a lower-precision input against a float32 out,
+    `gpu_lowp_to_f32` in ReduceOpsUtils.h; float16->float32 is an exact
+    widening, so casting up front reproduces that fused kernel's result
+    exactly) it is exactly 80000. Not run against actual CUDA tensors here:
+    this box's driver (12.8) is too old for the installed cu130 wheel
+    (`torch.cuda.is_available()` is False even under `srun` on the H100
+    nodes) -- verified instead by reading `ReduceOpsUtils.h`'s
+    `make_reduction` and `ReduceSumProdKernel.cu`'s `nansum_kernel_cuda`."""
+    y = torch.tensor([40000.0, 40000.0], dtype=torch.float16)
+    assert torch.isinf(y.sum())  # accumulating (and rounding) in float16 overflows
+    yd = y.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.nansum(yd, dim=0, out=out)
+    assert out.item() == 80000.0
+
+
+def test_nansum_out_dtype_must_match_out_dtype(mojo_gpu):
+    """An explicit `dtype=` that disagrees with `out`'s dtype raises, rather
+    than silently using either one (same rule as sum.IntList_out/mean.out)."""
+    y = torch.tensor([40000.0, 40000.0], dtype=torch.float16).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.nansum(
+            y,
+            dim=0,
+            dtype=torch.float32,
+            out=torch.empty((), dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int64,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+        torch.bool,
+    ],
+)
+def test_count_nonzero_dtypes(mojo_gpu, dtype):
+    """Every dtype the reduce_skeleton TRUTHY set accepts, output always
+    int64 (torch's count_nonzero.dim_IntList_out(self, dim, out=out) result
+    dtype)."""
+    if dtype is torch.bool:
+        x = torch.rand(6, 9) < 0.5
+    elif dtype.is_floating_point:
+        x = (torch.rand(6, 9) - 0.5).to(dtype)
+    elif dtype is torch.uint8:
+        x = torch.randint(0, 4, (6, 9), dtype=dtype)
+    else:
+        x = torch.randint(-3, 4, (6, 9), dtype=dtype)
+    xd = x.to(mojo_gpu)
+    for dim in (None, 0, 1, -1, (0, 1)):
+        got = torch.count_nonzero(xd, dim=dim)
+        expected = torch.count_nonzero(x, dim=dim)
+        assert got.dtype == torch.int64
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_count_nonzero_empty_dim_list_reduces_all(mojo_gpu):
+    """`count_nonzero.dim_IntList(self, [])` reduces every dim (unlike
+    any.dims/all.dims, where an explicit empty list reduces nothing); this is
+    also what `count_nonzero(self, dim=None)` redispatches to."""
+    x = torch.randn(4, 5)
+    xd = x.to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.ops.aten.count_nonzero.dim_IntList(xd, []).cpu(),
+        torch.ops.aten.count_nonzero.dim_IntList(x, []),
+    )
+    torch.testing.assert_close(torch.count_nonzero(xd).cpu(), torch.count_nonzero(x))
+
+
+def test_count_nonzero_nan_counts_as_nonzero(mojo_device):
+    """NaN is nonzero under the ordered `!=` test (matches any/all's rule)."""
+    x = torch.tensor([[1.0, 0.0, float("nan"), 0.0, float("nan")]])
+    torch.testing.assert_close(
+        torch.count_nonzero(x.to(mojo_device), dim=1).cpu(),
+        torch.count_nonzero(x, dim=1),
+    )
+
+
+def test_count_nonzero_noncontiguous_and_empty(mojo_device):
+    x = torch.randn(4, 6)
+    xd = x.to(mojo_device)
+    torch.testing.assert_close(
+        torch.count_nonzero(xd.t(), dim=0).cpu(), torch.count_nonzero(x.t(), dim=0)
+    )
+    e = torch.empty(0)
+    ed = e.to(mojo_device)
+    torch.testing.assert_close(
+        torch.count_nonzero(ed, dim=0).cpu(), torch.count_nonzero(e, dim=0)
+    )
+
+
+def test_count_nonzero_rejects_rank0(mojo_device):
+    """A rank-0 operand has no reduce dim; declined like sum/mean/amax are for
+    the same shape (see `_reduce_dims`'s empty-list-on-rank-0 case)."""
+    x = torch.tensor(5.0).to(mojo_device)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.count_nonzero.dim_IntList(x, [])
+
+
 @pytest.mark.parametrize("keepdim", [False, True])
 def test_sum_out_variant(mojo_gpu, keepdim):
     """out= writes into the caller's tensor, resizes on a shape mismatch, and
@@ -328,13 +509,115 @@ def test_sum_out_variant(mojo_gpu, keepdim):
     torch.testing.assert_close(resized.cpu(), x.sum(dim=1), rtol=2e-6, atol=2e-6)
 
 
-def test_sum_out_variant_declines_unsafe_cast(mojo_gpu):
-    """`safe_cast`: a float result poured into an integral out is refused,
-    matching sum.IntList_out's structured-kernel dtype check."""
+def test_sum_out_variant_into_int64_truncates_each_element_first(mojo_gpu):
+    """Verified against stock torch: a float result poured into an int64 out
+    with no `dtype=` is NOT a "sum then cast" -- torch truncates every
+    element to int64 first (`ScalarType dtype = result.scalar_type();`, used
+    as the reduction's own compute dtype), so this differs from
+    `x.sum(dim=1).to(int64)` whenever fractional parts would otherwise
+    accumulate before truncation."""
+    x = torch.tensor([[0.9, 0.9, 0.9]])
+    expected = x.to(torch.int64).sum(dim=1)
+    assert expected.item() != x.sum(dim=1).to(torch.int64).item()  # the two must differ
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    torch.sum(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_sum_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """`out`'s dtype is the compute dtype for ANY self, not just a floating
+    one: an int64 self summed into a float32 `out` casts each element to
+    float32 first, same as a float self does (test above). It must NOT
+    accumulate in int64 (self's own dtype) and cast the sum down afterward.
+    Verified on stock CUDA: [16777217, -16777216] (adjacent int64 values that
+    collapse to the same float32) sums to 0.0 in float32, not 1.0 from an
+    int64 sum cast down afterward."""
+    x = torch.tensor([16777217, -16777216], dtype=torch.int64)
+    xd = x.to(mojo_gpu)
+    assert x.sum().item() == 1  # int64 sum-then-cast would give 1.0, not 0.0
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    assert out.item() == 0.0
+
+
+def test_sum_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """SumSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`); bool/uint8 outs, which torch itself accepts for
+    sum.out, are declined rather than silently mishandled."""
     x = torch.randn(4, 5).to(mojo_gpu)
-    out = torch.empty(4, dtype=torch.int64, device=mojo_gpu)
-    with pytest.raises(RuntimeError, match="can't be cast"):
-        torch.sum(x, dim=1, out=out)
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.bool, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.sum(x, dim=1, out=torch.empty(4, dtype=torch.uint8, device=mojo_gpu))
+
+
+def test_sum_out_computes_in_outs_dtype(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as mean.out:
+    with no `dtype=`, sum.IntList_out accumulates in `out`'s own dtype, not
+    the input's (values picked so a float16 accumulation would round
+    differently than the float32 one torch actually does)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().sum(dim=0)
+    assert expected.item() != x.sum(dim=0).float().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as mean.out: an explicit `dtype=` that disagrees
+    with `out`'s dtype raises, rather than silently using either one."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.sum(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_sum_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
+    """`TORCH_IMPL_FUNC(sum_out)`'s CUDA path (`make_reduction_from_out_ty`)
+    builds its TensorIterator from `out`'s own dtype directly, so every
+    element is rounded to it BEFORE accumulating (`SumOp`'s own float32
+    `acc_dtype` then sums those already-rounded values). Verified on an
+    actual CUDA device: summing [1 + 2**-12, -1] with dtype=float16 rounds
+    1 + 2**-12 down to 1.0 first, giving exactly 0 -- not 2**-12 from summing
+    at full precision and rounding only the final scalar."""
+    x = torch.tensor([1.0 + 2**-12, -1.0])
+    xd = x.to(mojo_gpu)
+    assert (x.sum().half().item(), x.half().sum().item()) == (2**-12, 0.0)
+
+    out = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.sum(xd, dim=0, dtype=torch.float16, out=out)
+    assert out.item() == 0.0
+
+    out2 = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out2)  # dtype=None: same rule, dtype comes from `out`
+    assert out2.item() == 0.0
+
+
+def test_mean_rounds_each_element_to_the_target_dtype_first(mojo_gpu):
+    """Confirmed on an actual CUDA device (not CPU torch, whose `mean_out`
+    has a CPU-only `is_half_type` trick that avoids this): mean's CUDA path
+    is the exact same `make_reduction_from_out_ty` machinery as sum (above),
+    so it rounds every element to the target dtype BEFORE accumulating too --
+    `torch.mean(torch.tensor([1 + 2**-12, -1], device="cuda"),
+    dtype=torch.float16)` gives 0, not the CPU-only 2**-13. The mojo device
+    mirrors CUDA, not CPU."""
+    x = torch.tensor([1.0 + 2**-12, -1.0])
+    xd = x.to(mojo_gpu)
+    assert (x.mean().half().item(), x.half().mean().item()) == (2**-13, 0.0)
+
+    out = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.mean(xd, dtype=torch.float16, out=out)  # -> mean.dtype_out
+    assert out.item() == 0.0
+
+    out2 = torch.empty((), dtype=torch.float16, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out2)  # dtype=None: same rule -> mean.out
+    assert out2.item() == 0.0
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
@@ -374,6 +657,126 @@ def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
     torch.testing.assert_close(transposed.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
+    """`torch.mean(x, out=out)` with no `dim` dispatches to mean.dtype_out
+    (verified against stock torch's own overload resolution), always a full
+    reduce to a 0-d result regardless of input rank."""
+    x = torch.randn(4, 6, 5, dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = x.mean()
+    out = torch.empty((), dtype=dtype, device=mojo_gpu)
+    returned = torch.mean(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-2, atol=2e-2)
+
+
+def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
+    """`dtype=` promotes the input before reducing (only float16/bfloat16/
+    float32 are supported, same as mean()/mean.out/mean.dim). These two
+    values are picked so summing them AS float16 (cast-after-reduce, the bug)
+    rounds to a different float16-representable pair than summing them AS
+    float32 (cast-before-reduce, what torch does): a loose tolerance cannot
+    tell the two apart, so this uses an exact comparison."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.mean(dtype=torch.float32)
+    assert expected.item() != x.half().mean().float().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, dtype=torch.float32, out=out)  # no dim -> mean.dtype_out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_dtype_out_resizes_a_mismatching_out(mojo_gpu):
+    """Non-scalar `out` is resized to the full-reduce (0-d) shape."""
+    x = torch.randn(3, 4)
+    out = torch.empty(3, 4, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), x.mean())
+
+
+def test_mean_dtype_out_rejects_integer_input(mojo_gpu):
+    x = torch.randint(0, 10, (3, 4))
+    out = torch.empty((), device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x.to(mojo_gpu), out=out)
+
+
+def test_mean_out_computes_in_outs_dtype(mojo_gpu):
+    """With no `dtype=`, torch computes mean.out/mean.dtype_out in `out`'s
+    OWN dtype (`ReduceOps.cpp`: `ScalarType dtype = result.scalar_type();`),
+    not the input's: a float16 input poured into a float32 `out` must match
+    the float32-accumulated answer exactly, not a float16-rounded one poured
+    into fp32 (the values below are picked so the two differ)."""
+    x = torch.tensor([1.0, 1.0009765625], dtype=torch.float16)
+    xd = x.to(mojo_gpu)
+    expected = x.float().mean()
+    assert expected.item() != x.mean().float().item()  # the two must differ
+
+    out_dtype_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, out=out_dtype_out)  # -> mean.dtype_out
+    torch.testing.assert_close(out_dtype_out.cpu(), expected, rtol=0, atol=0)
+
+    out_dim_out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out_dim_out)  # -> mean.out
+    torch.testing.assert_close(out_dim_out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_out_declines_float64_out(mojo_gpu):
+    """No float64 kernel specialization exists; a float64 `out` is declined
+    cleanly instead of reaching the cast kernel with an unsupported pair."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, out=torch.empty((), dtype=torch.float64, device=mojo_gpu))
+
+
+def test_mean_out_dtype_must_match_out_dtype(mojo_gpu):
+    """torch requires an explicit `dtype=` to equal `out`'s dtype exactly and
+    raises otherwise ("Expected out tensor to have dtype X, but got dtype Y
+    instead"); it is not a safe-cast check."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dtype=torch.float32,
+            out=torch.empty((), dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_mean_out_explicit_dtype_bypasses_the_int_input_check(mojo_gpu, dtype):
+    """Verified on stock CUDA: an int/bool self with an explicit float
+    `dtype=` is valid (self is cast to it before reducing) -- mean only
+    requires self itself to be float/complex when `dtype=` is absent."""
+    x = (
+        torch.randint(0, 10, (4, 5), dtype=dtype)
+        if dtype is not torch.bool
+        else torch.randint(0, 2, (4, 5), dtype=dtype)
+    )
+    expected = x.float().mean(dim=0)
+    out = torch.empty(5, dtype=torch.float32, device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), dim=0, dtype=torch.float32, out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_mean_dtype_out_nan(mojo_gpu):
+    x = torch.randn(4, 6)
+    x[2, 3] = float("nan")
+    out = torch.empty((), device=mojo_gpu)
+    torch.mean(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), x.mean(), equal_nan=True)
+
+
 def test_out_variant_into_a_strided_destination(mojo_gpu):
     """A non-contiguous `out` cannot be written by the kernel directly, so the
     result is computed into a fresh buffer and copied across."""
@@ -384,6 +787,130 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
     torch.mean(x.to(mojo_gpu), dim=1, out=out)
     torch.testing.assert_close(out.cpu(), x.mean(dim=1), rtol=2e-6, atol=2e-6)
     torch.testing.assert_close(storage[:, 1].cpu(), torch.zeros(4))
+
+
+def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`out=x.reshape(-1)[x.numel():]` aliases `x`'s storage (a 0-element view
+    that would need to GROW to hold the result): `_scalar_reduction_out`
+    declines any aliasing `out=` outright rather than resizing it, since stock
+    CUDA has no one well-defined answer here (`torch.max(x, out=x)` -- a
+    different alias of the same helper's problem, tested alongside this one --
+    comes back silently WRONG on real CUDA, not merely a stale pointer)."""
+    x = torch.randn(3, 4, device=mojo_gpu)
+    out = x.reshape(-1)[x.numel() :]
+    with pytest.raises(NotImplementedError):
+        torch.mean(x, dim=1, out=out)
+
+
+# ---------------------------------------------------------------------------
+# prod
+# ---------------------------------------------------------------------------
+
+
+def test_prod_full_reduce_and_dtype_promotion(mojo_gpu):
+    """`prod()` (prod.default, no dim) and torch's bool/int -> int64 promotion,
+    matching test_sum_full_reduce_and_dtype_promotion."""
+    x = torch.rand(4, 5, generator=torch.Generator().manual_seed(0)) * 0.5 + 0.5
+    torch.testing.assert_close(
+        x.to(mojo_gpu).prod().cpu(), x.prod(), rtol=1e-5, atol=1e-6
+    )
+
+    for dtype in (torch.bool, torch.uint8, torch.int32):
+        if dtype is torch.bool:
+            i = torch.randint(0, 2, (3, 4), dtype=dtype)
+        else:
+            i = torch.randint(0, 3, (3, 4), dtype=dtype)
+        got = i.to(mojo_gpu).prod(dim=1)
+        assert got.dtype == torch.int64 == i.prod(dim=1).dtype
+        torch.testing.assert_close(got.cpu(), i.prod(dim=1))
+
+    # dtype= casts first: 1.7 * 2.7 * 3.7 as int64 is 1 * 2 * 3, not (int)11.65.
+    # (an explicit dtype=int32 is declined -- see `_is_sum_dtype` -- so int64
+    # is the dtype that exercises the cast-before-reduce rule here.)
+    y = torch.tensor([[1.7, 2.7, 3.7]])
+    ours = torch.prod(y.to(mojo_gpu), dim=1, dtype=torch.int64)
+    torch.testing.assert_close(ours.cpu(), torch.prod(y, dim=1, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_prod_dim_int_and_out(mojo_gpu, keepdim):
+    """prod.dim_int, and prod.int_out into a wrongly-shaped out that must be
+    resized (`resize_output`, the same rule every out= op follows)."""
+    x = torch.rand(6, 9) * 0.5 + 0.5
+    xd = x.to(mojo_gpu)
+    expected = x.prod(dim=1, keepdim=keepdim)
+    ours = torch.prod(xd, dim=1, keepdim=keepdim)
+    torch.testing.assert_close(ours.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+    out = torch.empty(0, device=mojo_gpu)
+    returned = torch.prod(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == tuple(expected.shape)
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_prod_empty_reduce_axis_is_one(mojo_gpu):
+    """An empty reduce axis contributes the identity: prod -> 1, unlike
+    amax/amin, which torch refuses on an empty axis."""
+    x = torch.empty(3, 0)
+    expected = x.prod(dim=1)
+    ours = torch.prod(x.to(mojo_gpu), dim=1).cpu()
+    torch.testing.assert_close(ours, expected)
+
+    # prod.default (no dim) over an all-empty-axes tensor is also the
+    # identity, matching torch.
+    y = torch.empty(0)
+    torch.testing.assert_close(torch.prod(y.to(mojo_gpu)).cpu(), torch.prod(y))
+
+
+def test_prod_noncontiguous(mojo_gpu):
+    """A transposed operand exercises the permute-and-materialize fallback."""
+    x = torch.rand(5, 8) * 0.5 + 0.5
+    xt = x.t()
+    assert not xt.is_contiguous()
+    torch.testing.assert_close(
+        xt.to(mojo_gpu).prod(dim=1).cpu(), xt.prod(dim=1), rtol=1e-5, atol=1e-6
+    )
+
+
+def test_prod_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
+    sum.IntList_out: with no `dtype=`, prod.int_out accumulates in `out`'s own
+    dtype, not the input's. An int64 self must NOT be multiplied in int64
+    (where 2**32 * 2**32 wraps to 0) and cast down afterward -- each element
+    is cast to `out`'s dtype FIRST. Verified on stock CUDA: [2**32, 2**32] as
+    int64 overflows to 0 in an int64 product, but 2**32 is an exact float32
+    value and so is their product, giving exactly 2**64 in a float32 out."""
+    x = torch.tensor([2**32, 2**32], dtype=torch.int64)
+    assert x.prod().item() == 0  # the int64 product wraps to 0
+    xd = x.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.prod(xd, dim=0, out=out)
+    assert out.item() == 2.0**64
+
+
+def test_prod_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as sum.IntList_out/mean.out: an explicit `dtype=`
+    that disagrees with `out`'s dtype raises, rather than silently using
+    either one."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(RuntimeError):
+        torch.prod(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_prod_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """ProdSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`, shared with sum); an int32 out -- which torch itself
+    accepts for prod.int_out -- is declined rather than silently
+    mishandled."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(NotImplementedError):
+        torch.prod(x, dim=1, out=torch.empty(4, dtype=torch.int32, device=mojo_gpu))
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +976,89 @@ def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
         )
 
 
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize(
+    "shape,dim", [((357, 789), 1), ((4, 5, 6), (0, 2)), ((37,), None)]
+)
+def test_amin_out(mojo_gpu, shape, dim, dtype, keepdim):
+    """amin.out over dtypes/dims/keepdim, including the dim=None full reduce
+    (empty dim list) and a non-contiguous input."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    dim_args = (dim,) if dim is not None else ()
+    expected = torch.amin(x, *dim_args, keepdim=keepdim)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    returned = torch.amin(x.to(mojo_gpu), *dim_args, out=out, keepdim=keepdim)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input, out already correctly shaped
+    if len(shape) >= 2:
+        xt = x.transpose(0, 1)
+        expected_t = torch.amin(xt, *dim_args, keepdim=keepdim)
+        out2 = torch.empty(expected_t.shape, dtype=dtype, device=mojo_gpu)
+        torch.amin(xt.to(mojo_gpu), *dim_args, out=out2, keepdim=keepdim)
+        torch.testing.assert_close(out2.cpu(), expected_t)
+
+
+def test_amin_out_resizes_a_mismatching_out(mojo_gpu):
+    x = torch.randn(2, 3, 4)
+    out = torch.empty(0, device=mojo_gpu)
+    torch.amin(x.to(mojo_gpu), dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), torch.amin(x, dim=2))
+
+
+def test_amin_out_rejects_a_mismatching_dtype(mojo_gpu):
+    """amin's meta func requires out.dtype == self.dtype exactly (no dtype=
+    kwarg exists to cast through)."""
+    x = torch.randn(4, 7)
+    with pytest.raises(RuntimeError):
+        torch.amin(
+            x.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float64, device=mojo_gpu),
+        )
+
+
+def test_amin_out_empty_reduce_dim_raises(mojo_gpu):
+    x = torch.empty(3, 0, 5)
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.amin(x.to(mojo_gpu), dim=1, out=out)
+
+
+def test_amax_amin_empty_reduce_dim_refused_even_with_empty_output(mojo_gpu):
+    """torch refuses a zero-length reduce dim EVEN WHEN the output itself is
+    empty too: amin(empty(0, 0), dim=1) still raises "Expected reduction dim
+    1 to have non-zero size", it does not just return an empty tensor."""
+    x = torch.empty(0, 0)
+    xd = x.to(mojo_gpu)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(xd, dim=1, out=torch.empty(0, device=mojo_gpu))
+
+    # sanity pair: reducing the EMPTY dim is refused regardless of which side
+    # it's on ((0, 3) dim=0, (3, 0) dim=1); reducing the NON-EMPTY dim while
+    # the other one happens to be empty is not an error (output is empty too).
+    a = torch.empty(0, 3)
+    b = torch.empty(3, 0)
+    for fn in (torch.amax, torch.amin):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(a.to(mojo_gpu), dim=0)
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(b.to(mojo_gpu), dim=1)
+        torch.testing.assert_close(fn(a.to(mojo_gpu), dim=1).cpu(), fn(a, dim=1))
+        torch.testing.assert_close(fn(b.to(mojo_gpu), dim=0).cpu(), fn(b, dim=0))
+
+
 def test_max_and_min_full_reduction(mojo_device):
     x = torch.randn(37, 41)
     xd = x.to(mojo_device)
@@ -456,6 +1066,172 @@ def test_max_and_min_full_reduction(mojo_device):
     torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
     ints = torch.randint(-100, 100, (5, 9), dtype=torch.int64)
     torch.testing.assert_close(torch.max(ints.to(mojo_device)).cpu(), torch.max(ints))
+
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 3)])
+def test_max_and_min_full_reduction_of_empty_refused(mojo_device, shape):
+    """The extent==0 refusal reused by full max()/min() (every dim is
+    reduced, so any zero dim makes the whole reduce extent 0) must stay
+    unaffected by widening amax/amin's out= refusal to empty outputs too."""
+    x = torch.empty(shape).to(mojo_device)
+    for fn in (torch.max, torch.min):
+        with pytest.raises((RuntimeError, NotImplementedError)):
+            fn(x)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+)
+@pytest.mark.parametrize("shape", [(37, 41), (357, 789), (128,)])
+def test_max_unary_out(mojo_device, shape, dtype):
+    """`max.unary_out`: the full-reduction `out=` overload (`aten::max`
+    itself has no `out=` form; torch routes `torch.max(x, out=t)` here)."""
+    if dtype.is_floating_point:
+        x = torch.randn(shape).to(dtype)
+    else:
+        x = torch.randint(-100, 100, shape, dtype=dtype)
+    xd = x.to(mojo_device)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    returned = torch.max(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+def test_max_unary_out_noncontiguous_and_wrongly_shaped_out(mojo_device):
+    x = torch.randn(6, 11)
+    xd = x.to(mojo_device)[:, ::2]
+    assert not xd.is_contiguous()
+    out = torch.empty(4, 4, device=mojo_device)  # wrong shape: resized to ()
+    torch.max(xd, out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), torch.max(x[:, ::2]))
+
+
+def test_max_unary_out_propagates_nan(mojo_device):
+    x = torch.tensor([1.0, float("nan"), -7.0])
+    out = torch.empty((), device=mojo_device)
+    torch.max(x.to(mojo_device), out=out)
+    assert out.cpu().isnan().item()
+
+
+def test_max_unary_out_declines_an_out_that_aliases_the_input(mojo_gpu):
+    """`_scalar_reduction_out` refuses any `out=` sharing storage with the
+    input outright, rather than resizing it: stock CUDA has no one
+    well-defined answer to reproduce here. `out=x[x.numel():]` (a 0-element
+    view that would need to GROW) computes the right answer on real CUDA, but
+    `out=x` itself -- same tensor, needing to SHRINK from (6,) to () --
+    silently returns the WRONG value there (`resize_output` mutates `self`'s
+    own metadata before the reduction reads it), so there is no single
+    aliasing behavior worth special-casing; every aliasing `out=` declines."""
+    x = torch.randn(6, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x[x.numel() :])
+    with pytest.raises(NotImplementedError):
+        torch.max(x, out=x)
+
+
+def test_max_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, max_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.max(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.max(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.max(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
+    """Stock CUDA errors on this too (an internal assert in Reduce.cuh,
+    verified on an H100), just not cleanly; declining is the closest match."""
+    x = torch.empty((0, 5), dtype=dtype)
+    out = torch.empty((), dtype=dtype, device=mojo_device)
+    with pytest.raises(RuntimeError):
+        torch.max(x.to(mojo_device), out=out)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+def test_min_unary_out(mojo_gpu, dtype):
+    """`torch.min(x, out=out)` dispatches to min.unary_out."""
+    if dtype.is_floating_point:
+        x = torch.randn(37, 41).to(dtype)
+    else:
+        x = torch.randint(-100, 100, (37, 41), dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = torch.min(x)
+
+    out = torch.empty((), dtype=dtype, device=mojo_gpu)
+    returned = torch.min(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    strided = xd.t()
+    out2 = torch.empty((), dtype=dtype, device=mojo_gpu)
+    torch.min(strided, out=out2)
+    torch.testing.assert_close(out2.cpu(), torch.min(x.t()))
+
+
+def test_min_unary_out_propagates_nan(mojo_gpu):
+    x = torch.tensor([1.0, float("nan"), -7.0, 3.0])
+    out = torch.empty((), device=mojo_gpu)
+    torch.min(x.to(mojo_gpu), out=out)
+    assert out.cpu().isnan().item()
+
+
+def test_min_unary_out_resizes_a_mismatching_out(mojo_gpu):
+    """`resize_output` first: a non-scalar `out` is resized to `()`."""
+    x = torch.randn(37, 41)
+    out = torch.empty(5, 3, device=mojo_gpu)
+    returned = torch.min(x.to(mojo_gpu), out=out)
+    assert tuple(returned.shape) == ()
+    torch.testing.assert_close(returned.cpu(), torch.min(x))
+
+
+def test_min_unary_out_requires_an_exact_dtype_match(mojo_gpu):
+    """Unlike mean.out/any.out's safe_cast, min_all_kernel_impl's
+    make_reduction on stock CUDA refuses ANY dtype mismatch, even a safe
+    upcast (verified against stock CUDA torch: int64 -> float32 raises
+    "provided dtype must match dtype of result")."""
+    x = torch.randint(-100, 100, (9, 5), dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        torch.min(
+            x.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+    y = torch.randn(9, 5)
+    with pytest.raises(RuntimeError):
+        torch.min(
+            y.to(mojo_gpu), out=torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        )
+
+    out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+    torch.min(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.min(x))
+
+
+@pytest.mark.parametrize("shape", [(0,), (3, 0), (0, 3)])
+def test_min_unary_out_empty_input_errors(mojo_gpu, shape):
+    """min.unary_out rides `_full_extremum_dims`, so it inherits the same
+    extent==0 refusal as full max()/min() (a zero-length reduce dim always
+    refuses here, since a full reduction's output is never itself empty)."""
+    out = torch.empty((), device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch.min(torch.empty(shape, device=mojo_gpu), out=out)
 
 
 @pytest.mark.parametrize("shape", [(7,), (357, 789), (1 << 20,)])
@@ -557,6 +1333,185 @@ def test_any_out_accepts_a_uint8_destination(mojo_gpu):
             dim=1,
             out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
         )
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int32, torch.float32])
+def test_all_out_variants(mojo_gpu, keepdim, dtype):
+    """all.out (int dim), all.dims_out (dim list) and all.all_out (no dim,
+    full reduction) all round-trip through the out= tensor, reusing the
+    same AllOp path as the non-out overloads."""
+    if dtype is torch.bool:
+        x = torch.randint(0, 2, (6, 9), dtype=dtype)
+    else:
+        x = torch.randint(0, 3, (6, 9), dtype=dtype)
+    xd = x.to(mojo_gpu)
+
+    # `out=` fixes the result dtype explicitly (here bool), which the
+    # bool-or-uint8 policy accepts regardless of the input's dtype -- unlike
+    # the no-out overloads, which follow the uint8-input-keeps-uint8 rule.
+    expected = torch.all(x, dim=1, keepdim=keepdim).bool()
+    out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    expected_dims = torch.all(x, dim=(0, 1), keepdim=keepdim).bool()
+    out_dims = torch.empty(expected_dims.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, dim=(0, 1), keepdim=keepdim, out=out_dims)
+    assert returned.data_ptr() == out_dims.data_ptr()
+    torch.testing.assert_close(out_dims.cpu(), expected_dims)
+
+    expected_full = torch.all(x).bool()
+    out_full = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    returned = torch.all(xd, out=out_full)
+    assert returned.data_ptr() == out_full.data_ptr()
+    torch.testing.assert_close(out_full.cpu(), expected_full)
+
+
+def test_all_out_accepts_a_uint8_destination(mojo_gpu):
+    """all's out dtype policy is bool-or-uint8, mirroring any.out."""
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.all(mask, dim=1)
+    out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)
+    torch.all(mask.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+    with pytest.raises(RuntimeError):
+        torch.all(
+            mask.to(mojo_gpu),
+            dim=1,
+            out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
+        )
+
+
+def test_all_out_resizes_and_handles_strided_and_noncontig(mojo_gpu):
+    """all.out follows the same resize/strided-copy rules as mean.out /
+    any.out (`_scalar_reduction_out`), exercised here for all's overloads."""
+    x = torch.randint(0, 2, (2, 3, 4), dtype=torch.bool)
+    xd = x.to(mojo_gpu)
+
+    # Mismatching shape -> resize_output.
+    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    torch.all(xd, dim=2, out=out)
+    assert tuple(out.shape) == (2, 3)
+    torch.testing.assert_close(out.cpu(), x.all(dim=2))
+
+    # Non-contiguous destination -> computed into a fresh buffer and copied.
+    storage = torch.zeros(2, 3, 2, dtype=torch.bool, device=mojo_gpu)
+    strided_out = storage[:, :, 0]
+    assert not strided_out.is_contiguous()
+    torch.all(xd, dim=2, out=strided_out)
+    torch.testing.assert_close(strided_out.cpu(), x.all(dim=2))
+    torch.testing.assert_close(
+        storage[:, :, 1].cpu(), torch.zeros(2, 3, dtype=torch.bool)
+    )
+
+    # Non-contiguous input works too.
+    x_t = x.transpose(0, 1)
+    out_t = torch.empty(x_t.shape[:-1], dtype=torch.bool, device=mojo_gpu)
+    torch.all(x_t.to(mojo_gpu), dim=-1, out=out_t)
+    torch.testing.assert_close(out_t.cpu(), x_t.all(dim=-1))
+
+    # all.dims_out with an empty tensor.
+    empty = torch.empty(0, 3, dtype=torch.bool, device=mojo_gpu)
+    out_empty = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    torch.all(empty, dim=(0, 1), out=out_empty)
+    torch.testing.assert_close(
+        out_empty.cpu(), torch.empty(0, 3, dtype=torch.bool).all(dim=(0, 1))
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.uint8, torch.int32, torch.float32, torch.float16]
+)
+def test_any_all_out_full_reduction(mojo_gpu, dtype):
+    """`any.all_out`: no dim/keepdim args, always reduces to a 0-d result.
+
+    The `out=` dtype is bool here on both sides, so the input-dtype-dependent
+    result-dtype rule (`aten::any` w/o `out` keeps a uint8 input as uint8)
+    does not come into play; that overload is unrelated to this one.
+    """
+    x = (torch.randn(5, 6) > 0.3).to(dtype)
+    xd = x.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    expected = torch.empty((), dtype=torch.bool)
+    torch.any(x, out=expected)
+    returned = torch.any(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    xt = x.t()
+    torch.any(xt, out=expected)
+    torch.any(xt.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # all-False input, including the empty-tensor case (identity = False)
+    zeros = torch.zeros(4, 0, dtype=dtype)
+    torch.any(zeros, out=expected)
+    torch.any(zeros.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_any_all_out_uint8_destination_and_resize(mojo_gpu):
+    """bool-or-uint8 dtype policy and `resize_output` apply to all_out too."""
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.any(mask)
+    out = torch.empty(4, dtype=torch.uint8, device=mojo_gpu)  # wrong shape too
+    torch.any(mask.to(mojo_gpu), out=out)
+    assert tuple(out.shape) == ()
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+    with pytest.raises(RuntimeError):
+        torch.any(
+            mask.to(mojo_gpu), out=torch.empty((), dtype=torch.float32, device=mojo_gpu)
+        )
+
+
+def test_any_all_out_nan_is_truthy(mojo_gpu):
+    x = torch.zeros(2, 100)
+    x[1, 50] = float("nan")
+    out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    torch.any(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.any(x))
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize("dims", [None, [0], [1], [0, 2], [-1, 0]])
+def test_any_dims_out(mojo_gpu, dims, keepdim):
+    """`any.dims_out`: optional int[] dim (None = full reduce), like
+    `any.dims` but writing into `out`."""
+    x = torch.randn(3, 4, 5) > 0
+    xd = x.to(mojo_gpu)
+    expected = torch.any(x, dim=dims, keepdim=keepdim)
+    out = torch.empty(expected.shape, dtype=torch.bool, device=mojo_gpu)
+    returned = torch.ops.aten.any.dims_out(xd, dims, keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    # non-contiguous input
+    xt = x.transpose(0, 1)
+    expected_t = torch.any(xt, dim=dims, keepdim=keepdim)
+    out_t = torch.empty(expected_t.shape, dtype=torch.bool, device=mojo_gpu)
+    torch.ops.aten.any.dims_out(xt.to(mojo_gpu), dims, keepdim, out=out_t)
+    torch.testing.assert_close(out_t.cpu(), expected_t)
+
+
+def test_any_dims_out_uint8_destination_and_resize(mojo_gpu):
+    mask = torch.randint(0, 2, (4, 7), dtype=torch.bool)
+    expected = torch.any(mask, dim=[1])
+    out = torch.empty(0, dtype=torch.uint8, device=mojo_gpu)  # wrong shape
+    torch.ops.aten.any.dims_out(mask.to(mojo_gpu), [1], False, out=out)
+    assert tuple(out.shape) == expected.shape
+    torch.testing.assert_close(out.cpu(), expected.to(torch.uint8))
+
+
+def test_any_dims_out_empty_dim_list_declines(mojo_gpu):
+    """An explicit empty dim list is declined, matching `any.dims`
+    (`test_unsupported_inputs_raise_not_implemented`)."""
+    mask = torch.randint(0, 2, (3, 4), dtype=torch.bool)
+    out = torch.empty(3, 4, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.any.dims_out(mask.to(mojo_gpu), [], False, out=out)
 
 
 def test_var_default_overloads_decompose_to_var_correction(mojo_gpu):
@@ -890,6 +1845,263 @@ def test_vector_norm_ord0_out_resizes(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected)
 
 
+def test_vector_norm_ord0_size_one_reduce_is_not_abs(mojo_gpu):
+    """The `_all_reduced_dims_size_one` abs shortcut is only valid for
+    ord != 0 (LinearAlgebra.cpp special-cases ord=0 to `ne(0)` there, not
+    `abs()`); a lone nonzero element must count as 1, not its magnitude."""
+    x = torch.tensor([[5.0], [0.0], [-3.0]])
+    expected = torch.linalg.vector_norm(x, ord=0, dim=1)
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0, dim=1)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_declines_non_floating_input(mojo_gpu):
+    """`TORCH_META_FUNC(linalg_vector_norm)` calls `checkFloatingOrComplex` on
+    the INPUT's own dtype unconditionally, before ever looking at `dtype=`:
+    an integer/bool input is rejected even though `dtype=float32` would make
+    the cast well-defined."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            (torch.randn(4, 5) > 0).to(mojo_gpu), dim=1, dtype=torch.float32
+        )
+
+
+@pytest.mark.parametrize(
+    "src_dtype,target_dtype",
+    [
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+def test_vector_norm_declines_narrowing_dtype(mojo_gpu, src_dtype, target_dtype):
+    """`check_linalg_norm_dtype`'s `promoteTypes(self_dtype, dtype) == dtype`:
+    among these three floats, only same-dtype or a target of float32 widens;
+    every other pair narrows and torch rejects it."""
+    x = torch.randn(4, 5, dtype=src_dtype)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x.to(mojo_gpu), dim=1, dtype=target_dtype)
+
+
+def test_vector_norm_out_declines_non_floating_input(mojo_gpu):
+    out = torch.empty(4, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), dim=1, out=out
+        )
+
+
+@pytest.mark.parametrize(
+    "shape,dim,keepdim",
+    [((1,), 0, False), ((1, 1), None, False), ((5, 1), 1, False), ((5, 1), 1, True)],
+)
+def test_vector_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu, shape, dim, keepdim):
+    """torch's `is_reduce_over_1D_vector`: every REDUCED dim has extent 1
+    (a kept dim may be any size), so the reduction is exactly `abs()`, not
+    square-then-sqrt -- squaring 1e20 overflows float32 to inf even though
+    abs(1e20) is exact (`linalg_vector_norm_out` in ATen's LinearAlgebra.cpp)."""
+    x = torch.tensor([1e20, -1e20, 3.0, -1.0, 0.0][: shape[0]], dtype=torch.float32)
+    x = x.reshape(shape)
+    expected = torch.linalg.vector_norm(x, dim=dim, keepdim=keepdim)
+    assert torch.isfinite(
+        expected
+    ).all()  # sanity: the reference itself must not be inf
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), dim=dim, keepdim=keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_reduce_over_size_one_dims_uses_abs(mojo_gpu):
+    """Same fix, reached through the legacy `norm.ScalarOpt_dim` overload."""
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, [1], False)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input(mojo_gpu):
+    """Any `out=` sharing storage with the input is declined outright, before
+    any resize is even considered -- not just when the current byte ranges
+    overlap. `resize_out` can reallocate a shared allocation to grow `dst`,
+    which would silently move the bytes `a`'s already-cached tensor info
+    still points at (see `_decline_aliasing_out`'s docstring); declining
+    every case uniformly avoids having to reason about which ones happen to
+    be safe. Covers: a genuinely shifted overlap, a same-tensor "in-place via
+    out=" call (`abs(x, out=x)` is fine on real torch, but this backend
+    declines it too rather than special-case it), and a same-storage `out=`
+    that merely reshapes the input (`x.squeeze(1)`, covering the exact same
+    bytes as `x` at a different rank -- no resize needed, but still declined,
+    since it still shares storage)."""
+    b = torch.arange(6, dtype=torch.float32).to(mojo_gpu)
+    inp = b[:-1].view(-1, 1)  # every reduced dim (dim=1) has extent 1
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(inp, dim=1, out=b[1:])
+
+    x = torch.tensor([[1e20], [-2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, keepdim=True, out=x)
+
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x, dim=1, out=x.squeeze(1))
+
+
+def test_vector_norm_size_one_reduce_out_declines_wrong_dtype(mojo_gpu):
+    """Same `exact` out-dtype policy as the accumulator path (`_check_out_dtype`):
+    confirmed on stock CUDA torch that an integer `out=` for a float result is
+    rejected, not silently cast."""
+    x = torch.tensor([[1e20]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, dtype=torch.int64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
+def test_vector_norm_size_one_reduce_out_declines_aliasing_input_needing_resize(
+    mojo_gpu,
+):
+    """The hazard `_decline_aliasing_out` exists for: a same-storage `out=`
+    that does NOT currently overlap the input's bytes at all, but whose
+    resize (growing it in place) would reallocate the storage `a` also reads
+    through -- caught by the storage-identity check before resize is even
+    attempted, not by comparing byte ranges (which would find no overlap
+    here, before OR after resizing this particular pair of slices)."""
+    base = torch.arange(4, dtype=torch.float32).to(mojo_gpu)
+    inp = base[:3].view(3, 1)  # every reduced dim (dim=1) has extent 1
+    out = base[3:]  # 1 element; the result needs 3 -- same storage as inp
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(inp, dim=1, out=out)
+
+
+def test_vector_norm_size_one_reduce_out_declines_internal_overlap(mojo_gpu):
+    """An `out=` with more than one logical element sharing one physical
+    address (`.expand()`) must be declined, not silently collapse every
+    reduced row into whichever write happens to land last."""
+    x = torch.tensor([[1e20], [2.0], [3.0]], dtype=torch.float32).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(3)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.linalg.vector_norm(x, dim=1, out=out)
+
+
+def test_reduction_out_declines_internal_overlap(mojo_gpu):
+    """Same check, in the general (non size-one-reduce) `_scalar_reduction_out`
+    path every out= reduction shares -- stock CUDA torch actually tolerates
+    this for `sum.out` (every aliased position ends up holding whichever
+    result happened to be written last, which is never what the caller
+    wanted), so this backend is intentionally stricter here."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    out = torch.empty(1, device=mojo_gpu).expand(4)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.sum(x, dim=1, out=out)
+
+
+def test_reduction_out_internal_overlap_is_fine_when_empty(mojo_gpu):
+    """An EMPTY out= is exempt regardless of its strides: nothing is written,
+    so a degenerate `.expand()` over a zero extent can't collapse anything.
+    Confirmed accepted on stock CUDA torch."""
+    x = torch.randn(0, 3, 1).to(mojo_gpu)
+    out = torch.empty(0, 1, device=mojo_gpu).expand(0, 3)
+    result = torch.sum(x, dim=2, out=out)
+    assert result.shape == (0, 3)
+
+
+# ---------------------------------------------------------------------------
+# norm (legacy overloads): all route through the same ord-2 path as
+# linalg_vector_norm above, so these tests only need to check the schema
+# plumbing (p=None/2, dim=[]/None/single/multi, dtype=, out=), not the math.
+#
+# These call `torch.ops.aten.norm.*` directly rather than the public
+# `torch.norm`/`Tensor.norm`: on a strided PrivateUse1 tensor (ours),
+# `torch/functional.py`'s `norm()` always redirects to
+# `torch.linalg.vector_norm`/`matrix_norm`/`_VF.nuclear_norm` before the
+# dispatcher is ever reached (confirmed with the boxed-kernel counters --
+# `torch.norm(x.to(mojo_gpu), p=2, dim=1)` increments
+# `aten::linalg_vector_norm`, never any `aten::norm.*`), so no public API
+# reaches these overloads on this device.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("p", [None, 2, 2.0])
+def test_norm_scalar_defaults_to_p2_over_all_dims(mojo_gpu, p):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x)
+    if p is None:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu))
+    else:
+        got = torch.ops.aten.norm.Scalar(x.to(mojo_gpu), p)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dtype(x.to(mojo_gpu), None, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [None, 1, [0, 1], []])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_norm_scalaropt_dim(mojo_gpu, dim, keepdim):
+    """An explicit empty dim list means "reduce every dim", same as dim=None,
+    unlike any.dims/all.dims."""
+    x = torch.randn(4, 5)
+    dim_arg = [] if dim is None else ([dim] if isinstance(dim, int) else dim)
+    expected = torch.linalg.vector_norm(
+        x, dim=(None if dim is None else dim), keepdim=keepdim
+    )
+    got = torch.ops.aten.norm.ScalarOpt_dim(x.to(mojo_gpu), 2, dim_arg, keepdim)
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_scalaropt_dim_dtype(mojo_gpu):
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=1, dtype=torch.float32)
+    got = torch.ops.aten.norm.ScalarOpt_dim_dtype(
+        x.to(mojo_gpu), None, [1], False, dtype=torch.float32
+    )
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_norm_out_resizes_a_wrongly_shaped_out(mojo_gpu):
+    x = torch.randn(4, 5)
+    expected = torch.linalg.vector_norm(x, dim=1)
+    out = torch.empty(1, dtype=torch.float32, device=mojo_gpu)  # wrong shape
+    returned = torch.ops.aten.norm.out(x.to(mojo_gpu), 2, [1], False, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == (4,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_norm_dtype_out(mojo_gpu):
+    """float64 is out of scope: `_is_float3` (mean/var/L2-norm) never admits
+    it, same as `linalg_vector_norm`, so this exercises the accumulation-dtype
+    plumbing with float32 instead."""
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=[0, 1], dtype=torch.float32)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    returned = torch.ops.aten.norm.dtype_out(
+        x.to(mojo_gpu), None, [0, 1], False, dtype=torch.float32, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_norm_declines_unimplemented_ord(mojo_gpu):
+    """ord=3 has no accumulator on this device (unlike 0, 1, 2, +-inf, which
+    each get their own `NormL*Op` / `NormSpec` variant)."""
+    x = torch.randn(4, 5).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.Scalar(x, 3)
+    with pytest.raises(NotImplementedError):
+        torch.ops.aten.norm.ScalarOpt_dim(x, 3, [1], False)
+
+
 # ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------
@@ -1074,10 +2286,22 @@ _EXPECTED_OVERLOADS = [
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
         ),
     ),
+    (
+        "aten::mean.dtype_out",
+        lambda d: torch.mean(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::amax", lambda d: torch.amax(torch.randn(4, 5).to(d), dim=1)),
     ("aten::amin", lambda d: torch.amin(torch.randn(4, 5).to(d), dim=1)),
     ("aten::max", lambda d: torch.max(torch.randn(4, 5).to(d))),
+    (
+        "aten::max.unary_out",
+        lambda d: torch.max(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::min", lambda d: torch.min(torch.randn(4, 5).to(d))),
+    (
+        "aten::min.unary_out",
+        lambda d: torch.min(torch.randn(4, 5).to(d), out=torch.empty((), device=d)),
+    ),
     ("aten::min.dim", lambda d: torch.min(torch.randn(4, 5).to(d), dim=1)),
     (
         "aten::min.dim_min",
@@ -1092,6 +2316,24 @@ _EXPECTED_OVERLOADS = [
     ("aten::all", lambda d: torch.all(_bools().to(d))),
     ("aten::all.dim", lambda d: torch.all(_bools().to(d), dim=1)),
     ("aten::all.dims", lambda d: torch.ops.aten.all.dims(_bools().to(d), [0, 1])),
+    (
+        "aten::all.out",
+        lambda d: torch.all(
+            _bools().to(d), dim=1, out=torch.empty(4, dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::all.all_out",
+        lambda d: torch.all(
+            _bools().to(d), out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::all.dims_out",
+        lambda d: torch.all(
+            _bools().to(d), dim=[0, 1], out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
     ("aten::any", lambda d: torch.any(_bools().to(d))),
     ("aten::any.dim", lambda d: torch.any(_bools().to(d), dim=1)),
     ("aten::any.dims", lambda d: torch.ops.aten.any.dims(_bools().to(d), [0, 1])),
@@ -1099,6 +2341,18 @@ _EXPECTED_OVERLOADS = [
         "aten::any.out",
         lambda d: torch.any(
             _bools().to(d), dim=1, out=torch.empty(4, dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::any.all_out",
+        lambda d: torch.any(
+            _bools().to(d), out=torch.empty((), dtype=torch.bool, device=d)
+        ),
+    ),
+    (
+        "aten::any.dims_out",
+        lambda d: torch.ops.aten.any.dims_out(
+            _bools().to(d), [0, 1], out=torch.empty((), dtype=torch.bool, device=d)
         ),
     ),
     ("aten::var.correction", lambda d: torch.var(torch.randn(4, 5).to(d), dim=1)),
@@ -1110,6 +2364,45 @@ _EXPECTED_OVERLOADS = [
         "aten::linalg_vector_norm.out",
         lambda d: torch.linalg.vector_norm(
             torch.randn(4, 5).to(d), dim=1, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.Scalar",
+        lambda d: torch.ops.aten.norm.Scalar(torch.randn(4, 5).to(d)),
+    ),
+    (
+        "aten::norm.ScalarOpt_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dtype(
+            torch.randn(4, 5).to(d), None, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim(
+            torch.randn(4, 5).to(d), 2, [1], False
+        ),
+    ),
+    (
+        "aten::norm.ScalarOpt_dim_dtype",
+        lambda d: torch.ops.aten.norm.ScalarOpt_dim_dtype(
+            torch.randn(4, 5).to(d), None, [1], False, dtype=torch.float32
+        ),
+    ),
+    (
+        "aten::norm.out",
+        lambda d: torch.ops.aten.norm.out(
+            torch.randn(4, 5).to(d), 2, [1], False, out=torch.empty(4, device=d)
+        ),
+    ),
+    (
+        "aten::norm.dtype_out",
+        lambda d: torch.ops.aten.norm.dtype_out(
+            torch.randn(4, 5).to(d),
+            None,
+            [1],
+            False,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float32, device=d),
         ),
     ),
     ("aten::cumsum", lambda d: torch.cumsum(torch.randn(4, 5).to(d), dim=1)),

@@ -58,8 +58,11 @@ SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
 COVERS: dict[str, str] = {
     "aten::sum": "test_sum (full-reduction case)",
     "aten::sum.dim_IntList": "test_sum (dim cases)",
+    "aten::nansum": "test_nansum (same kernel as sum, NaN-zeroing map)",
     "aten::mean": "test_mean (full-reduction case)",
     "aten::mean.dim": "test_mean (dim cases)",
+    "aten::prod": "test_prod (full-reduction case)",
+    "aten::prod.dim_int": "test_prod (dim cases)",
     "aten::max": "test_max",
     "aten::min": "test_min",
     "aten::amax": "test_amax",
@@ -72,6 +75,7 @@ COVERS: dict[str, str] = {
     "aten::any": "test_any (full-reduction case)",
     "aten::any.dim": "test_any (dim case)",
     "aten::any.dims": "test_any (same fast impl as .dim)",
+    "aten::count_nonzero.dim_IntList": "test_count_nonzero",
     "aten::min.dim": "test_min_dim",
     "aten::var.correction": "test_var",
     "aten::linalg_vector_norm": "test_vector_norm",
@@ -92,8 +96,11 @@ _SAME_KERNEL_OUT = (
     "written straight into (or copied into) the caller's tensors"
 )
 SKIPPED: dict[str, str] = {
+    "aten::max.unary_out": _SAME_KERNEL_OUT,
     "aten::sum.IntList_out": _SAME_KERNEL_OUT,
     "aten::topk.values": _SAME_KERNEL_OUT,
+    "aten::nansum.out": _SAME_KERNEL_OUT,
+    "aten::min.unary_out": _SAME_KERNEL_OUT,
     "aten::sort.values_stable": _SAME_KERNEL_OUT,
     "aten::multinomial.out": _SAME_KERNEL_OUT,
     "aten::median.dim_values": _SAME_KERNEL_OUT,
@@ -109,6 +116,18 @@ SKIPPED: dict[str, str] = {
         "full-sort route test_median and test_sort measure"
     ),
     "aten::nanmedian": "aten::median's route with nanmedian.dim's select mode",
+    "aten::norm.Scalar": "legacy norm overload -> the same ord-2 vector_norm kernel",
+    "aten::norm.ScalarOpt_dtype": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.ScalarOpt_dim": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.ScalarOpt_dim_dtype": (
+        "legacy norm overload -> the same ord-2 vector_norm kernel"
+    ),
+    "aten::norm.out": _SAME_KERNEL_OUT,
+    "aten::norm.dtype_out": _SAME_KERNEL_OUT,
 }
 
 
@@ -143,6 +162,26 @@ def test_sum(
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_nansum(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
+    if dim is None:
+        bench.run(
+            lambda: torch.nansum(x_ref),
+            lambda: torch.nansum(x_our),
+            flops=float(x_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.nansum(x_ref, dim=dim),
+            lambda: torch.nansum(x_our, dim=dim),
+            flops=float(x_ref.numel()),
+        )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
 def test_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
@@ -157,6 +196,26 @@ def test_mean(
         bench.run(
             lambda: torch.mean(x_ref, dim=dim),
             lambda: torch.mean(x_our, dim=dim),
+            flops=float(x_ref.numel()),
+        )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_prod(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
+    if dim is None:
+        bench.run(
+            lambda: torch.prod(x_ref),
+            lambda: torch.prod(x_our),
+            flops=float(x_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.prod(x_ref, dim=dim),
+            lambda: torch.prod(x_our, dim=dim),
             flops=float(x_ref.numel()),
         )
 
@@ -184,6 +243,26 @@ def test_min(
     )
     bench.run(
         lambda: torch.min(x_ref), lambda: torch.min(x_our), flops=float(x_ref.numel())
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bool", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_SHAPES)
+def test_count_nonzero(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, dim = DIM_SHAPES[shape_id]
+    src = (
+        torch.rand(shape) < 0.5
+        if dtype_id == "bool"
+        else unit_interval(shape, DTYPES[dtype_id])
+    )
+    x_ref, x_our = both(src, hw, mojo_device)
+    d = 0 if dim is None else dim
+    bench.run(
+        lambda: torch.count_nonzero(x_ref, dim=d),
+        lambda: torch.count_nonzero(x_our, dim=d),
+        flops=float(x_ref.numel()),
     )
 
 
