@@ -24,7 +24,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
-from std.utils.numerics import isinf, nan
+from std.utils.numerics import max_or_inf, nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -1632,31 +1632,23 @@ def op_var_correction(
 # ---------------------------------------------------------------------------
 
 
-def _vector_norm_spec(ord_v: Value) raises -> StaticString:
-    """`ord` -> the reduce-skeleton kernel token, shared by every
-    `linalg_vector_norm` / legacy `norm` overload. A missing `ord` (legacy
-    `norm`'s `p=None`) means 2, same as torch's `impl_func_norm`.
-
-    Order and token names are the shared convention across the four ord
-    sibling PRs (#564 ord=0, #567 ord=1, #570 ord=+inf, #571 ord=-inf): one
-    `if` per ord, so each sibling is a one-line addition here. Any other ord
-    (e.g. 3) declines.
-    """
+def _vector_norm_spec(
+    op_label: StaticString, ord_v: Value
+) raises -> StaticString:
+    """Which one-pass accumulator `ord` selects; anything else declines. A
+    missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
+    `impl_func_norm`. One `if` per ord, in torch's own enumeration order
+    (2, 1, inf, -inf, 0) -- sibling ops (#564 ord=0, #567 ord=1, #571 -inf)
+    land one branch at a time here."""
     if v_scalar_is_bool(ord_v):
-        unsupported("linalg_vector_norm with ord != 2")
-    var ord = v_f64_or(ord_v, 2.0)
-    if ord == 2.0:
+        unsupported(String(op_label) + " with an unsupported ord")
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f == 2.0:
         return "NormSpec"
-    if ord == 1.0:
-        return "NormL1Spec"
-    if ord > 0.0 and Bool(isinf(ord)):
+    if ord_f == max_or_inf[DType.float64]():
         return "NormInfSpec"
-    if ord < 0.0 and Bool(isinf(ord)):
-        return "NormNegInfSpec"
-    if ord == 0.0:
-        return "NormL0Spec"
-    unsupported("linalg_vector_norm with ord != 2")
-    raise Error("unreachable")
+    unsupported(String(op_label) + " with an unsupported ord")
+    return ""
 
 
 def _vector_norm_operand(
@@ -1693,33 +1685,6 @@ def _vector_norm_operand(
         _promote(src, want)
 
 
-def _refuse_empty_vector_norm(
-    op_label: StaticString, spec_op: StaticString, t: T, dims: List[Int]
-) raises:
-    """torch's `linalg_vector_norm` META function refuses ord<0 or ord==+inf
-    over a zero-length reduce dim EVEN WHEN THE OUTPUT ITSELF IS EMPTY TOO
-    (confirmed against live torch: `vector_norm(empty(0, 0), ord=inf, dim=1)`
-    still raises, output numel 0 and all). The generic skeleton's
-    `errors_on_empty_axis` guard (`_rowred_spec_into_go`) only fires when
-    `outputs > 0`, which is right for amax/amin (their codomain is never
-    empty when the reduce dim itself isn't) but NOT enough here, so this
-    host-side check runs first, shaped like `_refuse_empty_extremum`. ord
-    2/1/0 have no such rule -- torch answers their identity (0, 0, true) for
-    an empty reduce -- so this is a no-op for every other spec token.
-    """
-    if spec_op != "NormInfSpec" and spec_op != "NormNegInfSpec":
-        return
-    var extent = 1
-    for d in dims:
-        extent *= t.dim(d)
-    if extent == 0:
-        unsupported(
-            String(op_label)
-            + " cannot compute the norm on a reduce dimension of size 0"
-            " (torch refuses it too)"
-        )
-
-
 def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     """torch's `is_reduce_over_1D_vector`: every dim BEING REDUCED has extent
     1 (a dim that is kept may be any size). Squaring a lone element can
@@ -1729,8 +1694,10 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
     LinearAlgebra.cpp. Verified against that source for ord=+inf: the
     special case is keyed on `ord != 0.0`, so +inf (like 2) takes the `abs`
-    path here -- only `ord == 0` (`ne(0)`, a sibling PR's accumulator) needs
-    a different formula, not yet wired into this shortcut.
+    path here -- only `ord == 0` (`ne(0)`, a sibling PR's accumulator, not
+    counted as magnitude) needs a different formula, not wired into this
+    shortcut: callers must gate it out (`op != "NormL0Spec"`) once that
+    accumulator lands.
     """
     for d in dims:
         if a.dim(d) != 1:
@@ -1791,20 +1758,26 @@ def _vector_norm(
     rets: Values,
 ) raises:
     _require_mojo(a)
-    var spec_op = _vector_norm_spec(ord_v)
+    var op = _vector_norm_spec(op_label, ord_v)
     var src = _borrow(a)
     _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
-    _refuse_empty_vector_norm(op_label, spec_op, src.t, dims)
-    if _all_reduced_dims_size_one(src.t, dims):
+    if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         var out = _vector_norm_abs(src.t, dims, keepdim)
         ret_owned(rets, 0, out)
         _ = src^
         return
+    if op == "NormInfSpec":
+        # +inf (like -inf) has no identity: torch refuses a zero-length
+        # reduce dim even when the output itself is empty. Declining on the
+        # host gives a clean NotImplementedError; the skeleton's own guard
+        # (`_rowred_spec_into_go`, unconditional on `reduce_n == 0` too) is
+        # a plain `raise Error(...)` -> RuntimeError, not reached here.
+        _refuse_empty_extremum(op_label, src.t, dims)
     var out = _scalar_reduction(
-        "reduction", spec_op, src.t, dims, keepdim, src.t.stype, False, 0.0
+        "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
     )
     ret_owned(rets, 0, out)
     _ = src^
@@ -1823,21 +1796,22 @@ def _vector_norm_out(
 ) raises:
     _require_mojo(a)
     _require_mojo(out)
-    var spec_op = _vector_norm_spec(ord_v)
+    var op = _vector_norm_spec(op_label, ord_v)
     var src = _borrow(a)
     _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
-    _refuse_empty_vector_norm(op_label, spec_op, src.t, dims)
-    if _all_reduced_dims_size_one(src.t, dims):
+    if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         _vector_norm_abs_out(op_name, src.t, dims, keepdim, out)
         ret_ref(rets, 0, out)
         _ = src^
         return
+    if op == "NormInfSpec":
+        _refuse_empty_extremum(op_label, src.t, dims)
     _scalar_reduction_out(
         "reduction",
-        spec_op,
+        op,
         op_name,
         "exact",
         src.t,

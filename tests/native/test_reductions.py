@@ -2008,10 +2008,10 @@ def test_vector_norm_inf_out_and_resize(mojo_gpu):
 def test_vector_norm_inf_refuses_empty_reduce_dim_with_empty_output(mojo_gpu, dim):
     """torch's meta check refuses ord=+inf over a zero-length reduce dim EVEN
     WHEN THE OUTPUT ITSELF IS EMPTY TOO (confirmed on live CPU torch:
-    `vector_norm(empty(0, 0), ord=inf, dim=1)` still raises) -- unlike
-    amax/amin's `errors_on_empty_axis`, whose skeleton-generic guard only
-    fires when the output is nonempty, this needs the host-side
-    `_refuse_empty_vector_norm` check in front of it."""
+    `vector_norm(empty(0, 0), ord=inf, dim=1)` still raises) -- same as
+    amax/amin's `errors_on_empty_axis`, whose skeleton-generic guard
+    (`_rowred_spec_into_go`) is unconditional on `reduce_n == 0`, not gated
+    by the output count."""
     x = torch.empty(0, 0)
     with pytest.raises(RuntimeError):
         torch.linalg.vector_norm(x, ord=math.inf, dim=dim)

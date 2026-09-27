@@ -199,12 +199,15 @@ trait ReduceOp:
     comptime errors_on_empty_axis: Bool
     """Does torch REFUSE this reduction when the reduce axis has length zero?
 
-    Only the selection ops do -- "amax(): Expected reduction dim 1 to have
-    non-zero size", because there is no element to select. Every other
+    Only the selection ops (and the L-inf/L-negative-inf vector norm) do --
+    "amax(): Expected reduction dim 1 to have non-zero size", because there
+    is no element to select or no identity for max-of-abs. Every other
     accumulator answers with its identity finalized over n == 0, which is
     torch's answer too: sum -> 0, the L2 norm -> 0, all -> true, any -> false,
-    and mean -> nan (0/0). A reduction with no OUTPUTS is never an error for
-    anyone; it writes nothing."""
+    and mean -> nan (0/0). This refusal is UNCONDITIONAL: torch raises even
+    when the output itself is empty too (e.g. `amin(empty(0, 0), dim=1)`),
+    so `_rowred_spec_into_go` checks `reduce_n == 0` alone, not gated by the
+    output count."""
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
