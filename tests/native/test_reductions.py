@@ -2855,6 +2855,8 @@ def test_sort_every_dtype(mojo_gpu, dtype, columns):
     """Every kernel dtype, on a one-tile and a multi-tile row. The 64-bit
     dtypes matter most: their key is twice as wide, which halves the tile and
     so moves every route boundary."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     host = _dtype_probe((3, columns), dtype)
     for descending in (False, True):
         expected = torch.sort(host, dim=-1, descending=descending, stable=True)
@@ -2868,6 +2870,8 @@ def test_sort_every_dtype(mojo_gpu, dtype, columns):
 @pytest.mark.parametrize("dtype", [d for d in _SORT_DTYPES if d is not torch.bool])
 @pytest.mark.parametrize("k", [1, 9, 257])
 def test_topk_every_dtype(mojo_gpu, dtype, k):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     host = _dtype_probe((3, 257), dtype)
     for largest in (True, False):
         _check_topk(host, mojo_gpu, k, -1, largest)
@@ -2902,23 +2906,27 @@ def test_sort_and_topk_non_contiguous_input(mojo_gpu):
         _same(got.values, torch.topk(ref, 4, dim=-1).values)
 
 
-def test_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu):
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.float64]
+)
+def test_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu, dtype):
     """A negative NaN's bits sit below -inf and -0.0's below +0.0, but ATen
     orders every NaN above every number and treats the two zeros as equal."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     nan = float("nan")
     inf = float("inf")
-    host = torch.tensor([[0.0, -0.0, nan, -nan, inf, -inf, 1.0, -1.0, nan, 0.0]])
-    for dtype in (torch.float32, torch.bfloat16, torch.float16, torch.float64):
-        x = host.to(dtype)
-        for descending in (False, True):
-            expected = torch.sort(x, dim=-1, descending=descending, stable=True)
-            actual = torch.sort(x.to(mojo_gpu), dim=-1, descending=descending)
-            _same(actual.values, expected.values)
-            _same(actual.indices, expected.indices)
-        for k in (1, 3, 10):
-            for largest in (True, False):
-                got = torch.topk(x.to(mojo_gpu), k, largest=largest)
-                _same(got.values, torch.topk(x, k, largest=largest).values)
+    x = torch.tensor([[0.0, -0.0, nan, -nan, inf, -inf, 1.0, -1.0, nan, 0.0]])
+    x = x.to(dtype)
+    for descending in (False, True):
+        expected = torch.sort(x, dim=-1, descending=descending, stable=True)
+        actual = torch.sort(x.to(mojo_gpu), dim=-1, descending=descending)
+        _same(actual.values, expected.values)
+        _same(actual.indices, expected.indices)
+    for k in (1, 3, 10):
+        for largest in (True, False):
+            got = torch.topk(x.to(mojo_gpu), k, largest=largest)
+            _same(got.values, torch.topk(x, k, largest=largest).values)
 
 
 def test_sort_and_topk_many_rows(mojo_gpu):
@@ -3102,6 +3110,8 @@ def test_kthvalue_matches_cpu_across_the_routes(mojo_gpu, columns, k):
 def test_median_and_kthvalue_every_dtype(mojo_gpu, dtype, columns):
     """Heavily tied values: median's lowest-index tie rule is exact, and
     kthvalue's value is, with an index pointing at it."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     host = _dtype_probe((3, columns), dtype)
     _check_median(host, mojo_gpu, -1, False)
     for k in (1, columns // 3, columns):
