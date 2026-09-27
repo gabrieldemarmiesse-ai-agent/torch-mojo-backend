@@ -38,7 +38,7 @@ from torch.optim.optimizer import _default_to_fused_or_foreach
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
 
-from tests.native.conftest import side_stream_or_skip, skip_if_metal
+from tests.native.conftest import is_metal, side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import (
     get_accelerators,
     mojo_backend,
@@ -781,12 +781,18 @@ def test_blocking_to_cpu_ignores_explicit_pin_memory(mojo_device: str):
     torch.testing.assert_close(result, expected)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
 @pytest.mark.parametrize("transpose", [False, True])
 def test_to_cpu_device_conversion_stays_asynchronous(
     mojo_gpu: str, dtype: torch.dtype, transpose: bool
 ):
-    """Unlike copy_'s host cast, to() casts/relayouts on GPU and stays async."""
+    """Unlike copy_'s host cast, to() casts/relayouts on GPU and stays async --
+    including float64: verified on real CUDA (after warming the cast up once,
+    since an unwarmed first call pays a one-time lazy-init cost that looks
+    like blocking but is not) that it returns immediately with the transfer
+    stream still gated, exactly like float16/bfloat16. The one exception is
+    an Apple GPU, which has no float64 execution and so still takes the
+    (blocking) host-cast fallback for it."""
     with device_module.device(mojo_gpu):
         expected = torch.arange(1024, dtype=torch.float32).reshape(32, 32)
         if transpose:
@@ -795,37 +801,25 @@ def test_to_cpu_device_conversion_stays_asynchronous(
         _ = source.to("cpu", dtype=dtype, non_blocking=True)
         stream = device_module.current_stream(mojo_gpu)
         stream.synchronize()
-        with _held_transfer_stream(stream):
-            pending = stream.record_event()
-            downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
-            assert downloaded.is_pinned()
-            assert not pending.query()
+        if dtype == torch.float64 and is_metal(mojo_gpu):
+            with _held_transfer_stream(stream) as release:
+                pending = stream.record_event()
+                timer = Timer(0.2, release.set)
+                timer.start()
+                try:
+                    downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
+                    assert pending.query()
+                finally:
+                    timer.join()
+            torch.accelerator.synchronize(mojo_gpu)
+        else:
+            with _held_transfer_stream(stream):
+                pending = stream.record_event()
+                downloaded = source.to("cpu", dtype=dtype, non_blocking=True)
+                assert downloaded.is_pinned()
+                assert not pending.query()
         assert downloaded.stride() == expected.stride()
         torch.testing.assert_close(downloaded, expected.to(dtype))
-
-
-def test_to_cpu_host_conversion_is_deliberately_blocking(mojo_gpu: str):
-    """Float64 to() uses our host cast fallback; CUDA can cast it on the GPU."""
-    skip_if_metal(mojo_gpu, "Metal does not support float64")
-    with device_module.device(mojo_gpu):
-        expected = torch.arange(257, dtype=torch.float32)
-        source = expected.to(mojo_gpu)
-        _ = source.to("cpu", dtype=torch.float64, non_blocking=True)
-        stream = device_module.current_stream(mojo_gpu)
-        stream.synchronize()
-        with _held_transfer_stream(stream) as release:
-            pending = stream.record_event()
-            timer = Timer(0.2, release.set)
-            timer.start()
-            try:
-                output = source.to("cpu", dtype=torch.float64, non_blocking=True)
-                assert pending.query()
-                torch.testing.assert_close(output, expected.double())
-            finally:
-                timer.join()
-        torch.accelerator.synchronize(mojo_gpu)
-        assert output.is_pinned()
-        torch.testing.assert_close(output, expected.double())
 
 
 @pytest.mark.parametrize(

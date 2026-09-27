@@ -74,6 +74,7 @@ from tmb.ops.common import (
     copy_strided_into,
     elementwise_direct,
     fill_value,
+    is_cast_dtype_on,
     one_device,
     resize_out,
 )
@@ -123,6 +124,7 @@ def _is_truthy(dt: DType) -> Bool:
     """reduce_skeleton TRUTHY_DTYPES: the operand dtypes any()/all() accept."""
     return (
         _is_row_reduce(dt)
+        or dt == DType.float64
         or dt == DType.int16
         or dt == DType.int8
         or dt == DType.uint8
@@ -130,22 +132,51 @@ def _is_truthy(dt: DType) -> Bool:
     )
 
 
-def _is_castable(dt: DType) -> Bool:
+def _is_float_or_double(dt: DType) -> Bool:
+    """_is_float3 plus float64: mean's and the vector-norm's dtype gate, NOT
+    var's (its separate moments kernel, entry.mojo's FLOAT_DTYPES, has no
+    float64 specialization)."""
+    return _is_float3(dt) or dt == DType.float64
+
+
+def _is_castable(dt: DType, t: T) raises -> Bool:
     """aten_fast._CAST_DTYPES: what the cast kernel dispatches on, and so the
-    dtype pairs a promotion can go through."""
-    return (
-        _is_float3(dt)
-        or dt == DType.int64
-        or dt == DType.int32
-        or dt == DType.uint8
-        or dt == DType.bool
-    )
+    dtype pairs a promotion can go through -- exactly `is_cast_dtype_on`
+    (ops/common.mojo), which `_promote` (sum/nansum/mean/prod/cumsum/the
+    vector-norm dtype= path -- every caller of `_promote`) uses through this
+    one check rather than needing its own device guard."""
+    return is_cast_dtype_on(dt, t)
 
 
 def _is_sum_dtype(dt: DType) -> Bool:
     """What `fast_aten_sum` accumulates in (int32 is promoted to int64 by
     torch before it gets here, and an explicit `dtype=int32` was declined)."""
-    return _is_float3(dt) or dt == DType.int64
+    return _is_float3(dt) or dt == DType.float64 or dt == DType.int64
+
+
+def _decline_metal_float64(t: T, op: StaticString) raises:
+    """float64 has no Apple GPU execution: every dtype gate that admits it
+    below (sum/nansum/prod, mean, norm, any/all) declines it here the same
+    way `_check_extremum_dtype` already does for amax/amin/max/min."""
+    _decline_metal_float64_dtype(t.dtype, t, op)
+
+
+def _decline_metal_float64_dtype(dt: DType, t: T, op: StaticString) raises:
+    """Same decline, ALSO checked against a dtype not yet on `t` (a `dtype=`
+    target about to be promoted into): declining before the promotion means
+    an explicit `dtype=torch.float64` on an Apple GPU gets a clean
+    `unsupported()` instead of the cast kernel's own raw Error.
+
+    Checks `t`'s CURRENT dtype too, not just `dt`: a float64 self promoted
+    to a non-float64 target (`mean(x_float64, dtype=torch.float32)`, and the
+    same shape for sum/nansum/prod) still cast_to()s through the float64
+    side of that pair, which `_cast` raises on Apple GPUs precisely because
+    it's float64, regardless of which side. Declining on either dtype here
+    means the call site above needn't separately check `t.dtype`."""
+    if (dt == DType.float64 or t.dtype == DType.float64) and dev(
+        t.device
+    )[].api == "metal":
+        unsupported(String(op) + ": float64 is unavailable on Apple GPUs")
 
 
 def _is_cumsum_dtype(dt: DType, fast_ok: Bool) -> Bool:
@@ -211,7 +242,7 @@ def _promote(mut op: Operand, stype: Int32) raises:
     if op.t.stype == stype:
         return
     var target = max_dtype(stype)
-    if not _is_castable(op.t.dtype) or not _is_castable(target):
+    if not _is_castable(op.t.dtype, op.t) or not _is_castable(target, op.t):
         unsupported(
             "reduction dtype promotion from "
             + String(op.t.dtype)
@@ -748,12 +779,22 @@ def _out_reduce_dtype(
     return target
 
 
-def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
+def _promote_for_out_reduction(
+    mut src: Operand, target: DType, op_name: StaticString
+) raises:
     """Cast `src` to `target` before reducing: both mean and sum round every
     element to `target` first (their CUDA kernels build the reduction
     directly from it), then accumulate in float32 via their own `acc_dtype`
     -- mirroring CUDA, not CPU torch's separate half-precision-avoiding
-    `mean_out` path."""
+    `mean_out` path.
+
+    Declines float64 on an Apple GPU UNCONDITIONALLY, before the `src.t.dtype
+    != target` check below: when they're already equal (both float64, no
+    cast needed) `_promote` -- and so its own device-aware `_is_castable`
+    guard -- is never reached, so this is the one place that decision has to
+    be made for every out= reduction (sum.IntList_out, mean.out/dtype_out,
+    prod.int_out, nansum.out)."""
+    _decline_metal_float64_dtype(target, src.t, op_name)
     if src.t.dtype != target:
         _promote(src, torch_dtype(target))
 
@@ -776,6 +817,7 @@ def _sum(
         _promote(src, ST_INT64)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("sum of dtype " + String(src.t.dtype))
+    _decline_metal_float64(src.t, "sum")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
@@ -837,7 +879,7 @@ def op_sum_intlist_out(
     )
     if not _is_sum_dtype(target):
         unsupported("sum with dtype=" + String(target))
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::sum.IntList_out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
@@ -887,6 +929,7 @@ def _nansum_prep(
         _promote(src, ST_INT64)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("nansum of dtype " + String(src.t.dtype))
+    _decline_metal_float64(src.t, "nansum")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("nansum with no reduce dim (a rank-0 operand)")
@@ -950,7 +993,7 @@ def op_nansum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var target = _nansum_out_target(
         args[unsafe_offset=3], src.t.dtype, out, "aten::nansum.out"
     )
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::nansum.out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("nansum with no reduce dim (a rank-0 operand)")
@@ -981,11 +1024,12 @@ def _mean(
     var src = _borrow(a)
     var want = _opt_dtype(dtype_v)
     if want >= 0:
-        if not _is_float3(max_dtype(want)):
+        if not _is_float_or_double(max_dtype(want)):
             unsupported("mean with dtype=" + String(max_dtype(want)))
         _promote(src, want)
-    if not _is_float3(src.t.dtype):
+    if not _is_float_or_double(src.t.dtype):
         unsupported("mean of dtype " + String(src.t.dtype))
+    _decline_metal_float64(src.t, "mean")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
@@ -1032,14 +1076,14 @@ def _mean_out(
     _require_mojo(dst)
     var src = _borrow(a)
     var target = _out_reduce_dtype(dtype_v, dst, op_name)
-    if _opt_dtype(dtype_v) < 0 and not _is_float3(src.t.dtype):
+    if _opt_dtype(dtype_v) < 0 and not _is_float_or_double(src.t.dtype):
         # No explicit dtype=: torch requires self itself to be float/complex.
         # An explicit dtype= bypasses this -- self is cast to it below, so an
         # int64 self with dtype=torch.float32 is valid.
         unsupported("mean of dtype " + String(src.t.dtype))
-    if not _is_float3(target):
+    if not _is_float_or_double(target):
         unsupported("mean with dtype=" + String(target))
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, op_name)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
@@ -1411,6 +1455,7 @@ def _any_all(
     _require_mojo(a)
     if not _is_truthy(a.dtype):
         unsupported(String(spec) + " of dtype " + String(a.dtype))
+    _decline_metal_float64(a, spec)
     if (
         dim_v.tag == TAG_NONE
         and not keepdim
@@ -1516,6 +1561,7 @@ def op_any_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def _check_truthy_dtype(name: StaticString, a: T) raises:
     if not _is_truthy(a.dtype):
         unsupported(String(name) + " of dtype " + String(a.dtype))
+    _decline_metal_float64(a, name)
 
 
 def _truthy_reduce_dims(
@@ -1618,6 +1664,7 @@ def op_count_nonzero(
     _require_mojo(a)
     if not _is_truthy(a.dtype):
         unsupported("count_nonzero of dtype " + String(a.dtype))
+    _decline_metal_float64(a, "count_nonzero")
     # An explicit empty dim list reduces every dim (unlike any.dims/all.dims):
     # `count_nonzero.default(self, dim=None)` redispatches here with `dim=[]`.
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
@@ -1695,6 +1742,26 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
     return "NormPSpec"
 
 
+def _decline_normp_float64(
+    op: StaticString, op_label: StaticString, src_dtype: DType, dtype_v: Value
+) raises:
+    """NormPOp (general ord=p) has a fixed float32 accumulator, so a float64
+    self or `dtype=torch.float64` would silently compute in less precision
+    than asked for; declined on every device, before `_vector_norm_operand`
+    promotes anything."""
+    if op != "NormPSpec":
+        return
+    if src_dtype == DType.float64:
+        unsupported(
+            String(op_label) + " of dtype float64 with a general ord (p)"
+        )
+    var want = _opt_dtype(dtype_v)
+    if want >= 0 and max_dtype(want) == DType.float64:
+        unsupported(
+            String(op_label) + " with dtype=float64 and a general ord (p)"
+        )
+
+
 def _vector_norm_operand(
     op_label: StaticString, dtype_v: Value, mut src: Operand
 ) raises:
@@ -1707,18 +1774,25 @@ def _vector_norm_operand(
     before ever looking at `dtype=`, so an integer/bool input is declined
     even when `dtype=float32` would make the cast well-defined; and `dtype=`
     may only WIDEN (`check_linalg_norm_dtype`'s
-    `promoteTypes(self_dtype, dtype) == dtype`), so a float32 input with
-    `dtype=float16` is declined too. Restricted to the three floats this path
-    supports, "widen" means the same dtype or a target of float32.
+    `promoteTypes(self_dtype, dtype) == dtype`): a float32 input with
+    `dtype=float16` is declined, and (verified on real CUDA) so is a float64
+    input with `dtype=float32` -- float64 sits ABOVE float32 in this
+    promotion order, so it is a valid target from any of the other three
+    floats but never a valid source down to float32.
     """
-    if not _is_float3(src.t.dtype):
+    if not _is_float_or_double(src.t.dtype):
         unsupported(String(op_label) + " of dtype " + String(src.t.dtype))
     var want = _opt_dtype(dtype_v)
     if want >= 0:
         var target = max_dtype(want)
-        if not _is_float3(target):
+        if not _is_float_or_double(target):
             unsupported(String(op_label) + " with dtype=" + String(target))
-        if target != src.t.dtype and target != DType.float32:
+        var is_widen = (
+            target == src.t.dtype
+            or target == DType.float64
+            or (target == DType.float32 and src.t.dtype != DType.float64)
+        )
+        if not is_widen:
             unsupported(
                 String(op_label)
                 + ": the dtype of the input ("
@@ -1802,7 +1876,9 @@ def _vector_norm(
     _require_mojo(a)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
+    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
+    _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
@@ -1848,7 +1924,9 @@ def _vector_norm_out(
     _require_mojo(out)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
+    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
+    _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0 and src.t.rank != 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
@@ -2089,6 +2167,7 @@ def op_prod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _promote(src, ST_INT64)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("prod of dtype " + String(src.t.dtype))
+    _decline_metal_float64(src.t, "prod")
     var dims = _trailing_dims(src.t.rank, src.t.rank)
     var out = _scalar_reduction(
         "reduction",
@@ -2119,6 +2198,7 @@ def op_prod_dim_int(
         _promote(src, ST_INT64)
     if not _is_sum_dtype(src.t.dtype):
         unsupported("prod of dtype " + String(src.t.dtype))
+    _decline_metal_float64(src.t, "prod")
     var dims = _reduce_dim_single(v_int(args[unsafe_offset=1]), src.t.rank)
     var out = _scalar_reduction(
         "reduction",
@@ -2153,7 +2233,7 @@ def op_prod_int_out(
     )
     if not _is_sum_dtype(target):
         unsupported("prod with dtype=" + String(target))
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::prod.int_out")
     var dims = _reduce_dim_single(v_int(args[unsafe_offset=1]), src.t.rank)
     _scalar_reduction_out(
         "reduction",

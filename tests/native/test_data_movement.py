@@ -1471,9 +1471,9 @@ def test_select_scatter_negative_dim_and_index(mojo_device):
 
 
 def test_select_scatter_casts_src(mojo_gpu):
-    # float16 (not float64): the fast CastSpec kernel's dtype set is what
-    # select_scatter's src-cast uses, matching the old eager path's
-    # `_cast_tensor` (pre-gated on the same set, never a host round trip).
+    # float16: the fast CastSpec kernel's dtype set is what select_scatter's
+    # src-cast uses, matching the old eager path's `_cast_tensor` (pre-gated
+    # on the same set, never a host round trip).
     a = _fill((4, 5), torch.float32)
     src = torch.full((5,), 9.0, dtype=torch.float16)
     expected = a.select_scatter(src, 0, 1)
@@ -2598,6 +2598,7 @@ def test_empty_permuted_rejects_a_bad_layout(mojo_gpu):
 # ---------------------------------------------------------------------------
 
 _CAST_DTYPES = [
+    torch.float64,
     torch.float32,
     torch.float16,
     torch.bfloat16,
@@ -2610,6 +2611,9 @@ _CAST_DTYPES = [
 
 @pytest.mark.parametrize("src_dtype", _CAST_DTYPES)
 def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
+    """Runs on every backend, Apple GPUs included: float64 takes the fast
+    CastSpec kernel on CUDA/ROCm and the host round-trip fallback on Metal
+    (`is_cast_dtype_on`), and both must agree with CPU torch exactly."""
     for dst_dtype in _CAST_DTYPES:
         for numel in (1, 3, 17, 1027, 4099):
             for offset in (0, 1, 2, 3):
@@ -2624,6 +2628,103 @@ def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
                     numel,
                     offset,
                 )
+
+
+# `arange % 5` above (0-4 integers) cannot exercise float64's extra precision
+# or range: every one of those values is exact in every other dtype too, so
+# it can't catch a cast that silently loses bits or rounds wrong.
+_FLOAT64_PRECISION_VALUES = [
+    1 + 2**-40,  # needs > float32 mantissa bits; must round, not truncate
+    16777217.0,  # 2**24 + 1: exact in float64, not in float32
+    # PyTorch's half/bfloat16 (CPU and CUDA) are always constructed from
+    # float, so float64 -> half/bfloat16 double-rounds through float32 --
+    # verified on real CUDA. Each value sits just above the exact tie
+    # between two representable half/bf16 values, by less than float32's
+    # ulp there: a single (mathematically "correct") rounding step would
+    # round up, but double rounding first snaps to the tie in float32 and
+    # ties-to-even then rounds down -- this backend must match the double
+    # rounding, not the single-rounded answer.
+    1 + 2**-11 + 2**-25,  # float16 tie (2**-11) + an ulp float32 loses
+    1 + 2**-8 + 2**-30,  # bfloat16 tie (2**-8) + an ulp float32 loses
+    0.1,
+    -0.1,
+    1e30,
+    -1e30,
+    0.0,
+    -0.0,
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+]
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_float64_cast_precision_matches_cpu(mojo_gpu, dst_dtype):
+    """float64 -> a narrower float, and back, matches CPU torch bit-for-bit
+    on values chosen to expose a lost mantissa bit or a wrong rounding mode
+    (NaN/inf included, `equal_nan=True`)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor(_FLOAT64_PRECISION_VALUES, dtype=torch.float64)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
+    expected_back = expected.double()
+    got_back = got.to(mojo_gpu).double().cpu()
+    torch.testing.assert_close(got_back, expected_back, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.int64, torch.int32])
+def test_float64_cast_to_int_matches_cpu(mojo_gpu, dst_dtype):
+    """float64 -> int truncates toward zero, matching CPU exactly for every
+    finite, in-range value (NaN/inf/overflow-to-int is implementation-defined
+    in C++ and not assumed to agree between the host and the device)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    values = [v for v in _FLOAT64_PRECISION_VALUES if abs(v) < 1e18 and v == v]
+    x = torch.tensor(values, dtype=torch.float64)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.uint8, torch.int8, torch.int16])
+@pytest.mark.parametrize(
+    "src_dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
+def test_float_cast_to_narrow_int_wraps_like_an_int64_intermediate(
+    mojo_gpu, src_dtype, dst_dtype
+):
+    """A float -> uint8/int8/int16 cast wraps the value the way
+    `static_cast<int64_t>` then the narrower `static_cast` does (verified on
+    real CUDA): `(-1.0).to(uint8)` is 255, not the 0 a direct float ->
+    narrow-unsigned conversion gives. Values stay within int64's range (and
+    every source dtype's own exact-integer range), so CPU and CUDA agree --
+    genuinely out-of-int64-range magnitudes are implementation-defined and
+    not tested for exact equality (`test_float64_cast_to_int_matches_cpu`)."""
+    if src_dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    values = [-1.0, -1.5, -255.0, -256.0, -257.0, 1.5, 254.0, 255.0, 256.0, 257.0, 0.0]
+    x = torch.tensor(values, dtype=src_dtype)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    assert torch.equal(got, expected)
+
+
+def test_float_cast_to_int32_saturates_not_wraps(mojo_gpu):
+    """Unlike uint8/int8/int16 above, a float -> int32 cast does NOT chain
+    through int64: verified on real CUDA that a magnitude past int32's own
+    range but within int64's (3000000001.0) saturates to int32's min/max,
+    which is also what a direct float -> int32 SIMD cast already does --
+    routing it through int64 first would wrap instead (a real regression
+    caught while fixing the uint8/int8/int16 case above). CPU torch's
+    behavior here is implementation-defined UB and diverges from CUDA's
+    saturation, so the expected values are hardcoded to CUDA's, not read
+    from a CPU-computed reference."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([3000000001.0, -3000000001.0], dtype=torch.float64)
+    got = x.to(mojo_gpu).to(torch.int32).cpu()
+    torch.testing.assert_close(
+        got, torch.tensor([2147483647, -2147483648], dtype=torch.int32), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("dst_dtype", [torch.bfloat16, torch.float16])

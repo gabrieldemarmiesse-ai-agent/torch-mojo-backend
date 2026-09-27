@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_if_metal
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -443,9 +443,23 @@ def test_nansum_out_dtype_must_match_out_dtype(mojo_gpu):
         )
 
 
+def test_nansum_out_float64_out_and_nan(mojo_gpu):
+    """A float64 `out` with no `dtype=`: NaN is zeroed and the rest sums in
+    double (mirrors sum.IntList_out's cast-then-reduce, `nansum` semantics
+    with a NaN present)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(4, 5, dtype=torch.float64)
+    x[0, 0] = float("nan")
+    xd = x.to(mojo_gpu)
+    out = torch.empty(4, dtype=torch.float64, device=mojo_gpu)
+    torch.nansum(xd, dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), torch.nansum(x, dim=1))
+
+
 @pytest.mark.parametrize(
     "dtype",
     [
+        torch.float64,
         torch.float32,
         torch.float16,
         torch.bfloat16,
@@ -461,6 +475,8 @@ def test_count_nonzero_dtypes(mojo_gpu, dtype):
     """Every dtype the reduce_skeleton TRUTHY set accepts, output always
     int64 (torch's count_nonzero.dim_IntList_out(self, dim, out=out) result
     dtype)."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     if dtype is torch.bool:
         x = torch.rand(6, 9) < 0.5
     elif dtype.is_floating_point:
@@ -629,6 +645,51 @@ def test_sum_out_computes_in_outs_dtype(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
 
+def test_sum_out_float64_out_accumulates_in_double(mojo_gpu):
+    """A float64 `out` casts every element to double THEN sums (verified on
+    real CUDA against a naive `.double().sum()`, which a float32-then-cast
+    accumulation would miss by more than fp64 rounding)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    torch.manual_seed(1)
+    x = ((torch.rand(200_000) * 2 - 1) * 1e-3 + 1.0).float()
+    xd = x.to(mojo_gpu)
+    expected = x.double().sum()
+    assert expected.item() != x.sum().double().item()  # the two must differ
+    out = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.sum(xd, dim=0, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    # a float64 self needs no promotion at all.
+    x64 = torch.randn(357, 789, dtype=torch.float64)
+    out2 = torch.empty(357, dtype=torch.float64, device=mojo_gpu)
+    torch.sum(x64.to(mojo_gpu), dim=1, out=out2)
+    torch.testing.assert_close(out2.cpu(), x64.sum(dim=1))
+
+
+@pytest.mark.parametrize("fn_name", ["sum", "prod", "nansum", "mean"])
+def test_reduce_narrows_a_float64_self_with_explicit_dtype(mojo_gpu, fn_name):
+    """`dtype=torch.float32` on a float64 self is an explicit NARROWING cast
+    (unlike linalg_vector_norm/norm, sum/prod/nansum/mean have no widen-only
+    restriction -- verified on real CUDA that all four accept it). This is
+    also the one case the float64-on-Metal decline must catch by the SELF's
+    dtype, not just the requested target: `_is_castable` used to check only
+    `dtype=`'s target, so a float64 self with a non-float64 explicit dtype
+    reached the cast kernel on an Apple GPU instead of declining cleanly.
+
+    Asserts the decline itself on Metal (`is_metal`), rather than skipping
+    past it, so a Mac run actually exercises this fix instead of never
+    reaching it."""
+    fn = getattr(torch, fn_name)
+    x = torch.randn(4, 5, dtype=torch.float64)
+    if is_metal(mojo_gpu):
+        with pytest.raises(NotImplementedError):
+            fn(x.to(mojo_gpu), dim=1, dtype=torch.float32)
+        return
+    expected = fn(x, dim=1, dtype=torch.float32)
+    got = fn(x.to(mojo_gpu), dim=1, dtype=torch.float32).cpu()
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
     """Same equality rule as mean.out: an explicit `dtype=` that disagrees
     with `out`'s dtype raises, rather than silently using either one."""
@@ -721,11 +782,15 @@ def test_out_variant_resizes_a_mismatching_out(mojo_gpu):
     torch.testing.assert_close(transposed.cpu(), x.mean(dim=2), rtol=2e-6, atol=2e-6)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
 def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
     """`torch.mean(x, out=out)` with no `dim` dispatches to mean.dtype_out
     (verified against stock torch's own overload resolution), always a full
     reduce to a 0-d result regardless of input rank."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = torch.randn(4, 6, 5, dtype=dtype)
     xd = x.to(mojo_gpu)
     expected = x.mean()
@@ -736,8 +801,8 @@ def test_mean_dtype_out_full_reduce(mojo_gpu, dtype):
 
 
 def test_mean_dtype_out_casts_before_reducing(mojo_gpu):
-    """`dtype=` promotes the input before reducing (only float16/bfloat16/
-    float32 are supported, same as mean()/mean.out/mean.dim). These two
+    """`dtype=` promotes the input before reducing (float16/bfloat16/
+    float32/float64, same as mean()/mean.out/mean.dim). These two
     values are picked so summing them AS float16 (cast-after-reduce, the bug)
     rounds to a different float16-representable pair than summing them AS
     float32 (cast-before-reduce, what torch does): a loose tolerance cannot
@@ -787,14 +852,40 @@ def test_mean_out_computes_in_outs_dtype(mojo_gpu):
     torch.testing.assert_close(out_dim_out.cpu(), expected, rtol=0, atol=0)
 
 
-def test_mean_out_declines_float64_out(mojo_gpu):
-    """No float64 kernel specialization exists; a float64 `out` is declined
-    cleanly instead of reaching the cast kernel with an unsupported pair."""
+def test_mean_out_float64_out_accumulates_in_double(mojo_gpu):
+    """A float64 `out` with no `dtype=` computes mean ENTIRELY in double
+    (cast every element to double, then accumulate in double) -- verified on
+    real CUDA: it does not merely round a float32-accumulated answer. Values
+    picked so a float32 accumulation and a double one visibly differ."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    torch.manual_seed(1)
+    x = ((torch.rand(200_000) * 2 - 1) * 1e-3 + 1.0).float()
+    xd = x.to(mojo_gpu)
+    expected = x.double().mean()
+    assert expected.item() != x.mean().double().item()  # the two must differ
+
+    out = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.mean(xd, out=out)  # -> mean.dtype_out
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    out2 = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.mean(xd, dim=0, out=out2)  # -> mean.out
+    torch.testing.assert_close(out2.cpu(), expected, rtol=0, atol=0)
+
+
+def test_mean_out_declines_mismatched_float64_out(mojo_gpu):
+    """Unlike a float64 `out` with no `dtype=` (computed in double, above), a
+    float32 input with an EXPLICIT `dtype=torch.float64` still declines here:
+    `_out_reduce_dtype`'s policy takes `out`'s own dtype only when `dtype=`
+    is not given, so this exercises `_check_out_dtype`'s exact-match rule."""
     x = torch.randn(4, 5).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.mean(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
-    with pytest.raises(NotImplementedError):
-        torch.mean(x, out=torch.empty((), dtype=torch.float64, device=mojo_gpu))
+    with pytest.raises(RuntimeError):
+        torch.mean(
+            x,
+            dim=1,
+            dtype=torch.float64,
+            out=torch.empty(4, dtype=torch.float32, device=mojo_gpu),
+        )
 
 
 def test_mean_out_dtype_must_match_out_dtype(mojo_gpu):
@@ -948,6 +1039,25 @@ def test_prod_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
     assert out.item() == 2.0**64
 
 
+def test_prod_out_float64_out(mojo_gpu):
+    """A float64 `out` with no `dtype=` casts every element to double, not
+    float32, before multiplying: 2**24+1 is exact in double but rounds in
+    float32, so a float32-then-cast accumulation would give a different
+    (rounded) product than casting straight to double."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([2**24 + 1, 2**24 + 1], dtype=torch.int64)
+    expected = x.double().prod()
+    assert expected.item() != x.float().prod().double().item()  # must differ
+    out = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.prod(x.to(mojo_gpu), dim=0, out=out)
+    assert out.item() == expected.item()
+
+    x64 = torch.rand(4, 5, dtype=torch.float64) * 0.5 + 0.5
+    out2 = torch.empty(4, dtype=torch.float64, device=mojo_gpu)
+    torch.prod(x64.to(mojo_gpu), dim=1, out=out2)
+    torch.testing.assert_close(out2.cpu(), torch.prod(x64, dim=1))
+
+
 def test_prod_out_dtype_must_match_out_dtype(mojo_gpu):
     """Same equality rule as sum.IntList_out/mean.out: an explicit `dtype=`
     that disagrees with `out`'s dtype raises, rather than silently using
@@ -1023,7 +1133,10 @@ def test_amax_out_into_a_strided_destination(mojo_gpu):
 
 def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
     """amax's out dtype policy is exact (torch's meta: input/out dtypes must
-    match, no cast), unlike mean.out's safe_cast."""
+    match, no cast), unlike mean.out's safe_cast. A float32 self can't
+    satisfy that exact match against a float64 out (verified on real CUDA:
+    "Expected the dtype for input and out to match"), even though float64 is
+    itself a supported amax dtype (see test_amax_out_float64 below)."""
     x = torch.randn(4, 5).to(mojo_gpu)
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch.amax(x, dim=1, out=torch.empty(4, dtype=torch.float64, device=mojo_gpu))
@@ -1035,9 +1148,28 @@ def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
         )
 
 
+def test_amax_out_float64(mojo_gpu):
+    """A float64 self with a float64 out satisfies amax's exact-dtype policy
+    (selection needs no accumulation dtype, so this is the whole float64
+    story for amax/amin/max/min: EXTREMUM_DTYPES already covered them)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(357, 789, dtype=torch.float64)
+    out = torch.empty(357, dtype=torch.float64, device=mojo_gpu)
+    torch.amax(x.to(mojo_gpu), dim=1, out=out)
+    torch.testing.assert_close(out.cpu(), torch.amax(x, dim=1))
+
+
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int32, torch.int64]
+    "dtype",
+    [
+        torch.float64,
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+    ],
 )
 @pytest.mark.parametrize(
     "shape,dim", [((357, 789), 1), ((4, 5, 6), (0, 2)), ((37,), None)]
@@ -1045,6 +1177,8 @@ def test_amax_out_dtype_and_empty_dim_errors(mojo_gpu):
 def test_amin_out(mojo_gpu, shape, dim, dtype, keepdim):
     """amin.out over dtypes/dims/keepdim, including the dim=None full reduce
     (empty dim list) and a non-contiguous input."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     if dtype.is_floating_point:
         x = torch.randn(shape).to(dtype)
     else:
@@ -1139,12 +1273,22 @@ def test_max_and_min_full_reduction_of_empty_refused(mojo_device, shape):
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32]
+    "dtype",
+    [
+        torch.float64,
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int64,
+        torch.int32,
+    ],
 )
 @pytest.mark.parametrize("shape", [(37, 41), (357, 789), (128,)])
 def test_max_unary_out(mojo_device, shape, dtype):
     """`max.unary_out`: the full-reduction `out=` overload (`aten::max`
     itself has no `out=` form; torch routes `torch.max(x, out=t)` here)."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_device, "no float64 on Apple GPUs")
     if dtype.is_floating_point:
         x = torch.randn(shape).to(dtype)
     else:
@@ -1215,10 +1359,12 @@ def test_max_unary_out_refuses_empty_input(mojo_device, dtype):
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.int64]
 )
 def test_min_unary_out(mojo_gpu, dtype):
     """`torch.min(x, out=out)` dispatches to min.unary_out."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     if dtype.is_floating_point:
         x = torch.randn(37, 41).to(dtype)
     else:
@@ -1398,7 +1544,9 @@ def test_any_out_accepts_a_uint8_destination(mojo_gpu):
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int32, torch.float32])
+@pytest.mark.parametrize(
+    "dtype", [torch.bool, torch.uint8, torch.int32, torch.float32, torch.float64]
+)
 def test_all_out_variants(mojo_gpu, keepdim, dtype):
     """all.out (int dim), all.dims_out (dim list) and all.all_out (no dim,
     full reduction) all round-trip through the out= tensor, reusing the
@@ -1408,6 +1556,8 @@ def test_all_out_variants(mojo_gpu, keepdim, dtype):
     scalar each, so they can't show both outcomes in a single call) are
     checked against this mixed tensor (a real, non-vacuous False) and a
     second all-nonzero one (True)."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     mixed = torch.tensor(
         [
             [1, 1, 1, 1, 1, 1, 1, 1, 1],
@@ -1512,7 +1662,8 @@ def test_all_out_resizes_and_handles_strided_and_noncontig(mojo_gpu):
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.bool, torch.uint8, torch.int32, torch.float32, torch.float16]
+    "dtype",
+    [torch.bool, torch.uint8, torch.int32, torch.float32, torch.float16, torch.float64],
 )
 def test_any_all_out_full_reduction(mojo_gpu, dtype):
     """`any.all_out`: no dim/keepdim args, always reduces to a 0-d result.
@@ -1526,6 +1677,8 @@ def test_any_all_out_full_reduction(mojo_gpu, dtype):
     (one hot element, and an actual non-empty all-zero tensor) rather than
     relying on chance.
     """
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = torch.zeros(5, 6, dtype=dtype)
     x[2, 3] = 1
     xd = x.to(mojo_gpu)
@@ -1915,7 +2068,9 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
 @pytest.mark.parametrize(
     "shape,dim,keepdim",
     [
@@ -1927,6 +2082,8 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
 )
 def test_vector_norm_ord0_matches_torch(mojo_gpu, shape, dim, keepdim, dtype):
     """ord=0: count of nonzero elements (a separate compiled spec, NormL0Op)."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = torch.randint(-2, 3, shape).to(dtype)  # includes exact zeros
     ours = torch.linalg.vector_norm(
         x.to(mojo_gpu), ord=0, dim=dim, keepdim=keepdim
@@ -2346,9 +2503,7 @@ def test_norm_out_resizes_a_wrongly_shaped_out(mojo_gpu):
 
 
 def test_norm_dtype_out(mojo_gpu):
-    """float64 is out of scope: `_is_float3` (mean/var/L2-norm) never admits
-    it, same as `linalg_vector_norm`, so this exercises the accumulation-dtype
-    plumbing with float32 instead."""
+    """Exercises the accumulation-dtype plumbing with dtype=float32."""
     x = torch.randn(4, 5, dtype=torch.bfloat16)
     expected = torch.linalg.vector_norm(x, dim=[0, 1], dtype=torch.float32)
     out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
@@ -2357,6 +2512,56 @@ def test_norm_dtype_out(mojo_gpu):
     )
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_norm_dtype_out_float64(mojo_gpu):
+    """`dtype=torch.float64` widens from any of the three floats (verified on
+    real CUDA); norm.dtype_out/linalg_vector_norm.out both accumulate the sum
+    of squares in double, not float32-then-cast."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(4, 5, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x, dim=[0, 1], dtype=torch.float64)
+    out = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    returned = torch.ops.aten.norm.dtype_out(
+        x.to(mojo_gpu), None, [0, 1], False, dtype=torch.float64, out=out
+    )
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+    # a float64 self needs no dtype= at all, and rejects narrowing back down.
+    # Values close to 1.0 with a 2**-30 perturbation: below float32's own
+    # precision there, so a kernel that accumulated in float32 -- rather
+    # than genuinely in double -- would silently lose them and answer
+    # measurably differently (verified: the two differ starting a few ulps
+    # in), unlike bfloat16-sourced values above, which carry too little
+    # precision to tell float32 and float64 accumulation apart at all.
+    torch.manual_seed(0)
+    x64 = 1.0 + (torch.rand(5000, dtype=torch.float64) * 2 - 1) * 2**-30
+    expected64 = torch.linalg.vector_norm(x64, dim=0)
+    assert (
+        expected64.item()
+        != torch.linalg.vector_norm(x64.float(), dim=0).double().item()
+    )
+    out2 = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.linalg.vector_norm(x64.to(mojo_gpu), dim=0, out=out2)
+    torch.testing.assert_close(out2.cpu(), expected64, rtol=0, atol=0)
+    with pytest.raises(RuntimeError):
+        torch.linalg.vector_norm(x64.to(mojo_gpu), dim=0, dtype=torch.float32)
+
+
+def test_norm_general_p_declines_float64(mojo_gpu):
+    """NormPOp (any ord outside {0, 1, 2, +-inf}) keeps a plain float32
+    accumulator, unlike the dedicated-ord accumulators, which all use
+    `_float_acc` and so admit float64: a float64 self, or `dtype=
+    torch.float64` on another float input, would silently compute in less
+    precision than asked for (verified on real CUDA that this measurably
+    differs), so both are declined -- on every device, not just Apple's."""
+    x64 = torch.randn(4, 5, dtype=torch.float64).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x64, ord=3, dim=1)
+    x32 = torch.randn(4, 5, dtype=torch.float32).to(mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x32, ord=3, dim=1, dtype=torch.float64)
 
 
 def test_norm_general_p(mojo_gpu):
@@ -2523,7 +2728,9 @@ def test_vector_norm_general_p_declines_integer_input(mojo_gpu):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
 @pytest.mark.parametrize(
     "shape,dim",
     [((4099, 1031), 1), ((5003, 37), 1), ((1031, 4099), 0), ((1 << 20,), 0)],
@@ -2532,6 +2739,8 @@ def test_vector_norm_neginf_matches_torch(mojo_gpu, shape, dim, dtype):
     """ord=-inf selects the min |x|, an already-rounded, exactly
     representable element (not an accumulation), so exact equality is the
     right bar -- a loose tolerance would hide a selection error."""
+    if dtype is torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     x = (torch.rand(shape) * 0.9 + 0.05).to(dtype)
     ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=float("-inf"), dim=dim).cpu()
     expected = torch.linalg.vector_norm(x.double(), ord=float("-inf"), dim=dim)
@@ -2932,6 +3141,22 @@ def test_cumsum_dtype_kwarg_casts_before_accumulating(mojo_gpu):
     torch.testing.assert_close(result.cpu(), expected)
 
 
+def test_cumsum_narrows_a_float64_self_with_explicit_dtype(mojo_gpu):
+    """`cumsum(x_float64, dtype=torch.float32)`: the exact case that exposed
+    `_is_castable` checking only `dtype=`'s target and not the float64 SELF
+    -- `_promote`'s cast-then-accumulate reaches `_cast` with a float64
+    source regardless of the (non-float64) target. Asserts the decline on
+    Metal instead of skipping past it."""
+    x = torch.randn(4, 5, dtype=torch.float64)
+    if is_metal(mojo_gpu):
+        with pytest.raises(NotImplementedError):
+            torch.cumsum(x.to(mojo_gpu), dim=1, dtype=torch.float32)
+        return
+    expected = torch.cumsum(x, dim=1, dtype=torch.float32)
+    got = torch.cumsum(x.to(mojo_gpu), dim=1, dtype=torch.float32).cpu()
+    torch.testing.assert_close(got, expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.bool])
 def test_cumsum_integer_promotes_to_int64(mojo_gpu, dtype):
     """No dtype= kwarg: torch promotes every integer/bool cumsum to int64.
@@ -2974,7 +3199,9 @@ def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     """Eager has no graph fallback: every gate the old fast path answered with
     NOT_HANDLED is an actionable NotImplementedError here."""
     with pytest.raises(NotImplementedError):
-        torch.tensor(3.0, dtype=torch.float64).to(mojo_gpu).sum()  # no SumSpec f64
+        # int8/int16 promote to int64 through a cast the cast kernel does not
+        # dispatch on (same gap sum.IntList_out/cumsum document elsewhere).
+        torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum()
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
     with pytest.raises(NotImplementedError):

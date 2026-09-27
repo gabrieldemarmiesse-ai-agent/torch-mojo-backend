@@ -281,11 +281,14 @@ trait ReduceOp:
 # ---------------------------------------------------------------------------
 
 # Floating-point reductions accumulate in float32 (matching torch), float64
-# in its own dtype; integer ones accumulate in their own dtype.
+# in its own dtype; integer ones accumulate in their own dtype. sum/prod/
+# nansum: float64 is declined on Apple GPUs at the op level (no hardware
+# execution), same as EXTREMUM_DTYPES's float64 below.
 comptime SCALAR_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
 ]
@@ -301,7 +304,26 @@ comptime EXTREMUM_DTYPES: List[DType] = [
     DType.int32,
 ]
 
+# mean and the vector-norm accumulators (ord 0/1/2/+-inf); NOT var's (its own
+# moments kernel, entry.mojo's FLOAT_DTYPES, has no float64 specialization)
+# and NOT NormPOp's (below): op level declines float64 on Apple GPUs, as
+# above.
 comptime FLOAT_ONLY_DTYPES: List[DType] = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
+]
+
+# NormPOp (ord=p, any p outside {0, 1, 2, +-inf}): its accumulator is a plain
+# float32 -- `map_arg`/`finish_arg` take `arg` (ord) as a runtime Float32, not
+# a comptime-dtype pair -- so a float64 self would silently compute in less
+# precision than the input asked for. Verified on real CUDA that the two
+# answers differ (a p-norm over 2e5 elements near 1.0), so this is declined
+# outright on EVERY device, not just Apple's: `_decline_normp_float64`
+# (reductions.mojo) keeps it out of `NormPOp.dtypes` from ever being reached,
+# not merely from being compiled here.
+comptime NORMP_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
@@ -311,6 +333,7 @@ comptime TRUTHY_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
     DType.int16,
@@ -472,7 +495,7 @@ struct MeanOp(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -516,7 +539,7 @@ struct NormL2Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -555,7 +578,7 @@ struct NormL1Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -603,7 +626,7 @@ struct NormInfOp(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -688,7 +711,10 @@ struct NormL0Op(ReduceOp):
     (NaN == 0 is false) counts as nonzero, same rule as `AnyOp`. Accumulates
     in float, not int, matching CUDA's `acc_t` for this op: the count is a sum
     of 0.0/1.0 finished with a plain cast, never a separate int->float
-    conversion.
+    conversion. Verified on real CUDA that a float64 input accumulates the
+    count in double, not float32: a count just above 2**24 (not exactly
+    representable in float32) comes back exact for a double input and
+    rounded for a float32 one -- `_float_acc[in_dt]()` reproduces that.
     """
 
     comptime name = "norml0"
@@ -697,7 +723,7 @@ struct NormL0Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -737,7 +763,7 @@ struct NormPOp(ReduceOp):
     """
 
     comptime name = "normp"
-    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime dtypes = NORMP_DTYPES
     comptime errors_on_empty_axis = False
 
     @staticmethod
