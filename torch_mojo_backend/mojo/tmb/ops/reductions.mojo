@@ -24,7 +24,7 @@ contiguity, device and dtype only, so no post-reduction reshape is needed even
 on the permuted route.
 """
 from std.utils import IndexList
-from std.utils.numerics import min_or_neg_inf, nan
+from std.utils.numerics import max_or_inf, min_or_neg_inf, nan
 
 from tmb.backend.abi import (
     ST_BOOL,
@@ -1625,11 +1625,11 @@ def op_var_correction(
 
 # ---------------------------------------------------------------------------
 # linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|),
-# ord=-inf (min of |x|) and ord=0 (count of nonzero) share everything but the
-# accumulator; other ords decline. `norm`'s six legacy overloads are torch's
-# own redispatch onto this op (`impl_func_norm` in ATen's ReduceOps.cpp:
-# p=None -> 2, dim=[] -> every dim), so they share every helper below with
-# `linalg_vector_norm`.
+# ord=+inf (max of |x|), ord=-inf (min of |x|) and ord=0 (count of nonzero)
+# share everything but the accumulator; other ords decline. `norm`'s six
+# legacy overloads are torch's own redispatch onto this op (`impl_func_norm`
+# in ATen's ReduceOps.cpp: p=None -> 2, dim=[] -> every dim), so they share
+# every helper below with `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
@@ -1646,6 +1646,8 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
         return "NormSpec"
     if ord_f == 1.0:
         return "NormL1Spec"
+    if ord_f == max_or_inf[DType.float64]():
+        return "NormInfSpec"
     if ord_f == min_or_neg_inf[DType.float64]():
         return "NormNegInfSpec"
     if ord_f == 0.0:
@@ -1697,9 +1699,9 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
     LinearAlgebra.cpp. That special case fires for every ord != 0 (torch maps
     `ord == 0` to `ne(0)` there instead, since counting is not magnitude), so
-    it is correct for ord=1, 2 and -inf here; callers must skip it for ord=0,
-    where the general reduce path already computes `ne(0)` correctly through
-    `NormL0Op` for a size-one reduction, same as any other size.
+    it is correct for ord=1, 2, +inf and -inf here; callers must skip it for
+    ord=0, where the general reduce path already computes `ne(0)` correctly
+    through `NormL0Op` for a size-one reduction, same as any other size.
     """
     for d in dims:
         if a.dim(d) != 1:
@@ -1771,9 +1773,12 @@ def _vector_norm(
         ret_owned(rets, 0, out)
         _ = src^
         return
-    if op == "NormNegInfSpec":
-        # -inf has no identity: torch refuses a zero-length reduce dim (an
-        # empty output is still fine -- there is nothing to refuse for it).
+    if op == "NormInfSpec" or op == "NormNegInfSpec":
+        # +inf/-inf have no identity: torch refuses a zero-length reduce dim
+        # even when the output itself is empty. Declining on the host gives
+        # a clean NotImplementedError; the skeleton's own guard
+        # (`_rowred_spec_into_go`, unconditional on `reduce_n == 0` too) is
+        # a plain `raise Error(...)` -> RuntimeError, not reached here.
         _refuse_empty_extremum(op_label, src.t, dims)
     var out = _scalar_reduction(
         "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
@@ -1806,7 +1811,7 @@ def _vector_norm_out(
         ret_ref(rets, 0, out)
         _ = src^
         return
-    if op == "NormNegInfSpec":
+    if op == "NormInfSpec" or op == "NormNegInfSpec":
         _refuse_empty_extremum(op_label, src.t, dims)
     _scalar_reduction_out(
         "reduction",

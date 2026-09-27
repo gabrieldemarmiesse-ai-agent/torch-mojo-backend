@@ -199,12 +199,15 @@ trait ReduceOp:
     comptime errors_on_empty_axis: Bool
     """Does torch REFUSE this reduction when the reduce axis has length zero?
 
-    Only the selection ops do -- "amax(): Expected reduction dim 1 to have
-    non-zero size", because there is no element to select. Every other
+    Only the selection ops (and the L-inf/L-negative-inf vector norm) do --
+    "amax(): Expected reduction dim 1 to have non-zero size", because there
+    is no element to select or no identity for max-of-abs. Every other
     accumulator answers with its identity finalized over n == 0, which is
     torch's answer too: sum -> 0, the L2 norm -> 0, all -> true, any -> false,
-    and mean -> nan (0/0). A reduction with no OUTPUTS is never an error for
-    anyone; it writes nothing."""
+    and mean -> nan (0/0). This refusal is UNCONDITIONAL: torch raises even
+    when the output itself is empty too (e.g. `amin(empty(0, 0), dim=1)`),
+    so `_rowred_spec_into_go` checks `reduce_n == 0` alone, not gated by the
+    output count."""
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
@@ -552,6 +555,54 @@ struct NormL1Op(ReduceOp):
         dtype: DType, width: SIMDLength
     ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
         return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        return a.cast[out_dt]()
+
+
+struct NormInfOp(ReduceOp):
+    """linalg_vector_norm(ord=+inf): max of |x|, NaN PROPAGATED.
+
+    Identity 0 is valid for a max-of-abs (abs is never negative), and the
+    combine is MaxOp's NaN-propagating one -- `map` already turned any input
+    NaN into an accumulator NaN, so the same "b wins on greater-or-NaN" rule
+    carries it through. `errors_on_empty_axis = True` matches torch's
+    `linalg_vector_norm` meta check (LinearAlgebra.cpp): ord +inf (like ord
+    < 0) refuses an empty reduce dim because max-of-abs has no identity in
+    torch's own eyes, even though this accumulator's identity (0) would
+    happily answer 0.
+    """
+
+    comptime name = "norminf"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = True
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        return abs(x.cast[acc]())
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return (b.gt(a) | isnan(b)).select(b, a)
 
     @staticmethod
     def finish[

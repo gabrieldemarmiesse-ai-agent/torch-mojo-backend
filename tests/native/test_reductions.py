@@ -53,6 +53,7 @@ _REDUCE_OPS = {
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
+    "norminf": lambda t, **kw: torch.linalg.vector_norm(t, ord=math.inf, **kw),
     "norm_l1": lambda t, **kw: torch.linalg.vector_norm(t, ord=1, **kw),
     "norm_neginf": lambda t, **kw: torch.linalg.vector_norm(t, ord=float("-inf"), **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
@@ -1884,6 +1885,23 @@ def test_vector_norm_l1_out_resizes_and_strided_input(mojo_gpu):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_vector_norm_inf_matches_torch(mojo_gpu, dtype):
+    """ord=+inf: max of |x|, distinct from ord=2's sum of squares."""
+    x = (torch.randn(4099, 37) * 10).to(dtype)
+    expected = torch.linalg.vector_norm(x.double(), ord=math.inf, dim=1)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=1).cpu()
+    torch.testing.assert_close(ours.double(), expected, atol=1e-3, rtol=1e-3)
+
+
+def test_vector_norm_inf_with_an_accumulation_dtype(mojo_gpu):
+    cpu = torch.randn(4096, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(cpu, ord=math.inf, dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to(mojo_gpu), ord=math.inf, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected)
+
+
 def test_vector_norm_declines_non_floating_input(mojo_gpu):
     """`TORCH_META_FUNC(linalg_vector_norm)` calls `checkFloatingOrComplex` on
     the INPUT's own dtype unconditionally, before ever looking at `dtype=`:
@@ -2071,6 +2089,58 @@ def test_norm_scalaropt_dtype(mojo_gpu):
     got = torch.ops.aten.norm.ScalarOpt_dtype(x.to(mojo_gpu), None, dtype=torch.float32)
     assert got.dtype == torch.float32
     torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_vector_norm_inf_out_and_resize(mojo_gpu):
+    """A wrongly-shaped `out` is resized, same as every other scalar
+    reduction's out= path (`_scalar_reduction_out`)."""
+    x = torch.randn(5, 7)
+    expected = torch.linalg.vector_norm(x, ord=math.inf, dim=1)
+    out = torch.empty(0, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == (5,)
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [0, 1])
+def test_vector_norm_inf_refuses_empty_reduce_dim_with_empty_output(mojo_gpu, dim):
+    """torch's meta check refuses ord=+inf over a zero-length reduce dim EVEN
+    WHEN THE OUTPUT ITSELF IS EMPTY TOO (confirmed on live CPU torch:
+    `vector_norm(empty(0, 0), ord=inf, dim=1)` still raises) -- same as
+    amax/amin's `errors_on_empty_axis`, whose skeleton-generic guard
+    (`_rowred_spec_into_go`) is unconditional on `reduce_n == 0`, not gated
+    by the output count."""
+    x = torch.empty(0, 0)
+    with pytest.raises(RuntimeError):
+        torch.linalg.vector_norm(x, ord=math.inf, dim=dim)
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(x.to(mojo_gpu), ord=math.inf, dim=dim)
+
+
+def test_vector_norm_inf_declines_non_floating_input_with_dtype(mojo_gpu):
+    """Same rule as ord=2 (`checkFloatingOrComplex` on the input's own dtype,
+    unconditionally, before `dtype=` is ever consulted): int/bool inputs are
+    declined for ord=+inf too, even with a `dtype=` that would make the cast
+    well-defined."""
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu), ord=math.inf, dim=1
+        )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            torch.randint(0, 9, (4, 5)).to(mojo_gpu),
+            ord=math.inf,
+            dim=1,
+            dtype=torch.float32,
+        )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.vector_norm(
+            (torch.randn(4, 5) > 0).to(mojo_gpu),
+            ord=math.inf,
+            dim=1,
+            dtype=torch.float32,
+        )
 
 
 @pytest.mark.parametrize("dim", [None, 1, [0, 1], []])
