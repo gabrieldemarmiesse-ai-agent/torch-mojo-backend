@@ -59,10 +59,13 @@ from tmb.kernels.reduction.argreduce import _argreduce_spec_into
 from tmb.kernels.reduction.reduce_skeleton import (
     AllOp,
     AnyOp,
+    CountNonzeroOp,
     MaxOp,
     MinOp,
+    NanSumOp,
     NormL2Op,
     NormNegInfOp,
+    ProdOp,
     SumOp,
     _rowred_spec_into_go,
 )
@@ -1206,6 +1209,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 _rowred_spec_into_go[SumOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
+        comptime if _op_on["NanSumSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[NanSumOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
         comptime if _op_on["AmaxSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[MaxOp], "a scalar-reduction spec op"
@@ -1235,6 +1243,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 _rowred_spec_into_go[AllOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
+        comptime if _op_on["CountNonzeroSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[CountNonzeroOp],
+                "a scalar-reduction spec op",
+            ](argv, argc)
+            return 0
         comptime if _op_on["NormSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[NormL2Op], "a scalar-reduction spec op"
@@ -1243,6 +1257,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["NormNegInfSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[NormNegInfOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["ProdSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[ProdOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["LogSoftmaxSpec"]():
