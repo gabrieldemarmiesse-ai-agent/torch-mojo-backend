@@ -53,7 +53,6 @@ from tmb.backend.abi import (
     unsupported,
     v_bool_or,
     v_dtype_or,
-    v_f64,
     v_f64_or,
     v_int,
     v_int_or,
@@ -1625,21 +1624,36 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm / norm (ord=2 only: one pass, the root folded into the
-# finalize). `norm`'s six legacy overloads are torch's own redispatch onto
-# this op (`impl_func_norm` in ATen's ReduceOps.cpp: p=None -> 2, dim=[] ->
-# every dim), so they share every helper below with `linalg_vector_norm`.
+# linalg_vector_norm / norm (ord in {1, 2}: the L2 root folded into the
+# finalize, L1 with none; other ords decline). `norm`'s six legacy
+# overloads are torch's own redispatch onto this op (`impl_func_norm` in
+# ATen's ReduceOps.cpp: p=None -> 2, dim=[] -> every dim), so they share
+# every helper below with `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
+def _vector_norm_spec(ord_v: Value) raises -> StaticString:
+    """The kernel op token for `ord`, shared by every overload of both ops:
+    a missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
+    `impl_func_norm`. One `if` per supported ord; every other ord declines.
+    """
+    if v_scalar_is_bool(ord_v):
+        unsupported("vector_norm with ord != 1 or 2")
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f == 2.0:
+        return "NormSpec"
+    if ord_f == 1.0:
+        return "NormL1Spec"
+    unsupported("vector_norm with ord " + String(ord_f) + " != 1 or 2")
+    return ""
+
+
 def _vector_norm_operand(
-    op_label: StaticString, ord_v: Value, dtype_v: Value, mut src: Operand
+    op_label: StaticString, dtype_v: Value, mut src: Operand
 ) raises:
-    """The `ord` / `dtype=` gates shared by every overload of both ops: only
-    the ord-2 one-pass accumulator exists, and `dtype=` selects the
-    accumulation type by casting first (clip_grad_norm_ asks for float32). A
-    missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
-    `impl_func_norm`.
+    """The `dtype=` gate shared by every overload of both ops: `dtype=`
+    selects the accumulation type by casting first (clip_grad_norm_ asks for
+    float32).
 
     torch validates the INPUT's own dtype unconditionally
     (`checkFloatingOrComplex` in `TORCH_META_FUNC(linalg_vector_norm)`)
@@ -1650,8 +1664,6 @@ def _vector_norm_operand(
     `dtype=float16` is declined too. Restricted to the three floats this path
     supports, "widen" means the same dtype or a target of float32.
     """
-    if v_scalar_is_bool(ord_v) or v_f64_or(ord_v, 2.0) != 2.0:
-        unsupported(String(op_label) + " with ord != 2")
     if not _is_float3(src.t.dtype):
         unsupported(String(op_label) + " of dtype " + String(src.t.dtype))
     var want = _opt_dtype(dtype_v)
@@ -1676,9 +1688,9 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     overflow a magnitude the un-squared `abs` represents exactly (float32
     1e20: `(1e20)**2` overflows to inf, `sqrt(inf)` stays inf), so torch
     special-cases this to `abs()` instead of routing it through the
-    square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
-    LinearAlgebra.cpp. (torch also special-cases `ord == 0` to `ne(0)`
-    there, but ord is always 2 on this path.)
+    accumulator -- see `linalg_vector_norm_out` in ATen's LinearAlgebra.cpp.
+    That special case fires for every ord != 0 (torch maps `ord == 0` to
+    `ne(0)` there instead), so it is correct for both ord=1 and ord=2 here.
     """
     for d in dims:
         if a.dim(d) != 1:
@@ -1739,8 +1751,9 @@ def _vector_norm(
     rets: Values,
 ) raises:
     _require_mojo(a)
+    var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
-    _vector_norm_operand(op_label, ord_v, dtype_v, src)
+    _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
@@ -1750,7 +1763,7 @@ def _vector_norm(
         _ = src^
         return
     var out = _scalar_reduction(
-        "reduction", "NormSpec", src.t, dims, keepdim, src.t.stype, False, 0.0
+        "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
     )
     ret_owned(rets, 0, out)
     _ = src^
@@ -1769,8 +1782,9 @@ def _vector_norm_out(
 ) raises:
     _require_mojo(a)
     _require_mojo(out)
+    var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
-    _vector_norm_operand(op_label, ord_v, dtype_v, src)
+    _vector_norm_operand(op_label, dtype_v, src)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
@@ -1781,7 +1795,7 @@ def _vector_norm_out(
         return
     _scalar_reduction_out(
         "reduction",
-        "NormSpec",
+        op,
         op_name,
         "exact",
         src.t,
