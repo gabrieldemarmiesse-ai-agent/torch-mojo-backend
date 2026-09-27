@@ -164,11 +164,20 @@ def _decline_metal_float64(t: T, op: StaticString) raises:
 
 
 def _decline_metal_float64_dtype(dt: DType, t: T, op: StaticString) raises:
-    """Same decline, checked against a dtype not yet on `t` (a `dtype=`
-    target about to be promoted into): declining BEFORE the promotion means
+    """Same decline, ALSO checked against a dtype not yet on `t` (a `dtype=`
+    target about to be promoted into): declining before the promotion means
     an explicit `dtype=torch.float64` on an Apple GPU gets a clean
-    `unsupported()` instead of the cast kernel's own raw Error."""
-    if dt == DType.float64 and dev(t.device)[].api == "metal":
+    `unsupported()` instead of the cast kernel's own raw Error.
+
+    Checks `t`'s CURRENT dtype too, not just `dt`: a float64 self promoted
+    to a non-float64 target (`mean(x_float64, dtype=torch.float32)`, and the
+    same shape for sum/nansum/prod) still cast_to()s through the float64
+    side of that pair, which `_cast` raises on Apple GPUs precisely because
+    it's float64, regardless of which side. Declining on either dtype here
+    means the call site above needn't separately check `t.dtype`."""
+    if (dt == DType.float64 or t.dtype == DType.float64) and dev(
+        t.device
+    )[].api == "metal":
         unsupported(String(op) + ": float64 is unavailable on Apple GPUs")
 
 

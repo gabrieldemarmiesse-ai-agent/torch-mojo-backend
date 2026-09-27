@@ -630,6 +630,24 @@ def test_sum_out_float64_out_accumulates_in_double(mojo_gpu):
     torch.testing.assert_close(out2.cpu(), x64.sum(dim=1))
 
 
+@pytest.mark.parametrize("fn_name", ["sum", "prod", "nansum", "mean"])
+def test_reduce_narrows_a_float64_self_with_explicit_dtype(mojo_gpu, fn_name):
+    """`dtype=torch.float32` on a float64 self is an explicit NARROWING cast
+    (unlike linalg_vector_norm/norm, sum/prod/nansum/mean have no widen-only
+    restriction -- verified on real CUDA that all four accept it). This is
+    also the one case the float64-on-Metal decline must catch by the SELF's
+    dtype, not just the requested target: `_decline_metal_float64_dtype`
+    used to check only `dtype=`'s target, so a float64 self with a
+    non-float64 explicit dtype reached the cast kernel on an Apple GPU
+    instead of declining cleanly."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    fn = getattr(torch, fn_name)
+    x = torch.randn(4, 5, dtype=torch.float64)
+    expected = fn(x, dim=1, dtype=torch.float32)
+    got = fn(x.to(mojo_gpu), dim=1, dtype=torch.float32).cpu()
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_sum_out_dtype_must_match_out_dtype(mojo_gpu):
     """Same equality rule as mean.out: an explicit `dtype=` that disagrees
     with `out`'s dtype raises, rather than silently using either one."""

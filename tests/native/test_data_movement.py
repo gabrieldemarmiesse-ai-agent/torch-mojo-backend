@@ -2630,6 +2630,52 @@ def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
                 )
 
 
+# `arange % 5` above (0-4 integers) cannot exercise float64's extra precision
+# or range: every one of those values is exact in every other dtype too, so
+# it can't catch a cast that silently loses bits or rounds wrong.
+_FLOAT64_PRECISION_VALUES = [
+    1 + 2**-40,  # needs > float32 mantissa bits; must round, not truncate
+    16777217.0,  # 2**24 + 1: exact in float64, not in float32
+    0.1,
+    -0.1,
+    1e30,
+    -1e30,
+    0.0,
+    -0.0,
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+]
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_float64_cast_precision_matches_cpu(mojo_gpu, dst_dtype):
+    """float64 -> a narrower float, and back, matches CPU torch bit-for-bit
+    on values chosen to expose a lost mantissa bit or a wrong rounding mode
+    (NaN/inf included, `equal_nan=True`)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor(_FLOAT64_PRECISION_VALUES, dtype=torch.float64)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
+    expected_back = expected.double()
+    got_back = got.to(mojo_gpu).double().cpu()
+    torch.testing.assert_close(got_back, expected_back, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize("dst_dtype", [torch.int64, torch.int32])
+def test_float64_cast_to_int_matches_cpu(mojo_gpu, dst_dtype):
+    """float64 -> int truncates toward zero, matching CPU exactly for every
+    finite, in-range value (NaN/inf/overflow-to-int is implementation-defined
+    in C++ and not assumed to agree between the host and the device)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    values = [v for v in _FLOAT64_PRECISION_VALUES if abs(v) < 1e18 and v == v]
+    x = torch.tensor(values, dtype=torch.float64)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    assert torch.equal(got, expected)
+
+
 @pytest.mark.parametrize("dst_dtype", [torch.bfloat16, torch.float16])
 def test_float_narrowing_rounds_like_cpu(mojo_gpu, dst_dtype):
     """Rounding mode, not just range: 65_539 values at three base alignments,
