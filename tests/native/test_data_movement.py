@@ -2686,6 +2686,47 @@ def test_float64_cast_to_int_matches_cpu(mojo_gpu, dst_dtype):
     assert torch.equal(got, expected)
 
 
+@pytest.mark.parametrize("dst_dtype", [torch.uint8, torch.int8, torch.int16])
+@pytest.mark.parametrize(
+    "src_dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
+def test_float_cast_to_narrow_int_wraps_like_an_int64_intermediate(
+    mojo_gpu, src_dtype, dst_dtype
+):
+    """A float -> uint8/int8/int16 cast wraps the value the way
+    `static_cast<int64_t>` then the narrower `static_cast` does (verified on
+    real CUDA): `(-1.0).to(uint8)` is 255, not the 0 a direct float ->
+    narrow-unsigned conversion gives. Values stay within int64's range (and
+    every source dtype's own exact-integer range), so CPU and CUDA agree --
+    genuinely out-of-int64-range magnitudes are implementation-defined and
+    not tested for exact equality (`test_float64_cast_to_int_matches_cpu`)."""
+    if src_dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    values = [-1.0, -1.5, -255.0, -256.0, -257.0, 1.5, 254.0, 255.0, 256.0, 257.0, 0.0]
+    x = torch.tensor(values, dtype=src_dtype)
+    expected = x.to(dst_dtype)
+    got = x.to(mojo_gpu).to(dst_dtype).cpu()
+    assert torch.equal(got, expected)
+
+
+def test_float_cast_to_int32_saturates_not_wraps(mojo_gpu):
+    """Unlike uint8/int8/int16 above, a float -> int32 cast does NOT chain
+    through int64: verified on real CUDA that a magnitude past int32's own
+    range but within int64's (3000000001.0) saturates to int32's min/max,
+    which is also what a direct float -> int32 SIMD cast already does --
+    routing it through int64 first would wrap instead (a real regression
+    caught while fixing the uint8/int8/int16 case above). CPU torch's
+    behavior here is implementation-defined UB and diverges from CUDA's
+    saturation, so the expected values are hardcoded to CUDA's, not read
+    from a CPU-computed reference."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([3000000001.0, -3000000001.0], dtype=torch.float64)
+    got = x.to(mojo_gpu).to(torch.int32).cpu()
+    torch.testing.assert_close(
+        got, torch.tensor([2147483647, -2147483648], dtype=torch.int32), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("dst_dtype", [torch.bfloat16, torch.float16])
 def test_float_narrowing_rounds_like_cpu(mojo_gpu, dst_dtype):
     """Rounding mode, not just range: 65_539 values at three base alignments,

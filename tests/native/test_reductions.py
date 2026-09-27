@@ -2529,12 +2529,24 @@ def test_norm_dtype_out_float64(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
     # a float64 self needs no dtype= at all, and rejects narrowing back down.
-    x64 = torch.randn(4, 5, dtype=torch.float64)
-    out2 = torch.empty(4, dtype=torch.float64, device=mojo_gpu)
-    torch.linalg.vector_norm(x64.to(mojo_gpu), dim=1, out=out2)
-    torch.testing.assert_close(out2.cpu(), torch.linalg.vector_norm(x64, dim=1))
+    # Values close to 1.0 with a 2**-30 perturbation: below float32's own
+    # precision there, so a kernel that accumulated in float32 -- rather
+    # than genuinely in double -- would silently lose them and answer
+    # measurably differently (verified: the two differ starting a few ulps
+    # in), unlike bfloat16-sourced values above, which carry too little
+    # precision to tell float32 and float64 accumulation apart at all.
+    torch.manual_seed(0)
+    x64 = 1.0 + (torch.rand(5000, dtype=torch.float64) * 2 - 1) * 2**-30
+    expected64 = torch.linalg.vector_norm(x64, dim=0)
+    assert (
+        expected64.item()
+        != torch.linalg.vector_norm(x64.float(), dim=0).double().item()
+    )
+    out2 = torch.empty((), dtype=torch.float64, device=mojo_gpu)
+    torch.linalg.vector_norm(x64.to(mojo_gpu), dim=0, out=out2)
+    torch.testing.assert_close(out2.cpu(), expected64, rtol=0, atol=0)
     with pytest.raises(RuntimeError):
-        torch.linalg.vector_norm(x64.to(mojo_gpu), dim=1, dtype=torch.float32)
+        torch.linalg.vector_norm(x64.to(mojo_gpu), dim=0, dtype=torch.float32)
 
 
 def test_norm_general_p_declines_float64(mojo_gpu):

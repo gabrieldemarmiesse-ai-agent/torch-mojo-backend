@@ -2064,25 +2064,47 @@ comptime CAST_THREADS = GS_THREADS
 def _cast_elem[
     src: DType, dst: DType, width: Int
 ](v: SIMD[src, width]) -> SIMD[dst, width]:
-    """`v.cast[dst]()`, except float64 -> half/bfloat16 rounds through
-    float32 first: c10::Half/BFloat16 have no double constructor, so stock
-    PyTorch (CPU and CUDA) always double-rounds that pair, which a direct
-    SIMD cast does not reproduce. Verified on real CUDA with
-    `1 + 2**-11 + 2**-25`, exactly halfway between two float16 values in
-    float32 (so ties-to-even rounds it down to 1.0) but not in float64
-    (where it rounds up to 1.0009765625) -- CUDA gives 1.0."""
+    """`v.cast[dst]()`, except:
+
+    * float64 -> half/bfloat16 rounds through float32 first: c10::Half/
+      BFloat16 have no double constructor, so stock PyTorch (CPU and CUDA)
+      always double-rounds that pair, which a direct SIMD cast does not
+      reproduce. Verified on real CUDA with `1 + 2**-11 + 2**-25`, exactly
+      halfway between two float16 values in float32 (so ties-to-even rounds
+      it down to 1.0) but not in float64 (where it rounds up to
+      1.0009765625) -- CUDA gives 1.0.
+    * any float -> a narrower-than-32-bit integer (uint8/int8/int16)
+      truncates through int64 first: PyTorch's own float->integer narrowing
+      is exactly `static_cast<int64_t>` then the narrower `static_cast`, so
+      it wraps a negative or out-of-range value the way a chain of C
+      truncating casts would, not the saturating (and here, backwards)
+      answer a direct float->narrow-unsigned conversion gives. Verified on
+      real CUDA across float64/float32/float16/bfloat16 and these three
+      integer targets with negative, fractional and out-of-range values:
+      `(-1.0).to(uint8)` is 255, not the 0 a direct cast gives. int32 and
+      int64 targets do NOT chain through int64 -- confirmed on real CUDA
+      with a value in int64's range but past int32's (3000000001.0): torch
+      SATURATES to int32's own min/max there, which is also what a direct
+      float->int32 SIMD cast already does, so int32 is deliberately left
+      out of this branch (routing it through int64 would wrap instead).
+
+    Both intermediates are round-tripped through their bit pattern
+    (`bitcast`): the GPU backend otherwise folds the chained casts back into
+    one direct conversion -- a provably different result -- across a type
+    it has no float-specific folding rules for.
+    """
     comptime if src == DType.float64 and (
         dst == DType.float16 or dst == DType.bfloat16
     ):
         var mid = v.cast[DType.float32]()
-        # The GPU backend folds `.cast[float32]().cast[dst]()` back into one
-        # float64->half conversion (a provably different, single-rounded
-        # value) unless the intermediate is forced to materialize: round-trip
-        # it through its bit pattern, which an optimizer can't fuse away
-        # without recognizing the specific round-trip, across a type it has
-        # no float-specific folding rules for.
         var mid_bits = bitcast[DType.int32, width](mid)
         return bitcast[DType.float32, width](mid_bits).cast[dst]()
+    elif src.is_floating_point() and (
+        dst == DType.uint8 or dst == DType.int8 or dst == DType.int16
+    ):
+        var mid = v.cast[DType.int64]()
+        var mid_bits = bitcast[DType.int64, width](mid)
+        return bitcast[DType.int64, width](mid_bits).cast[dst]()
     else:
         return v.cast[dst]()
 
