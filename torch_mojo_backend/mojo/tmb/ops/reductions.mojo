@@ -1,6 +1,6 @@
 """ATen ops: reductions (sum, nansum, mean, amax/amin, max/min, the
-arg-reductions, any/all, count_nonzero, var, the vector norm (ord=2,
-ord=-inf), cumsum, and sort/topk).
+arg-reductions, any/all, count_nonzero, var, the vector norm (any ord),
+cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -419,7 +419,7 @@ def _reduce_into(
 
     Slot list of `_rowred_spec_into_go` / `_var_spec_into_go`: operand spec,
     reduce-dim tuple, keepdim, the accumulator's extra payload (var's
-    correction), output spec.
+    correction, the general vector norm's ord), output spec.
     """
     one_device(a, dst)
     var src = _ready_operand(a, dims, False)
@@ -633,6 +633,8 @@ def _scalar_reduction_out(
     keepdim: Bool,
     out_stype: Int32,
     mut dst: T,
+    with_correction: Bool = False,
+    correction: Float64 = 0.0,
 ) raises:
     """Compute into `out` when its shape, dtype, layout and device already
     match; otherwise compute into a fresh tensor and copy across.
@@ -663,10 +665,28 @@ def _scalar_reduction_out(
         resize_out(dst, shape, rank)
     assert_no_internal_overlap(dst)
     if _out_ready(dst, a, out_stype, numel):
-        _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
+        _reduce_into(
+            family,
+            op,
+            a,
+            dims.copy(),
+            keepdim,
+            dst,
+            with_correction,
+            correction,
+        )
         return
     var tmp = own(new_tensor(shape, rank, out_stype, a.device))
-    _reduce_into(family, op, a, dims.copy(), keepdim, tmp.t, False, 0.0)
+    _reduce_into(
+        family,
+        op,
+        a,
+        dims.copy(),
+        keepdim,
+        tmp.t,
+        with_correction,
+        correction,
+    )
     _copy_result_into(dst, tmp.t)
     _ = tmp^  # alive past the launch
 
@@ -1633,8 +1653,9 @@ def op_var_correction(
 
 # ---------------------------------------------------------------------------
 # linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|),
-# ord=+inf (max of |x|), ord=-inf (min of |x|) and ord=0 (count of nonzero)
-# share everything but the accumulator; other ords decline. `norm`'s six
+# ord=+inf (max of |x|), ord=-inf (min of |x|), ord=0 (count of nonzero) and
+# any other ord p (sum of |x|^p, then ^(1/p): `NormPOp`, p passed at run time)
+# share everything but the accumulator. `norm`'s six
 # legacy overloads are torch's own redispatch onto this op (`impl_func_norm`
 # in ATen's ReduceOps.cpp: p=None -> 2, dim=[] -> every dim), so they share
 # every helper below with `linalg_vector_norm`.
@@ -1644,9 +1665,9 @@ def op_var_correction(
 def _vector_norm_spec(ord_v: Value) raises -> StaticString:
     """The kernel op token for `ord`, shared by every overload of both ops:
     a missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
-    `impl_func_norm`. One `if` per supported ord, in torch's own
-    enumeration order (2, 1, inf, -inf, 0) -- sibling ops land one branch at
-    a time here; every other ord declines."""
+    `impl_func_norm`. The ords CUDA gives a dedicated kernel
+    (`norm_kernel_cuda_impl`: 0, 1, 2, inf, -inf) keep theirs; every other
+    ord is `NormPSpec`."""
     if v_scalar_is_bool(ord_v):
         unsupported("vector_norm with an unsupported ord")
     var ord_f = v_f64_or(ord_v, 2.0)
@@ -1660,8 +1681,7 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
         return "NormNegInfSpec"
     if ord_f == 0.0:
         return "NormL0Spec"
-    unsupported("vector_norm with an unsupported ord")
-    return ""
+    return "NormPSpec"
 
 
 def _vector_norm_operand(
@@ -1707,7 +1727,7 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
     LinearAlgebra.cpp. That special case fires for every ord != 0 (torch maps
     `ord == 0` to `ne(0)` there instead, since counting is not magnitude), so
-    it is correct for ord=1, 2, +inf and -inf here; callers must skip it for
+    it is correct for every other ord here; callers must skip it for
     ord=0, where the general reduce path already computes `ne(0)` correctly
     through `NormL0Op` for a size-one reduction, same as any other size.
     """
@@ -1781,15 +1801,23 @@ def _vector_norm(
         ret_owned(rets, 0, out)
         _ = src^
         return
-    if op == "NormInfSpec" or op == "NormNegInfSpec":
-        # +inf/-inf have no identity: torch refuses a zero-length reduce dim
-        # even when the output itself is empty. Declining on the host gives
-        # a clean NotImplementedError; the skeleton's own guard
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f < 0.0 or ord_f == max_or_inf[DType.float64]():
+        # No identity: torch refuses a zero-length reduce dim even when the
+        # output itself is empty. Declining on the host gives a clean
+        # NotImplementedError; the skeleton's own guard for +-inf
         # (`_rowred_spec_into_go`, unconditional on `reduce_n == 0` too) is
         # a plain `raise Error(...)` -> RuntimeError, not reached here.
         _refuse_empty_extremum(op_label, src.t, dims)
     var out = _scalar_reduction(
-        "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
+        "reduction",
+        op,
+        src.t,
+        dims,
+        keepdim,
+        src.t.stype,
+        op == "NormPSpec",
+        ord_f,
     )
     ret_owned(rets, 0, out)
     _ = src^
@@ -1819,7 +1847,8 @@ def _vector_norm_out(
         ret_ref(rets, 0, out)
         _ = src^
         return
-    if op == "NormInfSpec" or op == "NormNegInfSpec":
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f < 0.0 or ord_f == max_or_inf[DType.float64]():
         _refuse_empty_extremum(op_label, src.t, dims)
     _scalar_reduction_out(
         "reduction",
@@ -1831,6 +1860,8 @@ def _vector_norm_out(
         keepdim,
         src.t.stype,
         out,
+        op == "NormPSpec",
+        ord_f,
     )
     ret_ref(rets, 0, out)
     _ = src^

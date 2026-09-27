@@ -56,6 +56,8 @@ _REDUCE_OPS = {
     "norminf": lambda t, **kw: torch.linalg.vector_norm(t, ord=math.inf, **kw),
     "norm_l1": lambda t, **kw: torch.linalg.vector_norm(t, ord=1, **kw),
     "norm_neginf": lambda t, **kw: torch.linalg.vector_norm(t, ord=float("-inf"), **kw),
+    "norm_p3": lambda t, **kw: torch.linalg.vector_norm(t, ord=3, **kw),
+    "norm_pneg": lambda t, **kw: torch.linalg.vector_norm(t, ord=-1.5, **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
     "count_nonzero": lambda t, **kw: torch.count_nonzero(t, **kw),
@@ -2204,14 +2206,163 @@ def test_norm_dtype_out(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
 
 
-def test_norm_declines_unsupported_ord(mojo_gpu):
-    """ord=3 has no accumulator on this device (unlike 0, 1, 2, +-inf, which
-    each get their own `NormL*Op` / `NormSpec` variant)."""
-    x = torch.randn(4, 5).to(mojo_gpu)
+def test_norm_general_p(mojo_gpu):
+    x = torch.randn(4, 5)
+    d = x.to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.ops.aten.norm.Scalar(d, 3).cpu(), torch.linalg.vector_norm(x, 3)
+    )
+    torch.testing.assert_close(
+        torch.ops.aten.norm.ScalarOpt_dim(d, -1.5, [1], True).cpu(),
+        torch.linalg.vector_norm(x, -1.5, dim=1, keepdim=True),
+    )
+    xb = x.to(torch.bfloat16)
+    got = torch.ops.aten.norm.ScalarOpt_dtype(xb.to(mojo_gpu), 0.5, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(
+        got.cpu(), torch.linalg.vector_norm(xb, 0.5, dtype=torch.float32)
+    )
+    got = torch.ops.aten.norm.ScalarOpt_dim_dtype(
+        xb.to(mojo_gpu), 4, [0], False, dtype=torch.float32
+    )
+    torch.testing.assert_close(
+        got.cpu(), torch.linalg.vector_norm(xb, 4, dim=0, dtype=torch.float32)
+    )
+    out = torch.empty(1, device=mojo_gpu)
+    returned = torch.ops.aten.norm.out(d, 1.5, [1], False, out=out)
+    assert returned.data_ptr() == out.data_ptr() and out.shape == (4,)
+    torch.testing.assert_close(out.cpu(), torch.linalg.vector_norm(x, 1.5, dim=1))
+    out = torch.empty(3, dtype=torch.float32, device=mojo_gpu)
+    torch.ops.aten.norm.dtype_out(
+        xb.to(mojo_gpu), -2, [0, 1], False, dtype=torch.float32, out=out
+    )
+    assert out.shape == ()
+    torch.testing.assert_close(
+        out.cpu(), torch.linalg.vector_norm(xb, -2, dtype=torch.float32)
+    )
+
+
+# ---------------------------------------------------------------------------
+# linalg_vector_norm(ord=p) for any other p: NormPOp
+# ---------------------------------------------------------------------------
+
+_GENERAL_P = [3, 0.5, 1.5, -1, -2, 4]
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dim,keepdim", [(None, False), (1, False), (0, True), ((0, -1), False), (-1, True)]
+)
+def test_vector_norm_general_p_matches_torch(mojo_gpu, p, dtype, dim, keepdim):
+    x = (torch.randn(6, 357, 79) * 2).to(dtype)
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim, keepdim=keepdim)
+    assert ours.dtype == dtype
+    if dtype is torch.float32:
+        # fp64 reference: CPU and CUDA float32 already differ by ~3e-5 here
+        # (p=-2, where the elements nearest 0 dominate the sum).
+        expected = torch.linalg.vector_norm(x.double(), ord=p, dim=dim, keepdim=keepdim)
+        torch.testing.assert_close(ours.cpu().double(), expected, rtol=1e-4, atol=0)
+    else:
+        # Same-dtype reference: the half types overflow and go subnormal here.
+        expected = torch.linalg.vector_norm(x, ord=p, dim=dim, keepdim=keepdim)
+        torch.testing.assert_close(ours.cpu(), expected, rtol=1e-2, atol=0)
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+def test_vector_norm_general_p_noncontiguous_and_split(mojo_gpu, p):
+    base = torch.rand(789, 357) + 0.01
+    ours = torch.linalg.vector_norm(base.to(mojo_gpu).t(), ord=p, dim=1).cpu()
+    torch.testing.assert_close(
+        ours, torch.linalg.vector_norm(base.t(), ord=p, dim=1), rtol=1e-5, atol=0
+    )
+    big = torch.rand(1 << 20) + 0.01  # one output: the split + merge path
+    ours = torch.linalg.vector_norm(big.to(mojo_gpu), ord=p).cpu()
+    expected = torch.linalg.vector_norm(big.double(), ord=p).float()
+    torch.testing.assert_close(ours, expected, rtol=1e-4, atol=0)
+
+
+@pytest.mark.parametrize("p", [*_GENERAL_P, float("nan")])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_vector_norm_general_p_nonfinite_and_zeros(mojo_gpu, p, dtype):
+    """|0|^p = inf for p < 0 (so the norm is 0), inf and NaN go through pow."""
+    nan, inf = float("nan"), float("inf")
+    x = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [nan, 2.0, 3.0, 4.0],
+            [1.0, inf, 3.0, 4.0],
+            [1.0, 2.0, -inf, 4.0],
+            [0.0, 1.0, 2.0, 3.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [inf, inf, inf, inf],
+            [-1.0, 1.0, -1.0, 1.0],
+        ],
+        dtype=dtype,
+    )
+    for dim in (0, 1):
+        ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim).cpu()
+        expected = torch.linalg.vector_norm(x, ord=p, dim=dim)
+        torch.testing.assert_close(ours, expected, equal_nan=True, rtol=1e-5, atol=0)
+
+
+@pytest.mark.parametrize("p", [*_GENERAL_P, float("nan")])
+def test_vector_norm_general_p_empty(mojo_gpu, p):
+    """torch refuses p < 0 over an empty reduce dim (no identity); otherwise
+    an empty input gives 0, even for p = NaN."""
+    for shape, dim in (((3, 0), 1), ((3, 0), None), ((0, 5), 1), ((3, 0), 0)):
+        x = torch.empty(shape)
+        try:
+            expected = torch.linalg.vector_norm(x, ord=p, dim=dim)
+        except RuntimeError:
+            assert p < 0
+            with pytest.raises(NotImplementedError):
+                torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim)
+            continue
+        ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=dim).cpu()
+        torch.testing.assert_close(ours, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+def test_vector_norm_general_p_size_one_reduce_is_abs(mojo_gpu, p):
+    x = torch.tensor([[1e20], [-3.0], [0.0]])
+    ours = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=1).cpu()
+    torch.testing.assert_close(ours, torch.linalg.vector_norm(x, ord=p, dim=1))
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_vector_norm_general_p_with_an_accumulation_dtype(mojo_gpu, p, dtype):
+    x = torch.randn(64, 257).to(dtype)
+    got = torch.linalg.vector_norm(x.to(mojo_gpu), p, dim=1, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(
+        got.cpu(),
+        torch.linalg.vector_norm(x, p, dim=1, dtype=torch.float32),
+        rtol=1e-5,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("p", _GENERAL_P)
+def test_vector_norm_general_p_out_resizes(mojo_gpu, p):
+    x = torch.randn(5, 7)
+    out = torch.empty(1, device=mojo_gpu)  # wrong shape
+    returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=1, out=out)
+    assert returned.data_ptr() == out.data_ptr() and out.shape == (5,)
+    torch.testing.assert_close(out.cpu(), torch.linalg.vector_norm(x, ord=p, dim=1))
+    # A non-contiguous out= goes through the compute-then-copy route.
+    wide = torch.zeros(5, 2, device=mojo_gpu)
+    torch.linalg.vector_norm(x.to(mojo_gpu), ord=p, dim=1, out=wide[:, 0])
+    torch.testing.assert_close(
+        wide[:, 0].cpu(), torch.linalg.vector_norm(x, ord=p, dim=1)
+    )
+    assert (wide[:, 1].cpu() == 0).all()
+
+
+def test_vector_norm_general_p_declines_integer_input(mojo_gpu):
     with pytest.raises(NotImplementedError):
-        torch.ops.aten.norm.Scalar(x, 3)
-    with pytest.raises(NotImplementedError):
-        torch.ops.aten.norm.ScalarOpt_dim(x, 3, [1], False)
+        torch.linalg.vector_norm(torch.randint(0, 9, (4, 5)).to(mojo_gpu), ord=3)
 
 
 # ---------------------------------------------------------------------------
@@ -2470,8 +2621,6 @@ def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     scalar = torch.tensor(3.0).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         scalar.sum()
-    with pytest.raises(NotImplementedError):
-        torch.linalg.vector_norm(torch.randn(4, 5).to(mojo_gpu), ord=3)
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
     with pytest.raises(NotImplementedError):
