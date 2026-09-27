@@ -8,6 +8,16 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_BFLOAT16,
+    ST_BOOL,
+    ST_FLOAT16,
+    ST_FLOAT32,
+    ST_FLOAT64,
+    ST_INT16,
+    ST_INT32,
+    ST_INT64,
+    ST_INT8,
+    ST_UINT8,
     T,
     Value,
     check,
@@ -538,6 +548,174 @@ def scalar_embed(v: Value, dtype: DType) raises -> Float64:
     ):
         unsupported("a float scalar against a non-floating tensor")
     return v_f64(v)
+
+
+# ---------------------------------------------------------------------------
+# type promotion (c10/core/ScalarType.cpp + ATen's ResultTypeState)
+# ---------------------------------------------------------------------------
+
+comptime ST_UNDEFINED = Int32(-1)
+
+
+def is_float_stype(st: Int32) -> Bool:
+    return (
+        st == ST_FLOAT32
+        or st == ST_FLOAT16
+        or st == ST_BFLOAT16
+        or st == ST_FLOAT64
+    )
+
+
+def is_int_stype(st: Int32) -> Bool:
+    return (
+        st == ST_UINT8
+        or st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+    )
+
+
+def scalar_to_int(v: Value, st: Int32) raises -> Int:
+    """An ATen Scalar as integral dtype `st`'s value, never through a float
+    when it is an integer: `Scalar::to<scalar_t>()` (c10's checked_convert).
+    Out of range raises as `c10::overflows` says: an integer may be negative
+    down to minus an unsigned type's maximum (two's complement wrap), a float
+    must lie in [lowest, max] and then truncates. The result is the exact
+    integer, which the caller narrows into `st`."""
+    var lo = Int.MIN
+    var hi = Int.MAX
+    var name = String("int64_t")
+    if st == ST_INT8:
+        lo = -128
+        hi = 127
+        name = "int8_t"
+    elif st == ST_INT16:
+        lo = -32768
+        hi = 32767
+        name = "int16_t"
+    elif st == ST_INT32:
+        lo = -2147483648
+        hi = 2147483647
+        name = "int"
+    elif st == ST_UINT8:
+        lo = -255
+        hi = 255
+        name = "uint8_t"
+    if v_scalar_is_integral(v):
+        var i = v_int(v)
+        if i < lo or i > hi:
+            raise Error(
+                "value cannot be converted to type ", name, " without overflow"
+            )
+        return i
+    # c10::overflows<To, double> (torch 2.11): no wrap for a float, a
+    # value outside [lowest, max] -- or NaN / inf -- is refused, and one
+    # inside truncates. uint8's lowest is 0; int64's max is 2**63 - 1.
+    var f = v_f64(v)
+    var lo_f = 0.0 if st == ST_UINT8 else Float64(lo)
+    var ok = f >= lo_f and f <= Float64(hi)
+    if st == ST_INT64:
+        ok = f >= -9223372036854775808.0 and f < 9223372036854775808.0
+    if not ok:
+        raise Error(
+            "value cannot be converted to type ", name, " without overflow"
+        )
+    return Int(f)
+
+
+def known_stype(st: Int32) -> Bool:
+    return is_float_stype(st) or is_int_stype(st) or st == ST_BOOL
+
+
+def _pw_int_rank(st: Int32) -> Int:
+    if st == ST_INT8:
+        return 1
+    if st == ST_INT16:
+        return 2
+    if st == ST_INT32:
+        return 3
+    return 4
+
+
+def _pw_float_rank(st: Int32) -> Int:
+    if st == ST_FLOAT16 or st == ST_BFLOAT16:
+        return 1
+    if st == ST_FLOAT32:
+        return 2
+    return 3
+
+
+def promote_types(a: Int32, b: Int32) raises -> Int32:
+    """c10::promoteTypes over the dtypes the mojo device computes on."""
+    if a == ST_UNDEFINED:
+        return b
+    if b == ST_UNDEFINED or a == b:
+        return a
+    if not known_stype(a) or not known_stype(b):
+        unsupported(
+            "type promotion of dtypes " + String(a) + " and " + String(b)
+        )
+    if a == ST_BOOL:
+        return b
+    if b == ST_BOOL:
+        return a
+    if is_float_stype(a) and is_float_stype(b):
+        if (a == ST_FLOAT16 and b == ST_BFLOAT16) or (
+            a == ST_BFLOAT16 and b == ST_FLOAT16
+        ):
+            return ST_FLOAT32
+        return a if _pw_float_rank(a) > _pw_float_rank(b) else b
+    if is_float_stype(a):
+        return a
+    if is_float_stype(b):
+        return b
+    # both integral
+    if a == ST_UINT8 or b == ST_UINT8:
+        var other = b if a == ST_UINT8 else a
+        if other == ST_INT8:
+            return ST_INT16
+        return other
+    return a if _pw_int_rank(a) > _pw_int_rank(b) else b
+
+
+def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
+    """c10's combine_categories (the ResultTypeState fold)."""
+    if is_float_stype(higher):
+        return higher
+    if higher == ST_BOOL or is_float_stype(lower):
+        return promote_types(higher, lower)
+    if higher != ST_UNDEFINED:
+        return higher
+    return lower
+
+
+def can_cast(src: Int32, dst: Int32) -> Bool:
+    """`c10::canCast` over real dtypes: a cast that does not lower the
+    category (bool < integral < floating). What TensorIterator's
+    `enforce_safe_casting_to_output` asks of an `out=` / in-place output."""
+    var s = 2 if is_float_stype(src) else (0 if src == ST_BOOL else 1)
+    var d = 2 if is_float_stype(dst) else (0 if dst == ST_BOOL else 1)
+    return s <= d
+
+
+def result_type(a: T, b: T) raises -> Int32:
+    """`torch.result_type(a, b)` of two tensors: a dimensioned tensor ranks
+    above a 0-dim one, which wins only when it is of a higher category
+    (bool < integral < floating) -- `float16[3] + float32[]` is float16,
+    `int64[3] + float32[]` float32 (at::native::update_result_type_state).
+    """
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    if a.rank == 0:
+        zero = promote_types(zero, a.stype)
+    else:
+        dim = promote_types(dim, a.stype)
+    if b.rank == 0:
+        zero = promote_types(zero, b.stype)
+    else:
+        dim = promote_types(dim, b.stype)
+    return combine_categories(dim, zero)
 
 
 def binary_promotion(a_dtype: DType, b_dtype: DType) raises -> DType:

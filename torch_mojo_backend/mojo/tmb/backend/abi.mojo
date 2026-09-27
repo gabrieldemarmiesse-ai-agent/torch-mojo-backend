@@ -664,6 +664,19 @@ struct T(Copyable, Movable):
         `Tensor(a!)[]`, so ops mutating tensor lists call this per tensor."""
         external_call["tmb_tensor_bump_version", NoneType](self.h)
 
+    def impl(self) -> Int:
+        """The `TensorImpl` address: two arguments are the same tensor
+        (`TensorBase::is_same`) iff these match. The data pointer does not
+        say that -- independent empty tensors share a null one, and two
+        views of one storage share it too."""
+        return external_call["tmb_tensor_impl", Int](self.h)
+
+    def is_wrapped_number(self) -> Bool:
+        """`TensorImpl::is_wrapped_number`: a Python number the arg parser
+        wrapped in a 0-d CPU tensor, which promotes like a Scalar -- unlike
+        an explicit 0-d tensor, which promotes like one."""
+        return external_call["tmb_tensor_is_wrapped_number", Int32](self.h) != 0
+
     def storage_ptr(self) -> Int:
         return external_call["tmb_tensor_storage_data_ptr", Int](self.h)
 
