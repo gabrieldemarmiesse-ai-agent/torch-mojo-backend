@@ -395,11 +395,15 @@ def _fill_contiguous(t: T, s: FillScalar) raises:
 
 
 def is_cast_dtype(dt: DType) -> Bool:
-    """Mirrors tmb/kernels/data_movement/entry.mojo's `CAST_DTYPES`."""
+    """Mirrors tmb/kernels/data_movement/entry.mojo's `CAST_DTYPES`. float64
+    is in the list on every device; `_cast` itself declines it on Apple GPUs,
+    so a caller that also needs a clean pre-launch decline there must check
+    the device separately (see reductions.mojo's `_decline_metal_float64`)."""
     return (
         dt == DType.float32
         or dt == DType.float16
         or dt == DType.bfloat16
+        or dt == DType.float64
         or dt == DType.int64
         or dt == DType.int32
         or dt == DType.uint8

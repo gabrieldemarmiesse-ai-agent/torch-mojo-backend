@@ -2121,6 +2121,10 @@ def _cast[
 
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
+    elif (
+        src == DType.float64 or dst == DType.float64
+    ) and has_apple_gpu_accelerator():
+        raise Error("float64 is not supported on Apple GPUs")
     else:
 
         @always_inline
@@ -2179,11 +2183,14 @@ def _cast[
 
 
 # The dtypes fast cast supports on either end. Both the src and dst
-# dispatch loops iterate this list at compile time.
+# dispatch loops iterate this list at compile time. float64 is declined on
+# Apple GPUs inside `_cast` itself, not by omission here (so it still shows
+# up in the src/dst gate loops of every caller).
 comptime CAST_DTYPES = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
     DType.uint8,

@@ -260,11 +260,14 @@ trait ReduceOp:
 # ---------------------------------------------------------------------------
 
 # Floating-point reductions accumulate in float32 (matching torch), float64
-# in its own dtype; integer ones accumulate in their own dtype.
+# in its own dtype; integer ones accumulate in their own dtype. sum/prod/
+# nansum: float64 is declined on Apple GPUs at the op level (no hardware
+# execution), same as EXTREMUM_DTYPES's float64 below.
 comptime SCALAR_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
 ]
@@ -280,16 +283,21 @@ comptime EXTREMUM_DTYPES: List[DType] = [
     DType.int32,
 ]
 
+# mean and the vector-norm accumulators; NOT var's (its own moments kernel,
+# entry.mojo's FLOAT_DTYPES, has no float64 specialization). Op level declines
+# float64 on Apple GPUs, as above.
 comptime FLOAT_ONLY_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
 ]
 
 comptime TRUTHY_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
     DType.bfloat16,
+    DType.float64,
     DType.int64,
     DType.int32,
     DType.int16,
@@ -451,7 +459,7 @@ struct MeanOp(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -495,7 +503,7 @@ struct NormL2Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -534,7 +542,7 @@ struct NormL1Op(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
@@ -582,7 +590,7 @@ struct NormInfOp(ReduceOp):
 
     @staticmethod
     def acc_dtype[in_dt: DType]() -> DType:
-        return DType.float32
+        return _float_acc[in_dt]()
 
     @staticmethod
     def out_dtype[in_dt: DType]() -> DType:
