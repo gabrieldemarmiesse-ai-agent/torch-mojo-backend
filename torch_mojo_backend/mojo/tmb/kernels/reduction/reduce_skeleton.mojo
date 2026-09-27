@@ -72,10 +72,12 @@ from tmb.kernels.common.op_utils import (
     _device_sm_count,
     _enqueue_cached,
     _make_ptr,
+    _raw_f64,
     _reduce_spec_geom,
     _spec_ptr,
     _vec16_phase,
 )
+from tmb.kernels.common.pow_math import powf_c99
 from tmb.kernels.common.variant_gates import _dtype_arg_on, _dtype_supported
 
 
@@ -253,6 +255,25 @@ trait ReduceOp:
         (mean) is folded in here instead of costing a second launch.
         """
         ...
+
+    # The skeleton calls only the two `_arg` forms below, with the runtime
+    # argument of the launch (the general vector norm's ord; 0 otherwise).
+    # Float32, never Float64: Apple GPUs have no double, and a double kernel
+    # parameter there stalls the build of every op of the family.
+    # Their defaults drop it, so an op without one writes `map` / `finish`
+    # alone and compiles to the same code as before the argument existed.
+
+    @staticmethod
+    def map_arg[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
+        return Self.map[acc=acc](x)
+
+    @staticmethod
+    def finish_arg[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
+        return Self.finish[out_dt=out_dt](a, n)
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +726,74 @@ struct NormL0Op(ReduceOp):
         return a.cast[out_dt]()
 
 
+struct NormPOp(ReduceOp):
+    """linalg_vector_norm(ord=p) for any other p: sum of |x|^p, then ^(1/p).
+
+    CUDA's `NormOps`: p is cast to the float accumulator once, each element
+    is `powf(|x|, p)` and the root is `powf(acc, 1.0f / p)`, both through
+    `powf_c99` (CUDA's own powf on NVIDIA). A negative p is refused on an
+    empty reduce dim by the host; with elements, |0|^p = inf and the root of
+    inf is 0, as in torch.
+    """
+
+    comptime name = "normp"
+    comptime dtypes = FLOAT_ONLY_DTYPES
+    comptime errors_on_empty_axis = False
+
+    @staticmethod
+    def acc_dtype[in_dt: DType]() -> DType:
+        return DType.float32
+
+    @staticmethod
+    def out_dtype[in_dt: DType]() -> DType:
+        return in_dt
+
+    @staticmethod
+    def identity[acc: DType, width: SIMDLength]() -> SIMD[acc, width]:
+        return SIMD[acc, width](0)
+
+    @staticmethod
+    def map[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width]) -> SIMD[acc, width]:
+        comptime assert False, "NormPOp needs its ord: call map_arg"
+
+    @staticmethod
+    def map_arg[
+        in_dt: DType, width: SIMDLength, //, acc: DType
+    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
+        comptime assert acc == DType.float32
+        var ax = abs(x.cast[acc]())
+        var r = SIMD[acc, width]()
+        comptime for i in range(width):
+            r[i] = powf_c99(ax[i].cast[DType.float32](), arg).cast[acc]()
+        return r
+
+    @staticmethod
+    def combine[
+        dtype: DType, width: SIMDLength
+    ](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        return a + b
+
+    @staticmethod
+    def finish[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int) -> Scalar[out_dt]:
+        comptime assert False, "NormPOp needs its ord: call finish_arg"
+
+    @staticmethod
+    def finish_arg[
+        acc: DType, //, out_dt: DType
+    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
+        comptime assert acc == DType.float32
+        # CUDA fills an empty input's output with 0 instead of reducing
+        # (`norm_kernel_cuda`); only p = NaN tells that from pow(0, 1/p).
+        if n == 0:
+            return 0
+        var root = Float32(1.0) / arg
+        return powf_c99(a.cast[DType.float32](), root).cast[out_dt]()
+
+
 struct MaxOp(ReduceOp):
     """amax / max: selection, identity -inf, NaN PROPAGATED (torch's rule)."""
 
@@ -1023,6 +1112,7 @@ def _scan_contig[
     vec_start: Int,
     tail_start: Int,
     lane: Int,
+    arg: Float32,
 ) -> Scalar[acc]:
     """One lane's share of a contiguous shard, over a `lanes`-wide group.
 
@@ -1036,10 +1126,11 @@ def _scan_contig[
     while v < n_vec:
         acc_vec = Op.combine(
             acc_vec,
-            Op.map[acc=acc](
+            Op.map_arg[acc=acc](
                 in_ptr.unsafe_load[width=V, alignment=vec_align](
                     vec_start + v * V
-                )
+                ),
+                arg,
             ),
         )
         v += lanes
@@ -1048,13 +1139,13 @@ def _scan_contig[
     var jh = lane
     while jh < head:
         total = Op.combine(
-            total, Op.map[acc=acc](in_ptr[unsafe_offset=start + jh])
+            total, Op.map_arg[acc=acc](in_ptr[unsafe_offset=start + jh], arg)
         )
         jh += lanes
     var jt = tail_start + lane
     while jt < n:
         total = Op.combine(
-            total, Op.map[acc=acc](in_ptr[unsafe_offset=start + jt])
+            total, Op.map_arg[acc=acc](in_ptr[unsafe_offset=start + jt], arg)
         )
         jt += lanes
     return total
@@ -1078,6 +1169,7 @@ def _reduce_contig_kernel[
     cols_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
+    arg: Float32,
 ):
     """A `lanes`-wide group walks its shard of one row with 16-byte vector
     loads and folds the accumulator; grid is (row group, split).
@@ -1140,14 +1232,22 @@ def _reduce_contig_kernel[
         head = 0
         n_vec = 0
     var total = _scan_contig[Op, dtype, acc, V, vec_align, lanes](
-        in_ptr, start, n, head, n_vec, start + head, head + n_vec * V, lane
+        in_ptr,
+        start,
+        n,
+        head,
+        n_vec,
+        start + head,
+        head + n_vec * V,
+        lane,
+        arg,
     )
     var group_total = _block_fold[Op, acc, lanes](lane, total)
     if lane == 0:
         if splits == 1:
-            out_ptr[unsafe_offset=row] = Op.finish[
+            out_ptr[unsafe_offset=row] = Op.finish_arg[
                 out_dt=Op.out_dtype[dtype]()
-            ](group_total, cols)
+            ](group_total, cols, arg)
         else:
             ws_ptr[unsafe_offset=split * outputs + row] = group_total
 
@@ -1171,6 +1271,7 @@ def _reduce_strided_kernel[
     inner_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
+    arg: Float32,
 ):
     """One thread per output column, walking down the reduced axis with stride
     `inner`.
@@ -1204,13 +1305,14 @@ def _reduce_strided_kernel[
     var total = Op.identity[acc, 1]()[0]
     for r in range(r0, r1):
         total = Op.combine(
-            total, Op.map[acc=acc](in_ptr[unsafe_offset=base + r * inner])
+            total,
+            Op.map_arg[acc=acc](in_ptr[unsafe_offset=base + r * inner], arg),
         )
 
     if splits == 1:
-        out_ptr[unsafe_offset=out_index] = Op.finish[
+        out_ptr[unsafe_offset=out_index] = Op.finish_arg[
             out_dt=Op.out_dtype[dtype]()
-        ](total, reduce_n)
+        ](total, reduce_n, arg)
     else:
         ws_ptr[unsafe_offset=split * outputs + out_index] = total
 
@@ -1232,6 +1334,7 @@ def _reduce_merge_thread_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
+    arg: Float32,
 ):
     """Many outputs: one thread each. The workspace is split-major, so the
     threads of a warp read consecutive addresses at every step."""
@@ -1244,8 +1347,8 @@ def _reduce_merge_thread_kernel[
     var total = Op.identity[acc, 1]()[0]
     for k in range(splits):
         total = Op.combine(total, ws_ptr[unsafe_offset=k * outputs + o])
-    out_ptr[unsafe_offset=o] = Op.finish[out_dt=Op.out_dtype[dtype]()](
-        total, Int(reduce_arg)
+    out_ptr[unsafe_offset=o] = Op.finish_arg[out_dt=Op.out_dtype[dtype]()](
+        total, Int(reduce_arg), arg
     )
 
 
@@ -1261,6 +1364,7 @@ def _reduce_merge_block_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
+    arg: Float32,
 ):
     """Few outputs (the full-reduction end of the range): one block each,
     because a single thread walking hundreds of partials would serialize the
@@ -1275,8 +1379,8 @@ def _reduce_merge_block_kernel[
         total = Op.combine(total, ws_ptr[unsafe_offset=k * outputs + o])
     var block_total = _block_fold[Op, acc, RED_THREADS](tid, total)
     if tid == 0:
-        out_ptr[unsafe_offset=o] = Op.finish[out_dt=Op.out_dtype[dtype]()](
-            block_total, Int(reduce_arg)
+        out_ptr[unsafe_offset=o] = Op.finish_arg[out_dt=Op.out_dtype[dtype]()](
+            block_total, Int(reduce_arg), arg
         )
 
 
@@ -1320,9 +1424,10 @@ def _reduce_generic[
     reduce_n: Int,
     inner: Int,
     ctx: DeviceContext,
+    arg: Float32 = 0.0,
 ) raises:
     """Reduce `in` viewed as (outer, reduce_n, inner) into `outer * inner`
-    contiguous outputs, with `Op`'s algebra."""
+    contiguous outputs, with `Op`'s algebra and runtime argument."""
     comptime acc = Op.acc_dtype[dtype]()
     comptime out_dt = Op.out_dtype[dtype]()
     var out_ptr = _make_ptr[out_dt](out_addr)
@@ -1376,6 +1481,7 @@ def _reduce_generic[
                         Int64(reduce_n),
                         Int64(outputs),
                         Int64(1),
+                        arg,
                     )
                     return
                 _enqueue_cached[_reduce_contig_kernel[Op, dtype, RED_THREADS]](
@@ -1390,6 +1496,7 @@ def _reduce_generic[
                     Int64(reduce_n),
                     Int64(outputs),
                     Int64(1),
+                    arg,
                 )
             else:
                 _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
@@ -1405,6 +1512,7 @@ def _reduce_generic[
                     Int64(inner),
                     Int64(outputs),
                     Int64(1),
+                    arg,
                 )
             return
 
@@ -1428,6 +1536,7 @@ def _reduce_generic[
                 Int64(reduce_n),
                 Int64(outputs),
                 Int64(splits),
+                arg,
             )
         else:
             _enqueue_cached[_reduce_strided_kernel[Op, dtype]](
@@ -1443,6 +1552,7 @@ def _reduce_generic[
                 Int64(inner),
                 Int64(outputs),
                 Int64(splits),
+                arg,
             )
 
         # Few outputs cannot keep the device busy one thread each, so they get
@@ -1460,6 +1570,7 @@ def _reduce_generic[
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),
+                arg,
             )
         else:
             _enqueue_cached[_reduce_merge_thread_kernel[Op, dtype]](
@@ -1473,6 +1584,7 @@ def _reduce_generic[
                 Int64(outputs),
                 Int64(splits),
                 Int64(reduce_n),
+                arg,
             )
         # Dropping `ws` schedules a stream-ordered free after the kernels.
         _ = ws^
@@ -1488,6 +1600,22 @@ def _reduce_generic[
 def _rowred_spec_into_go[
     Op: ReduceOp
 ](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg,) raises:
+    _rowred_spec_into[Op](a_o, rdims_t, keepdim_o, out_o, 0.0)
+
+
+def _rowred_arg_spec_into_go[
+    Op: ReduceOp
+](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, arg_o: Arg, out_o: Arg,) raises:
+    """`_rowred_spec_into_go` with the op's runtime argument in the slot
+    before the output (the general vector norm's ord)."""
+    _rowred_spec_into[Op](
+        a_o, rdims_t, keepdim_o, out_o, Float32(_raw_f64(arg_o))
+    )
+
+
+def _rowred_spec_into[
+    Op: ReduceOp
+](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg, arg: Float32) raises:
     """TensorSpec entry for one scalar reduction (agents_docs/tensor_spec_design.md).
 
     The caller (`_reduce_into` in ops/reductions.mojo) owns dtype promotion
@@ -1534,5 +1662,5 @@ def _rowred_spec_into_go[
                 _check_into_sized(a, out, outputs, Op.out_dtype[dt]())
                 if outputs > 0:
                     _reduce_generic[Op, dt](
-                        out.ptr, a.ptr, outer, reduce_n, inner, ctx
+                        out.ptr, a.ptr, outer, reduce_n, inner, ctx, arg
                     )
