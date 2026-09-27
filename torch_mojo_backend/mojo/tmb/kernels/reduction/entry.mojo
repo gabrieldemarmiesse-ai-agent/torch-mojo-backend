@@ -63,6 +63,7 @@ from tmb.kernels.reduction.reduce_skeleton import (
     MaxOp,
     MinOp,
     NanSumOp,
+    NormL0Op,
     NormL1Op,
     NormL2Op,
     NormNegInfOp,
@@ -1263,6 +1264,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["NormNegInfSpec"]():
             _spec_dispatcher4[
                 _rowred_spec_into_go[NormNegInfOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["NormL0Spec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[NormL0Op], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["ProdSpec"]():

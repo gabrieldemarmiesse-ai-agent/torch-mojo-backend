@@ -1624,11 +1624,12 @@ def op_var_correction(
 
 
 # ---------------------------------------------------------------------------
-# linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|) and
-# ord=-inf (min of |x|) share everything but the accumulator; other ords
-# decline. `norm`'s six legacy overloads are torch's own redispatch onto this
-# op (`impl_func_norm` in ATen's ReduceOps.cpp: p=None -> 2, dim=[] -> every
-# dim), so they share every helper below with `linalg_vector_norm`.
+# linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|),
+# ord=-inf (min of |x|) and ord=0 (count of nonzero) share everything but the
+# accumulator; other ords decline. `norm`'s six legacy overloads are torch's
+# own redispatch onto this op (`impl_func_norm` in ATen's ReduceOps.cpp:
+# p=None -> 2, dim=[] -> every dim), so they share every helper below with
+# `linalg_vector_norm`.
 # ---------------------------------------------------------------------------
 
 
@@ -1647,6 +1648,8 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
         return "NormL1Spec"
     if ord_f == min_or_neg_inf[DType.float64]():
         return "NormNegInfSpec"
+    if ord_f == 0.0:
+        return "NormL0Spec"
     unsupported("vector_norm with an unsupported ord")
     return ""
 
@@ -1691,9 +1694,12 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     overflow a magnitude the un-squared `abs` represents exactly (float32
     1e20: `(1e20)**2` overflows to inf, `sqrt(inf)` stays inf), so torch
     special-cases this to `abs()` instead of routing it through the
-    accumulator -- see `linalg_vector_norm_out` in ATen's LinearAlgebra.cpp.
-    That special case fires for every ord != 0 (torch maps `ord == 0` to
-    `ne(0)` there instead), so it is correct for both ord=1 and ord=2 here.
+    square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
+    LinearAlgebra.cpp. That special case fires for every ord != 0 (torch maps
+    `ord == 0` to `ne(0)` there instead, since counting is not magnitude), so
+    it is correct for ord=1, 2 and -inf here; callers must skip it for ord=0,
+    where the general reduce path already computes `ne(0)` correctly through
+    `NormL0Op` for a size-one reduction, same as any other size.
     """
     for d in dims:
         if a.dim(d) != 1:
@@ -1760,7 +1766,7 @@ def _vector_norm(
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
-    if _all_reduced_dims_size_one(src.t, dims):
+    if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         var out = _vector_norm_abs(src.t, dims, keepdim)
         ret_owned(rets, 0, out)
         _ = src^
@@ -1795,7 +1801,7 @@ def _vector_norm_out(
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
-    if _all_reduced_dims_size_one(src.t, dims):
+    if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         _vector_norm_abs_out(op_name, src.t, dims, keepdim, out)
         ret_ref(rets, 0, out)
         _ = src^
