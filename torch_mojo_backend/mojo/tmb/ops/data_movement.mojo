@@ -719,17 +719,18 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # A host cast already required a completed readback. Keep that entire
         # fallback blocking; GPU casts/relayouts can remain stream-ordered.
         #
-        # float64 is excluded here even though it is now `is_cast_dtype_on`
-        # (the on-device cast in `_to_copy_same_device` above already used
-        # it): `tests/test_mojo_device.py::
-        # test_to_cpu_host_conversion_is_deliberately_blocking` -- and,
-        # presumably, real callers relying on the same historical guarantee
-        # -- depends on a float64 `.to("cpu", ...)` staying synchronous even
-        # under `non_blocking=True`, the one dtype this backend has always
-        # forced blocking downloads for. Widening `is_cast_dtype_on` for the
-        # on-device cast was correct; widening THIS decision along with it
-        # was not -- verified as a real regression on an H100 (passes on
-        # main, fails here) before this exclusion was added back.
+        # float64 stays excluded even though it is `is_cast_dtype_on` (the
+        # on-device cast in `_to_copy_same_device` above already uses it):
+        # verified on real CUDA (a `cuLaunchHostFunc` stream gate plus a
+        # `cuda.Event.query()`, the same technique
+        # `tests/test_mojo_device.py::_held_transfer_stream` uses) that stock
+        # PyTorch's OWN `x_f32_cuda.to("cpu", dtype=torch.float64,
+        # non_blocking=True)` blocks until the stream drains -- every other
+        # dtype pair tried (f32->i32, f32->f16, f32->f32) returns immediately,
+        # event still pending. float64 is the one destination CUDA itself
+        # never made an async pinned-download path for; matching that (not
+        # blanket-widening `is_cast_dtype_on`'s admission to this decision
+        # too) is what makes us agree with real hardware here.
         var async_download = non_blocking and (
             stype == t.stype
             or (
