@@ -258,19 +258,21 @@ trait ReduceOp:
 
     # The skeleton calls only the two `_arg` forms below, with the runtime
     # argument of the launch (the general vector norm's ord; 0 otherwise).
+    # Float32, never Float64: Apple GPUs have no double, and a double kernel
+    # parameter there stalls the build of every op of the family.
     # Their defaults drop it, so an op without one writes `map` / `finish`
     # alone and compiles to the same code as before the argument existed.
 
     @staticmethod
     def map_arg[
         in_dt: DType, width: SIMDLength, //, acc: DType
-    ](x: SIMD[in_dt, width], arg: Float64) -> SIMD[acc, width]:
+    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
         return Self.map[acc=acc](x)
 
     @staticmethod
     def finish_arg[
         acc: DType, //, out_dt: DType
-    ](a: Scalar[acc], n: Int, arg: Float64) -> Scalar[out_dt]:
+    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
         return Self.finish[out_dt=out_dt](a, n)
 
 
@@ -759,13 +761,12 @@ struct NormPOp(ReduceOp):
     @staticmethod
     def map_arg[
         in_dt: DType, width: SIMDLength, //, acc: DType
-    ](x: SIMD[in_dt, width], arg: Float64) -> SIMD[acc, width]:
+    ](x: SIMD[in_dt, width], arg: Float32) -> SIMD[acc, width]:
         comptime assert acc == DType.float32
-        var p = Float32(arg)
         var ax = abs(x.cast[acc]())
         var r = SIMD[acc, width]()
         comptime for i in range(width):
-            r[i] = powf_c99(ax[i].cast[DType.float32](), p).cast[acc]()
+            r[i] = powf_c99(ax[i].cast[DType.float32](), arg).cast[acc]()
         return r
 
     @staticmethod
@@ -783,13 +784,13 @@ struct NormPOp(ReduceOp):
     @staticmethod
     def finish_arg[
         acc: DType, //, out_dt: DType
-    ](a: Scalar[acc], n: Int, arg: Float64) -> Scalar[out_dt]:
+    ](a: Scalar[acc], n: Int, arg: Float32) -> Scalar[out_dt]:
         comptime assert acc == DType.float32
         # CUDA fills an empty input's output with 0 instead of reducing
         # (`norm_kernel_cuda`); only p = NaN tells that from pow(0, 1/p).
         if n == 0:
             return 0
-        var root = Float32(1.0) / Float32(arg)
+        var root = Float32(1.0) / arg
         return powf_c99(a.cast[DType.float32](), root).cast[out_dt]()
 
 
@@ -1111,7 +1112,7 @@ def _scan_contig[
     vec_start: Int,
     tail_start: Int,
     lane: Int,
-    arg: Float64,
+    arg: Float32,
 ) -> Scalar[acc]:
     """One lane's share of a contiguous shard, over a `lanes`-wide group.
 
@@ -1168,7 +1169,7 @@ def _reduce_contig_kernel[
     cols_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
-    arg: Float64,
+    arg: Float32,
 ):
     """A `lanes`-wide group walks its shard of one row with 16-byte vector
     loads and folds the accumulator; grid is (row group, split).
@@ -1270,7 +1271,7 @@ def _reduce_strided_kernel[
     inner_arg: Int64,
     outputs_arg: Int64,
     splits_arg: Int64,
-    arg: Float64,
+    arg: Float32,
 ):
     """One thread per output column, walking down the reduced axis with stride
     `inner`.
@@ -1333,7 +1334,7 @@ def _reduce_merge_thread_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
-    arg: Float64,
+    arg: Float32,
 ):
     """Many outputs: one thread each. The workspace is split-major, so the
     threads of a warp read consecutive addresses at every step."""
@@ -1363,7 +1364,7 @@ def _reduce_merge_block_kernel[
     outputs_arg: Int64,
     splits_arg: Int64,
     reduce_arg: Int64,
-    arg: Float64,
+    arg: Float32,
 ):
     """Few outputs (the full-reduction end of the range): one block each,
     because a single thread walking hundreds of partials would serialize the
@@ -1423,7 +1424,7 @@ def _reduce_generic[
     reduce_n: Int,
     inner: Int,
     ctx: DeviceContext,
-    arg: Float64 = 0.0,
+    arg: Float32 = 0.0,
 ) raises:
     """Reduce `in` viewed as (outer, reduce_n, inner) into `outer * inner`
     contiguous outputs, with `Op`'s algebra and runtime argument."""
@@ -1607,12 +1608,14 @@ def _rowred_arg_spec_into_go[
 ](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, arg_o: Arg, out_o: Arg,) raises:
     """`_rowred_spec_into_go` with the op's runtime argument in the slot
     before the output (the general vector norm's ord)."""
-    _rowred_spec_into[Op](a_o, rdims_t, keepdim_o, out_o, _raw_f64(arg_o))
+    _rowred_spec_into[Op](
+        a_o, rdims_t, keepdim_o, out_o, Float32(_raw_f64(arg_o))
+    )
 
 
 def _rowred_spec_into[
     Op: ReduceOp
-](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg, arg: Float64) raises:
+](a_o: Arg, rdims_t: Arg, keepdim_o: Arg, out_o: Arg, arg: Float32) raises:
     """TensorSpec entry for one scalar reduction (agents_docs/tensor_spec_design.md).
 
     The caller (`_reduce_into` in ops/reductions.mojo) owns dtype promotion
