@@ -2369,11 +2369,13 @@ def test_vector_norm_neginf_declines_non_floating_input(mojo_gpu):
 # 1 (`maybe_wrap_dim`'s 0-d exception), so dim=0/-1/None/[] are all valid and
 # reduce the single element, keepdim never changes the (always 0-d) shape,
 # and any other dim is out of range. `_reduce_dims` normalizes every one of
-# these specs to an empty dims list for a rank-0 operand, and the skeleton's
-# geometry (`_adjacent_reduce_geom` / `_reduce_spec_geom`) already computes
-# (outer=1, reduce_n=1, inner=1) for zero given dims, so most of these ops
+# these specs to an empty dims list for a rank-0 operand. `_adjacent_reduce_geom`
+# returns False for zero given dims (it never matches an empty interval), so
+# the rank-0 case falls through to its caller's own fallback -- `_reduce_spec_geom`
+# already computes (outer=1, reduce_n=1, inner=1) there, so most of these ops
 # need no kernel-side change at all -- see `_ready_operand`'s early return
-# and the `_argreduce_spec_into` rank-0 branch for the two spots that did.
+# and the `_argreduce_spec_into` rank-0 branch for the one spot that had no
+# such fallback and needed one added.
 # ---------------------------------------------------------------------------
 
 _RANK0_GENERIC_OPS = [op for op in _REDUCE_OPS if op not in ("prod", "count_nonzero")]
@@ -2406,6 +2408,20 @@ def test_reduce_skeleton_rank0_out_of_range_dim_declines(mojo_gpu, op):
         fn(x, dim=1)
     with pytest.raises((IndexError, NotImplementedError)):
         fn(x.to(mojo_gpu), dim=1)
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+@pytest.mark.parametrize("dims", [[0, -1], [0, 0], [-1, -1]])
+def test_reduce_skeleton_rank0_duplicate_dim_declines(mojo_gpu, op, dims):
+    """Every entry of `dims` normalizes to the same (only) dim, 0, on a
+    rank-0 operand: a second one is a duplicate, same as torch's own
+    refusal (confirmed on real CUDA: "dim 0 appears multiple times")."""
+    fn = _REDUCE_OPS[op]
+    x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
+    with pytest.raises(RuntimeError):
+        fn(x, dim=dims)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        fn(x.to(mojo_gpu), dim=dims)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int32, torch.bool])

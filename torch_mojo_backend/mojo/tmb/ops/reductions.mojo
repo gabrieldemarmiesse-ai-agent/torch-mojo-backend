@@ -268,8 +268,14 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
                 dims.append(d)
         return dims^
     if rank == 0:
+        # Every valid entry normalizes to the same (only) dim, 0: a second
+        # one is necessarily a duplicate, same as torch's own refusal.
+        var seen0 = False
         for i in range(len(given)):
             _ = _norm_dim(given[i], rank)
+            if seen0:
+                unsupported("duplicate reduce dim 0")
+            seen0 = True
         return dims^
     var seen = Array[Bool, MAX_RANK](fill=False)
     for i in range(len(given)):
