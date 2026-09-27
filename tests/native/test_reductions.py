@@ -49,6 +49,7 @@ _REDUCE_OPS = {
     "sum": lambda t, **kw: torch.sum(t, **kw),
     "nansum": lambda t, **kw: torch.nansum(t, **kw),
     "mean": lambda t, **kw: torch.mean(t, **kw),
+    "prod": lambda t, **kw: torch.prod(t, **kw),
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
@@ -83,6 +84,12 @@ def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
     fn = _REDUCE_OPS[op]
     if op in ("all", "any", "count_nonzero"):
         x = torch.rand(shape) < 0.5
+    elif op == "prod":
+        # Values near 1: a product over millions of elements from the [0.05,
+        # 0.95) range used below underflows to 0 on BOTH legs (device and the
+        # fp64 reference), which would pass trivially without checking that
+        # the split/merge path actually combines partial products correctly.
+        x = 1.0 + (torch.rand(shape) - 0.5) * 0.002
     else:
         x = torch.rand(shape) * 0.9 + 0.05
     ours = fn(x.to(mojo_gpu), dim=dim).cpu()
@@ -92,7 +99,14 @@ def test_reduce_skeleton_layouts_match_cpu(mojo_gpu, shape, dim, op):
         # fp64 reference on the same values: this measures the reduction
         # order, not the input dtype.
         expected = fn(x.double(), dim=dim)
-        torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
+        if op == "prod":
+            # Unlike a sum, a product compounds one float32 rounding error
+            # PER MULTIPLY: the relative error random-walks as
+            # sqrt(reduce extent) * eps32, ~1e-4 at the million-element end
+            # of these shapes -- looser than the other ops' shared tolerance.
+            torch.testing.assert_close(ours.double(), expected, atol=1e-5, rtol=3e-3)
+        else:
+            torch.testing.assert_close(ours.double(), expected, atol=1e-6, rtol=1e-4)
 
 
 @pytest.mark.parametrize("op", list(_REDUCE_OPS))
@@ -786,6 +800,117 @@ def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
     out = x.reshape(-1)[x.numel() :]
     with pytest.raises(NotImplementedError):
         torch.mean(x, dim=1, out=out)
+
+
+# ---------------------------------------------------------------------------
+# prod
+# ---------------------------------------------------------------------------
+
+
+def test_prod_full_reduce_and_dtype_promotion(mojo_gpu):
+    """`prod()` (prod.default, no dim) and torch's bool/int -> int64 promotion,
+    matching test_sum_full_reduce_and_dtype_promotion."""
+    x = torch.rand(4, 5, generator=torch.Generator().manual_seed(0)) * 0.5 + 0.5
+    torch.testing.assert_close(
+        x.to(mojo_gpu).prod().cpu(), x.prod(), rtol=1e-5, atol=1e-6
+    )
+
+    for dtype in (torch.bool, torch.uint8, torch.int32):
+        if dtype is torch.bool:
+            i = torch.randint(0, 2, (3, 4), dtype=dtype)
+        else:
+            i = torch.randint(0, 3, (3, 4), dtype=dtype)
+        got = i.to(mojo_gpu).prod(dim=1)
+        assert got.dtype == torch.int64 == i.prod(dim=1).dtype
+        torch.testing.assert_close(got.cpu(), i.prod(dim=1))
+
+    # dtype= casts first: 1.7 * 2.7 * 3.7 as int64 is 1 * 2 * 3, not (int)11.65.
+    # (an explicit dtype=int32 is declined -- see `_is_sum_dtype` -- so int64
+    # is the dtype that exercises the cast-before-reduce rule here.)
+    y = torch.tensor([[1.7, 2.7, 3.7]])
+    ours = torch.prod(y.to(mojo_gpu), dim=1, dtype=torch.int64)
+    torch.testing.assert_close(ours.cpu(), torch.prod(y, dim=1, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_prod_dim_int_and_out(mojo_gpu, keepdim):
+    """prod.dim_int, and prod.int_out into a wrongly-shaped out that must be
+    resized (`resize_output`, the same rule every out= op follows)."""
+    x = torch.rand(6, 9) * 0.5 + 0.5
+    xd = x.to(mojo_gpu)
+    expected = x.prod(dim=1, keepdim=keepdim)
+    ours = torch.prod(xd, dim=1, keepdim=keepdim)
+    torch.testing.assert_close(ours.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+    out = torch.empty(0, device=mojo_gpu)
+    returned = torch.prod(xd, dim=1, keepdim=keepdim, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert tuple(out.shape) == tuple(expected.shape)
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_prod_empty_reduce_axis_is_one(mojo_gpu):
+    """An empty reduce axis contributes the identity: prod -> 1, unlike
+    amax/amin, which torch refuses on an empty axis."""
+    x = torch.empty(3, 0)
+    expected = x.prod(dim=1)
+    ours = torch.prod(x.to(mojo_gpu), dim=1).cpu()
+    torch.testing.assert_close(ours, expected)
+
+    # prod.default (no dim) over an all-empty-axes tensor is also the
+    # identity, matching torch.
+    y = torch.empty(0)
+    torch.testing.assert_close(torch.prod(y.to(mojo_gpu)).cpu(), torch.prod(y))
+
+
+def test_prod_noncontiguous(mojo_gpu):
+    """A transposed operand exercises the permute-and-materialize fallback."""
+    x = torch.rand(5, 8) * 0.5 + 0.5
+    xt = x.t()
+    assert not xt.is_contiguous()
+    torch.testing.assert_close(
+        xt.to(mojo_gpu).prod(dim=1).cpu(), xt.prod(dim=1), rtol=1e-5, atol=1e-6
+    )
+
+
+def test_prod_out_variant_computes_in_outs_dtype_for_int_input_too(mojo_gpu):
+    """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
+    sum.IntList_out: with no `dtype=`, prod.int_out accumulates in `out`'s own
+    dtype, not the input's. An int64 self must NOT be multiplied in int64
+    (where 2**32 * 2**32 wraps to 0) and cast down afterward -- each element
+    is cast to `out`'s dtype FIRST. Verified on stock CUDA: [2**32, 2**32] as
+    int64 overflows to 0 in an int64 product, but 2**32 is an exact float32
+    value and so is their product, giving exactly 2**64 in a float32 out."""
+    x = torch.tensor([2**32, 2**32], dtype=torch.int64)
+    assert x.prod().item() == 0  # the int64 product wraps to 0
+    xd = x.to(mojo_gpu)
+    out = torch.empty((), dtype=torch.float32, device=mojo_gpu)
+    torch.prod(xd, dim=0, out=out)
+    assert out.item() == 2.0**64
+
+
+def test_prod_out_dtype_must_match_out_dtype(mojo_gpu):
+    """Same equality rule as sum.IntList_out/mean.out: an explicit `dtype=`
+    that disagrees with `out`'s dtype raises, rather than silently using
+    either one."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(RuntimeError):
+        torch.prod(
+            x,
+            dim=1,
+            dtype=torch.float32,
+            out=torch.empty(4, dtype=torch.float16, device=mojo_gpu),
+        )
+
+
+def test_prod_out_variant_declines_dtypes_the_kernel_lacks(mojo_gpu):
+    """ProdSpec only accumulates in float16/bfloat16/float32/int64
+    (`_is_sum_dtype`, shared with sum); an int32 out -- which torch itself
+    accepts for prod.int_out -- is declined rather than silently
+    mishandled."""
+    x = torch.rand(4, 5).to(mojo_gpu) * 0.5 + 0.5
+    with pytest.raises(NotImplementedError):
+        torch.prod(x, dim=1, out=torch.empty(4, dtype=torch.int32, device=mojo_gpu))
 
 
 # ---------------------------------------------------------------------------
