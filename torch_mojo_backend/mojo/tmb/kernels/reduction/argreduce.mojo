@@ -84,6 +84,7 @@ from tmb.kernels.common.op_utils import (
     _device_sm_count,
     _enqueue_cached,
     _make_ptr,
+    _raw_tuple_len,
 )
 
 from tmb.kernels.common.variant_gates import _dtype_arg_on
@@ -807,10 +808,17 @@ def _argreduce_spec_into[
     var reduce_n = 0
     var inner = 0
     if not _adjacent_reduce_geom(a, rdims_t, outer, reduce_n, inner):
-        raise Error(
-            "mojo spec argreduce: reduce dims must be an adjacent ascending"
-            " interval of a contiguous operand (Python pre-materializes)"
-        )
+        if a.rank == 0 and _raw_tuple_len(rdims_t) == 0:
+            # A rank-0 operand: no axis to iterate, one element, one output.
+            outer = 1
+            reduce_n = 1
+            inner = 1
+        else:
+            raise Error(
+                "mojo spec argreduce: reduce dims must be an adjacent"
+                " ascending interval of a contiguous operand (Python"
+                " pre-materializes)"
+            )
     var outputs = outer * inner
     if dst.numel != outputs or not dst.contig or dst.ctx_ptr != a.ctx_ptr:
         raise Error("mojo spec into: output buffer mismatch")

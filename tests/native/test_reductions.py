@@ -525,12 +525,27 @@ def test_count_nonzero_noncontiguous_and_empty(mojo_device):
     )
 
 
-def test_count_nonzero_rejects_rank0(mojo_device):
-    """A rank-0 operand has no reduce dim; declined like sum/mean/amax are for
-    the same shape (see `_reduce_dims`'s empty-list-on-rank-0 case)."""
-    x = torch.tensor(5.0).to(mojo_device)
-    with pytest.raises(NotImplementedError):
-        torch.ops.aten.count_nonzero.dim_IntList(x, [])
+@pytest.mark.parametrize("dim", [None, [], 0, -1])
+def test_count_nonzero_rank0(mojo_device, dim):
+    """A rank-0 operand has one (virtual) element and no real axis to
+    iterate: `_reduce_dims` normalizes any of these dim specs to empty and
+    the skeleton reduces the single element (see `_reduce_dims`'s rank-0
+    case)."""
+    x = torch.tensor(5.0)
+    xd = x.to(mojo_device)
+    expected = torch.count_nonzero(x, dim=dim)
+    got = torch.count_nonzero(xd, dim=dim)
+    assert got.shape == expected.shape == ()
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_count_nonzero_rank0_out_of_range_dim_raises(mojo_device):
+    x = torch.tensor(5.0)
+    xd = x.to(mojo_device)
+    with pytest.raises(IndexError):
+        torch.count_nonzero(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.count_nonzero(xd, dim=1)
 
 
 @pytest.mark.parametrize("keepdim", [False, True])
@@ -1565,6 +1580,17 @@ def test_any_all_out_nan_is_truthy(mojo_gpu):
     torch.testing.assert_close(out.cpu(), torch.any(x))
 
 
+def test_any_all_out_rank0_input(mojo_gpu):
+    """A rank-0 input reduces over zero axes -- a legitimate no-op, not the
+    user-requested empty dim list `any.dims`/`all.dims` decline."""
+    x = torch.tensor(True)
+    out = torch.empty((), dtype=torch.bool, device=mojo_gpu)
+    torch.any(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.any(x))
+    torch.all(x.to(mojo_gpu), out=out)
+    torch.testing.assert_close(out.cpu(), torch.all(x))
+
+
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize("dims", [None, [0], [1], [0, 2], [-1, 0]])
 def test_any_dims_out(mojo_gpu, dims, keepdim):
@@ -1945,6 +1971,19 @@ def test_vector_norm_ord0_out_resizes(mojo_gpu):
     returned = torch.linalg.vector_norm(x.to(mojo_gpu), ord=0, dim=1, out=out)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [None, 0, -1, []])
+def test_vector_norm_ord0_rank0(mojo_gpu, dim):
+    """ord=0 (`NormL0Spec`, count of nonzero) skips the size-one `abs`
+    shortcut entirely, so this exercises the general reduce path at rank 0
+    rather than the abs fast path the other ords take."""
+    x = torch.tensor(-3.5)
+    xd = x.to(mojo_gpu)
+    expected = torch.linalg.vector_norm(x, ord=0, dim=dim)
+    got = torch.linalg.vector_norm(xd, ord=0, dim=dim)
+    assert got.shape == expected.shape == ()
+    torch.testing.assert_close(got.cpu(), expected)
 
 
 def test_vector_norm_ord0_size_one_reduce_is_not_abs(mojo_gpu):
@@ -2443,6 +2482,205 @@ def test_vector_norm_neginf_declines_non_floating_input(mojo_gpu):
 
 
 # ---------------------------------------------------------------------------
+# rank-0 (0-d) operands: torch treats a 0-d tensor as if it were 1-d of size
+# 1 (`maybe_wrap_dim`'s 0-d exception), so dim=0/-1/None/[] are all valid and
+# reduce the single element, keepdim never changes the (always 0-d) shape,
+# and any other dim is out of range. `_reduce_dims` normalizes every one of
+# these specs to an empty dims list for a rank-0 operand. `_adjacent_reduce_geom`
+# returns False for zero given dims (it never matches an empty interval), so
+# the rank-0 case falls through to its caller's own fallback -- `_reduce_spec_geom`
+# already computes (outer=1, reduce_n=1, inner=1) there, so most of these ops
+# need no kernel-side change at all -- see `_ready_operand`'s early return
+# and the `_argreduce_spec_into` rank-0 branch for the one spot that had no
+# such fallback and needed one added.
+# ---------------------------------------------------------------------------
+
+_RANK0_GENERIC_OPS = [op for op in _REDUCE_OPS if op not in ("prod", "count_nonzero")]
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+@pytest.mark.parametrize("dim", [None, 0, -1, []])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_reduce_skeleton_rank0_matches_torch(mojo_gpu, op, dim, keepdim):
+    fn = _REDUCE_OPS[op]
+    x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
+    kw = {"dim": dim, "keepdim": keepdim}
+    expected = fn(x, **kw)
+    ours = fn(x.to(mojo_gpu), **kw).cpu()
+    assert ours.shape == expected.shape == ()
+    assert ours.dtype == expected.dtype
+    if ours.dtype == torch.bool:
+        torch.testing.assert_close(ours, expected)
+    else:
+        torch.testing.assert_close(
+            ours.double(), expected.double(), atol=1e-6, rtol=1e-4
+        )
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+def test_reduce_skeleton_rank0_out_of_range_dim_declines(mojo_gpu, op):
+    fn = _REDUCE_OPS[op]
+    x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
+    with pytest.raises(IndexError):
+        fn(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        fn(x.to(mojo_gpu), dim=1)
+
+
+@pytest.mark.parametrize("op", _RANK0_GENERIC_OPS)
+@pytest.mark.parametrize("dims", [[0, -1], [0, 0], [-1, -1]])
+def test_reduce_skeleton_rank0_duplicate_dim_declines(mojo_gpu, op, dims):
+    """Every entry of `dims` normalizes to the same (only) dim, 0, on a
+    rank-0 operand: a second one is a duplicate, same as torch's own
+    refusal (confirmed on real CUDA: "dim 0 appears multiple times")."""
+    fn = _REDUCE_OPS[op]
+    x = torch.tensor(True) if op in ("all", "any") else torch.tensor(-3.5)
+    with pytest.raises(RuntimeError):
+        fn(x, dim=dims)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        fn(x.to(mojo_gpu), dim=dims)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32, torch.bool])
+def test_sum_rank0_dtype_promotion(mojo_gpu, dtype):
+    """The bool/sub-int64 -> int64 promotion applies at rank 0 exactly as it
+    does at any other rank."""
+    x = (
+        torch.tensor(True, dtype=dtype)
+        if dtype is torch.bool
+        else torch.tensor(3, dtype=dtype)
+    )
+    xd = x.to(mojo_gpu)
+    for dim in (None, 0, -1, []):
+        expected = torch.sum(x, dim=dim)
+        got = torch.sum(xd, dim=dim)
+        assert got.dtype == expected.dtype
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_sum_out_rank0(mojo_gpu):
+    x = torch.tensor(-3.5)
+    xd = x.to(mojo_gpu)
+    expected = torch.sum(x, dim=0)
+    # A wrongly-shaped out= is resized, same as any other rank.
+    out = torch.empty(5, device=mojo_gpu)
+    returned = torch.sum(xd, dim=0, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == ()
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+def test_prod_rank0(mojo_gpu):
+    """`prod()` (no dim) and `prod.dim_int` (dim required, 0-d exception)."""
+    x = torch.tensor(1.3)
+    xd = x.to(mojo_gpu)
+    torch.testing.assert_close(torch.prod(xd).cpu(), torch.prod(x))
+    for dim in (0, -1):
+        torch.testing.assert_close(
+            torch.prod(xd, dim=dim).cpu(), torch.prod(x, dim=dim)
+        )
+    with pytest.raises(IndexError):
+        torch.prod(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.prod(xd, dim=1)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
+)
+def test_max_and_min_full_reduction_rank0(mojo_device, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_device, "no float64 on Apple GPUs")
+    x = (
+        torch.tensor(-3.5, dtype=dtype)
+        if dtype.is_floating_point
+        else torch.tensor(3, dtype=dtype)
+    )
+    xd = x.to(mojo_device)
+    torch.testing.assert_close(torch.max(xd).cpu(), torch.max(x))
+    torch.testing.assert_close(torch.min(xd).cpu(), torch.min(x))
+    torch.testing.assert_close(torch.amax(xd, dim=0).cpu(), torch.amax(x, dim=0))
+    torch.testing.assert_close(torch.amin(xd, dim=[]).cpu(), torch.amin(x, dim=[]))
+
+
+def test_max_unary_out_rank0_resizes(mojo_device):
+    """A wrongly-shaped out= is resized (confirmed on real CUDA, which warns
+    but still resizes -- torch.Resize.cpp's deprecated auto-resize path)."""
+    x = torch.tensor(-3.5)
+    xd = x.to(mojo_device)
+    expected = torch.max(x)
+    out = torch.empty(5, device=mojo_device)
+    returned = torch.max(xd, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    assert out.shape == ()
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+@pytest.mark.parametrize("dim", [0, -1])
+def test_min_dim_rank0(mojo_gpu, dim):
+    x = torch.tensor(2.5)
+    xd = x.to(mojo_gpu)
+    exp_v, exp_i = torch.min(x, dim=dim)
+    got_v, got_i = torch.min(xd, dim=dim)
+    assert got_v.shape == exp_v.shape == ()
+    torch.testing.assert_close(got_v.cpu(), exp_v)
+    torch.testing.assert_close(got_i.cpu(), exp_i)
+
+
+def test_min_dim_rank0_out_of_range_declines(mojo_gpu):
+    x = torch.tensor(2.5)
+    with pytest.raises(IndexError):
+        torch.min(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.min(x.to(mojo_gpu), dim=1)
+
+
+@pytest.mark.parametrize("dim", [None, 0, -1])
+@pytest.mark.parametrize("keepdim", [False, True])
+def test_argreduce_rank0(mojo_gpu, dim, keepdim):
+    x = torch.tensor(2.5)
+    xd = x.to(mojo_gpu)
+    kw = {"keepdim": keepdim}
+    if dim is not None:
+        kw["dim"] = dim
+    exp_max = torch.argmax(x, **kw)
+    exp_min = torch.argmin(x, **kw)
+    got_max = torch.argmax(xd, **kw)
+    got_min = torch.argmin(xd, **kw)
+    assert got_max.shape == exp_max.shape
+    torch.testing.assert_close(got_max.cpu(), exp_max)
+    torch.testing.assert_close(got_min.cpu(), exp_min)
+
+
+def test_argreduce_rank0_out_of_range_declines(mojo_gpu):
+    x = torch.tensor(2.5)
+    with pytest.raises(IndexError):
+        torch.argmax(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.argmax(x.to(mojo_gpu), dim=1)
+
+
+@pytest.mark.parametrize("correction", [0, 1])
+def test_var_correction_rank0(mojo_gpu, correction):
+    """A single element has zero degrees of freedom above `correction=0`:
+    torch answers 0 there and NaN (0/0) at `correction=1` (its own default),
+    the same divide stock CUDA performs -- confirmed on an actual H100."""
+    x = torch.tensor(2.5)
+    xd = x.to(mojo_gpu)
+    expected = torch.var(x, dim=0, correction=correction)
+    got = torch.var(xd, dim=0, correction=correction)
+    torch.testing.assert_close(got.cpu(), expected, equal_nan=True)
+
+
+def test_var_correction_rank0_out_of_range_declines(mojo_gpu):
+    x = torch.tensor(2.5)
+    with pytest.raises(IndexError):
+        torch.var(x, dim=1)
+    with pytest.raises((IndexError, NotImplementedError)):
+        torch.var(x.to(mojo_gpu), dim=1)
+
+
+# ---------------------------------------------------------------------------
 # cumsum
 # ---------------------------------------------------------------------------
 
@@ -2584,9 +2822,8 @@ def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
 def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     """Eager has no graph fallback: every gate the old fast path answered with
     NOT_HANDLED is an actionable NotImplementedError here."""
-    scalar = torch.tensor(3.0).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
-        scalar.sum()
+        torch.tensor(3.0, dtype=torch.float64).to(mojo_gpu).sum()  # no SumSpec f64
     with pytest.raises(NotImplementedError):
         torch.linalg.vector_norm(torch.randn(4, 5).to(mojo_gpu), ord=3)
     with pytest.raises(NotImplementedError):
