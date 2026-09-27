@@ -47,6 +47,7 @@ from tmb.backend.abi import (
     new_scalar,
     new_tensor,
     own,
+    own_if_new,
     release,
     ret_owned,
     ret_ref,
@@ -1382,7 +1383,7 @@ def _any_all(
 def _any_all_out_stype(a: T) -> Int32:
     """The dtype AnyOp/AllOp's kernel actually writes: torch's uint8
     compatibility keeps a uint8 input's dtype instead of narrowing to bool
-    (native_functions.yaml, Note "[all, any : uint8 compatibility]")."""
+    (ReduceOps.cpp, Note "[all, any : uint8 compatibility]")."""
     return ST_UINT8 if a.dtype == DType.uint8 else ST_BOOL
 
 
@@ -1509,6 +1510,9 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::all.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
+# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# One body serves both, exactly like op_any_out above.
 def op_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
@@ -1544,30 +1548,6 @@ def op_all_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         a,
         _reduce_dims(_none_value(), a.rank, False),
         False,
-        _any_all_out_stype(a),
-        out,
-    )
-    ret_ref(rets, 0, out)
-
-
-# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
-#   Tensor(a!) out) -> Tensor(a!)
-def op_all_dims_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=3])
-    _require_mojo(a)
-    _require_mojo(out)
-    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
-    _scalar_reduction_out(
-        "reduction",
-        "AllSpec",
-        "aten::all.dims_out",
-        "bool_or_uint8",
-        a,
-        dims,
-        v_bool_or(args[unsafe_offset=2], False),
         _any_all_out_stype(a),
         out,
     )
@@ -1724,11 +1704,10 @@ def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
-    var src_c = contiguous(a)
+    var src_c = own_if_new(contiguous(a), a)
     var out = own(new_tensor(shape, rank, a.stype, a.device))
-    elementwise_direct("elementwise", "AbsSpec", src_c, out.t, out.t.dtype)
-    if src_c.h != a.h:
-        release(src_c.h)
+    elementwise_direct("elementwise", "AbsSpec", src_c.t, out.t, out.t.dtype)
+    _ = src_c^
     return out^
 
 
@@ -2809,7 +2788,7 @@ def register_reductions(site: Site) raises:
     impl[op_all_all_out, "all.all_out"](site)
     impl[op_all_dim, "all.dim"](site)
     impl[op_all_dim, "all.dims"](site)
-    impl[op_all_dims_out, "all.dims_out"](site)
+    impl[op_all_out, "all.dims_out"](site)
     impl[op_all_out, "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
