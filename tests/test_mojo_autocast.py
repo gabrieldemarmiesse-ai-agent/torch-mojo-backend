@@ -62,31 +62,21 @@ def test_mojo_autocast_fallback_and_required_policies_are_registered():
 
 
 def test_mojo_autocast_norm_appends_a_float32_dtype(mojo_gpu: str):
-    """CUDA's fp32_append_dtype policy: the `norm` overloads that take no
-    output dtype redispatch to the ones that do, with float32 appended, rather
-    than having their inputs cast.
-
-    `torch.norm` on a privateuse1 tensor goes through `linalg_vector_norm`
-    (a plain fp32 policy), and the mojo device has no kernel for either
-    `norm.out` or `norm.dtype_out`, so what the policy does is visible in
-    WHICH structured overload the call ends up needing: the dtype-taking one
-    only under autocast. Make this a value check once the reductions group
-    registers `norm.out`.
-    """
+    """CUDA's fp32_append_dtype policy: `norm.Scalar` (no output dtype of its
+    own) redispatches to `norm.ScalarOpt_dtype` with float32 appended under
+    autocast, rather than having its input cast."""
     x = torch.randn(4, 6, device=mojo_gpu, dtype=torch.bfloat16)
+    expected = torch.linalg.vector_norm(x.cpu().double())
+
+    got = torch.ops.aten.norm.Scalar(x)
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.cpu().double(), expected, rtol=1e-2, atol=0)
+
     with torch.amp.autocast("mojo", dtype=torch.bfloat16):
         assert torch.norm(x).dtype == torch.float32
-
-    with pytest.raises(NotImplementedError) as plain:
-        torch.ops.aten.norm.Scalar(x)
-    assert "dtype_out" not in str(plain.value), plain.value
-
-    with (
-        torch.amp.autocast("mojo", dtype=torch.bfloat16),
-        pytest.raises(NotImplementedError) as appended,
-    ):
-        torch.ops.aten.norm.Scalar(x)
-    assert "norm.dtype_out" in str(appended.value), appended.value
+        got = torch.ops.aten.norm.Scalar(x)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu().double(), expected, rtol=1e-5, atol=0)
 
 
 def test_mojo_autocast_reaches_the_inner_ops_of_a_composite(mojo_h100):
