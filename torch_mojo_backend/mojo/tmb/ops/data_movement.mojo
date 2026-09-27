@@ -718,26 +718,17 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # destination whose lifetime can be tracked on the source's device.
         # A host cast already required a completed readback. Keep that entire
         # fallback blocking; GPU casts/relayouts can remain stream-ordered.
-        #
-        # float64 stays excluded even though it is `is_cast_dtype_on` (the
-        # on-device cast in `_to_copy_same_device` above already uses it):
-        # verified on real CUDA (a `cuLaunchHostFunc` stream gate plus a
-        # `cuda.Event.query()`, the same technique
-        # `tests/test_mojo_device.py::_held_transfer_stream` uses) that stock
-        # PyTorch's OWN `x_f32_cuda.to("cpu", dtype=torch.float64,
-        # non_blocking=True)` blocks until the stream drains -- every other
-        # dtype pair tried (f32->i32, f32->f16, f32->f32) returns immediately,
-        # event still pending. float64 is the one destination CUDA itself
-        # never made an async pinned-download path for; matching that (not
-        # blanket-widening `is_cast_dtype_on`'s admission to this decision
-        # too) is what makes us agree with real hardware here.
+        # float64 included: verified on real CUDA (an event recorded behind a
+        # `cuLaunchHostFunc` stream gate, AFTER warming up the cast once --
+        # an unwarmed first call pays a one-time lazy-init cost that looks
+        # like blocking but is not) that `x_f32_cuda.to("cpu",
+        # dtype=torch.float64, non_blocking=True)` returns immediately with
+        # the gate still held, exactly like every other dtype pair.
         var async_download = non_blocking and (
             stype == t.stype
             or (
                 is_cast_dtype_on(t.dtype, t)
                 and is_cast_dtype_on(max_dtype(stype), t)
-                and t.dtype != DType.float64
-                and max_dtype(stype) != DType.float64
             )
         )
         var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
