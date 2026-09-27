@@ -1,6 +1,6 @@
 """ATen ops: reductions (sum, nansum, mean, amax/amin, max/min, the
-arg-reductions, any/all, count_nonzero, var, the vector norm (ord=2,
-ord=-inf), cumsum, and sort/topk).
+arg-reductions, any/all, count_nonzero, var, the vector norm (any ord),
+cumsum, and sort/topk).
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`), keeping
 its three decisions:
@@ -47,6 +47,7 @@ from tmb.backend.abi import (
     new_scalar,
     new_tensor,
     own,
+    own_if_new,
     release,
     ret_owned,
     ret_ref,
@@ -266,11 +267,15 @@ def _promote(mut op: Operand, stype: Int32) raises:
 
 
 def _norm_dim(d: Int, rank: Int) raises -> Int:
-    if rank == 0 or d < -rank or d >= rank:
+    """torch's `maybe_wrap_dim`, including its 0-d exception: a rank-0
+    operand is wrapped as if it were a 1-d tensor of size 1, so dim 0 / -1
+    are valid (and normalize to 0) while anything else is out of range."""
+    var ndim = max(rank, 1)
+    if d < -ndim or d >= ndim:
         unsupported(
             "reduce dim " + String(d) + " out of range for rank " + String(rank)
         )
-    return d + rank if d < 0 else d
+    return d + ndim if d < 0 else d
 
 
 def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
@@ -278,8 +283,12 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
 
     `None` always reduces every dim. An EMPTY dim list reduces every dim for
     sum/mean/amax/amin/var, and nothing for any.dims/all.dims. A duplicate or
-    out-of-range dim is declined. An empty result means the caller declines:
-    the reduce bridges reject a zero-length dim spec.
+    out-of-range dim is declined. A rank-0 operand has no dim to mark (its
+    single element is already the whole reduction) so it always returns
+    empty, once every given dim has been validated against `_norm_dim`'s 0-d
+    exception ({-1, 0}) -- `empty_is_all` makes no difference there, since
+    "reduce everything" and "reduce nothing" coincide when there is nothing
+    to reduce over.
     """
     var dims = List[Int]()
     if v.tag == TAG_NONE:
@@ -287,7 +296,9 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
             dims.append(d)
         return dims^
     if v.tag == TAG_INT or v.tag == TAG_SCALAR_INT:
-        dims.append(_norm_dim(v_int(v), rank))
+        var d = _norm_dim(v_int(v), rank)
+        if rank > 0:
+            dims.append(d)
         return dims^
     if v.tag != TAG_INT_LIST:
         raise Error("expected an int or int[] dim argument, got tag ", v.tag)
@@ -296,6 +307,16 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
         if empty_is_all:
             for d in range(rank):
                 dims.append(d)
+        return dims^
+    if rank == 0:
+        # Every valid entry normalizes to the same (only) dim, 0: a second
+        # one is necessarily a duplicate, same as torch's own refusal.
+        var seen0 = False
+        for i in range(len(given)):
+            _ = _norm_dim(given[i], rank)
+            if seen0:
+                unsupported("duplicate reduce dim 0")
+            seen0 = True
         return dims^
     var seen = Array[Bool, MAX_RANK](fill=False)
     for i in range(len(given)):
@@ -306,6 +327,16 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
     for d in range(rank):
         if seen[d]:
             dims.append(d)
+    return dims^
+
+
+def _reduce_dim_single(d: Int, rank: Int) raises -> List[Int]:
+    """One explicit reduce dim (min.dim, prod.dim_int/.int_out) as a dims
+    list: empty for a rank-0 operand once `_norm_dim` has validated it."""
+    var norm = _norm_dim(d, rank)
+    var dims = List[Int]()
+    if rank > 0:
+        dims.append(norm)
     return dims^
 
 
@@ -427,8 +458,13 @@ def _ready_operand(
     operand (the ordinary rows/cols kernels) and, on an accelerator, an
     adjacent ascending interval anywhere else (the strided-axis kernels).
     `arg_route` picks the second gate's arg-reduction form, which adds the
-    coalescing floor its column kernel needs.
+    coalescing floor its column kernel needs. An empty `dims` (a rank-0
+    operand, the only case `_reduce_dims` produces one) has nothing to check
+    or permute -- `a` is already ready -- and skips straight past
+    `_arg_direct_ok`'s `dims[-1]`, which an empty list can't index.
     """
+    if len(dims) == 0:
+        return _borrow(a)
     var direct = _arg_direct_ok(a, dims) if arg_route else _middle_direct_ok(
         a, dims
     )
@@ -459,7 +495,7 @@ def _reduce_into(
 
     Slot list of `_rowred_spec_into_go` / `_var_spec_into_go`: operand spec,
     reduce-dim tuple, keepdim, the accumulator's extra payload (var's
-    correction), output spec.
+    correction, the general vector norm's ord), output spec.
     """
     one_device(a, dst)
     var src = _ready_operand(a, dims, False)
@@ -673,6 +709,8 @@ def _scalar_reduction_out(
     keepdim: Bool,
     out_stype: Int32,
     mut dst: T,
+    with_correction: Bool = False,
+    correction: Float64 = 0.0,
 ) raises:
     """Compute into `out` when its shape, dtype, layout and device already
     match; otherwise compute into a fresh tensor and copy across.
@@ -703,10 +741,28 @@ def _scalar_reduction_out(
         resize_out(dst, shape, rank)
     assert_no_internal_overlap(dst)
     if _out_ready(dst, a, out_stype, numel):
-        _reduce_into(family, op, a, dims.copy(), keepdim, dst, False, 0.0)
+        _reduce_into(
+            family,
+            op,
+            a,
+            dims.copy(),
+            keepdim,
+            dst,
+            with_correction,
+            correction,
+        )
         return
     var tmp = own(new_tensor(shape, rank, out_stype, a.device))
-    _reduce_into(family, op, a, dims.copy(), keepdim, tmp.t, False, 0.0)
+    _reduce_into(
+        family,
+        op,
+        a,
+        dims.copy(),
+        keepdim,
+        tmp.t,
+        with_correction,
+        correction,
+    )
     _copy_result_into(dst, tmp.t)
     _ = tmp^  # alive past the launch
 
@@ -772,7 +828,7 @@ def _sum(
         unsupported("sum of dtype " + String(src.t.dtype))
     _decline_metal_float64(src.t, "sum")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
     var out = _scalar_reduction(
         "reduction",
@@ -834,7 +890,7 @@ def op_sum_intlist_out(
         unsupported("sum with dtype=" + String(target))
     _promote_for_out_reduction(src, target, "aten::sum.IntList_out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "reduction",
@@ -884,7 +940,7 @@ def _nansum_prep(
         unsupported("nansum of dtype " + String(src.t.dtype))
     _decline_metal_float64(src.t, "nansum")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("nansum with no reduce dim (a rank-0 operand)")
     return dims^
 
@@ -948,7 +1004,7 @@ def op_nansum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
     _promote_for_out_reduction(src, target, "aten::nansum.out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("nansum with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "reduction",
@@ -984,7 +1040,7 @@ def _mean(
         unsupported("mean of dtype " + String(src.t.dtype))
     _decline_metal_float64(src.t, "mean")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
     var out = _scalar_reduction(
         "nn", "MeanSpec", src.t, dims, keepdim, src.t.stype, False, 0.0
@@ -1038,7 +1094,7 @@ def _mean_out(
         unsupported("mean with dtype=" + String(target))
     _promote_for_out_reduction(src, target, op_name)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
     _scalar_reduction_out(
         "nn",
@@ -1116,7 +1172,7 @@ def _amax_amin(op: StaticString, args: Values, rets: Values) raises:
     _require_mojo(a)
     _check_extremum_dtype(a, op)
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("amax/amin with no reduce dim (a rank-0 operand)")
     _refuse_empty_extremum(op, a, dims)
     var out = _scalar_reduction(
@@ -1151,7 +1207,7 @@ def _amax_amin_out(
     _require_mojo(out)
     _check_extremum_dtype(a, op)
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("amax/amin with no reduce dim (a rank-0 operand)")
     _refuse_empty_extremum(op, a, dims)
     _scalar_reduction_out(
@@ -1181,12 +1237,12 @@ def op_amin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _full_extremum_dims(op: StaticString, a: T) raises -> List[Int]:
-    """Shared gate for max(Tensor)/min(Tensor) and min.unary_out: dtype,
-    rank and empty-reduce-dim checks, then every dim is reduced."""
+    """Shared gate for max(Tensor)/min(Tensor) and min.unary_out: dtype and
+    empty-reduce-dim checks, then every dim is reduced. `_trailing_dims` of a
+    rank-0 operand is already empty, so `_refuse_empty_extremum`'s size
+    product over zero dims stays 1 (never the size-0 case torch refuses)."""
     _require_mojo(a)
     _check_extremum_dtype(a, op)
-    if a.rank == 0:
-        unsupported("max()/min() of a rank-0 tensor")
     var dims = _trailing_dims(a.rank, a.rank)
     _refuse_empty_extremum(op, a, dims)
     return dims^
@@ -1267,13 +1323,9 @@ def _min_dim_gate(a: T, dim: Int) raises -> List[Int]:
     _require_mojo(a)
     if not _is_row_reduce(a.dtype):
         unsupported("min.dim of dtype " + String(a.dtype))
-    if a.rank == 0:
-        unsupported("min.dim of a rank-0 tensor")
     if a.numel == 0:
         unsupported("min.dim of an empty tensor")
-    var dims = List[Int]()
-    dims.append(_norm_dim(dim, a.rank))
-    return dims^
+    return _reduce_dim_single(dim, a.rank)
 
 
 def _min_dim(a: T, dim: Int, keepdim: Bool) raises -> Tuple[Owned, Owned]:
@@ -1351,7 +1403,7 @@ def _argreduce(
     if a.numel == 0:
         unsupported("argmax/argmin of an empty tensor")
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("argmax/argmin of a rank-0 tensor")
     var keepdim = v_bool_or(args[unsafe_offset=2], False)
     var shape = IndexList[MAX_RANK](1)
@@ -1425,7 +1477,7 @@ def _any_all(
         return
     # any.dims / all.dims: an EXPLICIT empty dim list reduces nothing.
     var dims = _reduce_dims(dim_v, a.rank, False)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("any/all with an empty dim list")
     var out = _scalar_reduction(
         "reduction", spec, a, dims, keepdim, _any_all_out_stype(a), False, 0.0
@@ -1436,7 +1488,7 @@ def _any_all(
 def _any_all_out_stype(a: T) -> Int32:
     """The dtype AnyOp/AllOp's kernel actually writes: torch's uint8
     compatibility keeps a uint8 input's dtype instead of narrowing to bool
-    (native_functions.yaml, Note "[all, any : uint8 compatibility]")."""
+    (ReduceOps.cpp, Note "[all, any : uint8 compatibility]")."""
     return ST_UINT8 if a.dtype == DType.uint8 else ST_BOOL
 
 
@@ -1531,7 +1583,7 @@ def _truthy_reduce_dims(
     legitimate no-op, not a user-requested empty dim list to decline."""
     _check_truthy_dtype(name, a)
     var dims = _reduce_dims(dim_v, a.rank, False)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported(String(name) + " with an empty dim list")
     return dims^
 
@@ -1564,6 +1616,9 @@ def op_any_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::all.out(Tensor self, int dim, bool keepdim=False, *,
 #   Tensor(a!) out) -> Tensor(a!)
+# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# One body serves both, exactly like op_any_out above.
 def op_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
@@ -1605,30 +1660,6 @@ def op_all_all_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, out)
 
 
-# aten::all.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *,
-#   Tensor(a!) out) -> Tensor(a!)
-def op_all_dims_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=3])
-    _require_mojo(a)
-    _require_mojo(out)
-    var dims = _truthy_reduce_dims("all", a, args[unsafe_offset=1])
-    _scalar_reduction_out(
-        "reduction",
-        "AllSpec",
-        "aten::all.dims_out",
-        "bool_or_uint8",
-        a,
-        dims,
-        v_bool_or(args[unsafe_offset=2], False),
-        _any_all_out_stype(a),
-        out,
-    )
-    ret_ref(rets, 0, out)
-
-
 # ---------------------------------------------------------------------------
 # count_nonzero
 # ---------------------------------------------------------------------------
@@ -1646,7 +1677,7 @@ def op_count_nonzero(
     # An explicit empty dim list reduces every dim (unlike any.dims/all.dims):
     # `count_nonzero.default(self, dim=None)` redispatches here with `dim=[]`.
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("count_nonzero with no reduce dim (a rank-0 operand)")
     var out = _scalar_reduction(
         "reduction", "CountNonzeroSpec", a, dims, False, ST_INT64, False, 0.0
@@ -1671,7 +1702,7 @@ def op_var_correction(
     if a.numel == 0:
         unsupported("var of an empty tensor")
     var dims = _reduce_dims(args[unsafe_offset=1], a.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and a.rank != 0:
         unsupported("var with no reduce dim (a rank-0 operand)")
     var correction = v_f64_or(args[unsafe_offset=2], 1.0)
     var out = _scalar_reduction(
@@ -1689,8 +1720,9 @@ def op_var_correction(
 
 # ---------------------------------------------------------------------------
 # linalg_vector_norm / norm: ord=2 (sum of squares), ord=1 (sum of |x|),
-# ord=+inf (max of |x|), ord=-inf (min of |x|) and ord=0 (count of nonzero)
-# share everything but the accumulator; other ords decline. `norm`'s six
+# ord=+inf (max of |x|), ord=-inf (min of |x|), ord=0 (count of nonzero) and
+# any other ord p (sum of |x|^p, then ^(1/p): `NormPOp`, p passed at run time)
+# share everything but the accumulator. `norm`'s six
 # legacy overloads are torch's own redispatch onto this op (`impl_func_norm`
 # in ATen's ReduceOps.cpp: p=None -> 2, dim=[] -> every dim), so they share
 # every helper below with `linalg_vector_norm`.
@@ -1700,9 +1732,9 @@ def op_var_correction(
 def _vector_norm_spec(ord_v: Value) raises -> StaticString:
     """The kernel op token for `ord`, shared by every overload of both ops:
     a missing `ord` (legacy `norm`'s `p=None`) means 2, same as torch's
-    `impl_func_norm`. One `if` per supported ord, in torch's own
-    enumeration order (2, 1, inf, -inf, 0) -- sibling ops land one branch at
-    a time here; every other ord declines."""
+    `impl_func_norm`. The ords CUDA gives a dedicated kernel
+    (`norm_kernel_cuda_impl`: 0, 1, 2, inf, -inf) keep theirs; every other
+    ord is `NormPSpec`."""
     if v_scalar_is_bool(ord_v):
         unsupported("vector_norm with an unsupported ord")
     var ord_f = v_f64_or(ord_v, 2.0)
@@ -1716,8 +1748,34 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
         return "NormNegInfSpec"
     if ord_f == 0.0:
         return "NormL0Spec"
-    unsupported("vector_norm with an unsupported ord")
-    return ""
+    return "NormPSpec"
+
+
+def _decline_normp_float64(
+    op: StaticString, op_label: StaticString, src_dtype: DType, dtype_v: Value
+) raises:
+    """NormPOp (general ord=p) keeps a plain float32 accumulator --
+    `map_arg`/`finish_arg` take `arg` (the ord) as a runtime Float32, not a
+    comptime-dtype pair, so extending it to double would need a second,
+    Float64-typed kernel parameter track; that shape of change hung a Metal
+    build once, so it stays out. A float64 self or `dtype=torch.float64`
+    here would otherwise silently compute in less precision than asked for
+    (verified against real CUDA: a p-norm over 2e5 elements near 1.0 gives a
+    different answer from a float32-computed one cast up), so both are
+    declined outright on EVERY device, not just Apple's -- before
+    `_vector_norm_operand` promotes anything, so this never reaches `_cast`
+    with a float64 side at all for this ord."""
+    if op != "NormPSpec":
+        return
+    if src_dtype == DType.float64:
+        unsupported(
+            String(op_label) + " of dtype float64 with a general ord (p)"
+        )
+    var want = _opt_dtype(dtype_v)
+    if want >= 0 and max_dtype(want) == DType.float64:
+        unsupported(
+            String(op_label) + " with dtype=float64 and a general ord (p)"
+        )
 
 
 def _vector_norm_operand(
@@ -1770,7 +1828,7 @@ def _all_reduced_dims_size_one(a: T, dims: List[Int]) -> Bool:
     square-then-sqrt accumulator -- see `linalg_vector_norm_out` in ATen's
     LinearAlgebra.cpp. That special case fires for every ord != 0 (torch maps
     `ord == 0` to `ne(0)` there instead, since counting is not magnitude), so
-    it is correct for ord=1, 2, +inf and -inf here; callers must skip it for
+    it is correct for every other ord here; callers must skip it for
     ord=0, where the general reduce path already computes `ne(0)` correctly
     through `NormL0Op` for a size-one reduction, same as any other size.
     """
@@ -1787,11 +1845,10 @@ def _vector_norm_abs(a: T, dims: List[Int], keepdim: Bool) raises -> Owned:
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     _reduced_shape(a, dims, keepdim, shape, rank)
-    var src_c = contiguous(a)
+    var src_c = own_if_new(contiguous(a), a)
     var out = own(new_tensor(shape, rank, a.stype, a.device))
-    elementwise_direct("elementwise", "AbsSpec", src_c, out.t, out.t.dtype)
-    if src_c.h != a.h:
-        release(src_c.h)
+    elementwise_direct("elementwise", "AbsSpec", src_c.t, out.t, out.t.dtype)
+    _ = src_c^
     return out^
 
 
@@ -1835,25 +1892,34 @@ def _vector_norm(
     _require_mojo(a)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
+    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
     _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
     if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         var out = _vector_norm_abs(src.t, dims, keepdim)
         ret_owned(rets, 0, out)
         _ = src^
         return
-    if op == "NormInfSpec" or op == "NormNegInfSpec":
-        # +inf/-inf have no identity: torch refuses a zero-length reduce dim
-        # even when the output itself is empty. Declining on the host gives
-        # a clean NotImplementedError; the skeleton's own guard
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f < 0.0 or ord_f == max_or_inf[DType.float64]():
+        # No identity: torch refuses a zero-length reduce dim even when the
+        # output itself is empty. Declining on the host gives a clean
+        # NotImplementedError; the skeleton's own guard for +-inf
         # (`_rowred_spec_into_go`, unconditional on `reduce_n == 0` too) is
         # a plain `raise Error(...)` -> RuntimeError, not reached here.
         _refuse_empty_extremum(op_label, src.t, dims)
     var out = _scalar_reduction(
-        "reduction", op, src.t, dims, keepdim, src.t.stype, False, 0.0
+        "reduction",
+        op,
+        src.t,
+        dims,
+        keepdim,
+        src.t.stype,
+        op == "NormPSpec",
+        ord_f,
     )
     ret_owned(rets, 0, out)
     _ = src^
@@ -1874,17 +1940,19 @@ def _vector_norm_out(
     _require_mojo(out)
     var op = _vector_norm_spec(ord_v)
     var src = _borrow(a)
+    _decline_normp_float64(op, op_label, src.t.dtype, dtype_v)
     _vector_norm_operand(op_label, dtype_v, src)
     _decline_metal_float64(src.t, op_label)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
-    if len(dims) == 0:
+    if len(dims) == 0 and src.t.rank != 0:
         unsupported(String(op_label) + " with no reduce dim (a rank-0 operand)")
     if op != "NormL0Spec" and _all_reduced_dims_size_one(src.t, dims):
         _vector_norm_abs_out(op_name, src.t, dims, keepdim, out)
         ret_ref(rets, 0, out)
         _ = src^
         return
-    if op == "NormInfSpec" or op == "NormNegInfSpec":
+    var ord_f = v_f64_or(ord_v, 2.0)
+    if ord_f < 0.0 or ord_f == max_or_inf[DType.float64]():
         _refuse_empty_extremum(op_label, src.t, dims)
     _scalar_reduction_out(
         "reduction",
@@ -1896,6 +1964,8 @@ def _vector_norm_out(
         keepdim,
         src.t.stype,
         out,
+        op == "NormPSpec",
+        ord_f,
     )
     ret_ref(rets, 0, out)
     _ = src^
@@ -2104,8 +2174,6 @@ def op_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_prod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
-    if a.rank == 0:
-        unsupported("prod with no reduce dim (a rank-0 operand)")
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=1])
     if want >= 0:
@@ -2147,8 +2215,7 @@ def op_prod_dim_int(
     if not _is_sum_dtype(src.t.dtype):
         unsupported("prod of dtype " + String(src.t.dtype))
     _decline_metal_float64(src.t, "prod")
-    var dims = List[Int]()
-    dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
+    var dims = _reduce_dim_single(v_int(args[unsafe_offset=1]), src.t.rank)
     var out = _scalar_reduction(
         "reduction",
         "ProdSpec",
@@ -2183,8 +2250,7 @@ def op_prod_int_out(
     if not _is_sum_dtype(target):
         unsupported("prod with dtype=" + String(target))
     _promote_for_out_reduction(src, target, "aten::prod.int_out")
-    var dims = List[Int]()
-    dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
+    var dims = _reduce_dim_single(v_int(args[unsafe_offset=1]), src.t.rank)
     _scalar_reduction_out(
         "reduction",
         "ProdSpec",
@@ -2876,7 +2942,7 @@ def register_reductions(site: Site) raises:
     impl[op_all_all_out, "all.all_out"](site)
     impl[op_all_dim, "all.dim"](site)
     impl[op_all_dim, "all.dims"](site)
-    impl[op_all_dims_out, "all.dims_out"](site)
+    impl[op_all_out, "all.dims_out"](site)
     impl[op_all_out, "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
