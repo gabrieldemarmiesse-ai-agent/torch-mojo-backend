@@ -297,6 +297,39 @@ def test_anyall_nan_is_truthy(mojo_device):
         )
 
 
+@pytest.mark.parametrize("op", ["all", "any"])
+@pytest.mark.parametrize("dim_kw", [{}, {"dim": 1}, {"dim": [0, 1]}])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bool, torch.int32, torch.float32])
+def test_any_all_uint8_input_keeps_uint8_output(mojo_gpu, op, dim_kw, dtype):
+    """torch's uint8 compatibility (native_functions.yaml, Note "[all, any :
+    uint8 compatibility]"): a uint8 input's any/any.dim/any.dims (and all's)
+    result stays uint8; every other truthy dtype still narrows to bool."""
+    fn = torch.all if op == "all" else torch.any
+    if dtype is torch.bool:
+        x = torch.randint(0, 2, (3, 4, 5), dtype=dtype)
+    else:
+        x = torch.randint(0, 3, (3, 4, 5), dtype=dtype)
+    xd = x.to(mojo_gpu)
+    expected = fn(x, **dim_kw)
+    got = fn(xd, **dim_kw)
+    want_dtype = torch.uint8 if dtype is torch.uint8 else torch.bool
+    assert got.dtype == expected.dtype == want_dtype
+    torch.testing.assert_close(got.cpu(), expected)
+
+
+def test_any_all_uint8_output_values_are_0_or_1(mojo_gpu):
+    """The uint8-kept result carries the same 0/1 payload as the bool one,
+    not the raw int32 accumulator."""
+    x = torch.tensor([[2, 0, 0], [0, 0, 0], [3, 5, 0]], dtype=torch.uint8)
+    xd = x.to(mojo_gpu)
+    got_any = torch.any(xd, dim=1).cpu()
+    assert got_any.dtype == torch.uint8
+    torch.testing.assert_close(got_any, torch.tensor([1, 0, 1], dtype=torch.uint8))
+    got_all = torch.all(xd, dim=1).cpu()
+    assert got_all.dtype == torch.uint8
+    torch.testing.assert_close(got_all, torch.tensor([0, 0, 0], dtype=torch.uint8))
+
+
 def test_sum_full_reduce_and_dtype_promotion(mojo_gpu):
     """`sum()` with no dim reduces over every axis, and torch's promotion
     rules (bool / sub-int64 integers -> int64, an explicit dtype= casting the
@@ -382,15 +415,7 @@ def test_nansum_out_computes_in_outs_dtype(mojo_gpu):
     """Same `_out_reduce_dtype`/`_promote_for_out_reduction` path as
     sum.IntList_out/mean.out: with no `dtype=`, nansum.out accumulates in
     `out`'s own dtype, not the input's -- summing two 40000s in float16
-    overflows to inf, but widened to float32 first (what CUDA's own
-    `make_reduction` does for a lower-precision input against a float32 out,
-    `gpu_lowp_to_f32` in ReduceOpsUtils.h; float16->float32 is an exact
-    widening, so casting up front reproduces that fused kernel's result
-    exactly) it is exactly 80000. Not run against actual CUDA tensors here:
-    this box's driver (12.8) is too old for the installed cu130 wheel
-    (`torch.cuda.is_available()` is False even under `srun` on the H100
-    nodes) -- verified instead by reading `ReduceOpsUtils.h`'s
-    `make_reduction` and `ReduceSumProdKernel.cu`'s `nansum_kernel_cuda`."""
+    overflows to inf, but widened to float32 first it is exactly 80000."""
     y = torch.tensor([40000.0, 40000.0], dtype=torch.float16)
     assert torch.isinf(y.sum())  # accumulating (and rounding) in float16 overflows
     yd = y.to(mojo_gpu)
@@ -460,7 +485,7 @@ def test_count_nonzero_empty_dim_list_reduces_all(mojo_gpu):
 
 
 def test_count_nonzero_nan_counts_as_nonzero(mojo_device):
-    """NaN is nonzero under the ordered `!=` test (matches any/all's rule)."""
+    """NaN is nonzero under `not (x == 0)` (matches any/all's rule)."""
     x = torch.tensor([[1.0, 0.0, float("nan"), 0.0, float("nan")]])
     torch.testing.assert_close(
         torch.count_nonzero(x.to(mojo_device), dim=1).cpu(),
@@ -793,12 +818,7 @@ def test_out_variant_into_a_strided_destination(mojo_gpu):
 
 
 def test_mean_out_declines_an_out_that_aliases_the_input(mojo_gpu):
-    """`out=x.reshape(-1)[x.numel():]` aliases `x`'s storage (a 0-element view
-    that would need to GROW to hold the result): `_scalar_reduction_out`
-    declines any aliasing `out=` outright rather than resizing it, since stock
-    CUDA has no one well-defined answer here (`torch.max(x, out=x)` -- a
-    different alias of the same helper's problem, tested alongside this one --
-    comes back silently WRONG on real CUDA, not merely a stale pointer)."""
+    """See `_decline_aliasing_out` for why any aliasing `out=` declines."""
     x = torch.randn(3, 4, device=mojo_gpu)
     out = x.reshape(-1)[x.numel() :]
     with pytest.raises(NotImplementedError):
@@ -827,7 +847,7 @@ def test_prod_full_reduce_and_dtype_promotion(mojo_gpu):
         assert got.dtype == torch.int64 == i.prod(dim=1).dtype
         torch.testing.assert_close(got.cpu(), i.prod(dim=1))
 
-    # dtype= casts first: 1.7 * 2.7 * 3.7 as int64 is 1 * 2 * 3, not (int)11.65.
+    # dtype= casts first: 1.7 * 2.7 * 3.7 as int64 is 1 * 2 * 3, not (int)16.983.
     # (an explicit dtype=int32 is declined -- see `_is_sum_dtype` -- so int64
     # is the dtype that exercises the cast-before-reduce rule here.)
     y = torch.tensor([[1.7, 2.7, 3.7]])
@@ -1118,14 +1138,7 @@ def test_max_unary_out_propagates_nan(mojo_device):
 
 
 def test_max_unary_out_declines_an_out_that_aliases_the_input(mojo_gpu):
-    """`_scalar_reduction_out` refuses any `out=` sharing storage with the
-    input outright, rather than resizing it: stock CUDA has no one
-    well-defined answer to reproduce here. `out=x[x.numel():]` (a 0-element
-    view that would need to GROW) computes the right answer on real CUDA, but
-    `out=x` itself -- same tensor, needing to SHRINK from (6,) to () --
-    silently returns the WRONG value there (`resize_output` mutates `self`'s
-    own metadata before the reduction reads it), so there is no single
-    aliasing behavior worth special-casing; every aliasing `out=` declines."""
+    """See `_decline_aliasing_out` for why any aliasing `out=` declines."""
     x = torch.randn(6, device=mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.max(x, out=x[x.numel() :])
