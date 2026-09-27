@@ -137,9 +137,15 @@ def _is_float_or_double(dt: DType) -> Bool:
     return _is_float3(dt) or dt == DType.float64
 
 
-def _is_castable(dt: DType) -> Bool:
+def _is_castable(dt: DType, t: T) raises -> Bool:
     """aten_fast._CAST_DTYPES: what the cast kernel dispatches on, and so the
-    dtype pairs a promotion can go through."""
+    dtype pairs a promotion can go through. Device-aware like
+    `is_cast_dtype_on` (ops/common.mojo): false for float64 on an Apple GPU,
+    where `_cast` can't run it, so `_promote` (sum/nansum/mean/prod/cumsum/
+    the vector-norm dtype= path -- every caller of `_promote`) declines
+    cleanly through this ONE check rather than needing its own guard."""
+    if dt == DType.float64 and dev(t.device)[].api == "metal":
+        return False
     return (
         _is_float3(dt)
         or dt == DType.float64
@@ -244,7 +250,7 @@ def _promote(mut op: Operand, stype: Int32) raises:
     if op.t.stype == stype:
         return
     var target = max_dtype(stype)
-    if not _is_castable(op.t.dtype) or not _is_castable(target):
+    if not _is_castable(op.t.dtype, op.t) or not _is_castable(target, op.t):
         unsupported(
             "reduction dtype promotion from "
             + String(op.t.dtype)
@@ -726,12 +732,22 @@ def _out_reduce_dtype(
     return target
 
 
-def _promote_for_out_reduction(mut src: Operand, target: DType) raises:
+def _promote_for_out_reduction(
+    mut src: Operand, target: DType, op_name: StaticString
+) raises:
     """Cast `src` to `target` before reducing: both mean and sum round every
     element to `target` first (their CUDA kernels build the reduction
     directly from it), then accumulate in float32 via their own `acc_dtype`
     -- mirroring CUDA, not CPU torch's separate half-precision-avoiding
-    `mean_out` path."""
+    `mean_out` path.
+
+    Declines float64 on an Apple GPU UNCONDITIONALLY, before the `src.t.dtype
+    != target` check below: when they're already equal (both float64, no
+    cast needed) `_promote` -- and so its own device-aware `_is_castable`
+    guard -- is never reached, so this is the one place that decision has to
+    be made for every out= reduction (sum.IntList_out, mean.out/dtype_out,
+    prod.int_out, nansum.out)."""
+    _decline_metal_float64_dtype(target, src.t, op_name)
     if src.t.dtype != target:
         _promote(src, torch_dtype(target))
 
@@ -748,7 +764,6 @@ def _sum(
     var src = _borrow(a)
     var want = _opt_dtype(dtype_v)
     if want >= 0:
-        _decline_metal_float64_dtype(max_dtype(want), src.t, "sum")
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         # torch promotes bool / sub-int64 integer sums to int64.
@@ -817,8 +832,7 @@ def op_sum_intlist_out(
     )
     if not _is_sum_dtype(target):
         unsupported("sum with dtype=" + String(target))
-    _decline_metal_float64_dtype(target, src.t, "aten::sum.IntList_out")
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::sum.IntList_out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0:
         unsupported("sum with no reduce dim (a rank-0 operand)")
@@ -863,7 +877,6 @@ def _nansum_prep(
             unsupported(
                 "nansum with dtype=" + String(target) + " from a floating input"
             )
-        _decline_metal_float64_dtype(target, src.t, "nansum")
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         _promote(src, ST_INT64)
@@ -933,8 +946,7 @@ def op_nansum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var target = _nansum_out_target(
         args[unsafe_offset=3], src.t.dtype, out, "aten::nansum.out"
     )
-    _decline_metal_float64_dtype(target, src.t, "aten::nansum.out")
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::nansum.out")
     var dims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
     if len(dims) == 0:
         unsupported("nansum with no reduce dim (a rank-0 operand)")
@@ -967,7 +979,6 @@ def _mean(
     if want >= 0:
         if not _is_float_or_double(max_dtype(want)):
             unsupported("mean with dtype=" + String(max_dtype(want)))
-        _decline_metal_float64_dtype(max_dtype(want), src.t, "mean")
         _promote(src, want)
     if not _is_float_or_double(src.t.dtype):
         unsupported("mean of dtype " + String(src.t.dtype))
@@ -1025,8 +1036,7 @@ def _mean_out(
         unsupported("mean of dtype " + String(src.t.dtype))
     if not _is_float_or_double(target):
         unsupported("mean with dtype=" + String(target))
-    _decline_metal_float64_dtype(target, src.t, op_name)
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, op_name)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
     if len(dims) == 0:
         unsupported("mean with no reduce dim (a rank-0 operand)")
@@ -1748,7 +1758,6 @@ def _vector_norm_operand(
                 + ") can't convert without narrowing to dtype="
                 + String(target)
             )
-        _decline_metal_float64_dtype(target, src.t, op_label)
         _promote(src, want)
 
 
@@ -2100,7 +2109,6 @@ def op_prod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=1])
     if want >= 0:
-        _decline_metal_float64_dtype(max_dtype(want), src.t, "prod")
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         # torch promotes bool / sub-int64 integer prod to int64.
@@ -2133,7 +2141,6 @@ def op_prod_dim_int(
     var src = _borrow(a)
     var want = _opt_dtype(args[unsafe_offset=3])
     if want >= 0:
-        _decline_metal_float64_dtype(max_dtype(want), src.t, "prod")
         _promote(src, want)
     elif not src.t.dtype.is_floating_point():
         _promote(src, ST_INT64)
@@ -2175,8 +2182,7 @@ def op_prod_int_out(
     )
     if not _is_sum_dtype(target):
         unsupported("prod with dtype=" + String(target))
-    _decline_metal_float64_dtype(target, src.t, "aten::prod.int_out")
-    _promote_for_out_reduction(src, target)
+    _promote_for_out_reduction(src, target, "aten::prod.int_out")
     var dims = List[Int]()
     dims.append(_norm_dim(v_int(args[unsafe_offset=1]), src.t.rank))
     _scalar_reduction_out(

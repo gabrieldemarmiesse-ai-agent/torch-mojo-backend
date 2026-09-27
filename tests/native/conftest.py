@@ -26,6 +26,15 @@ def side_stream_or_skip(device: str) -> torch.Stream:
     return torch.Stream(device=device)
 
 
+def is_metal(device: str) -> bool:
+    """Whether `device` (a `mojo:<index>` string) is an Apple GPU -- the
+    inverse of `skip_if_metal`'s own check, for a test that wants to assert
+    the Metal-only decline itself rather than skip past it."""
+    idx = int(device.rsplit(":", 1)[-1])
+    accelerators = list(get_accelerators())
+    return idx < len(accelerators) and accelerators[idx].api == "metal"
+
+
 def skip_if_metal(device: str, reason: str):
     """Skip a case that is correct and by design on Apple's Metal backend.
 
@@ -38,9 +47,7 @@ def skip_if_metal(device: str, reason: str):
     names its own reason, and CUDA/ROCm runs are untouched because the index
     they check is never Metal.
     """
-    idx = int(device.rsplit(":", 1)[-1])
-    accelerators = list(get_accelerators())
-    if idx < len(accelerators) and accelerators[idx].api == "metal":
+    if is_metal(device):
         pytest.skip(reason)
 
 

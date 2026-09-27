@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_if_metal
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -636,13 +636,19 @@ def test_reduce_narrows_a_float64_self_with_explicit_dtype(mojo_gpu, fn_name):
     (unlike linalg_vector_norm/norm, sum/prod/nansum/mean have no widen-only
     restriction -- verified on real CUDA that all four accept it). This is
     also the one case the float64-on-Metal decline must catch by the SELF's
-    dtype, not just the requested target: `_decline_metal_float64_dtype`
-    used to check only `dtype=`'s target, so a float64 self with a
-    non-float64 explicit dtype reached the cast kernel on an Apple GPU
-    instead of declining cleanly."""
-    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    dtype, not just the requested target: `_is_castable` used to check only
+    `dtype=`'s target, so a float64 self with a non-float64 explicit dtype
+    reached the cast kernel on an Apple GPU instead of declining cleanly.
+
+    Asserts the decline itself on Metal (`is_metal`), rather than skipping
+    past it, so a Mac run actually exercises this fix instead of never
+    reaching it."""
     fn = getattr(torch, fn_name)
     x = torch.randn(4, 5, dtype=torch.float64)
+    if is_metal(mojo_gpu):
+        with pytest.raises(NotImplementedError):
+            fn(x.to(mojo_gpu), dim=1, dtype=torch.float32)
+        return
     expected = fn(x, dim=1, dtype=torch.float32)
     got = fn(x.to(mojo_gpu), dim=1, dtype=torch.float32).cpu()
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
@@ -2600,6 +2606,22 @@ def test_cumsum_dtype_kwarg_casts_before_accumulating(mojo_gpu):
     expected = torch.cumsum(y, dim=1, dtype=torch.int32)
     assert result.dtype == torch.int32
     torch.testing.assert_close(result.cpu(), expected)
+
+
+def test_cumsum_narrows_a_float64_self_with_explicit_dtype(mojo_gpu):
+    """`cumsum(x_float64, dtype=torch.float32)`: the exact case that exposed
+    `_is_castable` checking only `dtype=`'s target and not the float64 SELF
+    -- `_promote`'s cast-then-accumulate reaches `_cast` with a float64
+    source regardless of the (non-float64) target. Asserts the decline on
+    Metal instead of skipping past it."""
+    x = torch.randn(4, 5, dtype=torch.float64)
+    if is_metal(mojo_gpu):
+        with pytest.raises(NotImplementedError):
+            torch.cumsum(x.to(mojo_gpu), dim=1, dtype=torch.float32)
+        return
+    expected = torch.cumsum(x, dim=1, dtype=torch.float32)
+    got = torch.cumsum(x.to(mojo_gpu), dim=1, dtype=torch.float32).cpu()
+    torch.testing.assert_close(got, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.uint8, torch.bool])
