@@ -74,6 +74,7 @@ from tmb.ops.common import (
     copy_strided_into,
     elementwise_direct,
     fill_value,
+    is_cast_dtype_on,
     one_device,
     resize_out,
 )
@@ -140,21 +141,11 @@ def _is_float_or_double(dt: DType) -> Bool:
 
 def _is_castable(dt: DType, t: T) raises -> Bool:
     """aten_fast._CAST_DTYPES: what the cast kernel dispatches on, and so the
-    dtype pairs a promotion can go through. Device-aware like
-    `is_cast_dtype_on` (ops/common.mojo): false for float64 on an Apple GPU,
-    where `_cast` can't run it, so `_promote` (sum/nansum/mean/prod/cumsum/
-    the vector-norm dtype= path -- every caller of `_promote`) declines
-    cleanly through this ONE check rather than needing its own guard."""
-    if dt == DType.float64 and dev(t.device)[].api == "metal":
-        return False
-    return (
-        _is_float3(dt)
-        or dt == DType.float64
-        or dt == DType.int64
-        or dt == DType.int32
-        or dt == DType.uint8
-        or dt == DType.bool
-    )
+    dtype pairs a promotion can go through -- exactly `is_cast_dtype_on`
+    (ops/common.mojo), which `_promote` (sum/nansum/mean/prod/cumsum/the
+    vector-norm dtype= path -- every caller of `_promote`) uses through this
+    one check rather than needing its own device guard."""
+    return is_cast_dtype_on(dt, t)
 
 
 def _is_sum_dtype(dt: DType) -> Bool:
@@ -1754,17 +1745,10 @@ def _vector_norm_spec(ord_v: Value) raises -> StaticString:
 def _decline_normp_float64(
     op: StaticString, op_label: StaticString, src_dtype: DType, dtype_v: Value
 ) raises:
-    """NormPOp (general ord=p) keeps a plain float32 accumulator --
-    `map_arg`/`finish_arg` take `arg` (the ord) as a runtime Float32, not a
-    comptime-dtype pair, so extending it to double would need a second,
-    Float64-typed kernel parameter track; that shape of change hung a Metal
-    build once, so it stays out. A float64 self or `dtype=torch.float64`
-    here would otherwise silently compute in less precision than asked for
-    (verified against real CUDA: a p-norm over 2e5 elements near 1.0 gives a
-    different answer from a float32-computed one cast up), so both are
-    declined outright on EVERY device, not just Apple's -- before
-    `_vector_norm_operand` promotes anything, so this never reaches `_cast`
-    with a float64 side at all for this ord."""
+    """NormPOp (general ord=p) has a fixed float32 accumulator, so a float64
+    self or `dtype=torch.float64` would silently compute in less precision
+    than asked for; declined on every device, before `_vector_norm_operand`
+    promotes anything."""
     if op != "NormPSpec":
         return
     if src_dtype == DType.float64:

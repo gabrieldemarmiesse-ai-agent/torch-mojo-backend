@@ -15,6 +15,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from std.atomic import Atomic, Ordering
+from std.memory import bitcast
 from std.os import abort
 from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.collections import Array
@@ -2059,6 +2060,33 @@ def _where_select_go(
 comptime CAST_THREADS = GS_THREADS
 
 
+@always_inline
+def _cast_elem[
+    src: DType, dst: DType, width: Int
+](v: SIMD[src, width]) -> SIMD[dst, width]:
+    """`v.cast[dst]()`, except float64 -> half/bfloat16 rounds through
+    float32 first: c10::Half/BFloat16 have no double constructor, so stock
+    PyTorch (CPU and CUDA) always double-rounds that pair, which a direct
+    SIMD cast does not reproduce. Verified on real CUDA with
+    `1 + 2**-11 + 2**-25`, exactly halfway between two float16 values in
+    float32 (so ties-to-even rounds it down to 1.0) but not in float64
+    (where it rounds up to 1.0009765625) -- CUDA gives 1.0."""
+    comptime if src == DType.float64 and (
+        dst == DType.float16 or dst == DType.bfloat16
+    ):
+        var mid = v.cast[DType.float32]()
+        # The GPU backend folds `.cast[float32]().cast[dst]()` back into one
+        # float64->half conversion (a provably different, single-rounded
+        # value) unless the intermediate is forced to materialize: round-trip
+        # it through its bit pattern, which an optimizer can't fuse away
+        # without recognizing the specific round-trip, across a type it has
+        # no float-specific folding rules for.
+        var mid_bits = bitcast[DType.int32, width](mid)
+        return bitcast[DType.float32, width](mid_bits).cast[dst]()
+    else:
+        return v.cast[dst]()
+
+
 def _cast_vec_kernel[
     src: DType, dst: DType, VEC: Int
 ](
@@ -2092,7 +2120,7 @@ def _cast_vec_kernel[
             )
         else:
             out_ptr.unsafe_store[width=VEC, alignment=OALIGN](
-                j * VEC, v.cast[dst]()
+                j * VEC, _cast_elem[src, dst, VEC](v)
             )
         j += gstride
     # The tail is at most VEC-1 elements and the grid is never narrower than
@@ -2107,7 +2135,7 @@ def _cast_vec_kernel[
                 a != Scalar[src](0)
             ).cast[dst]()
         else:
-            out_ptr[unsafe_offset=t] = a.cast[dst]()
+            out_ptr[unsafe_offset=t] = _cast_elem[src, dst, 1](a)
 
 
 @always_inline

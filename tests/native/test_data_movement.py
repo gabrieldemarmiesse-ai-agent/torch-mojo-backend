@@ -2636,6 +2636,16 @@ def test_cast_is_exact_for_every_dtype_pair(mojo_gpu, src_dtype):
 _FLOAT64_PRECISION_VALUES = [
     1 + 2**-40,  # needs > float32 mantissa bits; must round, not truncate
     16777217.0,  # 2**24 + 1: exact in float64, not in float32
+    # PyTorch's half/bfloat16 (CPU and CUDA) are always constructed from
+    # float, so float64 -> half/bfloat16 double-rounds through float32 --
+    # verified on real CUDA. Each value sits just above the exact tie
+    # between two representable half/bf16 values, by less than float32's
+    # ulp there: a single (mathematically "correct") rounding step would
+    # round up, but double rounding first snaps to the tie in float32 and
+    # ties-to-even then rounds down -- this backend must match the double
+    # rounding, not the single-rounded answer.
+    1 + 2**-11 + 2**-25,  # float16 tie (2**-11) + an ulp float32 loses
+    1 + 2**-8 + 2**-30,  # bfloat16 tie (2**-8) + an ulp float32 loses
     0.1,
     -0.1,
     1e30,

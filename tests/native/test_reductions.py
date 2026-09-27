@@ -3187,7 +3187,9 @@ def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     """Eager has no graph fallback: every gate the old fast path answered with
     NOT_HANDLED is an actionable NotImplementedError here."""
     with pytest.raises(NotImplementedError):
-        torch.tensor(3.0, dtype=torch.float64).to(mojo_gpu).sum()  # no SumSpec f64
+        # int8/int16 promote to int64 through a cast the cast kernel does not
+        # dispatch on (same gap sum.IntList_out/cumsum document elsewhere).
+        torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum()
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
     with pytest.raises(NotImplementedError):
