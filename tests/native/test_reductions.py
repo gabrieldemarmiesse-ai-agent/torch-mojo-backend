@@ -53,6 +53,7 @@ _REDUCE_OPS = {
     "amax": lambda t, **kw: torch.amax(t, **kw),
     "amin": lambda t, **kw: torch.amin(t, **kw),
     "norm": lambda t, **kw: torch.linalg.vector_norm(t, **kw),
+    "norm_l1": lambda t, **kw: torch.linalg.vector_norm(t, ord=1, **kw),
     "norm_neginf": lambda t, **kw: torch.linalg.vector_norm(t, ord=float("-inf"), **kw),
     "all": lambda t, **kw: torch.all(t, **kw),
     "any": lambda t, **kw: torch.any(t, **kw),
@@ -1786,6 +1787,33 @@ def test_vector_norm_out_and_strided_input(mojo_gpu):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vector_norm_l1_with_an_accumulation_dtype(mojo_gpu, dtype):
+    """Same `dtype=` cast-before-accumulate contract as ord=2."""
+    cpu = torch.randn(4096, dtype=dtype)
+    expected = torch.linalg.vector_norm(cpu, 1, dtype=torch.float32)
+    got = torch.linalg.vector_norm(cpu.to(mojo_gpu), 1, dtype=torch.float32)
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_vector_norm_l1_out_resizes_and_strided_input(mojo_gpu):
+    contiguous = torch.linspace(-3.0, 4.0, 35).reshape(5, 7)
+    strided = contiguous.t()
+    expected = torch.linalg.vector_norm(strided, ord=1)
+
+    device_strided = contiguous.to(mojo_gpu).t()
+    out = torch.empty(0, dtype=torch.float32, device=mojo_gpu)
+    returned = torch.linalg.vector_norm(device_strided, ord=1, out=out)
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.cpu(), expected)
+
+    empty = torch.empty((0, 7), dtype=torch.float32).to(mojo_gpu)
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(empty, ord=1).cpu(), torch.tensor(0.0), rtol=0, atol=0
+    )
+
+
 def test_vector_norm_declines_non_floating_input(mojo_gpu):
     """`TORCH_META_FUNC(linalg_vector_norm)` calls `checkFloatingOrComplex` on
     the INPUT's own dtype unconditionally, before ever looking at `dtype=`:
@@ -2023,12 +2051,12 @@ def test_norm_dtype_out(mojo_gpu):
     torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-4)
 
 
-def test_norm_declines_ord_other_than_2(mojo_gpu):
+def test_norm_declines_unsupported_ord(mojo_gpu):
     x = torch.randn(4, 5).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
-        torch.ops.aten.norm.Scalar(x, 1)
+        torch.ops.aten.norm.Scalar(x, 3)
     with pytest.raises(NotImplementedError):
-        torch.ops.aten.norm.ScalarOpt_dim(x, float("inf"), [1], False)
+        torch.ops.aten.norm.ScalarOpt_dim(x, 3, [1], False)
 
 
 # ---------------------------------------------------------------------------
