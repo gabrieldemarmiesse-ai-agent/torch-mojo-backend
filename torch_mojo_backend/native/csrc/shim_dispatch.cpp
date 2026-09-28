@@ -507,6 +507,9 @@ void raise_from_kernel(int32_t rc, const char* op, const char* overload) {
   if (rc == 2) {
     TORCH_CHECK_NOT_IMPLEMENTED(false, msg, " [", where, "]");
   }
+  if (rc == 3) {
+    TORCH_CHECK_INDEX(false, msg, " [", where, "]");
+  }
   TORCH_CHECK(false, msg, " [", where, "]");
 }
 
