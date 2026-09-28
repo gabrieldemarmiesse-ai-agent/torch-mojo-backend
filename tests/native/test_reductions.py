@@ -3226,11 +3226,11 @@ def _cumsum_trivial_input(dtype: torch.dtype, shape: tuple[int, ...]) -> torch.T
 @pytest.mark.parametrize("dtype", _CUMSUM_TRIVIAL_DTYPES)
 @pytest.mark.parametrize("dim", [0, -1])
 def test_cumsum_rank0_matches_cpu(mojo_gpu, dim, dtype):
+    """Unlike the real scan, the trivial (self already the right dtype, no
+    dtype= cast needed) path is `copy_strided_into`, an itemsize-only
+    byte copy with no float64 arithmetic -- it works on Apple GPUs too,
+    unlike an actual cast (see `test_cumsum_rank0_dtype_kwarg` below)."""
     x = _cumsum_trivial_input(dtype, ())
-    if dtype == torch.float64 and is_metal(mojo_gpu):
-        with pytest.raises(NotImplementedError):
-            torch.cumsum(x.to(mojo_gpu), dim=dim)
-        return
     result = torch.cumsum(x.to(mojo_gpu), dim=dim)
     expected = torch.cumsum(x, dim=dim)
     assert result.shape == expected.shape == ()
@@ -3278,11 +3278,10 @@ _CUMSUM_EMPTY_SHAPES = [(0,), (3, 0), (0, 3)]
 @pytest.mark.parametrize("shape", _CUMSUM_EMPTY_SHAPES)
 @pytest.mark.parametrize("dtype", _CUMSUM_TRIVIAL_DTYPES)
 def test_cumsum_empty_matches_cpu(mojo_gpu, shape, dtype):
+    """Same byte-copy trivial path as `test_cumsum_rank0_matches_cpu` above,
+    so float64 works on Apple GPUs here too (numel==0 anyway, but the dtype
+    still has to round-trip through the tensor's metadata)."""
     x = _cumsum_trivial_input(dtype, shape)
-    if dtype == torch.float64 and is_metal(mojo_gpu):
-        with pytest.raises(NotImplementedError):
-            torch.cumsum(x.to(mojo_gpu), dim=0)
-        return
     for dim in range(len(shape)):
         result = torch.cumsum(x.to(mojo_gpu), dim=dim)
         expected = torch.cumsum(x, dim=dim)
