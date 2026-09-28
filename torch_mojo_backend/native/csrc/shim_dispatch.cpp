@@ -665,6 +665,12 @@ int32_t tmb_call_op(const char* op, const char* overload, const TmbValue* args, 
   } catch (const c10::NotImplementedError& e) {
     tmb_set_error(e.what_without_backtrace());
     return 2;
+  } catch (const c10::IndexError& e) {
+    // An op reached through tmb_call_op (nested dispatch, e.g. one op
+    // composing another) can itself raise IndexError; keep that distinct
+    // from the generic c10::Error catch below so the caller sees rc 3, not 1.
+    tmb_set_error(e.what_without_backtrace());
+    return 3;
   } catch (const c10::Error& e) {
     tmb_set_error(e.what_without_backtrace());
     return 1;

@@ -13,6 +13,8 @@ import math
 import pytest
 import torch
 
+from torch.utils.cpp_extension import load_inline
+
 from tests.native.conftest import is_metal, ran, skip_if_metal
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
@@ -4127,3 +4129,92 @@ def test_median_and_kthvalue_errors(mojo_gpu):
         torch.median(torch.empty(2, 0).to(mojo_gpu), 1)
     with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
         torch.median(torch.tensor([True, False]).to(mojo_gpu), 0)
+
+
+# ---------------------------------------------------------------------------
+# nested dispatch: one Mojo op calling another aten op through the real
+# dispatcher (`abi.call_op`/`call_op_raw` -> native/csrc's `tmb_call_op`,
+# distinct from the direct boxed-kernel path every op above goes through).
+# `tmb_call_op` has its own try/catch around the nested call and must map a
+# c10::IndexError raised by the nested op to rc 3, the same way the direct
+# path's `MojoBoxedKernel::operator()` does -- easy to regress since it is a
+# second, separate catch chain in shim_dispatch.cpp. No shipped op currently
+# nests a reduction with a caller-controlled dim, so this drives
+# `tmb_call_op` directly (already exported `extern "C"`, already loaded
+# RTLD_GLOBAL by `register_mojo_devices()`) with a deliberately bad dim
+# against the real `aten::sum.dim_IntList` kernel.
+# ---------------------------------------------------------------------------
+
+_NESTED_DISPATCH_PROBE_SOURCE = r"""
+#include <torch/extension.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct TmbValue { int32_t tag; int32_t len; int64_t a; int64_t b; };
+
+extern "C" int32_t tmb_call_op(const char* op, const char* overload, const TmbValue* args,
+                                int32_t n_args, TmbValue* rets, int32_t n_rets);
+extern "C" const char* tmb_get_error();
+
+// Mirrors abi.mojo's call_op: build the aten::sum.dim_IntList argument
+// records by hand and go through tmb_call_op exactly as a Mojo op would.
+std::pair<int64_t, std::string> nested_dispatch_probe(
+    torch::Tensor self, std::vector<int64_t> dims, bool keepdim) {
+  at::Tensor* self_h = new at::Tensor(self);
+  TmbValue args[4];
+  args[0] = TmbValue{/*TMB_TENSOR=*/1, 0, reinterpret_cast<int64_t>(self_h), 0};
+  args[1] = TmbValue{/*TMB_INT_LIST=*/7, static_cast<int32_t>(dims.size()),
+                     reinterpret_cast<int64_t>(dims.data()), 0};
+  args[2] = TmbValue{/*TMB_BOOL=*/5, 0, keepdim ? 1 : 0, 0};
+  args[3] = TmbValue{/*TMB_NONE=*/0, 0, 0, 0};  // dtype=None
+  TmbValue ret{0, 0, 0, 0};
+  int32_t rc = tmb_call_op("aten::sum", "dim_IntList", args, 4, &ret, 1);
+  std::string msg;
+  if (rc != 0) {
+    const char* e = tmb_get_error();
+    msg = e ? e : "";
+  } else if (ret.tag == 1) {
+    delete reinterpret_cast<at::Tensor*>(ret.a);
+  }
+  delete self_h;
+  return {rc, msg};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("nested_dispatch_probe", &nested_dispatch_probe);
+}
+"""
+
+
+@pytest.fixture(scope="session")
+def nested_dispatch_probe(registered):
+    """Builds once per session: the shim must already be loaded (RTLD_GLOBAL,
+    via `registered`) for `tmb_call_op`/`tmb_get_error` to resolve when this
+    extension loads."""
+    return load_inline(
+        name="tmb_reductions_nested_dispatch_probe",
+        cpp_sources=_NESTED_DISPATCH_PROBE_SOURCE,
+        with_cuda=False,
+        verbose=False,
+    )
+
+
+def test_nested_dispatch_maps_index_error_to_rc3(mojo_gpu, nested_dispatch_probe):
+    """rc 3 from a NESTED op call (one op calling another through
+    `tmb_call_op`) must reach Python as IndexError, same as the direct
+    boxed-kernel path `test_reduce_skeleton_rank2_out_of_range_int_dim_declines`
+    already covers."""
+    x = torch.randn(2, 3).to(mojo_gpu)
+    rc, msg = nested_dispatch_probe.nested_dispatch_probe(x, [5], False)
+    assert rc == 3, (rc, msg)
+    assert (
+        "Dimension out of range (expected to be in range of [-2, 1], but got 5)" in msg
+    )
+
+    rc, msg = nested_dispatch_probe.nested_dispatch_probe(x, [0, 0], False)
+    assert rc == 1, (rc, msg)  # duplicate dim: RuntimeError, not IndexError
+    assert "dim 0 appears multiple times in the list of dims" in msg
+
+    rc, msg = nested_dispatch_probe.nested_dispatch_probe(x, [1], False)
+    assert rc == 0, (rc, msg)  # sanity: a valid dim still succeeds

@@ -2321,12 +2321,8 @@ def _sort_kernel_dtype(a: T, op: StaticString) raises -> DType:
 
 
 def _sort_dim(a: T, dim: Int) raises -> Int:
-    """ATen's `maybe_wrap_dim` for sort/topk: a 0-d tensor has one dim.
-    Raises IndexError, matching stock CUDA."""
-    var ndim = max(a.rank, 1)
-    if dim < -ndim or dim >= ndim:
-        index_error(_dim_range_message(dim, ndim))
-    return dim + ndim if dim < 0 else dim
+    """ATen's `maybe_wrap_dim` for sort/topk: a 0-d tensor has one dim."""
+    return _norm_dim(dim, a.rank)
 
 
 def _selected_shape(a: T, dim: Int, k: Int) -> IndexList[MAX_RANK]:
