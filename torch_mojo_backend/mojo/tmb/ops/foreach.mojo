@@ -342,14 +342,90 @@ def _binary(
 # One row per overload pair, one line per row: a table read across.
 # fmt: off
 comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
-    # The overloads the multi-tensor apply started with; the other
-    # families join in the commits that follow.
-    _unary("_foreach_sqrt", "", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
-    _binary("", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
-    _binary("", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
-    _binary("", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
-    _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
-    _binary("", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    # unary: ForeachUnaryOp.cu. Floating lists only, except abs (every
+    # dtype), neg (not bool) and zero_; float64 where the GPU lowers it.
+    _unary("_foreach_abs", "_foreach_abs_", "abs", "aten::abs", "aten::abs_", D_ALL, True),
+    _unary("_foreach_acos", "_foreach_acos_", "acos", "aten::acos", "aten::acos_", D_FLOAT, False),
+    _unary("_foreach_asin", "_foreach_asin_", "asin", "aten::asin", "aten::asin_", D_FLOAT, False),
+    _unary("_foreach_atan", "_foreach_atan_", "atan", "aten::atan", "aten::atan_", D_FLOAT, False),
+    _unary("_foreach_ceil", "_foreach_ceil_", "ceil", "aten::ceil", "aten::ceil_", D_FLOAT, True),
+    _unary("_foreach_cos", "_foreach_cos_", "cos", "aten::cos", "aten::cos_", D_FLOAT, False),
+    _unary("_foreach_cosh", "_foreach_cosh_", "cosh", "aten::cosh", "aten::cosh_", D_FLOAT, False),
+    _unary("_foreach_erf", "_foreach_erf_", "erf", "aten::erf", "aten::erf_", D_FLOAT, False),
+    _unary("_foreach_erfc", "_foreach_erfc_", "erfc", "aten::erfc", "aten::erfc_", D_FLOAT, False),
+    _unary("_foreach_exp", "_foreach_exp_", "exp", "aten::exp", "aten::exp_", D_FLOAT, False),
+    _unary("_foreach_expm1", "_foreach_expm1_", "expm1", "aten::expm1", "aten::expm1_", D_FLOAT, False),
+    _unary("_foreach_floor", "_foreach_floor_", "floor", "aten::floor", "aten::floor_", D_FLOAT, True),
+    _unary("_foreach_frac", "_foreach_frac_", "frac", "aten::frac", "aten::frac_", D_FLOAT, True),
+    _unary("_foreach_lgamma", "_foreach_lgamma_", "lgamma", "aten::lgamma", "aten::lgamma_", D_FLOAT, False),
+    _unary("_foreach_log", "_foreach_log_", "log", "aten::log", "aten::log_", D_FLOAT, False),
+    _unary("_foreach_log10", "_foreach_log10_", "log10", "aten::log10", "aten::log10_", D_FLOAT, False),
+    _unary("_foreach_log1p", "_foreach_log1p_", "log1p", "aten::log1p", "aten::log1p_", D_FLOAT, False),
+    _unary("_foreach_log2", "_foreach_log2_", "log2", "aten::log2", "aten::log2_", D_FLOAT, False),
+    _unary("_foreach_neg", "_foreach_neg_", "neg", "aten::neg", "aten::neg_", D_INT, True),
+    _unary("_foreach_reciprocal", "_foreach_reciprocal_", "reciprocal", "aten::reciprocal", "aten::reciprocal_", D_FLOAT, True),
+    _unary("_foreach_round", "_foreach_round_", "round", "aten::round", "aten::round_", D_FLOAT, True),
+    _unary("_foreach_rsqrt", "_foreach_rsqrt_", "rsqrt", "aten::rsqrt", "aten::rsqrt_", D_FLOAT, False),
+    _unary("_foreach_sigmoid", "_foreach_sigmoid_", "sigmoid", "aten::sigmoid", "aten::sigmoid_", D_FLOAT, False),
+    _unary("_foreach_sign", "_foreach_sign_", "sign", "aten::sign", "aten::sign_", D_FLOAT, True),
+    _unary("_foreach_sin", "_foreach_sin_", "sin", "aten::sin", "aten::sin_", D_FLOAT, False),
+    _unary("_foreach_sinh", "_foreach_sinh_", "sinh", "aten::sinh", "aten::sinh_", D_FLOAT, False),
+    _unary("_foreach_sqrt", "_foreach_sqrt_", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
+    _unary("_foreach_tan", "_foreach_tan_", "tan", "aten::tan", "aten::tan_", D_FLOAT, False),
+    _unary("_foreach_tanh", "_foreach_tanh_", "tanh", "aten::tanh", "aten::tanh_", D_FLOAT, False),
+    _unary("_foreach_trunc", "_foreach_trunc_", "trunc", "aten::trunc", "aten::trunc_", D_FLOAT, True),
+    _unary("", "_foreach_zero_", "zero", "", "aten::zero_", D_ALL, True),
+    # binary: ForeachBinaryOp{Scalar,ScalarList,List,ScalarTensor}.cu.
+    _binary("_foreach_add.Scalar", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
+    _binary("_foreach_add.ScalarList", "_foreach_add_.ScalarList", "add", S_SCALARLIST, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_add.List", "_foreach_add_.List", "add", S_LIST, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_add.Tensor", "_foreach_add_.Tensor", "add", S_TENSOR, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_sub.Scalar", "_foreach_sub_.Scalar", "sub", S_SCALAR, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.ScalarList", "_foreach_sub_.ScalarList", "sub", S_SCALARLIST, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.List", "_foreach_sub_.List", "sub", S_LIST, "aten::sub", "Tensor", "aten::sub_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_mul.Scalar", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
+    _binary("_foreach_mul.ScalarList", "_foreach_mul_.ScalarList", "mul", S_SCALARLIST, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL),
+    _binary("_foreach_mul.List", "_foreach_mul_.List", "mul", S_LIST, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL),
+    _binary("_foreach_mul.Tensor", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
+    # div by a Scalar is CUDA's multiply by its reciprocal, slow path too.
+    _binary("_foreach_div.Scalar", "_foreach_div_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_FLOAT, reciprocal=True),
+    _binary("_foreach_div.ScalarList", "_foreach_div_.ScalarList", "div", S_SCALARLIST, "aten::div", "Scalar", "aten::div_", "Scalar", D_FLOAT),
+    _binary("_foreach_div.List", "_foreach_div_.List", "div", S_LIST, "aten::div", "Tensor", "aten::div_", "Tensor", D_FLOAT),
+    _binary("_foreach_div.Tensor", "_foreach_div_.Tensor", "div", S_TENSOR, "aten::div", "Tensor", "aten::div_", "Tensor", D_FLOAT),
+    # clamp_max / minimum are CUDA's `minimum`, clamp_min / maximum its
+    # `maximum`; the slow path is clamp_max / clamp_min for all four.
+    _binary("_foreach_clamp_max.Scalar", "_foreach_clamp_max_.Scalar", "minimum", S_SCALAR, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_clamp_max.ScalarList", "_foreach_clamp_max_.ScalarList", "minimum", S_SCALARLIST, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_clamp_max.List", "_foreach_clamp_max_.List", "minimum", S_LIST, "aten::clamp_max", "Tensor", "aten::clamp_max_", "Tensor", D_FLOAT),
+    _binary("_foreach_minimum.Scalar", "_foreach_minimum_.Scalar", "minimum", S_SCALAR, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_minimum.ScalarList", "_foreach_minimum_.ScalarList", "minimum", S_SCALARLIST, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_minimum.List", "_foreach_minimum_.List", "minimum", S_LIST, "aten::clamp_max", "Tensor", "aten::clamp_max_", "Tensor", D_FLOAT),
+    _binary("_foreach_clamp_min.Scalar", "_foreach_clamp_min_.Scalar", "maximum", S_SCALAR, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_clamp_min.ScalarList", "_foreach_clamp_min_.ScalarList", "maximum", S_SCALARLIST, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_clamp_min.List", "_foreach_clamp_min_.List", "maximum", S_LIST, "aten::clamp_min", "Tensor", "aten::clamp_min_", "Tensor", D_FLOAT),
+    _binary("_foreach_maximum.Scalar", "_foreach_maximum_.Scalar", "maximum", S_SCALAR, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_maximum.ScalarList", "_foreach_maximum_.ScalarList", "maximum", S_SCALARLIST, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_maximum.List", "_foreach_maximum_.List", "maximum", S_LIST, "aten::clamp_min", "Tensor", "aten::clamp_min_", "Tensor", D_FLOAT),
+    _binary("_foreach_pow.Scalar", "_foreach_pow_.Scalar", "pow", S_SCALAR, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
+    _binary("_foreach_pow.ScalarList", "_foreach_pow_.ScalarList", "pow", S_SCALARLIST, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
+    _binary("_foreach_pow.List", "_foreach_pow_.List", "pow", S_LIST, "aten::pow", "Tensor_Tensor", "aten::pow_", "Tensor", D_FLOAT),
+    # An integer exponent list promotes, as result_type and CPU torch say;
+    # stock CUDA truncates the base instead (ForeachBinaryOpScalar.cu:184
+    # takes its fast route without looking at the scalar, :47 converts it
+    # with `scalar.to<opmath_t>()`): _foreach_pow(1.5, [int [1, 2]]) is
+    # int64 [1, 1] there, float32 [1.5, 2.25] here.
+    _binary("_foreach_pow.ScalarAndTensor", "", "rpow", S_RPOW, "aten::pow", "Scalar", "", "", D_FLOAT),
+    # pointwise: ForeachPointwiseOp.cu (floating lists only).
+    _binary("_foreach_addcmul.Scalar", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
+    _binary("_foreach_addcmul.ScalarList", "_foreach_addcmul_.ScalarList", "addcmul", S_PW_SCALARLIST, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcmul.Tensor", "_foreach_addcmul_.Tensor", "addcmul", S_PW_TENSOR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Scalar", "_foreach_addcdiv_.Scalar", "addcdiv", S_PW_SCALAR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.ScalarList", "_foreach_addcdiv_.ScalarList", "addcdiv", S_PW_SCALARLIST, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Tensor", "_foreach_addcdiv_.Tensor", "addcdiv", S_PW_TENSOR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    # ternary: ForeachTernaryOp.cu (floating lists only).
+    _binary("_foreach_lerp.List", "_foreach_lerp_.List", "lerp", S_LERP_LIST, "aten::lerp", "Tensor", "aten::lerp_", "Tensor", D_FLOAT),
+    _binary("_foreach_lerp.Scalar", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    _binary("_foreach_lerp.ScalarList", "_foreach_lerp_.ScalarList", "lerp", S_LERP_SCALARLIST, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT),
 ]
 # fmt: on
 
@@ -712,13 +788,6 @@ def _fast_route(
     if (s == S_LIST or s == S_TENSOR) and e.alpha:
         if not _scalar_keeps_dtype(p.alpha, dt):
             return False
-    if e.kind == "sub":
-        # sub_check: a bool operand raises, which the per-tensor sub does.
-        if v_scalar_is_bool(p.scalar) or v_scalar_is_bool(p.alpha):
-            return False
-        for v in p.scalars:
-            if v_scalar_is_bool(v):
-                return False
     if s == S_TENSOR:
         ref other = p.other[0]
         if other.dtype != dt:
@@ -870,6 +939,23 @@ def _per_tensor(
     ret_tensor_list(rets, 0, result)
 
 
+def _sub_check(t: T, v: Value) raises:
+    """BinaryOps.h's `sub_check(self, scalar)`: no bool on either side."""
+    var bool_self = t.dtype == DType.bool
+    var bool_scalar = v_scalar_is_bool(v)
+    if bool_self and bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if bool_self or bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 def _scalar_twin(e: ForeachOverload) -> ForeachOverload:
     """The `.Scalar` overload a `.Tensor` row (mul, div) runs when its
     operand is a CPU tensor: ForeachBinaryOpScalarTensor.cu calls
@@ -921,6 +1007,17 @@ def _foreach(
             _per_tensor(scalar_row, inplace, p, rets)
         return
     p.check(e)
+    if e.kind == "sub":
+        # ForeachBinaryOpScalar{,List}.cu check before anything runs: the
+        # Scalar overload the first tensor, the ScalarList one every pair.
+        # The List overload checks nothing up front: a bool pair on the
+        # fast route (bool alpha) computes, any other raises in the
+        # per-tensor sub, as on CUDA.
+        if e.shape == S_SCALAR:
+            _sub_check(p.lists[0][0], p.scalar)
+        elif e.shape == S_SCALARLIST:
+            for i in range(len(p.lists[0])):
+                _sub_check(p.lists[0][i], p.scalars[i])
     if e.shape == S_TENSOR:
         ref other = p.other[0]
         if other.rank != 0 or other.numel != 1:
