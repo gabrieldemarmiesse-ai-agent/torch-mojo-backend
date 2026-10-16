@@ -691,6 +691,9 @@ def test_pow_follows_thrust_log_and_exp(mojo_gpu: str):
 
 @pytest.mark.parametrize("op", ["exp", "polar"])
 def test_complex_phase_argument_reduction(mojo_gpu: str, op: str):
+    skip_if_metal(
+        mojo_gpu, "tests the libdevice trig route; Metal uses its own sin/cos"
+    )
     # The AMD hardware trig instructions alone lose the residual near pi/2
     # and all phase information for large inputs. Exercise both sides of
     # libdevice's 105615-radian range-reduction boundary and finite extremes.
