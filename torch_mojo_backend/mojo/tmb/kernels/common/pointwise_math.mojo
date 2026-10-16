@@ -29,7 +29,7 @@ from std.collections import Array
 from std.memory import bitcast
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
-from std.sys.info import is_apple_gpu, is_nvidia_gpu, size_of
+from std.sys.info import is_amd_gpu, is_apple_gpu, is_nvidia_gpu, size_of
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.cuda_math import (
@@ -55,6 +55,7 @@ from tmb.kernels.common.libdevice_port import (
     nv_log1pf,
     nv_logf,
 )
+from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
@@ -1396,13 +1397,18 @@ def _st_round[
     CUDA's scalar_t code never skips (nor MPS, where every step of a
     composite is its own kernel). The opaque copy stops that on NVIDIA; on
     Apple GPUs (no inline assembly) an integer XOR with `fence`, a runtime
-    False, does. float32 / float64 keep nvcc's own default contraction."""
+    False, does; on AMD GPUs (v_fma_f16, or v_fma_mix_f32 through the
+    extension) a VGPR copy on both sides of the rounding (`amd_opaque`,
+    `cast_rounded`). float32 / float64 keep nvcc's own default
+    contraction."""
     comptime if dtype == w:
         return v
     elif is_apple_gpu():
         var bits = bitcast[DType.uint16, n](v.cast[dtype]())
         bits = bits ^ SIMD[DType.uint16, n](UInt16(1 if fence else 0))
         return bitcast[dtype, n](bits).cast[w]()
+    elif is_amd_gpu():
+        return amd_opaque(cast_rounded[dtype](v).cast[w]())
     else:
         return _opaque(v.cast[dtype]().cast[w]())
 
@@ -1532,7 +1538,8 @@ def _scalar_t[
         res = _st_round[dtype](x * y, fence) * q[0]
     else:
         comptime assert False, "unknown scalar_t kind"
-    return res.cast[dtype]()
+    # A last product by a float parameter (`* q[0]`) rounds in float first.
+    return cast_rounded[dtype](res)
 
 
 # ---------------------------------------------------------------------------
