@@ -611,11 +611,17 @@ def _pacos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 
 @always_inline
 def _pcos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
-    """The polynomials' `cos`: libdevice's cosf on NVIDIA (what the float
-    jiterator kernels call; std.math's is `cos.approx.ftz`, whose error
-    grows with the n * acos(x) argument), Metal's own cos on Apple (MPS's
-    `precise::cos`), std.math elsewhere."""
-    comptime if w == DType.float32 and is_nvidia_gpu():
+    """The polynomials' (and the complex exp's) `cos`: libdevice's cosf on
+    NVIDIA and AMD (what the float jiterator kernels and thrust's cexpf call
+    on CUDA), Metal's own cos on Apple (MPS's `precise::cos`), std.math
+    elsewhere (the host's libm). std.math's GPU float cos is no stand-in:
+    `cos.approx.ftz` on NVIDIA, whose error grows with the n * acos(x)
+    argument, and on AMD `llvm.cos`, i.e. v_cos_f32 of fract(x * 1/2pi)
+    with no range reduction past that rounded product: cos(float(pi/2))
+    comes out 0, not -4.37e-8, cos(100) is 1e-6 off, cos(1e6) 1e-2, and
+    cos = 1, sin = 0 for every |x| >= 2^24 * 2pi, where the product is an
+    integer (an overflowing complex pow then makes inf * sin a NaN)."""
+    comptime if w == DType.float32 and (is_nvidia_gpu() or is_amd_gpu()):
         return nv_cosf(x.cast[DType.float32]()).cast[w]()
     elif w == DType.float64:
         # std.math has no float64 cos on NVIDIA or AMD (`fcos` has no
@@ -628,7 +634,7 @@ def _pcos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 @always_inline
 def _psin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The polynomials' `sin`, as `_pcos`."""
-    comptime if w == DType.float32 and is_nvidia_gpu():
+    comptime if w == DType.float32 and (is_nvidia_gpu() or is_amd_gpu()):
         return nv_sinf(x.cast[DType.float32]()).cast[w]()
     elif w == DType.float64:
         return _sincos_f64(x.cast[DType.float64]())[0].cast[w]()
